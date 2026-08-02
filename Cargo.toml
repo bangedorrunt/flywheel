@@ -1,0 +1,42 @@
+[package]
+name = "flywheel"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-agent swarm orchestrator on the herdr backend — NTM-parity daily loop for opencode/pi/grok"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+regex-lite = "0.1"
+ureq = { version = "2", features = ["json"] }
+resonate-sdk = "0.6.0"
+
+[features]
+default = ["serve"]
+serve = ["dep:axum", "dep:tokio", "dep:tokio-stream", "dep:futures-core"]
+
+[dependencies.axum]
+version = "0.8"
+optional = true
+
+[dependencies.futures-core]
+version = "0.3"
+optional = true
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread", "macros", "net", "time"]
+optional = true
+
+[dependencies.tokio-stream]
+version = "0.1"
+optional = true
+
+[profile.release]
+strip = true
+lto = true
