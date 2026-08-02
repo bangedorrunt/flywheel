@@ -369,6 +369,30 @@ enum Commands {
     __Ready {
         project: String,
     },
+    /// internal: list in-progress beads as JSON (durable workflow leaf)
+    #[command(name = "__inprogress", hide = true)]
+    __Inprogress {
+        project: String,
+    },
+    /// internal: agent kind as text (durable workflow leaf)
+    #[command(name = "__kind", hide = true)]
+    __Kind {
+        project: String,
+        name: String,
+    },
+    /// internal: recent agent output as text (durable workflow leaf)
+    #[command(name = "__read", hide = true)]
+    __Read {
+        project: String,
+        name: String,
+    },
+    /// internal: replace an agent with a fresh pane instance (durable workflow leaf)
+    #[command(name = "__respawn", hide = true)]
+    __Respawn {
+        project: String,
+        name: String,
+        kind: String,
+    },
 }
 
 #[derive(Args, Default, Clone)]
@@ -774,6 +798,12 @@ fn main() {
         Some(Commands::__Send { project, name, text }) => cmd_internal_send(&cfg, project, name, text),
         Some(Commands::__MailBlocked { project, name }) => cmd_internal_mail_blocked(&cfg, project, name),
         Some(Commands::__Ready { project }) => cmd_internal_ready(&cfg, project),
+        Some(Commands::__Inprogress { project }) => cmd_internal_inprogress(&cfg, project),
+        Some(Commands::__Kind { project, name }) => cmd_internal_kind(&cfg, project, name),
+        Some(Commands::__Read { project, name }) => cmd_internal_read(&cfg, project, name),
+        Some(Commands::__Respawn { project, name, kind }) => {
+            cmd_internal_respawn(&cfg, project, name, kind)
+        }
         None => {
             // no command: show concise help with examples
             print_concise_help();
@@ -2565,6 +2595,102 @@ fn cmd_internal_ready(cfg: &Config, project: &str) -> Result<()> {
         })
         .collect();
     print_json(&json!({ "beads": beads }));
+    Ok(())
+}
+
+/// internal leaf: in-progress beads as [{id, title}] via `br list --status in_progress`.
+fn cmd_internal_inprogress(cfg: &Config, project: &str) -> Result<()> {
+    let dir = project_dir(cfg, project);
+    let out = std::process::Command::new("br")
+        .args(["list", "--status", "in_progress", "--json"])
+        .current_dir(&dir)
+        .output()
+        .map_err(|e| anyhow!("br not found: {e}"))?;
+    if !out.status.success() {
+        bail!(
+            "br list failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v: Value = serde_json::from_str(raw.trim())
+        .map_err(|e| anyhow!("br list bad JSON: {e}: {raw}"))?;
+    // br list --json wraps issues under "issues"
+    let list: &Vec<Value> = v
+        .get("issues")
+        .and_then(Value::as_array)
+        .or_else(|| v.as_array())
+        .ok_or_else(|| anyhow!("br list output has no issues array: {raw}"))?;
+    let beads: Vec<Value> = list
+        .iter()
+        .map(|b| {
+            json!({
+                "id": b.get("id").and_then(Value::as_str).unwrap_or(""),
+                "title": b.get("title").and_then(Value::as_str).unwrap_or("")
+            })
+        })
+        .collect();
+    print_json(&json!({ "beads": beads }));
+    Ok(())
+}
+
+/// internal leaf: print the herdr agent kind of a named agent.
+fn cmd_internal_kind(cfg: &Config, project: &str, name: &str) -> Result<()> {
+    let mut c = Client::connect(Some(&cfg.socket_path()))?;
+    let ws_id = find_workspace(&mut c, project)?;
+    let agent = c
+        .agent_list()?
+        .into_iter()
+        .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
+        .ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
+    println!("{}", agent.agent.as_deref().unwrap_or("unknown"));
+    Ok(())
+}
+
+/// internal leaf: print recent output of a named agent (context-marker check).
+fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
+    let mut c = Client::connect(Some(&cfg.socket_path()))?;
+    let ws_id = find_workspace(&mut c, project)?;
+    let agent = c
+        .agent_list()?
+        .into_iter()
+        .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
+        .ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
+    let text = c.agent_read(agent_target(&agent), "recent", Some(60))?;
+    print!("{text}");
+    Ok(())
+}
+
+/// internal leaf: close the agent's pane, split a fresh pane, restart the agent
+/// under the same name (fresh session context).
+fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> Result<()> {
+    let mut c = Client::connect(Some(&cfg.socket_path()))?;
+    let ws_id = find_workspace(&mut c, project)?;
+    let dir = project_dir(cfg, project);
+    let agent = c
+        .agent_list()?
+        .into_iter()
+        .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
+        .ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
+    let old_pane = agent.pane_id.clone();
+    // split the fresh pane FIRST (closing the old one while it is the only pane
+    // would close the whole workspace), then close the exhausted agent, then
+    // restart under the same name
+    let panes = c.pane_list(Some(&ws_id))?;
+    let anchor = panes
+        .iter()
+        .find(|p| p.pane_id != old_pane)
+        .map(|p| p.pane_id.clone())
+        .unwrap_or(old_pane.clone());
+    let new_pane = c.pane_split(&anchor, "down", Some(dir.to_str().unwrap()))?;
+    let _ = c.call("pane.close", json!({ "pane_id": old_pane }))?;
+    let fresh = start_agent_with_retry(&mut c, name, kind, &new_pane.pane_id)?;
+    println!(
+        "respawned {} {} -> {}",
+        kind_paint(kind),
+        dim(&old_pane),
+        fresh.pane_id
+    );
     Ok(())
 }
 

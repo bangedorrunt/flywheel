@@ -35,6 +35,15 @@ Two work sources:
   exhausted (dependencies unblock new beads naturally). Use this after a
   `/swarm` launch.
 
+Work-mode dynamics:
+- **interrupt recovery** — beads left `in_progress` by an interrupted/network-
+  dropped agent are re-prompted with a resume instruction before fresh beads;
+  the loop stays alive while any bead is stranded
+- **context respawn** — before delegating to an idle agent, the loop checks its
+  recent output for the `CONTEXT_LIMIT` marker (the bead prompt tells agents to
+  emit it past ~80% context); if found, the agent's pane is replaced by a fresh
+  instance under the same name and the queue item is handed to it
+
 ### Durability (Resonate)
 
 The loop runs as a **durable Resonate workflow** (requires a Resonate server,
