@@ -33,6 +33,8 @@ pub struct LoopParams {
     /// max poll iterations before failing (derived from --timeout-ms;
     /// deterministic across replays, unlike wall-clock deadlines)
     pub max_iterations: Option<u64>,
+    /// bead-driven mode: source work from `br ready` instead of a static queue
+    pub work: bool,
 }
 
 /// One polled agent state: (name, status string).
@@ -40,6 +42,18 @@ pub struct LoopParams {
 pub struct AgentState {
     pub name: String,
     pub status: String,
+}
+
+/// One ready bead from `br ready --json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadyBead {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadyArgs {
+    pub project: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +125,44 @@ async fn poll_swarm(args: PollArgs) -> Result<Vec<AgentState>> {
         });
     }
     Ok(out_states)
+}
+
+/// List ready beads via the flywheel binary (`br ready --json` in the project).
+/// Checkpointed.
+#[function]
+async fn poll_ready(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
+    let exe = self_exe().map_err(map_err)?;
+    let out = Command::new(&exe)
+        .args(["__ready", &args.project])
+        .output()
+        .map_err(|e| map_err(anyhow::anyhow!("__ready spawn failed: {e}")))?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__ready failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(raw.trim())
+        .map_err(|e| map_err(anyhow::anyhow!("__ready bad JSON: {e}: {raw}")))?;
+    let beads = v
+        .get("beads")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| map_err(anyhow::anyhow!("__ready missing beads: {raw}")))?;
+    let mut out_beads = Vec::with_capacity(beads.len());
+    for b in beads {
+        out_beads.push(ReadyBead {
+            id: b.get("id").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+            title: b.get("title").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+        });
+    }
+    Ok(out_beads)
+}
+
+/// The prompt given to an agent for a ready bead: self-contained + lifecycle.
+pub fn bead_prompt(id: &str, title: &str) -> String {
+    let template = r#"Execute bead {id}: {title}. Follow the bead lifecycle: claim (`br update {id} --claim --actor "$AGENT_NAME" --json`), reserve your files via agent-mail, announce, execute one narrow slice, verify acceptance criteria, close with an honest reason, `br sync --flush-only` and commit `.beads/`. If {id} is already claimed, pick the next ready bead from `br ready --json` or report back."#;
+    template.replace("{id}", id).replace("{title}", title)
 }
 
 /// Send one prompt via the flywheel binary. Checkpointed side effect.
@@ -190,6 +242,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     let interval = Duration::from_secs(params.interval_secs);
     let interval_min = Duration::from_secs(5);
     let mut iteration = 0u64;
+    // bead-driven mode tracks which beads were already handed out
+    let mut assigned: Vec<String> = Vec::new();
 
     loop {
         iteration += 1;
@@ -211,6 +265,28 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 },
             )
             .await?;
+
+        // bead-driven mode: refresh the instruction queue from the tracker each
+        // poll; the assigned-set is deterministic across replays (derives from
+        // checkpointed poll results)
+        if params.work {
+            let ready: Vec<ReadyBead> = ctx
+                .run(
+                    poll_ready,
+                    ReadyArgs {
+                        project: params.project.clone(),
+                    },
+                )
+                .await?;
+            let to_assign: Vec<&ReadyBead> = ready
+                .iter()
+                .filter(|b| !assigned.contains(&b.id))
+                .collect();
+            for bead in to_assign {
+                queue.push(bead_prompt(&bead.id, &bead.title));
+                assigned.push(bead.id.clone());
+            }
+        }
 
         let mut blocked_names: Vec<String> = Vec::new();
         let actions = plan_actions(&states, &mut queue, params.nudge.as_deref());
@@ -314,6 +390,9 @@ pub async fn run_durable_loop(cfg: &Config, params: LoopParams) -> anyhow::Resul
     resonate
         .register(notify_blocked)
         .map_err(|e| anyhow::anyhow!("register notify_blocked: {e}"))?;
+    resonate
+        .register(poll_ready)
+        .map_err(|e| anyhow::anyhow!("register poll_ready: {e}"))?;
 
     // Resume semantics: the persisted invocation id is reused while its promise
     // is still pending (crash resume); once it settles (complete/blocked/failed),
@@ -471,6 +550,14 @@ mod tests {
     }
 
     #[test]
+    fn bead_prompt_is_self_contained() {
+        let p = bead_prompt("bd-12", "fix auth flow");
+        assert!(p.contains("bd-12"));
+        assert!(p.contains("--claim"));
+        assert!(p.contains("br sync --flush-only"));
+    }
+
+    #[test]
     fn params_serde_roundtrip() {
         let p = LoopParams {
             project: "notetoself".into(),
@@ -480,6 +567,7 @@ mod tests {
             nudge: None,
             on_blocked: "continue".into(),
             max_iterations: Some(10),
+            work: false,
         };
         let v = serde_json::to_value(&p).unwrap();
         let back: LoopParams = serde_json::from_value(v).unwrap();

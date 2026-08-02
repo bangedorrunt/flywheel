@@ -28,6 +28,13 @@ idle/finished agents, reports blockers (`--on-blocked continue|stop|mail`),
 and exits 0 when the queue drains and the swarm settles. Idle agents with an
 empty queue get an optional `--nudge`.
 
+Two work sources:
+- `--queue p1,p2,p4,p5,p6,p8` — static stages/messages (the daily driver)
+- `--work` — **bead-driven**: each poll sources work from `br ready --json` and
+  feeds idle agents "claim and execute bead bd-N" prompts until the plan is
+  exhausted (dependencies unblock new beads naturally). Use this after a
+  `/swarm` launch.
+
 ### Durability (Resonate)
 
 The loop runs as a **durable Resonate workflow** (requires a Resonate server,
