@@ -200,6 +200,10 @@ enum Commands {
         /// run the sync polling loop instead of the durable Resonate workflow
         #[arg(long)]
         local: bool,
+        /// bead-driven mode: source work from `br ready` each poll instead of
+        /// a static queue — feeds the swarm until the plan/beads are done
+        #[arg(long)]
+        work: bool,
     },
     /// Query the state of a durable loop invocation on the Resonate server
     LoopStatus {
@@ -359,6 +363,11 @@ enum Commands {
     __MailBlocked {
         project: String,
         name: String,
+    },
+    /// internal: list ready beads as JSON (durable workflow leaf)
+    #[command(name = "__ready", hide = true)]
+    __Ready {
+        project: String,
     },
 }
 
@@ -714,6 +723,7 @@ fn main() {
             on_blocked,
             to,
             local,
+            work,
         }) => cmd_loop(
             &cfg,
             project,
@@ -724,6 +734,7 @@ fn main() {
             *timeout_ms,
             *once,
             *local,
+            *work,
             on_blocked,
             to,
         ),
@@ -762,6 +773,7 @@ fn main() {
         Some(Commands::__Poll { project, to }) => cmd_internal_poll(&cfg, project, to),
         Some(Commands::__Send { project, name, text }) => cmd_internal_send(&cfg, project, name, text),
         Some(Commands::__MailBlocked { project, name }) => cmd_internal_mail_blocked(&cfg, project, name),
+        Some(Commands::__Ready { project }) => cmd_internal_ready(&cfg, project),
         None => {
             // no command: show concise help with examples
             print_concise_help();
@@ -1914,6 +1926,7 @@ fn cmd_loop(
     timeout_ms: Option<u64>,
     once: bool,
     local: bool,
+    work: bool,
     on_blocked: &str,
     to: &str,
 ) -> Result<()> {
@@ -1941,6 +1954,7 @@ fn cmd_loop(
             nudge: nudge.map(String::from),
             on_blocked: on_blocked.to_string(),
             max_iterations,
+            work,
         };
         let rt = tokio::runtime::Runtime::new()?;
         println!(
@@ -2518,6 +2532,39 @@ fn cmd_internal_send(cfg: &Config, project: &str, name: &str, text: &str) -> Res
         .ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
     c.agent_prompt(agent_target(&agent), text, None)?;
     print_json(&json!({ "ok": true, "name": name }));
+    Ok(())
+}
+
+/// internal leaf: ready beads as [{id, title}] via `br ready --json`.
+fn cmd_internal_ready(cfg: &Config, project: &str) -> Result<()> {
+    let dir = project_dir(cfg, project);
+    let out = std::process::Command::new("br")
+        .args(["ready", "--json"])
+        .current_dir(&dir)
+        .output()
+        .map_err(|e| anyhow!("br not found: {e}"))?;
+    if !out.status.success() {
+        bail!(
+            "br ready failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v: Value = serde_json::from_str(raw.trim())
+        .map_err(|e| anyhow!("br ready bad JSON: {e}: {raw}"))?;
+    let beads: Vec<Value> = v
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|b| {
+            json!({
+                "id": b.get("id").and_then(Value::as_str).unwrap_or(""),
+                "title": b.get("title").and_then(Value::as_str).unwrap_or("")
+            })
+        })
+        .collect();
+    print_json(&json!({ "beads": beads }));
     Ok(())
 }
 
