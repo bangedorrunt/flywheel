@@ -31,7 +31,8 @@ empty queue get an optional `--nudge`.
 ### Durability (Resonate)
 
 The loop runs as a **durable Resonate workflow** (requires a Resonate server,
-default `http://localhost:8001` — run `resonate serve --storage-type sqlite`).
+default `http://localhost:8001` — installed as the launchd service
+`com.flywheel.resonate`; sqlite state survives reboots).
 Every poll, send, and sleep is a checkpoint: kill the loop process mid-run and
 `flywheel loop <project>` with the same flags **resumes the same invocation**
 from its last checkpoint. State is queryable via `flywheel loop-status
