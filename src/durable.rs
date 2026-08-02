@@ -57,6 +57,25 @@ pub struct ReadyArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PollKindArgs {
+    pub project: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadArgs {
+    pub project: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RespawnArgs {
+    pub project: String,
+    pub name: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PollArgs {
     pub project: String,
     pub to: String,
@@ -161,8 +180,103 @@ async fn poll_ready(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
 
 /// The prompt given to an agent for a ready bead: self-contained + lifecycle.
 pub fn bead_prompt(id: &str, title: &str) -> String {
-    let template = r#"Execute bead {id}: {title}. Follow the bead lifecycle: claim (`br update {id} --claim --actor "$AGENT_NAME" --json`), reserve your files via agent-mail, announce, execute one narrow slice, verify acceptance criteria, close with an honest reason, `br sync --flush-only` and commit `.beads/`. If {id} is already claimed, pick the next ready bead from `br ready --json` or report back."#;
+    let template = r#"Execute bead {id}: {title}. Follow the bead lifecycle: claim (`br update {id} --claim --actor "$AGENT_NAME" --json`), reserve your files via agent-mail, announce, execute one narrow slice, verify acceptance criteria, close with an honest reason, `br sync --flush-only` and commit `.beads/`. If your session context usage exceeds about 80%, do NOT start new work: finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you. If {id} is already claimed, pick the next ready bead from `br ready --json` or report back."#;
     template.replace("{id}", id).replace("{title}", title)
+}
+
+/// Prompt to resume an in-progress bead after an interruption.
+pub fn resume_prompt(id: &str, title: &str) -> String {
+    format!(
+        "Resume bead {id}: {title}. It is still in progress — continue it: re-check your work, finish, verify acceptance criteria, close with an honest reason, `br sync --flush-only` and commit `.beads/`. If your context is exhausted, reply exactly CONTEXT_LIMIT."
+    )
+}
+
+/// True when an agent's recent output carries the context-exhaustion marker.
+pub fn should_respawn(output: &str) -> bool {
+    output.contains("CONTEXT_LIMIT")
+}
+
+/// In-progress beads via the flywheel binary (`br list --status in_progress`).
+/// Checkpointed.
+#[function]
+async fn poll_inprogress(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
+    let exe = self_exe().map_err(map_err)?;
+    let out = Command::new(&exe)
+        .args(["__inprogress", &args.project])
+        .output()
+        .map_err(|e| map_err(anyhow::anyhow!("__inprogress spawn failed: {e}")))?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__inprogress failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(raw.trim())
+        .map_err(|e| map_err(anyhow::anyhow!("__inprogress bad JSON: {e}: {raw}")))?;
+    let beads = v
+        .get("beads")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| map_err(anyhow::anyhow!("__inprogress missing beads: {raw}")))?;
+    Ok(beads
+        .iter()
+        .map(|b| ReadyBead {
+            id: b.get("id").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+            title: b.get("title").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+        })
+        .collect())
+}
+
+/// Agent kind (opencode/pi/grok) for respawn. Checkpointed.
+#[function]
+async fn poll_kind(args: PollKindArgs) -> Result<String> {
+    let exe = self_exe().map_err(map_err)?;
+    let out = Command::new(&exe)
+        .args(["__kind", &args.project, &args.name])
+        .output()
+        .map_err(|e| map_err(anyhow::anyhow!("__kind spawn failed: {e}")))?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__kind failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Recent agent output via the flywheel binary. Checkpointed.
+#[function]
+async fn read_output(args: ReadArgs) -> Result<String> {
+    let exe = self_exe().map_err(map_err)?;
+    let out = Command::new(&exe)
+        .args(["__read", &args.project, &args.name])
+        .output()
+        .map_err(|e| map_err(anyhow::anyhow!("__read spawn failed: {e}")))?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__read failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Replace an exhausted agent with a fresh instance in a new pane.
+/// Checkpointed.
+#[function]
+async fn respawn_agent(args: RespawnArgs) -> Result<()> {
+    let exe = self_exe().map_err(map_err)?;
+    let out = Command::new(&exe)
+        .args(["__respawn", &args.project, &args.name, &args.kind])
+        .output()
+        .map_err(|e| map_err(anyhow::anyhow!("__respawn spawn failed: {e}")))?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__respawn failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
 }
 
 /// Send one prompt via the flywheel binary. Checkpointed side effect.
@@ -270,6 +384,25 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // poll; the assigned-set is deterministic across replays (derives from
         // checkpointed poll results)
         if params.work {
+            // interrupted work first: an in-progress bead's agent went idle —
+            // resume it before handing out fresh beads
+            let inprog: Vec<ReadyBead> = ctx
+                .run(
+                    poll_inprogress,
+                    ReadyArgs {
+                        project: params.project.clone(),
+                    },
+                )
+                .await?;
+            let to_resume: Vec<&ReadyBead> = inprog
+                .iter()
+                .filter(|b| !assigned.contains(&b.id))
+                .collect();
+            for bead in to_resume {
+                queue.push(resume_prompt(&bead.id, &bead.title));
+                assigned.push(bead.id.clone());
+            }
+
             let ready: Vec<ReadyBead> = ctx
                 .run(
                     poll_ready,
@@ -309,6 +442,40 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         for action in &actions {
             match action {
                 LoopAction::Send { name, text } => {
+                    // context guard: if the idle agent is context-exhausted,
+                    // respawn a fresh instance instead of delegating to it
+                    let output = ctx
+                        .run(
+                            read_output,
+                            ReadArgs {
+                                project: params.project.clone(),
+                                name: name.clone(),
+                            },
+                        )
+                        .await?;
+                    if should_respawn(&output) {
+                        let kind = ctx
+                            .run(
+                                poll_kind,
+                                PollKindArgs {
+                                    project: params.project.clone(),
+                                    name: name.clone(),
+                                },
+                            )
+                            .await?;
+                        ctx.run(
+                            respawn_agent,
+                            RespawnArgs {
+                                project: params.project.clone(),
+                                name: name.clone(),
+                                kind,
+                            },
+                        )
+                        .await?;
+                        // the fresh agent inherits the queue: put the prompt back
+                        queue.insert(0, text.clone());
+                        continue;
+                    }
                     ctx.run(
                         send_prompt,
                         SendArgs {
@@ -350,6 +517,22 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             }
         }
 
+        // work mode completion guard: a stranded in-progress bead (interrupted
+        // agent) must keep the loop alive — re-prompt it next poll.
+        let inprogress_empty = if params.work {
+            let inprog: Vec<ReadyBead> = ctx
+                .run(
+                    poll_inprogress,
+                    ReadyArgs {
+                        project: params.project.clone(),
+                    },
+                )
+                .await?;
+            inprog.is_empty()
+        } else {
+            true
+        };
+
         // settled = no work was dispatched this iteration AND everyone idle/done.
         // The states vector is pre-action, so an agent that just received the
         // last queue item is still "idle" here — without the any_work guard the
@@ -358,7 +541,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             .iter()
             .all(|s| matches!(s.status.as_str(), "idle" | "done"));
 
-        if queue.is_empty() && all_settled && !any_work {
+        if queue.is_empty() && all_settled && !any_work && inprogress_empty {
             return Ok("complete".to_string());
         }
 
@@ -393,6 +576,18 @@ pub async fn run_durable_loop(cfg: &Config, params: LoopParams) -> anyhow::Resul
     resonate
         .register(poll_ready)
         .map_err(|e| anyhow::anyhow!("register poll_ready: {e}"))?;
+    resonate
+        .register(poll_inprogress)
+        .map_err(|e| anyhow::anyhow!("register poll_inprogress: {e}"))?;
+    resonate
+        .register(read_output)
+        .map_err(|e| anyhow::anyhow!("register read_output: {e}"))?;
+    resonate
+        .register(poll_kind)
+        .map_err(|e| anyhow::anyhow!("register poll_kind: {e}"))?;
+    resonate
+        .register(respawn_agent)
+        .map_err(|e| anyhow::anyhow!("register respawn_agent: {e}"))?;
 
     // Resume semantics: the persisted invocation id is reused while its promise
     // is still pending (crash resume); once it settles (complete/blocked/failed),
@@ -547,6 +742,21 @@ mod tests {
         let mut q: Vec<String> = vec![];
         let actions = plan_actions(&states, &mut q, None);
         assert!(matches!(actions[0], LoopAction::Wait));
+    }
+
+    #[test]
+    fn resume_prompt_mentions_continuation() {
+        let p = resume_prompt("bd-7", "finish the parser");
+        assert!(p.contains("bd-7"));
+        assert!(p.contains("Resume"));
+        assert!(p.contains("CONTEXT_LIMIT"));
+    }
+
+    #[test]
+    fn context_marker_detection() {
+        assert!(should_respawn("...CONTEXT_LIMIT"));
+        assert!(should_respawn("CONTEXT_LIMIT\nall done"));
+        assert!(!should_respawn("all done"));
     }
 
     #[test]
