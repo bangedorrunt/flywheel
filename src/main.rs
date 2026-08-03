@@ -204,6 +204,13 @@ enum Commands {
         /// a static queue — feeds the swarm until the plan/beads are done
         #[arg(long)]
         work: bool,
+        /// send prompts without landing confirmation (escape hatch; confirm
+        /// is the default). Only affects the durable workflow.
+        #[arg(long)]
+        no_confirm: bool,
+        /// confirm timeout in ms for `__send --confirm` (default: leaf default 45s)
+        #[arg(long)]
+        confirm_timeout_ms: Option<u64>,
     },
     /// Query the state of a durable loop invocation on the Resonate server
     LoopStatus {
@@ -752,6 +759,8 @@ fn main() {
             to,
             local,
             work,
+            no_confirm,
+            confirm_timeout_ms,
         }) => cmd_loop(
             &cfg,
             project,
@@ -765,6 +774,8 @@ fn main() {
             *work,
             on_blocked,
             to,
+            *no_confirm,
+            *confirm_timeout_ms,
         ),
         Some(Commands::LoopStatus { project }) => cmd_loop_status(&cfg, project),
         Some(Commands::Zoom { project, to, off }) => cmd_zoom(&cfg, project, to, *off),
@@ -1965,6 +1976,8 @@ fn cmd_loop(
     work: bool,
     on_blocked: &str,
     to: &str,
+    no_confirm: bool,
+    confirm_timeout_ms: Option<u64>,
 ) -> Result<()> {
     if interval_secs < 5 {
         bail!("--interval must be >= 5 seconds");
@@ -1991,6 +2004,8 @@ fn cmd_loop(
             on_blocked: on_blocked.to_string(),
             max_iterations,
             work,
+            confirm_sends: !no_confirm,
+            confirm_timeout_ms,
         };
         let rt = tokio::runtime::Runtime::new()?;
         println!(
