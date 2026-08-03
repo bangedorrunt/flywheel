@@ -382,7 +382,11 @@ async fn notify_blocked(args: NotifyArgs) -> Result<()> {
 }
 
 /// Pure planning: given current states, decide actions and drain the queue.
-/// Deterministic across replays (states are checkpointed per iteration).
+/// Deterministic dispatch plan for one poll: working agents wait, blocked
+/// agents report, idle/done agents get the next queue item (or a nudge, or
+/// wait). `unknown` is NOT dispatchable by design: herdr cannot classify its
+/// lifecycle confidently — a prompt could land in a half-dead session and be
+/// silently lost. Unknown agents get `Wait` and never consume the queue.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoopAction {
     Send { name: String, text: String },
@@ -397,8 +401,10 @@ pub fn plan_actions(states: &[AgentState], queue: &mut Vec<String>, nudge: Optio
         match s.status.as_str() {
             "working" => actions.push(LoopAction::Wait),
             "blocked" => actions.push(LoopAction::Blocked { name: s.name.clone() }),
+            // never dispatch to an unclassified agent — queue stays intact
+            "unknown" => actions.push(LoopAction::Wait),
             _ => {
-                // idle / done / unknown → feed work or nudge
+                // idle / done → feed work or nudge
                 if !queue.is_empty() {
                     let text = queue.remove(0); // FIFO: stages in declared order
                     actions.push(LoopAction::Send {
@@ -414,6 +420,15 @@ pub fn plan_actions(states: &[AgentState], queue: &mut Vec<String>, nudge: Optio
         }
     }
     actions
+}
+
+/// Completion guard: everyone idle/done. `unknown` keeps the loop alive — an
+/// unclassified agent may still be doing the last delegated task, so the loop
+/// stays on the active cadence.
+pub fn all_settled(states: &[AgentState]) -> bool {
+    states
+        .iter()
+        .all(|s| matches!(s.status.as_str(), "idle" | "done"))
 }
 
 /// The durable monitoring workflow. Runs until the queue drains and the swarm
@@ -609,9 +624,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // The states vector is pre-action, so an agent that just received the
         // last queue item is still "idle" here — without the any_work guard the
         // loop would declare "complete" while the swarm is mid-work.
-        let all_settled = states
-            .iter()
-            .all(|s| matches!(s.status.as_str(), "idle" | "done"));
+        let all_settled = all_settled(&states);
 
         if queue.is_empty() && all_settled && !any_work && inprogress_empty {
             return Ok("complete".to_string());
@@ -814,6 +827,35 @@ mod tests {
         let mut q: Vec<String> = vec![];
         let actions = plan_actions(&states, &mut q, None);
         assert!(matches!(actions[0], LoopAction::Wait));
+    }
+
+    // ---- unknown agents: never dispatch, never nudge (bd-unknown-skip-dispatch) ----
+
+    #[test]
+    fn unknown_agent_keeps_queue() {
+        let states = vec![st("a", "unknown")];
+        let mut q = vec!["p1".to_string()];
+        let actions = plan_actions(&states, &mut q, None);
+        assert_eq!(q.len(), 1); // queue intact — unknown must never consume items
+        assert!(matches!(actions[0], LoopAction::Wait));
+    }
+
+    #[test]
+    fn unknown_with_nudge_no_send() {
+        let states = vec![st("a", "unknown")];
+        let mut q: Vec<String> = vec![];
+        let actions = plan_actions(&states, &mut q, Some("proceed"));
+        assert!(matches!(actions[0], LoopAction::Wait)); // no Nudge, no Send
+    }
+
+    #[test]
+    fn unknown_not_settled() {
+        // an unknown agent keeps the loop alive: the completion guard only
+        // matches idle|done
+        let states = vec![st("a", "unknown")];
+        assert!(!all_settled(&states));
+        let settled = vec![st("a", "idle"), st("b", "done")];
+        assert!(all_settled(&settled));
     }
 
     #[test]
