@@ -23,7 +23,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
 
 use config::{Config, Recipe, WorkflowStep};
-use herdr::{AgentInfo, AgentStatus, Client, Subscription, WaitOptions};
+use herdr::{AgentInfo, AgentStatus, Client, SendVerdict, Subscription, WaitOptions, classify_send_result};
 use output::{die, dim, error, kind_paint, print_json, status_paint};
 use state::{log_event, EventKind};
 
@@ -357,6 +357,10 @@ enum Commands {
         project: String,
         name: String,
         text: String,
+        /// Wait for the prompt to land (agent reaches working|blocked).
+        /// Optional timeout in ms (default 45_000 when given without a value).
+        #[arg(long, num_args = 0..=1, default_missing_value = "45000")]
+        confirm: Option<u64>,
     },
     /// internal: notify a blocked agent via agent-mail (durable workflow leaf)
     #[command(name = "__mail-blocked", hide = true)]
@@ -795,7 +799,9 @@ fn main() {
         Some(Commands::Tutorial) => cmd_tutorial(),
         Some(Commands::Serve { port }) => cmd_serve(&cfg, *port),
         Some(Commands::__Poll { project, to }) => cmd_internal_poll(&cfg, project, to),
-        Some(Commands::__Send { project, name, text }) => cmd_internal_send(&cfg, project, name, text),
+        Some(Commands::__Send { project, name, text, confirm }) => {
+            cmd_internal_send(&cfg, project, name, text, *confirm)
+        }
         Some(Commands::__MailBlocked { project, name }) => cmd_internal_mail_blocked(&cfg, project, name),
         Some(Commands::__Ready { project }) => cmd_internal_ready(&cfg, project),
         Some(Commands::__Inprogress { project }) => cmd_internal_inprogress(&cfg, project),
@@ -2551,8 +2557,20 @@ fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
     Ok(())
 }
 
-/// internal leaf: send one prompt to a named agent (no wait).
-fn cmd_internal_send(cfg: &Config, project: &str, name: &str, text: &str) -> Result<()> {
+/// internal leaf: send one prompt to a named agent.
+///
+/// Without `--confirm`: fire-and-forget (`wait: None`) — byte-identical to
+/// the legacy path. With `--confirm [TIMEOUT_MS]`: wait for the prompt to
+/// LAND (agent reaches working|blocked), classify the herdr error code, and
+/// emit `{"ok": true, "name", "landed", "status", "reason"}`. Exit 1 only
+/// for hard errors (agent not found); landing failures exit 0 with flags.
+fn cmd_internal_send(
+    cfg: &Config,
+    project: &str,
+    name: &str,
+    text: &str,
+    confirm_ms: Option<u64>,
+) -> Result<()> {
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
     let agent = c
@@ -2560,8 +2578,34 @@ fn cmd_internal_send(cfg: &Config, project: &str, name: &str, text: &str) -> Res
         .into_iter()
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
         .ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
-    c.agent_prompt(agent_target(&agent), text, None)?;
-    print_json(&json!({ "ok": true, "name": name }));
+
+    let Some(timeout_ms) = confirm_ms else {
+        // legacy fire-and-forget path
+        c.agent_prompt(agent_target(&agent), text, None)?;
+        print_json(&json!({ "ok": true, "name": name }));
+        return Ok(());
+    };
+
+    let wait = WaitOptions {
+        timeout_ms: Some(timeout_ms),
+        // landing semantics: the prompt started executing. NOT idle/done —
+        // a long task must not hold the leaf for its full duration.
+        until: vec![AgentStatus::Working, AgentStatus::Blocked],
+    };
+    let verdict = match c.agent_prompt_coded(agent_target(&agent), text, Some(wait)) {
+        Ok(info) => classify_send_result(None, info.agent_status),
+        Err(e) => classify_send_result(Some(&e.code), None),
+    };
+    let (landed, status, reason) = match verdict {
+        SendVerdict::Landed(st) => (true, st.map(|s| s.as_str().to_string()), "landed".to_string()),
+        SendVerdict::Stalled => (false, None, "stalled".to_string()),
+        SendVerdict::TimedOut => (false, None, "timeout".to_string()),
+        SendVerdict::Coded(code) => (false, None, format!("error:{code}")),
+    };
+    print_json(&json!({
+        "ok": true, "name": name, "landed": landed,
+        "status": status, "reason": reason,
+    }));
     Ok(())
 }
 
