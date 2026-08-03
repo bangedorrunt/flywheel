@@ -84,7 +84,7 @@ re-invocation, so fresh runs get fresh invocation ids
 
 ## Backend protocol
 
-herdr socket protocol v17: one JSON-RPC request per connection (newline-delimited),
+herdr socket protocol v18: one JSON-RPC request per connection (newline-delimited),
 `events.subscribe` keeps a long-lived stream. See `src/herdr.rs`.
 
 ## Exit codes
