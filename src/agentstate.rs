@@ -14,6 +14,12 @@
 //! Freshness matters: a stale file from a previous session must NEVER trigger
 //! a respawn — a healthy agent would be killed for no reason. Default max_age
 //! 15 minutes: longer than any plausible human gap, shorter than a lunch break.
+//!
+//! Most of this API is a published contract consumed by dependent beads
+//! (`bd-prompt-state-file` writer, `bd-read-state-fallback-zwa` reader);
+//! until they land, only `project_state_dir` is reachable from the binary.
+//! Remove this allow once a consumer uses `parse_state_file`/`is_fresh_at`.
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -163,7 +169,7 @@ pub fn parse_ts(ts: &str) -> Option<u64> {
     if h > 23 || mi > 59 || s > 60 {
         return None;
     }
-    if days_in_month(y as i64, mo, is_leap(y as i64)) < d {
+    if days_in_month(mo, is_leap(y as i64)) < d {
         return None;
     }
     let days = days_from_civil(y as i64, mo, d);
@@ -214,7 +220,7 @@ fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-fn days_in_month(y: i64, m: u32, leap: bool) -> u32 {
+fn days_in_month(m: u32, leap: bool) -> u32 {
     match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
