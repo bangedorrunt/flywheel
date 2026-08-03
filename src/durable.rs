@@ -431,13 +431,47 @@ pub fn all_settled(states: &[AgentState]) -> bool {
         .all(|s| matches!(s.status.as_str(), "idle" | "done"))
 }
 
+/// Adaptive poll cadence: fast while the swarm is busy, slow when settled.
+///
+/// A dispatch this iteration (`dispatched`) forces the active cadence: the
+/// recipient will be working during the sleep, but `states` is the PRE-action
+/// poll — without this the loop would sleep `base_secs` right after handing
+/// out work (the failure mode this function exists to fix). Otherwise, any
+/// agent `working`, `blocked`, or `unknown` → `active_secs`; a fully
+/// idle/done (or empty) swarm → `base_secs`. Clamped to >= 5s.
+///
+/// `unknown` counts as unsettled BY DESIGN: an unknown-heavy swarm is a swarm
+/// needing repair (`bd-unknown-respawn`), and repairs must proceed on the
+/// active cadence. An all-unknown swarm therefore polls at 30s rather than
+/// 300s — acceptable, because `--timeout-ms` (max_iterations) still bounds the
+/// run if it never converges.
+///
+/// Deterministic across replays: derives from the checkpointed states vector
+/// and the (also deterministic) action plan.
+///
+/// Follow-up idea (do NOT build here): a future redesign could wake the loop
+/// on herdr status events via a Resonate external promise — event-driven
+/// instead of polled. Requires an event listener with its own durability.
+pub fn next_interval_secs(
+    states: &[AgentState],
+    dispatched: bool,
+    base_secs: u64,
+    active_secs: u64,
+) -> u64 {
+    const INTERVAL_MIN: u64 = 5;
+    let busy = dispatched
+        || states
+            .iter()
+            .any(|s| matches!(s.status.as_str(), "working" | "blocked" | "unknown"));
+    let chosen = if busy { active_secs } else { base_secs };
+    chosen.max(INTERVAL_MIN)
+}
+
 /// The durable monitoring workflow. Runs until the queue drains and the swarm
 /// settles, or a blocked agent stops it (policy).
 #[function]
 async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     let mut queue = params.queue.clone();
-    let interval = Duration::from_secs(params.interval_secs);
-    let interval_min = Duration::from_secs(5);
     let mut iteration = 0u64;
     // bead-driven mode tracks which beads were already handed out
     let mut assigned: Vec<String> = Vec::new();
@@ -630,8 +664,17 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             return Ok("complete".to_string());
         }
 
-        // durable pause — the worker may exit here; the server resumes us
-        ctx.sleep(interval.max(interval_min)).await?;
+        // durable pause — the worker may exit here; the server resumes us.
+        // Adaptive cadence: 30s after a dispatch and while anyone is
+        // working/blocked/unknown, base interval when settled (the 5s floor
+        // lives in the fn).
+        ctx.sleep(Duration::from_secs(next_interval_secs(
+            &states,
+            any_work,
+            params.interval_secs,
+            30,
+        )))
+        .await?;
     }
 }
 
@@ -856,6 +899,64 @@ mod tests {
         assert!(!all_settled(&states));
         let settled = vec![st("a", "idle"), st("b", "done")];
         assert!(all_settled(&settled));
+    }
+
+    // ---- adaptive poll interval (bd-adaptive-interval) ----
+
+    #[test]
+    fn next_interval_working_is_active() {
+        let states = vec![st("a", "working")];
+        assert_eq!(next_interval_secs(&states, false, 300, 30), 30);
+    }
+
+    #[test]
+    fn next_interval_blocked_is_active() {
+        let states = vec![st("a", "blocked")];
+        assert_eq!(next_interval_secs(&states, false, 300, 30), 30);
+    }
+
+    #[test]
+    fn next_interval_all_idle_is_base() {
+        let states = vec![st("a", "idle"), st("b", "done")];
+        assert_eq!(next_interval_secs(&states, false, 300, 30), 300);
+    }
+
+    #[test]
+    fn next_interval_dispatch_forces_active() {
+        // states are PRE-action: an idle agent that just received a queue item
+        // will be working during the sleep — a dispatch must force the active
+        // cadence or the swarm drains at base speed
+        let states = vec![st("a", "idle")];
+        assert_eq!(next_interval_secs(&states, true, 300, 30), 30);
+    }
+
+    #[test]
+    fn next_interval_all_done_is_base() {
+        let states = vec![st("a", "done")];
+        assert_eq!(next_interval_secs(&states, false, 300, 30), 300);
+    }
+
+    #[test]
+    fn next_interval_unknown_is_active() {
+        // unknown counts as unsettled → active cadence, so pending repairs
+        // (bd-unknown-respawn) proceed promptly
+        let states = vec![st("a", "unknown")];
+        assert_eq!(next_interval_secs(&states, false, 300, 30), 30);
+    }
+
+    #[test]
+    fn next_interval_empty_is_base() {
+        let states = vec![];
+        assert_eq!(next_interval_secs(&states, false, 300, 30), 300);
+    }
+
+    #[test]
+    fn next_interval_clamps_to_interval_min() {
+        let states = vec![st("a", "working")];
+        assert_eq!(next_interval_secs(&states, false, 300, 2), 5);
+        // base below the floor also clamps
+        let idle = vec![st("a", "idle")];
+        assert_eq!(next_interval_secs(&idle, false, 3, 30), 5);
     }
 
     #[test]
