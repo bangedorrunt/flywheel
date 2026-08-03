@@ -182,29 +182,49 @@ impl Client {
 
     /// Send one request on a fresh connection and wait for its response.
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.call_coded(method, params)
+            .map_err(|e| anyhow!("herdr error {}: {}", e.code, e.message))
+    }
+
+    /// Like `call`, but returns a typed `HerdrError` carrying the protocol
+    /// error code — callers can classify (e.g. `agent_prompt_stalled`,
+    /// `timeout`) without parsing message strings.
+    pub fn call_coded(&mut self, method: &str, params: Value) -> std::result::Result<Value, HerdrError> {
         let id = self.next_id.to_string();
         self.next_id += 1;
         let req = json!({ "id": id, "method": method, "params": params });
-        let mut line = serde_json::to_string(&req)?;
+        let mut line = serde_json::to_string(&req)
+            .map_err(|e| HerdrError { code: "serialize".into(), message: e.to_string() })?;
         line.push('\n');
 
-        let mut reader = BufReader::new(self.open()?);
+        let mut reader = BufReader::new(self.open().map_err(|e| HerdrError {
+            code: "connect".into(),
+            message: e.to_string(),
+        })?);
         reader
             .get_mut()
             .write_all(line.as_bytes())
-            .context("write to herdr socket")?;
-        reader.get_mut().flush().context("flush herdr socket")?;
+            .map_err(|e| HerdrError { code: "io".into(), message: format!("write to herdr socket: {e}") })?;
+        reader
+            .get_mut()
+            .flush()
+            .map_err(|e| HerdrError { code: "io".into(), message: format!("flush herdr socket: {e}") })?;
 
         loop {
             let mut buf = String::new();
             let n = reader
                 .read_line(&mut buf)
-                .context("read from herdr socket")?;
+                .map_err(|e| HerdrError { code: "io".into(), message: format!("read from herdr socket: {e}") })?;
             if n == 0 {
-                bail!("herdr socket closed while waiting for response");
+                return Err(HerdrError {
+                    code: "io".into(),
+                    message: "herdr socket closed while waiting for response".into(),
+                });
             }
-            let val: Value = serde_json::from_str(buf.trim())
-                .with_context(|| format!("malformed herdr response: {buf}"))?;
+            let val: Value = serde_json::from_str(buf.trim()).map_err(|e| HerdrError {
+                code: "malformed".into(),
+                message: format!("malformed herdr response: {buf}: {e}"),
+            })?;
             // ignore pushed notifications (no matching id) and other ids
             if val.get("id").and_then(Value::as_str) != Some(id.as_str()) {
                 continue;
@@ -213,17 +233,22 @@ impl Client {
                 let code = err
                     .get("code")
                     .and_then(Value::as_str)
-                    .unwrap_or("error");
-                let msg = err
+                    .unwrap_or("error")
+                    .to_string();
+                let message = err
                     .get("message")
                     .and_then(Value::as_str)
-                    .unwrap_or("unknown error");
-                bail!("herdr error {code}: {msg}");
+                    .unwrap_or("unknown error")
+                    .to_string();
+                return Err(HerdrError { code, message });
             }
             return val
                 .get("result")
                 .cloned()
-                .ok_or_else(|| anyhow!("herdr response missing result: {val}"));
+                .ok_or_else(|| HerdrError {
+                    code: "malformed".into(),
+                    message: format!("herdr response missing result: {val}"),
+                });
         }
     }
 
@@ -390,15 +415,27 @@ impl Client {
         text: &str,
         wait: Option<WaitOptions>,
     ) -> Result<AgentInfo> {
+        self.agent_prompt_coded(target, text, wait)
+            .map_err(|e| anyhow!("herdr error {}: {}", e.code, e.message))
+    }
+
+    /// `agent.prompt` returning a typed `HerdrError` so callers can classify
+    /// protocol error codes (e.g. `agent_prompt_stalled`, `timeout`).
+    pub fn agent_prompt_coded(
+        &mut self,
+        target: &str,
+        text: &str,
+        wait: Option<WaitOptions>,
+    ) -> std::result::Result<AgentInfo, HerdrError> {
         let wait = wait.map(|w| {
             json!({ "timeout_ms": w.timeout_ms, "until": w.until.iter().map(|s| s.as_str()).collect::<Vec<_>>() })
         });
-        let res = self.call(
+        let res = self.call_coded(
             "agent.prompt",
             json!({ "target": target, "text": text, "wait": wait }),
         )?;
         serde_json::from_value(res.get("agent").cloned().unwrap_or(res))
-            .context("parse agent.prompt result")
+            .map_err(|e| HerdrError { code: "parse".into(), message: e.to_string() })
     }
 
     pub fn agent_wait(&mut self, target: &str, until: &[AgentStatus], timeout_ms: Option<u64>) -> Result<AgentInfo> {
@@ -473,6 +510,47 @@ impl Client {
 pub struct WaitOptions {
     pub timeout_ms: Option<u64>,
     pub until: Vec<AgentStatus>,
+}
+
+/// Typed herdr protocol error carrying the machine-readable code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrError {
+    pub code: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for HerdrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "herdr error {}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for HerdrError {}
+
+/// Classification of a confirmed `agent.prompt` outcome (see `classify_send_result`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendVerdict {
+    /// Prompt landed: herdr accepted it and the agent reached a working/blocked state.
+    Landed(Option<AgentStatus>),
+    /// herdr's lifecycle-change rule fired (`agent_prompt_stalled`): no landing observed.
+    Stalled,
+    /// Caller-side wait expired (`timeout`): the prompt may have started — ambiguous.
+    TimedOut,
+    /// Any other herdr error code (e.g. `agent_not_running`).
+    Coded(String),
+}
+
+/// Map a herdr error code + observed agent status to a send verdict.
+///
+/// Classifies on the protocol error CODE, never by parsing message strings
+/// (messages are human text and may change between server versions).
+pub fn classify_send_result(code: Option<&str>, agent_status: Option<AgentStatus>) -> SendVerdict {
+    match code {
+        Some("agent_prompt_stalled") => SendVerdict::Stalled,
+        Some("timeout") => SendVerdict::TimedOut,
+        Some(other) => SendVerdict::Coded(other.to_string()),
+        None => SendVerdict::Landed(agent_status),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -569,5 +647,41 @@ mod tests {
         let v = json!({ "timeout_ms": w.timeout_ms, "until": w.until.iter().map(|s| s.as_str()).collect::<Vec<_>>() });
         assert_eq!(v["until"][0], "idle");
         assert_eq!(v["timeout_ms"], 30_000);
+    }
+
+    #[test]
+    fn landing_wait_options_serialize() {
+        // `__send --confirm` waits for working|blocked — landing semantics,
+        // NOT idle/done (a long task must not hold the leaf for its duration).
+        let until = vec![AgentStatus::Working.as_str(), AgentStatus::Blocked.as_str()];
+        let v = json!({ "timeout_ms": 45_000, "until": until });
+        assert_eq!(v["until"][0], "working");
+        assert_eq!(v["until"][1], "blocked");
+        assert_eq!(v["timeout_ms"], 45_000);
+    }
+
+    #[test]
+    fn classify_send_result_verdicts() {
+        // stalled: herdr's 5s lifecycle-change rule fired
+        assert_eq!(
+            classify_send_result(Some("agent_prompt_stalled"), None),
+            SendVerdict::Stalled
+        );
+        // timeout: caller-side wait expired — prompt MAY have started
+        assert_eq!(
+            classify_send_result(Some("timeout"), Some(AgentStatus::Working)),
+            SendVerdict::TimedOut
+        );
+        // other codes classify as coded error (no message-string parsing)
+        assert_eq!(
+            classify_send_result(Some("agent_not_running"), None),
+            SendVerdict::Coded("agent_not_running".to_string())
+        );
+        // success: prompt landed, agent status observed
+        assert_eq!(
+            classify_send_result(None, Some(AgentStatus::Working)),
+            SendVerdict::Landed(Some(AgentStatus::Working))
+        );
+        assert_eq!(classify_send_result(None, None), SendVerdict::Landed(None));
     }
 }
