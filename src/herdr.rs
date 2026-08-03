@@ -471,6 +471,39 @@ impl Client {
         Ok(text.to_string())
     }
 
+    /// Block on `pane.wait_for_output` — wait until `pattern` appears in the
+    /// pane's terminal output.
+    ///
+    /// Docs' caveat (verbatim): "`pane wait-output` does not interpret agent
+    /// lifecycle. It polls the selected terminal snapshot and searches it
+    /// immediately, so output that already exists can match." This is a TEXT
+    /// wait — for agent state use [`Client::agent_wait`]; the two are
+    /// complementary and pane waits deliberately do NOT understand lifecycle.
+    ///
+    /// `mode` is `"match"` (literal substring) or `"regex"` (Rust regex,
+    /// herdr-side), mirroring the CLI's `--match`/`--regex`. The wait blocks
+    /// the socket — one request per connection, same as `agent_wait`.
+    ///
+    /// The snapshot (`read`) is raw terminal text (strip-ansi applied
+    /// server-side); it can be large — treat it as an opaque string.
+    ///
+    /// Returns a typed [`HerdrError`] so callers can classify: a non-matching
+    /// pattern with a short timeout errors with code `"timeout"` (it does NOT
+    /// hang), other protocol failures carry their own codes.
+    // wired by bd-wait-output-usage; dead in the binary until then
+    #[allow(dead_code)]
+    pub fn pane_wait_output(
+        &mut self,
+        pane_id: &str,
+        mode: &str,
+        pattern: &str,
+        timeout_ms: Option<u64>,
+    ) -> std::result::Result<PaneWaitResult, HerdrError> {
+        let params = wait_for_output_params(pane_id, mode, pattern, timeout_ms)?;
+        let res = self.call_coded("pane.wait_for_output", params)?;
+        parse_wait_for_output_result(&res)
+    }
+
     pub fn agent_send_keys(&mut self, target: &str, keys: &[&str]) -> Result<Value> {
         self.call("agent.send_keys", json!({ "target": target, "keys": keys }))
     }
@@ -551,6 +584,78 @@ pub fn classify_send_result(code: Option<&str>, agent_status: Option<AgentStatus
         Some(other) => SendVerdict::Coded(other.to_string()),
         None => SendVerdict::Landed(agent_status),
     }
+}
+
+/// Result of a `pane.wait_for_output` wait.
+///
+/// `read` is the matched terminal snapshot's text, treated as an opaque
+/// string — pane waits do NOT interpret agent lifecycle (see
+/// [`Client::pane_wait_output`]).
+// wired by bd-wait-output-usage; dead in the binary until then
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneWaitResult {
+    pub pane_id: String,
+    /// The line the pattern matched on, if the server reports one.
+    pub matched_line: Option<String>,
+    /// Snapshot text at match time (may be large; do not post-process).
+    pub read: String,
+}
+
+/// Request params for `pane.wait_for_output` (protocol v18).
+///
+/// `mode` mirrors the CLI's `--match`/`--regex`: `"match"` is a literal
+/// substring search, `"regex"` a Rust regex (herdr-side). Anything else is a
+/// caller bug — bail with code `"usage"`.
+// wired by bd-wait-output-usage; dead in the binary until then
+#[allow(dead_code)]
+pub fn wait_for_output_params(
+    pane_id: &str,
+    mode: &str,
+    pattern: &str,
+    timeout_ms: Option<u64>,
+) -> std::result::Result<Value, HerdrError> {
+    let match_type = match mode {
+        "match" => "substring",
+        "regex" => "regex",
+        other => {
+            return Err(HerdrError {
+                code: "usage".into(),
+                message: format!("unknown pane wait-output mode: {other} (expected \"match\" or \"regex\")"),
+            })
+        }
+    };
+    Ok(json!({
+        "pane_id": pane_id,
+        "source": "recent",
+        "match": { "type": match_type, "value": pattern },
+        "strip_ansi": true,
+        "timeout_ms": timeout_ms,
+    }))
+}
+
+/// Parse a `pane.wait_for_output` result envelope. Defensive: `read` is an
+/// object carrying the snapshot text; any shape drift becomes code `"parse"`.
+// wired by bd-wait-output-usage; dead in the binary until then
+#[allow(dead_code)]
+pub fn parse_wait_for_output_result(res: &Value) -> std::result::Result<PaneWaitResult, HerdrError> {
+    let parse_err = |msg: String| HerdrError { code: "parse".into(), message: msg };
+    if res.get("type").and_then(Value::as_str) != Some("output_matched") {
+        return Err(parse_err(format!("unexpected pane.wait_for_output result: {res}")));
+    }
+    let pane_id = res
+        .get("pane_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| parse_err(format!("pane.wait_for_output result missing pane_id: {res}")))?
+        .to_string();
+    let matched_line = res.get("matched_line").and_then(Value::as_str).map(str::to_string);
+    let read = res
+        .get("read")
+        .and_then(|r| r.get("text"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| parse_err(format!("pane.wait_for_output result missing read.text: {res}")))?
+        .to_string();
+    Ok(PaneWaitResult { pane_id, matched_line, read })
 }
 
 #[derive(Debug, Clone)]
@@ -683,5 +788,101 @@ mod tests {
             SendVerdict::Landed(Some(AgentStatus::Working))
         );
         assert_eq!(classify_send_result(None, None), SendVerdict::Landed(None));
+    }
+
+    // ---- pane.wait_for_output (bd-pane-wait-output-helper) ----
+
+    #[test]
+    fn wait_for_output_params_shape() {
+        // substring mode + timeout present
+        let v = wait_for_output_params("w13:p1", "match", "listening", Some(30_000)).unwrap();
+        assert_eq!(v["pane_id"], "w13:p1");
+        assert_eq!(v["source"], "recent");
+        assert_eq!(v["match"]["type"], "substring");
+        assert_eq!(v["match"]["value"], "listening");
+        assert_eq!(v["strip_ansi"], true);
+        assert_eq!(v["timeout_ms"], 30_000);
+        // regex mode + timeout absent (serializes as null, schema-valid)
+        let v = wait_for_output_params("w13:p1", "regex", r"ready\.\.\.", None).unwrap();
+        assert_eq!(v["match"]["type"], "regex");
+        assert_eq!(v["match"]["value"], r"ready\.\.\.");
+        assert!(v["timeout_ms"].is_null());
+    }
+
+    #[test]
+    fn wait_for_output_params_rejects_unknown_mode() {
+        assert!(wait_for_output_params("w13:p1", "fuzzy", "x", None).is_err());
+    }
+
+    #[test]
+    fn parse_wait_for_output_result_happy_path() {
+        // captured from the live server (protocol v18)
+        let v = json!({
+            "type": "output_matched",
+            "pane_id": "w13:p1",
+            "revision": 0,
+            "matched_line": "❯ sleep 1; echo probe-done-123",
+            "read": {
+                "pane_id": "w13:p1", "workspace_id": "w13", "tab_id": "w13:t1",
+                "source": "recent_unwrapped", "format": "text",
+                "text": "\n❯ sleep 1; echo probe-done-123\nprobe-done-123\n",
+                "revision": 0, "truncated": false
+            }
+        });
+        let r = parse_wait_for_output_result(&v).unwrap();
+        assert_eq!(r.pane_id, "w13:p1");
+        assert_eq!(r.matched_line.as_deref(), Some("❯ sleep 1; echo probe-done-123"));
+        assert!(r.read.contains("probe-done-123"));
+    }
+
+    #[test]
+    fn parse_wait_for_output_result_missing_matched_line() {
+        // a match with no matched_line still yields a result (defensive)
+        let v = json!({
+            "type": "output_matched",
+            "pane_id": "w13:p1",
+            "read": { "text": "done" }
+        });
+        let r = parse_wait_for_output_result(&v).unwrap();
+        assert_eq!(r.pane_id, "w13:p1");
+        assert_eq!(r.matched_line, None);
+        assert_eq!(r.read, "done");
+    }
+
+    #[test]
+    fn parse_wait_for_output_result_missing_read_text() {
+        // read is an object with a text field; anything else is a parse error
+        let v = json!({ "type": "output_matched", "pane_id": "w13:p1", "read": {} });
+        let e = parse_wait_for_output_result(&v).unwrap_err();
+        assert_eq!(e.code, "parse");
+    }
+
+    #[test]
+    fn parse_wait_for_output_result_rejects_unknown_type() {
+        let v = json!({ "type": "something_else", "pane_id": "w13:p1", "read": {} });
+        let e = parse_wait_for_output_result(&v).unwrap_err();
+        assert_eq!(e.code, "parse");
+    }
+
+    /// Wire verification against a live herdr server: needs a real pane id
+    /// (env `PANE_ID`) whose terminal already contains the pattern — pane
+    /// waits search existing output immediately (docs' caveat).
+    ///   PANE_ID=w13:p1 cargo test -- --ignored pane_wait_output_live
+    #[test]
+    #[ignore]
+    fn pane_wait_output_live() {
+        let pane_id = std::env::var("PANE_ID").expect("set PANE_ID to a live herdr pane id");
+        let mut c = Client::connect(None).unwrap();
+        // match against output that already exists
+        let r = c
+            .pane_wait_output(&pane_id, "match", "flywheel", Some(5_000))
+            .unwrap();
+        assert_eq!(r.pane_id, pane_id);
+        assert!(!r.read.is_empty());
+        // non-matching pattern must ERROR (code "timeout"), not hang
+        let e = c
+            .pane_wait_output(&pane_id, "match", "THIS-WILL-NEVER-MATCH-xyzzy", Some(1_500))
+            .unwrap_err();
+        assert_eq!(e.code, "timeout");
     }
 }
