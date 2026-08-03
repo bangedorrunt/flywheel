@@ -4,6 +4,7 @@
 //! monitor states, checkpoint progress. All tracker state lives in br/bv;
 //! all coordination lives in agent-mail; herdr is the backend.
 
+mod agentstate;
 mod config;
 mod durable;
 mod herdr;
@@ -1431,6 +1432,9 @@ fn cmd_kill(cfg: &Config, project: &str, force: bool) -> Result<()> {
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
     c.workspace_close(&ws_id)?;
+    // tidy-up: drop the project's agent state files (stale context signals
+    // must not survive into the next spawn — freshness only protects so much)
+    let _ = std::fs::remove_dir_all(agentstate::project_state_dir(&project_dir(cfg, project)));
     log(project, EventKind::Close, json!({ "workspace_id": ws_id }));
     println!("closed {project}");
     Ok(())

@@ -44,6 +44,30 @@ Work-mode dynamics:
   emit it past ~80% context); if found, the agent's pane is replaced by a fresh
   instance under the same name and the queue item is handed to it
 
+### Agent state files
+
+Context exhaustion is a soft signal the agent decides (~80% session usage).
+Terminal reads can silently miss content for full-screen agents (alternate
+screen), so the loop also trusts an advisory **agent state file** written by
+the agent itself:
+
+```
+<project>/.flywheel/agent-state/<agent-name>.json
+{ "context_pct": 82, "ts": "2026-08-03T03:00:00Z" }
+```
+
+- `context_pct` — 0..=100; the agent writes the file when its session context
+  reaches ~80%, before replying `CONTEXT_LIMIT`
+- `ts` — RFC3339 write time (same shape as the loop's own timestamps)
+- advisory: the agent never blocks its own work on the write
+- freshness — a file older than **15 minutes** is treated as stale (previous
+  session) and must never trigger a respawn
+- tidy-up — `flywheel kill` removes the project's `.flywheel/` state
+  directory; `.flywheel/` is git-ignored
+
+Project-relative (not `~/.local/state`): agents write from inside the repo
+without shell tricks.
+
 ### Durability (Resonate)
 
 The loop runs as a **durable Resonate workflow** (requires a Resonate server,

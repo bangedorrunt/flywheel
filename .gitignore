@@ -1,5 +1,8 @@
 /target
 .DS_Store
 
+# agent state files (context signals written by agents mid-session)
+.flywheel/
+
 # bv (beads viewer) local config and caches
 .bv/
