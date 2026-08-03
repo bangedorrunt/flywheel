@@ -25,7 +25,7 @@ command surface and a durable monitoring loop built on Resonate.
 - **br is CLI-only**: `br ready --json`, `br update <id> --claim --actor "$AGENT_NAME"`,
   `br close <id> --reason "..."`, `br sync --flush-only` + commit `.beads/`
   (br never runs git). `bv --robot-*` for triage; never bare `bv`.
-- **herdr protocol**: verify against `herdr api schema --json` (protocol v17).
+- **herdr protocol**: verify against `herdr api schema --json` (protocol v18).
   CLI output = one JSON line per command; exit 0 ok, 1 server error, 2 usage.
 - **Resonate SDK pinned**: `resonate-sdk = "0.6.0"` (crates.io). v0.6.0 has no
   version-based re-invocation — fresh runs get fresh invocation ids

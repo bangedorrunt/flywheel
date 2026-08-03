@@ -669,7 +669,7 @@ fn main() {
         print_json(&json!({
             "tool": "flywheel",
             "version": VERSION,
-            "backend": "herdr (socket protocol v17)",
+            "backend": "herdr (socket protocol v18)",
             "commands": [
                 "init spawn add list status send interrupt view watch zoom attach kill",
                 "work assign mail worktree checkpoint timeline audit history changes resume analytics",

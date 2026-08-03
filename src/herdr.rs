@@ -7,7 +7,9 @@
 //! Pushed notifications (events) arrive as:
 //!   {"event": "<type>", "data": {...}}
 //!
-//! Verified against herdr 0.7.5-preview (socket protocol v17, schema version 1).
+//! Verified against herdr 0.7.5-preview (socket protocol v18, schema version 1),
+//! preview build 2026-07-29-44b3adb12552. Canonical verification source:
+//! `herdr api schema --json` (fields: protocol, schema_version).
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
