@@ -35,6 +35,18 @@ pub struct LoopParams {
     pub max_iterations: Option<u64>,
     /// bead-driven mode: source work from `br ready` instead of a static queue
     pub work: bool,
+    /// send every prompt via `__send --confirm` (landing confirmation).
+    /// Default true — reliability is the default, --no-confirm is the escape
+    /// hatch. `#[serde(default)]` keeps pre-confirm saved params loadable.
+    #[serde(default = "default_true")]
+    pub confirm_sends: bool,
+    /// confirm timeout in ms; None → leaf default 45s.
+    #[serde(default)]
+    pub confirm_timeout_ms: Option<u64>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// One polled agent state: (name, status string).
@@ -86,6 +98,31 @@ pub struct SendArgs {
     pub project: String,
     pub name: String,
     pub text: String,
+    /// wait for the prompt to land (__send --confirm); default true in the loop
+    pub confirm: bool,
+    /// confirm timeout in ms; None → leaf default 45s
+    pub confirm_timeout_ms: Option<u64>,
+}
+
+/// Build the argv for the `__send` leaf invocation.
+///
+/// Pure (testable without spawning a process). `--confirm` is passed without
+/// a value when the timeout is None — the leaf's clap layer applies its own
+/// default (45s), keeping one source of truth for the default.
+pub fn send_prompt_argv(args: &SendArgs) -> Vec<String> {
+    let mut argv = vec![
+        "__send".to_string(),
+        args.project.clone(),
+        args.name.clone(),
+        args.text.clone(),
+    ];
+    if args.confirm {
+        argv.push("--confirm".to_string());
+        if let Some(ms) = args.confirm_timeout_ms {
+            argv.push(ms.to_string());
+        }
+    }
+    argv
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,12 +316,28 @@ async fn respawn_agent(args: RespawnArgs) -> Result<()> {
     Ok(())
 }
 
+/// Outcome of one confirmed `__send` invocation, parsed from the leaf JSON.
+/// `landed` is None on the legacy (non-confirm) path where no verdict exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendOutcome {
+    pub ok: bool,
+    pub name: String,
+    #[serde(default)]
+    pub landed: Option<bool>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 /// Send one prompt via the flywheel binary. Checkpointed side effect.
+/// With confirm, returns the parsed landing verdict; the legacy path returns
+/// an outcome with `landed: None`.
 #[function]
-async fn send_prompt(args: SendArgs) -> Result<()> {
+async fn send_prompt(args: SendArgs) -> Result<SendOutcome> {
     let exe = self_exe().map_err(map_err)?;
     let out = Command::new(&exe)
-        .args(["__send", &args.project, &args.name, &args.text])
+        .args(send_prompt_argv(&args))
         .output()
         .map_err(|e| map_err(anyhow::anyhow!("__send spawn failed: {e}")))?;
     if !out.status.success() {
@@ -293,7 +346,22 @@ async fn send_prompt(args: SendArgs) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(())
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let outcome: SendOutcome = serde_json::from_str(raw.trim())
+        .map_err(|e| map_err(anyhow::anyhow!("__send bad JSON: {e}: {raw}")))?;
+    let _ = crate::state::log_event(
+        &args.project,
+        crate::state::EventKind::Send,
+        serde_json::json!({
+            "to": args.name,
+            "confirm": args.confirm,
+            "landed": outcome.landed,
+            "status": outcome.status,
+            "reason": outcome.reason,
+            "source": "loop",
+        }),
+    );
+    Ok(outcome)
 }
 
 /// Notify a blocked agent via agent-mail. Checkpointed side effect.
@@ -482,6 +550,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             project: params.project.clone(),
                             name: name.clone(),
                             text: text.clone(),
+                            confirm: params.confirm_sends,
+                            confirm_timeout_ms: params.confirm_timeout_ms,
                         },
                     )
                     .await?;
@@ -507,6 +577,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 project: params.project.clone(),
                                 name: name.clone(),
                                 text: n.clone(),
+                                confirm: params.confirm_sends,
+                                confirm_timeout_ms: params.confirm_timeout_ms,
                             },
                         )
                         .await?;
@@ -778,11 +850,107 @@ mod tests {
             on_blocked: "continue".into(),
             max_iterations: Some(10),
             work: false,
+            confirm_sends: true,
+            confirm_timeout_ms: Some(45_000),
         };
         let v = serde_json::to_value(&p).unwrap();
         let back: LoopParams = serde_json::from_value(v).unwrap();
         assert_eq!(back.project, "notetoself");
         assert_eq!(back.interval_secs, 300);
         assert_eq!(back.max_iterations, Some(10));
+        assert!(back.confirm_sends);
+        assert_eq!(back.confirm_timeout_ms, Some(45_000));
+    }
+
+    #[test]
+    fn params_confirm_defaults_true_when_absent() {
+        // pre-confirm saved params (loops.json) must still load: confirm_sends
+        // defaults to true, timeout to None (leaf default 45s).
+        let v = serde_json::json!({
+            "project": "legacy",
+            "to": "all",
+            "interval_secs": 300,
+            "queue": [],
+            "nudge": null,
+            "on_blocked": "continue",
+            "max_iterations": null,
+            "work": false,
+        });
+        let p: LoopParams = serde_json::from_value(v).unwrap();
+        assert!(p.confirm_sends, "confirm_sends must default true for legacy params");
+        assert_eq!(p.confirm_timeout_ms, None);
+    }
+
+    #[test]
+    fn send_args_serde_roundtrip_with_confirm() {
+        let a = SendArgs {
+            project: "p".into(),
+            name: "a".into(),
+            text: "t".into(),
+            confirm: true,
+            confirm_timeout_ms: Some(45_000),
+        };
+        let v = serde_json::to_value(&a).unwrap();
+        let back: SendArgs = serde_json::from_value(v).unwrap();
+        assert!(back.confirm);
+        assert_eq!(back.confirm_timeout_ms, Some(45_000));
+    }
+
+    #[test]
+    fn send_prompt_argv_confirm_flag() {
+        // confirm + explicit timeout → `--confirm 45000`
+        let args = SendArgs {
+            project: "p".into(),
+            name: "a".into(),
+            text: "t".into(),
+            confirm: true,
+            confirm_timeout_ms: Some(45_000),
+        };
+        assert_eq!(
+            send_prompt_argv(&args),
+            vec!["__send", "p", "a", "t", "--confirm", "45000"]
+        );
+        // confirm + no timeout → bare `--confirm` (leaf applies its 45s default)
+        let args_no_ms = SendArgs {
+            project: "p".into(),
+            name: "a".into(),
+            text: "t".into(),
+            confirm: true,
+            confirm_timeout_ms: None,
+        };
+        assert_eq!(
+            send_prompt_argv(&args_no_ms),
+            vec!["__send", "p", "a", "t", "--confirm"]
+        );
+        // no confirm → legacy argv, byte-identical to the old builder
+        let args_legacy = SendArgs {
+            project: "p".into(),
+            name: "a".into(),
+            text: "t".into(),
+            confirm: false,
+            confirm_timeout_ms: None,
+        };
+        assert_eq!(
+            send_prompt_argv(&args_legacy),
+            vec!["__send", "p", "a", "t"]
+        );
+    }
+
+    #[test]
+    fn send_outcome_parses_confirm_and_legacy_json() {
+        // confirm path: verdict present
+        let v: SendOutcome = serde_json::from_str(
+            r#"{"ok": true, "name": "a", "landed": true, "status": "working", "reason": "landed"}"#,
+        )
+        .unwrap();
+        assert_eq!(v.landed, Some(true));
+        assert_eq!(v.status.as_deref(), Some("working"));
+        assert_eq!(v.reason.as_deref(), Some("landed"));
+
+        // legacy path: no verdict fields → None defaults
+        let legacy: SendOutcome =
+            serde_json::from_str(r#"{"ok": true, "name": "a"}"#).unwrap();
+        assert_eq!(legacy.landed, None);
+        assert_eq!(legacy.reason, None);
     }
 }
