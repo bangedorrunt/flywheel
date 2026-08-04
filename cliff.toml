@@ -1,0 +1,79 @@
+# git-cliff ~ configuration file
+# https://git-cliff.org/docs/configuration
+#
+# flywheel changelog automation:
+#   git cliff -o CHANGELOG.md          # regenerate the changelog
+#   git cliff --unreleased --dry-run   # preview pending entries
+#   git cliff --bump                   # bump version + tag + changelog (release)
+
+[changelog]
+# Keep a Changelog header
+header = """
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+"""
+body = """
+{% if version %}\
+    ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+    ## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | striptags | trim | upper_first }}
+    {% for commit in commits %}
+        - {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+            {% if commit.breaking %}[**breaking**] {% endif %}\
+            {{ commit.message | split(pat="\n") | first | upper_first }}\
+    {% endfor %}
+{% endfor %}
+"""
+trim = true
+render_always = true
+postprocessors = []
+
+[git]
+# Parse commits according to the conventional commits specification.
+conventional_commits = true
+# The repo's history mixes conventional commits with bead-prefixed ones
+# ("bd-<id>: ...") — keep both; the parsers below assign groups.
+filter_unconventional = false
+require_conventional = false
+split_commits = false
+commit_preprocessors = [
+    # Strip the bead tracker id prefix so group parsers see the substance:
+    # "bd-send-stall-escalation-13b: escalate stalled sends" -> "escalate stalled sends"
+    { pattern = '^bd-[a-z0-9-]+: ', replace = "" },
+    # Collapse the bead-sync/epic-close commits to a stable subject.
+    { pattern = '^(beads|close epic): ', replace = "" },
+]
+protect_breaking_commits = false
+commit_parsers = [
+    { message = "^feat", group = "<!-- 0 -->🚀 Features" },
+    { message = "^fix", group = "<!-- 1 -->🐛 Bug Fixes" },
+    { message = "^doc", group = "<!-- 3 -->📚 Documentation" },
+    { message = "^perf", group = "<!-- 4 -->⚡ Performance" },
+    { message = "^refactor", group = "<!-- 2 -->🚜 Refactor" },
+    { message = "^style", group = "<!-- 5 -->🎨 Styling" },
+    { message = "^test", group = "<!-- 6 -->🧪 Testing" },
+    { message = "^chore\\(release\\): prepare for", skip = true },
+    { message = "^chore\\(deps.*\\)", skip = true },
+    { message = "^chore|^ci", group = "<!-- 7 -->⚙️ Miscellaneous Tasks" },
+    # flywheel integration generator + the hardening-epic bead work are
+    # feature landings; the bug-fix beads land in Bug Fixes.
+    { message = "^flywheel integration|^integration:", group = "<!-- 0 -->🚀 Features" },
+    { message = "^duplicate-label|^pi agents spawn nameless|^bd-nil|^Bd-nil", group = "<!-- 1 -->🐛 Bug Fixes" },
+    { message = "^escalate|^respawn agents stuck|^state-file contract|^adaptive poll|^config surface|^per-agent last-sent|^resume-dedup|^typed pane wait|^__wait-output|^context verdict|^never dispatch|^confirmed sends|^--interval-active|^herdr protocol drift|^dedupe re-sends|^integration gate", group = "<!-- 0 -->🚀 Features" },
+    { message = "^clippy", group = "<!-- 7 -->⚙️ Miscellaneous Tasks" },
+    { message = ".*", group = "<!-- 10 -->💼 Other" },
+]
+filter_commits = false
+fail_on_unmatched_commit = false
+link_parsers = []
+use_branch_tags = false
+topo_order = false
+topo_order_commits = true
