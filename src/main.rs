@@ -398,6 +398,13 @@ enum Commands {
         #[arg(long)]
         timeout_ms: Option<u64>,
     },
+    /// internal: newest last-sent record for (agent, prompt-hash)
+    #[command(name = "__last-sent", hide = true)]
+    __LastSent {
+        project: String,
+        name: String,
+        hash: u64,
+    },
     /// internal: notify a blocked agent via agent-mail (durable workflow leaf)
     #[command(name = "__mail-blocked", hide = true)]
     __MailBlocked {
@@ -409,7 +416,9 @@ enum Commands {
     __Ready {
         project: String,
     },
-    /// internal: list in-progress beads as JSON (durable workflow leaf)
+    /// internal leaf: newest last-sent record for (agent, prompt-hash).
+
+/// internal: list in-progress beads as JSON (durable workflow leaf)
     #[command(name = "__inprogress", hide = true)]
     __Inprogress {
         project: String,
@@ -434,6 +443,15 @@ enum Commands {
         kind: String,
     },
 }
+fn cmd_internal_last_sent(_cfg: &Config, project: &str, name: &str, hash: u64) -> Result<()> {
+    let record = state::load_last_sent(project)
+        .into_iter()
+        .rev()
+        .find(|r| r.name == name && r.text_hash == hash);
+    print_json(&json!({ "record": record }));
+    Ok(())
+}
+
 
 #[derive(Args, Default, Clone)]
 struct AgentCounts {
@@ -872,7 +890,9 @@ fn main() {
             *regex,
             *timeout_ms,
         ),        Some(Commands::__Ready { project }) => cmd_internal_ready(&cfg, project),
-        Some(Commands::__Inprogress { project }) => cmd_internal_inprogress(&cfg, project),
+        Some(Commands::__LastSent { project, name, hash }) => {
+            cmd_internal_last_sent(&cfg, project, name, *hash)
+        }        Some(Commands::__Inprogress { project }) => cmd_internal_inprogress(&cfg, project),
         Some(Commands::__Kind { project, name }) => cmd_internal_kind(&cfg, project, name),
         Some(Commands::__Read { project, name }) => cmd_internal_read(&cfg, project, name),
         Some(Commands::__Respawn { project, name, kind }) => {
@@ -2750,6 +2770,27 @@ fn cmd_internal_send(
     invocation: Option<&str>,
     iteration: Option<u64>,
 ) -> Result<()> {
+    // resume-dedup (bd-resume-dedup): a landed record for THIS invocation
+    // means the prompt was delivered before a crash — skip the herdr call
+    // entirely. The __send subprocess is the idempotency boundary: it runs
+    // FRESH at send time, so the check cannot go stale (a workflow-level
+    // check's result would itself be checkpointed and replayed after the
+    // crash window — the folded form is the correct one; documented in the
+    // bead close). Skipped sends emit the landed shape with deduped:true and
+    // do NOT write a new record (the delivery is already recorded).
+    if let Some(inv) = invocation.filter(|i| !i.is_empty()) {
+        let hash = state::fnv1a64(text);
+        let records = state::load_last_sent(project);
+        let record = state::find_last_sent(&records, name, hash);
+        if !durable::should_resend(record, inv) {
+            print_json(&json!({
+                "ok": true, "name": name, "landed": true,
+                "status": serde_json::Value::Null, "reason": "landed", "deduped": true,
+            }));
+            return Ok(());
+        }
+    }
+
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
     let agent = c

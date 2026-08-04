@@ -101,6 +101,7 @@ pub struct ReadArgs {
     pub name: String,
 }
 
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RespawnArgs {
     pub project: String,
@@ -111,6 +112,11 @@ pub struct RespawnArgs {
     pub reason: String,
     /// Consecutive send failures for this agent, logged with the event.
     pub attempts: u64,
+    /// When a prompt is requeued with this respawn, the hash of that prompt
+    /// — its delivery record is INVALIDATED (the delivery died with the
+    /// respawned agent; the fresh agent must get the prompt again).
+    #[serde(default)]
+    pub text_hash: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +325,35 @@ pub fn parse_read_output(v: &serde_json::Value) -> anyhow::Result<ReadOutput> {
     })
 }
 
+/// Resume-dedup verdict: should the loop (re-)send this prompt?
+///
+/// - no record → never sent → resend.
+/// - record from ANOTHER invocation → a fresh run legitimately re-delegates
+///   → resend.
+/// - landed, same invocation → delivered before the crash → skip (the work
+///   is in flight; the queue item was already consumed).
+/// - unlanded, same invocation → crashed mid-flight → resend (safe, needed).
+///
+/// Without confirmed sends the registry records nothing (or unlanded), so the
+/// guard degrades to today's always-resend behavior.
+pub fn should_resend(record: Option<&crate::state::SentRecord>, current_invocation: &str) -> bool {
+    match record {
+        None => true,
+        Some(r) => {
+            r.invocation != current_invocation || !r.landed
+        }
+    }
+}
+
+/// Parse the `__last-sent` leaf output: `{"record": {...}|null}`.
+pub fn parse_last_sent_output(v: &serde_json::Value) -> anyhow::Result<Option<crate::state::SentRecord>> {
+    let rec = v
+        .get("record")
+        .filter(|r| !r.is_null())
+        .and_then(|r| serde_json::from_value(r.clone()).ok());
+    Ok(rec)
+}
+
 /// In-progress beads via the flywheel binary (`br list --status in_progress`).
 /// Checkpointed.
 #[function]
@@ -410,6 +445,15 @@ async fn respawn_agent(args: RespawnArgs) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
+    // a requeued prompt's delivery record dies with the respawned agent —
+    // invalidate it so the fresh agent gets the prompt (resume-dedup)
+    if let Some(h) = args.text_hash {
+        let mut records = crate::state::load_last_sent(&args.project);
+        records.retain(|r| !(r.name == args.name && r.text_hash == h));
+        if let Err(e) = crate::state::save_last_sent(&args.project, &records) {
+            eprintln!("flywheel: cannot invalidate last-sent record: {e:#}");
+        }
+    }
     let _ = crate::state::log_event(
         &args.project,
         crate::state::EventKind::Respawn,
@@ -435,6 +479,10 @@ pub struct SendOutcome {
     pub status: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+    /// true when __send skipped the herdr call because a landed record for
+    /// this (name, prompt, invocation) already exists (resume-dedup)
+    #[serde(default)]
+    pub deduped: bool,
 }
 
 /// Send one prompt via the flywheel binary. Checkpointed side effect.
@@ -797,6 +845,7 @@ async fn respawn_and_requeue(
             kind,
             reason: reason.to_string(),
             attempts,
+            text_hash: text.map(crate::state::fnv1a64),
         },
     )
     .await?;
@@ -990,8 +1039,24 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             landed: Some(false),
                             status: None,
                             reason: Some(format!("error:{e}")),
+                            deduped: false,
                         },
                     };
+                    // resume-dedup: __send skipped the herdr call because this
+                    // prompt already landed for this invocation — log it (the
+                    // landed handling below resets the failure counter; a
+                    // skipped item never fails)
+                    if outcome.deduped {
+                        let _ = crate::state::log_event(
+                            &params.project,
+                            crate::state::EventKind::SkippedDup,
+                            serde_json::json!({
+                                "name": name,
+                                "iteration": iteration,
+                                "source": "loop",
+                            }),
+                        );
+                    }
                     any_work = true;
                     match handle_send_result(&mut send_failures, name, &outcome) {
                         Escalation::Accept => {}
@@ -1383,6 +1448,7 @@ mod tests {
 
     fn so(landed: Option<bool>, reason: Option<&str>) -> SendOutcome {
         SendOutcome {
+            deduped: false,
             ok: true,
             name: "a".to_string(),
             landed,
@@ -1888,6 +1954,18 @@ mod tests {
             serde_json::from_str(r#"{"ok": true, "name": "a"}"#).unwrap();
         assert_eq!(legacy.landed, None);
         assert_eq!(legacy.reason, None);
+        assert!(!legacy.deduped);
+    }
+
+    #[test]
+    fn send_outcome_parses_deduped_flag() {
+        // the resume-dedup skip shape: landed with deduped:true
+        let v: SendOutcome = serde_json::from_str(
+            r#"{"ok": true, "name": "a", "landed": true, "status": null, "reason": "landed", "deduped": true}"#,
+        )
+        .unwrap();
+        assert_eq!(v.landed, Some(true));
+        assert!(v.deduped);
     }
 
     #[test]
@@ -2009,5 +2087,55 @@ mod tests {
         track_unknown(&mut m, "b", "unknown", UNKNOWN_RESPAWN_THRESHOLD); // b respawns
         assert_eq!(m.get("a"), Some(&1)); // a untouched by b's respawn
         assert!(!m.contains_key("b"));
+    }
+}
+
+#[cfg(test)]
+mod resume_dedup_tests {
+    use super::*;
+    use crate::state::SentRecord;
+
+    fn rec(name: &str, hash: u64, invocation: &str, landed: bool) -> SentRecord {
+        SentRecord {
+            name: name.to_string(),
+            text_hash: hash,
+            invocation: invocation.to_string(),
+            iteration: 1,
+            landed,
+        }
+    }
+
+    #[test]
+    fn should_resend_matrix() {
+        // no record -> never sent -> resend
+        assert!(should_resend(None, "inv-1"));
+        // landed, same invocation -> delivered; skip
+        assert!(!should_resend(Some(&rec("a", 1, "inv-1", true)), "inv-1"));
+        // unlanded, same invocation -> crashed mid-flight; resend
+        assert!(should_resend(Some(&rec("a", 1, "inv-1", false)), "inv-1"));
+        // any record from ANOTHER invocation -> fresh run re-delegates
+        assert!(should_resend(Some(&rec("a", 1, "inv-0", true)), "inv-1"));
+        assert!(should_resend(Some(&rec("a", 1, "inv-0", false)), "inv-1"));
+    }
+
+    #[test]
+    fn parse_last_sent_output_record_and_null() {
+        let with: serde_json::Value = serde_json::from_str(
+            r#"{"record": {"name": "a", "text_hash": 7, "invocation": "inv-1", "iteration": 2, "landed": true}}"#,
+        )
+        .unwrap();
+        let r = parse_last_sent_output(&with).unwrap().unwrap();
+        assert_eq!(r.name, "a");
+        assert!(r.landed);
+        let null: serde_json::Value = serde_json::from_str(r#"{"record": null}"#).unwrap();
+        assert!(parse_last_sent_output(&null).unwrap().is_none());
+    }
+
+    #[test]
+    fn should_resend_degrades_without_confirmation() {
+        // pre-confirm loops recorded nothing (or unlanded): resend = today
+        // (the fn docstring promises the guard degrades to re-sending)
+        assert!(should_resend(None, "inv-1"));
+        assert!(should_resend(Some(&rec("a", 1, "inv-1", false)), "inv-1"));
     }
 }
