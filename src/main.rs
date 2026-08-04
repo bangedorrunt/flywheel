@@ -1910,9 +1910,12 @@ fn plan_actions(
             AgentStatus::Idle | AgentStatus::Done | AgentStatus::Unknown => {
                 if !queue.is_empty() {
                     let text = queue.remove(0); // FIFO: stages in declared order
+                    // bead/resume prompts carry a {AGENT_NAME} placeholder —
+                    // substitute the receiving agent's herdr name (same
+                    // contract as the durable loop's plan_actions)
                     actions.push(LoopAction::Send {
                         name: name.clone(),
-                        text,
+                        text: text.replace("{AGENT_NAME}", name),
                     });
                 } else if nudge.is_some() {
                     actions.push(LoopAction::Nudge {
@@ -2202,6 +2205,30 @@ mod loop_tests {
                 assert_eq!(name, "a");
                 assert_eq!(text, "p1");
             }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_loop_substitutes_agent_name_at_dispatch() {
+        // the sync loop (--once/--local) dispatches the same bead prompts —
+        // the {AGENT_NAME} placeholder must resolve to the receiving agent
+        let states = vec![st("flywheel-proj-oc", AgentStatus::Idle)];
+        let mut q = vec!["write to .flywheel/agent-state/{AGENT_NAME}.json".into()];
+        let actions = plan_actions(&states, &mut q, None);
+        match &actions[0] {
+            LoopAction::Send { text, .. } => {
+                assert!(text.contains(".flywheel/agent-state/flywheel-proj-oc.json"));
+                assert!(!text.contains("{AGENT_NAME}"));
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+        // plain prompts stay untouched
+        let states = vec![st("a", AgentStatus::Idle)];
+        let mut q = vec!["t1".into()];
+        let actions = plan_actions(&states, &mut q, None);
+        match &actions[0] {
+            LoopAction::Send { text, .. } => assert_eq!(text, "t1"),
             other => panic!("expected Send, got {other:?}"),
         }
     }

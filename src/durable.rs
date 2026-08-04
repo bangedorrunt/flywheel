@@ -213,15 +213,22 @@ async fn poll_ready(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
 }
 
 /// The prompt given to an agent for a ready bead: self-contained + lifecycle.
+/// The state-file contract (bd-prompt-state-file) tells the agent to write
+/// `.flywheel/agent-state/{AGENT_NAME}.json` when context is high; the
+/// `{AGENT_NAME}` placeholder is substituted with the receiving agent's herdr
+/// name at dispatch time (plan_actions) so the agent never guesses the
+/// filename. `context_pct` < 80 is ignored by the READER (bd-read-state-
+/// fallback) — the threshold lives there, not here.
 pub fn bead_prompt(id: &str, title: &str) -> String {
-    let template = r#"Execute bead {id}: {title}. Follow the bead lifecycle: claim (`br update {id} --claim --actor "$AGENT_NAME" --json`), reserve your files via agent-mail, announce, execute one narrow slice, verify acceptance criteria, close with an honest reason, `br sync --flush-only` and commit `.beads/`. If your session context usage exceeds about 80%, do NOT start new work: finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you. If {id} is already claimed, pick the next ready bead from `br ready --json` or report back."#;
+    let template = r#"Execute bead {id}: {title}. Follow the bead lifecycle: claim (`br update {id} --claim --actor "$AGENT_NAME" --json`), reserve your files via agent-mail, announce, execute one narrow slice, verify acceptance criteria, close with an honest reason, `br sync --flush-only` and commit `.beads/`. If your session context usage exceeds about 80%: write `{"context_pct": <pct>, "ts": "<now RFC3339>"}` to `.flywheel/agent-state/{AGENT_NAME}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you. If {id} is already claimed, pick the next ready bead from `br ready --json` or report back."#;
     template.replace("{id}", id).replace("{title}", title)
 }
 
-/// Prompt to resume an in-progress bead after an interruption.
+/// Prompt to resume an in-progress bead after an interruption. Carries the
+/// same state-file contract (placeholder substituted at dispatch).
 pub fn resume_prompt(id: &str, title: &str) -> String {
     format!(
-        "Resume bead {id}: {title}. It is still in progress — continue it: re-check your work, finish, verify acceptance criteria, close with an honest reason, `br sync --flush-only` and commit `.beads/`. If your context is exhausted, reply exactly CONTEXT_LIMIT."
+        "Resume bead {id}: {title}. It is still in progress — continue it: re-check your work, finish, verify acceptance criteria, close with an honest reason, `br sync --flush-only` and commit `.beads/`. If your session context usage exceeds about 80%: write `{{\"context_pct\": <pct>, \"ts\": \"<now RFC3339>\"}}` to `.flywheel/agent-state/{{AGENT_NAME}}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you."
     )
 }
 
@@ -415,9 +422,12 @@ pub fn plan_actions(states: &[AgentState], queue: &mut Vec<String>, nudge: Optio
                 // idle / done → feed work or nudge
                 if !queue.is_empty() {
                     let text = queue.remove(0); // FIFO: stages in declared order
+                    // bead/resume prompts carry a {AGENT_NAME} placeholder —
+                    // substitute the receiving agent's herdr name so the
+                    // state-file path is concrete (no-op for plain prompts)
                     actions.push(LoopAction::Send {
                         name: s.name.clone(),
-                        text,
+                        text: text.replace("{AGENT_NAME}", &s.name),
                     });
                 } else if nudge.is_some() {
                     actions.push(LoopAction::Nudge { name: s.name.clone() });
@@ -1424,6 +1434,18 @@ mod tests {
     }
 
     #[test]
+    fn resume_prompt_carries_state_file_contract() {
+        let p = resume_prompt("bd-7", "finish the parser");
+        // the literal path pattern + the field; the name placeholder is
+        // substituted at dispatch (plan_actions) — the template must not
+        // hardcode any agent
+        assert!(p.contains(".flywheel/agent-state/"));
+        assert!(p.contains("context_pct"));
+        assert!(p.contains("{AGENT_NAME}"));
+        assert!(p.contains(".flywheel/agent-state/{AGENT_NAME}.json"));
+    }
+
+    #[test]
     fn context_marker_detection() {
         assert!(should_respawn("...CONTEXT_LIMIT"));
         assert!(should_respawn("CONTEXT_LIMIT\nall done"));
@@ -1436,6 +1458,44 @@ mod tests {
         assert!(p.contains("bd-12"));
         assert!(p.contains("--claim"));
         assert!(p.contains("br sync --flush-only"));
+    }
+
+    #[test]
+    fn bead_prompt_carries_state_file_contract() {
+        let p = bead_prompt("bd-12", "fix auth flow");
+        assert!(p.contains(".flywheel/agent-state/"));
+        assert!(p.contains("context_pct"));
+        assert!(p.contains(".flywheel/agent-state/{AGENT_NAME}.json"));
+        assert!(p.contains("CONTEXT_LIMIT"));
+    }
+
+    #[test]
+    fn plan_actions_substitutes_agent_name_at_dispatch() {
+        // a queued bead prompt carries {AGENT_NAME}; the idle agent's name
+        // replaces it when the Send action is built
+        let mut queue = vec![bead_prompt("bd-12", "fix auth flow")];
+        let states = vec![st("flywheel-proj-oc", "idle")];
+        let actions = plan_actions(&states, &mut queue, None);
+        match &actions[0] {
+            LoopAction::Send { name, text } => {
+                assert_eq!(name, "flywheel-proj-oc");
+                assert!(text.contains(".flywheel/agent-state/flywheel-proj-oc.json"));
+                assert!(!text.contains("{AGENT_NAME}"));
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn plan_actions_leaves_plain_prompts_untouched() {
+        let mut queue = vec!["t1".to_string()];
+        let states = vec![st("flywheel-proj-oc", "idle")];
+        let actions = plan_actions(&states, &mut queue, None);
+        match &actions[0] {
+            LoopAction::Send { text, .. } => assert_eq!(text, "t1"),
+            other => panic!("expected Send, got {other:?}"),
+        }
     }
 
     #[test]
