@@ -63,69 +63,58 @@ swarm via `__poll` (leaf), feeds queued instructions to idle agents via
 `__send`, sleeps durably, and exits when the queue drains. Crashes resume by
 re-running the same command (same invocation id while pending).
 
-<!-- br-agent-instructions-v1 -->
+<!-- br-agent-instructions-v2 -->
 
 ---
 
 ## Beads Workflow Integration
 
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`/`bd`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
-
-### Essential Commands
+Bead/issue work in this project is delegated to the **`beads` subagent**
+(triage → claim → reserve → announce → execute → verify → close → sync →
+handoff). The subagent definition is GENERATED — regenerate it after any
+flywheel rebuild so it stays current with the workflow:
 
 ```bash
-# View ready issues (open, unblocked, not deferred)
-br ready              # or: bd ready
-
-# List and search
-br list --status=open # All open issues
-br show <id>          # Full issue details with dependencies
-br search "keyword"   # Full-text search
-
-# Create and update
-br create --title="..." --description="..." --type=task --priority=2
-br update <id> --status=in_progress
-br close <id> --reason="Completed"
-br close <id1> <id2>  # Close multiple issues at once
-
-# Sync with git
-br sync --flush-only  # Export DB to JSONL
-br sync --status      # Check sync status
+flywheel integration opencode   # -> ~/.config/opencode/agents/beads.md
+flywheel integration pi         # -> ~/.pi/agent/agents/beads.md
+flywheel integration grok       # -> ~/.grok/agents/beads.md
 ```
 
-### Workflow Pattern
+### Essential Commands (same surface the subagent uses)
 
-1. **Start**: Run `br ready` to find actionable work
-2. **Claim**: Use `br update <id> --status=in_progress`
-3. **Work**: Implement the task
-4. **Complete**: Use `br close <id>`
-5. **Sync**: Always run `br sync --flush-only` at session end
+```bash
+br ready --json                    # ready work (open, unblocked, not deferred)
+br list --status=open --json       # all open issues
+br show <id>                       # full issue + dependencies
+br search "keyword"                # full-text search
+br create --title="..." --description="..." --type=task --priority=2
+br update <id> --claim --actor "$AGENT_NAME" --json   # atomic claim
+br close <id> --reason="..."       # close with an honest reason
+br sync --flush-only               # export DB -> JSONL (then commit .beads/)
+br dep add <new> --type discovered-from <current>     # link discoveries
+bv --robot-triage | --robot-next   # graph-aware picks; NEVER bare bv
+```
+
+### Lifecycle (mandatory, in order)
+
+1. **Triage** — `bv --robot-triage` / `br ready --json`; respect priority + dependency order.
+2. **Claim** — `br update <id> --claim --actor "$AGENT_NAME" --json`. Never work unclaimed.
+3. **Reserve** — agent-mail `file_reservation_paths` (exclusive) for files you will touch.
+4. **Announce** — agent-mail: which bead, which files, expected outcome.
+5. **Execute one narrow slice** — the bead is self-contained; no scope creep.
+6. **Quality gates** — narrowest test/lint/typecheck for the slice.
+7. **Verify compliance** — acceptance criteria met, not just "compiles".
+8. **Close + sync** — `br close` (honest reason), `br sync --flush-only`, `git add .beads/ && git commit` (br never runs git).
+9. **Handoff** — agent-mail: what changed / verified / remaining; release reservations.
 
 ### Key Concepts
 
-- **Dependencies**: Issues can block other issues. `br ready` shows only open, unblocked work.
-- **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers 0-4, not words)
-- **Types**: task, bug, feature, epic, chore, docs, question
-- **Blocking**: `br dep add <issue> <depends-on>` to add dependencies
-
-### Session Protocol
-
-**Before ending any session, run this checklist:**
-
-```bash
-git status              # Check what changed
-git add <files>         # Stage code changes
-br sync --flush-only    # Export beads changes to JSONL
-git commit -m "..."     # Commit everything
-git push                # Push to remote
-```
-
-### Best Practices
-
-- Check `br ready` at session start to find available work
-- Update status as you work (in_progress → closed)
-- Create new issues with `br create` when you discover tasks
-- Use descriptive titles and set appropriate priority/type
-- Always sync before ending session
+- **Dependencies**: `br ready` shows only open, unblocked, non-deferred work; `br dep add` links blocks/discovered-from.
+- **Priority**: 0-4 (P0 critical … P4 backlog). **Types**: task/bug/feature/epic/chore/docs/question.
+- **Context contract**: at ~80% session context, write `{"context_pct", "ts"}` to
+  `.flywheel/agent-state/<AGENT_NAME>.json` (best-effort), finish + sync the current bead,
+  then reply exactly `CONTEXT_LIMIT` — the orchestrator respawns you.
+- **br is CLI-only — NO beads MCP server.** `beads-mcp` is the legacy bd-era plugin; never wire it in.
+  Canonical agent contract: `br robot-docs guide`, `br capabilities --format json`, `br schema commands --format json`.
 
 <!-- end-br-agent-instructions -->

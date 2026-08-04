@@ -146,6 +146,23 @@ Caveat: `__wait-output` waits on raw pane OUTPUT, not agent lifecycle. Use
 `herdr agent wait` when you need lifecycle semantics (idle/working/blocked);
 use `__wait-output` when a specific line appearing is the signal.
 
+### Beads subagent integration
+
+Bead/issue work in a swarm is delegated to a generated `beads` SUBAGENT per
+tool (not an AGENTS.md section). `flywheel integration <kind>` renders the
+subagent definition from `integrations/{opencode,pi,grok}-beads.md.tpl` (shared
+body + per-kind frontmatter), version-stamped with the flywheel build:
+
+```sh
+flywheel integration opencode --out ~/.config/opencode/agents/beads.md
+flywheel integration pi         --out ~/.pi/agent/agents/beads.md
+flywheel integration grok       --out ~/.grok/agents/beads.md
+```
+
+Edit the templates, rebuild, re-run — the subagent files stay current with the
+workflow (lifecycle, agent-mail coordination, context contract). The tool
+AGENTS.md files carry only a pointer to the subagent.
+
 ## Backend protocol
 
 herdr socket protocol v18: one JSON-RPC request per connection (newline-delimited),

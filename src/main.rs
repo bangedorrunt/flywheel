@@ -15,7 +15,7 @@ mod work;
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -35,9 +35,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STAGES: &[(&str, &str)] = &[
     ("p1", "I want you to sort of randomly explore the code files in this project, choosing code files to deeply investigate and understand and trace their functionality and execution flows through the related code files which they import or which they are imported by. Once you understand the purpose of the code in the larger context of the workflows, I want you to do a super careful, methodical, and critical check with \"fresh eyes\" to find any obvious bugs, problems, errors, issues, silly mistakes, etc. and then systematically and meticulously and intelligently correct them. Be sure to comply with ALL rules in AGENTS dot md."),
     ("p2", "Ok can you now turn your attention to reviewing the code written by your fellow agents and checking for any issues, bugs, errors, problems, inefficiencies, security problems, reliability issues, etc. and carefully diagnose their underlying root causes using first-principle analysis and then fix or revise them if necessary? Don't restrict yourself to the latest commits, cast a wider net and go super deep! Use ultrathink."),
-    ("p4", "OK so please take ALL of that and elaborate on it more and then create a comprehensive and granular set of beads for all this with tasks, subtasks, and dependency structure overlaid, with detailed comments so that the whole thing is totally self-contained and self-documenting (including relevant background, reasoning/justification, considerations, etc.-- anything we'd want our \"future self\" to know about the goals and intentions and thought process and how it serves the over-arching goals of the project.)"),
+    ("p4", "OK so please take ALL of that and elaborate on it more and then create a comprehensive and granular set of beads for all this with tasks, subtasks, and dependency structure overlaid, with detailed comments so that the whole thing is totally self-contained and self-documenting (including relevant background, reasoning/justification, considerations, etc.-- anything we'd want our \"future self\" to know about the goals and intentions and thought process and how it serves the over-arching goals of the project.) Follow the beads-workflow discipline: check your beads N times before implementing, keep each bead self-contained (background, reasoning, acceptance criteria), and link dependencies with `br dep add`."),
     ("p5", "Check over each bead super carefully-- are you sure it makes sense? Is it optimal? Could we change anything to make the system work better for users? If so, revise the beads. It's a lot easier and faster to operate in \"plan space\" before we start implementing these things!"),
-    ("p6", "OK, so start systematically and methodically and meticulously and diligently executing those remaining beads tasks that you created in the optimal logical order! Don't forget to mark beads as you work on them."),
+    ("p6", "OK, so start systematically and methodically and meticulously and diligently executing those remaining beads tasks that you created in the optimal logical order! For each bead follow the FULL lifecycle: triage (`bv --robot-triage` / `br ready --json`) -> claim (`br update --claim --actor \"$AGENT_NAME\" --json`; never work unclaimed) -> reserve files via agent-mail -> announce -> execute one narrow slice -> quality gates -> verify acceptance criteria -> close with an honest reason (`br close`) -> `br sync --flush-only` + commit `.beads/` -> handoff message. Prefer delegating to the `beads` subagent when available."),
     ("p8", "Now, based on your knowledge of the project, commit all changed files now in a series of logically connected groupings with super detailed commit messages for each and then push. Take your time to do it right. Don't edit the code at all. Don't commit obviously ephemeral files. Use ultrathink."),
 ];
 
@@ -346,6 +346,16 @@ enum Commands {
     },
     /// Environment + toolchain health check
     Deps,
+    /// Generate the beads-agent integration instructions for an agent kind.
+    /// Omit KIND to list the available kinds. Re-run after a flywheel rebuild
+    /// to refresh the generated instructions with newer workflow changes.
+    Integration {
+        /// agent kind: opencode|pi|grok (shorts oc|pi|gk accepted); omit to list
+        kind: Option<String>,
+        /// write the integration to this file instead of stdout
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Configuration management
     Config {
         #[command(subcommand)]
@@ -865,6 +875,9 @@ fn main() {
         Some(Commands::Guards) => cmd_guards(&cfg),
         Some(Commands::Policy { cmd }) => cmd_policy(&cfg, cmd),
         Some(Commands::Deps) => cmd_deps(&cfg),
+        Some(Commands::Integration { kind, out }) => {
+            cmd_integration(kind.as_deref(), out.as_deref())
+        }
         Some(Commands::Config { cmd }) => cmd_config(&cfg, cmd),
         Some(Commands::Upgrade) => cmd_upgrade(),
         Some(Commands::Tutorial) => cmd_tutorial(),
@@ -2543,6 +2556,93 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Per-kind notes for the beads-agent integration template. Keep terse —
+/// the durable-loop behavior is kind-agnostic; these cover session/rendering
+/// quirks that agents should know about themselves.
+fn kind_notes(kind: &str) -> Option<&'static str> {
+    match kind {
+        "opencode" => Some(
+            "- Config: ~/.config/opencode (sessions in opencode's store, ~/.local/share/opencode).\n- Terminal rendering uses the alternate screen: your context state can leave host\n  scrollback, so the state file is the reliable context channel — write it at ~80%.\n- herdr confirms landings fast (~0.6s).",
+        ),
+        "pi" => Some(
+            "- Config + sessions: ~/.pi (session files under ~/.pi/agent/sessions/).\n- Your agent name is applied automatically at spawn; use it in `--actor` and the\n  state-file path. Landings confirm fast (~0.6s).",
+        ),
+        "grok" => Some(
+            "- Config + sessions: ~/.grok (active sessions in ~/.grok/active_sessions.json).\n- Landing latency can be higher: the orchestrator's confirm wait covers it — you\n  only need to reach working/blocked, not finish, for the send to count as landed.",
+        ),
+        _ => None,
+    }
+}
+
+/// The shared beads-agent BODY — the lifecycle, coordination rules, and
+/// context contract that all three agent kinds follow. Per-kind frontmatter
+/// and notes live in the wrappers below. Edit the templates in
+/// `integrations/` and rebuild — re-run `flywheel integration <kind>` after
+/// a rebuild to update the installed subagent files.
+const INTEGRATION_BODY: &str = include_str!("../integrations/beads-body.md.tpl");
+
+/// Per-kind subagent wrappers: frontmatter (tool-specific format) + {{BODY}}.
+fn integration_wrapper(kind: &str) -> Option<&'static str> {
+    match kind {
+        "opencode" => Some(include_str!("../integrations/opencode-beads.md.tpl")),
+        "pi" => Some(include_str!("../integrations/pi-beads.md.tpl")),
+        "grok" => Some(include_str!("../integrations/grok-beads.md.tpl")),
+        _ => None,
+    }
+}
+
+/// Render the beads SUBAGENT definition for one agent kind. Pure: `version`
+/// and `generated` are injected by the caller (deterministic tests).
+fn render_integration(kind: &str, version: &str, generated: &str) -> Result<String> {
+    let wrapper = integration_wrapper(kind)
+        .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok)"))?;
+    let notes = kind_notes(kind).unwrap_or_default();
+    let body = INTEGRATION_BODY
+        .replace("{{KIND_NOTES}}", notes)
+        .replace("{{VERSION}}", version)
+        .replace("{{GENERATED}}", generated);
+    Ok(wrapper
+        .replace("{{BODY}}", &body)
+        .replace("{{VERSION}}", version)
+        .replace("{{GENERATED}}", generated))
+}
+
+/// `flywheel integration [KIND] [--out PATH]` — generate the beads-agent
+/// integration instructions for opencode/pi/grok agents. With no KIND, list
+/// the available kinds. With `--out`, write the rendered file instead of
+/// stdout (e.g. append it to a project's AGENTS.md).
+fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
+    let Some(kind) = kind else {
+        println!("flywheel beads-agent subagents (flywheel {VERSION}):");
+        for (k, path) in [
+            ("opencode", "~/.config/opencode/agents/beads.md"),
+            ("pi", "~/.pi/agent/agents/beads.md"),
+            ("grok", "~/.grok/agents/beads.md"),
+        ] {
+            println!("  {k:9} flywheel integration {k} --out {path}");
+        }
+        println!(
+            "templates: integrations/opencode-beads.md.tpl, pi-beads.md.tpl, grok-beads.md.tpl + beads-body.md.tpl — edit, rebuild, re-run to update"
+        );
+        return Ok(());
+    };
+    // accept the spawn shorts (oc/pi/gk) as well as the full kind names
+    let kind = match kind {
+        "oc" => "opencode",
+        "gk" => "grok",
+        other => other,
+    };
+    let rendered = render_integration(kind, VERSION, &state::now_iso())?;
+    match out {
+        Some(path) => {
+            std::fs::write(path, &rendered)?;
+            println!("wrote {} ({} bytes)", dim(&path.display().to_string()), rendered.len());
+        }
+        None => print!("{rendered}"),
+    }
+    Ok(())
+}
+
 fn cmd_deps(cfg: &Config) -> Result<()> {
     let mut ok = true;
     println!("flywheel {}", dim(VERSION));
@@ -3311,5 +3411,61 @@ mod wait_output_tests {
         };
         let v = wait_output_json(true, r.matched_line.as_deref(), &r.pane_id);
         assert_eq!(v["matched_line"], "ready");
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+
+    #[test]
+    fn render_produces_subagent_with_frontmatter_and_body() {
+        let out = render_integration("opencode", "9.9.9", "2026-08-04T00:00:00Z").unwrap();
+        // subagent shape: YAML frontmatter naming the beads agent
+        assert!(out.starts_with("---\n"));
+        assert!(out.contains("name: beads"));
+        // version + generated stamps in the frontmatter comment
+        assert!(out.contains("flywheel 9.9.9"));
+        assert!(out.contains("2026-08-04T00:00:00Z"));
+        // the shared body's lifecycle
+        assert!(out.contains("br update bd-<id> --claim"));
+        assert!(out.contains("CONTEXT_LIMIT"));
+        assert!(out.contains(".flywheel/agent-state/<AGENT_NAME>.json"));
+        // per-kind config note
+        assert!(out.contains("~/.config/opencode"));
+        // no leftovers
+        assert!(!out.contains("{{BODY}}"));
+        assert!(!out.contains("{{KIND_NOTES}}"));
+        assert!(!out.contains("{{VERSION}}"));
+    }
+
+    #[test]
+    fn render_all_kinds_carry_their_config_dir() {
+        for (kind, cfg) in [
+            ("opencode", "~/.config/opencode"),
+            ("pi", "~/.pi"),
+            ("grok", "~/.grok"),
+        ] {
+            let out = render_integration(kind, "0.1.0", "ts").unwrap();
+            assert!(out.contains(cfg), "{kind} should mention {cfg}");
+            assert!(out.starts_with("---"), "{kind} frontmatter");
+        }
+    }
+
+    #[test]
+    fn render_rejects_unknown_kind() {
+        assert!(render_integration("claude", "0.1.0", "ts").is_err());
+    }
+
+    #[test]
+    fn render_contains_lifecycle_and_context_contract() {
+        let out = render_integration("pi", "0.1.0", "ts").unwrap();
+        assert!(out.contains("br update bd-<id> --claim"));
+        assert!(out.contains("br sync --flush-only"));
+        assert!(out.contains("CONTEXT_LIMIT"));
+        assert!(out.contains(".flywheel/agent-state/<AGENT_NAME>.json"));
+        assert!(out.contains("bv --robot-triage"));
+        assert!(out.contains("file_reservation_paths"));
+        assert!(out.contains("Never use `bd`"));
     }
 }
