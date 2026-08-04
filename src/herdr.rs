@@ -69,6 +69,9 @@ impl AgentStatus {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+// wire-contract struct: parsed from the herdr protocol; not every
+// field is consumed by the client — the unused ones must still deserialize.
+#[allow(dead_code)]
 pub struct AgentSessionInfo {
     pub agent: String,
     pub kind: String,
@@ -77,6 +80,9 @@ pub struct AgentSessionInfo {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+// wire-contract struct: parsed from the herdr protocol; not every
+// field is consumed by the client — the unused ones must still deserialize.
+#[allow(dead_code)]
 pub struct AgentInfo {
     pub agent: Option<String>,
     #[serde(default)]
@@ -108,6 +114,9 @@ pub struct AgentInfo {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+// wire-contract struct: parsed from the herdr protocol; not every
+// field is consumed by the client — the unused ones must still deserialize.
+#[allow(dead_code)]
 pub struct WorkspaceInfo {
     pub workspace_id: String,
     pub label: Option<String>,
@@ -141,6 +150,9 @@ pub fn resolve_workspace_id(matches: &[WorkspaceInfo], agents: &[AgentInfo], pre
 }
 
 #[derive(Debug, Clone, Deserialize)]
+// wire-contract struct: parsed from the herdr protocol; not every
+// field is consumed by the client — the unused ones must still deserialize.
+#[allow(dead_code)]
 pub struct PaneInfo {
     pub pane_id: String,
     pub tab_id: String,
@@ -153,6 +165,9 @@ pub struct PaneInfo {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+// wire-contract struct: parsed from the herdr protocol; not every
+// field is consumed by the client — the unused ones must still deserialize.
+#[allow(dead_code)]
 pub struct WorktreeInfo {
     pub workspace_id: String,
     pub branch: Option<String>,
@@ -169,6 +184,9 @@ pub struct PushEvent {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+// wire-contract struct: parsed from the herdr protocol; not every
+// field is consumed by the client — the unused ones must still deserialize.
+#[allow(dead_code)]
 pub struct PaneAgentStatusChanged {
     pub pane_id: String,
     pub workspace_id: String,

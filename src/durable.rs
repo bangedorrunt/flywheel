@@ -345,17 +345,6 @@ pub fn should_resend(record: Option<&crate::state::SentRecord>, current_invocati
     }
 }
 
-/// Parse the `__last-sent` leaf output: `{"record": {...}|null}`.
-pub fn parse_last_sent_output(v: &serde_json::Value) -> anyhow::Result<Option<crate::state::SentRecord>> {
-    let rec = v
-        .get("record")
-        .filter(|r| !r.is_null())
-        .and_then(|r| serde_json::from_value(r.clone()).ok());
-    Ok(rec)
-}
-
-/// In-progress beads via the flywheel binary (`br list --status in_progress`).
-/// Checkpointed.
 #[function]
 async fn poll_inprogress(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
     let exe = self_exe().map_err(map_err)?;
@@ -428,6 +417,7 @@ async fn read_output(args: ReadArgs) -> Result<ContextVerdict> {
         .unwrap_or(0);
     Ok(context_verdict(&ro.terminal, ro.state.as_ref(), now_unix))
 }
+
 
 /// Replace an exhausted agent with a fresh instance in a new pane.
 /// Checkpointed. Logs a `Respawn` event (side effect inside the leaf so the
@@ -814,6 +804,8 @@ pub fn track_unknown(
 /// CONTEXT_LIMIT guard, the send-escalation path (bd-send-stall-escalation),
 /// and the unknown-status repair (bd-unknown-respawn) so an agent can never
 /// be double-respawned in one iteration.
+#[allow(clippy::too_many_arguments)] // the single respawn point: ctx, params, queue,
+// kinds, name, text, reason, attempts — every parameter is load-bearing.
 async fn respawn_and_requeue(
     ctx: &Context,
     params: &LoopParams,
@@ -2118,18 +2110,6 @@ mod resume_dedup_tests {
         assert!(should_resend(Some(&rec("a", 1, "inv-0", false)), "inv-1"));
     }
 
-    #[test]
-    fn parse_last_sent_output_record_and_null() {
-        let with: serde_json::Value = serde_json::from_str(
-            r#"{"record": {"name": "a", "text_hash": 7, "invocation": "inv-1", "iteration": 2, "landed": true}}"#,
-        )
-        .unwrap();
-        let r = parse_last_sent_output(&with).unwrap().unwrap();
-        assert_eq!(r.name, "a");
-        assert!(r.landed);
-        let null: serde_json::Value = serde_json::from_str(r#"{"record": null}"#).unwrap();
-        assert!(parse_last_sent_output(&null).unwrap().is_none());
-    }
 
     #[test]
     fn should_resend_degrades_without_confirmation() {
