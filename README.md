@@ -168,6 +168,21 @@ AGENTS.md files carry only a pointer to the subagent.
 herdr socket protocol v18: one JSON-RPC request per connection (newline-delimited),
 `events.subscribe` keeps a long-lived stream. See `src/herdr.rs`.
 
+## Changelog / releases
+
+The changelog is GENERATED with [git-cliff](https://git-cliff.org) (Keep a
+Changelog + Conventional Commits; the config also groups the repo's
+bead-prefixed commits):
+
+```sh
+git cliff -o CHANGELOG.md          # regenerate (after commits/tags)
+git cliff --unreleased          # preview pending entries (stdout)
+git cliff --bump                   # release: bump version, tag vX.Y.Z, write changelog
+```
+
+Versioning: semantic (MAJOR breaking / MINOR features / PATCH fixes);
+`version` in `Cargo.toml` is the source of truth for the binary's `--version`.
+
 ## Exit codes
 
 0 ok · 1 herdr/server error · 2 usage error. stdout = data, stderr = messages,
