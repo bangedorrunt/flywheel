@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use config::{Config, Recipe, WorkflowStep};
 use herdr::{AgentInfo, AgentStatus, Client, SendVerdict, Subscription, WaitOptions, classify_send_result};
-use output::{die, dim, error, kind_paint, print_json, status_paint};
+use output::{die, dim, error, kind_paint, ok as paint_ok, print_json, status_paint};
 use state::{log_event, EventKind};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -2485,6 +2485,46 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
         Err(e) => {
             ok = false;
             println!("herdr socket: {} ({e:#})", error("FAIL"));
+        }
+    }
+
+    // herdr protocol drift check. The socket has no protocol method in v18,
+    // so we shell out to the herdr CLI itself (`api schema --json` — the
+    // canonical source; same binary as the socket server, so CLI vs socket
+    // drift is not a concern). A mismatch is a WARN, not an error: services
+    // are up, only the contract version differs — the WARN line is the
+    // signal and deps keeps exit 0 (a schema bump may still break the client
+    // at runtime; that is exactly what this line exists to predict).
+    match std::process::Command::new("herdr")
+        .args(["api", "schema", "--json"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| herdr::parse_protocol(&String::from_utf8_lossy(&o.stdout)))
+    {
+        Some(p) if p == herdr::HDR_PROTOCOL => println!(
+            "herdr protocol: {} (expected {})",
+            paint_ok(&p.to_string()),
+            herdr::HDR_PROTOCOL
+        ),
+        Some(p) => {
+            println!(
+                "herdr protocol: {} (expected {})",
+                crate::output::warn(&p.to_string()),
+                herdr::HDR_PROTOCOL
+            );
+            eprintln!(
+                "flywheel: WARNING herdr protocol {p} != verified {} — schema drift may break the client",
+                herdr::HDR_PROTOCOL
+            );
+        }
+        None => {
+            println!(
+                "herdr protocol: {} (expected {})",
+                crate::output::warn("unknown"),
+                herdr::HDR_PROTOCOL
+            );
+            eprintln!("flywheel: WARNING cannot read herdr protocol (herdr api schema --json failed)");
         }
     }
 

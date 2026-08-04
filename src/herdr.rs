@@ -11,6 +11,22 @@
 //! preview build 2026-07-29-44b3adb12552. Canonical verification source:
 //! `herdr api schema --json` (fields: protocol, schema_version).
 
+/// The herdr socket protocol version this client is verified against —
+/// single source of truth (bd-deps-protocol-check). `flywheel deps` warns
+/// when the live server reports a different value; a bump that adds required
+/// fields would break the client at runtime, and the WARN line turns a
+/// confusing mid-loop failure into a five-second diagnosis.
+pub const HDR_PROTOCOL: u64 = 18;
+
+/// Parse the protocol version from `herdr api schema --json` output (the
+/// top-level `protocol` field). `None` on any failure — the caller decides
+/// how to surface an unreadable schema.
+pub fn parse_protocol(raw: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|v| v.get("protocol").and_then(Value::as_u64))
+}
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -884,5 +900,24 @@ mod tests {
             .pane_wait_output(&pane_id, "match", "THIS-WILL-NEVER-MATCH-xyzzy", Some(1_500))
             .unwrap_err();
         assert_eq!(e.code, "timeout");
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn parse_protocol_reads_top_level_field() {
+        let raw = r#"{"protocol": 18, "schema_version": 1, "schemas": {}}"#;
+        assert_eq!(parse_protocol(raw), Some(18));
+    }
+
+    #[test]
+    fn parse_protocol_failures_are_none() {
+        assert_eq!(parse_protocol("not json"), None);
+        assert_eq!(parse_protocol(r#"{"schemas": {}}"#), None);
+        assert_eq!(parse_protocol(r#"{"protocol": "18"}"#), None);
+        assert_eq!(parse_protocol(""), None);
     }
 }
