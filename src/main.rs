@@ -646,12 +646,23 @@ fn agent_ordinal(name: &str, project: &str, short: &str) -> Option<u32> {
 /// Resolve a herdr workspace for a project by label; error if missing.
 fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
     let label = swarm_label(project);
-    for ws in c.workspace_list()? {
-        if ws.label.as_deref() == Some(label.as_str()) {
-            return Ok(ws.workspace_id);
-        }
+    let matches: Vec<herdr::WorkspaceInfo> = c
+        .workspace_list()?
+        .into_iter()
+        .filter(|ws| ws.label.as_deref() == Some(label.as_str()))
+        .collect();
+    if matches.is_empty() {
+        bail!("no flywheel swarm for {project} (run: flywheel spawn {project})")
     }
-    bail!("no flywheel swarm for {project} (run: flywheel spawn {project})")
+    // duplicate labels (a stale workspace from a dropped agent vs the live
+    // spawn — bd-nil): prefer the workspace holding managed agents; the
+    // agent list is only queried when needed (fast path stays one round trip)
+    if matches.len() > 1 {
+        let prefix = format!("flywheel-{}-", project_base(project));
+        let agents = c.agent_list()?;
+        return Ok(herdr::resolve_workspace_id(&matches, &agents, &prefix));
+    }
+    Ok(matches[0].workspace_id.clone())
 }
 
 /// Resolve target shorts (oc/pi/gk/all) to live agent infos in a workspace.
@@ -1128,6 +1139,21 @@ fn start_agent_with_retry(c: &mut Client, name: &str, kind: &str, pane_id: &str)
                 .find(|a| a.name.as_deref() == Some(name) && a.pane_id == pane_id)
             {
                 return Ok(a.clone());
+            }
+            // pi agents frequently register NAMELESS (herdr pi integration,
+            // bd-w17): accept the pane match and apply the name ourselves —
+            // name-based resolution (send/loop/status) depends on it
+            if let Some(a) = agents.iter().find(|a| a.pane_id == pane_id) {
+                if a.name.as_deref() != Some(name) {
+                    if let Err(e) = c.agent_rename(&a.pane_id, name) {
+                        eprintln!("agent.rename error: {e:#}");
+                    }
+                }
+                if let Ok(agents) = c.agent_list() {
+                    if let Some(a) = agents.iter().find(|a| a.pane_id == pane_id) {
+                        return Ok(a.clone());
+                    }
+                }
             }
         }
         std::thread::sleep(Duration::from_secs(3));

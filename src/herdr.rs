@@ -120,6 +120,26 @@ pub struct WorkspaceInfo {
     pub cwd: Option<String>,
 }
 
+/// Resolve which of several same-label workspaces a project actually maps
+/// to. Single match wins; with duplicates (a stale workspace left behind by
+/// a dropped agent vs the live spawn — bd-nil), prefer the workspace holding
+/// MANAGED agents (names starting with `prefix`); otherwise the first match.
+/// Deterministic — no wall clock in the durable path.
+pub fn resolve_workspace_id(matches: &[WorkspaceInfo], agents: &[AgentInfo], prefix: &str) -> String {
+    if matches.len() == 1 {
+        return matches[0].workspace_id.clone();
+    }
+    for ws in matches {
+        if agents.iter().any(|a| {
+            a.workspace_id == ws.workspace_id
+                && a.name.as_deref().map(|n| n.starts_with(prefix)).unwrap_or(false)
+        }) {
+            return ws.workspace_id.clone();
+        }
+    }
+    matches[0].workspace_id.clone()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PaneInfo {
     pub pane_id: String,
@@ -423,6 +443,15 @@ impl Client {
         )?;
         serde_json::from_value(res.get("agent").cloned().unwrap_or(res))
             .context("parse agent.start result")
+    }
+
+    /// Rename an agent record (pi agents often register NAMELESS — the spawn
+    /// path applies the requested name via this method, bd-w17).
+    pub fn agent_rename(&mut self, target: &str, name: &str) -> Result<Value> {
+        self.call(
+            "agent.rename",
+            json!({ "target": target, "name": name }),
+        )
     }
 
     pub fn agent_prompt(
@@ -911,5 +940,85 @@ mod protocol_tests {
         assert_eq!(parse_protocol(r#"{"schemas": {}}"#), None);
         assert_eq!(parse_protocol(r#"{"protocol": "18"}"#), None);
         assert_eq!(parse_protocol(""), None);
+    }
+}
+
+#[cfg(test)]
+mod workspace_resolve_tests {
+    use super::*;
+
+    fn ws(id: &str, label: &str) -> WorkspaceInfo {
+        WorkspaceInfo {
+            workspace_id: id.to_string(),
+            label: Some(label.to_string()),
+            pane_count: 1,
+            tab_count: 1,
+            agent_status: None,
+            cwd: None,
+        }
+    }
+
+    fn agent(name: Option<&str>, ws_id: &str) -> AgentInfo {
+        AgentInfo {
+            agent: Some("pi".into()),
+            agent_session: None,
+            agent_status: Some(AgentStatus::Idle),
+            cwd: Some("/proj".into()),
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: true,
+            launch_pending: false,
+            name: name.map(String::from),
+            pane_id: "w1:p1".into(),
+            revision: 1,
+            state_change_seq: 0,
+            state_labels: serde_json::Map::new(),
+            tab_id: "t1".into(),
+            terminal_id: "term_1".into(),
+            terminal_title: None,
+            workspace_id: ws_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn single_match_wins() {
+        let matches = vec![ws("w1", "flywheel-x"), ws("w2", "other")];
+        let agents = vec![];
+        assert_eq!(resolve_workspace_id(&matches, &agents, "flywheel-x-"), "w1");
+    }
+
+    #[test]
+    fn duplicate_labels_prefer_workspace_with_managed_agents() {
+        // w14 = stale (no agents), w15 = live (managed agent) — pick w15
+        let matches = vec![ws("w14", "flywheel-x"), ws("w15", "flywheel-x")];
+        let agents = vec![agent(Some("flywheel-x-pi"), "w15")];
+        assert_eq!(resolve_workspace_id(&matches, &agents, "flywheel-x-"), "w15");
+    }
+
+    #[test]
+    fn duplicate_labels_both_dead_fall_back_to_first() {
+        let matches = vec![ws("w14", "flywheel-x"), ws("w15", "flywheel-x")];
+        let agents = vec![agent(Some("unrelated-oc"), "w15")];
+        assert_eq!(resolve_workspace_id(&matches, &agents, "flywheel-x-"), "w14");
+    }
+
+    #[test]
+    fn duplicate_labels_both_live_prefer_first_deterministically() {
+        let matches = vec![ws("w14", "flywheel-x"), ws("w15", "flywheel-x")];
+        let agents = vec![
+            agent(Some("flywheel-x-oc"), "w14"),
+            agent(Some("flywheel-x-oc2"), "w15"),
+        ];
+        assert_eq!(resolve_workspace_id(&matches, &agents, "flywheel-x-"), "w14");
+    }
+
+    #[test]
+    fn nameless_managed_agent_does_not_count() {
+        // a pi record without a name is not a managed-agent signal — the
+        // rename fix (bd-w17) names it at spawn time
+        let matches = vec![ws("w14", "flywheel-x"), ws("w15", "flywheel-x")];
+        let agents = vec![agent(None, "w15")];
+        assert_eq!(resolve_workspace_id(&matches, &agents, "flywheel-x-"), "w14");
     }
 }
