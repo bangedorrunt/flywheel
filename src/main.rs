@@ -1307,6 +1307,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
 
 // ---- send ----
 
+#[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
 fn cmd_send(
     cfg: &Config,
     project: &str,
@@ -2091,6 +2092,7 @@ fn build_queue(queue: Option<&str>, workflow: Option<&str>) -> Result<Vec<String
     Ok(items)
 }
 
+#[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
 fn cmd_loop(
     cfg: &Config,
     project: &str,
