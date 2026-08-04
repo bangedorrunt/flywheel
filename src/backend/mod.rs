@@ -26,6 +26,8 @@
 // TODO(bd-herdr-backend-impl): drop this allow once a real impl consumes the surface.
 #![allow(dead_code)]
 
+pub mod agentmail;
+
 use crate::herdr::{
     AgentInfo, AgentStatus, PaneInfo, PushEvent, Subscription, WaitOptions, WorkspaceInfo,
 };
