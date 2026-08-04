@@ -50,6 +50,10 @@ pub struct LoopParams {
     /// confirm timeout in ms; None → leaf default 45s.
     #[serde(default)]
     pub confirm_timeout_ms: Option<u64>,
+    /// this invocation's id, set at run time (last-sent registry; empty when
+    /// running from pre-registry params — such sends record no invocation).
+    #[serde(default)]
+    pub invocation: String,
 }
 
 fn default_true() -> bool {
@@ -124,6 +128,11 @@ pub struct SendArgs {
     pub confirm: bool,
     /// confirm timeout in ms; None → leaf default 45s
     pub confirm_timeout_ms: Option<u64>,
+    /// loop invocation id (last-sent registry bookkeeping; empty when the
+    /// loop predates the registry)
+    pub invocation: String,
+    /// loop iteration at send time (last-sent registry bookkeeping)
+    pub iteration: u64,
 }
 
 /// Build the argv for the `__send` leaf invocation.
@@ -143,6 +152,12 @@ pub fn send_prompt_argv(args: &SendArgs) -> Vec<String> {
         if let Some(ms) = args.confirm_timeout_ms {
             argv.push(ms.to_string());
         }
+    }
+    if !args.invocation.is_empty() {
+        argv.push("--invocation".to_string());
+        argv.push(args.invocation.clone());
+        argv.push("--iteration".to_string());
+        argv.push(args.iteration.to_string());
     }
     argv
 }
@@ -959,6 +974,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 text: text.clone(),
                                 confirm: params.confirm_sends,
                                 confirm_timeout_ms: params.confirm_timeout_ms,
+                                invocation: params.invocation.clone(),
+                                iteration,
                             },
                         )
                         .await
@@ -1023,6 +1040,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 text: n.clone(),
                                 confirm: params.confirm_sends,
                                 confirm_timeout_ms: params.confirm_timeout_ms,
+                                invocation: params.invocation.clone(),
+                                iteration,
                             },
                         )
                         .await?;
@@ -1075,7 +1094,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
 
 /// Register the durable functions and start (or resume) the loop invocation.
 /// Returns the workflow result; the process must stay alive while awaiting.
-pub async fn run_durable_loop(cfg: &Config, params: LoopParams) -> anyhow::Result<String> {
+pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::Result<String> {
     let url = cfg
         .resonate_url()
         .unwrap_or_else(|| "http://localhost:8001".to_string());
@@ -1141,6 +1160,10 @@ pub async fn run_durable_loop(cfg: &Config, params: LoopParams) -> anyhow::Resul
             fresh
         }
     };
+
+    // the workflow must know its own invocation id for the last-sent registry
+    // (bd-resume-dedup filters records to the SAME invocation)
+    params.invocation = id.clone();
 
     let task = resonate.run(&id, swarm_loop, params.clone());
     let result: String = task
@@ -1706,6 +1729,7 @@ mod tests {
             work: false,
             confirm_sends: true,
             confirm_timeout_ms: Some(45_000),
+            invocation: "inv-1".into(),
         };
         let v = serde_json::to_value(&p).unwrap();
         let back: LoopParams = serde_json::from_value(v).unwrap();
@@ -1715,6 +1739,7 @@ mod tests {
         assert_eq!(back.max_iterations, Some(10));
         assert!(back.confirm_sends);
         assert_eq!(back.confirm_timeout_ms, Some(45_000));
+        assert_eq!(back.invocation, "inv-1");
     }
 
     #[test]
@@ -1764,6 +1789,8 @@ mod tests {
             text: "t".into(),
             confirm: true,
             confirm_timeout_ms: Some(45_000),
+                    invocation: "inv-1".into(),
+            iteration: 3,
         };
         let v = serde_json::to_value(&a).unwrap();
         let back: SendArgs = serde_json::from_value(v).unwrap();
@@ -1780,10 +1807,15 @@ mod tests {
             text: "t".into(),
             confirm: true,
             confirm_timeout_ms: Some(45_000),
+                    invocation: "inv-1".into(),
+            iteration: 3,
         };
         assert_eq!(
             send_prompt_argv(&args),
-            vec!["__send", "p", "a", "t", "--confirm", "45000"]
+            vec![
+                "__send", "p", "a", "t", "--confirm", "45000",
+                "--invocation", "inv-1", "--iteration", "3",
+            ]
         );
         // confirm + no timeout → bare `--confirm` (leaf applies its 45s default)
         let args_no_ms = SendArgs {
@@ -1792,22 +1824,51 @@ mod tests {
             text: "t".into(),
             confirm: true,
             confirm_timeout_ms: None,
+                    invocation: "inv-1".into(),
+            iteration: 3,
         };
         assert_eq!(
             send_prompt_argv(&args_no_ms),
-            vec!["__send", "p", "a", "t", "--confirm"]
+            vec![
+                "__send", "p", "a", "t", "--confirm",
+                "--invocation", "inv-1", "--iteration", "3",
+            ]
         );
-        // no confirm → legacy argv, byte-identical to the old builder
+        // no confirm → legacy argv plus the registry flags
         let args_legacy = SendArgs {
             project: "p".into(),
             name: "a".into(),
             text: "t".into(),
             confirm: false,
             confirm_timeout_ms: None,
+                    invocation: "inv-1".into(),
+            iteration: 3,
         };
         assert_eq!(
             send_prompt_argv(&args_legacy),
-            vec!["__send", "p", "a", "t"]
+            vec![
+                "__send", "p", "a", "t",
+                "--invocation", "inv-1", "--iteration", "3",
+            ]
+        );
+    }
+
+    #[test]
+    fn send_prompt_argv_omits_registry_flags_when_invocation_empty() {
+        // pre-registry params (empty invocation) → byte-identical to the
+        // legacy argv
+        let args = SendArgs {
+            project: "p".into(),
+            name: "a".into(),
+            text: "t".into(),
+            confirm: true,
+            confirm_timeout_ms: Some(45_000),
+            invocation: String::new(),
+            iteration: 3,
+        };
+        assert_eq!(
+            send_prompt_argv(&args),
+            vec!["__send", "p", "a", "t", "--confirm", "45000"]
         );
     }
 

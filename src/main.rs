@@ -376,6 +376,13 @@ enum Commands {
         /// Optional timeout in ms (default 45_000 when given without a value).
         #[arg(long, num_args = 0..=1, default_missing_value = "45000")]
         confirm: Option<u64>,
+        /// invocation id of the loop that delegated this prompt (last-sent
+        /// registry bookkeeping)
+        #[arg(long)]
+        invocation: Option<String>,
+        /// loop iteration at send time (last-sent registry bookkeeping)
+        #[arg(long)]
+        iteration: Option<u64>,
     },
     /// internal: notify a blocked agent via agent-mail (durable workflow leaf)
     #[command(name = "__mail-blocked", hide = true)]
@@ -820,9 +827,22 @@ fn main() {
         Some(Commands::Tutorial) => cmd_tutorial(),
         Some(Commands::Serve { port }) => cmd_serve(&cfg, *port),
         Some(Commands::__Poll { project, to }) => cmd_internal_poll(&cfg, project, to),
-        Some(Commands::__Send { project, name, text, confirm }) => {
-            cmd_internal_send(&cfg, project, name, text, *confirm)
-        }
+        Some(Commands::__Send {
+            project,
+            name,
+            text,
+            confirm,
+            invocation,
+            iteration,
+        }) => cmd_internal_send(
+            &cfg,
+            project,
+            name,
+            text,
+            *confirm,
+            invocation.as_deref(),
+            *iteration,
+        ),
         Some(Commands::__MailBlocked { project, name }) => cmd_internal_mail_blocked(&cfg, project, name),
         Some(Commands::__Ready { project }) => cmd_internal_ready(&cfg, project),
         Some(Commands::__Inprogress { project }) => cmd_internal_inprogress(&cfg, project),
@@ -2039,6 +2059,7 @@ fn cmd_loop(
             work,
             confirm_sends: !no_confirm,
             confirm_timeout_ms,
+            invocation: String::new(),
         };
         let rt = tokio::runtime::Runtime::new()?;
         println!(
@@ -2659,6 +2680,8 @@ fn cmd_internal_send(
     name: &str,
     text: &str,
     confirm_ms: Option<u64>,
+    invocation: Option<&str>,
+    iteration: Option<u64>,
 ) -> Result<()> {
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
@@ -2668,9 +2691,26 @@ fn cmd_internal_send(
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
         .ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
 
+    // last-sent registry: record what was delivered (or attempted). Best-
+    // effort — a registry failure must never lose the send itself.
+    let record = |landed: bool| {
+        let rec = state::SentRecord {
+            name: name.to_string(),
+            text_hash: state::fnv1a64(text),
+            invocation: invocation.unwrap_or_default().to_string(),
+            iteration: iteration.unwrap_or(0),
+            landed,
+        };
+        if let Err(e) = state::record_sent(project, rec) {
+            eprintln!("flywheel: cannot record sent prompt: {e:#}");
+        }
+    };
+
     let Some(timeout_ms) = confirm_ms else {
-        // legacy fire-and-forget path
+        // legacy fire-and-forget path — a successful herdr call means the
+        // prompt was written to the agent's terminal
         c.agent_prompt(agent_target(&agent), text, None)?;
+        record(true);
         print_json(&json!({ "ok": true, "name": name }));
         return Ok(());
     };
@@ -2691,6 +2731,7 @@ fn cmd_internal_send(
         SendVerdict::TimedOut => (false, None, "timeout".to_string()),
         SendVerdict::Coded(code) => (false, None, format!("error:{code}")),
     };
+    record(landed);
     print_json(&json!({
         "ok": true, "name": name, "landed": landed,
         "status": status, "reason": reason,
