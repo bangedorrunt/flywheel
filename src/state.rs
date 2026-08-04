@@ -28,6 +28,7 @@ pub enum EventKind {
     Close,
     Resume,
     Respawn,
+    SkippedDup,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,15 +140,20 @@ pub fn load_last_sent(project: &str) -> Vec<SentRecord> {
 /// mid-write cannot tear the registry). Best-effort by contract: callers log
 /// and continue on error.
 pub fn record_sent(project: &str, record: SentRecord) -> Result<()> {
+    let mut records = load_last_sent(project);
+    records.push(record);
+    trim_last_sent(&mut records);
+    save_last_sent(project, &records)
+}
+
+/// Persist the registry atomically (temp + rename).
+pub fn save_last_sent(project: &str, records: &[SentRecord]) -> Result<()> {
     let path = last_sent_file(project);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut records = load_last_sent(project);
-    records.push(record);
-    trim_last_sent(&mut records);
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&records)?)?;
+    std::fs::write(&tmp, serde_json::to_string_pretty(records)?)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
