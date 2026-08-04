@@ -384,6 +384,20 @@ enum Commands {
         #[arg(long)]
         iteration: Option<u64>,
     },
+    /// internal: block until a pane's output matches a pattern
+    #[command(name = "__wait-output", hide = true)]
+    __WaitOutput {
+        project: String,
+        target: String,
+        pattern: String,
+        /// treat the pattern as a Rust regex (herdr-side) instead of a
+        /// literal substring
+        #[arg(long)]
+        regex: bool,
+        /// max wait in ms (default: server-side default)
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+    },
     /// internal: notify a blocked agent via agent-mail (durable workflow leaf)
     #[command(name = "__mail-blocked", hide = true)]
     __MailBlocked {
@@ -844,7 +858,20 @@ fn main() {
             *iteration,
         ),
         Some(Commands::__MailBlocked { project, name }) => cmd_internal_mail_blocked(&cfg, project, name),
-        Some(Commands::__Ready { project }) => cmd_internal_ready(&cfg, project),
+        Some(Commands::__WaitOutput {
+            project,
+            target,
+            pattern,
+            regex,
+            timeout_ms,
+        }) => cmd_internal_wait_output(
+            &cfg,
+            project,
+            target,
+            pattern,
+            *regex,
+            *timeout_ms,
+        ),        Some(Commands::__Ready { project }) => cmd_internal_ready(&cfg, project),
         Some(Commands::__Inprogress { project }) => cmd_internal_inprogress(&cfg, project),
         Some(Commands::__Kind { project, name }) => cmd_internal_kind(&cfg, project, name),
         Some(Commands::__Read { project, name }) => cmd_internal_read(&cfg, project, name),
@@ -2780,8 +2807,83 @@ fn cmd_internal_send(
 }
 
 /// internal leaf: ready beads as [{id, title}] via `br ready --json`.
-fn cmd_internal_ready(cfg: &Config, project: &str) -> Result<()> {
-    let dir = project_dir(cfg, project);
+/// Resolve a `__wait-output` target to a pane id: an agent NAME (matched in
+/// the caller-provided, workspace-filtered agent list) maps to its pane; a
+/// target containing `:` is treated as a raw pane id; anything else is
+/// unknown. Pure — no lookup logic duplicated from `__send`.
+fn resolve_pane_id(agents: &[herdr::AgentInfo], target: &str) -> Option<String> {
+    if let Some(a) = agents.iter().find(|a| a.name.as_deref() == Some(target)) {
+        return Some(a.pane_id.clone());
+    }
+    if target.contains(':') && !target.is_empty() {
+        return Some(target.to_string());
+    }
+    None
+}
+
+/// The wait-output mode for the `--regex` flag: herdr's literal-substring
+/// mode is spelled `match` in the leaf (mapped to `substring` in the client).
+fn wait_output_mode(regex: bool) -> &'static str {
+    if regex {
+        "regex"
+    } else {
+        "match"
+    }
+}
+
+/// The leaf's machine-readable output shape.
+fn wait_output_json(matched: bool, matched_line: Option<&str>, pane_id: &str) -> Value {
+    json!({
+        "matched": matched,
+        "matched_line": matched_line,
+        "pane_id": pane_id,
+    })
+}
+
+/// internal leaf: block until a pane's output matches a pattern.
+///
+/// Target is an agent name (resolved via the project's agent list) or a raw
+/// pane id. Exit 0 on match, 1 on timeout / unknown target — stdout carries
+/// `{"matched", "matched_line", "pane_id"}` either way (stderr for messages).
+/// For automation/scripts; the durable workflow does not use this leaf (no
+/// workflow-step type yet — future option, see cmd_workflow).
+fn cmd_internal_wait_output(
+    cfg: &Config,
+    project: &str,
+    target: &str,
+    pattern: &str,
+    regex: bool,
+    timeout_ms: Option<u64>,
+) -> Result<()> {
+    let mut c = Client::connect(Some(&cfg.socket_path()))?;
+    let ws_id = find_workspace(&mut c, project)?;
+    let agents = c
+        .agent_list()?
+        .into_iter()
+        .filter(|a| a.workspace_id == ws_id)
+        .collect::<Vec<_>>();
+    let Some(pane_id) = resolve_pane_id(&agents, target) else {
+        let out = wait_output_json(false, None, "");
+        print_json(&out);
+        eprintln!("flywheel: target {target} not found in {project}");
+        std::process::exit(1);
+    };
+    match c.pane_wait_output(&pane_id, wait_output_mode(regex), pattern, timeout_ms) {
+        Ok(r) => {
+            print_json(&wait_output_json(true, r.matched_line.as_deref(), &r.pane_id));
+            Ok(())
+        }
+        Err(e) if e.code == "timeout" => {
+            let out = wait_output_json(false, None, &pane_id);
+            print_json(&out);
+            eprintln!("flywheel: no match for {pattern:?} in {pane_id} within timeout");
+            std::process::exit(1);
+        }
+        Err(e) => Err(anyhow::anyhow!("pane.wait_for_output failed: {e:#}")),
+    }
+}
+
+fn cmd_internal_ready(cfg: &Config, project: &str) -> Result<()> {    let dir = project_dir(cfg, project);
     let out = std::process::Command::new("br")
         .args(["ready", "--json"])
         .current_dir(&dir)
@@ -3066,4 +3168,81 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
 #[cfg(not(feature = "serve"))]
 fn cmd_serve(_cfg: &Config, _port: u16) -> Result<()> {
     bail!("serve support not compiled in (build with --features serve)")
+}
+
+#[cfg(test)]
+mod wait_output_tests {
+    use super::*;
+    use crate::herdr::{AgentInfo, PaneWaitResult};
+
+    fn agent(name: Option<&str>, pane: &str) -> AgentInfo {
+        AgentInfo {
+            agent: Some("opencode".into()),
+            agent_session: None,
+            agent_status: Some(AgentStatus::Idle),
+            cwd: Some("/proj".into()),
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: true,
+            launch_pending: false,
+            name: name.map(String::from),
+            pane_id: pane.to_string(),
+            revision: 1,
+            state_change_seq: 0,
+            state_labels: serde_json::Map::new(),
+            tab_id: "t1".into(),
+            terminal_id: "term_1".into(),
+            terminal_title: None,
+            workspace_id: "w1".into(),
+        }
+    }
+
+    #[test]
+    fn resolve_pane_id_maps_agent_name_to_pane() {
+        let agents = vec![agent(Some("flywheel-x-oc"), "w1:p1")];
+        assert_eq!(resolve_pane_id(&agents, "flywheel-x-oc"), Some("w1:p1".to_string()));
+    }
+
+    #[test]
+    fn resolve_pane_id_accepts_raw_pane_id() {
+        let agents = vec![agent(Some("flywheel-x-oc"), "w1:p1")];
+        assert_eq!(resolve_pane_id(&agents, "w2:p3"), Some("w2:p3".to_string()));
+    }
+
+    #[test]
+    fn resolve_pane_id_unknown_target_is_none() {
+        let agents = vec![agent(Some("flywheel-x-oc"), "w1:p1")];
+        assert_eq!(resolve_pane_id(&agents, "no-such-agent"), None);
+        assert_eq!(resolve_pane_id(&agents, ""), None);
+    }
+
+    #[test]
+    fn wait_output_mode_maps_regex_flag() {
+        assert_eq!(wait_output_mode(true), "regex");
+        assert_eq!(wait_output_mode(false), "match");
+    }
+
+    #[test]
+    fn wait_output_json_shape() {
+        let hit = wait_output_json(true, Some("tests passed"), "w1:p1");
+        assert_eq!(hit["matched"], true);
+        assert_eq!(hit["matched_line"], "tests passed");
+        assert_eq!(hit["pane_id"], "w1:p1");
+        let miss = wait_output_json(false, None, "w1:p1");
+        assert_eq!(miss["matched"], false);
+        assert_eq!(miss["matched_line"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn pane_wait_result_json_uses_leaf_shape() {
+        // the leaf renders a PaneWaitResult via the same helper
+        let r = PaneWaitResult {
+            pane_id: "w1:p1".into(),
+            matched_line: Some("ready".into()),
+            read: String::new(),
+        };
+        let v = wait_output_json(true, r.matched_line.as_deref(), &r.pane_id);
+        assert_eq!(v["matched_line"], "ready");
+    }
 }

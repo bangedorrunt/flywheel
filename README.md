@@ -124,6 +124,28 @@ Built against `resonate-sdk` 0.6.0. Note: 0.6.0 does not support version-based
 re-invocation, so fresh runs get fresh invocation ids
 (`swarm-loop:<project>:<ts>`), persisted in `~/.local/state/flywheel/loops.json`.
 
+### Blocking on pane output (`__wait-output`)
+
+`flywheel __wait-output <project> <agent-or-pane> <pattern> [--regex] [--timeout-ms N]`
+blocks until the target's terminal output matches the pattern (literal
+substring by default; `--regex` for a herdr-side regex) or the timeout elapses.
+The target is an agent name (resolved via the project's agent list) or a raw
+pane id (`w1:p1`) that lives in the swarm's workspace. stdout carries
+`{"matched", "matched_line", "pane_id"}`; exit 0 on match, 1 on timeout or
+unknown target.
+
+Recipe — block on a test run:
+
+```sh
+herdr pane run w1:p1 'cargo test'          # start the watcher in a pane
+flywheel __wait-output proj w1:p1 --regex 'passed|failed' --timeout-ms 120000
+# …script continues the moment the run prints a verdict
+```
+
+Caveat: `__wait-output` waits on raw pane OUTPUT, not agent lifecycle. Use
+`herdr agent wait` when you need lifecycle semantics (idle/working/blocked);
+use `__wait-output` when a specific line appearing is the signal.
+
 ## Backend protocol
 
 herdr socket protocol v18: one JSON-RPC request per connection (newline-delimited),

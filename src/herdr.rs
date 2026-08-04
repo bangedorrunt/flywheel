@@ -506,9 +506,7 @@ impl Client {
     /// Returns a typed [`HerdrError`] so callers can classify: a non-matching
     /// pattern with a short timeout errors with code `"timeout"` (it does NOT
     /// hang), other protocol failures carry their own codes.
-    // wired by bd-wait-output-usage; dead in the binary until then
-    #[allow(dead_code)]
-    pub fn pane_wait_output(
+        pub fn pane_wait_output(
         &mut self,
         pane_id: &str,
         mode: &str,
@@ -607,8 +605,6 @@ pub fn classify_send_result(code: Option<&str>, agent_status: Option<AgentStatus
 /// `read` is the matched terminal snapshot's text, treated as an opaque
 /// string — pane waits do NOT interpret agent lifecycle (see
 /// [`Client::pane_wait_output`]).
-// wired by bd-wait-output-usage; dead in the binary until then
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneWaitResult {
     pub pane_id: String,
@@ -623,8 +619,6 @@ pub struct PaneWaitResult {
 /// `mode` mirrors the CLI's `--match`/`--regex`: `"match"` is a literal
 /// substring search, `"regex"` a Rust regex (herdr-side). Anything else is a
 /// caller bug — bail with code `"usage"`.
-// wired by bd-wait-output-usage; dead in the binary until then
-#[allow(dead_code)]
 pub fn wait_for_output_params(
     pane_id: &str,
     mode: &str,
@@ -652,8 +646,6 @@ pub fn wait_for_output_params(
 
 /// Parse a `pane.wait_for_output` result envelope. Defensive: `read` is an
 /// object carrying the snapshot text; any shape drift becomes code `"parse"`.
-// wired by bd-wait-output-usage; dead in the binary until then
-#[allow(dead_code)]
 pub fn parse_wait_for_output_result(res: &Value) -> std::result::Result<PaneWaitResult, HerdrError> {
     let parse_err = |msg: String| HerdrError { code: "parse".into(), message: msg };
     if res.get("type").and_then(Value::as_str) != Some("output_matched") {
