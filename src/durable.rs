@@ -232,9 +232,65 @@ pub fn resume_prompt(id: &str, title: &str) -> String {
     )
 }
 
-/// True when an agent's recent output carries the context-exhaustion marker.
-pub fn should_respawn(output: &str) -> bool {
-    output.contains("CONTEXT_LIMIT")
+/// Exhaustion verdict from the two context channels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextVerdict {
+    /// Agent is at ~80%+ context — respawn before delegating more work.
+    Exhausted,
+    /// No exhaustion signal — safe to delegate.
+    Healthy,
+}
+
+/// Combined context-exhaustion verdict: terminal marker OR a fresh state file
+/// with `context_pct >= 80`. Stale files (older than `DEFAULT_MAX_AGE`), low
+/// percentages, and absent state never exhaust — worst case Healthy (today's
+/// semantics preserved when no agent writes files). The file channel wins
+/// when the channels disagree: it cannot scroll away (alt-screen caveat).
+///
+/// Pure and deterministic for a fixed `now_unix` — the caller (the leaf)
+/// evaluates it at run time so the verdict is checkpointed with the leaf
+/// result (replay-safe).
+pub fn context_verdict(
+    terminal: &str,
+    state: Option<&crate::agentstate::AgentStateFile>,
+    now_unix: u64,
+) -> ContextVerdict {
+    if terminal.contains("CONTEXT_LIMIT") {
+        return ContextVerdict::Exhausted;
+    }
+    if let Some(s) = state {
+        if s.context_pct >= 80
+            && crate::agentstate::is_fresh_at(&s.ts, now_unix, crate::agentstate::DEFAULT_MAX_AGE)
+        {
+            return ContextVerdict::Exhausted;
+        }
+    }
+    ContextVerdict::Healthy
+}
+
+/// Parsed `__read` leaf output: `{"terminal": "...", "state": {...}|null}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadOutput {
+    pub terminal: String,
+    #[serde(default)]
+    pub state: Option<crate::agentstate::AgentStateFile>,
+}
+
+/// Parse one `__read` JSON output into [`ReadOutput`]. A null or missing
+/// `state` yields `None` (file absent/malformed — the leaf never errors on
+/// the file channel).
+pub fn parse_read_output(v: &serde_json::Value) -> anyhow::Result<ReadOutput> {
+    Ok(ReadOutput {
+        terminal: v
+            .get("terminal")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        state: v
+            .get("state")
+            .filter(|s| !s.is_null())
+            .and_then(|s| serde_json::from_value(s.clone()).ok()),
+    })
 }
 
 /// In-progress beads via the flywheel binary (`br list --status in_progress`).
@@ -287,7 +343,7 @@ async fn poll_kind(args: PollKindArgs) -> Result<String> {
 
 /// Recent agent output via the flywheel binary. Checkpointed.
 #[function]
-async fn read_output(args: ReadArgs) -> Result<String> {
+async fn read_output(args: ReadArgs) -> Result<ContextVerdict> {
     let exe = self_exe().map_err(map_err)?;
     let out = Command::new(&exe)
         .args(["__read", &args.project, &args.name])
@@ -299,7 +355,17 @@ async fn read_output(args: ReadArgs) -> Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(raw.trim())
+        .map_err(|e| map_err(anyhow::anyhow!("__read bad JSON: {e}: {raw}")))?;
+    let ro = parse_read_output(&v).map_err(map_err)?;
+    // freshness evaluated HERE at run time so the verdict is checkpointed
+    // with the leaf result — a replay cannot re-judge a stale file later
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(context_verdict(&ro.terminal, ro.state.as_ref(), now_unix))
 }
 
 /// Replace an exhausted agent with a fresh instance in a new pane.
@@ -850,7 +916,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 LoopAction::Send { name, text } => {
                     // context guard: if the idle agent is context-exhausted,
                     // respawn a fresh instance instead of delegating to it
-                    let output = ctx
+                    let verdict = ctx
                         .run(
                             read_output,
                             ReadArgs {
@@ -859,7 +925,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             },
                         )
                         .await?;
-                    if should_respawn(&output) {
+                    if verdict == ContextVerdict::Exhausted {
                         respawn_and_requeue(
                             ctx,
                             &params,
@@ -1122,6 +1188,7 @@ pub async fn loop_status(cfg: &Config, project: &str) -> anyhow::Result<serde_js
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agentstate::AgentStateFile;
 
     fn st(name: &str, status: &str) -> AgentState {
         AgentState {
@@ -1447,9 +1514,125 @@ mod tests {
 
     #[test]
     fn context_marker_detection() {
-        assert!(should_respawn("...CONTEXT_LIMIT"));
-        assert!(should_respawn("CONTEXT_LIMIT\nall done"));
-        assert!(!should_respawn("all done"));
+        // the terminal-marker channel still exhausts on its own
+        assert_eq!(
+            context_verdict("...CONTEXT_LIMIT", None, 1_785_726_000),
+            ContextVerdict::Exhausted
+        );
+        assert_eq!(
+            context_verdict("CONTEXT_LIMIT\nall done", None, 1_785_726_000),
+            ContextVerdict::Exhausted
+        );
+        assert_eq!(
+            context_verdict("all done", None, 1_785_726_000),
+            ContextVerdict::Healthy
+        );
+    }
+
+    #[test]
+    fn context_verdict_fresh_file_exhausts_without_marker() {
+        // alt-screen case: terminal read shows nothing, file is fresh + hot
+        let state = Some(AgentStateFile {
+            context_pct: 85,
+            ts: "2026-08-03T03:00:00Z".into(),
+        });
+        assert_eq!(
+            context_verdict("", state.as_ref(), 1_785_726_000 + 100),
+            ContextVerdict::Exhausted
+        );
+    }
+
+    #[test]
+    fn context_verdict_stale_file_is_healthy() {
+        // a file from a previous session must never kill a healthy agent
+        let state = Some(AgentStateFile {
+            context_pct: 85,
+            ts: "2026-08-03T03:00:00Z".into(),
+        });
+        assert_eq!(
+            context_verdict("", state.as_ref(), 1_785_726_000 + 3600),
+            ContextVerdict::Healthy
+        );
+    }
+
+    #[test]
+    fn context_verdict_both_channels_exhausts() {
+        let state = Some(AgentStateFile {
+            context_pct: 90,
+            ts: "2026-08-03T03:00:00Z".into(),
+        });
+        assert_eq!(
+            context_verdict("CONTEXT_LIMIT", state.as_ref(), 1_785_726_000),
+            ContextVerdict::Exhausted
+        );
+    }
+
+    #[test]
+    fn context_verdict_neither_channel_is_healthy() {
+        assert_eq!(
+            context_verdict("working fine", None, 1_785_726_000),
+            ContextVerdict::Healthy
+        );
+        // absent state file → identical to today's behavior
+        assert_eq!(
+            context_verdict("", None, 1_785_726_000),
+            ContextVerdict::Healthy
+        );
+    }
+
+    #[test]
+    fn context_verdict_pct_boundary() {
+        let ts = "2026-08-03T03:00:00Z";
+        let low = AgentStateFile { context_pct: 79, ts: ts.into() };
+        let at = AgentStateFile { context_pct: 80, ts: ts.into() };
+        assert_eq!(
+            context_verdict("", Some(&low), 1_785_726_000),
+            ContextVerdict::Healthy
+        );
+        assert_eq!(
+            context_verdict("", Some(&at), 1_785_726_000),
+            ContextVerdict::Exhausted
+        );
+    }
+
+    #[test]
+    fn context_verdict_age_boundary() {
+        let ts = "2026-08-03T03:00:00Z"; // unix 1_785_726_000, max age 900s
+        let state = AgentStateFile { context_pct: 85, ts: ts.into() };
+        // exactly 15 min old → fresh → exhausted
+        assert_eq!(
+            context_verdict("", Some(&state), 1_785_726_000 + 900),
+            ContextVerdict::Exhausted
+        );
+        // one second older → stale → healthy
+        assert_eq!(
+            context_verdict("", Some(&state), 1_785_726_000 + 901),
+            ContextVerdict::Healthy
+        );
+    }
+
+    #[test]
+    fn parse_read_output_parses_new_leaf_shape() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"terminal": "hello", "state": {"context_pct": 85, "ts": "2026-08-03T03:00:00Z"}}"#,
+        )
+        .unwrap();
+        let ro = parse_read_output(&v).unwrap();
+        assert_eq!(ro.terminal, "hello");
+        assert_eq!(ro.state.as_ref().map(|s| s.context_pct), Some(85));
+    }
+
+    #[test]
+    fn parse_read_output_null_and_missing_state() {
+        let null_state: serde_json::Value =
+            serde_json::from_str(r#"{"terminal": "x", "state": null}"#).unwrap();
+        let ro = parse_read_output(&null_state).unwrap();
+        assert_eq!(ro.state, None);
+        // legacy plain-text output (pre-zwa) tolerated via terminal field
+        let missing: serde_json::Value = serde_json::from_str(r#"{"terminal": "y"}"#).unwrap();
+        let ro = parse_read_output(&missing).unwrap();
+        assert_eq!(ro.state, None);
+        assert_eq!(ro.terminal, "y");
     }
 
     #[test]
