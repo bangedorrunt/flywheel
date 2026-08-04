@@ -46,6 +46,14 @@ pub fn error(s: &str) -> String {
     paint(s, "31;1")
 }
 
+pub fn warn(s: &str) -> String {
+    paint(s, "33")
+}
+
+pub fn ok(s: &str) -> String {
+    paint(s, "32")
+}
+
 /// Print a fatal error to stderr with a hint, exit 1.
 pub fn die(err: &anyhow::Error, hint: Option<&str>) -> ! {
     eprintln!("{}", error(&format!("flywheel: {err:#}")));
@@ -58,4 +66,20 @@ pub fn die(err: &anyhow::Error, hint: Option<&str>) -> ! {
 /// Print a JSON value to stdout.
 pub fn print_json(v: &serde_json::Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warn_marks_text() {
+        // NO_COLOR forces the plain form; the text survives either way
+        std::env::set_var("NO_COLOR", "1");
+        assert_eq!(warn("drift"), "drift");
+        std::env::remove_var("NO_COLOR");
+        let painted = warn("drift");
+        assert!(painted.contains("drift"));
+        assert!(painted.contains("\x1b[33m") || !color_enabled());
+    }
 }
