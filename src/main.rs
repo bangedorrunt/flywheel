@@ -5,6 +5,7 @@
 //! all coordination lives in agent-mail; herdr is the backend.
 
 mod agentstate;
+mod backend;
 mod config;
 mod durable;
 mod herdr;
