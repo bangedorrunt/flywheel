@@ -2755,7 +2755,17 @@ fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
         .ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
     let text = c.agent_read(agent_target(&agent), "recent", Some(60))?;
-    print!("{text}");
+    // state-file fallback channel: parse the agent's state file when present.
+    // Malformed/absent files yield null — never an error (the loop treats
+    // null as "terminal channel only", identical to pre-zwa behavior).
+    let state: Option<agentstate::AgentStateFile> = agentstate::state_file_path(
+        &project_dir(cfg, project),
+        agent_target(&agent),
+    )
+    .ok()
+    .and_then(|p| std::fs::read_to_string(p).ok())
+    .and_then(|content| agentstate::parse_state_file(&content));
+    print_json(&json!({ "terminal": text, "state": state }));
     Ok(())
 }
 

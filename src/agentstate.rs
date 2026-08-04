@@ -16,9 +16,7 @@
 //! 15 minutes: longer than any plausible human gap, shorter than a lunch break.
 //!
 //! Most of this API is a published contract consumed by dependent beads
-//! (`bd-prompt-state-file` writer, `bd-read-state-fallback-zwa` reader);
-//! until they land, only `project_state_dir` is reachable from the binary.
-//! Remove this allow once a consumer uses `parse_state_file`/`is_fresh_at`.
+//! (`bd-prompt-state-file` writer, `bd-read-state-fallback-zwa` reader).
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
