@@ -2560,7 +2560,11 @@ fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
         agents
             .iter()
             .map(|a| {
-                json!([agent_target(a), a.agent_status.map(|s| s.as_str()).unwrap_or("unknown")])
+                json!([
+                    agent_target(a),
+                    a.agent_status.map(|s| s.as_str()).unwrap_or("unknown"),
+                    a.agent.clone().unwrap_or_default(),
+                ])
             })
             .collect()
     } else {
@@ -2568,7 +2572,11 @@ fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
         resolved
             .iter()
             .map(|a| {
-                json!([agent_target(a), a.agent_status.map(|s| s.as_str()).unwrap_or("unknown")])
+                json!([
+                    agent_target(a),
+                    a.agent_status.map(|s| s.as_str()).unwrap_or("unknown"),
+                    a.agent.clone().unwrap_or_default(),
+                ])
             })
             .collect()
     };
@@ -2730,28 +2738,35 @@ fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> 
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
     let dir = project_dir(cfg, project);
+    // The agent record may already be gone (herdr drops dead agents ~0.5s
+    // after they stop responding — the escalation path respawns exactly
+    // those). The pane itself usually survives; split from any pane in the
+    // workspace and skip closing an old pane we cannot identify.
     let agent = c
         .agent_list()?
         .into_iter()
-        .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
-        .ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
-    let old_pane = agent.pane_id.clone();
-    // split the fresh pane FIRST (closing the old one while it is the only pane
-    // would close the whole workspace), then close the exhausted agent, then
-    // restart under the same name
+        .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name));
+    let old_pane = agent.as_ref().map(|a| a.pane_id.clone());
     let panes = c.pane_list(Some(&ws_id))?;
-    let anchor = panes
-        .iter()
-        .find(|p| p.pane_id != old_pane)
-        .map(|p| p.pane_id.clone())
-        .unwrap_or(old_pane.clone());
+    let anchor = old_pane
+        .as_ref()
+        .and_then(|old| {
+            panes
+                .iter()
+                .find(|p| &p.pane_id != old)
+                .map(|p| p.pane_id.clone())
+        })
+        .or_else(|| panes.first().map(|p| p.pane_id.clone()))
+        .ok_or_else(|| anyhow!("no pane in {project} to split for respawn"))?;
     let new_pane = c.pane_split(&anchor, "down", Some(dir.to_str().unwrap()))?;
-    let _ = c.call("pane.close", json!({ "pane_id": old_pane }))?;
+    if let Some(old) = &old_pane {
+        let _ = c.call("pane.close", json!({ "pane_id": old }));
+    }
     let fresh = start_agent_with_retry(&mut c, name, kind, &new_pane.pane_id)?;
     println!(
         "respawned {} {} -> {}",
         kind_paint(kind),
-        dim(&old_pane),
+        old_pane.as_deref().unwrap_or("<gone>"),
         fresh.pane_id
     );
     Ok(())

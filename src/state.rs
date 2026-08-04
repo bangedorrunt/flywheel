@@ -27,6 +27,7 @@ pub enum EventKind {
     Loop,
     Close,
     Resume,
+    Respawn,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
