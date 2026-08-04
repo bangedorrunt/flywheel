@@ -95,6 +95,93 @@ pub fn project_checkpoint_dir(project: &str) -> PathBuf {
     state_dir().join("checkpoints").join(project)
 }
 
+// ---- last-sent registry (bd-last-sent-registry) ----
+//
+// Per-project sidecar (NOT the shared loops.json — that file is written by
+// any loop on any project; a per-project file keeps writers disjoint and
+// atomic-write races impossible). Records what the `__send` leaf actually
+// delivered, so a crash between herdr's landing and Resonate's checkpoint
+// can be deduplicated on resume (bd-resume-dedup). Single-writer per project
+// (the loop; `promise_pending` guards against concurrent loops).
+
+/// One delivered (or attempted) prompt send.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentRecord {
+    /// agent herdr name
+    pub name: String,
+    /// stable FNV-1a 64 hash of the exact prompt text
+    pub text_hash: u64,
+    /// invocation id that delegated the prompt (dedup filters to the SAME
+    /// invocation — a fresh run legitimately re-delegates)
+    pub invocation: String,
+    /// loop iteration at send time (diagnostics)
+    pub iteration: u64,
+    /// true when herdr confirmed the prompt landed (working|blocked)
+    pub landed: bool,
+}
+
+/// Bound on the per-project registry (FIFO trim). A long-running loop can
+/// send thousands of prompts; unbounded growth is a leak.
+pub const LAST_SENT_CAP: usize = 50;
+
+pub fn last_sent_file(project: &str) -> PathBuf {
+    state_dir().join("last_sent").join(format!("{project}.json"))
+}
+
+/// Load the project's sent records. Missing or corrupt files yield an empty
+/// vec — never an error or panic (bookkeeping must not break the loop).
+pub fn load_last_sent(project: &str) -> Vec<SentRecord> {
+    let raw = std::fs::read_to_string(last_sent_file(project)).unwrap_or_default();
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Append one record and persist atomically (temp + rename — a crash
+/// mid-write cannot tear the registry). Best-effort by contract: callers log
+/// and continue on error.
+pub fn record_sent(project: &str, record: SentRecord) -> Result<()> {
+    let path = last_sent_file(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut records = load_last_sent(project);
+    records.push(record);
+    trim_last_sent(&mut records);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&records)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Keep the newest `LAST_SENT_CAP` records (FIFO: drop the oldest).
+pub fn trim_last_sent(records: &mut Vec<SentRecord>) {
+    if records.len() > LAST_SENT_CAP {
+        let drop = records.len() - LAST_SENT_CAP;
+        records.drain(0..drop);
+    }
+}
+
+/// Find the newest record for (agent, prompt-hash). `bd-resume-dedup` uses
+/// this to decide whether a prompt was already delivered.
+pub fn find_last_sent<'a>(
+    records: &'a [SentRecord],
+    name: &str,
+    text_hash: u64,
+) -> Option<&'a SentRecord> {
+    records.iter().rev().find(|r| r.name == name && r.text_hash == text_hash)
+}
+
+/// FNV-1a 64: a trivial, byte-stable hash. Chosen over
+/// `DefaultHasher` (not guaranteed stable across Rust releases — replay
+/// determinism requires identical bytes across process restarts).
+pub fn fnv1a64(text: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 /// Append one event to the project's JSONL log (creates dir/file on first use).
 pub fn log_event(project: &str, kind: EventKind, data: serde_json::Value) -> Result<()> {
     let path = project_log_path(project);
@@ -392,5 +479,90 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(a.sends, 3);
+    }
+}
+
+#[cfg(test)]
+mod last_sent_tests {
+    use super::*;
+
+    fn rec(name: &str, hash: u64, invocation: &str, landed: bool) -> SentRecord {
+        SentRecord {
+            name: name.to_string(),
+            text_hash: hash,
+            invocation: invocation.to_string(),
+            iteration: 1,
+            landed,
+        }
+    }
+
+    #[test]
+    fn fnv1a64_is_stable_and_distinct() {
+        // same input, same value — byte-identical across processes/releases
+        assert_eq!(fnv1a64("prompt A"), fnv1a64("prompt A"));
+        assert_eq!(fnv1a64(""), fnv1a64(""));
+        // known vector (FNV-1a 64 offset basis + prime applied to "a")
+        // 0xaf63dc4c8601ec8c is the canonical FNV-1a 64 of the byte 'a'
+        assert_eq!(fnv1a64("a"), 0xaf63dc4c8601ec8c);
+        // distinct inputs must not collide trivially
+        assert_ne!(fnv1a64("prompt A"), fnv1a64("prompt B"));
+    }
+
+    #[test]
+    fn trim_keeps_newest_50() {
+        let mut v: Vec<SentRecord> = (0..60).map(|i| rec("a", i, "inv", true)).collect();
+        trim_last_sent(&mut v);
+        assert_eq!(v.len(), 50);
+        // FIFO: the oldest (0..10) dropped, the newest (10..60) kept
+        assert_eq!(v[0].text_hash, 10);
+        assert_eq!(v[49].text_hash, 59);
+    }
+
+    #[test]
+    fn trim_under_cap_is_noop() {
+        let mut v: Vec<SentRecord> = (0..3).map(|i| rec("a", i, "inv", true)).collect();
+        trim_last_sent(&mut v);
+        assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn load_save_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("flywheel-lastsent-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // the state dir is fixed by state_dir(); we test through the real file
+        // path machinery by temporarily pointing LAST_SENT at a temp dir —
+        // instead, exercise record_sent/load_last_sent against a fake project
+        // name that collides with nothing, then clean the file up.
+        let project = "__test_roundtrip__";
+        let _ = std::fs::remove_file(last_sent_file(project));
+        record_sent(project, rec("a", 1, "inv1", true)).unwrap();
+        record_sent(project, rec("b", 2, "inv1", false)).unwrap();
+        let v = load_last_sent(project);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].name, "a");
+        assert_eq!(v[1].name, "b");
+        assert!(v[0].landed);
+        let _ = std::fs::remove_file(last_sent_file(project));
+        let _ = std::fs::remove_file(last_sent_file(project).with_extension("json.tmp"));
+        drop(dir);
+    }
+
+    #[test]
+    fn load_corrupt_file_returns_empty() {
+        let project = "__test_corrupt__";
+        let p = last_sent_file(project);
+        let _ = std::fs::create_dir_all(p.parent().unwrap());
+        std::fs::write(&p, "{not json!!").unwrap();
+        assert!(load_last_sent(project).is_empty());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn find_last_sent_matches_name_and_hash() {
+        let v = vec![rec("a", 11, "inv1", true), rec("b", 22, "inv1", true)];
+        assert!(find_last_sent(&v, "a", 11).is_some());
+        assert!(find_last_sent(&v, "a", 22).is_none());
+        assert!(find_last_sent(&v, "b", 22).is_some());
+        assert!(find_last_sent(&v, "c", 11).is_none());
     }
 }
