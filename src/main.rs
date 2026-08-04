@@ -174,9 +174,16 @@ enum Commands {
     /// crashes resume via `flywheel loop <project>` (same invocation id).
     Loop {
         project: String,
-        /// poll interval in seconds (default 300 = 5 min)
+        /// poll interval in seconds (default 300 = 5 min); the SETTLED/base
+        /// cadence — used when nobody is working
         #[arg(long, default_value = "300")]
         interval: u64,
+        /// fast cadence while the swarm is working/blocked/unknown or right
+        /// after a dispatch (default 30s; floor 5s — values below are clamped
+        /// with a warning). Only affects the durable workflow; the sync loop
+        /// (--once/--local) polls at --interval.
+        #[arg(long, default_value = "30")]
+        interval_active: u64,
         /// comma-separated instruction queue (stage names p1..p8 or raw prompts)
         #[arg(long)]
         queue: Option<String>,
@@ -751,6 +758,7 @@ fn main() {
         Some(Commands::Loop {
             project,
             interval,
+            interval_active,
             queue,
             workflow,
             nudge,
@@ -766,6 +774,7 @@ fn main() {
             &cfg,
             project,
             *interval,
+            *interval_active,
             queue.as_deref(),
             workflow.as_deref(),
             nudge.as_deref(),
@@ -1931,8 +1940,14 @@ fn plan_actions(
 }
 
 /// Build the instruction queue from --queue / --workflow.
-fn build_queue(queue: Option<&str>, workflow: Option<&str>) -> Result<Vec<String>> {
-    let mut items: Vec<String> = Vec::new();
+/// Clamp the active cadence to the 5s floor (consistent with the workflow's
+/// `INTERVAL_MIN` in `next_interval_secs`). Pure — the warning is emitted by
+/// the caller when the value changes.
+fn clamp_active_interval(v: u64) -> u64 {
+    v.max(5)
+}
+
+fn build_queue(queue: Option<&str>, workflow: Option<&str>) -> Result<Vec<String>> {    let mut items: Vec<String> = Vec::new();
     if let Some(wf) = workflow {
         let workflows = config::Workflows::load()?;
         let steps = workflows
@@ -1974,6 +1989,7 @@ fn cmd_loop(
     cfg: &Config,
     project: &str,
     interval_secs: u64,
+    active_interval_secs: u64,
     queue: Option<&str>,
     workflow: Option<&str>,
     nudge: Option<&str>,
@@ -1988,6 +2004,15 @@ fn cmd_loop(
 ) -> Result<()> {
     if interval_secs < 5 {
         bail!("--interval must be >= 5 seconds");
+    }
+    // --interval-active clamps to the 5s floor (consistent with the
+    // workflow's INTERVAL_MIN) rather than erroring — the operator asked for
+    // responsiveness, not an error
+    let active_secs = clamp_active_interval(active_interval_secs);
+    if active_secs != active_interval_secs {
+        eprintln!(
+            "flywheel: warning: --interval-active {active_interval_secs}s below the 5s floor — clamping to 5"
+        );
     }
     if !matches!(on_blocked, "continue" | "stop" | "mail") {
         bail!("--on-blocked must be continue|stop|mail");
@@ -2006,6 +2031,7 @@ fn cmd_loop(
             project: project.to_string(),
             to: to.to_string(),
             interval_secs,
+            active_interval_secs: active_secs,
             queue: queue_items.clone(),
             nudge: nudge.map(String::from),
             on_blocked: on_blocked.to_string(),
@@ -2192,6 +2218,15 @@ mod loop_tests {
 
     fn st(name: &str, s: AgentStatus) -> (String, AgentStatus) {
         (name.to_string(), s)
+    }
+
+    #[test]
+    fn active_interval_clamps_to_floor() {
+        assert_eq!(clamp_active_interval(3), 5);
+        assert_eq!(clamp_active_interval(0), 5);
+        assert_eq!(clamp_active_interval(5), 5);
+        assert_eq!(clamp_active_interval(15), 15);
+        assert_eq!(clamp_active_interval(30), 30);
     }
 
     #[test]

@@ -79,6 +79,24 @@ from its last checkpoint. State is queryable via `flywheel loop-status
 <project>`. `--local` runs the plain sync loop instead; `--once` does a single
 poll pass (cron-friendly).
 
+#### Poll cadence (durable workflow)
+
+The loop has two cadences, both in seconds:
+
+- `--interval N` (default 300) — the **settled** cadence, used when nobody is
+  working. This is the pre-adaptive meaning and stays backward compatible.
+- `--interval-active N` (default 30, floor 5 — values below clamp with a
+  warning) — the **active** cadence, used while any agent is
+  working/blocked/unknown **or right after a dispatch**. The blocked-alert
+  latency bound (`--on-blocked mail`) is ≤ one active interval; a lower
+  `--interval-active` trades socket load for faster reaction per project.
+- The sync loop (`--local`/`--once`) polls flat at `--interval` — the active
+  cadence is durable-workflow-only.
+- `--timeout-ms` interplay: the durable workflow has no wall clock, so the
+  timeout becomes an ITERATION cap (`max_iterations`). With a faster active
+  cadence the wall-clock deadline is reached sooner — intended; tune
+  `--timeout-ms` accordingly.
+
 The same sequence as a one-shot workflow:
 `flywheel workflows run daily notetoself`
 (stages in `~/.config/flywheel/workflows.toml`).

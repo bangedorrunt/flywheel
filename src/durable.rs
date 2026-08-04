@@ -26,7 +26,14 @@ use crate::config::Config;
 pub struct LoopParams {
     pub project: String,
     pub to: String,
+    /// settled/base cadence: poll interval when nobody is working (default 300)
     pub interval_secs: u64,
+    /// fast cadence while anyone is working/blocked/unknown or right after a
+    /// dispatch (default 30s — the pre-config balance; floor 5s lives in
+    /// `next_interval_secs`). `#[serde(default = "default_active_interval")]`
+    /// keeps pre-yna saved params loadable.
+    #[serde(default = "default_active_interval")]
+    pub active_interval_secs: u64,
     pub queue: Vec<String>,
     pub nudge: Option<String>,
     pub on_blocked: String,
@@ -47,6 +54,10 @@ pub struct LoopParams {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_active_interval() -> u64 {
+    30
 }
 
 /// One polled agent state: (name, status string).
@@ -1049,14 +1060,14 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         }
 
         // durable pause — the worker may exit here; the server resumes us.
-        // Adaptive cadence: 30s after a dispatch and while anyone is
-        // working/blocked/unknown, base interval when settled (the 5s floor
-        // lives in the fn).
+        // Adaptive cadence: active interval after a dispatch and while anyone
+        // is working/blocked/unknown, base interval when settled (the 5s
+        // floor lives in the fn).
         ctx.sleep(Duration::from_secs(next_interval_secs(
             &states,
             any_work,
             params.interval_secs,
-            30,
+            params.active_interval_secs,
         )))
         .await?;
     }
@@ -1687,6 +1698,7 @@ mod tests {
             project: "notetoself".into(),
             to: "all".into(),
             interval_secs: 300,
+            active_interval_secs: 15,
             queue: vec!["p1".into()],
             nudge: None,
             on_blocked: "continue".into(),
@@ -1699,9 +1711,30 @@ mod tests {
         let back: LoopParams = serde_json::from_value(v).unwrap();
         assert_eq!(back.project, "notetoself");
         assert_eq!(back.interval_secs, 300);
+        assert_eq!(back.active_interval_secs, 15);
         assert_eq!(back.max_iterations, Some(10));
         assert!(back.confirm_sends);
         assert_eq!(back.confirm_timeout_ms, Some(45_000));
+    }
+
+    #[test]
+    fn params_active_interval_defaults_30_when_absent() {
+        // pre-yna saved params (loops.json) must still load: the active
+        // cadence defaults to 30, matching the pre-config balance
+        let v: serde_json::Value = serde_json::json!({
+            "project": "notetoself",
+            "to": "all",
+            "interval_secs": 300,
+            "queue": [],
+            "nudge": null,
+            "on_blocked": "continue",
+            "max_iterations": null,
+            "work": false,
+            "confirm_sends": true,
+            "confirm_timeout_ms": null,
+        });
+        let back: LoopParams = serde_json::from_value(v).unwrap();
+        assert_eq!(back.active_interval_secs, 30);
     }
 
     #[test]
