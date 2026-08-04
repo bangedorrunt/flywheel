@@ -600,20 +600,77 @@ pub fn parse_poll_entry(v: &serde_json::Value) -> anyhow::Result<AgentState> {
     })
 }
 
+/// Consecutive `unknown` polls before an agent is presumed a dead pane and
+/// respawned. 2 balances transient classification flicker (unknown → idle →
+/// unknown must never respawn) against a genuinely dead session: at the
+/// settled 300s cadence this is ~10 min before repair; with the adaptive
+/// cadence (active while the swarm is unsettled) repair typically fires
+/// within ~1 min.
+pub const UNKNOWN_RESPAWN_THRESHOLD: u64 = 2;
+
+/// Decision for one agent's unknown-status bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownAction {
+    /// Keep waiting (count below threshold, or agent classified).
+    None,
+    /// The agent has been unclassified for >= threshold polls — respawn it.
+    Respawn,
+}
+
+/// Pure unknown-status verdict: an agent counted `unknown` for at least
+/// `threshold` consecutive polls is presumed a dead pane. Never fires for a
+/// classified status (working/idle/blocked/done are proof of life).
+pub fn unknown_decision(status: &str, count: u64, threshold: u64) -> UnknownAction {
+    if status == "unknown" && count >= threshold {
+        UnknownAction::Respawn
+    } else {
+        UnknownAction::None
+    }
+}
+
+/// Per-poll unknown bookkeeping + decision for one agent (the workflow calls
+/// this once per polled state). Deterministic: rebuilt identically on replay
+/// from the checkpointed poll results.
+///
+/// Map contract: `unknown` increments the count; ANY other status removes the
+/// entry (flicker reset); a respawn removes the entry so the fresh instance
+/// starts a clean episode — exactly one respawn per stuck episode.
+pub fn track_unknown(
+    unknown_seen: &mut std::collections::HashMap<String, u64>,
+    name: &str,
+    status: &str,
+    threshold: u64,
+) -> UnknownAction {
+    if status != "unknown" {
+        unknown_seen.remove(name);
+        return UnknownAction::None;
+    }
+    let count = unknown_seen.entry(name.to_string()).or_insert(0);
+    *count += 1;
+    if unknown_decision(status, *count, threshold) == UnknownAction::Respawn {
+        unknown_seen.remove(name);
+        UnknownAction::Respawn
+    } else {
+        UnknownAction::None
+    }
+}
+
 /// Shared respawn path for the loop: re-poll the agent kind (preferring the
 /// kind learned from polls — a dropped agent's record cannot be re-queried),
 /// respawn a fresh instance under the same name, and re-queue `text` at the
-/// FRONT so the fresh agent inherits it next poll. The single respawn point
-/// in the workflow — used by the CONTEXT_LIMIT guard and the send-escalation
-/// path (bd-send-stall-escalation) so an agent can never be double-respawned
-/// in one iteration. bd-unknown-respawn reuses the same helper.
+/// FRONT so the fresh agent inherits it next poll (None when there is nothing
+/// to requeue — e.g. the unknown-status repair, whose agent was never
+/// dispatched work). The single respawn point in the workflow — used by the
+/// CONTEXT_LIMIT guard, the send-escalation path (bd-send-stall-escalation),
+/// and the unknown-status repair (bd-unknown-respawn) so an agent can never
+/// be double-respawned in one iteration.
 async fn respawn_and_requeue(
     ctx: &Context,
     params: &LoopParams,
     queue: &mut Vec<String>,
     kinds: &std::collections::HashMap<String, String>,
     name: &str,
-    text: &str,
+    text: Option<&str>,
     reason: &str,
     attempts: u64,
 ) -> Result<()> {
@@ -641,7 +698,9 @@ async fn respawn_and_requeue(
         },
     )
     .await?;
-    queue.insert(0, text.to_string());
+    if let Some(t) = text {
+        queue.insert(0, t.to_string());
+    }
     Ok(())
 }
 
@@ -660,6 +719,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // per-agent herdr kind learned from polls — needed to respawn an agent
     // whose record has been dropped (the escalation path).
     let mut agent_kinds: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // per-agent consecutive `unknown` poll count (unknown-status repair).
+    // Workflow-local and deterministic: rebuilt identically on replay from
+    // the checkpointed poll results.
+    let mut unknown_seen: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
 
     loop {
         iteration += 1;
@@ -687,6 +750,31 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         clear_live_failures(&mut send_failures, &states);
         // learn agent kinds for the respawn path (idempotent, never removes)
         learn_kinds(&mut agent_kinds, &states);
+
+        // unknown-status repair: an agent unclassified for 2+ consecutive
+        // polls is presumed a dead pane. Respawn it via the shared helper —
+        // nothing to requeue (unknown agents are never dispatched work) and
+        // the fresh instance starts a clean episode (counter reset inside
+        // track_unknown). Skip-dispatch (bd-unknown-skip-dispatch) keeps the
+        // queue intact meanwhile.
+        for s in &states {
+            let prev = unknown_seen.get(&s.name).copied().unwrap_or(0);
+            if track_unknown(&mut unknown_seen, &s.name, &s.status, UNKNOWN_RESPAWN_THRESHOLD)
+                == UnknownAction::Respawn
+            {
+                respawn_and_requeue(
+                    ctx,
+                    &params,
+                    &mut queue,
+                    &agent_kinds,
+                    &s.name,
+                    None,
+                    "unknown-stuck",
+                    prev + 1,
+                )
+                .await?;
+            }
+        }
 
         // bead-driven mode: refresh the instruction queue from the tracker each
         // poll; the assigned-set is deterministic across replays (derives from
@@ -768,7 +856,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             &mut queue,
                             &agent_kinds,
                             name,
-                            text,
+                            Some(text),
                             "context_limit",
                             0,
                         )
@@ -818,7 +906,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 &mut queue,
                                 &agent_kinds,
                                 name,
-                                text,
+                                Some(text),
                                 reason,
                                 attempts,
                             )
@@ -1521,5 +1609,68 @@ mod tests {
         let legacy: serde_json::Value = serde_json::from_str(r#"["a", "idle"]"#).unwrap();
         let s = parse_poll_entry(&legacy).unwrap();
         assert_eq!(s.kind, "");
+    }
+
+    #[test]
+    fn unknown_decision_respawns_at_threshold_only() {
+        // 0/1 unknown polls → wait; 2 → respawn; beyond → respawn (already stuck)
+        assert_eq!(unknown_decision("unknown", 0, UNKNOWN_RESPAWN_THRESHOLD), UnknownAction::None);
+        assert_eq!(unknown_decision("unknown", 1, UNKNOWN_RESPAWN_THRESHOLD), UnknownAction::None);
+        assert_eq!(unknown_decision("unknown", 2, UNKNOWN_RESPAWN_THRESHOLD), UnknownAction::Respawn);
+        assert_eq!(unknown_decision("unknown", 5, UNKNOWN_RESPAWN_THRESHOLD), UnknownAction::Respawn);
+    }
+
+    #[test]
+    fn unknown_decision_never_fires_on_classified_status() {
+        // a working/idle agent is confirmed alive — no respawn even at a high count
+        assert_eq!(unknown_decision("idle", 5, UNKNOWN_RESPAWN_THRESHOLD), UnknownAction::None);
+        assert_eq!(unknown_decision("working", 2, UNKNOWN_RESPAWN_THRESHOLD), UnknownAction::None);
+        assert_eq!(unknown_decision("blocked", 2, UNKNOWN_RESPAWN_THRESHOLD), UnknownAction::None);
+    }
+
+    #[test]
+    fn track_unknown_sequence_two_unknown_polls_respawns_once() {
+        // integration-style: (unknown, unknown) → exactly one Respawn, episode reset
+        let mut m = std::collections::HashMap::new();
+        assert_eq!(
+            track_unknown(&mut m, "a", "unknown", UNKNOWN_RESPAWN_THRESHOLD),
+            UnknownAction::None
+        );
+        assert_eq!(m.get("a"), Some(&1));
+        assert_eq!(
+            track_unknown(&mut m, "a", "unknown", UNKNOWN_RESPAWN_THRESHOLD),
+            UnknownAction::Respawn
+        );
+        // the fresh instance starts a clean episode — counter gone
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn track_unknown_flicker_never_respawns() {
+        // unknown → idle → unknown: the idle poll resets the counter, so the
+        // second unknown starts at 1 and never reaches the threshold
+        let mut m = std::collections::HashMap::new();
+        track_unknown(&mut m, "a", "unknown", UNKNOWN_RESPAWN_THRESHOLD);
+        track_unknown(&mut m, "a", "idle", UNKNOWN_RESPAWN_THRESHOLD);
+        assert!(m.is_empty());
+        assert_eq!(
+            track_unknown(&mut m, "a", "unknown", UNKNOWN_RESPAWN_THRESHOLD),
+            UnknownAction::None
+        );
+        assert_eq!(m.get("a"), Some(&1));
+        assert_eq!(
+            track_unknown(&mut m, "a", "unknown", UNKNOWN_RESPAWN_THRESHOLD),
+            UnknownAction::Respawn
+        );
+    }
+
+    #[test]
+    fn track_unknown_tracks_agents_independently() {
+        let mut m = std::collections::HashMap::new();
+        track_unknown(&mut m, "a", "unknown", UNKNOWN_RESPAWN_THRESHOLD);
+        track_unknown(&mut m, "b", "unknown", UNKNOWN_RESPAWN_THRESHOLD);
+        track_unknown(&mut m, "b", "unknown", UNKNOWN_RESPAWN_THRESHOLD); // b respawns
+        assert_eq!(m.get("a"), Some(&1)); // a untouched by b's respawn
+        assert!(!m.contains_key("b"));
     }
 }
