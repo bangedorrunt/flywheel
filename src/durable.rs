@@ -54,6 +54,12 @@ fn default_true() -> bool {
 pub struct AgentState {
     pub name: String,
     pub status: String,
+    /// herdr agent kind (`opencode`/`pi`/...). Learned from polls; used to
+    /// respawn an agent whose herdr record has been dropped (the escalation
+    /// path cannot poll_kind a gone record). `#[serde(default)]` so
+    /// checkpoints written before this field existed still resume.
+    #[serde(default)]
+    pub kind: String,
 }
 
 /// One ready bead from `br ready --json`.
@@ -85,6 +91,11 @@ pub struct RespawnArgs {
     pub project: String,
     pub name: String,
     pub kind: String,
+    /// Why the respawn happened — logged with the event (`stalled`,
+    /// `context_limit`, `error:<...>`, ...).
+    pub reason: String,
+    /// Consecutive send failures for this agent, logged with the event.
+    pub attempts: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,21 +175,7 @@ async fn poll_swarm(args: PollArgs) -> Result<Vec<AgentState>> {
         .ok_or_else(|| map_err(anyhow::anyhow!("__poll missing agents: {raw}")))?;
     let mut out_states = Vec::with_capacity(pairs.len());
     for p in pairs {
-        let arr = p
-            .as_array()
-            .ok_or_else(|| map_err(anyhow::anyhow!("__poll bad entry: {p}")))?;
-        out_states.push(AgentState {
-            name: arr
-                .first()
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            status: arr
-                .get(1)
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
-                .to_string(),
-        });
+        out_states.push(parse_poll_entry(p).map_err(map_err)?);
     }
     Ok(out_states)
 }
@@ -299,7 +296,8 @@ async fn read_output(args: ReadArgs) -> Result<String> {
 }
 
 /// Replace an exhausted agent with a fresh instance in a new pane.
-/// Checkpointed.
+/// Checkpointed. Logs a `Respawn` event (side effect inside the leaf so the
+/// log entry is checkpointed with the call).
 #[function]
 async fn respawn_agent(args: RespawnArgs) -> Result<()> {
     let exe = self_exe().map_err(map_err)?;
@@ -313,6 +311,16 @@ async fn respawn_agent(args: RespawnArgs) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
+    let _ = crate::state::log_event(
+        &args.project,
+        crate::state::EventKind::Respawn,
+        serde_json::json!({
+            "name": args.name,
+            "reason": args.reason,
+            "attempts": args.attempts,
+            "source": "loop",
+        }),
+    );
     Ok(())
 }
 
@@ -467,6 +475,176 @@ pub fn next_interval_secs(
     chosen.max(INTERVAL_MIN)
 }
 
+/// Decision for one non-landing (or ambiguous) confirmed send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Escalation {
+    /// Prompt did not land — respawn the agent and re-queue the prompt at the
+    /// FRONT so the fresh instance inherits it next poll.
+    RespawnAndRequeue,
+    /// Prompt landed (or is ambiguous): nothing to escalate. A landed send
+    /// clears the agent's failure history; a timeout leaves it untouched and
+    /// is verified by the next poll.
+    Accept,
+    /// 3+ consecutive failures on the same agent: hard stop the loop. A
+    /// genuinely broken environment must not burn the swarm forever.
+    FailStop,
+}
+
+/// Pure verdict for one confirmed send outcome.
+///
+/// `landed: true` (incl. a `blocked` status — a valid landing the
+/// `--on-blocked` policy owns) → [`Escalation::Accept`]; `landed: None`
+/// (legacy fire-and-forget path) → [`Escalation::Accept`]; a `timeout` reason
+/// is ambiguous (the prompt may have started) → [`Escalation::Accept`]
+/// WITHOUT touching the failure counter; any other non-landing (stalled,
+/// `error:<code>`) is a pane-health failure → respawn until `failures >= 3`
+/// then [`Escalation::FailStop`]. Deterministic: derives from the checkpointed
+/// leaf result and the (also deterministic) counter.
+pub fn escalate(outcome: &SendOutcome, failures: u64) -> Escalation {
+    match outcome.landed {
+        Some(true) | None => Escalation::Accept,
+        Some(false) => match outcome.reason.as_deref() {
+            Some("timeout") => Escalation::Accept,
+            _ => {
+                if failures >= 3 {
+                    Escalation::FailStop
+                } else {
+                    Escalation::RespawnAndRequeue
+                }
+            }
+        },
+    }
+}
+
+/// Pure send-outcome bookkeeping: run [`escalate`] AND update the per-agent
+/// failure counter in one place.
+///
+/// Reset contract (documented, both events checkpointed): a landed send
+/// removes the agent's counter; a timeout leaves it untouched (ambiguous —
+/// verified by the next poll); a non-landing failure increments it; at the
+/// cap the counter does not grow further ([`Escalation::FailStop`]).
+pub fn handle_send_result(
+    failures: &mut std::collections::HashMap<String, u64>,
+    name: &str,
+    outcome: &SendOutcome,
+) -> Escalation {
+    match escalate(outcome, failures.get(name).copied().unwrap_or(0)) {
+        Escalation::Accept => {
+            if outcome.landed == Some(true) {
+                failures.remove(name);
+            }
+            Escalation::Accept
+        }
+        Escalation::RespawnAndRequeue => {
+            *failures.entry(name.to_string()).or_insert(0) += 1;
+            Escalation::RespawnAndRequeue
+        }
+        fail_stop => fail_stop,
+    }
+}
+
+/// Pure proof-of-life reset: agents showing `working` or `blocked` in the
+/// poll are receiving prompts — drop their failure history. Agents absent
+/// from the poll (herdr dropped them) or `unknown` keep their counters.
+pub fn clear_live_failures(
+    failures: &mut std::collections::HashMap<String, u64>,
+    states: &[AgentState],
+) {
+    for s in states {
+        if matches!(s.status.as_str(), "working" | "blocked") {
+            failures.remove(&s.name);
+        }
+    }
+}
+
+/// Learn agent kinds from a poll. Never removes entries: a dropped agent's
+/// kind is exactly what the escalation path needs to respawn it, and a later
+/// kind-less poll must not clobber it.
+pub fn learn_kinds(kinds: &mut std::collections::HashMap<String, String>, states: &[AgentState]) {
+    for s in states {
+        if !s.kind.is_empty() {
+            kinds.insert(s.name.clone(), s.kind.clone());
+        }
+    }
+}
+
+/// Pick the kind for a respawn: the kind learned from polls (authoritative —
+/// a dropped agent's record cannot be re-queried), else the caller falls back
+/// to the `poll_kind` leaf.
+pub fn respawn_kind(kinds: &std::collections::HashMap<String, String>, name: &str) -> Option<String> {
+    kinds.get(name).cloned()
+}
+
+/// Parse one `__poll` entry: `[name, status, kind]` (kind added for respawn
+/// support; legacy 2-element entries yield an empty kind).
+pub fn parse_poll_entry(v: &serde_json::Value) -> anyhow::Result<AgentState> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("__poll bad entry: {v}"))?;
+    Ok(AgentState {
+        name: arr
+            .first()
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        status: arr
+            .get(1)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        kind: arr
+            .get(2)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+/// Shared respawn path for the loop: re-poll the agent kind (preferring the
+/// kind learned from polls — a dropped agent's record cannot be re-queried),
+/// respawn a fresh instance under the same name, and re-queue `text` at the
+/// FRONT so the fresh agent inherits it next poll. The single respawn point
+/// in the workflow — used by the CONTEXT_LIMIT guard and the send-escalation
+/// path (bd-send-stall-escalation) so an agent can never be double-respawned
+/// in one iteration. bd-unknown-respawn reuses the same helper.
+async fn respawn_and_requeue(
+    ctx: &Context,
+    params: &LoopParams,
+    queue: &mut Vec<String>,
+    kinds: &std::collections::HashMap<String, String>,
+    name: &str,
+    text: &str,
+    reason: &str,
+    attempts: u64,
+) -> Result<()> {
+    let kind = match respawn_kind(kinds, name) {
+        Some(k) => k,
+        None => {
+            ctx.run(
+                poll_kind,
+                PollKindArgs {
+                    project: params.project.clone(),
+                    name: name.to_string(),
+                },
+            )
+            .await?
+        }
+    };
+    ctx.run(
+        respawn_agent,
+        RespawnArgs {
+            project: params.project.clone(),
+            name: name.to_string(),
+            kind,
+            reason: reason.to_string(),
+            attempts,
+        },
+    )
+    .await?;
+    queue.insert(0, text.to_string());
+    Ok(())
+}
+
 /// The durable monitoring workflow. Runs until the queue drains and the swarm
 /// settles, or a blocked agent stops it (policy).
 #[function]
@@ -475,6 +653,13 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     let mut iteration = 0u64;
     // bead-driven mode tracks which beads were already handed out
     let mut assigned: Vec<String> = Vec::new();
+    // per-agent consecutive send-failure count (send-stall escalation).
+    // Workflow-local and deterministic: rebuilt identically on replay from
+    // the checkpointed leaf results (poll states + send outcomes).
+    let mut send_failures: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    // per-agent herdr kind learned from polls — needed to respawn an agent
+    // whose record has been dropped (the escalation path).
+    let mut agent_kinds: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     loop {
         iteration += 1;
@@ -496,6 +681,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 },
             )
             .await?;
+
+        // proof of life: a working/blocked agent is receiving prompts — its
+        // failure history is stale (landed sends reset at the send site too)
+        clear_live_failures(&mut send_failures, &states);
+        // learn agent kinds for the respawn path (idempotent, never removes)
+        learn_kinds(&mut agent_kinds, &states);
 
         // bead-driven mode: refresh the instruction queue from the tracker each
         // poll; the assigned-set is deterministic across replays (derives from
@@ -571,40 +762,69 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         )
                         .await?;
                     if should_respawn(&output) {
-                        let kind = ctx
-                            .run(
-                                poll_kind,
-                                PollKindArgs {
-                                    project: params.project.clone(),
-                                    name: name.clone(),
-                                },
-                            )
-                            .await?;
-                        ctx.run(
-                            respawn_agent,
-                            RespawnArgs {
-                                project: params.project.clone(),
-                                name: name.clone(),
-                                kind,
-                            },
+                        respawn_and_requeue(
+                            ctx,
+                            &params,
+                            &mut queue,
+                            &agent_kinds,
+                            name,
+                            text,
+                            "context_limit",
+                            0,
                         )
                         .await?;
-                        // the fresh agent inherits the queue: put the prompt back
-                        queue.insert(0, text.clone());
                         continue;
                     }
-                    ctx.run(
-                        send_prompt,
-                        SendArgs {
-                            project: params.project.clone(),
+                    let outcome = match ctx
+                        .run(
+                            send_prompt,
+                            SendArgs {
+                                project: params.project.clone(),
+                                name: name.clone(),
+                                text: text.clone(),
+                                confirm: params.confirm_sends,
+                                confirm_timeout_ms: params.confirm_timeout_ms,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(o) => o,
+                        // leaf error = the prompt did not land (agent dropped
+                        // mid-wait, __send crashed) — same escalation path as
+                        // a stalled send, never silently lost
+                        Err(e) => SendOutcome {
+                            ok: false,
                             name: name.clone(),
-                            text: text.clone(),
-                            confirm: params.confirm_sends,
-                            confirm_timeout_ms: params.confirm_timeout_ms,
+                            landed: Some(false),
+                            status: None,
+                            reason: Some(format!("error:{e}")),
                         },
-                    )
-                    .await?;
+                    };
                     any_work = true;
+                    match handle_send_result(&mut send_failures, name, &outcome) {
+                        Escalation::Accept => {}
+                        Escalation::FailStop => {
+                            return Err(map_err(anyhow::anyhow!(
+                                "agent {name} failed to accept 3 prompts in a row (last reason: {:?})",
+                                outcome.reason
+                            )));
+                        }
+                        Escalation::RespawnAndRequeue => {
+                            let attempts = send_failures.get(name).copied().unwrap_or(0);
+                            let reason = outcome.reason.as_deref().unwrap_or("stalled");
+                            respawn_and_requeue(
+                                ctx,
+                                &params,
+                                &mut queue,
+                                &agent_kinds,
+                                name,
+                                text,
+                                reason,
+                                attempts,
+                            )
+                            .await?;
+                        }
+                    }
                 }
                 LoopAction::Blocked { name } => {
                     if params.on_blocked == "mail" {
@@ -809,6 +1029,7 @@ mod tests {
         AgentState {
             name: name.to_string(),
             status: status.to_string(),
+            kind: String::new(),
         }
     }
 
@@ -959,6 +1180,153 @@ mod tests {
         assert_eq!(next_interval_secs(&idle, false, 3, 30), 5);
     }
 
+    // ---- send-stall escalation (bd-send-stall-escalation) ----
+
+    fn so(landed: Option<bool>, reason: Option<&str>) -> SendOutcome {
+        SendOutcome {
+            ok: true,
+            name: "a".to_string(),
+            landed,
+            status: None,
+            reason: reason.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn escalate_stalled_below_cap_respawns() {
+        // 1st..3rd stall (0/1/2 prior failures) → respawn + requeue
+        assert_eq!(
+            escalate(&so(Some(false), Some("stalled")), 0),
+            Escalation::RespawnAndRequeue
+        );
+        assert_eq!(
+            escalate(&so(Some(false), Some("stalled")), 1),
+            Escalation::RespawnAndRequeue
+        );
+        assert_eq!(
+            escalate(&so(Some(false), Some("stalled")), 2),
+            Escalation::RespawnAndRequeue
+        );
+    }
+
+    #[test]
+    fn escalate_stalled_at_cap_stops() {
+        // 4th consecutive stall (3 prior failures) → hard stop, no infinite loop
+        assert_eq!(
+            escalate(&so(Some(false), Some("stalled")), 3),
+            Escalation::FailStop
+        );
+    }
+
+    #[test]
+    fn escalate_coded_error_respawns() {
+        // agent dropped mid-wait (agent_not_found) or any other hard error
+        assert_eq!(
+            escalate(&so(Some(false), Some("error:agent_not_found")), 0),
+            Escalation::RespawnAndRequeue
+        );
+    }
+
+    #[test]
+    fn escalate_timeout_accepts() {
+        // ambiguous: the prompt may have started — verify next poll, never
+        // respawn, and never FailStop even with a large counter
+        assert_eq!(escalate(&so(Some(false), Some("timeout")), 0), Escalation::Accept);
+        assert_eq!(escalate(&so(Some(false), Some("timeout")), 9), Escalation::Accept);
+    }
+
+    #[test]
+    fn escalate_landed_accepts() {
+        let mut o = so(Some(true), Some("landed"));
+        o.status = Some("working".to_string());
+        assert_eq!(escalate(&o, 0), Escalation::Accept);
+        assert_eq!(escalate(&o, 7), Escalation::Accept);
+    }
+
+    #[test]
+    fn escalate_blocked_accepts() {
+        // blocked is a valid landing — the --on-blocked policy owns it
+        let mut o = so(Some(true), Some("landed"));
+        o.status = Some("blocked".to_string());
+        assert_eq!(escalate(&o, 0), Escalation::Accept);
+    }
+
+    #[test]
+    fn escalate_no_verdict_accepts() {
+        // legacy fire-and-forget path (confirm=false): no landing info at all
+        assert_eq!(escalate(&so(None, None), 0), Escalation::Accept);
+    }
+
+    #[test]
+    fn handle_send_result_landed_resets() {
+        let mut f: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        f.insert("a".to_string(), 2);
+        let esc = handle_send_result(&mut f, "a", &so(Some(true), Some("landed")));
+        assert_eq!(esc, Escalation::Accept);
+        assert!(!f.contains_key("a"), "landed send must clear the counter");
+    }
+
+    #[test]
+    fn handle_send_result_timeout_keeps_counter() {
+        // timeout is not a landing and not a failure — counter untouched
+        let mut f: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        f.insert("a".to_string(), 2);
+        let esc = handle_send_result(&mut f, "a", &so(Some(false), Some("timeout")));
+        assert_eq!(esc, Escalation::Accept);
+        assert_eq!(f.get("a"), Some(&2));
+    }
+
+    #[test]
+    fn handle_send_result_stall_increments() {
+        let mut f: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        f.insert("a".to_string(), 1);
+        let esc = handle_send_result(&mut f, "a", &so(Some(false), Some("stalled")));
+        assert_eq!(esc, Escalation::RespawnAndRequeue);
+        assert_eq!(f.get("a"), Some(&2), "stall must increment the counter");
+        // first failure on a clean agent starts at 1
+        let mut g: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        handle_send_result(&mut g, "a", &so(Some(false), Some("error:agent_not_found")));
+        assert_eq!(g.get("a"), Some(&1));
+    }
+
+    #[test]
+    fn handle_send_result_failstop_does_not_increment() {
+        // at the cap the loop stops — no further bookkeeping matters, but the
+        // counter must not grow past the cap
+        let mut f: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        f.insert("a".to_string(), 3);
+        let esc = handle_send_result(&mut f, "a", &so(Some(false), Some("stalled")));
+        assert_eq!(esc, Escalation::FailStop);
+        assert_eq!(f.get("a"), Some(&3));
+    }
+
+    #[test]
+    fn clear_live_failures_resets_working_and_blocked() {
+        // proof of life: a working/blocked agent is receiving prompts
+        let mut f: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        f.insert("work".to_string(), 2);
+        f.insert("block".to_string(), 1);
+        f.insert("idle".to_string(), 2);
+        let states = vec![st("work", "working"), st("block", "blocked"), st("idle", "idle")];
+        clear_live_failures(&mut f, &states);
+        assert!(!f.contains_key("work"));
+        assert!(!f.contains_key("block"));
+        assert_eq!(f.get("idle"), Some(&2), "idle is not proof of life");
+    }
+
+    #[test]
+    fn clear_live_failures_keeps_absent_and_unknown() {
+        // an agent missing from the poll (herdr dropped it) or unknown keeps
+        // its counter — no proof of life
+        let mut f: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        f.insert("gone".to_string(), 1);
+        f.insert("unk".to_string(), 1);
+        let states = vec![st("unk", "unknown")];
+        clear_live_failures(&mut f, &states);
+        assert_eq!(f.get("gone"), Some(&1));
+        assert_eq!(f.get("unk"), Some(&1));
+    }
+
     #[test]
     fn resume_prompt_mentions_continuation() {
         let p = resume_prompt("bd-7", "finish the parser");
@@ -1095,5 +1463,63 @@ mod tests {
             serde_json::from_str(r#"{"ok": true, "name": "a"}"#).unwrap();
         assert_eq!(legacy.landed, None);
         assert_eq!(legacy.reason, None);
+    }
+
+    #[test]
+    fn learn_kinds_from_poll_records_kinds() {
+        let mut kinds = std::collections::HashMap::new();
+        let states = vec![
+            AgentState {
+                name: "a".into(),
+                status: "idle".into(),
+                kind: "pi".into(),
+            },
+            AgentState {
+                name: "b".into(),
+                status: "working".into(),
+                kind: "opencode".into(),
+            },
+        ];
+        learn_kinds(&mut kinds, &states);
+        assert_eq!(kinds.get("a").map(String::as_str), Some("pi"));
+        assert_eq!(kinds.get("b").map(String::as_str), Some("opencode"));
+    }
+
+    #[test]
+    fn learn_kinds_keeps_previous_kind_when_poll_has_none() {
+        // an agent whose record was dropped disappears from the poll; a
+        // later poll with an empty kind must not clobber the learned one
+        let mut kinds = std::collections::HashMap::new();
+        kinds.insert("a".to_string(), "opencode".to_string());
+        let states = vec![AgentState {
+            name: "a".into(),
+            status: "idle".into(),
+            kind: String::new(),
+        }];
+        learn_kinds(&mut kinds, &states);
+        assert_eq!(kinds.get("a").map(String::as_str), Some("opencode"));
+    }
+
+    #[test]
+    fn respawn_kind_prefers_map_and_returns_none_for_unknown() {
+        let mut kinds = std::collections::HashMap::new();
+        kinds.insert("a".to_string(), "pi".to_string());
+        assert_eq!(respawn_kind(&kinds, "a"), Some("pi".to_string()));
+        assert_eq!(respawn_kind(&kinds, "zzz"), None);
+    }
+
+    #[test]
+    fn agent_state_parses_kind_from_poll_entry() {
+        // __poll emits [name, status, kind]; kind must be parsed (and absent
+        // in legacy entries tolerated)
+        let v: serde_json::Value =
+            serde_json::from_str(r#"["a", "idle", "pi"]"#).unwrap();
+        let s = parse_poll_entry(&v).unwrap();
+        assert_eq!(s.name, "a");
+        assert_eq!(s.status, "idle");
+        assert_eq!(s.kind, "pi");
+        let legacy: serde_json::Value = serde_json::from_str(r#"["a", "idle"]"#).unwrap();
+        let s = parse_poll_entry(&legacy).unwrap();
+        assert_eq!(s.kind, "");
     }
 }
