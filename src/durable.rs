@@ -444,7 +444,7 @@ async fn poll_ready(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
 /// filename. `context_pct` < 80 is ignored by the READER (bd-read-state-
 /// fallback) — the threshold lives there, not here.
 pub fn bead_prompt(id: &str, title: &str) -> String {
-    let template = r#"Execute bead {id}: {title}. Follow the bead lifecycle: claim (`br update {id} --claim --actor "$AGENT_NAME" --json`), reserve your files via agent-mail, announce, execute one narrow slice, verify acceptance criteria, close with an honest reason, `br sync --flush-only` and commit `.beads/`. Renew your own agent-mail file reservations periodically while working (extend the TTL before it lapses — the orchestrator cannot renew on your behalf), so long edits never lose their lease. If your session context usage exceeds about 80%: write `{"context_pct": <pct>, "ts": "<now RFC3339>"}` to `.flywheel/agent-state/{AGENT_NAME}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you. If {id} is already claimed, pick the next ready bead from `br ready --json` or report back."#;
+    let template = r#"Execute bead {id}: {title}. Follow the bead lifecycle: claim (`br update {id} --claim --actor "$AGENT_NAME" --json`), reserve your files via agent-mail, announce, execute one narrow slice, verify acceptance criteria, close with an honest reason, `br sync --flush-only` and commit `.beads/`. Renew your own agent-mail file reservations periodically while working (extend the TTL before it lapses — the orchestrator cannot renew on your behalf), so long edits never lose their lease. When a message has ack_required=true, call acknowledge_message after acting on it — the orchestrator cannot ack on your behalf. If your session context usage exceeds about 80%: write `{"context_pct": <pct>, "ts": "<now RFC3339>"}` to `.flywheel/agent-state/{AGENT_NAME}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you. If {id} is already claimed, pick the next ready bead from `br ready --json` or report back."#;
     template.replace("{id}", id).replace("{title}", title)
 }
 
@@ -452,7 +452,7 @@ pub fn bead_prompt(id: &str, title: &str) -> String {
 /// same state-file contract (placeholder substituted at dispatch).
 pub fn resume_prompt(id: &str, title: &str) -> String {
     format!(
-        "Resume bead {id}: {title}. It is still in progress — continue it: re-check your work, finish, verify acceptance criteria, close with an honest reason, `br sync --flush-only` and commit `.beads/`. Renew your own agent-mail file reservations periodically while working (extend the TTL before it lapses — the orchestrator cannot renew on your behalf), so long edits never lose their lease. If your session context usage exceeds about 80%: write `{{\"context_pct\": <pct>, \"ts\": \"<now RFC3339>\"}}` to `.flywheel/agent-state/{{AGENT_NAME}}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you."
+        "Resume bead {id}: {title}. It is still in progress — continue it: re-check your work, finish, verify acceptance criteria, close with an honest reason, `br sync --flush-only` and commit `.beads/`. Renew your own agent-mail file reservations periodically while working (extend the TTL before it lapses — the orchestrator cannot renew on your behalf), so long edits never lose their lease. When a message has ack_required=true, call acknowledge_message after acting on it — the orchestrator cannot ack on your behalf. If your session context usage exceeds about 80%: write `{{\"context_pct\": <pct>, \"ts\": \"<now RFC3339>\"}}` to `.flywheel/agent-state/{{AGENT_NAME}}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you."
     )
 }
 
@@ -2653,6 +2653,28 @@ mod tests {
             assert!(
                 p.contains("cannot renew on your behalf"),
                 "prompt must explain the orchestrator cannot renew for agents: {p}"
+            );
+        }
+    }
+
+    /// bd-fug: ack contract in bead_prompt + resume_prompt (grep-verifiable).
+    #[test]
+    fn spawn_prompts_carry_ack_contract_clause() {
+        for p in [
+            bead_prompt("bd-12", "fix auth flow"),
+            resume_prompt("bd-7", "finish the parser"),
+        ] {
+            assert!(
+                p.contains("ack_required=true"),
+                "prompt must mention ack_required: {p}"
+            );
+            assert!(
+                p.contains("acknowledge_message"),
+                "prompt must require acknowledge_message: {p}"
+            );
+            assert!(
+                p.contains("cannot ack on your behalf"),
+                "prompt must state orchestrator cannot ack: {p}"
             );
         }
     }
