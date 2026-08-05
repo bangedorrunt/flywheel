@@ -63,6 +63,18 @@ pub struct Mail {
     next_id: u64,
 }
 
+/// Full inbox filter bag (bd-mail-ack-sla-tracking). Callers construct this
+/// instead of passing 5 booleans positionally.
+#[derive(Debug, Clone, Default)]
+pub struct MailInboxFilter {
+    pub urgent_only: bool,
+    pub unread_only: bool,
+    pub ack_overdue_only: bool,
+    pub include_bodies: bool,
+    pub limit: u32,
+    pub since_ts: Option<String>,
+}
+
 impl Mail {
     pub fn from_config(cfg: Option<&MailConfig>) -> Result<Option<Self>> {
         let Some(c) = cfg else { return Ok(None) };
@@ -152,6 +164,72 @@ impl Mail {
             json!({
                 "project_key": project_key, "agent_name": agent_name,
                 "urgent_only": urgent_only, "limit": limit
+            }),
+        )
+    }
+
+    /// Full inbox filter bag (bd-mail-ack-sla-tracking). Callers construct
+    /// this instead of passing 5 booleans positionally.
+    /// Fetch the inbox with the full agent-mail filter set
+    /// (`fetch_inbox`): `unread_only`, `ack_overdue_only`, `since_ts`,
+    /// `include_bodies`, `limit` — plus `urgent_only` for parity with the
+    /// simple `inbox`.
+    pub fn inbox_filtered(
+        &mut self,
+        project_key: &str,
+        agent_name: &str,
+        filter: &MailInboxFilter,
+    ) -> Result<Value> {
+        let mut args = json!({
+            "project_key": project_key, "agent_name": agent_name,
+            "urgent_only": filter.urgent_only,
+            "unread_only": filter.unread_only,
+            "ack_overdue_only": filter.ack_overdue_only,
+            "include_bodies": filter.include_bodies,
+            "limit": filter.limit,
+        });
+        if let Some(ts) = &filter.since_ts {
+            args["since_ts"] = json!(ts);
+        }
+        self.call("fetch_inbox", args)
+    }
+
+    /// Mark a message read (`mark_message_read`): "I've seen it" — distinct
+    /// from ack, which means "I've acted on it".
+    pub fn mark_read(&mut self, project_key: &str, agent_name: &str, message_id: u64) -> Result<Value> {
+        self.call(
+            "mark_message_read",
+            json!({
+                "project_key": project_key, "agent_name": agent_name,
+                "message_id": message_id
+            }),
+        )
+    }
+
+    /// Acknowledge a message (`acknowledge_message`): sets both `read_ts`
+    /// and `ack_ts`. The ack contract: agents call this after ACTING on an
+    /// `ack_required=true` message — the orchestrator cannot ack for them
+    /// (ack is per-recipient).
+    pub fn ack(&mut self, project_key: &str, agent_name: &str, message_id: u64) -> Result<Value> {
+        self.call(
+            "acknowledge_message",
+            json!({
+                "project_key": project_key, "agent_name": agent_name,
+                "message_id": message_id
+            }),
+        )
+    }
+
+    /// Messages past the ack SLA (agent-mail's `ack_overdue_only` — default
+    /// 30-min window). The escalation protocol polls this to find exactly
+    /// which peers ignored their pings.
+    #[allow(dead_code)] // consumed by the Phase-4 escalation protocol + live test
+    pub fn ack_overdue(&mut self, project_key: &str, agent_name: &str) -> Result<Value> {
+        self.call(
+            "fetch_inbox",
+            json!({
+                "project_key": project_key, "agent_name": agent_name,
+                "ack_overdue_only": true
             }),
         )
     }
@@ -1045,5 +1123,117 @@ mod tests {
             "3+ rounds under one thread: {sum}"
         );
         let _ = (a1_id, b1_id, a2_id); // ids are the round evidence
+    }
+
+    // ---- ack + mark_read + SLA (bd-mail-ack-sla-tracking) ----
+
+    /// Ack/SLA acceptance: ack_required message round-trips through
+    /// mark_read (read_ts set) and ack (ack_ts set), and a fresh
+    /// ack_required message is NOT ack_overdue (no false positive). The
+    /// overdue side of the SLA is proven by the live probe: an
+    /// ack_required message older than the 30-min window appears in
+    /// `ack_overdue_only` results (verified manually against the server).
+    ///   `cargo test -- --ignored ack_mark_read_roundtrip`
+    #[test]
+    #[ignore = "needs a live agent-mail server (reads flywheel config)"]
+    fn ack_mark_read_roundtrip() {
+        let cfg = crate::config::Config::load().expect("config loads");
+        let mut mail = Mail::from_config(cfg.agent_mail.as_ref())
+            .expect("from_config ok")
+            .expect("agent_mail configured");
+        let mut observer = Mail {
+            name: "SapphireOwl".into(),
+            base: mail.base.clone(),
+            token: mail.token.clone(),
+            next_id: 1,
+        };
+        let key = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        mail.ensure_project(&key).expect("ensure_project");
+        observer.ensure_project(&key).expect("ensure_project");
+        let cfg_name = mail.name.clone();
+        let obs_name = observer.name.clone();
+        mail.register_agent(&key, &cfg_name, "flywheel", "flywheel", "ack-live-probe")
+            .expect("register A");
+        observer
+            .register_agent(&key, &obs_name, "flywheel", "flywheel", "ack-live-probe-observer")
+            .expect("register B");
+
+        // A sends an ack_required ping to B
+        let sent = mail
+            .send(&key, std::slice::from_ref(&obs_name), "ack roundtrip", "ping — ack required", "high", true, None)
+            .expect("send");
+        let msg_id = sent["deliveries"][0]["payload"]["id"]
+            .as_u64()
+            .expect("message id");
+
+        // fresh message must NOT be overdue yet
+        let overdue = observer
+            .ack_overdue(&key, &obs_name)
+            .expect("ack_overdue");
+        let overdue_ids: Vec<u64> = overdue
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m.get("id").and_then(Value::as_u64))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !overdue_ids.contains(&msg_id),
+            "fresh ack_required message must not be overdue: {overdue}"
+        );
+
+        // B marks read (seen, not acted)
+        observer
+            .mark_read(&key, &obs_name, msg_id)
+            .expect("mark_read");
+        let inbox = observer
+            .inbox_filtered(&key, &obs_name, &MailInboxFilter {
+                urgent_only: false,
+                unread_only: false,
+                ack_overdue_only: false,
+                include_bodies: true,
+                limit: 20,
+                since_ts: None,
+            })
+            .expect("inbox after mark_read");
+        let m = inbox
+            .as_array()
+            .and_then(|a| a.iter().find(|m| m.get("id").and_then(Value::as_u64) == Some(msg_id)))
+            .expect("message in inbox");
+        assert!(
+            m.get("read_ts").and_then(Value::as_str).is_some(),
+            "mark_read must set read_ts: {m}"
+        );
+        assert!(
+            m.get("ack_ts").and_then(Value::as_str).is_none(),
+            "mark_read must NOT set ack_ts (seen != acted): {m}"
+        );
+
+        // B acks (acted)
+        observer
+            .ack(&key, &obs_name, msg_id)
+            .expect("ack");
+        let inbox = observer
+            .inbox_filtered(&key, &obs_name, &MailInboxFilter {
+                urgent_only: false,
+                unread_only: false,
+                ack_overdue_only: false,
+                include_bodies: true,
+                limit: 20,
+                since_ts: None,
+            })
+            .expect("inbox after ack");
+        let m = inbox
+            .as_array()
+            .and_then(|a| a.iter().find(|m| m.get("id").and_then(Value::as_u64) == Some(msg_id)))
+            .expect("message in inbox");
+        assert!(
+            m.get("ack_ts").and_then(Value::as_str).is_some(),
+            "ack must set ack_ts: {m}"
+        );
     }
 }
