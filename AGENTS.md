@@ -75,6 +75,28 @@ Cross-links: [ADR-0002](docs/decisions/0002-pluggable-backend-abstraction.md),
 [ADR-0001](docs/decisions/0001-event-driven-agent-collaboration-spine.md),
 toron ADR-0003 (embed path).
 
+### Products + cross-project contact
+
+agent-mail **products** group projects for unified search/inbox. Captain stack
+conventions (create with `flywheel mail product ensure` / `link`):
+
+| Product | Projects |
+|---------|----------|
+| `trading-research` | hachiko, flywheel (+ strategy repos) |
+| `knowledge` | chiebukuro, toron |
+
+```bash
+flywheel mail contact request <project> --to <agent> [--to-project <path>]
+flywheel mail contact approve|deny <project> --from <agent>
+flywheel mail contact list <project>
+flywheel mail product ensure --name trading-research
+flywheel mail product link --product trading-research <project>
+flywheel mail product search --product trading-research "query"
+```
+
+Contact policy default: **auto** (not open). Cross-project spam requires shared
+context or explicit approve.
+
 ## Rules
 
 - **TDD**: write failing tests first (RED-GREEN-REFACTOR). `cargo test` must pass.

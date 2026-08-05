@@ -592,6 +592,81 @@ enum MailCmd {
     },
     /// list registered agents in the project
     Agents { project: String },
+    /// cross-project contact (request_contact / respond / list)
+    Contact {
+        #[command(subcommand)]
+        cmd: MailContactCmd,
+    },
+    /// product grouping for multi-project search/inbox
+    Product {
+        #[command(subcommand)]
+        cmd: MailProductCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum MailContactCmd {
+    /// request contact with an agent (optionally in another project)
+    Request {
+        project: String,
+        #[arg(long)]
+        to: String,
+        /// target project path for cross-project contact
+        #[arg(long)]
+        to_project: Option<String>,
+        #[arg(long, default_value = "cross-project coordination")]
+        reason: String,
+    },
+    /// accept a pending contact request
+    Approve {
+        project: String,
+        #[arg(long)]
+        from: String,
+    },
+    /// deny a pending contact request
+    Deny {
+        project: String,
+        #[arg(long)]
+        from: String,
+    },
+    /// list contact links for the flywheel identity
+    List { project: String },
+    /// set contact policy: open|auto|contacts_only|block_all
+    Policy {
+        project: String,
+        #[arg(long)]
+        policy: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MailProductCmd {
+    /// ensure a product exists (e.g. trading-research, knowledge)
+    Ensure {
+        #[arg(long)]
+        name: String,
+    },
+    /// link a project into a product
+    Link {
+        #[arg(long)]
+        product: String,
+        project: String,
+    },
+    /// search messages across a product
+    Search {
+        #[arg(long)]
+        product: String,
+        query: String,
+        #[arg(long, default_value = "20")]
+        limit: u32,
+    },
+    /// product-scoped inbox for the flywheel identity
+    Inbox {
+        #[arg(long)]
+        product: String,
+        #[arg(long, default_value = "20")]
+        limit: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1435,9 +1510,10 @@ fn start_agent_with_retry(
     name: &str,
     kind: &str,
     pane_id: &str,
+    args: &[String],
 ) -> Result<AgentInfo> {
     for attempt in 0..30 {
-        if let Err(e) = c.agent_start(name, kind, pane_id, 45_000, &[]) {
+        if let Err(e) = c.agent_start(name, kind, pane_id, 45_000, args) {
             if attempt == 0 {
                 eprintln!("agent.start error: {e:#}");
             }
@@ -2201,7 +2277,7 @@ fn cmd_add(
             let name = agent_name_n(project, short, *ordinal);
             let p = c.pane_split(&prev, "down", Some(dir.to_str().unwrap()))?;
             prev = p.pane_id.clone();
-            let agent = start_agent_with_retry(&mut c, &name, &kind, &prev)?;
+            let agent = start_agent_with_retry(&mut c, &name, &kind, &prev, &[])?;
             register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
             println!("  {} {}", kind_paint(&kind), agent.pane_id);
             spawned
@@ -2815,6 +2891,82 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let v = mail.list_agents(&key)?;
             print_json(&v);
         }
+        MailCmd::Contact { cmd } => match cmd {
+            MailContactCmd::Request {
+                project,
+                to,
+                to_project,
+                reason,
+            } => {
+                let key = project_dir(cfg, project).to_str().unwrap().to_string();
+                mail.ensure_project(&key)?;
+                let from = mail.name.clone();
+                let to_mail = resolve_mail_target(to);
+                let to_proj = to_project
+                    .as_ref()
+                    .map(|p| project_dir(cfg, p).to_str().unwrap().to_string());
+                let v = mail.request_contact(
+                    &key,
+                    &from,
+                    &to_mail,
+                    to_proj.as_deref(),
+                    reason,
+                    None,
+                )?;
+                print_json(&v);
+            }
+            MailContactCmd::Approve { project, from } => {
+                let key = project_dir(cfg, project).to_str().unwrap().to_string();
+                let to = mail.name.clone();
+                let from_mail = resolve_mail_target(from);
+                let v = mail.respond_contact(&key, &to, &from_mail, true)?;
+                print_json(&v);
+            }
+            MailContactCmd::Deny { project, from } => {
+                let key = project_dir(cfg, project).to_str().unwrap().to_string();
+                let to = mail.name.clone();
+                let from_mail = resolve_mail_target(from);
+                let v = mail.respond_contact(&key, &to, &from_mail, false)?;
+                print_json(&v);
+            }
+            MailContactCmd::List { project } => {
+                let key = project_dir(cfg, project).to_str().unwrap().to_string();
+                let name = mail.name.clone();
+                let v = mail.list_contacts(&key, &name)?;
+                print_json(&v);
+            }
+            MailContactCmd::Policy { project, policy } => {
+                let key = project_dir(cfg, project).to_str().unwrap().to_string();
+                let name = mail.name.clone();
+                let v = mail.set_contact_policy(&key, &name, policy)?;
+                print_json(&v);
+            }
+        },
+        MailCmd::Product { cmd } => match cmd {
+            MailProductCmd::Ensure { name } => {
+                let v = mail.ensure_product(name)?;
+                print_json(&v);
+            }
+            MailProductCmd::Link { product, project } => {
+                let key = project_dir(cfg, project).to_str().unwrap().to_string();
+                mail.ensure_project(&key)?;
+                let v = mail.products_link(product, &key)?;
+                print_json(&v);
+            }
+            MailProductCmd::Search {
+                product,
+                query,
+                limit,
+            } => {
+                let v = mail.search_product(product, query, *limit)?;
+                print_json(&v);
+            }
+            MailProductCmd::Inbox { product, limit } => {
+                let name = mail.name.clone();
+                let v = mail.inbox_product(product, &name, *limit)?;
+                print_json(&v);
+            }
+        },
     }
     Ok(())
 }
@@ -3062,6 +3214,7 @@ fn cmd_resume(cfg: &Config, project: &str, recipe: Option<&str>) -> Result<()> {
                 &[],
                 None,
                 false,
+                false,
             )?;
         } else {
             bail!("workspace gone (run: flywheel spawn {project} --recipe <name> or flywheel resume {project} --recipe daily)");
@@ -3124,6 +3277,7 @@ fn cmd_asset(cfg: &Config, kind: &str, cmd: &AssetCmd) -> Result<()> {
                 Some(name),
                 &[],
                 None,
+                false,
                 false,
             ),
             "workflows" => run_workflow(cfg, project, name),
@@ -3215,6 +3369,7 @@ fn cmd_ensemble(cfg: &Config, project: &str, recipe: &str, workflow: &str) -> Re
         Some(recipe),
         &[],
         None,
+        false,
         false,
     )?;
     run_workflow(cfg, project, workflow)
@@ -4480,7 +4635,6 @@ fn cmd_debate(
     Ok(())
 }
 
-
 // ---- plan-review-implement pattern (bd-pattern-plan-review-implement) ----
 //
 // Paper-first gate: implementer works on a branch and does not merge; the
@@ -4504,7 +4658,11 @@ pub fn parse_review_token(text: &str) -> Option<ReviewToken> {
         return None;
     }
     // first non-empty line carries the token
-    let line = t.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(t);
+    let line = t
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or(t);
     let upper = line.to_ascii_uppercase();
     if upper.starts_with("APPROVE") {
         return Some(ReviewToken::Approve);
@@ -4623,11 +4781,9 @@ pub fn pri_route(
             },
             change_rounds,
         ),
-        (PriPhase::AwaitingVerify, ReviewToken::Verified) => (
-            PriPhase::Done,
-            PriAction::HaltVerified,
-            change_rounds,
-        ),
+        (PriPhase::AwaitingVerify, ReviewToken::Verified) => {
+            (PriPhase::Done, PriAction::HaltVerified, change_rounds)
+        }
         (PriPhase::AwaitingVerify, ReviewToken::Reject(reason)) => (
             PriPhase::Escalated,
             PriAction::Escalate {
@@ -4772,8 +4928,8 @@ fn cmd_plan_review(
     )?;
     settle_agent(mux.as_mut(), planner)?;
     let planner_mail = mail_target(planner);
-    let plan_reply = harvest_latest(mail.as_mut(), &key, &thread, &planner_mail)?
-        .unwrap_or_default();
+    let plan_reply =
+        harvest_latest(mail.as_mut(), &key, &thread, &planner_mail)?.unwrap_or_default();
     current_path = extract_plan_path(&plan_reply, &current_path);
     let (next_phase, action) = pri_after_plan(&current_path);
     phase = next_phase;
@@ -4793,10 +4949,12 @@ fn cmd_plan_review(
                 )?;
                 settle_agent(mux.as_mut(), reviewer)?;
                 let rev_mail = mail_target(reviewer);
-                let body = harvest_latest(mail.as_mut(), &key, &thread, &rev_mail)?
-                    .unwrap_or_default();
+                let body =
+                    harvest_latest(mail.as_mut(), &key, &thread, &rev_mail)?.unwrap_or_default();
                 let token = parse_review_token(&body).ok_or_else(|| {
-                    anyhow!("reviewer reply missing APPROVE|CHANGES:|VERIFIED|REJECT: token: {body}")
+                    anyhow!(
+                        "reviewer reply missing APPROVE|CHANGES:|VERIFIED|REJECT: token: {body}"
+                    )
                 })?;
                 let (p, a, rounds) =
                     pri_route(phase, &token, &current_path, change_rounds, max_rounds);
@@ -4831,13 +4989,9 @@ fn cmd_plan_review(
                             Some(&thread),
                         )?;
                         settle_agent(mux.as_mut(), reviewer)?;
-                        let rev2 = harvest_latest(
-                            mail.as_mut(),
-                            &key,
-                            &thread,
-                            &mail_target(reviewer),
-                        )?
-                        .unwrap_or_default();
+                        let rev2 =
+                            harvest_latest(mail.as_mut(), &key, &thread, &mail_target(reviewer))?
+                                .unwrap_or_default();
                         let token2 = parse_review_token(&rev2).ok_or_else(|| {
                             anyhow!("verify reply missing VERIFIED|REJECT: token: {rev2}")
                         })?;
@@ -4869,13 +5023,9 @@ fn cmd_plan_review(
                             Some(&thread),
                         )?;
                         settle_agent(mux.as_mut(), planner)?;
-                        let pr = harvest_latest(
-                            mail.as_mut(),
-                            &key,
-                            &thread,
-                            &mail_target(planner),
-                        )?
-                        .unwrap_or_default();
+                        let pr =
+                            harvest_latest(mail.as_mut(), &key, &thread, &mail_target(planner))?
+                                .unwrap_or_default();
                         current_path = extract_plan_path(&pr, &current_path);
                         let (p2, a2) = pri_after_plan(&current_path);
                         phase = p2;
@@ -4898,13 +5048,9 @@ fn cmd_plan_review(
                         // fall through by continuing outer loop — but we need
                         // the next harvest. Inline one more review cycle:
                         settle_agent(mux.as_mut(), reviewer)?;
-                        let body = harvest_latest(
-                            mail.as_mut(),
-                            &key,
-                            &thread,
-                            &mail_target(reviewer),
-                        )?
-                        .unwrap_or_default();
+                        let body =
+                            harvest_latest(mail.as_mut(), &key, &thread, &mail_target(reviewer))?
+                                .unwrap_or_default();
                         let token = parse_review_token(&body).ok_or_else(|| {
                             anyhow!("reviewer reply missing token after CHANGES: {body}")
                         })?;
@@ -4998,7 +5144,6 @@ fn cmd_plan_review(
         }
     }
 }
-
 
 /// Resolve the A/B/judge agents for a debate: explicit names, or default to
 /// the swarm's first agents. Returns the (a, b, j) herdr agent names.
@@ -5652,7 +5797,7 @@ fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> 
     if let Some(old) = &old_pane {
         let _ = c.call("pane.close", json!({ "pane_id": old }));
     }
-    let fresh = start_agent_with_retry(&mut c, name, kind, &new_pane.pane_id)?;
+    let fresh = start_agent_with_retry(&mut c, name, kind, &new_pane.pane_id, &[])?;
     // pane-identity bridge bookkeeping (best-effort — never fail the respawn
     // on mail trouble): the old pane died (its identity file is stale), the
     // fresh pane must resolve to the same name (the agent keeps its identity)

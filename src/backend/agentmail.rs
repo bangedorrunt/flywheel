@@ -89,7 +89,15 @@ impl MailBackend for AgentMailMcpBackend {
         thread_id: Option<&str>,
     ) -> Result<Value> {
         self.mail
-            .send(project_key, to, subject, body, importance, ack_required, thread_id)
+            .send(
+                project_key,
+                to,
+                subject,
+                body,
+                importance,
+                ack_required,
+                thread_id,
+            )
             .map_err(BackendError::Other)
     }
 
@@ -106,23 +114,30 @@ impl MailBackend for AgentMailMcpBackend {
     }
 
     fn inbox(&mut self, project_key: &str, agent: &str, filter: &InboxFilter) -> Result<Value> {
-        // Mail::inbox only exposes urgent_only + limit; the richer filter set
-        // (unread_only/ack_overdue_only/since_ts/include_bodies) lands with
-        // bd-mail-ack-sla-tracking which extends Mail::inbox. Until then the
-        // trait forwards what Mail supports.
+        // full filter set lands with bd-mail-ack-sla-tracking (Mail::inbox_filtered)
+        let mail_filter = crate::mail::MailInboxFilter {
+            urgent_only: filter.urgent_only,
+            unread_only: filter.unread_only,
+            ack_overdue_only: filter.ack_overdue_only,
+            include_bodies: filter.include_bodies,
+            limit: filter.limit,
+            since_ts: filter.since_ts.clone(),
+        };
         self.mail
-            .inbox(project_key, agent, filter.urgent_only, filter.limit)
+            .inbox_filtered(project_key, agent, &mail_filter)
             .map_err(BackendError::Other)
     }
 
-    fn ack(&mut self, _project_key: &str, _agent: &str, _message_id: u64) -> Result<Value> {
-        // Phase 3: bd-mail-ack-sla-tracking.
-        Err(self.unsupported("ack"))
+    fn ack(&mut self, project_key: &str, agent: &str, message_id: u64) -> Result<Value> {
+        self.mail
+            .ack(project_key, agent, message_id)
+            .map_err(BackendError::Other)
     }
 
-    fn mark_read(&mut self, _project_key: &str, _agent: &str, _message_id: u64) -> Result<Value> {
-        // Phase 3: bd-mail-ack-sla-tracking.
-        Err(self.unsupported("mark_read"))
+    fn mark_read(&mut self, project_key: &str, agent: &str, message_id: u64) -> Result<Value> {
+        self.mail
+            .mark_read(project_key, agent, message_id)
+            .map_err(BackendError::Other)
     }
 
     fn reserve(
@@ -263,25 +278,78 @@ impl MailBackend for AgentMailMcpBackend {
 
     fn request_contact(
         &mut self,
-        _project_key: &str,
-        _from_agent: &str,
-        _to_agent: &str,
-        _to_project: Option<&str>,
-        _reason: &str,
+        project_key: &str,
+        from_agent: &str,
+        to_agent: &str,
+        to_project: Option<&str>,
+        reason: &str,
     ) -> Result<Value> {
-        // Phase 3: bd-mail-cross-project-contact.
-        Err(self.unsupported("request_contact"))
+        self.mail
+            .request_contact(project_key, from_agent, to_agent, to_project, reason, None)
+            .map_err(BackendError::Other)
     }
 
     fn respond_contact(
         &mut self,
-        _project_key: &str,
-        _to_agent: &str,
-        _from_agent: &str,
-        _accept: bool,
+        project_key: &str,
+        to_agent: &str,
+        from_agent: &str,
+        accept: bool,
     ) -> Result<Value> {
-        // Phase 3: bd-mail-cross-project-contact.
-        Err(self.unsupported("respond_contact"))
+        self.mail
+            .respond_contact(project_key, to_agent, from_agent, accept)
+            .map_err(BackendError::Other)
+    }
+
+    fn list_contacts(&mut self, project_key: &str, agent: &str) -> Result<Value> {
+        self.mail
+            .list_contacts(project_key, agent)
+            .map_err(BackendError::Other)
+    }
+
+    fn set_contact_policy(
+        &mut self,
+        project_key: &str,
+        agent: &str,
+        policy: &str,
+    ) -> Result<Value> {
+        self.mail
+            .set_contact_policy(project_key, agent, policy)
+            .map_err(BackendError::Other)
+    }
+
+    fn ensure_product(&mut self, product_key: &str) -> Result<Value> {
+        self.mail
+            .ensure_product(product_key)
+            .map_err(BackendError::Other)
+    }
+
+    fn products_link(&mut self, product_key: &str, project_key: &str) -> Result<Value> {
+        self.mail
+            .products_link(product_key, project_key)
+            .map_err(BackendError::Other)
+    }
+
+    fn search_product(
+        &mut self,
+        product_key: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<Value> {
+        self.mail
+            .search_product(product_key, query, limit)
+            .map_err(BackendError::Other)
+    }
+
+    fn inbox_product(
+        &mut self,
+        product_key: &str,
+        agent: &str,
+        limit: u32,
+    ) -> Result<Value> {
+        self.mail
+            .inbox_product(product_key, agent, limit)
+            .map_err(BackendError::Other)
     }
 }
 
@@ -373,31 +441,27 @@ mod tests {
         .expect("from_config ok")
         .expect("Some");
         let mut b = AgentMailMcpBackend::new(mail);
-        // register_agent USED to be Unsupported; bd-mail-register-on-spawn
-        // graduated it to real delegation (calls Mail::register_agent).
-        // renew graduated with bd-mail-lease-renewal-durable; the pane
-        // identity trio with bd-mail-pane-identity-bridge; reply +
-        // summarize_thread with bd-mail-reply-thread; ack + mark_read with
-        // bd-mail-ack-sla-tracking + bd-mail-build-slot-gating graduated ack/
-        // mark_read/renew/reply/slot_acquire/slot_release. The remaining 3 stay
-        // Unsupported until their Phase-3 beads land.
-        let cases: Vec<(&str, std::result::Result<Value, BackendError>)> = vec![
-            ("search", b.search("p", "q", 5, &Default::default())),
+        // All prior Phase-3 stubs have graduated (including
+        // bd-mail-cross-project-contact: request_contact/respond_contact).
+        // Dummy URL → BackendError::Other (delegation), never Unsupported.
+        for (method, res) in [
             (
                 "request_contact",
                 b.request_contact("p", "a", "b", None, "r"),
             ),
             ("respond_contact", b.respond_contact("p", "b", "a", true)),
-        ];
-        for (method, res) in cases {
+            ("list_contacts", b.list_contacts("p", "a")),
+            ("set_contact_policy", b.set_contact_policy("p", "a", "auto")),
+            ("ensure_product", b.ensure_product("trading-research")),
+            ("products_link", b.products_link("trading-research", "p")),
+        ] {
             match res {
-                Err(BackendError::Unsupported {
-                    backend, method: m, ..
-                }) => {
-                    assert_eq!(backend, "agentmail", "backend tag for {method}");
-                    assert_eq!(m, method, "method tag matches");
+                Err(BackendError::Other(_)) => {}
+                Err(BackendError::Unsupported { method: m, .. }) => {
+                    panic!("{method}: still Unsupported ({m}) — should delegate")
                 }
-                other => panic!("{method}: expected Unsupported, got {other:?}"),
+                Ok(_) => panic!("{method}: cannot succeed against dummy URL"),
+                Err(e) => panic!("{method}: unexpected {e:?}"),
             }
         }
     }
