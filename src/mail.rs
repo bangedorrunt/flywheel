@@ -75,6 +75,19 @@ pub struct MailInboxFilter {
     pub since_ts: Option<String>,
 }
 
+/// Filter bag for `Mail::search` (review-fix F8: folds the 10 positional args
+/// into a struct — the trait's `SearchFilter` is the backend-agnostic twin).
+#[derive(Debug, Clone, Default)]
+pub struct MailSearchFilter {
+    pub sender: Option<String>,
+    pub importance: Option<String>,
+    pub thread_id: Option<String>,
+    pub date_start: Option<String>,
+    pub date_end: Option<String>,
+    pub ranking: Option<String>,
+    pub include_body_md: bool,
+}
+
 impl Mail {
     pub fn from_config(cfg: Option<&MailConfig>) -> Result<Option<Self>> {
         let Some(c) = cfg else { return Ok(None) };
@@ -316,67 +329,45 @@ impl Mail {
         project_key: &str,
         query: &str,
         limit: u32,
-        sender: Option<&str>,
-        importance: Option<&str>,
-        thread_id: Option<&str>,
-        date_start: Option<&str>,
-        date_end: Option<&str>,
-        ranking: Option<&str>,
-        include_body_md: bool,
+        filter: &MailSearchFilter,
     ) -> Result<Value> {
         self.call(
             "search_messages",
-            Self::search_args(
-                project_key,
-                query,
-                limit,
-                sender,
-                importance,
-                thread_id,
-                date_start,
-                date_end,
-                ranking,
-                include_body_md,
-            ),
+            Self::search_args(project_key, query, limit, filter),
         )
     }
 
     /// Build the `search_messages` args JSON (pure; unit-testable).
     /// review-fix F1: emits `include_body_md: true` when requested.
+    /// review-fix F8: takes the filter struct instead of 10 positionals.
     pub fn search_args(
         project_key: &str,
         query: &str,
         limit: u32,
-        sender: Option<&str>,
-        importance: Option<&str>,
-        thread_id: Option<&str>,
-        date_start: Option<&str>,
-        date_end: Option<&str>,
-        ranking: Option<&str>,
-        include_body_md: bool,
+        filter: &MailSearchFilter,
     ) -> Value {
         let mut args = json!({
             "project_key": project_key, "query": query, "limit": limit
         });
-        if include_body_md {
+        if filter.include_body_md {
             args["include_body_md"] = json!(true);
         }
-        if let Some(s) = sender {
+        if let Some(s) = &filter.sender {
             args["sender"] = json!(s);
         }
-        if let Some(i) = importance {
+        if let Some(i) = &filter.importance {
             args["importance"] = json!(i);
         }
-        if let Some(t) = thread_id {
+        if let Some(t) = &filter.thread_id {
             args["thread_id"] = json!(t);
         }
-        if let Some(d) = date_start {
+        if let Some(d) = &filter.date_start {
             args["date_start"] = json!(d);
         }
-        if let Some(d) = date_end {
+        if let Some(d) = &filter.date_end {
             args["date_end"] = json!(d);
         }
-        if let Some(r) = ranking {
+        if let Some(r) = &filter.ranking {
             args["ranking"] = json!(r);
         }
         args
@@ -956,19 +947,7 @@ mod tests {
     /// review-fix F1: gained the `include_body_md` bool param.
     #[test]
     fn search_wrapper_exists() {
-        let _: fn(
-            &mut Mail,
-            &str,
-            &str,
-            u32,
-            Option<&str>,
-            Option<&str>,
-            Option<&str>,
-            Option<&str>,
-            Option<&str>,
-            Option<&str>,
-            bool,
-        ) -> Result<Value> = Mail::search;
+        let _: fn(&mut Mail, &str, &str, u32, &MailSearchFilter) -> Result<Value> = Mail::search;
     }
 
     /// review-fix F1: search_messages must request the body when asked.
@@ -981,19 +960,19 @@ mod tests {
             "proj",
             "q",
             1,
-            Some("sender"),
-            None,
-            Some("thread-1"),
-            None,
-            None,
-            Some("recency"),
-            true,
+            &MailSearchFilter {
+                sender: Some("sender".into()),
+                thread_id: Some("thread-1".into()),
+                ranking: Some("recency".into()),
+                include_body_md: true,
+                ..Default::default()
+            },
         );
         assert_eq!(args["include_body_md"], json!(true));
         assert_eq!(args["thread_id"], json!("thread-1"));
         assert_eq!(args["sender"], json!("sender"));
         // without the flag: no include_body_md key
-        let args = Mail::search_args("proj", "q", 1, None, None, None, None, None, None, false);
+        let args = Mail::search_args("proj", "q", 1, &MailSearchFilter::default());
         assert!(args.get("include_body_md").is_none());
     }
 
