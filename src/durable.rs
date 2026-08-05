@@ -1291,11 +1291,11 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
             );
             crate::state::save_active_loop(
                 &params.project,
-                &crate::state::ActiveLoop {
-                    id: fresh.clone(),
-                    params: serde_json::to_value(&params)?,
-                    created: crate::state::now_iso(),
-                },
+                &crate::state::ActiveLoop::new(
+                    fresh.clone(),
+                    serde_json::to_value(&params)?,
+                    crate::state::now_iso(),
+                ),
             )?;
             fresh
         }

@@ -1,5 +1,34 @@
 //! Local durable state: append-only JSONL event log + checkpoint snapshots.
 //! Location: ~/.local/state/flywheel/<project>.jsonl and checkpoints/<project>/<ts>-<slug>.json
+//!
+//! # `loops.json` schema (bd-loop-state-schema-v2)
+//!
+//! Registry of active durable loop runs at `~/.local/state/flywheel/loops.json`.
+//!
+//! **v1 (legacy):** flat object `{ "<project>": { id, params, created }, ... }`.
+//! No `schema` field. New control fields are absent.
+//!
+//! **v2 (current):** same flat project map **plus** a top-level `"schema": 2`
+//! and optional per-loop control fields for crash-resume:
+//! - `event_cursor: { max_seq, pane_ids }` — high-watermark for event subscribe
+//!   (`bd-event-subscribe-reactor`); `null`/absent = start fresh.
+//! - `escalation: { "<agent>": { first_blocked_ts, ping_count, last_tail } }` —
+//!   tier continuity for blocked agents (`bd-blocked-escalation-protocol`).
+//!   `first_blocked_ts` is Resonate `ctx.now()` i64-µs (deterministic; never
+//!   wall-clock `SystemTime`).
+//! - `respawn: { "<agent>": { diagnose_count, respawn_count } }` — bounded
+//!   self-heal budget (`bd-event-self-heal-unknown`).
+//!
+//! **Back-compat (both directions):**
+//! - v2 binary reading v1 file: missing `schema` → treat as v1; new fields
+//!   default via `#[serde(default)]` (`event_cursor=None`, empty maps). On
+//!   first write, migrate in place: set `schema: 2`, log to stderr, preserve
+//!   all v1 base fields (additive — no data loss).
+//! - v1 binary reading v2 file: serde ignores unknown fields (no
+//!   `deny_unknown_fields`); base `id`/`params`/`created` still load.
+//!
+//! State file = resumable control state only. Telemetry (counts, latencies)
+//! goes to the JSONL event log (`log_event`), not here.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -12,6 +41,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::state_dir;
 use crate::herdr::AgentStatus;
+
+/// Current `loops.json` schema version (bd-loop-state-schema-v2).
+pub const LOOPS_SCHEMA_VERSION: u32 = 2;
+
+/// Reserved top-level key in `loops.json` (not a project path).
+const LOOPS_SCHEMA_KEY: &str = "schema";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -41,51 +76,173 @@ pub struct LogEntry {
     pub data: serde_json::Value,
 }
 
-/// Registry of active durable loop runs: project -> invocation id + params.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// High-watermark for event-subscribe resume (bd-event-subscribe-reactor).
+/// Monotonic `max_seq` + the pane ids covered by that cursor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EventCursor {
+    pub max_seq: u64,
+    #[serde(default)]
+    pub pane_ids: Vec<String>,
+}
+
+/// Per-agent blocked escalation tier state (bd-blocked-escalation-protocol).
+/// `first_blocked_ts` is Resonate `ctx.now()` i64-µs — stored, not recomputed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EscalationState {
+    /// Deterministic timestamp (Resonate ctx.now, µs). Never wall-clock.
+    pub first_blocked_ts: i64,
+    pub ping_count: u32,
+    #[serde(default)]
+    pub last_tail: String,
+}
+
+/// Per-agent self-heal budget (bd-event-self-heal-unknown).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RespawnBudget {
+    pub diagnose_count: u32,
+    pub respawn_count: u32,
+}
+
+/// One active durable loop run: invocation id + params + v2 control state.
+///
+/// New fields use `#[serde(default)]` so a v1-shaped JSON still deserializes
+/// (fresh defaults). A v1 binary reading this struct's v2 JSON ignores the
+/// extra keys (serde default for structs without `deny_unknown_fields`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActiveLoop {
     pub id: String,
     pub params: serde_json::Value,
     pub created: String,
+    /// Event-subscribe high-watermark; `None` = start fresh (v1 / first run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_cursor: Option<EventCursor>,
+    /// Per-agent blocked escalation state (tier continuity across resume).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub escalation: BTreeMap<String, EscalationState>,
+    /// Per-agent diagnose/respawn budget (must not reset on crash).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub respawn: BTreeMap<String, RespawnBudget>,
+}
+
+impl ActiveLoop {
+    /// Construct a v2 entry with empty control fields (fresh loop start).
+    pub fn new(id: impl Into<String>, params: serde_json::Value, created: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            params,
+            created: created.into(),
+            event_cursor: None,
+            escalation: BTreeMap::new(),
+            respawn: BTreeMap::new(),
+        }
+    }
 }
 
 pub fn loops_file() -> PathBuf {
     state_dir().join("loops.json")
 }
 
-pub fn load_active_loop(project: &str) -> Result<Option<ActiveLoop>> {
+/// Read `loops.json` into (schema_version, project → ActiveLoop).
+///
+/// - Missing file → empty map, schema v2 (nothing to migrate).
+/// - Missing / non-numeric `schema` → treated as v1 (schema_version = 1).
+/// - Project entries that fail to deserialize are skipped (logged to stderr).
+/// - Torn/corrupt file → empty map (same contract as the pre-v2 reader).
+pub fn load_loops_registry() -> Result<(u32, BTreeMap<String, ActiveLoop>)> {
     let path = loops_file();
     if !path.exists() {
-        return Ok(None);
+        return Ok((LOOPS_SCHEMA_VERSION, BTreeMap::new()));
     }
     let raw = std::fs::read_to_string(&path)?;
-    let map: serde_json::Value = serde_json::from_str(&raw)?;
-    Ok(map
-        .get(project)
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()?)
+    Ok(parse_loops_registry(&raw))
 }
 
-pub fn save_active_loop(project: &str, al: &ActiveLoop) -> Result<()> {
+/// Pure parse of a `loops.json` body (unit-testable; no I/O).
+///
+/// Returns `(schema_version, loops)`. v1 files (no `schema` key) yield
+/// `schema_version = 1` and defaulted control fields on each `ActiveLoop`.
+pub fn parse_loops_registry(raw: &str) -> (u32, BTreeMap<String, ActiveLoop>) {
+    let map: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return (LOOPS_SCHEMA_VERSION, BTreeMap::new()),
+    };
+    let Some(obj) = map.as_object() else {
+        return (LOOPS_SCHEMA_VERSION, BTreeMap::new());
+    };
+
+    let schema = obj
+        .get(LOOPS_SCHEMA_KEY)
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(1); // missing schema → v1
+
+    let mut loops = BTreeMap::new();
+    for (k, v) in obj {
+        if k == LOOPS_SCHEMA_KEY {
+            continue;
+        }
+        match serde_json::from_value::<ActiveLoop>(v.clone()) {
+            Ok(al) => {
+                loops.insert(k.clone(), al);
+            }
+            Err(err) => {
+                eprintln!("flywheel: skipping malformed loops.json entry {k}: {err}");
+            }
+        }
+    }
+    (schema, loops)
+}
+
+/// Serialize the registry as schema v2 JSON (pretty). Pure — no I/O.
+pub fn serialize_loops_registry(loops: &BTreeMap<String, ActiveLoop>) -> Result<String> {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        LOOPS_SCHEMA_KEY.to_string(),
+        serde_json::Value::Number(LOOPS_SCHEMA_VERSION.into()),
+    );
+    for (project, al) in loops {
+        map.insert(project.clone(), serde_json::to_value(al)?);
+    }
+    Ok(serde_json::to_string_pretty(&serde_json::Value::Object(map))?)
+}
+
+/// Atomically write the full registry as schema v2.
+///
+/// If the on-disk file was v1 (or missing schema), logs the migration once.
+pub fn save_loops_registry(loops: &BTreeMap<String, ActiveLoop>) -> Result<()> {
     let path = loops_file();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut map: serde_json::Value = if path.exists() {
-        // a torn/corrupt loops.json must not destroy the registry
-        serde_json::from_str(&std::fs::read_to_string(&path)?).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-    map.as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("loops.json is not an object"))?
-        .insert(project.to_string(), serde_json::to_value(al)?);
+
+    // detect v1 → v2 for audit log
+    if path.exists() {
+        let prior = std::fs::read_to_string(&path).unwrap_or_default();
+        let (prior_schema, _) = parse_loops_registry(&prior);
+        if prior_schema < LOOPS_SCHEMA_VERSION {
+            eprintln!(
+                "flywheel: migrating loops.json v{prior_schema} → v{LOOPS_SCHEMA_VERSION} (state fields initialized fresh)"
+            );
+        }
+    }
+
+    let body = serialize_loops_registry(loops)?;
     // atomic write: temp file + rename so a crash mid-write cannot truncate the registry
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&map)?)?;
+    std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+pub fn load_active_loop(project: &str) -> Result<Option<ActiveLoop>> {
+    let (_schema, map) = load_loops_registry()?;
+    Ok(map.get(project).cloned())
+}
+
+pub fn save_active_loop(project: &str, al: &ActiveLoop) -> Result<()> {
+    let (_schema, mut map) = load_loops_registry()?;
+    map.insert(project.to_string(), al.clone());
+    save_loops_registry(&map)
 }
 
 pub fn project_log_path(project: &str) -> PathBuf {
@@ -433,6 +590,170 @@ fn slugify(s: &str) -> String {
         "checkpoint".into()
     } else {
         collapsed.chars().take(40).collect()
+    }
+}
+
+#[cfg(test)]
+mod loops_schema_v2_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Minimal v1 fixture: flat project map, no `schema` key, no control fields.
+    fn v1_fixture() -> String {
+        json!({
+            "/tmp/proj-a": {
+                "id": "swarm-loop:/tmp/proj-a:1",
+                "params": {"project": "/tmp/proj-a", "queue": []},
+                "created": "2026-08-04T00:00:00Z"
+            },
+            "/tmp/proj-b": {
+                "id": "swarm-loop:/tmp/proj-b:2",
+                "params": {"project": "/tmp/proj-b"},
+                "created": "2026-08-04T01:00:00Z"
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn parse_v1_defaults_new_fields_and_schema_1() {
+        let (schema, map) = parse_loops_registry(&v1_fixture());
+        assert_eq!(schema, 1);
+        assert_eq!(map.len(), 2);
+
+        let a = map.get("/tmp/proj-a").expect("proj-a");
+        assert_eq!(a.id, "swarm-loop:/tmp/proj-a:1");
+        assert_eq!(a.created, "2026-08-04T00:00:00Z");
+        assert!(a.event_cursor.is_none());
+        assert!(a.escalation.is_empty());
+        assert!(a.respawn.is_empty());
+        // base params intact
+        assert_eq!(a.params["project"], "/tmp/proj-a");
+    }
+
+    #[test]
+    fn v1_read_v2_write_roundtrip_preserves_base_fields() {
+        let (schema, map) = parse_loops_registry(&v1_fixture());
+        assert_eq!(schema, 1);
+
+        let body = serialize_loops_registry(&map).unwrap();
+        // written body is always schema v2
+        let written: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(written["schema"], 2);
+
+        let (schema2, map2) = parse_loops_registry(&body);
+        assert_eq!(schema2, 2);
+        assert_eq!(map2.len(), 2);
+
+        let a1 = map.get("/tmp/proj-a").unwrap();
+        let a2 = map2.get("/tmp/proj-a").unwrap();
+        assert_eq!(a1.id, a2.id);
+        assert_eq!(a1.params, a2.params);
+        assert_eq!(a1.created, a2.created);
+        // fresh control fields after v1→v2
+        assert!(a2.event_cursor.is_none());
+        assert!(a2.escalation.is_empty());
+        assert!(a2.respawn.is_empty());
+    }
+
+    #[test]
+    fn v2_control_fields_roundtrip() {
+        let mut escalation = BTreeMap::new();
+        escalation.insert(
+            "AgentOne".into(),
+            EscalationState {
+                first_blocked_ts: 1_700_000_000_000_000, // µs, ctx.now-shaped
+                ping_count: 2,
+                last_tail: "stuck on cargo".into(),
+            },
+        );
+        let mut respawn = BTreeMap::new();
+        respawn.insert(
+            "AgentOne".into(),
+            RespawnBudget {
+                diagnose_count: 1,
+                respawn_count: 2,
+            },
+        );
+        let al = ActiveLoop {
+            id: "swarm-loop:/tmp/p:9".into(),
+            params: json!({"project": "/tmp/p"}),
+            created: "2026-08-05T00:00:00Z".into(),
+            event_cursor: Some(EventCursor {
+                max_seq: 42,
+                pane_ids: vec!["%1".into(), "%2".into()],
+            }),
+            escalation,
+            respawn,
+        };
+        let mut map = BTreeMap::new();
+        map.insert("/tmp/p".into(), al.clone());
+
+        let body = serialize_loops_registry(&map).unwrap();
+        let (schema, map2) = parse_loops_registry(&body);
+        assert_eq!(schema, 2);
+        let got = map2.get("/tmp/p").unwrap();
+        assert_eq!(got, &al);
+        assert_eq!(got.event_cursor.as_ref().unwrap().max_seq, 42);
+        assert_eq!(got.escalation["AgentOne"].first_blocked_ts, 1_700_000_000_000_000);
+        assert_eq!(got.respawn["AgentOne"].respawn_count, 2);
+    }
+
+    #[test]
+    fn forward_tolerance_v1_shaped_struct_ignores_v2_fields() {
+        // A v1-shaped deserializer (only base fields) must still load a v2
+        // entry — serde ignores unknown fields without deny_unknown_fields.
+        #[derive(Debug, Deserialize)]
+        struct ActiveLoopV1 {
+            id: String,
+            params: serde_json::Value,
+            created: String,
+        }
+        let v2_entry = json!({
+            "id": "swarm-loop:/tmp/p:1",
+            "params": {"project": "/tmp/p"},
+            "created": "2026-08-05T00:00:00Z",
+            "event_cursor": {"max_seq": 7, "pane_ids": ["%1"]},
+            "escalation": {"A": {"first_blocked_ts": 1, "ping_count": 0, "last_tail": ""}},
+            "respawn": {"A": {"diagnose_count": 0, "respawn_count": 1}}
+        });
+        let v1: ActiveLoopV1 = serde_json::from_value(v2_entry).unwrap();
+        assert_eq!(v1.id, "swarm-loop:/tmp/p:1");
+        assert_eq!(v1.created, "2026-08-05T00:00:00Z");
+        assert_eq!(v1.params["project"], "/tmp/p");
+    }
+
+    #[test]
+    fn schema_key_is_not_a_project_entry() {
+        let raw = json!({
+            "schema": 2,
+            "/tmp/real": {
+                "id": "id-1",
+                "params": {},
+                "created": "t"
+            }
+        })
+        .to_string();
+        let (schema, map) = parse_loops_registry(&raw);
+        assert_eq!(schema, 2);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("/tmp/real"));
+        assert!(!map.contains_key("schema"));
+    }
+
+    #[test]
+    fn active_loop_new_has_fresh_control_fields() {
+        let al = ActiveLoop::new("id", json!({}), "now");
+        assert!(al.event_cursor.is_none());
+        assert!(al.escalation.is_empty());
+        assert!(al.respawn.is_empty());
+    }
+
+    #[test]
+    fn corrupt_loops_json_yields_empty_registry() {
+        let (schema, map) = parse_loops_registry("{not json!!");
+        assert_eq!(schema, LOOPS_SCHEMA_VERSION);
+        assert!(map.is_empty());
     }
 }
 
