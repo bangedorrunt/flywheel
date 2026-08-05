@@ -491,6 +491,23 @@ enum Commands {
         #[arg(long, default_value = "unknown-stuck")]
         reason: String,
     },
+    /// internal: scan orchestrator inbox for `[xproj]` swarm requests
+    #[command(name = "__xproj-inbox", hide = true)]
+    __XprojInbox {
+        project: String,
+        #[arg(long, default_value = "30")]
+        limit: u32,
+    },
+    /// internal: spawn the swarm for a parsed `[xproj]` request (full loop branch)
+    #[command(name = "__xproj-spawn", hide = true)]
+    __XprojSpawn {
+        project: String,
+        message_id: u64,
+        thread_id: String,
+        from: String,
+        recipe: String,
+        workers: u32,
+    },
     /// internal: renew the orchestrator's active file reservations
     /// (durable workflow leaf, bd-mail-lease-renewal-durable)
     #[command(name = "__renew-leases", hide = true)]
@@ -1267,6 +1284,25 @@ fn main() {
             name,
             reason,
         }) => cmd_internal_diagnose(&cfg, project, name, reason),
+        Some(Commands::__XprojInbox { project, limit }) => {
+            cmd_internal_xproj_inbox(&cfg, project, *limit)
+        }
+        Some(Commands::__XprojSpawn {
+            project,
+            message_id,
+            thread_id,
+            from,
+            recipe,
+            workers,
+        }) => cmd_internal_xproj_spawn(
+            &cfg,
+            project,
+            *message_id,
+            thread_id,
+            from,
+            recipe,
+            *workers,
+        ),
         Some(Commands::__RenewLeases {
             project,
             extend_seconds,
@@ -6029,6 +6065,119 @@ fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> 
         old_pane.as_deref().unwrap_or("<gone>"),
         fresh.pane_id
     );
+    Ok(())
+}
+
+/// internal leaf: scan orchestrator inbox for `[xproj]` swarm requests.
+/// Soft-fail: missing mail → empty list. Output: `{ "items": [ XprojInboxItem ] }`.
+fn cmd_internal_xproj_inbox(cfg: &Config, project: &str, limit: u32) -> Result<()> {
+    let mut mail = match mail::Mail::from_config(cfg.agent_mail.as_ref()) {
+        Ok(Some(m)) => m,
+        Ok(None) | Err(_) => {
+            print_json(&json!({ "items": [] }));
+            return Ok(());
+        }
+    };
+    let key = project_dir(cfg, project).to_str().unwrap().to_string();
+    if mail.ensure_project(&key).is_err() {
+        print_json(&json!({ "items": [] }));
+        return Ok(());
+    }
+    let name = mail.name.clone();
+    let filter = mail::MailInboxFilter {
+        urgent_only: false,
+        unread_only: false,
+        ack_overdue_only: false,
+        include_bodies: true,
+        limit,
+        since_ts: None,
+    };
+    let v = match mail.inbox_filtered(&key, &name, &filter) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("flywheel: xproj-inbox fetch failed: {e:#}");
+            print_json(&json!({ "items": [] }));
+            return Ok(());
+        }
+    };
+    let items = extract_xproj_from_inbox(&v);
+    print_json(&json!({ "items": items }));
+    Ok(())
+}
+
+/// internal leaf: spawn the swarm for a parsed `[xproj]` request (full loop
+/// branch — bd-pattern-cross-project-swarm §9.5).
+///
+/// Called DIRECTLY by the durable loop (not a queued agent prompt): parse the
+/// request's `recipe`/`workers`, spawn the swarm in THIS project, and reply a
+/// "swarm started" ack in the request thread so the requester sees it.
+///
+/// Best-effort: spawn failure replies an error in-thread (never kills the
+/// loop); a missing project dir or unknown recipe is surfaced in-thread too.
+fn cmd_internal_xproj_spawn(
+    cfg: &Config,
+    project: &str,
+    message_id: u64,
+    thread_id: &str,
+    from: &str,
+    recipe: &str,
+    workers: u32,
+) -> Result<()> {
+    let dir = project_dir(cfg, project);
+    let outcome = if !dir.exists() {
+        Err(anyhow!("project dir missing: {}", dir.display()))
+    } else {
+        // workers param = opencode count by default; a recipe with its own
+        // oc/pi/gk counts wins (recipe_counts prefers the recipe).
+        cmd_spawn(
+            cfg,
+            project,
+            &AgentCounts {
+                oc: Some(workers.max(1)),
+                pi: None,
+                gk: None,
+            },
+            Some(recipe),
+            &[],
+            None,
+            false, // background workspace
+            false, // not peer-aware by default
+        )
+    };
+    let spawned_ok = outcome.is_ok();
+    // reply in the request thread (best-effort; mail down must not kill the loop)
+    let reply = match outcome {
+        Ok(_) => format!(
+            "[xproj] swarm started: recipe={recipe}, {workers} worker(s) in project {project} (msg {message_id}). Reply thread: {thread_id}."
+        ),
+        Err(e) => format!(
+            "[xproj] spawn FAILED for msg {message_id}: {e:#}. Requester {from}, recipe={recipe}, workers={workers}."
+        ),
+    };
+    if let Ok(mut mail) = backend::mail_backend(cfg) {
+        let key = project_dir(cfg, project)
+            .to_str()
+            .unwrap_or(project)
+            .to_string();
+        let _ = mail.ensure_project(&key);
+        let _ = mail.send(
+            &key,
+            &[resolve_mail_target(from)],
+            &format!("[xproj] swarm reply (msg {message_id})"),
+            &reply,
+            "normal",
+            false,
+            Some(thread_id),
+        );
+    }
+    print_json(&json!({
+        "ok": true,
+        "message_id": message_id,
+        "spawned": spawned_ok,
+        "project": project,
+        "recipe": recipe,
+        "workers": workers,
+    }));
     Ok(())
 }
 
