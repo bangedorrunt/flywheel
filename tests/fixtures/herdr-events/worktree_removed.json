@@ -1,0 +1,15 @@
+{
+ "event": "worktree_removed",
+ "data": {
+  "workspace_id": "s1",
+  "worktree": {
+   "path": "s1",
+   "is_bare": false,
+   "is_detached": false,
+   "is_prunable": false,
+   "is_linked_worktree": false,
+   "label": "s1"
+  },
+  "forced": false
+ }
+}

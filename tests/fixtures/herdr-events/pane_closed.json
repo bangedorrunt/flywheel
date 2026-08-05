@@ -1,0 +1,7 @@
+{
+ "event": "pane_closed",
+ "data": {
+  "pane_id": "s1",
+  "workspace_id": "s1"
+ }
+}

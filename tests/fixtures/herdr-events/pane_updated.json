@@ -1,0 +1,14 @@
+{
+ "event": "pane_updated",
+ "data": {
+  "pane": {
+   "pane_id": "s1",
+   "terminal_id": "s1",
+   "workspace_id": "s1",
+   "tab_id": "s1",
+   "focused": false,
+   "agent_status": "idle",
+   "revision": 0
+  }
+ }
+}

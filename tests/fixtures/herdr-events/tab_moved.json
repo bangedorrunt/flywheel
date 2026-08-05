@@ -1,0 +1,9 @@
+{
+ "event": "tab_moved",
+ "data": {
+  "tab_id": "s1",
+  "workspace_id": "s1",
+  "insert_index": 0,
+  "tabs": []
+ }
+}

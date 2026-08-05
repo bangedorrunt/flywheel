@@ -1,0 +1,19 @@
+{
+ "event": "layout_updated",
+ "data": {
+  "layout": {
+   "workspace_id": "s1",
+   "tab_id": "s1",
+   "zoomed": false,
+   "area": {
+    "x": 0,
+    "y": 0,
+    "width": 0,
+    "height": 0
+   },
+   "focused_pane_id": "s1",
+   "panes": [],
+   "splits": []
+  }
+ }
+}

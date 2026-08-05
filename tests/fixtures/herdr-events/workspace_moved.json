@@ -1,0 +1,8 @@
+{
+ "event": "workspace_moved",
+ "data": {
+  "workspace_id": "s1",
+  "insert_index": 0,
+  "workspaces": []
+ }
+}
