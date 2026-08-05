@@ -8,6 +8,8 @@ command surface and a durable monitoring loop built on Resonate.
 - **Backends (ADR-0002):** pluggable multiplexer + mail via traits in `src/backend/`.
   Defaults: herdr + agentmail. Discover: `flywheel backend list --json`.
   Details: [Backends](#backends) below.
+- **herdr protocol v19** (default mux): unix socket JSON-RPC; event stream via
+  `events.subscribe`. Loop = **event-wake + poll heartbeat** (ADR-0001).
 - Tracker: br/bv (CLI-only — there is NO beads MCP server; `beads-mcp` is the
   legacy bd-era plugin, never wire it in).
 - Durable loop: Resonate server via launchd (`com.flywheel.resonate`,
@@ -170,10 +172,32 @@ src/
   output.rs    # TTY-aware color, JSON printing
 ```
 
-The durable loop (`flywheel loop <project>`) is the orchestrator: polls the
-swarm via `__poll` (leaf), feeds queued instructions to idle agents via
-`__send`, sleeps durably, and exits when the queue drains. Crashes resume by
-re-running the same command (same invocation id while pending).
+The durable loop (`flywheel loop <project>`) is the orchestrator: **primary
+signal** `__poll_events` (forward-only herdr subscribe); **correctness floor**
+`__poll` every iteration; dispatch via `__send`; durable sleep/checkpoint via
+Resonate. Crashes resume by re-running the same command (same invocation id
+while pending). Verify: `docs/decisions/_scripts/verify-0001.sh`.
+
+### Agent contracts (spawn prompts)
+
+Baked into `bead_prompt` / `resume_prompt` (`src/durable.rs`):
+
+- **Lease renew** — agents renew their own agent-mail file reservations; orchestrator cannot renew on their behalf.
+- **Ack** — when `ack_required=true`, call `acknowledge_message` after acting; orchestrator cannot ack on their behalf.
+- **Build-slot** — before `cargo build`/`cargo test`, acquire slot `cargo`; release when done (plan-review implementer prompt).
+- **Pane safety** — never close peers' panes; only flywheel-created panes are respawn targets.
+- **CONTEXT_LIMIT** — at ~80% context write state file + emit marker for respawn.
+
+### Collaboration patterns (ADR-0001 §9)
+
+Catalog: [docs/collab/recipes.md](docs/collab/recipes.md).
+
+| Pattern | CLI | Thread / token |
+|---------|-----|----------------|
+| Debate §9.1 | `flywheel debate "<prop>" --rounds N` | `debate-<ts>` |
+| Plan-review-implement §9.2 | `flywheel plan-review <proj> "<feature>"` | `plan-<bead\|ts>`; APPROVE/CHANGES/VERIFIED/REJECT |
+| Peer-triggered §9.4 | peer-aware spawn prompt | peer mail wakes idle agent |
+| Cross-project §9.5 | `flywheel xproj send/request` | product + contact; `[xproj]` |
 
 ### Pattern: plan-review-implement (ADR-0001 §9.2)
 

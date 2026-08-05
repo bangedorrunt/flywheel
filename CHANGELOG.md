@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 🚀 Features
 
+- **Collaboration spine (ADR-0001)** — event-wake loop + poll floor; patterns
+  `debate`, `plan-review`, `xproj`; mail contact/product; recipe catalog
+  `docs/collab/recipes.md`; agent ack/lease/build-slot contracts in spawn prompts.
 - **Pluggable backends (ADR-0002 R0)** — `MultiplexerBackend` + `MailBackend`
   traits; factory env/`.env`/config selection; `flywheel backend list|status|default`;
   feature-gated stubs (superlogical/tmux/toron). Defaults unchanged: herdr + agentmail.

@@ -125,7 +125,8 @@ The same sequence as a one-shot workflow:
 | Swarm lifecycle | `init spawn add list status kill attach zoom` |
 | Operator loop | `send interrupt view watch work loop loop-status` |
 | Assignment | `assign` (agent-mail bead dispatch) |
-| Coordination | `mail inbox/send/locks/unlock/conflicts/agents` |
+| Coordination | `mail inbox/send/locks/unlock/conflicts/agents` + `contact` + `product` |
+| Patterns | `debate`, `plan-review`, `xproj` (cross-project fan-out) |
 | Durability | `checkpoint timeline audit history changes resume analytics` |
 | Assets | `recipes workflows pipeline template ensemble` |
 | Safety | `safety guards policy` |
@@ -186,6 +187,23 @@ When `FLYWHEEL_BACKEND=herdr`: socket protocol v19, one JSON-RPC request per
 connection (newline-delimited); `events.subscribe` keeps a long-lived stream.
 See `src/herdr.rs` / `src/backend/herdr.rs`.
 
+## Collaboration (event-driven)
+
+The durable loop is **event-wake primary** (`__poll_events` / `events.subscribe`)
+with **`__poll` heartbeat** as the correctness floor (no event replay). See
+[ADR-0001](docs/decisions/0001-event-driven-agent-collaboration-spine.md) and
+`docs/decisions/_scripts/verify-0001.sh`.
+
+| Pattern | Command | Contract |
+|---------|---------|----------|
+| Debate | `flywheel debate "<proposition>" --rounds 3` | A/B + judge, thread `debate-<ts>` |
+| Plan→review→implement | `flywheel plan-review <project> "<feature>"` | APPROVE/CHANGES/VERIFIED/REJECT; paper-first |
+| Cross-project | `flywheel xproj send …` | product + contact; subject `[xproj]` |
+| Peer-triggered | spawn with peer-aware prompt | peer mail wakes idle peer |
+
+Full recipe catalog: [docs/collab/recipes.md](docs/collab/recipes.md). Agent
+contracts (ack, lease renew, build-slot, pane safety): `AGENTS.md`.
+
 ## Changelog / releases
 
 The changelog is GENERATED with [git-cliff](https://git-cliff.org) (Keep a
@@ -210,6 +228,7 @@ Versioning: semantic (MAJOR breaking / MINOR features / PATCH fixes);
 
 - checkpoint → respawn fidelity (store spawn spec), timeline rendering polish
 - policy approval workflow (prompt-based approvals, not just deny-guards)
-- `serve` SSE on real herdr events (currently state-poll stream)
+- `serve` SSE on live `events.subscribe` (loop already event-driven; serve may lag)
+- R1 toron mail embed + R2 superlogical multiplexer (ADR-0002)
 
 Feedback: open an issue at https://github.com/bangedorrunt/flywheel/issues
