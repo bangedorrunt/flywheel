@@ -831,7 +831,7 @@ fn main() {
         print_json(&json!({
             "tool": "flywheel",
             "version": VERSION,
-            "backend": "herdr (socket protocol v18)",
+            "backend": format!("herdr (socket protocol v{})", herdr::HDR_PROTOCOL),
             "commands": [
                 "init spawn add list status send interrupt view watch zoom attach kill",
                 "work assign mail worktree checkpoint timeline audit history changes resume analytics",
@@ -2801,6 +2801,56 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod protocol_check_tests {
+    use super::*;
+
+    /// (live, pin) -> severity. herdr's protocol is additive: higher is safe,
+    /// lower is the real safety net.
+    #[test]
+    fn protocol_check_three_states() {
+        for (live, pin, want) in [
+            (19u64, 19u64, ProtocolCheck::Match),
+            (20, 19, ProtocolCheck::Newer),
+            (18, 19, ProtocolCheck::Older),
+            (42, 19, ProtocolCheck::Newer),
+            (1, 19, ProtocolCheck::Older),
+            (0, 19, ProtocolCheck::Older),
+            (19, 18, ProtocolCheck::Newer),
+        ] {
+            assert_eq!(protocol_check(live, pin), want, "live={live} pin={pin}");
+        }
+    }
+}
+
+/// Severity of a live herdr protocol number vs the verified pin.
+///
+/// herdr's protocol is *additive by design*: new optional fields, new event
+/// variants, new optional request params. A live protocol HIGHER than the pin
+/// is safe (the client ignores what it doesn't know) — `HDR_PROTOCOL` is the
+/// *verified floor*, not the ceiling. A live protocol LOWER than the pin is
+/// unsafe: the server may not understand our requests. That asymmetry is
+/// what `protocol_check` encodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolCheck {
+    /// live == pin: exactly the verified contract.
+    Match,
+    /// live > pin: forward-compatible; the client may not use new features.
+    Newer,
+    /// live < pin: server too old; our requests may be rejected. Safety net.
+    Older,
+}
+
+fn protocol_check(live: u64, pin: u64) -> ProtocolCheck {
+    if live == pin {
+        ProtocolCheck::Match
+    } else if live > pin {
+        ProtocolCheck::Newer
+    } else {
+        ProtocolCheck::Older
+    }
+}
+
 fn cmd_deps(cfg: &Config) -> Result<()> {
     let mut ok = true;
     println!("flywheel {}", dim(VERSION));
@@ -2822,10 +2872,11 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
     // herdr protocol drift check. The socket has no protocol method in v18,
     // so we shell out to the herdr CLI itself (`api schema --json` — the
     // canonical source; same binary as the socket server, so CLI vs socket
-    // drift is not a concern). A mismatch is a WARN, not an error: services
-    // are up, only the contract version differs — the WARN line is the
-    // signal and deps keeps exit 0 (a schema bump may still break the client
-    // at runtime; that is exactly what this line exists to predict).
+    // drift is not a concern). HDR_PROTOCOL is the *verified floor*: live ==
+    // pin is green, live > pin is forward-compatible INFO (herdr is additive
+    // by design — this is the signal that triggers a bd-protocol-v2X-bump
+    // bead later), live < pin is ERROR + exit 1 (server too old — the safety
+    // net, per ADR-0001 gap A1).
     match std::process::Command::new("herdr")
         .args(["api", "schema", "--json"])
         .output()
@@ -2833,25 +2884,39 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
         .filter(|o| o.status.success())
         .and_then(|o| herdr::parse_protocol(&String::from_utf8_lossy(&o.stdout)))
     {
-        Some(p) if p == herdr::HDR_PROTOCOL => println!(
-            "herdr protocol: {} (expected {})",
-            paint_ok(&p.to_string()),
-            herdr::HDR_PROTOCOL
-        ),
-        Some(p) => {
-            println!(
-                "herdr protocol: {} (expected {})",
-                crate::output::warn(&p.to_string()),
+        Some(p) => match protocol_check(p, herdr::HDR_PROTOCOL) {
+            ProtocolCheck::Match => println!(
+                "herdr protocol: {} (verified {})",
+                paint_ok(&p.to_string()),
                 herdr::HDR_PROTOCOL
-            );
-            eprintln!(
-                "flywheel: WARNING herdr protocol {p} != verified {} — schema drift may break the client",
-                herdr::HDR_PROTOCOL
-            );
-        }
+            ),
+            ProtocolCheck::Newer => {
+                println!(
+                    "herdr protocol: {} (verified {})",
+                    crate::output::warn(&p.to_string()),
+                    herdr::HDR_PROTOCOL
+                );
+                eprintln!(
+                    "flywheel: INFO herdr protocol {p} > verified {} — forward-compatible (client ignores what it doesn't know), but flywheel may not use new features; rebuild against the newer schema when ready",
+                    herdr::HDR_PROTOCOL
+                );
+            }
+            ProtocolCheck::Older => {
+                ok = false;
+                println!(
+                    "herdr protocol: {} (verified {})",
+                    crate::output::error(&p.to_string()),
+                    herdr::HDR_PROTOCOL
+                );
+                eprintln!(
+                    "flywheel: ERROR herdr protocol {p} < verified {} — server too old, our requests may be rejected; upgrade herdr or rebuild flywheel against the pinned schema",
+                    herdr::HDR_PROTOCOL
+                );
+            }
+        },
         None => {
             println!(
-                "herdr protocol: {} (expected {})",
+                "herdr protocol: {} (verified {})",
                 crate::output::warn("unknown"),
                 herdr::HDR_PROTOCOL
             );
