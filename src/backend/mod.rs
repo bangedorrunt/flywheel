@@ -73,6 +73,14 @@ pub struct SearchFilter {
     pub date_start: Option<String>,
     pub date_end: Option<String>,
     pub ranking: Option<String>,
+    /// Include the full `body_md` field on each result. agent-mail's
+    /// `search_messages` returns subject-only unless this is set; the
+    /// collaboration patterns (debate, plan-review) harvest reply bodies via
+    /// `harvest_latest`, so this flag must be expressible at the TRAIT level
+    /// (the `MailBackend::search` method takes `&SearchFilter`).
+    ///
+    /// governed-by: ADR-0001 §9.1/§9.2 (review-fix F1, bd-review-fix-epic-m0b.1)
+    pub include_body_md: bool,
 }
 
 /// Errors a backend may surface. `Unsupported` is the honest signal for a
