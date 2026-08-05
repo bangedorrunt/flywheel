@@ -431,7 +431,14 @@ enum Commands {
     },
     /// internal: notify a blocked agent via agent-mail (durable workflow leaf)
     #[command(name = "__mail-blocked", hide = true)]
-    __MailBlocked { project: String, name: String },
+    __MailBlocked {
+        project: String,
+        name: String,
+        /// escalation tier 0..3 (bd-blocked-escalation-protocol): 0=first ping,
+        /// 1=reply, 2=urgent+summarize, 3=halt
+        #[arg(long, default_value_t = 0)]
+        tier: u32,
+    },
     /// internal: diagnose unresponsive agent (tail + health mail)
     #[command(name = "__diagnose", hide = true)]
     __Diagnose {
@@ -1053,9 +1060,11 @@ fn main() {
             invocation.as_deref(),
             *iteration,
         ),
-        Some(Commands::__MailBlocked { project, name }) => {
-            cmd_internal_mail_blocked(&cfg, project, name)
-        }
+        Some(Commands::__MailBlocked {
+            project,
+            name,
+            tier,
+        }) => cmd_internal_mail_blocked(&cfg, project, name, *tier),
         Some(Commands::__Diagnose {
             project,
             name,
@@ -4891,7 +4900,17 @@ fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> 
 /// Best-effort by contract: a missing/unreachable agent-mail must NEVER kill
 /// an overnight loop (same standard as the lease-renewal heartbeat) — the
 /// leaf exits 0 with `{"ok": false, "error": ...}` and the next poll retries.
-fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str) -> Result<()> {
+/// internal leaf: notify a blocked agent via agent-mail, tiered
+/// (bd-blocked-escalation-protocol). Tier 0 = first ping (high + ack),
+/// 1 = reply high in-thread, 2 = urgent + thread summary, 3 = halt.
+///
+/// governed-by: ADR-0002 — constructs the mail backend via the factory so the
+/// durable loop is backend-agnostic (agent-mail MCP today; toron later).
+///
+/// Best-effort by contract: a missing/unreachable agent-mail must NEVER kill
+/// an overnight loop (same standard as the lease-renewal heartbeat) — the
+/// leaf exits 0 with `{"ok": false, "error": ...}` and the next poll retries.
+fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str, tier: u32) -> Result<()> {
     let mut mail = match backend::mail_backend(cfg) {
         Ok(m) => m,
         Err(e) => {
@@ -4904,19 +4923,48 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str) -> Result<
     // the recipient is the agent's REGISTERED agent-mail identity (bd-odc) —
     // `name` is the herdr name, which is not a registrable identity
     let mail_target = resolve_mail_target(name);
-    match mail.ensure_project(&key).and_then(|_| {
-        mail.send(
+    let thread = format!("health-{name}");
+    let out = mail.ensure_project(&key).and_then(|_| match tier {
+        0 => mail.send(
             &key,
             std::slice::from_ref(&mail_target),
             "[flywheel] you are blocked",
             "The swarm loop detected you are blocked. Resolve or report the blocker.",
             "high",
             true,
-            Some(&format!("health-{name}")),
-        )
-    }) {
+            Some(&thread),
+        ),
+        1 => mail.send(
+            &key,
+            std::slice::from_ref(&mail_target),
+            "[flywheel] still blocked — 2nd ping (high)",
+            "Still blocked after a full interval. Please resolve or report the blocker so the loop can continue.",
+            "high",
+            true,
+            Some(&thread),
+        ),
+        2 => mail.send(
+            &key,
+            std::slice::from_ref(&mail_target),
+            "[flywheel] URGENT: blocked — escalation",
+            "Still blocked after multiple pings. Escalating; human attention requested.",
+            "urgent",
+            true,
+            Some(&thread),
+        ),
+        _ => mail.send(
+            &key,
+            std::slice::from_ref(&mail_target),
+            "[flywheel] HALTS: blocked too long — human required",
+            "The swarm loop is halting because this agent stayed blocked past the escalation budget. Resolve the blocker, then re-run the loop.",
+            "urgent",
+            true,
+            Some(&thread),
+        ),
+    });
+    match out {
         Ok(_) => {
-            print_json(&json!({ "ok": true, "notified": mail_target }));
+            print_json(&json!({ "ok": true, "notified": mail_target, "tier": tier }));
             Ok(())
         }
         Err(e) => {
