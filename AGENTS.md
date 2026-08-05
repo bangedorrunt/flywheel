@@ -135,6 +135,12 @@ runs. Do not overload normal bead dispatch.
 ## Rules
 
 - **TDD**: write failing tests first (RED-GREEN-REFACTOR). `cargo test` must pass.
+- **Live suite**: `cargo test -- --ignored` runs the 6 live integration tests (agent-mail
+  round-trips, herdr parity) against the running server — requires agent-mail on :8765 and
+  herdr up. The default `cargo test` skips them loudly (each has an explicit reason + runbook).
+- **Review-fix regression gate**: `bash docs/decisions/_scripts/verify-review-fixes.sh` asserts the
+  F1-F8 fixes (harvest body, gate loop, xproj to_project/focus, T3 halt, backend migration,
+  default agents, cleanup) stay fixed; `verify-0001.sh` / `verify-0002.sh` gate the ADRs.
 - **No script-based code changes** in this repo — edit files manually.
 - **No file deletion** without explicit user permission.
 - **br is CLI-only**: `br ready --json`, `br update <id> --claim --actor "$AGENT_NAME"`,

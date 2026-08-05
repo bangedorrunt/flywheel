@@ -83,7 +83,11 @@ fn xproj_parse_contract_for_receiver_loop() {
         .args(["xproj", "parse", body])
         .output()
         .expect("xproj parse");
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("json");
     assert_eq!(v["ok"], true);
@@ -152,16 +156,25 @@ fn debate_soak_three_rounds_ack_gated_verdict() {
     // success optional (needs live agents); failure must be structured (exit 1)
     if out.status.success() {
         let stdout = String::from_utf8_lossy(&out.stdout);
+        // review-fix F9/F1: a SUCCESSFUL debate must produce a real verdict —
+        // the judge line (which harvests reply bodies, not subjects). Assert
+        // the verdict marker so a contentless debate cannot silently pass.
         assert!(
-            stdout.contains("debate") || stdout.contains("verdict"),
-            "success output should mention debate/verdict: {stdout}"
+            stdout.contains("verdict"),
+            "successful debate must print a verdict: {stdout}"
+        );
+        assert!(
+            !stdout.contains("no verdict harvested"),
+            "successful debate must harvest the judge's verdict: {stdout}"
         );
     } else {
-        // acceptable: no agents / mail — stderr should not be empty panic
+        // acceptable only when live agents are absent — the skip reason must be
+        // explicit, and a panic is never acceptable
         let err = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            !err.contains("panic"),
-            "debate must not panic: {err}"
+        assert!(!err.contains("panic"), "debate must not panic: {err}");
+        eprintln!(
+            "SKIP: debate live path failed (no scripted agents in a live herdr \
+             session?) — run against a spawned swarm for the full contract"
         );
     }
 }
@@ -278,7 +291,11 @@ fn cross_project_xproj_and_product_surface() {
         .args(["__xproj-inbox", "/tmp/flywheel-xproj-e2e", "--limit", "5"])
         .output()
         .expect("xproj-inbox");
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert!(v.get("items").is_some(), "shape: {v}");
