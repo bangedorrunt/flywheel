@@ -35,8 +35,11 @@ use crate::herdr::{
 };
 use serde_json::Value;
 
-// (R0.6 will re-export `factory::multiplexer_backend`/`mail_backend` here once
-// call sites consume them via `backend::multiplexer_backend(&cfg)`.)
+// Factory entry points — consumers (the durable-loop leaf handlers in main.rs)
+// call `backend::multiplexer_backend(&cfg)` / `backend::mail_backend(&cfg)`.
+// `resolve_*` / `DEFAULT_*` stay factory-local until a caller needs them
+// (R0.10 cli-backend-subcommand will surface them).
+pub use factory::{mail_backend, multiplexer_backend};
 
 /// Filter bag for `MailBackend::inbox` (fields only; semantics land with the
 /// beads that consume them — `bd-mail-ack-sla-tracking` owns the ack-overdue

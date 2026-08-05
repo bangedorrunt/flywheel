@@ -718,6 +718,81 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
     Ok(matched)
 }
 
+/// Trait-object overloads of `find_workspace` / `resolve_agents` for the
+/// durable-loop leaf handlers (`__poll` / `__send` / `__mail-blocked`), which
+/// construct their backend via the factory (`backend::multiplexer_backend`)
+/// per ADR-0002 §5. The one-shot CLI commands keep the `&mut Client` overloads
+/// (they're herdr-specific and don't need backend-agnosticism yet — migrating
+/// them is churn with no payoff until superlogical ships). The two overloads
+/// share the helper bodies via macros-free duplication (small, narrow).
+fn find_workspace_dyn(backend: &mut dyn backend::MultiplexerBackend, project: &str) -> Result<String> {
+    let label = swarm_label(project);
+    let matches: Vec<herdr::WorkspaceInfo> = backend
+        .workspace_list()?
+        .into_iter()
+        .filter(|ws| ws.label.as_deref() == Some(label.as_str()))
+        .collect();
+    if matches.is_empty() {
+        bail!("no flywheel swarm for {project} (run: flywheel spawn {project})")
+    }
+    if matches.len() > 1 {
+        let prefix = format!("flywheel-{}-", project_base(project));
+        let agents = backend.agent_list()?;
+        for ws in &matches {
+            if agents.iter().any(|a| {
+                a.workspace_id == ws.workspace_id
+                    && a.name.as_deref().map(|n| n.starts_with(&prefix)).unwrap_or(false)
+            }) {
+                return Ok(ws.workspace_id.clone());
+            }
+        }
+    }
+    Ok(matches[0].workspace_id.clone())
+}
+
+fn resolve_agents_dyn(
+    backend: &mut dyn backend::MultiplexerBackend,
+    ws_id: &str,
+    project: &str,
+    to: &str,
+) -> Result<Vec<AgentInfo>> {
+    let agents = backend.agent_list()?;
+    let in_ws: Vec<AgentInfo> = agents
+        .into_iter()
+        .filter(|a| a.workspace_id == ws_id)
+        .collect();
+    if in_ws.is_empty() {
+        bail!("no agents in workspace {ws_id} — is the swarm spawned?");
+    }
+    let avail: Vec<String> = in_ws
+        .iter()
+        .map(|a| a.name.clone().unwrap_or_default())
+        .collect();
+    let want: Vec<String> = if to == "all" {
+        avail.clone()
+    } else {
+        to.split(',')
+            .map(|s| agent_name(project, s.trim()))
+            .collect()
+    };
+    let matched: Vec<AgentInfo> = in_ws
+        .into_iter()
+        .filter(|a| {
+            a.name
+                .as_deref()
+                .map(|n| want.iter().any(|w| name_matches_want(n, w)))
+                .unwrap_or(false)
+        })
+        .collect();
+    if matched.is_empty() {
+        bail!(
+            "no agents match --to {to} in {project} (available: {})",
+            avail.join(", ")
+        );
+    }
+    Ok(matched)
+}
+
 /// Exact name, or a digit-suffixed ordinal of it (oc2 matches oc).
 fn name_matches_want(name: &str, want: &str) -> bool {
     name == want
@@ -2847,10 +2922,13 @@ fn cmd_loop_status(cfg: &Config, project: &str) -> Result<()> {
 }
 
 /// internal leaf: JSON [[name, status], ...] for a project's managed agents.
+///
+/// governed-by: ADR-0002 — constructs the multiplexer via the factory so the
+/// durable loop is backend-agnostic (herdr today; superlogical/toron later).
 fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
-    let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    let ws_id = find_workspace(&mut c, project)?;
-    let agents = c
+    let mut backend = backend::multiplexer_backend(cfg)?;
+    let ws_id = find_workspace_dyn(backend.as_mut(), project)?;
+    let agents = backend
         .agent_list()?
         .into_iter()
         .filter(|a| a.workspace_id == ws_id)
@@ -2867,7 +2945,7 @@ fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
             })
             .collect()
     } else {
-        let resolved = resolve_agents(&mut c, &ws_id, project, to)?;
+        let resolved = resolve_agents_dyn(backend.as_mut(), &ws_id, project, to)?;
         resolved
             .iter()
             .map(|a| {
@@ -2884,6 +2962,15 @@ fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
 }
 
 /// internal leaf: send one prompt to a named agent.
+///
+/// **ADR-0002 note:** this leaf is NOT yet migrated to the trait factory. The
+/// confirm-path uses `Client::agent_prompt_coded` (typed `HerdrError` code →
+/// `classify_send_result` landing semantics), which the trait surface doesn't
+/// expose (the trait's `agent_prompt` returns a minimal JSON, losing the coded
+/// error). Migrating requires either a trait-level coded-prompt method or a
+/// different landing-detection mechanism — a design question, deferred to a
+/// follow-up bead. The `__poll` and `__mail-blocked` leaves ARE migrated
+/// (they map cleanly onto trait methods).
 ///
 /// Without `--confirm`: fire-and-forget (`wait: None`) — byte-identical to
 /// the legacy path. With `--confirm [TIMEOUT_MS]`: wait for the prompt to
@@ -3198,8 +3285,12 @@ fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> 
 }
 
 /// internal leaf: notify a blocked agent via agent-mail.
+/// internal leaf: notify a blocked agent via agent-mail (durable workflow leaf).
+///
+/// governed-by: ADR-0002 — constructs the mail backend via the factory so the
+/// durable loop is backend-agnostic (agent-mail MCP today; toron later).
 fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str) -> Result<()> {
-    let mut mail = mail_or_die(cfg)?;
+    let mut mail = backend::mail_backend(cfg)?;
     let key = project_dir(cfg, project).to_str().unwrap().to_string();
     mail.ensure_project(&key)?;
     mail.send(
@@ -3209,7 +3300,9 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str) -> Result<
         "The swarm loop detected you are blocked. Resolve or report the blocker.",
         "high",
         true,
-    )?;
+        None, // thread_id — Phase 3 (bd-blocked-escalation-protocol) adds threading
+    )
+    .map_err(|e| anyhow!("mail backend: {e}"))?;
     print_json(&json!({ "ok": true, "notified": name }));
     Ok(())
 }
