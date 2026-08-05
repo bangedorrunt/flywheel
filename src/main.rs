@@ -859,6 +859,29 @@ fn agent_name_n(project: &str, short: &str, ordinal: u32) -> String {
     }
 }
 
+/// Resolve a bare kind short (or any non-name value) to a concrete spawned
+/// agent name for the pattern drivers (debate, plan-review). review-fix F7:
+/// defaults like `oc`/`pi`/`gk` must resolve to the spawned
+/// `flywheel-<base>-<short>` (the herdr agent name) so `settle_agent` finds
+/// the agent and `resolve_mail_target` maps it to its registered identity.
+///
+/// Pass-through rule (a value that is ALREADY a concrete name):
+/// - starts with `flywheel-` (a spawned herdr name) — pass through
+/// - is already a valid adjective+noun identity (`agent_mail_name` is
+///   idempotent on those — returns the value unchanged) — pass through
+/// - contains `:` (a raw pane id) — pass through
+/// Everything else (bare shorts like `oc`, `pi`, `gk`) expands to the first
+/// ordinal of that kind.
+fn resolve_agent_default(project: &str, value: &str) -> String {
+    let v = value.trim();
+    let already_concrete = v.starts_with("flywheel-") || v.contains(':') || agent_mail_name(v) == v;
+    if v.is_empty() || already_concrete {
+        v.to_string()
+    } else {
+        agent_name_n(project, v, 1)
+    }
+}
+
 /// The ordinal of an existing agent of a kind, if its name follows the scheme.
 fn agent_ordinal(name: &str, project: &str, short: &str) -> Option<u32> {
     let pfx = format!("flywheel-{}-{short}", project_base(project));
@@ -2355,6 +2378,37 @@ mod agent_mail_name_tests {
         assert_eq!(resolve_mail_target("TopazOx"), "TopazOx");
         assert_eq!(resolve_mail_target("oc"), "oc");
         assert_eq!(resolve_mail_target(""), "");
+    }
+
+    /// review-fix F7: bare shorts resolve to the spawned herdr name; concrete
+    /// names pass through unchanged.
+    #[test]
+    fn resolve_agent_default_expands_shorts_and_passes_concrete() {
+        // bare shorts expand to the first-ordinal spawned name
+        assert_eq!(
+            resolve_agent_default("hachiko", "oc"),
+            "flywheel-hachiko-oc"
+        );
+        assert_eq!(
+            resolve_agent_default("hachiko", "pi"),
+            "flywheel-hachiko-pi"
+        );
+        assert_eq!(
+            resolve_agent_default("hachiko", "gk"),
+            "flywheel-hachiko-gk"
+        );
+        // explicit spawned names pass through
+        assert_eq!(
+            resolve_agent_default("hachiko", "flywheel-hachiko-oc2"),
+            "flywheel-hachiko-oc2"
+        );
+        // an already-mapped adjective+noun identity passes through
+        let mapped = agent_mail_name("flywheel-hachiko-oc");
+        assert_eq!(resolve_agent_default("hachiko", &mapped), mapped);
+        // raw pane id passes through
+        assert_eq!(resolve_agent_default("hachiko", "w1:p1"), "w1:p1");
+        // empty stays empty (caller validates distinctness)
+        assert_eq!(resolve_agent_default("hachiko", ""), "");
     }
 }
 
@@ -4943,21 +4997,25 @@ fn cmd_debate(
     let ts = crate::state::now_iso().replacen('-', "", 10); // compact ts for the thread id
     let thread = format!("debate-{ts}");
 
+    // scope the debate to the project dir (the proposition may be a project
+    // name; default to the flywheel project for ad-hoc debates)
+    let project = if cfg.workspace_root().join(proposition).exists() {
+        proposition.to_string()
+    } else {
+        "flywheel".to_string()
+    };
+    let key = project_dir(cfg, &project).to_str().unwrap().to_string();
+
     // agent names: explicit or default to the swarm's first oc/pi/gk
-    let (a, b, j) = resolve_debate_agents(cfg, proposition, agent_a, agent_b, judge, &thread)?;
+    // (review-fix F7: bare shorts resolve to the spawned flywheel-<base>-<short>
+    // so settle + mail addressing work against a default swarm)
+    let (a, b, j) = resolve_debate_agents(&project, agent_a, agent_b, judge)?;
 
     let mut mail = match backend::mail_backend(cfg) {
         Ok(m) => m,
         Err(e) => bail!("mail backend unavailable for debate: {e:#}"),
     };
     let mut mux = backend::multiplexer_backend(cfg)?;
-    // scope the debate to the project dir (the proposition may be a project
-    // name; default to the flywheel project for ad-hoc debates)
-    let key = if cfg.workspace_root().join(proposition).exists() {
-        project_dir(cfg, proposition).to_str().unwrap().to_string()
-    } else {
-        project_dir(cfg, "flywheel").to_str().unwrap().to_string()
-    };
     mail.ensure_project(&key)?;
 
     let mail_target = |agent: &str| resolve_mail_target(agent).to_string();
@@ -4968,7 +5026,7 @@ fn cmd_debate(
     );
     mail.send(
         &key,
-        &[mail_target(a)],
+        &[mail_target(&a)],
         &format!("[debate] {proposition}"),
         &opening,
         "high",
@@ -4980,15 +5038,7 @@ fn cmd_debate(
     let mut last_reply: Option<String> = None;
     for round in 1..=rounds {
         // A speaks on odd rounds (round 1 opening + counters), B on even
-        let speaker = if round == 1 {
-            a
-        } else if round % 2 == 1 {
-            a
-        } else {
-            b
-        };
-        let opponent = if speaker == a { b } else { a };
-        let _ = opponent;
+        let speaker: &str = if round % 2 == 1 { &a } else { &b };
         if round > 1 {
             let reply = last_reply.clone().unwrap_or_default();
             let counter = format!(
@@ -5018,15 +5068,15 @@ fn cmd_debate(
     );
     mail.send(
         &key,
-        &[mail_target(j)],
+        &[mail_target(&j)],
         &format!("[debate] {proposition} — judge"),
         &judge_prompt,
         "high",
         true,
         Some(&thread),
     )?;
-    settle_agent(mux.as_mut(), j)?;
-    let verdict = harvest_latest(mail.as_mut(), &key, &thread, &resolve_mail_target(j))?;
+    settle_agent(mux.as_mut(), &j)?;
+    let verdict = harvest_latest(mail.as_mut(), &key, &thread, &resolve_mail_target(&j))?;
     println!(
         "debate {thread} verdict: {}",
         verdict.unwrap_or_else(|| "(no verdict harvested)".into())
@@ -5282,9 +5332,11 @@ fn cmd_plan_review(
         Some(id) => format!("plan-{id}"),
         None => format!("plan-{ts}"),
     };
-    let planner = planner.unwrap_or("oc");
-    let reviewer = reviewer.unwrap_or("pi");
-    let implementer = implementer.unwrap_or("gk");
+    // review-fix F7: defaults resolve to the spawned flywheel-<base>-<short>
+    // names; explicit full names pass through unchanged.
+    let planner = resolve_agent_default(project, planner.unwrap_or("oc"));
+    let reviewer = resolve_agent_default(project, reviewer.unwrap_or("pi"));
+    let implementer = resolve_agent_default(project, implementer.unwrap_or("gk"));
     if planner == reviewer || planner == implementer || reviewer == implementer {
         bail!("plan-review needs three distinct agents (planner/reviewer/implementer)");
     }
@@ -5317,15 +5369,15 @@ fn cmd_plan_review(
     let open = pri_planner_prompt(feature, &current_path);
     mail.send(
         &key,
-        &[mail_target(planner)],
+        &[mail_target(&planner)],
         &subject,
         &open,
         "high",
         true,
         Some(&thread),
     )?;
-    settle_agent(mux.as_mut(), planner)?;
-    let planner_mail = mail_target(planner);
+    settle_agent(mux.as_mut(), &planner)?;
+    let planner_mail = mail_target(&planner);
     let plan_reply =
         harvest_latest(mail.as_mut(), &key, &thread, &planner_mail)?.unwrap_or_default();
     current_path = extract_plan_path(&plan_reply, &current_path);
@@ -5353,15 +5405,15 @@ fn cmd_plan_review(
                 };
                 mail.send(
                     &key,
-                    &[mail_target(planner)],
+                    &[mail_target(&planner)],
                     &subject,
                     &msg,
                     "high",
                     true,
                     Some(&thread),
                 )?;
-                settle_agent(mux.as_mut(), planner)?;
-                let pr = harvest_latest(mail.as_mut(), &key, &thread, &mail_target(planner))?
+                settle_agent(mux.as_mut(), &planner)?;
+                let pr = harvest_latest(mail.as_mut(), &key, &thread, &mail_target(&planner))?
                     .unwrap_or_default();
                 current_path = extract_plan_path(&pr, &current_path);
                 let (p2, a2) = pri_after_plan(&current_path);
@@ -5378,15 +5430,15 @@ fn cmd_plan_review(
                 };
                 mail.send(
                     &key,
-                    &[mail_target(reviewer)],
+                    &[mail_target(&reviewer)],
                     &subject,
                     &msg,
                     "high",
                     true,
                     Some(&thread),
                 )?;
-                settle_agent(mux.as_mut(), reviewer)?;
-                let body = harvest_latest(mail.as_mut(), &key, &thread, &mail_target(reviewer))?
+                settle_agent(mux.as_mut(), &reviewer)?;
+                let body = harvest_latest(mail.as_mut(), &key, &thread, &mail_target(&reviewer))?
                     .unwrap_or_default();
                 let token = parse_review_token(&body).ok_or_else(|| {
                     anyhow!(
@@ -5409,14 +5461,14 @@ fn cmd_plan_review(
                 };
                 mail.send(
                     &key,
-                    &[mail_target(implementer)],
+                    &[mail_target(&implementer)],
                     &subject,
                     &msg,
                     "high",
                     true,
                     Some(&thread),
                 )?;
-                settle_agent(mux.as_mut(), implementer)?;
+                settle_agent(mux.as_mut(), &implementer)?;
                 let (p2, a2) = pri_after_implement(&current_path);
                 phase = p2; // AwaitingVerify
                 action = a2;
@@ -5429,15 +5481,15 @@ fn cmd_plan_review(
                 };
                 mail.send(
                     &key,
-                    &[mail_target(reviewer)],
+                    &[mail_target(&reviewer)],
                     &subject,
                     &msg,
                     "high",
                     true,
                     Some(&thread),
                 )?;
-                settle_agent(mux.as_mut(), reviewer)?;
-                let rev2 = harvest_latest(mail.as_mut(), &key, &thread, &mail_target(reviewer))?
+                settle_agent(mux.as_mut(), &reviewer)?;
+                let rev2 = harvest_latest(mail.as_mut(), &key, &thread, &mail_target(&reviewer))?
                     .unwrap_or_default();
                 let token2 = parse_review_token(&rev2).ok_or_else(|| {
                     anyhow!("verify reply missing VERIFIED|REJECT: token: {rev2}")
@@ -5468,17 +5520,19 @@ fn cmd_plan_review(
 
 /// Resolve the A/B/judge agents for a debate: explicit names, or default to
 /// the swarm's first agents. Returns the (a, b, j) herdr agent names.
+/// Resolve the A/B/judge agents for a debate: explicit names, or default to
+/// the swarm's first agents. Returns the (a, b, j) herdr agent names.
+/// review-fix F7: bare shorts (`oc`/`pi`/`gk`) expand to the spawned
+/// `flywheel-<base>-<short>` names; explicit full names pass through.
 fn resolve_debate_agents<'a>(
-    _cfg: &Config,
-    _proposition: &str,
+    project: &str,
     agent_a: Option<&'a str>,
     agent_b: Option<&'a str>,
     judge: Option<&'a str>,
-    _thread: &str,
-) -> Result<(&'a str, &'a str, &'a str)> {
-    let a = agent_a.unwrap_or("oc");
-    let b = agent_b.unwrap_or("pi");
-    let j = judge.unwrap_or("gk");
+) -> Result<(String, String, String)> {
+    let a = resolve_agent_default(project, agent_a.unwrap_or("oc"));
+    let b = resolve_agent_default(project, agent_b.unwrap_or("pi"));
+    let j = resolve_agent_default(project, judge.unwrap_or("gk"));
     if a == b {
         bail!("debate needs two distinct agents (A and B are both '{a}')");
     }
@@ -6782,31 +6836,24 @@ mod debate_tests {
 
     #[test]
     fn debate_resolves_default_agents() {
-        let (_a, _b, j) =
-            resolve_debate_agents(&Config::default(), "p", None, None, None, "t").unwrap();
-        assert_eq!(j, "gk"); // judge defaults to grok
+        let (_a, _b, j) = resolve_debate_agents("hachiko", None, None, None).unwrap();
+        // review-fix F7: defaults expand to the spawned name
+        assert_eq!(j, "flywheel-hachiko-gk"); // judge defaults to grok
     }
 
     #[test]
     fn debate_rejects_same_agent_for_a_and_b() {
-        let r = resolve_debate_agents(&Config::default(), "p", Some("oc"), Some("oc"), None, "t");
+        let r = resolve_debate_agents("hachiko", Some("oc"), Some("oc"), None);
         assert!(r.is_err(), "A and B must be distinct");
     }
 
     #[test]
     fn debate_accepts_explicit_agents() {
-        let (a, b, j) = resolve_debate_agents(
-            &Config::default(),
-            "p",
-            Some("pi"),
-            Some("gk"),
-            Some("oc"),
-            "t",
-        )
-        .unwrap();
-        assert_eq!(a, "pi");
-        assert_eq!(b, "gk");
-        assert_eq!(j, "oc");
+        let (a, b, j) =
+            resolve_debate_agents("hachiko", Some("pi"), Some("gk"), Some("oc")).unwrap();
+        assert_eq!(a, "flywheel-hachiko-pi");
+        assert_eq!(b, "flywheel-hachiko-gk");
+        assert_eq!(j, "flywheel-hachiko-oc");
     }
 }
 
