@@ -38,7 +38,6 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-
 use crate::config::state_dir;
 use crate::herdr::AgentStatus;
 
@@ -126,7 +125,11 @@ pub struct ActiveLoop {
 
 impl ActiveLoop {
     /// Construct a v2 entry with empty control fields (fresh loop start).
-    pub fn new(id: impl Into<String>, params: serde_json::Value, created: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        params: serde_json::Value,
+        created: impl Into<String>,
+    ) -> Self {
         Self {
             id: id.into(),
             params,
@@ -203,7 +206,9 @@ pub fn serialize_loops_registry(loops: &BTreeMap<String, ActiveLoop>) -> Result<
     for (project, al) in loops {
         map.insert(project.clone(), serde_json::to_value(al)?);
     }
-    Ok(serde_json::to_string_pretty(&serde_json::Value::Object(map))?)
+    Ok(serde_json::to_string_pretty(&serde_json::Value::Object(
+        map,
+    ))?)
 }
 
 /// Atomically write the full registry as schema v2.
@@ -283,7 +288,9 @@ pub struct SentRecord {
 pub const LAST_SENT_CAP: usize = 50;
 
 pub fn last_sent_file(project: &str) -> PathBuf {
-    state_dir().join("last_sent").join(format!("{project}.json"))
+    state_dir()
+        .join("last_sent")
+        .join(format!("{project}.json"))
 }
 
 /// Load the project's sent records. Missing or corrupt files yield an empty
@@ -330,7 +337,10 @@ pub fn find_last_sent<'a>(
     name: &str,
     text_hash: u64,
 ) -> Option<&'a SentRecord> {
-    records.iter().rev().find(|r| r.name == name && r.text_hash == text_hash)
+    records
+        .iter()
+        .rev()
+        .find(|r| r.name == name && r.text_hash == text_hash)
 }
 
 /// FNV-1a 64: a trivial, byte-stable hash. Chosen over
@@ -349,8 +359,7 @@ pub fn fnv1a64(text: &str) -> u64 {
 pub fn log_event(project: &str, kind: EventKind, data: serde_json::Value) -> Result<()> {
     let path = project_log_path(project);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let entry = LogEntry {
         ts: now_iso(),
@@ -410,10 +419,15 @@ pub struct CheckpointAgent {
     pub pane_id: String,
 }
 
-pub fn save_checkpoint(project: &str, message: &str, workspace_id: Option<&str>, agents: Vec<CheckpointAgent>, git_dir: Option<&str>) -> Result<PathBuf> {
+pub fn save_checkpoint(
+    project: &str,
+    message: &str,
+    workspace_id: Option<&str>,
+    agents: Vec<CheckpointAgent>,
+    git_dir: Option<&str>,
+) -> Result<PathBuf> {
     let dir = project_checkpoint_dir(project);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let slug = slugify(message);
     let ts = now_compact();
     let path = dir.join(format!("{ts}-{slug}.json"));
@@ -439,7 +453,9 @@ pub fn list_checkpoints(project: &str) -> Result<Vec<Checkpoint>> {
     for entry in std::fs::read_dir(&dir)? {
         let path = entry?.path();
         if path.extension().map(|e| e == "json").unwrap_or(false) {
-            let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             if let Ok(cp) = serde_json::from_str::<Checkpoint>(&raw) {
                 out.push(cp);
             }
@@ -695,7 +711,10 @@ mod loops_schema_v2_tests {
         let got = map2.get("/tmp/p").unwrap();
         assert_eq!(got, &al);
         assert_eq!(got.event_cursor.as_ref().unwrap().max_seq, 42);
-        assert_eq!(got.escalation["AgentOne"].first_blocked_ts, 1_700_000_000_000_000);
+        assert_eq!(
+            got.escalation["AgentOne"].first_blocked_ts,
+            1_700_000_000_000_000
+        );
         assert_eq!(got.respawn["AgentOne"].respawn_count, 2);
     }
 
@@ -854,7 +873,8 @@ mod last_sent_tests {
 
     #[test]
     fn load_save_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("flywheel-lastsent-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("flywheel-lastsent-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // the state dir is fixed by state_dir(); we test through the real file
         // path machinery by temporarily pointing LAST_SENT at a temp dir —

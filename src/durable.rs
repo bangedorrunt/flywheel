@@ -6,12 +6,16 @@
 //! checkpoint on restart with the same invocation id. The queue and the agent
 //! states are deterministic across replays because every effect is checkpointed.
 //!
-//! Leaves shell out to the flywheel binary itself (`__poll` / `__send` hidden
-//! subcommands) so the blocking herdr socket client never runs on the async
-//! executor and each side effect is a single crash-safe process.
+//! Leaves shell out to the flywheel binary itself (`__poll` / `__poll_events` /
+//! `__send` hidden subcommands) so the blocking herdr socket client never runs
+//! on the async executor and each side effect is a single crash-safe process.
+//!
+//! **Event stream (bd-event-subscribe-reactor):** `__poll_events` is a forward-
+//! only latency optimization. herdr has no since/seq replay. The heartbeat
+//! `__poll` (agent.list snapshot) is the correctness floor on every iteration
+//! and after crash-resume.
 
 use std::process::Command;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -96,12 +100,46 @@ pub struct PollKindArgs {
     pub name: String,
 }
 
+/// Args for the `__poll_events` leaf (bd-event-subscribe-reactor).
+/// Simple identifier params only — Resonate constraint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PollEventsArgs {
+    pub project: String,
+    /// block up to this many ms collecting events
+    pub timeout_ms: u64,
+    /// best-effort in-run dedup cursor (0 = none)
+    #[serde(default)]
+    pub after_seq: u64,
+}
+
+/// One status-change event from `__poll_events`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PollEvent {
+    pub event_type: String,
+    pub pane_id: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    pub seq: u64,
+}
+
+/// Batch returned by `__poll_events`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PollEventsBatch {
+    #[serde(default)]
+    pub events: Vec<PollEvent>,
+    #[serde(default)]
+    pub max_seq: u64,
+    #[serde(default)]
+    pub stream_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadArgs {
     pub project: String,
     pub name: String,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RespawnArgs {
@@ -213,6 +251,129 @@ async fn poll_swarm(args: PollArgs) -> Result<Vec<AgentState>> {
     Ok(out_states)
 }
 
+/// Collect herdr push events for up to `timeout_ms` (forward-only).
+/// Checkpointed. Empty batch on stream failure is a soft outcome (the
+/// heartbeat `__poll` remains the correctness floor).
+#[function]
+async fn poll_events(args: PollEventsArgs) -> Result<PollEventsBatch> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args([
+        "__poll_events",
+        &args.project,
+        "--timeout-ms",
+        &args.timeout_ms.to_string(),
+    ]);
+    if args.after_seq > 0 {
+        cmd.args(["--after-seq", &args.after_seq.to_string()]);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| map_err(anyhow::anyhow!("__poll_events spawn failed: {e}")))?;
+    if !out.status.success() {
+        // soft-fail: return empty batch with the error so the loop can fall
+        // back to heartbeat __poll without killing the workflow
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Ok(PollEventsBatch {
+            events: vec![],
+            max_seq: args.after_seq,
+            stream_error: Some(if err.is_empty() {
+                format!("__poll_events exit {}", out.status)
+            } else {
+                err
+            }),
+        });
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    parse_poll_events_batch(raw.trim(), args.after_seq).map_err(map_err)
+}
+
+/// Pure parse of `__poll_events` stdout (unit-testable).
+pub fn parse_poll_events_batch(raw: &str, fallback_seq: u64) -> anyhow::Result<PollEventsBatch> {
+    let v: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| anyhow::anyhow!("__poll_events bad JSON: {e}: {raw}"))?;
+    let events = v
+        .get("events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::with_capacity(events.len());
+    for e in events {
+        let event_type = e
+            .get("event_type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let pane_id = e
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let agent = e
+            .get("agent")
+            .and_then(|a| {
+                if a.is_null() {
+                    None
+                } else {
+                    a.as_str().map(str::to_string)
+                }
+            });
+        let status = e
+            .get("status")
+            .and_then(|s| {
+                if s.is_null() {
+                    None
+                } else {
+                    s.as_str().map(str::to_string)
+                }
+            });
+        let seq = e.get("seq").and_then(Value::as_u64).unwrap_or(0);
+        out.push(PollEvent {
+            event_type,
+            pane_id,
+            agent,
+            status,
+            seq,
+        });
+    }
+    let max_seq = v
+        .get("max_seq")
+        .and_then(Value::as_u64)
+        .unwrap_or(fallback_seq);
+    let stream_error = v
+        .get("stream_error")
+        .and_then(|e| {
+            if e.is_null() {
+                None
+            } else {
+                e.as_str().map(str::to_string)
+            }
+        });
+    Ok(PollEventsBatch {
+        events: out,
+        max_seq,
+        stream_error,
+    })
+}
+
+/// Log each routed event to the project JSONL audit trail.
+pub fn log_poll_events(project: &str, batch: &PollEventsBatch) {
+    for e in &batch.events {
+        let _ = crate::state::log_event(
+            project,
+            crate::state::EventKind::State,
+            serde_json::json!({
+                "source": "poll_events",
+                "event_type": e.event_type,
+                "pane_id": e.pane_id,
+                "agent": e.agent,
+                "status": e.status,
+                "seq": e.seq,
+            }),
+        );
+    }
+}
+
 /// List ready beads via the flywheel binary (`br ready --json` in the project).
 /// Checkpointed.
 #[function]
@@ -238,8 +399,16 @@ async fn poll_ready(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
     let mut out_beads = Vec::with_capacity(beads.len());
     for b in beads {
         out_beads.push(ReadyBead {
-            id: b.get("id").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
-            title: b.get("title").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+            id: b
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            title: b
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         });
     }
     Ok(out_beads)
@@ -340,9 +509,7 @@ pub fn parse_read_output(v: &serde_json::Value) -> anyhow::Result<ReadOutput> {
 pub fn should_resend(record: Option<&crate::state::SentRecord>, current_invocation: &str) -> bool {
     match record {
         None => true,
-        Some(r) => {
-            r.invocation != current_invocation || !r.landed
-        }
+        Some(r) => r.invocation != current_invocation || !r.landed,
     }
 }
 
@@ -369,8 +536,16 @@ async fn poll_inprogress(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
     Ok(beads
         .iter()
         .map(|b| ReadyBead {
-            id: b.get("id").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
-            title: b.get("title").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+            id: b
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            title: b
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         })
         .collect())
 }
@@ -418,7 +593,6 @@ async fn read_output(args: ReadArgs) -> Result<ContextVerdict> {
         .unwrap_or(0);
     Ok(context_verdict(&ro.terminal, ro.state.as_ref(), now_unix))
 }
-
 
 /// Replace an exhausted agent with a fresh instance in a new pane.
 /// Checkpointed. Logs a `Respawn` event (side effect inside the leaf so the
@@ -559,7 +733,8 @@ async fn renew_leases(args: RenewLeaseArgs) -> Result<Value> {
         )));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(&stdout).map_err(|e| map_err(anyhow::anyhow!("__renew-leases bad JSON: {e}: {stdout}")))
+    serde_json::from_str(&stdout)
+        .map_err(|e| map_err(anyhow::anyhow!("__renew-leases bad JSON: {e}: {stdout}")))
 }
 
 /// Lease TTL policy for loop-made reservations: an initial TTL of
@@ -596,27 +771,35 @@ pub enum LoopAction {
     Wait,
 }
 
-pub fn plan_actions(states: &[AgentState], queue: &mut Vec<String>, nudge: Option<&str>) -> Vec<LoopAction> {
+pub fn plan_actions(
+    states: &[AgentState],
+    queue: &mut Vec<String>,
+    nudge: Option<&str>,
+) -> Vec<LoopAction> {
     let mut actions = Vec::new();
     for s in states {
         match s.status.as_str() {
             "working" => actions.push(LoopAction::Wait),
-            "blocked" => actions.push(LoopAction::Blocked { name: s.name.clone() }),
+            "blocked" => actions.push(LoopAction::Blocked {
+                name: s.name.clone(),
+            }),
             // never dispatch to an unclassified agent — queue stays intact
             "unknown" => actions.push(LoopAction::Wait),
             _ => {
                 // idle / done → feed work or nudge
                 if !queue.is_empty() {
                     let text = queue.remove(0); // FIFO: stages in declared order
-                    // bead/resume prompts carry a {AGENT_NAME} placeholder —
-                    // substitute the receiving agent's herdr name so the
-                    // state-file path is concrete (no-op for plain prompts)
+                                                // bead/resume prompts carry a {AGENT_NAME} placeholder —
+                                                // substitute the receiving agent's herdr name so the
+                                                // state-file path is concrete (no-op for plain prompts)
                     actions.push(LoopAction::Send {
                         name: s.name.clone(),
                         text: text.replace("{AGENT_NAME}", &s.name),
                     });
                 } else if nudge.is_some() {
-                    actions.push(LoopAction::Nudge { name: s.name.clone() });
+                    actions.push(LoopAction::Nudge {
+                        name: s.name.clone(),
+                    });
                 } else {
                     actions.push(LoopAction::Wait);
                 }
@@ -767,7 +950,10 @@ pub fn learn_kinds(kinds: &mut std::collections::HashMap<String, String>, states
 /// Pick the kind for a respawn: the kind learned from polls (authoritative —
 /// a dropped agent's record cannot be re-queried), else the caller falls back
 /// to the `poll_kind` leaf.
-pub fn respawn_kind(kinds: &std::collections::HashMap<String, String>, name: &str) -> Option<String> {
+pub fn respawn_kind(
+    kinds: &std::collections::HashMap<String, String>,
+    name: &str,
+) -> Option<String> {
     kinds.get(name).cloned()
 }
 
@@ -861,7 +1047,7 @@ pub fn track_unknown(
 /// and the unknown-status repair (bd-unknown-respawn) so an agent can never
 /// be double-respawned in one iteration.
 #[allow(clippy::too_many_arguments)] // the single respawn point: ctx, params, queue,
-// kinds, name, text, reason, attempts — every parameter is load-bearing.
+                                     // kinds, name, text, reason, attempts — every parameter is load-bearing.
 async fn respawn_and_requeue(
     ctx: &Context,
     params: &LoopParams,
@@ -914,14 +1100,24 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // per-agent consecutive send-failure count (send-stall escalation).
     // Workflow-local and deterministic: rebuilt identically on replay from
     // the checkpointed leaf results (poll states + send outcomes).
-    let mut send_failures: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut send_failures: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     // per-agent herdr kind learned from polls — needed to respawn an agent
     // whose record has been dropped (the escalation path).
-    let mut agent_kinds: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut agent_kinds: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     // per-agent consecutive `unknown` poll count (unknown-status repair).
     // Workflow-local and deterministic: rebuilt identically on replay from
     // the checkpointed poll results.
     let mut unknown_seen: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    // best-effort in-run event cursor (bd-event-subscribe-reactor). NOT used
+    // for crash recovery — heartbeat __poll is the floor. Survives within a
+    // single workflow run via local state; loops.json event_cursor is optional.
+    let mut event_cursor_seq: u64 = 0;
+    // consecutive __poll_events stream errors → force-log WARN at 3 (bead §6)
+    let mut event_stream_errors: u64 = 0;
+    // adaptive wait for the next poll_events block (starts active)
+    let mut wait_secs: u64 = params.active_interval_secs.max(5);
 
     loop {
         iteration += 1;
@@ -934,6 +1130,39 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             }
         }
 
+        // ---- event wake (latency optimization, forward-only) ----
+        // Blocks up to wait_secs collecting push events. Empty batch on
+        // idle/timeout is normal. Stream errors soft-fail into heartbeat.
+        let event_batch: PollEventsBatch = ctx
+            .run(
+                poll_events,
+                PollEventsArgs {
+                    project: params.project.clone(),
+                    timeout_ms: wait_secs.saturating_mul(1000),
+                    after_seq: event_cursor_seq,
+                },
+            )
+            .await?;
+        if event_batch.stream_error.is_some() {
+            event_stream_errors = event_stream_errors.saturating_add(1);
+            if event_stream_errors == 3 {
+                eprintln!(
+                    "flywheel: WARN event stream may be dead; heartbeat fallback active ({})",
+                    event_batch.stream_error.as_deref().unwrap_or("?")
+                );
+            }
+        } else {
+            event_stream_errors = 0;
+        }
+        if event_batch.max_seq > event_cursor_seq {
+            event_cursor_seq = event_batch.max_seq;
+        }
+        log_poll_events(&params.project, &event_batch);
+
+        // ---- correctness floor: authoritative agent.list snapshot ----
+        // Always runs. Catches any state change missed during a crash gap
+        // (events are not replayed). Full routing of event_batch is owned by
+        // bd-event-dispatch-zero-latency; here events only wake the loop early.
         let states: Vec<AgentState> = ctx
             .run(
                 poll_swarm,
@@ -958,8 +1187,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // queue intact meanwhile.
         for s in &states {
             let prev = unknown_seen.get(&s.name).copied().unwrap_or(0);
-            if track_unknown(&mut unknown_seen, &s.name, &s.status, UNKNOWN_RESPAWN_THRESHOLD)
-                == UnknownAction::Respawn
+            if track_unknown(
+                &mut unknown_seen,
+                &s.name,
+                &s.status,
+                UNKNOWN_RESPAWN_THRESHOLD,
+            ) == UnknownAction::Respawn
             {
                 respawn_and_requeue(
                     ctx,
@@ -1006,10 +1239,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     },
                 )
                 .await?;
-            let to_assign: Vec<&ReadyBead> = ready
-                .iter()
-                .filter(|b| !assigned.contains(&b.id))
-                .collect();
+            let to_assign: Vec<&ReadyBead> =
+                ready.iter().filter(|b| !assigned.contains(&b.id)).collect();
             for bead in to_assign {
                 queue.push(bead_prompt(&bead.id, &bead.title));
                 assigned.push(bead.id.clone());
@@ -1145,20 +1376,61 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 }
                 LoopAction::Nudge { name } => {
                     if let Some(n) = &params.nudge {
-                        ctx.run(
-                            send_prompt,
-                            SendArgs {
-                                project: params.project.clone(),
+                        // same failure contract as the Send path: a leaf error
+                        // (agent dropped mid-wait) must NOT kill the loop —
+                        // escalate to a respawn so the fresh instance gets
+                        // nudged next poll. A nudge consumes nothing from the
+                        // queue, so there is nothing to requeue.
+                        let outcome = match ctx
+                            .run(
+                                send_prompt,
+                                SendArgs {
+                                    project: params.project.clone(),
+                                    name: name.clone(),
+                                    text: n.clone(),
+                                    confirm: params.confirm_sends,
+                                    confirm_timeout_ms: params.confirm_timeout_ms,
+                                    invocation: params.invocation.clone(),
+                                    iteration,
+                                },
+                            )
+                            .await
+                        {
+                            Ok(o) => o,
+                            Err(e) => SendOutcome {
+                                ok: false,
                                 name: name.clone(),
-                                text: n.clone(),
-                                confirm: params.confirm_sends,
-                                confirm_timeout_ms: params.confirm_timeout_ms,
-                                invocation: params.invocation.clone(),
-                                iteration,
+                                landed: Some(false),
+                                status: None,
+                                reason: Some(format!("error:{e}")),
+                                deduped: false,
                             },
-                        )
-                        .await?;
+                        };
                         any_work = true;
+                        match handle_send_result(&mut send_failures, name, &outcome) {
+                            Escalation::Accept => {}
+                            Escalation::FailStop => {
+                                return Err(map_err(anyhow::anyhow!(
+                                    "agent {name} failed to accept 3 prompts in a row (last reason: {:?})",
+                                    outcome.reason
+                                )));
+                            }
+                            Escalation::RespawnAndRequeue => {
+                                let attempts = send_failures.get(name).copied().unwrap_or(0);
+                                let reason = outcome.reason.as_deref().unwrap_or("stalled");
+                                respawn_and_requeue(
+                                    ctx,
+                                    &params,
+                                    &mut queue,
+                                    &agent_kinds,
+                                    name,
+                                    None,
+                                    reason,
+                                    attempts,
+                                )
+                                .await?;
+                            }
+                        }
                     }
                 }
                 LoopAction::Wait => {}
@@ -1215,17 +1487,21 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             Err(e) => eprintln!("flywheel: lease renew failed (continuing): {e}"),
         }
 
-        // durable pause — the worker may exit here; the server resumes us.
-        // Adaptive cadence: active interval after a dispatch and while anyone
-        // is working/blocked/unknown, base interval when settled (the 5s
-        // floor lives in the fn).
-        ctx.sleep(Duration::from_secs(next_interval_secs(
+        // Adaptive wait for the NEXT poll_events block. We already blocked
+        // inside poll_events for wait_secs (or woke early on events), so there
+        // is no trailing ctx.sleep — that would double the idle latency.
+        // Resonate still checkpoints each leaf; crash mid-wait re-runs the
+        // leaf (fresh forward-only subscription — correct).
+        wait_secs = next_interval_secs(
             &states,
             any_work,
             params.interval_secs,
             params.active_interval_secs,
-        )))
-        .await?;
+        );
+        // if events woke us, tighten the next wait so we re-sample promptly
+        if !event_batch.events.is_empty() {
+            wait_secs = wait_secs.min(params.active_interval_secs).max(5);
+        }
     }
 }
 
@@ -1246,6 +1522,9 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     resonate
         .register(poll_swarm)
         .map_err(|e| anyhow::anyhow!("register poll_swarm: {e}"))?;
+    resonate
+        .register(poll_events)
+        .map_err(|e| anyhow::anyhow!("register poll_events: {e}"))?;
     resonate
         .register(send_prompt)
         .map_err(|e| anyhow::anyhow!("register send_prompt: {e}"))?;
@@ -1378,7 +1657,9 @@ mod tests {
         let mut q = vec!["p1".to_string(), "p6".to_string()];
         let actions = plan_actions(&states, &mut q, None);
         assert_eq!(q.len(), 1);
-        assert!(matches!(&actions[0], LoopAction::Send { name, text } if name == "a" && text == "p1"));
+        assert!(
+            matches!(&actions[0], LoopAction::Send { name, text } if name == "a" && text == "p1")
+        );
     }
 
     #[test]
@@ -1571,8 +1852,14 @@ mod tests {
     fn escalate_timeout_accepts() {
         // ambiguous: the prompt may have started — verify next poll, never
         // respawn, and never FailStop even with a large counter
-        assert_eq!(escalate(&so(Some(false), Some("timeout")), 0), Escalation::Accept);
-        assert_eq!(escalate(&so(Some(false), Some("timeout")), 9), Escalation::Accept);
+        assert_eq!(
+            escalate(&so(Some(false), Some("timeout")), 0),
+            Escalation::Accept
+        );
+        assert_eq!(
+            escalate(&so(Some(false), Some("timeout")), 9),
+            Escalation::Accept
+        );
     }
 
     #[test]
@@ -1647,7 +1934,11 @@ mod tests {
         f.insert("work".to_string(), 2);
         f.insert("block".to_string(), 1);
         f.insert("idle".to_string(), 2);
-        let states = vec![st("work", "working"), st("block", "blocked"), st("idle", "idle")];
+        let states = vec![
+            st("work", "working"),
+            st("block", "blocked"),
+            st("idle", "idle"),
+        ];
         clear_live_failures(&mut f, &states);
         assert!(!f.contains_key("work"));
         assert!(!f.contains_key("block"));
@@ -1758,8 +2049,14 @@ mod tests {
     #[test]
     fn context_verdict_pct_boundary() {
         let ts = "2026-08-03T03:00:00Z";
-        let low = AgentStateFile { context_pct: 79, ts: ts.into() };
-        let at = AgentStateFile { context_pct: 80, ts: ts.into() };
+        let low = AgentStateFile {
+            context_pct: 79,
+            ts: ts.into(),
+        };
+        let at = AgentStateFile {
+            context_pct: 80,
+            ts: ts.into(),
+        };
         assert_eq!(
             context_verdict("", Some(&low), 1_785_726_000),
             ContextVerdict::Healthy
@@ -1773,7 +2070,10 @@ mod tests {
     #[test]
     fn context_verdict_age_boundary() {
         let ts = "2026-08-03T03:00:00Z"; // unix 1_785_726_000, max age 900s
-        let state = AgentStateFile { context_pct: 85, ts: ts.into() };
+        let state = AgentStateFile {
+            context_pct: 85,
+            ts: ts.into(),
+        };
         // exactly 15 min old → fresh → exhausted
         assert_eq!(
             context_verdict("", Some(&state), 1_785_726_000 + 900),
@@ -1982,7 +2282,10 @@ mod tests {
             "work": false,
         });
         let p: LoopParams = serde_json::from_value(v).unwrap();
-        assert!(p.confirm_sends, "confirm_sends must default true for legacy params");
+        assert!(
+            p.confirm_sends,
+            "confirm_sends must default true for legacy params"
+        );
         assert_eq!(p.confirm_timeout_ms, None);
     }
 
@@ -1994,7 +2297,7 @@ mod tests {
             text: "t".into(),
             confirm: true,
             confirm_timeout_ms: Some(45_000),
-                    invocation: "inv-1".into(),
+            invocation: "inv-1".into(),
             iteration: 3,
         };
         let v = serde_json::to_value(&a).unwrap();
@@ -2012,14 +2315,22 @@ mod tests {
             text: "t".into(),
             confirm: true,
             confirm_timeout_ms: Some(45_000),
-                    invocation: "inv-1".into(),
+            invocation: "inv-1".into(),
             iteration: 3,
         };
         assert_eq!(
             send_prompt_argv(&args),
             vec![
-                "__send", "p", "a", "t", "--confirm", "45000",
-                "--invocation", "inv-1", "--iteration", "3",
+                "__send",
+                "p",
+                "a",
+                "t",
+                "--confirm",
+                "45000",
+                "--invocation",
+                "inv-1",
+                "--iteration",
+                "3",
             ]
         );
         // confirm + no timeout → bare `--confirm` (leaf applies its 45s default)
@@ -2029,14 +2340,21 @@ mod tests {
             text: "t".into(),
             confirm: true,
             confirm_timeout_ms: None,
-                    invocation: "inv-1".into(),
+            invocation: "inv-1".into(),
             iteration: 3,
         };
         assert_eq!(
             send_prompt_argv(&args_no_ms),
             vec![
-                "__send", "p", "a", "t", "--confirm",
-                "--invocation", "inv-1", "--iteration", "3",
+                "__send",
+                "p",
+                "a",
+                "t",
+                "--confirm",
+                "--invocation",
+                "inv-1",
+                "--iteration",
+                "3",
             ]
         );
         // no confirm → legacy argv plus the registry flags
@@ -2046,14 +2364,20 @@ mod tests {
             text: "t".into(),
             confirm: false,
             confirm_timeout_ms: None,
-                    invocation: "inv-1".into(),
+            invocation: "inv-1".into(),
             iteration: 3,
         };
         assert_eq!(
             send_prompt_argv(&args_legacy),
             vec![
-                "__send", "p", "a", "t",
-                "--invocation", "inv-1", "--iteration", "3",
+                "__send",
+                "p",
+                "a",
+                "t",
+                "--invocation",
+                "inv-1",
+                "--iteration",
+                "3",
             ]
         );
     }
@@ -2089,8 +2413,7 @@ mod tests {
         assert_eq!(v.reason.as_deref(), Some("landed"));
 
         // legacy path: no verdict fields → None defaults
-        let legacy: SendOutcome =
-            serde_json::from_str(r#"{"ok": true, "name": "a"}"#).unwrap();
+        let legacy: SendOutcome = serde_json::from_str(r#"{"ok": true, "name": "a"}"#).unwrap();
         assert_eq!(legacy.landed, None);
         assert_eq!(legacy.reason, None);
         assert!(!legacy.deduped);
@@ -2154,8 +2477,7 @@ mod tests {
     fn agent_state_parses_kind_from_poll_entry() {
         // __poll emits [name, status, kind]; kind must be parsed (and absent
         // in legacy entries tolerated)
-        let v: serde_json::Value =
-            serde_json::from_str(r#"["a", "idle", "pi"]"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"["a", "idle", "pi"]"#).unwrap();
         let s = parse_poll_entry(&v).unwrap();
         assert_eq!(s.name, "a");
         assert_eq!(s.status, "idle");
@@ -2168,18 +2490,39 @@ mod tests {
     #[test]
     fn unknown_decision_respawns_at_threshold_only() {
         // 0/1 unknown polls → wait; 2 → respawn; beyond → respawn (already stuck)
-        assert_eq!(unknown_decision("unknown", 0, UNKNOWN_RESPAWN_THRESHOLD), UnknownAction::None);
-        assert_eq!(unknown_decision("unknown", 1, UNKNOWN_RESPAWN_THRESHOLD), UnknownAction::None);
-        assert_eq!(unknown_decision("unknown", 2, UNKNOWN_RESPAWN_THRESHOLD), UnknownAction::Respawn);
-        assert_eq!(unknown_decision("unknown", 5, UNKNOWN_RESPAWN_THRESHOLD), UnknownAction::Respawn);
+        assert_eq!(
+            unknown_decision("unknown", 0, UNKNOWN_RESPAWN_THRESHOLD),
+            UnknownAction::None
+        );
+        assert_eq!(
+            unknown_decision("unknown", 1, UNKNOWN_RESPAWN_THRESHOLD),
+            UnknownAction::None
+        );
+        assert_eq!(
+            unknown_decision("unknown", 2, UNKNOWN_RESPAWN_THRESHOLD),
+            UnknownAction::Respawn
+        );
+        assert_eq!(
+            unknown_decision("unknown", 5, UNKNOWN_RESPAWN_THRESHOLD),
+            UnknownAction::Respawn
+        );
     }
 
     #[test]
     fn unknown_decision_never_fires_on_classified_status() {
         // a working/idle agent is confirmed alive — no respawn even at a high count
-        assert_eq!(unknown_decision("idle", 5, UNKNOWN_RESPAWN_THRESHOLD), UnknownAction::None);
-        assert_eq!(unknown_decision("working", 2, UNKNOWN_RESPAWN_THRESHOLD), UnknownAction::None);
-        assert_eq!(unknown_decision("blocked", 2, UNKNOWN_RESPAWN_THRESHOLD), UnknownAction::None);
+        assert_eq!(
+            unknown_decision("idle", 5, UNKNOWN_RESPAWN_THRESHOLD),
+            UnknownAction::None
+        );
+        assert_eq!(
+            unknown_decision("working", 2, UNKNOWN_RESPAWN_THRESHOLD),
+            UnknownAction::None
+        );
+        assert_eq!(
+            unknown_decision("blocked", 2, UNKNOWN_RESPAWN_THRESHOLD),
+            UnknownAction::None
+        );
     }
 
     #[test]
@@ -2227,6 +2570,41 @@ mod tests {
         assert_eq!(m.get("a"), Some(&1)); // a untouched by b's respawn
         assert!(!m.contains_key("b"));
     }
+
+    // ---- bd-event-subscribe-reactor: __poll_events batch parse ----
+
+    #[test]
+    fn parse_poll_events_batch_happy_path() {
+        let raw = r#"{
+            "events": [
+                {"event_type":"pane.agent_status_changed","pane_id":"%1","agent":"opencode","status":"done","seq":1},
+                {"event_type":"pane.agent_status_changed","pane_id":"%2","agent":null,"status":"idle","seq":2}
+            ],
+            "max_seq": 2,
+            "stream_error": null
+        }"#;
+        let batch = parse_poll_events_batch(raw, 0).unwrap();
+        assert_eq!(batch.events.len(), 2);
+        assert_eq!(batch.max_seq, 2);
+        assert!(batch.stream_error.is_none());
+        assert_eq!(batch.events[0].pane_id, "%1");
+        assert_eq!(batch.events[0].status.as_deref(), Some("done"));
+        assert_eq!(batch.events[1].agent, None);
+    }
+
+    #[test]
+    fn parse_poll_events_batch_empty_and_error() {
+        let raw = r#"{"events":[],"max_seq":7,"stream_error":"subscribe failed: down"}"#;
+        let batch = parse_poll_events_batch(raw, 0).unwrap();
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.max_seq, 7);
+        assert_eq!(batch.stream_error.as_deref(), Some("subscribe failed: down"));
+    }
+
+    #[test]
+    fn parse_poll_events_batch_rejects_garbage() {
+        assert!(parse_poll_events_batch("{not json", 0).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -2256,7 +2634,6 @@ mod resume_dedup_tests {
         assert!(should_resend(Some(&rec("a", 1, "inv-0", true)), "inv-1"));
         assert!(should_resend(Some(&rec("a", 1, "inv-0", false)), "inv-1"));
     }
-
 
     #[test]
     fn should_resend_degrades_without_confirmation() {
