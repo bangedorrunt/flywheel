@@ -660,7 +660,7 @@ fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
     let matches: Vec<herdr::WorkspaceInfo> = c
         .workspace_list()?
         .into_iter()
-        .filter(|ws| ws.label.as_deref() == Some(label.as_str()))
+        .filter(|ws| ws.label == label)
         .collect();
     if matches.is_empty() {
         bail!("no flywheel swarm for {project} (run: flywheel spawn {project})")
@@ -730,7 +730,7 @@ fn find_workspace_dyn(backend: &mut dyn backend::MultiplexerBackend, project: &s
     let matches: Vec<herdr::WorkspaceInfo> = backend
         .workspace_list()?
         .into_iter()
-        .filter(|ws| ws.label.as_deref() == Some(label.as_str()))
+        .filter(|ws| ws.label == label)
         .collect();
     if matches.is_empty() {
         bail!("no flywheel swarm for {project} (run: flywheel spawn {project})")
@@ -1032,14 +1032,14 @@ fn robot_snapshot(cfg: &Config) -> Result<Value> {
     let agents = c.agent_list()?;
     let fly: Vec<Value> = workspaces
         .iter()
-        .filter(|w| w.label.as_deref().map(|l| l.starts_with("flywheel-")).unwrap_or(false))
+        .filter(|w| w.label.starts_with("flywheel-"))
         .map(|w| {
             let ws_agents: Vec<Value> = agents
                 .iter()
                 .filter(|a| a.workspace_id == w.workspace_id)
                 .map(|a| {
                     json!({
-                        "name": a.name, "kind": a.agent, "status": a.agent_status.map(|s| s.as_str()),
+                        "name": a.name, "kind": a.agent, "status": a.agent_status.as_str(),
                         "pane_id": a.pane_id, "cwd": a.cwd, "interactive_ready": a.interactive_ready
                     })
                 })
@@ -1059,7 +1059,7 @@ fn robot_snapshot(cfg: &Config) -> Result<Value> {
         "ts": state::now_iso(),
         "workspaces": fly,
         "agents": agents.iter().map(|a| json!({
-            "name": a.name, "kind": a.agent, "status": a.agent_status.map(|s| s.as_str()),
+            "name": a.name, "kind": a.agent, "status": a.agent_status.as_str(),
             "workspace_id": a.workspace_id, "pane_id": a.pane_id
         })).collect::<Vec<_>>()
     }))
@@ -1196,7 +1196,7 @@ fn cmd_spawn(
                 dim(&format!("({})", agent.pane_id))
             );
             spawned.push(json!({
-                "name": agent.name, "kind": agent.agent, "pane_id": agent.pane_id, "status": agent.agent_status.map(|s| s.as_str())
+                "name": agent.name, "kind": agent.agent, "pane_id": agent.pane_id, "status": agent.agent_status.as_str()
             }));
         }
     }
@@ -1339,11 +1339,11 @@ fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
     let workspaces = c.workspace_list()?;
     let agents = c.agent_list()?;
     let mut rows: Vec<Value> = Vec::new();
-    for ws in workspaces.iter().filter(|w| all || w.label.as_deref().map(|l| l.starts_with("flywheel-")).unwrap_or(false)) {
+    for ws in workspaces.iter().filter(|w| all || w.label.starts_with("flywheel-")) {
         let ws_agents: Vec<Value> = agents
             .iter()
             .filter(|a| a.workspace_id == ws.workspace_id)
-            .map(|a| json!({ "name": a.name, "kind": a.agent, "status": a.agent_status.map(|s| s.as_str()) }))
+            .map(|a| json!({ "name": a.name, "kind": a.agent, "status": a.agent_status.as_str() }))
             .collect();
         rows.push(json!({
             "workspace_id": ws.workspace_id,
@@ -1392,7 +1392,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
         .iter()
         .map(|a| {
             json!({
-                "name": a.name, "kind": a.agent, "status": a.agent_status.map(|s| s.as_str()),
+                "name": a.name, "kind": a.agent, "status": a.agent_status.as_str(),
                 "pane_id": a.pane_id, "cwd": a.cwd, "workspace_id": ws_id
             })
         })
@@ -1458,7 +1458,7 @@ fn cmd_send(
             until: vec![AgentStatus::Idle, AgentStatus::Done, AgentStatus::Blocked],
         });
         let agent = c.agent_prompt(agent_target(a), &text, wait_opts)?;
-        let status = agent.agent_status.map(|s| s.as_str()).unwrap_or("unknown");
+        let status = agent.agent_status.as_str();
         if std::io::stdout().is_terminal() {
             println!(
                 "{} {}",
@@ -1528,7 +1528,7 @@ fn cmd_watch(cfg: &Config, project: &str, to: &str, until: Option<&str>, timeout
     for a in resolve_agents(&mut c, &ws_id, project, to)? {
         let name = agent_target(&a).to_string();
         watch_names.push(name.clone());
-        let st = a.agent_status.unwrap_or(AgentStatus::Unknown);
+        let st = a.agent_status;
         if std::io::stdout().is_terminal() {
             println!("{} {}", dim(&name), status_paint(st));
         }
@@ -1589,7 +1589,7 @@ fn cmd_watch(cfg: &Config, project: &str, to: &str, until: Option<&str>, timeout
                     let name = a.name.unwrap_or(a.pane_id.clone());
                     if watch_names.contains(&name) {
                         if let Some(u) = until_status {
-                            if a.agent_status == Some(u)
+                            if a.agent_status == u
                                 && all_matching(&mut c, &watch_names, u)?
                             {
                                 return Ok(());
@@ -1607,7 +1607,7 @@ fn all_matching(c: &mut Client, names: &[String], status: AgentStatus) -> Result
     for name in names {
         let a = agents.iter().find(|a| a.name.as_deref() == Some(name) || a.pane_id == *name);
         match a {
-            Some(a) if a.agent_status == Some(status) => {}
+            Some(a) if a.agent_status == status => {}
             _ => return Ok(false),
         }
     }
@@ -1799,8 +1799,8 @@ fn cmd_worktree(cfg: &Config, cmd: &WorktreeCmd) -> Result<()> {
                 println!(
                     "{}  {}  {}",
                     kind_paint(&w.branch.clone().unwrap_or_default()),
-                    w.workspace_id,
-                    dim(&w.path.clone().unwrap_or_default())
+                    w.open_workspace_id.clone().unwrap_or_default(),
+                    dim(&w.path)
                 );
             }
             if v.is_empty() {
@@ -1843,7 +1843,7 @@ fn cmd_checkpoint(cfg: &Config, cmd: &CheckpointCmd) -> Result<()> {
                 .map(|a| state::CheckpointAgent {
                     name: a.name.clone().unwrap_or_default(),
                     kind: a.agent.clone().unwrap_or_default(),
-                    status: a.agent_status.unwrap_or(AgentStatus::Unknown),
+                    status: a.agent_status,
                     pane_id: a.pane_id.clone(),
                 })
                 .collect();
@@ -1952,7 +1952,7 @@ fn cmd_changes(cfg: &Config, project: &str, since: usize) -> Result<()> {
             .iter()
             .find(|p| p.name == a.name.as_deref().unwrap_or(""));
         let prev_st = prev.map(|p| p.status.as_str()).unwrap_or("new");
-        let now_st = a.agent_status.map(|s| s.as_str()).unwrap_or("unknown");
+        let now_st = a.agent_status.as_str();
         if prev_st != now_st {
             println!("{}  {} → {}", dim(a.name.as_deref().unwrap_or("?")), dim(prev_st), status_paint(AgentStatus::parse(now_st).unwrap_or(AgentStatus::Unknown)));
         }
@@ -2318,13 +2318,13 @@ fn cmd_loop(
         let managed: Vec<(String, AgentStatus)> = if to == "all" {
             agents
                 .iter()
-                .map(|a| (agent_target(a).to_string(), a.agent_status.unwrap_or(AgentStatus::Unknown)))
+                .map(|a| (agent_target(a).to_string(), a.agent_status))
                 .collect()
         } else {
             let resolved = resolve_agents(&mut c, &ws_id, project, to)?;
             resolved
                 .iter()
-                .map(|a| (agent_target(a).to_string(), a.agent_status.unwrap_or(AgentStatus::Unknown)))
+                .map(|a| (agent_target(a).to_string(), a.agent_status))
                 .collect()
         };
 
@@ -2973,7 +2973,7 @@ fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
             .map(|a| {
                 json!([
                     agent_target(a),
-                    a.agent_status.map(|s| s.as_str()).unwrap_or("unknown"),
+                    a.agent_status.as_str(),
                     a.agent.clone().unwrap_or_default(),
                 ])
             })
@@ -2985,7 +2985,7 @@ fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
             .map(|a| {
                 json!([
                     agent_target(a),
-                    a.agent_status.map(|s| s.as_str()).unwrap_or("unknown"),
+                    a.agent_status.as_str(),
                     a.agent.clone().unwrap_or_default(),
                 ])
             })
@@ -3080,7 +3080,7 @@ fn cmd_internal_send(
         until: vec![AgentStatus::Working, AgentStatus::Blocked],
     };
     let verdict = match c.agent_prompt_coded(agent_target(&agent), text, Some(wait)) {
-        Ok(info) => classify_send_result(None, info.agent_status),
+        Ok(info) => classify_send_result(None, Some(info.agent_status)),
         Err(e) => classify_send_result(Some(&e.code), None),
     };
     let (landed, status, reason) = match verdict {
@@ -3372,7 +3372,7 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
         let agents = c.agent_list().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         Ok(serde_json::to_string(&json!({
             "agents": agents.iter().map(|a| json!({
-                "name": a.name, "kind": a.agent, "status": a.agent_status.map(|s| s.as_str()),
+                "name": a.name, "kind": a.agent, "status": a.agent_status.as_str(),
                 "workspace_id": a.workspace_id, "pane_id": a.pane_id
             })).collect::<Vec<_>>()
         })).unwrap())
@@ -3418,7 +3418,7 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
                 let payload = json!({
                     "tick": tick, "ts": chrono_like_ts(),
                     "agents": agents.iter().map(|a| json!({
-                        "name": a.name, "kind": a.agent, "status": a.agent_status.map(|s| s.as_str()),
+                        "name": a.name, "kind": a.agent, "status": a.agent_status.as_str(),
                         "workspace_id": a.workspace_id
                     })).collect::<Vec<_>>()
                 })
@@ -3476,7 +3476,7 @@ mod wait_output_tests {
         AgentInfo {
             agent: Some("opencode".into()),
             agent_session: None,
-            agent_status: Some(AgentStatus::Idle),
+            agent_status: AgentStatus::Idle,
             cwd: Some("/proj".into()),
             display_agent: None,
             focused: false,

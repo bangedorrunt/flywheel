@@ -7,8 +7,8 @@
 //! Pushed notifications (events) arrive as:
 //!   {"event": "<type>", "data": {...}}
 //!
-//! Verified against herdr 0.7.5-preview (socket protocol v18, schema version 1),
-//! preview build 2026-07-29-44b3adb12552. Canonical verification source:
+//! Verified against herdr 0.8.0-preview (socket protocol v19, schema version 1),
+//! preview build 2026-08-04-d78e3d3b5126. Canonical verification source:
 //! `herdr api schema --json` (fields: protocol, schema_version).
 
 /// The herdr socket protocol version this client is verified against —
@@ -16,7 +16,7 @@
 /// when the live server reports a different value; a bump that adds required
 /// fields would break the client at runtime, and the WARN line turns a
 /// confusing mid-loop failure into a five-second diagnosis.
-pub const HDR_PROTOCOL: u64 = 18;
+pub const HDR_PROTOCOL: u64 = 19;
 
 /// Parse the protocol version from `herdr api schema --json` output (the
 /// top-level `protocol` field). `None` on any failure — the caller decides
@@ -85,12 +85,9 @@ pub struct AgentSessionInfo {
 #[allow(dead_code)]
 pub struct AgentInfo {
     pub agent: Option<String>,
-    #[serde(default)]
-    pub agent_status: Option<AgentStatus>,
+    pub agent_status: AgentStatus,
     pub cwd: Option<String>,
-    #[serde(default)]
     pub display_agent: Option<String>,
-    #[serde(default)]
     pub focused: bool,
     pub foreground_cwd: Option<String>,
     #[serde(default)]
@@ -99,7 +96,6 @@ pub struct AgentInfo {
     pub launch_pending: bool,
     pub name: Option<String>,
     pub pane_id: String,
-    #[serde(default)]
     pub revision: u64,
     #[serde(default)]
     pub state_change_seq: u64,
@@ -119,13 +115,14 @@ pub struct AgentInfo {
 #[allow(dead_code)]
 pub struct WorkspaceInfo {
     pub workspace_id: String,
-    pub label: Option<String>,
-    #[serde(default)]
+    pub number: u64,
+    pub label: String,
+    pub focused: bool,
     pub pane_count: u64,
-    #[serde(default)]
     pub tab_count: u64,
+    pub active_tab_id: String,
+    pub agent_status: AgentStatus,
     #[serde(default)]
-    pub agent_status: Option<AgentStatus>,
     pub cwd: Option<String>,
 }
 
@@ -155,12 +152,12 @@ pub fn resolve_workspace_id(matches: &[WorkspaceInfo], agents: &[AgentInfo], pre
 #[allow(dead_code)]
 pub struct PaneInfo {
     pub pane_id: String,
+    pub terminal_id: String,
     pub tab_id: String,
     pub workspace_id: String,
+    pub focused: bool,
     pub cwd: Option<String>,
-    #[serde(default)]
-    pub agent_status: Option<AgentStatus>,
-    #[serde(default)]
+    pub agent_status: AgentStatus,
     pub revision: u64,
 }
 
@@ -169,10 +166,14 @@ pub struct PaneInfo {
 // field is consumed by the client — the unused ones must still deserialize.
 #[allow(dead_code)]
 pub struct WorktreeInfo {
-    pub workspace_id: String,
+    pub path: String,
     pub branch: Option<String>,
-    pub path: Option<String>,
-    pub label: Option<String>,
+    pub is_bare: bool,
+    pub is_detached: bool,
+    pub is_prunable: bool,
+    pub is_linked_worktree: bool,
+    pub open_workspace_id: Option<String>,
+    pub label: String,
 }
 
 /// Push notification pushed by the server (event subscription or server events).
@@ -762,11 +763,12 @@ mod tests {
             "tab_id": "w1:t1",
             "workspace_id": "w1",
             "terminal_id": "t1",
+            "focused": false,
             "interactive_ready": true,
             "revision": 3
         });
         let a: AgentInfo = serde_json::from_value(v).unwrap();
-        assert_eq!(a.agent_status, Some(AgentStatus::Working));
+        assert_eq!(a.agent_status, AgentStatus::Working);
         assert_eq!(a.pane_id, "w1:p2");
         assert!(a.interactive_ready);
     }
@@ -940,6 +942,26 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.code, "timeout");
     }
+
+    /// Live protocol round-trip against a running herdr server: every wire
+    /// struct the client parses (workspaces, panes, agents, worktrees) must
+    /// deserialize from the live socket without serde errors. Run against a
+    /// real herdr session: `cargo test -- --ignored live_snapshot_roundtrip`
+    #[test]
+    #[ignore = "needs a live herdr server"]
+    fn live_snapshot_roundtrip() {
+        let mut c = Client::connect(None).unwrap();
+        let workspaces = c.workspace_list().unwrap();
+        let panes = c.pane_list(None).unwrap();
+        let agents = c.agent_list().unwrap();
+        assert!(!workspaces.is_empty());
+        assert!(!panes.is_empty());
+        // worktrees may be empty on a session with no git repos; the parse
+        // itself is what we're asserting, so tolerate an empty list
+        let first = workspaces.first().unwrap();
+        let _ = c.worktree_list(Some(&first.workspace_id)).unwrap();
+        assert!(!agents.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -948,8 +970,16 @@ mod protocol_tests {
 
     #[test]
     fn parse_protocol_reads_top_level_field() {
-        let raw = r#"{"protocol": 18, "schema_version": 1, "schemas": {}}"#;
-        assert_eq!(parse_protocol(raw), Some(18));
+        let raw = r#"{"protocol": 19, "schema_version": 1, "schemas": {}}"#;
+        assert_eq!(parse_protocol(raw), Some(19));
+    }
+
+    #[test]
+    fn parse_protocol_reads_v19_from_schema_fixture() {
+        // Trimmed from the live `herdr api schema --json` output (protocol 19,
+        // herdr 0.8.0-preview.2026-08-04-d78e3d3b5126) — see tests/fixtures/.
+        let raw = include_str!("../tests/fixtures/herdr-schema-v19.json");
+        assert_eq!(parse_protocol(raw), Some(19));
     }
 
     #[test]
@@ -968,10 +998,13 @@ mod workspace_resolve_tests {
     fn ws(id: &str, label: &str) -> WorkspaceInfo {
         WorkspaceInfo {
             workspace_id: id.to_string(),
-            label: Some(label.to_string()),
+            number: 1,
+            label: label.to_string(),
+            focused: false,
             pane_count: 1,
             tab_count: 1,
-            agent_status: None,
+            active_tab_id: format!("{id}:t1"),
+            agent_status: AgentStatus::Unknown,
             cwd: None,
         }
     }
@@ -980,7 +1013,7 @@ mod workspace_resolve_tests {
         AgentInfo {
             agent: Some("pi".into()),
             agent_session: None,
-            agent_status: Some(AgentStatus::Idle),
+            agent_status: AgentStatus::Idle,
             cwd: Some("/proj".into()),
             display_agent: None,
             focused: false,

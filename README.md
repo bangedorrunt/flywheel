@@ -165,7 +165,7 @@ AGENTS.md files carry only a pointer to the subagent.
 
 ## Backend protocol
 
-herdr socket protocol v18: one JSON-RPC request per connection (newline-delimited),
+herdr socket protocol v19: one JSON-RPC request per connection (newline-delimited),
 `events.subscribe` keeps a long-lived stream. See `src/herdr.rs`.
 
 ## Changelog / releases
