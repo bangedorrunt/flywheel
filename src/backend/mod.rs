@@ -430,20 +430,10 @@ pub trait MailBackend: Send + Sync {
     fn products_link(&mut self, _product_key: &str, _project_key: &str) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "products_link"))
     }
-    fn search_product(
-        &mut self,
-        _product_key: &str,
-        _query: &str,
-        _limit: u32,
-    ) -> Result<Value> {
+    fn search_product(&mut self, _product_key: &str, _query: &str, _limit: u32) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "search_product"))
     }
-    fn inbox_product(
-        &mut self,
-        _product_key: &str,
-        _agent: &str,
-        _limit: u32,
-    ) -> Result<Value> {
+    fn inbox_product(&mut self, _product_key: &str, _agent: &str, _limit: u32) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "inbox_product"))
     }
 }

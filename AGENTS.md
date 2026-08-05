@@ -127,9 +127,10 @@ flywheel xproj send hachiko --to FlywheelOrch --to-project ~/workspace/flywheel 
 # requester reads via: flywheel mail product search --product trading-research "xproj"
 ```
 
-Receiving loop: treat inbox subjects starting with `[xproj]` as cross-project
-swarm requests (parse body via `parse_xproj_request`); do not overload normal
-dispatch. Reply results in the same thread.
+Receiving loop: each durable-loop iteration runs `__xproj-inbox` (orchestrator
+inbox scan). Messages with `[xproj]` + `recipe=` are queued as worker prompts
+once (`seen_xproj` dedup). Reply results in the same thread after the swarm
+runs. Do not overload normal bead dispatch.
 
 ## Rules
 

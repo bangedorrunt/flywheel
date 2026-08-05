@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use config::{Config, Recipe, WorkflowStep};
@@ -2924,6 +2925,104 @@ pub struct XprojRequest {
     pub product: String,
 }
 
+/// One `[xproj]` inbox hit for the durable loop (bd-pattern-cross-project-swarm).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct XprojInboxItem {
+    pub id: u64,
+    pub subject: String,
+    pub body: String,
+    pub thread_id: String,
+    pub from: String,
+}
+
+/// Build the worker queue prompt for a cross-project request.
+pub fn xproj_queue_prompt(item: &XprojInboxItem, req: &XprojRequest) -> String {
+    format!(
+        "CROSS-PROJECT SWARM REQUEST (message_id={}, thread={}, from={}).\n\
+         recipe={} workers={} product={}.\n\
+         Params:\n{}\n\n\
+         Run this recipe/workflow in THIS project (spawn workers if needed). \
+         When finished, reply a concise summary in agent-mail thread `{}` \
+         (reply_message / send with same thread_id) so the requester can read it. \
+         Acknowledge the request message if ack_required.",
+        item.id,
+        item.thread_id,
+        item.from,
+        req.recipe,
+        req.workers,
+        req.product,
+        req.params,
+        item.thread_id
+    )
+}
+
+/// Extract `[xproj]` items from a `fetch_inbox` JSON value (pure, unit-tested).
+/// Accepts either a bare array or `{messages:[...]}` / `{result:[...]}`.
+pub fn extract_xproj_from_inbox(v: &serde_json::Value) -> Vec<XprojInboxItem> {
+    let arr = v
+        .as_array()
+        .or_else(|| v.get("messages").and_then(|m| m.as_array()))
+        .or_else(|| v.get("result").and_then(|m| m.as_array()))
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for m in arr {
+        let subject = m
+            .get("subject")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        let body = m
+            .get("body_md")
+            .or_else(|| m.get("body"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        let combined = format!("{subject}\n{body}");
+        if !combined.to_ascii_lowercase().contains("[xproj]") {
+            continue;
+        }
+        let id = m.get("id").and_then(|i| i.as_u64()).unwrap_or(0);
+        let thread_id = m
+            .get("thread_id")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        let from = m
+            .get("from")
+            .or_else(|| m.get("sender"))
+            .and_then(|f| f.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(XprojInboxItem {
+            id,
+            subject,
+            body,
+            thread_id,
+            from,
+        });
+    }
+    out
+}
+
+/// Filter unseen xproj items and produce (message_id, queue_prompt) pairs.
+pub fn xproj_prompts_for_unseen(
+    items: &[XprojInboxItem],
+    seen: &std::collections::HashSet<u64>,
+) -> Vec<(u64, String)> {
+    let mut out = Vec::new();
+    for item in items {
+        if seen.contains(&item.id) {
+            continue;
+        }
+        let combined = format!("{}\n{}", item.subject, item.body);
+        if let Some(req) = parse_xproj_request(&combined) {
+            out.push((item.id, xproj_queue_prompt(item, &req)));
+        }
+    }
+    out
+}
+
 /// Parse an `[xproj]` swarm request from subject and/or body.
 ///
 /// Accepts lines like `recipe=backtest-5m`, `workers=4`, `product=trading-research`,
@@ -3148,14 +3247,8 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 let to_proj = to_project
                     .as_ref()
                     .map(|p| project_dir(cfg, p).to_str().unwrap().to_string());
-                let v = mail.request_contact(
-                    &key,
-                    &from,
-                    &to_mail,
-                    to_proj.as_deref(),
-                    reason,
-                    None,
-                )?;
+                let v =
+                    mail.request_contact(&key, &from, &to_mail, to_proj.as_deref(), reason, None)?;
                 print_json(&v);
             }
             MailContactCmd::Approve { project, from } => {
@@ -6715,6 +6808,23 @@ mod xproj_tests {
         let t = "[xproj] run 2-worker recipe=daily-p6\nbody line";
         let r = parse_xproj_request(t).expect("parse");
         assert_eq!(r.recipe, "daily-p6");
+    }
+
+    #[test]
+    fn extract_xproj_from_inbox_filters() {
+        let v = json!([
+            {"id": 1, "subject": "hello", "body_md": "nope", "thread_id": "t1", "from": "A"},
+            {"id": 2, "subject": "[xproj] run", "body_md": "recipe=daily\nworkers=2", "thread_id": "t2", "from": "B"},
+        ]);
+        let items = extract_xproj_from_inbox(&v);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, 2);
+        let mut seen = std::collections::HashSet::new();
+        let prompts = xproj_prompts_for_unseen(&items, &seen);
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].1.contains("recipe=daily"));
+        seen.insert(2);
+        assert!(xproj_prompts_for_unseen(&items, &seen).is_empty());
     }
 }
 

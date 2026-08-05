@@ -251,10 +251,7 @@ mod tests {
     #[test]
     fn state_file_path_builds_contract_path() {
         let p = state_file_path(Path::new("/proj"), "agent-1").unwrap();
-        assert_eq!(
-            p,
-            PathBuf::from("/proj/.flywheel/agent-state/agent-1.json")
-        );
+        assert_eq!(p, PathBuf::from("/proj/.flywheel/agent-state/agent-1.json"));
     }
 
     #[test]
@@ -295,8 +292,7 @@ mod tests {
 
     #[test]
     fn parse_state_file_happy() {
-        let f = parse_state_file(r#"{ "context_pct": 82, "ts": "2026-08-03T03:00:00Z" }"#)
-            .unwrap();
+        let f = parse_state_file(r#"{ "context_pct": 82, "ts": "2026-08-03T03:00:00Z" }"#).unwrap();
         assert_eq!(f.context_pct, 82);
         assert_eq!(f.ts, "2026-08-03T03:00:00Z");
     }
@@ -306,7 +302,10 @@ mod tests {
         assert_eq!(parse_state_file("not json"), None);
         assert_eq!(parse_state_file(""), None);
         assert_eq!(parse_state_file(r#"{ "context_pct": 82 }"#), None); // missing ts
-        assert_eq!(parse_state_file(r#"{ "ts": "2026-08-03T03:00:00Z" }"#), None); // missing pct
+        assert_eq!(
+            parse_state_file(r#"{ "ts": "2026-08-03T03:00:00Z" }"#),
+            None
+        ); // missing pct
         assert_eq!(
             parse_state_file(r#"{ "context_pct": 150, "ts": "2026-08-03T03:00:00Z" }"#),
             None // out of range
@@ -385,6 +384,10 @@ mod tests {
 
     #[test]
     fn freshness_unparseable_is_stale() {
-        assert!(!is_fresh_at("garbage", 1_785_726_000, Duration::from_secs(900)));
+        assert!(!is_fresh_at(
+            "garbage",
+            1_785_726_000,
+            Duration::from_secs(900)
+        ));
     }
 }

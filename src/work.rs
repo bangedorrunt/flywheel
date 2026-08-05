@@ -12,7 +12,9 @@ pub struct Bv {
 
 impl Bv {
     pub fn new(cwd: &str) -> Self {
-        Bv { cwd: cwd.to_string() }
+        Bv {
+            cwd: cwd.to_string(),
+        }
     }
 
     /// Run `bv --robot-<flag>` and return parsed JSON (bv always emits JSON in robot mode).

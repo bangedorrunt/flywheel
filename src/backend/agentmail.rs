@@ -330,23 +330,13 @@ impl MailBackend for AgentMailMcpBackend {
             .map_err(BackendError::Other)
     }
 
-    fn search_product(
-        &mut self,
-        product_key: &str,
-        query: &str,
-        limit: u32,
-    ) -> Result<Value> {
+    fn search_product(&mut self, product_key: &str, query: &str, limit: u32) -> Result<Value> {
         self.mail
             .search_product(product_key, query, limit)
             .map_err(BackendError::Other)
     }
 
-    fn inbox_product(
-        &mut self,
-        product_key: &str,
-        agent: &str,
-        limit: u32,
-    ) -> Result<Value> {
+    fn inbox_product(&mut self, product_key: &str, agent: &str, limit: u32) -> Result<Value> {
         self.mail
             .inbox_product(product_key, agent, limit)
             .map_err(BackendError::Other)

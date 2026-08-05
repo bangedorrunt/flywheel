@@ -18,7 +18,7 @@
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use resonate_sdk::function;
 use resonate_sdk::prelude::*;
