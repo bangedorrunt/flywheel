@@ -172,7 +172,7 @@ impl MultiplexerBackend for HerdrBackend {
         // Deserialize-only (parsed from the socket, never re-serialized), so
         // return the prompt target + status string instead of the struct.
         let info = self.client.agent_prompt(target, text, wait.cloned())?;
-        let status = info.agent_status.map(|s| s.as_str().to_string());
+        let status = Some(info.agent_status.as_str().to_string());
         Ok(json!({
             "agent": info.agent.clone().unwrap_or_default(),
             "pane_id": info.pane_id,
