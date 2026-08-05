@@ -1185,6 +1185,11 @@ fn cmd_spawn(
                 prev.clone()
             };
             let agent = start_agent_with_retry(&mut c, &name, &kind, &pane_id)?;
+            // governed-by: ADR-0001 (mail-register-on-spawn) — register the
+            // spawned agent as an agent-mail identity so it's addressable by
+            // name in mail. Best-effort: mail-not-configured is NOT a spawn
+            // failure (silent skip); a registration error is a warning.
+            register_spawned_agent(cfg, project, &name, &kind);
             println!(
                 "  {} {}",
                 kind_paint(&kind),
@@ -1250,6 +1255,34 @@ fn start_agent_with_retry(c: &mut Client, name: &str, kind: &str, pane_id: &str)
     bail!("agent start failed for {name} on {pane_id} after 30 attempts")
 }
 
+/// Register a spawned agent as an agent-mail identity (ADR-0001
+/// mail-register-on-spawn). Best-effort: if mail isn't configured or the
+/// backend returns an error, the spawn still succeeded — log a warning and
+/// continue. The agent becomes addressable by name in mail once registered.
+///
+/// governed-by: ADR-0001 (bd-mail-register-on-spawn), ADR-0002 (factory)
+fn register_spawned_agent(cfg: &Config, project: &str, name: &str, kind: &str) {
+    let key = match project_dir(cfg, project).to_str() {
+        Some(k) => k.to_string(),
+        None => return,
+    };
+    let mut mail = match backend::mail_backend(cfg) {
+        Ok(m) => m,
+        Err(_) => return, // mail not configured — silent skip
+    };
+    if let Err(e) = mail.ensure_project(&key) {
+        eprintln!("flywheel: mail ensure_project failed for {name}: {e}");
+        return;
+    }
+    // program = the herdr agent kind (codex/pi/grok); model defaults to the
+    // kind if unknown (agent-mail doesn't require it). task_description =
+    // the project + name so list_agents shows something useful.
+    let task = format!("spawned agent for {project}: {name}");
+    if let Err(e) = mail.register_agent(&key, name, kind, kind, &task) {
+        eprintln!("flywheel: mail register_agent failed for {name}: {e}");
+    }
+}
+
 // ---- add ----
 
 fn cmd_add(cfg: &Config, project: &str, counts: &AgentCounts, kinds: &[(String, u32)]) -> Result<()> {
@@ -1290,6 +1323,7 @@ fn cmd_add(cfg: &Config, project: &str, counts: &AgentCounts, kinds: &[(String, 
             let p = c.pane_split(&prev, "down", Some(dir.to_str().unwrap()))?;
             prev = p.pane_id.clone();
             let agent = start_agent_with_retry(&mut c, &name, &kind, &prev)?;
+            register_spawned_agent(cfg, project, &name, &kind);
             println!("  {} {}", kind_paint(&kind), agent.pane_id);
             spawned.push(json!({ "name": agent.name, "kind": agent.agent, "pane_id": agent.pane_id }));
         }

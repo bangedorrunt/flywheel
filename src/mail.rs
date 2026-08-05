@@ -22,9 +22,7 @@ fn post(url: &str, token: Option<&str>, body: Value) -> Result<Value> {
     let resp = req
         .send_json(body)
         .map_err(|e| anyhow!("agent-mail request failed: {e}"))?;
-    let out: Value = resp
-        .into_json()
-        .context("agent-mail returned non-JSON")?;
+    let out: Value = resp.into_json().context("agent-mail returned non-JSON")?;
     if let Some(err) = out.get("error") {
         bail!(
             "agent-mail error: {}",
@@ -66,11 +64,11 @@ pub struct Mail {
 impl Mail {
     pub fn from_config(cfg: Option<&MailConfig>) -> Result<Option<Self>> {
         let Some(c) = cfg else { return Ok(None) };
-        let url = c.url.clone().ok_or_else(|| anyhow!("agent_mail.url unset"))?;
-        let name = c
-            .name
+        let url = c
+            .url
             .clone()
-            .unwrap_or_else(|| "flywheel".to_string());
+            .ok_or_else(|| anyhow!("agent_mail.url unset"))?;
+        let name = c.name.clone().unwrap_or_else(|| "flywheel".to_string());
         Ok(Some(Mail {
             base: url,
             token: c.token.clone(),
@@ -86,7 +84,11 @@ impl Mail {
             "jsonrpc": "2.0", "id": id, "method": "tools/call",
             "params": { "name": tool, "arguments": args }
         });
-        let resp = post(&format!("{}/mcp/", self.base.trim_end_matches('/')), self.token.as_deref(), body)?;
+        let resp = post(
+            &format!("{}/mcp/", self.base.trim_end_matches('/')),
+            self.token.as_deref(),
+            body,
+        )?;
         tool_result(resp)
     }
 
@@ -112,7 +114,37 @@ impl Mail {
         self.call("list_agents", json!({ "project_key": project_key }))
     }
 
-    pub fn inbox(&mut self, project_key: &str, agent_name: &str, urgent_only: bool, limit: u32) -> Result<Value> {
+    /// Register or update an agent identity in a project (agent-mail MCP
+    /// `register_agent` tool). Idempotent on name — re-register updates the
+    /// profile + refreshes `last_active_ts`. Wraps the tool so `cmd_spawn`
+    /// can register each spawned agent, making it addressable by name in mail.
+    pub fn register_agent(
+        &mut self,
+        project_key: &str,
+        name: &str,
+        program: &str,
+        model: &str,
+        task_description: &str,
+    ) -> Result<Value> {
+        self.call(
+            "register_agent",
+            json!({
+                "project_key": project_key,
+                "name": name,
+                "program": program,
+                "model": model,
+                "task_description": task_description,
+            }),
+        )
+    }
+
+    pub fn inbox(
+        &mut self,
+        project_key: &str,
+        agent_name: &str,
+        urgent_only: bool,
+        limit: u32,
+    ) -> Result<Value> {
         self.call(
             "fetch_inbox",
             json!({
@@ -141,7 +173,14 @@ impl Mail {
         )
     }
 
-    pub fn reserve(&mut self, project_key: &str, paths: &[String], ttl_seconds: u64, exclusive: bool, reason: &str) -> Result<Value> {
+    pub fn reserve(
+        &mut self,
+        project_key: &str,
+        paths: &[String],
+        ttl_seconds: u64,
+        exclusive: bool,
+        reason: &str,
+    ) -> Result<Value> {
         self.call(
             "file_reservation_paths",
             json!({
@@ -199,5 +238,26 @@ mod tests {
         });
         let err = tool_result(resp).unwrap_err();
         assert!(err.to_string().contains("boom"));
+    }
+
+    /// `Mail::register_agent` exists and is callable (compile-time guard
+    /// against accidental removal; the envelope mirrors the existing
+    /// `ensure_project`/`send` wrappers exactly — live round-trip is
+    /// backend-parity-test integration territory). Constructed with a dummy
+    /// URL; no HTTP is made until the method is actually invoked.
+    #[test]
+    fn register_agent_method_exists() {
+        use crate::config::MailConfig;
+        let mut mail = Mail::from_config(Some(&MailConfig {
+            url: Some("http://127.0.0.1:9999".into()),
+            token: None,
+            name: Some("test".into()),
+        }))
+        .expect("from_config ok")
+        .expect("Some(Mail)");
+        // take a reference to the fn to prove it exists with the right signature;
+        // do NOT call it (would hit the dummy URL and fail).
+        let _: fn(&mut Mail, &str, &str, &str, &str, &str) -> Result<Value> = Mail::register_agent;
+        let _ = &mut mail; // silence unused-mut
     }
 }
