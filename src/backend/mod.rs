@@ -31,6 +31,12 @@ pub mod factory;
 pub mod herdr;
 #[cfg(test)]
 mod parity;
+#[cfg(feature = "backend-superlogical")]
+pub mod superlogical;
+#[cfg(feature = "backend-tmux")]
+pub mod tmux;
+#[cfg(feature = "mail-toron")]
+pub mod toron_mail;
 
 use crate::herdr::{
     AgentInfo, AgentStatus, PaneInfo, PushEvent, Subscription, WaitOptions, WorkspaceInfo,
@@ -122,6 +128,16 @@ impl BackendError {
             backend: backend.to_string(),
             method,
             reason: format!("backend '{backend}' does not implement '{method}'"),
+        }
+    }
+
+    /// Helper for stub backends: a whole-backend reason (not per-method). Used
+    /// by the superlogical/tmux/toron stubs (bd-toron-superlogical-stubs).
+    pub(crate) fn stub(backend: &'static str, reason: &str) -> Self {
+        Self::Unsupported {
+            backend: backend.to_string(),
+            method: "(stub)",
+            reason: reason.to_string(),
         }
     }
 }
@@ -317,7 +333,10 @@ pub trait MailBackend: Send + Sync {
     /// agent-mail MCP `resolve_pane_identity` tool, which reads the identity
     /// files the bridge writes (`bd-mail-pane-identity-bridge`, ADR-0001 A4).
     fn resolve_pane_identity(&mut self, _project_key: &str, _pane_id: &str) -> Result<Value> {
-        Err(BackendError::unsupported(self.name(), "resolve_pane_identity"))
+        Err(BackendError::unsupported(
+            self.name(),
+            "resolve_pane_identity",
+        ))
     }
     /// Write the per-pane identity file for a spawned agent. Filesystem op,
     /// not an MCP tool — herdr panes are not tmux panes, so agent-mail never
@@ -328,11 +347,17 @@ pub trait MailBackend: Send + Sync {
         _pane_id: &str,
         _agent_name: &str,
     ) -> Result<Value> {
-        Err(BackendError::unsupported(self.name(), "write_pane_identity"))
+        Err(BackendError::unsupported(
+            self.name(),
+            "write_pane_identity",
+        ))
     }
     /// Remove the per-pane identity file (pane exited / respawned).
     fn clear_pane_identity(&mut self, _project_key: &str, _pane_id: &str) -> Result<Value> {
-        Err(BackendError::unsupported(self.name(), "clear_pane_identity"))
+        Err(BackendError::unsupported(
+            self.name(),
+            "clear_pane_identity",
+        ))
     }
     fn conflicts(&mut self, _project_key: &str, _agent: &str, _paths: &[String]) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "conflicts"))

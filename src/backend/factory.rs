@@ -52,18 +52,24 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
     match name.as_str() {
         #[cfg(feature = "backend-herdr")]
         "herdr" => {
-            let client = HerdrClient::connect(Some(&cfg.socket_path()))
-                .map_err(BackendError::Other)?;
+            let client =
+                HerdrClient::connect(Some(&cfg.socket_path())).map_err(BackendError::Other)?;
             Ok(Box::new(crate::backend::herdr::HerdrBackend::new(client)))
         }
-        // R0.7 lands stubs for these; until then, an actionable error.
-        "superlogical" | "tmux" => Err(BackendError::Unsupported {
-            backend: name.clone(),
-            method: "(factory)",
-            reason: "{name} backend not yet wired (stub lands in bd-toron-superlogical-stubs); set FLYWHEEL_BACKEND=herdr"
-                .replacen("{name}", &name, 1),
-        }),
-        other => Err(backend_not_compiled_or_unknown(other, "multiplexer", "FLYWHEEL_BACKEND")),
+        // superlogical/tmux: stub backends (bd-toron-superlogical-stubs). With
+        // the feature on, construct the stub (name() enumerable, method
+        // defaults give the clear "not yet released / on hold" error). With
+        // the feature off, the arm is compiled out and the name falls through
+        // to `other` -> "not compiled in".
+        #[cfg(feature = "backend-superlogical")]
+        "superlogical" => Ok(Box::new(crate::backend::superlogical::SuperlogicalBackend)),
+        #[cfg(feature = "backend-tmux")]
+        "tmux" => Ok(Box::new(crate::backend::tmux::TmuxBackend)),
+        other => Err(backend_not_compiled_or_unknown(
+            other,
+            "multiplexer",
+            "FLYWHEEL_BACKEND",
+        )),
     }
 }
 
@@ -89,13 +95,15 @@ pub fn mail_backend(cfg: &Config) -> Result<Box<dyn MailBackend>> {
                 crate::backend::agentmail::AgentMailMcpBackend::new(mail),
             ))
         }
-        // R0.7 lands the toron stub; until then, an actionable error.
-        "toron" => Err(BackendError::Unsupported {
-            backend: name.clone(),
-            method: "(factory)",
-            reason: "toron backend not yet wired (stub lands in bd-toron-superlogical-stubs / real impl at R1); set FLYWHEEL_MAIL=agentmail".to_string(),
-        }),
-        other => Err(backend_not_compiled_or_unknown(other, "mail", "FLYWHEEL_MAIL")),
+        // toron: stub mail backend (bd-toron-superlogical-stubs). Feature on ->
+        // construct the stub; feature off -> falls through to `other`.
+        #[cfg(feature = "mail-toron")]
+        "toron" => Ok(Box::new(crate::backend::toron_mail::ToronMailBackend)),
+        other => Err(backend_not_compiled_or_unknown(
+            other,
+            "mail",
+            "FLYWHEEL_MAIL",
+        )),
     }
 }
 
@@ -222,8 +230,12 @@ mod tests {
 
     /// A stubbed-but-unwired backend (superlogical) returns an actionable
     /// Unsupported pointing at the stub bead (no silent fallback).
+    /// With `backend-superlogical` OFF, selecting superlogical yields the
+    /// feature-aware "not compiled in" error (no silent fallback). Gated to
+    /// the feature-off build (the stub itself is covered by --all-features).
+    #[cfg(not(feature = "backend-superlogical"))]
     #[test]
-    fn stubbed_backend_is_unsupported_with_stub_bead_pointer() {
+    fn stubbed_backend_not_compiled_in_default_build() {
         let _g = _lock_env();
         std::env::set_var("FLYWHEEL_BACKEND", "superlogical");
         let cfg = Config::default();
@@ -231,12 +243,12 @@ mod tests {
         match res {
             Err(BackendError::Unsupported { reason, .. }) => {
                 assert!(
-                    reason.contains("bd-toron-superlogical-stubs"),
-                    "reason: {reason}"
+                    reason.contains("not compiled in"),
+                    "reason should say not-compiled (feature off): {reason}"
                 );
             }
-            Err(e) => panic!("expected Unsupported for superlogical, got error: {e}"),
-            Ok(_) => panic!("expected Unsupported for superlogical, got Ok (silent fallback)"),
+            Err(e) => panic!("expected Unsupported, got error: {e}"),
+            Ok(_) => panic!("expected Unsupported, got Ok (silent fallback)"),
         }
         std::env::remove_var("FLYWHEEL_BACKEND");
     }
@@ -253,13 +265,15 @@ mod tests {
             backends.contains(&"agentmail"),
             "agentmail missing: {backends:?}"
         );
-        // superlogical/tmux/toron are NOT in the default build (stubs land in
-        // R0.7; their features are off by default)
+        // superlogical/tmux/toron are opt-in: present IFF their feature is on
+        #[cfg(not(feature = "backend-superlogical"))]
         assert!(
             !backends.contains(&"superlogical"),
-            "superlogical should be opt-in"
+            "superlogical should be opt-in (feature off)"
         );
+        #[cfg(not(feature = "backend-tmux"))]
         assert!(!backends.contains(&"tmux"), "tmux should be opt-in");
+        #[cfg(not(feature = "mail-toron"))]
         assert!(!backends.contains(&"toron"), "toron should be opt-in");
     }
 
@@ -280,5 +294,34 @@ mod tests {
             "mentions enabling the feature: {s}"
         );
         assert!(s.contains("FLYWHEEL_BACKEND"), "points at the env var: {s}");
+    }
+
+    /// Stub contract (runs only in `--all-features` builds where the stub
+    /// feature is on): the stub is name()-enumerable and every operation
+    /// returns an honest Unsupported naming it (no Ok, no panic).
+    #[cfg(feature = "backend-superlogical")]
+    #[test]
+    fn superlogical_stub_is_honest_unsupported() {
+        let b = crate::backend::superlogical::SuperlogicalBackend;
+        assert_eq!(b.name(), "superlogical");
+        let mut m: Box<dyn MultiplexerBackend> = Box::new(b);
+        match m.workspace_list() {
+            Err(BackendError::Unsupported { backend, .. }) => assert_eq!(backend, "superlogical"),
+            Ok(_) => panic!("stub must not Ok"),
+            Err(e) => panic!("expected Unsupported, got {e:?}"),
+        }
+    }
+
+    #[cfg(feature = "mail-toron")]
+    #[test]
+    fn toron_stub_is_honest_unsupported() {
+        let b = crate::backend::toron_mail::ToronMailBackend;
+        assert_eq!(b.name(), "toron");
+        let mut m: Box<dyn MailBackend> = Box::new(b);
+        match m.health() {
+            Err(BackendError::Unsupported { backend, .. }) => assert_eq!(backend, "toron"),
+            Ok(_) => panic!("stub must not Ok"),
+            Err(e) => panic!("expected Unsupported, got {e:?}"),
+        }
     }
 }
