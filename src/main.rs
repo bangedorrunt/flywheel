@@ -5515,6 +5515,29 @@ fn settle_agent(mux: &mut dyn backend::MultiplexerBackend, agent: &str) -> Resul
     Ok(())
 }
 
+/// Pure extraction of the latest message's body from a `search_messages`
+/// envelope. Precedence: `body_md` → `body` → `subject` (mirrors
+/// `extract_xproj_from_inbox`). Trims and rejects empty. Returns None when
+/// the envelope has no result or no readable text.
+///
+/// review-fix F1: the debate/plan-review patterns need the reply BODY (the
+/// argument / the APPROVE|CHANGES: token), not the subject line.
+///
+/// governed-by: ADR-0001 §9.1/§9.2 (bd-review-fix-epic-m0b.1)
+pub fn extract_latest_body(v: &serde_json::Value) -> Option<String> {
+    v.get("result")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|m| {
+            m.get("body_md")
+                .or_else(|| m.get("body"))
+                .or_else(|| m.get("subject"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Harvest the latest message in a thread from a sender (recency-ranked).
 fn harvest_latest(
     mail: &mut dyn backend::MailBackend,
@@ -5530,16 +5553,18 @@ fn harvest_latest(
             thread_id: Some(thread.to_string()),
             sender: Some(sender.to_string()),
             ranking: Some("recency".to_string()),
+            // review-fix F1: search_messages returns subject-only unless
+            // include_body_md is set — the debate/plan-review patterns need
+            // the reply BODY (the argument / the APPROVE|CHANGES: token),
+            // not the subject line.
+            include_body_md: true,
             ..Default::default()
         },
     )?;
-    let text = v
-        .get("result")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|arr| arr.first())
-        .and_then(|m| m.get("subject").and_then(serde_json::Value::as_str))
-        .map(|s| s.to_string());
-    Ok(text)
+    // body_md first, then body, then subject — mirrors the precedence in
+    // extract_xproj_from_inbox so a body-bearing envelope wins over the
+    // subject even if a server version omits one of the body keys.
+    Ok(extract_latest_body(&v))
 }
 
 fn cmd_upgrade() -> Result<()> {
@@ -6879,6 +6904,56 @@ mod plan_review_tests {
         );
         assert_eq!(p3, PriPhase::Done);
         assert_eq!(a3, PriAction::HaltVerified);
+    }
+
+    /// review-fix F1: harvest_latest content extraction must prefer the reply
+    /// BODY over the subject. The exact agent-mail search envelope (subject +
+    /// body_md) must yield the body; subject-only must fall back; empty → None.
+    #[test]
+    fn extract_latest_body_prefers_body_over_subject() {
+        let v = serde_json::json!({
+            "result": [{
+                "id": 1,
+                "subject": "Re: [debate] prop",
+                "body_md": "ARGUMENT: buy the dip",
+                "from": "TopazOx",
+                "thread_id": "debate-1"
+            }]
+        });
+        assert_eq!(
+            extract_latest_body(&v),
+            Some("ARGUMENT: buy the dip".to_string())
+        );
+    }
+
+    /// review-fix F1: a body-less envelope falls back to the subject.
+    #[test]
+    fn extract_latest_body_falls_back_to_subject_when_body_absent() {
+        let v = serde_json::json!({
+            "result": [{
+                "id": 2,
+                "subject": "Re: [debate] prop",
+                "from": "TopazOx"
+            }]
+        });
+        assert_eq!(
+            extract_latest_body(&v),
+            Some("Re: [debate] prop".to_string())
+        );
+    }
+
+    /// review-fix F1: empty result / empty text → None (no phantom "").
+    #[test]
+    fn extract_latest_body_empty_is_none() {
+        assert_eq!(
+            extract_latest_body(&serde_json::json!({"result": []})),
+            None
+        );
+        assert_eq!(extract_latest_body(&serde_json::json!({})), None);
+        let v = serde_json::json!({
+            "result": [{"id": 3, "subject": "   ", "body_md": ""}]
+        });
+        assert_eq!(extract_latest_body(&v), None);
     }
 
     #[test]

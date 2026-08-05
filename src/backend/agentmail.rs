@@ -261,6 +261,7 @@ impl MailBackend for AgentMailMcpBackend {
                 filter.date_start.as_deref(),
                 filter.date_end.as_deref(),
                 filter.ranking.as_deref(),
+                filter.include_body_md,
             )
             .map_err(BackendError::Other)
     }

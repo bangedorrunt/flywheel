@@ -322,10 +322,45 @@ impl Mail {
         date_start: Option<&str>,
         date_end: Option<&str>,
         ranking: Option<&str>,
+        include_body_md: bool,
     ) -> Result<Value> {
+        self.call(
+            "search_messages",
+            Self::search_args(
+                project_key,
+                query,
+                limit,
+                sender,
+                importance,
+                thread_id,
+                date_start,
+                date_end,
+                ranking,
+                include_body_md,
+            ),
+        )
+    }
+
+    /// Build the `search_messages` args JSON (pure; unit-testable).
+    /// review-fix F1: emits `include_body_md: true` when requested.
+    pub fn search_args(
+        project_key: &str,
+        query: &str,
+        limit: u32,
+        sender: Option<&str>,
+        importance: Option<&str>,
+        thread_id: Option<&str>,
+        date_start: Option<&str>,
+        date_end: Option<&str>,
+        ranking: Option<&str>,
+        include_body_md: bool,
+    ) -> Value {
         let mut args = json!({
             "project_key": project_key, "query": query, "limit": limit
         });
+        if include_body_md {
+            args["include_body_md"] = json!(true);
+        }
         if let Some(s) = sender {
             args["sender"] = json!(s);
         }
@@ -344,7 +379,7 @@ impl Mail {
         if let Some(r) = ranking {
             args["ranking"] = json!(r);
         }
-        self.call("search_messages", args)
+        args
     }
 
     pub fn reserve(
@@ -918,6 +953,7 @@ mod tests {
     }
 
     /// Mail::search exists with the right signature (bd-mail-search-summarize).
+    /// review-fix F1: gained the `include_body_md` bool param.
     #[test]
     fn search_wrapper_exists() {
         let _: fn(
@@ -931,7 +967,34 @@ mod tests {
             Option<&str>,
             Option<&str>,
             Option<&str>,
+            bool,
         ) -> Result<Value> = Mail::search;
+    }
+
+    /// review-fix F1: search_messages must request the body when asked.
+    /// Builds the args JSON via the same path as the live call and asserts
+    /// the `include_body_md` flag is emitted exactly when requested.
+    #[test]
+    fn search_sends_include_body_md() {
+        // with the flag: args must carry include_body_md: true
+        let args = Mail::search_args(
+            "proj",
+            "q",
+            1,
+            Some("sender"),
+            None,
+            Some("thread-1"),
+            None,
+            None,
+            Some("recency"),
+            true,
+        );
+        assert_eq!(args["include_body_md"], json!(true));
+        assert_eq!(args["thread_id"], json!("thread-1"));
+        assert_eq!(args["sender"], json!("sender"));
+        // without the flag: no include_body_md key
+        let args = Mail::search_args("proj", "q", 1, None, None, None, None, None, None, false);
+        assert!(args.get("include_body_md").is_none());
     }
 
     /// Cross-project contact + product wrappers (bd-mail-cross-project-contact).
