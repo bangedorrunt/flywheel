@@ -408,6 +408,28 @@ daily = [
         }
     }
 
+    /// bd-docs-backend-abstraction: ship `.env.example`; real `.env` stays gitignored.
+    #[test]
+    fn env_example_shipped_and_env_gitignored() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let example = root.join(".env.example");
+        assert!(
+            example.is_file(),
+            ".env.example missing at {}",
+            example.display()
+        );
+        let body = std::fs::read_to_string(&example).unwrap();
+        assert!(
+            body.contains("FLYWHEEL_BACKEND") && body.contains("FLYWHEEL_MAIL"),
+            ".env.example must document backend selection vars"
+        );
+        let gi = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(
+            gi.lines().any(|l| l.trim() == ".env"),
+            ".gitignore must contain exact line `.env`"
+        );
+    }
+
     // Env-var mutation is process-global; serialize tests that touch it
     // (same pattern as the backend factory tests).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

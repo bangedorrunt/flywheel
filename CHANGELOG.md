@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 🚀 Features
 
+- **Pluggable backends (ADR-0002 R0)** — `MultiplexerBackend` + `MailBackend`
+  traits; factory env/`.env`/config selection; `flywheel backend list|status|default`;
+  feature-gated stubs (superlogical/tmux/toron). Defaults unchanged: herdr + agentmail.
 - Herdr swarm orchestrator — ntm-parity CLI + durable loop (Resonate SDK 0.6.0)
 - Flywheel loop --work — bead-driven mode sourcing from br ready (dynamic plans)
 - Work-mode resilience — interrupt resume (in-progress beads) + context-limit respawn

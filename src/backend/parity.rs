@@ -1,5 +1,7 @@
 //! Parity tests for the backend abstraction (ADR-0002 R0.8).
 //!
+//! governed-by: ADR-0002
+//!
 //! Contract being proven: the trait wrappers (`HerdrBackend`, `AgentMailMcpBackend`)
 //! are **pure delegation** — a call through `Box<dyn MultiplexerBackend>` produces
 //! the same result as a direct `Client` call, because the wrapper adds no logic.

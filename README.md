@@ -1,9 +1,9 @@
 # flywheel
 
-Multi-agent swarm orchestrator on the **herdr** backend — an NTM-parity daily loop
-for opencode / pi / grok. Spawn swarms, dispatch the daily-driver stages
-(P1→P8), monitor states, checkpoint progress. Tracker state lives in **br/bv**,
-coordination in **agent-mail**, orchestration in herdr.
+Multi-agent swarm orchestrator with **pluggable backends** (default: **herdr**
+multiplexer + **agent-mail** coordination) — an NTM-parity daily loop for
+opencode / pi / grok. Spawn swarms, dispatch the daily-driver stages (P1→P8),
+monitor states, checkpoint progress. Tracker: **br/bv**.
 
 ## Install
 
@@ -13,7 +13,24 @@ cargo install --path . --force
 ```
 
 Config: `~/.config/flywheel/config.toml` (see `config.example.toml`).
-Requires a running herdr server (herdr.sock) — `flywheel deps` checks everything.
+Copy [`.env.example`](.env.example) → `.env` for local backend overrides
+(`.env` is gitignored). Default stack needs a running herdr server
+(herdr.sock) — `flywheel deps` checks everything.
+
+## Backends
+
+flywheel selects a **multiplexer** (pane/agent lifecycle) and a **mail**
+fabric via env / `.env` / config (ADR-0002). Defaults: `herdr` + `agentmail`.
+Future stubs: `superlogical` / `tmux` (mux), `toron` (mail).
+
+```bash
+flywheel backend list --json    # what is compiled in + active
+flywheel backend status         # config source + health
+# FLYWHEEL_BACKEND=herdr FLYWHEEL_MAIL=agentmail
+```
+
+Precedence: flag > env > `.env` > config.toml > default. Full matrix and
+migration path (R0→R2): `AGENTS.md` § Backends, `docs/decisions/0002-*.md`.
 
 ## The daily loop
 
@@ -163,10 +180,11 @@ Edit the templates, rebuild, re-run — the subagent files stay current with the
 workflow (lifecycle, agent-mail coordination, context contract). The tool
 AGENTS.md files carry only a pointer to the subagent.
 
-## Backend protocol
+## Backend protocol (herdr default)
 
-herdr socket protocol v19: one JSON-RPC request per connection (newline-delimited),
-`events.subscribe` keeps a long-lived stream. See `src/herdr.rs`.
+When `FLYWHEEL_BACKEND=herdr`: socket protocol v19, one JSON-RPC request per
+connection (newline-delimited); `events.subscribe` keeps a long-lived stream.
+See `src/herdr.rs` / `src/backend/herdr.rs`.
 
 ## Changelog / releases
 
