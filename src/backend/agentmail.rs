@@ -228,13 +228,26 @@ impl MailBackend for AgentMailMcpBackend {
 
     fn search(
         &mut self,
-        _project_key: &str,
-        _query: &str,
-        _limit: u32,
-        _filter: &crate::backend::SearchFilter,
+        project_key: &str,
+        query: &str,
+        limit: u32,
+        filter: &crate::backend::SearchFilter,
     ) -> Result<Value> {
-        // Phase 3: bd-mail-search-summarize.
-        Err(self.unsupported("search"))
+        // bd-mail-search-summarize: delegate to Mail::search, mapping the
+        // SearchFilter struct to the wrapper's optional params.
+        self.mail
+            .search(
+                project_key,
+                query,
+                limit,
+                filter.sender.as_deref(),
+                filter.importance.as_deref(),
+                filter.thread_id.as_deref(),
+                filter.date_start.as_deref(),
+                filter.date_end.as_deref(),
+                filter.ranking.as_deref(),
+            )
+            .map_err(BackendError::Other)
     }
 
     fn summarize_thread(

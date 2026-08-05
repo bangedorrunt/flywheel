@@ -301,6 +301,47 @@ impl Mail {
         )
     }
 
+    /// Search messages (agent-mail MCP `search_messages`, FTS5 over
+    /// subject+body). Filters: sender, importance, thread_id, date range,
+    /// ranking (relevance|recency). Used by the loop to answer "did a peer
+    /// already solve this bead?" before re-dispatching
+    /// (bd-mail-search-summarize). `limit` bounds the result set.
+    pub fn search(
+        &mut self,
+        project_key: &str,
+        query: &str,
+        limit: u32,
+        sender: Option<&str>,
+        importance: Option<&str>,
+        thread_id: Option<&str>,
+        date_start: Option<&str>,
+        date_end: Option<&str>,
+        ranking: Option<&str>,
+    ) -> Result<Value> {
+        let mut args = json!({
+            "project_key": project_key, "query": query, "limit": limit
+        });
+        if let Some(s) = sender {
+            args["sender"] = json!(s);
+        }
+        if let Some(i) = importance {
+            args["importance"] = json!(i);
+        }
+        if let Some(t) = thread_id {
+            args["thread_id"] = json!(t);
+        }
+        if let Some(d) = date_start {
+            args["date_start"] = json!(d);
+        }
+        if let Some(d) = date_end {
+            args["date_end"] = json!(d);
+        }
+        if let Some(r) = ranking {
+            args["ranking"] = json!(r);
+        }
+        self.call("search_messages", args)
+    }
+
     pub fn reserve(
         &mut self,
         project_key: &str,
@@ -738,6 +779,23 @@ mod tests {
         let _: fn(&mut Mail, &str, &str, &str, bool, u64) -> Result<Value> = Mail::acquire_slot;
         let _: fn(&mut Mail, &str, &str, &str, u64) -> Result<Value> = Mail::renew_slot;
         let _: fn(&mut Mail, &str, &str, &str) -> Result<Value> = Mail::release_slot;
+    }
+
+    /// Mail::search exists with the right signature (bd-mail-search-summarize).
+    #[test]
+    fn search_wrapper_exists() {
+        let _: fn(
+            &mut Mail,
+            &str,
+            &str,
+            u32,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+        ) -> Result<Value> = Mail::search;
     }
 
     // ---- renew (bd-mail-lease-renewal-durable) ----
