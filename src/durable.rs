@@ -570,12 +570,38 @@ pub fn should_resend(record: Option<&crate::state::SentRecord>, current_invocati
 /// Returns the tier to act at now. `ping_count` advances per notify so
 /// re-pings are monotonic; the tier is derived from elapsed time, not the
 /// counter, so a crash-resume continues at the correct tier.
+///
+/// Implemented halt rule (review-fix F4): `mail` mode halts at T3; `stop`
+/// mode halts at T0 (existing behavior); `continue` mode never halts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EscalationTier {
     T0,
     T1,
     T2,
     T3,
+}
+
+/// The bounded-halt decision for a blocked agent. Returns the exit message
+/// when the loop must halt for this tier under `on_blocked`, else None.
+///
+/// Rule (review-fix F4, bd-review-fix-epic-m0b.4):
+/// - `mail` mode: halt at T3 only (T0/T1/T2 keep notifying and continuing).
+/// - `stop` mode: halt at any tier (T0) — existing `--on-blocked stop`
+///   semantics, unchanged.
+/// - `continue` mode: never halt — blockers are ignored by contract.
+///
+/// Pure (no I/O) so the halt policy is table-testable and the loop arm is a
+/// thin wrapper.
+pub fn on_blocked_tier_exit(tier: EscalationTier, on_blocked: &str) -> Option<String> {
+    match on_blocked {
+        "mail" if tier == EscalationTier::T3 => Some(format!(
+            "halted: agent blocked past escalation budget (T3) — human required"
+        )),
+        "stop" => Some(format!(
+            "stopped: blocked agents (--on-blocked stop, tier {tier:?})"
+        )),
+        _ => None,
+    }
 }
 
 /// Map elapsed-us since first_blocked to the escalation tier.
@@ -1926,7 +1952,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_micros() as i64)
                             .unwrap_or(0);
-                        let tier = {
+                        let (tier_u32, tier_enum) = {
                             let mut al = crate::state::load_active_loop(&params.project)
                                 .map_err(map_err)?
                                 .unwrap_or_else(|| {
@@ -1948,22 +1974,41 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 escalation_tier(st.first_blocked_ts, now_us, params.interval_secs);
                             st.ping_count = st.ping_count.saturating_add(1);
                             let _ = crate::state::save_active_loop(&params.project, &al);
-                            match t {
+                            let u = match t {
                                 EscalationTier::T0 => 0u32,
                                 EscalationTier::T1 => 1,
                                 EscalationTier::T2 => 2,
                                 EscalationTier::T3 => 3,
-                            }
+                            };
+                            (u, t)
                         };
                         ctx.run(
                             notify_blocked,
                             NotifyArgs {
                                 project: params.project.clone(),
                                 name: name.clone(),
-                                tier,
+                                tier: tier_u32,
                             },
                         )
                         .await?;
+                        // review-fix F4: bounded halt at T3 — the escalation
+                        // contract says the loop halts (bounded) once a blocked
+                        // agent exceeds the budget. Send the final T3 mail
+                        // (above), then exit with a distinguishable outcome so
+                        // `flywheel loop` and the event log show WHY it stopped
+                        // (vs a normal "complete"). T0/T1/T2 keep notifying.
+                        if let Some(msg) = on_blocked_tier_exit(tier_enum, &params.on_blocked) {
+                            let _ = crate::state::log_event(
+                                &params.project,
+                                crate::state::EventKind::Loop,
+                                serde_json::json!({
+                                    "status": "halted",
+                                    "tier": tier_u32,
+                                    "name": name,
+                                }),
+                            );
+                            return Ok(msg);
+                        }
                     }
                 }
                 LoopAction::Nudge { name } => {
@@ -3776,5 +3821,32 @@ mod resume_dedup_tests {
         assert_eq!(a, b);
         // never exceeds T3 (bounded, not infinite spin)
         assert_eq!(escalation_tier(0, i64::MAX, 30), EscalationTier::T3);
+    }
+
+    /// review-fix F4: the bounded-halt decision table. `mail` mode halts at
+    /// T3 only; `stop` halts at any tier (T0); `continue` never halts.
+    #[test]
+    fn blocked_t3_halts_loop_mail_mode_only() {
+        use EscalationTier::*;
+        // mail mode: only T3 halts
+        assert_eq!(on_blocked_tier_exit(T0, "mail"), None);
+        assert_eq!(on_blocked_tier_exit(T1, "mail"), None);
+        assert_eq!(on_blocked_tier_exit(T2, "mail"), None);
+        let halt = on_blocked_tier_exit(T3, "mail");
+        assert!(halt.is_some());
+        assert!(halt.unwrap().contains("T3"));
+        // stop mode: halts at ANY tier (existing --on-blocked stop semantics)
+        for t in [T0, T1, T2, T3] {
+            assert!(
+                on_blocked_tier_exit(t, "stop").is_some(),
+                "stop must halt at {t:?}"
+            );
+        }
+        // continue mode: never halts
+        for t in [T0, T1, T2, T3] {
+            assert_eq!(on_blocked_tier_exit(t, "continue"), None);
+        }
+        // unknown mode string: never halts (defensive)
+        assert_eq!(on_blocked_tier_exit(T3, "whatever"), None);
     }
 }
