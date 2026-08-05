@@ -43,6 +43,22 @@ use crate::herdr::{
 };
 use serde_json::Value;
 
+/// Landing data for a coded `agent.prompt` (ADR-0002, review-fix F6).
+///
+/// Mirrors `herdr::classify_send_result` inputs so a backend-agnostic `__send`
+/// leaf can make the same landed/stalled/timeout/coded dispatch decisions as
+/// the concrete herdr client:
+/// - `status: Some(s)` → the prompt landed and the agent reached `s`.
+/// - `code: Some(c)` → herdr returned a protocol error code
+///   (e.g. `agent_prompt_stalled`, `timeout`, `agent_not_running`).
+/// Exactly one of the two is populated on the herdr backend (landed → status,
+/// error → code); other backends define their own contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptLanding {
+    pub status: Option<AgentStatus>,
+    pub code: Option<String>,
+}
+
 // Factory entry points — consumers (the durable-loop leaf handlers in main.rs)
 // call `backend::multiplexer_backend(&cfg)` / `backend::mail_backend(&cfg)`;
 // `flywheel backend list/status` (bd-cli-backend-subcommand) uses the resolve_
@@ -232,6 +248,27 @@ pub trait MultiplexerBackend: Send + Sync {
     ) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "agent_prompt"))
     }
+    /// Coded `agent.prompt` with landing semantics (ADR-0002, review-fix F6).
+    ///
+    /// The plain [`Self::agent_prompt`] returns a minimal JSON and LOSES the
+    /// coded error (e.g. `agent_prompt_stalled`) that the durable loop's
+    /// `__send` leaf classifies into landed/stalled/timeout. This method
+    /// returns the landing data (observed status + protocol error code)
+    /// without erroring on a non-landing outcome, so a backend-agnostic
+    /// `__send` can make the same dispatch decisions as the concrete herdr
+    /// client.
+    ///
+    /// `wait` semantics mirror herdr: when Some, block until the agent
+    /// reaches `until` or the timeout; landing = the prompt started
+    /// executing (working/blocked), NOT idle/done.
+    fn agent_prompt_coded(
+        &mut self,
+        _target: &str,
+        _text: &str,
+        _wait: Option<&WaitOptions>,
+    ) -> Result<PromptLanding> {
+        Err(BackendError::unsupported(self.name(), "agent_prompt_coded"))
+    }
     fn agent_wait(
         &mut self,
         _target: &str,
@@ -261,6 +298,14 @@ pub trait MultiplexerBackend: Send + Sync {
 pub trait MailBackend: Send + Sync {
     /// Stable backend identifier ("agentmail" | "toron").
     fn name(&self) -> &'static str;
+
+    /// The registered agent identity this backend sends AS / reads the inbox
+    /// for (the `sender_name`/`agent_name` in agent-mail calls). Review-fix
+    /// F6: the concrete `Mail.name` field is the identity; the trait must
+    /// expose it so call sites (inbox, send) route through the factory.
+    fn agent_name(&self) -> &str {
+        ""
+    }
 
     fn health(&mut self) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "health"))

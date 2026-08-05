@@ -148,6 +148,47 @@ mod tests {
     // above prove the error path; live round-trips (below, #[ignore]) prove
     // the happy path against a real socket/HTTP once infra exists.
 
+    /// review-fix F6: `agent_prompt_coded` maps a coded error to landing DATA
+    /// (status XOR code), NOT a transport Err — so a backend-agnostic __send
+    /// classifies identically to the concrete client. The pure mapping is the
+    /// contract under test (no socket needed).
+    #[test]
+    fn prompt_landing_maps_landed_status_and_coded_error() {
+        use crate::herdr::{AgentStatus, HerdrError};
+        // landed: Ok(AgentInfo) → status Some, code None
+        let ok = crate::backend::herdr::map_prompt_result(Ok(crate::herdr::AgentInfo {
+            agent: Some("pi".into()),
+            agent_session: None,
+            agent_status: AgentStatus::Working,
+            cwd: None,
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: false,
+            launch_pending: false,
+            name: None,
+            pane_id: "wT:p1".into(),
+            revision: 1,
+            state_change_seq: 0,
+            state_labels: serde_json::Map::new(),
+            tab_id: "t1".into(),
+            terminal_id: "term_1".into(),
+            terminal_title: None,
+            workspace_id: "w1".into(),
+        }));
+        let ok = ok.unwrap();
+        assert_eq!(ok.status, Some(AgentStatus::Working));
+        assert_eq!(ok.code, None);
+        // coded error: Err(HerdrError) → status None, code Some
+        let err = crate::backend::herdr::map_prompt_result(Err(HerdrError {
+            code: "agent_prompt_stalled".into(),
+            message: "x".into(),
+        }));
+        let err = err.unwrap();
+        assert_eq!(err.status, None);
+        assert_eq!(err.code.as_deref(), Some("agent_prompt_stalled"));
+    }
+
     /// Integration parity: `HerdrBackend::agent_list` returns the same JSON as
     /// `Client::agent_list` against a live herdr session. Needs a test session.
     #[test]
