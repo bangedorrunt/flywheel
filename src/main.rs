@@ -6180,7 +6180,7 @@ fn cmd_internal_xproj_spawn(
             Some(recipe),
             &[],
             None,
-            false, // background workspace
+            true, // background workspace (no_focus — must not steal terminal focus)
             false, // not peer-aware by default
         )
     };
