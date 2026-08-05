@@ -27,6 +27,7 @@
 #![allow(dead_code)]
 
 pub mod agentmail;
+pub mod herdr;
 
 use crate::herdr::{
     AgentInfo, AgentStatus, PaneInfo, PushEvent, Subscription, WaitOptions, WorkspaceInfo,
@@ -92,6 +93,15 @@ impl std::error::Error for BackendError {}
 impl From<anyhow::Error> for BackendError {
     fn from(e: anyhow::Error) -> Self {
         Self::Other(e)
+    }
+}
+
+impl From<crate::herdr::HerdrError> for BackendError {
+    /// Preserve herdr's typed error code as an `Other` with a lossless
+    /// anyhow context. (Backend callers handle `BackendError::Unsupported`;
+    /// transport errors stay opaque in `Other`.)
+    fn from(e: crate::herdr::HerdrError) -> Self {
+        Self::Other(anyhow::anyhow!("herdr error {}: {}", e.code, e.message))
     }
 }
 
