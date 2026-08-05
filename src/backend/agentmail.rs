@@ -60,14 +60,15 @@ impl MailBackend for AgentMailMcpBackend {
 
     fn register_agent(
         &mut self,
-        _project_key: &str,
-        _name: &str,
-        _program: &str,
-        _model: &str,
-        _task: &str,
+        project_key: &str,
+        name: &str,
+        program: &str,
+        model: &str,
+        task: &str,
     ) -> Result<Value> {
-        // Phase 3: bd-mail-register-on-spawn adds Mail::register_agent + behavior.
-        Err(self.unsupported("register_agent"))
+        self.mail
+            .register_agent(project_key, name, program, model, task)
+            .map_err(BackendError::Other)
     }
 
     fn list_agents(&mut self, project_key: &str) -> Result<Value> {
@@ -273,8 +274,10 @@ mod tests {
         .expect("from_config ok")
         .expect("Some");
         let mut b = AgentMailMcpBackend::new(mail);
+        // register_agent USED to be Unsupported; bd-mail-register-on-spawn
+        // graduated it to real delegation (calls Mail::register_agent). The
+        // remaining 10 stay Unsupported until their Phase-3 beads land.
         let cases: Vec<(&str, std::result::Result<Value, BackendError>)> = vec![
-            ("register_agent", b.register_agent("p", "a", "pi", "m", "t")),
             ("reply", b.reply("p", 1, "x", None)),
             ("ack", b.ack("p", "a", 1)),
             ("mark_read", b.mark_read("p", "a", 1)),
