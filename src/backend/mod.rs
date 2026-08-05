@@ -311,6 +311,29 @@ pub trait MailBackend: Send + Sync {
     ) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "renew"))
     }
+    /// Resolve the agent name for a pane from the canonical per-pane identity
+    /// file. Carrier-agnostic — the R1 `toron` backend resolves pane identity
+    /// natively (ADR-0003 §G9); the agentmail backend delegates to the
+    /// agent-mail MCP `resolve_pane_identity` tool, which reads the identity
+    /// files the bridge writes (`bd-mail-pane-identity-bridge`, ADR-0001 A4).
+    fn resolve_pane_identity(&mut self, _project_key: &str, _pane_id: &str) -> Result<Value> {
+        Err(BackendError::unsupported(self.name(), "resolve_pane_identity"))
+    }
+    /// Write the per-pane identity file for a spawned agent. Filesystem op,
+    /// not an MCP tool — herdr panes are not tmux panes, so agent-mail never
+    /// writes identities for them; the bridge does (ADR-0001 A4).
+    fn write_pane_identity(
+        &mut self,
+        _project_key: &str,
+        _pane_id: &str,
+        _agent_name: &str,
+    ) -> Result<Value> {
+        Err(BackendError::unsupported(self.name(), "write_pane_identity"))
+    }
+    /// Remove the per-pane identity file (pane exited / respawned).
+    fn clear_pane_identity(&mut self, _project_key: &str, _pane_id: &str) -> Result<Value> {
+        Err(BackendError::unsupported(self.name(), "clear_pane_identity"))
+    }
     fn conflicts(&mut self, _project_key: &str, _agent: &str, _paths: &[String]) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "conflicts"))
     }
