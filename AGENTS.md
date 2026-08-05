@@ -13,7 +13,12 @@ command surface and a durable monitoring loop built on Resonate.
   token from `~/.config/flywheel/config.toml`).
 - Durable loop: Resonate server via launchd (`com.flywheel.resonate`,
   `http://localhost:8001`, sqlite at `~/.local/state/flywheel/resonate.db`).
-- State/logs: `~/.local/state/flywheel/` (event logs, checkpoints, loops.json).
+- State/logs: `~/.local/state/flywheel/` (event logs, checkpoints, `loops.json`).
+  - `loops.json` schema **v2** (`src/state.rs`, bd-loop-state-schema-v2): top-level
+    `"schema": 2` + per-project `{ id, params, created, event_cursor?, escalation?,
+    respawn? }`. v1 files (no `schema`) load with fresh control fields and migrate
+    on next write. Control state only — telemetry stays in the JSONL event log.
+    See module docs on `state.rs` for both-direction back-compat.
 - The binary also lives at `~/.local/bin/flywheel` — rebuild + copy after
   changes (`cargo build --release && cp target/release/flywheel ~/.local/bin/flywheel`).
 
