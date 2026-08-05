@@ -4488,6 +4488,8 @@ fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
         .into_iter()
         .filter(|a| a.workspace_id == ws_id)
         .collect::<Vec<_>>();
+    // [name, status, kind, pane_id] — pane_id enables event→name routing
+    // (bd-event-dispatch-zero-latency). Older parsers ignore the 4th element.
     let managed: Vec<Value> = if to == "all" {
         agents
             .iter()
@@ -4496,6 +4498,7 @@ fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
                     agent_target(a),
                     a.agent_status.as_str(),
                     a.agent.clone().unwrap_or_default(),
+                    a.pane_id,
                 ])
             })
             .collect()
@@ -4508,6 +4511,7 @@ fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
                     agent_target(a),
                     a.agent_status.as_str(),
                     a.agent.clone().unwrap_or_default(),
+                    a.pane_id,
                 ])
             })
             .collect()

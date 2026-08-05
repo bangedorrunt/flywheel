@@ -80,6 +80,10 @@ pub struct AgentState {
     /// checkpoints written before this field existed still resume.
     #[serde(default)]
     pub kind: String,
+    /// herdr pane id — required to map push events → agent name
+    /// (bd-event-dispatch-zero-latency). `#[serde(default)]` for old polls.
+    #[serde(default)]
+    pub pane_id: String,
 }
 
 /// One ready bead from `br ready --json`.
@@ -763,11 +767,19 @@ pub fn lease_renew_seconds(heartbeat_interval_secs: u64) -> u64 {
 /// wait). `unknown` is NOT dispatchable by design: herdr cannot classify its
 /// lifecycle confidently — a prompt could land in a half-dead session and be
 /// silently lost. Unknown agents get `Wait` and never consume the queue.
+///
+/// `DispatchImmediate` is the event-path twin of `Send` (bd-event-dispatch):
+/// same `__send` leaf, same FIFO pop, marked so the loop can track
+/// dispatch-pending until a `working` event confirms landing.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoopAction {
     Send { name: String, text: String },
+    /// Event-wake redispatch: same leaf as `Send`, skips poll batching.
+    DispatchImmediate { name: String, text: String },
     Blocked { name: String },
     Nudge { name: String },
+    /// Self-heal signal for exited/unknown panes (bd-event-self-heal).
+    SelfHeal { name: String, reason: String },
     Wait,
 }
 
@@ -807,6 +819,122 @@ pub fn plan_actions(
         }
     }
     actions
+}
+
+/// Resolve agent herdr name for a pane id from the latest poll snapshot.
+pub fn name_for_pane(states: &[AgentState], pane_id: &str) -> Option<String> {
+    if pane_id.is_empty() {
+        return None;
+    }
+    states
+        .iter()
+        .find(|s| s.pane_id == pane_id)
+        .map(|s| s.name.clone())
+}
+
+/// Event-shaped decision path (bd-event-dispatch-zero-latency).
+///
+/// Pure: updates `dispatch_pending` and may pop the queue front (FIFO, same
+/// as `plan_actions`). Returns at most one action per event.
+///
+/// Double-dispatch guard: if `name` is already in `dispatch_pending`, a
+/// further `done`/`idle` does not re-pop the queue until a `working` event
+/// clears the flag (or `clear_dispatch_pending` after send landing).
+pub fn route_event(
+    states: &[AgentState],
+    ev: &PollEvent,
+    queue: &mut Vec<String>,
+    dispatch_pending: &mut std::collections::HashSet<String>,
+) -> Option<LoopAction> {
+    let name = name_for_pane(states, &ev.pane_id).or_else(|| {
+        // fallback: single-agent swarm with empty pane_id map — match by kind
+        // only when exactly one agent shares the event's agent field
+        let kind = ev.agent.as_deref()?;
+        let matches: Vec<_> = states.iter().filter(|s| s.kind == kind).collect();
+        if matches.len() == 1 {
+            Some(matches[0].name.clone())
+        } else {
+            None
+        }
+    });
+
+    let status = ev.status.as_deref().unwrap_or("");
+    match ev.event_type.as_str() {
+        "pane.agent_status_changed" => {
+            let name = name?;
+            match status {
+                "working" => {
+                    // landing confirmed — clear pending so next done can redispatch
+                    dispatch_pending.remove(&name);
+                    None
+                }
+                "blocked" => Some(LoopAction::Blocked { name }),
+                "done" | "idle" => {
+                    if dispatch_pending.contains(&name) {
+                        // flutter: already dispatched, wait for working
+                        return None;
+                    }
+                    if queue.is_empty() {
+                        return None;
+                    }
+                    let text = queue.remove(0);
+                    let text = text.replace("{AGENT_NAME}", &name);
+                    dispatch_pending.insert(name.clone());
+                    Some(LoopAction::DispatchImmediate { name, text })
+                }
+                _ => None,
+            }
+        }
+        "pane.agent_detected" => {
+            // new agent available — dispatch if free and queue non-empty
+            let name = name?;
+            if dispatch_pending.contains(&name) || queue.is_empty() {
+                return None;
+            }
+            // only if not already working
+            if status == "working" {
+                return None;
+            }
+            let text = queue.remove(0);
+            let text = text.replace("{AGENT_NAME}", &name);
+            dispatch_pending.insert(name.clone());
+            Some(LoopAction::DispatchImmediate { name, text })
+        }
+        "pane.exited" => {
+            let name = name.unwrap_or_else(|| format!("pane:{}", ev.pane_id));
+            dispatch_pending.remove(&name);
+            Some(LoopAction::SelfHeal {
+                name,
+                reason: "pane_exited".into(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Clear dispatch-pending after a confirmed send landing (or fail-stop).
+pub fn clear_dispatch_pending(
+    pending: &mut std::collections::HashSet<String>,
+    name: &str,
+    landed: Option<bool>,
+) {
+    // clear on definitive outcome: landed true, or landed false (will respawn)
+    // keep pending only when outcome is ambiguous (landed None on non-confirm)
+    match landed {
+        Some(true) => {
+            // keep until working event? Bead: clear on real landing.
+            // working event also clears; clearing here allows faster redispatch
+            // if working event is delayed. Prefer clear on landed.
+            pending.remove(name);
+        }
+        Some(false) => {
+            pending.remove(name);
+        }
+        None => {
+            // non-confirm path: assume sent, clear so we don't stick forever
+            pending.remove(name);
+        }
+    }
 }
 
 /// Completion guard: everyone idle/done. `unknown` keeps the loop alive — an
@@ -957,8 +1085,9 @@ pub fn respawn_kind(
     kinds.get(name).cloned()
 }
 
-/// Parse one `__poll` entry: `[name, status, kind]` (kind added for respawn
-/// support; legacy 2-element entries yield an empty kind).
+/// Parse one `__poll` entry: `[name, status, kind, pane_id?]`.
+/// kind added for respawn; pane_id for event→name routing
+/// (bd-event-dispatch). Legacy 2/3-element entries yield empty kind/pane_id.
 pub fn parse_poll_entry(v: &serde_json::Value) -> anyhow::Result<AgentState> {
     let arr = v
         .as_array()
@@ -976,6 +1105,11 @@ pub fn parse_poll_entry(v: &serde_json::Value) -> anyhow::Result<AgentState> {
             .to_string(),
         kind: arr
             .get(2)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        pane_id: arr
+            .get(3)
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_string(),
@@ -1118,6 +1252,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     let mut event_stream_errors: u64 = 0;
     // adaptive wait for the next poll_events block (starts active)
     let mut wait_secs: u64 = params.active_interval_secs.max(5);
+    // agents that received DispatchImmediate and await working confirmation
+    // (bd-event-dispatch double-dispatch guard)
+    let mut dispatch_pending: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     loop {
         iteration += 1;
@@ -1248,12 +1386,33 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         }
 
         let mut blocked_names: Vec<String> = Vec::new();
-        let actions = plan_actions(&states, &mut queue, params.nudge.as_deref());
-        for action in &actions {
-            if let LoopAction::Blocked { name } = action {
+        // event path first (zero-latency redispatch), then heartbeat plan_actions
+        let mut actions: Vec<LoopAction> = Vec::new();
+        for ev in &event_batch.events {
+            if let Some(a) = route_event(&states, ev, &mut queue, &mut dispatch_pending) {
+                if let LoopAction::Blocked { name } = &a {
+                    blocked_names.push(name.clone());
+                }
+                actions.push(a);
+            }
+        }
+        // heartbeat path: full-snapshot reconciliation (skips agents already
+        // dispatch-pending so event path and poll path don't double-feed)
+        let mut poll_actions = plan_actions(&states, &mut queue, params.nudge.as_deref());
+        poll_actions.retain(|a| match a {
+            LoopAction::Send { name, .. } => !dispatch_pending.contains(name),
+            _ => true,
+        });
+        // re-add Send names that survived to pending so event flutter is covered
+        for a in &poll_actions {
+            if let LoopAction::Send { name, .. } = a {
+                dispatch_pending.insert(name.clone());
+            }
+            if let LoopAction::Blocked { name } = a {
                 blocked_names.push(name.clone());
             }
         }
+        actions.extend(poll_actions);
 
         // with on_blocked=stop, the loop must not dispatch any more work this
         // iteration — check the blocker before any side effect fires
@@ -1267,7 +1426,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         let mut any_work = false;
         for action in &actions {
             match action {
-                LoopAction::Send { name, text } => {
+                LoopAction::Send { name, text }
+                | LoopAction::DispatchImmediate { name, text } => {
                     // context guard: if the idle agent is context-exhausted,
                     // respawn a fresh instance instead of delegating to it
                     let verdict = ctx
@@ -1280,6 +1440,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         )
                         .await?;
                     if verdict == ContextVerdict::Exhausted {
+                        clear_dispatch_pending(&mut dispatch_pending, name, Some(false));
                         respawn_and_requeue(
                             ctx,
                             &params,
@@ -1321,6 +1482,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             deduped: false,
                         },
                     };
+                    clear_dispatch_pending(&mut dispatch_pending, name, outcome.landed);
                     // resume-dedup: __send skipped the herdr call because this
                     // prompt already landed for this invocation — log it (the
                     // landed handling below resets the failure counter; a
@@ -1432,6 +1594,24 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             }
                         }
                     }
+                }
+                LoopAction::SelfHeal { name, reason } => {
+                    // pane exited / dead — shared respawn path (bd-event-self-heal
+                    // owns richer diagnose budgets; here we kick the existing
+                    // respawn so the agent is not stuck forever).
+                    let attempts = send_failures.get(name).copied().unwrap_or(0);
+                    respawn_and_requeue(
+                        ctx,
+                        &params,
+                        &mut queue,
+                        &agent_kinds,
+                        name,
+                        None,
+                        reason,
+                        attempts,
+                    )
+                    .await?;
+                    any_work = true;
                 }
                 LoopAction::Wait => {}
             }
@@ -1648,6 +1828,26 @@ mod tests {
             name: name.to_string(),
             status: status.to_string(),
             kind: String::new(),
+            pane_id: String::new(),
+        }
+    }
+
+    fn st_pane(name: &str, status: &str, pane: &str) -> AgentState {
+        AgentState {
+            name: name.to_string(),
+            status: status.to_string(),
+            kind: "opencode".to_string(),
+            pane_id: pane.to_string(),
+        }
+    }
+
+    fn pev(event_type: &str, pane: &str, status: &str, seq: u64) -> PollEvent {
+        PollEvent {
+            event_type: event_type.to_string(),
+            pane_id: pane.to_string(),
+            agent: Some("opencode".to_string()),
+            status: Some(status.to_string()),
+            seq,
         }
     }
 
@@ -2438,11 +2638,13 @@ mod tests {
                 name: "a".into(),
                 status: "idle".into(),
                 kind: "pi".into(),
+                pane_id: String::new(),
             },
             AgentState {
                 name: "b".into(),
                 status: "working".into(),
                 kind: "opencode".into(),
+                pane_id: String::new(),
             },
         ];
         learn_kinds(&mut kinds, &states);
@@ -2460,6 +2662,7 @@ mod tests {
             name: "a".into(),
             status: "idle".into(),
             kind: String::new(),
+            pane_id: String::new(),
         }];
         learn_kinds(&mut kinds, &states);
         assert_eq!(kinds.get("a").map(String::as_str), Some("opencode"));
@@ -2604,6 +2807,126 @@ mod tests {
     #[test]
     fn parse_poll_events_batch_rejects_garbage() {
         assert!(parse_poll_events_batch("{not json", 0).is_err());
+    }
+
+    // ---- bd-event-dispatch-zero-latency: route_event ----
+
+    #[test]
+    fn route_event_done_dispatches_and_pops_queue() {
+        let states = vec![st_pane("a", "done", "%1")];
+        let mut queue = vec!["p1".into(), "p2".into()];
+        let mut pending = std::collections::HashSet::new();
+        let a = route_event(
+            &states,
+            &pev("pane.agent_status_changed", "%1", "done", 1),
+            &mut queue,
+            &mut pending,
+        );
+        assert!(matches!(
+            a,
+            Some(LoopAction::DispatchImmediate { name, text }) if name == "a" && text == "p1"
+        ));
+        assert_eq!(queue, vec!["p2".to_string()]);
+        assert!(pending.contains("a"));
+    }
+
+    #[test]
+    fn route_event_double_dispatch_guard() {
+        let states = vec![st_pane("a", "done", "%1")];
+        let mut queue = vec!["p1".into(), "p2".into()];
+        let mut pending = std::collections::HashSet::new();
+        let _ = route_event(
+            &states,
+            &pev("pane.agent_status_changed", "%1", "done", 1),
+            &mut queue,
+            &mut pending,
+        );
+        // second done while pending → no redispatch
+        let a2 = route_event(
+            &states,
+            &pev("pane.agent_status_changed", "%1", "done", 2),
+            &mut queue,
+            &mut pending,
+        );
+        assert!(a2.is_none());
+        assert_eq!(queue, vec!["p2".to_string()]); // only one pop
+        // working clears pending
+        let a3 = route_event(
+            &states,
+            &pev("pane.agent_status_changed", "%1", "working", 3),
+            &mut queue,
+            &mut pending,
+        );
+        assert!(a3.is_none());
+        assert!(!pending.contains("a"));
+        // now a fresh done can redispatch
+        let a4 = route_event(
+            &states,
+            &pev("pane.agent_status_changed", "%1", "idle", 4),
+            &mut queue,
+            &mut pending,
+        );
+        assert!(matches!(
+            a4,
+            Some(LoopAction::DispatchImmediate { text, .. }) if text == "p2"
+        ));
+    }
+
+    #[test]
+    fn route_event_blocked_and_exited() {
+        let states = vec![st_pane("a", "working", "%1")];
+        let mut queue = vec!["p1".into()];
+        let mut pending = std::collections::HashSet::new();
+        let b = route_event(
+            &states,
+            &pev("pane.agent_status_changed", "%1", "blocked", 1),
+            &mut queue,
+            &mut pending,
+        );
+        assert!(matches!(b, Some(LoopAction::Blocked { name }) if name == "a"));
+        assert_eq!(queue.len(), 1); // blocked does not pop
+        let x = route_event(
+            &states,
+            &pev("pane.exited", "%1", "exited", 2),
+            &mut queue,
+            &mut pending,
+        );
+        assert!(matches!(
+            x,
+            Some(LoopAction::SelfHeal { name, reason })
+                if name == "a" && reason == "pane_exited"
+        ));
+    }
+
+    #[test]
+    fn route_event_substitutes_agent_name() {
+        let states = vec![st_pane("flywheel-oc", "idle", "%9")];
+        let mut queue = vec!["hi {AGENT_NAME}".into()];
+        let mut pending = std::collections::HashSet::new();
+        let a = route_event(
+            &states,
+            &pev("pane.agent_status_changed", "%9", "idle", 1),
+            &mut queue,
+            &mut pending,
+        );
+        match a {
+            Some(LoopAction::DispatchImmediate { text, .. }) => {
+                assert_eq!(text, "hi flywheel-oc");
+            }
+            other => panic!("expected DispatchImmediate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_poll_entry_reads_pane_id() {
+        let v = serde_json::json!(["a", "idle", "opencode", "%p1"]);
+        let s = parse_poll_entry(&v).unwrap();
+        assert_eq!(s.pane_id, "%p1");
+        assert_eq!(s.kind, "opencode");
+        // legacy 3-element still works
+        let v2 = serde_json::json!(["b", "working", "pi"]);
+        let s2 = parse_poll_entry(&v2).unwrap();
+        assert!(s2.pane_id.is_empty());
     }
 }
 
