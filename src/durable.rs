@@ -594,9 +594,9 @@ pub enum EscalationTier {
 /// thin wrapper.
 pub fn on_blocked_tier_exit(tier: EscalationTier, on_blocked: &str) -> Option<String> {
     match on_blocked {
-        "mail" if tier == EscalationTier::T3 => Some(format!(
-            "halted: agent blocked past escalation budget (T3) — human required"
-        )),
+        "mail" if tier == EscalationTier::T3 => {
+            Some("halted: agent blocked past escalation budget (T3) — human required".to_string())
+        }
         "stop" => Some(format!(
             "stopped: blocked agents (--on-blocked stop, tier {tier:?})"
         )),
@@ -945,19 +945,6 @@ async fn renew_leases(args: RenewLeaseArgs) -> Result<Value> {
 }
 
 /// Lease TTL policy for loop-made reservations: an initial TTL of
-/// `max(3600, 4 × heartbeat_interval)` so a single missed renew cannot expire
-/// the lease mid-run (bd-mail-lease-renewal-durable subtask 5). The heartbeat
-/// itself renews by `4 × heartbeat_interval` ([`renew_leases`]), so one tick
-/// of grace covers the whole reservation window.
-///
-/// No loop-side reserve call exists yet (agents reserve their own files; the
-/// loop's reservation path lands with the build-slot bead) — the policy is
-/// exercised by tests and consumed by that future reserve path.
-#[allow(dead_code)]
-pub fn lease_ttl_seconds(heartbeat_interval_secs: u64) -> u64 {
-    (4 * heartbeat_interval_secs).max(3600)
-}
-
 /// Renewal extension per heartbeat tick: `4 × heartbeat_interval`, floored at
 /// agent-mail's 60s `extend_seconds` minimum — never compute tiny extensions.
 pub fn lease_renew_seconds(heartbeat_interval_secs: u64) -> u64 {
@@ -998,12 +985,6 @@ pub enum LoopAction {
     },
     /// Self-heal: `__respawn` after diagnose failed to clear (budgeted).
     Respawn {
-        name: String,
-        reason: String,
-    },
-    /// Legacy alias treated as Diagnose (match arm still accepts it).
-    #[allow(dead_code)]
-    SelfHeal {
         name: String,
         reason: String,
     },
@@ -1353,9 +1334,6 @@ pub const DEFAULT_UNKNOWN_DIAGNOSE_THRESHOLD: u32 = 3;
 pub const DEFAULT_RESPAWN_BUDGET: u32 = 2;
 
 /// Legacy alias: old tests/callers used a hard respawn threshold of 2.
-/// Prefer [`DEFAULT_UNKNOWN_DIAGNOSE_THRESHOLD`] + [`self_heal_step`].
-pub const UNKNOWN_RESPAWN_THRESHOLD: u64 = 2;
-
 /// Per-agent self-heal bookkeeping (bd-event-self-heal-unknown).
 /// Survives within a run; optionally mirrored into `loops.json` `respawn`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1377,43 +1355,6 @@ pub enum HealAction {
     Respawn,
     /// Budget exhausted — surface as Blocked / human escalate.
     EscalateBlocked,
-}
-
-/// Legacy enum kept for older unit tests; maps onto the diagnose→respawn path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnknownAction {
-    None,
-    Respawn,
-}
-
-/// Pure unknown-status verdict (legacy): count >= threshold → Respawn.
-pub fn unknown_decision(status: &str, count: u64, threshold: u64) -> UnknownAction {
-    if status == "unknown" && count >= threshold {
-        UnknownAction::Respawn
-    } else {
-        UnknownAction::None
-    }
-}
-
-/// Legacy bookkeeping (direct respawn). Prefer [`self_heal_step`].
-pub fn track_unknown(
-    unknown_seen: &mut std::collections::HashMap<String, u64>,
-    name: &str,
-    status: &str,
-    threshold: u64,
-) -> UnknownAction {
-    if status != "unknown" {
-        unknown_seen.remove(name);
-        return UnknownAction::None;
-    }
-    let count = unknown_seen.entry(name.to_string()).or_insert(0);
-    *count += 1;
-    if unknown_decision(status, *count, threshold) == UnknownAction::Respawn {
-        unknown_seen.remove(name);
-        UnknownAction::Respawn
-    } else {
-        UnknownAction::None
-    }
 }
 
 /// Pure self-heal step (bd-event-self-heal-unknown).
@@ -2070,8 +2011,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         }
                     }
                 }
-                LoopAction::Diagnose { name, reason } | LoopAction::SelfHeal { name, reason } => {
-                    // SelfHeal is a legacy alias for Diagnose (pane_exited path).
+                LoopAction::Diagnose { name, reason } => {
                     let _ = ctx
                         .run(
                             diagnose_agent,
@@ -2874,21 +2814,6 @@ mod tests {
         }
     }
 
-    /// Initial TTL policy: `max(3600, 4 × heartbeat)` — a 1h floor so a single
-    /// missed renew can't expire a default-cadence (300s) lease; long
-    /// heartbeats scale the window linearly.
-    #[test]
-    fn lease_ttl_policy_floor_and_scale() {
-        // default base cadence 300s → 4×300 = 1200 < 3600 → 3600 floor
-        assert_eq!(lease_ttl_seconds(300), 3600);
-        // tiny interval → still the 1h floor
-        assert_eq!(lease_ttl_seconds(30), 3600);
-        assert_eq!(lease_ttl_seconds(60), 3600);
-        // long heartbeat → 4× dominates
-        assert_eq!(lease_ttl_seconds(1000), 4000);
-        assert_eq!(lease_ttl_seconds(3600), 14400);
-    }
-
     /// Renewal extension per tick: `4 × heartbeat`, floored at agent-mail's
     /// 60s minimum — never compute tiny extensions.
     #[test]
@@ -3220,90 +3145,6 @@ mod tests {
         assert_eq!(s.kind, "");
     }
 
-    #[test]
-    fn unknown_decision_respawns_at_threshold_only() {
-        // 0/1 unknown polls → wait; 2 → respawn; beyond → respawn (already stuck)
-        assert_eq!(
-            unknown_decision("unknown", 0, UNKNOWN_RESPAWN_THRESHOLD),
-            UnknownAction::None
-        );
-        assert_eq!(
-            unknown_decision("unknown", 1, UNKNOWN_RESPAWN_THRESHOLD),
-            UnknownAction::None
-        );
-        assert_eq!(
-            unknown_decision("unknown", 2, UNKNOWN_RESPAWN_THRESHOLD),
-            UnknownAction::Respawn
-        );
-        assert_eq!(
-            unknown_decision("unknown", 5, UNKNOWN_RESPAWN_THRESHOLD),
-            UnknownAction::Respawn
-        );
-    }
-
-    #[test]
-    fn unknown_decision_never_fires_on_classified_status() {
-        // a working/idle agent is confirmed alive — no respawn even at a high count
-        assert_eq!(
-            unknown_decision("idle", 5, UNKNOWN_RESPAWN_THRESHOLD),
-            UnknownAction::None
-        );
-        assert_eq!(
-            unknown_decision("working", 2, UNKNOWN_RESPAWN_THRESHOLD),
-            UnknownAction::None
-        );
-        assert_eq!(
-            unknown_decision("blocked", 2, UNKNOWN_RESPAWN_THRESHOLD),
-            UnknownAction::None
-        );
-    }
-
-    #[test]
-    fn track_unknown_sequence_two_unknown_polls_respawns_once() {
-        // integration-style: (unknown, unknown) → exactly one Respawn, episode reset
-        let mut m = std::collections::HashMap::new();
-        assert_eq!(
-            track_unknown(&mut m, "a", "unknown", UNKNOWN_RESPAWN_THRESHOLD),
-            UnknownAction::None
-        );
-        assert_eq!(m.get("a"), Some(&1));
-        assert_eq!(
-            track_unknown(&mut m, "a", "unknown", UNKNOWN_RESPAWN_THRESHOLD),
-            UnknownAction::Respawn
-        );
-        // the fresh instance starts a clean episode — counter gone
-        assert!(m.is_empty());
-    }
-
-    #[test]
-    fn track_unknown_flicker_never_respawns() {
-        // unknown → idle → unknown: the idle poll resets the counter, so the
-        // second unknown starts at 1 and never reaches the threshold
-        let mut m = std::collections::HashMap::new();
-        track_unknown(&mut m, "a", "unknown", UNKNOWN_RESPAWN_THRESHOLD);
-        track_unknown(&mut m, "a", "idle", UNKNOWN_RESPAWN_THRESHOLD);
-        assert!(m.is_empty());
-        assert_eq!(
-            track_unknown(&mut m, "a", "unknown", UNKNOWN_RESPAWN_THRESHOLD),
-            UnknownAction::None
-        );
-        assert_eq!(m.get("a"), Some(&1));
-        assert_eq!(
-            track_unknown(&mut m, "a", "unknown", UNKNOWN_RESPAWN_THRESHOLD),
-            UnknownAction::Respawn
-        );
-    }
-
-    #[test]
-    fn track_unknown_tracks_agents_independently() {
-        let mut m = std::collections::HashMap::new();
-        track_unknown(&mut m, "a", "unknown", UNKNOWN_RESPAWN_THRESHOLD);
-        track_unknown(&mut m, "b", "unknown", UNKNOWN_RESPAWN_THRESHOLD);
-        track_unknown(&mut m, "b", "unknown", UNKNOWN_RESPAWN_THRESHOLD); // b respawns
-        assert_eq!(m.get("a"), Some(&1)); // a untouched by b's respawn
-        assert!(!m.contains_key("b"));
-    }
-
     // ---- bd-event-subscribe-reactor: __poll_events batch parse ----
 
     #[test]
@@ -3570,13 +3411,11 @@ mod tests {
                 kind: "blocked",
                 content: String::new(),
             }),
-            LoopAction::Diagnose { name, reason } | LoopAction::SelfHeal { name, reason } => {
-                Some(DispatchRec {
-                    agent: name.clone(),
-                    kind: "diagnose",
-                    content: reason.clone(),
-                })
-            }
+            LoopAction::Diagnose { name, reason } => Some(DispatchRec {
+                agent: name.clone(),
+                kind: "diagnose",
+                content: reason.clone(),
+            }),
             LoopAction::Respawn { name, reason } => Some(DispatchRec {
                 agent: name.clone(),
                 kind: "respawn",

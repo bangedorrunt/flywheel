@@ -51,6 +51,7 @@ use serde_json::Value;
 /// - `status: Some(s)` → the prompt landed and the agent reached `s`.
 /// - `code: Some(c)` → herdr returned a protocol error code
 ///   (e.g. `agent_prompt_stalled`, `timeout`, `agent_not_running`).
+///
 /// Exactly one of the two is populated on the herdr backend (landed → status,
 /// error → code); other backends define their own contract.
 #[derive(Debug, Clone, PartialEq, Eq)]

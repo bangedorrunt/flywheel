@@ -253,19 +253,21 @@ impl MailBackend for AgentMailMcpBackend {
         filter: &crate::backend::SearchFilter,
     ) -> Result<Value> {
         // bd-mail-search-summarize: delegate to Mail::search, mapping the
-        // SearchFilter struct to the wrapper's optional params.
+        // trait SearchFilter to the wrapper's filter struct (review-fix F8).
         self.mail
             .search(
                 project_key,
                 query,
                 limit,
-                filter.sender.as_deref(),
-                filter.importance.as_deref(),
-                filter.thread_id.as_deref(),
-                filter.date_start.as_deref(),
-                filter.date_end.as_deref(),
-                filter.ranking.as_deref(),
-                filter.include_body_md,
+                &crate::mail::MailSearchFilter {
+                    sender: filter.sender.clone(),
+                    importance: filter.importance.clone(),
+                    thread_id: filter.thread_id.clone(),
+                    date_start: filter.date_start.clone(),
+                    date_end: filter.date_end.clone(),
+                    ranking: filter.ranking.clone(),
+                    include_body_md: filter.include_body_md,
+                },
             )
             .map_err(BackendError::Other)
     }

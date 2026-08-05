@@ -870,6 +870,7 @@ fn agent_name_n(project: &str, short: &str, ordinal: u32) -> String {
 /// - is already a valid adjective+noun identity (`agent_mail_name` is
 ///   idempotent on those — returns the value unchanged) — pass through
 /// - contains `:` (a raw pane id) — pass through
+///
 /// Everything else (bare shorts like `oc`, `pi`, `gk`) expands to the first
 /// ordinal of that kind.
 fn resolve_agent_default(project: &str, value: &str) -> String {
@@ -1497,6 +1498,8 @@ fn recipe_counts(
     Ok(out)
 }
 
+/// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
+#[allow(clippy::too_many_arguments)]
 fn cmd_spawn(
     cfg: &Config,
     project: &str,
@@ -5316,6 +5319,8 @@ pub fn extract_plan_path(text: &str, fallback: &str) -> String {
 /// not merge; VERIFIED does not close beads.
 ///
 /// governed-by: ADR-0001 §9.2 (bd-pattern-plan-review-implement)
+/// clap command signature — params map 1:1 to CLI flags.
+#[allow(clippy::too_many_arguments)]
 fn cmd_plan_review(
     cfg: &Config,
     project: &str,
@@ -6444,6 +6449,7 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str, tier: u32)
 /// 1. Capture recent output via the read path (best-effort).
 /// 2. Send high-importance mail on thread `health-<name>` to the orchestrator
 ///    identity (config agent_mail.name) so a human/supervisor can act.
+///
 /// Soft-fail always: exit 0 with `{ok, ...}` so overnight loops never die.
 fn cmd_internal_diagnose(cfg: &Config, project: &str, name: &str, reason: &str) -> Result<()> {
     // --- tail (best-effort) ---
