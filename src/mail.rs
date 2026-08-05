@@ -156,6 +156,12 @@ impl Mail {
         )
     }
 
+    /// Send a message. `thread_id` chains this message into an existing
+    /// thread or starts one (AD-0001 A3, bd-mail-reply-thread). flywheel's
+    /// thread-id conventions: bead work `<bead-id>`, debate `debate-<ts>`,
+    /// plan review `plan-<bead-id>` / `plan-<ts>`, health `health-<agent>`.
+    /// `None` = standalone message (never guess a thread — explicit only).
+    #[allow(clippy::too_many_arguments)] // mirrors the MailBackend::send trait surface
     pub fn send(
         &mut self,
         project_key: &str,
@@ -164,13 +170,55 @@ impl Mail {
         body: &str,
         importance: &str,
         ack: bool,
+        thread_id: Option<&str>,
+    ) -> Result<Value> {
+        let mut args = json!({
+            "project_key": project_key, "sender_name": self.name, "to": to,
+            "subject": subject, "body_md": body, "importance": importance,
+            "ack_required": ack
+        });
+        if let Some(t) = thread_id {
+            args["thread_id"] = json!(t);
+        }
+        self.call("send_message", args)
+    }
+
+    /// Reply to a message (agent-mail MCP `reply_message` tool). Omitting
+    /// `to` replies to the original sender (the tool contract); the reply
+    /// inherits the original's thread, importance and ack flags unless the
+    /// tool's defaults are overridden.
+    pub fn reply(
+        &mut self,
+        project_key: &str,
+        message_id: u64,
+        body: &str,
+        to: Option<&[String]>,
+    ) -> Result<Value> {
+        let mut args = json!({
+            "project_key": project_key, "sender_name": self.name,
+            "message_id": message_id, "body_md": body
+        });
+        if let Some(to) = to {
+            args["to"] = json!(to);
+        }
+        self.call("reply_message", args)
+    }
+
+    /// Summarize a thread (agent-mail MCP `summarize_thread` tool).
+    /// `llm_mode=false` (default) uses structured extraction — deterministic,
+    /// what the orchestrator/judge needs to read a thread compactly;
+    /// `llm_mode=true` produces a human-readable digest.
+    pub fn summarize_thread(
+        &mut self,
+        project_key: &str,
+        thread_id: &str,
+        llm_mode: bool,
     ) -> Result<Value> {
         self.call(
-            "send_message",
+            "summarize_thread",
             json!({
-                "project_key": project_key, "sender_name": self.name, "to": to,
-                "subject": subject, "body_md": body, "importance": importance,
-                "ack_required": ack
+                "project_key": project_key, "thread_id": thread_id,
+                "llm_mode": llm_mode
             }),
         )
     }
@@ -916,5 +964,86 @@ mod tests {
             after.get("agent_name").is_none(),
             "stale lookup after clear — identity file must be gone: {after}"
         );
+    }
+
+    // ---- reply + thread continuity (bd-mail-reply-thread) ----
+
+    /// Debate-loop acceptance: A opens a thread (thread_id set), B replies
+    /// (default to the original sender), A counters, then the judge reads
+    /// the whole thread via summarize_thread — all messages under ONE
+    /// thread_id, both participants visible, count matches 3. Runs against
+    /// the live agent-mail server:
+    ///   `cargo test -- --ignored debate_loop_thread_continuity`
+    #[test]
+    #[ignore = "needs a live agent-mail server (reads flywheel config)"]
+    fn debate_loop_thread_continuity() {
+        let cfg = crate::config::Config::load().expect("config loads");
+        let mut mail = Mail::from_config(cfg.agent_mail.as_ref())
+            .expect("from_config ok")
+            .expect("agent_mail configured");
+        let mut observer = Mail {
+            name: "SapphireOwl".into(),
+            base: mail.base.clone(),
+            token: mail.token.clone(),
+            next_id: 1,
+        };
+        let key = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        mail.ensure_project(&key).expect("ensure_project");
+        observer.ensure_project(&key).expect("ensure_project");
+        let cfg_name = mail.name.clone();
+        let obs_name = observer.name.clone();
+        mail.register_agent(&key, &cfg_name, "flywheel", "flywheel", "debate-live-probe")
+            .expect("register A");
+        observer
+            .register_agent(&key, &obs_name, "flywheel", "flywheel", "debate-live-probe-observer")
+            .expect("register B");
+
+        let thread = format!("debate-live-{}", std::process::id()); // unique per run
+        // round 1: A opens the thread with thread_id set
+        let a1 = mail
+            .send(&key, std::slice::from_ref(&obs_name), "debate round 1", "A: for", "normal", false, Some(&thread))
+            .expect("A send");
+        let a1_id = a1["deliveries"][0]["payload"]["id"]
+            .as_u64()
+            .expect("A message id: {a1}");
+        // round 2: B replies to A's message, defaulting to the original sender
+        let b1 = observer
+            .reply(&key, a1_id, "B: against", None)
+            .expect("B reply");
+        let b1_id = b1["deliveries"][0]["payload"]["id"]
+            .as_u64()
+            .expect("B message id: {b1}");
+        // round 3: A counters B's reply (thread continuity via reply_message)
+        let a2 = mail
+            .reply(&key, b1_id, "A: rebuttal", None)
+            .expect("A counter");
+        let a2_id = a2["deliveries"][0]["payload"]["id"]
+            .as_u64()
+            .expect("A message id: {a2}");
+
+        // judge reads the thread compactly
+        let sum = mail
+            .summarize_thread(&key, &thread, false)
+            .expect("summarize_thread");
+        assert_eq!(sum["thread_id"], json!(thread), "same thread: {sum}");
+        let participants = sum["summary"]["participants"]
+            .as_array()
+            .expect("participants list");
+        let names: Vec<&str> = participants
+            .iter()
+            .filter_map(|p| p.as_str())
+            .collect();
+        assert!(
+            names.contains(&cfg_name.as_str()) && names.contains(&obs_name.as_str()),
+            "both participants in thread: {names:?}"
+        );
+        assert!(
+            sum["summary"]["total_messages"].as_u64() >= Some(3),
+            "3+ rounds under one thread: {sum}"
+        );
+        let _ = (a1_id, b1_id, a2_id); // ids are the round evidence
     }
 }

@@ -77,8 +77,7 @@ impl MailBackend for AgentMailMcpBackend {
             .map_err(BackendError::Other)
     }
 
-    /// thread_id is accepted by the trait but the current `Mail::send` has no
-    /// thread param — ignored until bd-mail-reply-thread adds it.
+    /// thread_id chains into a conversation thread (bd-mail-reply-thread).
     fn send(
         &mut self,
         project_key: &str,
@@ -87,22 +86,23 @@ impl MailBackend for AgentMailMcpBackend {
         body: &str,
         importance: &str,
         ack_required: bool,
-        _thread_id: Option<&str>,
+        thread_id: Option<&str>,
     ) -> Result<Value> {
         self.mail
-            .send(project_key, to, subject, body, importance, ack_required)
+            .send(project_key, to, subject, body, importance, ack_required, thread_id)
             .map_err(BackendError::Other)
     }
 
     fn reply(
         &mut self,
-        _project_key: &str,
-        _message_id: u64,
-        _body: &str,
-        _to: Option<&[String]>,
+        project_key: &str,
+        message_id: u64,
+        body: &str,
+        to: Option<&[String]>,
     ) -> Result<Value> {
-        // Phase 3: bd-mail-reply-thread.
-        Err(self.unsupported("reply"))
+        self.mail
+            .reply(project_key, message_id, body, to)
+            .map_err(BackendError::Other)
     }
 
     fn inbox(&mut self, project_key: &str, agent: &str, filter: &InboxFilter) -> Result<Value> {
@@ -232,12 +232,13 @@ impl MailBackend for AgentMailMcpBackend {
 
     fn summarize_thread(
         &mut self,
-        _project_key: &str,
-        _thread_id: &str,
-        _llm_mode: bool,
+        project_key: &str,
+        thread_id: &str,
+        llm_mode: bool,
     ) -> Result<Value> {
-        // Phase 3: bd-mail-reply-thread (also owns the Mail::summarize wrapper).
-        Err(self.unsupported("summarize_thread"))
+        self.mail
+            .summarize_thread(project_key, thread_id, llm_mode)
+            .map_err(BackendError::Other)
     }
 
     fn request_contact(
@@ -355,10 +356,10 @@ mod tests {
         // register_agent USED to be Unsupported; bd-mail-register-on-spawn
         // graduated it to real delegation (calls Mail::register_agent).
         // renew graduated with bd-mail-lease-renewal-durable; the pane
-        // identity trio with bd-mail-pane-identity-bridge. The remaining 9
+        // identity trio with bd-mail-pane-identity-bridge; reply +
+        // summarize_thread with bd-mail-reply-thread. The remaining 7
         // stay Unsupported until their Phase-3 beads land.
         let cases: Vec<(&str, std::result::Result<Value, BackendError>)> = vec![
-            ("reply", b.reply("p", 1, "x", None)),
             ("ack", b.ack("p", "a", 1)),
             ("mark_read", b.mark_read("p", "a", 1)),
             (
@@ -367,7 +368,6 @@ mod tests {
             ),
             ("slot_release", b.slot_release("p", "a", "cargo")),
             ("search", b.search("p", "q", 5, &Default::default())),
-            ("summarize_thread", b.summarize_thread("p", "t", false)),
             (
                 "request_contact",
                 b.request_contact("p", "a", "b", None, "r"),
