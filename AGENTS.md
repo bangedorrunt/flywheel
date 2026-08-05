@@ -5,12 +5,11 @@ command surface and a durable monitoring loop built on Resonate.
 
 ## Session facts
 
-- Backend: herdr server via unix socket (newline-delimited JSON-RPC, one request
-  per connection — see `src/herdr.rs`). Raw pane control: `herdr` CLI.
+- **Backends (ADR-0002):** pluggable multiplexer + mail via traits in `src/backend/`.
+  Defaults: herdr + agentmail. Discover: `flywheel backend list --json`.
+  Details: [Backends](#backends) below.
 - Tracker: br/bv (CLI-only — there is NO beads MCP server; `beads-mcp` is the
   legacy bd-era plugin, never wire it in).
-- Coordination: agent-mail MCP server (`http://127.0.0.1:8765/mcp/`, bearer
-  token from `~/.config/flywheel/config.toml`).
 - Durable loop: Resonate server via launchd (`com.flywheel.resonate`,
   `http://localhost:8001`, sqlite at `~/.local/state/flywheel/resonate.db`).
 - State/logs: `~/.local/state/flywheel/` (event logs, checkpoints, `loops.json`).
@@ -21,6 +20,60 @@ command surface and a durable monitoring loop built on Resonate.
     See module docs on `state.rs` for both-direction back-compat.
 - The binary also lives at `~/.local/bin/flywheel` — rebuild + copy after
   changes (`cargo build --release && cp target/release/flywheel ~/.local/bin/flywheel`).
+
+## Backends
+
+Pluggable **multiplexer** + **mail** (ADR-0002). Collaboration spine (ADR-0001)
+targets traits, not concretes — backend swaps survive without bead rewrites.
+
+### Traits + matrix
+
+| Role | Trait | Default impl | Stubs (feature-gated, `Unsupported`) |
+|------|--------|--------------|--------------------------------------|
+| Multiplexer | `MultiplexerBackend` | `HerdrBackend` (`backend-herdr`) | superlogical, tmux |
+| Mail | `MailBackend` | `AgentMailMcpBackend` (`mail-agentmail`) | toron (`mail-toron`) |
+
+Factory: `src/backend/factory.rs` → `Box<dyn MultiplexerBackend>` /
+`Box<dyn MailBackend>`. Code: `src/backend/`.
+
+### Selection (precedence)
+
+**flag > env > `.env` (dotenvy) > `config.toml` `[backend]` > default**
+
+| Var / key | Values | Default |
+|-----------|--------|---------|
+| `FLYWHEEL_BACKEND` / `[backend] multiplexer` | `herdr` \| `superlogical` \| `tmux` | `herdr` |
+| `FLYWHEEL_MAIL` / `[backend] mail` | `agentmail` \| `toron` | `agentmail` |
+| `FLYWHEEL_AGENTMAIL_URL` / `TOKEN` / `FLYWHEEL_MAIL_NAME` | agent-mail MCP | config.toml |
+
+Copy `.env.example` → `.env` (gitignored). Never commit tokens.
+
+Cargo features: `backend-herdr`, `backend-superlogical`, `backend-tmux`,
+`mail-agentmail`, `mail-toron` (default = herdr + agentmail + serve).
+
+### Discovery
+
+```bash
+flywheel backend list --json   # compiled-in + active + ready|stub
+flywheel backend status        # active pair + config source + health
+flywheel backend default <multiplexer|mail> <name>  # write config.toml
+```
+
+Spawned agents: run `flywheel backend list --json` if dispatch primitive is unclear
+(herdr prompt vs future superlogical equivalent).
+
+### Migration path (ADR-0002 §4)
+
+| Phase | State | Action |
+|-------|--------|--------|
+| **R0** (now) | toron v0.1, superlogical pre-release | Traits + herdr/agentmail wraps; stubs reserve env names |
+| **R1** | toron-core ships | Real `ToronMailBackend`; flip `FLYWHEEL_MAIL=toron` when parity passes |
+| **R1.5** | toron `Backend` trait | Trait merge; delete flywheel `herdr.rs` when single source lands |
+| **R2** | superlogical SDK | Real `SuperlogicalBackend`; env flip |
+
+Cross-links: [ADR-0002](docs/decisions/0002-pluggable-backend-abstraction.md),
+[ADR-0001](docs/decisions/0001-event-driven-agent-collaboration-spine.md),
+toron ADR-0003 (embed path).
 
 ## Rules
 

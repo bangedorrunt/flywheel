@@ -6,7 +6,8 @@
 | **Date** | 2026-08-05 |
 | **Decision Maker** | Captain (bangedorrunt) |
 | **Supersedes** | Informal decisions baked into the prior `bd-herdr-automation-hardening-*` epic (send-confirm, unknown-skip, adaptive-interval, `bd-protocol-v18-kkd`) |
-| **Governs** | `src/herdr.rs`, `src/mail.rs`, `src/durable.rs`, `src/main.rs` (loop core), `src/state.rs` |
+| **Governs** | `src/durable.rs`, `src/main.rs` (loop core), `src/state.rs`; **via ADR-0002 traits** — collaboration beads target `MultiplexerBackend` / `MailBackend` (`src/backend/`), not concrete `herdr::Client` / `mail::Mail` (those wrap as `HerdrBackend` / `AgentMailMcpBackend`) |
+| **Depends on** | ADR-0002 (pluggable backends — R0 prerequisite for Phase 1–3 beads) |
 | **Verification** | `docs/decisions/_scripts/verify-0001.sh` (see §11) |
 
 ---
