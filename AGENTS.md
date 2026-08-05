@@ -97,6 +97,38 @@ flywheel mail product search --product trading-research "query"
 Contact policy default: **auto** (not open). Cross-project spam requires shared
 context or explicit approve.
 
+#### One-time setup (cross-project swarm, ADR-0001 §9.5)
+
+```bash
+# products
+flywheel mail product ensure --name trading-research
+flywheel mail product link --product trading-research ~/workspace/hachiko
+flywheel mail product link --product trading-research ~/workspace/flywheel
+flywheel mail product ensure --name knowledge
+flywheel mail product link --product knowledge ~/workspace/chiebukuro
+flywheel mail product link --product knowledge ~/workspace/toron
+
+# contact handshake (from hachiko side; flywheel orchestrator approves)
+flywheel xproj request hachiko --to FlywheelOrch --to-project ~/workspace/flywheel \
+  --reason "run backtest swarms"
+# on flywheel: flywheel mail contact approve flywheel --from HachikoStrategist
+```
+
+#### Runtime fan-out
+
+```bash
+# hachiko-strategist → flywheel orchestrator
+flywheel xproj send hachiko --to FlywheelOrch --to-project ~/workspace/flywheel \
+  --recipe backtest-5m --workers 4 --body "strategy=CrystalRegime asset=BTC"
+# body uses subject [xproj] + recipe=/workers=/product= lines
+# receiver: parse with flywheel xproj parse "…"; spawn recipe; reply in thread
+# requester reads via: flywheel mail product search --product trading-research "xproj"
+```
+
+Receiving loop: treat inbox subjects starting with `[xproj]` as cross-project
+swarm requests (parse body via `parse_xproj_request`); do not overload normal
+dispatch. Reply results in the same thread.
+
 ## Rules
 
 - **TDD**: write failing tests first (RED-GREEN-REFACTOR). `cargo test` must pass.

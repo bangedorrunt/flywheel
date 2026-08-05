@@ -276,6 +276,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: MailCmd,
     },
+    /// cross-project fan-out (contact + product; ADR-0001 §9.5)
+    Xproj {
+        #[command(subcommand)]
+        cmd: XprojCmd,
+    },
     /// git worktree swarms
     Worktree {
         #[command(subcommand)]
@@ -666,6 +671,49 @@ enum MailProductCmd {
         product: String,
         #[arg(long, default_value = "20")]
         limit: u32,
+    },
+}
+
+/// Cross-project swarm fan-out (bd-pattern-cross-project-swarm).
+#[derive(Subcommand)]
+enum XprojCmd {
+    /// one-time contact handshake with an agent in another project
+    Request {
+        /// local project (sender's workspace path/label)
+        project: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        to_project: String,
+        #[arg(long, default_value = "cross-project swarm fan-out")]
+        reason: String,
+    },
+    /// send a cross-project swarm request (`[xproj]` subject prefix)
+    Send {
+        /// local project (sender)
+        project: String,
+        #[arg(long)]
+        to: String,
+        /// absolute path or label of the receiving project
+        #[arg(long)]
+        to_project: String,
+        /// recipe/workflow name the receiver should run
+        #[arg(long)]
+        recipe: String,
+        /// free-form params for the receiver (strategy, asset, windows, …)
+        #[arg(long, default_value = "")]
+        body: String,
+        /// optional product for reply search (default: trading-research)
+        #[arg(long, default_value = "trading-research")]
+        product: String,
+        /// worker count hint for the receiver
+        #[arg(long, default_value_t = 2)]
+        workers: u32,
+    },
+    /// parse an `[xproj]` body (debug / orchestrator unit path)
+    Parse {
+        /// full message body or subject+body text
+        text: String,
     },
 }
 
@@ -1125,6 +1173,7 @@ fn main() {
             msg,
         }) => cmd_assign(&cfg, project, to, beads, msg.as_deref()),
         Some(Commands::Mail { cmd }) => cmd_mail(&cfg, cmd),
+        Some(Commands::Xproj { cmd }) => cmd_xproj(&cfg, cmd),
         Some(Commands::Worktree { cmd }) => cmd_worktree(&cfg, cmd),
         Some(Commands::Checkpoint { cmd }) => cmd_checkpoint(&cfg, cmd),
         Some(Commands::Timeline { project }) => cmd_timeline(project),
@@ -2828,6 +2877,164 @@ fn mail_or_die(cfg: &Config) -> Result<mail::Mail> {
             config::config_file().display()
         )
     })
+}
+
+/// Parsed cross-project swarm request (subject `[xproj] …` + body fields).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XprojRequest {
+    pub recipe: String,
+    pub workers: u32,
+    pub params: String,
+    pub product: String,
+}
+
+/// Parse an `[xproj]` swarm request from subject and/or body.
+///
+/// Accepts lines like `recipe=backtest-5m`, `workers=4`, `product=trading-research`,
+/// free-form remainder as params. Subject may be `[xproj] run … recipe=foo`.
+pub fn parse_xproj_request(text: &str) -> Option<XprojRequest> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    // require [xproj] marker somewhere (case-insensitive)
+    if !t.to_ascii_lowercase().contains("[xproj]") {
+        return None;
+    }
+    let mut recipe = String::new();
+    let mut workers = 2u32;
+    let mut product = "trading-research".to_string();
+    let mut params_parts: Vec<String> = Vec::new();
+    for raw in t.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("recipe=") {
+            recipe = line[line.len() - rest.len()..].to_string();
+            continue;
+        }
+        if let Some(rest) = lower.strip_prefix("workers=") {
+            if let Ok(n) = rest.trim().parse::<u32>() {
+                workers = n.max(1);
+            }
+            continue;
+        }
+        if let Some(rest) = lower.strip_prefix("product=") {
+            product = line[line.len() - rest.len()..].to_string();
+            continue;
+        }
+        // skip pure [xproj] subject lines without params
+        if lower.starts_with("[xproj]") && !line.contains('=') {
+            // maybe " [xproj] run 4-worker … recipe=foo" on one line
+            for tok in line.split_whitespace() {
+                let tl = tok.to_ascii_lowercase();
+                if let Some(r) = tl.strip_prefix("recipe=") {
+                    recipe = tok[tok.len() - r.len()..].to_string();
+                }
+            }
+            continue;
+        }
+        params_parts.push(line.to_string());
+    }
+    if recipe.is_empty() {
+        // last chance: recipe= anywhere in full text
+        for tok in t.split_whitespace() {
+            let tl = tok.to_ascii_lowercase();
+            if let Some(r) = tl.strip_prefix("recipe=") {
+                recipe = tok[tok.len() - r.len()..].to_string();
+                break;
+            }
+        }
+    }
+    if recipe.is_empty() {
+        return None;
+    }
+    Some(XprojRequest {
+        recipe,
+        workers,
+        params: params_parts.join("\n"),
+        product,
+    })
+}
+
+fn cmd_xproj(cfg: &Config, cmd: &XprojCmd) -> Result<()> {
+    match cmd {
+        XprojCmd::Request {
+            project,
+            to,
+            to_project,
+            reason,
+        } => {
+            let mut mail = mail_or_die(cfg)?;
+            let key = project_dir(cfg, project).to_str().unwrap().to_string();
+            let to_key = project_dir(cfg, to_project).to_str().unwrap().to_string();
+            mail.ensure_project(&key)?;
+            let from = mail.name.clone();
+            let to_mail = resolve_mail_target(to);
+            let v = mail.request_contact(&key, &from, &to_mail, Some(&to_key), reason, None)?;
+            print_json(&v);
+        }
+        XprojCmd::Send {
+            project,
+            to,
+            to_project,
+            recipe,
+            body,
+            product,
+            workers,
+        } => {
+            let mut mail = mail_or_die(cfg)?;
+            let key = project_dir(cfg, project).to_str().unwrap().to_string();
+            mail.ensure_project(&key)?;
+            let to_mail = resolve_mail_target(to);
+            let ts = crate::state::now_iso().replace(['-', ':'], "");
+            let thread = format!("xproj-{recipe}-{ts}");
+            let subject = format!("[xproj] run {workers}-worker swarm recipe={recipe}");
+            let body_md = format!(
+                "recipe={recipe}\nworkers={workers}\nproduct={product}\n\n{body}\n\n\
+                 Reply results in this thread. Receiver: spawn workers in your project, \
+                 run the recipe/workflow, reply a summary here."
+            );
+            // send into the local project inbox of the remote agent identity
+            // (cross-project delivery relies on approved contact + product search)
+            let v = mail.send(
+                &key,
+                &[to_mail],
+                &subject,
+                &body_md,
+                "high",
+                true,
+                Some(&thread),
+            )?;
+            print_json(&json!({
+                "ok": true,
+                "thread_id": thread,
+                "subject": subject,
+                "product": product,
+                "recipe": recipe,
+                "workers": workers,
+                "send": v,
+            }));
+        }
+        XprojCmd::Parse { text } => match parse_xproj_request(text) {
+            Some(r) => print_json(&json!({
+                "ok": true,
+                "recipe": r.recipe,
+                "workers": r.workers,
+                "product": r.product,
+                "params": r.params,
+            })),
+            None => {
+                print_json(&json!({
+                    "ok": false,
+                    "error": "not an [xproj] request or missing recipe=",
+                }));
+            }
+        },
+    }
+    Ok(())
 }
 
 fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
@@ -6330,6 +6537,35 @@ mod debate_tests {
         assert_eq!(a, "pi");
         assert_eq!(b, "gk");
         assert_eq!(j, "oc");
+    }
+}
+
+#[cfg(test)]
+mod xproj_tests {
+    use super::*;
+
+    #[test]
+    fn parse_xproj_request_happy() {
+        let t = "[xproj] run 4-worker\nrecipe=backtest-5m\nworkers=4\nproduct=trading-research\nstrategy=CrystalRegime\n";
+        let r = parse_xproj_request(t).expect("parse");
+        assert_eq!(r.recipe, "backtest-5m");
+        assert_eq!(r.workers, 4);
+        assert_eq!(r.product, "trading-research");
+        assert!(r.params.contains("strategy=CrystalRegime"));
+    }
+
+    #[test]
+    fn parse_xproj_request_requires_marker_and_recipe() {
+        assert!(parse_xproj_request("recipe=foo").is_none());
+        assert!(parse_xproj_request("[xproj] hello").is_none());
+        assert!(parse_xproj_request("").is_none());
+    }
+
+    #[test]
+    fn parse_xproj_recipe_in_subject_line() {
+        let t = "[xproj] run 2-worker recipe=daily-p6\nbody line";
+        let r = parse_xproj_request(t).expect("parse");
+        assert_eq!(r.recipe, "daily-p6");
     }
 }
 
