@@ -59,6 +59,20 @@ pub struct LoopParams {
     /// running from pre-registry params — such sends record no invocation).
     #[serde(default)]
     pub invocation: String,
+    /// consecutive `unknown` polls before Diagnose (bd-event-self-heal).
+    #[serde(default = "default_unknown_diagnose_threshold")]
+    pub unknown_diagnose_threshold: u32,
+    /// max respawns per agent per loop run before EscalateBlocked.
+    #[serde(default = "default_respawn_budget")]
+    pub respawn_budget: u32,
+}
+
+fn default_unknown_diagnose_threshold() -> u32 {
+    DEFAULT_UNKNOWN_DIAGNOSE_THRESHOLD
+}
+
+fn default_respawn_budget() -> u32 {
+    DEFAULT_RESPAWN_BUDGET
 }
 
 fn default_true() -> bool {
@@ -215,6 +229,14 @@ pub fn send_prompt_argv(args: &SendArgs) -> Vec<String> {
 pub struct NotifyArgs {
     pub project: String,
     pub name: String,
+}
+
+/// Args for the diagnose leaf (read tail + health mail).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnoseArgs {
+    pub project: String,
+    pub name: String,
+    pub reason: String,
 }
 
 fn map_err(e: anyhow::Error) -> Error {
@@ -517,6 +539,43 @@ pub fn should_resend(record: Option<&crate::state::SentRecord>, current_invocati
     }
 }
 
+/// Escalation tier for a blocked agent (bd-blocked-escalation-protocol, A6).
+///
+/// Tiered by elapsed time since first_blocked (Resonate `ctx.now()` i64-µs,
+/// deterministic):
+/// - `T0` (first detection): high + ack_required ping with the agent tail.
+/// - `T1` (+2×interval, still un-acked): reply in-thread, high, fresh tail.
+/// - `T2` (+4×interval): reply urgent + summarize_thread; CC human if set.
+/// - `T3` (+8×interval): loop halts (bounded), final "needs human" mail.
+///
+/// Returns the tier to act at now. `ping_count` advances per notify so
+/// re-pings are monotonic; the tier is derived from elapsed time, not the
+/// counter, so a crash-resume continues at the correct tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EscalationTier {
+    T0,
+    T1,
+    T2,
+    T3,
+}
+
+/// Map elapsed-us since first_blocked to the escalation tier.
+/// `interval_secs` is the loop's active interval (the durable sleep period).
+/// Elapsed thresholds: T1 at 2×, T2 at 4×, T3 at 8× the interval.
+pub fn escalation_tier(first_blocked_ts_us: i64, now_us: i64, interval_secs: u64) -> EscalationTier {
+    let interval_us = (interval_secs as i64).saturating_mul(1_000_000);
+    let elapsed = now_us.saturating_sub(first_blocked_ts_us);
+    if elapsed >= 8 * interval_us {
+        EscalationTier::T3
+    } else if elapsed >= 4 * interval_us {
+        EscalationTier::T2
+    } else if elapsed >= 2 * interval_us {
+        EscalationTier::T1
+    } else {
+        EscalationTier::T0
+    }
+}
+
 #[function]
 async fn poll_inprogress(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
     let exe = self_exe().map_err(map_err)?;
@@ -705,6 +764,44 @@ async fn notify_blocked(args: NotifyArgs) -> Result<()> {
     Ok(())
 }
 
+/// Diagnose an unresponsive agent: capture recent output + high-importance
+/// health mail (bd-event-self-heal). Soft-fail: never kill the loop.
+#[function]
+async fn diagnose_agent(args: DiagnoseArgs) -> Result<Value> {
+    let exe = self_exe().map_err(map_err)?;
+    let out = Command::new(&exe)
+        .args([
+            "__diagnose",
+            &args.project,
+            &args.name,
+            "--reason",
+            &args.reason,
+        ])
+        .output()
+        .map_err(|e| map_err(anyhow::anyhow!("__diagnose spawn failed: {e}")))?;
+    // soft: non-zero still returns JSON if any; empty → ok:false
+    let raw = String::from_utf8_lossy(&out.stdout);
+    if let Ok(v) = serde_json::from_str::<Value>(raw.trim()) {
+        let _ = crate::state::log_event(
+            &args.project,
+            crate::state::EventKind::State,
+            serde_json::json!({
+                "source": "diagnose",
+                "name": args.name,
+                "reason": args.reason,
+                "result": &v,
+            }),
+        );
+        return Ok(v);
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Ok(serde_json::json!({
+        "ok": false,
+        "name": args.name,
+        "error": if err.is_empty() { format!("exit {}", out.status) } else { err },
+    }))
+}
+
 /// Args for the [`renew_leases`] leaf.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenewLeaseArgs {
@@ -778,7 +875,12 @@ pub enum LoopAction {
     DispatchImmediate { name: String, text: String },
     Blocked { name: String },
     Nudge { name: String },
-    /// Self-heal signal for exited/unknown panes (bd-event-self-heal).
+    /// Self-heal: read tail + high-importance mail (bd-event-self-heal).
+    Diagnose { name: String, reason: String },
+    /// Self-heal: `__respawn` after diagnose failed to clear (budgeted).
+    Respawn { name: String, reason: String },
+    /// Legacy alias treated as Diagnose (match arm still accepts it).
+    #[allow(dead_code)]
     SelfHeal { name: String, reason: String },
     Wait,
 }
@@ -903,7 +1005,9 @@ pub fn route_event(
         "pane.exited" => {
             let name = name.unwrap_or_else(|| format!("pane:{}", ev.pane_id));
             dispatch_pending.remove(&name);
-            Some(LoopAction::SelfHeal {
+            // Diagnose immediately on exit (bd-event-self-heal subtask 4);
+            // the heal state machine escalates to Respawn next tick if needed.
+            Some(LoopAction::Diagnose {
                 name,
                 reason: "pane_exited".into(),
             })
@@ -1116,26 +1220,48 @@ pub fn parse_poll_entry(v: &serde_json::Value) -> anyhow::Result<AgentState> {
     })
 }
 
-/// Consecutive `unknown` polls before an agent is presumed a dead pane and
-/// respawned. 2 balances transient classification flicker (unknown → idle →
-/// unknown must never respawn) against a genuinely dead session: at the
-/// settled 300s cadence this is ~10 min before repair; with the adaptive
-/// cadence (active while the swarm is unsettled) repair typically fires
-/// within ~1 min.
+/// Consecutive `unknown` polls before **diagnose** (bd-event-self-heal).
+/// Default 3: tolerates brief classification flicker without mail spam.
+pub const DEFAULT_UNKNOWN_DIAGNOSE_THRESHOLD: u32 = 3;
+
+/// Max respawns per agent per loop run before escalate-to-blocked.
+pub const DEFAULT_RESPAWN_BUDGET: u32 = 2;
+
+/// Legacy alias: old tests/callers used a hard respawn threshold of 2.
+/// Prefer [`DEFAULT_UNKNOWN_DIAGNOSE_THRESHOLD`] + [`self_heal_step`].
 pub const UNKNOWN_RESPAWN_THRESHOLD: u64 = 2;
 
-/// Decision for one agent's unknown-status bookkeeping.
+/// Per-agent self-heal bookkeeping (bd-event-self-heal-unknown).
+/// Survives within a run; optionally mirrored into `loops.json` `respawn`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealState {
+    pub unknown_count: u32,
+    pub diagnose_count: u32,
+    pub respawn_count: u32,
+    /// After Diagnose this episode: next still-dead tick → Respawn.
+    pub awaiting_clear: bool,
+}
+
+/// Pure self-heal decision for one agent (table-driven tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealAction {
+    None,
+    /// Read tail + high-importance mail (thread `health-<name>`).
+    Diagnose,
+    /// `__respawn` + requeue in-flight work (if any).
+    Respawn,
+    /// Budget exhausted — surface as Blocked / human escalate.
+    EscalateBlocked,
+}
+
+/// Legacy enum kept for older unit tests; maps onto the diagnose→respawn path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnknownAction {
-    /// Keep waiting (count below threshold, or agent classified).
     None,
-    /// The agent has been unclassified for >= threshold polls — respawn it.
     Respawn,
 }
 
-/// Pure unknown-status verdict: an agent counted `unknown` for at least
-/// `threshold` consecutive polls is presumed a dead pane. Never fires for a
-/// classified status (working/idle/blocked/done are proof of life).
+/// Pure unknown-status verdict (legacy): count >= threshold → Respawn.
 pub fn unknown_decision(status: &str, count: u64, threshold: u64) -> UnknownAction {
     if status == "unknown" && count >= threshold {
         UnknownAction::Respawn
@@ -1144,13 +1270,7 @@ pub fn unknown_decision(status: &str, count: u64, threshold: u64) -> UnknownActi
     }
 }
 
-/// Per-poll unknown bookkeeping + decision for one agent (the workflow calls
-/// this once per polled state). Deterministic: rebuilt identically on replay
-/// from the checkpointed poll results.
-///
-/// Map contract: `unknown` increments the count; ANY other status removes the
-/// entry (flicker reset); a respawn removes the entry so the fresh instance
-/// starts a clean episode — exactly one respawn per stuck episode.
+/// Legacy bookkeeping (direct respawn). Prefer [`self_heal_step`].
 pub fn track_unknown(
     unknown_seen: &mut std::collections::HashMap<String, u64>,
     name: &str,
@@ -1169,6 +1289,71 @@ pub fn track_unknown(
     } else {
         UnknownAction::None
     }
+}
+
+/// Pure self-heal step (bd-event-self-heal-unknown).
+///
+/// | input | action |
+/// |-------|--------|
+/// | classified (not unknown, not exited) | reset episode counters; keep `respawn_count` |
+/// | unknown × diagnose_threshold | Diagnose, set `awaiting_clear` |
+/// | unknown while `awaiting_clear` | Respawn (if budget), else EscalateBlocked |
+/// | `exited=true` first time | Diagnose immediately |
+/// | `exited=true` after diagnose / again | Respawn or EscalateBlocked |
+///
+/// `respawn_budget` caps Respawn per agent for the whole loop run.
+pub fn self_heal_step(
+    hs: &mut HealState,
+    status: &str,
+    exited: bool,
+    diagnose_threshold: u32,
+    respawn_budget: u32,
+) -> HealAction {
+    let threshold = diagnose_threshold.max(1);
+    let budget = respawn_budget; // 0 = never respawn, escalate immediately
+
+    if !exited && status != "unknown" {
+        // proof of life — end episode (budget is lifetime of the run)
+        hs.unknown_count = 0;
+        hs.awaiting_clear = false;
+        return HealAction::None;
+    }
+
+    let try_respawn = |hs: &mut HealState| -> HealAction {
+        if hs.respawn_count >= budget {
+            return HealAction::EscalateBlocked;
+        }
+        hs.respawn_count = hs.respawn_count.saturating_add(1);
+        hs.awaiting_clear = false;
+        hs.unknown_count = 0;
+        HealAction::Respawn
+    };
+
+    if exited {
+        // definitive death signal — diagnose once, then respawn
+        if !hs.awaiting_clear {
+            hs.diagnose_count = hs.diagnose_count.saturating_add(1);
+            hs.awaiting_clear = true;
+            return HealAction::Diagnose;
+        }
+        return try_respawn(hs);
+    }
+
+    // unknown path
+    hs.unknown_count = hs.unknown_count.saturating_add(1);
+
+    if hs.awaiting_clear {
+        // diagnosed last tick; still unknown → respawn
+        return try_respawn(hs);
+    }
+
+    if hs.unknown_count >= threshold {
+        hs.diagnose_count = hs.diagnose_count.saturating_add(1);
+        hs.awaiting_clear = true;
+        return HealAction::Diagnose;
+    }
+
+    HealAction::None
 }
 
 /// Shared respawn path for the loop: re-poll the agent kind (preferring the
@@ -1240,10 +1425,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // whose record has been dropped (the escalation path).
     let mut agent_kinds: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    // per-agent consecutive `unknown` poll count (unknown-status repair).
-    // Workflow-local and deterministic: rebuilt identically on replay from
-    // the checkpointed poll results.
-    let mut unknown_seen: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    // per-agent self-heal bookkeeping (bd-event-self-heal-unknown). Deterministic
+    // across replay via checkpointed leaf results that drive the same steps.
+    let mut heal_states: std::collections::HashMap<String, HealState> =
+        std::collections::HashMap::new();
+    // pane_exited names observed this iteration (event path feeds heal step)
+    let mut exited_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     // best-effort in-run event cursor (bd-event-subscribe-reactor). NOT used
     // for crash recovery — heartbeat __poll is the floor. Survives within a
     // single workflow run via local state; loops.json event_cursor is optional.
@@ -1317,32 +1504,64 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // learn agent kinds for the respawn path (idempotent, never removes)
         learn_kinds(&mut agent_kinds, &states);
 
-        // unknown-status repair: an agent unclassified for 2+ consecutive
-        // polls is presumed a dead pane. Respawn it via the shared helper —
-        // nothing to requeue (unknown agents are never dispatched work) and
-        // the fresh instance starts a clean episode (counter reset inside
-        // track_unknown). Skip-dispatch (bd-unknown-skip-dispatch) keeps the
-        // queue intact meanwhile.
+        // self-heal (bd-event-self-heal): diagnose → respawn (budgeted) → blocked.
+        // Skip-dispatch for unknown still holds in plan_actions; heal runs here.
+        exited_names.clear();
+        for ev in &event_batch.events {
+            if ev.event_type == "pane.exited" {
+                if let Some(n) = name_for_pane(&states, &ev.pane_id) {
+                    exited_names.insert(n);
+                } else if let Some(a) = &ev.agent {
+                    // best-effort: single-kind match
+                    let hits: Vec<_> = states.iter().filter(|s| s.kind == *a).collect();
+                    if hits.len() == 1 {
+                        exited_names.insert(hits[0].name.clone());
+                    }
+                }
+            }
+        }
+        let mut heal_actions: Vec<LoopAction> = Vec::new();
         for s in &states {
-            let prev = unknown_seen.get(&s.name).copied().unwrap_or(0);
-            if track_unknown(
-                &mut unknown_seen,
-                &s.name,
+            let exited = exited_names.contains(&s.name);
+            let hs = heal_states.entry(s.name.clone()).or_default();
+            match self_heal_step(
+                hs,
                 &s.status,
-                UNKNOWN_RESPAWN_THRESHOLD,
-            ) == UnknownAction::Respawn
-            {
-                respawn_and_requeue(
-                    ctx,
-                    &params,
-                    &mut queue,
-                    &agent_kinds,
-                    &s.name,
-                    None,
-                    "unknown-stuck",
-                    prev + 1,
-                )
-                .await?;
+                exited,
+                params.unknown_diagnose_threshold,
+                params.respawn_budget,
+            ) {
+                HealAction::None => {}
+                HealAction::Diagnose => {
+                    let reason = if exited {
+                        "pane_exited"
+                    } else {
+                        "unknown-stuck"
+                    };
+                    heal_actions.push(LoopAction::Diagnose {
+                        name: s.name.clone(),
+                        reason: reason.into(),
+                    });
+                }
+                HealAction::Respawn => {
+                    heal_actions.push(LoopAction::Respawn {
+                        name: s.name.clone(),
+                        reason: if exited {
+                            "pane_exited".into()
+                        } else {
+                            "unknown-stuck".into()
+                        },
+                    });
+                }
+                HealAction::EscalateBlocked => {
+                    heal_actions.push(LoopAction::Blocked {
+                        name: s.name.clone(),
+                    });
+                    eprintln!(
+                        "flywheel: WARN agent {} exceeded respawn budget ({}); escalating blocked",
+                        s.name, params.respawn_budget
+                    );
+                }
             }
         }
 
@@ -1387,9 +1606,16 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
 
         let mut blocked_names: Vec<String> = Vec::new();
         // event path first (zero-latency redispatch), then heartbeat plan_actions
-        let mut actions: Vec<LoopAction> = Vec::new();
+        let mut actions: Vec<LoopAction> = heal_actions;
         for ev in &event_batch.events {
             if let Some(a) = route_event(&states, ev, &mut queue, &mut dispatch_pending) {
+                // pane.exited Diagnose is already covered by self_heal_step;
+                // skip duplicate Diagnose from route_event when heal ran.
+                if matches!(&a, LoopAction::Diagnose { name, reason }
+                    if reason == "pane_exited" && exited_names.contains(name))
+                {
+                    continue;
+                }
                 if let LoopAction::Blocked { name } = &a {
                     blocked_names.push(name.clone());
                 }
@@ -1595,11 +1821,32 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         }
                     }
                 }
-                LoopAction::SelfHeal { name, reason } => {
-                    // pane exited / dead — shared respawn path (bd-event-self-heal
-                    // owns richer diagnose budgets; here we kick the existing
-                    // respawn so the agent is not stuck forever).
-                    let attempts = send_failures.get(name).copied().unwrap_or(0);
+                LoopAction::Diagnose { name, reason }
+                | LoopAction::SelfHeal { name, reason } => {
+                    // SelfHeal is a legacy alias for Diagnose (pane_exited path).
+                    let _ = ctx
+                        .run(
+                            diagnose_agent,
+                            DiagnoseArgs {
+                                project: params.project.clone(),
+                                name: name.clone(),
+                                reason: reason.clone(),
+                            },
+                        )
+                        .await;
+                    // mark heal state awaiting_clear so next still-dead tick respawns
+                    let hs = heal_states.entry(name.clone()).or_default();
+                    if !hs.awaiting_clear {
+                        hs.diagnose_count = hs.diagnose_count.saturating_add(1);
+                        hs.awaiting_clear = true;
+                    }
+                    any_work = true;
+                }
+                LoopAction::Respawn { name, reason } => {
+                    let attempts = heal_states
+                        .get(name)
+                        .map(|h| u64::from(h.respawn_count))
+                        .unwrap_or(1);
                     respawn_and_requeue(
                         ctx,
                         &params,
@@ -1711,6 +1958,9 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     resonate
         .register(notify_blocked)
         .map_err(|e| anyhow::anyhow!("register notify_blocked: {e}"))?;
+    resonate
+        .register(diagnose_agent)
+        .map_err(|e| anyhow::anyhow!("register diagnose_agent: {e}"))?;
     resonate
         .register(renew_leases)
         .map_err(|e| anyhow::anyhow!("register renew_leases: {e}"))?;
@@ -1828,8 +2078,7 @@ mod tests {
             name: name.to_string(),
             status: status.to_string(),
             kind: String::new(),
-            pane_id: String::new(),
-        }
+            pane_id: String::new(),        }
     }
 
     fn st_pane(name: &str, status: &str, pane: &str) -> AgentState {
@@ -2435,6 +2684,8 @@ mod tests {
             confirm_sends: true,
             confirm_timeout_ms: Some(45_000),
             invocation: "inv-1".into(),
+            unknown_diagnose_threshold: 3,
+            respawn_budget: 2,
         };
         let v = serde_json::to_value(&p).unwrap();
         let back: LoopParams = serde_json::from_value(v).unwrap();
@@ -2445,6 +2696,8 @@ mod tests {
         assert!(back.confirm_sends);
         assert_eq!(back.confirm_timeout_ms, Some(45_000));
         assert_eq!(back.invocation, "inv-1");
+        assert_eq!(back.unknown_diagnose_threshold, 3);
+        assert_eq!(back.respawn_budget, 2);
     }
 
     #[test]
@@ -2893,9 +3146,92 @@ mod tests {
         );
         assert!(matches!(
             x,
-            Some(LoopAction::SelfHeal { name, reason })
+            Some(LoopAction::Diagnose { name, reason })
                 if name == "a" && reason == "pane_exited"
         ));
+    }
+
+    // ---- bd-event-self-heal-unknown: self_heal_step state machine ----
+
+    #[test]
+    fn self_heal_unknown_diagnose_then_respawn() {
+        let mut hs = HealState::default();
+        // threshold 3: first two unknowns → None
+        assert_eq!(
+            self_heal_step(&mut hs, "unknown", false, 3, 2),
+            HealAction::None
+        );
+        assert_eq!(
+            self_heal_step(&mut hs, "unknown", false, 3, 2),
+            HealAction::None
+        );
+        assert_eq!(
+            self_heal_step(&mut hs, "unknown", false, 3, 2),
+            HealAction::Diagnose
+        );
+        assert!(hs.awaiting_clear);
+        // still unknown after diagnose → respawn
+        assert_eq!(
+            self_heal_step(&mut hs, "unknown", false, 3, 2),
+            HealAction::Respawn
+        );
+        assert_eq!(hs.respawn_count, 1);
+    }
+
+    #[test]
+    fn self_heal_exited_diagnose_immediate() {
+        let mut hs = HealState::default();
+        assert_eq!(
+            self_heal_step(&mut hs, "working", true, 3, 2),
+            HealAction::Diagnose
+        );
+        assert_eq!(
+            self_heal_step(&mut hs, "unknown", true, 3, 2),
+            HealAction::Respawn
+        );
+    }
+
+    #[test]
+    fn self_heal_budget_exhausted_escalates() {
+        let mut hs = HealState {
+            respawn_count: 2,
+            awaiting_clear: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            self_heal_step(&mut hs, "unknown", false, 3, 2),
+            HealAction::EscalateBlocked
+        );
+    }
+
+    #[test]
+    fn self_heal_classified_resets_episode() {
+        let mut hs = HealState {
+            unknown_count: 2,
+            awaiting_clear: true,
+            diagnose_count: 1,
+            respawn_count: 1,
+        };
+        assert_eq!(
+            self_heal_step(&mut hs, "idle", false, 3, 2),
+            HealAction::None
+        );
+        assert_eq!(hs.unknown_count, 0);
+        assert!(!hs.awaiting_clear);
+        assert_eq!(hs.respawn_count, 1); // budget preserved
+    }
+
+    #[test]
+    fn self_heal_flicker_never_diagnoses() {
+        let mut hs = HealState::default();
+        self_heal_step(&mut hs, "unknown", false, 3, 2);
+        self_heal_step(&mut hs, "idle", false, 3, 2); // flicker reset
+        self_heal_step(&mut hs, "unknown", false, 3, 2);
+        assert_eq!(hs.unknown_count, 1);
+        assert_eq!(
+            self_heal_step(&mut hs, "unknown", false, 3, 2),
+            HealAction::None
+        );
     }
 
     #[test]
@@ -2964,5 +3300,37 @@ mod resume_dedup_tests {
         // (the fn docstring promises the guard degrades to re-sending)
         assert!(should_resend(None, "inv-1"));
         assert!(should_resend(Some(&rec("a", 1, "inv-1", false)), "inv-1"));
+    }
+
+    // ---- escalation tiers (bd-blocked-escalation-protocol) ----
+
+    #[test]
+    fn escalation_starts_at_t0() {
+        // first detection: elapsed < 2 intervals -> T0
+        assert_eq!(escalation_tier(1_000_000, 1_000_000, 30), EscalationTier::T0);
+        // just under 2 intervals
+        assert_eq!(escalation_tier(0, 59_999_999, 30), EscalationTier::T0);
+    }
+
+    #[test]
+    fn escalation_advances_by_interval_multiple() {
+        let i = 30; // seconds
+        let us = |secs: i64| secs * 1_000_000;
+        // T1 at 2x, T2 at 4x, T3 at 8x interval
+        assert_eq!(escalation_tier(0, us(60), i), EscalationTier::T1);
+        assert_eq!(escalation_tier(0, us(119), i), EscalationTier::T1);
+        assert_eq!(escalation_tier(0, us(120), i), EscalationTier::T2);
+        assert_eq!(escalation_tier(0, us(239), i), EscalationTier::T2);
+        assert_eq!(escalation_tier(0, us(240), i), EscalationTier::T3);
+    }
+
+    #[test]
+    fn escalation_is_deterministic_and_bounded() {
+        // same inputs -> same tier (crash-resume continues at the right tier)
+        let a = escalation_tier(0, 120_000_000, 30);
+        let b = escalation_tier(0, 120_000_000, 30);
+        assert_eq!(a, b);
+        // never exceeds T3 (bounded, not infinite spin)
+        assert_eq!(escalation_tier(0, i64::MAX, 30), EscalationTier::T3);
     }
 }

@@ -432,6 +432,14 @@ enum Commands {
     /// internal: notify a blocked agent via agent-mail (durable workflow leaf)
     #[command(name = "__mail-blocked", hide = true)]
     __MailBlocked { project: String, name: String },
+    /// internal: diagnose unresponsive agent (tail + health mail)
+    #[command(name = "__diagnose", hide = true)]
+    __Diagnose {
+        project: String,
+        name: String,
+        #[arg(long, default_value = "unknown-stuck")]
+        reason: String,
+    },
     /// internal: renew the orchestrator's active file reservations
     /// (durable workflow leaf, bd-mail-lease-renewal-durable)
     #[command(name = "__renew-leases", hide = true)]
@@ -1048,6 +1056,11 @@ fn main() {
         Some(Commands::__MailBlocked { project, name }) => {
             cmd_internal_mail_blocked(&cfg, project, name)
         }
+        Some(Commands::__Diagnose {
+            project,
+            name,
+            reason,
+        }) => cmd_internal_diagnose(&cfg, project, name, reason),
         Some(Commands::__RenewLeases {
             project,
             extend_seconds,
@@ -3250,6 +3263,8 @@ fn cmd_loop(
             confirm_sends: !no_confirm,
             confirm_timeout_ms,
             invocation: String::new(),
+            unknown_diagnose_threshold: cfg.unknown_diagnose_threshold(),
+            respawn_budget: cfg.respawn_budget(),
         };
         let rt = tokio::runtime::Runtime::new()?;
         println!(
@@ -4910,6 +4925,100 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str) -> Result<
             Ok(())
         }
     }
+}
+
+/// internal leaf: diagnose an unresponsive agent (bd-event-self-heal).
+///
+/// 1. Capture recent output via the read path (best-effort).
+/// 2. Send high-importance mail on thread `health-<name>` to the orchestrator
+///    identity (config agent_mail.name) so a human/supervisor can act.
+/// Soft-fail always: exit 0 with `{ok, ...}` so overnight loops never die.
+fn cmd_internal_diagnose(cfg: &Config, project: &str, name: &str, reason: &str) -> Result<()> {
+    // --- tail (best-effort) ---
+    let mut tail = String::new();
+    let mut backend = match backend::multiplexer_backend(cfg) {
+        Ok(b) => b,
+        Err(e) => {
+            print_json(&json!({
+                "ok": false,
+                "name": name,
+                "reason": reason,
+                "error": format!("multiplexer unavailable: {e:#}"),
+            }));
+            return Ok(());
+        }
+    };
+    // Prefer agent_read (recent, 80 lines); soft on failure.
+    match backend.agent_read(name, "recent", 80) {
+        Ok(v) => {
+            // herdr returns a string or {text}/array — normalize
+            tail = v
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
+                .unwrap_or_else(|| v.to_string());
+            if tail.len() > 4000 {
+                let start = tail.len().saturating_sub(4000);
+                tail = tail[start..].to_string();
+            }
+        }
+        Err(e) => {
+            eprintln!("flywheel: diagnose read {name}: {e:#}");
+        }
+    }
+
+    // --- health mail ---
+    let mut mailed = false;
+    let mut mail_err: Option<String> = None;
+    let recipient = cfg
+        .agent_mail
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| "Flywheel".to_string());
+    match backend::mail_backend(cfg) {
+        Ok(mut mail) => {
+            let key = project_dir(cfg, project).to_str().unwrap().to_string();
+            let subject = format!("[{project}] {name} unresponsive ({reason})");
+            let body = format!(
+                "Agent **{name}** is unresponsive (`{reason}`).\n\n\
+                 Project: `{project}`\n\
+                 Thread: `health-{name}`\n\n\
+                 ### Recent output (truncated)\n```\n{tail}\n```\n\n\
+                 flywheel will attempt respawn if the agent stays dead (budgeted)."
+            );
+            match mail.ensure_project(&key).and_then(|_| {
+                mail.send(
+                    &key,
+                    std::slice::from_ref(&recipient),
+                    &subject,
+                    &body,
+                    "high",
+                    false,
+                    Some(&format!("health-{name}")),
+                )
+            }) {
+                Ok(_) => mailed = true,
+                Err(e) => {
+                    mail_err = Some(format!("{e:#}"));
+                    eprintln!("flywheel: diagnose mail for {name}: {e:#}");
+                }
+            }
+        }
+        Err(e) => {
+            mail_err = Some(format!("mail backend: {e:#}"));
+        }
+    }
+
+    print_json(&json!({
+        "ok": true,
+        "name": name,
+        "reason": reason,
+        "tail_len": tail.len(),
+        "mailed": mailed,
+        "recipient": recipient,
+        "mail_error": mail_err,
+    }));
+    Ok(())
 }
 
 /// Internal leaf command: renew this identity's active file reservations in

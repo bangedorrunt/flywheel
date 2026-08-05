@@ -48,9 +48,37 @@ pub struct Config {
     pub kinds: Option<BTreeMap<String, String>>,
     /// backend selection (ADR-0002)
     pub backend: Option<BackendConfig>,
+    /// durable-loop self-heal knobs (bd-event-self-heal-unknown)
+    #[serde(default)]
+    pub r#loop: Option<LoopConfig>,
+}
+
+/// `[loop]` section: self-heal thresholds for the durable swarm loop.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LoopConfig {
+    /// consecutive `unknown` polls before Diagnose (default 3)
+    pub unknown_diagnose_threshold: Option<u32>,
+    /// max respawns per agent per loop run before escalate-blocked (default 2)
+    pub respawn_budget: Option<u32>,
 }
 
 impl Config {
+    /// Diagnose threshold (default 3).
+    pub fn unknown_diagnose_threshold(&self) -> u32 {
+        self.r#loop
+            .as_ref()
+            .and_then(|l| l.unknown_diagnose_threshold)
+            .unwrap_or(3)
+    }
+
+    /// Respawn budget (default 2).
+    pub fn respawn_budget(&self) -> u32 {
+        self.r#loop
+            .as_ref()
+            .and_then(|l| l.respawn_budget)
+            .unwrap_or(2)
+    }
+
     pub fn load() -> Result<Self> {
         // Load .env first (non-fatal if absent). dotenvy does NOT override
         // already-set env vars, so a real env var wins over .env (ADR-0002 §3.3
@@ -77,7 +105,41 @@ impl Config {
         if let Ok(v) = std::env::var("RESONATE_URL") {
             cfg.resonate_url = Some(v);
         }
+        // agent-mail env surface (the factory's error message documents
+        // FLYWHEEL_AGENTMAIL_URL/TOKEN — make good on it): any of the three
+        // vars materializes the [agent_mail] section, merging over config.toml.
+        let (mail_url, mail_token, mail_name) = Config::mail_env_overrides();
+        if mail_url.is_some() || mail_token.is_some() || mail_name.is_some() {
+            let mut mail_cfg = cfg.agent_mail.clone().unwrap_or_default();
+            if let Some(v) = mail_url {
+                mail_cfg.url = Some(v);
+            }
+            if let Some(v) = mail_token {
+                mail_cfg.token = Some(v);
+            }
+            if let Some(v) = mail_name {
+                mail_cfg.name = Some(v);
+            }
+            cfg.agent_mail = Some(mail_cfg);
+        }
         Ok(cfg)
+    }
+
+    /// Agent-mail env overrides: `FLYWHEEL_AGENTMAIL_URL` /
+    /// `FLYWHEEL_AGENTMAIL_TOKEN` / `FLYWHEEL_MAIL_NAME`. Empty values count
+    /// as unset (matching the factory's `.filter(|s| !s.is_empty())` rule).
+    pub fn mail_env_overrides() -> (Option<String>, Option<String>, Option<String>) {
+        (
+            std::env::var("FLYWHEEL_AGENTMAIL_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            std::env::var("FLYWHEEL_AGENTMAIL_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            std::env::var("FLYWHEEL_MAIL_NAME")
+                .ok()
+                .filter(|s| !s.is_empty()),
+        )
     }
 
     pub fn socket_path(&self) -> String {
@@ -344,5 +406,51 @@ daily = [
             }
             _ => panic!("expected send"),
         }
+    }
+
+    // Env-var mutation is process-global; serialize tests that touch it
+    // (same pattern as the backend factory tests).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn mail_env_overrides_read_all_vars() {
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("FLYWHEEL_AGENTMAIL_URL", "http://127.0.0.1:8765");
+        std::env::set_var("FLYWHEEL_AGENTMAIL_TOKEN", "secret");
+        std::env::set_var("FLYWHEEL_MAIL_NAME", "Orchid");
+        let (url, token, name) = Config::mail_env_overrides();
+        assert_eq!(url.as_deref(), Some("http://127.0.0.1:8765"));
+        assert_eq!(token.as_deref(), Some("secret"));
+        assert_eq!(name.as_deref(), Some("Orchid"));
+        std::env::remove_var("FLYWHEEL_AGENTMAIL_URL");
+        std::env::remove_var("FLYWHEEL_AGENTMAIL_TOKEN");
+        std::env::remove_var("FLYWHEEL_MAIL_NAME");
+    }
+
+    #[test]
+    fn mail_env_overrides_ignore_empty_values() {
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("FLYWHEEL_AGENTMAIL_URL", "");
+        let (url, token, name) = Config::mail_env_overrides();
+        assert_eq!(url, None, "empty url counts as unset");
+        assert_eq!(token, None);
+        assert_eq!(name, None);
+        std::env::remove_var("FLYWHEEL_AGENTMAIL_URL");
+    }
+
+    #[test]
+    fn mail_env_overrides_nothing_set() {
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("FLYWHEEL_AGENTMAIL_URL");
+        std::env::remove_var("FLYWHEEL_AGENTMAIL_TOKEN");
+        std::env::remove_var("FLYWHEEL_MAIL_NAME");
+        let (url, token, name) = Config::mail_env_overrides();
+        assert_eq!((url, token, name), (None, None, None));
     }
 }
