@@ -466,12 +466,7 @@ impl Mail {
     }
 
     /// Search messages across all projects linked to a product.
-    pub fn search_product(
-        &mut self,
-        product_key: &str,
-        query: &str,
-        limit: u32,
-    ) -> Result<Value> {
+    pub fn search_product(&mut self, product_key: &str, query: &str, limit: u32) -> Result<Value> {
         self.call(
             "search_messages_product",
             json!({
@@ -942,15 +937,8 @@ mod tests {
     /// Cross-project contact + product wrappers (bd-mail-cross-project-contact).
     #[test]
     fn cross_project_wrappers_exist() {
-        let _: fn(
-            &mut Mail,
-            &str,
-            &str,
-            &str,
-            Option<&str>,
-            &str,
-            Option<u64>,
-        ) -> Result<Value> = Mail::request_contact;
+        let _: fn(&mut Mail, &str, &str, &str, Option<&str>, &str, Option<u64>) -> Result<Value> =
+            Mail::request_contact;
         let _: fn(&mut Mail, &str, &str, &str, bool) -> Result<Value> = Mail::respond_contact;
         let _: fn(&mut Mail, &str, &str) -> Result<Value> = Mail::list_contacts;
         let _: fn(&mut Mail, &str, &str, &str) -> Result<Value> = Mail::set_contact_policy;
