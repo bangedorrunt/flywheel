@@ -198,7 +198,7 @@ with **`__poll` heartbeat** as the correctness floor (no event replay). See
 |---------|---------|----------|
 | Debate | `flywheel debate "<proposition>" --rounds 3` | A/B + judge, thread `debate-<ts>` |
 | Plan→review→implement | `flywheel plan-review <project> "<feature>"` | APPROVE/CHANGES/VERIFIED/REJECT; paper-first |
-| Cross-project | `flywheel xproj send …` | product + contact; subject `[xproj]` |
+| Cross-project | `flywheel xproj send …` | product + contact; subject `[xproj]`; `--to-project` is routing context (delivery is name-based after `xproj request --to-project` handshake) |
 | Peer-triggered | spawn with peer-aware prompt | peer mail wakes idle peer |
 
 Full recipe catalog: [docs/collab/recipes.md](docs/collab/recipes.md). Agent

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 🐛 Fixes
+
+- **Collaboration patterns carry real content** — debate/plan-review harvest reply
+  **bodies** (not subjects); plan-review gate is a real phase-driven loop honoring
+  `--max-change-rounds`; debate/plan-review default agents resolve to spawned
+  `flywheel-*` names (review-fix F1/F2/F7, 2026-08-05).
+- **Blocked escalation halts** — T3 (bounded) exits the durable loop with a
+  distinguishable `halted:` result under `--on-blocked mail` (review-fix F4).
+- **xproj honesty** — `--to-project` is routing context (validated + carried in the
+  body, never silently dropped); loop-triggered spawns are background, no focus
+  steal (review-fix F3/F5).
+- **Backend migration completed for the durable loop** — `__send`/`__kind`/`__read`/
+  `__respawn`/`__xproj-inbox` route through the backend factory; trait gained
+  `agent_prompt_coded` (landing semantics) + `MailBackend::agent_name`; CLI commands
+  stay concrete per documented deferral (review-fix F6).
+- **Quality gates honest** — verify-0001/0002 check real behavior; new
+  `verify-review-fixes.sh` regression gate; live `--ignored` suite runbook documented;
+  clippy `--workspace` 0 warnings 0 errors (review-fix F8/F9).
+
 ### 🚀 Features
 
 - **Collaboration spine (ADR-0001)** — event-wake loop + poll floor; patterns
