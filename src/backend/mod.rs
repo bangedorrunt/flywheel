@@ -44,10 +44,12 @@ use crate::herdr::{
 use serde_json::Value;
 
 // Factory entry points — consumers (the durable-loop leaf handlers in main.rs)
-// call `backend::multiplexer_backend(&cfg)` / `backend::mail_backend(&cfg)`.
-// `resolve_*` / `DEFAULT_*` stay factory-local until a caller needs them
-// (R0.10 cli-backend-subcommand will surface them).
-pub use factory::{mail_backend, multiplexer_backend};
+// call `backend::multiplexer_backend(&cfg)` / `backend::mail_backend(&cfg)`;
+// `flywheel backend list/status` (bd-cli-backend-subcommand) uses the resolve_
+// and compiled_backends helpers.
+pub use factory::{
+    compiled_backends, mail_backend, multiplexer_backend, resolve_backend_name, resolve_mail_name,
+};
 
 /// Filter bag for `MailBackend::inbox` (fields only; semantics land with the
 /// beads that consume them — `bd-mail-ack-sla-tracking` owns the ack-overdue
@@ -410,6 +412,39 @@ pub trait MailBackend: Send + Sync {
         _accept: bool,
     ) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "respond_contact"))
+    }
+    fn list_contacts(&mut self, _project_key: &str, _agent: &str) -> Result<Value> {
+        Err(BackendError::unsupported(self.name(), "list_contacts"))
+    }
+    fn set_contact_policy(
+        &mut self,
+        _project_key: &str,
+        _agent: &str,
+        _policy: &str,
+    ) -> Result<Value> {
+        Err(BackendError::unsupported(self.name(), "set_contact_policy"))
+    }
+    fn ensure_product(&mut self, _product_key: &str) -> Result<Value> {
+        Err(BackendError::unsupported(self.name(), "ensure_product"))
+    }
+    fn products_link(&mut self, _product_key: &str, _project_key: &str) -> Result<Value> {
+        Err(BackendError::unsupported(self.name(), "products_link"))
+    }
+    fn search_product(
+        &mut self,
+        _product_key: &str,
+        _query: &str,
+        _limit: u32,
+    ) -> Result<Value> {
+        Err(BackendError::unsupported(self.name(), "search_product"))
+    }
+    fn inbox_product(
+        &mut self,
+        _product_key: &str,
+        _agent: &str,
+        _limit: u32,
+    ) -> Result<Value> {
+        Err(BackendError::unsupported(self.name(), "inbox_product"))
     }
 }
 

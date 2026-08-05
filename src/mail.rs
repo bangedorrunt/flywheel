@@ -196,7 +196,12 @@ impl Mail {
 
     /// Mark a message read (`mark_message_read`): "I've seen it" — distinct
     /// from ack, which means "I've acted on it".
-    pub fn mark_read(&mut self, project_key: &str, agent_name: &str, message_id: u64) -> Result<Value> {
+    pub fn mark_read(
+        &mut self,
+        project_key: &str,
+        agent_name: &str,
+        message_id: u64,
+    ) -> Result<Value> {
         self.call(
             "mark_message_read",
             json!({
@@ -373,6 +378,145 @@ impl Mail {
         )
     }
 
+    // ---- cross-project contact + products (bd-mail-cross-project-contact) ----
+
+    /// Request contact approval to message another agent (optionally cross-project).
+    pub fn request_contact(
+        &mut self,
+        project_key: &str,
+        from_agent: &str,
+        to_agent: &str,
+        to_project: Option<&str>,
+        reason: &str,
+        ttl_seconds: Option<u64>,
+    ) -> Result<Value> {
+        let mut args = json!({
+            "project_key": project_key,
+            "from_agent": from_agent,
+            "to_agent": to_agent,
+            "reason": reason,
+        });
+        if let Some(p) = to_project {
+            args["to_project"] = json!(p);
+        }
+        if let Some(t) = ttl_seconds {
+            args["ttl_seconds"] = json!(t);
+        }
+        self.call("request_contact", args)
+    }
+
+    /// Accept or deny a contact request.
+    pub fn respond_contact(
+        &mut self,
+        project_key: &str,
+        to_agent: &str,
+        from_agent: &str,
+        accept: bool,
+    ) -> Result<Value> {
+        self.call(
+            "respond_contact",
+            json!({
+                "project_key": project_key,
+                "to_agent": to_agent,
+                "from_agent": from_agent,
+                "accept": accept,
+            }),
+        )
+    }
+
+    /// List contact links for an agent.
+    pub fn list_contacts(&mut self, project_key: &str, agent_name: &str) -> Result<Value> {
+        self.call(
+            "list_contacts",
+            json!({ "project_key": project_key, "agent_name": agent_name }),
+        )
+    }
+
+    /// Set contact policy: open | auto | contacts_only | block_all.
+    pub fn set_contact_policy(
+        &mut self,
+        project_key: &str,
+        agent_name: &str,
+        policy: &str,
+    ) -> Result<Value> {
+        self.call(
+            "set_contact_policy",
+            json!({
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "policy": policy,
+            }),
+        )
+    }
+
+    /// Ensure a product exists (organizational group of projects).
+    pub fn ensure_product(&mut self, product_key: &str) -> Result<Value> {
+        self.call("ensure_product", json!({ "product_key": product_key }))
+    }
+
+    /// Link a project into a product for product-scoped search/inbox.
+    pub fn products_link(&mut self, product_key: &str, project_key: &str) -> Result<Value> {
+        self.call(
+            "products_link",
+            json!({
+                "product_key": product_key,
+                "project_key": project_key,
+            }),
+        )
+    }
+
+    /// Search messages across all projects linked to a product.
+    pub fn search_product(
+        &mut self,
+        product_key: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<Value> {
+        self.call(
+            "search_messages_product",
+            json!({
+                "product_key": product_key,
+                "query": query,
+                "limit": limit,
+            }),
+        )
+    }
+
+    /// Fetch inbox across projects linked to a product.
+    pub fn inbox_product(
+        &mut self,
+        product_key: &str,
+        agent_name: &str,
+        limit: u32,
+    ) -> Result<Value> {
+        self.call(
+            "fetch_inbox_product",
+            json!({
+                "product_key": product_key,
+                "agent_name": agent_name,
+                "limit": limit,
+            }),
+        )
+    }
+
+    /// Summarize a thread in product scope.
+    #[allow(dead_code)] // CLI product summarize deferred; wrapper ready for patterns
+    pub fn summarize_thread_product(
+        &mut self,
+        product_key: &str,
+        thread_id: &str,
+        llm_mode: bool,
+    ) -> Result<Value> {
+        self.call(
+            "summarize_thread_product",
+            json!({
+                "product_key": product_key,
+                "thread_id": thread_id,
+                "llm_mode": llm_mode,
+            }),
+        )
+    }
+
     /// Acquire an advisory build slot (agent-mail `acquire_build_slot` tool).
     /// Returns `{granted: [...]}` or `{conflicts: [...]}` — advisory, not
     /// hard-blocking. Used to serialize `cargo build`/`cargo test` across
@@ -461,13 +605,10 @@ impl Mail {
         paths: Option<&[String]>,
         ids: Option<&[u64]>,
     ) -> Result<Value> {
-        self.call("renew_file_reservations", renew_args(
-            project_key,
-            agent_name,
-            extend_seconds,
-            paths,
-            ids,
-        ))
+        self.call(
+            "renew_file_reservations",
+            renew_args(project_key, agent_name, extend_seconds, paths, ids),
+        )
     }
 
     // ---- pane identity bridge (bd-mail-pane-identity-bridge, ADR-0001 A4) ----
@@ -798,6 +939,28 @@ mod tests {
         ) -> Result<Value> = Mail::search;
     }
 
+    /// Cross-project contact + product wrappers (bd-mail-cross-project-contact).
+    #[test]
+    fn cross_project_wrappers_exist() {
+        let _: fn(
+            &mut Mail,
+            &str,
+            &str,
+            &str,
+            Option<&str>,
+            &str,
+            Option<u64>,
+        ) -> Result<Value> = Mail::request_contact;
+        let _: fn(&mut Mail, &str, &str, &str, bool) -> Result<Value> = Mail::respond_contact;
+        let _: fn(&mut Mail, &str, &str) -> Result<Value> = Mail::list_contacts;
+        let _: fn(&mut Mail, &str, &str, &str) -> Result<Value> = Mail::set_contact_policy;
+        let _: fn(&mut Mail, &str) -> Result<Value> = Mail::ensure_product;
+        let _: fn(&mut Mail, &str, &str) -> Result<Value> = Mail::products_link;
+        let _: fn(&mut Mail, &str, &str, u32) -> Result<Value> = Mail::search_product;
+        let _: fn(&mut Mail, &str, &str, u32) -> Result<Value> = Mail::inbox_product;
+        let _: fn(&mut Mail, &str, &str, bool) -> Result<Value> = Mail::summarize_thread_product;
+    }
+
     // ---- renew (bd-mail-lease-renewal-durable) ----
 
     /// `renew` envelope: required params always present; optional `paths` /
@@ -840,14 +1003,8 @@ mod tests {
 
     /// Signature of [`Mail::renew`] (type alias keeps the compile-time guard
     /// readable; clippy rejects the inline fn type as too complex).
-    type RenewFn = fn(
-        &mut Mail,
-        &str,
-        &str,
-        u64,
-        Option<&[String]>,
-        Option<&[u64]>,
-    ) -> Result<Value>;
+    type RenewFn =
+        fn(&mut Mail, &str, &str, u64, Option<&[String]>, Option<&[u64]>) -> Result<Value>;
 
     /// `renew` is callable with the full signature (compile-time guard; no
     /// HTTP — dummy URL).
@@ -932,15 +1089,27 @@ mod tests {
         mail.register_agent(&key, &cfg_name, "flywheel", "flywheel", "renew-live-probe")
             .expect("register configured identity");
         observer
-            .register_agent(&key, &obs_name, "flywheel", "flywheel", "renew-live-probe-observer")
+            .register_agent(
+                &key,
+                &obs_name,
+                "flywheel",
+                "flywheel",
+                "renew-live-probe-observer",
+            )
             .expect("register observer identity");
 
         let path = format!("target/renew-live-probe-{}.tmp", std::process::id());
         let _ = mail.release(&key); // clear any stale probe from a prior run
 
         // --- renewed arm: TTL 60, renew +60 at t=45 → still active at t=90
-        mail.reserve(&key, std::slice::from_ref(&path), 60, true, "renew-live-probe")
-            .expect("reserve");
+        mail.reserve(
+            &key,
+            std::slice::from_ref(&path),
+            60,
+            true,
+            "renew-live-probe",
+        )
+        .expect("reserve");
         std::thread::sleep(Duration::from_secs(45));
         let my_name = mail.name.clone();
         // scope by path — an unscoped renew touches ALL of this agent's
@@ -958,20 +1127,28 @@ mod tests {
             .conflicts(&key, std::slice::from_ref(&path))
             .expect("conflicts check");
         assert_eq!(
-            conflicts["conflict_free"], json!(false),
+            conflicts["conflict_free"],
+            json!(false),
             "renewed lease must still be active at t=90: {conflicts}"
         );
         mail.release(&key).expect("release");
 
         // --- control arm: TTL 60, no renew → gone by t=60 (checked at t=62)
-        mail.reserve(&key, std::slice::from_ref(&path), 60, true, "renew-live-probe-control")
-            .expect("reserve");
+        mail.reserve(
+            &key,
+            std::slice::from_ref(&path),
+            60,
+            true,
+            "renew-live-probe-control",
+        )
+        .expect("reserve");
         std::thread::sleep(Duration::from_secs(62));
         let conflicts = observer
             .conflicts(&key, std::slice::from_ref(&path))
             .expect("conflicts check");
         assert_eq!(
-            conflicts["conflict_free"], json!(true),
+            conflicts["conflict_free"],
+            json!(true),
             "control lease must have expired by t=62: {conflicts}"
         );
         mail.release(&key).expect("release");
@@ -1022,7 +1199,8 @@ mod tests {
         let h = project_hash("/a/b/c");
         assert_eq!(h.len(), 12);
         assert!(
-            h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            h.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "must be lower hex: {h}"
         );
     }
@@ -1090,7 +1268,8 @@ mod tests {
         // a symlink someone else planted)
         let other = canonical_identity_path("/a/b/c", "w1:p2");
         std::fs::create_dir_all(other.parent().expect("parent")).expect("mkdir");
-        let target = std::env::temp_dir().join(format!("fw-identity-target-{}", std::process::id()));
+        let target =
+            std::env::temp_dir().join(format!("fw-identity-target-{}", std::process::id()));
         std::fs::write(&target, "OriginalAgent\n").expect("write target");
         std::os::unix::fs::symlink(&target, &other).expect("symlink");
         let err = mail
@@ -1152,8 +1331,14 @@ mod tests {
         // the configured identity must exist in the project (register_agent
         // is idempotent on name)
         let cfg_name = mail.name.clone();
-        mail.register_agent(&key, &cfg_name, "flywheel", "flywheel", "pane-identity-live-probe")
-            .expect("register configured identity");
+        mail.register_agent(
+            &key,
+            &cfg_name,
+            "flywheel",
+            "flywheel",
+            "pane-identity-live-probe",
+        )
+        .expect("register configured identity");
 
         let pane = format!("w9:p{}", std::process::id()); // unique per run
         let written = mail
@@ -1163,7 +1348,8 @@ mod tests {
             .resolve_pane_identity(&key, &pane)
             .expect("resolve_pane_identity call");
         assert_eq!(
-            resolved["agent_name"], json!(cfg_name),
+            resolved["agent_name"],
+            json!(cfg_name),
             "server must resolve the bridged name: {resolved}"
         );
         assert_eq!(
@@ -1172,7 +1358,8 @@ mod tests {
             "server must read OUR file — hash/format contract broken: {resolved}"
         );
 
-        mail.clear_pane_identity(&key, &pane).expect("clear_pane_identity");
+        mail.clear_pane_identity(&key, &pane)
+            .expect("clear_pane_identity");
         let after = mail
             .resolve_pane_identity(&key, &pane)
             .expect("resolve after clear");
@@ -1214,13 +1401,27 @@ mod tests {
         mail.register_agent(&key, &cfg_name, "flywheel", "flywheel", "debate-live-probe")
             .expect("register A");
         observer
-            .register_agent(&key, &obs_name, "flywheel", "flywheel", "debate-live-probe-observer")
+            .register_agent(
+                &key,
+                &obs_name,
+                "flywheel",
+                "flywheel",
+                "debate-live-probe-observer",
+            )
             .expect("register B");
 
         let thread = format!("debate-live-{}", std::process::id()); // unique per run
-        // round 1: A opens the thread with thread_id set
+                                                                    // round 1: A opens the thread with thread_id set
         let a1 = mail
-            .send(&key, std::slice::from_ref(&obs_name), "debate round 1", "A: for", "normal", false, Some(&thread))
+            .send(
+                &key,
+                std::slice::from_ref(&obs_name),
+                "debate round 1",
+                "A: for",
+                "normal",
+                false,
+                Some(&thread),
+            )
             .expect("A send");
         let a1_id = a1["deliveries"][0]["payload"]["id"]
             .as_u64()
@@ -1248,10 +1449,7 @@ mod tests {
         let participants = sum["summary"]["participants"]
             .as_array()
             .expect("participants list");
-        let names: Vec<&str> = participants
-            .iter()
-            .filter_map(|p| p.as_str())
-            .collect();
+        let names: Vec<&str> = participants.iter().filter_map(|p| p.as_str()).collect();
         assert!(
             names.contains(&cfg_name.as_str()) && names.contains(&obs_name.as_str()),
             "both participants in thread: {names:?}"
@@ -1296,21 +1494,33 @@ mod tests {
         mail.register_agent(&key, &cfg_name, "flywheel", "flywheel", "ack-live-probe")
             .expect("register A");
         observer
-            .register_agent(&key, &obs_name, "flywheel", "flywheel", "ack-live-probe-observer")
+            .register_agent(
+                &key,
+                &obs_name,
+                "flywheel",
+                "flywheel",
+                "ack-live-probe-observer",
+            )
             .expect("register B");
 
         // A sends an ack_required ping to B
         let sent = mail
-            .send(&key, std::slice::from_ref(&obs_name), "ack roundtrip", "ping — ack required", "high", true, None)
+            .send(
+                &key,
+                std::slice::from_ref(&obs_name),
+                "ack roundtrip",
+                "ping — ack required",
+                "high",
+                true,
+                None,
+            )
             .expect("send");
         let msg_id = sent["deliveries"][0]["payload"]["id"]
             .as_u64()
             .expect("message id");
 
         // fresh message must NOT be overdue yet
-        let overdue = observer
-            .ack_overdue(&key, &obs_name)
-            .expect("ack_overdue");
+        let overdue = observer.ack_overdue(&key, &obs_name).expect("ack_overdue");
         let overdue_ids: Vec<u64> = overdue
             .as_array()
             .map(|a| {
@@ -1329,18 +1539,25 @@ mod tests {
             .mark_read(&key, &obs_name, msg_id)
             .expect("mark_read");
         let inbox = observer
-            .inbox_filtered(&key, &obs_name, &MailInboxFilter {
-                urgent_only: false,
-                unread_only: false,
-                ack_overdue_only: false,
-                include_bodies: true,
-                limit: 20,
-                since_ts: None,
-            })
+            .inbox_filtered(
+                &key,
+                &obs_name,
+                &MailInboxFilter {
+                    urgent_only: false,
+                    unread_only: false,
+                    ack_overdue_only: false,
+                    include_bodies: true,
+                    limit: 20,
+                    since_ts: None,
+                },
+            )
             .expect("inbox after mark_read");
         let m = inbox
             .as_array()
-            .and_then(|a| a.iter().find(|m| m.get("id").and_then(Value::as_u64) == Some(msg_id)))
+            .and_then(|a| {
+                a.iter()
+                    .find(|m| m.get("id").and_then(Value::as_u64) == Some(msg_id))
+            })
             .expect("message in inbox");
         assert!(
             m.get("read_ts").and_then(Value::as_str).is_some(),
@@ -1352,22 +1569,27 @@ mod tests {
         );
 
         // B acks (acted)
-        observer
-            .ack(&key, &obs_name, msg_id)
-            .expect("ack");
+        observer.ack(&key, &obs_name, msg_id).expect("ack");
         let inbox = observer
-            .inbox_filtered(&key, &obs_name, &MailInboxFilter {
-                urgent_only: false,
-                unread_only: false,
-                ack_overdue_only: false,
-                include_bodies: true,
-                limit: 20,
-                since_ts: None,
-            })
+            .inbox_filtered(
+                &key,
+                &obs_name,
+                &MailInboxFilter {
+                    urgent_only: false,
+                    unread_only: false,
+                    ack_overdue_only: false,
+                    include_bodies: true,
+                    limit: 20,
+                    since_ts: None,
+                },
+            )
             .expect("inbox after ack");
         let m = inbox
             .as_array()
-            .and_then(|a| a.iter().find(|m| m.get("id").and_then(Value::as_u64) == Some(msg_id)))
+            .and_then(|a| {
+                a.iter()
+                    .find(|m| m.get("id").and_then(Value::as_u64) == Some(msg_id))
+            })
             .expect("message in inbox");
         assert!(
             m.get("ack_ts").and_then(Value::as_str).is_some(),
