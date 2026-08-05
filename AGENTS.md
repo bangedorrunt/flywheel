@@ -68,6 +68,20 @@ swarm via `__poll` (leaf), feeds queued instructions to idle agents via
 `__send`, sleeps durably, and exits when the queue drains. Crashes resume by
 re-running the same command (same invocation id while pending).
 
+### Pattern: plan-review-implement (ADR-0001 §9.2)
+
+```bash
+flywheel plan-review <project> "<feature spec>" \
+  [--max-change-rounds 2] [--planner oc] [--reviewer pi] [--implementer gk] \
+  [--bead bd-xxx]
+```
+
+Threaded gate (`plan-<bead|ts>`): planner drafts → reviewer `APPROVE|CHANGES:` →
+implementer (build-slot `cargo` before cargo; paper-first branch, no merge) →
+reviewer `VERIFIED|REJECT:`. Max change rounds then escalate. **Paper-first:**
+VERIFIED does not close beads or merge — human/overseer sign-off. Tokens are
+leading-line only (`parse_review_token`).
+
 <!-- br-agent-instructions-v2 -->
 
 ---
