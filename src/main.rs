@@ -1634,6 +1634,47 @@ fn start_agent_with_retry(
     bail!("agent start failed for {name} on {pane_id} after 30 attempts")
 }
 
+/// Trait-object variant of [`start_agent_with_retry`] (review-fix F6): the
+/// durable-loop respawn leaf routes through the backend factory, so this
+/// retries via `MultiplexerBackend::agent_start` + `agent_list` instead of
+/// the concrete `Client`. Same retry contract: 30 attempts, 3s sleep, accept
+/// a same-pane agent even if nameless (bd-w17) and apply the name.
+fn start_agent_with_retry_dyn(
+    backend: &mut dyn backend::MultiplexerBackend,
+    name: &str,
+    kind: &str,
+    pane_id: &str,
+    args: &[String],
+) -> Result<AgentInfo> {
+    for attempt in 0..30 {
+        if let Err(e) = backend.agent_start(name, kind, pane_id, args) {
+            if attempt == 0 {
+                eprintln!("agent.start error: {e:#}");
+            }
+        }
+        if let Ok(agents) = backend.agent_list() {
+            if let Some(a) = agents
+                .iter()
+                .find(|a| a.name.as_deref() == Some(name) && a.pane_id == pane_id)
+            {
+                return Ok(a.clone());
+            }
+            if let Some(a) = agents.iter().find(|a| a.pane_id == pane_id) {
+                if a.name.as_deref() != Some(name) {
+                    let _ = backend.agent_rename(&a.pane_id, Some(name));
+                }
+                if let Ok(agents) = backend.agent_list() {
+                    if let Some(a) = agents.iter().find(|a| a.pane_id == pane_id) {
+                        return Ok(a.clone());
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
+    bail!("agent start failed for {name} on {pane_id} after 30 attempts")
+}
+
 /// Register a spawned agent as an agent-mail identity (ADR-0001
 /// mail-register-on-spawn) and bridge it to its herdr pane (ADR-0001 A4,
 /// bd-mail-pane-identity-bridge): agent-mail only writes identity files for
@@ -5828,13 +5869,18 @@ fn cmd_internal_send(
         }
     }
 
-    let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    let ws_id = find_workspace(&mut c, project)?;
-    let agent = c
+    // review-fix F6: __send routes through the backend factory (ADR-0002).
+    // The trait now exposes agent_prompt_coded with landing data, so the
+    // durable loop's dispatch leaf is backend-agnostic (herdr today; toron /
+    // superlogical later) with byte-identical landing classification.
+    let mut backend = backend::multiplexer_backend(cfg)?;
+    let ws_id = find_workspace_dyn(backend.as_mut(), project)?;
+    let agent = backend
         .agent_list()?
         .into_iter()
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
         .ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
+    let target = agent_target(&agent).to_string();
 
     // last-sent registry: record what was delivered (or attempted). Best-
     // effort — a registry failure must never lose the send itself.
@@ -5854,7 +5900,7 @@ fn cmd_internal_send(
     let Some(timeout_ms) = confirm_ms else {
         // legacy fire-and-forget path — a successful herdr call means the
         // prompt was written to the agent's terminal
-        c.agent_prompt(agent_target(&agent), text, None)?;
+        backend.agent_prompt(&target, text, None)?;
         record(true);
         print_json(&json!({ "ok": true, "name": name }));
         return Ok(());
@@ -5866,10 +5912,10 @@ fn cmd_internal_send(
         // a long task must not hold the leaf for its full duration.
         until: vec![AgentStatus::Working, AgentStatus::Blocked],
     };
-    let verdict = match c.agent_prompt_coded(agent_target(&agent), text, Some(wait)) {
-        Ok(info) => classify_send_result(None, Some(info.agent_status)),
-        Err(e) => classify_send_result(Some(&e.code), None),
-    };
+    // review-fix F6: PromptLanding carries status XOR code; classify
+    // identically to the concrete path (landed → status, else code).
+    let landing = backend.agent_prompt_coded(&target, text, Some(&wait))?;
+    let verdict = classify_send_result(landing.code.as_deref(), landing.status);
     let (landed, status, reason) = match verdict {
         SendVerdict::Landed(st) => (
             true,
@@ -6039,9 +6085,9 @@ fn cmd_internal_inprogress(cfg: &Config, project: &str) -> Result<()> {
 
 /// internal leaf: print the herdr agent kind of a named agent.
 fn cmd_internal_kind(cfg: &Config, project: &str, name: &str) -> Result<()> {
-    let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    let ws_id = find_workspace(&mut c, project)?;
-    let agent = c
+    let mut backend = backend::multiplexer_backend(cfg)?;
+    let ws_id = find_workspace_dyn(backend.as_mut(), project)?;
+    let agent = backend
         .agent_list()?
         .into_iter()
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
@@ -6051,20 +6097,27 @@ fn cmd_internal_kind(cfg: &Config, project: &str, name: &str) -> Result<()> {
 }
 
 /// internal leaf: print recent output of a named agent (context-marker check).
+/// review-fix F6: routes through the backend factory (ADR-0002).
 fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
-    let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    let ws_id = find_workspace(&mut c, project)?;
-    let agent = c
+    let mut backend = backend::multiplexer_backend(cfg)?;
+    let ws_id = find_workspace_dyn(backend.as_mut(), project)?;
+    let agent = backend
         .agent_list()?
         .into_iter()
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
         .ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
-    let text = c.agent_read(agent_target(&agent), "recent", Some(60))?;
+    let target = agent_target(&agent).to_string();
+    let text = backend
+        .agent_read(&target, "recent", 60)?
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     // state-file fallback channel: parse the agent's state file when present.
     // Malformed/absent files yield null — never an error (the loop treats
     // null as "terminal channel only", identical to pre-zwa behavior).
     let state: Option<agentstate::AgentStateFile> =
-        agentstate::state_file_path(&project_dir(cfg, project), agent_target(&agent))
+        agentstate::state_file_path(&project_dir(cfg, project), &target)
             .ok()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|content| agentstate::parse_state_file(&content));
@@ -6075,19 +6128,20 @@ fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
 /// internal leaf: close the agent's pane, split a fresh pane, restart the agent
 /// under the same name (fresh session context).
 fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> Result<()> {
-    let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    let ws_id = find_workspace(&mut c, project)?;
+    // review-fix F6: respawn routes through the backend factory (ADR-0002).
+    let mut backend = backend::multiplexer_backend(cfg)?;
+    let ws_id = find_workspace_dyn(backend.as_mut(), project)?;
     let dir = project_dir(cfg, project);
     // The agent record may already be gone (herdr drops dead agents ~0.5s
     // after they stop responding — the escalation path respawns exactly
     // those). The pane itself usually survives; split from any pane in the
     // workspace and skip closing an old pane we cannot identify.
-    let agent = c
+    let agent = backend
         .agent_list()?
         .into_iter()
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name));
     let old_pane = agent.as_ref().map(|a| a.pane_id.clone());
-    let panes = c.pane_list(Some(&ws_id))?;
+    let panes = backend.pane_list(Some(&ws_id))?;
     let anchor = old_pane
         .as_ref()
         .and_then(|old| {
@@ -6098,11 +6152,15 @@ fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> 
         })
         .or_else(|| panes.first().map(|p| p.pane_id.clone()))
         .ok_or_else(|| anyhow!("no pane in {project} to split for respawn"))?;
-    let new_pane = c.pane_split(&anchor, "down", Some(dir.to_str().unwrap()))?;
+    let new_pane = backend.pane_split(&anchor, "down", Some(dir.to_str().unwrap()))?;
     if let Some(old) = &old_pane {
-        let _ = c.call("pane.close", json!({ "pane_id": old }));
+        // trait has no pane_close default; herdr Client has no typed helper —
+        // best-effort close via the concrete client only when we have one.
+        if let Ok(mut c) = Client::connect(Some(&cfg.socket_path())) {
+            let _ = c.call("pane.close", json!({ "pane_id": old }));
+        }
     }
-    let fresh = start_agent_with_retry(&mut c, name, kind, &new_pane.pane_id, &[])?;
+    let fresh = start_agent_with_retry_dyn(backend.as_mut(), name, kind, &new_pane.pane_id, &[])?;
     // pane-identity bridge bookkeeping (best-effort — never fail the respawn
     // on mail trouble): the old pane died (its identity file is stale), the
     // fresh pane must resolve to the same name (the agent keeps its identity)
@@ -6133,9 +6191,10 @@ fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> 
 /// internal leaf: scan orchestrator inbox for `[xproj]` swarm requests.
 /// Soft-fail: missing mail → empty list. Output: `{ "items": [ XprojInboxItem ] }`.
 fn cmd_internal_xproj_inbox(cfg: &Config, project: &str, limit: u32) -> Result<()> {
-    let mut mail = match mail::Mail::from_config(cfg.agent_mail.as_ref()) {
-        Ok(Some(m)) => m,
-        Ok(None) | Err(_) => {
+    // review-fix F6: the xproj-inbox leaf routes through the backend factory.
+    let mut mail = match backend::mail_backend(cfg) {
+        Ok(m) => m,
+        Err(_) => {
             print_json(&json!({ "items": [] }));
             return Ok(());
         }
@@ -6145,8 +6204,8 @@ fn cmd_internal_xproj_inbox(cfg: &Config, project: &str, limit: u32) -> Result<(
         print_json(&json!({ "items": [] }));
         return Ok(());
     }
-    let name = mail.name.clone();
-    let filter = mail::MailInboxFilter {
+    let name = mail.agent_name().to_string();
+    let filter = backend::InboxFilter {
         urgent_only: false,
         unread_only: false,
         ack_overdue_only: false,
@@ -6154,7 +6213,7 @@ fn cmd_internal_xproj_inbox(cfg: &Config, project: &str, limit: u32) -> Result<(
         limit,
         since_ts: None,
     };
-    let v = match mail.inbox_filtered(&key, &name, &filter) {
+    let v = match mail.inbox(&key, &name, &filter) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("flywheel: xproj-inbox fetch failed: {e:#}");

@@ -10,7 +10,9 @@
 //! No behavior change vs calling `crate::herdr::Client` directly. R0.8
 //! (`bd-backend-parity-test`) proves byte-identical results.
 
-use crate::backend::{BackendError, EventStream as BackendEventStream, MultiplexerBackend, Result};
+use crate::backend::{
+    BackendError, EventStream as BackendEventStream, MultiplexerBackend, PromptLanding, Result,
+};
 use crate::herdr::{
     AgentInfo, AgentStatus, Client, EventStream as HerdrEventStream, PaneInfo, PushEvent,
     Subscription, WaitOptions, WorkspaceInfo,
@@ -37,6 +39,28 @@ impl HerdrBackend {
             method,
             reason: "not implemented on the herdr backend; Client has no typed wrapper".to_string(),
         }
+    }
+}
+
+/// Map a raw `agent.prompt_coded` result to [`PromptLanding`] (review-fix F6).
+///
+/// A coded error (`agent_prompt_stalled`, `timeout`, …) is landing DATA, not
+/// a transport failure: the prompt did not land and the reason is a protocol
+/// code. Landed → `status: Some`, `code: None`; coded error → `status: None`,
+/// `code: Some`. Pure + unit-tested so the __send leaf's classification is
+/// proven identical to the concrete client path.
+pub fn map_prompt_result(
+    r: std::result::Result<crate::herdr::AgentInfo, crate::herdr::HerdrError>,
+) -> Result<PromptLanding> {
+    match r {
+        Ok(info) => Ok(PromptLanding {
+            status: Some(info.agent_status),
+            code: None,
+        }),
+        Err(e) => Ok(PromptLanding {
+            status: None,
+            code: Some(e.code),
+        }),
     }
 }
 
@@ -178,6 +202,19 @@ impl MultiplexerBackend for HerdrBackend {
             "pane_id": info.pane_id,
             "status": status,
         }))
+    }
+
+    fn agent_prompt_coded(
+        &mut self,
+        target: &str,
+        text: &str,
+        wait: Option<&WaitOptions>,
+    ) -> Result<PromptLanding> {
+        // review-fix F6: preserve the coded error (landing semantics) through
+        // the trait so a backend-agnostic __send can classify identically to
+        // the concrete client. The client returns Err(HerdrError) on a
+        // non-landing outcome — that is landing DATA, not a transport failure.
+        map_prompt_result(self.client.agent_prompt_coded(target, text, wait.cloned()))
     }
 
     fn agent_wait(

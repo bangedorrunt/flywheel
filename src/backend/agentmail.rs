@@ -48,6 +48,10 @@ impl MailBackend for AgentMailMcpBackend {
         "agentmail"
     }
 
+    fn agent_name(&self) -> &str {
+        &self.mail.name
+    }
+
     fn health(&mut self) -> Result<Value> {
         self.mail.health().map_err(BackendError::Other)
     }
