@@ -332,6 +332,76 @@ impl Mail {
         )
     }
 
+    /// Acquire an advisory build slot (agent-mail `acquire_build_slot` tool).
+    /// Returns `{granted: [...]}` or `{conflicts: [...]}` — advisory, not
+    /// hard-blocking. Used to serialize `cargo build`/`cargo test` across
+    /// parallel workers on the shared `target/` dir (bd-mail-build-slot-gating).
+    pub fn acquire_slot(
+        &mut self,
+        project_key: &str,
+        agent_name: &str,
+        slot: &str,
+        exclusive: bool,
+        ttl_seconds: u64,
+    ) -> Result<Value> {
+        self.call(
+            "acquire_build_slot",
+            json!({
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "slot": slot,
+                "exclusive": exclusive,
+                "ttl_seconds": ttl_seconds,
+            }),
+        )
+    }
+
+    /// Extend a build-slot lease (`renew_build_slot`). Idempotent; safe to
+    /// over-call. A slot auto-expires at its TTL if not renewed, so a forgotten
+    /// release can't deadlock peers forever.
+    ///
+    /// Not yet wired to the loop or trait (the MailBackend trait has only
+    /// slot_acquire/slot_release); this wrapper exists for agents/CLI use and
+    /// the loop's future renewal cadence. #[allow(dead_code)] until a caller
+    /// needs it.
+    #[allow(dead_code)]
+    pub fn renew_slot(
+        &mut self,
+        project_key: &str,
+        agent_name: &str,
+        slot: &str,
+        extend_seconds: u64,
+    ) -> Result<Value> {
+        self.call(
+            "renew_build_slot",
+            json!({
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "slot": slot,
+                "extend_seconds": extend_seconds,
+            }),
+        )
+    }
+
+    /// Release a build slot (`release_build_slot`). Non-destructive: the
+    /// release record is kept for audit. Critical to call after a build so the
+    /// TTL doesn't block peers (the TTL is the safety net, release is the norm).
+    pub fn release_slot(
+        &mut self,
+        project_key: &str,
+        agent_name: &str,
+        slot: &str,
+    ) -> Result<Value> {
+        self.call(
+            "release_build_slot",
+            json!({
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "slot": slot,
+            }),
+        )
+    }
+
     /// Extend the TTL of active reservations (agent-mail MCP
     /// `renew_file_reservations`). Renewing an already-fresh lease is a no-op
     /// — safe to over-call every heartbeat. `paths` / `ids` scope the renewal
@@ -658,6 +728,16 @@ mod tests {
         // do NOT call it (would hit the dummy URL and fail).
         let _: fn(&mut Mail, &str, &str, &str, &str, &str) -> Result<Value> = Mail::register_agent;
         let _ = &mut mail; // silence unused-mut
+    }
+
+    /// The three slot wrappers exist with the right signatures (compile-time
+    /// guard against accidental removal; envelopes mirror the existing
+    /// wrappers — live round-trip is backend-parity-test territory).
+    #[test]
+    fn slot_wrappers_exist() {
+        let _: fn(&mut Mail, &str, &str, &str, bool, u64) -> Result<Value> = Mail::acquire_slot;
+        let _: fn(&mut Mail, &str, &str, &str, u64) -> Result<Value> = Mail::renew_slot;
+        let _: fn(&mut Mail, &str, &str, &str) -> Result<Value> = Mail::release_slot;
     }
 
     // ---- renew (bd-mail-lease-renewal-durable) ----

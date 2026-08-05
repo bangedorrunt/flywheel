@@ -204,19 +204,26 @@ impl MailBackend for AgentMailMcpBackend {
 
     fn slot_acquire(
         &mut self,
-        _project_key: &str,
-        _agent: &str,
-        _slot: &str,
-        _exclusive: bool,
-        _ttl_seconds: u64,
+        project_key: &str,
+        agent: &str,
+        slot: &str,
+        exclusive: bool,
+        ttl_seconds: u64,
     ) -> Result<Value> {
-        // Phase 3: bd-mail-build-slot-gating.
-        Err(self.unsupported("slot_acquire"))
+        // bd-mail-build-slot-gating: delegate to Mail::acquire_slot. The slot
+        // is advisory (returns conflicts, doesn't hard-block); the caller
+        // decides to wait. TTL is the safety net against a forgotten release.
+        self.mail
+            .acquire_slot(project_key, agent, slot, exclusive, ttl_seconds)
+            .map_err(BackendError::Other)
     }
 
-    fn slot_release(&mut self, _project_key: &str, _agent: &str, _slot: &str) -> Result<Value> {
-        // Phase 3: bd-mail-build-slot-gating.
-        Err(self.unsupported("slot_release"))
+    fn slot_release(&mut self, project_key: &str, agent: &str, slot: &str) -> Result<Value> {
+        // bd-mail-build-slot-gating: delegate to Mail::release_slot. Must be
+        // called after a build; the TTL auto-expires if forgotten.
+        self.mail
+            .release_slot(project_key, agent, slot)
+            .map_err(BackendError::Other)
     }
 
     fn search(
@@ -357,16 +364,11 @@ mod tests {
         // graduated it to real delegation (calls Mail::register_agent).
         // renew graduated with bd-mail-lease-renewal-durable; the pane
         // identity trio with bd-mail-pane-identity-bridge; reply +
-        // summarize_thread with bd-mail-reply-thread. The remaining 7
-        // stay Unsupported until their Phase-3 beads land.
+        // summarize_thread with bd-mail-reply-thread; ack + mark_read with
+        // bd-mail-ack-sla-tracking + bd-mail-build-slot-gating graduated ack/
+        // mark_read/renew/reply/slot_acquire/slot_release. The remaining 3 stay
+        // Unsupported until their Phase-3 beads land.
         let cases: Vec<(&str, std::result::Result<Value, BackendError>)> = vec![
-            ("ack", b.ack("p", "a", 1)),
-            ("mark_read", b.mark_read("p", "a", 1)),
-            (
-                "slot_acquire",
-                b.slot_acquire("p", "a", "cargo", true, 1800),
-            ),
-            ("slot_release", b.slot_release("p", "a", "cargo")),
             ("search", b.search("p", "q", 5, &Default::default())),
             (
                 "request_contact",
