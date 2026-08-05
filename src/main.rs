@@ -5248,7 +5248,6 @@ fn cmd_plan_review(
     );
 
     // --- plan ---
-    let mut phase = PriPhase::AwaitingPlan;
     let mut change_rounds = 0u32;
     let mut current_path = plan_path.clone();
 
@@ -5267,26 +5266,65 @@ fn cmd_plan_review(
     let plan_reply =
         harvest_latest(mail.as_mut(), &key, &thread, &planner_mail)?.unwrap_or_default();
     current_path = extract_plan_path(&plan_reply, &current_path);
-    let (next_phase, action) = pri_after_plan(&current_path);
-    phase = next_phase;
+    let (_next_phase, action) = pri_after_plan(&current_path);
+    let mut phase = PriPhase::AwaitingPlanReview;
 
-    // --- gate loop ---
+    // --- gate loop (review-fix F2) ---
+    // A genuine phase-driven state machine. Every iteration routes on the
+    // CURRENT phase, performs exactly one agent interaction, and transitions
+    // via the pure helpers (pri_route / pri_after_plan / pri_after_implement).
+    // `phase` is READ each iteration (no dead assignments). `change_rounds`
+    // is bumped by pri_route on CHANGES and checked against max_rounds, so
+    // `--max-change-rounds N` is honored for any N (previously the loop ran
+    // at most one inline CHANGES cycle then bailed).
+    //
+    // governed-by: ADR-0001 §9.2 (bd-review-fix-epic-m0b.2)
+    let mut action = action;
     loop {
-        match &action {
-            PriAction::PromptReviewer { msg } => {
+        match phase {
+            PriPhase::AwaitingPlan => {
+                // planner revision round: prompt, settle, harvest, re-route
+                let msg = match &action {
+                    PriAction::PromptPlanner { msg } => msg.clone(),
+                    _ => bail!("phase AwaitingPlan without PromptPlanner action: {action:?}"),
+                };
+                mail.send(
+                    &key,
+                    &[mail_target(planner)],
+                    &subject,
+                    &msg,
+                    "high",
+                    true,
+                    Some(&thread),
+                )?;
+                settle_agent(mux.as_mut(), planner)?;
+                let pr = harvest_latest(mail.as_mut(), &key, &thread, &mail_target(planner))?
+                    .unwrap_or_default();
+                current_path = extract_plan_path(&pr, &current_path);
+                let (p2, a2) = pri_after_plan(&current_path);
+                phase = p2; // AwaitingPlanReview
+                action = a2;
+            }
+            PriPhase::AwaitingPlanReview => {
+                // reviewer gate: prompt, settle, harvest, parse, route
+                let msg = match &action {
+                    PriAction::PromptReviewer { msg } => msg.clone(),
+                    _ => {
+                        bail!("phase AwaitingPlanReview without PromptReviewer action: {action:?}")
+                    }
+                };
                 mail.send(
                     &key,
                     &[mail_target(reviewer)],
                     &subject,
-                    msg,
+                    &msg,
                     "high",
                     true,
                     Some(&thread),
                 )?;
                 settle_agent(mux.as_mut(), reviewer)?;
-                let rev_mail = mail_target(reviewer);
-                let body =
-                    harvest_latest(mail.as_mut(), &key, &thread, &rev_mail)?.unwrap_or_default();
+                let body = harvest_latest(mail.as_mut(), &key, &thread, &mail_target(reviewer))?
+                    .unwrap_or_default();
                 let token = parse_review_token(&body).ok_or_else(|| {
                     anyhow!(
                         "reviewer reply missing APPROVE|CHANGES:|VERIFIED|REJECT: token: {body}"
@@ -5295,188 +5333,72 @@ fn cmd_plan_review(
                 let (p, a, rounds) =
                     pri_route(phase, &token, &current_path, change_rounds, max_rounds);
                 phase = p;
+                action = a;
                 change_rounds = rounds;
-                match a {
-                    PriAction::PromptImplementer { msg } => {
-                        // build-slot instruction is in the prompt; agent self-gates
-                        mail.send(
-                            &key,
-                            &[mail_target(implementer)],
-                            &subject,
-                            &msg,
-                            "high",
-                            true,
-                            Some(&thread),
-                        )?;
-                        settle_agent(mux.as_mut(), implementer)?;
-                        let (p2, a2) = pri_after_implement(&current_path);
-                        phase = p2;
-                        // continue with verify prompt
-                        mail.send(
-                            &key,
-                            &[mail_target(reviewer)],
-                            &subject,
-                            match &a2 {
-                                PriAction::PromptReviewer { msg } => msg.as_str(),
-                                _ => unreachable!(),
-                            },
-                            "high",
-                            true,
-                            Some(&thread),
-                        )?;
-                        settle_agent(mux.as_mut(), reviewer)?;
-                        let rev2 =
-                            harvest_latest(mail.as_mut(), &key, &thread, &mail_target(reviewer))?
-                                .unwrap_or_default();
-                        let token2 = parse_review_token(&rev2).ok_or_else(|| {
-                            anyhow!("verify reply missing VERIFIED|REJECT: token: {rev2}")
-                        })?;
-                        let (p3, a3, _) =
-                            pri_route(phase, &token2, &current_path, change_rounds, max_rounds);
-                        phase = p3;
-                        match a3 {
-                            PriAction::HaltVerified => {
-                                println!(
-                                    "plan-review {thread}: VERIFIED (paper-first — human merge/close)"
-                                );
-                                return Ok(());
-                            }
-                            PriAction::Escalate { reason } => {
-                                eprintln!("plan-review {thread}: escalate: {reason}");
-                                return Ok(());
-                            }
-                            other => bail!("unexpected after verify: {other:?}"),
-                        }
-                    }
-                    PriAction::PromptPlanner { msg } => {
-                        mail.send(
-                            &key,
-                            &[mail_target(planner)],
-                            &subject,
-                            &msg,
-                            "high",
-                            true,
-                            Some(&thread),
-                        )?;
-                        settle_agent(mux.as_mut(), planner)?;
-                        let pr =
-                            harvest_latest(mail.as_mut(), &key, &thread, &mail_target(planner))?
-                                .unwrap_or_default();
-                        current_path = extract_plan_path(&pr, &current_path);
-                        let (p2, a2) = pri_after_plan(&current_path);
-                        phase = p2;
-                        // re-enter by sending review prompt (loop)
-                        let msg = match a2 {
-                            PriAction::PromptReviewer { msg } => msg,
-                            _ => unreachable!(),
-                        };
-                        // recurse one review by continuing loop with synthetic action
-                        // simplest: re-send and continue parsing at top via goto-style
-                        mail.send(
-                            &key,
-                            &[mail_target(reviewer)],
-                            &subject,
-                            &msg,
-                            "high",
-                            true,
-                            Some(&thread),
-                        )?;
-                        // fall through by continuing outer loop — but we need
-                        // the next harvest. Inline one more review cycle:
-                        settle_agent(mux.as_mut(), reviewer)?;
-                        let body =
-                            harvest_latest(mail.as_mut(), &key, &thread, &mail_target(reviewer))?
-                                .unwrap_or_default();
-                        let token = parse_review_token(&body).ok_or_else(|| {
-                            anyhow!("reviewer reply missing token after CHANGES: {body}")
-                        })?;
-                        let (p, a, rounds) =
-                            pri_route(phase, &token, &current_path, change_rounds, max_rounds);
-                        phase = p;
-                        change_rounds = rounds;
-                        match a {
-                            PriAction::PromptImplementer { msg } => {
-                                mail.send(
-                                    &key,
-                                    &[mail_target(implementer)],
-                                    &subject,
-                                    &msg,
-                                    "high",
-                                    true,
-                                    Some(&thread),
-                                )?;
-                                settle_agent(mux.as_mut(), implementer)?;
-                                let (_, a2) = pri_after_implement(&current_path);
-                                mail.send(
-                                    &key,
-                                    &[mail_target(reviewer)],
-                                    &subject,
-                                    match &a2 {
-                                        PriAction::PromptReviewer { msg } => msg.as_str(),
-                                        _ => unreachable!(),
-                                    },
-                                    "high",
-                                    true,
-                                    Some(&thread),
-                                )?;
-                                settle_agent(mux.as_mut(), reviewer)?;
-                                let rev2 = harvest_latest(
-                                    mail.as_mut(),
-                                    &key,
-                                    &thread,
-                                    &mail_target(reviewer),
-                                )?
-                                .unwrap_or_default();
-                                let token2 = parse_review_token(&rev2).ok_or_else(|| {
-                                    anyhow!("verify reply missing token: {rev2}")
-                                })?;
-                                let (p3, a3, _) = pri_route(
-                                    PriPhase::AwaitingVerify,
-                                    &token2,
-                                    &current_path,
-                                    change_rounds,
-                                    max_rounds,
-                                );
-                                phase = p3;
-                                match a3 {
-                                    PriAction::HaltVerified => {
-                                        println!(
-                                            "plan-review {thread}: VERIFIED (paper-first)"
-                                        );
-                                        return Ok(());
-                                    }
-                                    PriAction::Escalate { reason } => {
-                                        eprintln!("plan-review {thread}: escalate: {reason}");
-                                        return Ok(());
-                                    }
-                                    other => bail!("unexpected after verify: {other:?}"),
-                                }
-                            }
-                            PriAction::Escalate { reason } => {
-                                eprintln!("plan-review {thread}: escalate: {reason}");
-                                return Ok(());
-                            }
-                            other => bail!(
-                                "after second review only APPROVE/REJECT/CHANGES expected, got {other:?}"
-                            ),
-                        }
-                    }
-                    PriAction::Escalate { reason } => {
-                        eprintln!("plan-review {thread}: escalate: {reason}");
-                        return Ok(());
-                    }
-                    other => bail!("unexpected route after plan review: {other:?}"),
-                }
             }
-            PriAction::HaltVerified => {
+            PriPhase::AwaitingImplement => {
+                // implementer: prompt (build-slot in prompt), settle, verify
+                let msg = match &action {
+                    PriAction::PromptImplementer { msg } => msg.clone(),
+                    _ => bail!(
+                        "phase AwaitingImplement without PromptImplementer action: {action:?}"
+                    ),
+                };
+                mail.send(
+                    &key,
+                    &[mail_target(implementer)],
+                    &subject,
+                    &msg,
+                    "high",
+                    true,
+                    Some(&thread),
+                )?;
+                settle_agent(mux.as_mut(), implementer)?;
+                let (p2, a2) = pri_after_implement(&current_path);
+                phase = p2; // AwaitingVerify
+                action = a2;
+            }
+            PriPhase::AwaitingVerify => {
+                // verify: reviewer checks the implementation
+                let msg = match &action {
+                    PriAction::PromptReviewer { msg } => msg.clone(),
+                    _ => bail!("phase AwaitingVerify without PromptReviewer action: {action:?}"),
+                };
+                mail.send(
+                    &key,
+                    &[mail_target(reviewer)],
+                    &subject,
+                    &msg,
+                    "high",
+                    true,
+                    Some(&thread),
+                )?;
+                settle_agent(mux.as_mut(), reviewer)?;
+                let rev2 = harvest_latest(mail.as_mut(), &key, &thread, &mail_target(reviewer))?
+                    .unwrap_or_default();
+                let token2 = parse_review_token(&rev2).ok_or_else(|| {
+                    anyhow!("verify reply missing VERIFIED|REJECT: token: {rev2}")
+                })?;
+                let (p3, a3, _) =
+                    pri_route(phase, &token2, &current_path, change_rounds, max_rounds);
+                phase = p3;
+                action = a3;
+            }
+            PriPhase::Done => {
                 println!("plan-review {thread}: VERIFIED (paper-first — human merge/close)");
                 return Ok(());
             }
-            PriAction::Escalate { reason } => {
-                eprintln!("plan-review {thread}: escalate: {reason}");
+            PriPhase::Escalated => {
+                match &action {
+                    PriAction::Escalate { reason } => {
+                        eprintln!("plan-review {thread}: escalate: {reason}");
+                    }
+                    other => eprintln!(
+                        "plan-review {thread}: escalated with unexpected action {other:?}"
+                    ),
+                }
                 return Ok(());
             }
-            other => bail!("unexpected action in gate loop: {other:?}"),
         }
     }
 }
@@ -6954,6 +6876,128 @@ mod plan_review_tests {
             "result": [{"id": 3, "subject": "   ", "body_md": ""}]
         });
         assert_eq!(extract_latest_body(&v), None);
+    }
+
+    /// review-fix F2: the gate is a real state machine, not a single pass.
+    /// Walk the driver's phase machine over a scripted reviewer token sequence
+    /// (planner always replies PLAN, reviewer replies the given tokens in
+    /// order, implementer replies IMPLEMENT_DONE) and assert the visited phase
+    /// path + final outcome. This is the test that would have caught the
+    /// original never_loop defect: [Changes, Approve] must visit
+    /// AwaitingPlanReview TWICE (two CHANGES cycles) before reaching
+    /// AwaitingImplement → AwaitingVerify → Done.
+    #[test]
+    fn plan_review_gate_loops_on_changes_then_verifies() {
+        let path = ".flywheel/plans/x.md";
+        let mut phases: Vec<PriPhase> = Vec::new();
+        let mut phase = PriPhase::AwaitingPlanReview;
+        let mut action = pri_after_plan(path).1; // PromptReviewer
+        let mut change_rounds = 0u32;
+        // scripted reviewer replies: CHANGES then APPROVE (then VERIFIED at verify)
+        let mut reviewer_tokens = [
+            ReviewToken::Changes("fix a".into()),
+            ReviewToken::Approve,
+            ReviewToken::Verified,
+        ]
+        .into_iter();
+        let max_rounds = 2u32;
+        loop {
+            phases.push(phase.clone());
+            match phase {
+                PriPhase::AwaitingPlanReview => {
+                    let token = reviewer_tokens
+                        .next()
+                        .expect("scripted reviewer ran out of tokens");
+                    let (p, a, r) = pri_route(phase, &token, path, change_rounds, max_rounds);
+                    phase = p;
+                    action = a;
+                    change_rounds = r;
+                    // APPROVE routes to implement; CHANGES routes to planner
+                    match &action {
+                        PriAction::PromptImplementer { .. } => {
+                            phase = pri_after_implement(path).0;
+                            action = pri_after_implement(path).1;
+                        }
+                        PriAction::PromptPlanner { .. } => {
+                            // planner revises; back to review
+                            phase = pri_after_plan(path).0;
+                            action = pri_after_plan(path).1;
+                        }
+                        _ => panic!("unexpected action after review: {action:?}"),
+                    }
+                }
+                PriPhase::AwaitingVerify => {
+                    let token = reviewer_tokens
+                        .next()
+                        .expect("scripted verifier ran out of tokens");
+                    let (p, a, _) = pri_route(phase, &token, path, change_rounds, max_rounds);
+                    phase = p;
+                    action = a;
+                }
+                PriPhase::Done => break,
+                PriPhase::Escalated => panic!("unexpected escalation: {action:?}"),
+                other => panic!("unexpected phase: {other:?}"),
+            }
+        }
+        phases.push(PriPhase::Done);
+        // visited AwaitingPlanReview twice (initial + after CHANGES re-plan)
+        let reviews = phases
+            .iter()
+            .filter(|p| matches!(p, PriPhase::AwaitingPlanReview))
+            .count();
+        assert_eq!(reviews, 2, "phase path: {phases:?}");
+        assert_eq!(change_rounds, 1);
+        assert!(matches!(action, PriAction::HaltVerified));
+    }
+
+    /// review-fix F2: change rounds are HONORED — [Changes, Changes, Changes]
+    /// with max 2 escalates on the third instead of looping forever.
+    #[test]
+    fn plan_review_gate_escalates_when_change_rounds_exhausted() {
+        let path = ".flywheel/plans/x.md";
+        let mut phase = PriPhase::AwaitingPlanReview;
+        let mut action = pri_after_plan(path).1;
+        let mut change_rounds = 0u32;
+        let mut reviewer_tokens = [
+            ReviewToken::Changes("a".into()),
+            ReviewToken::Changes("b".into()),
+            ReviewToken::Changes("c".into()),
+        ]
+        .into_iter();
+        let max_rounds = 2u32;
+        let mut iterations = 0u32;
+        loop {
+            iterations += 1;
+            assert!(iterations < 20, "gate must terminate (max_change_rounds)");
+            match phase {
+                PriPhase::AwaitingPlanReview => {
+                    let token = reviewer_tokens
+                        .next()
+                        .expect("scripted reviewer ran out of tokens");
+                    let (p, a, r) = pri_route(phase, &token, path, change_rounds, max_rounds);
+                    phase = p;
+                    action = a;
+                    change_rounds = r;
+                    if matches!(action, PriAction::Escalate { .. }) {
+                        assert_eq!(change_rounds, 3);
+                        assert!(matches!(phase, PriPhase::Escalated));
+                        return;
+                    }
+                    match &action {
+                        PriAction::PromptPlanner { .. } => {
+                            phase = pri_after_plan(path).0;
+                            action = pri_after_plan(path).1;
+                        }
+                        other => panic!("unexpected: {other:?}"),
+                    }
+                }
+                PriPhase::Escalated => {
+                    assert!(matches!(action, PriAction::Escalate { .. }));
+                    return;
+                }
+                other => panic!("unexpected phase: {other:?}"),
+            }
+        }
     }
 
     #[test]
