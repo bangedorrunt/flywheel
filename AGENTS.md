@@ -216,9 +216,23 @@ flywheel plan-review <project> "<feature spec>" \
 
 Threaded gate (`plan-<bead|ts>`): planner drafts → reviewer `APPROVE|CHANGES:` →
 implementer (build-slot `cargo` before cargo; paper-first branch, no merge) →
-reviewer `VERIFIED|REJECT:`. Max change rounds then escalate. **Paper-first:**
-VERIFIED does not close beads or merge — human/overseer sign-off. Tokens are
-leading-line only (`parse_review_token`).
+reviewer `VERIFIED|REJECT:`. `--max-change-rounds N` is HONORED — the gate is a
+real phase-driven state machine that loops planner↔reviewer up to N rounds then
+escalates. **Paper-first:** VERIFIED does not close beads or merge — human/
+overseer sign-off. Tokens are leading-line only (`parse_review_token`).
+
+**Content semantics (review-fix F1, 2026-08-05):** debate + plan-review harvest
+agents' reply **bodies** (`body_md`), never subjects — a reviewer's
+APPROVE/CHANGES token and a debater's argument live in the body. Default agent
+names (`oc`/`pi`/`gk`) resolve to the spawned `flywheel-<base>-<short>`
+identities (review-fix F7).
+
+### Pattern: blocked escalation (ADR-0001 §4.4)
+
+Tiered by time blocked: T0 ping → T1 re-ping → T2 urgent → **T3 halts the loop**
+(bounded, `--on-blocked mail`; `stop` halts at any tier; `continue` never halts).
+The T3 exit is a distinguishable `halted:` result, not a normal `complete`
+(review-fix F4, 2026-08-05).
 
 <!-- br-agent-instructions-v2 -->
 
