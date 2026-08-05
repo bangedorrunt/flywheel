@@ -14,6 +14,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use resonate_sdk::function;
 use resonate_sdk::prelude::*;
@@ -252,7 +253,7 @@ async fn poll_ready(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
 /// filename. `context_pct` < 80 is ignored by the READER (bd-read-state-
 /// fallback) — the threshold lives there, not here.
 pub fn bead_prompt(id: &str, title: &str) -> String {
-    let template = r#"Execute bead {id}: {title}. Follow the bead lifecycle: claim (`br update {id} --claim --actor "$AGENT_NAME" --json`), reserve your files via agent-mail, announce, execute one narrow slice, verify acceptance criteria, close with an honest reason, `br sync --flush-only` and commit `.beads/`. If your session context usage exceeds about 80%: write `{"context_pct": <pct>, "ts": "<now RFC3339>"}` to `.flywheel/agent-state/{AGENT_NAME}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you. If {id} is already claimed, pick the next ready bead from `br ready --json` or report back."#;
+    let template = r#"Execute bead {id}: {title}. Follow the bead lifecycle: claim (`br update {id} --claim --actor "$AGENT_NAME" --json`), reserve your files via agent-mail, announce, execute one narrow slice, verify acceptance criteria, close with an honest reason, `br sync --flush-only` and commit `.beads/`. Renew your own agent-mail file reservations periodically while working (extend the TTL before it lapses — the orchestrator cannot renew on your behalf), so long edits never lose their lease. If your session context usage exceeds about 80%: write `{"context_pct": <pct>, "ts": "<now RFC3339>"}` to `.flywheel/agent-state/{AGENT_NAME}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you. If {id} is already claimed, pick the next ready bead from `br ready --json` or report back."#;
     template.replace("{id}", id).replace("{title}", title)
 }
 
@@ -260,7 +261,7 @@ pub fn bead_prompt(id: &str, title: &str) -> String {
 /// same state-file contract (placeholder substituted at dispatch).
 pub fn resume_prompt(id: &str, title: &str) -> String {
     format!(
-        "Resume bead {id}: {title}. It is still in progress — continue it: re-check your work, finish, verify acceptance criteria, close with an honest reason, `br sync --flush-only` and commit `.beads/`. If your session context usage exceeds about 80%: write `{{\"context_pct\": <pct>, \"ts\": \"<now RFC3339>\"}}` to `.flywheel/agent-state/{{AGENT_NAME}}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you."
+        "Resume bead {id}: {title}. It is still in progress — continue it: re-check your work, finish, verify acceptance criteria, close with an honest reason, `br sync --flush-only` and commit `.beads/`. Renew your own agent-mail file reservations periodically while working (extend the TTL before it lapses — the orchestrator cannot renew on your behalf), so long edits never lose their lease. If your session context usage exceeds about 80%: write `{{\"context_pct\": <pct>, \"ts\": \"<now RFC3339>\"}}` to `.flywheel/agent-state/{{AGENT_NAME}}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you."
     )
 }
 
@@ -524,6 +525,61 @@ async fn notify_blocked(args: NotifyArgs) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Args for the [`renew_leases`] leaf.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenewLeaseArgs {
+    pub project: String,
+    /// TTL extension per active reservation, in seconds.
+    pub extend_seconds: u64,
+}
+
+/// Renew the orchestrator's active file reservations (ADR-0001 gap A3,
+/// bd-mail-lease-renewal-durable). Checkpointed side effect: the leaf calls
+/// `__renew-leases` in a fresh process, so a crash between ticks is resumed
+/// idempotently (renewing an already-fresh lease is a no-op). Best-effort by
+/// contract: the caller logs a failure and continues — a missed renew is
+/// recoverable on the next tick and must never kill an overnight loop.
+#[function]
+async fn renew_leases(args: RenewLeaseArgs) -> Result<Value> {
+    let exe = self_exe().map_err(map_err)?;
+    let out = Command::new(&exe)
+        .args([
+            "__renew-leases",
+            &args.project,
+            &args.extend_seconds.to_string(),
+        ])
+        .output()
+        .map_err(|e| map_err(anyhow::anyhow!("__renew-leases spawn failed: {e}")))?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__renew-leases failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout).map_err(|e| map_err(anyhow::anyhow!("__renew-leases bad JSON: {e}: {stdout}")))
+}
+
+/// Lease TTL policy for loop-made reservations: an initial TTL of
+/// `max(3600, 4 × heartbeat_interval)` so a single missed renew cannot expire
+/// the lease mid-run (bd-mail-lease-renewal-durable subtask 5). The heartbeat
+/// itself renews by `4 × heartbeat_interval` ([`renew_leases`]), so one tick
+/// of grace covers the whole reservation window.
+///
+/// No loop-side reserve call exists yet (agents reserve their own files; the
+/// loop's reservation path lands with the build-slot bead) — the policy is
+/// exercised by tests and consumed by that future reserve path.
+#[allow(dead_code)]
+pub fn lease_ttl_seconds(heartbeat_interval_secs: u64) -> u64 {
+    (4 * heartbeat_interval_secs).max(3600)
+}
+
+/// Renewal extension per heartbeat tick: `4 × heartbeat_interval`, floored at
+/// agent-mail's 60s `extend_seconds` minimum — never compute tiny extensions.
+pub fn lease_renew_seconds(heartbeat_interval_secs: u64) -> u64 {
+    (4 * heartbeat_interval_secs).max(60)
 }
 
 /// Pure planning: given current states, decide actions and drain the queue.
@@ -1135,6 +1191,30 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             return Ok("complete".to_string());
         }
 
+        // Lease renewal heartbeat (bd-mail-lease-renewal-durable): extend the
+        // orchestrator's own file reservations by 4× the base interval each
+        // tick. Best-effort BY DESIGN — agent-mail being unreachable must not
+        // kill an overnight run; a missed renew is recoverable next tick
+        // (idempotent: renewing a fresh lease is a no-op). `ctx.run` makes it
+        // a checkpointed side effect, so crash-resume renews without
+        // duplicating reservations.
+        match ctx
+            .run(
+                renew_leases,
+                RenewLeaseArgs {
+                    project: params.project.clone(),
+                    extend_seconds: lease_renew_seconds(params.interval_secs),
+                },
+            )
+            .await
+        {
+            Ok(v) => {
+                let renewed = v.get("renewed").and_then(Value::as_u64).unwrap_or(0);
+                eprintln!("flywheel: renewed {renewed} lease(s)");
+            }
+            Err(e) => eprintln!("flywheel: lease renew failed (continuing): {e}"),
+        }
+
         // durable pause — the worker may exit here; the server resumes us.
         // Adaptive cadence: active interval after a dispatch and while anyone
         // is working/blocked/unknown, base interval when settled (the 5s
@@ -1172,6 +1252,9 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     resonate
         .register(notify_blocked)
         .map_err(|e| anyhow::anyhow!("register notify_blocked: {e}"))?;
+    resonate
+        .register(renew_leases)
+        .map_err(|e| anyhow::anyhow!("register renew_leases: {e}"))?;
     resonate
         .register(poll_ready)
         .map_err(|e| anyhow::anyhow!("register poll_ready: {e}"))?;
@@ -1742,6 +1825,70 @@ mod tests {
         assert!(p.contains("context_pct"));
         assert!(p.contains(".flywheel/agent-state/{AGENT_NAME}.json"));
         assert!(p.contains("CONTEXT_LIMIT"));
+    }
+
+    // ---- lease renewal (bd-mail-lease-renewal-durable) ----
+
+    /// Both spawn prompts carry the self-renew clause: agents renew their own
+    /// reservations (the orchestrator cannot renew on their behalf).
+    #[test]
+    fn spawn_prompts_carry_lease_renew_clause() {
+        for p in [
+            bead_prompt("bd-12", "fix auth flow"),
+            resume_prompt("bd-7", "finish the parser"),
+        ] {
+            assert!(
+                p.contains("Renew your own agent-mail file reservations"),
+                "prompt must instruct agents to renew their own leases: {p}"
+            );
+            assert!(
+                p.contains("cannot renew on your behalf"),
+                "prompt must explain the orchestrator cannot renew for agents: {p}"
+            );
+        }
+    }
+
+    /// Initial TTL policy: `max(3600, 4 × heartbeat)` — a 1h floor so a single
+    /// missed renew can't expire a default-cadence (300s) lease; long
+    /// heartbeats scale the window linearly.
+    #[test]
+    fn lease_ttl_policy_floor_and_scale() {
+        // default base cadence 300s → 4×300 = 1200 < 3600 → 3600 floor
+        assert_eq!(lease_ttl_seconds(300), 3600);
+        // tiny interval → still the 1h floor
+        assert_eq!(lease_ttl_seconds(30), 3600);
+        assert_eq!(lease_ttl_seconds(60), 3600);
+        // long heartbeat → 4× dominates
+        assert_eq!(lease_ttl_seconds(1000), 4000);
+        assert_eq!(lease_ttl_seconds(3600), 14400);
+    }
+
+    /// Renewal extension per tick: `4 × heartbeat`, floored at agent-mail's
+    /// 60s minimum — never compute tiny extensions.
+    #[test]
+    fn lease_renew_extension_floor_and_scale() {
+        assert_eq!(lease_renew_seconds(300), 1200);
+        assert_eq!(lease_renew_seconds(1000), 4000);
+        assert_eq!(lease_renew_seconds(30), 120);
+        // below the 60s floor → floor
+        assert_eq!(lease_renew_seconds(10), 60);
+        assert_eq!(lease_renew_seconds(0), 60);
+    }
+
+    /// The leaf args serialize/deserialize round-trip (Resonate requires
+    /// serializable leaf params; simple identifier params per the SDK rule).
+    #[test]
+    fn renew_lease_args_serde_roundtrip() {
+        let a = RenewLeaseArgs {
+            project: "proj-a".into(),
+            extend_seconds: 1200,
+        };
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(v["project"], "proj-a");
+        assert_eq!(v["extend_seconds"], 1200);
+        let back: RenewLeaseArgs = serde_json::from_value(v).unwrap();
+        assert_eq!(back.project, a.project);
+        assert_eq!(back.extend_seconds, a.extend_seconds);
     }
 
     #[test]

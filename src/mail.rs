@@ -203,6 +203,98 @@ impl Mail {
             json!({ "project_key": project_key, "agent_name": self.name, "paths": paths }),
         )
     }
+
+    /// Extend the TTL of active reservations (agent-mail MCP
+    /// `renew_file_reservations`). Renewing an already-fresh lease is a no-op
+    /// — safe to over-call every heartbeat. `paths` / `ids` scope the renewal
+    /// to specific reservations; `None`/`None` renews ALL of this agent's
+    /// active reservations in the project. The returned JSON carries the
+    /// renewed list (`{"renewed": N, "file_reservations": [...]}`) — see
+    /// [`list_own_reservations`].
+    ///
+    /// ADR-0001 gap A3 (bd-mail-lease-renewal-durable): long loops must not
+    /// lose their lease mid-run.
+    pub fn renew(
+        &mut self,
+        project_key: &str,
+        agent_name: &str,
+        extend_seconds: u64,
+        paths: Option<&[String]>,
+        ids: Option<&[u64]>,
+    ) -> Result<Value> {
+        self.call("renew_file_reservations", renew_args(
+            project_key,
+            agent_name,
+            extend_seconds,
+            paths,
+            ids,
+        ))
+    }
+}
+
+/// Build the `renew_file_reservations` argument envelope. Optional groups are
+/// omitted (not null) when absent — agent-mail rejects unknown/null members.
+fn renew_args(
+    project_key: &str,
+    agent_name: &str,
+    extend_seconds: u64,
+    paths: Option<&[String]>,
+    ids: Option<&[u64]>,
+) -> Value {
+    let mut args = json!({
+        "project_key": project_key,
+        "agent_name": agent_name,
+        "extend_seconds": extend_seconds,
+    });
+    if let Some(p) = paths {
+        args["paths"] = json!(p);
+    }
+    if let Some(i) = ids {
+        args["file_reservation_ids"] = json!(i);
+    }
+    args
+}
+
+/// One renewed reservation, as reported by `renew_file_reservations`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RenewedReservation {
+    pub id: u64,
+    pub path_pattern: String,
+    pub old_expires_ts: String,
+    pub new_expires_ts: String,
+}
+
+/// Extract the renewed reservations from a `renew_file_reservations`
+/// response. Agent-mail exposes no list-reservations MCP tool (verified
+/// against the full tools/list surface), so the renew response is the
+/// authoritative "what did I renew" source — the durable heartbeat logs this
+/// list each tick (bd-mail-lease-renewal-durable).
+pub fn list_own_reservations(resp: &Value) -> Vec<RenewedReservation> {
+    let mut out = Vec::new();
+    let Some(list) = resp.get("file_reservations").and_then(Value::as_array) else {
+        return out;
+    };
+    for r in list {
+        out.push(RenewedReservation {
+            id: r.get("id").and_then(Value::as_u64).unwrap_or(0),
+            path_pattern: r
+                .get("path_pattern")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            old_expires_ts: r
+                .get("old_expires_ts")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            new_expires_ts: r
+                .get("new_expires_ts")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -259,5 +351,184 @@ mod tests {
         // do NOT call it (would hit the dummy URL and fail).
         let _: fn(&mut Mail, &str, &str, &str, &str, &str) -> Result<Value> = Mail::register_agent;
         let _ = &mut mail; // silence unused-mut
+    }
+
+    // ---- renew (bd-mail-lease-renewal-durable) ----
+
+    /// `renew` envelope: required params always present; optional `paths` /
+    /// `ids` included only when `Some`. This is the exact JSON the MCP tool
+    /// call will carry (verified against agent-mail's
+    /// `renew_file_reservations` schema: project_key + agent_name required,
+    /// extend_seconds int, paths / file_reservation_ids optional).
+    #[test]
+    fn renew_args_envelope_shape() {
+        // paths + ids present
+        let v = renew_args(
+            "/proj",
+            "Orchid",
+            1800,
+            Some(&["src/a.rs".into(), "src/b.rs".into()]),
+            Some(&[7, 9]),
+        );
+        assert_eq!(v["project_key"], "/proj");
+        assert_eq!(v["agent_name"], "Orchid");
+        assert_eq!(v["extend_seconds"], 1800);
+        assert_eq!(v["paths"], json!(["src/a.rs", "src/b.rs"]));
+        assert_eq!(v["file_reservation_ids"], json!([7, 9]));
+
+        // both optional groups omitted
+        let v = renew_args("/proj", "Orchid", 60, None, None);
+        assert_eq!(v["project_key"], "/proj");
+        assert_eq!(v["agent_name"], "Orchid");
+        assert_eq!(v["extend_seconds"], 60);
+        assert!(v.get("paths").is_none(), "paths must be omitted when None");
+        assert!(
+            v.get("file_reservation_ids").is_none(),
+            "ids must be omitted when None"
+        );
+
+        // only ids
+        let v = renew_args("/proj", "Orchid", 60, None, Some(&[3]));
+        assert!(v.get("paths").is_none());
+        assert_eq!(v["file_reservation_ids"], json!([3]));
+    }
+
+    /// Signature of [`Mail::renew`] (type alias keeps the compile-time guard
+    /// readable; clippy rejects the inline fn type as too complex).
+    type RenewFn = fn(
+        &mut Mail,
+        &str,
+        &str,
+        u64,
+        Option<&[String]>,
+        Option<&[u64]>,
+    ) -> Result<Value>;
+
+    /// `renew` is callable with the full signature (compile-time guard; no
+    /// HTTP — dummy URL).
+    #[test]
+    fn renew_method_exists() {
+        use crate::config::MailConfig;
+        let mut mail = Mail::from_config(Some(&MailConfig {
+            url: Some("http://127.0.0.1:9999".into()),
+            token: None,
+            name: Some("test".into()),
+        }))
+        .expect("from_config ok")
+        .expect("Some(Mail)");
+        let _: RenewFn = Mail::renew;
+        let _ = &mut mail; // silence unused-mut
+    }
+
+    /// `list_own_reservations` parses the renew response into the renewed
+    /// reservation list (agent-mail exposes NO list-reservations MCP tool —
+    /// verified against the full tools/list surface — so the renew response
+    /// itself is the authoritative "what did I renew" source). Captured live
+    /// response shape from agent-mail 2026-08-05.
+    #[test]
+    fn list_own_reservations_parses_renew_response() {
+        let resp = json!({
+            "renewed": 2,
+            "file_reservations": [
+                {"id": 195, "path_pattern": "src/probe.tmp", "old_expires_ts": "2026-08-05T04:07:33Z", "new_expires_ts": "2026-08-05T04:08:33Z"},
+                {"id": 196, "path_pattern": "loops.json", "old_expires_ts": "2026-08-05T04:07:33Z", "new_expires_ts": "2026-08-05T04:08:33Z"}
+            ]
+        });
+        let list = list_own_reservations(&resp);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, 195);
+        assert_eq!(list[0].path_pattern, "src/probe.tmp");
+        assert_eq!(list[0].new_expires_ts, "2026-08-05T04:08:33Z");
+        assert_eq!(list[1].id, 196);
+        assert_eq!(list[1].path_pattern, "loops.json");
+    }
+
+    /// Empty renew response → empty list (heartbeat logs "renewed 0").
+    #[test]
+    fn list_own_reservations_empty_response() {
+        assert!(list_own_reservations(&json!({"renewed": 0})).is_empty());
+        assert!(list_own_reservations(&json!({})).is_empty());
+    }
+
+    /// Live lease-renewal round-trip (bd-mail-lease-renewal-durable
+    /// acceptance criterion): a TTL-60s reservation is renewed at t=45s and
+    /// still active at t=90s, while the no-renew control expires at t=60s.
+    /// Proves the 4h-loop/1h-lease scenario at 1/40 scale. Runs against the
+    /// real agent-mail server from the flywheel config:
+    /// `cargo test -- --ignored renew_lease_survives_renewal`
+    ///
+    /// Discriminator: the conflicts tool excludes SELF-owned reservations
+    /// (an owner sees its own path as conflict-free), so a second identity
+    /// ("observer") performs the conflict check — an alive lease conflicts
+    /// with the observer, an expired one does not.
+    #[test]
+    #[ignore = "needs a live agent-mail server (reads flywheel config)"]
+    fn renew_lease_survives_renewal() {
+        let cfg = crate::config::Config::load().expect("config loads");
+        let mut mail = Mail::from_config(cfg.agent_mail.as_ref())
+            .expect("from_config ok")
+            .expect("agent_mail configured");
+        let mut observer = Mail {
+            name: "SapphireOwl".into(),
+            base: mail.base.clone(),
+            token: mail.token.clone(),
+            next_id: 1,
+        };
+        let key = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        mail.ensure_project(&key).expect("ensure_project");
+        observer.ensure_project(&key).expect("ensure_project");
+        // the configured identity must exist in the project for lease ops
+        // (register_agent is idempotent on name)
+        let cfg_name = mail.name.clone();
+        let obs_name = observer.name.clone();
+        mail.register_agent(&key, &cfg_name, "flywheel", "flywheel", "renew-live-probe")
+            .expect("register configured identity");
+        observer
+            .register_agent(&key, &obs_name, "flywheel", "flywheel", "renew-live-probe-observer")
+            .expect("register observer identity");
+
+        let path = format!("target/renew-live-probe-{}.tmp", std::process::id());
+        let _ = mail.release(&key); // clear any stale probe from a prior run
+
+        // --- renewed arm: TTL 60, renew +60 at t=45 → still active at t=90
+        mail.reserve(&key, std::slice::from_ref(&path), 60, true, "renew-live-probe")
+            .expect("reserve");
+        std::thread::sleep(Duration::from_secs(45));
+        let my_name = mail.name.clone();
+        // scope by path — an unscoped renew touches ALL of this agent's
+        // active reservations (by design), which would include the live
+        // test's own file reservations
+        let r = mail
+            .renew(&key, &my_name, 60, Some(std::slice::from_ref(&path)), None)
+            .expect("renew");
+        assert_eq!(r["renewed"].as_u64(), Some(1), "exactly one renewed: {r}");
+        let renewed = list_own_reservations(&r);
+        assert_eq!(renewed.len(), 1);
+        assert_eq!(renewed[0].path_pattern, path);
+        std::thread::sleep(Duration::from_secs(45)); // t=90 > original expiry t=60
+        let conflicts = observer
+            .conflicts(&key, std::slice::from_ref(&path))
+            .expect("conflicts check");
+        assert_eq!(
+            conflicts["conflict_free"], json!(false),
+            "renewed lease must still be active at t=90: {conflicts}"
+        );
+        mail.release(&key).expect("release");
+
+        // --- control arm: TTL 60, no renew → gone by t=60 (checked at t=62)
+        mail.reserve(&key, std::slice::from_ref(&path), 60, true, "renew-live-probe-control")
+            .expect("reserve");
+        std::thread::sleep(Duration::from_secs(62));
+        let conflicts = observer
+            .conflicts(&key, std::slice::from_ref(&path))
+            .expect("conflicts check");
+        assert_eq!(
+            conflicts["conflict_free"], json!(true),
+            "control lease must have expired by t=62: {conflicts}"
+        );
+        mail.release(&key).expect("release");
     }
 }

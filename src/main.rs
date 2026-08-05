@@ -422,6 +422,13 @@ enum Commands {
         project: String,
         name: String,
     },
+    /// internal: renew the orchestrator's active file reservations
+    /// (durable workflow leaf, bd-mail-lease-renewal-durable)
+    #[command(name = "__renew-leases", hide = true)]
+    __RenewLeases {
+        project: String,
+        extend_seconds: u64,
+    },
     /// internal: list ready beads as JSON (durable workflow leaf)
     #[command(name = "__ready", hide = true)]
     __Ready {
@@ -976,6 +983,9 @@ fn main() {
             *iteration,
         ),
         Some(Commands::__MailBlocked { project, name }) => cmd_internal_mail_blocked(&cfg, project, name),
+        Some(Commands::__RenewLeases { project, extend_seconds }) => {
+            cmd_internal_renew_leases(&cfg, project, *extend_seconds)
+        }
         Some(Commands::__WaitOutput {
             project,
             target,
@@ -3338,6 +3348,30 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str) -> Result<
     )
     .map_err(|e| anyhow!("mail backend: {e}"))?;
     print_json(&json!({ "ok": true, "notified": name }));
+    Ok(())
+}
+
+/// Internal leaf command: renew this identity's active file reservations in
+/// the project, extending each by `extend_seconds` (bd-mail-lease-renewal-
+/// durable). Best-effort from the workflow's perspective — the durable leaf
+/// treats a non-zero exit as a missed renew (log + continue), never a hard
+/// loop failure. Output: `{"ok": true, "renewed": N, "file_reservations": [...]}`.
+fn cmd_internal_renew_leases(cfg: &Config, project: &str, extend_seconds: u64) -> Result<()> {
+    let mut mail = backend::mail_backend(cfg)?;
+    let key = project_dir(cfg, project).to_str().unwrap().to_string();
+    mail.ensure_project(&key)?;
+    let agent = mail.name().to_string();
+    let v = mail
+        .renew(&key, &agent, extend_seconds, None)
+        .map_err(|e| anyhow!("mail backend: {e}"))?;
+    let renewed = v.get("renewed").and_then(Value::as_u64).unwrap_or(0);
+    let reservations = crate::mail::list_own_reservations(&v);
+    print_json(&json!({
+        "ok": true,
+        "renewed": renewed,
+        "agent": agent,
+        "file_reservations": reservations,
+    }));
     Ok(())
 }
 
