@@ -1199,7 +1199,7 @@ fn cmd_spawn(
             // spawned agent as an agent-mail identity so it's addressable by
             // name in mail. Best-effort: mail-not-configured is NOT a spawn
             // failure (silent skip); a registration error is a warning.
-            register_spawned_agent(cfg, project, &name, &kind);
+            register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
             println!(
                 "  {} {}",
                 kind_paint(&kind),
@@ -1266,12 +1266,16 @@ fn start_agent_with_retry(c: &mut Client, name: &str, kind: &str, pane_id: &str)
 }
 
 /// Register a spawned agent as an agent-mail identity (ADR-0001
-/// mail-register-on-spawn). Best-effort: if mail isn't configured or the
-/// backend returns an error, the spawn still succeeded — log a warning and
-/// continue. The agent becomes addressable by name in mail once registered.
+/// mail-register-on-spawn) and bridge it to its herdr pane (ADR-0001 A4,
+/// bd-mail-pane-identity-bridge): agent-mail only writes identity files for
+/// tmux panes, so flywheel writes the canonical identity file for the
+/// herdr pane itself — `resolve_pane_identity` can then map the pane to the
+/// name. Best-effort: if mail isn't configured or the backend returns an
+/// error, the spawn still succeeded — log a warning and continue. The agent
+/// becomes addressable by name in mail once registered.
 ///
-/// governed-by: ADR-0001 (bd-mail-register-on-spawn), ADR-0002 (factory)
-fn register_spawned_agent(cfg: &Config, project: &str, name: &str, kind: &str) {
+/// governed-by: ADR-0001 (bd-mail-register-on-spawn, bd-mail-pane-identity-bridge), ADR-0002 (factory)
+fn register_spawned_agent(cfg: &Config, project: &str, name: &str, kind: &str, pane_id: &str) {
     let key = match project_dir(cfg, project).to_str() {
         Some(k) => k.to_string(),
         None => return,
@@ -1289,7 +1293,16 @@ fn register_spawned_agent(cfg: &Config, project: &str, name: &str, kind: &str) {
     // the project + name so list_agents shows something useful.
     let task = format!("spawned agent for {project}: {name}");
     if let Err(e) = mail.register_agent(&key, name, kind, kind, &task) {
+        // NOTE: agent-mail rejects names that aren't adjective+noun
+        // (flywheel's `flywheel-<base>-<kind>` names fail here — see
+        // bd-mail-register-on-spawn-naming). Registration is best-effort; the
+        // pane-identity bridge below still works because the identity file is
+        // the pane→name source the server reads, registration or not.
         eprintln!("flywheel: mail register_agent failed for {name}: {e}");
+    }
+    // bridge the identity to the herdr pane (best-effort, like register)
+    if let Err(e) = mail.write_pane_identity(&key, pane_id, name) {
+        eprintln!("flywheel: mail write_pane_identity failed for {name} on {pane_id}: {e}");
     }
 }
 
@@ -1333,7 +1346,7 @@ fn cmd_add(cfg: &Config, project: &str, counts: &AgentCounts, kinds: &[(String, 
             let p = c.pane_split(&prev, "down", Some(dir.to_str().unwrap()))?;
             prev = p.pane_id.clone();
             let agent = start_agent_with_retry(&mut c, &name, &kind, &prev)?;
-            register_spawned_agent(cfg, project, &name, &kind);
+            register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
             println!("  {} {}", kind_paint(&kind), agent.pane_id);
             spawned.push(json!({ "name": agent.name, "kind": agent.agent, "pane_id": agent.pane_id }));
         }
@@ -1667,10 +1680,33 @@ fn cmd_kill(cfg: &Config, project: &str, force: bool) -> Result<()> {
     }
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
+    // the panes die with the workspace — capture their ids first so the
+    // pane-identity bridge files can be cleared (no stale lookups after
+    // pane_exited, bd-mail-pane-identity-bridge)
+    let agents: Vec<AgentInfo> = c
+        .agent_list()?
+        .into_iter()
+        .filter(|a| a.workspace_id == ws_id)
+        .collect();
     c.workspace_close(&ws_id)?;
     // tidy-up: drop the project's agent state files (stale context signals
     // must not survive into the next spawn — freshness only protects so much)
     let _ = std::fs::remove_dir_all(agentstate::project_state_dir(&project_dir(cfg, project)));
+    // clear the identity files for the dead panes (best-effort — a missing
+    // file is a no-op, so double-exit is harmless)
+    if let Ok(mut mail) = backend::mail_backend(cfg) {
+        if let Some(key) = project_dir(cfg, project).to_str() {
+            for a in &agents {
+                if let Err(e) = mail.clear_pane_identity(key, &a.pane_id) {
+                    eprintln!(
+                        "flywheel: mail clear_pane_identity failed for {} on {}: {e}",
+                        a.name.as_deref().unwrap_or("<unnamed>"),
+                        a.pane_id
+                    );
+                }
+            }
+        }
+    }
     log(project, EventKind::Close, json!({ "workspace_id": ws_id }));
     println!("closed {project}");
     Ok(())
@@ -3319,6 +3355,24 @@ fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> 
         let _ = c.call("pane.close", json!({ "pane_id": old }));
     }
     let fresh = start_agent_with_retry(&mut c, name, kind, &new_pane.pane_id)?;
+    // pane-identity bridge bookkeeping (best-effort — never fail the respawn
+    // on mail trouble): the old pane died (its identity file is stale), the
+    // fresh pane must resolve to the same name (the agent keeps its identity)
+    if let Ok(mut mail) = backend::mail_backend(cfg) {
+        if let Some(key) = dir.to_str() {
+            if let Some(old) = &old_pane {
+                if let Err(e) = mail.clear_pane_identity(key, old) {
+                    eprintln!("flywheel: mail clear_pane_identity failed for {old}: {e}");
+                }
+            }
+            if let Err(e) = mail.write_pane_identity(key, &fresh.pane_id, name) {
+                eprintln!(
+                    "flywheel: mail write_pane_identity failed for {name} on {}: {e}",
+                    fresh.pane_id
+                );
+            }
+        }
+    }
     println!(
         "respawned {} {} -> {}",
         kind_paint(kind),

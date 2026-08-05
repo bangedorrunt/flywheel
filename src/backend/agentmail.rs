@@ -17,7 +17,7 @@
 
 use crate::backend::{BackendError, InboxFilter, MailBackend, Result};
 use crate::mail::Mail;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// Default mail backend: delegates to the agent-mail MCP HTTP client.
 pub struct AgentMailMcpBackend {
@@ -172,6 +172,36 @@ impl MailBackend for AgentMailMcpBackend {
             .map_err(BackendError::Other)
     }
 
+    fn resolve_pane_identity(&mut self, project_key: &str, pane_id: &str) -> Result<Value> {
+        // The MCP tool reads the identity files the bridge writes
+        // (bd-mail-pane-identity-bridge). A missing identity surfaces as a
+        // non-JSON isError text — callers treat that as not-found.
+        self.mail
+            .resolve_pane_identity(project_key, pane_id)
+            .map_err(BackendError::Other)
+    }
+
+    fn write_pane_identity(
+        &mut self,
+        project_key: &str,
+        pane_id: &str,
+        agent_name: &str,
+    ) -> Result<Value> {
+        let path = self
+            .mail
+            .write_pane_identity(project_key, pane_id, agent_name)
+            .map_err(BackendError::Other)?;
+        Ok(json!({ "path": path.to_string_lossy() }))
+    }
+
+    fn clear_pane_identity(&mut self, project_key: &str, pane_id: &str) -> Result<Value> {
+        let path = self
+            .mail
+            .clear_pane_identity(project_key, pane_id)
+            .map_err(BackendError::Other)?;
+        Ok(json!({ "path": path.to_string_lossy() }))
+    }
+
     fn slot_acquire(
         &mut self,
         _project_key: &str,
@@ -290,6 +320,26 @@ mod tests {
         }
     }
 
+    /// `resolve_pane_identity` delegates to the MCP tool (bd-mail-pane-
+    /// identity-bridge) — compile-time + runtime shape guard; no HTTP is
+    /// made successfully (dummy URL), so `Other` proves real delegation.
+    #[test]
+    fn resolve_pane_identity_is_real_delegation_not_unsupported() {
+        let mail = Mail::from_config(Some(&crate::config::MailConfig {
+            url: Some("http://127.0.0.1:9999".into()),
+            token: None,
+            name: Some("test-orchestrator".into()),
+        }))
+        .expect("from_config ok")
+        .expect("Some");
+        let mut b = AgentMailMcpBackend::new(mail);
+        match b.resolve_pane_identity("p", "w1:p1") {
+            Err(BackendError::Other(_)) => {}
+            Err(e) => panic!("resolve_pane_identity should delegate (Other), got {e:?}"),
+            Ok(_) => panic!("resolve cannot succeed against a dummy URL"),
+        }
+    }
+
     /// An Unsupported method returns the right BackendError shape (no panic,
     /// no silent Ok). Covers the Phase-3 stubs in one parameterized check.
     #[test]
@@ -304,7 +354,8 @@ mod tests {
         let mut b = AgentMailMcpBackend::new(mail);
         // register_agent USED to be Unsupported; bd-mail-register-on-spawn
         // graduated it to real delegation (calls Mail::register_agent).
-        // renew graduated with bd-mail-lease-renewal-durable. The remaining 9
+        // renew graduated with bd-mail-lease-renewal-durable; the pane
+        // identity trio with bd-mail-pane-identity-bridge. The remaining 9
         // stay Unsupported until their Phase-3 beads land.
         let cases: Vec<(&str, std::result::Result<Value, BackendError>)> = vec![
             ("reply", b.reply("p", 1, "x", None)),
