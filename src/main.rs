@@ -364,6 +364,42 @@ enum Commands {
         #[command(subcommand)]
         cmd: BackendCmd,
     },
+    /// N-round A/B debate + judge (ADR-0001 §9.1 — threaded, ack-gated)
+    Debate {
+        /// the proposition being debated
+        proposition: String,
+        /// number of debate rounds (default 3)
+        #[arg(long, default_value_t = 3)]
+        rounds: u32,
+        /// agent names or shorts for A, B, judge (default: spawn oc/oc/gk)
+        #[arg(long)]
+        agent_a: Option<String>,
+        #[arg(long)]
+        agent_b: Option<String>,
+        #[arg(long)]
+        judge: Option<String>,
+    },
+    /// Plan → review gate → implement → verify (ADR-0001 §9.2; paper-first)
+    #[command(name = "plan-review")]
+    PlanReview {
+        /// project path / label (workspace scope + plan dir)
+        project: String,
+        /// feature specification for the planner
+        feature: String,
+        /// max planner↔reviewer change rounds before escalate (default 2)
+        #[arg(long, default_value_t = 2)]
+        max_change_rounds: u32,
+        /// herdr agent names (defaults: planner=oc, reviewer=pi, implementer=gk)
+        #[arg(long)]
+        planner: Option<String>,
+        #[arg(long)]
+        reviewer: Option<String>,
+        #[arg(long)]
+        implementer: Option<String>,
+        /// optional bead id for thread plan-<id> and reservation reason
+        #[arg(long)]
+        bead: Option<String>,
+    },
     /// Reinstall the binary from source (cargo install --path)
     Upgrade,
     /// Interactive walkthrough
@@ -1035,6 +1071,38 @@ fn main() {
         }
         Some(Commands::Config { cmd }) => cmd_config(&cfg, cmd),
         Some(Commands::Backend { cmd }) => cmd_backend(&cfg, cmd),
+        Some(Commands::Debate {
+            proposition,
+            rounds,
+            agent_a,
+            agent_b,
+            judge,
+        }) => cmd_debate(
+            &cfg,
+            proposition,
+            *rounds,
+            agent_a.as_deref(),
+            agent_b.as_deref(),
+            judge.as_deref(),
+        ),
+        Some(Commands::PlanReview {
+            project,
+            feature,
+            max_change_rounds,
+            planner,
+            reviewer,
+            implementer,
+            bead,
+        }) => cmd_plan_review(
+            &cfg,
+            project,
+            feature,
+            *max_change_rounds,
+            planner.as_deref(),
+            reviewer.as_deref(),
+            implementer.as_deref(),
+            bead.as_deref(),
+        ),
         Some(Commands::Upgrade) => cmd_upgrade(),
         Some(Commands::Tutorial) => cmd_tutorial(),
         Some(Commands::Serve { port }) => cmd_serve(&cfg, *port),
@@ -4268,6 +4336,698 @@ fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
     Ok(())
 }
 
+/// `flywheel debate <proposition> [--rounds N] [--agent-a ..] [--agent-b ..]
+/// [--judge ..]` — N-round A/B debate + judge (ADR-0001 §9.1).
+///
+/// Threaded (thread_id = debate-<ts>), ack-gated (turn advances on the
+/// agent settling — done/idle — then the orchestrator harvests the speaker's
+/// latest message via search_messages). Judge reads via summarize_thread.
+///
+/// governed-by: ADR-0001 (bd-pattern-debate-loop)
+fn cmd_debate(
+    cfg: &Config,
+    proposition: &str,
+    rounds: u32,
+    agent_a: Option<&str>,
+    agent_b: Option<&str>,
+    judge: Option<&str>,
+) -> Result<()> {
+    let rounds = rounds.max(1);
+    let ts = crate::state::now_iso().replacen('-', "", 10); // compact ts for the thread id
+    let thread = format!("debate-{ts}");
+
+    // agent names: explicit or default to the swarm's first oc/pi/gk
+    let (a, b, j) = resolve_debate_agents(cfg, proposition, agent_a, agent_b, judge, &thread)?;
+
+    let mut mail = match backend::mail_backend(cfg) {
+        Ok(m) => m,
+        Err(e) => bail!("mail backend unavailable for debate: {e:#}"),
+    };
+    let mut mux = backend::multiplexer_backend(cfg)?;
+    // scope the debate to the project dir (the proposition may be a project
+    // name; default to the flywheel project for ad-hoc debates)
+    let key = if cfg.workspace_root().join(proposition).exists() {
+        project_dir(cfg, proposition).to_str().unwrap().to_string()
+    } else {
+        project_dir(cfg, "flywheel").to_str().unwrap().to_string()
+    };
+    mail.ensure_project(&key)?;
+
+    let mail_target = |agent: &str| resolve_mail_target(agent).to_string();
+
+    // opening: A argues FOR
+    let opening = format!(
+        "You are debating proposition: {proposition}\n\nArgue FOR it. Be concise and concrete (<= 120 words). Provide your single strongest argument with a brief reason.\n\nAfter replying in this thread, acknowledge the orchestrator's opening message to signal your turn is done."
+    );
+    mail.send(
+        &key,
+        &[mail_target(a)],
+        &format!("[debate] {proposition}"),
+        &opening,
+        "high",
+        true,
+        Some(&thread),
+    )?;
+    println!("debate {thread}: {} opens FOR (round 1)", a);
+
+    let mut last_reply: Option<String> = None;
+    for round in 1..=rounds {
+        // A speaks on odd rounds (round 1 opening + counters), B on even
+        let speaker = if round == 1 {
+            a
+        } else if round % 2 == 1 {
+            a
+        } else {
+            b
+        };
+        let opponent = if speaker == a { b } else { a };
+        let _ = opponent;
+        if round > 1 {
+            let reply = last_reply.clone().unwrap_or_default();
+            let counter = format!(
+                "You are debating proposition: {proposition}\n\nCounter the opponent's latest argument with a NEW point (do not repeat). <= 120 words. Acknowledge when done.\n\nOpponent's latest argument: {reply}"
+            );
+            mail.send(
+                &key,
+                &[mail_target(speaker)],
+                &format!("[debate] {proposition}"),
+                &counter,
+                "high",
+                true,
+                Some(&thread),
+            )?;
+        }
+        // settle: wait for the speaker to reach done/idle (the ack-gate proxy;
+        // full ack-checking is the loop's ack_overdue path)
+        settle_agent(mux.as_mut(), speaker)?;
+        // harvest the speaker's latest message in the thread
+        last_reply = harvest_latest(mail.as_mut(), &key, &thread, &resolve_mail_target(speaker))?;
+        println!("debate {thread}: {} replied (round {})", speaker, round);
+    }
+
+    // judge: read the thread, pick a winner
+    let judge_prompt = format!(
+        "You are the judge of this debate on: {proposition}\n\nRead the full thread via summarize_thread. Pick a winner in <= 100 words: name the winner's argument and why it is stronger. Reply in thread and acknowledge when done."
+    );
+    mail.send(
+        &key,
+        &[mail_target(j)],
+        &format!("[debate] {proposition} — judge"),
+        &judge_prompt,
+        "high",
+        true,
+        Some(&thread),
+    )?;
+    settle_agent(mux.as_mut(), j)?;
+    let verdict = harvest_latest(mail.as_mut(), &key, &thread, &resolve_mail_target(j))?;
+    println!(
+        "debate {thread} verdict: {}",
+        verdict.unwrap_or_else(|| "(no verdict harvested)".into())
+    );
+    Ok(())
+}
+
+
+// ---- plan-review-implement pattern (bd-pattern-plan-review-implement) ----
+//
+// Paper-first gate: implementer works on a branch and does not merge; the
+// reviewer's VERIFIED does not close beads — a human/overseer signs off.
+// Structured tokens only (APPROVE|CHANGES:|VERIFIED|REJECT:) — no free-text
+// routing. Build-slot 'cargo' must be acquired before cargo (agents self-gate).
+
+/// Reviewer structured tokens (leading token required).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewToken {
+    Approve,
+    Changes(String),
+    Verified,
+    Reject(String),
+}
+
+/// Parse the first structured token from a reviewer reply.
+pub fn parse_review_token(text: &str) -> Option<ReviewToken> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    // first non-empty line carries the token
+    let line = t.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(t);
+    let upper = line.to_ascii_uppercase();
+    if upper.starts_with("APPROVE") {
+        return Some(ReviewToken::Approve);
+    }
+    if upper.starts_with("VERIFIED") {
+        return Some(ReviewToken::Verified);
+    }
+    if upper.starts_with("CHANGES") {
+        let notes = line
+            .split_once(':')
+            .map(|(_, n)| n.trim().to_string())
+            .unwrap_or_default();
+        return Some(ReviewToken::Changes(notes));
+    }
+    if upper.starts_with("REJECT") {
+        let notes = line
+            .split_once(':')
+            .map(|(_, n)| n.trim().to_string())
+            .unwrap_or_default();
+        return Some(ReviewToken::Reject(notes));
+    }
+    None
+}
+
+/// Gate phase for the plan→review→implement→verify state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriPhase {
+    AwaitingPlan,
+    AwaitingPlanReview,
+    AwaitingImplement,
+    AwaitingVerify,
+    Done,
+    Escalated,
+}
+
+/// Next orchestrator action after a phase transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PriAction {
+    PromptPlanner { msg: String },
+    PromptReviewer { msg: String },
+    PromptImplementer { msg: String },
+    HaltVerified,
+    Escalate { reason: String },
+}
+
+/// Initial planner prompt (writes plan file + replies with path).
+pub fn pri_planner_prompt(feature: &str, plan_path: &str) -> String {
+    format!(
+        "You are the PLANNER for this feature (paper-first gate).\n\n\
+         Feature:\n{feature}\n\n\
+         Write a concrete implementation plan to `{plan_path}`.\n\
+         When done, reply in this thread with a single line:\n\
+         PLAN: {plan_path}\n\
+         Do not implement code. Do not merge."
+    )
+}
+
+/// Route a plan-review token at the current phase.
+///
+/// Returns (next_phase, action, updated_change_rounds).
+/// `change_rounds` counts completed CHANGES loops; escalate when the next
+/// CHANGES would exceed `max_change_rounds`.
+pub fn pri_route(
+    phase: PriPhase,
+    token: &ReviewToken,
+    plan_path: &str,
+    change_rounds: u32,
+    max_change_rounds: u32,
+) -> (PriPhase, PriAction, u32) {
+    match (phase, token) {
+        (PriPhase::AwaitingPlanReview, ReviewToken::Approve) => (
+            PriPhase::AwaitingImplement,
+            PriAction::PromptImplementer {
+                msg: format!(
+                    "You are the IMPLEMENTER (paper-first).\n\n\
+                     Implement the plan at `{plan_path}`.\n\
+                     - Reserve files via agent-mail (reason from the plan/bead).\n\
+                     - Before `cargo build`/`cargo test`, acquire build-slot `cargo` \
+                       (ttl ~1800s); release on completion.\n\
+                     - Work on a branch — do NOT merge to main.\n\
+                     - Do NOT close beads; the verifier + human own that.\n\
+                     When done, reply IMPLEMENT_DONE in this thread."
+                ),
+            },
+            change_rounds,
+        ),
+        (PriPhase::AwaitingPlanReview, ReviewToken::Changes(notes)) => {
+            let next = change_rounds.saturating_add(1);
+            if next > max_change_rounds {
+                (
+                    PriPhase::Escalated,
+                    PriAction::Escalate {
+                        reason: format!(
+                            "change rounds exhausted (max {max_change_rounds}): {notes}"
+                        ),
+                    },
+                    next,
+                )
+            } else {
+                (
+                    PriPhase::AwaitingPlan,
+                    PriAction::PromptPlanner {
+                        msg: format!(
+                            "Changes requested (round {next}/{max_change_rounds}):\n{notes}\n\n\
+                             Revise `{plan_path}`. Reply PLAN: {plan_path} when done."
+                        ),
+                    },
+                    next,
+                )
+            }
+        }
+        (PriPhase::AwaitingPlanReview, ReviewToken::Reject(reason)) => (
+            PriPhase::Escalated,
+            PriAction::Escalate {
+                reason: format!("plan rejected: {reason}"),
+            },
+            change_rounds,
+        ),
+        (PriPhase::AwaitingVerify, ReviewToken::Verified) => (
+            PriPhase::Done,
+            PriAction::HaltVerified,
+            change_rounds,
+        ),
+        (PriPhase::AwaitingVerify, ReviewToken::Reject(reason)) => (
+            PriPhase::Escalated,
+            PriAction::Escalate {
+                reason: format!("implementation rejected: {reason}"),
+            },
+            change_rounds,
+        ),
+        (PriPhase::AwaitingVerify, ReviewToken::Changes(notes)) => (
+            // treat CHANGES at verify as reject-with-notes (no more impl loop here)
+            PriPhase::Escalated,
+            PriAction::Escalate {
+                reason: format!("verify requested changes (escalate): {notes}"),
+            },
+            change_rounds,
+        ),
+        (phase, other) => (
+            PriPhase::Escalated,
+            PriAction::Escalate {
+                reason: format!("unexpected token {other:?} in phase {phase:?}"),
+            },
+            change_rounds,
+        ),
+    }
+}
+
+/// After implementer settles: send verify prompt to reviewer.
+pub fn pri_after_implement(plan_path: &str) -> (PriPhase, PriAction) {
+    (
+        PriPhase::AwaitingVerify,
+        PriAction::PromptReviewer {
+            msg: format!(
+                "You are the REVIEWER (verify step, read-only).\n\n\
+                 Verify the implementation matches the plan at `{plan_path}`.\n\
+                 Do NOT edit files. Check for mid-edit conflicts before reading.\n\
+                 Reply with first token VERIFIED or REJECT:<reason>."
+            ),
+        },
+    )
+}
+
+/// After planner settles with a plan path: send review prompt.
+pub fn pri_after_plan(plan_path: &str) -> (PriPhase, PriAction) {
+    (
+        PriPhase::AwaitingPlanReview,
+        PriAction::PromptReviewer {
+            msg: format!(
+                "You are the REVIEWER (plan gate).\n\n\
+                 Review the plan at `{plan_path}`.\n\
+                 Reply with first token APPROVE or CHANGES:<notes>.\n\
+                 Do not implement. Do not merge."
+            ),
+        },
+    )
+}
+
+/// Extract `PLAN: <path>` from planner reply (best-effort).
+pub fn extract_plan_path(text: &str, fallback: &str) -> String {
+    for line in text.lines() {
+        let t = line.trim();
+        let upper = t.to_ascii_uppercase();
+        if let Some(rest) = upper.strip_prefix("PLAN:") {
+            // use original casing from the line after the colon
+            if let Some((_, path)) = t.split_once(':') {
+                let p = path.trim();
+                if !p.is_empty() {
+                    return p.to_string();
+                }
+            }
+            let p = rest.trim();
+            if !p.is_empty() {
+                return p.to_string();
+            }
+        }
+    }
+    fallback.to_string()
+}
+
+/// `flywheel plan-review <project> <feature> [--max-change-rounds 2] ...`
+///
+/// Threaded gate (thread_id = plan-<bead|ts>). Paper-first: implementer does
+/// not merge; VERIFIED does not close beads.
+///
+/// governed-by: ADR-0001 §9.2 (bd-pattern-plan-review-implement)
+fn cmd_plan_review(
+    cfg: &Config,
+    project: &str,
+    feature: &str,
+    max_change_rounds: u32,
+    planner: Option<&str>,
+    reviewer: Option<&str>,
+    implementer: Option<&str>,
+    bead: Option<&str>,
+) -> Result<()> {
+    let max_rounds = max_change_rounds.max(1);
+    let ts = crate::state::now_iso().replace(['-', ':'], "");
+    let thread = match bead {
+        Some(id) => format!("plan-{id}"),
+        None => format!("plan-{ts}"),
+    };
+    let planner = planner.unwrap_or("oc");
+    let reviewer = reviewer.unwrap_or("pi");
+    let implementer = implementer.unwrap_or("gk");
+    if planner == reviewer || planner == implementer || reviewer == implementer {
+        bail!("plan-review needs three distinct agents (planner/reviewer/implementer)");
+    }
+
+    let plan_path = match bead {
+        Some(id) => format!(".flywheel/plans/{id}.md"),
+        None => format!(".flywheel/plans/plan-{ts}.md"),
+    };
+
+    let mut mail = match backend::mail_backend(cfg) {
+        Ok(m) => m,
+        Err(e) => bail!("mail backend unavailable for plan-review: {e:#}"),
+    };
+    let mut mux = backend::multiplexer_backend(cfg)?;
+    let key = project_dir(cfg, project).to_str().unwrap().to_string();
+    mail.ensure_project(&key)?;
+
+    let mail_target = |agent: &str| resolve_mail_target(agent);
+    let subject = format!("[plan-review] {project}");
+
+    eprintln!(
+        "plan-review {thread}: planner={} reviewer={} implementer={} max_change_rounds={max_rounds} paper-first",
+        planner, reviewer, implementer
+    );
+
+    // --- plan ---
+    let mut phase = PriPhase::AwaitingPlan;
+    let mut change_rounds = 0u32;
+    let mut current_path = plan_path.clone();
+
+    let open = pri_planner_prompt(feature, &current_path);
+    mail.send(
+        &key,
+        &[mail_target(planner)],
+        &subject,
+        &open,
+        "high",
+        true,
+        Some(&thread),
+    )?;
+    settle_agent(mux.as_mut(), planner)?;
+    let planner_mail = mail_target(planner);
+    let plan_reply = harvest_latest(mail.as_mut(), &key, &thread, &planner_mail)?
+        .unwrap_or_default();
+    current_path = extract_plan_path(&plan_reply, &current_path);
+    let (next_phase, action) = pri_after_plan(&current_path);
+    phase = next_phase;
+
+    // --- gate loop ---
+    loop {
+        match &action {
+            PriAction::PromptReviewer { msg } => {
+                mail.send(
+                    &key,
+                    &[mail_target(reviewer)],
+                    &subject,
+                    msg,
+                    "high",
+                    true,
+                    Some(&thread),
+                )?;
+                settle_agent(mux.as_mut(), reviewer)?;
+                let rev_mail = mail_target(reviewer);
+                let body = harvest_latest(mail.as_mut(), &key, &thread, &rev_mail)?
+                    .unwrap_or_default();
+                let token = parse_review_token(&body).ok_or_else(|| {
+                    anyhow!("reviewer reply missing APPROVE|CHANGES:|VERIFIED|REJECT: token: {body}")
+                })?;
+                let (p, a, rounds) =
+                    pri_route(phase, &token, &current_path, change_rounds, max_rounds);
+                phase = p;
+                change_rounds = rounds;
+                match a {
+                    PriAction::PromptImplementer { msg } => {
+                        // build-slot instruction is in the prompt; agent self-gates
+                        mail.send(
+                            &key,
+                            &[mail_target(implementer)],
+                            &subject,
+                            &msg,
+                            "high",
+                            true,
+                            Some(&thread),
+                        )?;
+                        settle_agent(mux.as_mut(), implementer)?;
+                        let (p2, a2) = pri_after_implement(&current_path);
+                        phase = p2;
+                        // continue with verify prompt
+                        mail.send(
+                            &key,
+                            &[mail_target(reviewer)],
+                            &subject,
+                            match &a2 {
+                                PriAction::PromptReviewer { msg } => msg.as_str(),
+                                _ => unreachable!(),
+                            },
+                            "high",
+                            true,
+                            Some(&thread),
+                        )?;
+                        settle_agent(mux.as_mut(), reviewer)?;
+                        let rev2 = harvest_latest(
+                            mail.as_mut(),
+                            &key,
+                            &thread,
+                            &mail_target(reviewer),
+                        )?
+                        .unwrap_or_default();
+                        let token2 = parse_review_token(&rev2).ok_or_else(|| {
+                            anyhow!("verify reply missing VERIFIED|REJECT: token: {rev2}")
+                        })?;
+                        let (p3, a3, _) =
+                            pri_route(phase, &token2, &current_path, change_rounds, max_rounds);
+                        phase = p3;
+                        match a3 {
+                            PriAction::HaltVerified => {
+                                println!(
+                                    "plan-review {thread}: VERIFIED (paper-first — human merge/close)"
+                                );
+                                return Ok(());
+                            }
+                            PriAction::Escalate { reason } => {
+                                eprintln!("plan-review {thread}: escalate: {reason}");
+                                return Ok(());
+                            }
+                            other => bail!("unexpected after verify: {other:?}"),
+                        }
+                    }
+                    PriAction::PromptPlanner { msg } => {
+                        mail.send(
+                            &key,
+                            &[mail_target(planner)],
+                            &subject,
+                            &msg,
+                            "high",
+                            true,
+                            Some(&thread),
+                        )?;
+                        settle_agent(mux.as_mut(), planner)?;
+                        let pr = harvest_latest(
+                            mail.as_mut(),
+                            &key,
+                            &thread,
+                            &mail_target(planner),
+                        )?
+                        .unwrap_or_default();
+                        current_path = extract_plan_path(&pr, &current_path);
+                        let (p2, a2) = pri_after_plan(&current_path);
+                        phase = p2;
+                        // re-enter by sending review prompt (loop)
+                        let msg = match a2 {
+                            PriAction::PromptReviewer { msg } => msg,
+                            _ => unreachable!(),
+                        };
+                        // recurse one review by continuing loop with synthetic action
+                        // simplest: re-send and continue parsing at top via goto-style
+                        mail.send(
+                            &key,
+                            &[mail_target(reviewer)],
+                            &subject,
+                            &msg,
+                            "high",
+                            true,
+                            Some(&thread),
+                        )?;
+                        // fall through by continuing outer loop — but we need
+                        // the next harvest. Inline one more review cycle:
+                        settle_agent(mux.as_mut(), reviewer)?;
+                        let body = harvest_latest(
+                            mail.as_mut(),
+                            &key,
+                            &thread,
+                            &mail_target(reviewer),
+                        )?
+                        .unwrap_or_default();
+                        let token = parse_review_token(&body).ok_or_else(|| {
+                            anyhow!("reviewer reply missing token after CHANGES: {body}")
+                        })?;
+                        let (p, a, rounds) =
+                            pri_route(phase, &token, &current_path, change_rounds, max_rounds);
+                        phase = p;
+                        change_rounds = rounds;
+                        match a {
+                            PriAction::PromptImplementer { msg } => {
+                                mail.send(
+                                    &key,
+                                    &[mail_target(implementer)],
+                                    &subject,
+                                    &msg,
+                                    "high",
+                                    true,
+                                    Some(&thread),
+                                )?;
+                                settle_agent(mux.as_mut(), implementer)?;
+                                let (_, a2) = pri_after_implement(&current_path);
+                                mail.send(
+                                    &key,
+                                    &[mail_target(reviewer)],
+                                    &subject,
+                                    match &a2 {
+                                        PriAction::PromptReviewer { msg } => msg.as_str(),
+                                        _ => unreachable!(),
+                                    },
+                                    "high",
+                                    true,
+                                    Some(&thread),
+                                )?;
+                                settle_agent(mux.as_mut(), reviewer)?;
+                                let rev2 = harvest_latest(
+                                    mail.as_mut(),
+                                    &key,
+                                    &thread,
+                                    &mail_target(reviewer),
+                                )?
+                                .unwrap_or_default();
+                                let token2 = parse_review_token(&rev2).ok_or_else(|| {
+                                    anyhow!("verify reply missing token: {rev2}")
+                                })?;
+                                let (p3, a3, _) = pri_route(
+                                    PriPhase::AwaitingVerify,
+                                    &token2,
+                                    &current_path,
+                                    change_rounds,
+                                    max_rounds,
+                                );
+                                phase = p3;
+                                match a3 {
+                                    PriAction::HaltVerified => {
+                                        println!(
+                                            "plan-review {thread}: VERIFIED (paper-first)"
+                                        );
+                                        return Ok(());
+                                    }
+                                    PriAction::Escalate { reason } => {
+                                        eprintln!("plan-review {thread}: escalate: {reason}");
+                                        return Ok(());
+                                    }
+                                    other => bail!("unexpected after verify: {other:?}"),
+                                }
+                            }
+                            PriAction::Escalate { reason } => {
+                                eprintln!("plan-review {thread}: escalate: {reason}");
+                                return Ok(());
+                            }
+                            other => bail!(
+                                "after second review only APPROVE/REJECT/CHANGES expected, got {other:?}"
+                            ),
+                        }
+                    }
+                    PriAction::Escalate { reason } => {
+                        eprintln!("plan-review {thread}: escalate: {reason}");
+                        return Ok(());
+                    }
+                    other => bail!("unexpected route after plan review: {other:?}"),
+                }
+            }
+            PriAction::HaltVerified => {
+                println!("plan-review {thread}: VERIFIED (paper-first — human merge/close)");
+                return Ok(());
+            }
+            PriAction::Escalate { reason } => {
+                eprintln!("plan-review {thread}: escalate: {reason}");
+                return Ok(());
+            }
+            other => bail!("unexpected action in gate loop: {other:?}"),
+        }
+    }
+}
+
+
+/// Resolve the A/B/judge agents for a debate: explicit names, or default to
+/// the swarm's first agents. Returns the (a, b, j) herdr agent names.
+fn resolve_debate_agents<'a>(
+    _cfg: &Config,
+    _proposition: &str,
+    agent_a: Option<&'a str>,
+    agent_b: Option<&'a str>,
+    judge: Option<&'a str>,
+    _thread: &str,
+) -> Result<(&'a str, &'a str, &'a str)> {
+    let a = agent_a.unwrap_or("oc");
+    let b = agent_b.unwrap_or("pi");
+    let j = judge.unwrap_or("gk");
+    if a == b {
+        bail!("debate needs two distinct agents (A and B are both '{a}')");
+    }
+    Ok((a, b, j))
+}
+
+/// Wait for an agent to settle (done/idle/blocked) — the turn-finality gate.
+fn settle_agent(mux: &mut dyn backend::MultiplexerBackend, agent: &str) -> Result<()> {
+    mux.agent_wait(
+        agent,
+        &[
+            crate::herdr::AgentStatus::Done,
+            crate::herdr::AgentStatus::Idle,
+            crate::herdr::AgentStatus::Blocked,
+        ],
+        Some(1_800_000),
+    )
+    .map_err(|e| anyhow!("agent {agent} settle failed: {e}"))?;
+    Ok(())
+}
+
+/// Harvest the latest message in a thread from a sender (recency-ranked).
+fn harvest_latest(
+    mail: &mut dyn backend::MailBackend,
+    key: &str,
+    thread: &str,
+    sender: &str,
+) -> Result<Option<String>> {
+    let v = mail.search(
+        key,
+        "",
+        1,
+        &backend::SearchFilter {
+            thread_id: Some(thread.to_string()),
+            sender: Some(sender.to_string()),
+            ranking: Some("recency".to_string()),
+            ..Default::default()
+        },
+    )?;
+    let text = v
+        .get("result")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|m| m.get("subject").and_then(serde_json::Value::as_str))
+        .map(|s| s.to_string());
+    Ok(text)
+}
+
 fn cmd_upgrade() -> Result<()> {
     let source = std::env::var("FLYWHEEL_SOURCE").unwrap_or_else(|_| "~/workspace/flywheel".into());
     let expanded = source.replacen(
@@ -4482,12 +5242,7 @@ fn summarize_status_event(ev: &herdr::PushEvent, seq: &mut u64) -> Option<Status
                 .map(|s| s.as_str().to_string())
                 .unwrap_or_else(|| "unknown".into()),
         ),
-        PaneExited(p) => (
-            "pane.exited",
-            p.pane_id.clone(),
-            None,
-            "exited".to_string(),
-        ),
+        PaneExited(p) => ("pane.exited", p.pane_id.clone(), None, "exited".to_string()),
         _ => return None,
     };
     *seq = seq.saturating_add(1);
@@ -5363,5 +6118,150 @@ mod integration_tests {
         assert!(out.contains("bv --robot-triage"));
         assert!(out.contains("file_reservation_paths"));
         assert!(out.contains("Never use `bd`"));
+    }
+}
+
+#[cfg(test)]
+mod debate_tests {
+    use super::*;
+
+    #[test]
+    fn debate_resolves_default_agents() {
+        let (_a, _b, j) =
+            resolve_debate_agents(&Config::default(), "p", None, None, None, "t").unwrap();
+        assert_eq!(j, "gk"); // judge defaults to grok
+    }
+
+    #[test]
+    fn debate_rejects_same_agent_for_a_and_b() {
+        let r = resolve_debate_agents(&Config::default(), "p", Some("oc"), Some("oc"), None, "t");
+        assert!(r.is_err(), "A and B must be distinct");
+    }
+
+    #[test]
+    fn debate_accepts_explicit_agents() {
+        let (a, b, j) = resolve_debate_agents(
+            &Config::default(),
+            "p",
+            Some("pi"),
+            Some("gk"),
+            Some("oc"),
+            "t",
+        )
+        .unwrap();
+        assert_eq!(a, "pi");
+        assert_eq!(b, "gk");
+        assert_eq!(j, "oc");
+    }
+}
+
+#[cfg(test)]
+mod plan_review_tests {
+    use super::*;
+
+    #[test]
+    fn parse_review_token_approve_verified() {
+        assert_eq!(parse_review_token("APPROVE"), Some(ReviewToken::Approve));
+        assert_eq!(
+            parse_review_token("approve\nmore text"),
+            Some(ReviewToken::Approve)
+        );
+        assert_eq!(parse_review_token("VERIFIED"), Some(ReviewToken::Verified));
+    }
+
+    #[test]
+    fn parse_review_token_changes_and_reject() {
+        assert_eq!(
+            parse_review_token("CHANGES: need more tests"),
+            Some(ReviewToken::Changes("need more tests".into()))
+        );
+        assert_eq!(
+            parse_review_token("REJECT: out of scope"),
+            Some(ReviewToken::Reject("out of scope".into()))
+        );
+        assert_eq!(parse_review_token("lgtm maybe"), None);
+    }
+
+    #[test]
+    fn pri_route_approve_path() {
+        let (p, a, rounds) = pri_route(
+            PriPhase::AwaitingPlanReview,
+            &ReviewToken::Approve,
+            ".flywheel/plans/x.md",
+            0,
+            2,
+        );
+        assert_eq!(p, PriPhase::AwaitingImplement);
+        assert_eq!(rounds, 0);
+        assert!(matches!(a, PriAction::PromptImplementer { .. }));
+        let (p2, a2) = pri_after_implement(".flywheel/plans/x.md");
+        assert_eq!(p2, PriPhase::AwaitingVerify);
+        assert!(matches!(a2, PriAction::PromptReviewer { .. }));
+        let (p3, a3, _) = pri_route(
+            PriPhase::AwaitingVerify,
+            &ReviewToken::Verified,
+            ".flywheel/plans/x.md",
+            0,
+            2,
+        );
+        assert_eq!(p3, PriPhase::Done);
+        assert_eq!(a3, PriAction::HaltVerified);
+    }
+
+    #[test]
+    fn pri_route_changes_then_exhaust() {
+        let (p, a, r) = pri_route(
+            PriPhase::AwaitingPlanReview,
+            &ReviewToken::Changes("fix".into()),
+            "p.md",
+            0,
+            2,
+        );
+        assert_eq!(p, PriPhase::AwaitingPlan);
+        assert_eq!(r, 1);
+        assert!(matches!(a, PriAction::PromptPlanner { .. }));
+        // second changes still ok
+        let (p2, _, r2) = pri_route(
+            PriPhase::AwaitingPlanReview,
+            &ReviewToken::Changes("more".into()),
+            "p.md",
+            1,
+            2,
+        );
+        assert_eq!(p2, PriPhase::AwaitingPlan);
+        assert_eq!(r2, 2);
+        // third exceeds max 2
+        let (p3, a3, r3) = pri_route(
+            PriPhase::AwaitingPlanReview,
+            &ReviewToken::Changes("again".into()),
+            "p.md",
+            2,
+            2,
+        );
+        assert_eq!(p3, PriPhase::Escalated);
+        assert_eq!(r3, 3);
+        assert!(matches!(a3, PriAction::Escalate { .. }));
+    }
+
+    #[test]
+    fn pri_route_reject_escalates() {
+        let (p, a, _) = pri_route(
+            PriPhase::AwaitingPlanReview,
+            &ReviewToken::Reject("nope".into()),
+            "p.md",
+            0,
+            2,
+        );
+        assert_eq!(p, PriPhase::Escalated);
+        assert!(matches!(a, PriAction::Escalate { reason } if reason.contains("rejected")));
+    }
+
+    #[test]
+    fn extract_plan_path_from_reply() {
+        assert_eq!(
+            extract_plan_path("PLAN: .flywheel/plans/bd-1.md\nthanks", "fallback.md"),
+            ".flywheel/plans/bd-1.md"
+        );
+        assert_eq!(extract_plan_path("no path here", "fb.md"), "fb.md");
     }
 }
