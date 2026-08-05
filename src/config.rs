@@ -430,6 +430,28 @@ daily = [
         );
     }
 
+    /// bd-docs-collab-spine-recipes: no stale poll-only / v18 framing.
+    #[test]
+    fn collab_docs_have_no_stale_tokens() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for rel in ["AGENTS.md", "README.md"] {
+            let body = std::fs::read_to_string(root.join(rel)).unwrap_or_default();
+            let lower = body.to_ascii_lowercase();
+            assert!(
+                !lower.contains("protocol v18"),
+                "{rel} still mentions protocol v18"
+            );
+            assert!(
+                !lower.contains("state-poll stream"),
+                "{rel} still mentions state-poll stream"
+            );
+        }
+        assert!(
+            root.join("docs/collab/recipes.md").is_file(),
+            "recipe catalog missing"
+        );
+    }
+
     // Env-var mutation is process-global; serialize tests that touch it
     // (same pattern as the backend factory tests).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
