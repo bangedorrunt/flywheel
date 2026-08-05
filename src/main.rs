@@ -109,6 +109,9 @@ enum Commands {
         /// do not focus the new workspace
         #[arg(long)]
         no_focus: bool,
+        /// spawn agents with the peer-aware self-poll template (ADR-0001 §9.3)
+        #[arg(long)]
+        peer_aware: bool,
     },
     /// Extend a running swarm with more agent panes
     Add {
@@ -954,6 +957,7 @@ fn main() {
             kinds,
             label,
             no_focus,
+            peer_aware,
         }) => cmd_spawn(
             &cfg,
             project,
@@ -962,6 +966,7 @@ fn main() {
             kinds,
             label.as_deref(),
             *no_focus,
+            *peer_aware,
         ),
         Some(Commands::Add {
             project,
@@ -1316,6 +1321,7 @@ fn cmd_spawn(
     kinds: &[(String, u32)],
     label_override: Option<&str>,
     no_focus: bool,
+    peer_aware: bool,
 ) -> Result<()> {
     let dir = project_dir(cfg, project);
     if !dir.exists() {
@@ -1345,12 +1351,39 @@ fn cmd_spawn(
     let mut first = true;
     // ordinals per kind across the whole plan (recipe + flags may repeat a kind)
     let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
+    // peer-aware bootstrap prompt (bd-pattern-peer-triggered, ADR-0001 §9.3).
+    // When --peer-aware, each spawned agent receives the self-poll template as
+    // its initial instruction. The template is read once; per-agent
+    // placeholders are substituted at the call site below.
+    let peer_template: Option<String> = if peer_aware {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("integrations/peer-aware.md.tpl");
+        match std::fs::read_to_string(&p) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!(
+                    "flywheel: cannot read peer-aware template {}: {e}",
+                    p.display()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     for (short, n) in &plan {
         let kind = cfg.resolve_kind(short);
         for _ in 0..*n {
             let ordinal = ordinals.entry(short.clone()).or_insert(0);
             *ordinal += 1;
             let name = agent_name_n(project, short, *ordinal);
+            let peer_args: Vec<String> = peer_template
+                .as_ref()
+                .map(|t| {
+                    vec![t
+                        .replace("{name}", &name)
+                        .replace("{task}", "await the swarm loop's queue or help peers")]
+                })
+                .unwrap_or_default();
             let pane_id = if first {
                 first = false;
                 prev.clone()
@@ -1359,7 +1392,7 @@ fn cmd_spawn(
                 prev = p.pane_id.clone();
                 prev.clone()
             };
-            let agent = start_agent_with_retry(&mut c, &name, &kind, &pane_id)?;
+            let agent = start_agent_with_retry(&mut c, &name, &kind, &pane_id, &peer_args)?;
             // governed-by: ADR-0001 (mail-register-on-spawn) — register the
             // spawned agent as an agent-mail identity so it's addressable by
             // name in mail. Best-effort: mail-not-configured is NOT a spawn
