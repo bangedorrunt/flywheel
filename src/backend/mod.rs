@@ -27,12 +27,16 @@
 #![allow(dead_code)]
 
 pub mod agentmail;
+pub mod factory;
 pub mod herdr;
 
 use crate::herdr::{
     AgentInfo, AgentStatus, PaneInfo, PushEvent, Subscription, WaitOptions, WorkspaceInfo,
 };
 use serde_json::Value;
+
+// (R0.6 will re-export `factory::multiplexer_backend`/`mail_backend` here once
+// call sites consume them via `backend::multiplexer_backend(&cfg)`.)
 
 /// Filter bag for `MailBackend::inbox` (fields only; semantics land with the
 /// beads that consume them — `bd-mail-ack-sla-tracking` owns the ack-overdue
