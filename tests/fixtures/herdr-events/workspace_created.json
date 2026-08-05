@@ -1,0 +1,15 @@
+{
+ "event": "workspace_created",
+ "data": {
+  "workspace": {
+   "workspace_id": "s1",
+   "number": 0,
+   "label": "s1",
+   "focused": false,
+   "pane_count": 0,
+   "tab_count": 0,
+   "active_tab_id": "s1",
+   "agent_status": "idle"
+  }
+ }
+}

@@ -1,0 +1,8 @@
+{
+ "event": "pane_agent_status_changed",
+ "data": {
+  "pane_id": "s1",
+  "workspace_id": "s1",
+  "agent_status": "idle"
+ }
+}

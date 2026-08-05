@@ -1,0 +1,7 @@
+{
+ "event": "pane_agent_detected",
+ "data": {
+  "pane_id": "s1",
+  "workspace_id": "s1"
+ }
+}

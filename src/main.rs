@@ -1562,13 +1562,24 @@ fn cmd_watch(cfg: &Config, project: &str, to: &str, until: Option<&str>, timeout
         }
     }
 
-    // subscribe to status changes in this workspace (long-lived connection)
-    let mut stream = c.subscribe(&[Subscription {
-        kind: "pane.agent_status_changed".into(),
-        pane_id: None,
-        workspace_id: Some(ws_id.clone()),
-        agent_status: None,
-    }])?;
+    // subscribe to status changes in this workspace (long-lived connection).
+    // The live herdr contract requires one subscription per pane
+    // (`pane.agent_status_changed` needs a concrete pane_id — a workspace
+    // scope alone is rejected), so build one subscription per pane in the
+    // workspace. Panes spawned after this point aren't subscribed; the poll
+    // fallback below covers them on any read error.
+    let panes = c.pane_list(Some(&ws_id))?;
+    let subs: Vec<Subscription> = panes
+        .iter()
+        .map(|p| Subscription::agent_status_changed(p.pane_id.clone()))
+        .collect();
+    let mut stream = match c.subscribe(&subs) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("flywheel: WARNING subscription failed ({e:#}); polling fallback");
+            None
+        }
+    };
 
     let deadline = timeout_ms
         .map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
@@ -1579,50 +1590,77 @@ fn cmd_watch(cfg: &Config, project: &str, to: &str, until: Option<&str>, timeout
             }
             // without a read timeout, a silent stream blocks forever and the
             // deadline above is never reached — bound each blocking read
-            stream
-                .set_read_timeout(Some(d.saturating_duration_since(std::time::Instant::now())))?;
-        } else {
-            stream.set_read_timeout(None)?;
+            if let Some(s) = stream.as_mut() {
+                s.set_read_timeout(Some(d.saturating_duration_since(std::time::Instant::now())))?;
+            }
+        } else if let Some(s) = stream.as_mut() {
+            s.set_read_timeout(None)?;
         }
-        match stream.read_event() {
-            Ok(Some(ev)) => {
-                if ev.kind == "pane.agent_status_changed" {
-                    if let Ok(change) = serde_json::from_value::<herdr::PaneAgentStatusChanged>(ev.data) {
-                        let name = change.agent.clone().unwrap_or(change.pane_id.clone());
-                        if watch_names.contains(&name) {
-                            if std::io::stdout().is_terminal() {
-                                println!("{} {}", dim(&name), status_paint(change.agent_status));
-                            }
-                            if let Some(u) = until_status {
-                                if change.agent_status == u
-                                    && all_matching(&mut c, &watch_names, u)?
-                                {
-                                    return Ok(());
+        match stream.as_mut() {
+            Some(s) => match s.read_event() {
+                Ok(Some(ev)) => {
+                    // typed: the subscription push (and the equivalent server
+                    // event) both land here with a fully parsed payload
+                    match ev.data {
+                        herdr::HerdrEventData::PaneAgentStatusChanged(change)
+                        | herdr::HerdrEventData::PaneAgentStatusChangedSub(change) => {
+                            let name = change.agent.clone().unwrap_or(change.pane_id.clone());
+                            if watch_names.contains(&name) {
+                                if std::io::stdout().is_terminal() {
+                                    println!("{} {}", dim(&name), status_paint(change.agent_status));
+                                }
+                                if let Some(u) = until_status {
+                                    if change.agent_status == u
+                                        && all_matching(&mut c, &watch_names, u)?
+                                    {
+                                        return Ok(());
+                                    }
                                 }
                             }
                         }
+                        _ => {}
                     }
                 }
-            }
-            Ok(None) => bail!("herdr socket closed"),
-            Err(_) => {
-                // transient read error: poll state as fallback
-                std::thread::sleep(Duration::from_millis(1000));
-                for a in c.agent_list()? {
-                    let name = a.name.unwrap_or(a.pane_id.clone());
-                    if watch_names.contains(&name) {
-                        if let Some(u) = until_status {
-                            if a.agent_status == u
-                                && all_matching(&mut c, &watch_names, u)?
-                            {
-                                return Ok(());
-                            }
-                        }
+                Ok(None) => bail!("herdr socket closed"),
+                Err(_) => {
+                    // transient read error: poll state as fallback
+                    std::thread::sleep(Duration::from_millis(1000));
+                    if watch_poll(&mut c, &watch_names, until_status)? {
+                        return Ok(());
                     }
+                }
+            },
+            None => {
+                // no subscription (empty workspace or rejected request):
+                // poll state until the deadline
+                std::thread::sleep(Duration::from_millis(1000));
+                if watch_poll(&mut c, &watch_names, until_status)? {
+                    return Ok(());
                 }
             }
         }
     }
+}
+
+/// Poll agent list as a subscription fallback: returns `true` when
+/// `until_status` is reached for all watched names (or `false` while
+/// polling — the caller owns the deadline).
+fn watch_poll(
+    c: &mut Client,
+    watch_names: &[String],
+    until_status: Option<AgentStatus>,
+) -> Result<bool> {
+    for a in c.agent_list()? {
+        let name = a.name.unwrap_or(a.pane_id.clone());
+        if watch_names.contains(&name) {
+            if let Some(u) = until_status {
+                if a.agent_status == u && all_matching(c, watch_names, u)? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn all_matching(c: &mut Client, names: &[String], status: AgentStatus) -> Result<bool> {

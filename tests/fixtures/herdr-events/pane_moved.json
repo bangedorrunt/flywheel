@@ -1,0 +1,17 @@
+{
+ "event": "pane_moved",
+ "data": {
+  "previous_pane_id": "s1",
+  "previous_workspace_id": "s1",
+  "previous_tab_id": "s1",
+  "pane": {
+   "pane_id": "s1",
+   "terminal_id": "s1",
+   "workspace_id": "s1",
+   "tab_id": "s1",
+   "focused": false,
+   "agent_status": "idle",
+   "revision": 0
+  }
+ }
+}

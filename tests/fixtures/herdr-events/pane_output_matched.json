@@ -1,0 +1,17 @@
+{
+ "event": "pane.output_matched",
+ "data": {
+  "pane_id": "s1",
+  "matched_line": "s1",
+  "read": {
+   "pane_id": "s1",
+   "workspace_id": "s1",
+   "tab_id": "s1",
+   "source": "visible",
+   "format": "text",
+   "text": "s1",
+   "revision": 0,
+   "truncated": false
+  }
+ }
+}

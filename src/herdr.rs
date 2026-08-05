@@ -177,11 +177,390 @@ pub struct WorktreeInfo {
 }
 
 /// Push notification pushed by the server (event subscription or server events).
-#[derive(Debug, Clone, Deserialize)]
+///
+/// Typed: `kind` is the wire event name parsed into `HerdrEventKind`, and
+/// `data` is deserialized into the matching typed payload — no `Value`
+/// leakage in the fields we route on (`agent_status`, `pane_id`, `agent`,
+/// `workspace_id`). Deserialization is implemented manually because the wire
+/// carries the kind in the envelope (`event`) while the payloads use
+/// per-variant content shapes (see `HerdrEventData::from_kind`).
+#[derive(Debug, Clone)]
 pub struct PushEvent {
-    #[serde(rename = "event")]
-    pub kind: String,
-    pub data: Value,
+    #[allow(dead_code)] // bin matches on the typed `data` variant; `kind` is the typed wire name
+    pub kind: HerdrEventKind,
+    pub data: HerdrEventData,
+}
+
+impl<'de> Deserialize<'de> for PushEvent {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let v = Value::deserialize(d)?;
+        let kind_str = v
+            .get("event")
+            .and_then(Value::as_str)
+            .ok_or_else(|| D::Error::custom("PushEvent missing 'event' field"))?;
+        let kind = HerdrEventKind::parse(kind_str)
+            .map_err(|_| D::Error::custom(format!("unknown herdr event kind: {kind_str}")))?;
+        let data = HerdrEventData::from_kind(kind, v.get("data").cloned().unwrap_or(Value::Null))
+            .map_err(D::Error::custom)?;
+        Ok(PushEvent { kind, data })
+    }
+}
+
+/// All herdr event kinds: the 26 server events (snake_case wire names) plus
+/// the 3 subscription pushes (dot namespaced wire names). `parse` accepts
+/// both namespaces; `as_wire_str` returns the exact wire name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by tests + the Phase-2 reactor; bin matches on data today
+pub enum HerdrEventKind {
+    // server events (26) — snake_case on the wire
+    WorkspaceCreated,
+    WorkspaceUpdated,
+    WorkspaceMetadataUpdated,
+    WorkspaceClosed,
+    WorkspaceRenamed,
+    WorkspaceMoved,
+    WorkspaceReordered,
+    WorkspaceFocused,
+    WorktreeCreated,
+    WorktreeOpened,
+    WorktreeRemoved,
+    TabCreated,
+    TabClosed,
+    TabRenamed,
+    TabMoved,
+    TabFocused,
+    PaneCreated,
+    PaneClosed,
+    PaneUpdated,
+    PaneFocused,
+    PaneMoved,
+    PaneOutputChanged,
+    PaneExited,
+    PaneAgentDetected,
+    PaneAgentStatusChanged,
+    LayoutUpdated,
+    // subscription pushes (3) — dotted on the wire
+    PaneAgentStatusChangedSub,
+    PaneOutputMatched,
+    PaneScrollChanged,
+}
+
+impl HerdrEventKind {
+    /// Parse a wire event name. Accepts both namespaces: the 26 snake_case
+    /// server events and the 3 dotted subscription events.
+    #[allow(dead_code)] // used by tests + reactor; parse itself is live via PushEvent::deserialize
+    pub fn parse(s: &str) -> Result<Self> {
+        use HerdrEventKind::*;
+        let kind = match s {
+            "workspace_created" => WorkspaceCreated,
+            "workspace_updated" => WorkspaceUpdated,
+            "workspace_metadata_updated" => WorkspaceMetadataUpdated,
+            "workspace_closed" => WorkspaceClosed,
+            "workspace_renamed" => WorkspaceRenamed,
+            "workspace_moved" => WorkspaceMoved,
+            "workspace_reordered" => WorkspaceReordered,
+            "workspace_focused" => WorkspaceFocused,
+            "worktree_created" => WorktreeCreated,
+            "worktree_opened" => WorktreeOpened,
+            "worktree_removed" => WorktreeRemoved,
+            "tab_created" => TabCreated,
+            "tab_closed" => TabClosed,
+            "tab_renamed" => TabRenamed,
+            "tab_moved" => TabMoved,
+            "tab_focused" => TabFocused,
+            "pane_created" => PaneCreated,
+            "pane_closed" => PaneClosed,
+            "pane_updated" => PaneUpdated,
+            "pane_focused" => PaneFocused,
+            "pane_moved" => PaneMoved,
+            "pane_output_changed" => PaneOutputChanged,
+            "pane_exited" => PaneExited,
+            "pane_agent_detected" => PaneAgentDetected,
+            "pane_agent_status_changed" => PaneAgentStatusChanged,
+            "layout_updated" => LayoutUpdated,
+            "pane.agent_status_changed" => PaneAgentStatusChangedSub,
+            "pane.output_matched" => PaneOutputMatched,
+            "pane.scroll_changed" => PaneScrollChanged,
+            other => bail!("unknown herdr event kind: {other}"),
+        };
+        Ok(kind)
+    }
+
+    /// The exact wire name for this kind.
+    #[allow(dead_code)] // used by tests + reactor (diagnostics)
+    pub fn as_wire_str(self) -> &'static str {
+        use HerdrEventKind::*;
+        match self {
+            WorkspaceCreated => "workspace_created",
+            WorkspaceUpdated => "workspace_updated",
+            WorkspaceMetadataUpdated => "workspace_metadata_updated",
+            WorkspaceClosed => "workspace_closed",
+            WorkspaceRenamed => "workspace_renamed",
+            WorkspaceMoved => "workspace_moved",
+            WorkspaceReordered => "workspace_reordered",
+            WorkspaceFocused => "workspace_focused",
+            WorktreeCreated => "worktree_created",
+            WorktreeOpened => "worktree_opened",
+            WorktreeRemoved => "worktree_removed",
+            TabCreated => "tab_created",
+            TabClosed => "tab_closed",
+            TabRenamed => "tab_renamed",
+            TabMoved => "tab_moved",
+            TabFocused => "tab_focused",
+            PaneCreated => "pane_created",
+            PaneClosed => "pane_closed",
+            PaneUpdated => "pane_updated",
+            PaneFocused => "pane_focused",
+            PaneMoved => "pane_moved",
+            PaneOutputChanged => "pane_output_changed",
+            PaneExited => "pane_exited",
+            PaneAgentDetected => "pane_agent_detected",
+            PaneAgentStatusChanged => "pane_agent_status_changed",
+            LayoutUpdated => "layout_updated",
+            PaneAgentStatusChangedSub => "pane.agent_status_changed",
+            PaneOutputMatched => "pane.output_matched",
+            PaneScrollChanged => "pane.scroll_changed",
+        }
+    }
+}
+
+// ---- typed event payloads ----
+//
+// Field sets mirror the live schema (`herdr api schema --json` →
+// `schemas/event/$defs/EventData.oneOf`). Nested objects that flywheel does
+// not consume yet stay `Value` — the goal is type safety for the fields we
+// route on, not a full model of every payload. `WorkspaceInfo`, `PaneInfo`
+// and `WorktreeInfo` (defined above) are reused for the nested payloads.
+
+/// tab payload (nested object; consumed fields only).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct TabInfo {
+    #[serde(default)]
+    pub tab_id: String,
+    #[serde(default)]
+    pub workspace_id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub number: u64,
+    #[serde(default)]
+    pub focused: bool,
+    #[serde(default)]
+    pub pane_count: u64,
+    #[serde(default)]
+    pub agent_status: Option<AgentStatus>,
+}
+
+/// scroll payload for `pane.scroll_changed` subscription events.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneScrollInfo {
+    #[serde(default)]
+    pub offset_from_bottom: u64,
+    #[serde(default)]
+    pub max_offset_from_bottom: u64,
+    #[serde(default)]
+    pub viewport_rows: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceCreated {
+    pub workspace: WorkspaceInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceUpdated {
+    pub workspace: WorkspaceInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceMetadataUpdated {
+    pub workspace: WorkspaceInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceClosed {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub workspace: Option<WorkspaceInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceRenamed {
+    pub workspace_id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceMoved {
+    pub workspace_id: String,
+    pub insert_index: u64,
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceReordered {
+    #[serde(default)]
+    pub workspace_ids: Vec<String>,
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceInfo>,
+    #[serde(default)]
+    pub before_workspace_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceFocused {
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorktreeCreated {
+    pub workspace: WorkspaceInfo,
+    pub worktree: WorktreeInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorktreeOpened {
+    pub workspace: WorkspaceInfo,
+    pub worktree: WorktreeInfo,
+    #[serde(default)]
+    pub already_open: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorktreeRemoved {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub workspace: Option<WorkspaceInfo>,
+    pub worktree: WorktreeInfo,
+    #[serde(default)]
+    pub forced: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct TabCreated {
+    pub tab: TabInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct TabClosed {
+    pub tab_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct TabRenamed {
+    pub tab_id: String,
+    pub workspace_id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct TabMoved {
+    pub tab_id: String,
+    pub workspace_id: String,
+    pub insert_index: u64,
+    #[serde(default)]
+    pub tabs: Vec<TabInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct TabFocused {
+    pub tab_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneCreated {
+    pub pane: PaneInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneClosed {
+    pub pane_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneUpdated {
+    pub pane: PaneInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneFocused {
+    pub pane_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneMoved {
+    pub pane: PaneInfo,
+    pub previous_pane_id: String,
+    pub previous_workspace_id: String,
+    pub previous_tab_id: String,
+    #[serde(default)]
+    pub closed_tab_id: Option<String>,
+    #[serde(default)]
+    pub closed_workspace_id: Option<String>,
+    #[serde(default)]
+    pub created_tab: Option<TabInfo>,
+    #[serde(default)]
+    pub created_workspace: Option<WorkspaceInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneOutputChanged {
+    pub pane_id: String,
+    pub workspace_id: String,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneExited {
+    pub pane_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneAgentDetected {
+    pub pane_id: String,
+    pub workspace_id: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub final_status: Option<AgentStatus>,
+    #[serde(default)]
+    pub released: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -195,7 +574,114 @@ pub struct PaneAgentStatusChanged {
     pub agent: Option<String>,
     #[serde(default)]
     pub display_agent: Option<String>,
+    #[serde(default)]
+    pub state_labels: Option<Value>,
+    #[serde(default)]
     pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct LayoutUpdated {
+    // not consumed yet — type `PaneLayoutSnapshot` when the reactor lands
+    #[serde(default)]
+    pub layout: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneOutputMatchedEvent {
+    pub pane_id: String,
+    #[serde(default)]
+    pub matched_line: Option<String>,
+    #[serde(default)]
+    pub read: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneScrollChangedEvent {
+    pub pane_id: String,
+    pub workspace_id: String,
+    #[serde(default)]
+    pub scroll: PaneScrollInfo,
+}
+
+/// Typed payload of a `PushEvent`, dispatched on the envelope's `kind`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // variant payloads consumed by tests + Phase-2 reactor
+#[allow(clippy::large_enum_variant, clippy::enum_variant_names)] // wire-fidelity names; parsed once per event
+pub enum HerdrEventData {
+    WorkspaceCreated(WorkspaceCreated),
+    WorkspaceUpdated(WorkspaceUpdated),
+    WorkspaceMetadataUpdated(WorkspaceMetadataUpdated),
+    WorkspaceClosed(WorkspaceClosed),
+    WorkspaceRenamed(WorkspaceRenamed),
+    WorkspaceMoved(WorkspaceMoved),
+    WorkspaceReordered(WorkspaceReordered),
+    WorkspaceFocused(WorkspaceFocused),
+    WorktreeCreated(WorktreeCreated),
+    WorktreeOpened(WorktreeOpened),
+    WorktreeRemoved(WorktreeRemoved),
+    TabCreated(TabCreated),
+    TabClosed(TabClosed),
+    TabRenamed(TabRenamed),
+    TabMoved(TabMoved),
+    TabFocused(TabFocused),
+    PaneCreated(PaneCreated),
+    PaneClosed(PaneClosed),
+    PaneUpdated(PaneUpdated),
+    PaneFocused(PaneFocused),
+    PaneMoved(PaneMoved),
+    PaneOutputChanged(PaneOutputChanged),
+    PaneExited(PaneExited),
+    PaneAgentDetected(PaneAgentDetected),
+    PaneAgentStatusChanged(PaneAgentStatusChanged),
+    LayoutUpdated(LayoutUpdated),
+    PaneAgentStatusChangedSub(PaneAgentStatusChanged),
+    PaneOutputMatched(PaneOutputMatchedEvent),
+    PaneScrollChanged(PaneScrollChangedEvent),
+}
+
+impl HerdrEventData {
+    /// Deserialize the payload `data` for the given `kind`.
+    pub fn from_kind(kind: HerdrEventKind, data: Value) -> Result<Self> {
+        use HerdrEventKind::*;
+        use serde_json::from_value;
+        Ok(match kind {
+            WorkspaceCreated => HerdrEventData::WorkspaceCreated(from_value(data)?),
+            WorkspaceUpdated => HerdrEventData::WorkspaceUpdated(from_value(data)?),
+            WorkspaceMetadataUpdated => HerdrEventData::WorkspaceMetadataUpdated(from_value(data)?),
+            WorkspaceClosed => HerdrEventData::WorkspaceClosed(from_value(data)?),
+            WorkspaceRenamed => HerdrEventData::WorkspaceRenamed(from_value(data)?),
+            WorkspaceMoved => HerdrEventData::WorkspaceMoved(from_value(data)?),
+            WorkspaceReordered => HerdrEventData::WorkspaceReordered(from_value(data)?),
+            WorkspaceFocused => HerdrEventData::WorkspaceFocused(from_value(data)?),
+            WorktreeCreated => HerdrEventData::WorktreeCreated(from_value(data)?),
+            WorktreeOpened => HerdrEventData::WorktreeOpened(from_value(data)?),
+            WorktreeRemoved => HerdrEventData::WorktreeRemoved(from_value(data)?),
+            TabCreated => HerdrEventData::TabCreated(from_value(data)?),
+            TabClosed => HerdrEventData::TabClosed(from_value(data)?),
+            TabRenamed => HerdrEventData::TabRenamed(from_value(data)?),
+            TabMoved => HerdrEventData::TabMoved(from_value(data)?),
+            TabFocused => HerdrEventData::TabFocused(from_value(data)?),
+            PaneCreated => HerdrEventData::PaneCreated(from_value(data)?),
+            PaneClosed => HerdrEventData::PaneClosed(from_value(data)?),
+            PaneUpdated => HerdrEventData::PaneUpdated(from_value(data)?),
+            PaneFocused => HerdrEventData::PaneFocused(from_value(data)?),
+            PaneMoved => HerdrEventData::PaneMoved(from_value(data)?),
+            PaneOutputChanged => HerdrEventData::PaneOutputChanged(from_value(data)?),
+            PaneExited => HerdrEventData::PaneExited(from_value(data)?),
+            PaneAgentDetected => HerdrEventData::PaneAgentDetected(from_value(data)?),
+            PaneAgentStatusChanged => HerdrEventData::PaneAgentStatusChanged(from_value(data)?),
+            LayoutUpdated => HerdrEventData::LayoutUpdated(from_value(data)?),
+            PaneAgentStatusChangedSub => {
+                HerdrEventData::PaneAgentStatusChangedSub(from_value(data)?)
+            }
+            PaneOutputMatched => HerdrEventData::PaneOutputMatched(from_value(data)?),
+            PaneScrollChanged => HerdrEventData::PaneScrollChanged(from_value(data)?),
+        })
+    }
 }
 
 /// Blocking JSON-RPC client over a unix socket.
@@ -714,20 +1200,64 @@ pub fn parse_wait_for_output_result(res: &Value) -> std::result::Result<PaneWait
     Ok(PaneWaitResult { pane_id, matched_line, read })
 }
 
+/// Subscription event kinds accepted by `events.subscribe` (dotted wire
+/// names). Distinct from `HerdrEventKind`'s server-event namespace: these
+/// are the *request* filters, and the server echoes the same name on pushes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // PaneOutputMatched/PaneScrollChanged await the Phase-2 reactor
+#[allow(clippy::enum_variant_names)] // wire-fidelity names
+pub enum SubscriptionEventKind {
+    PaneAgentStatusChanged,
+    PaneOutputMatched,
+    PaneScrollChanged,
+}
+
+impl SubscriptionEventKind {
+    /// The wire name for this subscription event (dotted).
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            SubscriptionEventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
+            SubscriptionEventKind::PaneOutputMatched => "pane.output_matched",
+            SubscriptionEventKind::PaneScrollChanged => "pane.scroll_changed",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Subscription {
-    pub kind: String,
-    pub pane_id: Option<String>,
-    pub workspace_id: Option<String>,
+    pub event: SubscriptionEventKind,
+    /// Required by the live server: `pane.agent_status_changed` (and the
+    /// other pane.* subscriptions) reject requests without a concrete
+    /// `pane_id` (verified against live herdr v19 — a `null` pane_id fails
+    /// with "missing field `pane_id`" and the connection is closed).
+    pub pane_id: String,
     pub agent_status: Option<AgentStatus>,
 }
 
 impl Subscription {
+    /// Subscribe to agent status changes for a specific pane. To watch a
+    /// whole workspace, build one subscription per pane (the server accepts
+    /// a `subscriptions` array in a single request).
+    pub fn agent_status_changed(pane_id: String) -> Self {
+        Subscription {
+            event: SubscriptionEventKind::PaneAgentStatusChanged,
+            pane_id,
+            agent_status: None,
+        }
+    }
+
+    /// Narrow the subscription to a single status (used by tests; the
+    /// Phase-2 reactor filters agent-status pushes this way).
+    #[allow(dead_code)]
+    pub fn with_agent_status(mut self, status: AgentStatus) -> Self {
+        self.agent_status = Some(status);
+        self
+    }
+
     pub fn to_value(&self) -> Value {
         json!({
-            "type": self.kind,
+            "type": self.event.as_wire_str(),
             "pane_id": self.pane_id,
-            "workspace_id": self.workspace_id,
             "agent_status": self.agent_status.map(|s| s.as_str()),
         })
     }
@@ -750,6 +1280,62 @@ mod tests {
         assert_eq!(AgentStatus::parse("blocked").unwrap(), AgentStatus::Blocked);
         assert_eq!(AgentStatus::Blocked.as_str(), "blocked");
         assert!(AgentStatus::parse("bogus").is_err());
+    }
+
+    /// Every wire name round-trips: parse(as_wire_str(k)) == k, across both
+    /// namespaces (26 snake server events + 3 dotted subscription events).
+    #[test]
+    fn kind_wire_roundtrip() {
+        let kinds = [
+            "workspace_created",
+            "workspace_updated",
+            "workspace_metadata_updated",
+            "workspace_closed",
+            "workspace_renamed",
+            "workspace_moved",
+            "workspace_reordered",
+            "workspace_focused",
+            "worktree_created",
+            "worktree_opened",
+            "worktree_removed",
+            "tab_created",
+            "tab_closed",
+            "tab_renamed",
+            "tab_moved",
+            "tab_focused",
+            "pane_created",
+            "pane_closed",
+            "pane_updated",
+            "pane_focused",
+            "pane_moved",
+            "pane_output_changed",
+            "pane_exited",
+            "pane_agent_detected",
+            "pane_agent_status_changed",
+            "layout_updated",
+            "pane.agent_status_changed",
+            "pane.output_matched",
+            "pane.scroll_changed",
+        ];
+        assert_eq!(kinds.len(), 29, "26 server + 3 subscription kinds");
+        for wire in kinds {
+            let k = HerdrEventKind::parse(wire).unwrap_or_else(|e| panic!("{wire}: {e}"));
+            assert_eq!(k.as_wire_str(), wire, "as_wire_str round-trips {wire}");
+        }
+        assert!(HerdrEventKind::parse("not_an_event").is_err());
+    }
+
+    /// The typed Subscription builder emits the exact wire request: the live
+    /// server requires a concrete `pane_id` (no nulls, no workspace_id).
+    #[test]
+    fn subscription_to_value_wire_shape() {
+        let v = Subscription::agent_status_changed("w1:p2".into())
+            .with_agent_status(AgentStatus::Blocked)
+            .to_value();
+        assert_eq!(v["type"], "pane.agent_status_changed");
+        assert_eq!(v["pane_id"], "w1:p2");
+        assert_eq!(v["agent_status"], "blocked");
+        assert!(v.get("workspace_id").is_none(), "workspace_id is not part of the wire contract");
     }
 
     #[test]
@@ -785,9 +1371,171 @@ mod tests {
             }
         });
         let e: PushEvent = serde_json::from_value(v).unwrap();
-        assert_eq!(e.kind, "pane.agent_status_changed");
-        let s: PaneAgentStatusChanged = serde_json::from_value(e.data).unwrap();
-        assert_eq!(s.agent_status, AgentStatus::Blocked);
+        assert_eq!(e.kind, HerdrEventKind::PaneAgentStatusChangedSub);
+        match e.data {
+            HerdrEventData::PaneAgentStatusChangedSub(s) => {
+                assert_eq!(s.agent_status, AgentStatus::Blocked);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// Same coverage as the parse tests above but with explicit per-file
+    /// includes (include_str! requires literal paths). One parse per event
+    /// kind — 26 server events + 3 subscription events = 29 fixtures, all
+    /// schema-derived (see `tests/fixtures/herdr-events/`).
+    #[test]
+    fn all_event_fixtures_parse_typed() {
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/workspace_created.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::WorkspaceCreated);
+        match e.data {
+            HerdrEventData::WorkspaceCreated(_) => {}
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/workspace_updated.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::WorkspaceUpdated);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/workspace_metadata_updated.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::WorkspaceMetadataUpdated);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/workspace_closed.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::WorkspaceClosed);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/workspace_renamed.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::WorkspaceRenamed);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/workspace_moved.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::WorkspaceMoved);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/workspace_reordered.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::WorkspaceReordered);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/workspace_focused.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::WorkspaceFocused);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/worktree_created.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::WorktreeCreated);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/worktree_opened.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::WorktreeOpened);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/worktree_removed.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::WorktreeRemoved);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/tab_created.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::TabCreated);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/tab_closed.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::TabClosed);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/tab_renamed.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::TabRenamed);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/tab_moved.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::TabMoved);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/tab_focused.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::TabFocused);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/pane_created.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::PaneCreated);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/pane_closed.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::PaneClosed);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/pane_updated.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::PaneUpdated);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/pane_focused.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::PaneFocused);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/pane_moved.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::PaneMoved);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/pane_output_changed.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::PaneOutputChanged);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/pane_exited.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::PaneExited);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/pane_agent_detected.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::PaneAgentDetected);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/pane_agent_status_changed.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::PaneAgentStatusChanged);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/layout_updated.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::LayoutUpdated);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/pane_agent_status_changed_sub.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::PaneAgentStatusChangedSub);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/pane_output_matched.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::PaneOutputMatched);
+        let e: PushEvent = serde_json::from_str(include_str!(
+            "../tests/fixtures/herdr-events/pane_scroll_changed.json"
+        ))
+        .unwrap();
+        assert_eq!(e.kind, HerdrEventKind::PaneScrollChanged);
     }
 
     #[test]
@@ -961,6 +1709,80 @@ mod tests {
         let first = workspaces.first().unwrap();
         let _ = c.worktree_list(Some(&first.workspace_id)).unwrap();
         assert!(!agents.is_empty());
+    }
+
+    /// Live capture verification for the typed event layer. Self-driving:
+    /// picks a free pane, subscribes to its agent-status changes, starts a
+    /// test agent on it, prompts it, and asserts every push parses into the
+    /// typed `PushEvent` (typed `kind` + typed payload — no `Value` in the
+    /// routed fields). Requires a live herdr server with at least one free
+    /// pane (a shell that isn't running an agent):
+    ///   `cargo test -- --ignored live_events_subscribe_typed`
+    #[test]
+    #[ignore = "needs a live herdr server with a free pane"]
+    fn live_events_subscribe_typed() {
+        let mut c = Client::connect(None).unwrap();
+        let panes = c.pane_list(None).unwrap();
+        let occupied: Vec<String> = c
+            .agent_list()
+            .unwrap()
+            .iter()
+            .map(|a| a.pane_id.clone())
+            .collect();
+        let pane = panes
+            .iter()
+            .find(|p| !occupied.contains(&p.pane_id))
+            .unwrap_or_else(|| panic!("no free pane to start a test agent; found panes {occupied:?}"));
+        let name = format!("live-probe-{}", std::process::id());
+        let mut stream = c
+            .subscribe(&[Subscription::agent_status_changed(pane.pane_id.clone())])
+            .unwrap();
+        stream.set_read_timeout(Some(Duration::from_millis(5_000))).unwrap();
+
+        // drive the transition on a separate client (the subscription socket
+        // must stay request-free)
+        let mut c2 = Client::connect(None).unwrap();
+        c2.agent_start(&name, "opencode", &pane.pane_id, 20_000, &[])
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(2_000));
+        let _ = c2.agent_prompt(&name, "Reply with the single word: done.", None);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut seen = 0;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            match stream.read_event() {
+                Ok(Some(ev)) => {
+                    // typed: the payload must be the agent-status variant with
+                    // parsed fields — a hand-parse (`Value`) would hide schema
+                    // drift here
+                    match &ev.data {
+                        HerdrEventData::PaneAgentStatusChangedSub(s)
+                        | HerdrEventData::PaneAgentStatusChanged(s) => {
+                            assert_eq!(s.pane_id, pane.pane_id);
+                            assert!(!s.workspace_id.is_empty());
+                            seen += 1;
+                        }
+                        other => panic!("unexpected typed variant: {other:?}"),
+                    }
+                }
+                Ok(None) => {
+                    // server closed the stream (e.g. the pane died) — fine
+                    // after we've captured at least one push
+                    if seen >= 1 {
+                        break;
+                    }
+                    panic!("stream closed before any push");
+                }
+                Err(_) => continue, // transient read error: keep polling
+            }
+            if seen >= 3 {
+                break;
+            }
+        }
+        assert!(seen >= 1, "expected at least one status-change push for {name}");
     }
 }
 

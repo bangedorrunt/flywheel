@@ -1,0 +1,8 @@
+{
+ "event": "tab_renamed",
+ "data": {
+  "tab_id": "s1",
+  "workspace_id": "s1",
+  "label": "s1"
+ }
+}

@@ -1,0 +1,7 @@
+{
+ "event": "workspace_renamed",
+ "data": {
+  "workspace_id": "s1",
+  "label": "s1"
+ }
+}
