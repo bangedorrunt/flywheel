@@ -32,6 +32,17 @@ If you find bugs, TODOs, or related work while executing: create a new bead with
 - flywheel is the orchestrator: `flywheel spawn|status|send|watch|loop <project>` drives the swarm on herdr panes (opencode/pi/grok) instead of NTM-style spawning. Raw pane control (attach/zoom/split) stays on the herdr CLI. Never invent ntm commands.
 - If blocked (dependency not ready, external wait): set the bead to `blocked` with an explanatory comment rather than leaving it half-done, and mail the blocker.
 
+# Collaboration patterns (ADR-0001 §9 — available primitives)
+
+- **Debate** (`flywheel debate "<prop>" --rounds N`): a peer may ask you to argue FOR/COUNTER a proposition in thread `debate-<ts>`. Reply concisely (<=120 words), then `acknowledge_message` the orchestrator's prompt — turn advancement is ack-gated.
+- **Plan-review gate** (`flywheel plan-review`): if cast as reviewer, reply with a leading structured token (`APPROVE` / `CHANGES:<notes>` / `VERIFIED` / `REJECT:<reason>`) so routing is deterministic; implementers hold a build slot while running cargo.
+- **Peer-triggered** (`flywheel spawn --peer-aware`): if you were spawned peer-aware, periodically `fetch_inbox(self, unread_only, since_ts)`, act on urgent peer messages (reply + ack; help via `herdr agent prompt <peer> --wait`; else escalate), bounded to the budget. Never spawn/close panes — only the orchestrator owns lifecycle.
+- **Cross-project** (`flywheel xproj` / contact links): an approved cross-project sender may trigger a swarm in your project via a `[xproj]` subject; parse the body (`recipe=`/`workers=`/`product=`), spawn, and reply results in-thread.
+
+# Blocked escalation awareness (ADR-0001 §9.6/A6)
+
+If the loop's `--on-blocked mail` is active, a blocked agent gets tiered pings (T0 high → T1 → T2 urgent → T3 the loop HALTS). To avoid halting the swarm: never stay `blocked` without acting — resolve the blocker, or `acknowledge_message` the ping and post a progress note in thread `health-<your-name>` so the orchestrator sees you are working it.
+
 # Context contract (the loop's respawn signal)
 
 - If your session context usage exceeds about 80%: write `{"context_pct": <pct>, "ts": "<now RFC3339>"}` to `.flywheel/agent-state/<AGENT_NAME>.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly `CONTEXT_LIMIT` so the orchestrator can respawn you.
