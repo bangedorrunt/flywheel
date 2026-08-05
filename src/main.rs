@@ -1815,7 +1815,7 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
         bail!("no agent-mail identities found for {project} (register first: flywheel mail agents)");
     }
     let subject = format!("[assign] {} → {}", project_base(project), bead_ids.join(", "));
-    mail.send(key, &targets, &subject, &body, "high", true)?;
+    mail.send(key, &targets, &subject, &body, "high", true, None)?;
     println!("assigned {} to {}", bead_ids.join(", "), targets.join(", "));
     Ok(())
 }
@@ -1841,7 +1841,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let key = project_dir(cfg, project).to_str().unwrap().to_string();
             mail.ensure_project(&key)?;
             let targets: Vec<String> = to.split(',').map(|s| s.trim().to_string()).collect();
-            let v = mail.send(&key, &targets, subject, body, importance, *ack)?;
+            let v = mail.send(&key, &targets, subject, body, importance, *ack, None)?;
             print_json(&v);
         }
         MailCmd::Locks { project, paths, ttl_seconds, exclusive, reason } => {
@@ -2469,6 +2469,7 @@ fn cmd_loop(
                                     "The swarm loop detected you are blocked. Resolve or report the blocker.",
                                     "high",
                                     true,
+                                    Some(&format!("health-{name}")),
                                 );
                                 println!("{} {name} → mail alert", dim("[loop] blocked"));
                             } else {
@@ -3501,7 +3502,7 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str) -> Result<
         "The swarm loop detected you are blocked. Resolve or report the blocker.",
         "high",
         true,
-        None, // thread_id — Phase 3 (bd-blocked-escalation-protocol) adds threading
+        Some(&format!("health-{name}")),
     )
     .map_err(|e| anyhow!("mail backend: {e}"))?;
     print_json(&json!({ "ok": true, "notified": name }));
