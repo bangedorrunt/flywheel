@@ -229,6 +229,8 @@ pub fn send_prompt_argv(args: &SendArgs) -> Vec<String> {
 pub struct NotifyArgs {
     pub project: String,
     pub name: String,
+    /// escalation tier 0..3 (bd-blocked-escalation-protocol)
+    pub tier: u32,
 }
 
 /// Args for the diagnose leaf (read tail + health mail).
@@ -335,24 +337,20 @@ pub fn parse_poll_events_batch(raw: &str, fallback_seq: u64) -> anyhow::Result<P
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let agent = e
-            .get("agent")
-            .and_then(|a| {
-                if a.is_null() {
-                    None
-                } else {
-                    a.as_str().map(str::to_string)
-                }
-            });
-        let status = e
-            .get("status")
-            .and_then(|s| {
-                if s.is_null() {
-                    None
-                } else {
-                    s.as_str().map(str::to_string)
-                }
-            });
+        let agent = e.get("agent").and_then(|a| {
+            if a.is_null() {
+                None
+            } else {
+                a.as_str().map(str::to_string)
+            }
+        });
+        let status = e.get("status").and_then(|s| {
+            if s.is_null() {
+                None
+            } else {
+                s.as_str().map(str::to_string)
+            }
+        });
         let seq = e.get("seq").and_then(Value::as_u64).unwrap_or(0);
         out.push(PollEvent {
             event_type,
@@ -366,15 +364,13 @@ pub fn parse_poll_events_batch(raw: &str, fallback_seq: u64) -> anyhow::Result<P
         .get("max_seq")
         .and_then(Value::as_u64)
         .unwrap_or(fallback_seq);
-    let stream_error = v
-        .get("stream_error")
-        .and_then(|e| {
-            if e.is_null() {
-                None
-            } else {
-                e.as_str().map(str::to_string)
-            }
-        });
+    let stream_error = v.get("stream_error").and_then(|e| {
+        if e.is_null() {
+            None
+        } else {
+            e.as_str().map(str::to_string)
+        }
+    });
     Ok(PollEventsBatch {
         events: out,
         max_seq,
@@ -562,7 +558,11 @@ pub enum EscalationTier {
 /// Map elapsed-us since first_blocked to the escalation tier.
 /// `interval_secs` is the loop's active interval (the durable sleep period).
 /// Elapsed thresholds: T1 at 2×, T2 at 4×, T3 at 8× the interval.
-pub fn escalation_tier(first_blocked_ts_us: i64, now_us: i64, interval_secs: u64) -> EscalationTier {
+pub fn escalation_tier(
+    first_blocked_ts_us: i64,
+    now_us: i64,
+    interval_secs: u64,
+) -> EscalationTier {
     let interval_us = (interval_secs as i64).saturating_mul(1_000_000);
     let elapsed = now_us.saturating_sub(first_blocked_ts_us);
     if elapsed >= 8 * interval_us {
@@ -752,7 +752,13 @@ async fn send_prompt(args: SendArgs) -> Result<SendOutcome> {
 async fn notify_blocked(args: NotifyArgs) -> Result<()> {
     let exe = self_exe().map_err(map_err)?;
     let out = Command::new(&exe)
-        .args(["__mail-blocked", &args.project, &args.name])
+        .args([
+            "__mail-blocked",
+            &args.project,
+            &args.name,
+            "--tier",
+            &args.tier.to_string(),
+        ])
         .output()
         .map_err(|e| map_err(anyhow::anyhow!("__mail-blocked spawn failed: {e}")))?;
     if !out.status.success() {
@@ -870,18 +876,37 @@ pub fn lease_renew_seconds(heartbeat_interval_secs: u64) -> u64 {
 /// dispatch-pending until a `working` event confirms landing.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoopAction {
-    Send { name: String, text: String },
+    Send {
+        name: String,
+        text: String,
+    },
     /// Event-wake redispatch: same leaf as `Send`, skips poll batching.
-    DispatchImmediate { name: String, text: String },
-    Blocked { name: String },
-    Nudge { name: String },
+    DispatchImmediate {
+        name: String,
+        text: String,
+    },
+    Blocked {
+        name: String,
+    },
+    Nudge {
+        name: String,
+    },
     /// Self-heal: read tail + high-importance mail (bd-event-self-heal).
-    Diagnose { name: String, reason: String },
+    Diagnose {
+        name: String,
+        reason: String,
+    },
     /// Self-heal: `__respawn` after diagnose failed to clear (budgeted).
-    Respawn { name: String, reason: String },
+    Respawn {
+        name: String,
+        reason: String,
+    },
     /// Legacy alias treated as Diagnose (match arm still accepts it).
     #[allow(dead_code)]
-    SelfHeal { name: String, reason: String },
+    SelfHeal {
+        name: String,
+        reason: String,
+    },
     Wait,
 }
 
@@ -1441,8 +1466,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     let mut wait_secs: u64 = params.active_interval_secs.max(5);
     // agents that received DispatchImmediate and await working confirmation
     // (bd-event-dispatch double-dispatch guard)
-    let mut dispatch_pending: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut dispatch_pending: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         iteration += 1;
@@ -1652,8 +1676,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         let mut any_work = false;
         for action in &actions {
             match action {
-                LoopAction::Send { name, text }
-                | LoopAction::DispatchImmediate { name, text } => {
+                LoopAction::Send { name, text } | LoopAction::DispatchImmediate { name, text } => {
                     // context guard: if the idle agent is context-exhausted,
                     // respawn a fresh instance instead of delegating to it
                     let verdict = ctx
@@ -1752,11 +1775,48 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 }
                 LoopAction::Blocked { name } => {
                     if params.on_blocked == "mail" {
+                        // bd-blocked-escalation-protocol: compute the tier from
+                        // the persisted first_blocked_ts (resume-continuous),
+                        // notify via the tiered leaf, persist the updated state.
+                        let now_us = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_micros() as i64)
+                            .unwrap_or(0);
+                        let tier = {
+                            let mut al = crate::state::load_active_loop(&params.project)
+                                .map_err(map_err)?
+                                .unwrap_or_else(|| {
+                                    crate::state::ActiveLoop::new(
+                                        "swarm-loop".to_string(),
+                                        serde_json::to_value(&params)
+                                            .unwrap_or(serde_json::Value::Null),
+                                        crate::state::now_iso(),
+                                    )
+                                });
+                            let st = al.escalation.entry(name.clone()).or_insert_with(|| {
+                                crate::state::EscalationState {
+                                    first_blocked_ts: now_us,
+                                    ping_count: 0,
+                                    last_tail: String::new(),
+                                }
+                            });
+                            let t =
+                                escalation_tier(st.first_blocked_ts, now_us, params.interval_secs);
+                            st.ping_count = st.ping_count.saturating_add(1);
+                            let _ = crate::state::save_active_loop(&params.project, &al);
+                            match t {
+                                EscalationTier::T0 => 0u32,
+                                EscalationTier::T1 => 1,
+                                EscalationTier::T2 => 2,
+                                EscalationTier::T3 => 3,
+                            }
+                        };
                         ctx.run(
                             notify_blocked,
                             NotifyArgs {
                                 project: params.project.clone(),
                                 name: name.clone(),
+                                tier,
                             },
                         )
                         .await?;
@@ -1821,8 +1881,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         }
                     }
                 }
-                LoopAction::Diagnose { name, reason }
-                | LoopAction::SelfHeal { name, reason } => {
+                LoopAction::Diagnose { name, reason } | LoopAction::SelfHeal { name, reason } => {
                     // SelfHeal is a legacy alias for Diagnose (pane_exited path).
                     let _ = ctx
                         .run(
@@ -2078,7 +2137,8 @@ mod tests {
             name: name.to_string(),
             status: status.to_string(),
             kind: String::new(),
-            pane_id: String::new(),        }
+            pane_id: String::new(),
+        }
     }
 
     fn st_pane(name: &str, status: &str, pane: &str) -> AgentState {
@@ -3054,7 +3114,10 @@ mod tests {
         let batch = parse_poll_events_batch(raw, 0).unwrap();
         assert!(batch.events.is_empty());
         assert_eq!(batch.max_seq, 7);
-        assert_eq!(batch.stream_error.as_deref(), Some("subscribe failed: down"));
+        assert_eq!(
+            batch.stream_error.as_deref(),
+            Some("subscribe failed: down")
+        );
     }
 
     #[test]
@@ -3103,7 +3166,7 @@ mod tests {
         );
         assert!(a2.is_none());
         assert_eq!(queue, vec!["p2".to_string()]); // only one pop
-        // working clears pending
+                                                   // working clears pending
         let a3 = route_event(
             &states,
             &pev("pane.agent_status_changed", "%1", "working", 3),
@@ -3264,6 +3327,212 @@ mod tests {
         let s2 = parse_poll_entry(&v2).unwrap();
         assert!(s2.pane_id.is_empty());
     }
+
+    // ---- bd-test-event-poll-parity: decision-level differential ----
+    // Live herdr session: tests/event_poll_parity.rs (#[ignore]).
+    // Pure tests prove plan_actions vs route_event agree on (agent, action, content).
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct DispatchRec {
+        agent: String,
+        kind: &'static str,
+        content: String,
+    }
+
+    fn rec_from_action(a: &LoopAction) -> Option<DispatchRec> {
+        match a {
+            LoopAction::Send { name, text } | LoopAction::DispatchImmediate { name, text } => {
+                Some(DispatchRec {
+                    agent: name.clone(),
+                    kind: "send",
+                    content: text.clone(),
+                })
+            }
+            LoopAction::Blocked { name } => Some(DispatchRec {
+                agent: name.clone(),
+                kind: "blocked",
+                content: String::new(),
+            }),
+            LoopAction::Diagnose { name, reason } | LoopAction::SelfHeal { name, reason } => {
+                Some(DispatchRec {
+                    agent: name.clone(),
+                    kind: "diagnose",
+                    content: reason.clone(),
+                })
+            }
+            LoopAction::Respawn { name, reason } => Some(DispatchRec {
+                agent: name.clone(),
+                kind: "respawn",
+                content: reason.clone(),
+            }),
+            LoopAction::Nudge { name } => Some(DispatchRec {
+                agent: name.clone(),
+                kind: "nudge",
+                content: String::new(),
+            }),
+            LoopAction::Wait => None,
+        }
+    }
+
+    fn poll_dispatch(states: &[AgentState], queue: &mut Vec<String>) -> Vec<DispatchRec> {
+        plan_actions(states, queue, None)
+            .iter()
+            .filter_map(rec_from_action)
+            .collect()
+    }
+
+    fn event_dispatch(
+        states: &[AgentState],
+        events: &[PollEvent],
+        queue: &mut Vec<String>,
+        pending: &mut std::collections::HashSet<String>,
+    ) -> Vec<DispatchRec> {
+        let mut out = Vec::new();
+        for ev in events {
+            if let Some(a) = route_event(states, ev, queue, pending) {
+                if let Some(r) = rec_from_action(&a) {
+                    out.push(r);
+                }
+            }
+        }
+        out
+    }
+
+    fn parity_report(poll: &[DispatchRec], event: &[DispatchRec]) -> String {
+        format!("poll={poll:?}\nevent={event:?}")
+    }
+
+    #[test]
+    fn event_poll_parity_done_dispatch_same_content() {
+        let states = vec![st_pane("a", "done", "%1")];
+        let mut q_poll = vec!["p1".into(), "p2".into()];
+        let mut q_ev = q_poll.clone();
+        let poll = poll_dispatch(&states, &mut q_poll);
+        let mut pending = std::collections::HashSet::new();
+        let event = event_dispatch(
+            &states,
+            &[pev("pane.agent_status_changed", "%1", "done", 1)],
+            &mut q_ev,
+            &mut pending,
+        );
+        assert_eq!(poll, event, "{}", parity_report(&poll, &event));
+        assert_eq!(poll[0].content, "p1");
+        assert_eq!(q_poll, q_ev);
+    }
+
+    #[test]
+    fn event_poll_parity_double_dispatch_guard() {
+        let states = vec![st_pane("a", "done", "%1")];
+        let mut q = vec!["p1".into(), "p2".into()];
+        let mut pending = std::collections::HashSet::new();
+        let e1 = event_dispatch(
+            &states,
+            &[
+                pev("pane.agent_status_changed", "%1", "done", 1),
+                pev("pane.agent_status_changed", "%1", "done", 2),
+            ],
+            &mut q,
+            &mut pending,
+        );
+        assert_eq!(e1.len(), 1, "double-dispatch guard: {e1:?}");
+        assert_eq!(e1[0].content, "p1");
+        assert_eq!(q, vec!["p2".to_string()]);
+    }
+
+    #[test]
+    fn event_poll_parity_blocked_identical() {
+        let states = vec![st_pane("a", "blocked", "%1")];
+        let mut q_poll = vec!["p1".into()];
+        let mut q_ev = q_poll.clone();
+        let poll = poll_dispatch(&states, &mut q_poll);
+        let mut pending = std::collections::HashSet::new();
+        let event = event_dispatch(
+            &states,
+            &[pev("pane.agent_status_changed", "%1", "blocked", 1)],
+            &mut q_ev,
+            &mut pending,
+        );
+        assert_eq!(poll, event, "{}", parity_report(&poll, &event));
+        assert_eq!(poll[0].kind, "blocked");
+        assert_eq!(q_poll.len(), 1);
+        assert_eq!(q_ev.len(), 1);
+    }
+
+    #[test]
+    fn event_poll_parity_unknown_no_dispatch() {
+        let states = vec![st_pane("a", "unknown", "%1")];
+        let mut q_poll = vec!["p1".into()];
+        let mut q_ev = q_poll.clone();
+        let poll = poll_dispatch(&states, &mut q_poll);
+        let mut pending = std::collections::HashSet::new();
+        let event = event_dispatch(
+            &states,
+            &[pev("pane.agent_status_changed", "%1", "unknown", 1)],
+            &mut q_ev,
+            &mut pending,
+        );
+        assert!(poll.is_empty(), "poll must not send to unknown: {poll:?}");
+        assert!(
+            event.is_empty(),
+            "event must not send to unknown: {event:?}"
+        );
+        assert_eq!(q_poll, vec!["p1".to_string()]);
+        assert_eq!(q_ev, vec!["p1".to_string()]);
+    }
+
+    #[test]
+    fn event_poll_parity_exited_diagnose_not_send() {
+        let states = vec![st_pane("a", "working", "%1")];
+        let mut q = vec!["p1".into()];
+        let mut pending = std::collections::HashSet::new();
+        let event = event_dispatch(
+            &states,
+            &[pev("pane.exited", "%1", "exited", 1)],
+            &mut q,
+            &mut pending,
+        );
+        assert_eq!(event.len(), 1);
+        assert_eq!(event[0].kind, "diagnose");
+        assert_eq!(event[0].content, "pane_exited");
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn event_poll_parity_agent_name_subst_identical() {
+        let states = vec![st_pane("fly-oc", "idle", "%2")];
+        let mut q_poll = vec!["go {AGENT_NAME}".into()];
+        let mut q_ev = q_poll.clone();
+        let poll = poll_dispatch(&states, &mut q_poll);
+        let mut pending = std::collections::HashSet::new();
+        let event = event_dispatch(
+            &states,
+            &[pev("pane.agent_status_changed", "%2", "idle", 1)],
+            &mut q_ev,
+            &mut pending,
+        );
+        assert_eq!(poll, event, "{}", parity_report(&poll, &event));
+        assert_eq!(poll[0].content, "go fly-oc");
+    }
+
+    #[test]
+    fn event_poll_parity_self_heal_diagnose_tick_agreement() {
+        let mut hs = HealState::default();
+        for _ in 0..2 {
+            assert_eq!(
+                self_heal_step(&mut hs, "unknown", false, 3, 2),
+                HealAction::None
+            );
+        }
+        assert_eq!(
+            self_heal_step(&mut hs, "unknown", false, 3, 2),
+            HealAction::Diagnose
+        );
+        let states = vec![st_pane("a", "unknown", "%1")];
+        let mut q = vec!["p1".into()];
+        let poll = poll_dispatch(&states, &mut q);
+        assert!(poll.is_empty());
+        assert_eq!(q, vec!["p1".to_string()]);
+    }
 }
 
 #[cfg(test)]
@@ -3307,7 +3576,10 @@ mod resume_dedup_tests {
     #[test]
     fn escalation_starts_at_t0() {
         // first detection: elapsed < 2 intervals -> T0
-        assert_eq!(escalation_tier(1_000_000, 1_000_000, 30), EscalationTier::T0);
+        assert_eq!(
+            escalation_tier(1_000_000, 1_000_000, 30),
+            EscalationTier::T0
+        );
         // just under 2 intervals
         assert_eq!(escalation_tier(0, 59_999_999, 30), EscalationTier::T0);
     }
