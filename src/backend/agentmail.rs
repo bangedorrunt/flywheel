@@ -149,13 +149,20 @@ impl MailBackend for AgentMailMcpBackend {
 
     fn renew(
         &mut self,
-        _project_key: &str,
+        project_key: &str,
         _agent: &str,
-        _extend_seconds: u64,
-        _paths: Option<&[String]>,
+        extend_seconds: u64,
+        paths: Option<&[String]>,
     ) -> Result<Value> {
-        // Phase 3: bd-mail-lease-renewal-durable.
-        Err(self.unsupported("renew"))
+        // Mail carries the agent name as a field; the explicit `agent` param
+        // is for the toron backend's per-agent targeting. Here we act as self.
+        // IDs are not exposed through the trait surface — `None` renews all of
+        // this agent's active reservations (bd-mail-lease-renewal-durable).
+        let _ = _agent; // explicit-ignore: documented above
+        let agent = self.mail.name.clone();
+        self.mail
+            .renew(project_key, &agent, extend_seconds, paths, None)
+            .map_err(BackendError::Other)
     }
 
     fn conflicts(&mut self, project_key: &str, _agent: &str, paths: &[String]) -> Result<Value> {
@@ -262,6 +269,27 @@ mod tests {
         assert_eq!(b.name(), "agentmail");
     }
 
+    /// `renew` delegates to `Mail::renew` (bd-mail-lease-renewal-durable) —
+    /// compile-time signature guard; no HTTP is made (dummy URL).
+    #[test]
+    fn renew_is_real_delegation_not_unsupported() {
+        let mail = Mail::from_config(Some(&crate::config::MailConfig {
+            url: Some("http://127.0.0.1:9999".into()),
+            token: None,
+            name: Some("test-orchestrator".into()),
+        }))
+        .expect("from_config ok")
+        .expect("Some");
+        let mut b = AgentMailMcpBackend::new(mail);
+        // an Unsupported error would mean the Phase-3 stub is still in place;
+        // a connection failure means it genuinely delegated to Mail::renew
+        match b.renew("p", "a", 1200, None) {
+            Err(BackendError::Other(_)) => {}
+            Err(e) => panic!("renew should delegate (Other), got {e:?}"),
+            Ok(_) => panic!("renew cannot succeed against a dummy URL"),
+        }
+    }
+
     /// An Unsupported method returns the right BackendError shape (no panic,
     /// no silent Ok). Covers the Phase-3 stubs in one parameterized check.
     #[test]
@@ -275,13 +303,13 @@ mod tests {
         .expect("Some");
         let mut b = AgentMailMcpBackend::new(mail);
         // register_agent USED to be Unsupported; bd-mail-register-on-spawn
-        // graduated it to real delegation (calls Mail::register_agent). The
-        // remaining 10 stay Unsupported until their Phase-3 beads land.
+        // graduated it to real delegation (calls Mail::register_agent).
+        // renew graduated with bd-mail-lease-renewal-durable. The remaining 9
+        // stay Unsupported until their Phase-3 beads land.
         let cases: Vec<(&str, std::result::Result<Value, BackendError>)> = vec![
             ("reply", b.reply("p", 1, "x", None)),
             ("ack", b.ack("p", "a", 1)),
             ("mark_read", b.mark_read("p", "a", 1)),
-            ("renew", b.renew("p", "a", 60, None)),
             (
                 "slot_acquire",
                 b.slot_acquire("p", "a", "cargo", true, 1800),
