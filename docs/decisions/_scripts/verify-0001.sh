@@ -26,11 +26,14 @@ else
   bad "register_agent not called in spawn path"
 fi
 
-# (c) event-driven dispatch present (events.subscribe used in loop, not just defined)
-if grep -rq 'subscribe' src/durable.rs src/main.rs 2>/dev/null; then
-  ok "event subscription wired into loop"
+# (c) event-driven dispatch present: the loop BOTH subscribes to push events
+# (__poll_events leaf, forward-only latency path) AND keeps the heartbeat
+# __poll snapshot as the correctness floor. The old check grepped for the word
+# 'subscribe' which appears in comments — this checks actual call sites.
+if grep -q 'poll_events,' src/durable.rs && grep -q 'poll_swarm,' src/durable.rs; then
+  ok "event wake + heartbeat poll both wired in swarm_loop"
 else
-  bad "event subscription not wired into loop"
+  bad "swarm_loop missing poll_events wake or poll_swarm heartbeat"
 fi
 
 # (d) bead DAG acyclic
@@ -44,7 +47,7 @@ fi
 if grep -rq 'agent-mail/identity' src/ 2>/dev/null; then
   ok "pane-identity bridge writes identity file"
 else
-  warn "pane-identity bridge not detected yet (Phase 3)"
+  bad "pane-identity bridge missing (ADR-0001 A4 gap)"
 fi
 
 echo

@@ -22,9 +22,32 @@ fn herdr_up() -> bool {
         .unwrap_or(false)
 }
 
-/// Default gate: unit suite name contract + simulated event-vs-poll latency.
+/// Default gate: the PURE decision-parity suite (route_event vs plan_actions)
+/// must exist and cover the dispatch semantics — this is the real always-on
+/// parity contract (review-fix F9). The simulated-timeline check below is
+/// supplementary; the authoritative pure suite lives in `durable::tests` and
+/// runs as part of `cargo test`.
 #[test]
 fn event_poll_parity_unit_suite_is_the_default_gate() {
+    // Guard against the pure parity suite being deleted or renamed silently:
+    // the five decision-parity tests must exist in durable.rs (they run with
+    // the default `cargo test`, so this is a static contract check).
+    let src = std::fs::read_to_string("src/durable.rs").unwrap_or_default();
+    for name in [
+        "event_poll_parity_done_dispatch_same_content",
+        "event_poll_parity_double_dispatch_guard",
+        "event_poll_parity_blocked_identical",
+        "event_poll_parity_unknown_no_dispatch",
+        "event_poll_parity_exited_diagnose_not_send",
+        "event_poll_parity_agent_name_subst_identical",
+        "event_poll_parity_self_heal_diagnose_tick_agreement",
+    ] {
+        assert!(
+            src.contains(name),
+            "pure parity test {name} missing from src/durable.rs — the event/poll \
+             dispatch contract must stay covered"
+        );
+    }
     // Simulated timeline: events at t=0,50,100ms; poll samples every 300ms.
     // Event path dispatches at event time; poll path only at sample boundaries.
     let event_times_ms = [0u64, 50, 100];
@@ -66,19 +89,11 @@ fn live_event_vs_poll_session_identical_dispatch() {
 
     // Use a disposable project path that may not have a workspace — both leaves
     // must soft-fail with structured JSON, not hang.
-    let project = format!(
-        "/tmp/flywheel-parity-{}",
-        std::process::id()
-    );
+    let project = format!("/tmp/flywheel-parity-{}", std::process::id());
 
     let t0 = Instant::now();
     let events = Command::new(flywheel())
-        .args([
-            "__poll_events",
-            &project,
-            "--timeout-ms",
-            "400",
-        ])
+        .args(["__poll_events", &project, "--timeout-ms", "400"])
         .output()
         .expect("spawn __poll_events");
     let event_elapsed = t0.elapsed();
