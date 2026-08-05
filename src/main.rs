@@ -1075,6 +1075,10 @@ fn robot_snapshot(cfg: &Config) -> Result<Value> {
     }))
 }
 
+/// Only used by the serve-gated SSE server; gate it so the lean
+/// backend-only build (`--no-default-features --features backend-herdr,
+/// mail-agentmail`) has no dead-code warning (bd-cargo-feature-flags).
+#[cfg(feature = "serve")]
 fn chrono_like_ts() -> String {
     state::now_iso()
 }

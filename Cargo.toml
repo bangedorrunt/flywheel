@@ -20,8 +20,19 @@ ureq = { version = "2", features = ["json"] }
 resonate-sdk = "0.6.0"
 
 [features]
-default = ["serve"]
-serve = ["dep:axum", "dep:tokio", "dep:tokio-stream", "dep:futures-core"]
+# Default build: the `serve` HTTP surface + the two default backends (herdr
+# multiplexer + agent-mail mail). Optional backends (superlogical/tmux/toron)
+# are opt-in; their stub impls land in bd-toron-superlogical-stubs (R0.7), and
+# their heavy deps (nostr-sdk etc.) only pull when enabled.
+default = ["serve", "backend-herdr", "mail-agentmail"]
+serve = ["dep:axum", "dep:tokio-stream", "dep:futures-core"]
+# Multiplexer backends (ADR-0002)
+backend-herdr = []
+backend-superlogical = []
+backend-tmux = []
+# Mail backends (ADR-0002)
+mail-agentmail = []
+mail-toron = []
 
 [dependencies.axum]
 version = "0.8"
@@ -31,10 +42,12 @@ optional = true
 version = "0.3"
 optional = true
 
+# tokio is a HARD dep: the durable loop + leaves (cmd_loop, __poll/__send)
+# create a tokio Runtime unconditionally (src/main.rs:2541,3387,3849). Only the
+# HTTP serve surface (axum + stream/futures helpers) is feature-gated.
 [dependencies.tokio]
 version = "1"
 features = ["rt-multi-thread", "macros", "net", "time"]
-optional = true
 
 [dependencies.tokio-stream]
 version = "0.1"

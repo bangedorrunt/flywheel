@@ -44,10 +44,13 @@ pub fn resolve_mail_name(cfg: &Config) -> String {
 }
 
 /// Construct the active multiplexer backend. Default = herdr; unrecognized →
-/// actionable error (no silent fallback to the default — ADR-0002 §6).
+/// actionable error (no silent fallback to the default — ADR-0002 §6). The
+/// `backend-herdr` cargo feature gates the herdr impl; when it's off, the
+/// name falls through to `other` with a feature-aware error.
 pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> {
     let name = resolve_backend_name(cfg);
     match name.as_str() {
+        #[cfg(feature = "backend-herdr")]
         "herdr" => {
             let client = HerdrClient::connect(Some(&cfg.socket_path()))
                 .map_err(BackendError::Other)?;
@@ -60,20 +63,18 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
             reason: "{name} backend not yet wired (stub lands in bd-toron-superlogical-stubs); set FLYWHEEL_BACKEND=herdr"
                 .replacen("{name}", &name, 1),
         }),
-        other => Err(BackendError::Unsupported {
-            backend: other.to_string(),
-            method: "(factory)",
-            reason: "unknown multiplexer backend '{other}'; set FLYWHEEL_BACKEND=herdr (or superlogical|tmux once stubbed)"
-                .replacen("{other}", other, 1),
-        }),
+        other => Err(backend_not_compiled_or_unknown(other, "multiplexer", "FLYWHEEL_BACKEND")),
     }
 }
 
 /// Construct the active mail backend. Default = agentmail; unrecognized →
-/// actionable error.
+/// actionable error. The `mail-agentmail` cargo feature gates the agentmail
+/// impl; when it's off, the name falls through to `other` with a feature-aware
+/// error.
 pub fn mail_backend(cfg: &Config) -> Result<Box<dyn MailBackend>> {
     let name = resolve_mail_name(cfg);
     match name.as_str() {
+        #[cfg(feature = "mail-agentmail")]
         "agentmail" => {
             let mail = Mail::from_config(cfg.agent_mail.as_ref())
                 .map_err(BackendError::Other)?
@@ -94,13 +95,52 @@ pub fn mail_backend(cfg: &Config) -> Result<Box<dyn MailBackend>> {
             method: "(factory)",
             reason: "toron backend not yet wired (stub lands in bd-toron-superlogical-stubs / real impl at R1); set FLYWHEEL_MAIL=agentmail".to_string(),
         }),
-        other => Err(BackendError::Unsupported {
-            backend: other.to_string(),
-            method: "(factory)",
-            reason: "unknown mail backend '{other}'; set FLYWHEEL_MAIL=agentmail (or toron once wired)"
-                .replacen("{other}", other, 1),
-        }),
+        other => Err(backend_not_compiled_or_unknown(other, "mail", "FLYWHEEL_MAIL")),
     }
+}
+
+/// Feature-aware error for a backend name that isn't compiled in or is unknown.
+/// The single message covers both cases: a known backend whose cargo feature is
+/// off (user must enable it) and a genuinely unknown name — both resolve the
+/// same way (set the env var to a compiled backend).
+fn backend_not_compiled_or_unknown(name: &str, _kind: &str, env_var: &str) -> BackendError {
+    BackendError::Unsupported {
+        backend: name.to_string(),
+        method: "(factory)",
+        reason: format!(
+            "backend '{name}' is not compiled in (enable its cargo feature) or unknown; set {env_var} to a compiled backend"
+        ),
+    }
+}
+
+/// The backends compiled into this binary (feature-gated). Used by
+/// `flywheel backend list` (R0.10) and by tests to assert the feature matrix.
+///
+/// clippy-clean pattern: each feature contributes a cfg-gated slice; the vec
+/// concatenates them (no `push`-after-`Vec::new` lint).
+pub fn compiled_backends() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    #[cfg(feature = "backend-herdr")]
+    {
+        out.extend(["herdr"]);
+    }
+    #[cfg(feature = "backend-superlogical")]
+    {
+        out.extend(["superlogical"]);
+    }
+    #[cfg(feature = "backend-tmux")]
+    {
+        out.extend(["tmux"]);
+    }
+    #[cfg(feature = "mail-agentmail")]
+    {
+        out.extend(["agentmail"]);
+    }
+    #[cfg(feature = "mail-toron")]
+    {
+        out.extend(["toron"]);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -199,5 +239,46 @@ mod tests {
             Ok(_) => panic!("expected Unsupported for superlogical, got Ok (silent fallback)"),
         }
         std::env::remove_var("FLYWHEEL_BACKEND");
+    }
+
+    /// The default build compiles herdr + agentmail (the `default` feature set
+    /// is `["serve", "backend-herdr", "mail-agentmail"]`). This is the
+    /// feature-matrix contract — compiled_backends() must reflect the actual
+    /// cfg gates (it's what `flywheel backend list` will surface in R0.10).
+    #[test]
+    fn default_build_compiles_herdr_and_agentmail() {
+        let backends = super::compiled_backends();
+        assert!(backends.contains(&"herdr"), "herdr missing: {backends:?}");
+        assert!(
+            backends.contains(&"agentmail"),
+            "agentmail missing: {backends:?}"
+        );
+        // superlogical/tmux/toron are NOT in the default build (stubs land in
+        // R0.7; their features are off by default)
+        assert!(
+            !backends.contains(&"superlogical"),
+            "superlogical should be opt-in"
+        );
+        assert!(!backends.contains(&"tmux"), "tmux should be opt-in");
+        assert!(!backends.contains(&"toron"), "toron should be opt-in");
+    }
+
+    /// A backend name with its feature off produces the feature-aware error
+    /// (no silent fallback). Simulated via backend_not_compiled_or_unknown
+    /// directly, since a unit test can't toggle cargo cfg at runtime.
+    #[test]
+    fn not_compiled_backend_error_is_actionable() {
+        let e = super::backend_not_compiled_or_unknown(
+            "superlogical",
+            "multiplexer",
+            "FLYWHEEL_BACKEND",
+        );
+        let s = e.to_string();
+        assert!(s.contains("superlogical"), "names the backend: {s}");
+        assert!(
+            s.contains("cargo feature"),
+            "mentions enabling the feature: {s}"
+        );
+        assert!(s.contains("FLYWHEEL_BACKEND"), "points at the env var: {s}");
     }
 }
