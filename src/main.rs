@@ -3127,13 +3127,34 @@ fn cmd_xproj(cfg: &Config, cmd: &XprojCmd) -> Result<()> {
             let ts = crate::state::now_iso().replace(['-', ':'], "");
             let thread = format!("xproj-{recipe}-{ts}");
             let subject = format!("[xproj] run {workers}-worker swarm recipe={recipe}");
+            // review-fix F3: `send_message` has NO to_project param — agent-mail
+            // delivers by recipient NAME across projects once the contact link is
+            // approved (see `xproj request --to-project` for the handshake; the
+            // receiver's loop polls ITS OWN project inbox via __xproj-inbox).
+            // `to_project` is therefore routing CONTEXT, not a delivery target:
+            // validate the path, carry it in the body so the receiver + logs have
+            // full context, and surface it in the JSON. Never silently drop it.
+            let to_project_validated: Option<String> = if to_project.is_empty() {
+                None
+            } else {
+                let p = project_dir(cfg, to_project);
+                if !p.is_dir() {
+                    eprintln!(
+                        "flywheel: warning: --to-project {} is not a directory — delivery is name-based; the contact handshake (xproj request --to-project) is what authorizes cross-project routing",
+                        p.display()
+                    );
+                }
+                Some(to_project.to_string())
+            };
             let body_md = format!(
-                "recipe={recipe}\nworkers={workers}\nproduct={product}\n\n{body}\n\n\
+                "recipe={recipe}\nworkers={workers}\nproduct={product}\n{}\n\n{body}\n\n\
                  Reply results in this thread. Receiver: spawn workers in your project, \
-                 run the recipe/workflow, reply a summary here."
+                 run the recipe/workflow, reply a summary here.",
+                to_project_validated
+                    .as_ref()
+                    .map(|tp| format!("to_project={tp}"))
+                    .unwrap_or_default()
             );
-            // send into the local project inbox of the remote agent identity
-            // (cross-project delivery relies on approved contact + product search)
             let v = mail.send(
                 &key,
                 &[to_mail],
@@ -3150,7 +3171,8 @@ fn cmd_xproj(cfg: &Config, cmd: &XprojCmd) -> Result<()> {
                 "product": product,
                 "recipe": recipe,
                 "workers": workers,
-                "send": v,
+                "to_project": to_project_validated,
+                "delivery": v,
             }));
         }
         XprojCmd::Parse { text } => match parse_xproj_request(text) {
@@ -6180,7 +6202,7 @@ fn cmd_internal_xproj_spawn(
             Some(recipe),
             &[],
             None,
-            true, // background workspace (no_focus — must not steal terminal focus)
+            true,  // background workspace (no_focus — must not steal terminal focus)
             false, // not peer-aware by default
         )
     };
@@ -6748,6 +6770,17 @@ mod xproj_tests {
         assert!(parse_xproj_request("recipe=foo").is_none());
         assert!(parse_xproj_request("[xproj] hello").is_none());
         assert!(parse_xproj_request("").is_none());
+    }
+
+    /// review-fix F3: the send body now carries a `to_project=` routing-context
+    /// line; the receiver's parse must tolerate it (recipe/workers still win).
+    #[test]
+    fn parse_xproj_request_tolerates_to_project_line() {
+        let t = "[xproj] run\nrecipe=backtest-5m\nworkers=4\nto_project=/Users/x/workspace/flywheel\nstrategy=X\n";
+        let r = parse_xproj_request(t).expect("parse");
+        assert_eq!(r.recipe, "backtest-5m");
+        assert_eq!(r.workers, 4);
+        assert!(r.params.contains("strategy=X"));
     }
 
     #[test]
