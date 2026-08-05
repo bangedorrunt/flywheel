@@ -1,5 +1,7 @@
 //! XDG configuration: ~/.config/flywheel/{config.toml, recipes.toml, workflows.toml, pipelines.toml, policy.toml}
-//! Precedence: flags > env (FLYWHEEL_SOCKET / FLYWHEEL_ROOT / FLYWHEEL_TIMEOUT) > config file > defaults.
+//! Precedence: flags > env (FLYWHEEL_SOCKET / FLYWHEEL_ROOT / FLYWHEEL_TIMEOUT /
+//! FLYWHEEL_BACKEND / FLYWHEEL_MAIL) > `.env` (dotenvy, project-local) >
+//! config file > defaults.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,6 +21,17 @@ pub struct MailConfig {
     pub name: Option<String>,
 }
 
+/// Backend selection (ADR-0002). `[backend] multiplexer` / `[backend] mail` in
+/// config.toml; overridden by `FLYWHEEL_BACKEND` / `FLYWHEEL_MAIL` env (which
+/// may themselves be set by `.env`). Defaults: herdr / agentmail.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BackendConfig {
+    /// multiplexer backend name (`herdr` default; `superlogical`/`tmux` future)
+    pub multiplexer: String,
+    /// mail backend name (`agentmail` default; `toron` future)
+    pub mail: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     /// herdr socket path (default ~/.config/herdr/herdr.sock)
@@ -33,10 +46,16 @@ pub struct Config {
     pub resonate_url: Option<String>,
     /// short name -> herdr agent kind (default: oc=opencode, pi=pi, gk=grok)
     pub kinds: Option<BTreeMap<String, String>>,
+    /// backend selection (ADR-0002)
+    pub backend: Option<BackendConfig>,
 }
 
 impl Config {
     pub fn load() -> Result<Self> {
+        // Load .env first (non-fatal if absent). dotenvy does NOT override
+        // already-set env vars, so a real env var wins over .env (ADR-0002 §3.3
+        // precedence: flag > env > .env > config.toml > default).
+        let _ = dotenvy::dotenv();
         let path = config_file();
         let mut cfg: Config = if path.exists() {
             let raw = std::fs::read_to_string(&path)
@@ -78,7 +97,11 @@ impl Config {
         self.workspace_root
             .clone()
             .map(PathBuf::from)
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")).join("workspace"))
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("/"))
+                    .join("workspace")
+            })
     }
 
     pub fn resonate_url(&self) -> Option<String> {
@@ -150,8 +173,8 @@ impl Recipes {
         if !path.exists() {
             return Ok(Recipes::default());
         }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))
     }
 }
@@ -191,8 +214,8 @@ impl Workflows {
         if !path.exists() {
             return Ok(Workflows::default());
         }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))
     }
 }
@@ -211,8 +234,8 @@ impl Pipelines {
         if !path.exists() {
             return Ok(Pipelines::default());
         }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))
     }
 }
@@ -233,18 +256,21 @@ impl Policy {
         if !path.exists() {
             return Ok(Policy::default());
         }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))
     }
 
     /// Returns the first matching deny pattern, if any.
     pub fn violation(&self, msg: &str) -> Option<&str> {
-        self.deny.iter().find(|p| {
-            regex_lite::Regex::new(p)
-                .map(|re| re.is_match(msg))
-                .unwrap_or_else(|_| msg.contains(p.as_str()))
-        }).map(|s| s.as_str())
+        self.deny
+            .iter()
+            .find(|p| {
+                regex_lite::Regex::new(p)
+                    .map(|re| re.is_match(msg))
+                    .unwrap_or_else(|_| msg.contains(p.as_str()))
+            })
+            .map(|s| s.as_str())
     }
 }
 
