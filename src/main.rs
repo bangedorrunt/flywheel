@@ -25,7 +25,9 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
 
 use config::{Config, Recipe, WorkflowStep};
-use herdr::{AgentInfo, AgentStatus, Client, SendVerdict, Subscription, WaitOptions, classify_send_result};
+use herdr::{
+    classify_send_result, AgentInfo, AgentStatus, Client, SendVerdict, Subscription, WaitOptions,
+};
 use output::{die, dim, error, kind_paint, ok as paint_ok, print_json, status_paint};
 use state::{log_event, EventKind};
 
@@ -47,7 +49,16 @@ fn stage_prompt(name: &str) -> Result<&'static str> {
         .iter()
         .find(|(n, _)| *n == name)
         .map(|(_, p)| *p)
-        .ok_or_else(|| anyhow!("unknown stage: {name} (known: {})", STAGES.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")))
+        .ok_or_else(|| {
+            anyhow!(
+                "unknown stage: {name} (known: {})",
+                STAGES
+                    .iter()
+                    .map(|(n, _)| *n)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
 }
 
 // ---- CLI surface ----
@@ -81,9 +92,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Scaffold a project (ensure dir + .beads) without spawning
-    Init {
-        project: String,
-    },
+    Init { project: String },
     /// Spawn a swarm: herdr workspace + agent panes
     Spawn {
         project: String,
@@ -116,9 +125,7 @@ enum Commands {
         all: bool,
     },
     /// Show one swarm's agents and states
-    Status {
-        project: Option<String>,
-    },
+    Status { project: Option<String> },
     /// Send a prompt to one or more agents (with optional wait)
     Send {
         project: String,
@@ -222,9 +229,7 @@ enum Commands {
         confirm_timeout_ms: Option<u64>,
     },
     /// Query the state of a durable loop invocation on the Resonate server
-    LoopStatus {
-        project: String,
-    },
+    LoopStatus { project: String },
     /// Zoom a pane (herdr pane.zoom)
     Zoom {
         project: String,
@@ -279,17 +284,11 @@ enum Commands {
         cmd: CheckpointCmd,
     },
     /// Event timeline of a swarm
-    Timeline {
-        project: String,
-    },
+    Timeline { project: String },
     /// Audit trail (the full event log)
-    Audit {
-        project: String,
-    },
+    Audit { project: String },
     /// Saved checkpoints (alias of checkpoint list)
-    History {
-        project: String,
-    },
+    History { project: String },
     /// What changed since a checkpoint
     Changes {
         project: String,
@@ -305,9 +304,7 @@ enum Commands {
         recipe: Option<String>,
     },
     /// Aggregate counters over the event log
-    Analytics {
-        project: String,
-    },
+    Analytics { project: String },
     /// Named spawn recipes
     Recipes {
         #[command(subcommand)]
@@ -362,6 +359,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// Backend discovery + selection (ADR-0002 pluggable backends)
+    Backend {
+        #[command(subcommand)]
+        cmd: BackendCmd,
+    },
     /// Reinstall the binary from source (cargo install --path)
     Upgrade,
     /// Interactive walkthrough
@@ -373,9 +375,20 @@ enum Commands {
     },
     /// internal: poll swarm state as JSON (durable workflow leaf)
     #[command(name = "__poll", hide = true)]
-    __Poll {
+    __Poll { project: String, to: String },
+    /// internal: block up to timeout collecting herdr push events (durable leaf)
+    ///
+    /// Forward-only `events.subscribe` — no replay. The loop's `__poll`
+    /// heartbeat is the correctness floor (bd-event-subscribe-reactor).
+    #[command(name = "__poll_events", hide = true)]
+    __PollEvents {
         project: String,
-        to: String,
+        /// max wait in ms collecting events (default 30000)
+        #[arg(long, default_value = "30000")]
+        timeout_ms: u64,
+        /// best-effort in-run dedup: skip events with seq <= this value
+        #[arg(long)]
+        after_seq: Option<u64>,
     },
     /// internal: send one prompt (durable workflow leaf)
     #[command(name = "__send", hide = true)]
@@ -418,10 +431,7 @@ enum Commands {
     },
     /// internal: notify a blocked agent via agent-mail (durable workflow leaf)
     #[command(name = "__mail-blocked", hide = true)]
-    __MailBlocked {
-        project: String,
-        name: String,
-    },
+    __MailBlocked { project: String, name: String },
     /// internal: renew the orchestrator's active file reservations
     /// (durable workflow leaf, bd-mail-lease-renewal-durable)
     #[command(name = "__renew-leases", hide = true)]
@@ -431,28 +441,16 @@ enum Commands {
     },
     /// internal: list ready beads as JSON (durable workflow leaf)
     #[command(name = "__ready", hide = true)]
-    __Ready {
-        project: String,
-    },
-    /// internal leaf: newest last-sent record for (agent, prompt-hash).
-
-/// internal: list in-progress beads as JSON (durable workflow leaf)
+    __Ready { project: String },
+    /// internal: list in-progress beads as JSON (durable workflow leaf)
     #[command(name = "__inprogress", hide = true)]
-    __Inprogress {
-        project: String,
-    },
+    __Inprogress { project: String },
     /// internal: agent kind as text (durable workflow leaf)
     #[command(name = "__kind", hide = true)]
-    __Kind {
-        project: String,
-        name: String,
-    },
+    __Kind { project: String, name: String },
     /// internal: recent agent output as text (durable workflow leaf)
     #[command(name = "__read", hide = true)]
-    __Read {
-        project: String,
-        name: String,
-    },
+    __Read { project: String, name: String },
     /// internal: replace an agent with a fresh pane instance (durable workflow leaf)
     #[command(name = "__respawn", hide = true)]
     __Respawn {
@@ -469,7 +467,6 @@ fn cmd_internal_last_sent(_cfg: &Config, project: &str, name: &str, hash: u64) -
     print_json(&json!({ "record": record }));
     Ok(())
 }
-
 
 #[derive(Args, Default, Clone)]
 struct AgentCounts {
@@ -532,9 +529,7 @@ enum MailCmd {
         reason: String,
     },
     /// release this identity's reservations
-    Unlock {
-        project: String,
-    },
+    Unlock { project: String },
     /// check reservation conflicts for paths
     Conflicts {
         project: String,
@@ -542,14 +537,14 @@ enum MailCmd {
         paths: Vec<String>,
     },
     /// list registered agents in the project
-    Agents {
-        project: String,
-    },
+    Agents { project: String },
 }
 
 #[derive(Subcommand)]
 enum WorktreeCmd {
-    List { project: String },
+    List {
+        project: String,
+    },
     Create {
         project: String,
         #[arg(long)]
@@ -578,18 +573,21 @@ enum CheckpointCmd {
         #[arg(long)]
         msg: String,
     },
-    List { project: String },
-    Show { project: String },
-    Latest { project: String },
+    List {
+        project: String,
+    },
+    Show {
+        project: String,
+    },
+    Latest {
+        project: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum AssetCmd {
     List,
-    Run {
-        name: String,
-        project: String,
-    },
+    Run { name: String, project: String },
 }
 
 #[derive(Subcommand)]
@@ -606,6 +604,24 @@ enum ConfigCmd {
     Get { key: String },
     Set { key: String, value: String },
     Path,
+}
+
+/// `flywheel backend` subcommands (ADR-0002 R0.10) — discovery + selection of
+/// the pluggable multiplexer/mail backends. clig.dev-disciplined: stdout=data,
+/// --json on reads, exit 0/1/2.
+#[derive(Subcommand)]
+enum BackendCmd {
+    /// List compiled-in backends (name, kind, ready|stub, active, feature)
+    List,
+    /// Show the active multiplexer + mail + config source + health
+    Status,
+    /// Persist a backend default to config.toml [backend] (env/flag still override)
+    Default {
+        /// multiplexer | mail
+        kind: String,
+        /// backend name (herdr|agentmail|superlogical|tmux|toron)
+        name: String,
+    },
 }
 
 fn parse_kind_count(s: &str) -> Result<(String, u32)> {
@@ -627,11 +643,7 @@ fn project_dir(cfg: &Config, project: &str) -> PathBuf {
 }
 
 fn swarm_label(project: &str) -> String {
-    let base = project
-        .rsplit('/')
-        .next()
-        .unwrap_or(project)
-        .to_string();
+    let base = project.rsplit('/').next().unwrap_or(project).to_string();
     format!("flywheel-{base}")
 }
 
@@ -732,7 +744,10 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
 /// (they're herdr-specific and don't need backend-agnosticism yet — migrating
 /// them is churn with no payoff until superlogical ships). The two overloads
 /// share the helper bodies via macros-free duplication (small, narrow).
-fn find_workspace_dyn(backend: &mut dyn backend::MultiplexerBackend, project: &str) -> Result<String> {
+fn find_workspace_dyn(
+    backend: &mut dyn backend::MultiplexerBackend,
+    project: &str,
+) -> Result<String> {
     let label = swarm_label(project);
     let matches: Vec<herdr::WorkspaceInfo> = backend
         .workspace_list()?
@@ -748,7 +763,10 @@ fn find_workspace_dyn(backend: &mut dyn backend::MultiplexerBackend, project: &s
         for ws in &matches {
             if agents.iter().any(|a| {
                 a.workspace_id == ws.workspace_id
-                    && a.name.as_deref().map(|n| n.starts_with(&prefix)).unwrap_or(false)
+                    && a.name
+                        .as_deref()
+                        .map(|n| n.starts_with(&prefix))
+                        .unwrap_or(false)
             }) {
                 return Ok(ws.workspace_id.clone());
             }
@@ -878,26 +896,60 @@ fn main() {
 
     let result = match &cli.command {
         Some(Commands::Init { project }) => cmd_init(&cfg, project),
-        Some(Commands::Spawn { project, counts, recipe, kinds, label, no_focus }) => {
-            cmd_spawn(&cfg, project, counts, recipe.as_deref(), kinds, label.as_deref(), *no_focus)
-        }
-        Some(Commands::Add { project, counts, kinds }) => {
-            cmd_add(&cfg, project, counts, kinds)
-        }
+        Some(Commands::Spawn {
+            project,
+            counts,
+            recipe,
+            kinds,
+            label,
+            no_focus,
+        }) => cmd_spawn(
+            &cfg,
+            project,
+            counts,
+            recipe.as_deref(),
+            kinds,
+            label.as_deref(),
+            *no_focus,
+        ),
+        Some(Commands::Add {
+            project,
+            counts,
+            kinds,
+        }) => cmd_add(&cfg, project, counts, kinds),
         Some(Commands::List { all }) => cmd_list(&cfg, *all),
         Some(Commands::Status { project }) => cmd_status(&cfg, project.as_deref()),
-        Some(Commands::Send { project, msg, to, stage, wait, timeout_ms, force }) => {
-            cmd_send(&cfg, project, msg.as_deref(), to, stage.as_deref(), *wait, *timeout_ms, *force)
-        }
-        Some(Commands::Interrupt { project, to, keys }) => {
-            cmd_interrupt(&cfg, project, to, keys)
-        }
-        Some(Commands::View { project, to, lines, source }) => {
-            cmd_view(&cfg, project, to, *lines, source)
-        }
-        Some(Commands::Watch { project, to, until, timeout_ms }) => {
-            cmd_watch(&cfg, project, to, until.as_deref(), *timeout_ms)
-        }
+        Some(Commands::Send {
+            project,
+            msg,
+            to,
+            stage,
+            wait,
+            timeout_ms,
+            force,
+        }) => cmd_send(
+            &cfg,
+            project,
+            msg.as_deref(),
+            to,
+            stage.as_deref(),
+            *wait,
+            *timeout_ms,
+            *force,
+        ),
+        Some(Commands::Interrupt { project, to, keys }) => cmd_interrupt(&cfg, project, to, keys),
+        Some(Commands::View {
+            project,
+            to,
+            lines,
+            source,
+        }) => cmd_view(&cfg, project, to, *lines, source),
+        Some(Commands::Watch {
+            project,
+            to,
+            until,
+            timeout_ms,
+        }) => cmd_watch(&cfg, project, to, until.as_deref(), *timeout_ms),
         Some(Commands::Loop {
             project,
             interval,
@@ -935,9 +987,12 @@ fn main() {
         Some(Commands::Attach { project, to }) => cmd_attach(&cfg, project, to),
         Some(Commands::Kill { project, force }) => cmd_kill(&cfg, project, *force),
         Some(Commands::Work { cmd }) => cmd_work(&cfg, cmd),
-        Some(Commands::Assign { project, to, beads, msg }) => {
-            cmd_assign(&cfg, project, to, beads, msg.as_deref())
-        }
+        Some(Commands::Assign {
+            project,
+            to,
+            beads,
+            msg,
+        }) => cmd_assign(&cfg, project, to, beads, msg.as_deref()),
         Some(Commands::Mail { cmd }) => cmd_mail(&cfg, cmd),
         Some(Commands::Worktree { cmd }) => cmd_worktree(&cfg, cmd),
         Some(Commands::Checkpoint { cmd }) => cmd_checkpoint(&cfg, cmd),
@@ -951,9 +1006,11 @@ fn main() {
         Some(Commands::Workflows { cmd }) => cmd_asset(&cfg, "workflows", cmd),
         Some(Commands::Pipeline { cmd }) => cmd_asset(&cfg, "pipeline", cmd),
         Some(Commands::Template { cmd }) => cmd_asset(&cfg, "template", cmd),
-        Some(Commands::Ensemble { project, recipe, workflow }) => {
-            cmd_ensemble(&cfg, project, recipe, workflow)
-        }
+        Some(Commands::Ensemble {
+            project,
+            recipe,
+            workflow,
+        }) => cmd_ensemble(&cfg, project, recipe, workflow),
         Some(Commands::Safety) => cmd_safety(&cfg),
         Some(Commands::Guards) => cmd_guards(&cfg),
         Some(Commands::Policy { cmd }) => cmd_policy(&cfg, cmd),
@@ -962,10 +1019,16 @@ fn main() {
             cmd_integration(kind.as_deref(), out.as_deref())
         }
         Some(Commands::Config { cmd }) => cmd_config(&cfg, cmd),
+        Some(Commands::Backend { cmd }) => cmd_backend(&cfg, cmd),
         Some(Commands::Upgrade) => cmd_upgrade(),
         Some(Commands::Tutorial) => cmd_tutorial(),
         Some(Commands::Serve { port }) => cmd_serve(&cfg, *port),
         Some(Commands::__Poll { project, to }) => cmd_internal_poll(&cfg, project, to),
+        Some(Commands::__PollEvents {
+            project,
+            timeout_ms,
+            after_seq,
+        }) => cmd_internal_poll_events(&cfg, project, *timeout_ms, *after_seq),
         Some(Commands::__Send {
             project,
             name,
@@ -982,32 +1045,34 @@ fn main() {
             invocation.as_deref(),
             *iteration,
         ),
-        Some(Commands::__MailBlocked { project, name }) => cmd_internal_mail_blocked(&cfg, project, name),
-        Some(Commands::__RenewLeases { project, extend_seconds }) => {
-            cmd_internal_renew_leases(&cfg, project, *extend_seconds)
+        Some(Commands::__MailBlocked { project, name }) => {
+            cmd_internal_mail_blocked(&cfg, project, name)
         }
+        Some(Commands::__RenewLeases {
+            project,
+            extend_seconds,
+        }) => cmd_internal_renew_leases(&cfg, project, *extend_seconds),
         Some(Commands::__WaitOutput {
             project,
             target,
             pattern,
             regex,
             timeout_ms,
-        }) => cmd_internal_wait_output(
-            &cfg,
+        }) => cmd_internal_wait_output(&cfg, project, target, pattern, *regex, *timeout_ms),
+        Some(Commands::__Ready { project }) => cmd_internal_ready(&cfg, project),
+        Some(Commands::__LastSent {
             project,
-            target,
-            pattern,
-            *regex,
-            *timeout_ms,
-        ),        Some(Commands::__Ready { project }) => cmd_internal_ready(&cfg, project),
-        Some(Commands::__LastSent { project, name, hash }) => {
-            cmd_internal_last_sent(&cfg, project, name, *hash)
-        }        Some(Commands::__Inprogress { project }) => cmd_internal_inprogress(&cfg, project),
+            name,
+            hash,
+        }) => cmd_internal_last_sent(&cfg, project, name, *hash),
+        Some(Commands::__Inprogress { project }) => cmd_internal_inprogress(&cfg, project),
         Some(Commands::__Kind { project, name }) => cmd_internal_kind(&cfg, project, name),
         Some(Commands::__Read { project, name }) => cmd_internal_read(&cfg, project, name),
-        Some(Commands::__Respawn { project, name, kind }) => {
-            cmd_internal_respawn(&cfg, project, name, kind)
-        }
+        Some(Commands::__Respawn {
+            project,
+            name,
+            kind,
+        }) => cmd_internal_respawn(&cfg, project, name, kind),
         None => {
             // no command: show concise help with examples
             print_concise_help();
@@ -1088,8 +1153,7 @@ fn chrono_like_ts() -> String {
 fn cmd_init(cfg: &Config, project: &str) -> Result<()> {
     let dir = project_dir(cfg, project);
     if !dir.exists() {
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("create {}", dir.display()))?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         println!("created {}", dir.display());
     }
     if dir.join(".beads").exists() {
@@ -1111,7 +1175,11 @@ fn cmd_init(cfg: &Config, project: &str) -> Result<()> {
 
 // ---- spawn ----
 
-fn recipe_counts(recipe: Option<&str>, counts: &AgentCounts, kinds: &[(String, u32)]) -> Result<Vec<(String, u32)>> {
+fn recipe_counts(
+    recipe: Option<&str>,
+    counts: &AgentCounts,
+    kinds: &[(String, u32)],
+) -> Result<Vec<(String, u32)>> {
     let mut out: Vec<(String, u32)> = Vec::new();
     if let Some(name) = recipe {
         let recipes = config::Recipes::load()?;
@@ -1161,7 +1229,10 @@ fn cmd_spawn(
 ) -> Result<()> {
     let dir = project_dir(cfg, project);
     if !dir.exists() {
-        bail!("project dir missing: {} (run: flywheel init {project})", dir.display());
+        bail!(
+            "project dir missing: {} (run: flywheel init {project})",
+            dir.display()
+        );
     }
     let plan = recipe_counts(recipe, counts, kinds)?;
     let label = label_override
@@ -1215,9 +1286,13 @@ fn cmd_spawn(
         }
     }
 
-    log(project, EventKind::Spawn, json!({
-        "workspace_id": ws.workspace_id, "label": label, "agents": spawned
-    }));
+    log(
+        project,
+        EventKind::Spawn,
+        json!({
+            "workspace_id": ws.workspace_id, "label": label, "agents": spawned
+        }),
+    );
 
     println!(
         "swarm ready: flywheel {} {} {}",
@@ -1232,7 +1307,12 @@ fn project_base(project: &str) -> String {
     project.rsplit('/').next().unwrap_or(project).to_string()
 }
 
-fn start_agent_with_retry(c: &mut Client, name: &str, kind: &str, pane_id: &str) -> Result<AgentInfo> {
+fn start_agent_with_retry(
+    c: &mut Client,
+    name: &str,
+    kind: &str,
+    pane_id: &str,
+) -> Result<AgentInfo> {
     for attempt in 0..30 {
         if let Err(e) = c.agent_start(name, kind, pane_id, 45_000, &[]) {
             if attempt == 0 {
@@ -1304,8 +1384,11 @@ fn register_spawned_agent(cfg: &Config, project: &str, name: &str, kind: &str, p
         // pane→name source the server reads, registration or not).
         eprintln!("flywheel: mail register_agent failed for {name}: {e}");
     }
-    // bridge the identity to the herdr pane (best-effort, like register)
-    if let Err(e) = mail.write_pane_identity(&key, pane_id, name) {
+    // bridge the identity to the herdr pane (best-effort, like register).
+    // The file holds the REGISTERED identity (the mapped adjective+noun) so
+    // resolve_pane_identity returns a name that exists in the registry — the
+    // herdr name is not registrable and would resolve to a dead end.
+    if let Err(e) = mail.write_pane_identity(&key, pane_id, &mail_name) {
         eprintln!("flywheel: mail write_pane_identity failed for {name} on {pane_id}: {e}");
     }
 }
@@ -1329,37 +1412,245 @@ fn register_spawned_agent(cfg: &Config, project: &str, name: &str, kind: &str, p
 /// Lists copied verbatim from mcp_agent_mail_rust
 /// crates/mcp-agent-mail-core/src/models.rs (Apache/MIT). If the server
 /// updates its lists, flywheel's copy must follow or registration breaks.
+/// If `s` lowercases to a VALID_ADJECTIVES+VALID_NOUNS pair (the server's
+/// whitelist shape, PascalCase after normalization), return the canonical
+/// PascalCase form; else None. This is the identity gate for
+/// [`agent_mail_name`]: an input already shaped as a pair passes through.
+fn valid_pair(s: &str, adjectives: &[&str], nouns: &[&str]) -> Option<String> {
+    let lower = s.to_ascii_lowercase();
+    for adj in adjectives {
+        if let Some(rest) = lower.strip_prefix(adj) {
+            if !rest.is_empty() && nouns.contains(&rest) {
+                let mut adj = (*adj).to_owned();
+                adj.get_mut(0..1)?.make_ascii_uppercase();
+                let mut noun = rest.to_owned();
+                noun.get_mut(0..1)?.make_ascii_uppercase();
+                return Some(format!("{adj}{noun}"));
+            }
+        }
+    }
+    None
+}
+
 fn agent_mail_name(herdr_name: &str) -> String {
+    // idempotency guard: an input already shaped as a whitelist pair (e.g. a
+    // previously mapped name) passes through unchanged — re-mapping a mapped
+    // name must be a no-op, not a second hash into a DIFFERENT pair.
+    if let Some(pair) = valid_pair(herdr_name, &ADJECTIVES, &NOUNS) {
+        return pair;
+    }
     // Keep in lockstep with mcp_agent_mail_core::models::VALID_ADJECTIVES.
     const ADJECTIVES: [&str; 75] = [
-        "red", "orange", "yellow", "pink", "black", "purple", "blue", "brown", "white",
-        "green", "chartreuse", "lilac", "fuchsia", "azure", "amber", "coral", "crimson",
-        "cyan", "gold", "golden", "gray", "indigo", "ivory", "jade", "lavender",
-        "magenta", "maroon", "navy", "olive", "pearl", "rose", "ruby", "sage", "scarlet",
-        "silver", "teal", "topaz", "violet", "cobalt", "copper", "bronze", "emerald",
-        "sapphire", "turquoise", "beige", "tan", "cream", "peach", "plum", "sunny",
-        "misty", "foggy", "stormy", "windy", "frosty", "dusty", "hazy", "cloudy",
-        "rainy", "snowy", "icy", "mossy", "sandy", "swift", "quiet", "bold", "calm",
-        "bright", "dark", "wild", "silent", "gentle", "rustic", "noble", "proud",
+        "red",
+        "orange",
+        "yellow",
+        "pink",
+        "black",
+        "purple",
+        "blue",
+        "brown",
+        "white",
+        "green",
+        "chartreuse",
+        "lilac",
+        "fuchsia",
+        "azure",
+        "amber",
+        "coral",
+        "crimson",
+        "cyan",
+        "gold",
+        "golden",
+        "gray",
+        "indigo",
+        "ivory",
+        "jade",
+        "lavender",
+        "magenta",
+        "maroon",
+        "navy",
+        "olive",
+        "pearl",
+        "rose",
+        "ruby",
+        "sage",
+        "scarlet",
+        "silver",
+        "teal",
+        "topaz",
+        "violet",
+        "cobalt",
+        "copper",
+        "bronze",
+        "emerald",
+        "sapphire",
+        "turquoise",
+        "beige",
+        "tan",
+        "cream",
+        "peach",
+        "plum",
+        "sunny",
+        "misty",
+        "foggy",
+        "stormy",
+        "windy",
+        "frosty",
+        "dusty",
+        "hazy",
+        "cloudy",
+        "rainy",
+        "snowy",
+        "icy",
+        "mossy",
+        "sandy",
+        "swift",
+        "quiet",
+        "bold",
+        "calm",
+        "bright",
+        "dark",
+        "wild",
+        "silent",
+        "gentle",
+        "rustic",
+        "noble",
+        "proud",
     ];
     // Keep in lockstep with mcp_agent_mail_core::models::VALID_NOUNS.
     const NOUNS: [&str; 132] = [
-        "stone", "lake", "creek", "pond", "mountain", "hill", "snow", "castle", "river",
-        "forest", "valley", "canyon", "meadow", "prairie", "desert", "island", "cliff",
-        "cave", "glacier", "waterfall", "spring", "stream", "reef", "dune", "ridge",
-        "peak", "gorge", "marsh", "brook", "glen", "grove", "fern", "hollow", "basin",
-        "cove", "bay", "harbor", "coast", "shore", "bluff", "knoll", "summit", "plateau",
-        "dog", "cat", "bear", "fox", "wolf", "deer", "elk", "moose", "otter", "beaver",
-        "badger", "lynx", "puma", "squirrel", "rabbit", "hare", "mouse", "mink", "seal",
-        "horse", "lion", "tiger", "panther", "leopard", "jaguar", "coyote", "bison",
-        "ox", "hawk", "eagle", "owl", "falcon", "raven", "heron", "crane", "finch",
-        "robin", "sparrow", "duck", "goose", "swan", "dove", "wren", "jay", "lark",
-        "kite", "condor", "osprey", "pelican", "gull", "tern", "stork", "ibis",
-        "cardinal", "oriole", "thrush", "trout", "salmon", "bass", "pike", "carp",
-        "turtle", "frog", "pine", "oak", "maple", "birch", "cedar", "willow", "aspen",
-        "elm", "orchid", "lotus", "ivy", "tower", "bridge", "forge", "mill", "barn",
-        "gate", "anchor", "lantern", "beacon", "compass", "horizon", "spire", "chapel",
-        "citadel", "fortress",
+        "stone",
+        "lake",
+        "creek",
+        "pond",
+        "mountain",
+        "hill",
+        "snow",
+        "castle",
+        "river",
+        "forest",
+        "valley",
+        "canyon",
+        "meadow",
+        "prairie",
+        "desert",
+        "island",
+        "cliff",
+        "cave",
+        "glacier",
+        "waterfall",
+        "spring",
+        "stream",
+        "reef",
+        "dune",
+        "ridge",
+        "peak",
+        "gorge",
+        "marsh",
+        "brook",
+        "glen",
+        "grove",
+        "fern",
+        "hollow",
+        "basin",
+        "cove",
+        "bay",
+        "harbor",
+        "coast",
+        "shore",
+        "bluff",
+        "knoll",
+        "summit",
+        "plateau",
+        "dog",
+        "cat",
+        "bear",
+        "fox",
+        "wolf",
+        "deer",
+        "elk",
+        "moose",
+        "otter",
+        "beaver",
+        "badger",
+        "lynx",
+        "puma",
+        "squirrel",
+        "rabbit",
+        "hare",
+        "mouse",
+        "mink",
+        "seal",
+        "horse",
+        "lion",
+        "tiger",
+        "panther",
+        "leopard",
+        "jaguar",
+        "coyote",
+        "bison",
+        "ox",
+        "hawk",
+        "eagle",
+        "owl",
+        "falcon",
+        "raven",
+        "heron",
+        "crane",
+        "finch",
+        "robin",
+        "sparrow",
+        "duck",
+        "goose",
+        "swan",
+        "dove",
+        "wren",
+        "jay",
+        "lark",
+        "kite",
+        "condor",
+        "osprey",
+        "pelican",
+        "gull",
+        "tern",
+        "stork",
+        "ibis",
+        "cardinal",
+        "oriole",
+        "thrush",
+        "trout",
+        "salmon",
+        "bass",
+        "pike",
+        "carp",
+        "turtle",
+        "frog",
+        "pine",
+        "oak",
+        "maple",
+        "birch",
+        "cedar",
+        "willow",
+        "aspen",
+        "elm",
+        "orchid",
+        "lotus",
+        "ivy",
+        "tower",
+        "bridge",
+        "forge",
+        "mill",
+        "barn",
+        "gate",
+        "anchor",
+        "lantern",
+        "beacon",
+        "compass",
+        "horizon",
+        "spire",
+        "chapel",
+        "citadel",
+        "fortress",
     ];
     let h = state::fnv1a64(herdr_name);
     let adj = ADJECTIVES[(h % ADJECTIVES.len() as u64) as usize];
@@ -1376,6 +1667,21 @@ fn agent_mail_name(herdr_name: &str) -> String {
         c.make_ascii_uppercase();
     }
     format!("{adj}{noun}")
+}
+
+/// Resolve a mail-recipient specifier to a registered agent-mail identity
+/// name. A herdr agent name (`flywheel-<base>-<kind>[N]`) maps
+/// deterministically to its adjective+noun identity — registration uses the
+/// same mapping (bd-odc), so the identity exists. Anything else passes
+/// through unchanged: it is either an already-valid identity (the mapping is
+/// idempotent for those) or a recipient the server will reject honestly.
+/// Pure — no registry round trips.
+fn resolve_mail_target(target: &str) -> String {
+    if target.contains('-') {
+        agent_mail_name(target)
+    } else {
+        target.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1415,34 +1721,209 @@ mod agent_mail_name_tests {
             // split at every possible adjective boundary and check membership
             // (mirrors split_valid_agent_name's lazy scan)
             let adjectives = [
-                "red", "blue", "green", "golden", "sapphire", "turquoise", "emerald",
-                "crimson", "frosty", "misty", "stormy", "swift", "quiet", "bold", "calm",
-                "bright", "dark", "wild", "silent", "gentle", "rustic", "noble", "proud",
-                "amber", "coral", "azure", "teal", "topaz", "violet", "pearl", "ruby",
-                "jade", "ivory", "indigo", "lilac", "fuchsia", "maroon", "navy", "olive",
-                "sage", "scarlet", "silver", "copper", "bronze", "beige", "cream", "peach",
-                "plum", "sunny", "foggy", "hazy", "cloudy", "rainy", "snowy", "icy",
-                "mossy", "sandy", "gray", "black", "white", "brown", "pink", "yellow",
-                "orange", "chartreuse", "lavender", "magenta", "rose", "cobalt", "tan",
+                "red",
+                "blue",
+                "green",
+                "golden",
+                "sapphire",
+                "turquoise",
+                "emerald",
+                "crimson",
+                "frosty",
+                "misty",
+                "stormy",
+                "swift",
+                "quiet",
+                "bold",
+                "calm",
+                "bright",
+                "dark",
+                "wild",
+                "silent",
+                "gentle",
+                "rustic",
+                "noble",
+                "proud",
+                "amber",
+                "coral",
+                "azure",
+                "teal",
+                "topaz",
+                "violet",
+                "pearl",
+                "ruby",
+                "jade",
+                "ivory",
+                "indigo",
+                "lilac",
+                "fuchsia",
+                "maroon",
+                "navy",
+                "olive",
+                "sage",
+                "scarlet",
+                "silver",
+                "copper",
+                "bronze",
+                "beige",
+                "cream",
+                "peach",
+                "plum",
+                "sunny",
+                "foggy",
+                "hazy",
+                "cloudy",
+                "rainy",
+                "snowy",
+                "icy",
+                "mossy",
+                "sandy",
+                "gray",
+                "black",
+                "white",
+                "brown",
+                "pink",
+                "yellow",
+                "orange",
+                "chartreuse",
+                "lavender",
+                "magenta",
+                "rose",
+                "cobalt",
+                "tan",
             ];
             let nouns = [
-                "stone", "lake", "creek", "pond", "mountain", "hill", "snow", "castle",
-                "river", "forest", "valley", "canyon", "meadow", "prairie", "desert",
-                "island", "cliff", "cave", "glacier", "waterfall", "spring", "stream",
-                "reef", "dune", "ridge", "peak", "gorge", "marsh", "brook", "glen",
-                "grove", "fern", "hollow", "basin", "cove", "bay", "harbor", "coast",
-                "shore", "bluff", "knoll", "summit", "plateau", "dog", "cat", "bear",
-                "fox", "wolf", "deer", "elk", "moose", "otter", "beaver", "badger",
-                "lynx", "puma", "squirrel", "rabbit", "hare", "mouse", "mink", "seal",
-                "horse", "lion", "tiger", "panther", "leopard", "jaguar", "coyote",
-                "bison", "ox", "hawk", "eagle", "owl", "falcon", "raven", "heron",
-                "crane", "finch", "robin", "sparrow", "duck", "goose", "swan", "dove",
-                "wren", "jay", "lark", "kite", "condor", "osprey", "pelican", "gull",
-                "tern", "stork", "ibis", "cardinal", "oriole", "thrush", "trout",
-                "salmon", "bass", "pike", "carp", "turtle", "frog", "pine", "oak",
-                "maple", "birch", "cedar", "willow", "aspen", "elm", "orchid", "lotus",
-                "ivy", "tower", "bridge", "forge", "mill", "barn", "gate", "anchor",
-                "lantern", "beacon", "compass", "horizon", "spire", "chapel", "citadel",
+                "stone",
+                "lake",
+                "creek",
+                "pond",
+                "mountain",
+                "hill",
+                "snow",
+                "castle",
+                "river",
+                "forest",
+                "valley",
+                "canyon",
+                "meadow",
+                "prairie",
+                "desert",
+                "island",
+                "cliff",
+                "cave",
+                "glacier",
+                "waterfall",
+                "spring",
+                "stream",
+                "reef",
+                "dune",
+                "ridge",
+                "peak",
+                "gorge",
+                "marsh",
+                "brook",
+                "glen",
+                "grove",
+                "fern",
+                "hollow",
+                "basin",
+                "cove",
+                "bay",
+                "harbor",
+                "coast",
+                "shore",
+                "bluff",
+                "knoll",
+                "summit",
+                "plateau",
+                "dog",
+                "cat",
+                "bear",
+                "fox",
+                "wolf",
+                "deer",
+                "elk",
+                "moose",
+                "otter",
+                "beaver",
+                "badger",
+                "lynx",
+                "puma",
+                "squirrel",
+                "rabbit",
+                "hare",
+                "mouse",
+                "mink",
+                "seal",
+                "horse",
+                "lion",
+                "tiger",
+                "panther",
+                "leopard",
+                "jaguar",
+                "coyote",
+                "bison",
+                "ox",
+                "hawk",
+                "eagle",
+                "owl",
+                "falcon",
+                "raven",
+                "heron",
+                "crane",
+                "finch",
+                "robin",
+                "sparrow",
+                "duck",
+                "goose",
+                "swan",
+                "dove",
+                "wren",
+                "jay",
+                "lark",
+                "kite",
+                "condor",
+                "osprey",
+                "pelican",
+                "gull",
+                "tern",
+                "stork",
+                "ibis",
+                "cardinal",
+                "oriole",
+                "thrush",
+                "trout",
+                "salmon",
+                "bass",
+                "pike",
+                "carp",
+                "turtle",
+                "frog",
+                "pine",
+                "oak",
+                "maple",
+                "birch",
+                "cedar",
+                "willow",
+                "aspen",
+                "elm",
+                "orchid",
+                "lotus",
+                "ivy",
+                "tower",
+                "bridge",
+                "forge",
+                "mill",
+                "barn",
+                "gate",
+                "anchor",
+                "lantern",
+                "beacon",
+                "compass",
+                "horizon",
+                "spire",
+                "chapel",
+                "citadel",
                 "fortress",
             ];
             let adj_ok = adjectives.iter().any(|a| {
@@ -1450,7 +1931,10 @@ mod agent_mail_name_tests {
                     .strip_prefix(a)
                     .is_some_and(|rest| nouns.contains(&rest) && !rest.is_empty())
             });
-            assert!(adj_ok, "{name} -> '{m}' must be a VALID_ADJECTIVES+VALID_NOUNS pair");
+            assert!(
+                adj_ok,
+                "{name} -> '{m}' must be a VALID_ADJECTIVES+VALID_NOUNS pair"
+            );
         }
     }
 
@@ -1479,11 +1963,83 @@ mod agent_mail_name_tests {
             seen.len()
         );
     }
+
+    /// Idempotency: a name already shaped as a whitelist pair maps to ITSELF
+    /// — re-mapping a mapped name must be a no-op, not a second hash into a
+    /// DIFFERENT pair (the reverse-mapping gap: send paths that receive a
+    /// mail identity must never re-map it).
+    #[test]
+    fn mapping_is_idempotent_on_valid_pairs() {
+        for name in [
+            "TopazOx",
+            "SapphireOwl",
+            "CoralFinch",
+            "MistyCardinal",
+            "AzurePine",
+        ] {
+            assert_eq!(
+                agent_mail_name(name),
+                name,
+                "{name} must pass through unchanged"
+            );
+        }
+    }
+
+    /// The shared splitter returns the canonical PascalCase form and rejects
+    /// anything that is not a whitelist pair (regardless of input case).
+    #[test]
+    fn valid_pair_splits_and_canonicalizes() {
+        let adjs = ["topaz", "sapphire"];
+        let nouns = ["ox", "owl"];
+        assert_eq!(
+            valid_pair("TopazOx", &adjs, &nouns),
+            Some("TopazOx".to_string())
+        );
+        assert_eq!(
+            valid_pair("sapphireowl", &adjs, &nouns),
+            Some("SapphireOwl".to_string())
+        );
+        // any adjective x any noun is a valid pair (topaz + owl both listed)
+        assert_eq!(
+            valid_pair("topazowl", &adjs, &nouns),
+            Some("TopazOwl".to_string())
+        );
+        assert_eq!(
+            valid_pair("topaz", &adjs, &nouns),
+            None,
+            "adjective alone is invalid"
+        );
+        assert_eq!(
+            valid_pair("ox", &adjs, &nouns),
+            None,
+            "noun alone is invalid"
+        );
+        assert_eq!(valid_pair("flywheel-flywheel-oc", &adjs, &nouns), None);
+        assert_eq!(valid_pair("", &adjs, &nouns), None);
+    }
+
+    /// A herdr agent name maps to its identity; anything already a valid
+    /// identity (or a bare short like "oc") passes through untouched.
+    #[test]
+    fn resolve_mail_target_maps_herdr_names_and_passes_through_others() {
+        assert_eq!(
+            resolve_mail_target("flywheel-flywheel-oc"),
+            agent_mail_name("flywheel-flywheel-oc")
+        );
+        assert_eq!(resolve_mail_target("TopazOx"), "TopazOx");
+        assert_eq!(resolve_mail_target("oc"), "oc");
+        assert_eq!(resolve_mail_target(""), "");
+    }
 }
 
 // ---- add ----
 
-fn cmd_add(cfg: &Config, project: &str, counts: &AgentCounts, kinds: &[(String, u32)]) -> Result<()> {
+fn cmd_add(
+    cfg: &Config,
+    project: &str,
+    counts: &AgentCounts,
+    kinds: &[(String, u32)],
+) -> Result<()> {
     let plan = recipe_counts(None, counts, kinds)?;
     let dir = project_dir(cfg, project);
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
@@ -1500,7 +2056,9 @@ fn cmd_add(cfg: &Config, project: &str, counts: &AgentCounts, kinds: &[(String, 
     // seed per-kind ordinals from existing agents so added names stay unique
     let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
     for a in &existing {
-        let Some(name) = a.name.as_deref() else { continue };
+        let Some(name) = a.name.as_deref() else {
+            continue;
+        };
         for (short, _) in &plan {
             if let Some(o) = agent_ordinal(name, project, short) {
                 ordinals
@@ -1523,10 +2081,15 @@ fn cmd_add(cfg: &Config, project: &str, counts: &AgentCounts, kinds: &[(String, 
             let agent = start_agent_with_retry(&mut c, &name, &kind, &prev)?;
             register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
             println!("  {} {}", kind_paint(&kind), agent.pane_id);
-            spawned.push(json!({ "name": agent.name, "kind": agent.agent, "pane_id": agent.pane_id }));
+            spawned
+                .push(json!({ "name": agent.name, "kind": agent.agent, "pane_id": agent.pane_id }));
         }
     }
-    log(project, EventKind::Add, json!({ "workspace_id": ws_id, "agents": spawned }));
+    log(
+        project,
+        EventKind::Add,
+        json!({ "workspace_id": ws_id, "agents": spawned }),
+    );
     Ok(())
 }
 
@@ -1537,7 +2100,10 @@ fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
     let workspaces = c.workspace_list()?;
     let agents = c.agent_list()?;
     let mut rows: Vec<Value> = Vec::new();
-    for ws in workspaces.iter().filter(|w| all || w.label.starts_with("flywheel-")) {
+    for ws in workspaces
+        .iter()
+        .filter(|w| all || w.label.starts_with("flywheel-"))
+    {
         let ws_agents: Vec<Value> = agents
             .iter()
             .filter(|a| a.workspace_id == ws.workspace_id)
@@ -1557,8 +2123,15 @@ fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
             if let Some(ags) = r["agents"].as_array() {
                 for a in ags {
                     let st = a["status"].as_str().unwrap_or("unknown");
-                    let st = AgentStatus::parse(st).map(status_paint).unwrap_or_else(|_| dim(st));
-                    println!("  {}  {}  {}", dim(a["name"].as_str().unwrap_or("?")), kind_paint(a["kind"].as_str().unwrap_or("?")), st);
+                    let st = AgentStatus::parse(st)
+                        .map(status_paint)
+                        .unwrap_or_else(|_| dim(st));
+                    println!(
+                        "  {}  {}  {}",
+                        dim(a["name"].as_str().unwrap_or("?")),
+                        kind_paint(a["kind"].as_str().unwrap_or("?")),
+                        st
+                    );
                 }
             }
             println!();
@@ -1598,7 +2171,9 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     if std::io::stdout().is_terminal() {
         for r in &rows {
             let st = r["status"].as_str().unwrap_or("unknown");
-            let st = AgentStatus::parse(st).map(status_paint).unwrap_or_else(|_| dim(st));
+            let st = AgentStatus::parse(st)
+                .map(status_paint)
+                .unwrap_or_else(|_| dim(st));
             println!(
                 "{}  {}  {}  {}",
                 kind_paint(r["kind"].as_str().unwrap_or("?")),
@@ -1669,9 +2244,13 @@ fn cmd_send(
         }));
     }
 
-    log(project, EventKind::Send, json!({
-        "to": to, "stage": stage, "text_len": text.len(), "wait": wait, "results": results
-    }));
+    log(
+        project,
+        EventKind::Send,
+        json!({
+            "to": to, "stage": stage, "text_len": text.len(), "wait": wait, "results": results
+        }),
+    );
     if !std::io::stdout().is_terminal() {
         print_json(&json!({ "results": results }));
     }
@@ -1695,7 +2274,11 @@ fn cmd_interrupt(cfg: &Config, project: &str, to: &str, keys: &[String]) -> Resu
             println!("interrupted {}", dim(agent_target(a)));
         }
     }
-    log(project, EventKind::Interrupt, json!({ "to": to, "keys": keys }));
+    log(
+        project,
+        EventKind::Interrupt,
+        json!({ "to": to, "keys": keys }),
+    );
     Ok(())
 }
 
@@ -1716,16 +2299,36 @@ fn cmd_view(cfg: &Config, project: &str, to: &str, lines: Option<u32>, source: &
     Ok(())
 }
 
-fn cmd_watch(cfg: &Config, project: &str, to: &str, until: Option<&str>, timeout_ms: Option<u64>) -> Result<()> {
+/// Resolve the display name for a watched pane from the subscription-time
+/// (pane, name) pairs. The `pane.agent_status_changed` push carries the agent
+/// KIND in its `agent` field — never the instance name — so event matching
+/// must go through the pane id (which IS in the payload); nameless agents
+/// have their pane id as the display name already.
+fn watch_name_for_pane<'a>(targets: &'a [(String, String)], pane_id: &str) -> Option<&'a str> {
+    targets
+        .iter()
+        .find(|(p, _)| p == pane_id)
+        .map(|(_, n)| n.as_str())
+}
+
+fn cmd_watch(
+    cfg: &Config,
+    project: &str,
+    to: &str,
+    until: Option<&str>,
+    timeout_ms: Option<u64>,
+) -> Result<()> {
     let until_status: Option<AgentStatus> = until.map(AgentStatus::parse).transpose()?;
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
 
     // initial state
     let mut watch_names: Vec<String> = Vec::new();
+    let mut watch_targets: Vec<(String, String)> = Vec::new();
     for a in resolve_agents(&mut c, &ws_id, project, to)? {
         let name = agent_target(&a).to_string();
         watch_names.push(name.clone());
+        watch_targets.push((a.pane_id.clone(), name.clone()));
         let st = a.agent_status;
         if std::io::stdout().is_terminal() {
             println!("{} {}", dim(&name), status_paint(st));
@@ -1756,8 +2359,7 @@ fn cmd_watch(cfg: &Config, project: &str, to: &str, until: Option<&str>, timeout
         }
     };
 
-    let deadline = timeout_ms
-        .map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
+    let deadline = timeout_ms.map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
     loop {
         if let Some(d) = deadline {
             if std::time::Instant::now() >= d {
@@ -1775,21 +2377,24 @@ fn cmd_watch(cfg: &Config, project: &str, to: &str, until: Option<&str>, timeout
             Some(s) => match s.read_event() {
                 Ok(Some(ev)) => {
                     // typed: the subscription push (and the equivalent server
-                    // event) both land here with a fully parsed payload
+                    // event) both land here with a fully parsed payload.
+                    // The payload's `agent` field is the agent KIND, not the
+                    // name — match via pane id (watch_targets).
                     match ev.data {
                         herdr::HerdrEventData::PaneAgentStatusChanged(change)
                         | herdr::HerdrEventData::PaneAgentStatusChangedSub(change) => {
-                            let name = change.agent.clone().unwrap_or(change.pane_id.clone());
-                            if watch_names.contains(&name) {
-                                if std::io::stdout().is_terminal() {
-                                    println!("{} {}", dim(&name), status_paint(change.agent_status));
-                                }
-                                if let Some(u) = until_status {
-                                    if change.agent_status == u
-                                        && all_matching(&mut c, &watch_names, u)?
-                                    {
-                                        return Ok(());
-                                    }
+                            let Some(name) = watch_name_for_pane(&watch_targets, &change.pane_id)
+                            else {
+                                continue;
+                            };
+                            if std::io::stdout().is_terminal() {
+                                println!("{} {}", dim(name), status_paint(change.agent_status));
+                            }
+                            if let Some(u) = until_status {
+                                if change.agent_status == u
+                                    && all_matching(&mut c, &watch_names, u)?
+                                {
+                                    return Ok(());
                                 }
                             }
                         }
@@ -1841,7 +2446,9 @@ fn watch_poll(
 fn all_matching(c: &mut Client, names: &[String], status: AgentStatus) -> Result<bool> {
     let agents = c.agent_list()?;
     for name in names {
-        let a = agents.iter().find(|a| a.name.as_deref() == Some(name) || a.pane_id == *name);
+        let a = agents
+            .iter()
+            .find(|a| a.name.as_deref() == Some(name) || a.pane_id == *name);
         match a {
             Some(a) if a.agent_status == status => {}
             _ => return Ok(false),
@@ -1958,13 +2565,20 @@ fn cmd_work(cfg: &Config, cmd: &WorkCmd) -> Result<()> {
 
 fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&str>) -> Result<()> {
     let Some(mail) = mail::Mail::from_config(cfg.agent_mail.as_ref())? else {
-        bail!("agent-mail not configured — set [agent_mail] url/token/name in {}", config::config_file().display());
+        bail!(
+            "agent-mail not configured — set [agent_mail] url/token/name in {}",
+            config::config_file().display()
+        );
     };
     let mut mail = mail;
     let dir = project_dir(cfg, project);
     let key = dir.to_str().unwrap();
     mail.ensure_project(key)?;
-    let bead_ids: Vec<String> = beads.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let bead_ids: Vec<String> = beads
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     if bead_ids.is_empty() {
         bail!("no beads given (--beads bd-1,bd-2)");
     }
@@ -1984,12 +2598,23 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
             })
             .unwrap_or_default()
     } else {
-        to.split(',').map(|s| s.trim().to_string()).collect()
+        // explicit targets: herdr agent names map to their registered
+        // agent-mail identities (bd-odc); already-valid identities pass
+        // through unchanged
+        to.split(',')
+            .map(|s| resolve_mail_target(s.trim()))
+            .collect()
     };
     if targets.is_empty() {
-        bail!("no agent-mail identities found for {project} (register first: flywheel mail agents)");
+        bail!(
+            "no agent-mail identities found for {project} (register first: flywheel mail agents)"
+        );
     }
-    let subject = format!("[assign] {} → {}", project_base(project), bead_ids.join(", "));
+    let subject = format!(
+        "[assign] {} → {}",
+        project_base(project),
+        bead_ids.join(", ")
+    );
     mail.send(key, &targets, &subject, &body, "high", true, None)?;
     println!("assigned {} to {}", bead_ids.join(", "), targets.join(", "));
     Ok(())
@@ -1998,28 +2623,53 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
 // ---- mail ----
 
 fn mail_or_die(cfg: &Config) -> Result<mail::Mail> {
-    mail::Mail::from_config(cfg.agent_mail.as_ref())?
-        .ok_or_else(|| anyhow!("agent-mail not configured — set [agent_mail] url/token/name in {}", config::config_file().display()))
+    mail::Mail::from_config(cfg.agent_mail.as_ref())?.ok_or_else(|| {
+        anyhow!(
+            "agent-mail not configured — set [agent_mail] url/token/name in {}",
+            config::config_file().display()
+        )
+    })
 }
 
 fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
     let mut mail = mail_or_die(cfg)?;
     match cmd {
-        MailCmd::Inbox { project, urgent, limit } => {
+        MailCmd::Inbox {
+            project,
+            urgent,
+            limit,
+        } => {
             let key = project_dir(cfg, project).to_str().unwrap().to_string();
             mail.ensure_project(&key)?;
             let name = mail.name.clone();
             let v = mail.inbox(&key, &name, *urgent, *limit)?;
             print_json(&v);
         }
-        MailCmd::Send { project, to, subject, body, importance, ack } => {
+        MailCmd::Send {
+            project,
+            to,
+            subject,
+            body,
+            importance,
+            ack,
+        } => {
             let key = project_dir(cfg, project).to_str().unwrap().to_string();
             mail.ensure_project(&key)?;
-            let targets: Vec<String> = to.split(',').map(|s| s.trim().to_string()).collect();
+            // herdr names resolve to their registered identities (bd-odc)
+            let targets: Vec<String> = to
+                .split(',')
+                .map(|s| resolve_mail_target(s.trim()))
+                .collect();
             let v = mail.send(&key, &targets, subject, body, importance, *ack, None)?;
             print_json(&v);
         }
-        MailCmd::Locks { project, paths, ttl_seconds, exclusive, reason } => {
+        MailCmd::Locks {
+            project,
+            paths,
+            ttl_seconds,
+            exclusive,
+            reason,
+        } => {
             let key = project_dir(cfg, project).to_str().unwrap().to_string();
             mail.ensure_project(&key)?;
             let v = mail.reserve(&key, paths, *ttl_seconds, *exclusive, reason)?;
@@ -2066,15 +2716,34 @@ fn cmd_worktree(cfg: &Config, cmd: &WorktreeCmd) -> Result<()> {
                 println!("no worktrees for {project}");
             }
         }
-        WorktreeCmd::Create { project, branch, base, label } => {
+        WorktreeCmd::Create {
+            project,
+            branch,
+            base,
+            label,
+        } => {
             let ws_id = find_workspace(&mut c, project)?;
             let v = c.worktree_create(&ws_id, branch, base.as_deref(), label.as_deref(), false)?;
-            println!("worktree {} created: {}", branch, v.get("workspace").and_then(|w| w.get("workspace_id")).and_then(Value::as_str).unwrap_or("?"));
+            println!(
+                "worktree {} created: {}",
+                branch,
+                v.get("workspace")
+                    .and_then(|w| w.get("workspace_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+            );
         }
         WorktreeCmd::Open { project, branch } => {
             let ws_id = find_workspace(&mut c, project)?;
             let v = c.worktree_create(&ws_id, branch, None, None, true)?;
-            println!("worktree {} opened: {}", branch, v.get("workspace").and_then(|w| w.get("workspace_id")).and_then(Value::as_str).unwrap_or("?"));
+            println!(
+                "worktree {} opened: {}",
+                branch,
+                v.get("workspace")
+                    .and_then(|w| w.get("workspace_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+            );
         }
         WorktreeCmd::Remove { project, force } => {
             let ws_id = find_workspace(&mut c, project)?;
@@ -2113,7 +2782,11 @@ fn cmd_checkpoint(cfg: &Config, cmd: &CheckpointCmd) -> Result<()> {
                 cp_agents,
                 Some(project_dir(cfg, project).to_str().unwrap()),
             )?;
-            log(project, EventKind::Checkpoint, json!({ "message": msg, "path": path.display().to_string() }));
+            log(
+                project,
+                EventKind::Checkpoint,
+                json!({ "message": msg, "path": path.display().to_string() }),
+            );
             println!("checkpoint saved: {}", dim(&path.display().to_string()));
         }
         CheckpointCmd::List { project } => {
@@ -2128,12 +2801,7 @@ fn cmd_checkpoint(cfg: &Config, cmd: &CheckpointCmd) -> Result<()> {
         }
         CheckpointCmd::Latest { project } => {
             if let Some(cp) = state::latest_checkpoint(project)? {
-                println!(
-                    "{} {}  {}",
-                    dim(&cp.ts),
-                    dim(&cp.project),
-                    cp.message
-                );
+                println!("{} {}  {}", dim(&cp.ts), dim(&cp.project), cp.message);
                 for a in &cp.agents {
                     println!("  {}  {}", kind_paint(&a.kind), status_paint(a.status));
                 }
@@ -2159,9 +2827,23 @@ fn cmd_timeline(project: &str) -> Result<()> {
                 e.data.get("to").and_then(Value::as_str).unwrap_or("?"),
                 e.data.get("stage").and_then(Value::as_str).unwrap_or("-")
             ),
-            EventKind::Spawn => format!("workspace={}", e.data.get("workspace_id").and_then(Value::as_str).unwrap_or("?")),
-            EventKind::Checkpoint => e.data.get("message").and_then(Value::as_str).unwrap_or("").to_string(),
-            EventKind::State => format!("state={}", e.data.get("state").and_then(Value::as_str).unwrap_or("?")),
+            EventKind::Spawn => format!(
+                "workspace={}",
+                e.data
+                    .get("workspace_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+            ),
+            EventKind::Checkpoint => e
+                .data
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            EventKind::State => format!(
+                "state={}",
+                e.data.get("state").and_then(Value::as_str).unwrap_or("?")
+            ),
             _ => String::new(),
         };
         println!("{} {:>12}  {}", dim(&e.ts), dim(&kind), detail);
@@ -2185,8 +2867,16 @@ fn cmd_history(project: &str) -> Result<()> {
         println!("no checkpoints for {project}");
         return Ok(());
     }
-    for (i, cp) in cps.iter().enumerate() {
-        println!("[{}] {}  {}  {}", i, dim(&cp.ts), dim(&cp.project), cp.message);
+    // newest first, so the displayed index matches `changes --since N`
+    // (0 = latest) — history's [i] and changes' --since agree
+    for (i, cp) in cps.iter().rev().enumerate() {
+        println!(
+            "[{}] {}  {}  {}",
+            i,
+            dim(&cp.ts),
+            dim(&cp.project),
+            cp.message
+        );
     }
     Ok(())
 }
@@ -2213,7 +2903,12 @@ fn cmd_changes(cfg: &Config, project: &str, since: usize) -> Result<()> {
         let prev_st = prev.map(|p| p.status.as_str()).unwrap_or("new");
         let now_st = a.agent_status.as_str();
         if prev_st != now_st {
-            println!("{}  {} → {}", dim(a.name.as_deref().unwrap_or("?")), dim(prev_st), status_paint(AgentStatus::parse(now_st).unwrap_or(AgentStatus::Unknown)));
+            println!(
+                "{}  {} → {}",
+                dim(a.name.as_deref().unwrap_or("?")),
+                dim(prev_st),
+                status_paint(AgentStatus::parse(now_st).unwrap_or(AgentStatus::Unknown))
+            );
         }
     }
     let head = state::git_head(project_dir(cfg, project).to_str().unwrap());
@@ -2236,7 +2931,15 @@ fn cmd_resume(cfg: &Config, project: &str, recipe: Option<&str>) -> Result<()> {
     if ws.is_none() {
         if let Some(r) = recipe {
             println!("respawn with recipe {r}…");
-            cmd_spawn(cfg, project, &AgentCounts::default(), Some(r), &[], None, false)?;
+            cmd_spawn(
+                cfg,
+                project,
+                &AgentCounts::default(),
+                Some(r),
+                &[],
+                None,
+                false,
+            )?;
         } else {
             bail!("workspace gone (run: flywheel spawn {project} --recipe <name> or flywheel resume {project} --recipe daily)");
         }
@@ -2263,13 +2966,26 @@ fn cmd_asset(cfg: &Config, kind: &str, cmd: &AssetCmd) -> Result<()> {
     match cmd {
         AssetCmd::List => {
             let names: Vec<String> = match kind {
-                "recipes" | "template" => config::Recipes::load()?.recipes.keys().cloned().collect(),
-                "workflows" => config::Workflows::load()?.workflows.keys().cloned().collect(),
-                "pipeline" => config::Pipelines::load()?.pipelines.keys().cloned().collect(),
+                "recipes" | "template" => {
+                    config::Recipes::load()?.recipes.keys().cloned().collect()
+                }
+                "workflows" => config::Workflows::load()?
+                    .workflows
+                    .keys()
+                    .cloned()
+                    .collect(),
+                "pipeline" => config::Pipelines::load()?
+                    .pipelines
+                    .keys()
+                    .cloned()
+                    .collect(),
                 _ => vec![],
             };
             if names.is_empty() {
-                println!("no {kind} defined (edit {})", config::config_dir().join(format!("{kind}.toml")).display());
+                println!(
+                    "no {kind} defined (edit {})",
+                    config::config_dir().join(format!("{kind}.toml")).display()
+                );
             } else {
                 for n in names {
                     println!("{n}");
@@ -2278,9 +2994,15 @@ fn cmd_asset(cfg: &Config, kind: &str, cmd: &AssetCmd) -> Result<()> {
             Ok(())
         }
         AssetCmd::Run { name, project } => match kind {
-            "recipes" | "template" => {
-                cmd_spawn(cfg, project, &AgentCounts::default(), Some(name), &[], None, false)
-            }
+            "recipes" | "template" => cmd_spawn(
+                cfg,
+                project,
+                &AgentCounts::default(),
+                Some(name),
+                &[],
+                None,
+                false,
+            ),
             "workflows" => run_workflow(cfg, project, name),
             "pipeline" => run_pipeline(cfg, project, name),
             _ => bail!("unknown asset kind {kind}"),
@@ -2334,7 +3056,10 @@ fn step_label(step: &WorkflowStep) -> String {
     match step {
         WorkflowStep::Send { to, stage, msg } => format!(
             "send → {to} {}",
-            stage.as_deref().map(|s| format!("[{s}]")).unwrap_or_else(|| msg.as_deref().unwrap_or("").chars().take(40).collect())
+            stage
+                .as_deref()
+                .map(|s| format!("[{s}]"))
+                .unwrap_or_else(|| msg.as_deref().unwrap_or("").chars().take(40).collect())
         ),
         WorkflowStep::Wait { until, .. } => format!("wait {until}"),
     }
@@ -2360,10 +3085,17 @@ fn run_pipeline(cfg: &Config, project: &str, name: &str) -> Result<()> {
 }
 
 fn cmd_ensemble(cfg: &Config, project: &str, recipe: &str, workflow: &str) -> Result<()> {
-    cmd_spawn(cfg, project, &AgentCounts::default(), Some(recipe), &[], None, false)?;
+    cmd_spawn(
+        cfg,
+        project,
+        &AgentCounts::default(),
+        Some(recipe),
+        &[],
+        None,
+        false,
+    )?;
     run_workflow(cfg, project, workflow)
 }
-
 
 // ---- loop (monitoring orchestrator) ----
 
@@ -2392,20 +3124,22 @@ fn plan_actions(
         match status {
             AgentStatus::Working => actions.push(LoopAction::Wait),
             AgentStatus::Blocked => actions.push(LoopAction::Blocked { name: name.clone() }),
-            AgentStatus::Idle | AgentStatus::Done | AgentStatus::Unknown => {
+            // parity with the durable loop (bd-unknown-skip-dispatch): never
+            // dispatch to an unclassified agent — a prompt could land in a
+            // half-dead session and be silently lost
+            AgentStatus::Unknown => actions.push(LoopAction::Wait),
+            AgentStatus::Idle | AgentStatus::Done => {
                 if !queue.is_empty() {
                     let text = queue.remove(0); // FIFO: stages in declared order
-                    // bead/resume prompts carry a {AGENT_NAME} placeholder —
-                    // substitute the receiving agent's herdr name (same
-                    // contract as the durable loop's plan_actions)
+                                                // bead/resume prompts carry a {AGENT_NAME} placeholder —
+                                                // substitute the receiving agent's herdr name (same
+                                                // contract as the durable loop's plan_actions)
                     actions.push(LoopAction::Send {
                         name: name.clone(),
                         text: text.replace("{AGENT_NAME}", name),
                     });
                 } else if nudge.is_some() {
-                    actions.push(LoopAction::Nudge {
-                        name: name.clone(),
-                    });
+                    actions.push(LoopAction::Nudge { name: name.clone() });
                 } else {
                     actions.push(LoopAction::Wait);
                 }
@@ -2423,7 +3157,8 @@ fn clamp_active_interval(v: u64) -> u64 {
     v.max(5)
 }
 
-fn build_queue(queue: Option<&str>, workflow: Option<&str>) -> Result<Vec<String>> {    let mut items: Vec<String> = Vec::new();
+fn build_queue(queue: Option<&str>, workflow: Option<&str>) -> Result<Vec<String>> {
+    let mut items: Vec<String> = Vec::new();
     if let Some(wf) = workflow {
         let workflows = config::Workflows::load()?;
         let steps = workflows
@@ -2501,9 +3236,7 @@ fn cmd_loop(
     if !local && !once {
         // durable loops have no wall clock; --timeout-ms becomes a poll cap
         // (deterministic across replays)
-        let max_iterations = timeout_ms.map(|ms| {
-            (ms / 1000).div_ceil(interval_secs.max(1))
-        });
+        let max_iterations = timeout_ms.map(|ms| (ms / 1000).div_ceil(interval_secs.max(1)));
         let params = durable::LoopParams {
             project: project.to_string(),
             to: to.to_string(),
@@ -2525,14 +3258,16 @@ fn cmd_loop(
         );
         let result = rt.block_on(durable::run_durable_loop(cfg, params))?;
         println!("loop: {result}");
-        log(project, EventKind::Loop, json!({ "status": "complete", "result": result }));
+        log(
+            project,
+            EventKind::Loop,
+            json!({ "status": "complete", "result": result }),
+        );
         return Ok(());
     }
 
     if queue_items.is_empty() && nudge.is_none() {
-        eprintln!(
-            "flywheel: no instructions queued and no --nudge — loop will only monitor"
-        );
+        eprintln!("flywheel: no instructions queued and no --nudge — loop will only monitor");
     }
 
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
@@ -2554,7 +3289,11 @@ fn cmd_loop(
         dim(project),
         interval_secs,
         queue_items.len(),
-        if nudge.is_some() { " + nudge".to_string() } else { String::new() }
+        if nudge.is_some() {
+            " + nudge".to_string()
+        } else {
+            String::new()
+        }
     );
 
     loop {
@@ -2610,6 +3349,10 @@ fn cmd_loop(
                 LoopAction::Send { name, text } => {
                     if let Err(e) = c.agent_prompt(name, text, None) {
                         eprintln!("flywheel: send to {name} failed: {e:#}");
+                        // the item was already popped by plan_actions — put it
+                        // back at the FRONT so the next poll retries it (a
+                        // dead agent never silently consumes a prompt)
+                        queue_items.insert(0, text.clone());
                         continue;
                     }
                     log(
@@ -2617,7 +3360,12 @@ fn cmd_loop(
                         EventKind::Send,
                         json!({ "to": name, "stage": "-", "text_len": text.len(), "wait": false, "source": "loop" }),
                     );
-                    println!("{} → {} {}", dim("[loop] sent"), dim(name), dim(&text.chars().take(60).collect::<String>()));
+                    println!(
+                        "{} → {} {}",
+                        dim("[loop] sent"),
+                        dim(name),
+                        dim(&text.chars().take(60).collect::<String>())
+                    );
                     any_work = true;
                 }
                 LoopAction::Nudge { name } => {
@@ -2625,7 +3373,11 @@ fn cmd_loop(
                     if let Err(e) = c.agent_prompt(name, n, None) {
                         eprintln!("flywheel: nudge to {name} failed: {e:#}");
                     } else {
-                        log(project, EventKind::Send, json!({ "to": name, "nudge": true, "text_len": n.len() }));
+                        log(
+                            project,
+                            EventKind::Send,
+                            json!({ "to": name, "nudge": true, "text_len": n.len() }),
+                        );
                         println!("{} → {name} (nudge)", dim("[loop] sent"));
                         any_work = true;
                     }
@@ -2637,9 +3389,13 @@ fn cmd_loop(
                             if let Ok(mut m) = mail_or_die(cfg) {
                                 let key = project_dir(cfg, project).to_str().unwrap().to_string();
                                 let _ = m.ensure_project(&key);
+                                // the recipient is the agent's REGISTERED
+                                // agent-mail identity (bd-odc) — the herdr
+                                // name is not a registrable identity
+                                let mail_target = resolve_mail_target(name);
                                 let _ = m.send(
                                     &key,
-                                    std::slice::from_ref(name),
+                                    std::slice::from_ref(&mail_target),
                                     "[flywheel] you are blocked",
                                     "The swarm loop detected you are blocked. Resolve or report the blocker.",
                                     "high",
@@ -2781,6 +3537,25 @@ mod loop_tests {
     }
 
     #[test]
+    fn unknown_agent_keeps_queue() {
+        // parity with the durable loop (bd-unknown-skip-dispatch): herdr
+        // cannot classify an unknown agent confidently — a prompt could land
+        // in a half-dead session and be silently lost. Never dispatch, never
+        // nudge; the queue stays intact.
+        let states = vec![st("a", AgentStatus::Unknown)];
+        let mut q = vec!["p1".into()];
+        let actions = plan_actions(&states, &mut q, None);
+        assert_eq!(q.len(), 1);
+        assert!(matches!(actions[0], LoopAction::Wait));
+        let mut q2: Vec<String> = vec![];
+        let actions = plan_actions(&states, &mut q2, Some("proceed"));
+        assert!(
+            matches!(actions[0], LoopAction::Wait),
+            "no nudge to unknown"
+        );
+    }
+
+    #[test]
     fn empty_queue_with_nudge_nudges() {
         let states = vec![st("a", AgentStatus::Idle)];
         let mut q: Vec<String> = vec![];
@@ -2808,12 +3583,27 @@ mod loop_tests {
     #[test]
     fn name_matching_handles_numbered_agents() {
         let base = "flywheel-proj-";
-        assert!(name_matches_want(&format!("{base}oc"), &format!("{base}oc")));
-        assert!(name_matches_want(&format!("{base}oc2"), &format!("{base}oc")));
-        assert!(name_matches_want(&format!("{base}oc10"), &format!("{base}oc")));
+        assert!(name_matches_want(
+            &format!("{base}oc"),
+            &format!("{base}oc")
+        ));
+        assert!(name_matches_want(
+            &format!("{base}oc2"),
+            &format!("{base}oc")
+        ));
+        assert!(name_matches_want(
+            &format!("{base}oc10"),
+            &format!("{base}oc")
+        ));
         // prefix collision: ocr must NOT match oc
-        assert!(!name_matches_want(&format!("{base}ocr"), &format!("{base}oc")));
-        assert!(!name_matches_want(&format!("{base}ocx"), &format!("{base}oc")));
+        assert!(!name_matches_want(
+            &format!("{base}ocr"),
+            &format!("{base}oc")
+        ));
+        assert!(!name_matches_want(
+            &format!("{base}ocx"),
+            &format!("{base}oc")
+        ));
     }
 
     #[test]
@@ -2825,6 +3615,36 @@ mod loop_tests {
         assert_eq!(agent_ordinal("flywheel-proj-oc2", "proj", "oc"), Some(2));
         assert_eq!(agent_ordinal("flywheel-proj-ocr", "proj", "oc"), None);
         assert_eq!(agent_ordinal("flywheel-proj-gk", "proj", "oc"), None);
+    }
+
+    #[test]
+    fn watch_matches_event_by_pane_id_not_agent_kind() {
+        // the pane.agent_status_changed push carries the agent KIND
+        // ("opencode"), never the instance name — matching must go through
+        // the pane id, which IS in the payload
+        let targets = vec![
+            ("w1:p1".to_string(), "flywheel-x-oc".to_string()),
+            ("w1:p2".to_string(), "flywheel-x-pi".to_string()),
+        ];
+        assert_eq!(
+            watch_name_for_pane(&targets, "w1:p1"),
+            Some("flywheel-x-oc")
+        );
+        assert_eq!(
+            watch_name_for_pane(&targets, "w1:p2"),
+            Some("flywheel-x-pi")
+        );
+        assert_eq!(watch_name_for_pane(&targets, "w9:p9"), None);
+        // pane ids never match by kind: the event's `agent` field is NOT a
+        // lookup key (that was the bug — kind vs name confusion)
+        assert_eq!(watch_name_for_pane(&targets, "opencode"), None);
+    }
+
+    #[test]
+    fn watch_matches_nameless_agents_by_pane() {
+        // a nameless pi agent's display name IS its pane id
+        let targets = vec![("w1:p2".to_string(), "w1:p2".to_string())];
+        assert_eq!(watch_name_for_pane(&targets, "w1:p2"), Some("w1:p2"));
     }
 }
 
@@ -2847,8 +3667,22 @@ fn cmd_safety(cfg: &Config) -> Result<()> {
     if c.ping().is_ok() {
         println!("herdr socket: ok");
     }
-    println!("br: {}", if command_exists("br") { status_paint(AgentStatus::Idle) } else { error("missing") });
-    println!("bv: {}", if command_exists("bv") { status_paint(AgentStatus::Idle) } else { error("missing") });
+    println!(
+        "br: {}",
+        if command_exists("br") {
+            status_paint(AgentStatus::Idle)
+        } else {
+            error("missing")
+        }
+    );
+    println!(
+        "bv: {}",
+        if command_exists("bv") {
+            status_paint(AgentStatus::Idle)
+        } else {
+            error("missing")
+        }
+    );
     Ok(())
 }
 
@@ -3008,7 +3842,11 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
     match out {
         Some(path) => {
             std::fs::write(path, &rendered)?;
-            println!("wrote {} ({} bytes)", dim(&path.display().to_string()), rendered.len());
+            println!(
+                "wrote {} ({} bytes)",
+                dim(&path.display().to_string()),
+                rendered.len()
+            );
         }
         None => print!("{rendered}"),
     }
@@ -3062,6 +3900,52 @@ fn protocol_check(live: u64, pin: u64) -> ProtocolCheck {
         ProtocolCheck::Newer
     } else {
         ProtocolCheck::Older
+    }
+}
+
+/// The agent-mail identity the orchestrator acts as: the configured
+/// `[agent_mail] name`, defaulting to "flywheel" — identical to
+/// `Mail::from_config`'s default, so lease renewal and the `flywheel mail
+/// locks` reservations always use the SAME identity.
+fn orchestrator_mail_name(cfg: &Config) -> String {
+    cfg.agent_mail
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| "flywheel".to_string())
+}
+
+#[cfg(test)]
+mod mail_name_tests {
+    use super::*;
+    use config::MailConfig;
+
+    #[test]
+    fn configured_name_wins() {
+        let cfg = Config {
+            agent_mail: Some(MailConfig {
+                url: Some("http://x".into()),
+                token: None,
+                name: Some("Orchid".into()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(orchestrator_mail_name(&cfg), "Orchid");
+    }
+
+    #[test]
+    fn default_name_is_flywheel() {
+        // no agent_mail section at all
+        assert_eq!(orchestrator_mail_name(&Config::default()), "flywheel");
+        // agent_mail section without a name
+        let cfg = Config {
+            agent_mail: Some(MailConfig {
+                url: Some("http://x".into()),
+                token: None,
+                name: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(orchestrator_mail_name(&cfg), "flywheel");
     }
 }
 
@@ -3134,7 +4018,9 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
                 crate::output::warn("unknown"),
                 herdr::HDR_PROTOCOL
             );
-            eprintln!("flywheel: WARNING cannot read herdr protocol (herdr api schema --json failed)");
+            eprintln!(
+                "flywheel: WARNING cannot read herdr protocol (herdr api schema --json failed)"
+            );
         }
     }
 
@@ -3189,11 +4075,18 @@ fn cmd_config(cfg: &Config, cmd: &ConfigCmd) -> Result<()> {
             println!("{raw}");
             println!("# effective (flags/env > file):");
             println!("socket_path = {:?}", cfg.socket_path());
-            println!("workspace_root = {:?}", cfg.workspace_root().display().to_string());
+            println!(
+                "workspace_root = {:?}",
+                cfg.workspace_root().display().to_string()
+            );
             println!("default_timeout_ms = {}", cfg.timeout_ms());
         }
         ConfigCmd::Get { key } => {
-            let raw = if path.exists() { std::fs::read_to_string(&path)? } else { String::new() };
+            let raw = if path.exists() {
+                std::fs::read_to_string(&path)?
+            } else {
+                String::new()
+            };
             let cfg: config::Config = toml::from_str(&raw).unwrap_or_default();
             let value = match key.as_str() {
                 "socket_path" => cfg.socket_path,
@@ -3204,13 +4097,25 @@ fn cmd_config(cfg: &Config, cmd: &ConfigCmd) -> Result<()> {
             println!("{}", value.unwrap_or_default());
         }
         ConfigCmd::Set { key, value } => {
-            let raw = if path.exists() { std::fs::read_to_string(&path)? } else { String::new() };
+            let raw = if path.exists() {
+                std::fs::read_to_string(&path)?
+            } else {
+                String::new()
+            };
             let mut cfg: config::Config = toml::from_str(&raw).unwrap_or_default();
             match key.as_str() {
                 "socket_path" => cfg.socket_path = Some(value.clone()),
                 "workspace_root" => cfg.workspace_root = Some(value.clone()),
                 "default_timeout_ms" => cfg.default_timeout_ms = Some(value.parse()?),
-                _ => bail!("unknown key: {key} (socket_path|workspace_root|default_timeout_ms)"),
+                "backend.multiplexer" => {
+                    cfg.backend.get_or_insert_with(Default::default).multiplexer = value.clone()
+                }
+                "backend.mail" => {
+                    cfg.backend.get_or_insert_with(Default::default).mail = value.clone()
+                }
+                _ => bail!(
+                    "unknown key: {key} (socket_path|workspace_root|default_timeout_ms|backend.multiplexer|backend.mail)"
+                ),
             }
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -3223,9 +4128,129 @@ fn cmd_config(cfg: &Config, cmd: &ConfigCmd) -> Result<()> {
     Ok(())
 }
 
+/// `flywheel backend` — discovery + selection of the pluggable backends
+/// (ADR-0002 R0.10). The `list` subcommand enumerates compiled-in backends
+/// (name/kind/ready|stub/active/compiled), `status` shows the active pair +
+/// config source + health, and `default` persists a backend to config.toml
+/// `[backend]` (env/flag still override at runtime).
+///
+/// governed-by: ADR-0002 (bd-cli-backend-subcommand)
+fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
+    match cmd {
+        BackendCmd::List => {
+            let active_mux = backend::resolve_backend_name(cfg);
+            let active_mail = backend::resolve_mail_name(cfg);
+            let compiled = backend::compiled_backends();
+            let mut rows: Vec<Value> = Vec::new();
+            // multiplexers
+            for (name, stub) in [("herdr", false), ("superlogical", true), ("tmux", true)] {
+                rows.push(json!({
+                    "name": name,
+                    "kind": "multiplexer",
+                    "status": if stub { "stub" } else { "ready" },
+                    "active": active_mux == name,
+                    "compiled_feature": compiled.contains(&name),
+                }));
+            }
+            // mail
+            for (name, stub) in [("agentmail", false), ("toron", true)] {
+                rows.push(json!({
+                    "name": name,
+                    "kind": "mail",
+                    "status": if stub { "stub" } else { "ready" },
+                    "active": active_mail == name,
+                    "compiled_feature": compiled.contains(&name),
+                }));
+            }
+            print_json(&json!({"backends": rows}));
+        }
+        BackendCmd::Status => {
+            let mux = backend::resolve_backend_name(cfg);
+            let mail = backend::resolve_mail_name(cfg);
+            // config source: env overrides config field over default. Report
+            // which layer selected the active name (env/.env/config/default).
+            let mux_source = if std::env::var_os("FLYWHEEL_BACKEND").is_some_and(|v| !v.is_empty())
+            {
+                "env"
+            } else if cfg
+                .backend
+                .as_ref()
+                .map(|b| b.multiplexer.as_str())
+                .is_some_and(|b| b == mux)
+            {
+                "config"
+            } else {
+                "default"
+            };
+            let mail_source = if std::env::var_os("FLYWHEEL_MAIL").is_some_and(|v| !v.is_empty()) {
+                "env"
+            } else if cfg
+                .backend
+                .as_ref()
+                .map(|b| b.mail.as_str())
+                .is_some_and(|b| b == mail)
+            {
+                "config"
+            } else {
+                "default"
+            };
+            // health: multiplexer = socket reachable; mail = agentmail /health
+            let mux_health = backend::multiplexer_backend(cfg)
+                .and_then(|mut b| b.agent_list().map(|_| true))
+                .unwrap_or(false);
+            let mail_health = if mail == "agentmail" {
+                backend::mail_backend(cfg)
+                    .and_then(|mut m| m.health().map(|_| true))
+                    .unwrap_or(false)
+            } else {
+                false // stub backends aren't healthy by construction
+            };
+            print_json(&json!({
+                "multiplexer": {"name": mux, "source": mux_source, "healthy": mux_health},
+                "mail": {"name": mail, "source": mail_source, "healthy": mail_health},
+            }));
+        }
+        BackendCmd::Default { kind, name } => {
+            let path = config::config_file();
+            let raw = if path.exists() {
+                std::fs::read_to_string(&path)?
+            } else {
+                String::new()
+            };
+            let mut cfg_w: config::Config = toml::from_str(&raw).unwrap_or_default();
+            let bc = cfg_w.backend.get_or_insert_with(Default::default);
+            match kind.as_str() {
+                "multiplexer" => bc.multiplexer = name.clone(),
+                "mail" => bc.mail = name.clone(),
+                other => bail!("unknown backend kind: {other} (multiplexer|mail)"),
+            }
+            // A `BackendConfig::default()` has empty fields; when the user sets
+            // one kind, initialize the OTHER to the currently-resolved default
+            // so the written config never contains empty strings (which would
+            // deserialize as unset — harmless, but sloppy).
+            if bc.multiplexer.is_empty() {
+                bc.multiplexer = backend::resolve_backend_name(cfg);
+            }
+            if bc.mail.is_empty() {
+                bc.mail = backend::resolve_mail_name(cfg);
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, toml::to_string_pretty(&cfg_w)?)?;
+            println!("default {kind} = {name}");
+        }
+    }
+    Ok(())
+}
+
 fn cmd_upgrade() -> Result<()> {
     let source = std::env::var("FLYWHEEL_SOURCE").unwrap_or_else(|_| "~/workspace/flywheel".into());
-    let expanded = source.replacen("~", &dirs::home_dir().unwrap_or_default().display().to_string(), 1);
+    let expanded = source.replacen(
+        "~",
+        &dirs::home_dir().unwrap_or_default().display().to_string(),
+        1,
+    );
     if !std::path::Path::new(&expanded).join("Cargo.toml").exists() {
         bail!("no Cargo.toml at {expanded} — set FLYWHEEL_SOURCE to the repo path");
     }
@@ -3278,6 +4303,177 @@ fn cmd_loop_status(cfg: &Config, project: &str) -> Result<()> {
     let v = rt.block_on(durable::loop_status(cfg, project))?;
     print_json(&v);
     Ok(())
+}
+
+/// internal leaf: JSON batch of push events collected within `timeout_ms`.
+///
+/// governed-by: ADR-0001 (A2 event stream) + ADR-0002 (backend factory).
+///
+/// **Forward-only:** herdr `events.subscribe` has no since/seq param (schema-
+/// verified). This leaf opens a fresh subscription, blocks up to `timeout_ms`,
+/// and returns whatever arrived. Crash recovery is NOT via event replay —
+/// the loop's `__poll` snapshot is the correctness floor. `after_seq` is
+/// best-effort in-run dedup only (skips events whose local seq is <= it).
+///
+/// Wire shape:
+/// ```json
+/// { "events": [{ "event_type", "pane_id", "agent", "status", "seq" }, ...],
+///   "max_seq": 0, "stream_error": null }
+/// ```
+fn cmd_internal_poll_events(
+    cfg: &Config,
+    project: &str,
+    timeout_ms: u64,
+    after_seq: Option<u64>,
+) -> Result<()> {
+    let batch = collect_poll_events(cfg, project, timeout_ms, after_seq)?;
+    print_json(&batch);
+    Ok(())
+}
+
+/// Collect status-change events for `project` until `timeout_ms` elapses.
+/// Extracted for unit-testability of the empty/error paths via the JSON shape.
+fn collect_poll_events(
+    cfg: &Config,
+    project: &str,
+    timeout_ms: u64,
+    after_seq: Option<u64>,
+) -> Result<serde_json::Value> {
+    let mut backend = backend::multiplexer_backend(cfg)?;
+    let ws_id = match find_workspace_dyn(backend.as_mut(), project) {
+        Ok(id) => id,
+        Err(e) => {
+            // no workspace yet — empty batch, not a hard error (loop may
+            // spawn agents later; heartbeat __poll handles empty swarms)
+            return Ok(json!({
+                "events": [],
+                "max_seq": after_seq.unwrap_or(0),
+                "stream_error": format!("no workspace: {e}"),
+            }));
+        }
+    };
+
+    let panes = backend.pane_list(Some(&ws_id)).unwrap_or_default();
+    if panes.is_empty() {
+        return Ok(json!({
+            "events": [],
+            "max_seq": after_seq.unwrap_or(0),
+            "stream_error": null,
+        }));
+    }
+
+    let subs: Vec<Subscription> = panes
+        .iter()
+        .map(|p| Subscription::agent_status_changed(p.pane_id.clone()))
+        .collect();
+
+    let mut stream = match backend.subscribe(&subs) {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(json!({
+                "events": [],
+                "max_seq": after_seq.unwrap_or(0),
+                "stream_error": format!("subscribe failed: {e}"),
+            }));
+        }
+    };
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    let mut seq = after_seq.unwrap_or(0);
+    let mut stream_error: Option<String> = None;
+
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        // floor: don't spin with 0-duration timeouts
+        let read_to = remaining.max(Duration::from_millis(1));
+        if let Err(e) = stream.set_read_timeout(Some(read_to)) {
+            stream_error = Some(format!("set_read_timeout: {e}"));
+            break;
+        }
+        match stream.read_event() {
+            Ok(Some(ev)) => {
+                if let Some(item) = summarize_status_event(&ev, &mut seq) {
+                    if after_seq.is_some_and(|a| item.seq <= a) {
+                        continue; // already seen this run
+                    }
+                    events.push(json!({
+                        "event_type": item.event_type,
+                        "pane_id": item.pane_id,
+                        "agent": item.agent,
+                        "status": item.status,
+                        "seq": item.seq,
+                    }));
+                }
+            }
+            Ok(None) => {
+                stream_error = Some("stream closed".into());
+                break;
+            }
+            Err(_) => {
+                // read timeout or transient I/O — end this batch (leaf returns
+                // whatever was collected; next iteration opens a fresh stream)
+                break;
+            }
+        }
+    }
+
+    Ok(json!({
+        "events": events,
+        "max_seq": seq,
+        "stream_error": stream_error,
+    }))
+}
+
+/// Compact form of a status-change push for the `__poll_events` JSON batch.
+struct StatusEventItem {
+    event_type: &'static str,
+    pane_id: String,
+    agent: Option<String>,
+    status: String,
+    seq: u64,
+}
+
+/// Map a typed push event to a status item, advancing `seq`. Returns `None`
+/// for non-status events (output_changed etc. — filtered at subscribe time
+/// but defensive).
+fn summarize_status_event(ev: &herdr::PushEvent, seq: &mut u64) -> Option<StatusEventItem> {
+    use herdr::HerdrEventData::*;
+    let (event_type, pane_id, agent, status) = match &ev.data {
+        PaneAgentStatusChanged(c) | PaneAgentStatusChangedSub(c) => (
+            "pane.agent_status_changed",
+            c.pane_id.clone(),
+            c.agent.clone().or_else(|| c.display_agent.clone()),
+            c.agent_status.as_str().to_string(),
+        ),
+        PaneAgentDetected(p) => (
+            "pane.agent_detected",
+            p.pane_id.clone(),
+            p.agent.clone(),
+            p.final_status
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_else(|| "unknown".into()),
+        ),
+        PaneExited(p) => (
+            "pane.exited",
+            p.pane_id.clone(),
+            None,
+            "exited".to_string(),
+        ),
+        _ => return None,
+    };
+    *seq = seq.saturating_add(1);
+    Some(StatusEventItem {
+        event_type,
+        pane_id,
+        agent,
+        status,
+        seq: *seq,
+    })
 }
 
 /// internal leaf: JSON [[name, status], ...] for a project's managed agents.
@@ -3409,7 +4605,11 @@ fn cmd_internal_send(
         Err(e) => classify_send_result(Some(&e.code), None),
     };
     let (landed, status, reason) = match verdict {
-        SendVerdict::Landed(st) => (true, st.map(|s| s.as_str().to_string()), "landed".to_string()),
+        SendVerdict::Landed(st) => (
+            true,
+            st.map(|s| s.as_str().to_string()),
+            "landed".to_string(),
+        ),
         SendVerdict::Stalled => (false, None, "stalled".to_string()),
         SendVerdict::TimedOut => (false, None, "timeout".to_string()),
         SendVerdict::Coded(code) => (false, None, format!("error:{code}")),
@@ -3486,7 +4686,11 @@ fn cmd_internal_wait_output(
     };
     match c.pane_wait_output(&pane_id, wait_output_mode(regex), pattern, timeout_ms) {
         Ok(r) => {
-            print_json(&wait_output_json(true, r.matched_line.as_deref(), &r.pane_id));
+            print_json(&wait_output_json(
+                true,
+                r.matched_line.as_deref(),
+                &r.pane_id,
+            ));
             Ok(())
         }
         Err(e) if e.code == "timeout" => {
@@ -3499,7 +4703,8 @@ fn cmd_internal_wait_output(
     }
 }
 
-fn cmd_internal_ready(cfg: &Config, project: &str) -> Result<()> {    let dir = project_dir(cfg, project);
+fn cmd_internal_ready(cfg: &Config, project: &str) -> Result<()> {
+    let dir = project_dir(cfg, project);
     let out = std::process::Command::new("br")
         .args(["ready", "--json"])
         .current_dir(&dir)
@@ -3512,8 +4717,8 @@ fn cmd_internal_ready(cfg: &Config, project: &str) -> Result<()> {    let dir = 
         );
     }
     let raw = String::from_utf8_lossy(&out.stdout);
-    let v: Value = serde_json::from_str(raw.trim())
-        .map_err(|e| anyhow!("br ready bad JSON: {e}: {raw}"))?;
+    let v: Value =
+        serde_json::from_str(raw.trim()).map_err(|e| anyhow!("br ready bad JSON: {e}: {raw}"))?;
     let beads: Vec<Value> = v
         .as_array()
         .cloned()
@@ -3545,8 +4750,8 @@ fn cmd_internal_inprogress(cfg: &Config, project: &str) -> Result<()> {
         );
     }
     let raw = String::from_utf8_lossy(&out.stdout);
-    let v: Value = serde_json::from_str(raw.trim())
-        .map_err(|e| anyhow!("br list bad JSON: {e}: {raw}"))?;
+    let v: Value =
+        serde_json::from_str(raw.trim()).map_err(|e| anyhow!("br list bad JSON: {e}: {raw}"))?;
     // br list --json wraps issues under "issues"
     let list: &Vec<Value> = v
         .get("issues")
@@ -3592,13 +4797,11 @@ fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
     // state-file fallback channel: parse the agent's state file when present.
     // Malformed/absent files yield null — never an error (the loop treats
     // null as "terminal channel only", identical to pre-zwa behavior).
-    let state: Option<agentstate::AgentStateFile> = agentstate::state_file_path(
-        &project_dir(cfg, project),
-        agent_target(&agent),
-    )
-    .ok()
-    .and_then(|p| std::fs::read_to_string(p).ok())
-    .and_then(|content| agentstate::parse_state_file(&content));
+    let state: Option<agentstate::AgentStateFile> =
+        agentstate::state_file_path(&project_dir(cfg, project), agent_target(&agent))
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|content| agentstate::parse_state_file(&content));
     print_json(&json!({ "terminal": text, "state": state }));
     Ok(())
 }
@@ -3644,7 +4847,7 @@ fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> 
                     eprintln!("flywheel: mail clear_pane_identity failed for {old}: {e}");
                 }
             }
-            if let Err(e) = mail.write_pane_identity(key, &fresh.pane_id, name) {
+            if let Err(e) = mail.write_pane_identity(key, &fresh.pane_id, &agent_mail_name(name)) {
                 eprintln!(
                     "flywheel: mail write_pane_identity failed for {name} on {}: {e}",
                     fresh.pane_id
@@ -3661,27 +4864,48 @@ fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> 
     Ok(())
 }
 
-/// internal leaf: notify a blocked agent via agent-mail.
 /// internal leaf: notify a blocked agent via agent-mail (durable workflow leaf).
 ///
 /// governed-by: ADR-0002 — constructs the mail backend via the factory so the
 /// durable loop is backend-agnostic (agent-mail MCP today; toron later).
+///
+/// Best-effort by contract: a missing/unreachable agent-mail must NEVER kill
+/// an overnight loop (same standard as the lease-renewal heartbeat) — the
+/// leaf exits 0 with `{"ok": false, "error": ...}` and the next poll retries.
 fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str) -> Result<()> {
-    let mut mail = backend::mail_backend(cfg)?;
+    let mut mail = match backend::mail_backend(cfg) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("flywheel: mail backend unavailable for blocked alert to {name}: {e:#}");
+            print_json(&json!({ "ok": false, "notified": name, "error": format!("{e:#}") }));
+            return Ok(());
+        }
+    };
     let key = project_dir(cfg, project).to_str().unwrap().to_string();
-    mail.ensure_project(&key)?;
-    mail.send(
-        &key,
-        &[name.to_string()],
-        "[flywheel] you are blocked",
-        "The swarm loop detected you are blocked. Resolve or report the blocker.",
-        "high",
-        true,
-        Some(&format!("health-{name}")),
-    )
-    .map_err(|e| anyhow!("mail backend: {e}"))?;
-    print_json(&json!({ "ok": true, "notified": name }));
-    Ok(())
+    // the recipient is the agent's REGISTERED agent-mail identity (bd-odc) —
+    // `name` is the herdr name, which is not a registrable identity
+    let mail_target = resolve_mail_target(name);
+    match mail.ensure_project(&key).and_then(|_| {
+        mail.send(
+            &key,
+            std::slice::from_ref(&mail_target),
+            "[flywheel] you are blocked",
+            "The swarm loop detected you are blocked. Resolve or report the blocker.",
+            "high",
+            true,
+            Some(&format!("health-{name}")),
+        )
+    }) {
+        Ok(_) => {
+            print_json(&json!({ "ok": true, "notified": mail_target }));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("flywheel: blocked alert to {name} failed: {e:#}");
+            print_json(&json!({ "ok": false, "notified": mail_target, "error": format!("{e:#}") }));
+            Ok(())
+        }
+    }
 }
 
 /// Internal leaf command: renew this identity's active file reservations in
@@ -3693,7 +4917,10 @@ fn cmd_internal_renew_leases(cfg: &Config, project: &str, extend_seconds: u64) -
     let mut mail = backend::mail_backend(cfg)?;
     let key = project_dir(cfg, project).to_str().unwrap().to_string();
     mail.ensure_project(&key)?;
-    let agent = mail.name().to_string();
+    // NOTE: MailBackend::name() returns the backend identifier ("agentmail"),
+    // not the orchestrator's agent-mail identity — use the configured name so
+    // the reported `agent` matches the reservations' owner.
+    let agent = orchestrator_mail_name(cfg);
     let v = mail
         .renew(&key, &agent, extend_seconds, None)
         .map_err(|e| anyhow!("mail backend: {e}"))?;
@@ -3736,13 +4963,16 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
     async fn snapshot(State(st): State<Arc<AppState>>) -> Result<String, StatusCode> {
         let mut c = Client::connect(Some(&st.cfg.socket_path()))
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let agents = c.agent_list().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let agents = c
+            .agent_list()
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         Ok(serde_json::to_string(&json!({
             "agents": agents.iter().map(|a| json!({
                 "name": a.name, "kind": a.agent, "status": a.agent_status.as_str(),
                 "workspace_id": a.workspace_id, "pane_id": a.pane_id
             })).collect::<Vec<_>>()
-        })).unwrap())
+        }))
+        .unwrap())
     }
 
     async fn send(State(st): State<Arc<AppState>>, body: String) -> Result<String, StatusCode> {
@@ -3759,8 +4989,8 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
         let mut c = Client::connect(Some(&st.cfg.socket_path()))
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let ws_id = find_workspace(&mut c, project).map_err(|_| StatusCode::NOT_FOUND)?;
-        let targets = resolve_agents(&mut c, &ws_id, project, to)
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        let targets =
+            resolve_agents(&mut c, &ws_id, project, to).map_err(|_| StatusCode::BAD_REQUEST)?;
         for a in &targets {
             c.agent_prompt(agent_target(a), msg, None)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -3768,8 +4998,7 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
         Ok(json!({ "ok": true, "targets": targets.len() }).to_string())
     }
 
-    async fn sse_handler(State(st): State<Arc<AppState>>) -> axum::response::Response
-    {
+    async fn sse_handler(State(st): State<Arc<AppState>>) -> axum::response::Response {
         use axum::response::sse::Event;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
         let cfg = st.cfg.clone();
@@ -3791,14 +5020,20 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
                 })
                 .to_string();
                 tick += 1;
-                if tx.send(Ok(Event::default().event("state").data(payload))).await.is_err() {
+                if tx
+                    .send(Ok(Event::default().event("state").data(payload)))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
         });
         use axum::response::IntoResponse;
         axum::response::Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
-            .keep_alive(axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+            .keep_alive(
+                axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+            )
             .into_response()
     }
 
@@ -3865,7 +5100,10 @@ mod wait_output_tests {
     #[test]
     fn resolve_pane_id_maps_agent_name_to_pane() {
         let agents = vec![agent(Some("flywheel-x-oc"), "w1:p1")];
-        assert_eq!(resolve_pane_id(&agents, "flywheel-x-oc"), Some("w1:p1".to_string()));
+        assert_eq!(
+            resolve_pane_id(&agents, "flywheel-x-oc"),
+            Some("w1:p1".to_string())
+        );
     }
 
     #[test]
