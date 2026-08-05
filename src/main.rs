@@ -1288,21 +1288,192 @@ fn register_spawned_agent(cfg: &Config, project: &str, name: &str, kind: &str, p
         eprintln!("flywheel: mail ensure_project failed for {name}: {e}");
         return;
     }
-    // program = the herdr agent kind (codex/pi/grok); model defaults to the
-    // kind if unknown (agent-mail doesn't require it). task_description =
-    // the project + name so list_agents shows something useful.
-    let task = format!("spawned agent for {project}: {name}");
-    if let Err(e) = mail.register_agent(&key, name, kind, kind, &task) {
-        // NOTE: agent-mail rejects names that aren't adjective+noun
-        // (flywheel's `flywheel-<base>-<kind>` names fail here — see
-        // bd-mail-register-on-spawn-naming). Registration is best-effort; the
-        // pane-identity bridge below still works because the identity file is
-        // the pane→name source the server reads, registration or not.
+    // bd-odc fix: agent-mail's register_agent REJECTS non-adjective+noun
+    // names, and flywheel spawns `flywheel-<base>-<kind>` names. Map to a
+    // stable adjective+noun (agent_mail_name), keep the herdr name in
+    // task_description so list_agents is the reverse lookup.
+    let mail_name = agent_mail_name(name);
+    let task = format!("{name} (flywheel agent for {project})");
+    if let Err(e) = mail.register_agent(&key, &mail_name, kind, kind, &task) {
+        // Best-effort: a registration failure must never fail the spawn. The
+        // pane-identity bridge below still works (the identity file is the
+        // pane→name source the server reads, registration or not).
         eprintln!("flywheel: mail register_agent failed for {name}: {e}");
     }
     // bridge the identity to the herdr pane (best-effort, like register)
     if let Err(e) = mail.write_pane_identity(&key, pane_id, name) {
         eprintln!("flywheel: mail write_pane_identity failed for {name} on {pane_id}: {e}");
+    }
+}
+
+/// Deterministic herdr-agent-name → agent-mail adjective+noun mapping.
+///
+/// agent-mail's `register_agent` validates names against a FIXED whitelist:
+/// `VALID_ADJECTIVES` (75) × `VALID_NOUNS` (132), lowercase-split + PascalCase
+/// (bd-odc; verified from `mcp_agent_mail_core::models`). Any other shape is
+/// rejected, INCLUDING lookalikes like `FrostDolphin` (dolphin isn't in the
+/// noun list). This maps any herdr name (`flywheel-flywheel-oc`) to a stable
+/// adjective+noun from the SAME whitelist via FNV-1a hash into the lists.
+///
+/// The mapping is deterministic — the same herdr name always maps to the
+/// same agent-mail name, across runs and machines — so re-registration is
+/// idempotent and the reverse lookup (herdr name in task_description) is
+/// stable. Collisions (different herdr names → same pair) are possible but
+/// harmless: register_agent is an upsert per name, and the herdr name is
+/// preserved in task_description, so no information is lost.
+///
+/// Lists copied verbatim from mcp_agent_mail_rust
+/// crates/mcp-agent-mail-core/src/models.rs (Apache/MIT). If the server
+/// updates its lists, flywheel's copy must follow or registration breaks.
+fn agent_mail_name(herdr_name: &str) -> String {
+    // Keep in lockstep with mcp_agent_mail_core::models::VALID_ADJECTIVES.
+    const ADJECTIVES: [&str; 75] = [
+        "red", "orange", "yellow", "pink", "black", "purple", "blue", "brown", "white",
+        "green", "chartreuse", "lilac", "fuchsia", "azure", "amber", "coral", "crimson",
+        "cyan", "gold", "golden", "gray", "indigo", "ivory", "jade", "lavender",
+        "magenta", "maroon", "navy", "olive", "pearl", "rose", "ruby", "sage", "scarlet",
+        "silver", "teal", "topaz", "violet", "cobalt", "copper", "bronze", "emerald",
+        "sapphire", "turquoise", "beige", "tan", "cream", "peach", "plum", "sunny",
+        "misty", "foggy", "stormy", "windy", "frosty", "dusty", "hazy", "cloudy",
+        "rainy", "snowy", "icy", "mossy", "sandy", "swift", "quiet", "bold", "calm",
+        "bright", "dark", "wild", "silent", "gentle", "rustic", "noble", "proud",
+    ];
+    // Keep in lockstep with mcp_agent_mail_core::models::VALID_NOUNS.
+    const NOUNS: [&str; 132] = [
+        "stone", "lake", "creek", "pond", "mountain", "hill", "snow", "castle", "river",
+        "forest", "valley", "canyon", "meadow", "prairie", "desert", "island", "cliff",
+        "cave", "glacier", "waterfall", "spring", "stream", "reef", "dune", "ridge",
+        "peak", "gorge", "marsh", "brook", "glen", "grove", "fern", "hollow", "basin",
+        "cove", "bay", "harbor", "coast", "shore", "bluff", "knoll", "summit", "plateau",
+        "dog", "cat", "bear", "fox", "wolf", "deer", "elk", "moose", "otter", "beaver",
+        "badger", "lynx", "puma", "squirrel", "rabbit", "hare", "mouse", "mink", "seal",
+        "horse", "lion", "tiger", "panther", "leopard", "jaguar", "coyote", "bison",
+        "ox", "hawk", "eagle", "owl", "falcon", "raven", "heron", "crane", "finch",
+        "robin", "sparrow", "duck", "goose", "swan", "dove", "wren", "jay", "lark",
+        "kite", "condor", "osprey", "pelican", "gull", "tern", "stork", "ibis",
+        "cardinal", "oriole", "thrush", "trout", "salmon", "bass", "pike", "carp",
+        "turtle", "frog", "pine", "oak", "maple", "birch", "cedar", "willow", "aspen",
+        "elm", "orchid", "lotus", "ivy", "tower", "bridge", "forge", "mill", "barn",
+        "gate", "anchor", "lantern", "beacon", "compass", "horizon", "spire", "chapel",
+        "citadel", "fortress",
+    ];
+    let h = state::fnv1a64(herdr_name);
+    let adj = ADJECTIVES[(h % ADJECTIVES.len() as u64) as usize];
+    let noun = NOUNS[((h >> 32) % NOUNS.len() as u64) as usize];
+    // PascalCase: adjective + noun, each capitalized (server normalizes to
+    // PascalCase before storing, so any case is accepted; produce the canonical
+    // form).
+    let mut adj = adj.to_owned();
+    let mut noun = noun.to_owned();
+    if let Some(c) = adj.get_mut(0..1) {
+        c.make_ascii_uppercase();
+    }
+    if let Some(c) = noun.get_mut(0..1) {
+        c.make_ascii_uppercase();
+    }
+    format!("{adj}{noun}")
+}
+
+#[cfg(test)]
+mod agent_mail_name_tests {
+    use super::*;
+
+    /// The mapping is deterministic: same herdr name → same adjective+noun,
+    /// every call (and across machines — no randomness, no time).
+    #[test]
+    fn mapping_is_deterministic() {
+        let a = agent_mail_name("flywheel-flywheel-oc");
+        let b = agent_mail_name("flywheel-flywheel-oc");
+        assert_eq!(a, b);
+        assert_eq!(a, agent_mail_name("flywheel-flywheel-oc"));
+    }
+
+    /// The output is a valid agent-mail name per the server contract
+    /// (mcp_agent_mail_core::models::normalize_agent_name): a VALID_ADJECTIVES
+    /// member + VALID_NOUNS member, total length >= 5. This is the REAL gate
+    /// — bd-odc proved lookalikes like FrostDolphin are rejected.
+    #[test]
+    fn mapping_produces_valid_agent_mail_name() {
+        for name in [
+            "flywheel-flywheel-oc",
+            "flywheel-hachiko-pi2",
+            "flywheel-toron-gk3",
+            "oc",
+            "pi",
+            "gk",
+        ] {
+            let m = agent_mail_name(name);
+            let lower = m.to_ascii_lowercase();
+            assert!(
+                lower.len() >= 5,
+                "{name} -> '{m}' too short for normalize_agent_name (>=5)"
+            );
+            // split at every possible adjective boundary and check membership
+            // (mirrors split_valid_agent_name's lazy scan)
+            let adjectives = [
+                "red", "blue", "green", "golden", "sapphire", "turquoise", "emerald",
+                "crimson", "frosty", "misty", "stormy", "swift", "quiet", "bold", "calm",
+                "bright", "dark", "wild", "silent", "gentle", "rustic", "noble", "proud",
+                "amber", "coral", "azure", "teal", "topaz", "violet", "pearl", "ruby",
+                "jade", "ivory", "indigo", "lilac", "fuchsia", "maroon", "navy", "olive",
+                "sage", "scarlet", "silver", "copper", "bronze", "beige", "cream", "peach",
+                "plum", "sunny", "foggy", "hazy", "cloudy", "rainy", "snowy", "icy",
+                "mossy", "sandy", "gray", "black", "white", "brown", "pink", "yellow",
+                "orange", "chartreuse", "lavender", "magenta", "rose", "cobalt", "tan",
+            ];
+            let nouns = [
+                "stone", "lake", "creek", "pond", "mountain", "hill", "snow", "castle",
+                "river", "forest", "valley", "canyon", "meadow", "prairie", "desert",
+                "island", "cliff", "cave", "glacier", "waterfall", "spring", "stream",
+                "reef", "dune", "ridge", "peak", "gorge", "marsh", "brook", "glen",
+                "grove", "fern", "hollow", "basin", "cove", "bay", "harbor", "coast",
+                "shore", "bluff", "knoll", "summit", "plateau", "dog", "cat", "bear",
+                "fox", "wolf", "deer", "elk", "moose", "otter", "beaver", "badger",
+                "lynx", "puma", "squirrel", "rabbit", "hare", "mouse", "mink", "seal",
+                "horse", "lion", "tiger", "panther", "leopard", "jaguar", "coyote",
+                "bison", "ox", "hawk", "eagle", "owl", "falcon", "raven", "heron",
+                "crane", "finch", "robin", "sparrow", "duck", "goose", "swan", "dove",
+                "wren", "jay", "lark", "kite", "condor", "osprey", "pelican", "gull",
+                "tern", "stork", "ibis", "cardinal", "oriole", "thrush", "trout",
+                "salmon", "bass", "pike", "carp", "turtle", "frog", "pine", "oak",
+                "maple", "birch", "cedar", "willow", "aspen", "elm", "orchid", "lotus",
+                "ivy", "tower", "bridge", "forge", "mill", "barn", "gate", "anchor",
+                "lantern", "beacon", "compass", "horizon", "spire", "chapel", "citadel",
+                "fortress",
+            ];
+            let adj_ok = adjectives.iter().any(|a| {
+                lower
+                    .strip_prefix(a)
+                    .is_some_and(|rest| nouns.contains(&rest) && !rest.is_empty())
+            });
+            assert!(adj_ok, "{name} -> '{m}' must be a VALID_ADJECTIVES+VALID_NOUNS pair");
+        }
+    }
+
+    /// The mapping spreads across the tables (not all names collapse to one
+    /// adjective+noun) — collisions are harmless but rare is better.
+    #[test]
+    fn mapping_has_spread() {
+        let names = [
+            "flywheel-flywheel-oc",
+            "flywheel-flywheel-oc2",
+            "flywheel-hachiko-pi",
+            "flywheel-hachiko-pi2",
+            "flywheel-toron-gk",
+            "flywheel-toron-gk2",
+            "flywheel-chiebukuro-oc",
+            "flywheel-chiebukuro-pi",
+            "flywheel-chiebukuro-gk",
+        ];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for n in names {
+            seen.insert(agent_mail_name(n));
+        }
+        assert!(
+            seen.len() >= 6,
+            "expected spread across adjective+noun pairs, got {} unique: {seen:?}",
+            seen.len()
+        );
     }
 }
 
