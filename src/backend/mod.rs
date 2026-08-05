@@ -29,6 +29,8 @@
 pub mod agentmail;
 pub mod factory;
 pub mod herdr;
+#[cfg(test)]
+mod parity;
 
 use crate::herdr::{
     AgentInfo, AgentStatus, PaneInfo, PushEvent, Subscription, WaitOptions, WorkspaceInfo,
