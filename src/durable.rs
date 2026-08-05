@@ -241,6 +241,29 @@ pub struct DiagnoseArgs {
     pub reason: String,
 }
 
+/// Args for the xproj-inbox leaf (cross-project swarm receive path).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XprojInboxArgs {
+    pub project: String,
+    #[serde(default = "default_xproj_limit")]
+    pub limit: u32,
+}
+
+fn default_xproj_limit() -> u32 {
+    30
+}
+
+/// Args for the xproj-spawn leaf (cross-project swarm receive, full branch).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XprojSpawnArgs {
+    pub project: String,
+    pub message_id: u64,
+    pub thread_id: String,
+    pub from: String,
+    pub recipe: String,
+    pub workers: u32,
+}
+
 fn map_err(e: anyhow::Error) -> Error {
     Error::Application {
         message: e.to_string(),
@@ -764,6 +787,57 @@ async fn notify_blocked(args: NotifyArgs) -> Result<()> {
     if !out.status.success() {
         return Err(map_err(anyhow::anyhow!(
             "__mail-blocked failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Scan orchestrator inbox for `[xproj]` requests. Soft-fail empty.
+#[function]
+async fn poll_xproj_inbox(args: XprojInboxArgs) -> Result<Vec<crate::XprojInboxItem>> {
+    let exe = self_exe().map_err(map_err)?;
+    let out = Command::new(&exe)
+        .args([
+            "__xproj-inbox",
+            &args.project,
+            "--limit",
+            &args.limit.to_string(),
+        ])
+        .output()
+        .map_err(|e| map_err(anyhow::anyhow!("__xproj-inbox spawn failed: {e}")))?;
+    if !out.status.success() {
+        return Ok(vec![]);
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v: Value = serde_json::from_str(raw.trim()).unwrap_or(json!({ "items": [] }));
+    let items = v.get("items").cloned().unwrap_or(json!([]));
+    let parsed: Vec<crate::XprojInboxItem> = serde_json::from_value(items).unwrap_or_default();
+    Ok(parsed)
+}
+
+/// Spawn the swarm for a parsed `[xproj]` request (full loop branch).
+/// Delegates to the `__xproj-spawn` leaf which calls `cmd_spawn` + replies
+/// in-thread. Soft-fail: spawn errors are surfaced in-thread by the leaf, the
+/// loop continues.
+#[function]
+async fn spawn_xproj(args: XprojSpawnArgs) -> Result<()> {
+    let exe = self_exe().map_err(map_err)?;
+    let out = Command::new(&exe)
+        .args([
+            "__xproj-spawn",
+            &args.project,
+            &args.message_id.to_string(),
+            &args.thread_id,
+            &args.from,
+            &args.recipe,
+            &args.workers.to_string(),
+        ])
+        .output()
+        .map_err(|e| map_err(anyhow::anyhow!("__xproj-spawn spawn failed: {e}")))?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__xproj-spawn failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
@@ -1467,6 +1541,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // agents that received DispatchImmediate and await working confirmation
     // (bd-event-dispatch double-dispatch guard)
     let mut dispatch_pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // cross-project [xproj] message ids already queued (avoid re-enqueue)
+    let mut seen_xproj: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     loop {
         iteration += 1;
@@ -1527,6 +1603,74 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         clear_live_failures(&mut send_failures, &states);
         // learn agent kinds for the respawn path (idempotent, never removes)
         learn_kinds(&mut agent_kinds, &states);
+
+        // ---- cross-project receive (bd-pattern-cross-project-swarm §9.5) ----
+        // Scan orchestrator inbox for [xproj] requests. For each unseen item,
+        // PARSE + SPAWN DIRECTLY (full loop branch): if the request carries a
+        // recipe, call `__xproj-spawn` which spawns the swarm in this project
+        // and replies in-thread. If it doesn't parse to a recipe, fall back to
+        // queueing a prompt for an idle agent to interpret. Soft-fail.
+        let xproj_items: Vec<crate::XprojInboxItem> = ctx
+            .run(
+                poll_xproj_inbox,
+                XprojInboxArgs {
+                    project: params.project.clone(),
+                    limit: 30,
+                },
+            )
+            .await
+            .unwrap_or_default();
+        for item in &xproj_items {
+            if seen_xproj.contains(&item.id) {
+                continue;
+            }
+            seen_xproj.insert(item.id);
+            let combined = format!("{} {}", item.subject, item.body);
+            let req = crate::parse_xproj_request(&combined);
+            let action = if let Some(r) = req.filter(|r| !r.recipe.is_empty()) {
+                // FULL BRANCH: spawn the requested swarm directly.
+                let spawned = ctx
+                    .run(
+                        spawn_xproj,
+                        XprojSpawnArgs {
+                            project: params.project.clone(),
+                            message_id: item.id,
+                            thread_id: item.thread_id.clone(),
+                            from: item.from.clone(),
+                            recipe: r.recipe.clone(),
+                            workers: r.workers,
+                        },
+                    )
+                    .await;
+                if let Err(e) = &spawned {
+                    eprintln!("flywheel: __xproj-spawn failed for msg {}: {e}", item.id);
+                }
+                "spawned"
+            } else {
+                // FALLBACK: an agent interprets the unparseable request.
+                let prompt = crate::xproj_queue_prompt(
+                    item,
+                    &crate::XprojRequest {
+                        recipe: String::new(),
+                        workers: 2,
+                        params: combined.clone(),
+                        product: String::new(),
+                    },
+                );
+                queue.push(prompt);
+                "queued"
+            };
+            let _ = crate::state::log_event(
+                &params.project,
+                crate::state::EventKind::State,
+                serde_json::json!({
+                    "source": "xproj_inbox",
+                    "message_id": item.id,
+                    "action": action,
+                }),
+            );
+            eprintln!("flywheel: cross-project request msg {} {action}", item.id);
+        }
 
         // self-heal (bd-event-self-heal): diagnose → respawn (budgeted) → blocked.
         // Skip-dispatch for unknown still holds in plan_actions; heal runs here.
@@ -2020,6 +2164,12 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     resonate
         .register(diagnose_agent)
         .map_err(|e| anyhow::anyhow!("register diagnose_agent: {e}"))?;
+    resonate
+        .register(poll_xproj_inbox)
+        .map_err(|e| anyhow::anyhow!("register poll_xproj_inbox: {e}"))?;
+    resonate
+        .register(spawn_xproj)
+        .map_err(|e| anyhow::anyhow!("register spawn_xproj: {e}"))?;
     resonate
         .register(renew_leases)
         .map_err(|e| anyhow::anyhow!("register renew_leases: {e}"))?;
