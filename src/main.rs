@@ -2742,7 +2742,9 @@ fn cmd_send(
             println!(
                 "{} {}",
                 dim(agent_target(a)),
-                status_paint(herdr_shim::parse_agent_status(status).unwrap_or(AgentStatus::Unknown))
+                status_paint(
+                    herdr_shim::parse_agent_status(status).unwrap_or(AgentStatus::Unknown)
+                )
             );
         }
         results.push(json!({
@@ -2824,7 +2826,8 @@ fn cmd_watch(
     until: Option<&str>,
     timeout_ms: Option<u64>,
 ) -> Result<()> {
-    let until_status: Option<AgentStatus> = until.map(herdr_shim::parse_agent_status).transpose()?;
+    let until_status: Option<AgentStatus> =
+        until.map(herdr_shim::parse_agent_status).transpose()?;
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
 
@@ -3793,7 +3796,9 @@ fn cmd_changes(cfg: &Config, project: &str, since: usize) -> Result<()> {
                 "{}  {} → {}",
                 dim(a.name.as_deref().unwrap_or("?")),
                 dim(prev_st),
-                status_paint(herdr_shim::parse_agent_status(now_st).unwrap_or(AgentStatus::Unknown))
+                status_paint(
+                    herdr_shim::parse_agent_status(now_st).unwrap_or(AgentStatus::Unknown)
+                )
             );
         }
     }
@@ -4755,12 +4760,7 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
 /// `dry_run` prints the target change without touching any file.
 /// `boot_port` (>0) also spawns `toron serve --mcp-http <port>` on a
 /// background task (requires the toron binary on PATH + operator-key env).
-fn toron_setup_mcp(
-    url: Option<&str>,
-    agents: &str,
-    boot_port: u16,
-    dry_run: bool,
-) -> Result<()> {
+fn toron_setup_mcp(url: Option<&str>, agents: &str, boot_port: u16, dry_run: bool) -> Result<()> {
     let url = url.unwrap_or("http://127.0.0.1:18080/mcp");
     let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME unset"))?;
     let home = std::path::Path::new(&home);
@@ -4791,7 +4791,10 @@ fn toron_setup_mcp(
         }
     }
 
-    if changed.iter().any(|c| c.contains("added") || c.contains("updated")) {
+    if changed
+        .iter()
+        .any(|c| c.contains("added") || c.contains("updated"))
+    {
         println!("toron MCP wired: {url}  {}", changed.join(" · "));
         println!("restart the agent editor for a new session to pick up the MCP server.");
     } else {
@@ -4956,7 +4959,10 @@ fn boot_toron_server(port: u16) -> Result<()> {
         .stderr(std::process::Stdio::null());
     // preserve operator-key env so the full privileged surface works
     if std::env::var_os("TORON_OPERATOR_KEY").is_some() {
-        cmd.env("TORON_OPERATOR_KEY", std::env::var("TORON_OPERATOR_KEY").unwrap());
+        cmd.env(
+            "TORON_OPERATOR_KEY",
+            std::env::var("TORON_OPERATOR_KEY").unwrap(),
+        );
     }
     cmd.spawn()?;
     println!("booted toron serve --mcp-http {bind} (detached).");
@@ -5374,9 +5380,9 @@ fn cmd_debate(
     // Compact ts for the thread id: ISO-8601 (`2026-08-06T13:03:42Z`) is NOT a
     // valid thread id — toron's send_message validator (AM-Rust parity) requires
     // `[a-zA-Z0-9._-]` only, no `:`. Replace hyphens AND colons AND the trailing
-    // Z so the id is e.g. `debate-20260806T130342`.
+    // Z so the id is e.g. `debate-20260806T130548`.
     let iso = crate::state::now_iso().replacen('-', "", 10);
-    let ts = iso.replace(':', "").replace('Z', "").replace('T', "T");
+    let ts: String = iso.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     let thread = format!("debate-{ts}");
 
     // scope the debate to the project dir (the proposition may be a project
@@ -6434,7 +6440,13 @@ fn cmd_internal_wait_output(
         eprintln!("flywheel: target {target} not found in {project}");
         std::process::exit(1);
     };
-    match herdr_shim::pane_wait_output(&mut c, &pane_id, wait_output_mode(regex), pattern, timeout_ms) {
+    match herdr_shim::pane_wait_output(
+        &mut c,
+        &pane_id,
+        wait_output_mode(regex),
+        pattern,
+        timeout_ms,
+    ) {
         Ok(r) => {
             print_json(&wait_output_json(
                 true,
