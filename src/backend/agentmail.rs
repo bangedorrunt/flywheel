@@ -20,9 +20,10 @@ pub struct AgentMailMcpBackend {
 }
 
 impl AgentMailMcpBackend {
-    /// Construct from the in-process `Mail` facade (which `Mail::in_process`
-    /// builds; `[agent_mail]` config is optional). The factory
-    /// (`bd-backend-env-config`) calls this; tests can inject a `Mail` directly.
+    /// Construct from the `Mail` facade (which `Mail::from_config` builds;
+    /// `[agent_mail]` config is optional — in-process by default, remote
+    /// daemon when `url` is set). The factory (`bd-backend-env-config`) calls
+    /// this; tests can inject a `Mail` directly.
     pub fn new(mail: Mail) -> Self {
         Self { mail }
     }
@@ -360,15 +361,17 @@ mod tests {
     }
 
     /// name() reports the right identifier — the one piece we can assert
-    /// without a live Mail. Constructed via `Mail::in_process` (in-process).
+    /// without a live Mail. Constructed via `Mail::from_config`; a url set
+    /// exercises the remote-daemon constructor (no HTTP happens — `name()`
+    /// reads the facade field).
     #[test]
     fn agentmail_name_is_agentmail() {
-        let mail = Mail::in_process(Some(&crate::config::MailConfig {
+        let mail = Mail::from_config(Some(&crate::config::MailConfig {
             url: Some("http://127.0.0.1:9999".into()),
             token: None,
             name: Some("test-orchestrator".into()),
         }))
-        .expect("in_process yields Some(Mail)")
+        .expect("from_config yields Some(Mail)")
         .expect("Some(Mail) unwraps");
         let b = AgentMailMcpBackend::new(mail);
         assert_eq!(b.name(), "agentmail");
@@ -379,7 +382,7 @@ mod tests {
     /// `Other` error, proving real delegation rather than `Unsupported`.
     #[test]
     fn renew_is_real_delegation_not_unsupported() {
-        let mail = Mail::in_process(None).expect("in_process ok").expect("Some");
+        let mail = Mail::from_config(None).expect("from_config ok").expect("Some");
         let mut b = AgentMailMcpBackend::new(mail);
         match b.renew("p", "a", 1200, None) {
             Err(BackendError::Other(_)) => {}
@@ -393,7 +396,7 @@ mod tests {
     /// would mean the pane-identity bridge is still stubbed).
     #[test]
     fn resolve_pane_identity_is_real_delegation_not_unsupported() {
-        let mail = Mail::in_process(None).expect("in_process ok").expect("Some");
+        let mail = Mail::from_config(None).expect("from_config ok").expect("Some");
         let mut b = AgentMailMcpBackend::new(mail);
         match b.resolve_pane_identity("p", "w1:p1") {
             Ok(v) => assert!(v.get("agent_name").is_none(), "no identity file"),
@@ -407,7 +410,7 @@ mod tests {
     /// succeed. A real `Unsupported` would mean the delegation is still stubbed.
     #[test]
     fn unsupported_methods_report_unsupported_not_panic() {
-        let mail = Mail::in_process(None).expect("in_process ok").expect("Some");
+        let mail = Mail::from_config(None).expect("from_config ok").expect("Some");
         let mut b = AgentMailMcpBackend::new(mail);
         // (method, result, expected-ok) — never Unsupported, never panic.
         for (method, res, expected_ok) in [

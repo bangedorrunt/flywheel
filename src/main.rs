@@ -10,6 +10,7 @@ mod config;
 mod durable;
 mod herdr_shim;
 mod mail_shim;
+mod mcp_http;
 mod output;
 mod state;
 mod toron_embed;
@@ -3049,7 +3050,7 @@ fn cmd_work(cfg: &Config, cmd: &WorkCmd) -> Result<()> {
 }
 
 fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&str>) -> Result<()> {
-    let Some(mail) = mail_shim::Mail::in_process(cfg.agent_mail.as_ref())? else {
+    let Some(mail) = mail_shim::Mail::from_config(cfg.agent_mail.as_ref())? else {
         bail!(
             "agent-mail not configured — set [agent_mail] url/token/name in {}",
             config::config_file().display()
@@ -3108,7 +3109,7 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
 // ---- mail ----
 
 fn mail_or_die(cfg: &Config) -> Result<mail_shim::Mail> {
-    mail_shim::Mail::in_process(cfg.agent_mail.as_ref())?.ok_or_else(|| {
+    mail_shim::Mail::from_config(cfg.agent_mail.as_ref())?.ok_or_else(|| {
         anyhow!(
             "agent-mail not configured — set [agent_mail] url/token/name in {}",
             config::config_file().display()
@@ -4763,7 +4764,7 @@ fn protocol_check(live: u64, pin: u64) -> ProtocolCheck {
 
 /// The agent-mail identity the orchestrator acts as: the configured
 /// `[agent_mail] name`, defaulting to "flywheel" — identical to
-/// `Mail::in_process`'s default, so lease renewal and the `flywheel mail
+/// `Mail::from_config`'s default, so lease renewal and the `flywheel mail
 /// locks` reservations always use the SAME identity.
 fn orchestrator_mail_name(cfg: &Config) -> String {
     cfg.agent_mail
@@ -4899,7 +4900,7 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
         }
     }
 
-    match mail_shim::Mail::in_process(cfg.agent_mail.as_ref()) {
+    match mail_shim::Mail::from_config(cfg.agent_mail.as_ref()) {
         Ok(Some(mut m)) => match m.health() {
             Ok(_) => println!("agent-mail: {}", status_paint(AgentStatus::Idle)),
             Err(e) => {

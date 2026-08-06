@@ -11,15 +11,19 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 1_800_000;
 
-/// `[agent_mail]` section. OPTIONAL (ADR-0003 Decision 3A, bd-o8j.2): the
-/// default integrated path uses the in-process toron mailbox, which needs no
-/// config — only the agent identity `name` is read (default `flywheel`). The
-/// `url`/`token` fields are retained for a future remote-daemon path.
+/// `[agent_mail]` section. OPTIONAL (ADR-0003 Decision 3A/3B, bd-o8j.2/.3):
+/// the default integrated path uses the in-process toron mailbox, which needs
+/// no config — only the agent identity `name` is read (default `flywheel`).
+/// When `url` is set, `Mail::from_config` switches to the REMOTE-daemon path
+/// (bd-o8j.3): flywheel drives a standalone `toron serve --mcp-http <addr>`
+/// over MCP, and `token` is passed as a bearer token.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MailConfig {
-    /// agent-mail server base URL, e.g. http://127.0.0.1:8765 (remote-daemon only)
+    /// toron daemon base URL, e.g. http://127.0.0.1:19001 (`toron serve
+    /// --mcp-http <addr>`). Set → remote-daemon mode; unset → integrated
+    /// in-process mailbox (default).
     pub url: Option<String>,
-    /// bearer token for the agent-mail MCP endpoint (remote-daemon only)
+    /// bearer token for the daemon's MCP endpoint (remote-daemon only)
     pub token: Option<String>,
     /// agent identity (adjective+noun) used when registering/messaging
     pub name: Option<String>,
@@ -44,8 +48,8 @@ pub struct Config {
     pub workspace_root: Option<String>,
     /// default --wait timeout in ms for send/watch (default 1800000)
     pub default_timeout_ms: Option<u64>,
-    /// optional mail config (only the identity name is used by the integrated
-    /// in-process path — bd-o8j.2)
+    /// optional mail config (in-process by default; remote daemon when
+    /// `agent_mail.url` is set — bd-o8j.2/.3)
     pub agent_mail: Option<MailConfig>,
     /// Resonate server URL for the durable loop (default http://localhost:8001)
     pub resonate_url: Option<String>,

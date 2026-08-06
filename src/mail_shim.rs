@@ -1,19 +1,28 @@
-//! In-process agent-mail shim (ADR-0003 Decision 3A, bd-o8j.2).
+//! In-process agent-mail shim (ADR-0003 Decision 3A/3B, bd-o8j.2/.3).
 //!
 //! `src/mail.rs` (the HTTP JSON-RPC client to the agent-mail MCP server) was
 //! deleted. This shim keeps the `Mail` surface call sites depend on (method
-//! signatures + JSON shapes) but routes every operation through the IN-PROCESS
-//! `toron_core::mailbox::Mailbox` (InProcessBus + SQLite index, an operator
-//! key attached so `ensure_project`/send/register work) — zero HTTP, one
-//! mailbox per process (lazily shared across `Mail` instances).
+//! signatures + JSON shapes) and routes every operation through one of two
+//! backends:
 //!
-//! flywheel main.rs dispatch is sync, so each op is `block_on`'d on a shared
-//! tokio runtime. The pane-identity bridge helpers (`project_hash`,
-//! `write_pane_identity`, …) are filesystem ops, not HTTP — kept verbatim.
+//! - IN-PROCESS (default): the `toron_core::mailbox::Mailbox` (InProcessBus +
+//!   SQLite index, an operator key attached so `ensure_project`/send/register
+//!   work) — zero HTTP, one mailbox per process (lazily shared across `Mail`
+//!   instances).
+//! - REMOTE-DAEMON (OPTIONAL, bd-o8j.3): a standalone `toron serve --mcp-http
+//!   <addr>` over Streamable HTTP (MCP), driven by a minimal MCP client
+//!   (`crate::mcp_http::McpClient`). Selected when `[agent_mail] url` is set.
 //!
-//! Known limitations of the demo mailbox (reported, not papered over):
-//! - the mailbox is per-process: state does not survive separate flywheel
-//!   invocations (the durable loop's leaf subprocesses each see a fresh one);
+//! flywheel main.rs dispatch is sync, so each in-process op is `block_on`'d on
+//! a shared tokio runtime (the remote path is ureq-sync, no runtime needed).
+//! The pane-identity bridge helpers (`project_hash`,
+//! `write_pane_identity`, …) are LOCAL filesystem ops regardless of backend —
+//! they bridge flywheel's own herdr panes, which only the local process sees.
+//!
+//! Known limitations (reported, not papered over):
+//! - the in-process mailbox is per-process: state does not survive separate
+//!   flywheel invocations (the durable loop's leaf subprocesses each see a
+//!   fresh one);
 //! - toron message ids are hex event ids, not u64 sequence numbers;
 //! - `ensure_product` needs an operator key; `demo_mailbox` has none.
 //!
@@ -35,6 +44,7 @@ use toron_core::nostr::identity::AgentProfile;
 use toron_mcp::ToJson;
 
 use crate::config::MailConfig;
+use crate::mcp_http::McpClient;
 
 /// In-process mailbox context: the single shared mailbox every `Mail` instance
 /// operates on. Mirrors `toron_mcp::demo_mailbox` (InProcessBus + SQLite index
@@ -112,42 +122,110 @@ pub struct MailSearchFilter {
     pub include_body_md: bool,
 }
 
-/// In-process agent-mail facade. Every method maps 1:1 onto a
-/// `toron_core::mailbox::Mailbox` call (see the deleted `src/mail.rs` for the
-/// surface this replaces).
+/// Which backend a `Mail` routes through.
+enum BackendKind {
+    /// Integrated toron mailbox in this process (the default, bd-o8j.2).
+    InProcess,
+    /// Standalone `toron serve --mcp-http` daemon over Streamable HTTP.
+    Remote(McpClient),
+}
+
+/// Agent-mail facade. Every public method maps 1:1 onto either a
+/// `toron_core::mailbox::Mailbox` call (in-process) or a toron MCP `tools/call`
+/// against a remote daemon (see the deleted `src/mail.rs` for the surface this
+/// replaces). JSON return shapes are identical across backends.
 pub struct Mail {
     /// The agent identity this facade sends AS / reads the inbox for.
     pub name: String,
+    /// Active backend (in-process default; remote when `url` is set).
+    backend: BackendKind,
 }
 
 impl Mail {
-    /// Construct the in-process mail facade. `[agent_mail]` config is now
-    /// OPTIONAL: the integrated mailbox is always available (only the agent
-    /// identity name is read, defaulting to `flywheel`). There is no
-    /// remote-daemon HTTP fallback.
-    pub fn in_process(cfg: Option<&MailConfig>) -> Result<Option<Self>> {
+    /// Construct the mail facade from `[agent_mail]` config. Picks the
+    /// backend: `cfg.url` Some → remote-daemon (bd-o8j.3); None/unset →
+    /// integrated in-process mailbox (default). The config section stays
+    /// OPTIONAL — no config means the integrated mailbox with identity
+    /// `flywheel`.
+    pub fn from_config(cfg: Option<&MailConfig>) -> Result<Option<Self>> {
+        match cfg.and_then(|c| c.url.as_deref()) {
+            Some(url) if !url.is_empty() => Self::remote(cfg),
+            _ => Ok(Some(Mail {
+                name: cfg
+                    .and_then(|c| c.name.clone())
+                    .unwrap_or_else(|| "flywheel".to_string()),
+                backend: BackendKind::InProcess,
+            })),
+        }
+    }
+
+    /// Construct a REMOTE-daemon-backed facade: `cfg.url` must be Some
+    /// (`http://host:port` of a `toron serve --mcp-http` daemon). `Ok(None)`
+    /// when no url is set — callers treat that as mail-not-configured.
+    pub fn remote(cfg: Option<&MailConfig>) -> Result<Option<Self>> {
         let name = cfg
             .and_then(|c| c.name.clone())
             .unwrap_or_else(|| "flywheel".to_string());
-        Ok(Some(Mail { name }))
+        let Some(url) = cfg.and_then(|c| c.url.clone()) else {
+            return Ok(None);
+        };
+        let client = McpClient::new(&url, cfg.and_then(|c| c.token.clone()))
+            .map_err(|e| anyhow::anyhow!("agent-mail remote daemon {url}: {e:#}"))?;
+        Ok(Some(Mail {
+            name,
+            backend: BackendKind::Remote(client),
+        }))
     }
 
-    /// `health_check` (in-process).
+    /// Route a tool call through the remote daemon (in-process backend errors).
+    fn call_remote(&self, tool: &str, args: Value) -> Result<Value> {
+        match &self.backend {
+            BackendKind::Remote(client) => client.call_tool(tool, args),
+            BackendKind::InProcess => bail!("{tool} requires the remote-daemon backend"),
+        }
+    }
+
+    /// `health_check` (in-process) / `health_check` (remote).
     pub fn health(&mut self) -> Result<Value> {
-        let report = block_on(mailbox().health_check());
-        Ok(report.to_json())
+        match &self.backend {
+            BackendKind::InProcess => {
+                let report = block_on(mailbox().health_check());
+                Ok(report.to_json())
+            }
+            BackendKind::Remote(_) => {
+                // `project_key` is unused by the toron tool; empty string.
+                let mut v = self.call_remote("health_check", json!({ "project_key": "" }))?;
+                v["transport"] = json!("http"); // distinguishing marker: remote mode
+                Ok(v)
+            }
+        }
     }
 
     /// `ensure_project`.
     pub fn ensure_project(&mut self, project_key: &str) -> Result<Value> {
-        let state = block_on(mailbox().ensure_project(project_key))?;
-        Ok(state.to_json())
+        match &self.backend {
+            BackendKind::InProcess => {
+                let state = block_on(mailbox().ensure_project(project_key))?;
+                Ok(state.to_json())
+            }
+            BackendKind::Remote(_) => {
+                self.call_remote("ensure_project", json!({ "human_key": project_key }))
+            }
+        }
     }
 
     /// `list_agents` (project's registered identities).
     pub fn list_agents(&mut self, project_key: &str) -> Result<Value> {
-        let agents = block_on(mailbox().list_agents(project_key, ListAgentsOptions::default()))?;
-        Ok(Value::Array(agents.iter().map(ToJson::to_json).collect()))
+        match &self.backend {
+            BackendKind::InProcess => {
+                let agents =
+                    block_on(mailbox().list_agents(project_key, ListAgentsOptions::default()))?;
+                Ok(Value::Array(agents.iter().map(ToJson::to_json).collect()))
+            }
+            BackendKind::Remote(_) => {
+                self.call_remote("list_agents", json!({ "project_key": project_key }))
+            }
+        }
     }
 
     /// `register_agent` (upsert on the agent's key).
@@ -159,12 +237,26 @@ impl Mail {
         model: &str,
         task_description: &str,
     ) -> Result<Value> {
-        let mut profile = AgentProfile::new(name);
-        profile.program = Some(program.to_string());
-        profile.model = Some(model.to_string());
-        profile.task_description = Some(task_description.to_string());
-        let agent = block_on(mailbox().register_agent(project_key, &profile))?;
-        Ok(agent.to_json())
+        match &self.backend {
+            BackendKind::InProcess => {
+                let mut profile = AgentProfile::new(name);
+                profile.program = Some(program.to_string());
+                profile.model = Some(model.to_string());
+                profile.task_description = Some(task_description.to_string());
+                let agent = block_on(mailbox().register_agent(project_key, &profile))?;
+                Ok(agent.to_json())
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "register_agent",
+                json!({
+                    "project_key": project_key,
+                    "name": name,
+                    "program": program,
+                    "model": model,
+                    "task_description": task_description,
+                }),
+            ),
+        }
     }
 
     /// `fetch_inbox` (simple filter set).
@@ -175,14 +267,27 @@ impl Mail {
         _urgent_only: bool,
         limit: u32,
     ) -> Result<Value> {
-        let msgs = block_on(mailbox().fetch_inbox(&FetchInbox {
-            project_slug: project_key.to_string(),
-            agent_name: agent_name.to_string(),
-            unread_only: false,
-            limit: Some(limit as usize),
-            include_bodies: true,
-        }))?;
-        Ok(Value::Array(msgs.iter().map(ToJson::to_json).collect()))
+        match &self.backend {
+            BackendKind::InProcess => {
+                let msgs = block_on(mailbox().fetch_inbox(&FetchInbox {
+                    project_slug: project_key.to_string(),
+                    agent_name: agent_name.to_string(),
+                    unread_only: false,
+                    limit: Some(limit as usize),
+                    include_bodies: true,
+                }))?;
+                Ok(Value::Array(msgs.iter().map(ToJson::to_json).collect()))
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "fetch_inbox",
+                json!({
+                    "project_key": project_key,
+                    "agent_name": agent_name,
+                    "limit": limit,
+                    "include_bodies": true,
+                }),
+            ),
+        }
     }
 
     /// `fetch_inbox` with the full filter bag. `urgent_only` /
@@ -194,14 +299,28 @@ impl Mail {
         agent_name: &str,
         filter: &MailInboxFilter,
     ) -> Result<Value> {
-        let msgs = block_on(mailbox().fetch_inbox(&FetchInbox {
-            project_slug: project_key.to_string(),
-            agent_name: agent_name.to_string(),
-            unread_only: filter.unread_only,
-            limit: Some(filter.limit as usize),
-            include_bodies: filter.include_bodies,
-        }))?;
-        Ok(Value::Array(msgs.iter().map(ToJson::to_json).collect()))
+        match &self.backend {
+            BackendKind::InProcess => {
+                let msgs = block_on(mailbox().fetch_inbox(&FetchInbox {
+                    project_slug: project_key.to_string(),
+                    agent_name: agent_name.to_string(),
+                    unread_only: filter.unread_only,
+                    limit: Some(filter.limit as usize),
+                    include_bodies: filter.include_bodies,
+                }))?;
+                Ok(Value::Array(msgs.iter().map(ToJson::to_json).collect()))
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "fetch_inbox",
+                json!({
+                    "project_key": project_key,
+                    "agent_name": agent_name,
+                    "limit": filter.limit,
+                    "include_bodies": filter.include_bodies,
+                    "unread_only": filter.unread_only,
+                }),
+            ),
+        }
     }
 
     /// `mark_message_read`.
@@ -211,22 +330,46 @@ impl Mail {
         agent_name: &str,
         message_id: u64,
     ) -> Result<Value> {
-        let r = block_on(mailbox().mark_message_read(
-            project_key,
-            agent_name,
-            &message_id.to_string(),
-        ))?;
-        Ok(r.to_json())
+        match &self.backend {
+            BackendKind::InProcess => {
+                let r = block_on(mailbox().mark_message_read(
+                    project_key,
+                    agent_name,
+                    &message_id.to_string(),
+                ))?;
+                Ok(r.to_json())
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "mark_message_read",
+                json!({
+                    "project_key": project_key,
+                    "agent_name": agent_name,
+                    "message_id": message_id as i64,
+                }),
+            ),
+        }
     }
 
     /// `acknowledge_message`.
     pub fn ack(&mut self, project_key: &str, agent_name: &str, message_id: u64) -> Result<Value> {
-        let r = block_on(mailbox().acknowledge_message(
-            project_key,
-            agent_name,
-            &message_id.to_string(),
-        ))?;
-        Ok(r.to_json())
+        match &self.backend {
+            BackendKind::InProcess => {
+                let r = block_on(mailbox().acknowledge_message(
+                    project_key,
+                    agent_name,
+                    &message_id.to_string(),
+                ))?;
+                Ok(r.to_json())
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "acknowledge_message",
+                json!({
+                    "project_key": project_key,
+                    "agent_name": agent_name,
+                    "message_id": message_id as i64,
+                }),
+            ),
+        }
     }
 
     /// Messages past the ack SLA. toron has no ack-overdue projection yet —
@@ -234,14 +377,26 @@ impl Mail {
     /// protocol's "nothing overdue" branch behaves as before.
     #[allow(dead_code)] // consumed by the Phase-4 escalation protocol + live test
     pub fn ack_overdue(&mut self, project_key: &str, agent_name: &str) -> Result<Value> {
-        let msgs = block_on(mailbox().fetch_inbox(&FetchInbox {
-            project_slug: project_key.to_string(),
-            agent_name: agent_name.to_string(),
-            unread_only: false,
-            limit: None,
-            include_bodies: false,
-        }))?;
-        Ok(Value::Array(msgs.iter().map(ToJson::to_json).collect()))
+        match &self.backend {
+            BackendKind::InProcess => {
+                let msgs = block_on(mailbox().fetch_inbox(&FetchInbox {
+                    project_slug: project_key.to_string(),
+                    agent_name: agent_name.to_string(),
+                    unread_only: false,
+                    limit: None,
+                    include_bodies: false,
+                }))?;
+                Ok(Value::Array(msgs.iter().map(ToJson::to_json).collect()))
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "fetch_inbox",
+                json!({
+                    "project_key": project_key,
+                    "agent_name": agent_name,
+                    "include_bodies": false,
+                }),
+            ),
+        }
     }
 
     /// `send_message`.
@@ -256,18 +411,37 @@ impl Mail {
         ack: bool,
         thread_id: Option<&str>,
     ) -> Result<Value> {
-        let result = block_on(mailbox().send_message(&SendMessage {
-            project_slug: project_key.to_string(),
-            sender_name: self.name.clone(),
-            to: to.to_vec(),
-            subject: subject.to_string(),
-            body_md: body.to_string(),
-            importance: Some(importance.to_string()),
-            ack_required: ack,
-            thread_id: thread_id.map(String::from),
-            ..Default::default()
-        }))?;
-        Ok(result.to_json())
+        match &self.backend {
+            BackendKind::InProcess => {
+                let result = block_on(mailbox().send_message(&SendMessage {
+                    project_slug: project_key.to_string(),
+                    sender_name: self.name.clone(),
+                    to: to.to_vec(),
+                    subject: subject.to_string(),
+                    body_md: body.to_string(),
+                    importance: Some(importance.to_string()),
+                    ack_required: ack,
+                    thread_id: thread_id.map(String::from),
+                    ..Default::default()
+                }))?;
+                Ok(result.to_json())
+            }
+            BackendKind::Remote(_) => {
+                let mut args = json!({
+                    "project_key": project_key,
+                    "sender_name": self.name,
+                    "to": to,
+                    "subject": subject,
+                    "body_md": body,
+                    "importance": importance,
+                    "ack_required": ack,
+                });
+                if let Some(tid) = thread_id {
+                    args["thread_id"] = json!(tid);
+                }
+                self.call_remote("send_message", args)
+            }
+        }
     }
 
     /// `reply_message` (threaded).
@@ -278,16 +452,31 @@ impl Mail {
         body: &str,
         to: Option<&[String]>,
     ) -> Result<Value> {
-        let result = block_on(mailbox().reply_message(&SendMessage {
-            project_slug: project_key.to_string(),
-            sender_name: self.name.clone(),
-            to: to.map(|t| t.to_vec()).unwrap_or_default(),
-            subject: String::new(),
-            body_md: body.to_string(),
-            thread_id: Some(message_id.to_string()),
-            ..Default::default()
-        }))?;
-        Ok(result.to_json())
+        match &self.backend {
+            BackendKind::InProcess => {
+                let result = block_on(mailbox().reply_message(&SendMessage {
+                    project_slug: project_key.to_string(),
+                    sender_name: self.name.clone(),
+                    to: to.map(|t| t.to_vec()).unwrap_or_default(),
+                    subject: String::new(),
+                    body_md: body.to_string(),
+                    thread_id: Some(message_id.to_string()),
+                    ..Default::default()
+                }))?;
+                Ok(result.to_json())
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "reply_message",
+                json!({
+                    "project_key": project_key,
+                    "sender_name": self.name,
+                    "to": to.map(|t| t.to_vec()).unwrap_or_default(),
+                    "subject": "",
+                    "body_md": body,
+                    "thread_id": message_id.to_string(),
+                }),
+            ),
+        }
     }
 
     /// `summarize_thread`.
@@ -297,8 +486,20 @@ impl Mail {
         thread_id: &str,
         llm_mode: bool,
     ) -> Result<Value> {
-        let s = block_on(mailbox().summarize_thread(project_key, thread_id, false, llm_mode, None))?;
-        Ok(s.to_json())
+        match &self.backend {
+            BackendKind::InProcess => {
+                let s = block_on(mailbox().summarize_thread(project_key, thread_id, false, llm_mode, None))?;
+                Ok(s.to_json())
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "summarize_thread",
+                json!({
+                    "project_key": project_key,
+                    "thread_id": thread_id,
+                    "llm_mode": llm_mode,
+                }),
+            ),
+        }
     }
 
     /// `search_messages`. The JSON envelope is `{"result": [...]}` so
@@ -310,18 +511,46 @@ impl Mail {
         limit: u32,
         filter: &MailSearchFilter,
     ) -> Result<Value> {
-        let msgs = block_on(mailbox().search_messages(&SearchMessages {
-            project_key: project_key.to_string(),
-            query: query.to_string(),
-            limit: Some(limit as usize),
-            ranking: filter.ranking.clone(),
-            sender_name: filter.sender.clone(),
-            importance: filter.importance.clone(),
-            thread_id: filter.thread_id.clone(),
-            include_body_md: filter.include_body_md,
-            ..Default::default()
-        }))?;
-        Ok(json!({ "result": msgs.iter().map(ToJson::to_json).collect::<Vec<Value>>() }))
+        match &self.backend {
+            BackendKind::InProcess => {
+                let msgs = block_on(mailbox().search_messages(&SearchMessages {
+                    project_key: project_key.to_string(),
+                    query: query.to_string(),
+                    limit: Some(limit as usize),
+                    ranking: filter.ranking.clone(),
+                    sender_name: filter.sender.clone(),
+                    importance: filter.importance.clone(),
+                    thread_id: filter.thread_id.clone(),
+                    include_body_md: filter.include_body_md,
+                    ..Default::default()
+                }))?;
+                Ok(json!({ "result": msgs.iter().map(ToJson::to_json).collect::<Vec<Value>>() }))
+            }
+            BackendKind::Remote(_) => {
+                let mut args = json!({
+                    "project_key": project_key,
+                    "query": query,
+                    "limit": limit,
+                });
+                if filter.include_body_md {
+                    args["include_body_md"] = json!(true);
+                }
+                if let Some(s) = &filter.sender {
+                    args["sender"] = json!(s);
+                }
+                if let Some(i) = &filter.importance {
+                    args["importance"] = json!(i);
+                }
+                if let Some(t) = &filter.thread_id {
+                    args["thread_id"] = json!(t);
+                }
+                if let Some(r) = &filter.ranking {
+                    args["ranking"] = json!(r);
+                }
+                let res = self.call_remote("search_messages", args)?;
+                Ok(json!({ "result": res }))
+            }
+        }
     }
 
     /// Build the `search_messages` args JSON (pure parity surface; kept for
@@ -369,27 +598,62 @@ impl Mail {
         exclusive: bool,
         reason: &str,
     ) -> Result<Value> {
-        let r = block_on(mailbox().file_reservation_paths(
-            project_key,
-            &self.name,
-            paths,
-            Some(ttl_seconds),
-            exclusive,
-            Some(reason),
-        ))?;
-        Ok(r.to_json())
+        match &self.backend {
+            BackendKind::InProcess => {
+                let r = block_on(mailbox().file_reservation_paths(
+                    project_key,
+                    &self.name,
+                    paths,
+                    Some(ttl_seconds),
+                    exclusive,
+                    Some(reason),
+                ))?;
+                Ok(r.to_json())
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "file_reservation_paths",
+                json!({
+                    "project_key": project_key,
+                    "agent_name": self.name,
+                    "paths": paths,
+                    "ttl_seconds": ttl_seconds as i64,
+                    "exclusive": exclusive,
+                    "reason": reason,
+                }),
+            ),
+        }
     }
 
     /// `release_file_reservations`.
     pub fn release(&mut self, project_key: &str) -> Result<Value> {
-        let r = block_on(mailbox().release_file_reservations(project_key, &self.name, &[]))?;
-        Ok(r.to_json())
+        match &self.backend {
+            BackendKind::InProcess => {
+                let r = block_on(mailbox().release_file_reservations(project_key, &self.name, &[]))?;
+                Ok(r.to_json())
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "release_file_reservations",
+                json!({ "project_key": project_key, "agent_name": self.name }),
+            ),
+        }
     }
 
     /// `check_file_reservation_conflicts`.
     pub fn conflicts(&mut self, project_key: &str, paths: &[String]) -> Result<Value> {
-        let r = block_on(mailbox().check_file_reservation_conflicts(project_key, &self.name, paths))?;
-        Ok(r.to_json())
+        match &self.backend {
+            BackendKind::InProcess => {
+                let r = block_on(mailbox().check_file_reservation_conflicts(project_key, &self.name, paths))?;
+                Ok(r.to_json())
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "check_file_reservation_conflicts",
+                json!({
+                    "project_key": project_key,
+                    "agent_name": self.name,
+                    "paths": paths,
+                }),
+            ),
+        }
     }
 
     /// `renew_file_reservations`. The response keeps the `file_reservations`
@@ -402,21 +666,60 @@ impl Mail {
         paths: Option<&[String]>,
         _ids: Option<&[u64]>,
     ) -> Result<Value> {
-        let r = block_on(mailbox().renew_file_reservations(
-            project_key,
-            agent_name,
-            paths.unwrap_or(&[]),
-            extend_seconds,
-        ))?;
-        Ok(json!({
-            "renewed": r.renewed,
-            "file_reservations": r.reservations.iter().map(|res| json!({
-                "id": res.id,
-                "path_pattern": res.path_pattern,
-                "old_expires_ts": "",
-                "new_expires_ts": res.expires_ts_us.map(|u| u.to_string()).unwrap_or_default(),
-            })).collect::<Vec<Value>>(),
-        }))
+        match &self.backend {
+            BackendKind::InProcess => {
+                let r = block_on(mailbox().renew_file_reservations(
+                    project_key,
+                    agent_name,
+                    paths.unwrap_or(&[]),
+                    extend_seconds,
+                ))?;
+                Ok(json!({
+                    "renewed": r.renewed,
+                    "file_reservations": r.reservations.iter().map(|res| json!({
+                        "id": res.id,
+                        "path_pattern": res.path_pattern,
+                        "old_expires_ts": "",
+                        "new_expires_ts": res.expires_ts_us.map(|u| u.to_string()).unwrap_or_default(),
+                    })).collect::<Vec<Value>>(),
+                }))
+            }
+            BackendKind::Remote(_) => {
+                let mut args = json!({
+                    "project_key": project_key,
+                    "agent_name": agent_name,
+                    "extend_seconds": extend_seconds as i64,
+                });
+                if let Some(p) = paths {
+                    args["paths"] = json!(p);
+                }
+                let res = self.call_remote("renew_file_reservations", args)?;
+                // Remap the tool's `reservations` array onto the in-process
+                // `file_reservations` envelope `list_own_reservations` reads.
+                let mut out = json!({ "renewed": res.get("renewed").cloned().unwrap_or(json!(0)) });
+                let fr = res
+                    .get("reservations")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|r| {
+                                json!({
+                                    "id": r.get("id").cloned().unwrap_or(json!(0)),
+                                    "path_pattern": r.get("path_pattern").cloned().unwrap_or(json!("")),
+                                    "old_expires_ts": "",
+                                    "new_expires_ts": r.get("expires_ts_us")
+                                        .and_then(Value::as_u64)
+                                        .map(|u| u.to_string())
+                                        .unwrap_or_default(),
+                                })
+                            })
+                            .collect::<Vec<Value>>()
+                    })
+                    .unwrap_or_default();
+                out["file_reservations"] = json!(fr);
+                Ok(out)
+            }
+        }
     }
 
     // ---- cross-project contact + products (bd-mail-cross-project-contact) ----
@@ -431,14 +734,30 @@ impl Mail {
         reason: &str,
         _ttl_seconds: Option<u64>,
     ) -> Result<Value> {
-        let link = block_on(mailbox().request_contact(&RequestContact {
-            project_slug: project_key.to_string(),
-            from_agent: from_agent.to_string(),
-            to_agent: to_agent.to_string(),
-            to_project: to_project.map(String::from),
-            reason: Some(reason.to_string()),
-        }))?;
-        Ok(link.to_json())
+        match &self.backend {
+            BackendKind::InProcess => {
+                let link = block_on(mailbox().request_contact(&RequestContact {
+                    project_slug: project_key.to_string(),
+                    from_agent: from_agent.to_string(),
+                    to_agent: to_agent.to_string(),
+                    to_project: to_project.map(String::from),
+                    reason: Some(reason.to_string()),
+                }))?;
+                Ok(link.to_json())
+            }
+            BackendKind::Remote(_) => {
+                let mut args = json!({
+                    "project_key": project_key,
+                    "from_agent": from_agent,
+                    "to_agent": to_agent,
+                    "reason": reason,
+                });
+                if let Some(tp) = to_project {
+                    args["to_project"] = json!(tp);
+                }
+                self.call_remote("request_contact", args)
+            }
+        }
     }
 
     /// `respond_contact`.
@@ -449,20 +768,41 @@ impl Mail {
         from_agent: &str,
         accept: bool,
     ) -> Result<Value> {
-        let link = block_on(mailbox().respond_contact(&RespondContact {
-            project_slug: project_key.to_string(),
-            to_agent: to_agent.to_string(),
-            from_agent: from_agent.to_string(),
-            accept,
-            from_project: None,
-        }))?;
-        Ok(link.to_json())
+        match &self.backend {
+            BackendKind::InProcess => {
+                let link = block_on(mailbox().respond_contact(&RespondContact {
+                    project_slug: project_key.to_string(),
+                    to_agent: to_agent.to_string(),
+                    from_agent: from_agent.to_string(),
+                    accept,
+                    from_project: None,
+                }))?;
+                Ok(link.to_json())
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "respond_contact",
+                json!({
+                    "project_key": project_key,
+                    "to_agent": to_agent,
+                    "from_agent": from_agent,
+                    "accept": accept,
+                }),
+            ),
+        }
     }
 
     /// `list_contacts`.
     pub fn list_contacts(&mut self, project_key: &str, agent_name: &str) -> Result<Value> {
-        let links = block_on(mailbox().list_contacts(project_key, agent_name))?;
-        Ok(Value::Array(links.iter().map(ToJson::to_json).collect()))
+        match &self.backend {
+            BackendKind::InProcess => {
+                let links = block_on(mailbox().list_contacts(project_key, agent_name))?;
+                Ok(Value::Array(links.iter().map(ToJson::to_json).collect()))
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "list_contacts",
+                json!({ "project_key": project_key, "agent_name": agent_name }),
+            ),
+        }
     }
 
     /// `set_contact_policy`.
@@ -472,24 +812,54 @@ impl Mail {
         agent_name: &str,
         policy: &str,
     ) -> Result<Value> {
-        let id = block_on(mailbox().set_contact_policy(
-            project_key,
-            agent_name,
-            ContactPolicy::parse(policy),
-        ))?;
-        Ok(json!({ "policy": policy, "event_id": id }))
+        match &self.backend {
+            BackendKind::InProcess => {
+                let id = block_on(mailbox().set_contact_policy(
+                    project_key,
+                    agent_name,
+                    ContactPolicy::parse(policy),
+                ))?;
+                Ok(json!({ "policy": policy, "event_id": id }))
+            }
+            BackendKind::Remote(_) => {
+                let res = self.call_remote(
+                    "set_contact_policy",
+                    json!({
+                        "project_key": project_key,
+                        "agent_name": agent_name,
+                        "policy": policy,
+                    }),
+                )?;
+                Ok(json!({ "policy": policy, "event_id": res }))
+            }
+        }
     }
 
     /// `ensure_product`.
     pub fn ensure_product(&mut self, product_key: &str) -> Result<Value> {
-        let info = block_on(mailbox().ensure_product(product_key, product_key))?;
-        Ok(info.to_json())
+        match &self.backend {
+            BackendKind::InProcess => {
+                let info = block_on(mailbox().ensure_product(product_key, product_key))?;
+                Ok(info.to_json())
+            }
+            BackendKind::Remote(_) => {
+                self.call_remote("ensure_product", json!({ "product_key": product_key }))
+            }
+        }
     }
 
     /// `products_link`.
     pub fn products_link(&mut self, product_key: &str, project_key: &str) -> Result<Value> {
-        let info = block_on(mailbox().products_link(product_key, project_key))?;
-        Ok(info.to_json())
+        match &self.backend {
+            BackendKind::InProcess => {
+                let info = block_on(mailbox().products_link(product_key, project_key))?;
+                Ok(info.to_json())
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "products_link",
+                json!({ "product_key": product_key, "project_key": project_key }),
+            ),
+        }
     }
 
     /// `search_messages_product`.
@@ -499,27 +869,62 @@ impl Mail {
         query: &str,
         limit: u32,
     ) -> Result<Value> {
-        let res = block_on(mailbox().search_messages_product(
-            product_key,
-            query,
-            Some(limit as usize),
-            true,
-        ))?;
-        Ok(json!({ "result": res.iter().map(|(p, m)| {
-            let mut v = m.to_json();
-            v["project"] = json!(p);
-            v
-        }).collect::<Vec<Value>>() }))
+        match &self.backend {
+            BackendKind::InProcess => {
+                let res = block_on(mailbox().search_messages_product(
+                    product_key,
+                    query,
+                    Some(limit as usize),
+                    true,
+                ))?;
+                Ok(json!({ "result": res.iter().map(|(p, m)| {
+                    let mut v = m.to_json();
+                    v["project"] = json!(p);
+                    v
+                }).collect::<Vec<Value>>() }))
+            }
+            BackendKind::Remote(_) => {
+                let res = self.call_remote(
+                    "search_messages_product",
+                    json!({
+                        "product_key": product_key,
+                        "query": query,
+                        "limit": limit,
+                        "include_body_md": true,
+                    }),
+                )?;
+                Ok(json!({ "result": res }))
+            }
+        }
     }
 
     /// `fetch_inbox_product`.
     pub fn inbox_product(&mut self, product_key: &str, agent_name: &str, limit: u32) -> Result<Value> {
-        let res = block_on(mailbox().fetch_inbox_product(product_key, agent_name))?;
-        Ok(json!({ "messages": res.iter().take(limit as usize).map(|(p, m)| {
-            let mut v = m.to_json();
-            v["project"] = json!(p);
-            v
-        }).collect::<Vec<Value>>() }))
+        match &self.backend {
+            BackendKind::InProcess => {
+                let res = block_on(mailbox().fetch_inbox_product(product_key, agent_name))?;
+                Ok(json!({ "messages": res.iter().take(limit as usize).map(|(p, m)| {
+                    let mut v = m.to_json();
+                    v["project"] = json!(p);
+                    v
+                }).collect::<Vec<Value>>() }))
+            }
+            BackendKind::Remote(_) => {
+                let res = self.call_remote(
+                    "fetch_inbox_product",
+                    json!({
+                        "product_key": product_key,
+                        "agent_name": agent_name,
+                        "limit": limit,
+                    }),
+                )?;
+                let msgs = res
+                    .as_array()
+                    .map(|arr| arr.iter().take(limit as usize).cloned().collect::<Vec<Value>>())
+                    .unwrap_or_default();
+                Ok(json!({ "messages": msgs }))
+            }
+        }
     }
 
     // ---- build slots (bd-mail-build-slot-gating) ----
@@ -533,14 +938,28 @@ impl Mail {
         exclusive: bool,
         ttl_seconds: u64,
     ) -> Result<Value> {
-        let r = block_on(mailbox().acquire_build_slot(
-            project_key,
-            agent_name,
-            slot,
-            Some(ttl_seconds),
-            exclusive,
-        ))?;
-        Ok(r.to_json())
+        match &self.backend {
+            BackendKind::InProcess => {
+                let r = block_on(mailbox().acquire_build_slot(
+                    project_key,
+                    agent_name,
+                    slot,
+                    Some(ttl_seconds),
+                    exclusive,
+                ))?;
+                Ok(r.to_json())
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "acquire_build_slot",
+                json!({
+                    "project_key": project_key,
+                    "agent_name": agent_name,
+                    "slot": slot,
+                    "ttl_seconds": ttl_seconds as i64,
+                    "exclusive": exclusive,
+                }),
+            ),
+        }
     }
 
     /// `renew_build_slot`.
@@ -552,17 +971,55 @@ impl Mail {
         slot: &str,
         extend_seconds: u64,
     ) -> Result<Value> {
-        let r = block_on(mailbox().renew_build_slot(project_key, agent_name, slot, extend_seconds))?;
-        Ok(match r {
-            Some(b) => b.to_json(),
-            None => json!({ "slot": slot, "renewed": false }),
-        })
+        match &self.backend {
+            BackendKind::InProcess => {
+                let r = block_on(mailbox().renew_build_slot(project_key, agent_name, slot, extend_seconds))?;
+                Ok(match r {
+                    Some(b) => b.to_json(),
+                    None => json!({ "slot": slot, "renewed": false }),
+                })
+            }
+            BackendKind::Remote(_) => {
+                let res = self.call_remote(
+                    "renew_build_slot",
+                    json!({
+                        "project_key": project_key,
+                        "agent_name": agent_name,
+                        "slot": slot,
+                        "extend_seconds": extend_seconds as i64,
+                    }),
+                )?;
+                if res.is_null() {
+                    Ok(json!({ "slot": slot, "renewed": false }))
+                } else {
+                    Ok(res)
+                }
+            }
+        }
     }
 
     /// `release_build_slot`.
     pub fn release_slot(&mut self, project_key: &str, agent_name: &str, slot: &str) -> Result<Value> {
-        block_on(mailbox().release_build_slot(project_key, agent_name, slot))?;
-        Ok(json!({ "slot": slot, "released": true }))
+        match &self.backend {
+            BackendKind::InProcess => {
+                block_on(mailbox().release_build_slot(project_key, agent_name, slot))?;
+                Ok(json!({ "slot": slot, "released": true }))
+            }
+            BackendKind::Remote(_) => {
+                let res = self.call_remote(
+                    "release_build_slot",
+                    json!({
+                        "project_key": project_key,
+                        "agent_name": agent_name,
+                        "slot": slot,
+                    }),
+                )?;
+                Ok(json!({
+                    "slot": slot,
+                    "released": res.get("released").cloned().unwrap_or(json!(true)),
+                }))
+            }
+        }
     }
 
     // ---- pane identity bridge (bd-mail-pane-identity-bridge, ADR-0001 A4) ----
@@ -751,4 +1208,108 @@ pub fn list_own_reservations(resp: &Value) -> Vec<RenewedReservation> {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_config_none_defaults_to_in_process_flywheel() {
+        let mail = Mail::from_config(None).expect("from_config ok").expect("Some");
+        assert_eq!(mail.name, "flywheel");
+        assert!(matches!(&mail.backend, BackendKind::InProcess));
+    }
+
+    #[test]
+    fn from_config_without_url_is_in_process() {
+        let cfg = MailConfig {
+            url: None,
+            token: None,
+            name: Some("orchestrator".into()),
+        };
+        let mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
+        assert_eq!(mail.name, "orchestrator");
+        assert!(matches!(&mail.backend, BackendKind::InProcess));
+    }
+
+    #[test]
+    fn from_config_with_empty_url_is_in_process() {
+        let cfg = MailConfig {
+            url: Some(String::new()),
+            token: None,
+            name: None,
+        };
+        let mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
+        assert!(matches!(&mail.backend, BackendKind::InProcess));
+    }
+
+    #[test]
+    fn from_config_with_url_picks_remote() {
+        let cfg = MailConfig {
+            url: Some("http://127.0.0.1:19001".into()),
+            token: Some("secret".into()),
+            name: Some("orchestrator".into()),
+        };
+        let mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
+        assert_eq!(mail.name, "orchestrator");
+        assert!(matches!(&mail.backend, BackendKind::Remote(_)));
+    }
+
+    #[test]
+    fn remote_without_url_returns_none() {
+        assert!(Mail::remote(None).expect("ok").is_none());
+        let cfg = MailConfig {
+            url: None,
+            token: None,
+            name: None,
+        };
+        assert!(Mail::remote(Some(&cfg)).expect("ok").is_none());
+    }
+
+    #[test]
+    fn remote_with_url_constructs_facade() {
+        let cfg = MailConfig {
+            url: Some("http://127.0.0.1:19001".into()),
+            token: None,
+            name: Some("smoke".into()),
+        };
+        let mail = Mail::remote(Some(&cfg)).expect("ok").expect("Some");
+        assert_eq!(mail.name, "smoke");
+        assert!(matches!(&mail.backend, BackendKind::Remote(_)));
+    }
+
+    #[test]
+    fn call_remote_on_in_process_backend_errors() {
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        assert!(mail.call_remote("health_check", json!({})).is_err());
+    }
+
+    /// Live remote-daemon smoke: with a `toron serve --mcp-http` daemon up and
+    /// `FLYWHEEL_AGENTMAIL_URL` set, exercises the facade's remote path
+    /// end-to-end — `health` carries the `http` transport marker and
+    /// `list_agents` returns `[]` from the daemon's fresh mailbox.
+    #[test]
+    #[ignore = "requires a live toron serve --mcp-http daemon (FLYWHEEL_AGENTMAIL_URL)"]
+    fn remote_facade_against_live_daemon() {
+        let Some(url) = std::env::var("FLYWHEEL_AGENTMAIL_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+        else {
+            eprintln!("skipping: FLYWHEEL_AGENTMAIL_URL not set");
+            return;
+        };
+        let cfg = MailConfig {
+            url: Some(url),
+            token: None,
+            name: Some("smoke-test".into()),
+        };
+        let mut mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
+        let h = mail.health().expect("remote health");
+        assert_eq!(h["transport"], json!("http"), "remote marker present");
+        let agents = mail
+            .list_agents("/tmp/flywheel-remote-smoke")
+            .expect("remote list_agents");
+        assert_eq!(agents, json!([]), "fresh daemon mailbox has no agents");
+    }
 }

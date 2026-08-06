@@ -82,7 +82,7 @@ pub fn mail_backend(cfg: &Config) -> Result<Box<dyn MailBackend>> {
     match name.as_str() {
         #[cfg(feature = "mail-agentmail")]
         "agentmail" => {
-            let mail = Mail::in_process(cfg.agent_mail.as_ref())
+            let mail = Mail::from_config(cfg.agent_mail.as_ref())
                 .map_err(BackendError::Other)?
                 .ok_or_else(|| BackendError::Unsupported {
                     backend: "agentmail".to_string(),
