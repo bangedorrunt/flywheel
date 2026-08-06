@@ -661,6 +661,26 @@ enum ToronCmd {
         #[arg(long)]
         stdio: bool,
     },
+    /// Auto-wire the toron MCP server into the agent MCP configs
+    /// (opencode ~/.config/opencode/opencode.json, pi ~/.pi/agent/mcp.json,
+    /// grok ~/.grok/config.toml). Idempotent — re-running only updates the
+    /// toron entry, never clobbers other servers.
+    #[command(name = "setup-mcp")]
+    SetupMcp {
+        /// toron MCP server URL (default http://127.0.0.1:18080/mcp)
+        #[arg(long)]
+        url: Option<String>,
+        /// which agents to wire: opencode,pi,grok (comma-sep; default all)
+        #[arg(long, default_value = "opencode,pi,grok")]
+        agents: String,
+        /// also boot a toron serve --mcp-http <port> daemon (needs the toron
+        /// binary on PATH and TORON_OPERATOR_KEY / TORON_KEY_PASSPHRASE set)
+        #[arg(long, default_value_t = 0)]
+        boot_port: u16,
+        /// print what would change without touching any file
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3546,6 +3566,18 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
 /// the dispatch — mirroring how cmd_loop drives the durable workflow. `cfg` is
 /// forwarded but unused by the embed: the demo mailbox is fully in-process.
 fn cmd_toron(cfg: &Config, cmd: &ToronCmd) -> Result<()> {
+    // The MCP-config wiring is pure file I/O — it runs synchronously and does
+    // not need the tokio embed runtime. Handle it before delegating to the
+    // in-process mailbox dispatch.
+    if let ToronCmd::SetupMcp {
+        url,
+        agents,
+        boot_port,
+        dry_run,
+    } = cmd
+    {
+        return toron_setup_mcp(url.as_deref(), agents, *boot_port, *dry_run);
+    }
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(toron_embed::dispatch(cfg, cmd))
 }
@@ -4709,6 +4741,225 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
         }
         None => print!("{rendered}"),
     }
+    Ok(())
+}
+
+/// Auto-wire the toron MCP server into the agent MCP configs.
+///
+/// Idempotent upsert per agent kind:
+/// - opencode  ~/.config/opencode/opencode.json   `mcp.toron`   (JSON, remote)
+/// - pi        ~/.pi/agent/mcp.json               `mcpServers.toron` (JSON)
+/// - grok      ~/.grok/config.toml                `[mcp_servers.toron]` (TOML)
+///
+/// Never clobbers other MCP servers; only the `toron` key is added/updated.
+/// `dry_run` prints the target change without touching any file.
+/// `boot_port` (>0) also spawns `toron serve --mcp-http <port>` on a
+/// background task (requires the toron binary on PATH + operator-key env).
+fn toron_setup_mcp(
+    url: Option<&str>,
+    agents: &str,
+    boot_port: u16,
+    dry_run: bool,
+) -> Result<()> {
+    let url = url.unwrap_or("http://127.0.0.1:18080/mcp");
+    let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME unset"))?;
+    let home = std::path::Path::new(&home);
+    let mut changed: Vec<String> = Vec::new();
+
+    for kind in agents.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let kind = match kind {
+            "oc" => "opencode",
+            "gk" => "grok",
+            other => other,
+        };
+        match kind {
+            "opencode" => {
+                let p = home.join(".config/opencode/opencode.json");
+                changed.push(upsert_opencode_toron(&p, url, dry_run)?);
+            }
+            "pi" => {
+                let p = home.join(".pi/agent/mcp.json");
+                changed.push(upsert_pi_toron(&p, url, dry_run)?);
+            }
+            "grok" => {
+                let p = home.join(".grok/config.toml");
+                changed.push(upsert_grok_toron(&p, url, dry_run)?);
+            }
+            other => {
+                eprintln!("flywheel: unknown agent kind '{other}' — use opencode,pi,grok (shorts oc,pi,gk)");
+            }
+        }
+    }
+
+    if changed.iter().any(|c| c.contains("added") || c.contains("updated")) {
+        println!("toron MCP wired: {url}  {}", changed.join(" · "));
+        println!("restart the agent editor for a new session to pick up the MCP server.");
+    } else {
+        println!("toron MCP already present at {url} — nothing to change.");
+    }
+
+    if boot_port > 0 && !dry_run {
+        boot_toron_server(boot_port)?;
+    } else if boot_port > 0 {
+        println!("(--dry-run) would boot toron serve --mcp-http 127.0.0.1:{boot_port}");
+    }
+    Ok(())
+}
+
+/// opencode: `mcp.toron` in top-level JSON config.
+fn upsert_opencode_toron(path: &std::path::Path, url: &str, dry: bool) -> Result<String> {
+    let mut v: serde_json::Value = load_json_or_default(path)?;
+    let obj = v
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("opencode config root must be an object"))?;
+    // Ensure `mcp` exists *in its own statement* so the borrow of `obj` ends,
+    // then re-take a single mutable borrow. Avoids the double-borrow E0500.
+    if !obj.contains_key("mcp") || !obj["mcp"].is_object() {
+        obj.insert("mcp".into(), serde_json::json!({}));
+    }
+    let mcp = obj["mcp"].as_object_mut().unwrap();
+    let prev = mcp.get("toron").cloned();
+    let want = serde_json::json!({"type":"remote","url":url,"enabled":true});
+    let action = if prev.is_some() {
+        if prev.as_ref() == Some(&want) {
+            return Ok("opencode unchanged".to_string());
+        }
+        "updated"
+    } else {
+        "added"
+    };
+    mcp.insert("toron".into(), want);
+    if dry {
+        return Ok(format!("opencode {action} ({})", pretty_path(path)));
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&v)? + "\n")?;
+    Ok(format!("opencode {action}"))
+}
+
+/// pi: `mcpServers.toron` in JSON.
+fn upsert_pi_toron(path: &std::path::Path, url: &str, dry: bool) -> Result<String> {
+    let mut v: serde_json::Value = load_json_or_default(path)?;
+    let obj = v
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("pi mcp.json root must be an object"))?;
+    if !obj.contains_key("mcpServers") || !obj["mcpServers"].is_object() {
+        obj.insert("mcpServers".into(), serde_json::json!({}));
+    }
+    let servers = obj["mcpServers"].as_object_mut().unwrap();
+    let prev = servers.get("toron").cloned();
+    let want = serde_json::json!({"url":url,"directTools":true});
+    let action = if prev.is_some() {
+        if prev.as_ref() == Some(&want) {
+            return Ok("pi unchanged".to_string());
+        }
+        "updated"
+    } else {
+        "added"
+    };
+    servers.insert("toron".into(), want);
+    if dry {
+        return Ok(format!("pi {action} ({})", pretty_path(path)));
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&v)? + "\n")?;
+    Ok(format!("pi {action}"))
+}
+
+/// grok: `[mcp_servers.toron]` section in TOML. Line-based idempotent upsert
+/// (no toml dependency): if an `[mcp_servers.toron]` header exists, rewrite the
+/// following url/enabled lines; else append a new block.
+fn upsert_grok_toron(path: &std::path::Path, url: &str, dry: bool) -> Result<String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    // find `[mcp_servers.toron]` (exact or any `[mcp_servers.toron*]` is != ours,
+    // so match the bare header only).
+    let mut idx: Option<usize> = None;
+    for (i, l) in lines.iter().enumerate() {
+        if l.trim() == "[mcp_servers.toron]" {
+            idx = Some(i);
+            break;
+        }
+    }
+    match idx {
+        Some(i) => {
+            // already present: replace the section body's url/enabled lines
+            // up to the next `[section]` header.
+            let mut j = i + 1;
+            let mut found_url = false;
+            while j < lines.len() && !lines[j].trim_start().starts_with('[') {
+                let t = lines[j].trim();
+                if t.starts_with("url =") {
+                    lines[j] = format!("url = \"{url}\"");
+                    found_url = true;
+                }
+                j += 1;
+            }
+            if !found_url {
+                // ensure an url line right after the header, before the next header
+                lines.insert(i + 1, format!("url = \"{url}\""));
+            }
+            let act = if found_url { "updated" } else { "added url" };
+            if dry {
+                return Ok(format!("grok {act} ({})", pretty_path(path)));
+            }
+            std::fs::write(path, lines.join("\n") + "\n")?;
+            Ok(format!("grok {act}"))
+        }
+        None => {
+            if dry {
+                return Ok(format!("grok added ({})", pretty_path(path)));
+            }
+            lines.push(String::from("[mcp_servers.toron]"));
+            lines.push(format!("url = \"{url}\""));
+            lines.push(String::from("enabled = true"));
+            lines.push(String::new());
+            std::fs::write(path, lines.join("\n") + "\n")?;
+            Ok("grok added".to_string())
+        }
+    }
+}
+
+fn load_json_or_default(path: &std::path::Path) -> Result<serde_json::Value> {
+    if path.exists() {
+        let s = std::fs::read_to_string(path)?;
+        if s.trim().is_empty() {
+            return Ok(serde_json::json!({}));
+        }
+        serde_json::from_str(&s).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+    } else {
+        Ok(serde_json::json!({}))
+    }
+}
+
+fn pretty_path(p: &std::path::Path) -> String {
+    if let Ok(h) = std::env::var("HOME") {
+        if let Ok(strip) = p.strip_prefix(&h) {
+            return format!("~/{}", strip.display());
+        }
+    }
+    p.display().to_string()
+}
+
+/// Spawn `toron serve --mcp-http <port>` as a detached background daemon.
+/// Requires the toron binary on PATH; propagates TORON_OPERATOR_KEY +
+/// TORON_KEY_PASSPHRASE from the current env.
+fn boot_toron_server(port: u16) -> Result<()> {
+    let bind = format!("127.0.0.1:{port}");
+    // refuse if a toron is already listening
+    if std::net::TcpStream::connect(bind.as_str().parse::<std::net::SocketAddr>()?).is_ok() {
+        println!("toron MCP server already listening at {bind} — skipping boot.");
+        return Ok(());
+    }
+    let mut cmd = std::process::Command::new("toron");
+    cmd.args(["serve", "--mcp-http", &bind, "--no-color"]);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // preserve operator-key env so the full privileged surface works
+    if std::env::var_os("TORON_OPERATOR_KEY").is_some() {
+        cmd.env("TORON_OPERATOR_KEY", std::env::var("TORON_OPERATOR_KEY").unwrap());
+    }
+    cmd.spawn()?;
+    println!("booted toron serve --mcp-http {bind} (detached).");
     Ok(())
 }
 
