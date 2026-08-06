@@ -5120,7 +5120,12 @@ fn cmd_debate(
     judge: Option<&str>,
 ) -> Result<()> {
     let rounds = rounds.max(1);
-    let ts = crate::state::now_iso().replacen('-', "", 10); // compact ts for the thread id
+    // Compact ts for the thread id: ISO-8601 (`2026-08-06T13:03:42Z`) is NOT a
+    // valid thread id — toron's send_message validator (AM-Rust parity) requires
+    // `[a-zA-Z0-9._-]` only, no `:`. Replace hyphens AND colons AND the trailing
+    // Z so the id is e.g. `debate-20260806T130342`.
+    let iso = crate::state::now_iso().replacen('-', "", 10);
+    let ts = iso.replace(':', "").replace('Z', "").replace('T', "T");
     let thread = format!("debate-{ts}");
 
     // scope the debate to the project dir (the proposition may be a project
@@ -7169,14 +7174,13 @@ mod plan_review_tests {
         .into_iter();
         let max_rounds = 2u32;
         loop {
-            phases.push(phase.clone());
+            phases.push(phase);
             match phase {
                 PriPhase::AwaitingPlanReview => {
                     let token = reviewer_tokens
                         .next()
                         .expect("scripted reviewer ran out of tokens");
-                    let (p, a, r) = pri_route(phase, &token, path, change_rounds, max_rounds);
-                    phase = p;
+                    let (_, a, r) = pri_route(phase, &token, path, change_rounds, max_rounds);
                     action = a;
                     change_rounds = r;
                     // APPROVE routes to implement; CHANGES routes to planner
