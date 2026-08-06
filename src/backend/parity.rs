@@ -2,7 +2,7 @@
 //!
 //! governed-by: ADR-0002
 //!
-//! Contract being proven: the trait wrappers (`HerdrBackend`, `AgentMailMcpBackend`)
+//! Contract being proven: the trait wrappers (`HerdrBackend`, `ToronMailBackend`)
 //! are **pure delegation** — a call through `Box<dyn MultiplexerBackend>` produces
 //! the same result as a direct `Client` call, because the wrapper adds no logic.
 //!
@@ -154,7 +154,7 @@ mod tests {
     /// contract under test (no socket needed).
     #[test]
     fn prompt_landing_maps_landed_status_and_coded_error() {
-        use crate::herdr_shim::{AgentStatus, AgentInfo};
+        use crate::herdr_shim::{AgentInfo, AgentStatus};
         // landed: Ok(AgentInfo) → status Some, code None
         let ok = crate::backend::herdr::map_prompt_result(Ok(AgentInfo {
             agent: Some("pi".into()),
@@ -179,12 +179,11 @@ mod tests {
         assert_eq!(ok.status, Some(AgentStatus::Working));
         assert_eq!(ok.code, None);
         // coded error: Err(toron BackendError) → status None, code Some
-        let err = crate::backend::herdr::map_prompt_result(Err(
-            toron_core::backend::BackendError::new(
+        let err =
+            crate::backend::herdr::map_prompt_result(Err(toron_core::backend::BackendError::new(
                 toron_core::backend::error::BackendErrorCode::AgentPromptStalled,
                 "x",
-            ),
-        ));
+            )));
         let err = err.unwrap();
         assert_eq!(err.status, None);
         assert_eq!(err.code.as_deref(), Some("agent_prompt_stalled"));
@@ -200,13 +199,13 @@ mod tests {
         // assert byte-identical Vec<AgentInfo>.
     }
 
-    /// Integration parity: `AgentMailMcpBackend::send` round-trips through the
+    /// Integration parity: `ToronMailBackend::send` round-trips through the
     /// real agent-mail MCP identically to `Mail::send`. Needs a test project.
     #[test]
     #[ignore = "needs a test agent-mail project; run with --ignored once infra lands"]
     fn agentmail_send_matches_direct_call() {
         // TODO: stand up a test agent-mail project, send via both
-        // Mail::send and AgentMailMcpBackend::new(mail).send(...), assert
+        // Mail::send and ToronMailBackend::new(mail).send(...), assert
         // identical response JSON.
     }
 }

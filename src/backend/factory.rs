@@ -1,21 +1,29 @@
 //! Backend factory — resolves the active `MultiplexerBackend` and
 //! `MailBackend` from config/env and constructs them.
 //!
-//! governed-by: ADR-0002
+//! governed-by: ADR-0002, ADR-0003
 //!
 //! Selection precedence (flag > env > `.env` > config.toml > default):
 //! - `FLYWHEEL_BACKEND` (`herdr` default; `superlogical`/`tmux` future/stub)
-//! - `FLYWHEEL_MAIL`    (`agentmail` default; `toron` future/stub)
+//! - `FLYWHEEL_MAIL`    (`agentmail` default; `toron` opt-in)
 //!
-//! Phase 0: only the default impls are wired (herdr + agentmail). The stub
-//! backends (`superlogical`, `tmux`, `toron`) land in `bd-toron-superlogical-
+//! Mail backend routing (ADR-0003 V2/V3 — fixes the BUG1 shared-url misroute):
+//! each backend reads ONLY its own config section. `FLYWHEEL_MAIL=agentmail`
+//! → the REAL agent-mail server backend (`src/backend/agentmail.rs`), reading
+//! `[mail.agentmail]` (url default `http://127.0.0.1:8765`). `FLYWHEEL_MAIL=toron`
+//! → the toron facade (`src/backend/toron.rs` over `mail_shim::Mail`), reading
+//! `[mail.toron]` (absent → embedded in-process). The old `[agent_mail]` url
+//! is never a routing source.
+//!
+//! Stub backends (`superlogical`, `tmux`) land in `bd-toron-superlogical-
 //! stubs` (R0.7); until then an unrecognized name returns a clear
 //! `BackendError::Unsupported` so a user who typos the env var gets an
-//! actionable error, not a silent fallback to herdr/agentmail.
+//! actionable error, not a silent fallback.
 
 use crate::backend::{BackendError, MailBackend, MultiplexerBackend, Result};
 use crate::config::Config;
 use crate::herdr_shim::Client as HerdrClient;
+#[cfg(feature = "mail-toron")]
 use crate::mail_shim::Mail;
 
 /// Default multiplexer backend name.
@@ -80,24 +88,39 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
 pub fn mail_backend(cfg: &Config) -> Result<Box<dyn MailBackend>> {
     let name = resolve_mail_name(cfg);
     match name.as_str() {
+        // FLYWHEEL_MAIL=agentmail -> the REAL agent-mail server backend
+        // (ADR-0003 V2). Reads `[mail.agentmail]` (url defaults to
+        // 127.0.0.1:8765). LAZY: construction never dials; ops report the
+        // actionable "not reachable" error when `am` is down (ADR-0003 V4).
         #[cfg(feature = "mail-agentmail")]
         "agentmail" => {
-            let mail = Mail::from_config(cfg.agent_mail.as_ref())
+            let server = cfg.agentmail_server();
+            let name = cfg
+                .agent_mail
+                .as_ref()
+                .and_then(|m| m.name.clone())
+                .unwrap_or_else(|| "flywheel".to_string());
+            let url = server.url.unwrap_or_default();
+            Ok(Box::new(crate::backend::agentmail::AgentMailBackend::new(
+                &url,
+                server.token,
+                name,
+            )?))
+        }
+        // FLYWHEEL_MAIL=toron -> the toron facade (`Mail::from_config`):
+        // embedded in-process by default; the `[mail.toron]` daemon when its
+        // url is set (ADR-0003 V2/V3).
+        #[cfg(feature = "mail-toron")]
+        "toron" => {
+            let mail = Mail::from_config(Some(&cfg.toron_mail_config()))
                 .map_err(BackendError::Other)?
                 .ok_or_else(|| BackendError::Unsupported {
-                    backend: "agentmail".to_string(),
+                    backend: "toron".to_string(),
                     method: "(factory)",
-                    reason: "in-process mail facade unavailable"
-                        .to_string(),
+                    reason: "in-process mail facade unavailable".to_string(),
                 })?;
-            Ok(Box::new(
-                crate::backend::agentmail::AgentMailMcpBackend::new(mail),
-            ))
+            Ok(Box::new(crate::backend::toron::ToronMailBackend::new(mail)))
         }
-        // toron: stub mail backend (bd-toron-superlogical-stubs). Feature on ->
-        // construct the stub; feature off -> falls through to `other`.
-        #[cfg(feature = "mail-toron")]
-        "toron" => Ok(Box::new(crate::backend::toron_mail::ToronMailBackend)),
         other => Err(backend_not_compiled_or_unknown(
             other,
             "mail",
@@ -313,14 +336,19 @@ mod tests {
 
     #[cfg(feature = "mail-toron")]
     #[test]
-    fn toron_stub_is_honest_unsupported() {
-        let b = crate::backend::toron_mail::ToronMailBackend;
+    fn toron_backend_is_real_facade() {
+        // FLYWHEEL_MAIL=toron constructs the toron facade (Mail::from_config):
+        // name() is truthful, and health() delegates to the in-process mailbox
+        // (Ok), NOT an honest-Unsupported stub (pre-ADR-0003 behavior).
+        let _g = _lock_env();
+        std::env::set_var("FLYWHEEL_MAIL", "toron");
+        let cfg = Config::default();
+        let mut b = super::mail_backend(&cfg).expect("toron facade constructs");
         assert_eq!(b.name(), "toron");
-        let mut m: Box<dyn MailBackend> = Box::new(b);
-        match m.health() {
-            Err(BackendError::Unsupported { backend, .. }) => assert_eq!(backend, "toron"),
-            Ok(_) => panic!("stub must not Ok"),
-            Err(e) => panic!("expected Unsupported, got {e:?}"),
+        match b.health() {
+            Ok(_) => {}
+            Err(e) => panic!("toron facade health() must delegate to in-process mailbox: {e:?}"),
         }
+        std::env::remove_var("FLYWHEEL_MAIL");
     }
 }
