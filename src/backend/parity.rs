@@ -29,7 +29,7 @@
 #[cfg(test)]
 mod tests {
     use crate::backend::{BackendError, MailBackend, MultiplexerBackend};
-    use crate::herdr::HerdrError;
+    use crate::herdr_shim::HerdrError;
 
     // ---- error coercion: the path real transport errors take ----
 
@@ -154,11 +154,10 @@ mod tests {
     /// contract under test (no socket needed).
     #[test]
     fn prompt_landing_maps_landed_status_and_coded_error() {
-        use crate::herdr::{AgentStatus, HerdrError};
+        use crate::herdr_shim::{AgentStatus, AgentInfo};
         // landed: Ok(AgentInfo) → status Some, code None
-        let ok = crate::backend::herdr::map_prompt_result(Ok(crate::herdr::AgentInfo {
+        let ok = crate::backend::herdr::map_prompt_result(Ok(AgentInfo {
             agent: Some("pi".into()),
-            agent_session: None,
             agent_status: AgentStatus::Working,
             cwd: None,
             display_agent: None,
@@ -179,11 +178,13 @@ mod tests {
         let ok = ok.unwrap();
         assert_eq!(ok.status, Some(AgentStatus::Working));
         assert_eq!(ok.code, None);
-        // coded error: Err(HerdrError) → status None, code Some
-        let err = crate::backend::herdr::map_prompt_result(Err(HerdrError {
-            code: "agent_prompt_stalled".into(),
-            message: "x".into(),
-        }));
+        // coded error: Err(toron BackendError) → status None, code Some
+        let err = crate::backend::herdr::map_prompt_result(Err(
+            toron_core::backend::BackendError::new(
+                toron_core::backend::error::BackendErrorCode::AgentPromptStalled,
+                "x",
+            ),
+        ));
         let err = err.unwrap();
         assert_eq!(err.status, None);
         assert_eq!(err.code.as_deref(), Some("agent_prompt_stalled"));

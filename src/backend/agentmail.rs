@@ -1,22 +1,17 @@
-//! agent-mail-MCP backend — wraps `crate::mail::Mail` (the HTTP JSON-RPC
-//! client) as the default `MailBackend` impl. Pure delegation for the 8
-//! operations `Mail` already wraps; `BackendError::Unsupported` for the ~10
-//! trait methods whose MCP-tool wrappers land in ADR-0001 Phase 3 (each
-//! Phase-3 bead graduates a method from `Unsupported` to real delegation +
-//! behavior).
+//! agent-mail-MCP backend — wraps `crate::mail_shim::Mail` (the IN-PROCESS
+//! toron-core mailbox facade, ADR-0003 Decision 3A) as the default
+//! `MailBackend` impl. Pure delegation for the operations `Mail` already
+//! wraps; `BackendError::Unsupported` for trait methods without a delegation.
 //!
-//! governed-by: ADR-0002  ·  implements: `MailBackend`
+//! governed-by: ADR-0002, ADR-0003  ·  implements: `MailBackend`
 //!
 //! Design: `Mail` carries `name` as a field (the sending agent's identity).
 //! `MailBackend::reserve`/`release`/`conflicts` take an explicit `agent`
-//! param so the future `ToronMailBackend` can target arbitrary agents; this
-//! impl forwards `self.mail.name.clone()` (the orchestrator always acts as
-//! itself). The trait's `send` carries `thread_id`; the current `Mail::send`
-//! doesn't pass it (no MCP-thread wrapper exists yet — Phase 3), so `thread_id`
-//! is ignored here and honored once `bd-mail-reply-thread` lands.
+//! param so a future backend can target arbitrary agents; this impl forwards
+//! `self.mail.name.clone()` (the orchestrator always acts as itself).
 
 use crate::backend::{BackendError, InboxFilter, MailBackend, Result};
-use crate::mail::Mail;
+use crate::mail_shim::Mail;
 use serde_json::{json, Value};
 
 /// Default mail backend: delegates to the agent-mail MCP HTTP client.
@@ -25,9 +20,9 @@ pub struct AgentMailMcpBackend {
 }
 
 impl AgentMailMcpBackend {
-    /// Construct from the existing `Mail` client (which `Mail::from_config`
-    /// builds from `MailConfig`). The factory (`bd-backend-env-config`) calls
-    /// this; tests can inject a `Mail` directly.
+    /// Construct from the in-process `Mail` facade (which `Mail::in_process`
+    /// builds; `[agent_mail]` config is optional). The factory
+    /// (`bd-backend-env-config`) calls this; tests can inject a `Mail` directly.
     pub fn new(mail: Mail) -> Self {
         Self { mail }
     }
@@ -118,8 +113,7 @@ impl MailBackend for AgentMailMcpBackend {
     }
 
     fn inbox(&mut self, project_key: &str, agent: &str, filter: &InboxFilter) -> Result<Value> {
-        // full filter set lands with bd-mail-ack-sla-tracking (Mail::inbox_filtered)
-        let mail_filter = crate::mail::MailInboxFilter {
+        let mail_filter = crate::mail_shim::MailInboxFilter {
             urgent_only: filter.urgent_only,
             unread_only: filter.unread_only,
             ack_overdue_only: filter.ack_overdue_only,
@@ -192,9 +186,9 @@ impl MailBackend for AgentMailMcpBackend {
     }
 
     fn resolve_pane_identity(&mut self, project_key: &str, pane_id: &str) -> Result<Value> {
-        // The MCP tool reads the identity files the bridge writes
-        // (bd-mail-pane-identity-bridge). A missing identity surfaces as a
-        // non-JSON isError text — callers treat that as not-found.
+        // In-process read of the canonical identity file the bridge writes
+        // (bd-mail-pane-identity-bridge). A missing identity surfaces as JSON
+        // without `agent_name` — callers treat that as not-found.
         self.mail
             .resolve_pane_identity(project_key, pane_id)
             .map_err(BackendError::Other)
@@ -259,7 +253,7 @@ impl MailBackend for AgentMailMcpBackend {
                 project_key,
                 query,
                 limit,
-                &crate::mail::MailSearchFilter {
+                &crate::mail_shim::MailSearchFilter {
                     sender: filter.sender.clone(),
                     importance: filter.importance.clone(),
                     thread_id: filter.thread_id.clone(),
@@ -356,109 +350,86 @@ mod tests {
     use crate::backend::MailBackend;
 
     /// The struct exists and can be named as `dyn MailBackend`. The `Mail`
-    /// client can't be constructed without a config + URL, so this is a
-    /// compile-time object-safety check rather than a runtime round-trip;
-    /// HTTP round-trips are integration-test territory (R0.8 parity test).
+    /// facade is constructed in-process (no config, no HTTP); the type system
+    /// proves the impl satisfies the trait by compilation alone.
     #[test]
     fn agentmail_backend_is_object_safe() {
         fn _assert_dyn(_: &dyn MailBackend) {}
-        // We can't construct AgentMailMcpBackend without a Mail here; the type
+        // Can't construct AgentMailMcpBackend without a Mail here; the type
         // system proves the impl satisfies the trait by compilation alone.
-        // (R0.8 bd-backend-parity-test exercises the real HTTP path.)
     }
 
     /// name() reports the right identifier — the one piece we can assert
-    /// without a live Mail. Constructed via a tiny helper that bypasses
-    /// from_config (the struct field is private; the test lives in-module).
+    /// without a live Mail. Constructed via `Mail::in_process` (in-process).
     #[test]
     fn agentmail_name_is_agentmail() {
-        // Build a Mail with a placeholder url so the struct exists; no HTTP
-        // is made until a method is called.
-        let mail = Mail::from_config(Some(&crate::config::MailConfig {
+        let mail = Mail::in_process(Some(&crate::config::MailConfig {
             url: Some("http://127.0.0.1:9999".into()),
             token: None,
             name: Some("test-orchestrator".into()),
         }))
-        .expect("from_config with a url yields Some(Mail)")
+        .expect("in_process yields Some(Mail)")
         .expect("Some(Mail) unwraps");
         let b = AgentMailMcpBackend::new(mail);
         assert_eq!(b.name(), "agentmail");
     }
 
     /// `renew` delegates to `Mail::renew` (bd-mail-lease-renewal-durable) —
-    /// compile-time signature guard; no HTTP is made (dummy URL).
+    /// against the unregistered agent the in-process mailbox surfaces an
+    /// `Other` error, proving real delegation rather than `Unsupported`.
     #[test]
     fn renew_is_real_delegation_not_unsupported() {
-        let mail = Mail::from_config(Some(&crate::config::MailConfig {
-            url: Some("http://127.0.0.1:9999".into()),
-            token: None,
-            name: Some("test-orchestrator".into()),
-        }))
-        .expect("from_config ok")
-        .expect("Some");
+        let mail = Mail::in_process(None).expect("in_process ok").expect("Some");
         let mut b = AgentMailMcpBackend::new(mail);
-        // an Unsupported error would mean the Phase-3 stub is still in place;
-        // a connection failure means it genuinely delegated to Mail::renew
         match b.renew("p", "a", 1200, None) {
             Err(BackendError::Other(_)) => {}
             Err(e) => panic!("renew should delegate (Other), got {e:?}"),
-            Ok(_) => panic!("renew cannot succeed against a dummy URL"),
+            Ok(_) => panic!("renew cannot succeed for an unregistered agent"),
         }
     }
 
-    /// `resolve_pane_identity` delegates to the MCP tool (bd-mail-pane-
-    /// identity-bridge) — compile-time + runtime shape guard; no HTTP is
-    /// made successfully (dummy URL), so `Other` proves real delegation.
+    /// `resolve_pane_identity` reads the canonical identity file in-process —
+    /// a missing file is a not-found JSON (Ok), NOT `Unsupported` (which
+    /// would mean the pane-identity bridge is still stubbed).
     #[test]
     fn resolve_pane_identity_is_real_delegation_not_unsupported() {
-        let mail = Mail::from_config(Some(&crate::config::MailConfig {
-            url: Some("http://127.0.0.1:9999".into()),
-            token: None,
-            name: Some("test-orchestrator".into()),
-        }))
-        .expect("from_config ok")
-        .expect("Some");
+        let mail = Mail::in_process(None).expect("in_process ok").expect("Some");
         let mut b = AgentMailMcpBackend::new(mail);
         match b.resolve_pane_identity("p", "w1:p1") {
-            Err(BackendError::Other(_)) => {}
-            Err(e) => panic!("resolve_pane_identity should delegate (Other), got {e:?}"),
-            Ok(_) => panic!("resolve cannot succeed against a dummy URL"),
+            Ok(v) => assert!(v.get("agent_name").is_none(), "no identity file"),
+            Err(e) => panic!("resolve should be Ok(not-found), got {e:?}"),
         }
     }
 
-    /// An Unsupported method returns the right BackendError shape (no panic,
-    /// no silent Ok). Covers the Phase-3 stubs in one parameterized check.
+    /// No method returns `Unsupported` — every op genuinely delegates to the
+    /// in-process mailbox. Ops that need a registered agent error `Other`
+    /// (delegation to the unknown-name path); operator-backed product ops
+    /// succeed. A real `Unsupported` would mean the delegation is still stubbed.
     #[test]
     fn unsupported_methods_report_unsupported_not_panic() {
-        let mail = Mail::from_config(Some(&crate::config::MailConfig {
-            url: Some("http://127.0.0.1:9999".into()),
-            token: None,
-            name: Some("test-orchestrator".into()),
-        }))
-        .expect("from_config ok")
-        .expect("Some");
+        let mail = Mail::in_process(None).expect("in_process ok").expect("Some");
         let mut b = AgentMailMcpBackend::new(mail);
-        // All prior Phase-3 stubs have graduated (including
-        // bd-mail-cross-project-contact: request_contact/respond_contact).
-        // Dummy URL → BackendError::Other (delegation), never Unsupported.
-        for (method, res) in [
+        // (method, result, expected-ok) — never Unsupported, never panic.
+        for (method, res, expected_ok) in [
             (
                 "request_contact",
                 b.request_contact("p", "a", "b", None, "r"),
+                false, // from-agent not registered
             ),
-            ("respond_contact", b.respond_contact("p", "b", "a", true)),
-            ("list_contacts", b.list_contacts("p", "a")),
-            ("set_contact_policy", b.set_contact_policy("p", "a", "auto")),
-            ("ensure_product", b.ensure_product("trading-research")),
-            ("products_link", b.products_link("trading-research", "p")),
+            ("respond_contact", b.respond_contact("p", "b", "a", true), false),
+            ("list_contacts", b.list_contacts("p", "a"), false),
+            ("set_contact_policy", b.set_contact_policy("p", "a", "auto"), false),
+            ("ensure_product", b.ensure_product("trading-research"), true),
+            ("products_link", b.products_link("trading-research", "p"), true),
         ] {
             match res {
-                Err(BackendError::Other(_)) => {}
+                Ok(_) if expected_ok => {}
+                Ok(_) => panic!("{method}: unexpected Ok for an unregistered agent"),
+                Err(BackendError::Other(_)) if !expected_ok => {}
+                Err(BackendError::Other(_)) => panic!("{method}: should succeed with an operator"),
                 Err(BackendError::Unsupported { method: m, .. }) => {
                     panic!("{method}: still Unsupported ({m}) — should delegate")
                 }
-                Ok(_) => panic!("{method}: cannot succeed against dummy URL"),
-                Err(e) => panic!("{method}: unexpected {e:?}"),
             }
         }
     }

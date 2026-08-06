@@ -3,8 +3,9 @@
 //!
 //! governed-by: ADR-0002
 //!
-//! Phase 0 (R0): define the traits. Current concrete clients (`herdr::Client`,
-//! `mail::Mail`) are wrapped by their backend impls in sibling beads
+//! Phase 0 (R0): define the traits. Concrete clients (`herdr_shim::Client` —
+//! the toron-core herdr client — and `mail_shim::Mail`, the in-process toron
+//! mailbox facade) are wrapped by their backend impls in sibling beads
 //! (`bd-herdr-backend-impl`, `bd-agentmail-backend-impl`). The factory
 //! (`bd-backend-env-config`) selects the active backend from
 //! `FLYWHEEL_BACKEND` / `FLYWHEEL_MAIL`. Trait signatures mirror toron ADR-0003
@@ -38,7 +39,7 @@ pub mod tmux;
 #[cfg(feature = "mail-toron")]
 pub mod toron_mail;
 
-use crate::herdr::{
+use crate::herdr_shim::{
     AgentInfo, AgentStatus, PaneInfo, PushEvent, Subscription, WaitOptions, WorkspaceInfo,
 };
 use serde_json::Value;
@@ -138,12 +139,24 @@ impl From<anyhow::Error> for BackendError {
     }
 }
 
-impl From<crate::herdr::HerdrError> for BackendError {
+impl From<crate::herdr_shim::HerdrError> for BackendError {
     /// Preserve herdr's typed error code as an `Other` with a lossless
     /// anyhow context. (Backend callers handle `BackendError::Unsupported`;
     /// transport errors stay opaque in `Other`.)
-    fn from(e: crate::herdr::HerdrError) -> Self {
+    fn from(e: crate::herdr_shim::HerdrError) -> Self {
         Self::Other(anyhow::anyhow!("herdr error {}: {}", e.code, e.message))
+    }
+}
+
+impl From<toron_core::backend::BackendError> for BackendError {
+    /// The toron-core herdr client's typed error (ADR-0003 Decision 3A,
+    /// bd-o8j.2): classification on `code`, message in the `Other` context.
+    fn from(e: toron_core::backend::BackendError) -> Self {
+        Self::Other(anyhow::anyhow!(
+            "herdr error {}: {}",
+            e.code().as_str(),
+            e.message
+        ))
     }
 }
 
@@ -241,17 +254,20 @@ pub trait MultiplexerBackend: Send + Sync {
     fn agent_rename(&mut self, _target: &str, _new_name: Option<&str>) -> Result<()> {
         Err(BackendError::unsupported(self.name(), "agent_rename"))
     }
-    fn agent_prompt(
+    /// `agent.prompt` — the single herdr-client `prompt` definition lives in
+    /// toron-core (ADR-0003 "one definition"; bd-o8j.2 deleted flywheel's
+    /// client copy), this trait method is the backend-abstraction twin.
+    fn prompt(
         &mut self,
         _target: &str,
         _text: &str,
         _wait: Option<&WaitOptions>,
     ) -> Result<Value> {
-        Err(BackendError::unsupported(self.name(), "agent_prompt"))
+        Err(BackendError::unsupported(self.name(), "prompt"))
     }
     /// Coded `agent.prompt` with landing semantics (ADR-0002, review-fix F6).
     ///
-    /// The plain [`Self::agent_prompt`] returns a minimal JSON and LOSES the
+    /// The plain [`Self::prompt`] returns a minimal JSON and LOSES the
     /// coded error (e.g. `agent_prompt_stalled`) that the durable loop's
     /// `__send` leaf classifies into landed/stalled/timeout. This method
     /// returns the landing data (observed status + protocol error code)
@@ -262,13 +278,13 @@ pub trait MultiplexerBackend: Send + Sync {
     /// `wait` semantics mirror herdr: when Some, block until the agent
     /// reaches `until` or the timeout; landing = the prompt started
     /// executing (working/blocked), NOT idle/done.
-    fn agent_prompt_coded(
+    fn prompt_coded(
         &mut self,
         _target: &str,
         _text: &str,
         _wait: Option<&WaitOptions>,
     ) -> Result<PromptLanding> {
-        Err(BackendError::unsupported(self.name(), "agent_prompt_coded"))
+        Err(BackendError::unsupported(self.name(), "prompt_coded"))
     }
     fn agent_wait(
         &mut self,

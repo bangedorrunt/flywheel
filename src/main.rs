@@ -8,8 +8,8 @@ mod agentstate;
 mod backend;
 mod config;
 mod durable;
-mod herdr;
-mod mail;
+mod herdr_shim;
+mod mail_shim;
 mod output;
 mod state;
 mod toron_embed;
@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use config::{Config, Recipe, WorkflowStep};
-use herdr::{
+use herdr_shim::{
     classify_send_result, AgentInfo, AgentStatus, Client, SendVerdict, Subscription, WaitOptions,
 };
 use output::{die, dim, error, kind_paint, ok as paint_ok, print_json, status_paint};
@@ -957,7 +957,7 @@ fn agent_ordinal(name: &str, project: &str, short: &str) -> Option<u32> {
 /// Resolve a herdr workspace for a project by label; error if missing.
 fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
     let label = swarm_label(project);
-    let matches: Vec<herdr::WorkspaceInfo> = c
+    let matches: Vec<herdr_shim::WorkspaceInfo> = c
         .workspace_list()?
         .into_iter()
         .filter(|ws| ws.label == label)
@@ -971,7 +971,7 @@ fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
     if matches.len() > 1 {
         let prefix = format!("flywheel-{}-", project_base(project));
         let agents = c.agent_list()?;
-        return Ok(herdr::resolve_workspace_id(&matches, &agents, &prefix));
+        return Ok(herdr_shim::resolve_workspace_id(&matches, &agents, &prefix));
     }
     Ok(matches[0].workspace_id.clone())
 }
@@ -1028,7 +1028,7 @@ fn find_workspace_dyn(
     project: &str,
 ) -> Result<String> {
     let label = swarm_label(project);
-    let matches: Vec<herdr::WorkspaceInfo> = backend
+    let matches: Vec<herdr_shim::WorkspaceInfo> = backend
         .workspace_list()?
         .into_iter()
         .filter(|ws| ws.label == label)
@@ -1147,7 +1147,7 @@ fn main() {
         print_json(&json!({
             "tool": "flywheel",
             "version": VERSION,
-            "backend": format!("herdr (socket protocol v{})", herdr::HDR_PROTOCOL),
+            "backend": format!("herdr (socket protocol v{})", herdr_shim::HDR_PROTOCOL),
             "commands": [
                 "init spawn add list status send interrupt view watch zoom attach kill",
                 "work assign mail worktree checkpoint timeline audit history changes resume analytics",
@@ -1655,7 +1655,7 @@ fn cmd_spawn(
                 first = false;
                 prev.clone()
             } else {
-                let p = c.pane_split(&prev, "down", Some(dir.to_str().unwrap()))?;
+                let p = herdr_shim::pane_split(&mut c, &prev, "down", Some(dir.to_str().unwrap()))?;
                 prev = p.pane_id.clone();
                 prev.clone()
             };
@@ -2561,7 +2561,7 @@ fn cmd_add(
             let ordinal = ordinals.entry(short.clone()).or_insert(0);
             *ordinal += 1;
             let name = agent_name_n(project, short, *ordinal);
-            let p = c.pane_split(&prev, "down", Some(dir.to_str().unwrap()))?;
+            let p = herdr_shim::pane_split(&mut c, &prev, "down", Some(dir.to_str().unwrap()))?;
             prev = p.pane_id.clone();
             let agent = start_agent_with_retry(&mut c, &name, &kind, &prev, &[])?;
             register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
@@ -2608,7 +2608,7 @@ fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
             if let Some(ags) = r["agents"].as_array() {
                 for a in ags {
                     let st = a["status"].as_str().unwrap_or("unknown");
-                    let st = AgentStatus::parse(st)
+                    let st = herdr_shim::parse_agent_status(st)
                         .map(status_paint)
                         .unwrap_or_else(|_| dim(st));
                     println!(
@@ -2656,7 +2656,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     if std::io::stdout().is_terminal() {
         for r in &rows {
             let st = r["status"].as_str().unwrap_or("unknown");
-            let st = AgentStatus::parse(st)
+            let st = herdr_shim::parse_agent_status(st)
                 .map(status_paint)
                 .unwrap_or_else(|_| dim(st));
             println!(
@@ -2721,7 +2721,7 @@ fn cmd_send(
             println!(
                 "{} {}",
                 dim(agent_target(a)),
-                status_paint(AgentStatus::parse(status).unwrap_or(AgentStatus::Unknown))
+                status_paint(herdr_shim::parse_agent_status(status).unwrap_or(AgentStatus::Unknown))
             );
         }
         results.push(json!({
@@ -2803,7 +2803,7 @@ fn cmd_watch(
     until: Option<&str>,
     timeout_ms: Option<u64>,
 ) -> Result<()> {
-    let until_status: Option<AgentStatus> = until.map(AgentStatus::parse).transpose()?;
+    let until_status: Option<AgentStatus> = until.map(herdr_shim::parse_agent_status).transpose()?;
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
 
@@ -2836,7 +2836,7 @@ fn cmd_watch(
         .iter()
         .map(|p| Subscription::agent_status_changed(p.pane_id.clone()))
         .collect();
-    let mut stream = match c.subscribe(&subs) {
+    let mut stream = match herdr_shim::subscribe(&mut c, &subs) {
         Ok(s) => Some(s),
         Err(e) => {
             eprintln!("flywheel: WARNING subscription failed ({e:#}); polling fallback");
@@ -2866,8 +2866,8 @@ fn cmd_watch(
                     // The payload's `agent` field is the agent KIND, not the
                     // name — match via pane id (watch_targets).
                     match ev.data {
-                        herdr::HerdrEventData::PaneAgentStatusChanged(change)
-                        | herdr::HerdrEventData::PaneAgentStatusChangedSub(change) => {
+                        herdr_shim::HerdrEventData::PaneAgentStatusChanged(change)
+                        | herdr_shim::HerdrEventData::PaneAgentStatusChangedSub(change) => {
                             let Some(name) = watch_name_for_pane(&watch_targets, &change.pane_id)
                             else {
                                 continue;
@@ -2948,7 +2948,7 @@ fn cmd_zoom(cfg: &Config, project: &str, to: &str, off: bool) -> Result<()> {
     let targets = resolve_agents(&mut c, &ws_id, project, to)?;
     let mode = if off { "off" } else { "on" };
     for a in &targets {
-        c.pane_zoom(&a.pane_id, mode)?;
+        herdr_shim::pane_zoom(&mut c, &a.pane_id, mode)?;
     }
     println!("zoom {mode} for {to}");
     Ok(())
@@ -3049,7 +3049,7 @@ fn cmd_work(cfg: &Config, cmd: &WorkCmd) -> Result<()> {
 }
 
 fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&str>) -> Result<()> {
-    let Some(mail) = mail::Mail::from_config(cfg.agent_mail.as_ref())? else {
+    let Some(mail) = mail_shim::Mail::in_process(cfg.agent_mail.as_ref())? else {
         bail!(
             "agent-mail not configured — set [agent_mail] url/token/name in {}",
             config::config_file().display()
@@ -3107,8 +3107,8 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
 
 // ---- mail ----
 
-fn mail_or_die(cfg: &Config) -> Result<mail::Mail> {
-    mail::Mail::from_config(cfg.agent_mail.as_ref())?.ok_or_else(|| {
+fn mail_or_die(cfg: &Config) -> Result<mail_shim::Mail> {
+    mail_shim::Mail::in_process(cfg.agent_mail.as_ref())?.ok_or_else(|| {
         anyhow!(
             "agent-mail not configured — set [agent_mail] url/token/name in {}",
             config::config_file().display()
@@ -3556,7 +3556,7 @@ fn cmd_worktree(cfg: &Config, cmd: &WorktreeCmd) -> Result<()> {
     match cmd {
         WorktreeCmd::List { project } => {
             let ws_id = find_workspace(&mut c, project)?;
-            let v = c.worktree_list(Some(&ws_id))?;
+            let v = herdr_shim::worktree_list(&mut c, Some(&ws_id))?;
             for w in &v {
                 println!(
                     "{}  {}  {}",
@@ -3760,7 +3760,7 @@ fn cmd_changes(cfg: &Config, project: &str, since: usize) -> Result<()> {
                 "{}  {} → {}",
                 dim(a.name.as_deref().unwrap_or("?")),
                 dim(prev_st),
-                status_paint(AgentStatus::parse(now_st).unwrap_or(AgentStatus::Unknown))
+                status_paint(herdr_shim::parse_agent_status(now_st).unwrap_or(AgentStatus::Unknown))
             );
         }
     }
@@ -3889,7 +3889,7 @@ fn run_workflow(cfg: &Config, project: &str, name: &str) -> Result<()> {
                 }
             }
             WorkflowStep::Wait { until, timeout_ms } => {
-                let st = AgentStatus::parse(until)?;
+                let st = herdr_shim::parse_agent_status(until)?;
                 let targets = resolve_agents(&mut c, &ws_id, project, "all")?;
                 for a in &targets {
                     c.agent_wait(
@@ -4763,7 +4763,7 @@ fn protocol_check(live: u64, pin: u64) -> ProtocolCheck {
 
 /// The agent-mail identity the orchestrator acts as: the configured
 /// `[agent_mail] name`, defaulting to "flywheel" — identical to
-/// `Mail::from_config`'s default, so lease renewal and the `flywheel mail
+/// `Mail::in_process`'s default, so lease renewal and the `flywheel mail
 /// locks` reservations always use the SAME identity.
 fn orchestrator_mail_name(cfg: &Config) -> String {
     cfg.agent_mail
@@ -4838,23 +4838,23 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .and_then(|o| herdr::parse_protocol(&String::from_utf8_lossy(&o.stdout)))
+        .and_then(|o| herdr_shim::parse_protocol(&String::from_utf8_lossy(&o.stdout)))
     {
-        Some(p) => match protocol_check(p, herdr::HDR_PROTOCOL) {
+        Some(p) => match protocol_check(p, herdr_shim::HDR_PROTOCOL) {
             ProtocolCheck::Match => println!(
                 "herdr protocol: {} (verified {})",
                 paint_ok(&p.to_string()),
-                herdr::HDR_PROTOCOL
+                herdr_shim::HDR_PROTOCOL
             ),
             ProtocolCheck::Newer => {
                 println!(
                     "herdr protocol: {} (verified {})",
                     crate::output::warn(&p.to_string()),
-                    herdr::HDR_PROTOCOL
+                    herdr_shim::HDR_PROTOCOL
                 );
                 eprintln!(
                     "flywheel: INFO herdr protocol {p} > verified {} — forward-compatible (client ignores what it doesn't know), but flywheel may not use new features; rebuild against the newer schema when ready",
-                    herdr::HDR_PROTOCOL
+                    herdr_shim::HDR_PROTOCOL
                 );
             }
             ProtocolCheck::Older => {
@@ -4862,11 +4862,11 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
                 println!(
                     "herdr protocol: {} (verified {})",
                     crate::output::error(&p.to_string()),
-                    herdr::HDR_PROTOCOL
+                    herdr_shim::HDR_PROTOCOL
                 );
                 eprintln!(
                     "flywheel: ERROR herdr protocol {p} < verified {} — server too old, our requests may be rejected; upgrade herdr or rebuild flywheel against the pinned schema",
-                    herdr::HDR_PROTOCOL
+                    herdr_shim::HDR_PROTOCOL
                 );
             }
         },
@@ -4874,7 +4874,7 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
             println!(
                 "herdr protocol: {} (verified {})",
                 crate::output::warn("unknown"),
-                herdr::HDR_PROTOCOL
+                herdr_shim::HDR_PROTOCOL
             );
             eprintln!(
                 "flywheel: WARNING cannot read herdr protocol (herdr api schema --json failed)"
@@ -4899,7 +4899,7 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
         }
     }
 
-    match mail::Mail::from_config(cfg.agent_mail.as_ref()) {
+    match mail_shim::Mail::in_process(cfg.agent_mail.as_ref()) {
         Ok(Some(mut m)) => match m.health() {
             Ok(_) => println!("agent-mail: {}", status_paint(AgentStatus::Idle)),
             Err(e) => {
@@ -5671,9 +5671,9 @@ fn settle_agent(mux: &mut dyn backend::MultiplexerBackend, agent: &str) -> Resul
     mux.agent_wait(
         agent,
         &[
-            crate::herdr::AgentStatus::Done,
-            crate::herdr::AgentStatus::Idle,
-            crate::herdr::AgentStatus::Blocked,
+            crate::herdr_shim::AgentStatus::Done,
+            crate::herdr_shim::AgentStatus::Idle,
+            crate::herdr_shim::AgentStatus::Blocked,
         ],
         Some(1_800_000),
     )
@@ -5930,8 +5930,8 @@ struct StatusEventItem {
 /// Map a typed push event to a status item, advancing `seq`. Returns `None`
 /// for non-status events (output_changed etc. — filtered at subscribe time
 /// but defensive).
-fn summarize_status_event(ev: &herdr::PushEvent, seq: &mut u64) -> Option<StatusEventItem> {
-    use herdr::HerdrEventData::*;
+fn summarize_status_event(ev: &herdr_shim::PushEvent, seq: &mut u64) -> Option<StatusEventItem> {
+    use herdr_shim::HerdrEventData::*;
     let (event_type, pane_id, agent, status) = match &ev.data {
         PaneAgentStatusChanged(c) | PaneAgentStatusChangedSub(c) => (
             "pane.agent_status_changed",
@@ -6081,7 +6081,7 @@ fn cmd_internal_send(
     let Some(timeout_ms) = confirm_ms else {
         // legacy fire-and-forget path — a successful herdr call means the
         // prompt was written to the agent's terminal
-        backend.agent_prompt(&target, text, None)?;
+        backend.prompt(&target, text, None)?;
         record(true);
         print_json(&json!({ "ok": true, "name": name }));
         return Ok(());
@@ -6095,7 +6095,7 @@ fn cmd_internal_send(
     };
     // review-fix F6: PromptLanding carries status XOR code; classify
     // identically to the concrete path (landed → status, else code).
-    let landing = backend.agent_prompt_coded(&target, text, Some(&wait))?;
+    let landing = backend.prompt_coded(&target, text, Some(&wait))?;
     let verdict = classify_send_result(landing.code.as_deref(), landing.status);
     let (landed, status, reason) = match verdict {
         SendVerdict::Landed(st) => (
@@ -6120,7 +6120,7 @@ fn cmd_internal_send(
 /// the caller-provided, workspace-filtered agent list) maps to its pane; a
 /// target containing `:` is treated as a raw pane id; anything else is
 /// unknown. Pure — no lookup logic duplicated from `__send`.
-fn resolve_pane_id(agents: &[herdr::AgentInfo], target: &str) -> Option<String> {
+fn resolve_pane_id(agents: &[herdr_shim::AgentInfo], target: &str) -> Option<String> {
     if let Some(a) = agents.iter().find(|a| a.name.as_deref() == Some(target)) {
         return Some(a.pane_id.clone());
     }
@@ -6177,7 +6177,7 @@ fn cmd_internal_wait_output(
         eprintln!("flywheel: target {target} not found in {project}");
         std::process::exit(1);
     };
-    match c.pane_wait_output(&pane_id, wait_output_mode(regex), pattern, timeout_ms) {
+    match herdr_shim::pane_wait_output(&mut c, &pane_id, wait_output_mode(regex), pattern, timeout_ms) {
         Ok(r) => {
             print_json(&wait_output_json(
                 true,
@@ -6678,7 +6678,7 @@ fn cmd_internal_renew_leases(cfg: &Config, project: &str, extend_seconds: u64) -
         .renew(&key, &agent, extend_seconds, None)
         .map_err(|e| anyhow!("mail backend: {e}"))?;
     let renewed = v.get("renewed").and_then(Value::as_u64).unwrap_or(0);
-    let reservations = crate::mail::list_own_reservations(&v);
+    let reservations = crate::mail_shim::list_own_reservations(&v);
     print_json(&json!({
         "ok": true,
         "renewed": renewed,
@@ -6825,12 +6825,11 @@ fn cmd_serve(_cfg: &Config, _port: u16) -> Result<()> {
 #[cfg(test)]
 mod wait_output_tests {
     use super::*;
-    use crate::herdr::{AgentInfo, PaneWaitResult};
+    use crate::herdr_shim::{AgentInfo, PaneWaitResult};
 
     fn agent(name: Option<&str>, pane: &str) -> AgentInfo {
         AgentInfo {
             agent: Some("opencode".into()),
-            agent_session: None,
             agent_status: AgentStatus::Idle,
             cwd: Some("/proj".into()),
             display_agent: None,
