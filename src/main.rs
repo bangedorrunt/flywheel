@@ -934,9 +934,7 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
     let want: Vec<String> = if to == "all" {
         avail.clone()
     } else {
-        to.split(',')
-            .map(|s| agent_name(project, s.trim()))
-            .collect()
+        to.split(',').map(|s| to_want_token(project, s)).collect()
     };
     let matched: Vec<AgentInfo> = in_ws
         .into_iter()
@@ -1015,9 +1013,7 @@ fn resolve_agents_dyn(
     let want: Vec<String> = if to == "all" {
         avail.clone()
     } else {
-        to.split(',')
-            .map(|s| agent_name(project, s.trim()))
-            .collect()
+        to.split(',').map(|s| to_want_token(project, s)).collect()
     };
     let matched: Vec<AgentInfo> = in_ws
         .into_iter()
@@ -1035,6 +1031,27 @@ fn resolve_agents_dyn(
         );
     }
     Ok(matched)
+}
+
+/// Normalize a single `--to` token to the concrete agent name it should
+/// match against. Bare kind shorts (`oc`, `pi`, `gk`) wrap to the first
+/// ordinal (`flywheel-<base>-oc`); anything already concrete passes through
+/// unchanged:
+///   - `flywheel-...` (a spawned herdr name, exactly what `flywheel list`
+///     shows) — pass through, do NOT double-wrap
+///   - contains `:` (a raw pane id) — pass through
+///
+/// This mirrors `resolve_agent_default`'s pass-through rule. bd-bwf: before
+/// this, `flywheel send --to flywheel-toron-oc` double-wrapped to
+/// `flywheel-toron-flywheel-toron-oc` and was rejected even though `list`
+/// showed that exact name as available.
+fn to_want_token(project: &str, token: &str) -> String {
+    let t = token.trim();
+    if t.is_empty() || t.starts_with("flywheel-") || t.contains(':') {
+        t.to_string()
+    } else {
+        agent_name(project, t)
+    }
 }
 
 /// Exact name, or a digit-suffixed ordinal of it (oc2 matches oc).
@@ -2413,6 +2430,28 @@ mod agent_mail_name_tests {
         // empty stays empty (caller validates distinctness)
         assert_eq!(resolve_agent_default("hachiko", ""), "");
     }
+
+    /// bd-bwf: full herdr names shown by `flywheel list` must NOT be
+    /// double-wrapped. Bare shorts still expand.
+    #[test]
+    fn to_want_token_passes_through_full_names() {
+        // full spawned name passes through (the fix for bd-bwf)
+        assert_eq!(
+            to_want_token("toron", "flywheel-toron-oc"),
+            "flywheel-toron-oc"
+        );
+        assert_eq!(
+            to_want_token("toron", "flywheel-toron-oc2"),
+            "flywheel-toron-oc2"
+        );
+        // bare shorts expand to first ordinal
+        assert_eq!(to_want_token("toron", "oc"), "flywheel-toron-oc");
+        assert_eq!(to_want_token("toron", "pi"), "flywheel-toron-pi");
+        // raw pane id passes through
+        assert_eq!(to_want_token("toron", "w1:p1"), "w1:p1");
+        // empty passes through (caller validates distinctness)
+        assert_eq!(to_want_token("toron", ""), "");
+    }
 }
 
 // ---- add ----
@@ -3302,7 +3341,15 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         } => {
             let key = project_dir(cfg, project).to_str().unwrap().to_string();
             mail.ensure_project(&key)?;
+            // bd-7hw: idempotently register the orchestrator identity so
+            // `fetch_inbox` doesn't reject "Agent not found". register_agent
+            // is an upsert — safe to call every time.
             let name = mail.name.clone();
+            if let Err(e) =
+                mail.register_agent(&key, &name, "flywheel", "flywheel", "flywheel orchestrator")
+            {
+                eprintln!("flywheel: self-register failed (non-fatal): {e:#}");
+            }
             let v = mail.inbox(&key, &name, *urgent, *limit)?;
             print_json(&v);
         }
