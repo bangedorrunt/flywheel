@@ -680,6 +680,11 @@ enum ToronCmd {
         /// print what would change without touching any file
         #[arg(long)]
         dry_run: bool,
+        /// also point flywheel's OWN mail backend at the same toron URL
+        /// (writes `[agent_mail] url` in ~/Library/Application Support/
+        /// flywheel/config.toml, so flywheel + all agents share one mailbox)
+        #[arg(long)]
+        flywheel: bool,
     },
 }
 
@@ -3577,9 +3582,10 @@ fn cmd_toron(cfg: &Config, cmd: &ToronCmd) -> Result<()> {
         agents,
         boot_port,
         dry_run,
+        flywheel,
     } = cmd
     {
-        return toron_setup_mcp(url.as_deref(), agents, *boot_port, *dry_run);
+        return toron_setup_mcp(url.as_deref(), agents, *boot_port, *dry_run, *flywheel);
     }
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(toron_embed::dispatch(cfg, cmd))
@@ -4760,7 +4766,13 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
 /// `dry_run` prints the target change without touching any file.
 /// `boot_port` (>0) also spawns `toron serve --mcp-http <port>` on a
 /// background task (requires the toron binary on PATH + operator-key env).
-fn toron_setup_mcp(url: Option<&str>, agents: &str, boot_port: u16, dry_run: bool) -> Result<()> {
+fn toron_setup_mcp(
+    url: Option<&str>,
+    agents: &str,
+    boot_port: u16,
+    dry_run: bool,
+    flywheel: bool,
+) -> Result<()> {
     let url = url.unwrap_or("http://127.0.0.1:18080/mcp");
     let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME unset"))?;
     let home = std::path::Path::new(&home);
@@ -4791,12 +4803,23 @@ fn toron_setup_mcp(url: Option<&str>, agents: &str, boot_port: u16, dry_run: boo
         }
     }
 
+    if flywheel {
+        // also point flywheel's OWN mail backend at the same toron URL so
+        // flywheel + all agents share one mailbox.
+        changed.push(setup_flywheel_backend(url, dry_run)?);
+    }
+
     if changed
         .iter()
         .any(|c| c.contains("added") || c.contains("updated"))
     {
         println!("toron MCP wired: {url}  {}", changed.join(" · "));
         println!("restart the agent editor for a new session to pick up the MCP server.");
+        if flywheel {
+            println!(
+                "flywheel backend: next session routes mail through {url} (env FLYWHEEL_AGENTMAIL_URL overrides config)."
+            );
+        }
     } else {
         println!("toron MCP already present at {url} — nothing to change.");
     }
@@ -4967,6 +4990,72 @@ fn boot_toron_server(port: u16) -> Result<()> {
     cmd.spawn()?;
     println!("booted toron serve --mcp-http {bind} (detached).");
     Ok(())
+}
+
+/// Point flywheel's OWN mail backend at the toron URL.
+///
+/// Writes/updates the `[agent_mail] url` line in the flywheel config.toml so
+/// flywheel and all registered agents converge on ONE toron mailbox. The env
+/// `FLYWHEEL_AGENTMAIL_URL` still wins at load time (config.rs merges env over
+/// the file) — config.toml is the durable default, env is the per-session
+/// override. Idempotent; only touches the `[agent_mail]` block's `url`.
+fn setup_flywheel_backend(url: &str, dry: bool) -> Result<String> {
+    let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME unset"))?;
+    let path = std::path::Path::new(&home).join("Library/Application Support/flywheel/config.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+
+    // Locate `[agent_mail]` and rewrite its `url = ...` line; if no section
+    // exists, append one.
+    let mut in_mail = false;
+    let mut url_line: Option<usize> = None;
+    let mut section_idx: Option<usize> = None;
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if t.starts_with('[') && t.ends_with(']') && t != "[agent_mail]" {
+            break; // past the agent_mail block — stop scanning
+        }
+        if t == "[agent_mail]" {
+            in_mail = true;
+            section_idx = Some(i);
+        }
+        if in_mail && t.starts_with("url =") {
+            url_line = Some(i);
+        }
+    }
+
+    let action = match url_line {
+        Some(i) => {
+            let existing = lines[i].trim();
+            if existing == format!("url = \"{url}\"") {
+                return Ok("flywheel unchanged".to_string());
+            }
+            lines[i] = format!("url = \"{url}\"");
+            "updated".to_string()
+        }
+        None => match section_idx {
+            Some(i) => {
+                // agent_mail section present but no url line — insert right after
+                // the section header.
+                lines.insert(i + 1, format!("url = \"{url}\""));
+                "added url".to_string()
+            }
+            None => {
+                // no [agent_mail] at all — append a fresh block.
+                lines.push(String::from("[agent_mail]"));
+                lines.push(format!("url = \"{url}\""));
+                lines.push(String::from("name = \"flywheel\""));
+                lines.push(String::new());
+                "added section".to_string()
+            }
+        },
+    };
+
+    if dry {
+        return Ok(format!("flywheel backend {action}"));
+    }
+    std::fs::write(&path, lines.join("\n") + "\n")?;
+    Ok(format!("flywheel backend {action}"))
 }
 
 #[cfg(test)]
