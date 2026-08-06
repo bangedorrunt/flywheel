@@ -21,12 +21,16 @@ Copy [`.env.example`](.env.example) → `.env` for local backend overrides
 
 flywheel selects a **multiplexer** (pane/agent lifecycle) and a **mail**
 fabric via env / `.env` / config (ADR-0002). Defaults: `herdr` + `agentmail`.
-Future stubs: `superlogical` / `tmux` (mux), `toron` (mail).
+Mail backends (ADR-0003): `agentmail` = the real mcp_agent_mail server
+(`[mail.agentmail]`, default `http://127.0.0.1:8765`); `toron` = the toron
+facade (`[mail.toron]`, absent → embedded in-process). Stubs: `superlogical` /
+`tmux` (mux).
 
 ```bash
 flywheel backend list --json    # what is compiled in + active
 flywheel backend status         # config source + health
 # FLYWHEEL_BACKEND=herdr FLYWHEEL_MAIL=agentmail
+# FLYWHEEL_MAIL=toron           # toron facade (embedded or [mail.toron] daemon)
 ```
 
 Precedence: flag > env > `.env` > config.toml > default. Full matrix and
