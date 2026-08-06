@@ -275,6 +275,13 @@ fn self_exe() -> anyhow::Result<std::path::PathBuf> {
 }
 
 /// Poll the swarm via the flywheel binary itself. Checkpointed.
+///
+/// SOFT-FAIL: if `__poll` exits non-zero (e.g. the swarm was killed or never
+/// spawned — a normal operational state, not an error), return an EMPTY state
+/// list so the durable loop settles cleanly (`all_settled` treats an empty
+/// swarm as settled) instead of crashing the whole invocation. This mirrors
+/// the `poll_events` leaf's soft-fail and fixes the "durable loop invocation
+/// failed: __poll failed" that killed a run after `flywheel kill <proj>`.
 #[function]
 async fn poll_swarm(args: PollArgs) -> Result<Vec<AgentState>> {
     let exe = self_exe().map_err(map_err)?;
@@ -283,10 +290,18 @@ async fn poll_swarm(args: PollArgs) -> Result<Vec<AgentState>> {
         .output()
         .map_err(|e| map_err(anyhow::anyhow!("__poll spawn failed: {e}")))?;
     if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__poll failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+        // Swarm gone / not spawned — soft-fail to empty so the loop settles
+        // rather than aborting the durable run.
+        let reason = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        eprintln!(
+            "flywheel: __poll soft-fail (swarm absent?): {}",
+            if reason.is_empty() {
+                format!("__poll exit {}", out.status)
+            } else {
+                reason
+            }
+        );
+        return Ok(Vec::new());
     }
     let raw = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(raw.trim())
@@ -2384,6 +2399,15 @@ mod tests {
         assert!(!all_settled(&states));
         let settled = vec![st("a", "idle"), st("b", "done")];
         assert!(all_settled(&settled));
+    }
+
+    #[test]
+    fn empty_swarm_is_settled() {
+        // An EMPTY state list is settled: the poll_swarm soft-fail (swarm
+        // killed / never spawned -> pass an empty Vec) settles the loop
+        // gracefully instead of crashing the durable invocation with
+        // "__poll failed". This is the invariant the soft-fail relies on.
+        assert!(all_settled(&[][..]));
     }
 
     // ---- adaptive poll interval (bd-adaptive-interval) ----
