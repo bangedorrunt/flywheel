@@ -22,7 +22,7 @@ use toron_mcp::ToJson;
 
 use crate::config::Config;
 use crate::output::print_json;
-use crate::{ToronMailCmd, ToronCmd};
+use crate::{ToronCmd, ToronMailCmd};
 
 /// Build the in-process demo mailbox exactly as toron-mcp does.
 async fn mailbox() -> Result<toron_core::mailbox::Mailbox> {

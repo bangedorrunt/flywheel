@@ -37,7 +37,7 @@ pub mod superlogical;
 #[cfg(feature = "backend-tmux")]
 pub mod tmux;
 #[cfg(feature = "mail-toron")]
-pub mod toron_mail;
+pub mod toron;
 
 use crate::herdr_shim::{
     AgentInfo, AgentStatus, PaneInfo, PushEvent, Subscription, WaitOptions, WorkspaceInfo,
@@ -257,12 +257,7 @@ pub trait MultiplexerBackend: Send + Sync {
     /// `agent.prompt` — the single herdr-client `prompt` definition lives in
     /// toron-core (ADR-0003 "one definition"; bd-o8j.2 deleted flywheel's
     /// client copy), this trait method is the backend-abstraction twin.
-    fn prompt(
-        &mut self,
-        _target: &str,
-        _text: &str,
-        _wait: Option<&WaitOptions>,
-    ) -> Result<Value> {
+    fn prompt(&mut self, _target: &str, _text: &str, _wait: Option<&WaitOptions>) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "prompt"))
     }
     /// Coded `agent.prompt` with landing semantics (ADR-0002, review-fix F6).

@@ -188,12 +188,7 @@ impl MultiplexerBackend for HerdrBackend {
         Ok(())
     }
 
-    fn prompt(
-        &mut self,
-        target: &str,
-        text: &str,
-        wait: Option<&WaitOptions>,
-    ) -> Result<Value> {
+    fn prompt(&mut self, target: &str, text: &str, wait: Option<&WaitOptions>) -> Result<Value> {
         // WaitOptions is Clone (toron-core derive); trait passes by ref, Client
         // takes by value. Clone the Option<&T> into Option<T>. AgentInfo is
         // Deserialize-only (parsed from the socket, never re-serialized), so
@@ -249,8 +244,8 @@ impl MultiplexerBackend for HerdrBackend {
     fn subscribe(&mut self, filters: &[Subscription]) -> Result<Box<dyn BackendEventStream>> {
         // herdr events.subscribe is forward-only (no since/seq param — schema-
         // verified). The loop's heartbeat poll is the correctness floor.
-        let stream = herdr_shim::subscribe(&mut self.client, filters)
-            .map_err(BackendError::from)?;
+        let stream =
+            herdr_shim::subscribe(&mut self.client, filters).map_err(BackendError::from)?;
         Ok(Box::new(HerdrEventStreamAdapter(stream)))
     }
 }

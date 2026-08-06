@@ -44,7 +44,7 @@ use toron_core::nostr::identity::AgentProfile;
 use toron_mcp::ToJson;
 
 use crate::config::MailConfig;
-use crate::mcp_http::McpClient;
+use crate::mcp_http::{McpClient, ServerKind};
 
 /// In-process mailbox context: the single shared mailbox every `Mail` instance
 /// operates on. Mirrors `toron_mcp::demo_mailbox` (InProcessBus + SQLite index
@@ -71,12 +71,10 @@ async fn build_mailbox() -> anyhow::Result<toron_core::mailbox::Mailbox> {
     .await?;
     let data_dir = std::env::temp_dir().join("flywheel-mail");
     let operator = toron_core::keys::generate();
-    Ok(toron_core::mailbox::Mailbox::new(
-        std::sync::Arc::new(bus),
-        data_dir,
-        Some(operator),
+    Ok(
+        toron_core::mailbox::Mailbox::new(std::sync::Arc::new(bus), data_dir, Some(operator))
+            .with_index_pool(pool),
     )
-    .with_index_pool(pool))
 }
 
 /// Run one async mailbox operation on a fresh tokio runtime (flywheel main.rs
@@ -88,7 +86,9 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 }
 
 /// Full inbox filter bag (bd-mail-ack-sla-tracking). Callers construct this
-/// instead of passing 5 booleans positionally.
+/// instead of passing 5 booleans positionally. Constructed by the toron
+/// backend (`mail-toron` feature); suppressed as dead in the default build.
+#[cfg_attr(not(feature = "mail-toron"), allow(dead_code))]
 #[derive(Debug, Clone, Default)]
 pub struct MailInboxFilter {
     /// Not yet applied by the toron projection (parity surface kept).
@@ -107,6 +107,9 @@ pub struct MailInboxFilter {
 
 /// Filter bag for `Mail::search` (review-fix F8: folds the 10 positional args
 /// into a struct — the trait's `SearchFilter` is the backend-agnostic twin).
+/// Constructed by the toron backend (`mail-toron` feature); suppressed as dead
+/// in the default build.
+#[cfg_attr(not(feature = "mail-toron"), allow(dead_code))]
 #[derive(Debug, Clone, Default)]
 pub struct MailSearchFilter {
     pub sender: Option<String>,
@@ -134,6 +137,12 @@ enum BackendKind {
 /// `toron_core::mailbox::Mailbox` call (in-process) or a toron MCP `tools/call`
 /// against a remote daemon (see the deleted `src/mail.rs` for the surface this
 /// replaces). JSON return shapes are identical across backends.
+///
+/// This is the TORON facade (ADR-0003 V2). Its full method surface is consumed
+/// by the feature-gated toron backend (`mail-toron`) plus the CLI mail
+/// commands; in the default build (toron backend off) the ops the CLI doesn't
+/// call are dead — suppressed so the default build stays warning-free.
+#[cfg_attr(not(feature = "mail-toron"), allow(dead_code))]
 pub struct Mail {
     /// The agent identity this facade sends AS / reads the inbox for.
     pub name: String,
@@ -141,6 +150,7 @@ pub struct Mail {
     backend: BackendKind,
 }
 
+#[cfg_attr(not(feature = "mail-toron"), allow(dead_code))]
 impl Mail {
     /// Construct the mail facade from `[agent_mail]` config. Picks the
     /// backend: `cfg.url` Some → remote-daemon (bd-o8j.3); None/unset →
@@ -169,8 +179,12 @@ impl Mail {
         let Some(url) = cfg.and_then(|c| c.url.clone()) else {
             return Ok(None);
         };
-        let client = McpClient::new(&url, cfg.and_then(|c| c.token.clone()))
-            .map_err(|e| anyhow::anyhow!("agent-mail remote daemon {url}: {e:#}"))?;
+        let client = McpClient::new(
+            &url,
+            cfg.and_then(|c| c.token.clone()),
+            ServerKind::Toron, // this facade IS the toron transport (ADR-0003 V1)
+        )
+        .map_err(|e| anyhow::anyhow!("agent-mail remote daemon {url}: {e:#}"))?;
         Ok(Some(Mail {
             name,
             backend: BackendKind::Remote(client),
@@ -180,7 +194,10 @@ impl Mail {
     /// Route a tool call through the remote daemon (in-process backend errors).
     fn call_remote(&self, tool: &str, args: Value) -> Result<Value> {
         match &self.backend {
-            BackendKind::Remote(client) => client.call_tool(tool, args),
+            BackendKind::Remote(client) => {
+                // McpError (Transport|Tool) -> anyhow via the blanket From.
+                client.call_tool(tool, args).map_err(anyhow::Error::from)
+            }
             BackendKind::InProcess => bail!("{tool} requires the remote-daemon backend"),
         }
     }
@@ -488,7 +505,13 @@ impl Mail {
     ) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
-                let s = block_on(mailbox().summarize_thread(project_key, thread_id, false, llm_mode, None))?;
+                let s = block_on(mailbox().summarize_thread(
+                    project_key,
+                    thread_id,
+                    false,
+                    llm_mode,
+                    None,
+                ))?;
                 Ok(s.to_json())
             }
             BackendKind::Remote(_) => self.call_remote(
@@ -628,7 +651,8 @@ impl Mail {
     pub fn release(&mut self, project_key: &str) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
-                let r = block_on(mailbox().release_file_reservations(project_key, &self.name, &[]))?;
+                let r =
+                    block_on(mailbox().release_file_reservations(project_key, &self.name, &[]))?;
                 Ok(r.to_json())
             }
             BackendKind::Remote(_) => self.call_remote(
@@ -642,7 +666,11 @@ impl Mail {
     pub fn conflicts(&mut self, project_key: &str, paths: &[String]) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
-                let r = block_on(mailbox().check_file_reservation_conflicts(project_key, &self.name, paths))?;
+                let r = block_on(mailbox().check_file_reservation_conflicts(
+                    project_key,
+                    &self.name,
+                    paths,
+                ))?;
                 Ok(r.to_json())
             }
             BackendKind::Remote(_) => self.call_remote(
@@ -863,12 +891,7 @@ impl Mail {
     }
 
     /// `search_messages_product`.
-    pub fn search_product(
-        &mut self,
-        product_key: &str,
-        query: &str,
-        limit: u32,
-    ) -> Result<Value> {
+    pub fn search_product(&mut self, product_key: &str, query: &str, limit: u32) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 let res = block_on(mailbox().search_messages_product(
@@ -899,15 +922,22 @@ impl Mail {
     }
 
     /// `fetch_inbox_product`.
-    pub fn inbox_product(&mut self, product_key: &str, agent_name: &str, limit: u32) -> Result<Value> {
+    pub fn inbox_product(
+        &mut self,
+        product_key: &str,
+        agent_name: &str,
+        limit: u32,
+    ) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 let res = block_on(mailbox().fetch_inbox_product(product_key, agent_name))?;
-                Ok(json!({ "messages": res.iter().take(limit as usize).map(|(p, m)| {
+                Ok(
+                    json!({ "messages": res.iter().take(limit as usize).map(|(p, m)| {
                     let mut v = m.to_json();
                     v["project"] = json!(p);
                     v
-                }).collect::<Vec<Value>>() }))
+                }).collect::<Vec<Value>>() }),
+                )
             }
             BackendKind::Remote(_) => {
                 let res = self.call_remote(
@@ -920,7 +950,12 @@ impl Mail {
                 )?;
                 let msgs = res
                     .as_array()
-                    .map(|arr| arr.iter().take(limit as usize).cloned().collect::<Vec<Value>>())
+                    .map(|arr| {
+                        arr.iter()
+                            .take(limit as usize)
+                            .cloned()
+                            .collect::<Vec<Value>>()
+                    })
                     .unwrap_or_default();
                 Ok(json!({ "messages": msgs }))
             }
@@ -973,7 +1008,12 @@ impl Mail {
     ) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
-                let r = block_on(mailbox().renew_build_slot(project_key, agent_name, slot, extend_seconds))?;
+                let r = block_on(mailbox().renew_build_slot(
+                    project_key,
+                    agent_name,
+                    slot,
+                    extend_seconds,
+                ))?;
                 Ok(match r {
                     Some(b) => b.to_json(),
                     None => json!({ "slot": slot, "renewed": false }),
@@ -999,7 +1039,12 @@ impl Mail {
     }
 
     /// `release_build_slot`.
-    pub fn release_slot(&mut self, project_key: &str, agent_name: &str, slot: &str) -> Result<Value> {
+    pub fn release_slot(
+        &mut self,
+        project_key: &str,
+        agent_name: &str,
+        slot: &str,
+    ) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 block_on(mailbox().release_build_slot(project_key, agent_name, slot))?;
@@ -1035,33 +1080,13 @@ impl Mail {
         pane_id: &str,
         agent_name: &str,
     ) -> Result<PathBuf> {
-        let name = agent_name.trim();
-        if name.is_empty() {
-            bail!("refusing to write empty pane identity for {pane_id}");
-        }
-        let path = canonical_identity_path(project_key, pane_id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
-            bail!(
-                "refusing to overwrite symlinked pane identity {}",
-                path.display()
-            );
-        }
-        write_identity_file(&path, format!("{name}\n").as_bytes())?;
-        Ok(path)
+        write_identity_for(project_key, pane_id, agent_name)
     }
 
     /// Remove the per-pane identity file (pane exited / respawned). No-op if
     /// absent — duplicate exit events must not fail. Returns the path.
     pub fn clear_pane_identity(&self, project_key: &str, pane_id: &str) -> Result<PathBuf> {
-        let path = canonical_identity_path(project_key, pane_id);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(path),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(path),
-            Err(e) => Err(e).context("remove pane identity"),
-        }
+        clear_identity_for(project_key, pane_id)
     }
 
     /// Resolve the agent name for a pane from the canonical identity file
@@ -1161,11 +1186,49 @@ pub fn canonical_identity_path(project_key: &str, pane_id: &str) -> PathBuf {
 
 /// Write the identity file atomically (temp + rename), mirroring agent-mail
 /// core's `write_identity_file` (0600, overwrite-only, no symlink).
-fn write_identity_file(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_identity_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("rename onto {}", path.display()))?;
     Ok(())
+}
+
+/// Write a per-pane identity file with the agent-mail-core guardrails (empty-
+/// name refusal, symlink refusal). Shared by the toron `Mail` facade and the
+/// real agent-mail backend (ADR-0003 V3) — both write the SAME file the
+/// agent-mail server reads.
+pub(crate) fn write_identity_for(
+    project_key: &str,
+    pane_id: &str,
+    agent_name: &str,
+) -> Result<PathBuf> {
+    let name = agent_name.trim();
+    if name.is_empty() {
+        bail!("refusing to write empty pane identity for {pane_id}");
+    }
+    let path = canonical_identity_path(project_key, pane_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        bail!(
+            "refusing to overwrite symlinked pane identity {}",
+            path.display()
+        );
+    }
+    write_identity_file(&path, format!("{name}\n").as_bytes())?;
+    Ok(path)
+}
+
+/// Remove a per-pane identity file (no-op when absent). Shared by the toron
+/// `Mail` facade and the real agent-mail backend.
+pub(crate) fn clear_identity_for(project_key: &str, pane_id: &str) -> Result<PathBuf> {
+    let path = canonical_identity_path(project_key, pane_id);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(path),
+        Err(e) => Err(e).context("remove pane identity"),
+    }
 }
 
 /// One renewed reservation, as reported by `renew_file_reservations`.
@@ -1216,7 +1279,9 @@ mod tests {
 
     #[test]
     fn from_config_none_defaults_to_in_process_flywheel() {
-        let mail = Mail::from_config(None).expect("from_config ok").expect("Some");
+        let mail = Mail::from_config(None)
+            .expect("from_config ok")
+            .expect("Some");
         assert_eq!(mail.name, "flywheel");
         assert!(matches!(&mail.backend, BackendKind::InProcess));
     }

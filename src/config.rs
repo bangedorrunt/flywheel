@@ -11,22 +11,44 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 1_800_000;
 
-/// `[agent_mail]` section. OPTIONAL (ADR-0003 Decision 3A/3B, bd-o8j.2/.3):
-/// the default integrated path uses the in-process toron mailbox, which needs
-/// no config — only the agent identity `name` is read (default `flywheel`).
-/// When `url` is set, `Mail::from_config` switches to the REMOTE-daemon path
-/// (bd-o8j.3): flywheel drives a standalone `toron serve --mcp-http <addr>`
-/// over MCP, and `token` is passed as a bearer token.
+/// `[agent_mail]` section — the SHARED mail identity (ADR-0003 V3). Keeps only
+/// the identity/name (and shared token); per-backend transport lives in
+/// `[mail.agentmail]` (real agent-mail server) and `[mail.toron]` (toron
+/// daemon). `url` is tolerated on load for legacy-config migration but is no
+/// longer the source of truth for either backend's routing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MailConfig {
-    /// toron daemon base URL, e.g. http://127.0.0.1:19001 (`toron serve
-    /// --mcp-http <addr>`). Set → remote-daemon mode; unset → integrated
-    /// in-process mailbox (default).
+    /// Legacy field: the pre-split single transport URL. Backends read their
+    /// own `[mail.*]` section now; kept so old configs still parse. The toron
+    /// facade uses it as a fallback until migrated (bd-am3).
     pub url: Option<String>,
-    /// bearer token for the daemon's MCP endpoint (remote-daemon only)
+    /// bearer token (shared; also carried by each `[mail.*]` section)
     pub token: Option<String>,
     /// agent identity (adjective+noun) used when registering/messaging
     pub name: Option<String>,
+}
+
+/// One per-backend transport section under `[mail.*]` (ADR-0003 V3): the
+/// real agent-mail server (`[mail.agentmail]`, 127.0.0.1:8765) and the toron
+/// daemon (`[mail.toron]`, 127.0.0.1:18080; absent → embedded in-process).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MailServerConfig {
+    /// daemon base URL (e.g. `http://127.0.0.1:8765`). Unset → default
+    /// (agent-mail: the standard port; toron: embedded in-process).
+    pub url: Option<String>,
+    /// bearer token for the daemon's MCP endpoint
+    pub token: Option<String>,
+}
+
+/// `[mail]` section — the per-backend transport table (ADR-0003 V3). Splitting
+/// the old shared `[agent_mail] url` fixes the BUG1 misroute: each backend
+/// reads ONLY its own section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MailSections {
+    /// `[mail.agentmail]` — real agent-mail server (8765).
+    pub agentmail: Option<MailServerConfig>,
+    /// `[mail.toron]` — toron daemon (18080); absent → embedded in-process.
+    pub toron: Option<MailServerConfig>,
 }
 
 /// Backend selection (ADR-0002). `[backend] multiplexer` / `[backend] mail` in
@@ -51,6 +73,9 @@ pub struct Config {
     /// optional mail config (in-process by default; remote daemon when
     /// `agent_mail.url` is set — bd-o8j.2/.3)
     pub agent_mail: Option<MailConfig>,
+    /// per-backend mail transport (ADR-0003 V3): `[mail.agentmail]` for the
+    /// real agent-mail server, `[mail.toron]` for the toron daemon
+    pub mail: Option<MailSections>,
     /// Resonate server URL for the durable loop (default http://localhost:8001)
     pub resonate_url: Option<String>,
     /// short name -> herdr agent kind (default: oc=opencode, pi=pi, gk=grok)
@@ -115,28 +140,38 @@ impl Config {
             cfg.resonate_url = Some(v);
         }
         // agent-mail env surface (the factory's error message documents
-        // FLYWHEEL_AGENTMAIL_URL/TOKEN — make good on it): any of the three
-        // vars materializes the [agent_mail] section, merging over config.toml.
-        let (mail_url, mail_token, mail_name) = Config::mail_env_overrides();
-        if mail_url.is_some() || mail_token.is_some() || mail_name.is_some() {
+        // FLYWHEEL_AGENTMAIL_URL/TOKEN — make good on it): FLYWHEEL_AGENTMAIL_URL
+        // / FLYWHEEL_AGENTMAIL_TOKEN feed `[mail.agentmail]` ONLY (ADR-0003 V3 —
+        // never toron), merging over config.toml; FLYWHEEL_MAIL_NAME feeds the
+        // shared `[agent_mail]` identity.
+        let (am_url, am_token, mail_name) = Config::mail_env_overrides();
+        if am_url.is_some() || am_token.is_some() {
+            let mut am = cfg
+                .mail
+                .as_mut()
+                .map(|m| m.agentmail.clone())
+                .unwrap_or_default()
+                .unwrap_or_default();
+            if let Some(v) = am_url {
+                am.url = Some(v);
+            }
+            if let Some(v) = am_token {
+                am.token = Some(v);
+            }
+            cfg.mail.get_or_insert_with(Default::default).agentmail = Some(am);
+        }
+        if let Some(v) = mail_name {
             let mut mail_cfg = cfg.agent_mail.clone().unwrap_or_default();
-            if let Some(v) = mail_url {
-                mail_cfg.url = Some(v);
-            }
-            if let Some(v) = mail_token {
-                mail_cfg.token = Some(v);
-            }
-            if let Some(v) = mail_name {
-                mail_cfg.name = Some(v);
-            }
+            mail_cfg.name = Some(v);
             cfg.agent_mail = Some(mail_cfg);
         }
         Ok(cfg)
     }
 
     /// Agent-mail env overrides: `FLYWHEEL_AGENTMAIL_URL` /
-    /// `FLYWHEEL_AGENTMAIL_TOKEN` / `FLYWHEEL_MAIL_NAME`. Empty values count
-    /// as unset (matching the factory's `.filter(|s| !s.is_empty())` rule).
+    /// `FLYWHEEL_AGENTMAIL_TOKEN` feed `[mail.agentmail]`; `FLYWHEEL_MAIL_NAME`
+    /// feeds the shared `[agent_mail]` identity. Empty values count as unset
+    /// (matching the factory's `.filter(|s| !s.is_empty())` rule).
     pub fn mail_env_overrides() -> (Option<String>, Option<String>, Option<String>) {
         (
             std::env::var("FLYWHEEL_AGENTMAIL_URL")
@@ -149,6 +184,59 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
         )
+    }
+
+    /// Effective agent-mail (AM) transport config: `[mail.agentmail]` url/token,
+    /// url defaulting to the standard agent-mail port (`http://127.0.0.1:8765`)
+    /// so the zero-config default build constructs lazily (ADR-0003 V3/V4 —
+    /// ops then report the actionable "not reachable" error if `am` is down).
+    /// The token falls back to the shared `[agent_mail] token` when the
+    /// per-backend section omits one (ADR-0003 V3: `[agent_mail]` keeps
+    /// "token if shared"); the URL never falls back to `[agent_mail] url`
+    /// (that is the BUG1 misroute this split fixes).
+    pub fn agentmail_server(&self) -> MailServerConfig {
+        let sec = self.mail.as_ref().and_then(|m| m.agentmail.as_ref());
+        let shared = self.agent_mail.as_ref();
+        MailServerConfig {
+            url: Some(
+                sec.and_then(|c| c.url.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "http://127.0.0.1:8765".to_string()),
+            ),
+            token: sec
+                .and_then(|c| c.token.clone())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    shared
+                        .and_then(|c| c.token.clone())
+                        .filter(|s| !s.is_empty())
+                }),
+        }
+    }
+
+    /// Effective toron facade config: identity `name` from the shared
+    /// `[agent_mail]`, transport url/token from `[mail.toron]`. When
+    /// `[mail.toron]` is absent, falls back to the legacy `[agent_mail] url`
+    /// (a pre-split config keeps its toron remote until bd-am3 migrates the
+    /// block); no url anywhere → embedded in-process toron.
+    pub fn toron_mail_config(&self) -> MailConfig {
+        let sec = self.mail.as_ref().and_then(|m| m.toron.as_ref());
+        let legacy = self.agent_mail.as_ref();
+        MailConfig {
+            url: sec
+                .and_then(|c| c.url.clone())
+                .filter(|s| !s.is_empty())
+                .or_else(|| legacy.and_then(|c| c.url.clone()).filter(|s| !s.is_empty())),
+            token: sec
+                .and_then(|c| c.token.clone())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    legacy
+                        .and_then(|c| c.token.clone())
+                        .filter(|s| !s.is_empty())
+                }),
+            name: legacy.and_then(|c| c.name.clone()),
+        }
     }
 
     pub fn socket_path(&self) -> String {
@@ -505,5 +593,87 @@ daily = [
         std::env::remove_var("FLYWHEEL_MAIL_NAME");
         let (url, token, name) = Config::mail_env_overrides();
         assert_eq!((url, token, name), (None, None, None));
+    }
+
+    /// Per-backend config split (ADR-0003 V3, BUG1): `[mail.agentmail]` and
+    /// `[mail.toron]` carry their OWN url — the shared `[agent_mail]` url can
+    /// never route the wrong backend. `agentmail_server()` defaults to the
+    /// standard AM port (zero-config default build); `toron_mail_config()`
+    /// defaults to embedded in-process (no url).
+    #[test]
+    fn per_backend_config_split_isolates_urls() {
+        let cfg = Config {
+            agent_mail: Some(MailConfig {
+                url: Some("http://127.0.0.1:18080".into()), // legacy (ignored)
+                token: Some("shared".into()),
+                name: Some("Orchid".into()),
+            }),
+            mail: Some(MailSections {
+                agentmail: Some(MailServerConfig {
+                    url: Some("http://127.0.0.1:8765".into()),
+                    token: Some("am-token".into()),
+                }),
+                toron: Some(MailServerConfig {
+                    url: Some("http://127.0.0.1:18080".into()),
+                    token: Some("toron-token".into()),
+                }),
+            }),
+            ..Default::default()
+        };
+        // AM reads ONLY [mail.agentmail]; the legacy [agent_mail] url (toron!)
+        // must NOT leak into it — that was the BUG1 misroute.
+        let am = cfg.agentmail_server();
+        assert_eq!(am.url.as_deref(), Some("http://127.0.0.1:8765"));
+        assert_eq!(am.token.as_deref(), Some("am-token"));
+        // toron reads [mail.toron] + shared identity name
+        let toron = cfg.toron_mail_config();
+        assert_eq!(toron.url.as_deref(), Some("http://127.0.0.1:18080"));
+        assert_eq!(toron.token.as_deref(), Some("toron-token"));
+        assert_eq!(toron.name.as_deref(), Some("Orchid"));
+    }
+
+    /// Legacy-config bridge: an old `[agent_mail] url` (a toron URL) keeps the
+    /// toron facade remote until bd-am3 migrates the block; agentmail still
+    /// defaults to the AM port and never sees the legacy url (BUG1). The
+    /// shared `[agent_mail] token` IS inherited by agentmail (ADR-0003 V3:
+    /// "[agent_mail] keeps … token if shared").
+    #[test]
+    fn toron_falls_back_to_legacy_agent_mail_url_but_agentmail_does_not() {
+        let cfg = Config {
+            agent_mail: Some(MailConfig {
+                url: Some("http://127.0.0.1:18080".into()),
+                token: Some("legacy".into()),
+                name: Some("Orchid".into()),
+            }),
+            ..Default::default()
+        };
+        let toron = cfg.toron_mail_config();
+        assert_eq!(toron.url.as_deref(), Some("http://127.0.0.1:18080"));
+        assert_eq!(toron.token.as_deref(), Some("legacy"));
+        assert_eq!(toron.name.as_deref(), Some("Orchid"));
+        let am = cfg.agentmail_server();
+        assert_eq!(
+            am.url.as_deref(),
+            Some("http://127.0.0.1:8765"),
+            "AM never inherits the legacy toron url"
+        );
+        assert_eq!(
+            am.token.as_deref(),
+            Some("legacy"),
+            "AM inherits the SHARED token (V3)"
+        );
+    }
+
+    /// Zero-config default build: no sections at all → AM points at the
+    /// standard port, toron is embedded in-process.
+    #[test]
+    fn zero_config_defaults_agentmail_port_and_embedded_toron() {
+        let cfg = Config::default();
+        let am = cfg.agentmail_server();
+        assert_eq!(am.url.as_deref(), Some("http://127.0.0.1:8765"));
+        assert_eq!(am.token, None);
+        let toron = cfg.toron_mail_config();
+        assert_eq!(toron.url, None, "no url -> embedded in-process toron");
+        assert_eq!(toron.name, None);
     }
 }

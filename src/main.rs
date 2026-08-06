@@ -681,8 +681,8 @@ enum ToronCmd {
         #[arg(long)]
         dry_run: bool,
         /// also point flywheel's OWN mail backend at the same toron URL
-        /// (writes `[agent_mail] url` in ~/Library/Application Support/
-        /// flywheel/config.toml, so flywheel + all agents share one mailbox)
+        /// (writes `[mail.toron] url` in the flywheel config.toml, so flywheel
+        /// + all agents share one mailbox)
         #[arg(long)]
         flywheel: bool,
     },
@@ -3078,12 +3078,12 @@ fn cmd_work(cfg: &Config, cmd: &WorkCmd) -> Result<()> {
 }
 
 fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&str>) -> Result<()> {
-    let Some(mail) = mail_shim::Mail::from_config(cfg.agent_mail.as_ref())? else {
-        bail!(
-            "agent-mail not configured — set [agent_mail] url/token/name in {}",
+    let mail = mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))?.ok_or_else(|| {
+        anyhow!(
+            "agent-mail (toron) not configured — set [mail.toron] url in {}",
             config::config_file().display()
-        );
-    };
+        )
+    })?;
     let mut mail = mail;
     let dir = project_dir(cfg, project);
     let key = dir.to_str().unwrap();
@@ -3137,9 +3137,9 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
 // ---- mail ----
 
 fn mail_or_die(cfg: &Config) -> Result<mail_shim::Mail> {
-    mail_shim::Mail::from_config(cfg.agent_mail.as_ref())?.ok_or_else(|| {
+    mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))?.ok_or_else(|| {
         anyhow!(
-            "agent-mail not configured — set [agent_mail] url/token/name in {}",
+            "agent-mail (toron) not configured — set [mail.toron] url in {}",
             config::config_file().display()
         )
     })
@@ -4306,7 +4306,7 @@ fn cmd_loop(
                                 );
                                 println!("{} {name} → mail alert", dim("[loop] blocked"));
                             } else {
-                                eprintln!("flywheel: --on-blocked mail needs [agent_mail] config");
+                                eprintln!("flywheel: --on-blocked mail needs [mail.toron] config");
                             }
                         }
                         _ => {
@@ -4994,28 +4994,29 @@ fn boot_toron_server(port: u16) -> Result<()> {
 
 /// Point flywheel's OWN mail backend at the toron URL.
 ///
-/// Writes/updates the `[agent_mail] url` line in the flywheel config.toml so
-/// flywheel and all registered agents converge on ONE toron mailbox. The env
+/// Writes/updates the `[mail.toron] url` line in the flywheel config.toml so
+/// flywheel and all registered agents converge on ONE toron mailbox (the
+/// shared `[agent_mail]` section keeps the identity name). The env
 /// `FLYWHEEL_AGENTMAIL_URL` still wins at load time (config.rs merges env over
 /// the file) — config.toml is the durable default, env is the per-session
-/// override. Idempotent; only touches the `[agent_mail]` block's `url`.
+/// override. Idempotent; only touches the `[mail.toron]` block's `url`.
 fn setup_flywheel_backend(url: &str, dry: bool) -> Result<String> {
     let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME unset"))?;
     let path = std::path::Path::new(&home).join("Library/Application Support/flywheel/config.toml");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
 
-    // Locate `[agent_mail]` and rewrite its `url = ...` line; if no section
+    // Locate `[mail.toron]` and rewrite its `url = ...` line; if no section
     // exists, append one.
     let mut in_mail = false;
     let mut url_line: Option<usize> = None;
     let mut section_idx: Option<usize> = None;
     for (i, l) in lines.iter().enumerate() {
         let t = l.trim();
-        if t.starts_with('[') && t.ends_with(']') && t != "[agent_mail]" {
-            break; // past the agent_mail block — stop scanning
+        if t.starts_with('[') && t.ends_with(']') && t != "[mail.toron]" {
+            break; // past the mail.toron block — stop scanning
         }
-        if t == "[agent_mail]" {
+        if t == "[mail.toron]" {
             in_mail = true;
             section_idx = Some(i);
         }
@@ -5035,16 +5036,18 @@ fn setup_flywheel_backend(url: &str, dry: bool) -> Result<String> {
         }
         None => match section_idx {
             Some(i) => {
-                // agent_mail section present but no url line — insert right after
+                // mail.toron section present but no url line — insert right after
                 // the section header.
                 lines.insert(i + 1, format!("url = \"{url}\""));
                 "added url".to_string()
             }
             None => {
-                // no [agent_mail] at all — append a fresh block.
+                // no [mail.toron] at all — append fresh blocks (identity first).
                 lines.push(String::from("[agent_mail]"));
-                lines.push(format!("url = \"{url}\""));
                 lines.push(String::from("name = \"flywheel\""));
+                lines.push(String::new());
+                lines.push(String::from("[mail.toron]"));
+                lines.push(format!("url = \"{url}\""));
                 lines.push(String::new());
                 "added section".to_string()
             }
@@ -5246,7 +5249,7 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
         }
     }
 
-    match mail_shim::Mail::from_config(cfg.agent_mail.as_ref()) {
+    match mail_shim::Mail::from_config(Some(&cfg.toron_mail_config())) {
         Ok(Some(mut m)) => match m.health() {
             Ok(_) => println!("agent-mail: {}", status_paint(AgentStatus::Idle)),
             Err(e) => {
@@ -5254,7 +5257,7 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
                 println!("agent-mail: {} ({e:#})", error("FAIL"));
             }
         },
-        Ok(None) => println!("agent-mail: {}", dim("not configured (set [agent_mail])")),
+        Ok(None) => println!("agent-mail: {}", dim("not configured (set [mail.toron])")),
         Err(e) => {
             ok = false;
             println!("agent-mail: {} ({e:#})", error("FAIL"));
@@ -5357,8 +5360,8 @@ fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
                     "compiled_feature": compiled.contains(&name),
                 }));
             }
-            // mail
-            for (name, stub) in [("agentmail", false), ("toron", true)] {
+            // mail: agentmail = real agent-mail backend; toron = toron facade
+            for (name, stub) in [("agentmail", false), ("toron", false)] {
                 rows.push(json!({
                     "name": name,
                     "kind": "mail",
@@ -5399,17 +5402,15 @@ fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
             } else {
                 "default"
             };
-            // health: multiplexer = socket reachable; mail = agentmail /health
+            // health: multiplexer = socket reachable; mail = the selected
+            // backend's health() (agentmail → AM health_check; toron → toron
+            // facade health; not-compiled → false).
             let mux_health = backend::multiplexer_backend(cfg)
                 .and_then(|mut b| b.agent_list().map(|_| true))
                 .unwrap_or(false);
-            let mail_health = if mail == "agentmail" {
-                backend::mail_backend(cfg)
-                    .and_then(|mut m| m.health().map(|_| true))
-                    .unwrap_or(false)
-            } else {
-                false // stub backends aren't healthy by construction
-            };
+            let mail_health = backend::mail_backend(cfg)
+                .and_then(|mut m| m.health().map(|_| true))
+                .unwrap_or(false);
             print_json(&json!({
                 "multiplexer": {"name": mux, "source": mux_source, "healthy": mux_health},
                 "mail": {"name": mail, "source": mail_source, "healthy": mail_health},
