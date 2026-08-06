@@ -237,6 +237,26 @@ impl MailBackend for AgentMailBackend {
         self.call("renew_file_reservations", args)
     }
 
+    fn force_release_file_reservation(
+        &mut self,
+        project_key: &str,
+        agent: &str,
+        file_reservation_id: u64,
+        note: Option<&str>,
+        notify_previous: bool,
+    ) -> Result<Value> {
+        let mut args = json!({
+            "project_key": project_key,
+            "agent_name": agent,
+            "file_reservation_id": file_reservation_id,
+            "notify_previous": notify_previous,
+        });
+        if let Some(n) = note {
+            args["note"] = json!(n);
+        }
+        self.call("force_release_file_reservation", args)
+    }
+
     fn conflicts(&mut self, project_key: &str, _agent: &str, paths: &[String]) -> Result<Value> {
         let _ = _agent;
         self.call(
@@ -276,6 +296,13 @@ impl MailBackend for AgentMailBackend {
         Ok(json!({ "path": path.to_string_lossy() }))
     }
 
+    fn cleanup_pane_identities(&mut self, project_key: &str) -> Result<Value> {
+        self.call(
+            "cleanup_pane_identities",
+            json!({ "project_key": project_key }),
+        )
+    }
+
     fn slot_acquire(
         &mut self,
         project_key: &str,
@@ -303,6 +330,24 @@ impl MailBackend for AgentMailBackend {
                 "project_key": project_key,
                 "agent_name": agent,
                 "slot": slot,
+            }),
+        )
+    }
+
+    fn slot_renew(
+        &mut self,
+        project_key: &str,
+        agent: &str,
+        slot: &str,
+        extend_seconds: u64,
+    ) -> Result<Value> {
+        self.call(
+            "renew_build_slot",
+            json!({
+                "project_key": project_key,
+                "agent_name": agent,
+                "slot": slot,
+                "extend_seconds": extend_seconds as i64,
             }),
         )
     }
@@ -352,6 +397,22 @@ impl MailBackend for AgentMailBackend {
             "summarize_thread",
             json!({
                 "project_key": project_key,
+                "thread_id": thread_id,
+                "llm_mode": llm_mode,
+            }),
+        )
+    }
+
+    fn summarize_thread_product(
+        &mut self,
+        product_key: &str,
+        thread_id: &str,
+        llm_mode: bool,
+    ) -> Result<Value> {
+        self.call(
+            "summarize_thread_product",
+            json!({
+                "product_key": product_key,
                 "thread_id": thread_id,
                 "llm_mode": llm_mode,
             }),
@@ -516,9 +577,13 @@ mod tests {
     }
 
     /// Pane-identity write is a LOCAL filesystem op (no dialing): it succeeds
-    /// even against a dead server, writing the canonical identity file.
+    /// even against a dead server, writing the canonical identity file. The
+    /// identity base is pinned to a temp dir (test hook) so the test never
+    /// touches the real `~/.config` and is immune to parallel env mutation.
     #[test]
     fn write_pane_identity_is_local_not_network() {
+        let base = std::env::temp_dir().join(format!("fw-am-idbase-{}", std::process::id()));
+        crate::mail_shim::set_test_identity_base(Some(base));
         let mut b = AgentMailBackend::new("http://127.0.0.1:1", None, "Orchid".into()).unwrap();
         // temp project path + pane id that sanitizes to a file-safe name
         let key = std::env::temp_dir().join("fw-am-identity-test");
@@ -534,5 +599,6 @@ mod tests {
             !std::path::Path::new(path).exists(),
             "file removed after clear"
         );
+        crate::mail_shim::set_test_identity_base(None);
     }
 }

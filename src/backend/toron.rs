@@ -187,6 +187,28 @@ impl MailBackend for ToronMailBackend {
             .map_err(BackendError::Other)
     }
 
+    fn force_release_file_reservation(
+        &mut self,
+        project_key: &str,
+        agent: &str,
+        file_reservation_id: u64,
+        note: Option<&str>,
+        notify_previous: bool,
+    ) -> Result<Value> {
+        // ADR-0003 V6 surface restore: delegate to Mail::force_release_file_reservation.
+        // The in-process toron mailbox needs an operator key (attached by the
+        // facade) and applies its own staleness heuristic.
+        self.mail
+            .force_release_file_reservation(
+                project_key,
+                agent,
+                &file_reservation_id.to_string(),
+                note,
+                notify_previous,
+            )
+            .map_err(BackendError::Other)
+    }
+
     fn conflicts(&mut self, project_key: &str, _agent: &str, paths: &[String]) -> Result<Value> {
         let _ = _agent;
         self.mail
@@ -224,6 +246,13 @@ impl MailBackend for ToronMailBackend {
         Ok(json!({ "path": path.to_string_lossy() }))
     }
 
+    fn cleanup_pane_identities(&mut self, project_key: &str) -> Result<Value> {
+        // ADR-0003 V6 surface restore: delegate to Mail::cleanup_pane_identities.
+        self.mail
+            .cleanup_pane_identities(project_key)
+            .map_err(BackendError::Other)
+    }
+
     fn slot_acquire(
         &mut self,
         project_key: &str,
@@ -245,6 +274,20 @@ impl MailBackend for ToronMailBackend {
         // called after a build; the TTL auto-expires if forgotten.
         self.mail
             .release_slot(project_key, agent, slot)
+            .map_err(BackendError::Other)
+    }
+
+    fn slot_renew(
+        &mut self,
+        project_key: &str,
+        agent: &str,
+        slot: &str,
+        extend_seconds: u64,
+    ) -> Result<Value> {
+        // ADR-0003 V6 surface restore: delegate to Mail::renew_slot
+        // (renew_build_slot).
+        self.mail
+            .renew_slot(project_key, agent, slot, extend_seconds)
             .map_err(BackendError::Other)
     }
 
@@ -283,6 +326,18 @@ impl MailBackend for ToronMailBackend {
     ) -> Result<Value> {
         self.mail
             .summarize_thread(project_key, thread_id, llm_mode)
+            .map_err(BackendError::Other)
+    }
+
+    fn summarize_thread_product(
+        &mut self,
+        product_key: &str,
+        thread_id: &str,
+        llm_mode: bool,
+    ) -> Result<Value> {
+        // ADR-0003 V6 surface restore: delegate to Mail::summarize_thread_product.
+        self.mail
+            .summarize_thread_product(product_key, thread_id, llm_mode)
             .map_err(BackendError::Other)
     }
 
@@ -403,6 +458,37 @@ mod tests {
         match b.resolve_pane_identity("p", "w1:p1") {
             Ok(v) => assert!(v.get("agent_name").is_none(), "no identity file"),
             Err(e) => panic!("resolve should be Ok(not-found), got {e:?}"),
+        }
+    }
+
+    /// ADR-0003 V6 restored surface: the 4 new methods DELEGATE to the
+    /// in-process toron mailbox — never `Unsupported` (that would mean the
+    /// surface restore is stubbed). Outcomes vary by op, but a real
+    /// `Unsupported` is always a failure.
+    #[test]
+    fn restored_surface_delegates_not_unsupported() {
+        let mail = Mail::from_config(None)
+            .expect("from_config ok")
+            .expect("Some");
+        let mut b = ToronMailBackend::new(mail);
+        for (method, res) in [
+            ("slot_renew", b.slot_renew("p", "a", "slot-x", 120)),
+            (
+                "summarize_thread_product",
+                b.summarize_thread_product("prod-x", "t1", false),
+            ),
+            (
+                "force_release_file_reservation",
+                b.force_release_file_reservation("p", "a", 1, None, false),
+            ),
+            ("cleanup_pane_identities", b.cleanup_pane_identities("p")),
+        ] {
+            match res {
+                Err(BackendError::Unsupported { method: m, .. }) => {
+                    panic!("{method}: still Unsupported ({m}) — surface restore failed")
+                }
+                _ => {} // Ok (no-op/not-wired) or Other (unregistered agent / operator) — both prove delegation
+            }
         }
     }
 

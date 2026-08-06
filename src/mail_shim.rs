@@ -525,6 +525,31 @@ impl Mail {
         }
     }
 
+    /// `summarize_thread_product` — summarize a thread across a product's
+    /// member projects (ADR-0003 V6 surface restore).
+    pub fn summarize_thread_product(
+        &mut self,
+        product_key: &str,
+        thread_id: &str,
+        llm_mode: bool,
+    ) -> Result<Value> {
+        match &self.backend {
+            BackendKind::InProcess => {
+                let s =
+                    block_on(mailbox().summarize_thread_product(product_key, thread_id, llm_mode))?;
+                Ok(s.to_json())
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "summarize_thread_product",
+                json!({
+                    "product_key": product_key,
+                    "thread_id": thread_id,
+                    "llm_mode": llm_mode,
+                }),
+            ),
+        }
+    }
+
     /// `search_messages`. The JSON envelope is `{"result": [...]}` so
     /// `harvest_latest` (debate / plan-review) reads `result[0].body_md`.
     pub fn search(
@@ -747,6 +772,69 @@ impl Mail {
                 out["file_reservations"] = json!(fr);
                 Ok(out)
             }
+        }
+    }
+
+    /// `force_release_file_reservation` — operator force-release of a stale
+    /// reservation (ADR-0003 V6 surface restore). In-process requires the
+    /// operator key (attached by `build_mailbox`); remote delegates to the
+    /// daemon's tool.
+    pub fn force_release_file_reservation(
+        &mut self,
+        project_key: &str,
+        agent_name: &str,
+        file_reservation_id: &str,
+        note: Option<&str>,
+        notify_previous: bool,
+    ) -> Result<Value> {
+        match &self.backend {
+            BackendKind::InProcess => {
+                block_on(mailbox().force_release_file_reservation(
+                    project_key,
+                    agent_name,
+                    file_reservation_id,
+                    note,
+                    notify_previous,
+                ))?;
+                Ok(json!({ "ok": true }))
+            }
+            BackendKind::Remote(_) => {
+                let mut args = json!({
+                    "project_key": project_key,
+                    "agent_name": agent_name,
+                    "file_reservation_id": file_reservation_id,
+                    "notify_previous": notify_previous,
+                });
+                if let Some(n) = note {
+                    args["note"] = json!(n);
+                }
+                self.call_remote("force_release_file_reservation", args)
+            }
+        }
+    }
+
+    /// `cleanup_pane_identities` — prune identities whose panes are absent
+    /// from herdr's live pane list (ADR-0003 V6 surface restore). toron holds
+    /// no per-pane identity files (live herdr mapping), so in-process "prune"
+    /// reports the stale names; without a herdr backend it returns the
+    /// not-wired note (same contract as the toron-mcp tool).
+    pub fn cleanup_pane_identities(&mut self, _project_key: &str) -> Result<Value> {
+        match &self.backend {
+            BackendKind::InProcess => {
+                match toron_core::backend::herdr::HerdrBackend::connect(None) {
+                    Ok(backend) => {
+                        let pruned = mailbox().cleanup_pane_identities(&backend)?;
+                        Ok(json!({ "pruned": pruned }))
+                    }
+                    Err(e) => Ok(json!({
+                        "note": format!("pane cleanup requires a herdr backend; not wired: {e}"),
+                    })),
+                }
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "cleanup_pane_identities",
+                json!({ "project_key": _project_key }),
+            ),
         }
     }
 
@@ -997,8 +1085,8 @@ impl Mail {
         }
     }
 
-    /// `renew_build_slot`.
-    #[allow(dead_code)] // parity surface; the MailBackend trait has no slot_renew
+    /// `renew_build_slot` (ADR-0003 V6: the `MailBackend::slot_renew` surface
+    /// consumes this; no longer dead code).
     pub fn renew_slot(
         &mut self,
         project_key: &str,
@@ -1126,7 +1214,31 @@ impl Mail {
 /// Config base for identity files: `$XDG_CONFIG_HOME` when set, else
 /// `~/.config` — identical to agent-mail core's `config_base_dir()`, so the
 /// bridge writes exactly where the server reads.
+///
+/// `#[cfg(test)]`: a process-global override pins the base to a temp dir so
+/// tests never touch the real `~/.config` AND stay immune to parallel tests
+/// that mutate `XDG_CONFIG_HOME`/`HOME` (the write+clear pair must resolve the
+/// same path regardless of env races).
+#[cfg(test)]
+static TEST_IDENTITY_BASE: std::sync::LazyLock<std::sync::Mutex<Option<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+pub(crate) fn set_test_identity_base(path: Option<PathBuf>) {
+    *TEST_IDENTITY_BASE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
+}
+
 fn identity_base() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_IDENTITY_BASE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
+        return path;
+    }
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         return PathBuf::from(xdg);
     }

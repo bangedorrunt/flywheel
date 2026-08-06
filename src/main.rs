@@ -5001,8 +5001,7 @@ fn boot_toron_server(port: u16) -> Result<()> {
 /// the file) — config.toml is the durable default, env is the per-session
 /// override. Idempotent; only touches the `[mail.toron]` block's `url`.
 fn setup_flywheel_backend(url: &str, dry: bool) -> Result<String> {
-    let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME unset"))?;
-    let path = std::path::Path::new(&home).join("Library/Application Support/flywheel/config.toml");
+    let path = config::config_file();
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
 
