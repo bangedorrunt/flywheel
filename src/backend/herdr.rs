@@ -1,20 +1,20 @@
-//! herdr multiplexer backend — wraps `crate::herdr::Client` (the unix-socket
-//! JSON-RPC client, protocol 19) as the default `MultiplexerBackend` impl.
+//! herdr multiplexer backend — wraps `herdr_shim::Client` (the toron-core
+//! unix-socket JSON-RPC client) as the default `MultiplexerBackend` impl.
 //! Pure delegation to the existing typed helpers; `BackendError::Unsupported`
 //! only for trait methods whose `Client` wrapper doesn't exist yet
 //! (`pane_close`, `pane_run` — added when needed; herdr has `pane.close` via
 //! raw `call`, no typed helper).
 //!
-//! governed-by: ADR-0002  ·  implements: `MultiplexerBackend`
+//! governed-by: ADR-0002, ADR-0003  ·  implements: `MultiplexerBackend`
 //!
-//! No behavior change vs calling `crate::herdr::Client` directly. R0.8
+//! No behavior change vs calling `herdr_shim::Client` directly. R0.8
 //! (`bd-backend-parity-test`) proves byte-identical results.
 
 use crate::backend::{
     BackendError, EventStream as BackendEventStream, MultiplexerBackend, PromptLanding, Result,
 };
-use crate::herdr::{
-    AgentInfo, AgentStatus, Client, EventStream as HerdrEventStream, PaneInfo, PushEvent,
+use crate::herdr_shim::{
+    self, AgentInfo, AgentStatus, Client, EventStream as HerdrEventStream, PaneInfo, PushEvent,
     Subscription, WaitOptions, WorkspaceInfo,
 };
 use serde_json::{json, Value};
@@ -50,7 +50,7 @@ impl HerdrBackend {
 /// `code: Some`. Pure + unit-tested so the __send leaf's classification is
 /// proven identical to the concrete client path.
 pub fn map_prompt_result(
-    r: std::result::Result<crate::herdr::AgentInfo, crate::herdr::HerdrError>,
+    r: std::result::Result<AgentInfo, toron_core::backend::BackendError>,
 ) -> Result<PromptLanding> {
     match r {
         Ok(info) => Ok(PromptLanding {
@@ -59,12 +59,12 @@ pub fn map_prompt_result(
         }),
         Err(e) => Ok(PromptLanding {
             status: None,
-            code: Some(e.code),
+            code: Some(e.code().as_str().to_string()),
         }),
     }
 }
 
-/// Adapter: `herdr::EventStream` → `backend::EventStream`. Forwards
+/// Adapter: `herdr_shim::EventStream` → `backend::EventStream`. Forwards
 /// `read_event` and `set_read_timeout` verbatim.
 struct HerdrEventStreamAdapter(HerdrEventStream);
 
@@ -111,8 +111,7 @@ impl MultiplexerBackend for HerdrBackend {
         direction: &str,
         cwd: Option<&str>,
     ) -> Result<PaneInfo> {
-        self.client
-            .pane_split(parent_pane_id, direction, cwd)
+        herdr_shim::pane_split(&mut self.client, parent_pane_id, direction, cwd)
             .map_err(BackendError::from)
     }
 
@@ -138,13 +137,17 @@ impl MultiplexerBackend for HerdrBackend {
     }
 
     fn pane_wait_output(&mut self, pane_id: &str, needle: &str, timeout_ms: u64) -> Result<Value> {
-        // Map the trait's simple (pane, needle, timeout) onto Client's richer
-        // (pane, mode, pattern, timeout). mode="match" = literal substring
-        // (matches the loop's existing usage of __wait-output).
-        let res = self
-            .client
-            .pane_wait_output(pane_id, "match", needle, Some(timeout_ms))
-            .map_err(BackendError::from)?;
+        // Map the trait's simple (pane, needle, timeout) onto the shim's
+        // richer (pane, mode, pattern, timeout). mode="match" = literal
+        // substring (matches the loop's existing usage of __wait-output).
+        let res = herdr_shim::pane_wait_output(
+            &mut self.client,
+            pane_id,
+            "match",
+            needle,
+            Some(timeout_ms),
+        )
+        .map_err(BackendError::from)?;
         Ok(json!({
             "pane_id": res.pane_id,
             "matched_line": res.matched_line,
@@ -185,13 +188,13 @@ impl MultiplexerBackend for HerdrBackend {
         Ok(())
     }
 
-    fn agent_prompt(
+    fn prompt(
         &mut self,
         target: &str,
         text: &str,
         wait: Option<&WaitOptions>,
     ) -> Result<Value> {
-        // WaitOptions is Clone (herdr.rs derive); trait passes by ref, Client
+        // WaitOptions is Clone (toron-core derive); trait passes by ref, Client
         // takes by value. Clone the Option<&T> into Option<T>. AgentInfo is
         // Deserialize-only (parsed from the socket, never re-serialized), so
         // return the prompt target + status string instead of the struct.
@@ -204,7 +207,7 @@ impl MultiplexerBackend for HerdrBackend {
         }))
     }
 
-    fn agent_prompt_coded(
+    fn prompt_coded(
         &mut self,
         target: &str,
         text: &str,
@@ -212,7 +215,7 @@ impl MultiplexerBackend for HerdrBackend {
     ) -> Result<PromptLanding> {
         // review-fix F6: preserve the coded error (landing semantics) through
         // the trait so a backend-agnostic __send can classify identically to
-        // the concrete client. The client returns Err(HerdrError) on a
+        // the concrete client. The client returns Err(toron BackendError) on a
         // non-landing outcome — that is landing DATA, not a transport failure.
         map_prompt_result(self.client.agent_prompt_coded(target, text, wait.cloned()))
     }
@@ -246,7 +249,8 @@ impl MultiplexerBackend for HerdrBackend {
     fn subscribe(&mut self, filters: &[Subscription]) -> Result<Box<dyn BackendEventStream>> {
         // herdr events.subscribe is forward-only (no since/seq param — schema-
         // verified). The loop's heartbeat poll is the correctness floor.
-        let stream = self.client.subscribe(filters).map_err(BackendError::from)?;
+        let stream = herdr_shim::subscribe(&mut self.client, filters)
+            .map_err(BackendError::from)?;
         Ok(Box::new(HerdrEventStreamAdapter(stream)))
     }
 }

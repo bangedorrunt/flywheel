@@ -39,7 +39,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::state_dir;
-use crate::herdr::AgentStatus;
+use crate::herdr_shim::AgentStatus;
 
 /// Current `loops.json` schema version (bd-loop-state-schema-v2).
 pub const LOOPS_SCHEMA_VERSION: u32 = 2;

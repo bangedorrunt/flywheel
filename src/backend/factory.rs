@@ -15,8 +15,8 @@
 
 use crate::backend::{BackendError, MailBackend, MultiplexerBackend, Result};
 use crate::config::Config;
-use crate::herdr::Client as HerdrClient;
-use crate::mail::Mail;
+use crate::herdr_shim::Client as HerdrClient;
+use crate::mail_shim::Mail;
 
 /// Default multiplexer backend name.
 pub const DEFAULT_BACKEND: &str = "herdr";
@@ -52,8 +52,8 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
     match name.as_str() {
         #[cfg(feature = "backend-herdr")]
         "herdr" => {
-            let client =
-                HerdrClient::connect(Some(&cfg.socket_path())).map_err(BackendError::Other)?;
+            let client = HerdrClient::connect(Some(&cfg.socket_path()))
+                .map_err(|e| BackendError::Other(anyhow::anyhow!("{e}")))?;
             Ok(Box::new(crate::backend::herdr::HerdrBackend::new(client)))
         }
         // superlogical/tmux: stub backends (bd-toron-superlogical-stubs). With
@@ -82,13 +82,12 @@ pub fn mail_backend(cfg: &Config) -> Result<Box<dyn MailBackend>> {
     match name.as_str() {
         #[cfg(feature = "mail-agentmail")]
         "agentmail" => {
-            let mail = Mail::from_config(cfg.agent_mail.as_ref())
+            let mail = Mail::in_process(cfg.agent_mail.as_ref())
                 .map_err(BackendError::Other)?
                 .ok_or_else(|| BackendError::Unsupported {
                     backend: "agentmail".to_string(),
                     method: "(factory)",
-                    reason: "agent_mail config unset (set [agent_mail] url/token in config.toml \
-                             or FLYWHEEL_AGENTMAIL_URL/FLYWHEEL_AGENTMAIL_TOKEN env)"
+                    reason: "in-process mail facade unavailable"
                         .to_string(),
                 })?;
             Ok(Box::new(

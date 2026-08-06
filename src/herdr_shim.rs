@@ -1,0 +1,803 @@
+//! flywheel-local herdr shim (ADR-0003 Decision 3A, bd-o8j.2).
+//!
+//! `src/herdr.rs` was deleted; toron-core owns the SINGLE herdr client
+//! definition. This module re-exports the toron-core herdr types and adds the
+//! flywheel-specific helpers that main.rs / the backend layer still consume
+//! but toron-core does not provide (event-payload decoding, `pane_split`,
+//! `pane_zoom`, `pane_wait_output`, `worktree_list`, the subscription stream
+//! adapter).
+//!
+//! The shim is PURE DELEGATION over the toron-core `Client`:
+//! - every protocol call goes through `toron_core::backend::herdr::Client`
+//!   (`call` / `call_coded` / `subscribe`);
+//! - no JSON-RPC / socket / error-classification logic is re-implemented;
+//! - the only non-delegation code here is serde shape-parsing of the payloads
+//!   flywheel routes on, which toron-core deliberately does not model.
+//!
+//! `set_read_timeout`: the toron-core `EventStream` exposes no socket handle,
+//! so this shim wraps it in a reader thread + bounded channel and implements
+//! `set_read_timeout` via `recv_timeout` — behavior-identical to the old
+//! socket SO_RCVTIMEO (blocking read returns Err on expiry), no protocol
+//! reimplementation.
+//!
+//! governed-by: ADR-0003
+
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+pub use toron_core::backend::herdr::{
+    classify_send_result, AgentInfo, Client, PaneInfo, SendVerdict, Subscription, WaitOptions,
+    WorkspaceInfo, HDR_PROTOCOL,
+};
+pub use toron_core::backend::types::AgentStatus;
+
+/// Parse `AgentStatus` from its wire string (the old inherent `parse` —
+/// toron-core exposes `FromStr` instead, so this is a thin free wrapper).
+pub fn parse_agent_status(s: &str) -> Result<AgentStatus> {
+    s.parse().map_err(|e| anyhow!("{e}"))
+}
+
+/// Parse the protocol version from `herdr api schema --json` output (the
+/// top-level `protocol` field). `None` on any failure — the caller decides
+/// how to surface an unreadable schema.
+pub fn parse_protocol(raw: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|v| v.get("protocol").and_then(Value::as_u64))
+}
+
+/// Resolve which of several same-label workspaces a project actually maps
+/// to. Single match wins; with duplicates (a stale workspace left behind by
+/// a dropped agent vs the live spawn — bd-nil), prefer the workspace holding
+/// MANAGED agents (names starting with `prefix`); otherwise the first match.
+/// Deterministic — no wall clock in the durable path.
+pub fn resolve_workspace_id(
+    matches: &[WorkspaceInfo],
+    agents: &[AgentInfo],
+    prefix: &str,
+) -> String {
+    if matches.len() == 1 {
+        return matches[0].workspace_id.clone();
+    }
+    for ws in matches {
+        if agents.iter().any(|a| {
+            a.workspace_id == ws.workspace_id
+                && a.name
+                    .as_deref()
+                    .map(|n| n.starts_with(prefix))
+                    .unwrap_or(false)
+        }) {
+            return ws.workspace_id.clone();
+        }
+    }
+    matches[0].workspace_id.clone()
+}
+
+// ---------------------------------------------------------------------------
+// flywheel-local wire types (deleted `src/herdr.rs` — verbatim). toron-core
+// models the client, not the per-event payload shapes flywheel routes on.
+// ---------------------------------------------------------------------------
+
+/// push notification payload wrapper (`kind` = wire event name, `data` =
+/// typed payload). Parsed from the raw `(kind, Value)` the toron-core
+/// `EventStream::read_event` yields.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // bin matches on the typed `data` variant; `kind` is informational
+pub struct PushEvent {
+    pub kind: HerdrEventKind,
+    pub data: HerdrEventData,
+}
+
+/// All herdr event kinds: the 26 server events (snake_case wire names) plus
+/// the 3 subscription pushes (dot namespaced wire names). `parse` accepts
+/// both namespaces; `as_wire_str` returns the exact wire name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by tests + the reactor; bin matches on data today
+pub enum HerdrEventKind {
+    WorkspaceCreated,
+    WorkspaceUpdated,
+    WorkspaceMetadataUpdated,
+    WorkspaceClosed,
+    WorkspaceRenamed,
+    WorkspaceMoved,
+    WorkspaceReordered,
+    WorkspaceFocused,
+    WorktreeCreated,
+    WorktreeOpened,
+    WorktreeRemoved,
+    TabCreated,
+    TabClosed,
+    TabRenamed,
+    TabMoved,
+    TabFocused,
+    PaneCreated,
+    PaneClosed,
+    PaneUpdated,
+    PaneFocused,
+    PaneMoved,
+    PaneOutputChanged,
+    PaneExited,
+    PaneAgentDetected,
+    PaneAgentStatusChanged,
+    LayoutUpdated,
+    PaneAgentStatusChangedSub,
+    PaneOutputMatched,
+    PaneScrollChanged,
+}
+
+impl HerdrEventKind {
+    /// Parse a wire event name. Accepts both namespaces: the 26 snake_case
+    /// server events and the 3 dotted subscription events.
+    pub fn parse(s: &str) -> Result<Self> {
+        use HerdrEventKind::*;
+        let kind = match s {
+            "workspace_created" => WorkspaceCreated,
+            "workspace_updated" => WorkspaceUpdated,
+            "workspace_metadata_updated" => WorkspaceMetadataUpdated,
+            "workspace_closed" => WorkspaceClosed,
+            "workspace_renamed" => WorkspaceRenamed,
+            "workspace_moved" => WorkspaceMoved,
+            "workspace_reordered" => WorkspaceReordered,
+            "workspace_focused" => WorkspaceFocused,
+            "worktree_created" => WorktreeCreated,
+            "worktree_opened" => WorktreeOpened,
+            "worktree_removed" => WorktreeRemoved,
+            "tab_created" => TabCreated,
+            "tab_closed" => TabClosed,
+            "tab_renamed" => TabRenamed,
+            "tab_moved" => TabMoved,
+            "tab_focused" => TabFocused,
+            "pane_created" => PaneCreated,
+            "pane_closed" => PaneClosed,
+            "pane_updated" => PaneUpdated,
+            "pane_focused" => PaneFocused,
+            "pane_moved" => PaneMoved,
+            "pane_output_changed" => PaneOutputChanged,
+            "pane_exited" => PaneExited,
+            "pane_agent_detected" => PaneAgentDetected,
+            "pane_agent_status_changed" => PaneAgentStatusChanged,
+            "layout_updated" => LayoutUpdated,
+            "pane.agent_status_changed" => PaneAgentStatusChangedSub,
+            "pane.output_matched" => PaneOutputMatched,
+            "pane.scroll_changed" => PaneScrollChanged,
+            other => bail!("unknown herdr event kind: {other}"),
+        };
+        Ok(kind)
+    }
+}
+
+// ---- typed event payloads ----
+//
+// Field sets mirror the live schema (`herdr api schema --json` →
+// `schemas/event/$defs/EventData.oneOf`). Nested objects that flywheel does
+// not consume yet stay `Value` — the goal is type safety for the fields we
+// route on, not a full model of every payload. `WorkspaceInfo` and `PaneInfo`
+// (re-exported from toron-core) are reused for the nested payloads.
+
+/// tab payload (nested object; consumed fields only).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct TabInfo {
+    #[serde(default)]
+    pub tab_id: String,
+    #[serde(default)]
+    pub workspace_id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub number: u64,
+    #[serde(default)]
+    pub focused: bool,
+    #[serde(default)]
+    pub pane_count: u64,
+    #[serde(default)]
+    pub agent_status: Option<AgentStatus>,
+}
+
+/// scroll payload for `pane.scroll_changed` subscription events.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneScrollInfo {
+    #[serde(default)]
+    pub offset_from_bottom: u64,
+    #[serde(default)]
+    pub max_offset_from_bottom: u64,
+    #[serde(default)]
+    pub viewport_rows: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceCreated {
+    pub workspace: WorkspaceInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceUpdated {
+    pub workspace: WorkspaceInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceMetadataUpdated {
+    pub workspace: WorkspaceInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceClosed {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub workspace: Option<WorkspaceInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceRenamed {
+    pub workspace_id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceMoved {
+    pub workspace_id: String,
+    pub insert_index: u64,
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceReordered {
+    #[serde(default)]
+    pub workspace_ids: Vec<String>,
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceInfo>,
+    #[serde(default)]
+    pub before_workspace_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceFocused {
+    pub workspace_id: String,
+}
+
+/// flywheel-shaped worktree record (`worktree.list`). toron-core's
+/// `WorktreeInfo` models the create/remove payloads, not this listing shape.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorktreeInfo {
+    pub path: String,
+    pub branch: Option<String>,
+    pub is_bare: bool,
+    pub is_detached: bool,
+    pub is_prunable: bool,
+    pub is_linked_worktree: bool,
+    pub open_workspace_id: Option<String>,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorktreeCreated {
+    pub workspace: WorkspaceInfo,
+    pub worktree: WorktreeInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorktreeOpened {
+    pub workspace: WorkspaceInfo,
+    pub worktree: WorktreeInfo,
+    #[serde(default)]
+    pub already_open: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorktreeRemoved {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub workspace: Option<WorkspaceInfo>,
+    pub worktree: WorktreeInfo,
+    #[serde(default)]
+    pub forced: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct TabCreated {
+    pub tab: TabInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct TabClosed {
+    pub tab_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct TabRenamed {
+    pub tab_id: String,
+    pub workspace_id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct TabMoved {
+    pub tab_id: String,
+    pub workspace_id: String,
+    pub insert_index: u64,
+    #[serde(default)]
+    pub tabs: Vec<TabInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct TabFocused {
+    pub tab_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneCreated {
+    pub pane: PaneInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneClosed {
+    pub pane_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneUpdated {
+    pub pane: PaneInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneFocused {
+    pub pane_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneMoved {
+    pub pane: PaneInfo,
+    pub previous_pane_id: String,
+    pub previous_workspace_id: String,
+    pub previous_tab_id: String,
+    #[serde(default)]
+    pub closed_tab_id: Option<String>,
+    #[serde(default)]
+    pub closed_workspace_id: Option<String>,
+    #[serde(default)]
+    pub created_tab: Option<TabInfo>,
+    #[serde(default)]
+    pub created_workspace: Option<WorkspaceInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneOutputChanged {
+    pub pane_id: String,
+    pub workspace_id: String,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneExited {
+    pub pane_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneAgentDetected {
+    pub pane_id: String,
+    pub workspace_id: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub final_status: Option<AgentStatus>,
+    #[serde(default)]
+    pub released: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+// wire-contract struct: parsed from the herdr protocol; not every
+// field is consumed by the client — the unused ones must still deserialize.
+#[allow(dead_code)]
+pub struct PaneAgentStatusChanged {
+    pub pane_id: String,
+    pub workspace_id: String,
+    pub agent_status: AgentStatus,
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub display_agent: Option<String>,
+    #[serde(default)]
+    pub state_labels: Option<Value>,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct LayoutUpdated {
+    // not consumed yet — type `PaneLayoutSnapshot` when the reactor lands
+    #[serde(default)]
+    pub layout: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneOutputMatchedEvent {
+    pub pane_id: String,
+    #[serde(default)]
+    pub matched_line: Option<String>,
+    #[serde(default)]
+    pub read: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneScrollChangedEvent {
+    pub pane_id: String,
+    pub workspace_id: String,
+    #[serde(default)]
+    pub scroll: PaneScrollInfo,
+}
+
+/// Typed payload of a `PushEvent`, dispatched on the envelope's `kind`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // variant payloads consumed by tests + reactor
+#[allow(clippy::large_enum_variant, clippy::enum_variant_names)] // wire-fidelity names; parsed once per event
+pub enum HerdrEventData {
+    WorkspaceCreated(WorkspaceCreated),
+    WorkspaceUpdated(WorkspaceUpdated),
+    WorkspaceMetadataUpdated(WorkspaceMetadataUpdated),
+    WorkspaceClosed(WorkspaceClosed),
+    WorkspaceRenamed(WorkspaceRenamed),
+    WorkspaceMoved(WorkspaceMoved),
+    WorkspaceReordered(WorkspaceReordered),
+    WorkspaceFocused(WorkspaceFocused),
+    WorktreeCreated(WorktreeCreated),
+    WorktreeOpened(WorktreeOpened),
+    WorktreeRemoved(WorktreeRemoved),
+    TabCreated(TabCreated),
+    TabClosed(TabClosed),
+    TabRenamed(TabRenamed),
+    TabMoved(TabMoved),
+    TabFocused(TabFocused),
+    PaneCreated(PaneCreated),
+    PaneClosed(PaneClosed),
+    PaneUpdated(PaneUpdated),
+    PaneFocused(PaneFocused),
+    PaneMoved(PaneMoved),
+    PaneOutputChanged(PaneOutputChanged),
+    PaneExited(PaneExited),
+    PaneAgentDetected(PaneAgentDetected),
+    PaneAgentStatusChanged(PaneAgentStatusChanged),
+    LayoutUpdated(LayoutUpdated),
+    PaneAgentStatusChangedSub(PaneAgentStatusChanged),
+    PaneOutputMatched(PaneOutputMatchedEvent),
+    PaneScrollChanged(PaneScrollChangedEvent),
+}
+
+impl HerdrEventData {
+    /// Deserialize the payload `data` for the given `kind`.
+    pub fn from_kind(kind: HerdrEventKind, data: Value) -> Result<Self> {
+        use serde_json::from_value;
+        use HerdrEventKind::*;
+        Ok(match kind {
+            WorkspaceCreated => HerdrEventData::WorkspaceCreated(from_value(data)?),
+            WorkspaceUpdated => HerdrEventData::WorkspaceUpdated(from_value(data)?),
+            WorkspaceMetadataUpdated => HerdrEventData::WorkspaceMetadataUpdated(from_value(data)?),
+            WorkspaceClosed => HerdrEventData::WorkspaceClosed(from_value(data)?),
+            WorkspaceRenamed => HerdrEventData::WorkspaceRenamed(from_value(data)?),
+            WorkspaceMoved => HerdrEventData::WorkspaceMoved(from_value(data)?),
+            WorkspaceReordered => HerdrEventData::WorkspaceReordered(from_value(data)?),
+            WorkspaceFocused => HerdrEventData::WorkspaceFocused(from_value(data)?),
+            WorktreeCreated => HerdrEventData::WorktreeCreated(from_value(data)?),
+            WorktreeOpened => HerdrEventData::WorktreeOpened(from_value(data)?),
+            WorktreeRemoved => HerdrEventData::WorktreeRemoved(from_value(data)?),
+            TabCreated => HerdrEventData::TabCreated(from_value(data)?),
+            TabClosed => HerdrEventData::TabClosed(from_value(data)?),
+            TabRenamed => HerdrEventData::TabRenamed(from_value(data)?),
+            TabMoved => HerdrEventData::TabMoved(from_value(data)?),
+            TabFocused => HerdrEventData::TabFocused(from_value(data)?),
+            PaneCreated => HerdrEventData::PaneCreated(from_value(data)?),
+            PaneClosed => HerdrEventData::PaneClosed(from_value(data)?),
+            PaneUpdated => HerdrEventData::PaneUpdated(from_value(data)?),
+            PaneFocused => HerdrEventData::PaneFocused(from_value(data)?),
+            PaneMoved => HerdrEventData::PaneMoved(from_value(data)?),
+            PaneOutputChanged => HerdrEventData::PaneOutputChanged(from_value(data)?),
+            PaneExited => HerdrEventData::PaneExited(from_value(data)?),
+            PaneAgentDetected => HerdrEventData::PaneAgentDetected(from_value(data)?),
+            PaneAgentStatusChanged => HerdrEventData::PaneAgentStatusChanged(from_value(data)?),
+            LayoutUpdated => HerdrEventData::LayoutUpdated(from_value(data)?),
+            PaneAgentStatusChangedSub => {
+                HerdrEventData::PaneAgentStatusChangedSub(from_value(data)?)
+            }
+            PaneOutputMatched => HerdrEventData::PaneOutputMatched(from_value(data)?),
+            PaneScrollChanged => HerdrEventData::PaneScrollChanged(from_value(data)?),
+        })
+    }
+}
+
+/// Typed herdr protocol error carrying the machine-readable code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrError {
+    pub code: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for HerdrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "herdr error {}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for HerdrError {}
+
+/// Map a toron-core `BackendError` onto the flywheel-local typed error.
+/// Classification stays on the machine code (`BackendErrorCode::as_str`).
+fn to_herdr_error(e: toron_core::backend::error::BackendError) -> HerdrError {
+    HerdrError {
+        code: e.code().as_str().to_string(),
+        message: e.message.clone(),
+    }
+}
+
+/// Result of a `pane.wait_for_output` wait.
+///
+/// `read` is the matched terminal snapshot's text, treated as an opaque
+/// string — pane waits do NOT interpret agent lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneWaitResult {
+    pub pane_id: String,
+    /// The line the pattern matched on, if the server reports one.
+    pub matched_line: Option<String>,
+    /// Snapshot text at match time (may be large; do not post-process).
+    pub read: String,
+}
+
+/// Request params for `pane.wait_for_output` (protocol v18).
+///
+/// `mode` mirrors the CLI's `--match`/`--regex`: `"match"` is a literal
+/// substring search, `"regex"` a Rust regex (herdr-side). Anything else is a
+/// caller bug — bail with code `"usage"`.
+pub fn wait_for_output_params(
+    pane_id: &str,
+    mode: &str,
+    pattern: &str,
+    timeout_ms: Option<u64>,
+) -> std::result::Result<Value, HerdrError> {
+    let match_type = match mode {
+        "match" => "substring",
+        "regex" => "regex",
+        other => {
+            return Err(HerdrError {
+                code: "usage".into(),
+                message: format!(
+                    "unknown pane wait-output mode: {other} (expected \"match\" or \"regex\")"
+                ),
+            })
+        }
+    };
+    Ok(json!({
+        "pane_id": pane_id,
+        "source": "recent",
+        "match": { "type": match_type, "value": pattern },
+        "strip_ansi": true,
+        "timeout_ms": timeout_ms,
+    }))
+}
+
+/// Parse a `pane.wait_for_output` result envelope. Defensive: `read` is an
+/// object carrying the snapshot text; any shape drift becomes code `"parse"`.
+pub fn parse_wait_for_output_result(
+    res: &Value,
+) -> std::result::Result<PaneWaitResult, HerdrError> {
+    let parse_err = |msg: String| HerdrError {
+        code: "parse".into(),
+        message: msg,
+    };
+    if res.get("type").and_then(Value::as_str) != Some("output_matched") {
+        return Err(parse_err(format!(
+            "unexpected pane.wait_for_output result: {res}"
+        )));
+    }
+    let pane_id = res
+        .get("pane_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            parse_err(format!(
+                "pane.wait_for_output result missing pane_id: {res}"
+            ))
+        })?
+        .to_string();
+    let matched_line = res
+        .get("matched_line")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let read = res
+        .get("read")
+        .and_then(|r| r.get("text"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            parse_err(format!(
+                "pane.wait_for_output result missing read.text: {res}"
+            ))
+        })?
+        .to_string();
+    Ok(PaneWaitResult {
+        pane_id,
+        matched_line,
+        read,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Pure-delegation client helpers (methods flywheel used that toron-core's
+// `Client` does not expose). Each forwards to the toron-core `Client`'s raw
+// `call` / `call_coded` — zero protocol logic here.
+// ---------------------------------------------------------------------------
+
+/// `pane.split` — delegation over `Client::call`.
+pub fn pane_split(
+    c: &mut Client,
+    pane_id: &str,
+    direction: &str,
+    cwd: Option<&str>,
+) -> Result<PaneInfo> {
+    let res = c.call(
+        "pane.split",
+        json!({ "target_pane_id": pane_id, "direction": direction, "cwd": cwd }),
+    )?;
+    serde_json::from_value(res.get("pane").cloned().unwrap_or(res))
+        .context("parse pane.split result")
+}
+
+/// `pane.zoom` — delegation over `Client::call`.
+pub fn pane_zoom(c: &mut Client, pane_id: &str, mode: &str) -> Result<Value> {
+    c.call("pane.zoom", json!({ "pane_id": pane_id, "mode": mode }))
+        .map_err(|e| anyhow!("herdr pane.zoom failed: {e}"))
+}
+
+/// `pane.wait_for_output` — delegation over `Client::call_coded`. Returns a
+/// typed `HerdrError` so callers can classify (`timeout` code on a miss).
+pub fn pane_wait_output(
+    c: &mut Client,
+    pane_id: &str,
+    mode: &str,
+    pattern: &str,
+    timeout_ms: Option<u64>,
+) -> std::result::Result<PaneWaitResult, HerdrError> {
+    let params = wait_for_output_params(pane_id, mode, pattern, timeout_ms)?;
+    let res = c
+        .call_coded("pane.wait_for_output", params)
+        .map_err(to_herdr_error)?;
+    parse_wait_for_output_result(&res)
+}
+
+/// `worktree.list` — delegation over `Client::call`, returning the
+/// flywheel-shaped [`WorktreeInfo`].
+pub fn worktree_list(c: &mut Client, workspace_id: Option<&str>) -> Result<Vec<WorktreeInfo>> {
+    let res = c.call("worktree.list", json!({ "workspace_id": workspace_id }))?;
+    serde_json::from_value(res.get("worktrees").cloned().unwrap_or(res))
+        .context("parse worktree.list result")
+}
+
+// ---------------------------------------------------------------------------
+// Subscription stream adapter.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::large_enum_variant)] // Event carries the typed push payload by design
+enum StreamItem {
+    Event(PushEvent),
+    Closed,
+    Error(String),
+}
+
+/// A bounded subscription stream. The toron-core `EventStream` runs on a
+/// dedicated reader thread; `set_read_timeout` bounds each `read_event` via
+/// `recv_timeout` (the toron-core stream has no socket handle to set
+/// SO_RCVTIMEO on, so the bound moves to the channel — same observable
+/// behavior: a quiet stream's `read_event` returns Err after the deadline).
+pub struct EventStream {
+    rx: std::sync::mpsc::Receiver<StreamItem>,
+    timeout: Option<Duration>,
+}
+
+/// Subscribe to herdr push events, returning the flywheel-shaped stream.
+/// Delegation: the subscription handshake + socket lifecycle are entirely
+/// toron-core's.
+pub fn subscribe(c: &mut Client, subscriptions: &[Subscription]) -> Result<EventStream> {
+    let inner = c
+        .subscribe(subscriptions)
+        .map_err(|e| anyhow!("herdr subscribe failed: {e}"))?;
+    let (tx, rx) = std::sync::mpsc::channel::<StreamItem>();
+    std::thread::spawn(move || {
+        let mut inner = inner;
+        loop {
+            match inner.read_event() {
+                Ok(Some((kind, data))) => {
+                    let ev = match HerdrEventKind::parse(&kind) {
+                        Ok(k) => match HerdrEventData::from_kind(k, data) {
+                            Ok(data) => PushEvent { kind: k, data },
+                            Err(e) => {
+                                let _ = tx.send(StreamItem::Error(format!(
+                                    "malformed herdr event {kind}: {e}"
+                                )));
+                                break;
+                            }
+                        },
+                        Err(e) => {
+                            let _ = tx.send(StreamItem::Error(format!(
+                                "unknown herdr event kind {kind}: {e}"
+                            )));
+                            break;
+                        }
+                    };
+                    if tx.send(StreamItem::Event(ev)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    let _ = tx.send(StreamItem::Closed);
+                    break;
+                }
+                Err(e) => {
+                    let _ = tx.send(StreamItem::Error(format!("herdr read failed: {e}")));
+                    break;
+                }
+            }
+        }
+    });
+    Ok(EventStream { rx, timeout: None })
+}
+
+impl EventStream {
+    /// Read one pushed event. `Ok(None)` when the server closes the stream;
+    /// `Err` on a read timeout (when a deadline was set) or transient I/O.
+    pub fn read_event(&mut self) -> Result<Option<PushEvent>> {
+        let item = match self.timeout {
+            Some(d) => self.rx.recv_timeout(d).map_err(|e| match e {
+                std::sync::mpsc::RecvTimeoutError::Timeout => {
+                    anyhow!("herdr stream read timed out")
+                }
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    anyhow!("herdr stream closed")
+                }
+            }),
+            None => self.rx.recv().map_err(|_| anyhow!("herdr stream closed")),
+        }?;
+        match item {
+            StreamItem::Event(e) => Ok(Some(e)),
+            StreamItem::Closed => Ok(None),
+            StreamItem::Error(msg) => Err(anyhow!("{msg}")),
+        }
+    }
+
+    /// Bound (or unbound) each blocking read. `None` restores blocking reads.
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
+        self.timeout = timeout;
+        Ok(())
+    }
+}
