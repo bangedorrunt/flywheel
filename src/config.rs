@@ -2,6 +2,15 @@
 //! Precedence: flags > env (FLYWHEEL_SOCKET / FLYWHEEL_ROOT / FLYWHEEL_TIMEOUT /
 //! FLYWHEEL_BACKEND / FLYWHEEL_MAIL) > `.env` (dotenvy, project-local) >
 //! config file > defaults.
+//!
+//! Config path convergence (ADR-0003 V5): the REAL XDG dir is
+//! `$XDG_CONFIG_HOME || ~/.config/flywheel` — NOT `dirs::config_dir()`, which
+//! returns `~/Library/Application Support` on macOS (the doc used to lie).
+//! `Config::load()` dual-reads XDG first with the legacy macOS path
+//! (`~/Library/Application Support/flywheel/config.toml`) as fallback; on the
+//! first successful legacy load it COPIES (not atomic-moves — rename across
+//! volumes fails, crash mid-move loses config) to XDG, keeps the legacy file
+//! as backup, and all later writes go through XDG (`config_file()`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -118,11 +127,23 @@ impl Config {
         // already-set env vars, so a real env var wins over .env (ADR-0002 §3.3
         // precedence: flag > env > .env > config.toml > default).
         let _ = dotenvy::dotenv();
-        let path = config_file();
-        let mut cfg: Config = if path.exists() {
-            let raw = std::fs::read_to_string(&path)
-                .with_context(|| format!("read {}", path.display()))?;
-            toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?
+        // Dual-read (ADR-0003 V5): XDG first; the legacy macOS path as a
+        // fallback. On the first successful legacy load, COPY to XDG and keep
+        // the legacy file as backup; every later run reads/writes XDG.
+        let xdg = config_file();
+        let legacy = legacy_config_file();
+        let mut cfg: Config = if xdg.exists() {
+            let raw =
+                std::fs::read_to_string(&xdg).with_context(|| format!("read {}", xdg.display()))?;
+            toml::from_str(&raw).with_context(|| format!("parse {}", xdg.display()))?
+        } else if legacy.exists() {
+            let raw = std::fs::read_to_string(&legacy)
+                .with_context(|| format!("read {}", legacy.display()))?;
+            let parsed: Config =
+                toml::from_str(&raw).with_context(|| format!("parse {}", legacy.display()))?;
+            // Write-through to XDG thereafter (copy, not move — V5).
+            migrate_legacy_config(&legacy, &xdg);
+            parsed
         } else {
             Config::default()
         };
@@ -288,13 +309,55 @@ impl Config {
 }
 
 pub fn config_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
-        .join("flywheel")
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let base = xdg.unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("~"))
+            .join(".config")
+    });
+    base.join("flywheel")
 }
 
 pub fn config_file() -> PathBuf {
     config_dir().join("config.toml")
+}
+
+/// Legacy pre-XDG config dir: on macOS `dirs::config_dir()` returned
+/// `~/Library/Application Support`, so old flywheel configs live there.
+/// `Config::load()` falls back to this path and migrates it to XDG on first
+/// success (ADR-0003 V5). On non-macOS this is just a path that won't exist
+/// (XDG is the canonical location there already).
+pub fn legacy_config_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join("Library/Application Support/flywheel")
+}
+
+pub fn legacy_config_file() -> PathBuf {
+    legacy_config_dir().join("config.toml")
+}
+
+/// Copy the legacy config to the real XDG path (COPY, never atomic-move —
+/// ADR-0003 V5: rename across volumes fails and a crash mid-move loses the
+/// config; copying keeps the legacy file as a backup). Creates the XDG dir.
+/// Best-effort: a copy failure must not fail startup (the legacy file remains
+/// the load source until a later run succeeds).
+fn migrate_legacy_config(legacy: &Path, xdg: &Path) {
+    if let Err(e) = (|| -> std::io::Result<()> {
+        if let Some(parent) = xdg.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(legacy, xdg)?;
+        Ok(())
+    })() {
+        eprintln!(
+            "flywheel: could not copy legacy config {} -> {}: {e}",
+            legacy.display(),
+            xdg.display()
+        );
+    }
 }
 
 pub fn state_dir() -> PathBuf {
@@ -675,5 +738,121 @@ daily = [
         let toron = cfg.toron_mail_config();
         assert_eq!(toron.url, None, "no url -> embedded in-process toron");
         assert_eq!(toron.name, None);
+    }
+
+    // ---- ADR-0003 V5: XDG config convergence ----
+    //
+    // `config_dir()` returns the REAL XDG path ($XDG_CONFIG_HOME ||
+    // ~/.config/flywheel), NOT `dirs::config_dir()` (macOS Application
+    // Support — the doc used to lie). These tests isolate HOME/XDG in a temp
+    // dir (serialized via ENV_LOCK — env mutation is process-global).
+
+    /// Real XDG dir: `$XDG_CONFIG_HOME` wins; else `~/.config/flywheel`.
+    #[test]
+    fn config_dir_is_real_xdg() {
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = std::env::temp_dir().join(format!("flywheel-cfg-xdg-{}", std::process::id()));
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        assert_eq!(config_dir(), tmp.join("flywheel"));
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    /// No XDG_CONFIG_HOME → `~/.config/flywheel` (NOT macOS Application
+    /// Support, which is what `dirs::config_dir()` returns).
+    #[test]
+    fn config_dir_falls_back_to_home_dot_config() {
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let home = std::env::temp_dir().join(format!("flywheel-cfg-home-{}", std::process::id()));
+        std::env::set_var("HOME", &home);
+        assert_eq!(
+            config_dir(),
+            home.join(".config/flywheel"),
+            "XDG default is ~/.config/flywheel, not dirs::config_dir()"
+        );
+        std::env::remove_var("HOME");
+    }
+
+    /// `Config::load()` dual-reads: XDG wins when present; a legacy macOS
+    /// config is read as a fallback and COPIED (not moved) to XDG, keeping the
+    /// legacy file as backup. The live `[agent_mail]` block survives the copy.
+    #[test]
+    fn load_migrates_legacy_config_to_xdg_copying() {
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Isolate HOME + XDG in temp dirs (clean; no real config interference).
+        let home =
+            std::env::temp_dir().join(format!("flywheel-legacy-home-{}", std::process::id()));
+        let xdg = std::env::temp_dir().join(format!("flywheel-xdg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&xdg);
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        // legacy macOS path + live [agent_mail] block (ADR-0003 V5)
+        let legacy_dir = home.join("Library/Application Support/flywheel");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(
+            legacy_dir.join("config.toml"),
+            "[agent_mail]\nname = \"Orchid\"\n",
+        )
+        .unwrap();
+
+        let cfg = Config::load().expect("load falls back to legacy");
+        assert_eq!(
+            cfg.agent_mail.as_ref().and_then(|m| m.name.as_deref()),
+            Some("Orchid"),
+            "live [agent_mail] block survives migration"
+        );
+        // Copied to XDG; legacy kept as backup (NOT moved).
+        let xdg_file = xdg.join("flywheel/config.toml");
+        assert!(xdg_file.exists(), "legacy config copied to XDG");
+        assert!(
+            legacy_dir.join("config.toml").exists(),
+            "legacy file kept as backup (copy, not move)"
+        );
+        let copied = std::fs::read_to_string(&xdg_file).unwrap();
+        assert!(copied.contains("Orchid"), "copied body intact");
+        std::env::remove_var("HOME");
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    /// XDG beats legacy when both exist (precedence XDG > legacy > default).
+    #[test]
+    fn load_prefers_xdg_over_legacy() {
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!("flywheel-pref-home-{}", std::process::id()));
+        let xdg = std::env::temp_dir().join(format!("flywheel-pref-xdg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&xdg);
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        std::fs::create_dir_all(home.join("Library/Application Support/flywheel")).unwrap();
+        std::fs::write(
+            home.join("Library/Application Support/flywheel/config.toml"),
+            "[agent_mail]\nname = \"Legacy\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(xdg.join("flywheel")).unwrap();
+        std::fs::write(
+            xdg.join("flywheel/config.toml"),
+            "[agent_mail]\nname = \"Xdg\"\n",
+        )
+        .unwrap();
+
+        let cfg = Config::load().expect("load reads XDG");
+        assert_eq!(
+            cfg.agent_mail.as_ref().and_then(|m| m.name.as_deref()),
+            Some("Xdg"),
+            "XDG wins over legacy"
+        );
+        std::env::remove_var("HOME");
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 }

@@ -394,6 +394,23 @@ pub trait MailBackend: Send + Sync {
     ) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "renew"))
     }
+    /// Operator force-release of a stale reservation (`force_release_file_reservation`).
+    /// Non-operator surface per ADR-0003 V6 (the destructive hint is the
+    /// caller's responsibility — it is NOT gated behind the excluded
+    /// operator-only macro/guard/create identities).
+    fn force_release_file_reservation(
+        &mut self,
+        _project_key: &str,
+        _agent: &str,
+        _file_reservation_id: u64,
+        _note: Option<&str>,
+        _notify_previous: bool,
+    ) -> Result<Value> {
+        Err(BackendError::unsupported(
+            self.name(),
+            "force_release_file_reservation",
+        ))
+    }
     /// Resolve the agent name for a pane from the canonical per-pane identity
     /// file. Carrier-agnostic — the R1 `toron` backend resolves pane identity
     /// natively (ADR-0003 §G9); the agentmail backend delegates to the
@@ -426,6 +443,14 @@ pub trait MailBackend: Send + Sync {
             "clear_pane_identity",
         ))
     }
+    /// Prune identities whose panes are absent from the live pane list
+    /// (`cleanup_pane_identities`; ADR-0003 V6 surface restore).
+    fn cleanup_pane_identities(&mut self, _project_key: &str) -> Result<Value> {
+        Err(BackendError::unsupported(
+            self.name(),
+            "cleanup_pane_identities",
+        ))
+    }
     fn conflicts(&mut self, _project_key: &str, _agent: &str, _paths: &[String]) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "conflicts"))
     }
@@ -441,6 +466,18 @@ pub trait MailBackend: Send + Sync {
     }
     fn slot_release(&mut self, _project_key: &str, _agent: &str, _slot: &str) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "slot_release"))
+    }
+    /// Extend an active build-slot lease's TTL (`renew_build_slot`). Idempotent
+    /// and safe to over-call (ADR-0003 V6 restores the full non-operator
+    /// surface; the concrete `Mail` facade already wraps it as `renew_slot`).
+    fn slot_renew(
+        &mut self,
+        _project_key: &str,
+        _agent: &str,
+        _slot: &str,
+        _extend_seconds: u64,
+    ) -> Result<Value> {
+        Err(BackendError::unsupported(self.name(), "slot_renew"))
     }
     fn search(
         &mut self,
@@ -458,6 +495,19 @@ pub trait MailBackend: Send + Sync {
         _llm_mode: bool,
     ) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "summarize_thread"))
+    }
+    /// Summarize a thread across a product's member projects
+    /// (`summarize_thread_product`; ADR-0003 V6 surface restore).
+    fn summarize_thread_product(
+        &mut self,
+        _product_key: &str,
+        _thread_id: &str,
+        _llm_mode: bool,
+    ) -> Result<Value> {
+        Err(BackendError::unsupported(
+            self.name(),
+            "summarize_thread_product",
+        ))
     }
     fn request_contact(
         &mut self,
