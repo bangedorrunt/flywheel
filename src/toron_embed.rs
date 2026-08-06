@@ -48,6 +48,14 @@ pub async fn dispatch(_cfg: &Config, cmd: &ToronCmd) -> Result<()> {
             print_json(&agents.to_json());
         }
         ToronCmd::StartMcp { port, stdio } => start_mcp(*port, *stdio).await?,
+        // SetupMcp is handled synchronously in cmd_toron (pure file I/O, no
+        // embed runtime needed) before this dispatch is reached. Reaching here
+        // is a logic error — fail loudly rather than silently no-op.
+        ToronCmd::SetupMcp { .. } => {
+            return Err(anyhow::anyhow!(
+                "toron setup-mcp must run outside the in-process embed dispatch"
+            ))
+        }
     }
     Ok(())
 }
