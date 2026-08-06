@@ -33,7 +33,7 @@ targets traits, not concretes — backend swaps survive without bead rewrites.
 | Role | Trait | Default impl | Stubs (feature-gated, `Unsupported`) |
 |------|--------|--------------|--------------------------------------|
 | Multiplexer | `MultiplexerBackend` | `HerdrBackend` (`backend-herdr`) | superlogical, tmux |
-| Mail | `MailBackend` | `AgentMailMcpBackend` (`mail-agentmail`) | toron (`mail-toron`) |
+| Mail | `MailBackend` | `AgentMailBackend` real AM (`mail-agentmail`) | none (toron is a real peer, `mail-toron`) |
 
 Factory: `src/backend/factory.rs` → `Box<dyn MultiplexerBackend>` /
 `Box<dyn MailBackend>`. Code: `src/backend/`.
@@ -46,7 +46,13 @@ Factory: `src/backend/factory.rs` → `Box<dyn MultiplexerBackend>` /
 |-----------|--------|---------|
 | `FLYWHEEL_BACKEND` / `[backend] multiplexer` | `herdr` \| `superlogical` \| `tmux` | `herdr` |
 | `FLYWHEEL_MAIL` / `[backend] mail` | `agentmail` \| `toron` | `agentmail` |
-| `FLYWHEEL_AGENTMAIL_URL` / `TOKEN` / `FLYWHEEL_MAIL_NAME` | agent-mail MCP | config.toml |
+| `FLYWHEEL_AGENTMAIL_URL` / `TOKEN` | feeds `[mail.agentmail]` only (ADR-0003 V3) | config.toml |
+| `FLYWHEEL_MAIL_NAME` | shared identity (`[agent_mail] name`) | `flywheel` |
+
+Mail transport is **per-backend** (ADR-0003): `[mail.agentmail]` = real
+mcp_agent_mail server (default `http://127.0.0.1:8765`); `[mail.toron]` =
+toron daemon (absent → embedded in-process). The legacy `[agent_mail] url`
+is not a routing source.
 
 Copy `.env.example` → `.env` (gitignored). Never commit tokens.
 

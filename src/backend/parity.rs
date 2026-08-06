@@ -345,13 +345,12 @@ mod tests {
                     collect_shape(val, extra_drop, recurse_arrays, out);
                 }
             }
-            serde_json::Value::Array(items) => {
-                if recurse_arrays {
-                    for it in items {
-                        collect_shape(it, extra_drop, recurse_arrays, out);
-                    }
+            serde_json::Value::Array(items) if recurse_arrays => {
+                for it in items {
+                    collect_shape(it, extra_drop, recurse_arrays, out);
                 }
             }
+            serde_json::Value::Array(_) => {}
             _ => {}
         }
     }
