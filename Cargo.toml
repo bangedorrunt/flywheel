@@ -18,6 +18,10 @@ toml = "0.8"
 regex-lite = "0.1"
 ureq = { version = "2", features = ["json"] }
 resonate-sdk = "0.6.0"
+# In-process toron integration (ADR-0003 Decision 3A, bd-o8j.1): flywheel
+# embeds toron-core's mailbox + toron-mcp's server surface with zero IPC.
+toron-core = { path = "../toron/crates/toron-core" }
+toron-mcp = { path = "../toron/crates/toron-mcp" }
 
 [features]
 # Default build: the `serve` HTTP surface + the two default backends (herdr
@@ -47,7 +51,7 @@ optional = true
 # HTTP serve surface (axum + stream/futures helpers) is feature-gated.
 [dependencies.tokio]
 version = "1"
-features = ["rt-multi-thread", "macros", "net", "time"]
+features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"]
 
 [dependencies.tokio-stream]
 version = "0.1"

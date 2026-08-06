@@ -12,6 +12,7 @@ mod herdr;
 mod mail;
 mod output;
 mod state;
+mod toron_embed;
 mod work;
 
 use std::collections::BTreeMap;
@@ -418,6 +419,11 @@ enum Commands {
         #[arg(long, default_value = "7337")]
         port: u16,
     },
+    /// In-process toron mailbox/MCP integration (ADR-0003 Decision 3A, bd-o8j.1)
+    Toron {
+        #[command(subcommand)]
+        cmd: ToronCmd,
+    },
     /// internal: poll swarm state as JSON (durable workflow leaf)
     #[command(name = "__poll", hide = true)]
     __Poll { project: String, to: String },
@@ -624,6 +630,62 @@ enum MailCmd {
     Product {
         #[command(subcommand)]
         cmd: MailProductCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ToronCmd {
+    /// In-process toron mailbox health (bus + archive) as JSON
+    Status,
+    /// Exercise the in-process toron mailbox message surface (zero IPC)
+    Mail {
+        #[command(subcommand)]
+        cmd: ToronMailCmd,
+    },
+    /// List registered agents in a project as JSON (empty array on a fresh
+    /// demo mailbox — the temp SQLite bus is per-process)
+    Agents {
+        /// project slug
+        #[arg(long)]
+        project: String,
+    },
+    /// Serve the toron MCP endpoint from this process on a background task;
+    /// blocks until Ctrl-C
+    #[command(name = "start-mcp")]
+    StartMcp {
+        /// Streamable HTTP bind port on 127.0.0.1 (default 8000)
+        #[arg(long, default_value_t = 8000)]
+        port: u16,
+        /// serve over stdio instead of Streamable HTTP
+        #[arg(long)]
+        stdio: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ToronMailCmd {
+    /// send a message via the in-process mailbox
+    Send {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        from: String,
+        /// comma-separated recipient names
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        body: String,
+    },
+    /// fetch an agent's inbox from the in-process mailbox
+    Inbox {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        limit: Option<usize>,
     },
 }
 
@@ -1294,6 +1356,7 @@ fn main() {
         Some(Commands::Upgrade) => cmd_upgrade(),
         Some(Commands::Tutorial) => cmd_tutorial(),
         Some(Commands::Serve { port }) => cmd_serve(&cfg, *port),
+        Some(Commands::Toron { cmd }) => cmd_toron(&cfg, cmd),
         Some(Commands::__Poll { project, to }) => cmd_internal_poll(&cfg, project, to),
         Some(Commands::__PollEvents {
             project,
@@ -3472,6 +3535,18 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         },
     }
     Ok(())
+}
+
+// ---- toron (in-process embed) ----
+
+/// `flywheel toron <subcommand>`: drive the in-process toron mailbox / MCP
+/// server (ADR-0003 Decision 3A, bd-o8j.1). The embed is async (toron-mcp's
+/// mailbox is built over tokio), so build a fresh tokio runtime and block_on
+/// the dispatch — mirroring how cmd_loop drives the durable workflow. `cfg` is
+/// forwarded but unused by the embed: the demo mailbox is fully in-process.
+fn cmd_toron(cfg: &Config, cmd: &ToronCmd) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(toron_embed::dispatch(cfg, cmd))
 }
 
 // ---- worktree ----
