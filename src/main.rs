@@ -12,6 +12,7 @@ mod herdr_shim;
 mod mail_shim;
 mod mcp_http;
 mod output;
+mod profile;
 mod state;
 mod toron_embed;
 mod work;
