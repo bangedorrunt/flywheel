@@ -142,7 +142,7 @@ async fn build_mailbox() -> anyhow::Result<toron_core::mailbox::Mailbox> {
 /// main.rs dispatch is sync; each op is a short-lived, sequential block_on).
 /// The runtime is pre-built by `Mail::from_config` — the expect below is
 /// unreachable post-init (c3b.1: no `Runtime::new` per op).
-fn block_on<F: std::future::Future>(f: F) -> F::Output {
+pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
     runtime()
         .expect("runtime initialized by Mail::from_config before any op")
         .block_on(f)
@@ -203,6 +203,7 @@ pub struct MailSearchFilter {
 }
 
 /// Which backend a `Mail` routes through.
+#[derive(Debug, Clone)]
 enum BackendKind {
     /// Integrated toron mailbox in this process (the default, bd-o8j.2).
     InProcess,
@@ -220,6 +221,7 @@ enum BackendKind {
 /// commands; in the default build (toron backend off) the ops the CLI doesn't
 /// call are dead — suppressed so the default build stays warning-free.
 #[cfg_attr(not(feature = "mail-toron"), allow(dead_code))]
+#[derive(Debug, Clone)]
 pub struct Mail {
     /// The agent identity this facade sends AS / reads the inbox for.
     pub name: String,
@@ -325,17 +327,40 @@ impl Mail {
         }
     }
 
-    /// `list_agents` (project's registered identities).
-    pub fn list_agents(&self, project_key: &str) -> Result<Value> {
+    /// `list_agents` (project's registered identities). `active_within_days`
+    /// filters to agents active within that window (surface parity — the
+    /// daemon supports it on the wire; in-process passes it to the mailbox).
+    pub fn list_agents(
+        &self,
+        project_key: &str,
+        active_within_days: Option<u64>,
+    ) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
-                let agents =
-                    block_on(mailbox().list_agents(project_key, ListAgentsOptions::default()))?;
+                let agents = block_on(mailbox().list_agents(
+                    project_key,
+                    ListAgentsOptions { active_within_days },
+                ))?;
                 Ok(Value::Array(agents.iter().map(ToJson::to_json).collect()))
             }
             BackendKind::Remote(_) => self.call_remote(
                 "list_agents",
                 crate::backend::wire::list_agents_args(project_key),
+            ),
+        }
+    }
+
+    /// `whois` (project + agent name → profile). Surface parity — the mailbox
+    /// owns name resolution (G2); the daemon tool of the same name.
+    pub fn whois(&self, project_key: &str, agent_name: &str) -> Result<Value> {
+        match &self.backend {
+            BackendKind::InProcess => {
+                let who = block_on(mailbox().whois(project_key, agent_name))?;
+                Ok(who.to_json())
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "whois",
+                crate::backend::wire::whois_args(project_key, agent_name),
             ),
         }
     }
@@ -693,22 +718,22 @@ impl Mail {
         &self,
         project_key: &str,
         thread_id: &str,
-        llm_mode: bool,
+        include_examples: bool,
     ) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 let s = block_on(mailbox().summarize_thread(
                     project_key,
                     thread_id,
+                    include_examples,
                     false,
-                    llm_mode,
                     None,
                 ))?;
                 Ok(s.to_json())
             }
             BackendKind::Remote(_) => self.call_remote(
                 "summarize_thread",
-                crate::backend::wire::summarize_thread_args(project_key, thread_id, llm_mode),
+                crate::backend::wire::summarize_thread_args(project_key, thread_id, include_examples),
             ),
         }
     }
@@ -817,6 +842,7 @@ impl Mail {
     pub fn reserve(
         &self,
         project_key: &str,
+        agent_name: &str,
         paths: &[String],
         ttl_seconds: u64,
         exclusive: bool,
@@ -826,7 +852,7 @@ impl Mail {
             BackendKind::InProcess => {
                 let r = block_on(mailbox().file_reservation_paths(
                     project_key,
-                    &self.name,
+                    agent_name,
                     paths,
                     Some(ttl_seconds),
                     exclusive,
@@ -838,7 +864,7 @@ impl Mail {
                 "file_reservation_paths",
                 crate::backend::wire::reserve_args(
                     project_key,
-                    &self.name,
+                    agent_name,
                     paths,
                     ttl_seconds,
                     exclusive,
@@ -848,35 +874,46 @@ impl Mail {
         }
     }
 
-    /// `release_file_reservations`.
-    pub fn release(&self, project_key: &str) -> Result<Value> {
+    /// `release_file_reservations` (agent-scoped; `paths` empty = all own).
+    pub fn release_paths(
+        &self,
+        project_key: &str,
+        agent_name: &str,
+        paths: &[String],
+    ) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
-                let r =
-                    block_on(mailbox().release_file_reservations(project_key, &self.name, &[]))?;
+                let r = block_on(
+                    mailbox().release_file_reservations(project_key, agent_name, paths),
+                )?;
                 Ok(r.to_json())
             }
             BackendKind::Remote(_) => self.call_remote(
                 "release_file_reservations",
-                crate::backend::wire::release_args(project_key, &self.name),
+                crate::backend::wire::release_args(project_key, agent_name),
             ),
         }
     }
 
-    /// `check_file_reservation_conflicts`.
-    pub fn conflicts(&self, project_key: &str, paths: &[String]) -> Result<Value> {
+    /// `check_file_reservation_conflicts` (agent-scoped).
+    pub fn conflicts_for(
+        &self,
+        project_key: &str,
+        agent_name: &str,
+        paths: &[String],
+    ) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 let r = block_on(mailbox().check_file_reservation_conflicts(
                     project_key,
-                    &self.name,
+                    agent_name,
                     paths,
                 ))?;
                 Ok(r.to_json())
             }
             BackendKind::Remote(_) => self.call_remote(
                 "check_file_reservation_conflicts",
-                crate::backend::wire::conflicts_args(project_key, &self.name, paths),
+                crate::backend::wire::conflicts_args(project_key, agent_name, paths),
             ),
         }
     }
@@ -986,19 +1023,30 @@ impl Mail {
     /// `cleanup_pane_identities` — prune identities whose panes are absent
     /// from herdr's live pane list (ADR-0003 V6 surface restore). toron holds
     /// no per-pane identity files (live herdr mapping), so in-process "prune"
-    /// reports the stale names; without a herdr backend it returns the
-    /// not-wired note (same contract as the toron-mcp tool).
+    /// reports the stale names.
+    ///
+    /// Honest errors (c3b.7): a herdr CONNECT failure when herdr IS the
+    /// active multiplexer is a real outage — the caller must see Err, not an
+    /// Ok note that reads like success. The Ok-note path fires ONLY for the
+    /// genuinely-not-applicable configuration (active multiplexer is not
+    /// herdr — the cleanup is herdr-specific; that is a config fact, not a
+    /// failure).
     pub fn cleanup_pane_identities(&self, _project_key: &str) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
+                if !multiplexer_is_herdr() {
+                    return Ok(json!({
+                        "note": "active multiplexer is not herdr; pane identity cleanup not applicable",
+                    }));
+                }
                 match toron_core::backend::herdr::HerdrBackend::connect(None) {
                     Ok(backend) => {
                         let pruned = mailbox().cleanup_pane_identities(&backend)?;
                         Ok(json!({ "pruned": pruned }))
                     }
-                    Err(e) => Ok(json!({
-                        "note": format!("pane cleanup requires a herdr backend; not wired: {e}"),
-                    })),
+                    Err(e) => Err(anyhow!(
+                        "herdr unreachable; pane identity cleanup skipped: {e}"
+                    )),
                 }
             }
             BackendKind::Remote(_) => self.call_remote(
@@ -1115,11 +1163,13 @@ impl Mail {
         }
     }
 
-    /// `ensure_product`.
-    pub fn ensure_product(&self, product_key: &str) -> Result<Value> {
+    /// `ensure_product` (idempotent product manifest; `name` defaults to the
+    /// key when the caller has no separate display name).
+    pub fn ensure_product(&self, product_key: &str, name: Option<&str>) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
-                let info = block_on(mailbox().ensure_product(product_key, product_key))?;
+                let info =
+                    block_on(mailbox().ensure_product(product_key, name.unwrap_or(product_key)))?;
                 Ok(info.to_json())
             }
             BackendKind::Remote(_) => self.call_remote(
@@ -1342,6 +1392,27 @@ impl Mail {
 // ---------------------------------------------------------------------------
 // Pane identity files (bd-mail-pane-identity-bridge, ADR-0001 A4)
 // ---------------------------------------------------------------------------
+
+/// c3b.7: is herdr the ACTIVE multiplexer? Distinguishes "herdr is the
+/// configured mux but the daemon is down" (a REAL failure the caller must
+/// see) from "the mux is not herdr" (cleanup genuinely not applicable).
+/// Mirrors factory precedence: `FLYWHEEL_BACKEND` env > `[backend]
+/// multiplexer` config > default (`herdr`). Config load is best-effort —
+/// no config file means the default applies.
+fn multiplexer_is_herdr() -> bool {
+    crate::config::Config::load()
+        .map(|cfg| crate::backend::factory::resolve_backend_name(&cfg))
+        .unwrap_or_else(|_| {
+            // Config unreadable (e.g. tests without a config file): env or
+            // the documented default.
+            std::env::var("FLYWHEEL_BACKEND")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| crate::backend::factory::DEFAULT_BACKEND.to_string())
+        })
+        == "herdr"
+}
+
 //
 // flywheel's bridge for herdr panes: agent-mail writes per-pane identity
 // files only for tmux panes; herdr panes (wT:p1) never get one, so
@@ -1766,7 +1837,7 @@ mod tests {
         let h = mail.health().expect("remote health");
         assert_eq!(h["transport"], json!("http"), "remote marker present");
         let agents = mail
-            .list_agents("/tmp/flywheel-remote-smoke")
+            .list_agents("/tmp/flywheel-remote-smoke", None)
             .expect("remote list_agents");
         assert_eq!(agents, json!([]), "fresh daemon mailbox has no agents");
     }
@@ -1929,5 +2000,45 @@ mod tests {
             err.to_string().contains("RFC3339"),
             "names the parse failure: {err}"
         );
+    }
+
+    /// c3b.7: herdr IS the active multiplexer (default) but the daemon is
+    /// unreachable → the cleanup must return Err naming the outage, never an
+    /// Ok note that reads like success.
+    #[test]
+    fn cleanup_pane_identities_herdr_down_is_err() {
+        let _g = crate::config::lock_env();
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+        // Point the herdr socket at a dead path so connect fails fast.
+        unsafe { std::env::set_var("HERDR_SOCKET_PATH", "/tmp/flywheel-c3b7-dead.sock") };
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let err = mail
+            .cleanup_pane_identities("c3b7-herdr-down")
+            .expect_err("herdr down must be an error, not Ok(note)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("herdr unreachable"),
+            "names the outage + skip: {msg}"
+        );
+        unsafe { std::env::remove_var("HERDR_SOCKET_PATH") };
+    }
+
+    /// c3b.7: the active multiplexer is NOT herdr (tmux) → the cleanup is
+    /// genuinely not applicable → Ok with the not-wired note (a config fact,
+    /// not a failure).
+    #[test]
+    fn cleanup_pane_identities_non_herdr_mux_is_ok_note() {
+        let _g = crate::config::lock_env();
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "tmux") };
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let v = mail
+            .cleanup_pane_identities("c3b7-not-herdr")
+            .expect("non-herdr mux is not a failure");
+        let note = v.get("note").and_then(Value::as_str).unwrap_or_default();
+        assert!(
+            note.contains("not herdr"),
+            "note explains the config fact: {note}"
+        );
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
     }
 }

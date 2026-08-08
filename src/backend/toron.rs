@@ -1,25 +1,38 @@
-//! toron mail backend — wraps `crate::mail_shim::Mail` (the toron facade,
-//! ADR-0003 Decision 3A) as the `MailBackend` impl for `FLYWHEEL_MAIL=toron`.
-//! Pure delegation for the operations `Mail` already wraps;
-//! `BackendError::Unsupported` for trait methods without a delegation.
+//! toron mail backend — implements `toron_core::mailbox::surface::MailSurface`
+//! (ADR-0007 D2 / R1, consumed in bead bd-adr7-mail-adapt-se2.3) over the
+//! `Mail` facade (the toron transport: integrated in-process mailbox or the
+//! remote `toron serve --mcp-http` daemon).
 //!
-//! governed-by: ADR-0002, ADR-0003  ·  implements: `MailBackend`
+//! governed-by: ADR-0002, ADR-0003, ADR-0007
 //!
-//! Renamed from the pre-ADR-0003 `AgentMailMcpBackend` (a MISNOMER — it
-//! wrapped the toron facade, not agent-mail). The `"agentmail"` label now
-//! belongs to the REAL agent-mail backend (`crate::backend::agentmail`,
-//! ADR-0003 V2). `name()` is truthful: `"toron"`.
+//! This file is the TORON side of the unified mail surface. The flywheel-local
+//! `MailBackend` trait was deleted with se2.3 — both toron and agent-mail
+//! implement the ONE trait from toron-core. Value→DTO conversion happens
+//! here at the facade edge: the facade's JSON is the AM-parity wire shape
+//! (`toron_mcp::ToJson`), and every surface DTO derives `Deserialize`, so the
+//! conversion is `serde_json::from_value` except where the envelope differs
+//! (send receipt, renew) — mapped explicitly, never with silent defaults.
 //!
-//! Design: `Mail` carries `name` as a field (the sending agent's identity).
-//! `MailBackend::reserve`/`release`/`conflicts` take an explicit `agent`
-//! param so a future backend can target arbitrary agents; this impl forwards
-//! `self.mail.name.clone()` (the orchestrator always acts as itself).
-//!
-//! gated by: cargo feature `mail-toron` (off by default).
+//! Runtime note: the facade methods are SYNC (they `block_on` the shared
+//! tokio runtime — c3b.1). The surface methods are async. Calling the facade
+//! synchronously from inside an async fn running ON the same shared runtime
+//! would nest `block_on` (panic). Every facade call therefore moves to a
+//! `tokio::task::spawn_blocking` thread first (F8-style), where its
+//! `block_on(shared)` is a plain thread→runtime bridge. No per-op runtime is
+//! created; the shared runtime's blocking pool is reused.
 
-use crate::backend::{BackendError, InboxFilter, MailBackend, Result};
-use crate::mail_shim::Mail;
-use serde_json::{json, Value};
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::backend::{
+    AcquireBuildSlotResult, AcquireResult, BuildSlot, ConflictReport, ContactLink, ContactRequest,
+    ContactResponse, DeliveryLine, InboxQuery, MailError, MailItem, MailSurface, MessageId,
+    ProductHit, ProductInfo, ReceiptOp, ReceiptOutcome, RegisteredAgent, ReleaseResult,
+    RenewResult, ReplyMail, SearchQuery, SendMail, SendReceipt, ThreadSummary, WhoIs,
+};
+use crate::mail_shim::{Mail, MailInboxFilter, MailSearchFilter};
+use crate::backend::AgentProfile;
+use toron_core::mailbox::unwrap::ContactPolicy;
 
 /// Toron mail backend: delegates to the toron `Mail` facade (`Mail::from_config`
 /// picks embedded in-process vs the remote `[mail.toron]` daemon).
@@ -30,14 +43,136 @@ pub struct ToronMailBackend {
 impl ToronMailBackend {
     /// Construct from the `Mail` facade (which `Mail::from_config` builds;
     /// `[mail.toron]` config is optional — in-process by default, remote
-    /// daemon when `url` is set). The factory (`bd-backend-env-config`) calls
-    /// this; tests can inject a `Mail` directly.
+    /// daemon when `url` is set).
     pub fn new(mail: Mail) -> Self {
         Self { mail }
     }
 }
 
-impl MailBackend for ToronMailBackend {
+/// Run one sync facade op (which internally `block_on`s the shared runtime)
+/// from the async surface WITHOUT nesting `block_on` on the same runtime:
+/// `spawn_blocking` moves the call to a blocking thread first (F8-style).
+async fn run_facade<T>(
+    mail: Mail,
+    f: impl FnOnce(&Mail) -> anyhow::Result<T> + Send + 'static,
+) -> Result<T, MailError>
+where
+    T: Send + 'static,
+{
+    let (mail, f) = (mail.clone(), f);
+    tokio::task::spawn_blocking(move || f(&mail))
+        .await
+        .map_err(|e| MailError::other(format!("facade task join failed: {e}")))?
+        .map_err(|e| MailError::other(format!("{e:#}")))
+}
+
+/// `send`/`reply` envelope: the facade JSON is `{deliveries, count,
+/// verified_sender}` with `deliveries[].payload = {recipient, event_id}` —
+/// the surface `SendReceipt` derives its `id` from the first delivery, so the
+/// conversion is explicit.
+#[derive(Deserialize)]
+struct SendEnvelope {
+    deliveries: Vec<DeliveryEnvelope>,
+    count: usize,
+    #[allow(dead_code)]
+    verified_sender: bool,
+}
+
+#[derive(Deserialize)]
+struct DeliveryEnvelope {
+    #[allow(dead_code)]
+    project: String,
+    payload: DeliveryPayloadEnvelope,
+}
+
+#[derive(Deserialize)]
+struct DeliveryPayloadEnvelope {
+    recipient: String,
+    event_id: String,
+}
+
+fn send_receipt_from(v: Value) -> Result<SendReceipt, MailError> {
+    let env: SendEnvelope = serde_json::from_value(v)
+        .map_err(|e| MailError::other(format!("send receipt shape mismatch: {e}")))?;
+    let deliveries: Vec<DeliveryLine> = env
+        .deliveries
+        .into_iter()
+        .map(|d| DeliveryLine {
+            recipient: d.payload.recipient,
+            event_id: MessageId::from(d.payload.event_id),
+        })
+        .collect();
+    let id = deliveries
+        .first()
+        .map(|d| d.event_id.clone())
+        .unwrap_or_else(|| MessageId::from(String::new()));
+    Ok(SendReceipt {
+        id,
+        deliveries,
+        count: env.count,
+    })
+}
+
+/// `renew` envelope: the facade emits `{renewed, file_reservations:[{id,
+/// path_pattern, old_expires_ts, new_expires_ts}]}` (AM-parity shape); the
+/// surface `RenewResult` wants `{renewed, reservations: [GrantedReservation]}`.
+/// `exclusive`/`reason` are absent from the envelope — defaulted honestly
+/// (the renewal never changes them).
+fn renew_result_from(v: Value) -> Result<RenewResult, MailError> {
+    let renewed = v
+        .get("renewed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let reservations = v
+        .get("file_reservations")
+        .or_else(|| v.get("reservations"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|r| toron_core::mailbox::reservations::GrantedReservation {
+                    id: r.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                    path_pattern: r
+                        .get("path_pattern")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    exclusive: true,
+                    reason: String::new(),
+                    expires_ts_us: r
+                        .get("new_expires_ts")
+                        .and_then(Value::as_str)
+                        .and_then(|s| s.parse().ok()),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(RenewResult {
+        renewed,
+        reservations,
+    })
+}
+
+fn into_typed<T>(v: Value, op: &str) -> Result<T, MailError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_value(v)
+        .map_err(|e| MailError::other(format!("{op} response shape mismatch: {e}")))
+}
+
+/// Tolerant row-envelope extraction (`{"result": [...]}`, `{"messages":
+/// [...]}`, or a bare array) shared by the product fan-outs.
+fn row_array(v: &Value) -> Vec<Value> {
+    v.get("result")
+        .and_then(Value::as_array)
+        .or_else(|| v.get("messages").and_then(Value::as_array))
+        .or_else(|| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[async_trait::async_trait]
+impl MailSurface for ToronMailBackend {
     fn name(&self) -> &'static str {
         "toron"
     }
@@ -46,362 +181,507 @@ impl MailBackend for ToronMailBackend {
         &self.mail.name
     }
 
-    fn health(&self) -> Result<Value> {
-        self.mail.health().map_err(BackendError::Other)
+    async fn send(&self, req: &SendMail) -> Result<SendReceipt, MailError> {
+        let mail = self.mail.clone();
+        let (project, to, subject, body, importance, ack, thread) = (
+            req.project.clone(),
+            req.to.clone(),
+            req.subject.clone(),
+            req.body_md.clone(),
+            req.importance.clone().unwrap_or_else(|| "normal".into()),
+            req.ack_required,
+            req.thread_id.clone(),
+        );
+        let v = run_facade(mail, move |m| {
+            m.send(&project, &to, &subject, &body, &importance, ack, thread.as_deref())
+        })
+        .await?;
+        send_receipt_from(v)
     }
 
-    fn ensure_project(&self, project_key: &str) -> Result<Value> {
-        self.mail
-            .ensure_project(project_key)
-            .map_err(BackendError::Other)
+    async fn reply(&self, req: &ReplyMail) -> Result<SendReceipt, MailError> {
+        let mail = self.mail.clone();
+        let (project, message_id, body, to) = (
+            req.project.clone(),
+            req.thread_id.as_str().to_string(),
+            req.body_md.clone(),
+            req.to.clone(),
+        );
+        let v = run_facade(mail, move |m| {
+            m.reply(&project, &message_id, &body, Some(&to))
+        })
+        .await?;
+        send_receipt_from(v)
     }
 
-    fn register_agent(
-        &self,
-        project_key: &str,
-        name: &str,
-        program: &str,
-        model: &str,
-        task: &str,
-    ) -> Result<Value> {
-        self.mail
-            .register_agent(project_key, name, program, model, task)
-            .map_err(BackendError::Other)
-    }
-
-    fn list_agents(&self, project_key: &str) -> Result<Value> {
-        self.mail
-            .list_agents(project_key)
-            .map_err(BackendError::Other)
-    }
-
-    /// thread_id chains into a conversation thread (bd-mail-reply-thread).
-    fn send(
-        &self,
-        project_key: &str,
-        to: &[String],
-        subject: &str,
-        body: &str,
-        importance: &str,
-        ack_required: bool,
-        thread_id: Option<&str>,
-    ) -> Result<Value> {
-        self.mail
-            .send(
-                project_key,
-                to,
-                subject,
-                body,
-                importance,
-                ack_required,
-                thread_id,
-            )
-            .map_err(BackendError::Other)
-    }
-
-    fn reply(
-        &self,
-        project_key: &str,
-        message_id: &str,
-        body: &str,
-        to: Option<&[String]>,
-    ) -> Result<Value> {
-        self.mail
-            .reply(project_key, message_id, body, to)
-            .map_err(BackendError::Other)
-    }
-
-    fn inbox(&self, project_key: &str, agent: &str, filter: &InboxFilter) -> Result<Value> {
-        let mail_filter = crate::mail_shim::MailInboxFilter {
-            urgent_only: filter.urgent_only,
-            unread_only: filter.unread_only,
-            ack_overdue_only: filter.ack_overdue_only,
-            include_bodies: filter.include_bodies,
-            limit: filter.limit,
-            since_ts: filter.since_ts.clone(),
+    async fn inbox(&self, req: &InboxQuery) -> Result<Vec<MailItem>, MailError> {
+        let mail = self.mail.clone();
+        let (project, agent, urgent_only, since_ts) = (
+            req.project.clone(),
+            req.agent.clone(),
+            req.urgent_only,
+            req.since_ts.clone(),
+        );
+        let filter = MailInboxFilter {
+            urgent_only,
+            unread_only: req.unread_only,
+            ack_overdue_only: false,
+            include_bodies: req.include_bodies,
+            limit: req.limit.unwrap_or(100) as u32,
+            since_ts,
         };
-        self.mail
-            .inbox_filtered(project_key, agent, &mail_filter)
-            .map_err(BackendError::Other)
+        let v = run_facade(mail, move |m| m.inbox_filtered(&project, &agent, &filter)).await?;
+        into_typed(v, "inbox")
     }
 
-    fn ack(&self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
-        self.mail
-            .ack(project_key, agent, message_id)
-            .map_err(BackendError::Other)
+    async fn acknowledge(&self, req: &ReceiptOp) -> Result<ReceiptOutcome, MailError> {
+        let mail = self.mail.clone();
+        let (project, agent, id) = (
+            req.project.clone(),
+            req.agent.clone(),
+            req.message_id.as_str().to_string(),
+        );
+        let v = run_facade(mail, move |m| m.ack(&project, &agent, &id)).await?;
+        into_typed(v, "ack")
     }
 
-    fn mark_read(&self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
-        self.mail
-            .mark_read(project_key, agent, message_id)
-            .map_err(BackendError::Other)
+    async fn mark_read(&self, req: &ReceiptOp) -> Result<ReceiptOutcome, MailError> {
+        let mail = self.mail.clone();
+        let (project, agent, id) = (
+            req.project.clone(),
+            req.agent.clone(),
+            req.message_id.as_str().to_string(),
+        );
+        let v = run_facade(mail, move |m| m.mark_read(&project, &agent, &id)).await?;
+        into_typed(v, "mark_read")
     }
 
-    fn reserve(
+    async fn search(&self, req: &SearchQuery) -> Result<Vec<MailItem>, MailError> {
+        let mail = self.mail.clone();
+        let (project, query) = (req.project.clone(), req.query.clone());
+        let filter = MailSearchFilter {
+            sender: req.sender.clone(),
+            importance: req.importance.clone(),
+            thread_id: req.thread_id.clone(),
+            date_start: req.date_start.clone(),
+            date_end: req.date_end.clone(),
+            ranking: req.ranking.clone(),
+            include_body_md: req.include_body_md,
+        };
+        let limit = req.limit.unwrap_or(50) as u32;
+        let v = run_facade(mail, move |m| m.search(&project, &query, limit, &filter)).await?;
+        // The facade envelope is `{"result": [...]}`.
+        let arr = v.get("result").cloned().unwrap_or(v);
+        into_typed(arr, "search")
+    }
+
+    async fn request_contact(&self, req: &ContactRequest) -> Result<ContactLink, MailError> {
+        let mail = self.mail.clone();
+        let (project, from, to, reason) = (
+            req.project.clone(),
+            req.from_agent.clone(),
+            req.to_agent.clone(),
+            req.reason.clone(),
+        );
+        let to_project = req.to_project.clone();
+        let reason = reason.unwrap_or_default();
+        let v = run_facade(mail, move |m| {
+            m.request_contact(&project, &from, &to, to_project.as_deref(), &reason, None)
+        })
+        .await?;
+        into_typed(v, "request_contact")
+    }
+
+    async fn respond_contact(&self, req: &ContactResponse) -> Result<ContactLink, MailError> {
+        let mail = self.mail.clone();
+        let (project, to, from, accept) = (
+            req.project.clone(),
+            req.to_agent.clone(),
+            req.from_agent.clone(),
+            req.accept,
+        );
+        let v = run_facade(mail, move |m| m.respond_contact(&project, &to, &from, accept)).await?;
+        into_typed(v, "respond_contact")
+    }
+
+    async fn list_contacts(
         &self,
-        project_key: &str,
-        _agent: &str,
-        paths: &[String],
-        ttl_seconds: u64,
-        exclusive: bool,
-        reason: &str,
-    ) -> Result<Value> {
-        // Mail carries the agent name as a field; the explicit `agent` param
-        // is for the toron backend's per-agent targeting. Here we act as self.
-        let _ = _agent; // explicit-ignore: documented above
-        self.mail
-            .reserve(project_key, paths, ttl_seconds, exclusive, reason)
-            .map_err(BackendError::Other)
-    }
-
-    fn release(&self, project_key: &str, _agent: &str) -> Result<Value> {
-        let _ = _agent;
-        self.mail.release(project_key).map_err(BackendError::Other)
-    }
-
-    fn renew(
-        &self,
-        project_key: &str,
-        _agent: &str,
-        extend_seconds: u64,
-        paths: Option<&[String]>,
-    ) -> Result<Value> {
-        // Mail carries the agent name as a field; the explicit `agent` param
-        // is for the toron backend's per-agent targeting. Here we act as self.
-        // IDs are not exposed through the trait surface — `None` renews all of
-        // this agent's active reservations (bd-mail-lease-renewal-durable).
-        let _ = _agent; // explicit-ignore: documented above
-        let agent = self.mail.name.clone();
-        self.mail
-            .renew(project_key, &agent, extend_seconds, paths, None)
-            .map_err(BackendError::Other)
-    }
-
-    fn force_release_file_reservation(
-        &self,
-        project_key: &str,
+        project: &str,
         agent: &str,
-        file_reservation_id: u64,
+    ) -> Result<Vec<ContactLink>, MailError> {
+        let mail = self.mail.clone();
+        let (project, agent) = (project.to_string(), agent.to_string());
+        let v = run_facade(mail, move |m| m.list_contacts(&project, &agent)).await?;
+        into_typed(v, "list_contacts")
+    }
+
+    async fn set_contact_policy(
+        &self,
+        project: &str,
+        agent: &str,
+        policy: ContactPolicy,
+    ) -> Result<(), MailError> {
+        let mail = self.mail.clone();
+        let (project, agent, policy) = (project.to_string(), agent.to_string(), policy);
+        let v = run_facade(mail, move |m| m.set_contact_policy(&project, &agent, policy.as_str())).await?;
+        let _ = v;
+        Ok(())
+    }
+
+    async fn register_agent(
+        &self,
+        project: &str,
+        profile: &AgentProfile,
+    ) -> Result<RegisteredAgent, MailError> {
+        let mail = self.mail.clone();
+        let (project, name, program, model, task) = (
+            project.to_string(),
+            profile.name.clone(),
+            profile.program.clone().unwrap_or_default(),
+            profile.model.clone().unwrap_or_default(),
+            profile.task_description.clone().unwrap_or_default(),
+        );
+        let v = run_facade(mail, move |m| {
+            m.register_agent(&project, &name, &program, &model, &task)
+        })
+        .await?;
+        into_typed(v, "register_agent")
+    }
+
+    async fn list_agents(
+        &self,
+        project: &str,
+        active_within_days: Option<u64>,
+    ) -> Result<Vec<WhoIs>, MailError> {
+        let mail = self.mail.clone();
+        let (project, days) = (project.to_string(), active_within_days);
+        let v = run_facade(mail, move |m| m.list_agents(&project, days)).await?;
+        into_typed(v, "list_agents")
+    }
+
+    async fn whois(&self, project: &str, agent: &str) -> Result<WhoIs, MailError> {
+        let mail = self.mail.clone();
+        let (project, agent) = (project.to_string(), agent.to_string());
+        let v = run_facade(mail, move |m| m.whois(&project, &agent)).await?;
+        into_typed(v, "whois")
+    }
+
+    async fn health(&self) -> Result<toron_core::mailbox::infra::HealthReport, MailError> {
+        let mail = self.mail.clone();
+        let v = run_facade(mail, |m| m.health()).await?;
+        into_typed(v, "health")
+    }
+
+    async fn ensure_project(&self, human_key: &str) -> Result<toron_core::mailbox::infra::ProjectState, MailError> {
+        let mail = self.mail.clone();
+        let key = human_key.to_string();
+        let v = run_facade(mail, move |m| m.ensure_project(&key)).await?;
+        into_typed(v, "ensure_project")
+    }
+
+    async fn reserve(
+        &self,
+        project: &str,
+        agent: &str,
+        paths: &[String],
+        ttl_secs: Option<u64>,
+        exclusive: bool,
+        reason: Option<&str>,
+    ) -> Result<AcquireResult, MailError> {
+        let mail = self.mail.clone();
+        let (project, agent, paths, ttl, exclusive, reason) = (
+            project.to_string(),
+            agent.to_string(),
+            paths.to_vec(),
+            ttl_secs.unwrap_or(3600),
+            exclusive,
+            reason.unwrap_or("").to_string(),
+        );
+        let v = run_facade(mail, move |m| {
+            m.reserve(&project, &agent, &paths, ttl, exclusive, &reason)
+        })
+        .await?;
+        into_typed(v, "reserve")
+    }
+
+    async fn check_conflicts(
+        &self,
+        project: &str,
+        agent: &str,
+        paths: &[String],
+    ) -> Result<ConflictReport, MailError> {
+        let mail = self.mail.clone();
+        let (project, agent, paths) = (project.to_string(), agent.to_string(), paths.to_vec());
+        let v = run_facade(mail, move |m| m.conflicts_for(&project, &agent, &paths)).await?;
+        into_typed(v, "check_conflicts")
+    }
+
+    async fn renew_reservations(
+        &self,
+        project: &str,
+        agent: &str,
+        paths: &[String],
+        extend_secs: u64,
+    ) -> Result<RenewResult, MailError> {
+        let mail = self.mail.clone();
+        let (project, agent, paths, extend) = (
+            project.to_string(),
+            agent.to_string(),
+            paths.to_vec(),
+            extend_secs,
+        );
+        let v = run_facade(mail, move |m| {
+            m.renew(&project, &agent, extend, Some(&paths), None)
+        })
+        .await?;
+        renew_result_from(v)
+    }
+
+    async fn release_reservations(
+        &self,
+        project: &str,
+        agent: &str,
+        paths: &[String],
+    ) -> Result<ReleaseResult, MailError> {
+        let mail = self.mail.clone();
+        let (project, agent, paths) = (project.to_string(), agent.to_string(), paths.to_vec());
+        let v = run_facade(mail, move |m| m.release_paths(&project, &agent, &paths)).await?;
+        into_typed(v, "release_reservations")
+    }
+
+    async fn force_release(
+        &self,
+        project: &str,
+        requestor: &str,
+        reservation_id: &str,
         note: Option<&str>,
         notify_previous: bool,
-    ) -> Result<Value> {
-        // ADR-0003 V6 surface restore: delegate to Mail::force_release_file_reservation.
-        // The in-process toron mailbox needs an operator key (attached by the
-        // facade) and applies its own staleness heuristic.
-        self.mail
-            .force_release_file_reservation(
-                project_key,
-                agent,
-                &file_reservation_id.to_string(),
-                note,
-                notify_previous,
-            )
-            .map_err(BackendError::Other)
+    ) -> Result<(), MailError> {
+        let mail = self.mail.clone();
+        let (project, requestor, id, note, notify) = (
+            project.to_string(),
+            requestor.to_string(),
+            reservation_id.to_string(),
+            note.unwrap_or("").to_string(),
+            notify_previous,
+        );
+        run_facade(mail, move |m| {
+            m.force_release_file_reservation(&project, &requestor, &id, Some(&note), notify)
+                .map(|_| ())
+        })
+        .await
     }
 
-    fn conflicts(&self, project_key: &str, _agent: &str, paths: &[String]) -> Result<Value> {
-        let _ = _agent;
-        self.mail
-            .conflicts(project_key, paths)
-            .map_err(BackendError::Other)
-    }
-
-    fn resolve_pane_identity(&self, project_key: &str, pane_id: &str) -> Result<Value> {
-        // In-process read of the canonical identity file the bridge writes
-        // (bd-mail-pane-identity-bridge). A missing identity surfaces as JSON
-        // without `agent_name` — callers treat that as not-found.
-        self.mail
-            .resolve_pane_identity(project_key, pane_id)
-            .map_err(BackendError::Other)
-    }
-
-    fn write_pane_identity(
+    async fn slot_acquire(
         &self,
-        project_key: &str,
-        pane_id: &str,
-        agent_name: &str,
-    ) -> Result<Value> {
-        let path = self
-            .mail
-            .write_pane_identity(project_key, pane_id, agent_name)
-            .map_err(BackendError::Other)?;
-        Ok(json!({ "path": path.to_string_lossy() }))
-    }
-
-    fn clear_pane_identity(&self, project_key: &str, pane_id: &str) -> Result<Value> {
-        let path = self
-            .mail
-            .clear_pane_identity(project_key, pane_id)
-            .map_err(BackendError::Other)?;
-        Ok(json!({ "path": path.to_string_lossy() }))
-    }
-
-    fn cleanup_pane_identities(&self, project_key: &str) -> Result<Value> {
-        // ADR-0003 V6 surface restore: delegate to Mail::cleanup_pane_identities.
-        self.mail
-            .cleanup_pane_identities(project_key)
-            .map_err(BackendError::Other)
-    }
-
-    fn slot_acquire(
-        &self,
-        project_key: &str,
+        project: &str,
         agent: &str,
         slot: &str,
+        ttl_secs: Option<u64>,
         exclusive: bool,
-        ttl_seconds: u64,
-    ) -> Result<Value> {
-        // bd-mail-build-slot-gating: delegate to Mail::acquire_slot. The slot
-        // is advisory (returns conflicts, doesn't hard-block); the caller
-        // decides to wait. TTL is the safety net against a forgotten release.
-        self.mail
-            .acquire_slot(project_key, agent, slot, exclusive, ttl_seconds)
-            .map_err(BackendError::Other)
+    ) -> Result<AcquireBuildSlotResult, MailError> {
+        let mail = self.mail.clone();
+        let (project, agent, slot, ttl, exclusive) = (
+            project.to_string(),
+            agent.to_string(),
+            slot.to_string(),
+            ttl_secs.unwrap_or(3600),
+            exclusive,
+        );
+        let v = run_facade(mail, move |m| m.acquire_slot(&project, &agent, &slot, exclusive, ttl)).await?;
+        into_typed(v, "slot_acquire")
     }
 
-    fn slot_release(&self, project_key: &str, agent: &str, slot: &str) -> Result<Value> {
-        // bd-mail-build-slot-gating: delegate to Mail::release_slot. Must be
-        // called after a build; the TTL auto-expires if forgotten.
-        self.mail
-            .release_slot(project_key, agent, slot)
-            .map_err(BackendError::Other)
-    }
-
-    fn slot_renew(
+    async fn slot_renew(
         &self,
-        project_key: &str,
+        project: &str,
         agent: &str,
         slot: &str,
-        extend_seconds: u64,
-    ) -> Result<Value> {
-        // ADR-0003 V6 surface restore: delegate to Mail::renew_slot
-        // (renew_build_slot).
-        self.mail
-            .renew_slot(project_key, agent, slot, extend_seconds)
-            .map_err(BackendError::Other)
+        extend_secs: u64,
+    ) -> Result<Option<BuildSlot>, MailError> {
+        let mail = self.mail.clone();
+        let (project, agent, slot, extend) = (
+            project.to_string(),
+            agent.to_string(),
+            slot.to_string(),
+            extend_secs,
+        );
+        let v = run_facade(mail, move |m| m.renew_slot(&project, &agent, &slot, extend)).await?;
+        // The facade JSON for a no-op renew is `{...}` without a lease.
+        if v.get("slot").is_none() && v.get("expires_ts_us").is_none() {
+            return Ok(None);
+        }
+        Ok(Some(into_typed(v, "slot_renew")?))
     }
 
-    fn search(
+    async fn slot_release(&self, project: &str, agent: &str, slot: &str) -> Result<bool, MailError> {
+        let mail = self.mail.clone();
+        let (project, agent, slot) = (project.to_string(), agent.to_string(), slot.to_string());
+        let v = run_facade(mail, move |m| m.release_slot(&project, &agent, &slot)).await?;
+        Ok(v.get("released").and_then(Value::as_bool).unwrap_or(false))
+    }
+
+    async fn ensure_product(
         &self,
-        project_key: &str,
+        product_key: &str,
+        name: &str,
+    ) -> Result<ProductInfo, MailError> {
+        let mail = self.mail.clone();
+        let (product_key, name) = (product_key.to_string(), name.to_string());
+        let v = run_facade(mail, move |m| m.ensure_product(&product_key, Some(&name))).await?;
+        into_typed(v, "ensure_product")
+    }
+
+    async fn products_link(
+        &self,
+        product_key: &str,
+        project: &str,
+    ) -> Result<ProductInfo, MailError> {
+        let mail = self.mail.clone();
+        let (product_key, project) = (product_key.to_string(), project.to_string());
+        let v = run_facade(mail, move |m| m.products_link(&product_key, &project)).await?;
+        into_typed(v, "products_link")
+    }
+
+    async fn search_product(
+        &self,
+        product_key: &str,
         query: &str,
-        limit: u32,
-        filter: &crate::backend::SearchFilter,
-    ) -> Result<Value> {
-        // bd-mail-search-summarize: delegate to Mail::search, mapping the
-        // trait SearchFilter to the wrapper's filter struct (review-fix F8).
-        self.mail
-            .search(
-                project_key,
-                query,
-                limit,
-                &crate::mail_shim::MailSearchFilter {
-                    sender: filter.sender.clone(),
-                    importance: filter.importance.clone(),
-                    thread_id: filter.thread_id.clone(),
-                    date_start: filter.date_start.clone(),
-                    date_end: filter.date_end.clone(),
-                    ranking: filter.ranking.clone(),
-                    include_body_md: filter.include_body_md,
-                },
-            )
-            .map_err(BackendError::Other)
+        limit: Option<usize>,
+    ) -> Result<Vec<ProductHit>, MailError> {
+        let mail = self.mail.clone();
+        let (product_key, query) = (product_key.to_string(), query.to_string());
+        let limit = limit.unwrap_or(50) as u32;
+        let key_for_facade = product_key.clone();
+        let v = run_facade(mail, move |m| {
+            m.search_product(&key_for_facade, &query, limit)
+        })
+        .await?;
+        // Envelope `{"result": [...]}` of `MailItem`-shaped rows (+ `project`).
+        let arr = row_array(&v);
+        arr.into_iter()
+            .map(|m| {
+                Ok(ProductHit {
+                    project: m
+                        .get("project")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&product_key)
+                        .to_string(),
+                    item: into_typed(m, "search_product")?,
+                })
+            })
+            .collect()
     }
 
-    fn summarize_thread(
+    async fn inbox_product(
         &self,
-        project_key: &str,
-        thread_id: &str,
-        llm_mode: bool,
-    ) -> Result<Value> {
-        self.mail
-            .summarize_thread(project_key, thread_id, llm_mode)
-            .map_err(BackendError::Other)
+        product_key: &str,
+        agent: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<ProductHit>, MailError> {
+        let mail = self.mail.clone();
+        let (product_key, agent) = (product_key.to_string(), agent.to_string());
+        let limit = limit.unwrap_or(100) as u32;
+        let key_for_facade = product_key.clone();
+        let v = run_facade(mail, move |m| {
+            m.inbox_product(&key_for_facade, &agent, limit)
+        })
+        .await?;
+        // Envelope `{"messages": [...]}` / `{"result": [...]}` of
+        // `MailItem`-shaped rows (+ `project`).
+        let arr = row_array(&v);
+        arr.into_iter()
+            .map(|m| {
+                Ok(ProductHit {
+                    project: m
+                        .get("project")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&product_key)
+                        .to_string(),
+                    item: into_typed(m, "inbox_product")?,
+                })
+            })
+            .collect()
     }
 
-    fn summarize_thread_product(
+    async fn summarize_thread_product(
         &self,
         product_key: &str,
         thread_id: &str,
-        llm_mode: bool,
-    ) -> Result<Value> {
-        // ADR-0003 V6 surface restore: delegate to Mail::summarize_thread_product.
-        self.mail
-            .summarize_thread_product(product_key, thread_id, llm_mode)
-            .map_err(BackendError::Other)
+        include_examples: bool,
+    ) -> Result<ThreadSummary, MailError> {
+        let mail = self.mail.clone();
+        let (product_key, thread_id) = (product_key.to_string(), thread_id.to_string());
+        let v = run_facade(mail, move |m| {
+            m.summarize_thread_product(&product_key, &thread_id, include_examples)
+        })
+        .await?;
+        into_typed(v, "summarize_thread_product")
     }
 
-    fn request_contact(
+    async fn summarize_thread(
         &self,
-        project_key: &str,
-        from_agent: &str,
-        to_agent: &str,
-        to_project: Option<&str>,
-        reason: &str,
-    ) -> Result<Value> {
-        self.mail
-            .request_contact(project_key, from_agent, to_agent, to_project, reason, None)
-            .map_err(BackendError::Other)
+        project: &str,
+        thread_id: &str,
+        include_examples: bool,
+    ) -> Result<ThreadSummary, MailError> {
+        let mail = self.mail.clone();
+        let (project, thread_id) = (project.to_string(), thread_id.to_string());
+        let v = run_facade(mail, move |m| {
+            m.summarize_thread(&project, &thread_id, include_examples)
+        })
+        .await?;
+        into_typed(v, "summarize_thread")
     }
 
-    fn respond_contact(
+    async fn resolve_pane_identity(
         &self,
-        project_key: &str,
-        to_agent: &str,
-        from_agent: &str,
-        accept: bool,
-    ) -> Result<Value> {
-        self.mail
-            .respond_contact(project_key, to_agent, from_agent, accept)
-            .map_err(BackendError::Other)
+        project: &str,
+        pane_id: &str,
+    ) -> Result<Option<String>, MailError> {
+        let mail = self.mail.clone();
+        let (project, pane_id) = (project.to_string(), pane_id.to_string());
+        let v = run_facade(mail, move |m| m.resolve_pane_identity(&project, &pane_id)).await?;
+        Ok(v.get("agent_name").and_then(Value::as_str).map(String::from))
     }
 
-    fn list_contacts(&self, project_key: &str, agent: &str) -> Result<Value> {
-        self.mail
-            .list_contacts(project_key, agent)
-            .map_err(BackendError::Other)
+    async fn cleanup_pane_identities(&self, project: &str) -> Result<Vec<String>, MailError> {
+        let mail = self.mail.clone();
+        let project = project.to_string();
+        let v = run_facade(mail, move |m| m.cleanup_pane_identities(&project)).await?;
+        Ok(v.get("pruned").and_then(Value::as_array).map(|a| {
+            a.iter().filter_map(Value::as_str).map(String::from).collect()
+        }).unwrap_or_default())
     }
 
-    fn set_contact_policy(
+    async fn write_pane_identity(
         &self,
-        project_key: &str,
+        project: &str,
+        pane_id: &str,
         agent: &str,
-        policy: &str,
-    ) -> Result<Value> {
-        self.mail
-            .set_contact_policy(project_key, agent, policy)
-            .map_err(BackendError::Other)
+    ) -> Result<(), MailError> {
+        let mail = self.mail.clone();
+        let (project, pane_id, agent) = (project.to_string(), pane_id.to_string(), agent.to_string());
+        run_facade(mail, move |m| {
+            m.write_pane_identity(&project, &pane_id, &agent).map(|_| ())
+        })
+        .await
     }
 
-    fn ensure_product(&self, product_key: &str) -> Result<Value> {
-        self.mail
-            .ensure_product(product_key)
-            .map_err(BackendError::Other)
-    }
-
-    fn products_link(&self, product_key: &str, project_key: &str) -> Result<Value> {
-        self.mail
-            .products_link(product_key, project_key)
-            .map_err(BackendError::Other)
-    }
-
-    fn search_product(&self, product_key: &str, query: &str, limit: u32) -> Result<Value> {
-        self.mail
-            .search_product(product_key, query, limit)
-            .map_err(BackendError::Other)
-    }
-
-    fn inbox_product(&self, product_key: &str, agent: &str, limit: u32) -> Result<Value> {
-        self.mail
-            .inbox_product(product_key, agent, limit)
-            .map_err(BackendError::Other)
+    async fn clear_pane_identity(&self, project: &str, pane_id: &str) -> Result<(), MailError> {
+        let mail = self.mail.clone();
+        let (project, pane_id) = (project.to_string(), pane_id.to_string());
+        run_facade(mail, move |m| {
+            m.clear_pane_identity(&project, &pane_id).map(|_| ())
+        })
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::MailBackend;
+    use crate::backend::MailSurface;
 
     /// name() reports the right identifier — the one piece we can assert
     /// without a live Mail. Constructed via `Mail::from_config`; a url set
@@ -418,111 +698,51 @@ mod tests {
         .expect("Some(Mail) unwraps");
         let b = ToronMailBackend::new(mail);
         assert_eq!(b.name(), "toron");
+        assert_eq!(b.agent_name(), "test-orchestrator");
     }
 
-    /// `renew` delegates to `Mail::renew` (bd-mail-lease-renewal-durable) —
-    /// against the unregistered agent the in-process mailbox surfaces an
-    /// `Other` error, proving real delegation rather than `Unsupported`.
+    /// The send envelope conversion is explicit: a missing/odd shape is a
+    /// typed error, never a silent empty receipt.
     #[test]
-    fn renew_is_real_delegation_not_unsupported() {
-        let mail = Mail::from_config(None)
-            .expect("from_config ok")
-            .expect("Some");
-        let b = ToronMailBackend::new(mail);
-        match b.renew("p", "a", 1200, None) {
-            Err(BackendError::Other(_)) => {}
-            Err(e) => panic!("renew should delegate (Other), got {e:?}"),
-            Ok(_) => panic!("renew cannot succeed for an unregistered agent"),
-        }
+    fn send_envelope_converts_to_send_receipt() {
+        let v = serde_json::json!({
+            "deliveries": [{
+                "project": "demo",
+                "payload": { "recipient": "BlueLake", "event_id": "abc123" }
+            }],
+            "count": 1,
+            "verified_sender": true,
+        });
+        let r = send_receipt_from(v).expect("convert");
+        assert_eq!(r.count, 1);
+        assert_eq!(r.deliveries[0].recipient, "BlueLake");
+        assert_eq!(r.deliveries[0].event_id.as_str(), "abc123");
+        assert_eq!(r.id.as_str(), "abc123", "id = first delivery's event id");
+
+        let bad = serde_json::json!({ "count": "nope" });
+        assert!(send_receipt_from(bad).is_err(), "shape mismatch is an error");
     }
 
-    /// `resolve_pane_identity` reads the canonical identity file in-process —
-    /// a missing file is a not-found JSON (Ok), NOT `Unsupported` (which
-    /// would mean the pane-identity bridge is still stubbed).
+    /// Renew envelope → RenewResult: `file_reservations` (facade) and
+    /// `reservations` (daemon) both parse; ids stay strings.
     #[test]
-    fn resolve_pane_identity_is_real_delegation_not_unsupported() {
-        let mail = Mail::from_config(None)
-            .expect("from_config ok")
-            .expect("Some");
-        let b = ToronMailBackend::new(mail);
-        match b.resolve_pane_identity("p", "w1:p1") {
-            Ok(v) => assert!(v.get("agent_name").is_none(), "no identity file"),
-            Err(e) => panic!("resolve should be Ok(not-found), got {e:?}"),
-        }
-    }
-
-    /// ADR-0003 V6 restored surface: the 4 new methods DELEGATE to the
-    /// in-process toron mailbox — never `Unsupported` (that would mean the
-    /// surface restore is stubbed). Outcomes vary by op, but a real
-    /// `Unsupported` is always a failure.
-    #[test]
-    fn restored_surface_delegates_not_unsupported() {
-        let mail = Mail::from_config(None)
-            .expect("from_config ok")
-            .expect("Some");
-        let b = ToronMailBackend::new(mail);
-        for (method, res) in [
-            ("slot_renew", b.slot_renew("p", "a", "slot-x", 120)),
-            (
-                "summarize_thread_product",
-                b.summarize_thread_product("prod-x", "t1", false),
-            ),
-            (
-                "force_release_file_reservation",
-                b.force_release_file_reservation("p", "a", 1, None, false),
-            ),
-            ("cleanup_pane_identities", b.cleanup_pane_identities("p")),
-        ] {
-            if let Err(BackendError::Unsupported { method: m, .. }) = res {
-                panic!("{method}: still Unsupported ({m}) — surface restore failed")
-            }
-        }
-    }
-
-    /// No method returns `Unsupported` — every op genuinely delegates to the
-    /// in-process mailbox. Ops that need a registered agent error `Other`
-    /// (delegation to the unknown-name path); operator-backed product ops
-    /// succeed. A real `Unsupported` would mean the delegation is still stubbed.
-    #[test]
-    fn unsupported_methods_report_unsupported_not_panic() {
-        let mail = Mail::from_config(None)
-            .expect("from_config ok")
-            .expect("Some");
-        let b = ToronMailBackend::new(mail);
-        // (method, result, expected-ok) — never Unsupported, never panic.
-        for (method, res, expected_ok) in [
-            (
-                "request_contact",
-                b.request_contact("p", "a", "b", None, "r"),
-                false, // from-agent not registered
-            ),
-            (
-                "respond_contact",
-                b.respond_contact("p", "b", "a", true),
-                false,
-            ),
-            ("list_contacts", b.list_contacts("p", "a"), false),
-            (
-                "set_contact_policy",
-                b.set_contact_policy("p", "a", "auto"),
-                false,
-            ),
-            ("ensure_product", b.ensure_product("trading-research"), true),
-            (
-                "products_link",
-                b.products_link("trading-research", "p"),
-                true,
-            ),
-        ] {
-            match res {
-                Ok(_) if expected_ok => {}
-                Ok(_) => panic!("{method}: unexpected Ok for an unregistered agent"),
-                Err(BackendError::Other(_)) if !expected_ok => {}
-                Err(BackendError::Other(_)) => panic!("{method}: should succeed with an operator"),
-                Err(BackendError::Unsupported { method: m, .. }) => {
-                    panic!("{method}: still Unsupported ({m}) — should delegate")
-                }
-            }
-        }
+    fn renew_envelope_converts_to_renew_result() {
+        let v = serde_json::json!({
+            "renewed": 1,
+            "file_reservations": [{
+                "id": "deadbeef",
+                "path_pattern": "src/**",
+                "old_expires_ts": "",
+                "new_expires_ts": "1786200000000000",
+            }],
+        });
+        let r = renew_result_from(v).expect("convert");
+        assert_eq!(r.renewed, 1);
+        assert_eq!(r.reservations[0].id, "deadbeef");
+        assert_eq!(
+            r.reservations[0].expires_ts_us,
+            Some(1786200000000000),
+            "new_expires_ts parses as i64, never unwrap_or(0)"
+        );
     }
 }

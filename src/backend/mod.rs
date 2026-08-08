@@ -41,8 +41,6 @@ pub mod tmux;
 #[cfg(feature = "mail-toron")]
 pub mod toron;
 
-use serde_json::Value;
-
 /// The unified multiplexer backend trait (ADR-0005 P1): sync, `&self`,
 /// object-safe, Unsupported-open. The ONE trait source lives in toron-core;
 /// this re-export keeps flywheel call sites on the historical name.
@@ -61,15 +59,19 @@ pub use toron_core::mailbox::surface::{
 };
 pub use toron_core::mailbox::error::MailError;
 pub use toron_core::mailbox::ids::MessageId;
-pub use toron_core::mailbox::identity::{AgentProfile, RegisteredAgent, WhoIs};
+pub use toron_core::mailbox::{AgentProfile, RegisteredAgent, WhoIs};
+#[allow(unused_imports)]
 pub use toron_core::mailbox::infra::{HealthReport, ProjectState};
 pub use toron_core::mailbox::contacts::ContactLink;
 pub use toron_core::mailbox::search::ThreadSummary;
 pub use toron_core::mailbox::product::ProductInfo;
+#[allow(unused_imports)]
 pub use toron_core::mailbox::reservations::{
     AcquireResult, ConflictReport, GrantedReservation, PathConflict, ReleaseResult, RenewResult,
 };
 pub use toron_core::mailbox::build_slots::AcquireBuildSlotResult;
+pub use toron_core::mailbox::unwrap::ContactPolicy;
+#[allow(unused_imports)]
 pub use toron_core::index::slots::{BuildSlot, GrantedSlot, SlotConflict};
 
 // Factory entry points — consumers (the durable-loop leaf handlers in main.rs)
@@ -79,6 +81,14 @@ pub use toron_core::index::slots::{BuildSlot, GrantedSlot, SlotConflict};
 pub use factory::{
     compiled_backends, mail_backend, multiplexer_backend, resolve_backend_name, resolve_mail_name,
 };
+
+/// Drive one `MailSurface` future from sync flywheel dispatch (the durable
+/// loop is sync; each op is a short-lived block_on on the shared runtime —
+/// c3b.1). The surface impls never nest `block_on` on that runtime
+/// (in-process ops are pure async; adapters are sync-HTTP), so this is safe.
+pub fn run_mail<F: std::future::Future>(f: F) -> F::Output {
+    crate::mail_shim::block_on(f)
+}
 
 /// Errors a backend may surface. `Unsupported` is the honest signal for a
 /// method a backend doesn't implement (real impl gap, or a stub backend like

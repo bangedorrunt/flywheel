@@ -21,7 +21,7 @@
 //! `BackendError::Unsupported` so a user who typos the env var gets an
 //! actionable error, not a silent fallback.
 
-use crate::backend::{BackendError, MailBackend, MultiplexerBackend, Result};
+use crate::backend::{BackendError, MailSurface, MultiplexerBackend, Result};
 use crate::config::Config;
 #[cfg(feature = "mail-toron")]
 use crate::mail_shim::Mail;
@@ -89,7 +89,7 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
 /// actionable error. The `mail-agentmail` cargo feature gates the agentmail
 /// impl; when it's off, the name falls through to `other` with a feature-aware
 /// error.
-pub fn mail_backend(cfg: &Config) -> Result<Box<dyn MailBackend>> {
+pub fn mail_backend(cfg: &Config) -> Result<Box<dyn MailSurface>> {
     let name = resolve_mail_name(cfg);
     match name.as_str() {
         // FLYWHEEL_MAIL=agentmail -> the REAL agent-mail server backend
@@ -348,7 +348,7 @@ mod tests {
         let cfg = Config::default();
         let b = super::mail_backend(&cfg).expect("toron facade constructs");
         assert_eq!(b.name(), "toron");
-        match b.health() {
+        match crate::backend::run_mail(b.health()) {
             Ok(_) => {}
             Err(e) => panic!("toron facade health() must delegate to in-process mailbox: {e:?}"),
         }
@@ -366,8 +366,8 @@ mod tests {
         let _g = lock_env();
         unsafe { std::env::set_var("FLYWHEEL_MAIL", "toron") };
         let cfg = Config::default();
-        let b: Box<dyn MailBackend> = super::mail_backend(&cfg).expect("toron facade constructs");
-        let arc: Arc<dyn MailBackend> = Arc::from(b);
+        let b: Box<dyn MailSurface> = super::mail_backend(&cfg).expect("toron facade constructs");
+        let arc: Arc<dyn MailSurface> = Arc::from(b);
         // Methods are callable through `&Arc` (deref to `&dyn MailBackend`),
         // proving no `&mut self` receiver remains.
         let name = arc.name();
@@ -377,7 +377,7 @@ mod tests {
         let handles: Vec<_> = (0..2)
             .map(|_| {
                 let arc = Arc::clone(&arc);
-                std::thread::spawn(move || match arc.health() {
+                std::thread::spawn(move || match crate::backend::run_mail(arc.health()) {
                     Ok(_) => true,
                     Err(e) => {
                         eprintln!("health from thread: {e:?}");

@@ -2217,7 +2217,7 @@ fn register_spawned_agent(cfg: &Config, project: &str, name: &str, kind: &str, p
         Ok(m) => m,
         Err(_) => return, // mail not configured — silent skip
     };
-    if let Err(e) = mail.ensure_project(&key) {
+    if let Err(e) = backend::run_mail(mail.ensure_project(&key)) {
         eprintln!("flywheel: mail ensure_project failed for {name}: {e}");
         return;
     }
@@ -2227,7 +2227,14 @@ fn register_spawned_agent(cfg: &Config, project: &str, name: &str, kind: &str, p
     // task_description so list_agents is the reverse lookup.
     let mail_name = agent_mail_name(name);
     let task = format!("{name} (flywheel agent for {project})");
-    if let Err(e) = mail.register_agent(&key, &mail_name, kind, kind, &task) {
+    let profile = backend::AgentProfile {
+        name: mail_name.clone(),
+        program: Some(kind.to_string()),
+        model: Some(kind.to_string()),
+        persona: None,
+        task_description: Some(task),
+    };
+    if let Err(e) = backend::run_mail(mail.register_agent(&key, &profile)) {
         // Best-effort: a registration failure must never fail the spawn. The
         // pane-identity bridge below still works (the identity file is the
         // pane→name source the server reads, registration or not).
@@ -2237,7 +2244,7 @@ fn register_spawned_agent(cfg: &Config, project: &str, name: &str, kind: &str, p
     // The file holds the REGISTERED identity (the mapped adjective+noun) so
     // resolve_pane_identity returns a name that exists in the registry — the
     // herdr name is not registrable and would resolve to a dead end.
-    if let Err(e) = mail.write_pane_identity(&key, pane_id, &mail_name) {
+    if let Err(e) = backend::run_mail(mail.write_pane_identity(&key, pane_id, &mail_name)) {
         eprintln!("flywheel: mail write_pane_identity failed for {name} on {pane_id}: {e}");
     }
 }
@@ -3440,7 +3447,7 @@ fn cmd_kill(cfg: &Config, project: &str, force: bool) -> Result<()> {
     // file is a no-op, so double-exit is harmless)
     if let Ok(mail) = backend::mail_backend(cfg) && let Some(key) = project_dir(cfg, project).to_str() {
         for a in &agents {
-            if let Err(e) = mail.clear_pane_identity(key, &a.pane_id) {
+            if let Err(e) = backend::run_mail(mail.clear_pane_identity(key, &a.pane_id)) {
                 eprintln!(
                     "flywheel: mail clear_pane_identity failed for {} on {}: {e}",
                     a.name.as_deref().unwrap_or("<unnamed>"),
@@ -3510,7 +3517,7 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
         msg.unwrap_or("Execute these beads per the standard lifecycle: claim -> reserve -> execute -> verify -> close -> sync.")
     );
     let targets: Vec<String> = if to == "all" {
-        let agents = mail.list_agents(&key)?;
+        let agents = mail.list_agents(&key, None)?;
         agents
             .as_array()
             .map(|arr| {
@@ -3955,13 +3962,15 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
-            let v = mail.reserve(&key, paths, *ttl_seconds, *exclusive, reason)?;
+            let agent = as_agent.clone().unwrap_or_else(|| mail.name.clone());
+            let v = mail.reserve(&key, &agent, paths, *ttl_seconds, *exclusive, reason)?;
             print_json(&v);
         }
         MailCmd::Unlock { project, as_agent } => {
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
-            let v = mail.release(&key)?;
+            let agent = as_agent.clone().unwrap_or_else(|| mail.name.clone());
+            let v = mail.release_paths(&key, &agent, &[])?;
             print_json(&v);
         }
         MailCmd::Conflicts {
@@ -3972,14 +3981,15 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
-            let v = mail.conflicts(&key, paths)?;
+            let agent = as_agent.clone().unwrap_or_else(|| mail.name.clone());
+            let v = mail.conflicts_for(&key, &agent, paths)?;
             print_json(&v);
         }
         MailCmd::Agents { project } => {
             let key = project_dir_str(cfg, project)?;
             let mail = mail_or_die(cfg)?;
             mail.ensure_project(&key)?;
-            let v = mail.list_agents(&key)?;
+            let v = mail.list_agents(&key, None)?;
             print_json(&v);
         }
         MailCmd::Contact { cmd } => match cmd {
@@ -4036,7 +4046,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         MailCmd::Product { cmd } => match cmd {
             MailProductCmd::Ensure { name } => {
                 let mail = mail_or_die(cfg)?;
-                let v = mail.ensure_product(name)?;
+                let v = mail.ensure_product(name, Some(name))?;
                 print_json(&v);
             }
             MailProductCmd::Link { product, project } => {
@@ -5930,7 +5940,11 @@ fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
                 .map(|b| b.agent_list().is_ok())
                 .unwrap_or(false);
             let mail_health = backend::mail_backend(cfg)
-                .and_then(|m| m.health().map(|_| true))
+                .and_then(|m| {
+                    backend::run_mail(m.health())
+                        .map(|_| true)
+                        .map_err(Into::into)
+                })
                 .unwrap_or(false);
             print_json(&json!({
                 "multiplexer": {"name": mux, "source": mux_source, "healthy": mux_health},
@@ -7190,15 +7204,16 @@ fn cmd_debate(
         Err(e) => bail!("mail backend unavailable for debate: {e:#}"),
     };
     let mux = backend::multiplexer_backend(cfg)?;
-    mail.ensure_project(&key)?;
+    backend::run_mail(mail.ensure_project(&key))?;
 
     let mail_target = |agent: &str| resolve_mail_target(agent).to_string();
 
     // opening: A argues FOR
     let opening = format!(
-        "You are debating proposition: {proposition}\n\nArgue FOR it. Be concise and concrete (<= 120 words). Provide your single strongest argument with a brief reason.\n\nAfter replying in this thread, acknowledge the orchestrator's opening message to signal your turn is done."
+        "You are debating proposition: {proposition}\n\nArgue FOR it. Be concise and concise (<= 120 words). Provide your single strongest argument with a brief reason.\n\nAfter replying in this thread, acknowledge the orchestrator's opening message to signal your turn is done."
     );
-    mail.send(
+    mail_send(
+        &*mail,
         &key,
         &[mail_target(&a)],
         &format!("[debate] {proposition}"),
@@ -7218,7 +7233,8 @@ fn cmd_debate(
             let counter = format!(
                 "You are debating proposition: {proposition}\n\nCounter the opponent's latest argument with a NEW point (do not repeat). <= 120 words. Acknowledge when done.\n\nOpponent's latest argument: {reply}"
             );
-            mail.send(
+            mail_send(
+                &*mail,
                 &key,
                 &[mail_target(speaker)],
                 &format!("[debate] {proposition}"),
@@ -7240,7 +7256,8 @@ fn cmd_debate(
     let judge_prompt = format!(
         "You are the judge of this debate on: {proposition}\n\nRead the full thread via summarize_thread. Pick a winner in <= 100 words: name the winner's argument and why it is stronger. Reply in thread and acknowledge when done."
     );
-    mail.send(
+    mail_send(
+        &*mail,
         &key,
         &[mail_target(&j)],
         &format!("[debate] {proposition} — judge"),
@@ -7528,7 +7545,7 @@ fn cmd_plan_review(
     };
     let mux = backend::multiplexer_backend(cfg)?;
     let key = project_dir_str(cfg, project)?;
-    mail.ensure_project(&key)?;
+    backend::run_mail(mail.ensure_project(&key))?;
 
     let mail_target = |agent: &str| resolve_mail_target(agent);
     let subject = format!("[plan-review] {project}");
@@ -7543,15 +7560,7 @@ fn cmd_plan_review(
     let mut current_path = plan_path.clone();
 
     let open = pri_planner_prompt(feature, &current_path);
-    mail.send(
-        &key,
-        &[mail_target(&planner)],
-        &subject,
-        &open,
-        "high",
-        true,
-        Some(&thread),
-    )?;
+    mail_send(&*mail, &key, &[mail_target(&planner)], &subject, &open, "high", true, Some(&thread))?;
     settle_agent(&*mux, &planner)?;
     let planner_mail = mail_target(&planner);
     let plan_reply =
@@ -7579,15 +7588,7 @@ fn cmd_plan_review(
                     PriAction::PromptPlanner { msg } => msg.clone(),
                     _ => bail!("phase AwaitingPlan without PromptPlanner action: {action:?}"),
                 };
-                mail.send(
-                    &key,
-                    &[mail_target(&planner)],
-                    &subject,
-                    &msg,
-                    "high",
-                    true,
-                    Some(&thread),
-                )?;
+                mail_send(&*mail, &key, &[mail_target(&planner)], &subject, &msg, "high", true, Some(&thread))?;
                 settle_agent(&*mux, &planner)?;
                 let pr = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&planner))?
                     .unwrap_or_default();
@@ -7604,15 +7605,7 @@ fn cmd_plan_review(
                         bail!("phase AwaitingPlanReview without PromptReviewer action: {action:?}")
                     }
                 };
-                mail.send(
-                    &key,
-                    &[mail_target(&reviewer)],
-                    &subject,
-                    &msg,
-                    "high",
-                    true,
-                    Some(&thread),
-                )?;
+                mail_send(&*mail, &key, &[mail_target(&reviewer)], &subject, &msg, "high", true, Some(&thread))?;
                 settle_agent(&*mux, &reviewer)?;
                 let body = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&reviewer))?
                     .unwrap_or_default();
@@ -7635,15 +7628,7 @@ fn cmd_plan_review(
                         "phase AwaitingImplement without PromptImplementer action: {action:?}"
                     ),
                 };
-                mail.send(
-                    &key,
-                    &[mail_target(&implementer)],
-                    &subject,
-                    &msg,
-                    "high",
-                    true,
-                    Some(&thread),
-                )?;
+                mail_send(&*mail, &key, &[mail_target(&implementer)], &subject, &msg, "high", true, Some(&thread))?;
                 settle_agent(&*mux, &implementer)?;
                 let (p2, a2) = pri_after_implement(&current_path);
                 phase = p2; // AwaitingVerify
@@ -7655,15 +7640,7 @@ fn cmd_plan_review(
                     PriAction::PromptReviewer { msg } => msg.clone(),
                     _ => bail!("phase AwaitingVerify without PromptReviewer action: {action:?}"),
                 };
-                mail.send(
-                    &key,
-                    &[mail_target(&reviewer)],
-                    &subject,
-                    &msg,
-                    "high",
-                    true,
-                    Some(&thread),
-                )?;
+                mail_send(&*mail, &key, &[mail_target(&reviewer)], &subject, &msg, "high", true, Some(&thread))?;
                 settle_agent(&*mux, &reviewer)?;
                 let rev2 = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&reviewer))?
                     .unwrap_or_default();
@@ -7753,33 +7730,64 @@ pub fn extract_latest_body(v: &serde_json::Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Drive a surface `send` from sync dispatch with the AM-shaped positional
+/// surface (the durable loop's bread-and-butter). Seam: `SendMail` struct,
+/// `run_mail` block_on on the shared runtime.
+#[allow(clippy::too_many_arguments)]
+fn mail_send(
+    mail: &dyn backend::MailSurface,
+    key: &str,
+    to: &[String],
+    subject: &str,
+    body: &str,
+    importance: &str,
+    ack: bool,
+    thread: Option<&str>,
+) -> Result<backend::SendReceipt> {
+    Ok(backend::run_mail(mail.send(&backend::SendMail {
+        project: key.to_string(),
+        sender: mail.agent_name().to_string(),
+        to: to.to_vec(),
+        subject: subject.to_string(),
+        body_md: body.to_string(),
+        importance: Some(importance.to_string()),
+        ack_required: ack,
+        thread_id: thread.map(String::from),
+        ..Default::default()
+    }))?)
+}
+
 /// Harvest the latest message in a thread from a sender (recency-ranked).
 fn harvest_latest(
-    mail: &dyn backend::MailBackend,
+    mail: &dyn backend::MailSurface,
     key: &str,
     thread: &str,
     sender: &str,
 ) -> Result<Option<String>> {
-    let v = mail.search(
-        key,
-        "",
-        1,
-        &backend::SearchFilter {
-            thread_id: Some(thread.to_string()),
-            sender: Some(sender.to_string()),
-            ranking: Some("recency".to_string()),
-            // review-fix F1: search_messages returns subject-only unless
-            // include_body_md is set — the debate/plan-review patterns need
-            // the reply BODY (the argument / the APPROVE|CHANGES: token),
-            // not the subject line.
-            include_body_md: true,
-            ..Default::default()
-        },
-    )?;
+    let items = backend::run_mail(mail.search(&backend::SearchQuery {
+        project: key.to_string(),
+        query: String::new(),
+        limit: Some(1),
+        sender: Some(sender.to_string()),
+        thread_id: Some(thread.to_string()),
+        ranking: Some("recency".to_string()),
+        // review-fix F1: search_messages returns subject-only unless
+        // include_body_md is set — the debate/plan-review patterns need
+        // the reply BODY (the argument / the APPROVE|CHANGES: token),
+        // not the subject line.
+        include_body_md: true,
+        ..Default::default()
+    }))?;
     // body_md first, then body, then subject — mirrors the precedence in
     // extract_xproj_from_inbox so a body-bearing envelope wins over the
     // subject even if a server version omits one of the body keys.
-    Ok(extract_latest_body(&v))
+    Ok(items.first().map(|m| {
+        if !m.body_md.is_empty() {
+            m.body_md.trim().to_string()
+        } else {
+            m.subject.trim().to_string()
+        }
+    }))
 }
 
 fn cmd_upgrade() -> Result<()> {
@@ -8437,10 +8445,10 @@ fn cmd_internal_respawn(
     // on mail trouble): the old pane died (its identity file is stale), the
     // fresh pane must resolve to the same name (the agent keeps its identity)
     if let Ok(mail) = backend::mail_backend(cfg) && let Some(key) = dir.to_str() {
-        if let Some(old) = &old_pane && let Err(e) = mail.clear_pane_identity(key, old) {
+        if let Some(old) = &old_pane && let Err(e) = backend::run_mail(mail.clear_pane_identity(key, old)) {
             eprintln!("flywheel: mail clear_pane_identity failed for {old}: {e}");
         }
-        if let Err(e) = mail.write_pane_identity(key, &fresh.pane_id, &agent_mail_name(name)) {
+        if let Err(e) = backend::run_mail(mail.write_pane_identity(key, &fresh.pane_id, &agent_mail_name(name))) {
             eprintln!(
                 "flywheel: mail write_pane_identity failed for {name} on {}: {e}",
                 fresh.pane_id
@@ -8468,20 +8476,20 @@ fn cmd_internal_xproj_inbox(cfg: &Config, project: &str, limit: u32) -> Result<(
         }
     };
     let key = project_dir_str(cfg, project)?;
-    if mail.ensure_project(&key).is_err() {
+    if backend::run_mail(mail.ensure_project(&key)).is_err() {
         print_json(&json!({ "items": [] }));
         return Ok(());
     }
     let name = mail.agent_name().to_string();
-    let filter = backend::InboxFilter {
-        urgent_only: false,
+    let v = match backend::run_mail(mail.inbox(&backend::InboxQuery {
+        project: key.clone(),
+        agent: name,
         unread_only: false,
-        ack_overdue_only: false,
+        urgent_only: false,
         include_bodies: true,
-        limit,
+        limit: Some(limit as usize),
         since_ts: None,
-    };
-    let v = match mail.inbox(&key, &name, &filter) {
+    })) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("flywheel: xproj-inbox fetch failed: {e:#}");
@@ -8489,7 +8497,8 @@ fn cmd_internal_xproj_inbox(cfg: &Config, project: &str, limit: u32) -> Result<(
             return Ok(());
         }
     };
-    let items = extract_xproj_from_inbox(&v);
+    let v_json = serde_json::to_value(&v).unwrap_or_default();
+    let items = extract_xproj_from_inbox(&v_json);
     print_json(&json!({ "items": items }));
     Ok(())
 }
@@ -8548,8 +8557,9 @@ fn cmd_internal_xproj_spawn(
             .to_str()
             .unwrap_or(project)
             .to_string();
-        let _ = mail.ensure_project(&key);
-        let _ = mail.send(
+        let _ = backend::run_mail(mail.ensure_project(&key));
+        let _ = mail_send(
+            &*mail,
             &key,
             &[resolve_mail_target(from)],
             &format!("[xproj] swarm reply (msg {message_id})"),
@@ -8602,8 +8612,11 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str, tier: u32)
     // `name` is the herdr name, which is not a registrable identity
     let mail_target = resolve_mail_target(name);
     let thread = format!("health-{name}");
-    let out = mail.ensure_project(&key).and_then(|_| match tier {
-        0 => mail.send(
+    let out = (|| -> Result<backend::SendReceipt> {
+        backend::run_mail(mail.ensure_project(&key)).map_err(|e| anyhow!("{e}"))?;
+        match tier {
+        0 => mail_send(
+            &*mail,
             &key,
             std::slice::from_ref(&mail_target),
             "[flywheel] you are blocked",
@@ -8612,7 +8625,8 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str, tier: u32)
             true,
             Some(&thread),
         ),
-        1 => mail.send(
+        1 => mail_send(
+            &*mail,
             &key,
             std::slice::from_ref(&mail_target),
             "[flywheel] still blocked — 2nd ping (high)",
@@ -8621,7 +8635,8 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str, tier: u32)
             true,
             Some(&thread),
         ),
-        2 => mail.send(
+        2 => mail_send(
+            &*mail,
             &key,
             std::slice::from_ref(&mail_target),
             "[flywheel] URGENT: blocked — escalation",
@@ -8630,7 +8645,8 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str, tier: u32)
             true,
             Some(&thread),
         ),
-        _ => mail.send(
+        _ => mail_send(
+            &*mail,
             &key,
             std::slice::from_ref(&mail_target),
             "[flywheel] HALTS: blocked too long — human required",
@@ -8639,7 +8655,8 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str, tier: u32)
             true,
             Some(&thread),
         ),
-    });
+        }
+    })();
     match out {
         Ok(_) => {
             print_json(&json!({ "ok": true, "notified": mail_target, "tier": tier }));
@@ -8713,8 +8730,10 @@ fn cmd_internal_diagnose(cfg: &Config, project: &str, name: &str, reason: &str) 
                  ### Recent output (truncated)\n```\n{tail}\n```\n\n\
                  flywheel will attempt respawn if the agent stays dead (budgeted)."
             );
-            match mail.ensure_project(&key).and_then(|_| {
-                mail.send(
+            match (|| -> Result<backend::SendReceipt> {
+                backend::run_mail(mail.ensure_project(&key)).map_err(|e| anyhow!("{e}"))?;
+                mail_send(
+                    &*mail,
                     &key,
                     std::slice::from_ref(&recipient),
                     &subject,
@@ -8723,7 +8742,7 @@ fn cmd_internal_diagnose(cfg: &Config, project: &str, name: &str, reason: &str) 
                     false,
                     Some(&format!("health-{name}")),
                 )
-            }) {
+            })() {
                 Ok(_) => mailed = true,
                 Err(e) => {
                     mail_err = Some(format!("{e:#}"));
@@ -8756,19 +8775,28 @@ fn cmd_internal_diagnose(cfg: &Config, project: &str, name: &str, reason: &str) 
 fn cmd_internal_renew_leases(cfg: &Config, project: &str, extend_seconds: u64) -> Result<()> {
     let mail = backend::mail_backend(cfg)?;
     let key = project_dir_str(cfg, project)?;
-    mail.ensure_project(&key)?;
-    // NOTE: MailBackend::name() returns the backend identifier ("agentmail"),
-    // not the orchestrator's agent-mail identity — use the configured name so
-    // the reported `agent` matches the reservations' owner.
+    backend::run_mail(mail.ensure_project(&key))?;
+    // NOTE: MailSurface::agent_name() is the orchestrator identity; the
+    // reported `agent` must match the reservations' owner — use the
+    // configured name explicitly.
     let agent = orchestrator_mail_name(cfg);
-    let v = mail
-        .renew(&key, &agent, extend_seconds, None)
+    let v = backend::run_mail(mail.renew_reservations(&key, &agent, &[], extend_seconds))
         .map_err(|e| anyhow!("mail backend: {e}"))?;
-    let renewed = v.get("renewed").and_then(Value::as_u64).unwrap_or(0);
-    let reservations = crate::mail_shim::list_own_reservations(&v);
+    // Surface `RenewResult` → the AM-parity `file_reservations` envelope
+    // `list_own_reservations` / older CLI consumers parse.
+    let envelope = json!({
+        "renewed": v.renewed,
+        "file_reservations": v.reservations.iter().map(|r| json!({
+            "id": r.id,
+            "path_pattern": r.path_pattern,
+            "old_expires_ts": "",
+            "new_expires_ts": r.expires_ts_us.map(|u| u.to_string()).unwrap_or_default(),
+        })).collect::<Vec<_>>(),
+    });
+    let reservations = crate::mail_shim::list_own_reservations(&envelope);
     print_json(&json!({
         "ok": true,
-        "renewed": renewed,
+        "renewed": v.renewed,
         "agent": agent,
         "file_reservations": reservations,
     }));

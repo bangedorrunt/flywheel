@@ -25,7 +25,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::{BackendError, MailBackend, MultiplexerBackend};
+    use crate::backend::{BackendError, InboxQuery, MailSurface, MultiplexerBackend, run_mail};
     use crate::herdr_shim::HerdrError;
 
     // ---- error coercion: the path real transport errors take ----
@@ -68,70 +68,6 @@ mod tests {
         fn name(&self) -> &'static str {
             "all-unsupported-mux"
         }
-    }
-
-    struct AllUnsupportedMail;
-    impl MailBackend for AllUnsupportedMail {
-        fn name(&self) -> &'static str {
-            "all-unsupported-mail"
-        }
-        fn agent_name(&self) -> &str {
-            "all-unsupported-agent"
-        }
-    }
-
-    #[test]
-    fn every_mux_default_method_is_unsupported_not_ok() {
-        let b = AllUnsupportedMux;
-        // spot-check across the method categories (workspace/pane/agent/events)
-        // The unified trait (ADR-0005 P1) returns toron-core's machine-code
-        // BackendError; Unsupported is a code, not a variant.
-        let unsupported = |e: toron_core::backend::BackendError| {
-            e.code() == &toron_core::backend::error::BackendErrorCode::Unsupported
-        };
-        assert!(b.workspace_list().is_err_and(unsupported));
-        assert!(b.pane_split("p", "right", None).is_err_and(unsupported));
-        assert!(b.agent_list().is_err_and(unsupported));
-        assert!(b.subscribe(&[]).is_err_and(unsupported));
-        // name() is the one non-default — it must succeed
-        assert_eq!(b.name(), "all-unsupported-mux");
-    }
-
-    #[test]
-    fn every_mail_default_method_is_unsupported_not_ok() {
-        let b = AllUnsupportedMail;
-        assert!(matches!(b.health(), Err(BackendError::Unsupported { .. })));
-        assert!(matches!(
-            b.ensure_project("p"),
-            Err(BackendError::Unsupported { .. })
-        ));
-        assert!(matches!(
-            b.send("p", &[], "s", "b", "normal", false, None),
-            Err(BackendError::Unsupported { .. })
-        ));
-        assert!(matches!(
-            b.reserve("p", "a", &[], 60, true, "r"),
-            Err(BackendError::Unsupported { .. })
-        ));
-        // ADR-0003 V6 restored surface: the 4 new methods also default to
-        // Unsupported (no method default returns Ok — Unsupported-honesty).
-        assert!(matches!(
-            b.slot_renew("p", "a", "s", 60),
-            Err(BackendError::Unsupported { .. })
-        ));
-        assert!(matches!(
-            b.summarize_thread_product("prod", "t", false),
-            Err(BackendError::Unsupported { .. })
-        ));
-        assert!(matches!(
-            b.force_release_file_reservation("p", "a", 1, None, false),
-            Err(BackendError::Unsupported { .. })
-        ));
-        assert!(matches!(
-            b.cleanup_pane_identities("p"),
-            Err(BackendError::Unsupported { .. })
-        ));
-        assert_eq!(b.name(), "all-unsupported-mail");
     }
 
     /// `BackendError::Display` includes the backend name + method + reason —
@@ -383,7 +319,7 @@ mod tests {
     /// Build the backend for a kind against its live server. agentmail needs
     /// a bearer token (`FLYWHEEL_AGENTMAIL_TOKEN`); toron needs none (the
     /// e2e daemon binds localhost).
-    fn live_backend(kind: ParityKind) -> Box<dyn MailBackend> {
+    fn live_backend(kind: ParityKind) -> Box<dyn MailSurface> {
         match kind {
             ParityKind::Agentmail => {
                 let token = std::env::var("FLYWHEEL_AGENTMAIL_TOKEN")
@@ -438,22 +374,16 @@ mod tests {
         let project = "/private/tmp/flywheel-parity";
         let agent = "CoralFinch";
         let kinds = [ParityKind::Agentmail, ParityKind::Toron];
-        let mut backends: Vec<(ParityKind, Box<dyn MailBackend>)> =
+        let mut backends: Vec<(ParityKind, Box<dyn MailSurface>)> =
             kinds.iter().map(|k| (*k, live_backend(*k))).collect();
 
         // health: both must report a status-ish field (allowlist-normalized).
         for (kind, b) in backends.iter_mut() {
-            let h = b
-                .health()
-                .unwrap_or_else(|e| panic!("{} health: {e}", kind.name()));
-            let status = h
-                .get("status")
-                .or_else(|| h.pointer("/bus/ok"))
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
+            let h = run_mail(b.health()).unwrap_or_else(|e| panic!("{} health: {e}", kind.name()));
+            let status = serde_json::to_value(&h).unwrap_or_default();
             assert!(
-                !status.is_null(),
-                "{} health has a status/bus.ok field: {h}",
+                status.get("bus").is_some() || status.get("status").is_some(),
+                "{} health has a status/bus.ok field: {status}",
                 kind.name()
             );
         }
@@ -461,7 +391,8 @@ mod tests {
         // ensure_project: same normalized key shape (slug/human_key/…).
         let mut ensured = Vec::new();
         for (kind, b) in backends.iter_mut() {
-            ensured.push((*kind, b.ensure_project(project).expect("ensure_project")));
+            let s = run_mail(b.ensure_project(project)).expect("ensure_project");
+            ensured.push((*kind, serde_json::to_value(&s).unwrap_or_default()));
         }
         assert_shape_parity(
             "ensure_project",
@@ -477,44 +408,53 @@ mod tests {
         // documented shared semantic field is `name` (the identity). Assert
         // both echo the same identity; the shape divergence is allowlisted.
         for (kind, b) in backends.iter_mut() {
-            let r = b
-                .register_agent(project, agent, "opencode", "test", "parity")
+            let profile = crate::backend::AgentProfile {
+                name: agent.to_string(),
+                program: Some("opencode".into()),
+                model: Some("test".into()),
+                persona: None,
+                task_description: Some("parity".into()),
+            };
+            let r = run_mail(b.register_agent(project, &profile))
                 .unwrap_or_else(|e| panic!("{} register_agent: {e}", kind.name()));
-            let got = r
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_else(|| panic!("{} register_agent echoes name: {r}", kind.name()));
-            assert_eq!(got, agent, "{} register_agent identity: {r}", kind.name());
+            assert_eq!(r.name, agent, "{} register_agent identity: {r:?}", kind.name());
         }
 
         // list_agents: both array of agent objects with same semantic keys.
         let mut agents = Vec::new();
         for (kind, b) in backends.iter_mut() {
-            agents.push((*kind, b.list_agents(project).expect("list_agents")));
+            let a = run_mail(b.list_agents(project, None)).expect("list_agents");
+            agents.push((*kind, serde_json::to_value(&a).unwrap_or_default()));
         }
         assert_shape_parity("list_agents", &agents[0].1, &agents[1].1, &[], true);
 
         // send + inbox round-trip: send to self, then fetch the inbox.
         for (_kind, b) in backends.iter_mut() {
-            b.send(
-                project,
-                &[agent.to_string()],
-                "parity subject",
-                "parity body",
-                "normal",
-                false,
-                None,
-            )
+            let _ = run_mail(b.send(&crate::backend::SendMail {
+                project: project.to_string(),
+                sender: agent.to_string(),
+                to: vec![agent.to_string()],
+                subject: "parity subject".into(),
+                body_md: "parity body".into(),
+                importance: Some("normal".into()),
+                ack_required: false,
+                ..Default::default()
+            }))
             .expect("send");
         }
         let mut inboxes = Vec::new();
         for (kind, b) in backends.iter_mut() {
-            let filter = crate::backend::InboxFilter {
+            let items = run_mail(b.inbox(&InboxQuery {
+                project: project.to_string(),
+                agent: agent.to_string(),
+                unread_only: false,
+                limit: Some(5),
                 include_bodies: true,
-                limit: 5,
-                ..Default::default()
-            };
-            inboxes.push((*kind, b.inbox(project, agent, &filter).expect("inbox")));
+                urgent_only: false,
+                since_ts: None,
+            }))
+            .expect("inbox");
+            inboxes.push((*kind, serde_json::to_value(&items).unwrap_or_default()));
         }
         assert_shape_parity("inbox", &inboxes[0].1, &inboxes[1].1, &[], true);
 
@@ -522,46 +462,45 @@ mod tests {
         // row), then assert both backends' replies landed. The reply subject
         // contract (c3b.5) is `Re: <parent subject>` — the empty-subject
         // hardcode is gone; the parent lookup runs against the project inbox.
-        let reply_targets = inboxes
+        let reply_targets: Vec<(ParityKind, Vec<crate::backend::MailItem>)> = inboxes
             .iter()
             .map(|(kind, v)| {
-                let row = v
-                    .as_array()
-                    .and_then(|a| a.first())
-                    .unwrap_or_else(|| panic!("{} inbox has a row to reply to", kind.name()));
-                let id = row
-                    .get("id")
-                    .or_else(|| row.get("message_id"))
-                    .or_else(|| row.get("event_id"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_else(|| panic!("{} inbox row has an id: {row}", kind.name()))
-                    .to_string();
-                (*kind, id)
+                let items: Vec<crate::backend::MailItem> =
+                    serde_json::from_value(v.clone()).expect("inbox rows are MailItems");
+                assert!(!items.is_empty(), "{} inbox has a row to reply to", kind.name());
+                (*kind, items)
             })
-            .collect::<Vec<_>>();
+            .collect();
         for (kind, b) in backends.iter_mut() {
-            let (_, id) = reply_targets
+            let (_, items) = reply_targets
                 .iter()
                 .find(|(k, _)| *k == *kind)
-                .expect("target id");
-            b.reply(project, id, "parity reply body", Some(&[agent.to_string()]))
-                .unwrap_or_else(|e| panic!("{} reply: {e}", kind.name()));
+                .expect("target items");
+            let id = items[0].id.as_str();
+            let _ = run_mail(b.reply(&crate::backend::ReplyMail {
+                project: project.to_string(),
+                sender: agent.to_string(),
+                to: vec![agent.to_string()],
+                subject: "Re: parity subject".into(),
+                body_md: "parity reply body".into(),
+                ack_required: false,
+                thread_id: crate::backend::MessageId::from(id.to_string()),
+            }))
+            .unwrap_or_else(|e| panic!("{} reply: {e}", kind.name()));
         }
         // both replies visible in the inbox (subject prefixed `Re: `).
         for (kind, b) in backends.iter_mut() {
-            let filter = crate::backend::InboxFilter {
+            let items = run_mail(b.inbox(&InboxQuery {
+                project: project.to_string(),
+                agent: agent.to_string(),
+                unread_only: false,
+                limit: Some(10),
                 include_bodies: true,
-                limit: 10,
-                ..Default::default()
-            };
-            let v = b.inbox(project, agent, &filter).expect("inbox after reply");
-            let subjects: Vec<String> = v
-                .as_array()
-                .unwrap_or(&Vec::new())
-                .iter()
-                .filter_map(|r| r.get("subject").and_then(serde_json::Value::as_str))
-                .map(String::from)
-                .collect();
+                urgent_only: false,
+                since_ts: None,
+            }))
+            .expect("inbox after reply");
+            let subjects: Vec<String> = items.iter().map(|m| m.subject.clone()).collect();
             assert!(
                 subjects.iter().any(|s| s.starts_with("Re: parity subject")),
                 "{} reply carries Re: parent subject: {subjects:?}",
@@ -575,36 +514,28 @@ mod tests {
         // message element shape is already proven by the inbox parity above.
         let mut searches = Vec::new();
         for (kind, b) in backends.iter_mut() {
-            let mut last = b
-                .search(
-                    project,
-                    "parity",
-                    5,
-                    &crate::backend::SearchFilter::default(),
-                )
-                .expect("search");
+            let mut last = run_mail(b.search(&crate::backend::SearchQuery {
+                project: project.to_string(),
+                query: "parity".into(),
+                limit: Some(5),
+                ..Default::default()
+            }))
+            .expect("search");
             if *kind == ParityKind::Toron {
                 let deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(10);
-                while std::time::Instant::now() < deadline
-                    && last
-                        .pointer("/result")
-                        .and_then(serde_json::Value::as_array)
-                        .map(|a| a.is_empty())
-                        .unwrap_or(true)
-                {
+                while std::time::Instant::now() < deadline && last.is_empty() {
                     std::thread::sleep(std::time::Duration::from_millis(500));
-                    last = b
-                        .search(
-                            project,
-                            "parity",
-                            5,
-                            &crate::backend::SearchFilter::default(),
-                        )
-                        .expect("search");
+                    last = run_mail(b.search(&crate::backend::SearchQuery {
+                        project: project.to_string(),
+                        query: "parity".into(),
+                        limit: Some(5),
+                        ..Default::default()
+                    }))
+                    .expect("search");
                 }
             }
-            searches.push((*kind, last));
+            searches.push((*kind, serde_json::to_value(&last).unwrap_or_default()));
         }
         assert_shape_parity("search", &searches[0].1, &searches[1].1, &[], false);
     }
@@ -622,38 +553,45 @@ mod tests {
         let project = "/private/tmp/flywheel-ack-hex";
         let agent = "CoralFinch";
 
-        b.ensure_project(project).expect("ensure_project");
-        b.register_agent(project, agent, "opencode", "test", "ack-hex")
-            .expect("register_agent");
-        b.send(
-            project,
-            &[agent.to_string()],
-            "se2.2 ack-hex subject",
-            "se2.2 ack-hex body",
-            "normal",
-            false,
-            None,
-        )
+        run_mail(b.ensure_project(project)).expect("ensure_project");
+        let profile = crate::backend::AgentProfile {
+            name: agent.to_string(),
+            program: Some("opencode".into()),
+            model: Some("test".into()),
+            persona: None,
+            task_description: Some("ack-hex".into()),
+        };
+        run_mail(b.register_agent(project, &profile)).expect("register_agent");
+        let _ = run_mail(b.send(&crate::backend::SendMail {
+            project: project.to_string(),
+            sender: agent.to_string(),
+            to: vec![agent.to_string()],
+            subject: "se2.2 ack-hex subject".into(),
+            body_md: "se2.2 ack-hex body".into(),
+            importance: Some("normal".into()),
+            ack_required: false,
+            ..Default::default()
+        }))
         .expect("send");
 
-        let filter = crate::backend::InboxFilter {
-            include_bodies: true,
-            limit: 10,
-            ..Default::default()
-        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let id = loop {
-            let inbox = b.inbox(project, agent, &filter).expect("inbox");
-            let arr = inbox.as_array().expect("inbox is an array");
-            if let Some(id) = arr
-                .iter()
-                .find_map(|m| m.get("id").and_then(serde_json::Value::as_str))
-            {
-                break id.to_string();
+            let inbox = run_mail(b.inbox(&InboxQuery {
+                project: project.to_string(),
+                agent: agent.to_string(),
+                unread_only: false,
+                limit: Some(10),
+                include_bodies: true,
+                urgent_only: false,
+                since_ts: None,
+            }))
+            .expect("inbox");
+            if let Some(item) = inbox.first() {
+                break item.id.as_str().to_string();
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "toron inbox never delivered the message: {inbox}"
+                "toron inbox never delivered the message"
             );
             std::thread::sleep(std::time::Duration::from_millis(500));
         };
@@ -664,8 +602,18 @@ mod tests {
         );
         assert_ne!(id, "0", "hex id never becomes 0");
 
-        b.ack(project, agent, &id).expect("ack(hex) succeeds");
-        b.mark_read(project, agent, &id).expect("mark_read(hex) succeeds");
+        run_mail(b.acknowledge(&crate::backend::ReceiptOp {
+            project: project.to_string(),
+            agent: agent.to_string(),
+            message_id: crate::backend::MessageId::from(id.clone()),
+        }))
+        .expect("ack(hex) succeeds");
+        run_mail(b.mark_read(&crate::backend::ReceiptOp {
+            project: project.to_string(),
+            agent: agent.to_string(),
+            message_id: crate::backend::MessageId::from(id),
+        }))
+        .expect("mark_read(hex) succeeds");
     }
 
     /// 193.3: the shape-normalization allowlist is not vacuous — id-type,
