@@ -33,8 +33,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use anyhow::{anyhow, bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use tokio::runtime::Runtime;
 
@@ -303,7 +303,8 @@ impl Mail {
             }
             BackendKind::Remote(_) => {
                 // `project_key` is unused by the toron tool; empty string.
-                let mut v = self.call_remote("health_check", json!({ "project_key": "" }))?;
+                let mut v =
+                    self.call_remote("health_check", crate::backend::wire::health_check_args())?;
                 v["transport"] = json!("http"); // distinguishing marker: remote mode
                 Ok(v)
             }
@@ -317,9 +318,10 @@ impl Mail {
                 let state = block_on(mailbox().ensure_project(project_key))?;
                 Ok(state.to_json())
             }
-            BackendKind::Remote(_) => {
-                self.call_remote("ensure_project", json!({ "human_key": project_key }))
-            }
+            BackendKind::Remote(_) => self.call_remote(
+                "ensure_project",
+                crate::backend::wire::ensure_project_args(project_key),
+            ),
         }
     }
 
@@ -331,9 +333,10 @@ impl Mail {
                     block_on(mailbox().list_agents(project_key, ListAgentsOptions::default()))?;
                 Ok(Value::Array(agents.iter().map(ToJson::to_json).collect()))
             }
-            BackendKind::Remote(_) => {
-                self.call_remote("list_agents", json!({ "project_key": project_key }))
-            }
+            BackendKind::Remote(_) => self.call_remote(
+                "list_agents",
+                crate::backend::wire::list_agents_args(project_key),
+            ),
         }
     }
 
@@ -357,13 +360,13 @@ impl Mail {
             }
             BackendKind::Remote(_) => self.call_remote(
                 "register_agent",
-                json!({
-                    "project_key": project_key,
-                    "name": name,
-                    "program": program,
-                    "model": model,
-                    "task_description": task_description,
-                }),
+                crate::backend::wire::register_agent_args(
+                    project_key,
+                    name,
+                    program,
+                    model,
+                    task_description,
+                ),
             ),
         }
     }
@@ -389,12 +392,16 @@ impl Mail {
             }
             BackendKind::Remote(_) => self.call_remote(
                 "fetch_inbox",
-                json!({
-                    "project_key": project_key,
-                    "agent_name": agent_name,
-                    "limit": limit,
-                    "include_bodies": true,
-                }),
+                crate::backend::wire::inbox_args(
+                    project_key,
+                    agent_name,
+                    false,
+                    false,
+                    false,
+                    true,
+                    limit,
+                    None,
+                ),
             ),
         }
     }
@@ -446,13 +453,16 @@ impl Mail {
             BackendKind::Remote(_) => {
                 let v = self.call_remote(
                     "fetch_inbox",
-                    json!({
-                        "project_key": project_key,
-                        "agent_name": agent_name,
-                        "limit": filter.limit,
-                        "include_bodies": filter.include_bodies,
-                        "unread_only": filter.unread_only,
-                    }),
+                    crate::backend::wire::inbox_args(
+                        project_key,
+                        agent_name,
+                        filter.urgent_only,
+                        filter.unread_only,
+                        filter.ack_overdue_only,
+                        filter.include_bodies,
+                        filter.limit,
+                        filter.since_ts.as_deref(),
+                    ),
                 )?;
                 // Same policy on the wire rows (InboxMessageOut carries
                 // `importance` + `created_ts_us`): filter client-side.
@@ -504,11 +514,11 @@ impl Mail {
                 // agentmail.rs owns the decimal-id edge).
                 self.call_remote(
                     "mark_message_read",
-                    json!({
-                        "project_key": project_key,
-                        "agent_name": agent_name,
-                        "message_id": message_id,
-                    }),
+                    crate::backend::wire::mark_read_args(
+                        project_key,
+                        agent_name,
+                        json!(message_id),
+                    ),
                 )
             }
         }
@@ -519,7 +529,8 @@ impl Mail {
         match &self.backend {
             BackendKind::InProcess => {
                 // toron ids are hex event ids — pass through verbatim.
-                let r = block_on(mailbox().acknowledge_message(project_key, agent_name, message_id))?;
+                let r =
+                    block_on(mailbox().acknowledge_message(project_key, agent_name, message_id))?;
                 Ok(r.to_json())
             }
             BackendKind::Remote(_) => {
@@ -528,11 +539,7 @@ impl Mail {
                 // pass it through verbatim (se2.2).
                 self.call_remote(
                     "acknowledge_message",
-                    json!({
-                        "project_key": project_key,
-                        "agent_name": agent_name,
-                        "message_id": message_id,
-                    }),
+                    crate::backend::wire::ack_args(project_key, agent_name, json!(message_id)),
                 )
             }
         }
@@ -556,11 +563,16 @@ impl Mail {
             }
             BackendKind::Remote(_) => self.call_remote(
                 "fetch_inbox",
-                json!({
-                    "project_key": project_key,
-                    "agent_name": agent_name,
-                    "include_bodies": false,
-                }),
+                crate::backend::wire::inbox_args(
+                    project_key,
+                    agent_name,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                ),
             ),
         }
     }
@@ -593,18 +605,16 @@ impl Mail {
                 Ok(result.to_json())
             }
             BackendKind::Remote(_) => {
-                let mut args = json!({
-                    "project_key": project_key,
-                    "sender_name": self.name,
-                    "to": to,
-                    "subject": subject,
-                    "body_md": body,
-                    "importance": importance,
-                    "ack_required": ack,
-                });
-                if let Some(tid) = thread_id {
-                    args["thread_id"] = json!(tid);
-                }
+                let args = crate::backend::wire::send_args(
+                    project_key,
+                    &self.name,
+                    to,
+                    subject,
+                    body,
+                    importance,
+                    ack,
+                    thread_id,
+                );
                 self.call_remote("send_message", args)
             }
         }
@@ -635,16 +645,47 @@ impl Mail {
             }
             BackendKind::Remote(_) => self.call_remote(
                 "reply_message",
-                json!({
-                    "project_key": project_key,
-                    "sender_name": self.name,
-                    "to": to.map(|t| t.to_vec()).unwrap_or_default(),
-                    "subject": "",
-                    "body_md": body,
-                    "thread_id": message_id.to_string(),
-                }),
+                crate::backend::wire::reply_args(
+                    project_key,
+                    &self.name,
+                    &to.map(|t| t.to_vec()).unwrap_or_default(),
+                    // c3b.5: reply subject populated from the parent (`Re: `);
+                    // was hardcoded `""` (unverified wire contract).
+                    &self.parent_reply_subject(project_key, message_id)?,
+                    body,
+                    "thread_id",
+                    json!(message_id),
+                ),
             ),
         }
+    }
+
+    /// c3b.5: resolve the `Re: <parent subject>` subject for a reply. Looks
+    /// the parent up in the project inbox (the message being replied to must
+    /// be visible to this identity); falls back to `""` when the parent
+    /// cannot be found — the wire builder still carries the subject field, so
+    /// the hardcoded-empty contract is gone. Works for BOTH backends (the
+    /// inbox fetch is the common projection).
+    fn parent_reply_subject(&self, project_key: &str, message_id: &str) -> Result<String> {
+        let v = self.inbox_filtered(
+            project_key,
+            &self.name,
+            &MailInboxFilter {
+                unread_only: false,
+                include_bodies: false,
+                limit: 500,
+                ..Default::default()
+            },
+        )?;
+        let parent = v.as_array().and_then(|rs| {
+            rs.iter().find(|r| {
+                r["id"].as_str() == Some(message_id) || r["thread_id"].as_str() == Some(message_id)
+            })
+        });
+        Ok(match parent.and_then(|r| r["subject"].as_str()) {
+            Some(subj) if !subj.is_empty() => format!("Re: {subj}"),
+            _ => String::new(),
+        })
     }
 
     /// `summarize_thread`.
@@ -667,11 +708,7 @@ impl Mail {
             }
             BackendKind::Remote(_) => self.call_remote(
                 "summarize_thread",
-                json!({
-                    "project_key": project_key,
-                    "thread_id": thread_id,
-                    "llm_mode": llm_mode,
-                }),
+                crate::backend::wire::summarize_thread_args(project_key, thread_id, llm_mode),
             ),
         }
     }
@@ -692,11 +729,11 @@ impl Mail {
             }
             BackendKind::Remote(_) => self.call_remote(
                 "summarize_thread_product",
-                json!({
-                    "product_key": product_key,
-                    "thread_id": thread_id,
-                    "llm_mode": llm_mode,
-                }),
+                crate::backend::wire::summarize_thread_product_args(
+                    product_key,
+                    thread_id,
+                    llm_mode,
+                ),
             ),
         }
     }
@@ -726,27 +763,21 @@ impl Mail {
                 Ok(json!({ "result": msgs.iter().map(ToJson::to_json).collect::<Vec<Value>>() }))
             }
             BackendKind::Remote(_) => {
-                let mut args = json!({
-                    "project_key": project_key,
-                    "query": query,
-                    "limit": limit,
-                });
-                if filter.include_body_md {
-                    args["include_body_md"] = json!(true);
-                }
-                if let Some(s) = &filter.sender {
-                    args["sender"] = json!(s);
-                }
-                if let Some(i) = &filter.importance {
-                    args["importance"] = json!(i);
-                }
-                if let Some(t) = &filter.thread_id {
-                    args["thread_id"] = json!(t);
-                }
-                if let Some(r) = &filter.ranking {
-                    args["ranking"] = json!(r);
-                }
-                let res = self.call_remote("search_messages", args)?;
+                let res = self.call_remote(
+                    "search_messages",
+                    crate::backend::wire::search_args(
+                        project_key,
+                        query,
+                        limit,
+                        filter.include_body_md,
+                        filter.sender.as_deref(),
+                        filter.importance.as_deref(),
+                        filter.thread_id.as_deref(),
+                        filter.date_start.as_deref(),
+                        filter.date_end.as_deref(),
+                        filter.ranking.as_deref(),
+                    ),
+                )?;
                 // The toron daemon already returns the envelope
                 // (`{"result": [...], "next_cursor": ...}`); legacy
                 // agent-mail returned a bare array. Pass the envelope
@@ -768,31 +799,18 @@ impl Mail {
         limit: u32,
         filter: &MailSearchFilter,
     ) -> Value {
-        let mut args = json!({
-            "project_key": project_key, "query": query, "limit": limit
-        });
-        if filter.include_body_md {
-            args["include_body_md"] = json!(true);
-        }
-        if let Some(s) = &filter.sender {
-            args["sender"] = json!(s);
-        }
-        if let Some(i) = &filter.importance {
-            args["importance"] = json!(i);
-        }
-        if let Some(t) = &filter.thread_id {
-            args["thread_id"] = json!(t);
-        }
-        if let Some(d) = &filter.date_start {
-            args["date_start"] = json!(d);
-        }
-        if let Some(d) = &filter.date_end {
-            args["date_end"] = json!(d);
-        }
-        if let Some(r) = &filter.ranking {
-            args["ranking"] = json!(r);
-        }
-        args
+        crate::backend::wire::search_args(
+            project_key,
+            query,
+            limit,
+            filter.include_body_md,
+            filter.sender.as_deref(),
+            filter.importance.as_deref(),
+            filter.thread_id.as_deref(),
+            filter.date_start.as_deref(),
+            filter.date_end.as_deref(),
+            filter.ranking.as_deref(),
+        )
     }
 
     /// `file_reservation_paths`.
@@ -818,14 +836,14 @@ impl Mail {
             }
             BackendKind::Remote(_) => self.call_remote(
                 "file_reservation_paths",
-                json!({
-                    "project_key": project_key,
-                    "agent_name": self.name,
-                    "paths": paths,
-                    "ttl_seconds": ttl_seconds as i64,
-                    "exclusive": exclusive,
-                    "reason": reason,
-                }),
+                crate::backend::wire::reserve_args(
+                    project_key,
+                    &self.name,
+                    paths,
+                    ttl_seconds,
+                    exclusive,
+                    reason,
+                ),
             ),
         }
     }
@@ -840,7 +858,7 @@ impl Mail {
             }
             BackendKind::Remote(_) => self.call_remote(
                 "release_file_reservations",
-                json!({ "project_key": project_key, "agent_name": self.name }),
+                crate::backend::wire::release_args(project_key, &self.name),
             ),
         }
     }
@@ -858,11 +876,7 @@ impl Mail {
             }
             BackendKind::Remote(_) => self.call_remote(
                 "check_file_reservation_conflicts",
-                json!({
-                    "project_key": project_key,
-                    "agent_name": self.name,
-                    "paths": paths,
-                }),
+                crate::backend::wire::conflicts_args(project_key, &self.name, paths),
             ),
         }
     }
@@ -896,15 +910,15 @@ impl Mail {
                 }))
             }
             BackendKind::Remote(_) => {
-                let mut args = json!({
-                    "project_key": project_key,
-                    "agent_name": agent_name,
-                    "extend_seconds": extend_seconds as i64,
-                });
-                if let Some(p) = paths {
-                    args["paths"] = json!(p);
-                }
-                let res = self.call_remote("renew_file_reservations", args)?;
+                let res = self.call_remote(
+                    "renew_file_reservations",
+                    crate::backend::wire::renew_args(
+                        project_key,
+                        agent_name,
+                        extend_seconds,
+                        paths,
+                    ),
+                )?;
                 // Remap the tool's `reservations` array onto the in-process
                 // `file_reservations` envelope `list_own_reservations` reads.
                 let mut out = json!({ "renewed": res.get("renewed").cloned().unwrap_or(json!(0)) });
@@ -956,18 +970,16 @@ impl Mail {
                 ))?;
                 Ok(json!({ "ok": true }))
             }
-            BackendKind::Remote(_) => {
-                let mut args = json!({
-                    "project_key": project_key,
-                    "agent_name": agent_name,
-                    "file_reservation_id": file_reservation_id,
-                    "notify_previous": notify_previous,
-                });
-                if let Some(n) = note {
-                    args["note"] = json!(n);
-                }
-                self.call_remote("force_release_file_reservation", args)
-            }
+            BackendKind::Remote(_) => self.call_remote(
+                "force_release_file_reservation",
+                crate::backend::wire::force_release_args(
+                    project_key,
+                    agent_name,
+                    json!(file_reservation_id),
+                    note,
+                    notify_previous,
+                ),
+            ),
         }
     }
 
@@ -991,7 +1003,7 @@ impl Mail {
             }
             BackendKind::Remote(_) => self.call_remote(
                 "cleanup_pane_identities",
-                json!({ "project_key": _project_key }),
+                crate::backend::wire::cleanup_pane_identities_args(_project_key),
             ),
         }
     }
@@ -1019,18 +1031,16 @@ impl Mail {
                 }))?;
                 Ok(link.to_json())
             }
-            BackendKind::Remote(_) => {
-                let mut args = json!({
-                    "project_key": project_key,
-                    "from_agent": from_agent,
-                    "to_agent": to_agent,
-                    "reason": reason,
-                });
-                if let Some(tp) = to_project {
-                    args["to_project"] = json!(tp);
-                }
-                self.call_remote("request_contact", args)
-            }
+            BackendKind::Remote(_) => self.call_remote(
+                "request_contact",
+                crate::backend::wire::request_contact_args(
+                    project_key,
+                    from_agent,
+                    to_agent,
+                    to_project,
+                    reason,
+                ),
+            ),
         }
     }
 
@@ -1055,12 +1065,12 @@ impl Mail {
             }
             BackendKind::Remote(_) => self.call_remote(
                 "respond_contact",
-                json!({
-                    "project_key": project_key,
-                    "to_agent": to_agent,
-                    "from_agent": from_agent,
-                    "accept": accept,
-                }),
+                crate::backend::wire::respond_contact_args(
+                    project_key,
+                    to_agent,
+                    from_agent,
+                    accept,
+                ),
             ),
         }
     }
@@ -1074,7 +1084,7 @@ impl Mail {
             }
             BackendKind::Remote(_) => self.call_remote(
                 "list_contacts",
-                json!({ "project_key": project_key, "agent_name": agent_name }),
+                crate::backend::wire::list_contacts_args(project_key, agent_name),
             ),
         }
     }
@@ -1098,11 +1108,7 @@ impl Mail {
             BackendKind::Remote(_) => {
                 let res = self.call_remote(
                     "set_contact_policy",
-                    json!({
-                        "project_key": project_key,
-                        "agent_name": agent_name,
-                        "policy": policy,
-                    }),
+                    crate::backend::wire::set_contact_policy_args(project_key, agent_name, policy),
                 )?;
                 Ok(json!({ "policy": policy, "event_id": res }))
             }
@@ -1116,9 +1122,10 @@ impl Mail {
                 let info = block_on(mailbox().ensure_product(product_key, product_key))?;
                 Ok(info.to_json())
             }
-            BackendKind::Remote(_) => {
-                self.call_remote("ensure_product", json!({ "product_key": product_key }))
-            }
+            BackendKind::Remote(_) => self.call_remote(
+                "ensure_product",
+                crate::backend::wire::ensure_product_args(product_key),
+            ),
         }
     }
 
@@ -1131,7 +1138,7 @@ impl Mail {
             }
             BackendKind::Remote(_) => self.call_remote(
                 "products_link",
-                json!({ "product_key": product_key, "project_key": project_key }),
+                crate::backend::wire::products_link_args(product_key, project_key),
             ),
         }
     }
@@ -1155,12 +1162,7 @@ impl Mail {
             BackendKind::Remote(_) => {
                 let res = self.call_remote(
                     "search_messages_product",
-                    json!({
-                        "product_key": product_key,
-                        "query": query,
-                        "limit": limit,
-                        "include_body_md": true,
-                    }),
+                    crate::backend::wire::search_product_args(product_key, query, limit),
                 )?;
                 Ok(json!({ "result": res }))
             }
@@ -1168,12 +1170,7 @@ impl Mail {
     }
 
     /// `fetch_inbox_product`.
-    pub fn inbox_product(
-        &self,
-        product_key: &str,
-        agent_name: &str,
-        limit: u32,
-    ) -> Result<Value> {
+    pub fn inbox_product(&self, product_key: &str, agent_name: &str, limit: u32) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 let res = block_on(mailbox().fetch_inbox_product(product_key, agent_name))?;
@@ -1188,11 +1185,7 @@ impl Mail {
             BackendKind::Remote(_) => {
                 let res = self.call_remote(
                     "fetch_inbox_product",
-                    json!({
-                        "product_key": product_key,
-                        "agent_name": agent_name,
-                        "limit": limit,
-                    }),
+                    crate::backend::wire::inbox_product_args(product_key, agent_name, limit),
                 )?;
                 let msgs = res
                     .as_array()
@@ -1232,13 +1225,13 @@ impl Mail {
             }
             BackendKind::Remote(_) => self.call_remote(
                 "acquire_build_slot",
-                json!({
-                    "project_key": project_key,
-                    "agent_name": agent_name,
-                    "slot": slot,
-                    "ttl_seconds": ttl_seconds as i64,
-                    "exclusive": exclusive,
-                }),
+                crate::backend::wire::slot_acquire_args(
+                    project_key,
+                    agent_name,
+                    slot,
+                    exclusive,
+                    ttl_seconds,
+                ),
             ),
         }
     }
@@ -1268,12 +1261,12 @@ impl Mail {
             BackendKind::Remote(_) => {
                 let res = self.call_remote(
                     "renew_build_slot",
-                    json!({
-                        "project_key": project_key,
-                        "agent_name": agent_name,
-                        "slot": slot,
-                        "extend_seconds": extend_seconds as i64,
-                    }),
+                    crate::backend::wire::slot_renew_args(
+                        project_key,
+                        agent_name,
+                        slot,
+                        extend_seconds,
+                    ),
                 )?;
                 if res.is_null() {
                     Ok(json!({ "slot": slot, "renewed": false }))
@@ -1285,12 +1278,7 @@ impl Mail {
     }
 
     /// `release_build_slot`.
-    pub fn release_slot(
-        &self,
-        project_key: &str,
-        agent_name: &str,
-        slot: &str,
-    ) -> Result<Value> {
+    pub fn release_slot(&self, project_key: &str, agent_name: &str, slot: &str) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 block_on(mailbox().release_build_slot(project_key, agent_name, slot))?;
@@ -1299,11 +1287,7 @@ impl Mail {
             BackendKind::Remote(_) => {
                 let res = self.call_remote(
                     "release_build_slot",
-                    json!({
-                        "project_key": project_key,
-                        "agent_name": agent_name,
-                        "slot": slot,
-                    }),
+                    crate::backend::wire::slot_release_args(project_key, agent_name, slot),
                 )?;
                 Ok(json!({
                     "slot": slot,
@@ -1632,7 +1616,10 @@ mod tests {
     #[test]
     fn block_on_uses_shared_runtime() {
         let _mail = Mail::from_config(None).expect("ok").expect("Some");
-        assert!(RUNTIME.get().is_some(), "from_config initialized the runtime");
+        assert!(
+            RUNTIME.get().is_some(),
+            "from_config initialized the runtime"
+        );
         assert!(block_on(mailbox().ensure_project("se2.1-runtime-test")).is_ok());
         assert!(
             block_on(mailbox().ensure_project("se2.1-runtime-test-2")).is_ok(),
@@ -1652,13 +1639,24 @@ mod tests {
         unsafe { std::env::set_var("TORON_MCP_DATA_DIR", "/tmp/flywheel-se2.1-mcp") };
         let (data_dir, db) = mailbox_roots();
         assert_eq!(data_dir, PathBuf::from("/tmp/flywheel-se2.1-durable"));
-        assert_eq!(db, PathBuf::from("/tmp/flywheel-se2.1-durable/flywheel-mail.sqlite"));
+        assert_eq!(
+            db,
+            PathBuf::from("/tmp/flywheel-se2.1-durable/flywheel-mail.sqlite")
+        );
         unsafe { std::env::remove_var("TORON_DATA_DIR") };
         let (data_dir, _) = mailbox_roots();
-        assert_eq!(data_dir, PathBuf::from("/tmp/flywheel-se2.1-mcp"), "alias fallback");
+        assert_eq!(
+            data_dir,
+            PathBuf::from("/tmp/flywheel-se2.1-mcp"),
+            "alias fallback"
+        );
         unsafe { std::env::set_var("TORON_DATA_DIR", "   ") };
         let (data_dir, _) = mailbox_roots();
-        assert_eq!(data_dir, PathBuf::from("/tmp/flywheel-se2.1-mcp"), "blank counts as unset");
+        assert_eq!(
+            data_dir,
+            PathBuf::from("/tmp/flywheel-se2.1-mcp"),
+            "blank counts as unset"
+        );
         unsafe { std::env::remove_var("TORON_DATA_DIR") };
         unsafe { std::env::remove_var("TORON_MCP_DATA_DIR") };
         let (data_dir, db) = mailbox_roots();
