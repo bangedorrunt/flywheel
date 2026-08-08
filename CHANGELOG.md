@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 🐛 Fixes
 
+- **Live toron ↔ agent-mail search parity** (2026-08-08) — toron's
+  unwrap-loop projection now attributes inbound gift-wraps to their project
+  via the `agents` index: registration upserts `agents` with the verbatim
+  project slug, the pipeline resolves `project_slug` from the recipient key
+  at projection time (was hardcoded empty → project-filtered search always
+  returned `[]`); `search_messages` emits the AM-shaped
+  `{result, next_cursor}` envelope; `mail_shim` passes the daemon envelope
+  through instead of double-wrapping it; the live parity test polls the async
+  projection (bounded 10s) and `live_parity_full_surface` passes against both
+  backends end-to-end.
 - **Collaboration patterns carry real content** — debate/plan-review harvest reply
   **bodies** (not subjects); plan-review gate is a real phase-driven loop honoring
   `--max-change-rounds`; debate/plan-review default agents resolve to spawned

@@ -516,20 +516,42 @@ mod tests {
         }
         assert_shape_parity("inbox", &inboxes[0].1, &inboxes[1].1, &[], true);
 
-        // search: envelope-only (toron's search index can lag; the message
-        // element shape is already proven by the inbox parity above).
+        // search: envelope-only parity. toron's projection is async (bus →
+        // unwrap-loop → sqlite), so poll the toron backend briefly until its
+        // result is non-empty before comparing shapes (bounded, 10s). The
+        // message element shape is already proven by the inbox parity above.
         let mut searches = Vec::new();
         for (kind, b) in backends.iter_mut() {
-            searches.push((
-                *kind,
-                b.search(
+            let mut last = b
+                .search(
                     project,
                     "parity",
                     5,
                     &crate::backend::SearchFilter::default(),
                 )
-                .expect("search"),
-            ));
+                .expect("search");
+            if *kind == ParityKind::Toron {
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::time::Instant::now() < deadline
+                    && last
+                        .pointer("/result")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|a| a.is_empty())
+                        .unwrap_or(true)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    last = b
+                        .search(
+                            project,
+                            "parity",
+                            5,
+                            &crate::backend::SearchFilter::default(),
+                        )
+                        .expect("search");
+                }
+            }
+            searches.push((*kind, last));
         }
         assert_shape_parity("search", &searches[0].1, &searches[1].1, &[], false);
     }
