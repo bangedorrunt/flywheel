@@ -268,6 +268,242 @@ pub fn row_json(mc: &MergedCron, status: &str, next_due_ts: Option<i64>) -> Valu
     })
 }
 
+/// A cron's derived status row (Spec 3): paused | due | running | succeeded |
+/// failed, plus the next-due tick for the scheduler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronStatus {
+    pub name: String,
+    pub status: &'static str,
+    pub enabled: bool,
+    pub next_due: Option<i64>,
+}
+
+/// One recorded run of a cron's workflow (state-log projection).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronRun {
+    pub ts: String,
+    pub project: String,
+    pub run_id: Option<String>,
+    pub status: String,
+    pub bead: Option<String>,
+}
+
+/// The cron manager contract (ADR-0005 Spec 3, P4.6). The flywheel CLI
+/// compiles against THIS trait — never against a concrete manager. Two
+/// implementations:
+///
+/// - [`RegistryCronManager`] — today's default: reads `crons.toml` + the
+///   workflow catalog + the state log. Pure catalog/control surface.
+/// - The P4.3 **cron manager** (BlueOak, in-progress): a Resonate
+///   durable-sleep loop that DRIVES ticks (register/pause/resume/status/history
+///   through the same contract). The CLI is backend-agnostic: swap the
+///   manager, the command surface is unchanged.
+///
+/// `add` MUST fail closed on an unresolvable template / unparsable cron /
+/// unknown owner (the lint-gate contract); the CLI does not re-validate.
+pub trait CronManager {
+    /// The merged view: registry entries + schedule-triggered workflows.
+    fn list(&self) -> Result<Vec<MergedCron>>;
+    /// One cron by name (merged view). None when unknown.
+    fn show(&self, name: &str) -> Result<Option<MergedCron>>;
+    /// Register a new cron (validation + persist). Fails closed.
+    fn add(&mut self, entry: CronEntry) -> Result<()>;
+    /// Pause (false) or resume (true) a cron without losing registration.
+    fn set_enabled(&mut self, name: &str, enabled: bool) -> Result<()>;
+    /// Derived status for one cron.
+    fn status(&self, name: &str) -> Result<Option<CronStatus>>;
+    /// Derived status for every cron in the merged view.
+    fn status_all(&self) -> Result<Vec<CronStatus>>;
+    /// Run history for a cron (state-log scan + failure beads).
+    fn history(&self, name: &str) -> Result<Vec<CronRun>>;
+}
+
+/// The default (registry-backed) cron manager. Reads `crons.toml` + the
+/// workflow catalog + the state log — no tick driving. The P4.3 durable-sleep
+/// manager replaces this behind the same [`CronManager`] contract.
+pub struct RegistryCronManager {
+    /// Workflow provider: built-ins + catalog, name → (workflow, source).
+    workflows: BTreeMap<String, (Workflow, &'static str)>,
+}
+
+impl RegistryCronManager {
+    pub fn new(workflows: BTreeMap<String, (Workflow, &'static str)>) -> Self {
+        Self { workflows }
+    }
+
+    /// Load the manager over the real catalog (built-ins + canonical YAML).
+    pub fn load() -> Result<Self> {
+        let mut workflows: BTreeMap<String, (Workflow, &'static str)> = BTreeMap::new();
+        for (name, wf) in crate::builtin_workflows::builtin_workflows() {
+            workflows.insert(name, (wf, "builtin"));
+        }
+        let cat = crate::workflow_catalog::WorkflowCatalog::load()?;
+        for (name, wf) in cat.workflows {
+            workflows.insert(name, (wf, "catalog"));
+        }
+        Ok(Self::new(workflows))
+    }
+
+    /// The merged view from the current registry state.
+    fn merged(&self) -> Result<Vec<MergedCron>> {
+        let crons = Crons::load()?;
+        Ok(merged_entries(&crons, &self.workflows))
+    }
+}
+
+/// A manager whose workflows are injected (tests use hermetic catalogs).
+pub fn make_registry_manager(
+    workflows: BTreeMap<String, (Workflow, &'static str)>,
+) -> RegistryCronManager {
+    RegistryCronManager::new(workflows)
+}
+
+impl CronManager for RegistryCronManager {
+    fn list(&self) -> Result<Vec<MergedCron>> {
+        self.merged()
+    }
+
+    fn show(&self, name: &str) -> Result<Option<MergedCron>> {
+        Ok(self
+            .merged()?
+            .into_iter()
+            .find(|m| m.entry.name == name))
+    }
+
+    fn add(&mut self, entry: CronEntry) -> Result<()> {
+        // fail-stop validation, mirroring lint_flywheel_tier: template must
+        // resolve, owner profile must exist, cron must parse (upsert checks).
+        if !self.workflows.contains_key(&entry.template) {
+            bail!("template {:?} does not resolve (flywheel workflow list)", entry.template);
+        }
+        let profiles = crate::profile::ProfileCatalog::load().unwrap_or_default();
+        if !profiles.get(&entry.owner).is_some() {
+            bail!(
+                "owner profile {:?} does not resolve (known: {})",
+                entry.owner,
+                profiles.names().join(", ")
+            );
+        }
+        let mut crons = Crons::load()?;
+        crons.upsert(entry)?;
+        crons.save()
+    }
+
+    fn set_enabled(&mut self, name: &str, enabled: bool) -> Result<()> {
+        let mut crons = Crons::load()?;
+        crons.set_enabled(name, enabled)?;
+        crons.save()
+    }
+
+    fn status(&self, name: &str) -> Result<Option<CronStatus>> {
+        Ok(self.show(name)?.map(|mc| cron_status(&mc)))
+    }
+
+    fn status_all(&self) -> Result<Vec<CronStatus>> {
+        Ok(self.merged()?.iter().map(cron_status).collect())
+    }
+
+    fn history(&self, name: &str) -> Result<Vec<CronRun>> {
+        Ok(cron_history(name))
+    }
+}
+
+/// Derive a [`CronStatus`] row for a merged cron (registry state + state log).
+fn cron_status(mc: &MergedCron) -> CronStatus {
+    let (last, in_flight) = last_run_state(&mc.entry.name);
+    let status = derive_status(mc.entry.enabled, in_flight, last.as_deref());
+    let next_due = next_due(&mc.entry.cron, now_ts());
+    CronStatus {
+        name: mc.entry.name.clone(),
+        status,
+        enabled: mc.entry.enabled,
+        next_due,
+    }
+}
+
+/// Last terminal status + in-flight flag for a workflow from the state log.
+fn last_run_state(name: &str) -> (Option<String>, bool) {
+    let dir = crate::config::state_dir();
+    let mut last_status: Option<String> = None;
+    let mut in_flight = false;
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return (None, false);
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name().to_string_lossy().to_string();
+        if !fname.ends_with(".jsonl") {
+            continue;
+        }
+        let project = fname.trim_end_matches(".jsonl").to_string();
+        let Ok(events) = crate::state::read_log(&project) else {
+            continue;
+        };
+        for e in events {
+            if e.kind != crate::state::EventKind::Workflow {
+                continue;
+            }
+            let owner = e.data.get("workflow").and_then(Value::as_str);
+            if owner != Some(name) {
+                continue;
+            }
+            match e.data.get("status").and_then(Value::as_str) {
+                Some(s) if s == "failed" || s == "succeeded" => {
+                    last_status = Some(s.to_string())
+                }
+                Some(s) if s == "running" => in_flight = true,
+                _ => {}
+            }
+        }
+    }
+    (last_status, in_flight)
+}
+
+/// Run history for a workflow from the state log (+ failure beads).
+fn cron_history(name: &str) -> Vec<CronRun> {
+    let dir = crate::config::state_dir();
+    let mut rows: Vec<CronRun> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return rows;
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name().to_string_lossy().to_string();
+        if !fname.ends_with(".jsonl") {
+            continue;
+        }
+        let project = fname.trim_end_matches(".jsonl").to_string();
+        let Ok(events) = crate::state::read_log(&project) else {
+            continue;
+        };
+        for e in events {
+            if e.kind != crate::state::EventKind::Workflow {
+                continue;
+            }
+            let owner = e.data.get("workflow").and_then(Value::as_str);
+            if owner != Some(name) {
+                continue;
+            }
+            rows.push(CronRun {
+                ts: e.ts.clone(),
+                project: project.clone(),
+                run_id: e
+                    .data
+                    .get("run_id")
+                    .and_then(Value::as_i64)
+                    .map(|i| i.to_string()),
+                status: e
+                    .data
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("done")
+                    .to_string(),
+                bead: e.data.get("bead").and_then(Value::as_str).map(str::to_string),
+            });
+        }
+    }
+    rows.sort_by(|a, b| b.ts.cmp(&a.ts));
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +737,112 @@ mod tests {
         assert_eq!(row["enabled"], true);
         assert_eq!(row["status"], "succeeded");
         assert_eq!(row["next_due"], 1776214200);
+    }
+
+    /// THE trait seam (bd-p4-cli-b99j, handoff): the CLI surface must compile
+    /// against the [`CronManager`] CONTRACT, not a concrete impl — the P4.3
+    /// durable-sleep cron manager will implement the same trait. This mock
+    /// stands in for that manager and exercises the full surface: list/show/
+    /// add/set_enabled/status/status_all/history.
+    #[derive(Default)]
+    struct MockManager {
+        crons: Vec<CronEntry>,
+    }
+
+    impl CronManager for MockManager {
+        fn list(&self) -> Result<Vec<MergedCron>> {
+            Ok(self
+                .crons
+                .iter()
+                .map(|e| MergedCron {
+                    entry: e.clone(),
+                    source: "cron",
+                })
+                .collect())
+        }
+        fn show(&self, name: &str) -> Result<Option<MergedCron>> {
+            Ok(self
+                .crons
+                .iter()
+                .find(|e| e.name == name)
+                .map(|e| MergedCron {
+                    entry: e.clone(),
+                    source: "cron",
+                }))
+        }
+        fn add(&mut self, entry: CronEntry) -> Result<()> {
+            self.crons.push(entry);
+            Ok(())
+        }
+        fn set_enabled(&mut self, name: &str, enabled: bool) -> Result<()> {
+            let e = self
+                .crons
+                .iter_mut()
+                .find(|e| e.name == name)
+                .ok_or_else(|| anyhow!("unknown cron {name:?}"))?;
+            e.enabled = enabled;
+            Ok(())
+        }
+        fn status(&self, name: &str) -> Result<Option<CronStatus>> {
+            Ok(self.show(name)?.map(|mc| cron_status(&mc)))
+        }
+        fn status_all(&self) -> Result<Vec<CronStatus>> {
+            Ok(self.list()?.iter().map(cron_status).collect())
+        }
+        fn history(&self, _name: &str) -> Result<Vec<CronRun>> {
+            Ok(vec![])
+        }
+    }
+
+    /// The CLI drives any manager through the trait: register → pause →
+    /// resume → status — all via the [`CronManager`] surface.
+    #[test]
+    fn cli_surface_works_against_any_manager_impl() {
+        let mut mgr = MockManager::default();
+        let mut entry = sample("weekly-docker-upgrade");
+
+        // add
+        mgr.add(entry.clone()).expect("add");
+        assert_eq!(mgr.list().unwrap().len(), 1);
+
+        // show + status (due before any runs)
+        let shown = mgr.show("weekly-docker-upgrade").unwrap().expect("show");
+        assert_eq!(shown.entry.template, "weekly-docker-upgrade-wf");
+        let st = mgr.status("weekly-docker-upgrade").unwrap().expect("status");
+        assert_eq!(st.status, "due");
+        assert!(st.next_due.is_some(), "next_due computed");
+
+        // pause → status flips to paused, entry preserved
+        mgr.set_enabled("weekly-docker-upgrade", false).unwrap();
+        let paused = mgr.status("weekly-docker-upgrade").unwrap().unwrap();
+        assert_eq!(paused.status, "paused");
+        assert_eq!(
+            mgr.show("weekly-docker-upgrade").unwrap().unwrap().entry.cron,
+            entry.cron,
+            "pause preserves cron expr"
+        );
+
+        // resume → back to due
+        mgr.set_enabled("weekly-docker-upgrade", true).unwrap();
+        assert_eq!(
+            mgr.status("weekly-docker-upgrade").unwrap().unwrap().status,
+            "due"
+        );
+
+        // status_all + history complete the surface
+        let all = mgr.status_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(mgr.history("weekly-docker-upgrade").unwrap().len(), 0);
+
+        // the same lifecycle through a trait object (the CLI's dispatch shape)
+        let mut dyn_mgr: Box<dyn CronManager> = Box::new(MockManager::default());
+        dyn_mgr.add(entry.clone()).unwrap();
+        entry.enabled = false;
+        dyn_mgr.set_enabled(&entry.name, false).unwrap();
+        assert_eq!(
+            dyn_mgr.status(&entry.name).unwrap().unwrap().status,
+            "paused"
+        );
+        assert!(!dyn_mgr.list().unwrap()[0].entry.enabled);
     }
 }
