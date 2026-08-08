@@ -13,6 +13,8 @@ mod mail_shim;
 mod mcp_http;
 mod output;
 mod profile;
+mod stages;
+mod workflow_catalog;
 mod state;
 mod toron_embed;
 mod work;
@@ -1051,7 +1053,7 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
 /// them is churn with no payoff until superlogical ships). The two overloads
 /// share the helper bodies via macros-free duplication (small, narrow).
 fn find_workspace_dyn(
-    backend: &mut dyn backend::MultiplexerBackend,
+    backend: &dyn backend::MultiplexerBackend,
     project: &str,
 ) -> Result<String> {
     let label = swarm_label(project);
@@ -1082,7 +1084,7 @@ fn find_workspace_dyn(
 }
 
 fn resolve_agents_dyn(
-    backend: &mut dyn backend::MultiplexerBackend,
+    backend: &dyn backend::MultiplexerBackend,
     ws_id: &str,
     project: &str,
     to: &str,
@@ -1773,7 +1775,7 @@ fn start_agent_with_retry(
 /// the concrete `Client`. Same retry contract: 30 attempts, 3s sleep, accept
 /// a same-pane agent even if nameless (bd-w17) and apply the name.
 fn start_agent_with_retry_dyn(
-    backend: &mut dyn backend::MultiplexerBackend,
+    backend: &dyn backend::MultiplexerBackend,
     name: &str,
     kind: &str,
     pane_id: &str,
@@ -5406,7 +5408,7 @@ fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
             // backend's health() (agentmail → AM health_check; toron → toron
             // facade health; not-compiled → false).
             let mux_health = backend::multiplexer_backend(cfg)
-                .and_then(|mut b| b.agent_list().map(|_| true))
+                .map(|b| b.agent_list().is_ok())
                 .unwrap_or(false);
             let mail_health = backend::mail_backend(cfg)
                 .and_then(|mut m| m.health().map(|_| true))
@@ -5493,7 +5495,7 @@ fn cmd_debate(
         Ok(m) => m,
         Err(e) => bail!("mail backend unavailable for debate: {e:#}"),
     };
-    let mut mux = backend::multiplexer_backend(cfg)?;
+    let mux = backend::multiplexer_backend(cfg)?;
     mail.ensure_project(&key)?;
 
     let mail_target = |agent: &str| resolve_mail_target(agent).to_string();
@@ -5534,7 +5536,7 @@ fn cmd_debate(
         }
         // settle: wait for the speaker to reach done/idle (the ack-gate proxy;
         // full ack-checking is the loop's ack_overdue path)
-        settle_agent(mux.as_mut(), speaker)?;
+        settle_agent(&*mux, speaker)?;
         // harvest the speaker's latest message in the thread
         last_reply = harvest_latest(mail.as_mut(), &key, &thread, &resolve_mail_target(speaker))?;
         println!("debate {thread}: {} replied (round {})", speaker, round);
@@ -5553,7 +5555,7 @@ fn cmd_debate(
         true,
         Some(&thread),
     )?;
-    settle_agent(mux.as_mut(), &j)?;
+    settle_agent(&*mux, &j)?;
     let verdict = harvest_latest(mail.as_mut(), &key, &thread, &resolve_mail_target(&j))?;
     println!(
         "debate {thread} verdict: {}",
@@ -5830,7 +5832,7 @@ fn cmd_plan_review(
         Ok(m) => m,
         Err(e) => bail!("mail backend unavailable for plan-review: {e:#}"),
     };
-    let mut mux = backend::multiplexer_backend(cfg)?;
+    let mux = backend::multiplexer_backend(cfg)?;
     let key = project_dir(cfg, project).to_str().unwrap().to_string();
     mail.ensure_project(&key)?;
 
@@ -5856,7 +5858,7 @@ fn cmd_plan_review(
         true,
         Some(&thread),
     )?;
-    settle_agent(mux.as_mut(), &planner)?;
+    settle_agent(&*mux, &planner)?;
     let planner_mail = mail_target(&planner);
     let plan_reply =
         harvest_latest(mail.as_mut(), &key, &thread, &planner_mail)?.unwrap_or_default();
@@ -5892,7 +5894,7 @@ fn cmd_plan_review(
                     true,
                     Some(&thread),
                 )?;
-                settle_agent(mux.as_mut(), &planner)?;
+                settle_agent(&*mux, &planner)?;
                 let pr = harvest_latest(mail.as_mut(), &key, &thread, &mail_target(&planner))?
                     .unwrap_or_default();
                 current_path = extract_plan_path(&pr, &current_path);
@@ -5917,7 +5919,7 @@ fn cmd_plan_review(
                     true,
                     Some(&thread),
                 )?;
-                settle_agent(mux.as_mut(), &reviewer)?;
+                settle_agent(&*mux, &reviewer)?;
                 let body = harvest_latest(mail.as_mut(), &key, &thread, &mail_target(&reviewer))?
                     .unwrap_or_default();
                 let token = parse_review_token(&body).ok_or_else(|| {
@@ -5948,7 +5950,7 @@ fn cmd_plan_review(
                     true,
                     Some(&thread),
                 )?;
-                settle_agent(mux.as_mut(), &implementer)?;
+                settle_agent(&*mux, &implementer)?;
                 let (p2, a2) = pri_after_implement(&current_path);
                 phase = p2; // AwaitingVerify
                 action = a2;
@@ -5968,7 +5970,7 @@ fn cmd_plan_review(
                     true,
                     Some(&thread),
                 )?;
-                settle_agent(mux.as_mut(), &reviewer)?;
+                settle_agent(&*mux, &reviewer)?;
                 let rev2 = harvest_latest(mail.as_mut(), &key, &thread, &mail_target(&reviewer))?
                     .unwrap_or_default();
                 let token2 = parse_review_token(&rev2).ok_or_else(|| {
@@ -6020,7 +6022,7 @@ fn resolve_debate_agents<'a>(
 }
 
 /// Wait for an agent to settle (done/idle/blocked) — the turn-finality gate.
-fn settle_agent(mux: &mut dyn backend::MultiplexerBackend, agent: &str) -> Result<()> {
+fn settle_agent(mux: &dyn backend::MultiplexerBackend, agent: &str) -> Result<()> {
     mux.agent_wait(
         agent,
         &[
@@ -6181,8 +6183,8 @@ fn collect_poll_events(
     timeout_ms: u64,
     after_seq: Option<u64>,
 ) -> Result<serde_json::Value> {
-    let mut backend = backend::multiplexer_backend(cfg)?;
-    let ws_id = match find_workspace_dyn(backend.as_mut(), project) {
+    let backend = backend::multiplexer_backend(cfg)?;
+    let ws_id = match find_workspace_dyn(&*backend, project) {
         Ok(id) => id,
         Err(e) => {
             // no workspace yet — empty batch, not a hard error (loop may
@@ -6280,28 +6282,31 @@ struct StatusEventItem {
     seq: u64,
 }
 
-/// Map a typed push event to a status item, advancing `seq`. Returns `None`
-/// for non-status events (output_changed etc. — filtered at subscribe time
-/// but defensive).
-fn summarize_status_event(ev: &herdr_shim::PushEvent, seq: &mut u64) -> Option<StatusEventItem> {
-    use herdr_shim::HerdrEventData::*;
-    let (event_type, pane_id, agent, status) = match &ev.data {
-        PaneAgentStatusChanged(c) | PaneAgentStatusChangedSub(c) => (
+/// Map a typed backend push event to a status item, advancing `seq`. Returns
+/// `None` for non-status events (defensive — the subscription is already
+/// narrowed to agent-status pushes). Consumes the UNIFIED toron-core
+/// `BackendEvent` (ADR-0005 P1); the wire event_type strings are preserved so
+/// downstream consumers see the same names as before the trait unification.
+fn summarize_status_event(
+    ev: &toron_core::backend::BackendEvent,
+    seq: &mut u64,
+) -> Option<StatusEventItem> {
+    use toron_core::backend::BackendEvent::*;
+    let (event_type, pane_id, agent, status) = match ev {
+        AgentStatusChanged { pane, agent, status } => (
             "pane.agent_status_changed",
-            c.pane_id.clone(),
-            c.agent.clone().or_else(|| c.display_agent.clone()),
-            c.agent_status.as_str().to_string(),
+            pane.0.clone(),
+            agent.clone(),
+            status.as_str().to_string(),
         ),
-        PaneAgentDetected(p) => (
+        AgentDetected { pane, agent, status } => (
             "pane.agent_detected",
-            p.pane_id.clone(),
-            p.agent.clone(),
-            p.final_status
-                .map(|s| s.as_str().to_string())
-                .unwrap_or_else(|| "unknown".into()),
+            pane.0.clone(),
+            agent.clone(),
+            status.as_str().to_string(),
         ),
-        PaneExited(p) => ("pane.exited", p.pane_id.clone(), None, "exited".to_string()),
-        _ => return None,
+        PaneExited { pane } => ("pane.exited", pane.0.clone(), None, "exited".to_string()),
+        Raw(_) => return None,
     };
     *seq = seq.saturating_add(1);
     Some(StatusEventItem {
@@ -6318,8 +6323,8 @@ fn summarize_status_event(ev: &herdr_shim::PushEvent, seq: &mut u64) -> Option<S
 /// governed-by: ADR-0002 — constructs the multiplexer via the factory so the
 /// durable loop is backend-agnostic (herdr today; superlogical/toron later).
 fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
-    let mut backend = backend::multiplexer_backend(cfg)?;
-    let ws_id = find_workspace_dyn(backend.as_mut(), project)?;
+    let backend = backend::multiplexer_backend(cfg)?;
+    let ws_id = find_workspace_dyn(&*backend, project)?;
     let agents = backend
         .agent_list()?
         .into_iter()
@@ -6340,7 +6345,7 @@ fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
             })
             .collect()
     } else {
-        let resolved = resolve_agents_dyn(backend.as_mut(), &ws_id, project, to)?;
+        let resolved = resolve_agents_dyn(&*backend, &ws_id, project, to)?;
         resolved
             .iter()
             .map(|a| {
@@ -6407,8 +6412,8 @@ fn cmd_internal_send(
     // The trait now exposes agent_prompt_coded with landing data, so the
     // durable loop's dispatch leaf is backend-agnostic (herdr today; toron /
     // superlogical later) with byte-identical landing classification.
-    let mut backend = backend::multiplexer_backend(cfg)?;
-    let ws_id = find_workspace_dyn(backend.as_mut(), project)?;
+    let backend = backend::multiplexer_backend(cfg)?;
+    let ws_id = find_workspace_dyn(&*backend, project)?;
     let agent = backend
         .agent_list()?
         .into_iter()
@@ -6625,8 +6630,8 @@ fn cmd_internal_inprogress(cfg: &Config, project: &str) -> Result<()> {
 
 /// internal leaf: print the herdr agent kind of a named agent.
 fn cmd_internal_kind(cfg: &Config, project: &str, name: &str) -> Result<()> {
-    let mut backend = backend::multiplexer_backend(cfg)?;
-    let ws_id = find_workspace_dyn(backend.as_mut(), project)?;
+    let backend = backend::multiplexer_backend(cfg)?;
+    let ws_id = find_workspace_dyn(&*backend, project)?;
     let agent = backend
         .agent_list()?
         .into_iter()
@@ -6639,8 +6644,8 @@ fn cmd_internal_kind(cfg: &Config, project: &str, name: &str) -> Result<()> {
 /// internal leaf: print recent output of a named agent (context-marker check).
 /// review-fix F6: routes through the backend factory (ADR-0002).
 fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
-    let mut backend = backend::multiplexer_backend(cfg)?;
-    let ws_id = find_workspace_dyn(backend.as_mut(), project)?;
+    let backend = backend::multiplexer_backend(cfg)?;
+    let ws_id = find_workspace_dyn(&*backend, project)?;
     let agent = backend
         .agent_list()?
         .into_iter()
@@ -6669,8 +6674,8 @@ fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
 /// under the same name (fresh session context).
 fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> Result<()> {
     // review-fix F6: respawn routes through the backend factory (ADR-0002).
-    let mut backend = backend::multiplexer_backend(cfg)?;
-    let ws_id = find_workspace_dyn(backend.as_mut(), project)?;
+    let backend = backend::multiplexer_backend(cfg)?;
+    let ws_id = find_workspace_dyn(&*backend, project)?;
     let dir = project_dir(cfg, project);
     // The agent record may already be gone (herdr drops dead agents ~0.5s
     // after they stop responding — the escalation path respawns exactly
@@ -6700,7 +6705,7 @@ fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> 
             let _ = c.call("pane.close", json!({ "pane_id": old }));
         }
     }
-    let fresh = start_agent_with_retry_dyn(backend.as_mut(), name, kind, &new_pane.pane_id, &[])?;
+    let fresh = start_agent_with_retry_dyn(&*backend, name, kind, &new_pane.pane_id, &[])?;
     // pane-identity bridge bookkeeping (best-effort — never fail the respawn
     // on mail trouble): the old pane died (its identity file is stale), the
     // fresh pane must resolve to the same name (the agent keeps its identity)
@@ -6935,7 +6940,7 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str, tier: u32)
 fn cmd_internal_diagnose(cfg: &Config, project: &str, name: &str, reason: &str) -> Result<()> {
     // --- tail (best-effort) ---
     let mut tail = String::new();
-    let mut backend = match backend::multiplexer_backend(cfg) {
+    let backend = match backend::multiplexer_backend(cfg) {
         Ok(b) => b,
         Err(e) => {
             print_json(&json!({

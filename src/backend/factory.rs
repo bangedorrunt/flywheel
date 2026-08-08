@@ -22,7 +22,6 @@
 
 use crate::backend::{BackendError, MailBackend, MultiplexerBackend, Result};
 use crate::config::Config;
-use crate::herdr_shim::Client as HerdrClient;
 #[cfg(feature = "mail-toron")]
 use crate::mail_shim::Mail;
 
@@ -60,9 +59,13 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
     match name.as_str() {
         #[cfg(feature = "backend-herdr")]
         "herdr" => {
-            let client = HerdrClient::connect(Some(&cfg.socket_path()))
-                .map_err(|e| BackendError::Other(anyhow::anyhow!("{e}")))?;
-            Ok(Box::new(crate::backend::herdr::HerdrBackend::new(client)))
+            // ADR-0005 P1: the unified HerdrBackend (toron-core) connects the
+            // client itself and implements the unified Backend trait.
+            let backend = toron_core::backend::herdr::HerdrBackend::connect(Some(
+                &cfg.socket_path(),
+            ))
+            .map_err(|e| BackendError::Other(anyhow::anyhow!("{e}")))?;
+            Ok(Box::new(backend))
         }
         // superlogical/tmux: stub backends (bd-toron-superlogical-stubs). With
         // the feature on, construct the stub (name() enumerable, method

@@ -14,7 +14,6 @@
 //! gated by: cargo feature `backend-superlogical` (off by default).
 
 use crate::backend::{BackendError, MultiplexerBackend};
-
 /// Stub superlogical backend. `name()` is the only override — every trait
 /// method inherits the default `BackendError::Unsupported` (which names this
 /// backend), so any use is an honest "not yet released" error.
