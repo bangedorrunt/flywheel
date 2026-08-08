@@ -79,11 +79,11 @@ impl Crons {
 
     /// Persist to an explicit path.
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        // Atomic temp+rename (l4s.3): a torn write would corrupt crons.toml
+        // and take the whole schedule surface down. Shared helper.
         let raw = toml::to_string_pretty(self)?;
-        std::fs::write(path, raw).with_context(|| format!("write {}", path.display()))
+        crate::fs_util::atomic_write(path, raw.as_bytes())
+            .with_context(|| format!("write {}", path.display()))
     }
 
     /// Insert or replace a cron by name (rejects an unparsable cron expr).
@@ -767,6 +767,41 @@ mod tests {
         assert_eq!(got.cron, "30 3 * * 0");
         assert!(got.enabled);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// l4s.3: save_to writes ATOMICALLY — the destination is either the old
+    /// or the new content, never torn; a stale temp file from a "crash"
+    /// neither corrupts the destination nor survives the save.
+    #[test]
+    fn save_to_is_atomic_leaves_no_temp() {
+        let path = tmp_path("atomic");
+        let _ = std::fs::remove_file(&path);
+        let mut crons = Crons::default();
+        crons.upsert(sample("atomic-cron")).unwrap();
+        crons.save_to(&path).unwrap();
+
+        // Simulated crash residue: a stale temp file must be ignored (the
+        // atomic rename never touches it) and a fresh save must produce a
+        // clean, loadable destination with no NEW temp leftovers.
+        let stale = path.with_file_name(format!(".{}.tmp-999999", "crons.toml"));
+        std::fs::write(&stale, b"garbage").unwrap();
+        crons.upsert(sample("atomic-cron-2")).unwrap();
+        crons.save_to(&path).unwrap();
+
+        let loaded = Crons::load_from(&path).unwrap();
+        assert!(loaded.get("atomic-cron-2").is_some(), "fresh save intact");
+        let dir = path.parent().unwrap();
+        let pid_tmp = format!(".crons.toml.tmp-{}", std::process::id());
+        let leftovers: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n == &pid_tmp)
+            .collect();
+        assert!(leftovers.is_empty(), "no temps from this save: {leftovers:?}");
+        assert!(stale.exists(), "pre-existing stale temp left inert, not clobbered");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&stale);
     }
 
     /// THE pause/resume acceptance: toggling `enabled` must never lose the

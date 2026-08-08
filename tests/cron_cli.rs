@@ -23,11 +23,13 @@ fn flywheel() -> &'static str {
 struct Hermetic {
     _dir: tempfile::TempDir,
     config_home: PathBuf,
+    state_home: PathBuf,
 }
 
 fn hermetic() -> Hermetic {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let config_home = dir.path().join("config");
+    let state_home = dir.path().join("state");
     fs::create_dir_all(config_home.join("flywheel/workflows")).expect("workflows dir");
     // A schedule-triggered workflow that `cron add` can bind a template to.
     fs::write(
@@ -63,6 +65,7 @@ steps:
     Hermetic {
         _dir: dir,
         config_home,
+        state_home,
     }
 }
 
@@ -70,6 +73,7 @@ fn run(h: &Hermetic, args: &[&str]) -> Output {
     Command::new(flywheel())
         .args(args)
         .env("XDG_CONFIG_HOME", &h.config_home)
+        .env("XDG_STATE_HOME", &h.state_home)
         .output()
         .expect("spawn flywheel")
 }

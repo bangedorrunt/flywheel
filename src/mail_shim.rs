@@ -1571,6 +1571,10 @@ mod tests {
     /// override the per-invocation temp default; unset/blank → temp.
     #[test]
     fn mailbox_roots_env_and_default() {
+        // Env mutation is process-global — serialize under the crate-wide
+        // env lock (193.2); siblings (factory FLYWHEEL_MAIL, config XDG)
+        // share the same lock.
+        let _g = crate::config::lock_env();
         unsafe { std::env::set_var("TORON_DATA_DIR", "/tmp/flywheel-se2.1-durable") };
         unsafe { std::env::set_var("TORON_MCP_DATA_DIR", "/tmp/flywheel-se2.1-mcp") };
         let (data_dir, db) = mailbox_roots();

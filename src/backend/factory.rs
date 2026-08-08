@@ -181,21 +181,16 @@ pub fn compiled_backends() -> Vec<&'static str> {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use std::sync::Mutex;
+    use crate::config::lock_env;
 
-    // Env-var mutation is process-global; serialize the tests that touch it so
-    // parallel test runs don't race (classic env-test hazard). This lock is
-    // std-only (no serial_test dep).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn _lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    // Env-var mutation is process-global: serialize under the crate-wide
+    // env lock (config::lock_env, 193.2) — a per-module lock would still
+    // race sibling modules' env-mutating tests.
 
     /// Defaults resolve to herdr + toron when nothing is set.
     #[test]
     fn defaults_resolve_to_herdr_and_toron() {
-        let _g = _lock_env();
+        let _g = lock_env();
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
         unsafe { std::env::remove_var("FLYWHEEL_MAIL") };
         let cfg = Config::default();
@@ -206,7 +201,7 @@ mod tests {
     /// Env overrides config (the precedence contract — flag wiring is R0.6).
     #[test]
     fn env_overrides_config() {
-        let _g = _lock_env();
+        let _g = lock_env();
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
         unsafe { std::env::set_var("FLYWHEEL_MAIL", "toron") };
         let cfg = Config::default();
@@ -219,7 +214,7 @@ mod tests {
     /// Empty env falls back to config (env present-but-empty = unset).
     #[test]
     fn empty_env_falls_back_to_config() {
-        let _g = _lock_env();
+        let _g = lock_env();
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "") };
         let cfg = Config {
             backend: Some(crate::config::BackendConfig {
@@ -237,7 +232,7 @@ mod tests {
     /// live socket (the name is bogus so it fails at the match, not connect).
     #[test]
     fn unknown_backend_name_is_unsupported_not_silent_fallback() {
-        let _g = _lock_env();
+        let _g = lock_env();
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "nonsense") };
         let cfg = Config::default();
         let res = multiplexer_backend(&cfg);
@@ -262,7 +257,7 @@ mod tests {
     #[cfg(not(feature = "backend-superlogical"))]
     #[test]
     fn stubbed_backend_not_compiled_in_default_build() {
-        let _g = _lock_env();
+        let _g = lock_env();
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
         let cfg = Config::default();
         let res = multiplexer_backend(&cfg);
@@ -348,7 +343,7 @@ mod tests {
         // FLYWHEEL_MAIL=toron constructs the toron facade (Mail::from_config):
         // name() is truthful, and health() delegates to the in-process mailbox
         // (Ok), NOT an honest-Unsupported stub (pre-ADR-0003 behavior).
-        let _g = _lock_env();
+        let _g = lock_env();
         unsafe { std::env::set_var("FLYWHEEL_MAIL", "toron") };
         let cfg = Config::default();
         let mut b = super::mail_backend(&cfg).expect("toron facade constructs");

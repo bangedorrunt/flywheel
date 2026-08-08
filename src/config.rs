@@ -18,6 +18,20 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// Crate-wide lock for tests that mutate process env vars (193.2): env is
+/// process-global, so ALL env-mutating tests across modules must serialize
+/// under ONE lock — per-module locks would still race each other. Config's
+/// tests own the reference pattern; every other module's env-mutating test
+/// takes this lock.
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the crate-wide env lock (poison-tolerant).
+pub(crate) fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub const DEFAULT_TIMEOUT_MS: u64 = 1_800_000;
 
 /// `[agent_mail]` section — the SHARED mail identity (ADR-0003 V3). Keeps only
@@ -155,7 +169,12 @@ impl Config {
             cfg.workspace_root = Some(v);
         }
         if let Ok(v) = std::env::var("FLYWHEEL_TIMEOUT") {
-            cfg.default_timeout_ms = Some(v.parse().unwrap_or(DEFAULT_TIMEOUT_MS));
+            // Fail loudly on bad input (is1.6): a typo'd value must abort
+            // startup, never silently fall back to the default.
+            cfg.default_timeout_ms = Some(
+                v.parse()
+                    .map_err(|e| anyhow::anyhow!("FLYWHEEL_TIMEOUT={v:?} is not a number of ms: {e}"))?,
+            );
         }
         if let Ok(v) = std::env::var("RESONATE_URL") {
             cfg.resonate_url = Some(v);
@@ -262,8 +281,13 @@ impl Config {
             .clone()
             .or_else(|| std::env::var("HERDR_SOCKET_PATH").ok())
             .unwrap_or_else(|| {
-                dirs::config_dir()
-                    .unwrap_or_else(|| Path::new("~").to_path_buf())
+                // Converge with the module's own XDG-first base (is1.6): the
+                // canonical herdr client (toron-core backend/herdr.rs) resolves
+                // `HERDR_SOCKET_PATH` or `$XDG_CONFIG_HOME/herdr/herdr.sock`.
+                // `dirs::config_dir()` would point at ~/Library/Application
+                // Support on macOS — divergent, and a real "flywheel can't
+                // find herdr" bug with default config.
+                xdg_config_base()
                     .join("herdr/herdr.sock")
                     .to_string_lossy()
                     .into_owned()
@@ -305,16 +329,23 @@ impl Config {
     }
 }
 
-pub fn config_dir() -> PathBuf {
-    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+/// The XDG config BASE (is1.6): `$XDG_CONFIG_HOME` when set, else
+/// `~/.config`. `config_dir()` appends `/flywheel`; the herdr socket appends
+/// `/herdr/herdr.sock` — both converge on this base (matches the canonical
+/// herdr client in toron-core).
+pub fn xdg_config_base() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
-    let base = xdg.unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("~"))
-            .join(".config")
-    });
-    base.join("flywheel")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("~"))
+                .join(".config")
+        })
+}
+
+pub fn config_dir() -> PathBuf {
+    xdg_config_base().join("flywheel")
 }
 
 pub fn config_file() -> PathBuf {
@@ -358,11 +389,18 @@ fn migrate_legacy_config(legacy: &Path, xdg: &Path) {
 }
 
 pub fn state_dir() -> PathBuf {
-    dirs::state_dir()
+    // Honor XDG_STATE_HOME first (193.2): hermetic state for tests/prod,
+    // matching how config_dir() honors XDG_CONFIG_HOME. `dirs::state_dir()`
+    // (macOS: ~/Library/Application Support) is the fallback.
+    std::env::var_os("XDG_STATE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
         .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("~"))
-                .join(".local/state")
+            dirs::state_dir().unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("~"))
+                    .join(".local/state")
+            })
         })
         .join("flywheel")
 }
@@ -609,15 +647,9 @@ daily = [
         );
     }
 
-    // Env-var mutation is process-global; serialize tests that touch it
-    // (same pattern as the backend factory tests).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn mail_env_overrides_read_all_vars() {
-        let _g = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = lock_env();
         unsafe { std::env::set_var("FLYWHEEL_AGENTMAIL_URL", "http://127.0.0.1:8765") };
         unsafe { std::env::set_var("FLYWHEEL_AGENTMAIL_TOKEN", "secret") };
         unsafe { std::env::set_var("FLYWHEEL_MAIL_NAME", "Orchid") };
@@ -779,6 +811,81 @@ daily = [
             "XDG default is ~/.config/flywheel, not dirs::config_dir()"
         );
         unsafe { std::env::remove_var("HOME") };
+    }
+
+    /// is1.6: the herdr socket fallback converges with `config_dir()`
+    /// (XDG_CONFIG_HOME first), matching the canonical herdr client in
+    /// toron-core (`HERDR_SOCKET_PATH` else `$XDG_CONFIG_HOME/herdr/herdr.sock`).
+    #[test]
+    fn socket_path_follows_xdg_config_home() {
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe { std::env::remove_var("HERDR_SOCKET_PATH") };
+        let tmp = std::env::temp_dir().join(format!("flywheel-sock-xdg-{}", std::process::id()));
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
+        let cfg = Config::default();
+        assert_eq!(cfg.socket_path(), tmp.join("herdr/herdr.sock").to_string_lossy());
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    /// is1.6: no XDG_CONFIG_HOME → `~/.config/herdr/herdr.sock` (never
+    /// `dirs::config_dir()` / macOS Application Support).
+    #[test]
+    fn socket_path_falls_back_to_home_dot_config() {
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe { std::env::remove_var("HERDR_SOCKET_PATH") };
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        let home = std::env::temp_dir().join(format!("flywheel-sock-home-{}", std::process::id()));
+        unsafe { std::env::set_var("HOME", &home) };
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.socket_path(),
+            home.join(".config/herdr/herdr.sock").to_string_lossy(),
+            "socket default is ~/.config/herdr/herdr.sock, not Application Support"
+        );
+        unsafe { std::env::remove_var("HOME") };
+    }
+
+    /// is1.6: a non-numeric FLYWHEEL_TIMEOUT aborts Config::load() naming
+    /// the var — never a silent fallback to the default.
+    #[test]
+    fn flywheel_timeout_env_fails_loudly() {
+        let _g = lock_env();
+        // Isolate HOME + XDG so load() only sees our env.
+        let home = std::env::temp_dir().join(format!("flywheel-to-home-{}", std::process::id()));
+        let xdg = std::env::temp_dir().join(format!("flywheel-to-xdg-{}", std::process::id()));
+        unsafe { std::env::set_var("HOME", &home) };
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+        unsafe { std::env::set_var("FLYWHEEL_TIMEOUT", "abc") };
+        let err = Config::load().expect_err("bad FLYWHEEL_TIMEOUT must abort load");
+        assert!(
+            format!("{err:#}").contains("FLYWHEEL_TIMEOUT"),
+            "error names the var: {err:#}"
+        );
+        unsafe { std::env::set_var("FLYWHEEL_TIMEOUT", "30000") };
+        let cfg = Config::load().expect("valid timeout parses");
+        assert_eq!(cfg.default_timeout_ms, Some(30000));
+        unsafe { std::env::remove_var("FLYWHEEL_TIMEOUT") };
+        unsafe { std::env::remove_var("HOME") };
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    /// 193.2: `state_dir()` honors `XDG_STATE_HOME` first (hermetic state
+    /// for tests/prod) — mirror of the XDG_CONFIG_HOME contract.
+    #[test]
+    fn state_dir_honors_xdg_state_home() {
+        let _g = lock_env();
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        unsafe { std::env::set_var("XDG_STATE_HOME", "/tmp/fw-state-xdg") };
+        assert_eq!(
+            state_dir(),
+            PathBuf::from("/tmp/fw-state-xdg/flywheel"),
+            "XDG_STATE_HOME wins over dirs::state_dir()"
+        );
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 
     /// `Config::load()` dual-reads: XDG wins when present; a legacy macOS
