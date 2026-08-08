@@ -235,7 +235,11 @@ fn absorb_workflow_steps(name: &str, steps: &[LegacyStep]) -> (Workflow, Vec<Map
                     guard: None,
                     on_error: Default::default(),
                     action: Action::Delay {
-                        secs: timeout_ms.map(|ms| ms / 1000).unwrap_or(0),
+                        // Round UP (is1.5): integer division truncates a
+                        // sub-second wait to 0s — a silent no-op. 500ms → 1s
+                        // keeps the effective wait; only a 0/absent timeout
+                        // maps to 0.
+                        secs: timeout_ms.map(|ms| ms.div_ceil(1000)).unwrap_or(0),
                     },
                 });
             }
@@ -322,6 +326,53 @@ mod tests {
         let catalog = WorkflowCatalog::load_from(dir.clone()).unwrap();
         assert!(catalog.workflows.contains_key("triage"));
         assert_eq!(catalog.workflows["triage"].name, "triage");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// is1.5: absorbed `Wait` timeouts round UP — a sub-second wait must not
+    /// truncate to a 0s delay (silent no-op).
+    #[test]
+    fn absorbed_wait_timeout_rounds_up_not_truncates() {
+        let dir = config_root("wait-round");
+        write(
+            &dir.join("workflows.toml"),
+            r#"[[sub-second]]
+type = "wait"
+until = "ready"
+timeout_ms = 500
+"#,
+        );
+        // absorb directly (self-contained): the step shapes parse from a
+        // legacy file written above.
+        let raw = std::fs::read_to_string(dir.join("workflows.toml")).unwrap();
+        let legacy: LegacyWorkflows = toml::from_str(&raw).unwrap();
+        let steps = legacy.workflows.get("sub-second").unwrap();
+        let (wf, _notes) = absorb_workflow_steps("sub-second", steps);
+        match &wf.steps[0].action {
+            Action::Delay { secs } => {
+                assert_eq!(*secs, 1, "500ms rounds UP to 1s, never 0");
+            }
+            other => panic!("wait absorbed to Delay, got {other:?}"),
+        }
+        // exact-second and absent-timeout boundaries.
+        let steps2 = vec![LegacyStep::Wait {
+            until: "x".into(),
+            timeout_ms: Some(1500),
+        }];
+        let (wf2, _) = absorb_workflow_steps("w2", &steps2);
+        match &wf2.steps[0].action {
+            Action::Delay { secs } => assert_eq!(*secs, 2, "1500ms -> 2s"),
+            other => panic!("{other:?}"),
+        }
+        let steps3 = vec![LegacyStep::Wait {
+            until: "x".into(),
+            timeout_ms: None,
+        }];
+        let (wf3, _) = absorb_workflow_steps("w3", &steps3);
+        match &wf3.steps[0].action {
+            Action::Delay { secs } => assert_eq!(*secs, 0, "absent timeout -> 0 (no wait)"),
+            other => panic!("{other:?}"),
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
