@@ -28,7 +28,7 @@ struct Hermetic {
 fn hermetic() -> Hermetic {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let config_home = dir.path().join("config");
-    fs::create_dir_all(&config_home.join("flywheel/workflows")).expect("workflows dir");
+    fs::create_dir_all(config_home.join("flywheel/workflows")).expect("workflows dir");
     // A schedule-triggered workflow that `cron add` can bind a template to.
     fs::write(
         config_home.join("flywheel/workflows/weekly-docker-upgrade.yaml"),

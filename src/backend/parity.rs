@@ -135,7 +135,7 @@ mod tests {
     /// the actionable message a user sees when hitting an Unsupported op.
     #[test]
     fn unsupported_display_is_actionable() {
-        let mut b = AllUnsupportedMux;
+        let b = AllUnsupportedMux;
         match b.workspace_list() {
             Err(e) => {
                 let s = e.to_string();

@@ -291,10 +291,10 @@ impl Config {
 
     /// Resolve a short agent name (oc/pi/gk) or full kind to a herdr agent kind.
     pub fn resolve_kind(&self, short: &str) -> String {
-        if let Some(map) = &self.kinds {
-            if let Some(k) = map.get(short) {
-                return k.clone();
-            }
+        if let Some(map) = &self.kinds
+            && let Some(k) = map.get(short)
+        {
+            return k.clone();
         }
         match short {
             "oc" => "opencode".into(),

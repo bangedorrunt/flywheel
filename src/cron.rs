@@ -105,6 +105,7 @@ impl Crons {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn get(&self, name: &str) -> Option<&CronEntry> {
         self.crons.get(name)
     }
@@ -178,9 +179,9 @@ pub fn next_due(cron_expr: &str, from_ts: i64) -> Option<i64> {
 ///    crate uses 1=Sunday…7=Saturday. Per numeric component `d` the crate
 ///    ordinal is `(d % 7) + 1`. Names (`sun`, `mon`, …) and `*` pass through —
 ///    the crate maps names to the same 1=Sun convention.
-/// 6/7-field and `@`-shorthand expressions pass through unchanged (their
-/// day-of-week fields are already in the crate's 1-7 form). Garbage passes
-/// through too — the parse fails downstream in `next_due`/`upsert`.
+///    6/7-field and `@`-shorthand expressions pass through unchanged (their
+///    day-of-week fields are already in the crate's 1-7 form). Garbage passes
+///    through too — the parse fails downstream in `next_due`/`upsert`.
 fn normalize_cron(expr: &str) -> String {
     let trimmed = expr.trim();
     let mut fields: Vec<String> = trimmed.split_whitespace().map(|s| s.to_string()).collect();
@@ -352,6 +353,7 @@ impl RegistryCronManager {
 }
 
 /// A manager whose workflows are injected (tests use hermetic catalogs).
+#[cfg(test)]
 pub fn make_registry_manager(
     workflows: BTreeMap<String, (Workflow, &'static str)>,
 ) -> RegistryCronManager {
@@ -448,7 +450,7 @@ pub fn cron_runner() -> toron_workflow::ActionRunner {
             match resp {
                 Ok(r) => {
                     let status = r.status();
-                    Ok(json!({ "ok": status >= 200 && status < 300, "status": status }))
+                    Ok(json!({ "ok": (200..300).contains(&status), "status": status }))
                 }
                 Err(e) => Err(anyhow!("probe failed: {e}")),
             }
@@ -673,7 +675,7 @@ fn last_run_state(name: &str) -> (Option<String>, bool) {
                 Some(s) if s == "failed" || s == "succeeded" => {
                     last_status = Some(s.to_string())
                 }
-                Some(s) if s == "running" => in_flight = true,
+                Some("running") => in_flight = true,
                 _ => {}
             }
         }
@@ -1248,7 +1250,7 @@ mod tests {
 
         // All five up → pass.
         let engine = toron_workflow::WorkflowEngine::local(cron_runner()).unwrap();
-        let all_up: Vec<u16> = ports.iter().map(|p| *p).collect();
+        let all_up: Vec<u16> = ports.to_vec();
         let out = engine
             .invoke("gate-all-up", gate_wf(&all_up), json!({}))
             .await

@@ -483,11 +483,8 @@ mod tests {
             ),
             ("cleanup_pane_identities", b.cleanup_pane_identities("p")),
         ] {
-            match res {
-                Err(BackendError::Unsupported { method: m, .. }) => {
-                    panic!("{method}: still Unsupported ({m}) — surface restore failed")
-                }
-                _ => {} // Ok (no-op/not-wired) or Other (unregistered agent / operator) — both prove delegation
+            if let Err(BackendError::Unsupported { method: m, .. }) = res {
+                panic!("{method}: still Unsupported ({m}) — surface restore failed")
             }
         }
     }
