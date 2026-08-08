@@ -1436,13 +1436,6 @@ fn multiplexer_is_herdr() -> bool {
 static TEST_IDENTITY_BASE: std::sync::LazyLock<std::sync::Mutex<Option<PathBuf>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
-#[cfg(test)]
-pub(crate) fn set_test_identity_base(path: Option<PathBuf>) {
-    *TEST_IDENTITY_BASE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
-}
-
 fn identity_base() -> PathBuf {
     #[cfg(test)]
     if let Some(path) = TEST_IDENTITY_BASE
