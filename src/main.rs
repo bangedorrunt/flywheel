@@ -8064,13 +8064,16 @@ fn cmd_internal_send(
 
     // last-sent registry: record what was delivered (or attempted). Best-
     // effort — a registry failure must never lose the send itself.
-    let record = |landed: bool| {
+    // cg6.5: `ambiguous` marks timeout-confirm sends — the prompt may have
+    // started, so resume-dedup (should_resend) must NOT re-delegate them.
+    let record = |landed: bool, ambiguous: bool| {
         let rec = state::SentRecord {
             name: name.to_string(),
             text_hash: state::fnv1a64(text),
             invocation: invocation.unwrap_or_default().to_string(),
             iteration: iteration.unwrap_or(0),
             landed,
+            ambiguous,
         };
         if let Err(e) = state::record_sent(project, rec) {
             eprintln!("flywheel: cannot record sent prompt: {e:#}");
@@ -8081,7 +8084,7 @@ fn cmd_internal_send(
         // legacy fire-and-forget path — a successful herdr call means the
         // prompt was written to the agent's terminal
         backend.prompt(&target, text, None)?;
-        record(true);
+        record(true, false);
         print_json(&json!({ "ok": true, "name": name }));
         return Ok(());
     };
@@ -8106,7 +8109,9 @@ fn cmd_internal_send(
         SendVerdict::TimedOut => (false, None, "timeout".to_string()),
         SendVerdict::Coded(code) => (false, None, format!("error:{code}")),
     };
-    record(landed);
+    // cg6.5: a timeout is AMBIGUOUS (the prompt may have started) — record it
+    // as such so resume never re-delegates a possibly-mid-flight prompt.
+    record(landed, reason == "timeout");
     print_json(&json!({
         "ok": true, "name": name, "landed": landed,
         "status": status, "reason": reason,

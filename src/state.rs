@@ -406,6 +406,13 @@ pub struct SentRecord {
     pub iteration: u64,
     /// true when herdr confirmed the prompt landed (working|blocked)
     pub landed: bool,
+    /// cg6.5: a timeout-confirm send is AMBIGUOUS — the prompt may have
+    /// started, so resume-dedup must NOT re-delegate it (the next poll is
+    /// the correctness floor). `#[serde(default)] false` keeps legacy
+    /// records resend-eligible (unchanged behavior); only NEW timeout
+    /// records carry the flag.
+    #[serde(default)]
+    pub ambiguous: bool,
 }
 
 /// Bound on the per-project registry (FIFO trim). A long-running loop can
@@ -958,13 +965,14 @@ mod tests {
 mod last_sent_tests {
     use super::*;
 
-    fn rec(name: &str, hash: u64, invocation: &str, landed: bool) -> SentRecord {
+    fn rec(name: &str, hash: u64, invocation: &str, landed: bool, ambiguous: bool) -> SentRecord {
         SentRecord {
-            name: name.to_string(),
+            name: name.into(),
             text_hash: hash,
-            invocation: invocation.to_string(),
+            invocation: invocation.into(),
             iteration: 1,
             landed,
+            ambiguous,
         }
     }
 
@@ -982,7 +990,7 @@ mod last_sent_tests {
 
     #[test]
     fn trim_keeps_newest_50() {
-        let mut v: Vec<SentRecord> = (0..60).map(|i| rec("a", i, "inv", true)).collect();
+        let mut v: Vec<SentRecord> = (0..60).map(|i| rec("a", i, "inv", true, false)).collect();
         trim_last_sent(&mut v);
         assert_eq!(v.len(), 50);
         // FIFO: the oldest (0..10) dropped, the newest (10..60) kept
@@ -992,7 +1000,7 @@ mod last_sent_tests {
 
     #[test]
     fn trim_under_cap_is_noop() {
-        let mut v: Vec<SentRecord> = (0..3).map(|i| rec("a", i, "inv", true)).collect();
+        let mut v: Vec<SentRecord> = (0..3).map(|i| rec("a", i, "inv", true, false)).collect();
         trim_last_sent(&mut v);
         assert_eq!(v.len(), 3);
     }
@@ -1008,8 +1016,8 @@ mod last_sent_tests {
         // name that collides with nothing, then clean the file up.
         let project = "__test_roundtrip__";
         let _ = std::fs::remove_file(last_sent_file(project));
-        record_sent(project, rec("a", 1, "inv1", true)).unwrap();
-        record_sent(project, rec("b", 2, "inv1", false)).unwrap();
+        record_sent(project, rec("a", 1, "inv1", true, false)).unwrap();
+        record_sent(project, rec("b", 2, "inv1", false, false)).unwrap();
         let v = load_last_sent(project);
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].name, "a");
@@ -1032,7 +1040,7 @@ mod last_sent_tests {
 
     #[test]
     fn find_last_sent_matches_name_and_hash() {
-        let v = vec![rec("a", 11, "inv1", true), rec("b", 22, "inv1", true)];
+        let v = vec![rec("a", 11, "inv1", true, false), rec("b", 22, "inv1", true, false)];
         assert!(find_last_sent(&v, "a", 11).is_some());
         assert!(find_last_sent(&v, "a", 22).is_none());
         assert!(find_last_sent(&v, "b", 22).is_some());

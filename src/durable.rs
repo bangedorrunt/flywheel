@@ -607,7 +607,10 @@ pub fn parse_read_output(v: &serde_json::Value) -> anyhow::Result<ReadOutput> {
 pub fn should_resend(record: Option<&crate::state::SentRecord>, current_invocation: &str) -> bool {
     match record {
         None => true,
-        Some(r) => r.invocation != current_invocation || !r.landed,
+        // cg6.5: a timeout-confirm record is AMBIGUOUS — the prompt may be
+        // mid-flight; never re-delegate it on resume. The next poll is the
+        // correctness floor (it reveals whether the prompt landed).
+        Some(r) => r.invocation != current_invocation || (!r.landed && !r.ambiguous),
     }
 }
 
@@ -3928,13 +3931,14 @@ mod resume_dedup_tests {
     use super::*;
     use crate::state::SentRecord;
 
-    fn rec(name: &str, hash: u64, invocation: &str, landed: bool) -> SentRecord {
+    fn rec(name: &str, hash: u64, invocation: &str, landed: bool, ambiguous: bool) -> SentRecord {
         SentRecord {
             name: name.to_string(),
             text_hash: hash,
             invocation: invocation.to_string(),
             iteration: 1,
             landed,
+            ambiguous,
         }
     }
 
@@ -3943,12 +3947,16 @@ mod resume_dedup_tests {
         // no record -> never sent -> resend
         assert!(should_resend(None, "inv-1"));
         // landed, same invocation -> delivered; skip
-        assert!(!should_resend(Some(&rec("a", 1, "inv-1", true)), "inv-1"));
+        assert!(!should_resend(Some(&rec("a", 1, "inv-1", true, false)), "inv-1"));
         // unlanded, same invocation -> crashed mid-flight; resend
-        assert!(should_resend(Some(&rec("a", 1, "inv-1", false)), "inv-1"));
+        assert!(should_resend(Some(&rec("a", 1, "inv-1", false, false)), "inv-1"));
+        // cg6.5: ambiguous (timeout-confirm), same invocation -> may be
+        // mid-flight; NEVER re-delegate
+        assert!(!should_resend(Some(&rec("a", 1, "inv-1", false, true)), "inv-1"));
         // any record from ANOTHER invocation -> fresh run re-delegates
-        assert!(should_resend(Some(&rec("a", 1, "inv-0", true)), "inv-1"));
-        assert!(should_resend(Some(&rec("a", 1, "inv-0", false)), "inv-1"));
+        assert!(should_resend(Some(&rec("a", 1, "inv-0", true, false)), "inv-1"));
+        assert!(should_resend(Some(&rec("a", 1, "inv-0", false, false)), "inv-1"));
+        assert!(should_resend(Some(&rec("a", 1, "inv-0", false, true)), "inv-1"));
     }
 
     #[test]
@@ -3956,7 +3964,7 @@ mod resume_dedup_tests {
         // pre-confirm loops recorded nothing (or unlanded): resend = today
         // (the fn docstring promises the guard degrades to re-sending)
         assert!(should_resend(None, "inv-1"));
-        assert!(should_resend(Some(&rec("a", 1, "inv-1", false)), "inv-1"));
+        assert!(should_resend(Some(&rec("a", 1, "inv-1", false, false)), "inv-1"));
     }
 
     // ---- escalation tiers (bd-blocked-escalation-protocol) ----
