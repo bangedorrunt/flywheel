@@ -7,3 +7,7 @@
 # bv (beads viewer) local config and caches
 .bv/
 .env
+
+# agent private keys (ncryptsec) + archive lock — NEVER commit
+agents/
+.archive.lock

@@ -112,7 +112,7 @@ impl MailBackend for ToronMailBackend {
     fn reply(
         &mut self,
         project_key: &str,
-        message_id: u64,
+        message_id: &str,
         body: &str,
         to: Option<&[String]>,
     ) -> Result<Value> {
@@ -135,13 +135,13 @@ impl MailBackend for ToronMailBackend {
             .map_err(BackendError::Other)
     }
 
-    fn ack(&mut self, project_key: &str, agent: &str, message_id: u64) -> Result<Value> {
+    fn ack(&mut self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
         self.mail
             .ack(project_key, agent, message_id)
             .map_err(BackendError::Other)
     }
 
-    fn mark_read(&mut self, project_key: &str, agent: &str, message_id: u64) -> Result<Value> {
+    fn mark_read(&mut self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
         self.mail
             .mark_read(project_key, agent, message_id)
             .map_err(BackendError::Other)

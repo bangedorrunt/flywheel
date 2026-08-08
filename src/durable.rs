@@ -257,7 +257,9 @@ fn default_xproj_limit() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XprojSpawnArgs {
     pub project: String,
-    pub message_id: u64,
+    /// String: agent-mail ids are u64 (arrive as numbers), toron ids are hex
+    /// event ids (strings). The leaf passes it through verbatim.
+    pub message_id: String,
     pub thread_id: String,
     pub from: String,
     pub recipe: String,
@@ -868,7 +870,7 @@ async fn spawn_xproj(args: XprojSpawnArgs) -> Result<()> {
         .args([
             "__xproj-spawn",
             &args.project,
-            &args.message_id.to_string(),
+            &args.message_id,
             &args.thread_id,
             &args.from,
             &args.recipe,
@@ -1523,8 +1525,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // agents that received DispatchImmediate and await working confirmation
     // (bd-event-dispatch double-dispatch guard)
     let mut dispatch_pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // cross-project [xproj] message ids already queued (avoid re-enqueue)
-    let mut seen_xproj: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // cross-project [xproj] message ids already queued (avoid re-enqueue).
+    // String: toron ids are hex event ids; agent-mail ids normalize to string.
+    let mut seen_xproj: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         iteration += 1;
@@ -1606,7 +1609,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             if seen_xproj.contains(&item.id) {
                 continue;
             }
-            seen_xproj.insert(item.id);
+            seen_xproj.insert(item.id.clone());
             let combined = format!("{} {}", item.subject, item.body);
             let req = crate::parse_xproj_request(&combined);
             let action = if let Some(r) = req.filter(|r| !r.recipe.is_empty()) {
@@ -1616,7 +1619,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         spawn_xproj,
                         XprojSpawnArgs {
                             project: params.project.clone(),
-                            message_id: item.id,
+                            message_id: item.id.clone(),
                             thread_id: item.thread_id.clone(),
                             from: item.from.clone(),
                             recipe: r.recipe.clone(),
