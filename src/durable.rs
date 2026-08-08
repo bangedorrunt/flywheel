@@ -30,6 +30,7 @@
 //!   written BEFORE spawning: one swarm per message id.
 //!   Pure read leaves (poll_*) need no dedup — re-running them is harmless.
 
+use std::collections::HashMap;
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -285,6 +286,29 @@ pub struct XprojInboxArgs {
 
 fn default_xproj_limit() -> u32 {
     30
+}
+
+/// Mail digest for one agent (loop-side wake signal, fed by `__mail-digest`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MailDigest {
+    pub agent: String,
+    #[serde(default)]
+    pub unread: usize,
+    #[serde(default)]
+    pub urgent: usize,
+    #[serde(default)]
+    pub last_from: Option<String>,
+    #[serde(default)]
+    pub last_subject: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+}
+
+/// Args for the mail-digest leaf: which agents' unread mail to summarize.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailDigestArgs {
+    pub project: String,
+    pub agents: Vec<String>,
 }
 
 /// Args for the xproj-spawn leaf (cross-project swarm receive, full branch).
@@ -1042,6 +1066,41 @@ async fn poll_xproj_inbox(args: XprojInboxArgs) -> Result<Vec<crate::XprojInboxI
     Ok(parsed)
 }
 
+/// Fetch one mail digest per agent (loop-side wake signal). Runs `__mail-
+/// digest` once per agent; a failing or empty digest yields a zeroed entry —
+/// a mail hiccup must not stall dispatch. Checkpointed: on replay the same
+/// digests are replayed, so prompt text stays deterministic.
+#[function]
+async fn poll_mail_digests(args: MailDigestArgs) -> Result<Vec<MailDigest>> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut digests = Vec::with_capacity(args.agents.len());
+    for agent in &args.agents {
+        let mut cmd = Command::new(&exe);
+        cmd.args(["__mail-digest", &args.project, agent]);
+        let out = match run_leaf_cmd(cmd, "__mail-digest").await {
+            Ok(o) => o,
+            Err(_) => {
+                digests.push(MailDigest {
+                    agent: agent.clone(),
+                    ..Default::default()
+                });
+                continue;
+            }
+        };
+        let raw = String::from_utf8_lossy(&out.stdout);
+        let mut d: MailDigest =
+            serde_json::from_str(raw.trim()).unwrap_or_else(|_| MailDigest {
+                agent: agent.clone(),
+                ..Default::default()
+            });
+        if d.agent.is_empty() {
+            d.agent = agent.clone();
+        }
+        digests.push(d);
+    }
+    Ok(digests)
+}
+
 /// Spawn the swarm for a parsed `[xproj]` request (full loop branch).
 /// Delegates to the `__xproj-spawn` leaf which calls `cmd_spawn` + replies
 /// in-thread. Soft-fail: spawn errors are surfaced in-thread by the leaf, the
@@ -1178,6 +1237,17 @@ pub fn lease_renew_seconds(heartbeat_interval_secs: u64) -> u64 {
 /// lifecycle confidently — a prompt could land in a half-dead session and be
 /// silently lost. Unknown agents get `Wait` and never consume the queue.
 ///
+/// `digests` (per-agent mail digests from the `__mail-digest` leaf) shape two
+/// behaviors — the loop-side wake signal that replaces per-agent peer-poll
+/// templates (token-efficient: agents hold NO standing polling instructions;
+/// the orchestrator polls once per iteration):
+///   - a dispatched prompt is prefixed with a compact mail line when the
+///     agent has unread mail (`[mail] 2 unread (last: X re: Y)`) so the
+///     agent wakes already knowing a peer asked it something;
+///   - an idle agent with URGENT unread mail and an empty queue gets a wake
+///     prompt instead of silent `Wait` — it is asked to check + reply, then
+///     await work. Urgent mail IS work.
+///
 /// `DispatchImmediate` is the event-path twin of `Send` (bd-event-dispatch):
 /// same `__send` leaf, same FIFO pop, marked so the loop can track
 /// dispatch-pending until a `working` event confirms landing.
@@ -1211,10 +1281,37 @@ pub enum LoopAction {
     Wait,
 }
 
+/// One-line mail digest prefix for a prompt, when the agent has unread mail.
+fn digest_prefix(d: &MailDigest) -> Option<String> {
+    if d.unread == 0 {
+        return None;
+    }
+    let mut line = format!("[mail] {} unread", d.unread);
+    if let (Some(f), Some(s)) = (&d.last_from, &d.last_subject) {
+        line.push_str(&format!(" (last: {f} re: {s})"));
+    } else if let Some(f) = &d.last_from {
+        line.push_str(&format!(" (last: {f})"));
+    }
+    Some(line)
+}
+
+/// Wake prompt for an idle agent with urgent unread mail and an empty queue.
+fn urgent_wake_prompt(d: &MailDigest) -> String {
+    let mut line = format!(
+        "MAIL WAKE: {} urgent unread in your inbox. Check it and reply in-thread where needed, then await work.",
+        d.urgent
+    );
+    if let (Some(f), Some(s)) = (&d.last_from, &d.last_subject) {
+        line.push_str(&format!(" Latest: {f} re: {s}"));
+    }
+    line
+}
+
 pub fn plan_actions(
     states: &[AgentState],
     queue: &mut Vec<String>,
     nudge: Option<&str>,
+    digests: &HashMap<String, MailDigest>,
 ) -> Vec<LoopAction> {
     let mut actions = Vec::new();
     for s in states {
@@ -1232,13 +1329,33 @@ pub fn plan_actions(
                                                 // bead/resume prompts carry a {AGENT_NAME} placeholder —
                                                 // substitute the receiving agent's herdr name so the
                                                 // state-file path is concrete (no-op for plain prompts)
+                    let base = text.replace("{AGENT_NAME}", &s.name);
+                    let text = match digests.get(&s.name) {
+                        Some(d) => match digest_prefix(d) {
+                            Some(p) => format!("{p}\n{base}"),
+                            None => base,
+                        },
+                        None => base,
+                    };
                     actions.push(LoopAction::Send {
                         name: s.name.clone(),
-                        text: text.replace("{AGENT_NAME}", &s.name),
+                        text,
                     });
                 } else if nudge.is_some() {
+                    // orchestrator direction beats the autonomous mail wake —
+                    // the captain's instruction is the higher-signal work
                     actions.push(LoopAction::Nudge {
                         name: s.name.clone(),
+                    });
+                } else if let Some(d) = digests.get(&s.name)
+                    && d.urgent > 0
+                {
+                    // urgent unread mail with nothing queued: wake the agent
+                    // to handle it — mail IS work (loop-side wake, no
+                    // per-agent polling template).
+                    actions.push(LoopAction::Send {
+                        name: s.name.clone(),
+                        text: urgent_wake_prompt(d),
                     });
                 } else {
                     actions.push(LoopAction::Wait);
@@ -2079,7 +2196,38 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         }
         // heartbeat path: full-snapshot reconciliation (skips agents already
         // dispatch-pending so event path and poll path don't double-feed)
-        let mut poll_actions = plan_actions(&states, &mut queue, params.nudge.as_deref());
+        // Loop-side mail wake: fetch per-agent digests ONCE per iteration
+        // (checkpointed leaf). Idle agents with unread mail get the digest
+        // prefixed to their next prompt; idle agents with URGENT mail and an
+        // empty queue get woken directly. This replaces per-agent peer-poll
+        // templates — agents hold no standing polling instructions.
+        let idle_names: Vec<String> = states
+            .iter()
+            .filter(|s| matches!(s.status.as_str(), "idle" | "done"))
+            .map(|s| s.name.clone())
+            .collect();
+        let digests: HashMap<String, MailDigest> = if idle_names.is_empty() {
+            HashMap::new()
+        } else {
+            ctx.run(
+                poll_mail_digests,
+                MailDigestArgs {
+                    project: params.project.clone(),
+                    agents: idle_names,
+                },
+            )
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| (d.agent.clone(), d))
+            .collect()
+        };
+        let mut poll_actions = plan_actions(
+            &states,
+            &mut queue,
+            params.nudge.as_deref(),
+            &digests,
+        );
         poll_actions.retain(|a| match a {
             LoopAction::Send { name, .. } => !dispatch_pending.contains(name),
             _ => true,
@@ -2489,6 +2637,9 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
         .register(poll_xproj_inbox)
         .map_err(|e| anyhow::anyhow!("register poll_xproj_inbox: {e}"))?;
     resonate
+        .register(poll_mail_digests)
+        .map_err(|e| anyhow::anyhow!("register poll_mail_digests: {e}"))?;
+    resonate
         .register(spawn_xproj)
         .map_err(|e| anyhow::anyhow!("register spawn_xproj: {e}"))?;
     resonate
@@ -2635,7 +2786,7 @@ mod tests {
     fn idle_agent_pops_queue() {
         let states = vec![st("a", "idle")];
         let mut q = vec!["p1".to_string(), "p6".to_string()];
-        let actions = plan_actions(&states, &mut q, None);
+        let actions = plan_actions(&states, &mut q, None, &HashMap::new());
         assert_eq!(q.len(), 1);
         assert!(
             matches!(&actions[0], LoopAction::Send { name, text } if name == "a" && text == "p1")
@@ -2646,7 +2797,7 @@ mod tests {
     fn queue_drains_across_idle_agents_in_order() {
         let states = vec![st("a", "idle"), st("b", "done")];
         let mut q = vec!["p1".to_string(), "p6".to_string()];
-        let actions = plan_actions(&states, &mut q, None);
+        let actions = plan_actions(&states, &mut q, None, &HashMap::new());
         assert!(q.is_empty());
         match (&actions[0], &actions[1]) {
             (LoopAction::Send { name: n1, text: t1 }, LoopAction::Send { name: n2, text: t2 }) => {
@@ -2663,7 +2814,7 @@ mod tests {
     fn working_agent_gets_nothing() {
         let states = vec![st("a", "working")];
         let mut q = vec!["p1".to_string()];
-        let actions = plan_actions(&states, &mut q, None);
+        let actions = plan_actions(&states, &mut q, None, &HashMap::new());
         assert_eq!(q.len(), 1);
         assert!(matches!(actions[0], LoopAction::Wait));
     }
@@ -2672,7 +2823,7 @@ mod tests {
     fn blocked_agent_reports_and_keeps_queue() {
         let states = vec![st("a", "blocked")];
         let mut q = vec!["p1".to_string()];
-        let actions = plan_actions(&states, &mut q, None);
+        let actions = plan_actions(&states, &mut q, None, &HashMap::new());
         assert!(matches!(&actions[0], LoopAction::Blocked { name } if name == "a"));
         assert_eq!(q.len(), 1);
     }
@@ -2681,7 +2832,7 @@ mod tests {
     fn empty_queue_with_nudge_nudges() {
         let states = vec![st("a", "idle")];
         let mut q: Vec<String> = vec![];
-        let actions = plan_actions(&states, &mut q, Some("proceed"));
+        let actions = plan_actions(&states, &mut q, Some("proceed"), &HashMap::new());
         assert!(matches!(&actions[0], LoopAction::Nudge { name } if name == "a"));
     }
 
@@ -2689,7 +2840,7 @@ mod tests {
     fn empty_queue_no_nudge_waits() {
         let states = vec![st("a", "done")];
         let mut q: Vec<String> = vec![];
-        let actions = plan_actions(&states, &mut q, None);
+        let actions = plan_actions(&states, &mut q, None, &HashMap::new());
         assert!(matches!(actions[0], LoopAction::Wait));
     }
 
@@ -2699,7 +2850,7 @@ mod tests {
     fn unknown_agent_keeps_queue() {
         let states = vec![st("a", "unknown")];
         let mut q = vec!["p1".to_string()];
-        let actions = plan_actions(&states, &mut q, None);
+        let actions = plan_actions(&states, &mut q, None, &HashMap::new());
         assert_eq!(q.len(), 1); // queue intact — unknown must never consume items
         assert!(matches!(actions[0], LoopAction::Wait));
     }
@@ -2708,7 +2859,7 @@ mod tests {
     fn unknown_with_nudge_no_send() {
         let states = vec![st("a", "unknown")];
         let mut q: Vec<String> = vec![];
-        let actions = plan_actions(&states, &mut q, Some("proceed"));
+        let actions = plan_actions(&states, &mut q, Some("proceed"), &HashMap::new());
         assert!(matches!(actions[0], LoopAction::Wait)); // no Nudge, no Send
     }
 
@@ -3209,7 +3360,7 @@ mod tests {
         // replaces it when the Send action is built
         let mut queue = vec![bead_prompt("bd-12", "fix auth flow")];
         let states = vec![st("flywheel-proj-oc", "idle")];
-        let actions = plan_actions(&states, &mut queue, None);
+        let actions = plan_actions(&states, &mut queue, None, &HashMap::new());
         match &actions[0] {
             LoopAction::Send { name, text } => {
                 assert_eq!(name, "flywheel-proj-oc");
@@ -3225,11 +3376,112 @@ mod tests {
     fn plan_actions_leaves_plain_prompts_untouched() {
         let mut queue = vec!["t1".to_string()];
         let states = vec![st("flywheel-proj-oc", "idle")];
-        let actions = plan_actions(&states, &mut queue, None);
+        let actions = plan_actions(&states, &mut queue, None, &HashMap::new());
         match &actions[0] {
             LoopAction::Send { text, .. } => assert_eq!(text, "t1"),
             other => panic!("expected Send, got {other:?}"),
         }
+    }
+
+    // ---- loop-side mail wake (replaces per-agent peer-poll templates) ----
+
+    fn digest(unread: usize, urgent: usize, from: &str, subj: &str) -> MailDigest {
+        MailDigest {
+            agent: "flywheel-proj-oc".into(),
+            unread,
+            urgent,
+            last_from: (!from.is_empty()).then(|| from.to_string()),
+            last_subject: (!subj.is_empty()).then(|| subj.to_string()),
+            thread_id: None,
+        }
+    }
+
+    fn digest_map(d: MailDigest) -> HashMap<String, MailDigest> {
+        let mut m = HashMap::new();
+        m.insert(d.agent.clone(), d);
+        m
+    }
+
+    #[test]
+    fn plan_actions_prepends_mail_digest_to_dispatched_prompt() {
+        let mut queue = vec!["do the work".to_string()];
+        let states = vec![st("flywheel-proj-oc", "idle")];
+        let d = digest_map(digest(2, 1, "PinkGorge", "[bd-1] need input"));
+        let actions = plan_actions(&states, &mut queue, None, &d);
+        match &actions[0] {
+            LoopAction::Send { text, .. } => {
+                assert!(
+                    text.starts_with("[mail] 2 unread (last: PinkGorge re: [bd-1] need input)\ndo the work"),
+                    "digest must prefix the prompt: {text}"
+                );
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_actions_skips_digest_prefix_when_no_unread() {
+        let mut queue = vec!["do the work".to_string()];
+        let states = vec![st("flywheel-proj-oc", "idle")];
+        let d = digest_map(digest(0, 0, "", ""));
+        let actions = plan_actions(&states, &mut queue, None, &d);
+        match &actions[0] {
+            LoopAction::Send { text, .. } => assert_eq!(text, "do the work"),
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_actions_wakes_idle_agent_on_urgent_mail_with_empty_queue() {
+        // idle + urgent unread + empty queue → wake prompt, not silent Wait
+        let mut queue: Vec<String> = Vec::new();
+        let states = vec![st("flywheel-proj-oc", "idle")];
+        let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] help needed"));
+        let actions = plan_actions(&states, &mut queue, None, &d);
+        match &actions[0] {
+            LoopAction::Send { text, .. } => {
+                assert!(
+                    text.contains("MAIL WAKE: 1 urgent unread"),
+                    "wake prompt must say urgent: {text}"
+                );
+                assert!(text.contains("PinkGorge re: [bd-1] help needed"));
+            }
+            other => panic!("expected wake Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_actions_waits_when_idle_with_no_mail_and_no_queue() {
+        let mut queue: Vec<String> = Vec::new();
+        let states = vec![st("flywheel-proj-oc", "idle")];
+        let d = digest_map(digest(0, 0, "", ""));
+        let actions = plan_actions(&states, &mut queue, None, &d);
+        assert_eq!(actions[0], LoopAction::Wait);
+    }
+
+    #[test]
+    fn plan_actions_nudge_wins_over_urgent_wake_when_nudge_present() {
+        // nudge is orchestrator direction; a nudge beats the mail wake so the
+        // loop's own queue instruction takes precedence
+        let mut queue: Vec<String> = Vec::new();
+        let states = vec![st("flywheel-proj-oc", "idle")];
+        let d = digest_map(digest(3, 2, "PinkGorge", "[bd-1] urgent"));
+        let actions = plan_actions(&states, &mut queue, Some("proceed"), &d);
+        match &actions[0] {
+            LoopAction::Nudge { .. } => {}
+            other => panic!("expected Nudge (orchestrator direction wins), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_actions_working_agent_ignores_mail_digest() {
+        // a working agent is busy; the digest is not for it this tick
+        let mut queue = vec!["do the work".to_string()];
+        let states = vec![st("flywheel-proj-oc", "working")];
+        let d = digest_map(digest(5, 1, "PinkGorge", "[bd-1] input"));
+        let actions = plan_actions(&states, &mut queue, None, &d);
+        assert_eq!(actions[0], LoopAction::Wait);
+        assert_eq!(queue.len(), 1, "queue must not be consumed by a working agent");
     }
 
     #[test]
@@ -3810,7 +4062,7 @@ mod tests {
     }
 
     fn poll_dispatch(states: &[AgentState], queue: &mut Vec<String>) -> Vec<DispatchRec> {
-        plan_actions(states, queue, None)
+        plan_actions(states, queue, None, &HashMap::new())
             .iter()
             .filter_map(rec_from_action)
             .collect()
