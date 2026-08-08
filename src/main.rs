@@ -618,13 +618,16 @@ enum WorkCmd {
 
 #[derive(Subcommand)]
 enum MailCmd {
-    /// fetch inbox for the flywheel identity
+    /// fetch inbox (default: config identity; override with --as / FLYWHEEL_MAIL_AS / AGENT_NAME)
     Inbox {
         project: String,
         #[arg(long)]
         urgent: bool,
         #[arg(long, default_value = "20")]
         limit: u32,
+        /// act as this registered agent (adjective+noun or herdr short name)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
     },
     /// send a message to registered agents
     Send {
@@ -639,6 +642,12 @@ enum MailCmd {
         importance: String,
         #[arg(long)]
         ack: bool,
+        /// act as this agent (required for crew peer mail; else CoralFinch/config)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+        /// thread id (use bead id for collab threads)
+        #[arg(long = "thread-id")]
+        thread_id: Option<String>,
     },
     /// reserve files (advisory locks)
     Locks {
@@ -651,14 +660,23 @@ enum MailCmd {
         exclusive: bool,
         #[arg(long, default_value = "flywheel")]
         reason: String,
+        /// hold locks as this agent (crew must pass --as $AGENT_NAME)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
     },
     /// release this identity's reservations
-    Unlock { project: String },
+    Unlock {
+        project: String,
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+    },
     /// check reservation conflicts for paths
     Conflicts {
         project: String,
         #[arg(long)]
         paths: Vec<String>,
+        #[arg(long = "as")]
+        as_agent: Option<String>,
     },
     /// list registered agents in the project
     Agents { project: String },
@@ -3492,10 +3510,53 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
 fn mail_or_die(cfg: &Config) -> Result<mail_shim::Mail> {
     mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))?.ok_or_else(|| {
         anyhow!(
-            "agent-mail (toron) not configured — set [mail.toron] url in {}",
+            "toron mail not configured — set [mail.toron] url in {} (AM fallback: mail=agentmail)",
             config::config_file().display()
         )
     })
+}
+
+/// Who this CLI mail invocation acts as (bd-mail-actor-identity-nze).
+///
+/// Priority: explicit `--as` → `FLYWHEEL_MAIL_AS` → `AGENT_NAME` → config
+/// `[agent_mail].name` (orchestrator CoralFinch). Without this, every crew
+/// `flywheel mail send` collapsed to CoralFinch and peer collab was unreadable.
+fn resolve_mail_actor(explicit: Option<&str>) -> Option<String> {
+    if let Some(a) = explicit {
+        let t = a.trim();
+        if !t.is_empty() {
+            return Some(resolve_mail_target(t));
+        }
+    }
+    for key in ["FLYWHEEL_MAIL_AS", "AGENT_NAME"] {
+        if let Ok(v) = std::env::var(key) {
+            let t = v.trim();
+            if !t.is_empty() {
+                return Some(resolve_mail_target(t));
+            }
+        }
+    }
+    None
+}
+
+/// Mail facade acting as resolved actor (registers identity best-effort).
+fn mail_as(cfg: &Config, project_key: &str, as_agent: Option<&str>) -> Result<mail_shim::Mail> {
+    let mut mail = mail_or_die(cfg)?;
+    if let Some(name) = resolve_mail_actor(as_agent) {
+        mail.name = name;
+    }
+    // Ensure the actor exists so send/reserve/inbox don't 404 "Agent not found".
+    let name = mail.name.clone();
+    if let Err(e) = mail.register_agent(
+        project_key,
+        &name,
+        "flywheel",
+        "flywheel",
+        "flywheel mail CLI actor",
+    ) {
+        eprintln!("flywheel: mail self-register as {name} failed (non-fatal): {e:#}");
+    }
+    Ok(mail)
 }
 
 /// Parsed cross-project swarm request (subject `[xproj] …` + body fields).
@@ -3802,24 +3863,17 @@ fn cmd_xproj(cfg: &Config, cmd: &XprojCmd) -> Result<()> {
 }
 
 fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
-    let mut mail = mail_or_die(cfg)?;
     match cmd {
         MailCmd::Inbox {
             project,
             urgent,
             limit,
+            as_agent,
         } => {
             let key = project_dir(cfg, project).to_str().unwrap().to_string();
+            let mut mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
-            // bd-7hw: idempotently register the orchestrator identity so
-            // `fetch_inbox` doesn't reject "Agent not found". register_agent
-            // is an upsert — safe to call every time.
             let name = mail.name.clone();
-            if let Err(e) =
-                mail.register_agent(&key, &name, "flywheel", "flywheel", "flywheel orchestrator")
-            {
-                eprintln!("flywheel: self-register failed (non-fatal): {e:#}");
-            }
             let v = mail.inbox(&key, &name, *urgent, *limit)?;
             print_json(&v);
         }
@@ -3830,15 +3884,26 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             body,
             importance,
             ack,
+            as_agent,
+            thread_id,
         } => {
             let key = project_dir(cfg, project).to_str().unwrap().to_string();
+            let mut mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
             // herdr names resolve to their registered identities (bd-odc)
             let targets: Vec<String> = to
                 .split(',')
                 .map(|s| resolve_mail_target(s.trim()))
                 .collect();
-            let v = mail.send(&key, &targets, subject, body, importance, *ack, None)?;
+            let v = mail.send(
+                &key,
+                &targets,
+                subject,
+                body,
+                importance,
+                *ack,
+                thread_id.as_deref(),
+            )?;
             print_json(&v);
         }
         MailCmd::Locks {
@@ -3847,25 +3912,34 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             ttl_seconds,
             exclusive,
             reason,
+            as_agent,
         } => {
             let key = project_dir(cfg, project).to_str().unwrap().to_string();
+            let mut mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
             let v = mail.reserve(&key, paths, *ttl_seconds, *exclusive, reason)?;
             print_json(&v);
         }
-        MailCmd::Unlock { project } => {
+        MailCmd::Unlock { project, as_agent } => {
             let key = project_dir(cfg, project).to_str().unwrap().to_string();
+            let mut mail = mail_as(cfg, &key, as_agent.as_deref())?;
             let v = mail.release(&key)?;
             print_json(&v);
         }
-        MailCmd::Conflicts { project, paths } => {
+        MailCmd::Conflicts {
+            project,
+            paths,
+            as_agent,
+        } => {
             let key = project_dir(cfg, project).to_str().unwrap().to_string();
+            let mut mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
             let v = mail.conflicts(&key, paths)?;
             print_json(&v);
         }
         MailCmd::Agents { project } => {
             let key = project_dir(cfg, project).to_str().unwrap().to_string();
+            let mut mail = mail_or_die(cfg)?;
             mail.ensure_project(&key)?;
             let v = mail.list_agents(&key)?;
             print_json(&v);
@@ -3878,6 +3952,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 reason,
             } => {
                 let key = project_dir(cfg, project).to_str().unwrap().to_string();
+                let mut mail = mail_as(cfg, &key, None)?;
                 mail.ensure_project(&key)?;
                 let from = mail.name.clone();
                 let to_mail = resolve_mail_target(to);
@@ -3890,6 +3965,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             }
             MailContactCmd::Approve { project, from } => {
                 let key = project_dir(cfg, project).to_str().unwrap().to_string();
+                let mut mail = mail_as(cfg, &key, None)?;
                 let to = mail.name.clone();
                 let from_mail = resolve_mail_target(from);
                 let v = mail.respond_contact(&key, &to, &from_mail, true)?;
@@ -3897,6 +3973,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             }
             MailContactCmd::Deny { project, from } => {
                 let key = project_dir(cfg, project).to_str().unwrap().to_string();
+                let mut mail = mail_as(cfg, &key, None)?;
                 let to = mail.name.clone();
                 let from_mail = resolve_mail_target(from);
                 let v = mail.respond_contact(&key, &to, &from_mail, false)?;
@@ -3904,12 +3981,14 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             }
             MailContactCmd::List { project } => {
                 let key = project_dir(cfg, project).to_str().unwrap().to_string();
+                let mut mail = mail_as(cfg, &key, None)?;
                 let name = mail.name.clone();
                 let v = mail.list_contacts(&key, &name)?;
                 print_json(&v);
             }
             MailContactCmd::Policy { project, policy } => {
                 let key = project_dir(cfg, project).to_str().unwrap().to_string();
+                let mut mail = mail_as(cfg, &key, None)?;
                 let name = mail.name.clone();
                 let v = mail.set_contact_policy(&key, &name, policy)?;
                 print_json(&v);
@@ -3917,11 +3996,13 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         },
         MailCmd::Product { cmd } => match cmd {
             MailProductCmd::Ensure { name } => {
+                let mut mail = mail_or_die(cfg)?;
                 let v = mail.ensure_product(name)?;
                 print_json(&v);
             }
             MailProductCmd::Link { product, project } => {
                 let key = project_dir(cfg, project).to_str().unwrap().to_string();
+                let mut mail = mail_or_die(cfg)?;
                 mail.ensure_project(&key)?;
                 let v = mail.products_link(product, &key)?;
                 print_json(&v);
@@ -3931,10 +4012,12 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 query,
                 limit,
             } => {
+                let mut mail = mail_or_die(cfg)?;
                 let v = mail.search_product(product, query, *limit)?;
                 print_json(&v);
             }
             MailProductCmd::Inbox { product, limit } => {
+                let mut mail = mail_or_die(cfg)?;
                 let name = mail.name.clone();
                 let v = mail.inbox_product(product, &name, *limit)?;
                 print_json(&v);
