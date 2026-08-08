@@ -26,13 +26,15 @@ toron-mcp = { path = "../toron/crates/toron-mcp" }
 # ALL workflow execution through toron-workflow's WorkflowEngine. This is the
 # cargo edge the tier diagram always implied but no Cargo.toml wired.
 toron-workflow = { path = "../toron/crates/toron-workflow" }
+cron = "0.17.0"
+chrono = "0.4.45"
 
 [features]
-# Default build: the `serve` HTTP surface + the two default backends (herdr
-# multiplexer + agent-mail mail). Optional backends (superlogical/tmux/toron)
-# are opt-in; their stub impls land in bd-toron-superlogical-stubs (R0.7), and
-# their heavy deps (nostr-sdk etc.) only pull when enabled.
-default = ["serve", "backend-herdr", "mail-agentmail"]
+# Default build: the `serve` HTTP surface + herdr multiplexer + BOTH mail
+# backends (toron is the default selection; agent-mail remains compiled in as
+# opt-in via FLYWHEEL_MAIL). Optional multiplexers (superlogical/tmux) are
+# opt-in; their stub impls land in bd-toron-superlogical-stubs (R0.7).
+default = ["serve", "backend-herdr", "mail-agentmail", "mail-toron"]
 serve = ["dep:axum", "dep:tokio-stream", "dep:futures-core"]
 # Multiplexer backends (ADR-0002)
 backend-herdr = []
@@ -63,6 +65,7 @@ optional = true
 
 [dev-dependencies]
 serde_json = "1"
+tempfile = "3.27.0"
 uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
