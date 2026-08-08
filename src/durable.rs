@@ -310,6 +310,31 @@ fn self_exe() -> anyhow::Result<std::path::PathBuf> {
     std::env::current_exe().map_err(anyhow::Error::from)
 }
 
+/// Run a leaf's blocking child-process wait on tokio's blocking pool
+/// (cg6.8). Every leaf body is `async fn` doing a plain synchronous
+/// `std::process::Command::output()` — a blocking child wait inline on the
+/// workflow task. Resonate SDK 0.6.0 executes leaves INLINE on the workflow
+/// task (verified in context.rs), so a blocked worker thread is occupied for
+/// the leaf's full duration (up to 300s for `poll_events`). Benign on the
+/// current multi-threaded `Runtime::new()` (a blocked worker is masked by
+/// the pool), but a latent footgun: a `current_thread` runtime would stall
+/// the whole loop on the first leaf, and any future `ctx.run(...).spawn()`
+/// fan-out would silently serialize — and exhaust — the thread pool.
+///
+/// `spawn_blocking` moves the exact same `std::process::Command` code to
+/// tokio's blocking pool; the child-process-per-leaf crash-isolation
+/// boundary is untouched (a leaf panic still cannot kill the loop's
+/// memory).
+async fn run_leaf_cmd(
+    mut cmd: std::process::Command,
+    label: &'static str,
+) -> Result<std::process::Output> {
+    tokio::task::spawn_blocking(move || cmd.output())
+        .await
+        .map_err(|e| map_err(anyhow::anyhow!("{label} leaf task join failed: {e}")))?
+        .map_err(|e| map_err(anyhow::anyhow!("{label} spawn failed: {e}")))
+}
+
 /// Poll the swarm via the flywheel binary itself. Checkpointed.
 ///
 /// SOFT-FAIL: if `__poll` exits non-zero (e.g. the swarm was killed or never
@@ -321,10 +346,9 @@ fn self_exe() -> anyhow::Result<std::path::PathBuf> {
 #[function]
 async fn poll_swarm(args: PollArgs) -> Result<Vec<AgentState>> {
     let exe = self_exe().map_err(map_err)?;
-    let out = Command::new(&exe)
-        .args(["__poll", &args.project, &args.to])
-        .output()
-        .map_err(|e| map_err(anyhow::anyhow!("__poll spawn failed: {e}")))?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__poll", &args.project, &args.to]);
+    let out = run_leaf_cmd(cmd, "__poll").await?;
     if !out.status.success() {
         // Swarm gone / not spawned — soft-fail to empty so the loop settles
         // rather than aborting the durable run.
@@ -369,9 +393,7 @@ async fn poll_events(args: PollEventsArgs) -> Result<PollEventsBatch> {
     if args.after_seq > 0 {
         cmd.args(["--after-seq", &args.after_seq.to_string()]);
     }
-    let out = cmd
-        .output()
-        .map_err(|e| map_err(anyhow::anyhow!("__poll_events spawn failed: {e}")))?;
+    let out = run_leaf_cmd(cmd, "__poll_events").await?;
     if !out.status.success() {
         // soft-fail: return empty batch with the error so the loop can fall
         // back to heartbeat __poll without killing the workflow
@@ -480,10 +502,9 @@ pub fn log_poll_events(project: &str, batch: &PollEventsBatch) {
 #[function]
 async fn poll_ready(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
     let exe = self_exe().map_err(map_err)?;
-    let out = Command::new(&exe)
-        .args(["__ready", &args.project])
-        .output()
-        .map_err(|e| map_err(anyhow::anyhow!("__ready spawn failed: {e}")))?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__ready", &args.project]);
+    let out = run_leaf_cmd(cmd, "__ready").await?;
     if !out.status.success() {
         return Err(map_err(anyhow::anyhow!(
             "__ready failed: {}",
@@ -689,10 +710,9 @@ pub fn escalation_tier(
 #[function]
 async fn poll_inprogress(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
     let exe = self_exe().map_err(map_err)?;
-    let out = Command::new(&exe)
-        .args(["__inprogress", &args.project])
-        .output()
-        .map_err(|e| map_err(anyhow::anyhow!("__inprogress spawn failed: {e}")))?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__inprogress", &args.project]);
+    let out = run_leaf_cmd(cmd, "__inprogress").await?;
     if !out.status.success() {
         return Err(map_err(anyhow::anyhow!(
             "__inprogress failed: {}",
@@ -727,10 +747,9 @@ async fn poll_inprogress(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
 #[function]
 async fn poll_kind(args: PollKindArgs) -> Result<String> {
     let exe = self_exe().map_err(map_err)?;
-    let out = Command::new(&exe)
-        .args(["__kind", &args.project, &args.name])
-        .output()
-        .map_err(|e| map_err(anyhow::anyhow!("__kind spawn failed: {e}")))?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__kind", &args.project, &args.name]);
+    let out = run_leaf_cmd(cmd, "__kind").await?;
     if !out.status.success() {
         return Err(map_err(anyhow::anyhow!(
             "__kind failed: {}",
@@ -744,10 +763,9 @@ async fn poll_kind(args: PollKindArgs) -> Result<String> {
 #[function]
 async fn read_output(args: ReadArgs) -> Result<ContextVerdict> {
     let exe = self_exe().map_err(map_err)?;
-    let out = Command::new(&exe)
-        .args(["__read", &args.project, &args.name])
-        .output()
-        .map_err(|e| map_err(anyhow::anyhow!("__read spawn failed: {e}")))?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__read", &args.project, &args.name]);
+    let out = run_leaf_cmd(cmd, "__read").await?;
     if !out.status.success() {
         return Err(map_err(anyhow::anyhow!(
             "__read failed: {}",
@@ -784,9 +802,7 @@ async fn respawn_agent(args: RespawnArgs) -> Result<()> {
     if args.reason == "context_limit" {
         cmd.arg("--force");
     }
-    let out = cmd
-        .output()
-        .map_err(|e| map_err(anyhow::anyhow!("__respawn spawn failed: {e}")))?;
+    let out = run_leaf_cmd(cmd, "__respawn").await?;
     if !out.status.success() {
         return Err(map_err(anyhow::anyhow!(
             "__respawn failed: {}",
@@ -839,10 +855,9 @@ pub struct SendOutcome {
 #[function]
 async fn send_prompt(args: SendArgs) -> Result<SendOutcome> {
     let exe = self_exe().map_err(map_err)?;
-    let out = Command::new(&exe)
-        .args(send_prompt_argv(&args))
-        .output()
-        .map_err(|e| map_err(anyhow::anyhow!("__send spawn failed: {e}")))?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(send_prompt_argv(&args));
+    let out = run_leaf_cmd(cmd, "__send").await?;
     if !out.status.success() {
         return Err(map_err(anyhow::anyhow!(
             "__send failed: {}",
@@ -973,16 +988,15 @@ async fn notify_blocked(args: NotifyArgs) -> Result<EscalationOutcome> {
     .map_err(map_err)?;
     if should_mail {
         let exe = self_exe().map_err(map_err)?;
-        let out = Command::new(&exe)
-            .args([
-                "__mail-blocked",
-                &args.project,
-                &args.name,
-                "--tier",
-                &tier.to_string(),
-            ])
-            .output()
-            .map_err(|e| map_err(anyhow::anyhow!("__mail-blocked spawn failed: {e}")))?;
+        let mut cmd = Command::new(&exe);
+        cmd.args([
+            "__mail-blocked",
+            &args.project,
+            &args.name,
+            "--tier",
+            &tier.to_string(),
+        ]);
+        let out = run_leaf_cmd(cmd, "__mail-blocked").await?;
         if !out.status.success() {
             return Err(map_err(anyhow::anyhow!(
                 "__mail-blocked failed: {}",
@@ -1010,15 +1024,14 @@ async fn notify_blocked(args: NotifyArgs) -> Result<EscalationOutcome> {
 #[function]
 async fn poll_xproj_inbox(args: XprojInboxArgs) -> Result<Vec<crate::XprojInboxItem>> {
     let exe = self_exe().map_err(map_err)?;
-    let out = Command::new(&exe)
-        .args([
-            "__xproj-inbox",
-            &args.project,
-            "--limit",
-            &args.limit.to_string(),
-        ])
-        .output()
-        .map_err(|e| map_err(anyhow::anyhow!("__xproj-inbox spawn failed: {e}")))?;
+    let mut cmd = Command::new(&exe);
+    cmd.args([
+        "__xproj-inbox",
+        &args.project,
+        "--limit",
+        &args.limit.to_string(),
+    ]);
+    let out = run_leaf_cmd(cmd, "__xproj-inbox").await?;
     if !out.status.success() {
         return Ok(vec![]);
     }
@@ -1043,18 +1056,17 @@ async fn spawn_xproj(args: XprojSpawnArgs) -> Result<()> {
     }
     crate::state::xproj_seen_mark(&args.project, &args.message_id).map_err(map_err)?;
     let exe = self_exe().map_err(map_err)?;
-    let out = Command::new(&exe)
-        .args([
-            "__xproj-spawn",
-            &args.project,
-            &args.message_id,
-            &args.thread_id,
-            &args.from,
-            &args.recipe,
-            &args.workers.to_string(),
-        ])
-        .output()
-        .map_err(|e| map_err(anyhow::anyhow!("__xproj-spawn spawn failed: {e}")))?;
+    let mut cmd = Command::new(&exe);
+    cmd.args([
+        "__xproj-spawn",
+        &args.project,
+        &args.message_id,
+        &args.thread_id,
+        &args.from,
+        &args.recipe,
+        &args.workers.to_string(),
+    ]);
+    let out = run_leaf_cmd(cmd, "__xproj-spawn").await?;
     if !out.status.success() {
         // cg6.6: unmark so a FAILED spawn is retried next iteration — the
         // marker file is the replay-dedup for SUCCESSFUL spawns only;
@@ -1085,16 +1097,15 @@ async fn spawn_xproj(args: XprojSpawnArgs) -> Result<()> {
 #[function]
 async fn diagnose_agent(args: DiagnoseArgs) -> Result<Value> {
     let exe = self_exe().map_err(map_err)?;
-    let out = Command::new(&exe)
-        .args([
-            "__diagnose",
-            &args.project,
-            &args.name,
-            "--reason",
-            &args.reason,
-        ])
-        .output()
-        .map_err(|e| map_err(anyhow::anyhow!("__diagnose spawn failed: {e}")))?;
+    let mut cmd = Command::new(&exe);
+    cmd.args([
+        "__diagnose",
+        &args.project,
+        &args.name,
+        "--reason",
+        &args.reason,
+    ]);
+    let out = run_leaf_cmd(cmd, "__diagnose").await?;
     // soft: non-zero still returns JSON if any; empty → ok:false
     let raw = String::from_utf8_lossy(&out.stdout);
     if let Ok(v) = serde_json::from_str::<Value>(raw.trim()) {
@@ -1135,14 +1146,13 @@ pub struct RenewLeaseArgs {
 #[function]
 async fn renew_leases(args: RenewLeaseArgs) -> Result<Value> {
     let exe = self_exe().map_err(map_err)?;
-    let out = Command::new(&exe)
-        .args([
-            "__renew-leases",
-            &args.project,
-            &args.extend_seconds.to_string(),
-        ])
-        .output()
-        .map_err(|e| map_err(anyhow::anyhow!("__renew-leases spawn failed: {e}")))?;
+    let mut cmd = Command::new(&exe);
+    cmd.args([
+        "__renew-leases",
+        &args.project,
+        &args.extend_seconds.to_string(),
+    ]);
+    let out = run_leaf_cmd(cmd, "__renew-leases").await?;
     if !out.status.success() {
         return Err(map_err(anyhow::anyhow!(
             "__renew-leases failed: {}",
@@ -4191,5 +4201,61 @@ mod resume_dedup_tests {
         assert_eq!(st.ping_count, 1);
         assert_eq!(st.last_ping_tier, Some(0), "T0 ping marked");
         cg61_cleanup(&project);
+    }
+
+    // ---- cg6.8: leaves run child processes on the blocking pool ----
+
+    /// The leaf runner executes the SAME std::process::Command (a trivial
+    /// echo here) and returns its stdout — proving the spawn_blocking path
+    /// works end-to-end (blocking pool → child wait → Output).
+    #[tokio::test]
+    async fn run_leaf_cmd_executes_and_returns_output() {
+        let out = run_leaf_cmd(
+            {
+                let mut cmd = std::process::Command::new("/bin/sh");
+                cmd.args(["-c", "printf 'leaf-ok'"]);
+                cmd
+            },
+            "__test-leaf",
+        )
+        .await
+        .expect("leaf runs on the blocking pool");
+        assert!(out.status.success(), "child exits 0");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "leaf-ok",
+            "stdout captured"
+        );
+    }
+
+    /// A non-zero child exit is a CALL-SITE status check (as before the
+    /// refactor) — run_leaf_cmd returns the Output; a genuinely unspawnable
+    /// command surfaces as an Err naming the leaf.
+    #[tokio::test]
+    async fn run_leaf_cmd_propagates_child_failure() {
+        // non-zero exit: Output returned, status preserved (call site checks).
+        let out = run_leaf_cmd(
+            {
+                let mut cmd = std::process::Command::new("/bin/sh");
+                cmd.args(["-c", "exit 3"]);
+                cmd
+            },
+            "__test-leaf",
+        )
+        .await
+        .expect("non-zero exit is a status, not an Err");
+        assert_eq!(out.status.code(), Some(3), "child exit code preserved");
+
+        // missing binary: spawn failure surfaces as Err naming the leaf.
+        let spawn_err = run_leaf_cmd(
+            std::process::Command::new("/nonexistent/leaf-bin"),
+            "__test-leaf",
+        )
+        .await
+        .expect_err("missing binary fails spawn");
+        assert!(
+            format!("{spawn_err}").contains("__test-leaf"),
+            "labels the leaf: {spawn_err}"
+        );
     }
 }
