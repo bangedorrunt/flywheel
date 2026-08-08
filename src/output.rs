@@ -74,7 +74,10 @@ mod tests {
 
     #[test]
     fn warn_marks_text() {
-        // NO_COLOR forces the plain form; the text survives either way
+        // NO_COLOR forces the plain form; the text survives either way.
+        // Env mutation is process-global — serialize under the crate-wide
+        // env lock (193.2).
+        let _g = crate::config::lock_env();
         unsafe { std::env::set_var("NO_COLOR", "1") };
         assert_eq!(warn("drift"), "drift");
         unsafe { std::env::remove_var("NO_COLOR") };

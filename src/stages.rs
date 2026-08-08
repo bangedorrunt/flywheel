@@ -201,6 +201,8 @@ mod tests {
     /// A user `stages.toml` override replaces a compiled-in prompt.
     #[test]
     fn user_override_replaces_prompt() {
+        // XDG_CONFIG_HOME mutation is process-global — serialize (193.2).
+        let _g = crate::config::lock_env();
         let lib = StageLibrary::compiled_in();
         let old = lib.resolve("p6").unwrap().to_string();
         let dir = std::env::temp_dir().join(format!("fw-stages-{}", uuid::Uuid::new_v4()));
