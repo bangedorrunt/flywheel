@@ -260,7 +260,6 @@ mod tests {
     fn normalize_key(k: &str) -> Option<String> {
         match k {
             // id-type allowlist: AM u64 vs toron hex → compare the KEY only
-            // (value type is canonicalized to `id` in the shape tag below)
             "id" | "event_id" | "message_id" => Some("id".to_string()),
             // sender naming: AM `from` (name) vs toron `sender` (npub)
             "from" | "sender" => Some("sender".to_string()),
@@ -519,6 +518,57 @@ mod tests {
         }
         assert_shape_parity("inbox", &inboxes[0].1, &inboxes[1].1, &[], true);
 
+        // reply: reply to the just-sent message (its id comes from the inbox
+        // row), then assert both backends' replies landed. The reply subject
+        // contract (c3b.5) is `Re: <parent subject>` — the empty-subject
+        // hardcode is gone; the parent lookup runs against the project inbox.
+        let reply_targets = inboxes
+            .iter()
+            .map(|(kind, v)| {
+                let row = v
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .unwrap_or_else(|| panic!("{} inbox has a row to reply to", kind.name()));
+                let id = row
+                    .get("id")
+                    .or_else(|| row.get("message_id"))
+                    .or_else(|| row.get("event_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| panic!("{} inbox row has an id: {row}", kind.name()))
+                    .to_string();
+                (*kind, id)
+            })
+            .collect::<Vec<_>>();
+        for (kind, b) in backends.iter_mut() {
+            let (_, id) = reply_targets
+                .iter()
+                .find(|(k, _)| *k == *kind)
+                .expect("target id");
+            b.reply(project, id, "parity reply body", Some(&[agent.to_string()]))
+                .unwrap_or_else(|e| panic!("{} reply: {e}", kind.name()));
+        }
+        // both replies visible in the inbox (subject prefixed `Re: `).
+        for (kind, b) in backends.iter_mut() {
+            let filter = crate::backend::InboxFilter {
+                include_bodies: true,
+                limit: 10,
+                ..Default::default()
+            };
+            let v = b.inbox(project, agent, &filter).expect("inbox after reply");
+            let subjects: Vec<String> = v
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .filter_map(|r| r.get("subject").and_then(serde_json::Value::as_str))
+                .map(String::from)
+                .collect();
+            assert!(
+                subjects.iter().any(|s| s.starts_with("Re: parity subject")),
+                "{} reply carries Re: parent subject: {subjects:?}",
+                kind.name()
+            );
+        }
+
         // search: envelope-only parity. toron's projection is async (bus →
         // unwrap-loop → sqlite), so poll the toron backend briefly until its
         // result is non-empty before comparing shapes (bounded, 10s). The
@@ -616,5 +666,35 @@ mod tests {
 
         b.ack(project, agent, &id).expect("ack(hex) succeeds");
         b.mark_read(project, agent, &id).expect("mark_read(hex) succeeds");
+    }
+
+    /// 193.3: the shape-normalization allowlist is not vacuous — id-type,
+    /// sender-naming, and timestamp-representation differences collapse onto
+    /// the shared semantic key, and AM-only DB fields are dropped.
+    #[test]
+    fn shape_normalization_allowlist_is_not_vacuous() {
+        use serde_json::json;
+        // AM shape: numeric id, `from` naming, string created_ts, AM-only cols.
+        let am = json!({
+            "id": 42,
+            "from": "CoralFinch",
+            "created_ts": "2026-08-08T00:00:00Z",
+            "read_ts": 0,
+            "kind": "mail",
+            "project_id": 7,
+            "to": ["x"],
+            "attachments": [],
+        });
+        // toron shape: hex event_id, `sender` npub, epoch-µs number.
+        let toron = json!({
+            "event_id": "a1b2c3",
+            "sender": "7f7ed685445ed08a1d90005c092480b33e8f5439d9fcb0689d45830b6f3707ea",
+            "created_ts_us": 1786000000000000_i64,
+        });
+        assert_shape_parity("normalization", &am, &toron, &[], true);
+        // op-scoped extra_drop removes keys BOTH sides may omit.
+        let am2 = json!({ "id": 1, "result": [] });
+        let toron2 = json!({ "id": "hex", "result": [], "renewed": 0 });
+        assert_shape_parity("extra_drop", &am2, &toron2, &["renewed"], false);
     }
 }

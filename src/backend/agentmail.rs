@@ -18,9 +18,10 @@
 //! writes — the same `agent-mail/identity/<project_hash>/<pane_id>` layout
 //! `mail_shim` uses).
 
+use crate::backend::wire;
 use crate::backend::{BackendError, InboxFilter, MailBackend, Result, SearchFilter};
 use crate::mcp_http::{McpClient, McpError, ServerKind};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Real agent-mail backend. Constructed lazily by the factory; never dials on
 /// construction (ADR-0003 V4).
@@ -57,6 +58,37 @@ impl AgentMailBackend {
             McpError::Tool(t) => BackendError::Other(anyhow::anyhow!("agent-mail {tool}: {t}")),
         })
     }
+
+    /// c3b.5: resolve the `Re: <parent subject>` subject for a reply. The
+    /// parent's subject is looked up from the project inbox (the message being
+    /// replied to must be visible to this identity). Falls back to `""` when
+    /// the parent cannot be found — the wire builder still carries the subject
+    /// field, so the hardcoded-empty contract is gone.
+    fn parent_reply_subject(&self, project_key: &str, id: u64) -> Result<String> {
+        let rows = self.call(
+            "fetch_inbox",
+            wire::inbox_args(
+                project_key,
+                &self.name,
+                false,
+                false,
+                false,
+                false,
+                500,
+                None,
+            ),
+        )?;
+        let parent = rows.as_array().and_then(|rs| {
+            rs.iter().find(|r| {
+                r["id"].as_u64() == Some(id)
+                    || r["id"].as_str().and_then(|s| s.parse::<u64>().ok()) == Some(id)
+            })
+        });
+        Ok(match parent.and_then(|r| r["subject"].as_str()) {
+            Some(subj) if !subj.is_empty() => format!("Re: {subj}"),
+            _ => String::new(),
+        })
+    }
 }
 
 impl MailBackend for AgentMailBackend {
@@ -70,11 +102,11 @@ impl MailBackend for AgentMailBackend {
 
     fn health(&self) -> Result<Value> {
         // BUG4: the MCP `health_check` tool, NOT a REST /health.
-        self.call("health_check", json!({}))
+        self.call("health_check", wire::health_check_args())
     }
 
     fn ensure_project(&self, project_key: &str) -> Result<Value> {
-        self.call("ensure_project", json!({ "human_key": project_key }))
+        self.call("ensure_project", wire::ensure_project_args(project_key))
     }
 
     fn register_agent(
@@ -87,18 +119,12 @@ impl MailBackend for AgentMailBackend {
     ) -> Result<Value> {
         self.call(
             "register_agent",
-            json!({
-                "project_key": project_key,
-                "name": name,
-                "program": program,
-                "model": model,
-                "task_description": task,
-            }),
+            wire::register_agent_args(project_key, name, program, model, task),
         )
     }
 
     fn list_agents(&self, project_key: &str) -> Result<Value> {
-        self.call("list_agents", json!({ "project_key": project_key }))
+        self.call("list_agents", wire::list_agents_args(project_key))
     }
 
     fn send(
@@ -111,19 +137,19 @@ impl MailBackend for AgentMailBackend {
         ack_required: bool,
         thread_id: Option<&str>,
     ) -> Result<Value> {
-        let mut args = json!({
-            "project_key": project_key,
-            "sender_name": self.name,
-            "to": to,
-            "subject": subject,
-            "body_md": body,
-            "importance": importance,
-            "ack_required": ack_required,
-        });
-        if let Some(tid) = thread_id {
-            args["thread_id"] = json!(tid);
-        }
-        self.call("send_message", args)
+        self.call(
+            "send_message",
+            wire::send_args(
+                project_key,
+                &self.name,
+                to,
+                subject,
+                body,
+                importance,
+                ack_required,
+                thread_id,
+            ),
+        )
     }
 
     fn reply(
@@ -136,62 +162,59 @@ impl MailBackend for AgentMailBackend {
         // AM's reply_message takes the numeric `message_id` (toron's takes a
         // hex thread_id — the per-backend mapping divergence of ADR-0003 V1).
         // A non-decimal id is a caller bug — Err loudly, never 0 (se2.2).
-        let id = message_id
-            .parse::<u64>()
-            .map_err(|e| anyhow::anyhow!("agent-mail message_id {message_id:?} is not a decimal id: {e}"))?;
+        let id = message_id.parse::<u64>().map_err(|e| {
+            anyhow::anyhow!("agent-mail message_id {message_id:?} is not a decimal id: {e}")
+        })?;
         self.call(
             "reply_message",
-            json!({
-                "project_key": project_key,
-                "sender_name": self.name,
-                "to": to.map(|t| t.to_vec()).unwrap_or_default(),
-                "subject": "",
-                "body_md": body,
-                "message_id": id as i64,
-            }),
+            wire::reply_args(
+                project_key,
+                &self.name,
+                &to.map(|t| t.to_vec()).unwrap_or_default(),
+                // c3b.5: reply subject populated from the parent (`Re: `) —
+                // the caller owns parent lookup; the wire builder carries it
+                // (was hardcoded `""`).
+                &self.parent_reply_subject(project_key, id)?,
+                body,
+                "message_id",
+                json!(id),
+            ),
         )
     }
 
     fn inbox(&self, project_key: &str, agent: &str, filter: &InboxFilter) -> Result<Value> {
-        let mut args = serde_json::Map::new();
-        args.insert("project_key".into(), json!(project_key));
-        args.insert("agent_name".into(), json!(agent));
-        args.insert("urgent_only".into(), json!(filter.urgent_only));
-        args.insert("unread_only".into(), json!(filter.unread_only));
-        args.insert("ack_overdue_only".into(), json!(filter.ack_overdue_only));
-        args.insert("include_bodies".into(), json!(filter.include_bodies));
-        args.insert("limit".into(), json!(filter.limit));
-        if let Some(ts) = &filter.since_ts {
-            args.insert("since_ts".into(), json!(ts));
-        }
-        self.call("fetch_inbox", Value::Object(args))
+        self.call(
+            "fetch_inbox",
+            wire::inbox_args(
+                project_key,
+                agent,
+                filter.urgent_only,
+                filter.unread_only,
+                filter.ack_overdue_only,
+                filter.include_bodies,
+                filter.limit,
+                filter.since_ts.as_deref(),
+            ),
+        )
     }
 
     fn ack(&self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
-        let id = message_id
-            .parse::<u64>()
-            .map_err(|e| anyhow::anyhow!("agent-mail message_id {message_id:?} is not a decimal id: {e}"))?;
+        let id = message_id.parse::<u64>().map_err(|e| {
+            anyhow::anyhow!("agent-mail message_id {message_id:?} is not a decimal id: {e}")
+        })?;
         self.call(
             "acknowledge_message",
-            json!({
-                "project_key": project_key,
-                "agent_name": agent,
-                "message_id": id as i64,
-            }),
+            wire::ack_args(project_key, agent, json!(id)),
         )
     }
 
     fn mark_read(&self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
-        let id = message_id
-            .parse::<u64>()
-            .map_err(|e| anyhow::anyhow!("agent-mail message_id {message_id:?} is not a decimal id: {e}"))?;
+        let id = message_id.parse::<u64>().map_err(|e| {
+            anyhow::anyhow!("agent-mail message_id {message_id:?} is not a decimal id: {e}")
+        })?;
         self.call(
             "mark_message_read",
-            json!({
-                "project_key": project_key,
-                "agent_name": agent,
-                "message_id": id as i64,
-            }),
+            wire::mark_read_args(project_key, agent, json!(id)),
         )
     }
 
@@ -209,14 +232,14 @@ impl MailBackend for AgentMailBackend {
         let _ = _agent;
         self.call(
             "file_reservation_paths",
-            json!({
-                "project_key": project_key,
-                "agent_name": self.name,
-                "paths": paths,
-                "ttl_seconds": ttl_seconds as i64,
-                "exclusive": exclusive,
-                "reason": reason,
-            }),
+            wire::reserve_args(
+                project_key,
+                &self.name,
+                paths,
+                ttl_seconds,
+                exclusive,
+                reason,
+            ),
         )
     }
 
@@ -224,7 +247,7 @@ impl MailBackend for AgentMailBackend {
         let _ = _agent;
         self.call(
             "release_file_reservations",
-            json!({ "project_key": project_key, "agent_name": self.name }),
+            wire::release_args(project_key, &self.name),
         )
     }
 
@@ -235,16 +258,11 @@ impl MailBackend for AgentMailBackend {
         extend_seconds: u64,
         paths: Option<&[String]>,
     ) -> Result<Value> {
-        let mut args = json!({
-            "project_key": project_key,
-            "agent_name": agent,
-            "extend_seconds": extend_seconds as i64,
-        });
-        if let Some(p) = paths {
-            args["paths"] = json!(p);
-        }
         // AM already returns the `file_reservations` envelope consumers read.
-        self.call("renew_file_reservations", args)
+        self.call(
+            "renew_file_reservations",
+            wire::renew_args(project_key, agent, extend_seconds, paths),
+        )
     }
 
     fn force_release_file_reservation(
@@ -255,34 +273,30 @@ impl MailBackend for AgentMailBackend {
         note: Option<&str>,
         notify_previous: bool,
     ) -> Result<Value> {
-        let mut args = json!({
-            "project_key": project_key,
-            "agent_name": agent,
-            "file_reservation_id": file_reservation_id,
-            "notify_previous": notify_previous,
-        });
-        if let Some(n) = note {
-            args["note"] = json!(n);
-        }
-        self.call("force_release_file_reservation", args)
+        self.call(
+            "force_release_file_reservation",
+            wire::force_release_args(
+                project_key,
+                agent,
+                json!(file_reservation_id),
+                note,
+                notify_previous,
+            ),
+        )
     }
 
     fn conflicts(&self, project_key: &str, _agent: &str, paths: &[String]) -> Result<Value> {
         let _ = _agent;
         self.call(
             "check_file_reservation_conflicts",
-            json!({
-                "project_key": project_key,
-                "agent_name": self.name,
-                "paths": paths,
-            }),
+            wire::conflicts_args(project_key, &self.name, paths),
         )
     }
 
     fn resolve_pane_identity(&self, project_key: &str, pane_id: &str) -> Result<Value> {
         self.call(
             "resolve_pane_identity",
-            json!({ "project_key": project_key, "pane_id": pane_id }),
+            wire::resolve_pane_identity_args(project_key, pane_id),
         )
     }
 
@@ -309,7 +323,7 @@ impl MailBackend for AgentMailBackend {
     fn cleanup_pane_identities(&self, project_key: &str) -> Result<Value> {
         self.call(
             "cleanup_pane_identities",
-            json!({ "project_key": project_key }),
+            wire::cleanup_pane_identities_args(project_key),
         )
     }
 
@@ -323,24 +337,14 @@ impl MailBackend for AgentMailBackend {
     ) -> Result<Value> {
         self.call(
             "acquire_build_slot",
-            json!({
-                "project_key": project_key,
-                "agent_name": agent,
-                "slot": slot,
-                "exclusive": exclusive,
-                "ttl_seconds": ttl_seconds as i64,
-            }),
+            wire::slot_acquire_args(project_key, agent, slot, exclusive, ttl_seconds),
         )
     }
 
     fn slot_release(&self, project_key: &str, agent: &str, slot: &str) -> Result<Value> {
         self.call(
             "release_build_slot",
-            json!({
-                "project_key": project_key,
-                "agent_name": agent,
-                "slot": slot,
-            }),
+            wire::slot_release_args(project_key, agent, slot),
         )
     }
 
@@ -353,12 +357,7 @@ impl MailBackend for AgentMailBackend {
     ) -> Result<Value> {
         self.call(
             "renew_build_slot",
-            json!({
-                "project_key": project_key,
-                "agent_name": agent,
-                "slot": slot,
-                "extend_seconds": extend_seconds as i64,
-            }),
+            wire::slot_renew_args(project_key, agent, slot, extend_seconds),
         )
     }
 
@@ -369,32 +368,21 @@ impl MailBackend for AgentMailBackend {
         limit: u32,
         filter: &SearchFilter,
     ) -> Result<Value> {
-        let mut args = serde_json::Map::new();
-        args.insert("project_key".into(), json!(project_key));
-        args.insert("query".into(), json!(query));
-        args.insert("limit".into(), json!(limit));
-        if filter.include_body_md {
-            args.insert("include_body_md".into(), json!(true));
-        }
-        if let Some(s) = &filter.sender {
-            args.insert("sender".into(), json!(s));
-        }
-        if let Some(i) = &filter.importance {
-            args.insert("importance".into(), json!(i));
-        }
-        if let Some(t) = &filter.thread_id {
-            args.insert("thread_id".into(), json!(t));
-        }
-        if let Some(d) = &filter.date_start {
-            args.insert("date_start".into(), json!(d));
-        }
-        if let Some(d) = &filter.date_end {
-            args.insert("date_end".into(), json!(d));
-        }
-        if let Some(r) = &filter.ranking {
-            args.insert("ranking".into(), json!(r));
-        }
-        self.call("search_messages", Value::Object(args))
+        self.call(
+            "search_messages",
+            wire::search_args(
+                project_key,
+                query,
+                limit,
+                filter.include_body_md,
+                filter.sender.as_deref(),
+                filter.importance.as_deref(),
+                filter.thread_id.as_deref(),
+                filter.date_start.as_deref(),
+                filter.date_end.as_deref(),
+                filter.ranking.as_deref(),
+            ),
+        )
     }
 
     fn summarize_thread(
@@ -405,11 +393,7 @@ impl MailBackend for AgentMailBackend {
     ) -> Result<Value> {
         self.call(
             "summarize_thread",
-            json!({
-                "project_key": project_key,
-                "thread_id": thread_id,
-                "llm_mode": llm_mode,
-            }),
+            wire::summarize_thread_args(project_key, thread_id, llm_mode),
         )
     }
 
@@ -421,11 +405,7 @@ impl MailBackend for AgentMailBackend {
     ) -> Result<Value> {
         self.call(
             "summarize_thread_product",
-            json!({
-                "product_key": product_key,
-                "thread_id": thread_id,
-                "llm_mode": llm_mode,
-            }),
+            wire::summarize_thread_product_args(product_key, thread_id, llm_mode),
         )
     }
 
@@ -437,16 +417,10 @@ impl MailBackend for AgentMailBackend {
         to_project: Option<&str>,
         reason: &str,
     ) -> Result<Value> {
-        let mut args = json!({
-            "project_key": project_key,
-            "from_agent": from_agent,
-            "to_agent": to_agent,
-            "reason": reason,
-        });
-        if let Some(tp) = to_project {
-            args["to_project"] = json!(tp);
-        }
-        self.call("request_contact", args)
+        self.call(
+            "request_contact",
+            wire::request_contact_args(project_key, from_agent, to_agent, to_project, reason),
+        )
     }
 
     fn respond_contact(
@@ -458,69 +432,46 @@ impl MailBackend for AgentMailBackend {
     ) -> Result<Value> {
         self.call(
             "respond_contact",
-            json!({
-                "project_key": project_key,
-                "to_agent": to_agent,
-                "from_agent": from_agent,
-                "accept": accept,
-            }),
+            wire::respond_contact_args(project_key, to_agent, from_agent, accept),
         )
     }
 
     fn list_contacts(&self, project_key: &str, agent: &str) -> Result<Value> {
         self.call(
             "list_contacts",
-            json!({ "project_key": project_key, "agent_name": agent }),
+            wire::list_contacts_args(project_key, agent),
         )
     }
 
-    fn set_contact_policy(
-        &self,
-        project_key: &str,
-        agent: &str,
-        policy: &str,
-    ) -> Result<Value> {
+    fn set_contact_policy(&self, project_key: &str, agent: &str, policy: &str) -> Result<Value> {
         self.call(
             "set_contact_policy",
-            json!({
-                "project_key": project_key,
-                "agent_name": agent,
-                "policy": policy,
-            }),
+            wire::set_contact_policy_args(project_key, agent, policy),
         )
     }
 
     fn ensure_product(&self, product_key: &str) -> Result<Value> {
-        self.call("ensure_product", json!({ "product_key": product_key }))
+        self.call("ensure_product", wire::ensure_product_args(product_key))
     }
 
     fn products_link(&self, product_key: &str, project_key: &str) -> Result<Value> {
         self.call(
             "products_link",
-            json!({ "product_key": product_key, "project_key": project_key }),
+            wire::products_link_args(product_key, project_key),
         )
     }
 
     fn search_product(&self, product_key: &str, query: &str, limit: u32) -> Result<Value> {
         self.call(
             "search_messages_product",
-            json!({
-                "product_key": product_key,
-                "query": query,
-                "limit": limit,
-                "include_body_md": true,
-            }),
+            wire::search_product_args(product_key, query, limit),
         )
     }
 
     fn inbox_product(&self, product_key: &str, agent: &str, limit: u32) -> Result<Value> {
         self.call(
             "fetch_inbox_product",
-            json!({
-                "product_key": product_key,
-                "agent_name": agent,
-                "limit": limit,
-            }),
+            wire::inbox_product_args(product_key, agent, limit),
         )
     }
 }
