@@ -387,7 +387,12 @@ async fn poll_events(args: PollEventsArgs) -> Result<PollEventsBatch> {
         });
     }
     let raw = String::from_utf8_lossy(&out.stdout);
-    parse_poll_events_batch(raw.trim(), args.after_seq).map_err(map_err)
+    let batch = parse_poll_events_batch(raw.trim(), args.after_seq).map_err(map_err)?;
+    // is1.4: log the batch INSIDE the leaf so the entries are checkpointed
+    // with the result — a body-level log re-fires on every crash-resume
+    // replay and duplicates JSONL entries (the event log feeds analytics).
+    log_poll_events(&args.project, &batch);
+    Ok(batch)
 }
 
 /// Pure parse of `__poll_events` stdout (unit-testable).
@@ -859,6 +864,19 @@ async fn send_prompt(args: SendArgs) -> Result<SendOutcome> {
             "source": "loop",
         }),
     );
+    if outcome.deduped {
+        // is1.4: the resume-dedup skip is logged HERE (checkpointed) — the
+        // body-side log duplicated on replay.
+        let _ = crate::state::log_event(
+            &args.project,
+            crate::state::EventKind::SkippedDup,
+            serde_json::json!({
+                "name": args.name,
+                "iteration": args.iteration,
+                "source": "loop",
+            }),
+        );
+    }
     Ok(outcome)
 }
 
@@ -971,6 +989,19 @@ async fn notify_blocked(args: NotifyArgs) -> Result<EscalationOutcome> {
                 String::from_utf8_lossy(&out.stderr).trim()
             )));
         }
+        if tier == 3 {
+            // is1.4: the T3 halt event is logged HERE (checkpointed with the
+            // leaf) — the body-side log duplicated on crash-resume replay.
+            let _ = crate::state::log_event(
+                &args.project,
+                crate::state::EventKind::Loop,
+                serde_json::json!({
+                    "status": "halted",
+                    "tier": tier,
+                    "name": args.name,
+                }),
+            );
+        }
     }
     Ok(EscalationOutcome { tier, ping_count })
 }
@@ -1030,6 +1061,18 @@ async fn spawn_xproj(args: XprojSpawnArgs) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
+    // is1.4: the spawn event is logged HERE (checkpointed with the leaf) —
+    // the body-side log duplicated on crash-resume replay.
+    let _ = crate::state::log_event(
+        &args.project,
+        crate::state::EventKind::State,
+        serde_json::json!({
+            "source": "xproj_spawn",
+            "message_id": args.message_id,
+            "recipe": args.recipe,
+            "workers": args.workers,
+        }),
+    );
     Ok(())
 }
 
@@ -1785,7 +1828,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         if event_batch.max_seq > event_cursor_seq {
             event_cursor_seq = event_batch.max_seq;
         }
-        log_poll_events(&params.project, &event_batch);
+        // (is1.4: the event batch is logged INSIDE the poll_events leaf —
+        // checkpointed; a body-side log would duplicate on replay.)
 
         // ---- correctness floor: authoritative agent.list snapshot ----
         // Always runs. Catches any state change missed during a crash gap
@@ -1873,15 +1917,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 queue.push(prompt);
                 "queued"
             };
-            let _ = crate::state::log_event(
-                &params.project,
-                crate::state::EventKind::State,
-                serde_json::json!({
-                    "source": "xproj_inbox",
-                    "message_id": item.id,
-                    "action": action,
-                }),
-            );
+            // is1.4: the spawned/queued outcome is NOT logged body-side —
+            // spawn_xproj logs its own (checkpointed) event; the queued case
+            // is visible via the queue + this one-shot eprintln.
             eprintln!("flywheel: cross-project request msg {} {action}", item.id);
         }
 
@@ -2120,20 +2158,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     };
                     clear_dispatch_pending(&mut dispatch_pending, name, outcome.landed);
                     // resume-dedup: __send skipped the herdr call because this
-                    // prompt already landed for this invocation — log it (the
-                    // landed handling below resets the failure counter; a
-                    // skipped item never fails)
-                    if outcome.deduped {
-                        let _ = crate::state::log_event(
-                            &params.project,
-                            crate::state::EventKind::SkippedDup,
-                            serde_json::json!({
-                                "name": name,
-                                "iteration": iteration,
-                                "source": "loop",
-                            }),
-                        );
-                    }
+                    // prompt already landed for this invocation (is1.4: the
+                    // SkippedDup event is logged INSIDE the send_prompt leaf —
+                    // checkpointed; the landed handling below resets the
+                    // failure counter; a skipped item never fails)
                     any_work = true;
                     match handle_send_result(&mut send_failures, name, &outcome) {
                         Escalation::Accept => {}
@@ -2214,15 +2242,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         // `flywheel loop` and the event log show WHY it stopped
                         // (vs a normal "complete"). T0/T1/T2 keep notifying.
                         if let Some(msg) = on_blocked_tier_exit(tier_enum, &params.on_blocked) {
-                            let _ = crate::state::log_event(
-                                &params.project,
-                                crate::state::EventKind::Loop,
-                                serde_json::json!({
-                                    "status": "halted",
-                                    "tier": out.tier,
-                                    "name": name,
-                                }),
-                            );
+                            // (is1.4: the halted event is logged INSIDE the
+                            // notify_blocked leaf at T3 — checkpointed, so a
+                            // crash-resume cannot double-log the halt.)
                             return Ok(msg);
                         }
                     }
@@ -2389,7 +2411,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         {
             Ok(v) => {
                 let renewed = v.get("renewed").and_then(Value::as_u64).unwrap_or(0);
-                eprintln!("flywheel: renewed {renewed} lease(s)");
+                // is1.4: quiet at idle — only print when something renewed.
+                if renewed > 0 {
+                    eprintln!("flywheel: renewed {renewed} lease(s)");
+                }
             }
             Err(e) => eprintln!("flywheel: lease renew failed (continuing): {e}"),
         }
