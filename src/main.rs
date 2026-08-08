@@ -1663,16 +1663,70 @@ fn robot_snapshot(cfg: &Config) -> Result<Value> {
             })
         })
         .collect();
+    // P6.4: runs section — the same log-derived run list the `runs` CLI
+    // serves, so an agent driver polls run-state from the snapshot alone.
+    let runs: Vec<Value> = snapshot_runs();
     Ok(json!({
         "tool": "flywheel",
         "version": VERSION,
         "ts": state::now_iso(),
         "workspaces": fly,
+        "runs": runs,
         "agents": agents.iter().map(|a| json!({
             "name": a.name, "kind": a.agent, "status": a.agent_status.as_str(),
             "workspace_id": a.workspace_id, "pane_id": a.pane_id
         })).collect::<Vec<_>>()
     }))
+}
+
+/// Run list for the robot snapshot (P6.4) — workflow/pipeline/loop entries
+/// from the per-project logs, newest first, with state + owner + run-id.
+/// Independent of the `runs` CLI so the snapshot has no subcommand coupling.
+fn snapshot_runs() -> Vec<Value> {
+    use state::{EventKind, LogEntry};
+    let dir = config::state_dir();
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".jsonl") {
+            continue;
+        }
+        let project = name.trim_end_matches(".jsonl").to_string();
+        let Ok(rows) = state::read_log(&project) else {
+            continue;
+        };
+        for e in rows {
+            let run_kind = match e.kind {
+                EventKind::Workflow => Some("workflow"),
+                EventKind::Pipeline => Some("pipeline"),
+                EventKind::Loop => Some("loop"),
+                _ => None,
+            };
+            let Some(run_kind) = run_kind else { continue };
+            let owner = ["workflow", "pipeline", "loop", "agent"]
+                .iter()
+                .find_map(|k| e.data.get(*k).and_then(Value::as_str).map(String::from))
+                .unwrap_or_default();
+            out.push(json!({
+                "id": format!("{project}:{}", e.ts),
+                "project": project,
+                "kind": run_kind,
+                "owner": owner,
+                "state": e.data.get("status").and_then(Value::as_str).unwrap_or("done"),
+                "ts": e.ts,
+            }));
+        }
+    }
+    out.sort_by(|a, b| {
+        b.get("ts")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .cmp(a.get("ts").and_then(Value::as_str).unwrap_or(""))
+    });
+    out
 }
 
 /// Only used by the serve-gated SSE server; gate it so the lean
@@ -8317,7 +8371,6 @@ mod plan_review_tests {
 #[cfg(test)]
 mod profile_cli_tests {
     use super::*;
-
     #[test]
     fn is_builtin_profile_classifies_the_six() {
         for name in ["oracle", "planner", "reviewer", "coder", "scout", "housekeeper"] {
@@ -8380,5 +8433,20 @@ mod profile_cli_tests {
             );
         }
         assert_eq!(names.len(), 6);
+    }
+
+    #[test]
+    fn snapshot_runs_returns_well_formed_entries() {
+        // Runs section is always a JSON array; every entry carries the fields
+        // the agent driver contracts on (id/project/kind/owner/state/ts).
+        let runs = snapshot_runs();
+        for r in &runs {
+            assert!(r.get("id").and_then(Value::as_str).is_some(), "id");
+            assert!(r.get("project").and_then(Value::as_str).is_some(), "project");
+            assert!(r.get("kind").and_then(Value::as_str).is_some(), "kind");
+            assert!(r.get("owner").and_then(Value::as_str).is_some(), "owner");
+            assert!(r.get("state").and_then(Value::as_str).is_some(), "state");
+            assert!(r.get("ts").and_then(Value::as_str).is_some(), "ts");
+        }
     }
 }
