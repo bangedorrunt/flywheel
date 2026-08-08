@@ -23,13 +23,53 @@ use serde::{Deserialize, Serialize};
 /// under ONE lock — per-module locks would still race each other. Config's
 /// tests own the reference pattern; every other module's env-mutating test
 /// takes this lock.
+#[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Take the crate-wide env lock (poison-tolerant).
+/// Take the crate-wide env lock (poison-tolerant). Test-only (193.2).
+#[cfg(test)]
 pub(crate) fn lock_env() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Hermetic state dir for a test (193.2): holds the crate-wide env lock and
+/// points `XDG_STATE_HOME` at a fresh per-call temp dir for the guard's
+/// lifetime, removing it on drop. Every test that writes `state_dir()`
+/// artifacts (loops sidecars, last_sent, xproj seen-markers) MUST take this
+/// — the real state dir is shared with production loops and sibling test
+/// processes; writing it poisons later runs (e.g. a v1 fixture left behind
+/// re-triggers the sidecar migration mid-suite).
+#[cfg(test)]
+pub(crate) struct TestStateHome {
+    _env: std::sync::MutexGuard<'static, ()>,
+    dir: PathBuf,
+}
+
+#[cfg(test)]
+impl Drop for TestStateHome {
+    fn drop(&mut self) {
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Begin a hermetic state-dir test (see [`TestStateHome`]).
+#[cfg(test)]
+pub(crate) fn test_state_home() -> TestStateHome {
+    let _env = lock_env();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "flywheel-state-home-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create test state home");
+    unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
+    TestStateHome { _env, dir }
 }
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 1_800_000;

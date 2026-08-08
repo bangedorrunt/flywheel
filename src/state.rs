@@ -1007,6 +1007,7 @@ mod last_sent_tests {
 
     #[test]
     fn load_save_roundtrip() {
+        let _g = crate::config::test_state_home(); // 193.2: never touch the real state dir
         let dir =
             std::env::temp_dir().join(format!("flywheel-lastsent-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1132,12 +1133,11 @@ mod loops_sidecar_tests {
     use super::*;
     use serde_json::json;
 
-    static LOOPS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn loops_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        LOOPS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn loops_test_guard() -> crate::config::TestStateHome {
+        // 193.2: hermetic XDG_STATE_HOME (holds the crate-wide env lock) —
+        // the REAL state dir is shared with production loops; a leftover
+        // fixture there re-triggers the sidecar migration mid-suite.
+        crate::config::test_state_home()
     }
 
     fn test_project(tag: &str) -> String {
@@ -1365,6 +1365,7 @@ mod loops_sidecar_tests {
         let _g = loops_test_guard();
         let p = test_project("v1");
         let legacy = loops_file();
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap(); // hermetic dir starts empty
         let pre_legacy = std::fs::read_to_string(&legacy).ok();
         let pre_markers = loops_dir_markers();
         // minimal v1 fixture: flat project map, no schema key
