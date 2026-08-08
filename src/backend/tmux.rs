@@ -9,7 +9,7 @@
 //!
 //! gated by: cargo feature `backend-tmux` (off by default).
 
-use crate::backend::{BackendError, MultiplexerBackend};
+use crate::backend::MultiplexerBackend;
 
 /// Stub tmux backend. `name()` is the only override — every trait method
 /// inherits the default `BackendError::Unsupported` (naming this backend).
@@ -25,9 +25,4 @@ impl MultiplexerBackend for TmuxBackend {
     fn name(&self) -> &'static str {
         "tmux"
     }
-}
-
-/// Convenience: the whole-backend Unsupported error the factory surfaces.
-pub fn stub_error() -> BackendError {
-    BackendError::stub("tmux", TmuxBackend::REASON)
 }
