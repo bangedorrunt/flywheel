@@ -28,7 +28,7 @@
 //! governed-by: ADR-0005 Spec 2, P3.2
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -117,7 +117,7 @@ impl WorkflowCatalog {
     }
 
     /// Load canonical `workflows/*.yaml` (unified schema).
-    fn load_canonical(&mut self, config_root: &PathBuf) -> Result<()> {
+    fn load_canonical(&mut self, config_root: &Path) -> Result<()> {
         let dir = config_root.join("workflows");
         if !dir.is_dir() {
             return Ok(());
@@ -142,7 +142,7 @@ impl WorkflowCatalog {
     /// through the SAME catalog surface. Legacy name collisions with canonical
     /// YAML are overwritten by the canonical file (canonical is the home);
     /// a mapping note records the shadowed legacy entry.
-    fn absorb(&mut self, config_root: &PathBuf) -> Result<()> {
+    fn absorb(&mut self, config_root: &Path) -> Result<()> {
         // Legacy workflows.toml
         let wf_path = config_root.join("workflows.toml");
         if wf_path.exists() {
@@ -243,7 +243,7 @@ fn absorb_workflow_steps(name: &str, steps: &[LegacyStep]) -> (Workflow, Vec<Map
     }
     let wf = Workflow {
         name: name.to_string(),
-        description: Some(format!("absorbed legacy workflows.toml workflow")),
+        description: Some("absorbed legacy workflows.toml workflow".to_string()),
         trigger: None,
         guard: None,
         steps: unified,

@@ -151,6 +151,7 @@ runs. Do not overload normal bead dispatch.
 - **Review-fix regression gate**: `bash docs/decisions/_scripts/verify-review-fixes.sh` asserts the
   F1-F8 fixes (harvest body, gate loop, xproj to_project/focus, T3 halt, backend migration,
   default agents, cleanup) stay fixed; `verify-0001.sh` / `verify-0002.sh` gate the ADRs.
+- **Clippy gate**: `bash scripts/verify-clippy.sh` must exit 0 (cargo clippy --all-targets --all-features --locked -- -D warnings).
 - **No script-based code changes** in this repo — edit files manually.
 - **No file deletion** without explicit user permission.
 - **br is CLI-only**: `br ready --json`, `br update <id> --claim --actor "$AGENT_NAME"`,

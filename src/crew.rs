@@ -20,7 +20,6 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use toron_workflow::schema::{Action, CrewSpec, Workflow};
@@ -37,6 +36,7 @@ impl CrewPlan {
     /// Resolve the fan-out count for a `parallel over: "@crew.<role>"` step.
     /// `@crew.coder` → the coder member count (1 if the role isn't in the
     /// crew); a bare `N` stays `N` (elastic).
+    #[cfg(test)]
     pub fn fanout_count(&self, over: &str) -> u32 {
         if let Some(role) = over.trim().strip_prefix("@crew.") {
             self.members.get(role).copied().unwrap_or(1).max(1)

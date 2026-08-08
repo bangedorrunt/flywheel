@@ -13,6 +13,7 @@
 //! governed-by: ADR-0005 Spec 3, bd-p4-migrate-sagas-7rmo
 
 /// The three design workflows, name → YAML.
+#[cfg(test)]
 pub const DESIGN_WORKFLOWS: &[(&str, &str)] = &[
     ("docker-upgrade", r##"
 name: docker-upgrade

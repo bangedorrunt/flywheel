@@ -1851,7 +1851,7 @@ fn robot_snapshot(cfg: &Config) -> Result<Value> {
 /// from the per-project logs, newest first, with state + owner + run-id.
 /// Independent of the `runs` CLI so the snapshot has no subcommand coupling.
 fn snapshot_runs() -> Vec<Value> {
-    use state::{EventKind, LogEntry};
+    use state::EventKind;
     let dir = config::state_dir();
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1958,10 +1958,8 @@ fn recipe_counts(
         }
     }
     for (k, n) in [("oc", counts.oc), ("pi", counts.pi), ("gk", counts.gk)] {
-        if let Some(n) = n {
-            if n > 0 {
-                out.push((k.into(), n));
-            }
+        if let Some(n) = n && n > 0 {
+            out.push((k.into(), n));
         }
     }
     for (k, n) in kinds {
@@ -2102,10 +2100,8 @@ fn start_agent_with_retry(
     args: &[String],
 ) -> Result<AgentInfo> {
     for attempt in 0..30 {
-        if let Err(e) = c.agent_start(name, kind, pane_id, 45_000, args) {
-            if attempt == 0 {
-                eprintln!("agent.start error: {e:#}");
-            }
+        if let Err(e) = c.agent_start(name, kind, pane_id, 45_000, args) && attempt == 0 {
+            eprintln!("agent.start error: {e:#}");
         }
         // a timeout can leave the agent already booted; check the registry.
         // match name AND pane — a same-named agent on another pane is not ours.
@@ -2120,15 +2116,11 @@ fn start_agent_with_retry(
             // bd-w17): accept the pane match and apply the name ourselves —
             // name-based resolution (send/loop/status) depends on it
             if let Some(a) = agents.iter().find(|a| a.pane_id == pane_id) {
-                if a.name.as_deref() != Some(name) {
-                    if let Err(e) = c.agent_rename(&a.pane_id, name) {
-                        eprintln!("agent.rename error: {e:#}");
-                    }
+                if a.name.as_deref() != Some(name) && let Err(e) = c.agent_rename(&a.pane_id, name) {
+                    eprintln!("agent.rename error: {e:#}");
                 }
-                if let Ok(agents) = c.agent_list() {
-                    if let Some(a) = agents.iter().find(|a| a.pane_id == pane_id) {
-                        return Ok(a.clone());
-                    }
+                if let Ok(agents) = c.agent_list() && let Some(a) = agents.iter().find(|a| a.pane_id == pane_id) {
+                    return Ok(a.clone());
                 }
             }
         }
@@ -2150,10 +2142,8 @@ fn start_agent_with_retry_dyn(
     args: &[String],
 ) -> Result<AgentInfo> {
     for attempt in 0..30 {
-        if let Err(e) = backend.agent_start(name, kind, pane_id, args) {
-            if attempt == 0 {
-                eprintln!("agent.start error: {e:#}");
-            }
+        if let Err(e) = backend.agent_start(name, kind, pane_id, args) && attempt == 0 {
+            eprintln!("agent.start error: {e:#}");
         }
         if let Ok(agents) = backend.agent_list() {
             if let Some(a) = agents
@@ -2166,10 +2156,8 @@ fn start_agent_with_retry_dyn(
                 if a.name.as_deref() != Some(name) {
                     let _ = backend.agent_rename(&a.pane_id, Some(name));
                 }
-                if let Ok(agents) = backend.agent_list() {
-                    if let Some(a) = agents.iter().find(|a| a.pane_id == pane_id) {
-                        return Ok(a.clone());
-                    }
+                if let Ok(agents) = backend.agent_list() && let Some(a) = agents.iter().find(|a| a.pane_id == pane_id) {
+                    return Ok(a.clone());
                 }
             }
         }
@@ -2248,14 +2236,12 @@ fn register_spawned_agent(cfg: &Config, project: &str, name: &str, kind: &str, p
 fn valid_pair(s: &str, adjectives: &[&str], nouns: &[&str]) -> Option<String> {
     let lower = s.to_ascii_lowercase();
     for adj in adjectives {
-        if let Some(rest) = lower.strip_prefix(adj) {
-            if !rest.is_empty() && nouns.contains(&rest) {
-                let mut adj = (*adj).to_owned();
-                adj.get_mut(0..1)?.make_ascii_uppercase();
-                let mut noun = rest.to_owned();
-                noun.get_mut(0..1)?.make_ascii_uppercase();
-                return Some(format!("{adj}{noun}"));
-            }
+        if let Some(rest) = lower.strip_prefix(adj) && !rest.is_empty() && nouns.contains(&rest) {
+            let mut adj = (*adj).to_owned();
+            adj.get_mut(0..1)?.make_ascii_uppercase();
+            let mut noun = rest.to_owned();
+            noun.get_mut(0..1)?.make_ascii_uppercase();
+            return Some(format!("{adj}{noun}"));
         }
     }
     None
@@ -3218,10 +3204,8 @@ fn cmd_watch(
         if std::io::stdout().is_terminal() {
             println!("{} {}", dim(&name), status_paint(st));
         }
-        if let Some(u) = until_status {
-            if st == u && all_matching(&mut c, &watch_names, u)? {
-                return Ok(());
-            }
+        if let Some(u) = until_status && st == u && all_matching(&mut c, &watch_names, u)? {
+            return Ok(());
         }
     }
 
@@ -3275,12 +3259,11 @@ fn cmd_watch(
                             if std::io::stdout().is_terminal() {
                                 println!("{} {}", dim(name), status_paint(change.agent_status));
                             }
-                            if let Some(u) = until_status {
-                                if change.agent_status == u
-                                    && all_matching(&mut c, &watch_names, u)?
-                                {
-                                    return Ok(());
-                                }
+                            if let Some(u) = until_status
+                                && change.agent_status == u
+                                && all_matching(&mut c, &watch_names, u)?
+                            {
+                                return Ok(());
                             }
                         }
                         _ => {}
@@ -3317,12 +3300,12 @@ fn watch_poll(
 ) -> Result<bool> {
     for a in c.agent_list()? {
         let name = a.name.unwrap_or(a.pane_id.clone());
-        if watch_names.contains(&name) {
-            if let Some(u) = until_status {
-                if a.agent_status == u && all_matching(c, watch_names, u)? {
-                    return Ok(true);
-                }
-            }
+        if watch_names.contains(&name)
+            && let Some(u) = until_status
+            && a.agent_status == u
+            && all_matching(c, watch_names, u)?
+        {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -3399,16 +3382,14 @@ fn cmd_kill(cfg: &Config, project: &str, force: bool) -> Result<()> {
     let _ = std::fs::remove_dir_all(agentstate::project_state_dir(&project_dir(cfg, project)));
     // clear the identity files for the dead panes (best-effort — a missing
     // file is a no-op, so double-exit is harmless)
-    if let Ok(mut mail) = backend::mail_backend(cfg) {
-        if let Some(key) = project_dir(cfg, project).to_str() {
-            for a in &agents {
-                if let Err(e) = mail.clear_pane_identity(key, &a.pane_id) {
-                    eprintln!(
-                        "flywheel: mail clear_pane_identity failed for {} on {}: {e}",
-                        a.name.as_deref().unwrap_or("<unnamed>"),
-                        a.pane_id
-                    );
-                }
+    if let Ok(mut mail) = backend::mail_backend(cfg) && let Some(key) = project_dir(cfg, project).to_str() {
+        for a in &agents {
+            if let Err(e) = mail.clear_pane_identity(key, &a.pane_id) {
+                eprintln!(
+                    "flywheel: mail clear_pane_identity failed for {} on {}: {e}",
+                    a.name.as_deref().unwrap_or("<unnamed>"),
+                    a.pane_id
+                );
             }
         }
     }
@@ -4686,14 +4667,12 @@ fn cmd_loop(
 
     loop {
         // re-check deadline
-        if let Some(d) = deadline {
-            if std::time::Instant::now() >= d {
-                bail!(
-                    "loop timed out after {}s (queue remaining: {})",
-                    timeout_ms.unwrap_or(0) / 1000,
-                    queue_items.len()
-                );
-            }
+        if let Some(d) = deadline && std::time::Instant::now() >= d {
+            bail!(
+                "loop timed out after {}s (queue remaining: {})",
+                timeout_ms.unwrap_or(0) / 1000,
+                queue_items.len()
+            );
         }
 
         let agents = c
@@ -5443,10 +5422,8 @@ fn load_json_or_default(path: &std::path::Path) -> Result<serde_json::Value> {
 }
 
 fn pretty_path(p: &std::path::Path) -> String {
-    if let Ok(h) = std::env::var("HOME") {
-        if let Ok(strip) = p.strip_prefix(&h) {
-            return format!("~/{}", strip.display());
-        }
+    if let Ok(h) = std::env::var("HOME") && let Ok(strip) = p.strip_prefix(&h) {
+        return format!("~/{}", strip.display());
     }
     p.display().to_string()
 }
@@ -6007,10 +5984,8 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             for n in cat.names() {
                 // carry local (non-builtin) entries verbatim; the edited one is
                 // rewritten from the merge so partial edits keep built-in fields
-                if n == *name || !is_builtin_profile(&n) {
-                    if let Some(p) = cat.get(&n) {
-                        on_disk.insert(n, p.clone());
-                    }
+                if (n == *name || !is_builtin_profile(&n)) && let Some(p) = cat.get(&n) {
+                    on_disk.insert(n, p.clone());
                 }
             }
             on_disk.insert(name.clone(), merged);
@@ -6794,10 +6769,8 @@ fn cmd_cron(cmd: &CronCmd) -> Result<()> {
                 if let Some(d) = st.next_due {
                     println!("next_due: {d}");
                 }
-                if let Some(wf) = manager_workflow(name) {
-                    if let Some(p) = &wf.policy {
-                        println!("policy:   {p:?}");
-                    }
+                if let Some(wf) = manager_workflow(name) && let Some(p) = &wf.policy {
+                    println!("policy:   {p:?}");
                 }
             }
             Ok(())
@@ -7036,13 +7009,11 @@ fn lint_flywheel_tier(name: &str, wf: &toron_workflow::schema::Workflow) -> usiz
             if let Some(profile) = spec.get("profile").and_then(|v| v.as_str()) {
                 check_profile(profile, profiles, blocking, emit);
             }
-            if let Some(stage) = spec.get("stage").and_then(|v| v.as_str()) {
-                if !stages.has(stage) {
-                    emit(
-                        &format!("stage {stage:?} does not resolve (semantic or p-code alias)"),
-                        blocking,
-                    );
-                }
+            if let Some(stage) = spec.get("stage").and_then(|v| v.as_str()) && !stages.has(stage) {
+                emit(
+                    &format!("stage {stage:?} does not resolve (semantic or p-code alias)"),
+                    blocking,
+                );
             }
         }
         if let Some(profile) = json.get("profile").and_then(|v| v.as_str()) {
@@ -8373,19 +8344,15 @@ fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> 
     // pane-identity bridge bookkeeping (best-effort — never fail the respawn
     // on mail trouble): the old pane died (its identity file is stale), the
     // fresh pane must resolve to the same name (the agent keeps its identity)
-    if let Ok(mut mail) = backend::mail_backend(cfg) {
-        if let Some(key) = dir.to_str() {
-            if let Some(old) = &old_pane {
-                if let Err(e) = mail.clear_pane_identity(key, old) {
-                    eprintln!("flywheel: mail clear_pane_identity failed for {old}: {e}");
-                }
-            }
-            if let Err(e) = mail.write_pane_identity(key, &fresh.pane_id, &agent_mail_name(name)) {
-                eprintln!(
-                    "flywheel: mail write_pane_identity failed for {name} on {}: {e}",
-                    fresh.pane_id
-                );
-            }
+    if let Ok(mut mail) = backend::mail_backend(cfg) && let Some(key) = dir.to_str() {
+        if let Some(old) = &old_pane && let Err(e) = mail.clear_pane_identity(key, old) {
+            eprintln!("flywheel: mail clear_pane_identity failed for {old}: {e}");
+        }
+        if let Err(e) = mail.write_pane_identity(key, &fresh.pane_id, &agent_mail_name(name)) {
+            eprintln!(
+                "flywheel: mail write_pane_identity failed for {name} on {}: {e}",
+                fresh.pane_id
+            );
         }
     }
     println!(
@@ -9411,7 +9378,7 @@ mod profile_cli_tests {
         let names: Vec<String> = cat.names();
         for name in &names {
             assert!(
-                recipes.get(name).is_none(),
+                !recipes.contains_key(name),
                 "no user recipe named {name} in a fresh install"
             );
         }

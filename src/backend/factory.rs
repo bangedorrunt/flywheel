@@ -332,9 +332,11 @@ mod tests {
     fn superlogical_stub_is_honest_unsupported() {
         let b = crate::backend::superlogical::SuperlogicalBackend;
         assert_eq!(b.name(), "superlogical");
-        let mut m: Box<dyn MultiplexerBackend> = Box::new(b);
+        let m: Box<dyn MultiplexerBackend> = Box::new(b);
         match m.workspace_list() {
-            Err(BackendError::Unsupported { backend, .. }) => assert_eq!(backend, "superlogical"),
+            Err(toron_core::backend::BackendError { code: toron_core::backend::BackendErrorCode::Unsupported, message }) => {
+                assert!(message.contains("superlogical"), "names the backend: {message}")
+            }
             Ok(_) => panic!("stub must not Ok"),
             Err(e) => panic!("expected Unsupported, got {e:?}"),
         }

@@ -194,42 +194,42 @@ impl ProfileCatalog {
         let mut profiles = compiled_in_defaults();
         let mut harnesses = compiled_in_harnesses();
 
-        if let Some(path) = path {
-            if path.exists() {
-                let raw = std::fs::read_to_string(path)
-                    .with_context(|| format!("read {}", path.display()))?;
-                let toml: ProfilesToml = toml::from_str(&raw)
-                    .with_context(|| format!("parse {}", path.display()))?;
-                // Layered: user profiles OVERRIDE built-ins field-by-field
-                // (empty user fields inherit the compiled-in value), so a
-                // partial `[profiles.scout] {model=...}` keeps the built-in
-                // harness. Unknown user names are added as-is.
-                for (name, user) in toml.profiles {
-                    match profiles.get(&name) {
-                        Some(base) => {
-                            let merged = Profile {
-                                harness: pick(user.harness, &base.harness),
-                                model: pick(user.model, &base.model),
-                                role: pick(user.role, &base.role),
-                                behavior: pick(user.behavior, &base.behavior),
-                                task_hint: pick(user.task_hint, &base.task_hint),
-                                backend: pick(user.backend, &base.backend),
-                                default_workflow: pick(user.default_workflow, &base.default_workflow),
-                                skills: if user.skills.is_empty() {
-                                    base.skills.clone()
-                                } else {
-                                    user.skills
-                                },
-                            };
-                            profiles.insert(name, merged);
-                        }
-                        None => {
-                            profiles.insert(name, user);
-                        }
+        if let Some(path) = path
+            && path.exists()
+        {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("read {}", path.display()))?;
+            let toml: ProfilesToml = toml::from_str(&raw)
+                .with_context(|| format!("parse {}", path.display()))?;
+            // Layered: user profiles OVERRIDE built-ins field-by-field
+            // (empty user fields inherit the compiled-in value), so a
+            // partial `[profiles.scout] {model=...}` keeps the built-in
+            // harness. Unknown user names are added as-is.
+            for (name, user) in toml.profiles {
+                match profiles.get(&name) {
+                    Some(base) => {
+                        let merged = Profile {
+                            harness: pick(user.harness, &base.harness),
+                            model: pick(user.model, &base.model),
+                            role: pick(user.role, &base.role),
+                            behavior: pick(user.behavior, &base.behavior),
+                            task_hint: pick(user.task_hint, &base.task_hint),
+                            backend: pick(user.backend, &base.backend),
+                            default_workflow: pick(user.default_workflow, &base.default_workflow),
+                            skills: if user.skills.is_empty() {
+                                base.skills.clone()
+                            } else {
+                                user.skills
+                            },
+                        };
+                        profiles.insert(name, merged);
+                    }
+                    None => {
+                        profiles.insert(name, user);
                     }
                 }
-                harnesses.extend(toml.harness);
             }
+            harnesses.extend(toml.harness);
         }
 
         Ok(Self {

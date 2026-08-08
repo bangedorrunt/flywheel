@@ -45,19 +45,6 @@ pub use toron_core::backend::Backend as MultiplexerBackend;
 /// Coded `agent.prompt` landing data (unified in toron-core).
 pub use toron_core::backend::PromptLanding;
 
-/// Landing data for a coded `agent.prompt` (ADR-0002, review-fix F6).
-///
-/// Mirrors `herdr::classify_send_result` inputs so a backend-agnostic `__send`
-/// leaf can make the same landed/stalled/timeout/coded dispatch decisions as
-/// the concrete herdr client:
-/// - `status: Some(s)` → the prompt landed and the agent reached `s`.
-/// - `code: Some(c)` → herdr returned a protocol error code
-///   (e.g. `agent_prompt_stalled`, `timeout`, `agent_not_running`).
-///
-/// Exactly one of the two is populated on the herdr backend (landed → status,
-/// error → code); other backends define their own contract. (Re-exported from
-/// toron-core — ADR-0005 P1 unified the type.)
-
 // Factory entry points — consumers (the durable-loop leaf handlers in main.rs)
 // call `backend::multiplexer_backend(&cfg)` / `backend::mail_backend(&cfg)`;
 // `flywheel backend list/status` (bd-cli-backend-subcommand) uses the resolve_
