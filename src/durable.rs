@@ -1318,9 +1318,21 @@ pub enum Escalation {
     /// clears the agent's failure history; a timeout leaves it untouched and
     /// is verified by the next poll.
     Accept,
-    /// 3+ consecutive failures on the same agent: hard stop the loop. A
-    /// genuinely broken environment must not burn the swarm forever.
+    /// 4 consecutive non-landing sends on the same agent (3 respawns, then
+    /// the 4th fails): hard stop the loop. A genuinely broken environment
+    /// must not burn the swarm forever. (cg6.4: threshold is FOUR — the
+    /// counter `escalate` reads is the pre-increment value, so
+    /// `failures >= 3` at call time means 4 failures have happened.)
     FailStop,
+}
+
+/// The FailStop error message (cg6.4): states the REAL contract — the loop
+/// respawns an agent after the first three non-landing sends and stops on
+/// the FOURTH. Single source of truth for both halt sites + tests.
+pub fn failstop_message(name: &str, reason: Option<&str>) -> String {
+    format!(
+        "agent {name} failed to accept 4 prompts in a row (last reason: {reason:?})"
+    )
 }
 
 /// Pure verdict for one confirmed send outcome.
@@ -1330,8 +1342,10 @@ pub enum Escalation {
 /// (legacy fire-and-forget path) → [`Escalation::Accept`]; a `timeout` reason
 /// is ambiguous (the prompt may have started) → [`Escalation::Accept`]
 /// WITHOUT touching the failure counter; any other non-landing (stalled,
-/// `error:<code>`) is a pane-health failure → respawn until `failures >= 3`
-/// then [`Escalation::FailStop`]. Deterministic: derives from the checkpointed
+/// `error:<code>`) is a pane-health failure → respawn on the first 3
+/// failures; the 4th (`failures >= 3` at call time — the counter is the
+/// PRE-increment value, see [`handle_send_result`]) → [`Escalation::FailStop`].
+/// Deterministic: derives from the checkpointed
 /// leaf result and the (also deterministic) counter.
 pub fn escalate(outcome: &SendOutcome, failures: u64) -> Escalation {
     match outcome.landed {
@@ -2078,8 +2092,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         Escalation::Accept => {}
                         Escalation::FailStop => {
                             return Err(map_err(anyhow::anyhow!(
-                                "agent {name} failed to accept 3 prompts in a row (last reason: {:?})",
-                                outcome.reason
+                                "{}",
+                                failstop_message(name, outcome.reason.as_deref())
                             )));
                         }
                         Escalation::RespawnAndRequeue => {
@@ -2203,8 +2217,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             Escalation::Accept => {}
                             Escalation::FailStop => {
                                 return Err(map_err(anyhow::anyhow!(
-                                    "agent {name} failed to accept 3 prompts in a row (last reason: {:?})",
-                                    outcome.reason
+                                    "{}",
+                                    failstop_message(name, outcome.reason.as_deref())
                                 )));
                             }
                             Escalation::RespawnAndRequeue => {
@@ -2721,6 +2735,22 @@ mod tests {
             escalate(&so(Some(false), Some("stalled")), 3),
             Escalation::FailStop
         );
+    }
+
+    /// cg6.4: the FailStop message must state the REAL threshold (4 prompts),
+    /// matching the pre-increment counter semantics — message, doc and code
+    /// agree on one number.
+    #[test]
+    fn failstop_message_states_real_contract() {
+        let m = failstop_message("agent-a", Some("stalled"));
+        assert!(m.contains("agent-a"));
+        assert!(
+            m.contains("4 prompts in a row"),
+            "message must match the actual 4-failure threshold: {m}"
+        );
+        assert!(!m.contains("3 prompts"), "no stale count in message: {m}");
+        let m2 = failstop_message("agent-b", None);
+        assert!(m2.contains("4 prompts in a row"));
     }
 
     #[test]
