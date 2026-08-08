@@ -120,6 +120,15 @@ enum Commands {
         /// spawn agents with the peer-aware self-poll template (ADR-0001 §9.3)
         #[arg(long)]
         peer_aware: bool,
+        /// peer-aware poll cadence (minutes idle between inbox polls; default 5)
+        #[arg(long, default_value_t = 5)]
+        peer_poll_interval_minutes: u32,
+        /// peer-aware liveness budget (minutes alive; default 30)
+        #[arg(long, default_value_t = 30)]
+        peer_poll_budget_minutes: u32,
+        /// peer-aware max peer-prompts per task (default 3)
+        #[arg(long, default_value_t = 3)]
+        peer_max_prompts: u32,
     },
     /// Extend a running swarm with more agent panes
     Add {
@@ -549,6 +558,12 @@ enum Commands {
         project: String,
         #[arg(long, default_value = "30")]
         limit: u32,
+    },
+    /// internal: mail digest for one agent (unread counts + last sender/subject)
+    #[command(name = "__mail-digest", hide = true)]
+    __MailDigest {
+        project: String,
+        agent: String,
     },
     /// internal: spawn the swarm for a parsed `[xproj]` request (full loop branch)
     #[command(name = "__xproj-spawn", hide = true)]
@@ -1586,6 +1601,9 @@ fn main() {
             label,
             no_focus,
             peer_aware,
+            peer_poll_interval_minutes,
+            peer_poll_budget_minutes,
+            peer_max_prompts,
         }) => cmd_spawn(
             &cfg,
             project,
@@ -1595,6 +1613,9 @@ fn main() {
             label.as_deref(),
             *no_focus,
             *peer_aware,
+            *peer_poll_interval_minutes,
+            *peer_poll_budget_minutes,
+            *peer_max_prompts,
         ),
         Some(Commands::Add {
             project,
@@ -1781,6 +1802,9 @@ fn main() {
         }) => cmd_internal_diagnose(&cfg, project, name, reason),
         Some(Commands::__XprojInbox { project, limit }) => {
             cmd_internal_xproj_inbox(&cfg, project, *limit)
+        }
+        Some(Commands::__MailDigest { project, agent }) => {
+            cmd_internal_mail_digest(&cfg, project, agent)
         }
         Some(Commands::__XprojSpawn {
             project,
@@ -2023,6 +2047,25 @@ fn recipe_counts(
 
 /// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
 #[allow(clippy::too_many_arguments)]
+/// Render the peer-aware self-poll template (ADR-0001 §9.3) with all
+/// placeholders substituted. Pure + deterministic so the injected prompt is
+/// free of literal `{placeholder}` text (bd-pattern-peer-triggered).
+fn peer_prompt_template(
+    tpl: &str,
+    name: &str,
+    poll_interval_minutes: u32,
+    poll_budget_minutes: u32,
+    max_peer_prompts: u32,
+) -> String {
+    tpl.replace("{name}", name)
+        .replace("{task}", "await the swarm loop's queue or help peers")
+        .replace("{poll_interval_minutes}", &poll_interval_minutes.to_string())
+        .replace("{poll_budget_minutes}", &poll_budget_minutes.to_string())
+        .replace("{max_peer_prompts}", &max_peer_prompts.to_string())
+}
+
+/// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
+#[allow(clippy::too_many_arguments)]
 fn cmd_spawn(
     cfg: &Config,
     project: &str,
@@ -2032,6 +2075,9 @@ fn cmd_spawn(
     label_override: Option<&str>,
     no_focus: bool,
     peer_aware: bool,
+    peer_poll_interval_minutes: u32,
+    peer_poll_budget_minutes: u32,
+    peer_max_prompts: u32,
 ) -> Result<()> {
     let dir = project_dir(cfg, project);
     if !dir.exists() {
@@ -2093,9 +2139,13 @@ fn cmd_spawn(
             let peer_args: Vec<String> = peer_template
                 .as_ref()
                 .map(|t| {
-                    vec![t
-                        .replace("{name}", &name)
-                        .replace("{task}", "await the swarm loop's queue or help peers")]
+                    vec![peer_prompt_template(
+                        t,
+                        &name,
+                        peer_poll_interval_minutes,
+                        peer_poll_budget_minutes,
+                        peer_max_prompts,
+                    )]
                 })
                 .unwrap_or_default();
             let pane_id = if first {
@@ -4390,6 +4440,9 @@ fn cmd_resume(cfg: &Config, project: &str, recipe: Option<&str>) -> Result<()> {
                 None,
                 false,
                 false,
+                5,
+                30,
+                3,
             )?;
         } else {
             bail!("workspace gone (run: flywheel spawn {project} --recipe <name> or flywheel resume {project} --recipe daily)");
@@ -4454,6 +4507,9 @@ fn cmd_asset(cfg: &Config, kind: &str, cmd: &AssetCmd) -> Result<()> {
                 None,
                 false,
                 false,
+                5,
+                30,
+                3,
             ),
             "workflows" => run_workflow(cfg, project, name),
             "pipeline" => run_pipeline(cfg, project, name),
@@ -4571,6 +4627,9 @@ fn cmd_ensemble(cfg: &Config, project: &str, recipe: &str, workflow: &str) -> Re
         None,
         false,
         false,
+        5,
+        30,
+        3,
     )?;
     run_workflow(cfg, project, workflow)
 }
@@ -8504,6 +8563,81 @@ fn cmd_internal_respawn(
 
 /// internal leaf: scan orchestrator inbox for `[xproj]` swarm requests.
 /// Soft-fail: missing mail → empty list. Output: `{ "items": [ XprojInboxItem ] }`.
+/// internal leaf: mail digest for ONE agent (loop-side wake signal).
+///
+/// The durable loop calls this per idle agent before dispatch; the digest is
+/// prepended to the next prompt so the agent wakes already knowing what peers
+/// asked it — without carrying a standing peer-poll template in its context
+/// (token-efficient: no per-agent self-poll loop; the orchestrator polls).
+///
+/// Output: `{ "agent": <mail name>, "unread": N, "urgent": N,
+/// "last_from": "...", "last_subject": "...", "thread_id": "..." }`.
+/// Soft-fail: mail down / unknown agent → zeroed digest, never an error.
+fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<()> {
+    let zero = json!({
+        "agent": agent, "unread": 0, "urgent": 0,
+        "last_from": null, "last_subject": null, "thread_id": null,
+    });
+    let mail = match backend::mail_backend(cfg) {
+        Ok(m) => m,
+        Err(_) => {
+            print_json(&zero);
+            return Ok(());
+        }
+    };
+    let key = project_dir_str(cfg, project)?;
+    if backend::run_mail(mail.ensure_project(&key)).is_err() {
+        print_json(&zero);
+        return Ok(());
+    }
+    let name = resolve_mail_target(agent.trim());
+    let v = match backend::run_mail(mail.inbox(&backend::InboxQuery {
+        project: key,
+        agent: name.clone(),
+        unread_only: true,
+        urgent_only: false,
+        include_bodies: false,
+        limit: Some(10),
+        since_ts: None,
+    })) {
+        Ok(v) => v,
+        Err(_) => {
+            print_json(&zero);
+            return Ok(());
+        }
+    };
+    let v_json = serde_json::to_value(&v).unwrap_or_default();
+    let arr = v_json.as_array().cloned().unwrap_or_default();
+    let unread = arr.len();
+    let urgent = arr
+        .iter()
+        .filter(|m| {
+            m.get("importance")
+                .and_then(|i| i.as_str())
+                .map(|i| i == "high" || i == "urgent")
+                .unwrap_or(false)
+        })
+        .count();
+    let last = arr.first();
+    // the wire row names the sender `sender` (toron MCP) or `from`
+    // (agent-mail MCP) — read both (MailItem aliases them, but the raw
+    // serde_json::Value here is the untyped projection).
+    let last_from = last.and_then(|m| {
+        m.get("sender")
+            .or_else(|| m.get("from"))
+            .and_then(|f| f.as_str())
+    });
+    print_json(&json!({
+        "agent": name,
+        "unread": unread,
+        "urgent": urgent,
+        "last_from": last_from,
+        "last_subject": last.and_then(|m| m.get("subject").and_then(|s| s.as_str())),
+        "thread_id": last.and_then(|m| m.get("thread_id").and_then(|t| t.as_str())),
+    }));
+    Ok(())
+}
+
 fn cmd_internal_xproj_inbox(cfg: &Config, project: &str, limit: u32) -> Result<()> {
     // review-fix F6: the xproj-inbox leaf routes through the backend factory.
     let mail = match backend::mail_backend(cfg) {
@@ -8578,6 +8712,9 @@ fn cmd_internal_xproj_spawn(
             None,
             true,  // background workspace (no_focus — must not steal terminal focus)
             false, // not peer-aware by default
+            5,
+            30,
+            3,
         )
     };
     let spawned_ok = outcome.is_ok();
