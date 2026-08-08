@@ -36,17 +36,12 @@ pub mod tmux;
 #[cfg(feature = "mail-toron")]
 pub mod toron;
 
-use crate::herdr_shim::{
-    AgentInfo, AgentStatus, PaneInfo, PushEvent, Subscription, WaitOptions, WorkspaceInfo,
-};
 use serde_json::Value;
 
 /// The unified multiplexer backend trait (ADR-0005 P1): sync, `&self`,
 /// object-safe, Unsupported-open. The ONE trait source lives in toron-core;
 /// this re-export keeps flywheel call sites on the historical name.
 pub use toron_core::backend::Backend as MultiplexerBackend;
-/// Unified event stream yielded by `Backend::subscribe`.
-pub use toron_core::backend::EventStream;
 /// Coded `agent.prompt` landing data (unified in toron-core).
 pub use toron_core::backend::PromptLanding;
 
