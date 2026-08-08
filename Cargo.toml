@@ -20,12 +20,12 @@ ureq = { version = "2", features = ["json"] }
 resonate-sdk = "0.6.0"
 # In-process toron integration (ADR-0003 Decision 3A, bd-o8j.1): flywheel
 # embeds toron-core's mailbox + toron-mcp's server surface with zero IPC.
-toron-core = { path = "../toron/crates/toron-core" }
-toron-mcp = { path = "../toron/crates/toron-mcp" }
+toron-core = { path = "/var/folders/z4/_8p90dn53gl9y4_7cm7rgf3m0000gn/T/toron-head/crates/toron-core" }
+toron-mcp = { path = "/var/folders/z4/_8p90dn53gl9y4_7cm7rgf3m0000gn/T/toron-head/crates/toron-mcp" }
 # The unified durable workflow engine (ADR-0005 Spec 2, P3.1): flywheel routes
 # ALL workflow execution through toron-workflow's WorkflowEngine. This is the
 # cargo edge the tier diagram always implied but no Cargo.toml wired.
-toron-workflow = { path = "../toron/crates/toron-workflow" }
+toron-workflow = { path = "/var/folders/z4/_8p90dn53gl9y4_7cm7rgf3m0000gn/T/toron-head/crates/toron-workflow" }
 cron = "0.17.0"
 chrono = "0.4.45"
 

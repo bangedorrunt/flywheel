@@ -135,6 +135,10 @@ impl MailBackend for AgentMailBackend {
     ) -> Result<Value> {
         // AM's reply_message takes the numeric `message_id` (toron's takes a
         // hex thread_id — the per-backend mapping divergence of ADR-0003 V1).
+        // A non-decimal id is a caller bug — Err loudly, never 0 (se2.2).
+        let id = message_id
+            .parse::<u64>()
+            .map_err(|e| anyhow::anyhow!("agent-mail message_id {message_id:?} is not a decimal id: {e}"))?;
         self.call(
             "reply_message",
             json!({
@@ -143,7 +147,7 @@ impl MailBackend for AgentMailBackend {
                 "to": to.map(|t| t.to_vec()).unwrap_or_default(),
                 "subject": "",
                 "body_md": body,
-                "message_id": message_id.parse::<u64>().unwrap_or(0) as i64,
+                "message_id": id as i64,
             }),
         )
     }
@@ -164,23 +168,29 @@ impl MailBackend for AgentMailBackend {
     }
 
     fn ack(&mut self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
+        let id = message_id
+            .parse::<u64>()
+            .map_err(|e| anyhow::anyhow!("agent-mail message_id {message_id:?} is not a decimal id: {e}"))?;
         self.call(
             "acknowledge_message",
             json!({
                 "project_key": project_key,
                 "agent_name": agent,
-                "message_id": message_id.parse::<u64>().unwrap_or(0) as i64,
+                "message_id": id as i64,
             }),
         )
     }
 
     fn mark_read(&mut self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
+        let id = message_id
+            .parse::<u64>()
+            .map_err(|e| anyhow::anyhow!("agent-mail message_id {message_id:?} is not a decimal id: {e}"))?;
         self.call(
             "mark_message_read",
             json!({
                 "project_key": project_key,
                 "agent_name": agent,
-                "message_id": message_id.parse::<u64>().unwrap_or(0) as i64,
+                "message_id": id as i64,
             }),
         )
     }
@@ -573,6 +583,43 @@ mod tests {
             }
             Err(e) => panic!("expected Other, got {e:?}"),
             Ok(_) => panic!("cannot succeed against a dead port"),
+        }
+    }
+
+    /// se2.2: a non-decimal message_id must Err naming the decimal format —
+    /// never silently become 0 (toron hex ids belong to the toron backend,
+    /// not this one). The parse runs before any dialing, so a dead server is
+    /// indistinguishable from a parse failure: the error must say "decimal".
+    #[test]
+    fn ack_rejects_non_decimal_message_id() {
+        let mut b = AgentMailBackend::new("http://127.0.0.1:1", None, "Orchid".into()).unwrap();
+        match b.ack("proj", "Orchid", "deadbeef") {
+            Err(BackendError::Other(e)) => {
+                let s = format!("{e:#}");
+                assert!(s.contains("decimal"), "names the id format: {s}");
+                assert!(
+                    !s.contains("not reachable"),
+                    "parse fails before any dial: {s}"
+                );
+            }
+            Err(e) => panic!("expected Other, got {e:?}"),
+            Ok(_) => panic!("non-decimal id cannot ack"),
+        }
+    }
+
+    /// se2.2: same honesty for mark_read — a hex string must Err, never 0.
+    #[test]
+    fn mark_read_rejects_non_decimal_message_id() {
+        let mut b = AgentMailBackend::new("http://127.0.0.1:1", None, "Orchid".into()).unwrap();
+        match b.mark_read("proj", "Orchid", "a1b2c3d4") {
+            Err(BackendError::Other(e)) => {
+                assert!(
+                    format!("{e:#}").contains("decimal"),
+                    "names the id format: {e:#}"
+                );
+            }
+            Err(e) => panic!("expected Other, got {e:?}"),
+            Ok(_) => panic!("non-decimal id cannot mark_read"),
         }
     }
 
