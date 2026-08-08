@@ -15,6 +15,8 @@ mod output;
 mod profile;
 mod stages;
 mod workflow_catalog;
+mod crew;
+mod builtin_workflows;
 mod state;
 mod toron_embed;
 mod work;
