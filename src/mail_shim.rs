@@ -596,7 +596,14 @@ impl Mail {
                     args["ranking"] = json!(r);
                 }
                 let res = self.call_remote("search_messages", args)?;
-                Ok(json!({ "result": res }))
+                // The toron daemon already returns the envelope
+                // (`{"result": [...], "next_cursor": ...}`); legacy
+                // agent-mail returned a bare array. Pass the envelope
+                // through when present, else wrap.
+                Ok(match &res {
+                    Value::Object(m) if m.contains_key("result") => res,
+                    _ => json!({ "result": res }),
+                })
             }
         }
     }
