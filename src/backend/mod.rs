@@ -1,30 +1,27 @@
-//! Pluggable backend abstraction — trait surface for the multiplexer (herdr /
-//! superlogical / tmux) and the mail fabric (agent-mail MCP / toron).
+//! Pluggable backend abstraction — multiplexer (herdr / superlogical / tmux)
+//! via the UNIFIED toron-core `Backend` trait (ADR-0005 P1), and the mail
+//! fabric (agent-mail MCP / toron) via flywheel-local `MailBackend`.
 //!
-//! governed-by: ADR-0002
+//! governed-by: ADR-0002, ADR-0005
 //!
-//! Phase 0 (R0): define the traits. Concrete clients (`herdr_shim::Client` —
-//! the toron-core herdr client — and `mail_shim::Mail`, the in-process toron
-//! mailbox facade) are wrapped by their backend impls in sibling beads
-//! (`bd-herdr-backend-impl`, `bd-agentmail-backend-impl`). The factory
-//! (`bd-backend-env-config`) selects the active backend from
-//! `FLYWHEEL_BACKEND` / `FLYWHEEL_MAIL`. Trait signatures mirror toron ADR-0003
-//! §architecture layer 5 so the R1.5 merge (toron-core owns the trait) is
-//! mechanical.
+//! ADR-0005 P1 (bd-p1-unify-y9j): the multiplexer trait surface is UNIFIED in
+//! toron-core (`toron_core::backend::Backend`). flywheel no longer defines a
+//! local `MultiplexerBackend` trait — it re-exports the unified one:
+//! `pub use toron_core::backend::Backend as MultiplexerBackend;`. Call sites
+//! keep the name; the trait is sync, `&self`, object-safe, Unsupported-open.
+//! The herdr *client* was already unified (herdr_shim re-exports toron-core).
 //!
-//! Design: every method except `name()` has a default body returning
-//! `BackendError::Unsupported`. Real impls override what they support; future
-//! backends inherit `Unsupported` for operations they don't yet implement
-//! (ADR-0002 §6 — open-to-extension, not sealed). The trait is object-safe
-//! (`Box<dyn MultiplexerBackend>` / `Box<dyn MailBackend>`).
+//! `MailBackend` is EXPLICITLY DEFERRED (ADR-0005 P1.1 decision #7): a
+//! separate coordination domain (~30 AM-parity ops) that stays flywheel-local
+//! and keeps flywheel's `BackendError` (machine-message style with
+//! `Unsupported{backend,method,reason}`). P1 does NOT merge it into the
+//! unified `Backend`; a future phase may move it to toron-core.
 //!
-//! Phase-0 caveat: this whole module is the trait surface defined ahead of
-//! its consumers. Nothing constructs/uses it outside `#[cfg(test)]` until
-//! `bd-herdr-backend-impl` / `bd-agentmail-backend-impl` / `bd-backend-env-config`
-//! land, so `dead_code` is allowed module-wide here and removed when those
-//! beads wire the factory + first real impl.
+//! Design (inherited from the unified trait + MailBackend): every method
+//! except `name()` has a default body returning an Unsupported error. Real
+//! impls override what they support (ADR-0002 §6 — open-to-extension).
 
-// TODO(bd-herdr-backend-impl): drop this allow once a real impl consumes the surface.
+// TODO(bd-p2-cli-wn8): re-evaluate this allow when the catalog CLI lands.
 #![allow(dead_code)]
 
 pub mod agentmail;
@@ -44,6 +41,15 @@ use crate::herdr_shim::{
 };
 use serde_json::Value;
 
+/// The unified multiplexer backend trait (ADR-0005 P1): sync, `&self`,
+/// object-safe, Unsupported-open. The ONE trait source lives in toron-core;
+/// this re-export keeps flywheel call sites on the historical name.
+pub use toron_core::backend::Backend as MultiplexerBackend;
+/// Unified event stream yielded by `Backend::subscribe`.
+pub use toron_core::backend::EventStream;
+/// Coded `agent.prompt` landing data (unified in toron-core).
+pub use toron_core::backend::PromptLanding;
+
 /// Landing data for a coded `agent.prompt` (ADR-0002, review-fix F6).
 ///
 /// Mirrors `herdr::classify_send_result` inputs so a backend-agnostic `__send`
@@ -54,12 +60,8 @@ use serde_json::Value;
 ///   (e.g. `agent_prompt_stalled`, `timeout`, `agent_not_running`).
 ///
 /// Exactly one of the two is populated on the herdr backend (landed → status,
-/// error → code); other backends define their own contract.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PromptLanding {
-    pub status: Option<AgentStatus>,
-    pub code: Option<String>,
-}
+/// error → code); other backends define their own contract. (Re-exported from
+/// toron-core — ADR-0005 P1 unified the type.)
 
 // Factory entry points — consumers (the durable-loop leaf handlers in main.rs)
 // call `backend::multiplexer_backend(&cfg)` / `backend::mail_backend(&cfg)`;
@@ -184,124 +186,8 @@ impl BackendError {
 
 /// Type alias so trait signatures read `Result<T>` and real impls get
 /// `anyhow::Error -> BackendError` coercion for free via the `From` impl.
+/// (MailBackend-only in P1 — the multiplexer uses toron-core's `BackendError`.)
 pub type Result<T> = std::result::Result<T, BackendError>;
-
-/// Pushed-event stream returned by `MultiplexerBackend::subscribe`. herdr's
-/// concrete `EventStream` is wrapped by `HerdrBackend` (R0.2) to satisfy this
-/// trait; future backends provide their own impl. `read_event` is the only
-/// required method; `set_read_timeout` defaults to a no-op.
-pub trait EventStream: Send {
-    fn read_event(&mut self) -> Result<Option<PushEvent>>;
-    fn set_read_timeout(&mut self, _timeout: Option<std::time::Duration>) -> Result<()> {
-        Ok(())
-    }
-}
-
-/// Terminal / workspace / pane / agent-lifecycle backend. Default = herdr;
-/// future = superlogical; legacy = tmux. Method set mirrors toron ADR-0003
-/// §architecture layer 5. All methods take `&mut self` because the underlying
-/// socket/HTTP clients are stateful (per-call request ids).
-pub trait MultiplexerBackend: Send + Sync {
-    /// Stable backend identifier ("herdr" | "superlogical" | "tmux").
-    fn name(&self) -> &'static str;
-
-    fn workspace_list(&mut self) -> Result<Vec<WorkspaceInfo>> {
-        Err(BackendError::unsupported(self.name(), "workspace_list"))
-    }
-    fn workspace_create(&mut self, _label: Option<&str>) -> Result<WorkspaceInfo> {
-        Err(BackendError::unsupported(self.name(), "workspace_create"))
-    }
-    fn workspace_close(&mut self, _workspace_id: &str) -> Result<()> {
-        Err(BackendError::unsupported(self.name(), "workspace_close"))
-    }
-    fn pane_split(
-        &mut self,
-        _parent_pane_id: &str,
-        _direction: &str,
-        _cwd: Option<&str>,
-    ) -> Result<PaneInfo> {
-        Err(BackendError::unsupported(self.name(), "pane_split"))
-    }
-    fn pane_list(&mut self, _workspace_id: Option<&str>) -> Result<Vec<PaneInfo>> {
-        Err(BackendError::unsupported(self.name(), "pane_list"))
-    }
-    fn pane_close(&mut self, _pane_id: &str) -> Result<()> {
-        Err(BackendError::unsupported(self.name(), "pane_close"))
-    }
-    fn pane_run(&mut self, _pane_id: &str, _command: &str) -> Result<()> {
-        Err(BackendError::unsupported(self.name(), "pane_run"))
-    }
-    fn pane_wait_output(
-        &mut self,
-        _pane_id: &str,
-        _needle: &str,
-        _timeout_ms: u64,
-    ) -> Result<Value> {
-        Err(BackendError::unsupported(self.name(), "pane_wait_output"))
-    }
-    fn agent_list(&mut self) -> Result<Vec<AgentInfo>> {
-        Err(BackendError::unsupported(self.name(), "agent_list"))
-    }
-    fn agent_start(
-        &mut self,
-        _name: &str,
-        _kind: &str,
-        _pane_id: &str,
-        _args: &[String],
-    ) -> Result<AgentInfo> {
-        Err(BackendError::unsupported(self.name(), "agent_start"))
-    }
-    fn agent_rename(&mut self, _target: &str, _new_name: Option<&str>) -> Result<()> {
-        Err(BackendError::unsupported(self.name(), "agent_rename"))
-    }
-    /// `agent.prompt` — the single herdr-client `prompt` definition lives in
-    /// toron-core (ADR-0003 "one definition"; bd-o8j.2 deleted flywheel's
-    /// client copy), this trait method is the backend-abstraction twin.
-    fn prompt(&mut self, _target: &str, _text: &str, _wait: Option<&WaitOptions>) -> Result<Value> {
-        Err(BackendError::unsupported(self.name(), "prompt"))
-    }
-    /// Coded `agent.prompt` with landing semantics (ADR-0002, review-fix F6).
-    ///
-    /// The plain [`Self::prompt`] returns a minimal JSON and LOSES the
-    /// coded error (e.g. `agent_prompt_stalled`) that the durable loop's
-    /// `__send` leaf classifies into landed/stalled/timeout. This method
-    /// returns the landing data (observed status + protocol error code)
-    /// without erroring on a non-landing outcome, so a backend-agnostic
-    /// `__send` can make the same dispatch decisions as the concrete herdr
-    /// client.
-    ///
-    /// `wait` semantics mirror herdr: when Some, block until the agent
-    /// reaches `until` or the timeout; landing = the prompt started
-    /// executing (working/blocked), NOT idle/done.
-    fn prompt_coded(
-        &mut self,
-        _target: &str,
-        _text: &str,
-        _wait: Option<&WaitOptions>,
-    ) -> Result<PromptLanding> {
-        Err(BackendError::unsupported(self.name(), "prompt_coded"))
-    }
-    fn agent_wait(
-        &mut self,
-        _target: &str,
-        _until: &[AgentStatus],
-        _timeout_ms: Option<u64>,
-    ) -> Result<AgentInfo> {
-        Err(BackendError::unsupported(self.name(), "agent_wait"))
-    }
-    fn agent_read(&mut self, _target: &str, _source: &str, _lines: u32) -> Result<Value> {
-        Err(BackendError::unsupported(self.name(), "agent_read"))
-    }
-    fn agent_send_keys(&mut self, _target: &str, _keys: &[&str]) -> Result<()> {
-        Err(BackendError::unsupported(self.name(), "agent_send_keys"))
-    }
-    /// Subscribe to push events. herdr delivers forward-only (no replay); the
-    /// loop's heartbeat poll is the correctness floor (ADR-0001 gap A2,
-    /// `bd-event-subscribe-reactor`).
-    fn subscribe(&mut self, _filters: &[Subscription]) -> Result<Box<dyn EventStream>> {
-        Err(BackendError::unsupported(self.name(), "subscribe"))
-    }
-}
 
 /// Coordination / mail backend. Default = agent-mail MCP; future = toron
 /// (Nostr, in-process). Operation-shaped (the calls flywheel needs), not the
@@ -555,9 +441,9 @@ pub trait MailBackend: Send + Sync {
 
 #[cfg(test)]
 mod trait_contract_tests {
-    // RED→GREEN: these references failed to compile until the traits above were
-    // defined. The Dummy impls prove object-safety + a complete method surface
-    // (only `name()` is overridden; every other method inherits `Unsupported`).
+    // The unified `MultiplexerBackend` (= toron-core `Backend`) is proven
+    // object-safe + Unsupported-open by toron-core's own tests. Here we keep
+    // the MailBackend (deferred, flywheel-local) contract check.
 
     use super::{BackendError, MailBackend, MultiplexerBackend};
 
@@ -576,18 +462,17 @@ mod trait_contract_tests {
     }
 
     #[test]
-    fn mux_backend_is_object_safe_and_complete() {
-        let mut b: Box<dyn MultiplexerBackend> = Box::new(DummyMux);
+    fn unified_mux_is_object_safe_and_unsupported_open() {
+        // `&self` receiver (unified trait): no `mut` needed.
+        let b: Box<dyn MultiplexerBackend> = Box::new(DummyMux);
         assert_eq!(b.name(), "dummy-mux");
-        match b.workspace_list() {
-            Err(BackendError::Unsupported {
-                backend, method, ..
-            }) => {
-                assert_eq!(backend, "dummy-mux");
-                assert_eq!(method, "workspace_list");
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
+        let err = b.workspace_list().unwrap_err();
+        assert_eq!(
+            err.code(),
+            &toron_core::backend::error::BackendErrorCode::Unsupported
+        );
+        assert!(err.message.contains("dummy-mux"));
+        assert!(err.message.contains("workspace_list"));
     }
 
     #[test]
@@ -605,7 +490,7 @@ mod trait_contract_tests {
         }
     }
 
-    /// Object-safety: the trait can be named as `dyn MultiplexerBackend`.
+    /// Object-safety: the unified trait can be named as `dyn MultiplexerBackend`.
     #[test]
     fn mux_dyn_name_compiles() {
         fn _assert_dyn(_: &dyn MultiplexerBackend) {}
