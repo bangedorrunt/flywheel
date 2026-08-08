@@ -133,6 +133,52 @@ pub struct ResolvedProfile {
     pub signing: SigningContext,
 }
 
+/// A **squad**: a named group of profile counts (ADR-0005 Spec 1b — the
+/// generalization of the legacy `Recipe`). A squad spec maps profile name →
+/// how many of that profile to spawn (e.g. `{planner: 1, coder: 2}`).
+///
+/// The legacy `Recipe{oc,pi,gk,extra}` maps onto a squad via
+/// [`Recipe::to_squad`] (the kind names `oc`/`pi`/`gk` become profile names);
+/// `Recipe` stays as a convenience alias with no forced migration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Squad {
+    /// profile name -> count
+    #[serde(flatten)]
+    pub counts: BTreeMap<String, u32>,
+}
+
+impl Squad {
+    /// Build a squad from a legacy `Recipe` (P6.1). The recipe's named kinds
+    /// (`oc`/`pi`/`gk`) map 1:1 onto profile names; `extra` kinds map to their
+    /// profile names directly. Zero counts are dropped.
+    pub fn from_recipe(r: &crate::config::Recipe) -> Self {
+        let mut counts = BTreeMap::new();
+        for (name, n) in [
+            ("oc", r.oc.unwrap_or(0)),
+            ("pi", r.pi.unwrap_or(0)),
+            ("gk", r.gk.unwrap_or(0)),
+        ] {
+            if n > 0 {
+                counts.insert(name.to_string(), n);
+            }
+        }
+        for (k, n) in &r.extra {
+            if *n > 0 {
+                counts.insert(k.clone(), *n);
+            }
+        }
+        Self { counts }
+    }
+
+    /// All (profile, count) pairs, ordered by profile name.
+    pub fn members(&self) -> Vec<(&str, u32)> {
+        self.counts
+            .iter()
+            .map(|(k, v)| (k.as_str(), *v))
+            .collect()
+    }
+}
+
 impl ProfileCatalog {
     /// Load the catalog from `~/.config/flywheel/profiles.toml`, layered over
     /// the compiled-in defaults. Missing file -> defaults only (zero-config,
@@ -586,5 +632,52 @@ spawn_cmd = "hermes --project {project} --role {role}"
             .resolve("coder", Some("demo"), "npub-operator", &no_project)
             .unwrap_err();
         assert!(err.to_string().contains("not registered"), "{err}");
+    }
+
+    #[test]
+    fn recipe_to_squad_maps_kinds_to_profile_counts() {
+        // Legacy Recipe{oc:1, pi:1} + an extra kind -> a squad of profiles.
+        use crate::config::Recipe;
+        let r = Recipe {
+            oc: Some(1),
+            pi: Some(1),
+            gk: None,
+            extra: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("claude".into(), 2u32);
+                m
+            },
+        };
+        let squad = Squad::from_recipe(&r);
+        assert_eq!(
+            squad.counts.get("oc"),
+            Some(&1),
+            "recipe oc -> squad profile oc x1"
+        );
+        assert_eq!(
+            squad.counts.get("pi"),
+            Some(&1),
+            "recipe pi -> squad profile pi x1"
+        );
+        assert_eq!(
+            squad.counts.get("claude"),
+            Some(&2),
+            "extra kinds map to profile counts"
+        );
+        assert_eq!(squad.counts.get("gk"), None, "zero gk dropped");
+        // Deterministic member order by profile name.
+        let members: Vec<(&str, u32)> = squad.members();
+        assert_eq!(
+            members,
+            vec![("claude", 2), ("oc", 1), ("pi", 1)],
+            "sorted (claude, oc, pi)"
+        );
+    }
+
+    #[test]
+    fn recipe_to_squad_empty_recipe_yields_empty_squad() {
+        use crate::config::Recipe;
+        let squad = Squad::from_recipe(&Recipe::default());
+        assert!(squad.counts.is_empty(), "empty recipe -> empty squad");
     }
 }
