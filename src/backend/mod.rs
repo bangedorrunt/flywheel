@@ -459,7 +459,7 @@ mod trait_contract_tests {
 
     #[test]
     fn mail_backend_is_object_safe_and_complete() {
-        let mut b: Box<dyn MailBackend> = Box::new(DummyMail);
+        let b: Box<dyn MailBackend> = Box::new(DummyMail);
         assert_eq!(b.name(), "dummy-mail");
         match b.health() {
             Err(BackendError::Unsupported {

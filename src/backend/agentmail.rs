@@ -552,7 +552,7 @@ mod tests {
     /// never listening, so the first call fails fast with a transport error.
     #[test]
     fn unreachable_server_returns_actionable_error() {
-        let mut b = AgentMailBackend::new("http://127.0.0.1:1", None, "Orchid".into()).unwrap();
+        let b = AgentMailBackend::new("http://127.0.0.1:1", None, "Orchid".into()).unwrap();
         match b.health() {
             Err(BackendError::Other(e)) => {
                 let s = format!("{e:#}");
@@ -574,7 +574,7 @@ mod tests {
     /// the agent-mail backend never says "toron".
     #[test]
     fn error_strings_say_agent_mail_not_toron() {
-        let mut b = AgentMailBackend::new("http://127.0.0.1:1", None, "Orchid".into()).unwrap();
+        let b = AgentMailBackend::new("http://127.0.0.1:1", None, "Orchid".into()).unwrap();
         match b.ensure_project("p") {
             Err(BackendError::Other(e)) => {
                 let s = format!("{e:#}");
@@ -592,7 +592,7 @@ mod tests {
     /// indistinguishable from a parse failure: the error must say "decimal".
     #[test]
     fn ack_rejects_non_decimal_message_id() {
-        let mut b = AgentMailBackend::new("http://127.0.0.1:1", None, "Orchid".into()).unwrap();
+        let b = AgentMailBackend::new("http://127.0.0.1:1", None, "Orchid".into()).unwrap();
         match b.ack("proj", "Orchid", "deadbeef") {
             Err(BackendError::Other(e)) => {
                 let s = format!("{e:#}");
@@ -610,7 +610,7 @@ mod tests {
     /// se2.2: same honesty for mark_read — a hex string must Err, never 0.
     #[test]
     fn mark_read_rejects_non_decimal_message_id() {
-        let mut b = AgentMailBackend::new("http://127.0.0.1:1", None, "Orchid".into()).unwrap();
+        let b = AgentMailBackend::new("http://127.0.0.1:1", None, "Orchid".into()).unwrap();
         match b.mark_read("proj", "Orchid", "a1b2c3d4") {
             Err(BackendError::Other(e)) => {
                 assert!(
@@ -631,7 +631,7 @@ mod tests {
     fn write_pane_identity_is_local_not_network() {
         let base = std::env::temp_dir().join(format!("fw-am-idbase-{}", std::process::id()));
         crate::mail_shim::set_test_identity_base(Some(base));
-        let mut b = AgentMailBackend::new("http://127.0.0.1:1", None, "Orchid".into()).unwrap();
+        let b = AgentMailBackend::new("http://127.0.0.1:1", None, "Orchid".into()).unwrap();
         // temp project path + pane id that sanitizes to a file-safe name
         let key = std::env::temp_dir().join("fw-am-identity-test");
         let key = key.to_string_lossy().to_string();
