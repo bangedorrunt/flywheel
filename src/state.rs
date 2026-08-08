@@ -172,7 +172,14 @@ fn ensure_loops_migrated() -> Result<()> {
         return Ok(());
     }
     let raw = std::fs::read_to_string(&legacy)?;
-    let (_schema, map) = parse_loops_registry(&raw);
+    let (prior_schema, map) = parse_loops_registry(&raw);
+    if prior_schema < LOOPS_SCHEMA_VERSION {
+        // Genuine v1 content (not absence — absence returns above): keep the
+        // audit signal, now reworded for the sidecar split (l4s.2).
+        eprintln!(
+            "flywheel: migrating loops.json v{prior_schema} → v{LOOPS_SCHEMA_VERSION} (split into per-project sidecars)"
+        );
+    }
     let dir = loops_dir();
     std::fs::create_dir_all(&dir)?;
     for (project, al) in &map {
@@ -200,6 +207,9 @@ fn ensure_loops_migrated() -> Result<()> {
 /// Migrates a legacy shared `loops.json` on first access, then scans the
 /// per-project sidecars (l4s.1). Missing dir → empty map, schema v2.
 /// Sidecars that fail to deserialize are skipped (logged to stderr).
+/// Test-only since the sidecar migration (l4s.1): no production caller reads
+/// the whole registry.
+#[cfg(test)]
 pub fn load_loops_registry() -> Result<(u32, BTreeMap<String, ActiveLoop>)> {
     ensure_loops_migrated()?;
     let dir = loops_dir();
@@ -266,6 +276,8 @@ pub fn parse_loops_registry(raw: &str) -> (u32, BTreeMap<String, ActiveLoop>) {
 }
 
 /// Serialize the registry as schema v2 JSON (pretty). Pure — no I/O.
+/// Test-only since the sidecar migration (l4s.1).
+#[cfg(test)]
 pub fn serialize_loops_registry(loops: &BTreeMap<String, ActiveLoop>) -> Result<String> {
     let mut map = serde_json::Map::new();
     map.insert(
@@ -283,35 +295,9 @@ pub fn serialize_loops_registry(loops: &BTreeMap<String, ActiveLoop>) -> Result<
 /// Bulk-write the registry as per-project sidecars (l4s.1). Kept for callers
 /// that think in whole-registry terms (status views, tests, cleanup): every
 /// entry is written to its own sidecar atomically, and sidecars for projects
-/// absent from the map are removed.
-pub fn save_loops_registry(loops: &BTreeMap<String, ActiveLoop>) -> Result<()> {
-    ensure_loops_migrated()?;
-    let dir = loops_dir();
-    std::fs::create_dir_all(&dir)?;
-    for (project, al) in loops {
-        let path = sidecar_file(project);
-        let body = serde_json::to_string_pretty(al)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, body)?;
-        std::fs::rename(&tmp, &path)?;
-    }
-    // drop sidecars whose project is no longer in the map
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let Some(project) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
-            continue;
-        };
-        if !loops.contains_key(&project) {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-    Ok(())
-}
-
+/// absent from the map are removed. Removed (l4s.1+[lints]): zero callers in
+/// the post-sidecar tree; per-project writers use `save_active_loop` and the
+/// registry views use `load_active_loop`/`load_loops_registry`.
 pub fn load_active_loop(project: &str) -> Result<Option<ActiveLoop>> {
     ensure_loops_migrated()?;
     let path = sidecar_file(project);
@@ -339,6 +325,7 @@ pub fn save_active_loop(project: &str, al: &ActiveLoop) -> Result<()> {
 
 /// Delete a project's active-loop sidecar (no-op when absent). Used by tests
 /// and cleanup; there is no tombstone — absence means "no active loop".
+#[cfg(test)]
 pub fn remove_active_loop(project: &str) -> Result<()> {
     let path = sidecar_file(project);
     match std::fs::remove_file(&path) {
@@ -1015,7 +1002,7 @@ mod last_sent_tests {
     fn run_log_classifies_pending_failed_and_owner() {
         // Mirrors the P6.3 digest semantics: run-kind entries classify as
         // pending / failed and carry an owner, non-run kinds are ignored.
-        let entries = vec![
+        let entries = [
             LogEntry {
                 ts: "2026-08-08T01:00:00Z".into(),
                 kind: EventKind::Workflow,
@@ -1108,7 +1095,7 @@ mod loops_sidecar_tests {
         format!("l4s1-{tag}-{}", std::process::id())
     }
 
-    fn make_loop(project: &str, ping_count: u32) -> ActiveLoop {
+    fn make_loop(_project: &str, ping_count: u32) -> ActiveLoop {
         let mut al = ActiveLoop::new("swarm-loop", json!({}), now_iso());
         al.escalation.insert(
             "agent-x".to_string(),
@@ -1254,5 +1241,91 @@ mod loops_sidecar_tests {
         remove_active_loop(&p).unwrap();
         assert!(!sidecar_file(&p).exists());
         remove_active_loop(&p).unwrap(); // idempotent
+    }
+
+    // ---- l4s.2: read failures propagate, never clobber ----
+
+    /// A read failure on the registry aborts the save with an error and the
+    /// on-disk state is untouched (crash > corrupt). Simulated by making the
+    /// legacy path a DIRECTORY (read_to_string → EISDIR).
+    #[test]
+    fn unreadable_registry_aborts_save_without_clobber() {
+        let _g = loops_test_guard();
+        let p = test_project("unreadable");
+        let legacy = loops_file();
+        // snapshot + park any real legacy file
+        let pre_legacy = std::fs::read_to_string(&legacy).ok();
+        let _ = std::fs::remove_file(&legacy);
+        // a directory at the legacy path is unreadable as a file
+        std::fs::create_dir_all(&legacy).unwrap();
+        let err = save_active_loop(&p, &make_loop(&p, 3)).unwrap_err();
+        assert!(err.to_string().contains("Is a directory") || err.to_string().contains("EISDIR") || err.to_string().contains("not a regular file") || !err.to_string().is_empty(), "save aborts: {err:#}");
+        assert!(legacy.is_dir(), "unreadable path left untouched");
+        // restore
+        std::fs::remove_dir_all(&legacy).unwrap();
+        if let Some(bytes) = pre_legacy {
+            std::fs::write(&legacy, bytes).unwrap();
+        }
+        let _ = remove_active_loop(&p);
+    }
+
+    /// A missing registry saves normally — no error, no migration log (the
+    /// audit eprintln only fires on GENUINE v1 content, l4s.2).
+    #[test]
+    fn missing_registry_saves_normally() {
+        let _g = loops_test_guard();
+        let p = test_project("missing");
+        let legacy = loops_file();
+        let pre_legacy = std::fs::read_to_string(&legacy).ok();
+        let _ = std::fs::remove_file(&legacy);
+        // fresh registry: save must succeed
+        save_active_loop(&p, &make_loop(&p, 5)).unwrap();
+        assert_eq!(load_active_loop(&p).unwrap().unwrap().escalation.get("agent-x").unwrap().ping_count, 5);
+        if let Some(bytes) = pre_legacy {
+            // restore the real legacy (it will re-split on next access)
+            let _ = std::fs::remove_file(&legacy);
+            std::fs::write(&legacy, bytes).unwrap();
+        }
+        let _ = remove_active_loop(&p);
+    }
+
+    /// Genuine v1 content still migrates (schema downgrade path preserved:
+    /// audit message + split into sidecars).
+    #[test]
+    fn genuine_v1_content_migrates_with_audit() {
+        let _g = loops_test_guard();
+        let p = test_project("v1");
+        let legacy = loops_file();
+        let pre_legacy = std::fs::read_to_string(&legacy).ok();
+        let pre_markers = loops_dir_markers();
+        // minimal v1 fixture: flat project map, no schema key
+        let fixture = json!({
+            p.clone(): {
+                "id": format!("swarm-loop:{p}:1"),
+                "params": {"project": p},
+                "created": "2026-08-04T00:00:00Z"
+            }
+        })
+        .to_string();
+        std::fs::write(&legacy, fixture).unwrap();
+        // read triggers the split; the v1 entry gains defaulted control fields
+        let (_schema, loaded) = load_loops_registry().unwrap();
+        assert_eq!(loaded.get(&p).unwrap().id, format!("swarm-loop:{p}:1"));
+        assert!(sidecar_file(&p).exists());
+        let new_marker = loops_dir_markers().into_iter().any(|n| !pre_markers.contains(&n));
+        assert!(new_marker, "legacy renamed after v1 migration");
+        // restore
+        let _ = std::fs::remove_file(sidecar_file(&p));
+        for n in loops_dir_markers() {
+            if !pre_markers.contains(&n) {
+                let _ = std::fs::remove_file(loops_file().parent().unwrap().join(&n));
+            }
+        }
+        match pre_legacy {
+            Some(bytes) => std::fs::write(&legacy, bytes).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&legacy);
+            }
+        }
     }
 }

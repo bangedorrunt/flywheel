@@ -1461,6 +1461,16 @@ pub struct HealState {
     pub awaiting_clear: bool,
 }
 
+/// Record a diagnose outcome in the heal state (cg6.2): only a SUCCESSFUL
+/// diagnose advances the episode (increment count + set awaiting_clear); a
+/// failed diagnose leaves the state untouched so the next poll retries.
+fn apply_diagnose_outcome(hs: &mut HealState, ok: bool) {
+    if ok && !hs.awaiting_clear {
+        hs.diagnose_count = hs.diagnose_count.saturating_add(1);
+        hs.awaiting_clear = true;
+    }
+}
+
 /// Pure self-heal decision for one agent (table-driven tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealAction {
@@ -1547,6 +1557,10 @@ pub fn self_heal_step(
 /// CONTEXT_LIMIT guard, the send-escalation path (bd-send-stall-escalation),
 /// and the unknown-status repair (bd-unknown-respawn) so an agent can never
 /// be double-respawned in one iteration.
+///
+/// cg6.2: leaf errors NEVER abort the loop — on a poll_kind or respawn_agent
+/// failure the failure is logged and the queue is left unchanged (the next
+/// poll re-derives the agent's state; the send-dedup prevents duplicates).
 #[allow(clippy::too_many_arguments)] // the single respawn point: ctx, params, queue,
                                      // kinds, name, text, reason, attempts — every parameter is load-bearing.
 async fn respawn_and_requeue(
@@ -1558,40 +1572,71 @@ async fn respawn_and_requeue(
     text: Option<&str>,
     reason: &str,
     attempts: u64,
-) -> Result<()> {
+) {
     let kind = match respawn_kind(kinds, name) {
         Some(k) => k,
-        None => {
-            ctx.run(
+        None => match ctx
+            .run(
                 poll_kind,
                 PollKindArgs {
                     project: params.project.clone(),
                     name: name.to_string(),
                 },
             )
-            .await?
-        }
-    };
-    ctx.run(
-        respawn_agent,
-        RespawnArgs {
-            project: params.project.clone(),
-            name: name.to_string(),
-            kind,
-            reason: reason.to_string(),
-            attempts,
-            text_hash: text.map(crate::state::fnv1a64),
+            .await
+        {
+            Ok(k) => k,
+            Err(e) => {
+                // cg6.2: skip the respawn this tick; queue unchanged.
+                eprintln!("flywheel: poll_kind leaf failed for {name} (skipping respawn): {e}");
+                return;
+            }
         },
-    )
-    .await?;
+    };
+    if let Err(e) = ctx
+        .run(
+            respawn_agent,
+            RespawnArgs {
+                project: params.project.clone(),
+                name: name.to_string(),
+                kind,
+                reason: reason.to_string(),
+                attempts,
+                text_hash: text.map(crate::state::fnv1a64),
+            },
+        )
+        .await
+    {
+        // cg6.2: herdr hiccup during respawn must not kill the loop — the
+        // prompt is NOT requeued (the respawn may not have happened; the
+        // next poll re-evaluates the agent's state).
+        eprintln!("flywheel: respawn_agent leaf failed for {name} (continuing): {e}");
+        return;
+    }
     if let Some(t) = text {
         queue.insert(0, t.to_string());
     }
-    Ok(())
 }
 
 /// The durable monitoring workflow. Runs until the queue drains and the swarm
 /// settles, or a blocked agent stops it (policy).
+///
+/// ## Leaf-error policy (cg6.2)
+/// Leaf errors NEVER abort the loop. Every `ctx.run(...)` outcome below is
+/// converted to a soft default (logged via eprintln; the next poll is the
+/// correctness floor). A transient herdr/mail hiccup — an agent exiting
+/// between poll and read, herdr briefly down during a respawn, a daemon
+/// blip on notify — degrades that tick, never kills the run. Genuinely
+/// fatal conditions (config errors, Resonate unreachable) live OUTSIDE the
+/// leaf boundary and still hard-fail.
+///
+/// Process-per-leaf cost (durable review #8): each iteration spawns 3-8
+/// `flywheel` subprocesses (poll_events + poll_swarm + xproj_inbox +
+/// renew_leases + per-dispatch read_output/send_prompt), ~7ms (clap-only) to
+/// ~14ms (config+backend init) each — 60-120ms per iteration, negligible at
+/// the 30-300s cadence. This boundary is the CRASH-ISOLATION design (a leaf
+/// panic cannot kill the loop's memory) — do not "optimize" it away without
+/// a crash-isolation replacement.
 #[function]
 async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     let mut queue = params.queue.clone();
@@ -1642,7 +1687,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // ---- event wake (latency optimization, forward-only) ----
         // Blocks up to wait_secs collecting push events. Empty batch on
         // idle/timeout is normal. Stream errors soft-fail into heartbeat.
-        let event_batch: PollEventsBatch = ctx
+        let event_batch: PollEventsBatch = match ctx
             .run(
                 poll_events,
                 PollEventsArgs {
@@ -1651,7 +1696,20 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     after_seq: event_cursor_seq,
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                // cg6.2: leaf errors never abort the loop — a transport
+                // hiccup degrades to the heartbeat fallback this tick.
+                eprintln!("flywheel: poll_events leaf failed (continuing): {e}");
+                PollEventsBatch {
+                    events: vec![],
+                    max_seq: 0,
+                    stream_error: Some(format!("leaf error: {e}")),
+                }
+            }
+        };
         if event_batch.stream_error.is_some() {
             event_stream_errors = event_stream_errors.saturating_add(1);
             if event_stream_errors == 3 {
@@ -1672,7 +1730,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // Always runs. Catches any state change missed during a crash gap
         // (events are not replayed). Full routing of event_batch is owned by
         // bd-event-dispatch-zero-latency; here events only wake the loop early.
-        let states: Vec<AgentState> = ctx
+        let states: Vec<AgentState> = match ctx
             .run(
                 poll_swarm,
                 PollArgs {
@@ -1680,7 +1738,17 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     to: params.to.clone(),
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                // cg6.2: the correctness floor must not be a crash point —
+                // a transient herdr failure yields an empty snapshot; the
+                // next tick re-polls.
+                eprintln!("flywheel: poll_swarm leaf failed (continuing with empty snapshot): {e}");
+                vec![]
+            }
+        };
 
         // proof of life: a working/blocked agent is receiving prompts — its
         // failure history is stale (landed sends reset at the send site too)
@@ -1823,14 +1891,23 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         if params.work {
             // interrupted work first: an in-progress bead's agent went idle —
             // resume it before handing out fresh beads
-            let inprog: Vec<ReadyBead> = ctx
+            let inprog: Vec<ReadyBead> = match ctx
                 .run(
                     poll_inprogress,
                     ReadyArgs {
                         project: params.project.clone(),
                     },
                 )
-                .await?;
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    // cg6.2: leaf errors never abort the loop — a tracker
+                    // hiccup yields no interrupted-work refresh this tick.
+                    eprintln!("flywheel: poll_inprogress leaf failed (continuing): {e}");
+                    vec![]
+                }
+            };
             let to_resume: Vec<&ReadyBead> = inprog
                 .iter()
                 .filter(|b| !assigned.contains(&b.id))
@@ -1840,14 +1917,22 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 assigned.push(bead.id.clone());
             }
 
-            let ready: Vec<ReadyBead> = ctx
+            let ready: Vec<ReadyBead> = match ctx
                 .run(
                     poll_ready,
                     ReadyArgs {
                         project: params.project.clone(),
                     },
                 )
-                .await?;
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    // cg6.2: leaf errors never abort the loop.
+                    eprintln!("flywheel: poll_ready leaf failed (continuing): {e}");
+                    vec![]
+                }
+            };
             let to_assign: Vec<&ReadyBead> =
                 ready.iter().filter(|b| !assigned.contains(&b.id)).collect();
             for bead in to_assign {
@@ -1907,7 +1992,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 LoopAction::Send { name, text } | LoopAction::DispatchImmediate { name, text } => {
                     // context guard: if the idle agent is context-exhausted,
                     // respawn a fresh instance instead of delegating to it
-                    let verdict = ctx
+                    let verdict = match ctx
                         .run(
                             read_output,
                             ReadArgs {
@@ -1915,7 +2000,20 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 name: name.clone(),
                             },
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // cg6.2: the agent may have exited between poll
+                            // and read (a real race) — skip the context guard;
+                            // the send path below soft-fails if the agent is
+                            // gone. A leaf error must never abort the loop.
+                            eprintln!(
+                                "flywheel: read_output leaf failed for {name} (continuing): {e}"
+                            );
+                            ContextVerdict::Healthy
+                        }
+                    };
                     if verdict == ContextVerdict::Exhausted {
                         clear_dispatch_pending(&mut dispatch_pending, name, Some(false));
                         respawn_and_requeue(
@@ -1928,7 +2026,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             "context_limit",
                             0,
                         )
-                        .await?;
+                        .await; // cg6.2: soft — leaf failures logged inside
                         continue;
                     }
                     let outcome = match ctx
@@ -1997,7 +2095,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 reason,
                                 attempts,
                             )
-                            .await?;
+                            .await; // cg6.2: soft — leaf failures logged inside
                         }
                     }
                 }
@@ -2015,7 +2113,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         // replayed, never re-executed; even an in-flight
                         // re-execution derives from persisted state, so the
                         // tier cannot jump).
-                        let out = ctx
+                        let out = match ctx
                             .run(
                                 notify_blocked,
                                 NotifyArgs {
@@ -2027,7 +2125,21 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                         .unwrap_or(serde_json::Value::Null),
                                 },
                             )
-                            .await?;
+                            .await
+                        {
+                            Ok(o) => o,
+                            Err(e) => {
+                                // cg6.2: leaf errors never abort the loop — a
+                                // mail daemon hiccup skips this tick's ping;
+                                // escalation state is untouched (the leaf
+                                // persists only on success) and the next poll
+                                // retries.
+                                eprintln!(
+                                    "flywheel: notify_blocked leaf failed for {name} (continuing): {e}"
+                                );
+                                continue;
+                            }
+                        };
                         let tier_enum = match out.tier {
                             0 => EscalationTier::T0,
                             1 => EscalationTier::T1,
@@ -2108,13 +2220,13 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                     reason,
                                     attempts,
                                 )
-                                .await?;
+                                .await; // cg6.2: soft — leaf failures logged inside
                             }
                         }
                     }
                 }
                 LoopAction::Diagnose { name, reason } => {
-                    let _ = ctx
+                    let diag = ctx
                         .run(
                             diagnose_agent,
                             DiagnoseArgs {
@@ -2124,11 +2236,20 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             },
                         )
                         .await;
-                    // mark heal state awaiting_clear so next still-dead tick respawns
                     let hs = heal_states.entry(name.clone()).or_default();
-                    if !hs.awaiting_clear {
-                        hs.diagnose_count = hs.diagnose_count.saturating_add(1);
-                        hs.awaiting_clear = true;
+                    match diag {
+                        Ok(_) => {
+                            // mark heal state awaiting_clear so next still-dead tick respawns
+                            apply_diagnose_outcome(hs, true);
+                        }
+                        Err(e) => {
+                            // cg6.2: a failed diagnose must not advance heal
+                            // state (herdr hiccup ≠ agent healed) — the next
+                            // poll retries the diagnose.
+                            eprintln!(
+                                "flywheel: diagnose_agent leaf failed for {name} (heal state untouched): {e}"
+                            );
+                        }
                     }
                     any_work = true;
                 }
@@ -2147,7 +2268,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         reason,
                         attempts,
                     )
-                    .await?;
+                    .await; // cg6.2: soft — leaf failures logged inside
                     any_work = true;
                 }
                 LoopAction::Wait => {}
@@ -2157,15 +2278,23 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // work mode completion guard: a stranded in-progress bead (interrupted
         // agent) must keep the loop alive — re-prompt it next poll.
         let inprogress_empty = if params.work {
-            let inprog: Vec<ReadyBead> = ctx
+            match ctx
                 .run(
                     poll_inprogress,
                     ReadyArgs {
                         project: params.project.clone(),
                     },
                 )
-                .await?;
-            inprog.is_empty()
+                .await
+            {
+                Ok(bs) => bs.is_empty(),
+                Err(e) => {
+                    // cg6.2: a leaf hiccup must not crash the completion
+                    // check — treat as non-empty so the loop keeps polling.
+                    eprintln!("flywheel: poll_inprogress leaf failed (completion guard): {e}");
+                    false
+                }
+            }
         } else {
             true
         };
@@ -3385,6 +3514,24 @@ mod tests {
 
     // ---- bd-event-self-heal-unknown: self_heal_step state machine ----
 
+    /// cg6.2: only a SUCCESSFUL diagnose advances the heal episode — a failed
+    /// leaf must not inflate diagnose_count or pre-set awaiting_clear.
+    #[test]
+    fn apply_diagnose_outcome_only_advances_on_success() {
+        let mut hs = HealState::default();
+        // leaf failed: state untouched
+        apply_diagnose_outcome(&mut hs, false);
+        assert_eq!(hs.diagnose_count, 0);
+        assert!(!hs.awaiting_clear);
+        // success: episode advances
+        apply_diagnose_outcome(&mut hs, true);
+        assert_eq!(hs.diagnose_count, 1);
+        assert!(hs.awaiting_clear);
+        // second success with awaiting_clear already set: count unchanged
+        apply_diagnose_outcome(&mut hs, true);
+        assert_eq!(hs.diagnose_count, 1);
+    }
+
     #[test]
     fn self_heal_unknown_diagnose_then_respawn() {
         let mut hs = HealState::default();
@@ -3556,10 +3703,10 @@ mod tests {
     ) -> Vec<DispatchRec> {
         let mut out = Vec::new();
         for ev in events {
-            if let Some(a) = route_event(states, ev, queue, pending) {
-                if let Some(r) = rec_from_action(&a) {
-                    out.push(r);
-                }
+            if let Some(a) = route_event(states, ev, queue, pending)
+                && let Some(r) = rec_from_action(&a)
+            {
+                out.push(r);
             }
         }
         out
