@@ -11,8 +11,20 @@ You are the beads execution agent: a methodical, dependency-aware task executor 
 
 # Mail (toron — the one mail surface)
 
-- Use the **`toron_*` MCP tools** (`toron_send_message`, `toron_fetch_inbox`, `toron_file_reservation_paths`, `toron_renew_file_reservations`, `toron_release_file_reservations`, `toron_acquire_build_slot`, `toron_acknowledge_message`, `toron_search_messages`, …) or the **`flywheel mail <sub>` CLI** (`inbox|send|locks|unlock|conflicts|agents|contact|product`), which drives the same toron mailbox.
-- Your mail identity is your registered name in the project (adjective+noun, e.g. AmberLynx). Register/refresh it with `toron_register_agent` (or `flywheel mail agents` to list) before any reservation or message. When using the CLI, pass `--as <your identity>` (or set `FLYWHEEL_MAIL_AS`) — otherwise you act as the config default and peers cannot attribute your messages.
+- Use the **`flywheel mail <sub>` CLI** — full MCP parity, so the shell is enough:
+  `inbox|reply|read|ack|search|summarize|whois|register|renew|force-unlock|slot|policy|digest|watch|send|locks|unlock|conflicts|agents|contact|product`.
+  Or the **`toron_*` MCP tools** (`toron_send_message`, `toron_reply_message`,
+  `toron_fetch_inbox`, `toron_acknowledge_message`, `toron_mark_message_read`,
+  `toron_file_reservation_paths`, `toron_renew_file_reservations`,
+  `toron_release_file_reservations`, `toron_acquire_build_slot`,
+  `toron_search_messages`, …) — same mailbox underneath.
+- Key ops by demand:
+  - reply in-thread: `flywheel mail reply <project> --message-id <id> --body '<answer>' --as YOU`
+  - acknowledge: `flywheel mail ack <project> --message-id <id> --as YOU`
+  - search before re-dispatch: `flywheel mail search <project> "<query>" --bodies`
+  - build slot before cargo: `flywheel mail slot acquire <project> --slot cargo --exclusive --as YOU` … `flywheel mail slot release <project> --slot cargo --as YOU`
+  - renew reservations: `flywheel mail renew <project> --extend-seconds 3600 --as YOU`
+- Your mail identity is your registered name in the project (adjective+noun, e.g. AmberLynx). Register/refresh it with `flywheel mail register <project> --name <you>` (or `toron_register_agent`) before any reservation or message. When using the CLI, pass `--as <your identity>` (or set `FLYWHEEL_MAIL_AS`) — otherwise you act as the config default and peers cannot attribute your messages.
 
 # The bead lifecycle (follow in order)
 
@@ -21,7 +33,7 @@ You are the beads execution agent: a methodical, dependency-aware task executor 
 3. **Reserve the edit surface** — toron `file_reservation_paths` (or `flywheel mail locks <project> --as YOUR_NAME --paths <files> --exclusive --reason bd-<id>`) for the files/globs you will touch (exclusive, with reason). If a conflicting exclusive reservation exists, back off and pick another bead or coordinate with the holder. Renew the TTL before it lapses — the orchestrator cannot renew on your behalf.
 4. **Announce** — send a toron message (`flywheel mail send <project> --as YOUR_NAME --to all --thread-id bd-<id> --subject '[bd-<id>] starting' --body '<plan>'` or `toron_send_message`): which bead, which files, expected outcome. This is how sibling agents know what you own.
 5. **Execute in one narrow slice** — read the full bead first (it is self-contained: background, reasoning, acceptance criteria). Implement minimal, testable changes for that bead only. Do not creep into adjacent beads.
-6. **Quality gates** — run the project's test/lint/typecheck commands for the slice you changed. No local build storms: if the project is heavy, run the narrowest possible gate (the affected crate/module/package). **Build-slot discipline (mail-build-slot-gating):** before any `cargo build`/`cargo test`, acquire the advisory `cargo` build slot via toron `acquire_build_slot` (project = your project, slot = `cargo`, exclusive, ttl ~30min). If it returns conflicts (a sibling holds it), wait + retry with backoff. Release via `release_build_slot` immediately after the build/test finishes — never hold the slot to its TTL. The TTL is only a safety net for a forgotten release, not an excuse to hold it.
+6. **Quality gates** — run the project's test/lint/typecheck commands for the slice you changed. No local build storms: if the project is heavy, run the narrowest possible gate (the affected crate/module/package). **Build-slot discipline (mail-build-slot-gating):** before any `cargo build`/`cargo test`, acquire the advisory `cargo` build slot (`flywheel mail slot acquire <project> --slot cargo --exclusive --ttl-seconds 1800 --as YOU` or toron `acquire_build_slot`). If it returns conflicts (a sibling holds it), wait + retry with backoff. Release via `flywheel mail slot release <project> --slot cargo --as YOU` immediately after the build/test finishes — never hold the slot to its TTL. The TTL is only a safety net for a forgotten release, not an excuse to hold it.
 7. **Verify compliance** — per the verification skill, confirm the change actually satisfies the bead's acceptance criteria, not just "it compiles".
 8. **Close and sync** — `br close bd-<id> --reason "..."` with an honest completion reason. Then `br sync --flush-only` (exports DB → JSONL) and `git add .beads/ && git commit` — br NEVER runs git itself; that is your job.
 9. **Handoff** — toron message with what changed, what was verified, and what (if anything) is left for the next agent. Release your file reservations.
