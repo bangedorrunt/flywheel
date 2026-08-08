@@ -236,18 +236,15 @@ impl Config {
     }
 
     /// Effective toron facade config: identity `name` from the shared
-    /// `[agent_mail]`, transport url/token from `[mail.toron]`. When
-    /// `[mail.toron]` is absent, falls back to the legacy `[agent_mail] url`
-    /// (a pre-split config keeps its toron remote until bd-am3 migrates the
-    /// block); no url anywhere → embedded in-process toron.
+    /// `[agent_mail]`, transport url/token from `[mail.toron]` ONLY (no
+    /// legacy `[agent_mail] url` fallback — the shared url is never a routing
+    /// source, ADR-0003 V2/V3). No `[mail.toron]` url anywhere → embedded
+    /// in-process toron.
     pub fn toron_mail_config(&self) -> MailConfig {
         let sec = self.mail.as_ref().and_then(|m| m.toron.as_ref());
         let legacy = self.agent_mail.as_ref();
         MailConfig {
-            url: sec
-                .and_then(|c| c.url.clone())
-                .filter(|s| !s.is_empty())
-                .or_else(|| legacy.and_then(|c| c.url.clone()).filter(|s| !s.is_empty())),
+            url: sec.and_then(|c| c.url.clone()).filter(|s| !s.is_empty()),
             token: sec
                 .and_then(|c| c.token.clone())
                 .filter(|s| !s.is_empty())
@@ -695,34 +692,41 @@ daily = [
         assert_eq!(toron.name.as_deref(), Some("Orchid"));
     }
 
-    /// Legacy-config bridge: an old `[agent_mail] url` (a toron URL) keeps the
-    /// toron facade remote until bd-am3 migrates the block; agentmail still
-    /// defaults to the AM port and never sees the legacy url (BUG1). The
-    /// shared `[agent_mail] token` IS inherited by agentmail (ADR-0003 V3:
-    /// "[agent_mail] keeps … token if shared").
+    /// The legacy `[agent_mail] url` is ignored by BOTH backends (no
+    /// backward-compat bridge — ADR-0003 V2/V3 BUG1 fix): with no
+    /// `[mail.toron]`, toron is embedded in-process; agentmail defaults to
+    /// the AM port. The shared `[agent_mail] token` IS inherited by both
+    /// backends (ADR-0003 V3: "[agent_mail] keeps … token if shared").
     #[test]
-    fn toron_falls_back_to_legacy_agent_mail_url_but_agentmail_does_not() {
+    fn legacy_agent_mail_url_never_routes() {
         let cfg = Config {
             agent_mail: Some(MailConfig {
                 url: Some("http://127.0.0.1:18080".into()),
-                token: Some("legacy".into()),
+                token: Some("shared".into()),
                 name: Some("Orchid".into()),
             }),
             ..Default::default()
         };
         let toron = cfg.toron_mail_config();
-        assert_eq!(toron.url.as_deref(), Some("http://127.0.0.1:18080"));
-        assert_eq!(toron.token.as_deref(), Some("legacy"));
+        assert_eq!(
+            toron.url, None,
+            "no [mail.toron] -> embedded in-process, legacy url ignored"
+        );
+        assert_eq!(
+            toron.token.as_deref(),
+            Some("shared"),
+            "toron inherits the SHARED token (V3)"
+        );
         assert_eq!(toron.name.as_deref(), Some("Orchid"));
         let am = cfg.agentmail_server();
         assert_eq!(
             am.url.as_deref(),
             Some("http://127.0.0.1:8765"),
-            "AM never inherits the legacy toron url"
+            "AM never inherits the legacy url"
         );
         assert_eq!(
             am.token.as_deref(),
-            Some("legacy"),
+            Some("shared"),
             "AM inherits the SHARED token (V3)"
         );
     }

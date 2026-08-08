@@ -1,7 +1,7 @@
 # flywheel
 
 Multi-agent swarm orchestrator with **pluggable backends** (default: **herdr**
-multiplexer + **agent-mail** coordination) — an NTM-parity daily loop for
+multiplexer + **toron** coordination) — an NTM-parity daily loop for
 opencode / pi / grok. Spawn swarms, dispatch the daily-driver stages (P1→P8),
 monitor states, checkpoint progress. Tracker: **br/bv**.
 
@@ -20,17 +20,17 @@ Copy [`.env.example`](.env.example) → `.env` for local backend overrides
 ## Backends
 
 flywheel selects a **multiplexer** (pane/agent lifecycle) and a **mail**
-fabric via env / `.env` / config (ADR-0002). Defaults: `herdr` + `agentmail`.
-Mail backends (ADR-0003): `agentmail` = the real mcp_agent_mail server
-(`[mail.agentmail]`, default `http://127.0.0.1:8765`); `toron` = the toron
-facade (`[mail.toron]`, absent → embedded in-process). Stubs: `superlogical` /
+fabric via env / `.env` / config (ADR-0002). Defaults: `herdr` + `toron`.
+Mail backends (ADR-0003): `toron` = the toron facade (`[mail.toron]`, absent
+→ embedded in-process); `agentmail` = the real mcp_agent_mail server
+(`[mail.agentmail]`, default `http://127.0.0.1:8765`). Stubs: `superlogical` /
 `tmux` (mux).
 
 ```bash
 flywheel backend list --json    # what is compiled in + active
 flywheel backend status         # config source + health
-# FLYWHEEL_BACKEND=herdr FLYWHEEL_MAIL=agentmail
-# FLYWHEEL_MAIL=toron           # toron facade (embedded or [mail.toron] daemon)
+# FLYWHEEL_BACKEND=herdr FLYWHEEL_MAIL=toron
+# FLYWHEEL_MAIL=agentmail       # real agent-mail server ([mail.agentmail])
 ```
 
 Precedence: flag > env > `.env` > config.toml > default. Full matrix and
