@@ -51,7 +51,9 @@ pub fn list_agents_args(project_key: &str) -> Value {
 
 /// `whois`.
 pub fn whois_args(project_key: &str, name: &str) -> Value {
-    json!({ "project_key": project_key, "name": name })
+    // the daemon's WhoisArgs field is `agent_name` (not `name` — wire drift
+    // caught by live test 2026-08-09)
+    json!({ "project_key": project_key, "agent_name": name })
 }
 
 /// `send_message`.
