@@ -142,7 +142,10 @@ enum Commands {
         project: String,
         /// prompt text (or --stage for the daily-driver stages)
         msg: Option<String>,
-        /// target agents: comma-separated shorts (oc,pi,gk) or "all"
+        /// target agents: comma-separated shorts (oc,pi,gk), full names, or "all"
+        /// (bare shorts reach the whole crew of a kind — oc hits oc,oc2,oc3;
+        /// a full name like flywheel-flywheel-oc or a numbered short like oc2
+        /// matches EXACTLY one agent)
         #[arg(long, default_value = "all")]
         to: String,
         /// daily-driver stage name: p1|p2|p4|p5|p6|p8
@@ -267,7 +270,7 @@ enum Commands {
         #[command(subcommand)]
         cmd: WorkCmd,
     },
-    /// Assign beads to agents via agent-mail
+    /// Assign beads to agents via mail (toron default)
     Assign {
         project: String,
         #[arg(long, default_value = "all")]
@@ -279,7 +282,7 @@ enum Commands {
         #[arg(long)]
         msg: Option<String>,
     },
-    /// agent-mail coordination surfaces
+    /// toron mail coordination surfaces
     Mail {
         #[command(subcommand)]
         cmd: MailCmd,
@@ -1352,8 +1355,8 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
         .iter()
         .map(|a| a.name.clone().unwrap_or_default())
         .collect();
-    let want: Vec<String> = if to == "all" {
-        avail.clone()
+    let want: Vec<WantToken> = if to == "all" {
+        avail.iter().cloned().map(|a| WantToken { name: a, broaden: false }).collect()
     } else {
         to.split(',').map(|s| to_want_token(project, s)).collect()
     };
@@ -1431,8 +1434,8 @@ fn resolve_agents_dyn(
         .iter()
         .map(|a| a.name.clone().unwrap_or_default())
         .collect();
-    let want: Vec<String> = if to == "all" {
-        avail.clone()
+    let want: Vec<WantToken> = if to == "all" {
+        avail.iter().cloned().map(|a| WantToken { name: a, broaden: false }).collect()
     } else {
         to.split(',').map(|s| to_want_token(project, s)).collect()
     };
@@ -1466,20 +1469,42 @@ fn resolve_agents_dyn(
 /// this, `flywheel send --to flywheel-toron-oc` double-wrapped to
 /// `flywheel-toron-flywheel-toron-oc` and was rejected even though `list`
 /// showed that exact name as available.
-fn to_want_token(project: &str, token: &str) -> String {
+/// A normalized `--to` token: the concrete agent name to match against, plus
+/// whether the token was a BARE kind short (`oc`/`pi`/`gk`) that may broaden
+/// to all numbered agents of that kind. Concrete names (`flywheel-<base>-oc`,
+/// `flywheel-<base>-oc2`), numbered shorts (`oc2`), pane ids, and mail
+/// identities match EXACTLY — a full name never silently drags in oc2/oc3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WantToken {
+    name: String,
+    broaden: bool,
+}
+
+fn to_want_token(project: &str, token: &str) -> WantToken {
     let t = token.trim();
     if t.is_empty() || t.starts_with("flywheel-") || t.contains(':') {
-        t.to_string()
+        WantToken {
+            name: t.to_string(),
+            broaden: false,
+        }
     } else {
-        agent_name(project, t)
+        let broaden = matches!(t, "oc" | "pi" | "gk") && t.chars().all(|c| c.is_ascii_lowercase());
+        WantToken {
+            name: agent_name(project, t),
+            broaden,
+        }
     }
 }
 
-/// Exact name, or a digit-suffixed ordinal of it (oc2 matches oc).
-fn name_matches_want(name: &str, want: &str) -> bool {
-    name == want
-        || (name.starts_with(want)
-            && name[want.len()..]
+/// Exact match, or — for BARE kind shorts only — a digit-suffixed ordinal of
+/// it (`oc` → oc, oc2, oc3). A concrete want (`flywheel-<base>-oc`) matches
+/// exactly one agent; steering a single crew member no longer drags in its
+/// numbered siblings.
+fn name_matches_want(name: &str, want: &WantToken) -> bool {
+    name == want.name
+        || (want.broaden
+            && name.starts_with(&want.name)
+            && name[want.name.len()..]
                 .chars()
                 .next()
                 .map(|c| c.is_ascii_digit())
@@ -1513,7 +1538,7 @@ fn main() {
                 "recipes workflows pipeline template ensemble safety guards policy deps config upgrade tutorial serve"
             ],
             "tracker": "br/bv (CLI, no MCP)",
-            "coordination": "agent-mail (MCP over HTTP)",
+            "coordination": "toron mail",
             "stages": ["p1", "p2", "p4", "p5", "p6", "p8"],
             "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error" }
         }));
@@ -2936,25 +2961,43 @@ mod agent_mail_name_tests {
     }
 
     /// bd-bwf: full herdr names shown by `flywheel list` must NOT be
-    /// double-wrapped. Bare shorts still expand.
+    /// double-wrapped. Bare shorts expand; concrete names stay exact
+    /// (WantToken.broaden=false) so a full name never drags in oc2.
     #[test]
     fn to_want_token_passes_through_full_names() {
-        // full spawned name passes through (the fix for bd-bwf)
+        // full spawned name passes through, no broadening (the fix for bd-bwf)
         assert_eq!(
             to_want_token("toron", "flywheel-toron-oc"),
-            "flywheel-toron-oc"
+            WantToken { name: "flywheel-toron-oc".into(), broaden: false }
         );
         assert_eq!(
             to_want_token("toron", "flywheel-toron-oc2"),
-            "flywheel-toron-oc2"
+            WantToken { name: "flywheel-toron-oc2".into(), broaden: false }
         );
-        // bare shorts expand to first ordinal
-        assert_eq!(to_want_token("toron", "oc"), "flywheel-toron-oc");
-        assert_eq!(to_want_token("toron", "pi"), "flywheel-toron-pi");
+        // numbered short: exact, no broadening to oc20
+        assert_eq!(
+            to_want_token("toron", "oc2"),
+            WantToken { name: "flywheel-toron-oc2".into(), broaden: false }
+        );
+        // bare shorts expand to first ordinal AND broaden to numbered agents
+        assert_eq!(
+            to_want_token("toron", "oc"),
+            WantToken { name: "flywheel-toron-oc".into(), broaden: true }
+        );
+        assert_eq!(
+            to_want_token("toron", "pi"),
+            WantToken { name: "flywheel-toron-pi".into(), broaden: true }
+        );
         // raw pane id passes through
-        assert_eq!(to_want_token("toron", "w1:p1"), "w1:p1");
+        assert_eq!(
+            to_want_token("toron", "w1:p1"),
+            WantToken { name: "w1:p1".into(), broaden: false }
+        );
         // empty passes through (caller validates distinctness)
-        assert_eq!(to_want_token("toron", ""), "");
+        assert_eq!(
+            to_want_token("toron", ""),
+            WantToken { name: "".into(), broaden: false }
+        );
     }
 }
 
@@ -3650,7 +3693,7 @@ pub fn xproj_queue_prompt(item: &XprojInboxItem, req: &XprojRequest) -> String {
          recipe={} workers={} product={}.\n\
          Params:\n{}\n\n\
          Run this recipe/workflow in THIS project (spawn workers if needed). \
-         When finished, reply a concise summary in agent-mail thread `{}` \
+         When finished, reply a concise summary in mail thread `{}` \
          (reply_message / send with same thread_id) so the requester can read it. \
          Acknowledge the request message if ack_required.",
         item.id,
@@ -5018,27 +5061,22 @@ mod loop_tests {
     #[test]
     fn name_matching_handles_numbered_agents() {
         let base = "flywheel-proj-";
-        assert!(name_matches_want(
-            &format!("{base}oc"),
-            &format!("{base}oc")
-        ));
-        assert!(name_matches_want(
-            &format!("{base}oc2"),
-            &format!("{base}oc")
-        ));
-        assert!(name_matches_want(
-            &format!("{base}oc10"),
-            &format!("{base}oc")
-        ));
+        // bare short broadens: oc matches oc, oc2, oc10
+        let want_oc = WantToken { name: format!("{base}oc"), broaden: true };
+        assert!(name_matches_want(&format!("{base}oc"), &want_oc));
+        assert!(name_matches_want(&format!("{base}oc2"), &want_oc));
+        assert!(name_matches_want(&format!("{base}oc10"), &want_oc));
         // prefix collision: ocr must NOT match oc
-        assert!(!name_matches_want(
-            &format!("{base}ocr"),
-            &format!("{base}oc")
-        ));
-        assert!(!name_matches_want(
-            &format!("{base}ocx"),
-            &format!("{base}oc")
-        ));
+        assert!(!name_matches_want(&format!("{base}ocr"), &want_oc));
+        assert!(!name_matches_want(&format!("{base}ocx"), &want_oc));
+        // concrete full name is EXACT: flywheel-proj-oc must NOT match oc2
+        let want_exact = WantToken { name: format!("{base}oc"), broaden: false };
+        assert!(name_matches_want(&format!("{base}oc"), &want_exact));
+        assert!(!name_matches_want(&format!("{base}oc2"), &want_exact));
+        // numbered short is exact too: oc2 must NOT match oc20
+        let want_oc2 = WantToken { name: format!("{base}oc2"), broaden: false };
+        assert!(name_matches_want(&format!("{base}oc2"), &want_oc2));
+        assert!(!name_matches_want(&format!("{base}oc20"), &want_oc2));
     }
 
     #[test]
@@ -5782,13 +5820,13 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
 
     match mail_shim::Mail::from_config(Some(&cfg.toron_mail_config())) {
         Ok(Some(m)) => match m.health() {
-            Ok(_) => println!("agent-mail: {}", status_paint(AgentStatus::Idle)),
+            Ok(_) => println!("mail (toron): {}", status_paint(AgentStatus::Idle)),
             Err(e) => {
                 ok = false;
-                println!("agent-mail: {} ({e:#})", error("FAIL"));
+                println!("mail (toron): {} ({e:#})", error("FAIL"));
             }
         },
-        Ok(None) => println!("agent-mail: {}", dim("not configured (set [mail.toron])")),
+        Ok(None) => println!("mail (toron): {}", dim("not configured (set [mail.toron])")),
         Err(e) => {
             ok = false;
             println!("agent-mail: {} ({e:#})", error("FAIL"));

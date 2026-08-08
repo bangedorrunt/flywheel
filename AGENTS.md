@@ -170,7 +170,7 @@ runs. Do not overload normal bead dispatch.
 
 - `cli-design` — command surface, help, output discipline
 - `br`, `bv`, `beads-workflow`, `beads-compliance-and-completion-verification` — tracker lifecycle
-- `agent-mail` — coordination (identities, reservations, threads)
+- `toron` — coordination (identities, reservations, threads, build slots)
 - `resonate-philosophy`, `resonate-basic-durable-world-usage-rust`,
   `resonate-basic-ephemeral-world-usage-rust`, `resonate-durable-sleep-scheduled-work-rust` — durable loop design
 - `herdr` — raw pane/workspace control (upstream master copy)
@@ -181,11 +181,11 @@ runs. Do not overload normal bead dispatch.
 ```
 src/
   main.rs      # clap surface, swarm helpers, sync loop, hidden __poll/__send leaves
-  herdr.rs     # socket client: one request per connection, typed helpers
+  herdr_shim.rs # herdr client re-exports + helpers (client lives in toron-core)
   durable.rs   # Resonate workflow (swarm_loop) + leaves + resume/status
   config.rs    # XDG config, recipes/workflows/pipelines/policy
   state.rs     # event log, checkpoints, active-loop registry, analytics
-  mail.rs      # agent-mail JSON-RPC over HTTP
+  mail_shim.rs # mail facade over toron-core MailSurface (toron)
   work.rs      # br/bv pass-through
   output.rs    # TTY-aware color, JSON printing
 ```
@@ -200,7 +200,7 @@ while pending). Verify: `docs/decisions/_scripts/verify-0001.sh`.
 
 Baked into `bead_prompt` / `resume_prompt` (`src/durable.rs`):
 
-- **Lease renew** — agents renew their own agent-mail file reservations; orchestrator cannot renew on their behalf.
+- **Lease renew** — agents renew their own file reservations (toron `renew_file_reservations` / `flywheel mail locks`); orchestrator cannot renew on their behalf.
 - **Ack** — when `ack_required=true`, call `acknowledge_message` after acting; orchestrator cannot ack on their behalf.
 - **Build-slot** — before `cargo build`/`cargo test`, acquire slot `cargo`; release when done (plan-review implementer prompt).
 - **Pane safety** — never close peers' panes; only flywheel-created panes are respawn targets.
@@ -281,13 +281,13 @@ bv --robot-triage | --robot-next   # graph-aware picks; NEVER bare bv
 
 1. **Triage** — `bv --robot-triage` / `br ready --json`; respect priority + dependency order.
 2. **Claim** — `br update <id> --claim --actor "$AGENT_NAME" --json`. Never work unclaimed.
-3. **Reserve** — agent-mail `file_reservation_paths` (exclusive) for files you will touch.
-4. **Announce** — agent-mail: which bead, which files, expected outcome.
+3. **Reserve** — toron `file_reservation_paths` (exclusive) for files you will touch. (`flywheel mail locks <project> --as YOUR_NAME` is the CLI equivalent.)
+4. **Announce** — toron: which bead, which files, expected outcome (`flywheel mail send` / `toron_send_message`, thread-id = bead id).
 5. **Execute one narrow slice** — the bead is self-contained; no scope creep.
 6. **Quality gates** — narrowest test/lint/typecheck for the slice.
 7. **Verify compliance** — acceptance criteria met, not just "compiles".
 8. **Close + sync** — `br close` (honest reason), `br sync --flush-only`, `git add .beads/ && git commit` (br never runs git).
-9. **Handoff** — agent-mail: what changed / verified / remaining; release reservations.
+9. **Handoff** — toron: what changed / verified / remaining; release reservations.
 
 ### Key Concepts
 
