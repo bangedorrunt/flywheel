@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 🚀 Features
 
+- **Unified workflow CLI (ADR-0005 P3.7)** — `flywheel workflow {list,show,run,
+  lint,new,history,crew}`: one vocabulary over built-ins + canonical YAML +
+  absorbed legacy. `run` invokes through the engine (lint gate first); `crew
+  <name>` previews the auto-crew; `lint` is the fail-stop gate adding the
+  flywheel-tier checks the engine cannot do (profile `@name`, `stage:` alias,
+  `{{inputs.x}}` resolution) on top of engine lint.
 - **Collaboration spine (ADR-0001)** — event-wake loop + poll floor; patterns
   `debate`, `plan-review`, `xproj`; mail contact/product; recipe catalog
   `docs/collab/recipes.md`; agent ack/lease/build-slot contracts in spawn prompts.

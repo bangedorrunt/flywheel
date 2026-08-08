@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -395,6 +396,14 @@ enum Commands {
     Runs {
         #[command(subcommand)]
         cmd: RunsCmd,
+    },
+    /// Unified workflow surface (ADR-0005 Spec 5 / P3.7) — catalog, lint,
+    /// run, scaffold, history, and auto-crew preview. One vocabulary, one
+    /// engine: built-ins + canonical `workflows/*.yaml` + absorbed legacy
+    /// `workflows.toml` / `pipelines.toml`.
+    Workflow {
+        #[command(subcommand)]
+        cmd: WorkflowCmd,
     },
     /// N-round A/B debate + judge (ADR-0001 §9.1 — threaded, ack-gated)
     Debate {
@@ -1063,6 +1072,55 @@ enum RunsCmd {
     },
 }
 
+/// Unified workflow commands (ADR-0005 Spec 5 / P3.7). `lint` is the
+/// fail-stop gate every run must pass; `crew <name>` previews the auto-crew
+/// a workflow would spawn.
+#[derive(Subcommand)]
+enum WorkflowCmd {
+    /// List catalog + built-in workflows (name, source, trigger, crew)
+    List,
+    /// Show one workflow's definition
+    Show {
+        /// workflow name (built-in or catalog)
+        name: String,
+    },
+    /// Lint ALL built-in + catalog workflows (the fail-stop gate). Exit 0
+    /// clean, 1 on any blocking issue, 2 on a parse failure.
+    Lint {
+        /// lint only this workflow (name), else all
+        name: Option<String>,
+    },
+    /// Run a workflow by name through the unified engine (lint gate first)
+    Run {
+        /// workflow name (built-in or catalog)
+        name: String,
+        /// JSON inputs for the invoke path ({{inputs.x}})
+        #[arg(long)]
+        inputs: Option<String>,
+        /// crew strategy: auto | <squad> (default auto)
+        #[arg(long)]
+        crew: Option<String>,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+    /// Scaffold a new workflow YAML in the config dir
+    New {
+        /// workflow name (must be a valid identifier)
+        name: String,
+    },
+    /// Run history for a workflow (from the state log)
+    History {
+        /// workflow name
+        name: String,
+    },
+    /// Preview the auto-crew a workflow would spawn (crew: auto)
+    Crew {
+        /// workflow name (built-in or catalog)
+        name: String,
+    },
+}
+
 fn parse_kind_count(s: &str) -> Result<(String, u32)> {
     let (k, v) = s
         .split_once('=')
@@ -1507,6 +1565,7 @@ fn main() {
         Some(Commands::Profile { cmd }) => cmd_profile(&cfg, cmd),
         Some(Commands::Squad { cmd }) => cmd_squad(&cfg, cmd),
         Some(Commands::Runs { cmd }) => cmd_runs(&cfg, cmd),
+        Some(Commands::Workflow { cmd }) => cmd_workflow(cmd),
         Some(Commands::Debate {
             proposition,
             rounds,
@@ -6131,6 +6190,462 @@ fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
     }
 }
 
+/// `flywheel workflow` — the unified orchestration surface (ADR-0005 Spec 5 /
+/// P3.7). Wires the dead-code modules (`crew`, `workflow_catalog`,
+/// `builtin_workflows`) into the CLI: catalog listing, the fail-stop lint
+/// gate, engine-backed `run`, scaffolding, history, and the auto-crew
+/// preview.
+fn cmd_workflow(cmd: &WorkflowCmd) -> Result<()> {
+    use toron_workflow::schema::{Action, CrewSpec, Workflow};
+    use toron_workflow::{lint_workflow, Level};
+
+    /// The full workflow set: built-ins (compiled-in) + catalog (canonical
+    /// YAML + absorbed legacy), name → (workflow, source).
+    fn all_workflows() -> Result<BTreeMap<String, (Workflow, &'static str)>> {
+        let mut out: BTreeMap<String, (Workflow, &'static str)> = BTreeMap::new();
+        for (name, wf) in builtin_workflows::builtin_workflows() {
+            out.insert(name, (wf, "builtin"));
+        }
+        let cat = workflow_catalog::WorkflowCatalog::load()?;
+        for (name, wf) in cat.workflows {
+            // Canonical YAML / absorbed legacy wins over a same-named built-in
+            // (the catalog is the home; built-ins are zero-config defaults).
+            out.insert(name, (wf, "catalog"));
+        }
+        Ok(out)
+    }
+
+    /// Lint one workflow; print issues; return the blocking (Error-level) count.
+    fn lint_one(name: &str, wf: &Workflow) -> usize {
+        // Engine tier (toron-workflow lint): schema, guards (evalexpr +
+        // timeout), template refs, graph acyclicity — inherited, fail-stop.
+        let report = lint_workflow(wf);
+        let mut blocking = report
+            .issues
+            .iter()
+            .filter(|i| i.level == Level::Error)
+            .count();
+        for issue in &report.issues {
+            eprintln!(
+                "[{name}] {:>7} {}",
+                if issue.level == Level::Error {
+                    "error"
+                } else {
+                    "warning"
+                },
+                issue.message
+            );
+        }
+        // Flywheel tier (ADR-0005 lint-gate contract — the ENGINE cannot do
+        // these: no dependency inversion means it never imports flywheel's
+        // StageLibrary / ProfileCatalog). Owned here, fail-stop.
+        blocking += lint_flywheel_tier(name, wf);
+        blocking
+    }
+
+    /// Resolve a single workflow by name across built-ins + catalog.
+    fn resolve_workflow<'a>(
+        name: &str,
+        all: &'a BTreeMap<String, (Workflow, &'static str)>,
+    ) -> Result<&'a Workflow> {
+        all.get(name)
+            .map(|(wf, _)| wf)
+            .ok_or_else(|| anyhow!("unknown workflow {name:?} (flywheel workflow list)"))
+    }
+
+    match cmd {
+        WorkflowCmd::List => {
+            let all = all_workflows()?;
+            if all.is_empty() {
+                println!("no workflows defined");
+                return Ok(());
+            }
+            let mut rows: Vec<Value> = Vec::new();
+            for (name, (wf, source)) in &all {
+                rows.push(json!({
+                    "name": name,
+                    "source": source,
+                    "trigger": wf.trigger.as_ref().map(|t| t.type_name()),
+                    "crew": match &wf.crew {
+                        Some(CrewSpec::Auto) => "auto",
+                        Some(CrewSpec::Explicit(_)) => "explicit",
+                        None => "none",
+                    },
+                    "steps": wf.steps.len(),
+                    "graph_nodes": wf.graph.as_ref().map(|g| g.nodes.len()),
+                    "inputs": wf.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(),
+                }));
+            }
+            print_json(&json!({ "workflows": rows }));
+            Ok(())
+        }
+        WorkflowCmd::Show { name } => {
+            let all = all_workflows()?;
+            let (wf, source) = all
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown workflow {name:?} (flywheel workflow list)"))?;
+            let crew = match &wf.crew {
+                Some(CrewSpec::Auto) => "auto".to_string(),
+                Some(CrewSpec::Explicit(m)) => serde_json::to_string(m)?,
+                None => "none".to_string(),
+            };
+            let step_labels: Vec<String> = wf
+                .steps
+                .iter()
+                .map(|s| {
+                    let n = s.name.clone().unwrap_or_else(|| "<unnamed>".to_string());
+                    format!("{n}: {}", s.action.type_name())
+                })
+                .collect();
+            print_json(&json!({
+                "name": wf.name,
+                "source": source,
+                "description": wf.description,
+                "trigger": wf.trigger.as_ref().map(|t| t.type_name()),
+                "guard": wf.guard,
+                "crew": crew,
+                "inputs": wf.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(),
+                "steps": step_labels,
+                "graph_nodes": wf.graph.as_ref().map(|g| g.nodes.len()),
+            }));
+            Ok(())
+        }
+        WorkflowCmd::Lint { name } => {
+            let all = all_workflows()?;
+            match name {
+                Some(n) => {
+                    let (wf, _) = all.get(n).ok_or_else(|| {
+                        anyhow!("unknown workflow {n:?} (flywheel workflow list)")
+                    })?;
+                    let blocking = lint_one(n, wf);
+                    if blocking > 0 {
+                        std::process::exit(1);
+                    }
+                    Ok(())
+                }
+                None => {
+                    let mut blocking_total = 0;
+                    for (n, (wf, _)) in &all {
+                        blocking_total += lint_one(n, wf);
+                    }
+                    if blocking_total > 0 {
+                        std::process::exit(1);
+                    }
+                    println!("lint clean: {} workflow(s)", all.len());
+                    Ok(())
+                }
+            }
+        }
+        WorkflowCmd::Run {
+            name,
+            inputs,
+            crew,
+            json,
+        } => {
+            let all = all_workflows()?;
+            let wf = resolve_workflow(name, &all)?.clone();
+            // Fail-stop gate: lint before running.
+            let blocking = lint_one(name, &wf);
+            if blocking > 0 {
+                bail!("workflow {name:?} has {blocking} blocking lint issue(s) — refusing to run");
+            }
+            let inputs_value: Value = match inputs {
+                Some(s) if !s.trim().is_empty() => {
+                    serde_json::from_str(s).map_err(|e| anyhow!("--inputs must be JSON: {e}"))?
+                }
+                _ => json!({}),
+            };
+            // Crew resolution: auto → infer from the workflow; <squad> →
+            // explicit role:count. Used for the preview + the engine invoke.
+            let crew_plan = match crew.as_deref() {
+                None | Some("auto") => crew::plan_crew(&wf),
+                Some(squad) => {
+                    let cat = profile::ProfileCatalog::load()?;
+                    let recipes = config::Recipes::load()?.recipes;
+                    let squad_counts = match recipes.get(squad) {
+                        Some(r) => profile::Squad::from_recipe(r).counts,
+                        None if cat.get(squad).is_some() => {
+                            let mut m = BTreeMap::new();
+                            m.insert(squad.to_string(), 1u32);
+                            m
+                        }
+                        None => {
+                            bail!("unknown squad {squad:?} (flywheel squad list)")
+                        }
+                    };
+                    crew::CrewPlan {
+                        members: squad_counts,
+                    }
+                }
+            };
+            // A recording action runner: flywheel's CLI run exercises the
+            // engine (delays, approvals park durably, graph scheduling,
+            // control-flow); action side-effects are recorded, not dispatched
+            // (herdr dispatch is the P4 spawn-await binding).
+            let runner: toron_workflow::ActionRunner =
+                Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+            let rt = tokio::runtime::Runtime::new()?;
+            let run_id = format!("fw-cli-{}", state::now_iso());
+            let output = rt.block_on(async {
+                let engine = toron_workflow::WorkflowEngine::local(runner)?;
+                engine
+                    .invoke(&run_id, wf.clone(), inputs_value.clone())
+                    .await
+            })?;
+            log(
+                "workflow",
+                EventKind::Workflow,
+                json!({
+                    "workflow": name,
+                    "status": "done",
+                    "crew": crew_plan.members,
+                    "run_id": run_id,
+                }),
+            );
+            if *json {
+                print_json(&json!({
+                    "workflow": name,
+                    "run_id": run_id,
+                    "crew": crew_plan.members,
+                    "output": output,
+                }));
+            } else {
+                println!(
+                    "workflow {name} ran (run_id {run_id}, crew {} member(s))",
+                    crew_plan.members.len()
+                );
+                print_json(&output);
+            }
+            Ok(())
+        }
+        WorkflowCmd::New { name } => {
+            if name.trim().is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+            {
+                bail!("invalid workflow name {name:?} (alnum/_/-/.)");
+            }
+            let dir = config::config_dir().join("workflows");
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+            let path = dir.join(format!("{name}.yaml"));
+            if path.exists() {
+                bail!("workflow already exists: {}", path.display());
+            }
+            let scaffold = format!(
+                "name: {name}\ndescription: \"\"\ntrigger:\n  type: webhook\ninputs:\n  - name: goal\nsteps:\n  - name: step-1\n    action: send_dm\n    to: operator\n    body: \"started {{name}}\"\n"
+            );
+            std::fs::write(&path, scaffold)?;
+            println!("wrote {}", path.display());
+            Ok(())
+        }
+        WorkflowCmd::History { name } => {
+            use state::EventKind;
+            let dir = config::state_dir();
+            let mut rows: Vec<Value> = Vec::new();
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                print_json(&json!({ "workflow": name, "runs": [] }));
+                return Ok(());
+            };
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if !fname.ends_with(".jsonl") {
+                    continue;
+                }
+                let project = fname.trim_end_matches(".jsonl").to_string();
+                let Ok(events) = state::read_log(&project) else {
+                    continue;
+                };
+                for e in events {
+                    if e.kind != EventKind::Workflow {
+                        continue;
+                    }
+                    let owner = e
+                        .data
+                        .get("workflow")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if owner == *name {
+                        rows.push(json!({
+                            "ts": e.ts,
+                            "project": project,
+                            "run_id": e.data.get("run_id"),
+                            "status": e.data.get("status").and_then(Value::as_str).unwrap_or("done"),
+                            "crew": e.data.get("crew"),
+                        }));
+                    }
+                }
+            }
+            rows.sort_by(|a, b| {
+                b.get("ts")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .cmp(a.get("ts").and_then(Value::as_str).unwrap_or(""))
+            });
+            print_json(&json!({ "workflow": name, "runs": rows }));
+            Ok(())
+        }
+        WorkflowCmd::Crew { name } => {
+            let all = all_workflows()?;
+            let wf = resolve_workflow(name, &all)?;
+            let plan = crew::plan_crew(wf);
+            let members: Vec<Value> = plan
+                .members
+                .iter()
+                .map(|(role, count)| json!({ "role": role, "count": count }))
+                .collect();
+            if members.is_empty() {
+                println!("workflow {name} has no crew (crew omitted or no profile refs)");
+                return Ok(());
+            }
+            print_json(&json!({ "workflow": name, "crew": members }));
+            Ok(())
+        }
+    }
+}
+
+/// The flywheel-tier lint checks (the bead's fail-stop contract): profile
+/// `@name` resolution against the ProfileCatalog, `stage:` alias resolution
+/// against the StageLibrary, and `{{inputs.x}}` presence against the declared
+/// `inputs:`. The ENGINE cannot do these (no dependency inversion — it never
+/// imports flywheel's StageLibrary / ProfileCatalog), so the CLI owns them
+/// and fails closed before any run.
+fn lint_flywheel_tier(name: &str, wf: &toron_workflow::schema::Workflow) -> usize {
+    let profiles = profile::ProfileCatalog::load().unwrap_or_default();
+    let stages = stages::StageLibrary::load().unwrap_or_default();
+    let declared_inputs: std::collections::HashSet<&str> =
+        wf.inputs.iter().map(|i| i.name.as_str()).collect();
+    let mut blocking = 0;
+
+    // Emit an error line for this workflow (name captured).
+    let emit = |msg: &str, blocking: &mut usize| {
+        eprintln!("[{name}]    error {msg}");
+        *blocking += 1;
+    };
+
+    fn check_profile(
+        profile: &str,
+        profiles: &profile::ProfileCatalog,
+        blocking: &mut usize,
+        emit: &dyn Fn(&str, &mut usize),
+    ) {
+        let bare = profile.trim_start_matches('@');
+        if bare.is_empty() {
+            return;
+        }
+        if !profiles.get(bare).is_some() {
+            let msg = format!(
+                "profile {profile:?} does not resolve (known: {})",
+                profiles.names().join(", ")
+            );
+            emit(&msg, blocking);
+        }
+    }
+
+    fn collect_input_refs(
+        v: &serde_json::Value,
+        declared: &std::collections::HashSet<&str>,
+        blocking: &mut usize,
+        emit: &dyn Fn(&str, &mut usize),
+    ) {
+        match v {
+            serde_json::Value::String(s) => {
+                for inner in template_tokens(s) {
+                    if let Some(key) = inner.strip_prefix("inputs.") {
+                        if !declared.contains(key) {
+                            let msg = format!(
+                                "{{{{inputs.{key}}}}} references input {key:?} that is not declared in `inputs:`"
+                            );
+                            emit(&msg, blocking);
+                        }
+                    }
+                }
+            }
+            serde_json::Value::Array(a) => {
+                for item in a {
+                    collect_input_refs(item, declared, blocking, emit);
+                }
+            }
+            serde_json::Value::Object(o) => {
+                for v in o.values() {
+                    collect_input_refs(v, declared, blocking, emit);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn template_tokens(s: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut rest = s;
+        while let Some(start) = rest.find("{{") {
+            if let Some(end) = rest[start + 2..].find("}}") {
+                out.push(&rest[start + 2..start + 2 + end]);
+                rest = &rest[start + 2 + end + 2..];
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
+    // Walk one action: dispatch_job spec (profile + stage), spawn profile,
+    // and {{inputs.X}} refs across all string leaves.
+    fn scan_action(
+        action: &toron_workflow::schema::Action,
+        profiles: &profile::ProfileCatalog,
+        stages: &stages::StageLibrary,
+        declared: &std::collections::HashSet<&str>,
+        blocking: &mut usize,
+        emit: &dyn Fn(&str, &mut usize),
+    ) {
+        let json = serde_json::to_value(action).unwrap_or_default();
+        if let Some(spec) = json.get("spec").and_then(|s| s.as_object()) {
+            if let Some(profile) = spec.get("profile").and_then(|v| v.as_str()) {
+                check_profile(profile, profiles, blocking, emit);
+            }
+            if let Some(stage) = spec.get("stage").and_then(|v| v.as_str()) {
+                if !stages.has(stage) {
+                    emit(
+                        &format!("stage {stage:?} does not resolve (semantic or p-code alias)"),
+                        blocking,
+                    );
+                }
+            }
+        }
+        if let Some(profile) = json.get("profile").and_then(|v| v.as_str()) {
+            check_profile(profile, profiles, blocking, emit);
+        }
+        for v in json.as_object().into_iter().flat_map(|o| o.values()) {
+            collect_input_refs(v, declared, blocking, emit);
+        }
+    }
+
+    for step in &wf.steps {
+        scan_action(
+            &step.action,
+            &profiles,
+            &stages,
+            &declared_inputs,
+            &mut blocking,
+            &emit,
+        );
+    }
+    if let Some(graph) = &wf.graph {
+        for node in graph.nodes.values() {
+            scan_action(
+                &node.action,
+                &profiles,
+                &stages,
+                &declared_inputs,
+                &mut blocking,
+                &emit,
+            );
+        }
+    }
+    blocking
+}
+
 /// ISO timestamp `now - secs` (for `runs digest --since`).
 fn now_minus(secs: u64) -> String {
     let (now, _) = state::utc_now();
@@ -8483,6 +8998,124 @@ mod profile_cli_tests {
             assert!(r.get("owner").and_then(Value::as_str).is_some(), "owner");
             assert!(r.get("state").and_then(Value::as_str).is_some(), "state");
             assert!(r.get("ts").and_then(Value::as_str).is_some(), "ts");
+        }
+    }
+}
+
+#[cfg(test)]
+mod workflow_cli_lint_tests {
+    use super::*;
+    use toron_workflow::schema::parse_workflow;
+
+    /// The flywheel-tier lint fails closed on an unresolved `@profile`
+    /// (the bead's fail-stop contract).
+    #[test]
+    fn lint_rejects_unresolved_profile() {
+        let wf = parse_workflow(
+            r##"
+name: t
+trigger:
+  type: webhook
+inputs:
+  - name: goal
+steps:
+  - name: a
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@doesnotexist" }
+"##,
+        )
+        .expect("parse");
+        let blocking = lint_flywheel_tier("t", &wf);
+        assert!(blocking > 0, "unresolved profile must be a blocking issue");
+    }
+
+    /// An unresolved `stage:` alias fails closed.
+    #[test]
+    fn lint_rejects_unresolved_stage() {
+        let wf = parse_workflow(
+            r##"
+name: t
+trigger:
+  type: webhook
+inputs:
+  - name: goal
+steps:
+  - name: a
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@planner", stage: "not-a-real-stage" }
+"##,
+        )
+        .expect("parse");
+        let blocking = lint_flywheel_tier("t", &wf);
+        assert!(blocking > 0, "unresolved stage must be a blocking issue");
+    }
+
+    /// A `{{inputs.x}}` ref with no matching `inputs:` declaration fails closed.
+    #[test]
+    fn lint_rejects_undeclared_input_ref() {
+        let wf = parse_workflow(
+            r##"
+name: t
+trigger:
+  type: webhook
+inputs:
+  - name: goal
+steps:
+  - name: a
+    action: send_dm
+    to: x
+    body: "{{inputs.ghost}}"
+"##,
+        )
+        .expect("parse");
+        let blocking = lint_flywheel_tier("t", &wf);
+        assert!(
+            blocking > 0,
+            "undeclared input ref must be a blocking issue"
+        );
+    }
+
+    /// A clean workflow passes the flywheel tier (no blocking issues).
+    #[test]
+    fn lint_clean_workflow_passes() {
+        let wf = parse_workflow(
+            r##"
+name: t
+trigger:
+  type: webhook
+inputs:
+  - name: goal
+steps:
+  - name: a
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@planner", stage: "systematic-execute" }
+"##,
+        )
+        .expect("parse");
+        let blocking = lint_flywheel_tier("t", &wf);
+        assert_eq!(blocking, 0, "clean workflow must lint clean");
+    }
+
+    /// The CI gate (bead contract: lint over EVERY built-in on every change):
+    /// every compiled-in workflow passes the FULL gate — engine tier
+    /// (lint_workflow) + flywheel tier (profile/stage/inputs resolution).
+    #[test]
+    fn every_builtin_passes_full_lint_gate() {
+        for (name, wf) in builtin_workflows::builtin_workflows() {
+            let engine = toron_workflow::lint_workflow(&wf);
+            assert!(
+                engine.is_clean(),
+                "built-in {name} fails engine lint: {:?}",
+                engine.issues
+            );
+            let tier = lint_flywheel_tier(&name, &wf);
+            assert_eq!(
+                tier, 0,
+                "built-in {name} fails flywheel-tier lint (profile/stage/inputs)"
+            );
         }
     }
 }
