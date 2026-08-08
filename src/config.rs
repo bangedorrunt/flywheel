@@ -618,16 +618,16 @@ daily = [
         let _g = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("FLYWHEEL_AGENTMAIL_URL", "http://127.0.0.1:8765");
-        std::env::set_var("FLYWHEEL_AGENTMAIL_TOKEN", "secret");
-        std::env::set_var("FLYWHEEL_MAIL_NAME", "Orchid");
+        unsafe { std::env::set_var("FLYWHEEL_AGENTMAIL_URL", "http://127.0.0.1:8765") };
+        unsafe { std::env::set_var("FLYWHEEL_AGENTMAIL_TOKEN", "secret") };
+        unsafe { std::env::set_var("FLYWHEEL_MAIL_NAME", "Orchid") };
         let (url, token, name) = Config::mail_env_overrides();
         assert_eq!(url.as_deref(), Some("http://127.0.0.1:8765"));
         assert_eq!(token.as_deref(), Some("secret"));
         assert_eq!(name.as_deref(), Some("Orchid"));
-        std::env::remove_var("FLYWHEEL_AGENTMAIL_URL");
-        std::env::remove_var("FLYWHEEL_AGENTMAIL_TOKEN");
-        std::env::remove_var("FLYWHEEL_MAIL_NAME");
+        unsafe { std::env::remove_var("FLYWHEEL_AGENTMAIL_URL") };
+        unsafe { std::env::remove_var("FLYWHEEL_AGENTMAIL_TOKEN") };
+        unsafe { std::env::remove_var("FLYWHEEL_MAIL_NAME") };
     }
 
     #[test]
@@ -635,12 +635,12 @@ daily = [
         let _g = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("FLYWHEEL_AGENTMAIL_URL", "");
+        unsafe { std::env::set_var("FLYWHEEL_AGENTMAIL_URL", "") };
         let (url, token, name) = Config::mail_env_overrides();
         assert_eq!(url, None, "empty url counts as unset");
         assert_eq!(token, None);
         assert_eq!(name, None);
-        std::env::remove_var("FLYWHEEL_AGENTMAIL_URL");
+        unsafe { std::env::remove_var("FLYWHEEL_AGENTMAIL_URL") };
     }
 
     #[test]
@@ -648,9 +648,9 @@ daily = [
         let _g = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::remove_var("FLYWHEEL_AGENTMAIL_URL");
-        std::env::remove_var("FLYWHEEL_AGENTMAIL_TOKEN");
-        std::env::remove_var("FLYWHEEL_MAIL_NAME");
+        unsafe { std::env::remove_var("FLYWHEEL_AGENTMAIL_URL") };
+        unsafe { std::env::remove_var("FLYWHEEL_AGENTMAIL_TOKEN") };
+        unsafe { std::env::remove_var("FLYWHEEL_MAIL_NAME") };
         let (url, token, name) = Config::mail_env_overrides();
         assert_eq!((url, token, name), (None, None, None));
     }
@@ -758,9 +758,9 @@ daily = [
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = std::env::temp_dir().join(format!("flywheel-cfg-xdg-{}", std::process::id()));
-        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
         assert_eq!(config_dir(), tmp.join("flywheel"));
-        std::env::remove_var("XDG_CONFIG_HOME");
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 
     /// No XDG_CONFIG_HOME → `~/.config/flywheel` (NOT macOS Application
@@ -770,15 +770,15 @@ daily = [
         let _g = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::remove_var("XDG_CONFIG_HOME");
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
         let home = std::env::temp_dir().join(format!("flywheel-cfg-home-{}", std::process::id()));
-        std::env::set_var("HOME", &home);
+        unsafe { std::env::set_var("HOME", &home) };
         assert_eq!(
             config_dir(),
             home.join(".config/flywheel"),
             "XDG default is ~/.config/flywheel, not dirs::config_dir()"
         );
-        std::env::remove_var("HOME");
+        unsafe { std::env::remove_var("HOME") };
     }
 
     /// `Config::load()` dual-reads: XDG wins when present; a legacy macOS
@@ -795,8 +795,8 @@ daily = [
         let xdg = std::env::temp_dir().join(format!("flywheel-xdg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&xdg);
-        std::env::set_var("HOME", &home);
-        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        unsafe { std::env::set_var("HOME", &home) };
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
         // legacy macOS path + live [agent_mail] block (ADR-0003 V5)
         let legacy_dir = home.join("Library/Application Support/flywheel");
         std::fs::create_dir_all(&legacy_dir).unwrap();
@@ -821,8 +821,8 @@ daily = [
         );
         let copied = std::fs::read_to_string(&xdg_file).unwrap();
         assert!(copied.contains("Orchid"), "copied body intact");
-        std::env::remove_var("HOME");
-        std::env::remove_var("XDG_CONFIG_HOME");
+        unsafe { std::env::remove_var("HOME") };
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 
     /// XDG beats legacy when both exist (precedence XDG > legacy > default).
@@ -835,8 +835,8 @@ daily = [
         let xdg = std::env::temp_dir().join(format!("flywheel-pref-xdg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&xdg);
-        std::env::set_var("HOME", &home);
-        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        unsafe { std::env::set_var("HOME", &home) };
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
         std::fs::create_dir_all(home.join("Library/Application Support/flywheel")).unwrap();
         std::fs::write(
             home.join("Library/Application Support/flywheel/config.toml"),
@@ -856,7 +856,7 @@ daily = [
             Some("Xdg"),
             "XDG wins over legacy"
         );
-        std::env::remove_var("HOME");
-        std::env::remove_var("XDG_CONFIG_HOME");
+        unsafe { std::env::remove_var("HOME") };
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 }

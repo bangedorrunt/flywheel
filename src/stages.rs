@@ -205,7 +205,7 @@ mod tests {
         let old = lib.resolve("p6").unwrap().to_string();
         let dir = std::env::temp_dir().join(format!("fw-stages-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
         std::fs::create_dir_all(dir.join("flywheel")).unwrap();
         std::fs::write(
             dir.join("flywheel/stages.toml"),

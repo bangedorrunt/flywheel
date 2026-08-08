@@ -196,8 +196,8 @@ mod tests {
     #[test]
     fn defaults_resolve_to_herdr_and_toron() {
         let _g = _lock_env();
-        std::env::remove_var("FLYWHEEL_BACKEND");
-        std::env::remove_var("FLYWHEEL_MAIL");
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+        unsafe { std::env::remove_var("FLYWHEEL_MAIL") };
         let cfg = Config::default();
         assert_eq!(resolve_backend_name(&cfg), "herdr");
         assert_eq!(resolve_mail_name(&cfg), "toron");
@@ -207,20 +207,20 @@ mod tests {
     #[test]
     fn env_overrides_config() {
         let _g = _lock_env();
-        std::env::set_var("FLYWHEEL_BACKEND", "superlogical");
-        std::env::set_var("FLYWHEEL_MAIL", "toron");
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
+        unsafe { std::env::set_var("FLYWHEEL_MAIL", "toron") };
         let cfg = Config::default();
         assert_eq!(resolve_backend_name(&cfg), "superlogical");
         assert_eq!(resolve_mail_name(&cfg), "toron");
-        std::env::remove_var("FLYWHEEL_BACKEND");
-        std::env::remove_var("FLYWHEEL_MAIL");
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+        unsafe { std::env::remove_var("FLYWHEEL_MAIL") };
     }
 
     /// Empty env falls back to config (env present-but-empty = unset).
     #[test]
     fn empty_env_falls_back_to_config() {
         let _g = _lock_env();
-        std::env::set_var("FLYWHEEL_BACKEND", "");
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "") };
         let cfg = Config {
             backend: Some(crate::config::BackendConfig {
                 multiplexer: "tmux".into(),
@@ -229,7 +229,7 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(resolve_backend_name(&cfg), "tmux");
-        std::env::remove_var("FLYWHEEL_BACKEND");
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
     }
 
     /// An unknown backend name returns an actionable Unsupported (not a silent
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn unknown_backend_name_is_unsupported_not_silent_fallback() {
         let _g = _lock_env();
-        std::env::set_var("FLYWHEEL_BACKEND", "nonsense");
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "nonsense") };
         let cfg = Config::default();
         let res = multiplexer_backend(&cfg);
         match res {
@@ -251,7 +251,7 @@ mod tests {
             Err(e) => panic!("expected Unsupported for unknown backend, got error: {e}"),
             Ok(_) => panic!("expected Unsupported for unknown backend, got Ok (silent fallback)"),
         }
-        std::env::remove_var("FLYWHEEL_BACKEND");
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
     }
 
     /// A stubbed-but-unwired backend (superlogical) returns an actionable
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn stubbed_backend_not_compiled_in_default_build() {
         let _g = _lock_env();
-        std::env::set_var("FLYWHEEL_BACKEND", "superlogical");
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
         let cfg = Config::default();
         let res = multiplexer_backend(&cfg);
         match res {
@@ -276,7 +276,7 @@ mod tests {
             Err(e) => panic!("expected Unsupported, got error: {e}"),
             Ok(_) => panic!("expected Unsupported, got Ok (silent fallback)"),
         }
-        std::env::remove_var("FLYWHEEL_BACKEND");
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
     }
 
     /// The default build compiles herdr + toron + agentmail (the `default`
@@ -347,7 +347,7 @@ mod tests {
         // name() is truthful, and health() delegates to the in-process mailbox
         // (Ok), NOT an honest-Unsupported stub (pre-ADR-0003 behavior).
         let _g = _lock_env();
-        std::env::set_var("FLYWHEEL_MAIL", "toron");
+        unsafe { std::env::set_var("FLYWHEEL_MAIL", "toron") };
         let cfg = Config::default();
         let mut b = super::mail_backend(&cfg).expect("toron facade constructs");
         assert_eq!(b.name(), "toron");
@@ -355,6 +355,6 @@ mod tests {
             Ok(_) => {}
             Err(e) => panic!("toron facade health() must delegate to in-process mailbox: {e:?}"),
         }
-        std::env::remove_var("FLYWHEEL_MAIL");
+        unsafe { std::env::remove_var("FLYWHEEL_MAIL") };
     }
 }
