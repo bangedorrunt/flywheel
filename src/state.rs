@@ -145,19 +145,88 @@ pub fn loops_file() -> PathBuf {
     state_dir().join("loops.json")
 }
 
-/// Read `loops.json` into (schema_version, project → ActiveLoop).
+/// Directory of per-project active-loop sidecars (l4s.1): each project's
+/// `ActiveLoop` v2 payload lives in `loops/<project>.json` so writers on
+/// DIFFERENT projects never share a read-modify-write (the lost-update race
+/// the legacy shared `loops.json` had). Projects are filesystem-safe slugs
+/// (same ones used for `<project>.jsonl` logs).
+pub fn loops_dir() -> PathBuf {
+    state_dir().join("loops")
+}
+
+fn sidecar_file(project: &str) -> PathBuf {
+    loops_dir().join(format!("{project}.json"))
+}
+
+/// One-time migration of the legacy SHARED `loops.json` into per-project
+/// sidecars (l4s.1): each entry becomes `loops/<project>.json` (atomic
+/// temp+rename), then the legacy file is renamed to
+/// `loops.json.migrated-<ts>` so a broken split is recoverable.
 ///
-/// - Missing file → empty map, schema v2 (nothing to migrate).
-/// - Missing / non-numeric `schema` → treated as v1 (schema_version = 1).
-/// - Project entries that fail to deserialize are skipped (logged to stderr).
-/// - Torn/corrupt file → empty map (same contract as the pre-v2 reader).
-pub fn load_loops_registry() -> Result<(u32, BTreeMap<String, ActiveLoop>)> {
-    let path = loops_file();
-    if !path.exists() {
-        return Ok((LOOPS_SCHEMA_VERSION, BTreeMap::new()));
+/// Concurrent-safe without coordination: while the legacy file exists, any
+/// number of migrators may re-split (sidecar writes are atomic and
+/// content-identical), and the legacy rename tolerates the loser's ENOENT.
+fn ensure_loops_migrated() -> Result<()> {
+    let legacy = loops_file();
+    if !legacy.exists() {
+        return Ok(());
     }
-    let raw = std::fs::read_to_string(&path)?;
-    Ok(parse_loops_registry(&raw))
+    let raw = std::fs::read_to_string(&legacy)?;
+    let (_schema, map) = parse_loops_registry(&raw);
+    let dir = loops_dir();
+    std::fs::create_dir_all(&dir)?;
+    for (project, al) in &map {
+        let path = sidecar_file(project);
+        let body = serde_json::to_string_pretty(al)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &path)?;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let renamed = legacy.with_file_name(format!("loops.json.migrated-{ts}"));
+    match std::fs::rename(&legacy, &renamed) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+/// Read ALL active loops as (schema_version, project → ActiveLoop).
+///
+/// Migrates a legacy shared `loops.json` on first access, then scans the
+/// per-project sidecars (l4s.1). Missing dir → empty map, schema v2.
+/// Sidecars that fail to deserialize are skipped (logged to stderr).
+pub fn load_loops_registry() -> Result<(u32, BTreeMap<String, ActiveLoop>)> {
+    ensure_loops_migrated()?;
+    let dir = loops_dir();
+    let mut loops = BTreeMap::new();
+    if !dir.exists() {
+        return Ok((LOOPS_SCHEMA_VERSION, loops));
+    }
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue; // skips *.json.tmp writers mid-flight
+        }
+        let Some(project) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+            continue;
+        };
+        let raw = std::fs::read_to_string(&path)?;
+        match serde_json::from_str::<ActiveLoop>(&raw) {
+            Ok(al) => {
+                loops.insert(project, al);
+            }
+            Err(err) => {
+                eprintln!("flywheel: skipping malformed loops sidecar {project}: {err}");
+            }
+        }
+    }
+    Ok((LOOPS_SCHEMA_VERSION, loops))
 }
 
 /// Pure parse of a `loops.json` body (unit-testable; no I/O).
@@ -211,43 +280,72 @@ pub fn serialize_loops_registry(loops: &BTreeMap<String, ActiveLoop>) -> Result<
     ))?)
 }
 
-/// Atomically write the full registry as schema v2.
-///
-/// If the on-disk file was v1 (or missing schema), logs the migration once.
+/// Bulk-write the registry as per-project sidecars (l4s.1). Kept for callers
+/// that think in whole-registry terms (status views, tests, cleanup): every
+/// entry is written to its own sidecar atomically, and sidecars for projects
+/// absent from the map are removed.
 pub fn save_loops_registry(loops: &BTreeMap<String, ActiveLoop>) -> Result<()> {
-    let path = loops_file();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    ensure_loops_migrated()?;
+    let dir = loops_dir();
+    std::fs::create_dir_all(&dir)?;
+    for (project, al) in loops {
+        let path = sidecar_file(project);
+        let body = serde_json::to_string_pretty(al)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &path)?;
     }
-
-    // detect v1 → v2 for audit log
-    if path.exists() {
-        let prior = std::fs::read_to_string(&path).unwrap_or_default();
-        let (prior_schema, _) = parse_loops_registry(&prior);
-        if prior_schema < LOOPS_SCHEMA_VERSION {
-            eprintln!(
-                "flywheel: migrating loops.json v{prior_schema} → v{LOOPS_SCHEMA_VERSION} (state fields initialized fresh)"
-            );
+    // drop sidecars whose project is no longer in the map
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(project) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+            continue;
+        };
+        if !loops.contains_key(&project) {
+            let _ = std::fs::remove_file(&path);
         }
     }
+    Ok(())
+}
 
-    let body = serialize_loops_registry(loops)?;
-    // atomic write: temp file + rename so a crash mid-write cannot truncate the registry
+pub fn load_active_loop(project: &str) -> Result<Option<ActiveLoop>> {
+    ensure_loops_migrated()?;
+    let path = sidecar_file(project);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path)?;
+    Ok(Some(serde_json::from_str(&raw)?))
+}
+
+/// Persist one project's active loop to ITS OWN sidecar (l4s.1): writers on
+/// different projects are disjoint by construction — no shared read-modify-
+/// write, no lost updates. Atomic temp+rename (same pattern as before).
+pub fn save_active_loop(project: &str, al: &ActiveLoop) -> Result<()> {
+    ensure_loops_migrated()?;
+    let dir = loops_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = sidecar_file(project);
+    let body = serde_json::to_string_pretty(al)?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
-pub fn load_active_loop(project: &str) -> Result<Option<ActiveLoop>> {
-    let (_schema, map) = load_loops_registry()?;
-    Ok(map.get(project).cloned())
-}
-
-pub fn save_active_loop(project: &str, al: &ActiveLoop) -> Result<()> {
-    let (_schema, mut map) = load_loops_registry()?;
-    map.insert(project.to_string(), al.clone());
-    save_loops_registry(&map)
+/// Delete a project's active-loop sidecar (no-op when absent). Used by tests
+/// and cleanup; there is no tombstone — absence means "no active loop".
+pub fn remove_active_loop(project: &str) -> Result<()> {
+    let path = sidecar_file(project);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub fn project_log_path(project: &str) -> PathBuf {
@@ -985,5 +1083,176 @@ mod last_sent_tests {
             })
             .collect();
         assert_eq!(owners, vec!["plan", "ship", "nightly"]);
+    }
+}
+
+/// l4s.1: per-project sidecar persistence + legacy migration tests.
+///
+/// These share the REAL state dir (`state_dir()` is fixed) and the migration
+/// test manipulates the real legacy `loops.json`, so they are serialized by a
+/// mutex and restore pre-test state.
+#[cfg(test)]
+mod loops_sidecar_tests {
+    use super::*;
+    use serde_json::json;
+
+    static LOOPS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn loops_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        LOOPS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn test_project(tag: &str) -> String {
+        format!("l4s1-{tag}-{}", std::process::id())
+    }
+
+    fn make_loop(project: &str, ping_count: u32) -> ActiveLoop {
+        let mut al = ActiveLoop::new("swarm-loop", json!({}), now_iso());
+        al.escalation.insert(
+            "agent-x".to_string(),
+            EscalationState {
+                first_blocked_ts: 1_700_000_000_000_000,
+                ping_count,
+                last_tail: String::new(),
+            },
+        );
+        al
+    }
+
+    fn loops_dir_markers() -> Vec<String> {
+        std::fs::read_dir(loops_file().parent().unwrap())
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with("loops.json.migrated-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// l4s.1 AC2: a legacy shared v2 `loops.json` migrates to per-project
+    /// sidecars on first read; the legacy file is renamed away (recoverable)
+    /// and the registry view carries the same data after migration.
+    #[test]
+    fn legacy_registry_migrates_to_sidecars() {
+        let _g = loops_test_guard();
+        let p1 = test_project("mig-a");
+        let p2 = test_project("mig-b");
+        let legacy = loops_file();
+        // snapshot pre-test state (restore at the end)
+        let pre_legacy = std::fs::read_to_string(&legacy).ok();
+        let pre_markers = loops_dir_markers();
+        // fixture: legacy shared v2 file with 2 projects
+        let mut map = BTreeMap::new();
+        map.insert(p1.clone(), make_loop(&p1, 1));
+        map.insert(p2.clone(), make_loop(&p2, 2));
+        let body = serialize_loops_registry(&map).unwrap();
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, body).unwrap();
+        // migrate via read
+        let (_schema, loaded) = load_loops_registry().unwrap();
+        assert_eq!(
+            loaded.get(&p1).unwrap().escalation.get("agent-x").unwrap().ping_count,
+            1,
+            "p1 survives migration"
+        );
+        assert_eq!(
+            loaded.get(&p2).unwrap().escalation.get("agent-x").unwrap().ping_count,
+            2,
+            "p2 survives migration"
+        );
+        // legacy renamed + sidecars written
+        assert!(!legacy.exists(), "legacy shared file renamed away");
+        assert!(sidecar_file(&p1).exists(), "p1 sidecar written");
+        assert!(sidecar_file(&p2).exists(), "p2 sidecar written");
+        let new_marker = loops_dir_markers()
+            .into_iter()
+            .any(|n| !pre_markers.contains(&n));
+        assert!(new_marker, "loops.json.migrated-<ts> marker created");
+        // restore: my sidecars + my marker go; legacy returns to prior state
+        for p in [&p1, &p2] {
+            let _ = std::fs::remove_file(sidecar_file(p));
+            let _ = std::fs::remove_file(sidecar_file(p).with_extension("json.tmp"));
+        }
+        for n in loops_dir_markers() {
+            if !pre_markers.contains(&n) {
+                let _ = std::fs::remove_file(loops_file().parent().unwrap().join(&n));
+            }
+        }
+        match pre_legacy {
+            Some(bytes) => std::fs::write(&legacy, bytes).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&legacy);
+            }
+        }
+    }
+
+    /// l4s.1: save/load per project — writers are disjoint, readers see only
+    /// their own project.
+    #[test]
+    fn sidecar_roundtrip_per_project() {
+        let _g = loops_test_guard();
+        let p1 = test_project("rt-a");
+        let p2 = test_project("rt-b");
+        save_active_loop(&p1, &make_loop(&p1, 7)).unwrap();
+        save_active_loop(&p2, &make_loop(&p2, 9)).unwrap();
+        let a1 = load_active_loop(&p1).unwrap().expect("p1");
+        let a2 = load_active_loop(&p2).unwrap().expect("p2");
+        assert_eq!(a1.escalation.get("agent-x").unwrap().ping_count, 7);
+        assert_eq!(a2.escalation.get("agent-x").unwrap().ping_count, 9);
+        assert_eq!(load_active_loop("l4s1-no-such-project").unwrap(), None);
+        remove_active_loop(&p1).unwrap();
+        remove_active_loop(&p2).unwrap();
+    }
+
+    /// l4s.1 AC1: 8 writers on 8 DIFFERENT projects, 50 saves each, run
+    /// concurrently — every project's record survives (no lost updates).
+    #[test]
+    fn stress_concurrent_saves_no_lost_updates() {
+        let _g = loops_test_guard();
+        let n = 8usize;
+        let per = 50usize;
+        let projects: Vec<String> =
+            (0..n).map(|i| test_project(&format!("stress-{i}"))).collect();
+        let mut handles = Vec::new();
+        for (i, p) in projects.iter().enumerate() {
+            let p = p.clone();
+            handles.push(std::thread::spawn(move || {
+                for k in 0..per {
+                    save_active_loop(&p, &make_loop(&p, (i * 1000 + k) as u32)).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let (_schema, loaded) = load_loops_registry().unwrap();
+        for (i, p) in projects.iter().enumerate() {
+            let al = loaded
+                .get(p)
+                .unwrap_or_else(|| panic!("project {p} lost in concurrent saves"));
+            assert_eq!(
+                al.escalation.get("agent-x").unwrap().ping_count / 1000,
+                i as u32,
+                "project {p} carried another writer's data"
+            );
+        }
+        for p in &projects {
+            remove_active_loop(p).unwrap();
+        }
+    }
+
+    /// remove_active_loop deletes the sidecar and is a no-op when absent.
+    #[test]
+    fn remove_active_loop_deletes_sidecar() {
+        let _g = loops_test_guard();
+        let p = test_project("rm");
+        save_active_loop(&p, &make_loop(&p, 1)).unwrap();
+        assert!(sidecar_file(&p).exists());
+        remove_active_loop(&p).unwrap();
+        assert!(!sidecar_file(&p).exists());
+        remove_active_loop(&p).unwrap(); // idempotent
     }
 }

@@ -3819,12 +3819,9 @@ mod resume_dedup_tests {
         format!("cg6.1-{tag}-{}", std::process::id())
     }
 
-    /// Remove a test loop's registry entry (best-effort cleanup).
+    /// Remove a test loop's registry sidecar (best-effort cleanup).
     fn cg61_cleanup(project: &str) {
-        if let Ok((_schema, mut map)) = crate::state::load_loops_registry() {
-            map.remove(project);
-            let _ = crate::state::save_loops_registry(&map);
-        }
+        let _ = crate::state::remove_active_loop(project);
     }
 
     /// Pure: the step derives the tier from the persisted first-blocked
