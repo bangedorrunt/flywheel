@@ -41,28 +41,24 @@ use state::{log_event, EventKind};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// ---- stage prompts (verbatim from the author's daily-driver set) ----
+// ---- stage prompts (ADR-0005 Spec 2a / P3.3) ----
+//
+// Resolved through the `stages` library: compiled-in defaults (the former
+// STAGES const, verbatim) under semantic names + p-code aliases, overridable
+// by ~/.config/flywheel/stages.toml. A `--stage` name may be a semantic name
+// (`systematic-execute`) OR a p-code alias (`p6`) — both resolve to the same
+// prompt (the stage_alias contract).
 
-const STAGES: &[(&str, &str)] = &[
-    ("p1", "I want you to sort of randomly explore the code files in this project, choosing code files to deeply investigate and understand and trace their functionality and execution flows through the related code files which they import or which they are imported by. Once you understand the purpose of the code in the larger context of the workflows, I want you to do a super careful, methodical, and critical check with \"fresh eyes\" to find any obvious bugs, problems, errors, issues, silly mistakes, etc. and then systematically and meticulously and intelligently correct them. Be sure to comply with ALL rules in AGENTS dot md."),
-    ("p2", "Ok can you now turn your attention to reviewing the code written by your fellow agents and checking for any issues, bugs, errors, problems, inefficiencies, security problems, reliability issues, etc. and carefully diagnose their underlying root causes using first-principle analysis and then fix or revise them if necessary? Don't restrict yourself to the latest commits, cast a wider net and go super deep! Use ultrathink."),
-    ("p4", "OK so please take ALL of that and elaborate on it more and then create a comprehensive and granular set of beads for all this with tasks, subtasks, and dependency structure overlaid, with detailed comments so that the whole thing is totally self-contained and self-documenting (including relevant background, reasoning/justification, considerations, etc.-- anything we'd want our \"future self\" to know about the goals and intentions and thought process and how it serves the over-arching goals of the project.) Follow the beads-workflow discipline: check your beads N times before implementing, keep each bead self-contained (background, reasoning, acceptance criteria), and link dependencies with `br dep add`."),
-    ("p5", "Check over each bead super carefully-- are you sure it makes sense? Is it optimal? Could we change anything to make the system work better for users? If so, revise the beads. It's a lot easier and faster to operate in \"plan space\" before we start implementing these things!"),
-    ("p6", "OK, so start systematically and methodically and meticulously and diligently executing those remaining beads tasks that you created in the optimal logical order! For each bead follow the FULL lifecycle: triage (`bv --robot-triage` / `br ready --json`) -> claim (`br update --claim --actor \"$AGENT_NAME\" --json`; never work unclaimed) -> reserve files via agent-mail -> announce -> execute one narrow slice -> quality gates -> verify acceptance criteria -> close with an honest reason (`br close`) -> `br sync --flush-only` + commit `.beads/` -> handoff message. Prefer delegating to the `beads` subagent when available."),
-    ("p8", "Now, based on your knowledge of the project, commit all changed files now in a series of logically connected groupings with super detailed commit messages for each and then push. Take your time to do it right. Don't edit the code at all. Don't commit obviously ephemeral files. Use ultrathink."),
-];
-
-fn stage_prompt(name: &str) -> Result<&'static str> {
-    STAGES
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, p)| *p)
+fn stage_prompt(name: &str) -> Result<String> {
+    let lib = stages::StageLibrary::load()?;
+    lib.resolve(name)
+        .map(|p| p.to_string())
         .ok_or_else(|| {
             anyhow!(
                 "unknown stage: {name} (known: {})",
-                STAGES
+                lib.list()
                     .iter()
-                    .map(|(n, _)| *n)
+                    .map(|(n, a)| format!("{n} ({a})"))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -340,6 +336,11 @@ enum Commands {
     Template {
         #[command(subcommand)]
         cmd: AssetCmd,
+    },
+    /// Stage prompts (ADR-0005 P3.3): list semantic names + p-code aliases
+    Stage {
+        #[command(subcommand)]
+        cmd: StageCmd,
     },
     /// Recipe + workflow in one launch
     Ensemble {
@@ -891,6 +892,13 @@ enum CheckpointCmd {
 enum AssetCmd {
     List,
     Run { name: String, project: String },
+}
+
+/// `flywheel stage` subcommands (ADR-0005 P3.3): the stage library surface.
+#[derive(Subcommand)]
+enum StageCmd {
+    /// List all stages: semantic name + p-code alias (and the override path)
+    List,
 }
 
 #[derive(Subcommand)]
@@ -1481,6 +1489,7 @@ fn main() {
         Some(Commands::Workflows { cmd }) => cmd_asset(&cfg, "workflows", cmd),
         Some(Commands::Pipeline { cmd }) => cmd_asset(&cfg, "pipeline", cmd),
         Some(Commands::Template { cmd }) => cmd_asset(&cfg, "template", cmd),
+        Some(Commands::Stage { cmd }) => cmd_stage(cmd),
         Some(Commands::Ensemble {
             project,
             recipe,
@@ -2918,7 +2927,7 @@ fn cmd_send(
     force: bool,
 ) -> Result<()> {
     let text = match (stage, msg) {
-        (Some(s), _) => stage_prompt(s)?.to_string(),
+        (Some(s), _) => stage_prompt(s)?,
         (None, Some(m)) => m.to_string(),
         (None, None) => bail!("provide --stage NAME or a message text"),
     };
@@ -4114,6 +4123,31 @@ fn cmd_asset(cfg: &Config, kind: &str, cmd: &AssetCmd) -> Result<()> {
     }
 }
 
+/// `flywheel stage list`: the stage library surface (ADR-0005 P3.3).
+fn cmd_stage(cmd: &StageCmd) -> Result<()> {
+    match cmd {
+        StageCmd::List => {
+            let lib = stages::StageLibrary::load()?;
+            println!("stages (semantic name <-> p-code alias):");
+            for (name, alias) in lib.list() {
+                println!("  {name} <-> {alias}");
+            }
+            println!("semantic alias table (Spec 2a):");
+            for (semantic, code) in lib.semantic_aliases() {
+                println!("  {semantic} = {code}");
+            }
+            println!("override: {}", override_display());
+            Ok(())
+        }
+    }
+}
+
+fn override_display() -> String {
+    stages::override_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<none>".to_string())
+}
+
 fn run_workflow(cfg: &Config, project: &str, name: &str) -> Result<()> {
     let workflows = config::Workflows::load()?;
     let steps = workflows
@@ -4127,7 +4161,7 @@ fn run_workflow(cfg: &Config, project: &str, name: &str) -> Result<()> {
         match step {
             WorkflowStep::Send { to, stage, msg } => {
                 let text = match (stage.as_deref(), msg.as_deref()) {
-                    (Some(s), _) => stage_prompt(s)?.to_string(),
+                    (Some(s), _) => stage_prompt(s)?,
                     (None, Some(m)) => m.to_string(),
                     (None, None) => bail!("workflow step {i}: send needs stage or msg"),
                 };
@@ -4274,7 +4308,7 @@ fn build_queue(queue: Option<&str>, workflow: Option<&str>) -> Result<Vec<String
             match step {
                 WorkflowStep::Send { stage, msg, .. } => {
                     let text = match (stage.as_deref(), msg.as_deref()) {
-                        (Some(s), _) => stage_prompt(s)?.to_string(),
+                        (Some(s), _) => stage_prompt(s)?,
                         (None, Some(m)) => m.to_string(),
                         (None, None) => bail!("workflow {wf}: send step needs stage or msg"),
                     };
@@ -4292,7 +4326,7 @@ fn build_queue(queue: Option<&str>, workflow: Option<&str>) -> Result<Vec<String
                 continue;
             }
             if let Ok(p) = stage_prompt(token) {
-                items.push(p.to_string());
+                items.push(p);
             } else {
                 items.push(token.to_string());
             }

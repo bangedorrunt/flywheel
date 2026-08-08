@@ -14,6 +14,7 @@
 //! governed-by: ADR-0005 Spec 2a, P3.3
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -155,6 +156,12 @@ impl StageLibrary {
     pub fn semantic_aliases(&self) -> Vec<(&'static str, &'static str)> {
         SEMANTIC_ALIASES.to_vec()
     }
+}
+
+/// The user override path (`~/.config/flywheel/stages.toml`), if present.
+pub fn override_path() -> Option<PathBuf> {
+    let path = config_dir().join("stages.toml");
+    path.is_file().then_some(path)
 }
 #[cfg(test)]
 mod tests {
