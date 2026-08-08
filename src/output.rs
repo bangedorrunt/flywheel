@@ -75,9 +75,9 @@ mod tests {
     #[test]
     fn warn_marks_text() {
         // NO_COLOR forces the plain form; the text survives either way
-        std::env::set_var("NO_COLOR", "1");
+        unsafe { std::env::set_var("NO_COLOR", "1") };
         assert_eq!(warn("drift"), "drift");
-        std::env::remove_var("NO_COLOR");
+        unsafe { std::env::remove_var("NO_COLOR") };
         let painted = warn("drift");
         assert!(painted.contains("drift"));
         assert!(painted.contains("\x1b[33m") || !color_enabled());
