@@ -555,4 +555,63 @@ mod tests {
         }
         assert_shape_parity("search", &searches[0].1, &searches[1].1, &[], false);
     }
+
+    /// se2.2 live acceptance (bd-adr7-mail-adapt-se2.2): toron message ids
+    /// are hex event ids — send → inbox → ack(hex) must work end-to-end with
+    /// the id passed through untouched. A numeric coercion (the pre-fix
+    /// `parse::<u64>().unwrap_or(0)`) would turn the id into 0 or Err — both
+    /// fail this round-trip.
+    #[test]
+    #[cfg(feature = "mail-toron")]
+    #[ignore = "requires a live toron daemon (127.0.0.1:18080)"]
+    fn live_toron_ack_hex_roundtrip() {
+        let mut b = live_backend(ParityKind::Toron);
+        let project = "/private/tmp/flywheel-ack-hex";
+        let agent = "CoralFinch";
+
+        b.ensure_project(project).expect("ensure_project");
+        b.register_agent(project, agent, "opencode", "test", "ack-hex")
+            .expect("register_agent");
+        b.send(
+            project,
+            &[agent.to_string()],
+            "se2.2 ack-hex subject",
+            "se2.2 ack-hex body",
+            "normal",
+            false,
+            None,
+        )
+        .expect("send");
+
+        let filter = crate::backend::InboxFilter {
+            include_bodies: true,
+            limit: 10,
+            ..Default::default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let id = loop {
+            let inbox = b.inbox(project, agent, &filter).expect("inbox");
+            let arr = inbox.as_array().expect("inbox is an array");
+            if let Some(id) = arr
+                .iter()
+                .find_map(|m| m.get("id").and_then(serde_json::Value::as_str))
+            {
+                break id.to_string();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "toron inbox never delivered the message: {inbox}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        };
+        assert!(!id.is_empty(), "delivered message carries an id");
+        assert!(
+            id.parse::<u64>().is_err(),
+            "toron id is hex, not decimal: {id}"
+        );
+        assert_ne!(id, "0", "hex id never becomes 0");
+
+        b.ack(project, agent, &id).expect("ack(hex) succeeds");
+        b.mark_read(project, agent, &id).expect("mark_read(hex) succeeds");
+    }
 }

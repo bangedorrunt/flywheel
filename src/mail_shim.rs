@@ -7,8 +7,8 @@
 //!
 //! - IN-PROCESS (default): the `toron_core::mailbox::Mailbox` (InProcessBus +
 //!   SQLite index, an operator key attached so `ensure_project`/send/register
-//!   work) — zero HTTP, one mailbox per process (lazily shared across `Mail`
-//!   instances).
+//!   work) — zero HTTP, one mailbox per process, built eagerly at the first
+//!   `Mail` construction (`init_mailbox`, se2.1 Phase A).
 //! - REMOTE-DAEMON (OPTIONAL, bd-o8j.3): a standalone `toron serve --mcp-http
 //!   <addr>` over Streamable HTTP (MCP), driven by a minimal MCP client
 //!   (`crate::mcp_http::McpClient`). Selected when `[agent_mail] url` is set.
@@ -20,9 +20,11 @@
 //! they bridge flywheel's own herdr panes, which only the local process sees.
 //!
 //! Known limitations (reported, not papered over):
-//! - the in-process mailbox is per-process: state does not survive separate
-//!   flywheel invocations (the durable loop's leaf subprocesses each see a
-//!   fresh one);
+//! - the in-process mailbox is per-process by default: state does not survive
+//!   separate flywheel invocations unless `TORON_DATA_DIR` (or the
+//!   `TORON_MCP_DATA_DIR` alias) is set — the explicit durable root
+//!   (se2.1 Phase A; Phase B makes `$XDG_DATA_HOME/toron` the default, gated
+//!   on toron R2.0 KDF);
 //! - toron message ids are hex event ids, not u64 sequence numbers;
 //! - `ensure_product` needs an operator key; `demo_mailbox` has none.
 //!
@@ -31,7 +33,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use tokio::runtime::Runtime;
@@ -46,30 +48,89 @@ use toron_mcp::ToJson;
 use crate::config::MailConfig;
 use crate::mcp_http::{McpClient, ServerKind};
 
-/// In-process mailbox context: the single shared mailbox every `Mail` instance
-/// operates on. Mirrors `toron_mcp::demo_mailbox` (InProcessBus + SQLite index
-/// in the system temp dir) but WITH an operator key, so write paths
-/// (`ensure_project`, send, register) work — the demo mailbox is operator-less
-/// and would reject every `ensure_project` on first use.
+/// Shared tokio runtime: ONE per process (c3b.1 / se2.1 Phase A), built by
+/// `init_mailbox` — never a fresh `Runtime::new` per op. Construction failure
+/// is captured in the `Result`, so it propagates as an error at
+/// `Mail::from_config`, never a panic mid-op.
+static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
+
+/// The single shared in-process mailbox every `Mail` instance operates on
+/// (ADR-0003 Decision 3A). Mirrors `toron_mcp::demo_mailbox` (InProcessBus +
+/// SQLite index) but WITH an operator key, so write paths (`ensure_project`,
+/// send, register) work — the demo mailbox is operator-less and would reject
+/// every `ensure_project` on first use. Root dirs honor `TORON_DATA_DIR` /
+/// `TORON_MCP_DATA_DIR` when set (se2.1 Phase A).
+static MAILBOX: OnceLock<Result<toron_core::mailbox::Mailbox, String>> = OnceLock::new();
+
+fn runtime() -> Result<&'static Runtime> {
+    RUNTIME
+        .get_or_init(|| {
+            Runtime::new().map_err(|e| format!("failed to initialize tokio runtime: {e}"))
+        })
+        .as_ref()
+        .map_err(|e| anyhow!("{e}"))
+}
+
+/// Build the shared runtime + mailbox eagerly, propagating failures as errors
+/// (c3b.1: no panic on runtime/threadpool construction failure). Called from
+/// `Mail::from_config`; every in-process op then reads the pre-built statics.
+fn init_mailbox() -> Result<()> {
+    let _rt = runtime()?;
+    match MAILBOX.get_or_init(|| match runtime() {
+        Ok(rt) => rt.block_on(build_mailbox()).map_err(|e| format!("{e:#}")),
+        Err(e) => Err(e.to_string()),
+    }) {
+        Ok(_) => Ok(()),
+        Err(e) => bail!("flywheel mail: in-process mailbox: {e}"),
+    }
+}
+
+/// The shared in-process mailbox. Only reachable after a successful
+/// `init_mailbox` (via `Mail::from_config`) — an unreachable panic here means
+/// a call path skipped construction, which is a programming error.
 fn mailbox() -> &'static toron_core::mailbox::Mailbox {
-    static MB: OnceLock<toron_core::mailbox::Mailbox> = OnceLock::new();
-    MB.get_or_init(|| {
-        let rt = Runtime::new().expect("flywheel mail: tokio runtime");
-        rt.block_on(build_mailbox())
-            .expect("flywheel mail: toron in-process mailbox")
-    })
+    match MAILBOX.get() {
+        Some(Ok(mb)) => mb,
+        Some(Err(e)) => {
+            unreachable!("mailbox init failure must surface via Mail::from_config: {e}")
+        }
+        None => unreachable!("mailbox() before Mail::from_config"),
+    }
+}
+
+/// Root dirs for the in-process mailbox (se2.1 Phase A): `TORON_DATA_DIR`
+/// (or the `TORON_MCP_DATA_DIR` alias) when set — explicit durable root for
+/// tests/prod, with the SQLite index beside it. Default stays per-invocation
+/// temp until Phase B flips it to `$XDG_DATA_HOME/toron` (gated on toron
+/// R2.0 KDF). Returns (data_dir, sqlite db path).
+fn mailbox_roots() -> (PathBuf, PathBuf) {
+    for var in ["TORON_DATA_DIR", "TORON_MCP_DATA_DIR"] {
+        if let Ok(dir) = std::env::var(var) {
+            let dir = dir.trim();
+            if !dir.is_empty() {
+                let root = PathBuf::from(dir);
+                return (root.clone(), root.join("flywheel-mail.sqlite"));
+            }
+        }
+    }
+    (
+        std::env::temp_dir().join("flywheel-mail"),
+        std::env::temp_dir().join(format!("flywheel-mail-{}.sqlite", std::process::id())),
+    )
 }
 
 async fn build_mailbox() -> anyhow::Result<toron_core::mailbox::Mailbox> {
-    let db = std::env::temp_dir().join(format!("flywheel-mail-{}.sqlite", std::process::id()));
-    let pool = toron_core::index::schema::connect(db.to_str().unwrap()).await?;
+    let (data_dir, db) = mailbox_roots();
+    std::fs::create_dir_all(&data_dir)
+        .with_context(|| format!("create mail data dir {}", data_dir.display()))?;
+    let db_path = db.to_string_lossy().into_owned();
+    let pool = toron_core::index::schema::connect(&db_path).await?;
     toron_core::index::schema::migrate(&pool).await?;
     let bus = toron_core::bus::InProcessBus::open(
         pool.clone(),
         toron_core::bus::in_process::InProcessBusConfig::default(),
     )
     .await?;
-    let data_dir = std::env::temp_dir().join("flywheel-mail");
     let operator = toron_core::keys::generate();
     Ok(
         toron_core::mailbox::Mailbox::new(std::sync::Arc::new(bus), data_dir, Some(operator))
@@ -77,11 +138,13 @@ async fn build_mailbox() -> anyhow::Result<toron_core::mailbox::Mailbox> {
     )
 }
 
-/// Run one async mailbox operation on a fresh tokio runtime (flywheel main.rs
-/// dispatch is sync; each op is a short-lived, sequential block_on).
+/// Run one async mailbox operation on the shared tokio runtime (flywheel
+/// main.rs dispatch is sync; each op is a short-lived, sequential block_on).
+/// The runtime is pre-built by `Mail::from_config` — the expect below is
+/// unreachable post-init (c3b.1: no `Runtime::new` per op).
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
-    Runtime::new()
-        .expect("flywheel mail: tokio runtime")
+    runtime()
+        .expect("runtime initialized by Mail::from_config before any op")
         .block_on(f)
 }
 
@@ -160,12 +223,19 @@ impl Mail {
     pub fn from_config(cfg: Option<&MailConfig>) -> Result<Option<Self>> {
         match cfg.and_then(|c| c.url.as_deref()) {
             Some(url) if !url.is_empty() => Self::remote(cfg),
-            _ => Ok(Some(Mail {
-                name: cfg
-                    .and_then(|c| c.name.clone())
-                    .unwrap_or_else(|| "flywheel".to_string()),
-                backend: BackendKind::InProcess,
-            })),
+            _ => {
+                // Eager shared-runtime + mailbox build (se2.1 Phase A / c3b.1):
+                // failures propagate as errors here — no panic on runtime or
+                // mailbox construction failure, and every op reuses the one
+                // pre-built runtime.
+                init_mailbox()?;
+                Ok(Some(Mail {
+                    name: cfg
+                        .and_then(|c| c.name.clone())
+                        .unwrap_or_else(|| "flywheel".to_string()),
+                    backend: BackendKind::InProcess,
+                }))
+            }
         }
     }
 
@@ -353,14 +423,21 @@ impl Mail {
                 let r = block_on(mailbox().mark_message_read(project_key, agent_name, message_id))?;
                 Ok(r.to_json())
             }
-            BackendKind::Remote(_) => self.call_remote(
-                "mark_message_read",
-                json!({
-                    "project_key": project_key,
-                    "agent_name": agent_name,
-                    "message_id": message_id.parse::<u64>().unwrap_or(0) as i64,
-                }),
-            ),
+            BackendKind::Remote(_) => {
+                // The remote daemon is toron (`[mail.toron] url`): its
+                // message ids are hex event ids and its `mark_message_read`
+                // tool takes a String — pass the id through verbatim, never
+                // coerce it to a number (se2.2; the AM backend in
+                // agentmail.rs owns the decimal-id edge).
+                self.call_remote(
+                    "mark_message_read",
+                    json!({
+                        "project_key": project_key,
+                        "agent_name": agent_name,
+                        "message_id": message_id,
+                    }),
+                )
+            }
         }
     }
 
@@ -372,14 +449,19 @@ impl Mail {
                 let r = block_on(mailbox().acknowledge_message(project_key, agent_name, message_id))?;
                 Ok(r.to_json())
             }
-            BackendKind::Remote(_) => self.call_remote(
-                "acknowledge_message",
-                json!({
-                    "project_key": project_key,
-                    "agent_name": agent_name,
-                    "message_id": message_id.parse::<u64>().unwrap_or(0) as i64,
-                }),
-            ),
+            BackendKind::Remote(_) => {
+                // Same as mark_message_read above: the toron daemon's
+                // `acknowledge_message` takes the hex event id as a String —
+                // pass it through verbatim (se2.2).
+                self.call_remote(
+                    "acknowledge_message",
+                    json!({
+                        "project_key": project_key,
+                        "agent_name": agent_name,
+                        "message_id": message_id,
+                    }),
+                )
+            }
         }
     }
 
@@ -1347,9 +1429,11 @@ pub(crate) fn clear_identity_for(project_key: &str, pane_id: &str) -> Result<Pat
 }
 
 /// One renewed reservation, as reported by `renew_file_reservations`.
+/// The id is a String: toron reservation ids are hex event ids, agent-mail's
+/// are decimal — both pass through without numeric coercion (se2.2).
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct RenewedReservation {
-    pub id: u64,
+    pub id: String,
     pub path_pattern: String,
     pub old_expires_ts: String,
     pub new_expires_ts: String,
@@ -1367,7 +1451,11 @@ pub fn list_own_reservations(resp: &Value) -> Vec<RenewedReservation> {
     };
     for r in list {
         out.push(RenewedReservation {
-            id: r.get("id").and_then(Value::as_u64).unwrap_or(0),
+            id: match r.get("id") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                _ => String::new(),
+            },
             path_pattern: r
                 .get("path_pattern")
                 .and_then(Value::as_str)
@@ -1463,6 +1551,121 @@ mod tests {
     fn call_remote_on_in_process_backend_errors() {
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         assert!(mail.call_remote("health_check", json!({})).is_err());
+    }
+
+    /// se2.1 Phase A (c3b.1): all ops share ONE tokio runtime per process —
+    /// `from_config` builds it eagerly, and ops run on it (no `Runtime::new`
+    /// per op).
+    #[test]
+    fn block_on_uses_shared_runtime() {
+        let _mail = Mail::from_config(None).expect("ok").expect("Some");
+        assert!(RUNTIME.get().is_some(), "from_config initialized the runtime");
+        assert!(block_on(mailbox().ensure_project("se2.1-runtime-test")).is_ok());
+        assert!(
+            block_on(mailbox().ensure_project("se2.1-runtime-test-2")).is_ok(),
+            "second op reuses the same runtime"
+        );
+    }
+
+    /// se2.1 Phase A: `TORON_DATA_DIR` (and the `TORON_MCP_DATA_DIR` alias)
+    /// override the per-invocation temp default; unset/blank → temp.
+    #[test]
+    fn mailbox_roots_env_and_default() {
+        unsafe { std::env::set_var("TORON_DATA_DIR", "/tmp/flywheel-se2.1-durable") };
+        unsafe { std::env::set_var("TORON_MCP_DATA_DIR", "/tmp/flywheel-se2.1-mcp") };
+        let (data_dir, db) = mailbox_roots();
+        assert_eq!(data_dir, PathBuf::from("/tmp/flywheel-se2.1-durable"));
+        assert_eq!(db, PathBuf::from("/tmp/flywheel-se2.1-durable/flywheel-mail.sqlite"));
+        unsafe { std::env::remove_var("TORON_DATA_DIR") };
+        let (data_dir, _) = mailbox_roots();
+        assert_eq!(data_dir, PathBuf::from("/tmp/flywheel-se2.1-mcp"), "alias fallback");
+        unsafe { std::env::set_var("TORON_DATA_DIR", "   ") };
+        let (data_dir, _) = mailbox_roots();
+        assert_eq!(data_dir, PathBuf::from("/tmp/flywheel-se2.1-mcp"), "blank counts as unset");
+        unsafe { std::env::remove_var("TORON_DATA_DIR") };
+        unsafe { std::env::remove_var("TORON_MCP_DATA_DIR") };
+        let (data_dir, db) = mailbox_roots();
+        assert_eq!(data_dir, std::env::temp_dir().join("flywheel-mail"));
+        assert_eq!(
+            db,
+            std::env::temp_dir().join(format!("flywheel-mail-{}.sqlite", std::process::id()))
+        );
+    }
+
+    /// se2.2: toron reservation ids are hex event ids — `list_own_reservations`
+    /// must keep them as strings, never coerce a hex id to 0.
+    #[test]
+    fn list_own_reservations_keeps_hex_id() {
+        let resp = json!({
+            "renewed": 1,
+            "file_reservations": [{
+                "id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+                "path_pattern": "src/*.rs",
+                "old_expires_ts": "",
+                "new_expires_ts": "1750000000000000",
+            }]
+        });
+        let out = list_own_reservations(&resp);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].id, "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "hex id passes through untouched"
+        );
+        assert_ne!(out[0].id, "0", "hex id never becomes 0");
+    }
+
+    /// se2.2: agent-mail's numeric reservation ids surface as their decimal
+    /// string — never "".
+    #[test]
+    fn list_own_reservations_keeps_numeric_id() {
+        let resp = json!({
+            "renewed": 1,
+            "file_reservations": [{
+                "id": 42,
+                "path_pattern": "src/*.rs",
+                "old_expires_ts": "",
+                "new_expires_ts": "",
+            }]
+        });
+        let out = list_own_reservations(&resp);
+        assert_eq!(out[0].id, "42");
+    }
+
+    /// se2.2: the remote edge is the toron daemon — a hex message id must be
+    /// forwarded verbatim, never parsed. With a dead daemon the error is a
+    /// transport failure; a "decimal"/"invalid digit" error would mean the
+    /// id was coerced before it ever left (the F3 bug).
+    #[test]
+    fn remote_ack_passes_hex_id_through() {
+        let cfg = MailConfig {
+            url: Some("http://127.0.0.1:1".into()),
+            token: None,
+            name: Some("smoke".into()),
+        };
+        let mut mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
+        let err = mail
+            .ack("proj", "smoke", "a1b2c3d4e5f60718293a4b5c6d7e8f90")
+            .expect_err("hex id forwarded; dead daemon must still fail the call");
+        let s = format!("{err:#}");
+        assert!(!s.contains("decimal"), "no id parse before dial: {s}");
+        assert!(!s.contains("invalid digit"), "no id parse before dial: {s}");
+    }
+
+    /// se2.2: mark_read's remote edge has the same pass-through honesty.
+    #[test]
+    fn remote_mark_read_passes_hex_id_through() {
+        let cfg = MailConfig {
+            url: Some("http://127.0.0.1:1".into()),
+            token: None,
+            name: Some("smoke".into()),
+        };
+        let mut mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
+        let err = mail
+            .mark_read("proj", "smoke", "a1b2c3d4e5f60718293a4b5c6d7e8f90")
+            .expect_err("hex id forwarded; dead daemon must still fail the call");
+        let s = format!("{err:#}");
+        assert!(!s.contains("decimal"), "no id parse before dial: {s}");
+        assert!(!s.contains("invalid digit"), "no id parse before dial: {s}");
     }
 
     /// Live remote-daemon smoke: with a `toron serve --mcp-http` daemon up and
