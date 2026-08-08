@@ -296,6 +296,24 @@ enum Commands {
         #[command(subcommand)]
         cmd: MailCmd,
     },
+    /// ask a peer a question over mail and wait for the in-thread reply
+    /// (the real-time collab primitive: send urgent + block for the answer)
+    Collab {
+        project: String,
+        /// peer agent (adjective+noun or herdr short name)
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        body: String,
+        /// seconds to wait for the reply (default 300; 0 = forever)
+        #[arg(long, default_value = "300")]
+        timeout_secs: u64,
+        /// act as this agent (default: config identity)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+    },
     /// cross-project fan-out (contact + product; ADR-0001 §9.5)
     Xproj {
         #[command(subcommand)]
@@ -646,11 +664,52 @@ enum MailCmd {
         project: String,
         #[arg(long)]
         urgent: bool,
+        #[arg(long)]
+        unread: bool,
         #[arg(long, default_value = "20")]
         limit: u32,
         /// act as this registered agent (adjective+noun or herdr short name)
         #[arg(long = "as")]
         as_agent: Option<String>,
+    },
+    /// reply to a message in its thread (thread = the message id or thread id)
+    Reply {
+        project: String,
+        /// message id to reply to (toron hex event id / thread id)
+        #[arg(long = "message-id")]
+        message_id: String,
+        #[arg(long)]
+        body: String,
+        /// act as this agent (required for crew peer mail; else CoralFinch/config)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+    },
+    /// per-agent mail digest: unread/urgent counts + last sender/subject
+    /// (orchestrator "who has mail" view; default = own identity)
+    Digest {
+        project: String,
+        /// act as this registered agent (adjective+noun or herdr short name)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+        /// digest every registered agent (table, --json = array)
+        #[arg(long)]
+        all: bool,
+    },
+    /// wait until a thread gains a new message (blocks; Ctrl-C to abort)
+    Watch {
+        project: String,
+        /// thread id or message id to watch
+        #[arg(long = "thread")]
+        thread_id: String,
+        /// act as this registered agent (default: config identity)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+        /// seconds to wait before giving up (default 300; 0 = forever)
+        #[arg(long, default_value = "300")]
+        timeout_secs: u64,
+        /// poll interval seconds (default 5)
+        #[arg(long, default_value = "5")]
+        interval_secs: u64,
     },
     /// send a message to registered agents
     Send {
@@ -1699,6 +1758,14 @@ fn main() {
             msg,
         }) => cmd_assign(&cfg, project, to, beads, msg.as_deref()),
         Some(Commands::Mail { cmd }) => cmd_mail(&cfg, cmd),
+        Some(Commands::Collab {
+            project,
+            to,
+            subject,
+            body,
+            timeout_secs,
+            as_agent,
+        }) => cmd_collab(&cfg, project, to, subject, body, *timeout_secs, as_agent.as_deref()),
         Some(Commands::Xproj { cmd }) => cmd_xproj(&cfg, cmd),
         Some(Commands::Worktree { cmd }) => cmd_worktree(&cfg, cmd),
         Some(Commands::Checkpoint { cmd }) => cmd_checkpoint(&cfg, cmd),
@@ -4005,6 +4072,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         MailCmd::Inbox {
             project,
             urgent,
+            unread,
             limit,
             as_agent,
         } => {
@@ -4012,8 +4080,78 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
             let name = mail.name.clone();
-            let v = mail.inbox(&key, &name, *urgent, *limit)?;
+            // --unread needs the filtered surface; --urgent and the plain
+            // path share the legacy inbox() call (toron's in-process fetch
+            // ignores urgent_only, the filter applies it in inbox_filtered).
+            let v = if *unread {
+                mail.inbox_filtered(
+                    &key,
+                    &name,
+                    &mail_shim::MailInboxFilter {
+                        unread_only: true,
+                        include_bodies: true,
+                        ..Default::default()
+                    },
+                )?
+            } else {
+                mail.inbox(&key, &name, *urgent, *limit)?
+            };
             print_json(&v);
+        }
+        MailCmd::Reply {
+            project,
+            message_id,
+            body,
+            as_agent,
+        } => {
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            let v = mail.reply(&key, message_id, body, None)?;
+            print_json(&v);
+        }
+        MailCmd::Digest {
+            project,
+            as_agent,
+            all,
+        } => {
+            let key = project_dir_str(cfg, project)?;
+            if *all {
+                let mail = mail_or_die(cfg)?;
+                mail.ensure_project(&key)?;
+                let agents = mail.list_agents(&key, None)?;
+                let mut out = Vec::new();
+                if let Some(arr) = agents.as_array() {
+                    for a in arr {
+                        let n = a.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                        if let Ok(d) = digest_for(&mail, &key, n) {
+                            out.push(d);
+                        }
+                    }
+                }
+                print_json(&json!(out));
+            } else {
+                let mail = mail_as(cfg, &key, as_agent.as_deref())?;
+                mail.ensure_project(&key)?;
+                let name = mail.name.clone();
+                print_json(&digest_for(&mail, &key, &name)?);
+            }
+        }
+        MailCmd::Watch {
+            project,
+            thread_id,
+            as_agent,
+            timeout_secs,
+            interval_secs,
+        } => {
+            cmd_mail_watch(
+                cfg,
+                project,
+                thread_id,
+                as_agent.as_deref(),
+                *timeout_secs,
+                *interval_secs,
+            )?;
         }
         MailCmd::Send {
             project,
@@ -4194,10 +4332,164 @@ fn cmd_toron(cfg: &Config, cmd: &ToronCmd) -> Result<()> {
     rt.block_on(toron_embed::dispatch(cfg, cmd))
 }
 
+// ---- mail digest / watch / collab (real-time collab primitives) ----
+
+/// Per-agent digest from the live mailbox (mirror of the `__mail-digest`
+/// leaf, surfaced for the orchestrator). Reads `sender`/`from` aliases and
+/// counts high|urgent as urgent.
+///
+/// NOTE on `unread`: toron's projection has NO read-state — `unread_only`
+/// is a documented no-op (messages are "fresh on first read" per pipeline
+/// dedup). The digest therefore reports the RECENT inbox (limit 10) with an
+/// honest label: `recent` = messages in the projection window, `urgent` =
+/// high|urgent importance among them. The wake trigger uses `urgent > 0`,
+/// which IS meaningful (importance is a real message attribute).
+fn digest_for(mail: &mail_shim::Mail, key: &str, name: &str) -> Result<Value> {
+    let v = mail.inbox_filtered(
+        key,
+        name,
+        &mail_shim::MailInboxFilter {
+            unread_only: false,
+            include_bodies: false,
+            limit: 10,
+            ..Default::default()
+        },
+    )?;
+    let arr = v.as_array().cloned().unwrap_or_default();
+    let recent = arr.len();
+    let urgent = arr
+        .iter()
+        .filter(|m| {
+            m.get("importance")
+                .and_then(|i| i.as_str())
+                .map(|i| i == "high" || i == "urgent")
+                .unwrap_or(false)
+        })
+        .count();
+    let last = arr.first();
+    let last_from = last.and_then(|m| {
+        m.get("sender")
+            .or_else(|| m.get("from"))
+            .and_then(|f| f.as_str())
+    });
+    Ok(json!({
+        "agent": name,
+        "recent": recent,
+        "urgent": urgent,
+        "last_from": last_from,
+        "last_subject": last.and_then(|m| m.get("subject").and_then(|s| s.as_str())),
+        "thread_id": last.and_then(|m| m.get("thread_id").and_then(|t| t.as_str())),
+    }))
+}
+
+/// Block until a thread gains a message newer than the current latest
+/// (thread = a message id or a free-form thread id; search by thread_id).
+/// Polls `search_messages(thread_id=...)` every `interval_secs`; prints the
+/// newest message and exits 0 on the first NEW arrival, 1 on timeout.
+fn cmd_mail_watch(
+    cfg: &Config,
+    project: &str,
+    thread_id: &str,
+    as_agent: Option<&str>,
+    timeout_secs: u64,
+    interval_secs: u64,
+) -> Result<()> {
+    let key = project_dir_str(cfg, project)?;
+    let mail = mail_as(cfg, &key, as_agent)?;
+    mail.ensure_project(&key)?;
+    // Watch via fetch_inbox + CLIENT-side thread match: FTS5 tokenizes on
+    // hyphens and letter/digit boundaries, so hyphenated thread ids are not
+    // reliably phrase-searchable (e2e-verified). The inbox projection
+    // carries `thread_id` per row — exact matching, no FTS dependency.
+    let latest = |m: &mail_shim::Mail| -> Result<Option<Value>> {
+        let v = m.inbox_filtered(
+            &key,
+            &m.name,
+            &mail_shim::MailInboxFilter {
+                unread_only: false,
+                include_bodies: true,
+                limit: 200,
+                ..Default::default()
+            },
+        )?;
+        Ok(v.as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .find(|row| {
+                row.get("thread_id")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t == thread_id)
+                    .unwrap_or(false)
+            }))
+    };
+    let start = std::time::Instant::now();
+    let seen: Option<String> = latest(&mail)?
+        .and_then(|m| m.get("id").and_then(|i| i.as_str()).map(String::from));
+    eprintln!("flywheel: watching thread {thread_id} (latest {}); Ctrl-C to abort", seen.as_deref().unwrap_or("<none>"));
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+        if timeout_secs > 0 && start.elapsed().as_secs() >= timeout_secs {
+            eprintln!("flywheel: no new message in thread {thread_id} within {timeout_secs}s");
+            std::process::exit(1);
+        }
+        match latest(&mail)? {
+            Some(m) => {
+                let id = m.get("id").and_then(|i| i.as_str()).map(String::from);
+                if id.as_deref() != seen.as_deref() {
+                    print_json(&json!({ "thread": thread_id, "new_message": m }));
+                    return Ok(());
+                }
+            }
+            None => {
+                if seen.is_none() {
+                    eprintln!("flywheel: thread {thread_id} has no messages yet");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// Real-time collab primitive: send an urgent ask to a peer, then block for
+/// the in-thread reply and print it. Combines `mail send` (urgent, ack) +
+/// `mail watch` — the A-asks-B pattern as one command. Exit 0 on reply,
+/// 1 on timeout.
+fn cmd_collab(
+    cfg: &Config,
+    project: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+    timeout_secs: u64,
+    as_agent: Option<&str>,
+) -> Result<()> {
+    let key = project_dir_str(cfg, project)?;
+    let mail = mail_as(cfg, &key, as_agent)?;
+    mail.ensure_project(&key)?;
+    let thread_id = format!("collab-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"));
+    let targets: Vec<String> = to
+        .split(',')
+        .map(|s| resolve_mail_target(s.trim()))
+        .collect();
+    let sent = mail.send(&key, &targets, subject, body, "urgent", true, Some(&thread_id))?;
+    let msg_id = sent
+        .get("id")
+        .or_else(|| sent.get("message_id"))
+        .and_then(|i| i.as_str())
+        .unwrap_or(&thread_id)
+        .to_string();
+    eprintln!(
+        "flywheel: asked {} (thread {thread_id}, msg {msg_id}); waiting up to {timeout_secs}s for the reply…",
+        targets.join(", ")
+    );
+    cmd_mail_watch(cfg, project, &thread_id, as_agent, timeout_secs, 5)
+}
+
 // ---- worktree ----
 
-fn cmd_worktree(cfg: &Config, cmd: &WorktreeCmd) -> Result<()> {
-    let mut c = Client::connect(Some(&cfg.socket_path()))?;
+fn cmd_worktree(cfg: &Config, cmd: &WorktreeCmd) -> Result<()> {    let mut c = Client::connect(Some(&cfg.socket_path()))?;
     match cmd {
         WorktreeCmd::List { project } => {
             let ws_id = find_workspace(&mut c, project)?;
@@ -8574,8 +8866,13 @@ fn cmd_internal_respawn(
 /// "last_from": "...", "last_subject": "...", "thread_id": "..." }`.
 /// Soft-fail: mail down / unknown agent → zeroed digest, never an error.
 fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<()> {
+    // `agent` is the caller's key (herdr name from the poll snapshot, or a
+    // mail name) — echo it verbatim so the loop can key its digest map by
+    // the same name it will look up in plan_actions. The inbox query below
+    // resolves to the registered mail identity.
+    let key_name = agent.trim().to_string();
     let zero = json!({
-        "agent": agent, "unread": 0, "urgent": 0,
+        "agent": key_name, "unread": 0, "urgent": 0,
         "last_from": null, "last_subject": null, "thread_id": null,
     });
     let mail = match backend::mail_backend(cfg) {
@@ -8590,11 +8887,15 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
         print_json(&zero);
         return Ok(());
     }
-    let name = resolve_mail_target(agent.trim());
+    let name = resolve_mail_target(&key_name);
+    // toron's projection has NO read-state: `unread_only` is a documented
+    // no-op ("fresh on first read"). Fetch the RECENT inbox (limit 10) and
+    // report `recent` + `urgent` (importance high|urgent) — both honest;
+    // `urgent` is the wake trigger and IS meaningful.
     let v = match backend::run_mail(mail.inbox(&backend::InboxQuery {
         project: key,
         agent: name.clone(),
-        unread_only: true,
+        unread_only: false,
         urgent_only: false,
         include_bodies: false,
         limit: Some(10),
@@ -8608,7 +8909,7 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
     };
     let v_json = serde_json::to_value(&v).unwrap_or_default();
     let arr = v_json.as_array().cloned().unwrap_or_default();
-    let unread = arr.len();
+    let recent = arr.len();
     let urgent = arr
         .iter()
         .filter(|m| {
@@ -8628,8 +8929,8 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
             .and_then(|f| f.as_str())
     });
     print_json(&json!({
-        "agent": name,
-        "unread": unread,
+        "agent": key_name,
+        "recent": recent,
         "urgent": urgent,
         "last_from": last_from,
         "last_subject": last.and_then(|m| m.get("subject").and_then(|s| s.as_str())),
