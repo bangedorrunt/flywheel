@@ -253,4 +253,79 @@ steps:
             plan.members
         );
     }
+
+    /// 193.3: `infer_auto` recurses into Branch / Foreach / Retry — a crew
+    /// nested three actions deep still resolves every distinct profile ref.
+    #[test]
+    fn infer_auto_recurses_branch_foreach_retry() {
+        use toron_workflow::schema::{Action, Step, StepOnError, Trigger, Workflow};
+        let dj = |profile: &str| Step {
+            name: None,
+            guard: None,
+            on_error: StepOnError::Continue,
+            action: Action::DispatchJob {
+                assignee: "x".into(),
+                spec: serde_json::json!({ "profile": profile }),
+                channel: None,
+            },
+        };
+        let mk = |name: &str, steps: Vec<Step>| Workflow {
+            name: name.into(),
+            description: None,
+            trigger: Some(Trigger::MessagePosted {
+                channel: None,
+                project: None,
+            }),
+            policy: None,
+            guard: None,
+            crew: Some(CrewSpec::Auto),
+            steps,
+            graph: None,
+            inputs: vec![],
+        };
+        let wf = mk(
+            "nested",
+            vec![Step {
+                name: Some("outer-branch".into()),
+                guard: None,
+                on_error: StepOnError::Continue,
+                action: Action::Branch {
+                    if_guard: "true".into(),
+                    then: vec![dj("@reviewer")],
+                    else_steps: vec![dj("@oracle")],
+                },
+            }],
+        );
+        // Foreach + Retry (the other recursion arms).
+        let wf2 = mk(
+            "nested2",
+            vec![
+                Step {
+                    name: Some("loop".into()),
+                    guard: None,
+                    on_error: StepOnError::Continue,
+                    action: Action::Foreach {
+                        over: "items".into(),
+                        each: Box::new(dj("@coder")),
+                    },
+                },
+                Step {
+                    name: Some("retry".into()),
+                    guard: None,
+                    on_error: StepOnError::Continue,
+                    action: Action::Retry {
+                        max_attempts: 3,
+                        backoff_secs: 1,
+                        step: Box::new(dj("@scout")),
+                    },
+                },
+            ],
+        );
+        let plan = plan_crew(&wf);
+        assert_eq!(plan.members.get("reviewer"), Some(&1), "{:?}", plan.members);
+        assert_eq!(plan.members.get("oracle"), Some(&1), "{:?}", plan.members);
+        let plan2 = plan_crew(&wf2);
+        assert_eq!(plan2.members.get("coder"), Some(&1), "{:?}", plan2.members);
+        assert_eq!(plan2.members.get("scout"), Some(&1), "{:?}", plan2.members);
+    }
 }
