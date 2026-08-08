@@ -22,6 +22,10 @@ resonate-sdk = "0.6.0"
 # embeds toron-core's mailbox + toron-mcp's server surface with zero IPC.
 toron-core = { path = "../toron/crates/toron-core" }
 toron-mcp = { path = "../toron/crates/toron-mcp" }
+# The unified durable workflow engine (ADR-0005 Spec 2, P3.1): flywheel routes
+# ALL workflow execution through toron-workflow's WorkflowEngine. This is the
+# cargo edge the tier diagram always implied but no Cargo.toml wired.
+toron-workflow = { path = "../toron/crates/toron-workflow" }
 
 [features]
 # Default build: the `serve` HTTP surface + the two default backends (herdr
