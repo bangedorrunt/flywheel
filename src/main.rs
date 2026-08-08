@@ -21,6 +21,7 @@ mod state;
 mod toron_embed;
 mod work;
 mod cron;
+mod smart_cron;
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -6944,9 +6945,13 @@ fn lint_flywheel_tier(name: &str, wf: &toron_workflow::schema::Workflow) -> usiz
             serde_json::Value::String(s) => {
                 for inner in template_tokens(s) {
                     if let Some(key) = inner.strip_prefix("inputs.") {
-                        if !declared.contains(key) {
+                        // Nested refs (`{{inputs.bundle.run_id}}`) resolve
+                        // against the declared ROOT input (`bundle`); the
+                        // engine drills into the object at runtime.
+                        let root = key.split('.').next().unwrap_or(key);
+                        if !declared.contains(root) {
                             let msg = format!(
-                                "{{{{inputs.{key}}}}} references input {key:?} that is not declared in `inputs:`"
+                                "{{{{inputs.{key}}}}} references input {root:?} that is not declared in `inputs:`"
                             );
                             emit(&msg, blocking);
                         }
@@ -9467,6 +9472,30 @@ steps:
             blocking > 0,
             "undeclared input ref must be a blocking issue"
         );
+    }
+
+    /// A nested ref into a declared OBJECT input (`{{inputs.bundle.run_id}}`)
+    /// resolves against the declared root and lints clean — the engine drills
+    /// into the object at runtime (bd-p4-migrate-sagas-7rmo design needs it).
+    #[test]
+    fn lint_accepts_nested_ref_into_declared_object_input() {
+        let wf = parse_workflow(
+            r##"
+name: t
+trigger:
+  type: webhook
+inputs:
+  - name: bundle
+steps:
+  - name: a
+    action: send_dm
+    to: x
+    body: "{{inputs.bundle.run_id}} {{inputs.bundle.workflow}}"
+"##,
+        )
+        .expect("parse");
+        let blocking = lint_flywheel_tier("t", &wf);
+        assert_eq!(blocking, 0, "nested ref into declared root must lint clean");
     }
 
     /// A clean workflow passes the flywheel tier (no blocking issues).
