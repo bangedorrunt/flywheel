@@ -4367,6 +4367,15 @@ fn digest_for(mail: &mail_shim::Mail, key: &str, name: &str) -> Result<Value> {
         })
         .count();
     let last = arr.first();
+    let last_urgent = arr
+        .iter()
+        .find(|m| {
+            m.get("importance")
+                .and_then(|i| i.as_str())
+                .map(|i| i == "high" || i == "urgent")
+                .unwrap_or(false)
+        })
+        .or(last);
     let last_from = last.and_then(|m| {
         m.get("sender")
             .or_else(|| m.get("from"))
@@ -4376,6 +4385,9 @@ fn digest_for(mail: &mail_shim::Mail, key: &str, name: &str) -> Result<Value> {
         "agent": name,
         "recent": recent,
         "urgent": urgent,
+        "last_id": last_urgent.and_then(|m| {
+            m.get("id").or_else(|| m.get("message_id")).and_then(|i| i.as_str())
+        }),
         "last_from": last_from,
         "last_subject": last.and_then(|m| m.get("subject").and_then(|s| s.as_str())),
         "thread_id": last.and_then(|m| m.get("thread_id").and_then(|t| t.as_str())),
@@ -8920,6 +8932,16 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
         })
         .count();
     let last = arr.first();
+    // wake key: the most recent URGENT message (the loop wakes once per id)
+    let last_urgent = arr
+        .iter()
+        .find(|m| {
+            m.get("importance")
+                .and_then(|i| i.as_str())
+                .map(|i| i == "high" || i == "urgent")
+                .unwrap_or(false)
+        })
+        .or(last);
     // the wire row names the sender `sender` (toron MCP) or `from`
     // (agent-mail MCP) — read both (MailItem aliases them, but the raw
     // serde_json::Value here is the untyped projection).
@@ -8932,6 +8954,9 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
         "agent": key_name,
         "recent": recent,
         "urgent": urgent,
+        "last_id": last_urgent.and_then(|m| {
+            m.get("id").or_else(|| m.get("message_id")).and_then(|i| i.as_str())
+        }),
         "last_from": last_from,
         "last_subject": last.and_then(|m| m.get("subject").and_then(|s| s.as_str())),
         "thread_id": last.and_then(|m| m.get("thread_id").and_then(|t| t.as_str())),

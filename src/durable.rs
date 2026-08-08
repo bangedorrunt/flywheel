@@ -301,6 +301,11 @@ pub struct MailDigest {
     pub recent: usize,
     #[serde(default)]
     pub urgent: usize,
+    /// id of the most recent urgent message (the wake dedup key: the loop
+    /// wakes an agent ONCE per message id, so a still-unreplied urgent
+    /// message does not re-prompt every iteration).
+    #[serde(default)]
+    pub last_id: Option<String>,
     #[serde(default)]
     pub last_from: Option<String>,
     #[serde(default)]
@@ -1336,6 +1341,7 @@ pub fn plan_actions(
     queue: &mut Vec<String>,
     nudge: Option<&str>,
     digests: &HashMap<String, MailDigest>,
+    wake_suppressed: &std::collections::HashSet<String>,
 ) -> Vec<LoopAction> {
     let mut actions = Vec::new();
     for s in states {
@@ -1373,6 +1379,7 @@ pub fn plan_actions(
                     });
                 } else if let Some(d) = digests.get(&s.name)
                     && d.urgent > 0
+                    && !wake_suppressed.contains(&s.name)
                 {
                     // urgent mail with nothing queued: wake the agent
                     // to handle it — mail IS work (loop-side wake, no
@@ -1931,6 +1938,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // cross-project [xproj] message ids already queued (avoid re-enqueue).
     // String: toron ids are hex event ids; agent-mail ids normalize to string.
     let mut seen_xproj: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // mail-wake dedup: agent herdr name → last urgent message id it was woken
+    // for. An agent is woken ONCE per message id; a still-unreplied urgent
+    // message does not re-prompt every iteration (the reply changes the
+    // thread, and the NEXT urgent message id wakes again). Deterministic on
+    // replay: rebuilt from the checkpointed digest leaf results.
+    let mut woken_for: HashMap<String, String> = HashMap::new();
 
     loop {
         iteration += 1;
@@ -2246,12 +2259,37 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             .map(|d| (d.agent.clone(), d))
             .collect()
         };
+        // Wake dedup: an agent already woken for the CURRENT urgent message
+        // id is not re-woken (its digest still prefixes prompts — the agent
+        // may yet reply — but the urgent>0 wake trigger is suppressed).
+        let wake_suppressed: std::collections::HashSet<String> = digests
+            .iter()
+            .filter(|(name, d)| {
+                d.urgent > 0
+                    && match &d.last_id {
+                        Some(id) => woken_for.get(*name).map(|w| w == id).unwrap_or(false),
+                        None => true, // no id to key on — suppress the loop
+                    }
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
         let mut poll_actions = plan_actions(
             &states,
             &mut queue,
             params.nudge.as_deref(),
             &digests,
+            &wake_suppressed,
         );
+        // record wake decisions so the same urgent message does not re-wake
+        for a in &poll_actions {
+            if let LoopAction::Send { name, text } = a
+                && text.starts_with("MAIL WAKE:")
+                && let Some(d) = digests.get(name)
+                && let Some(id) = &d.last_id
+            {
+                woken_for.insert(name.clone(), id.clone());
+            }
+        }
         poll_actions.retain(|a| match a {
             LoopAction::Send { name, .. } => !dispatch_pending.contains(name),
             _ => true,
@@ -2810,7 +2848,7 @@ mod tests {
     fn idle_agent_pops_queue() {
         let states = vec![st("a", "idle")];
         let mut q = vec!["p1".to_string(), "p6".to_string()];
-        let actions = plan_actions(&states, &mut q, None, &HashMap::new());
+        let actions = plan_actions(&states, &mut q, None, &HashMap::new(), &std::collections::HashSet::new());
         assert_eq!(q.len(), 1);
         assert!(
             matches!(&actions[0], LoopAction::Send { name, text } if name == "a" && text == "p1")
@@ -2821,7 +2859,7 @@ mod tests {
     fn queue_drains_across_idle_agents_in_order() {
         let states = vec![st("a", "idle"), st("b", "done")];
         let mut q = vec!["p1".to_string(), "p6".to_string()];
-        let actions = plan_actions(&states, &mut q, None, &HashMap::new());
+        let actions = plan_actions(&states, &mut q, None, &HashMap::new(), &std::collections::HashSet::new());
         assert!(q.is_empty());
         match (&actions[0], &actions[1]) {
             (LoopAction::Send { name: n1, text: t1 }, LoopAction::Send { name: n2, text: t2 }) => {
@@ -2838,7 +2876,7 @@ mod tests {
     fn working_agent_gets_nothing() {
         let states = vec![st("a", "working")];
         let mut q = vec!["p1".to_string()];
-        let actions = plan_actions(&states, &mut q, None, &HashMap::new());
+        let actions = plan_actions(&states, &mut q, None, &HashMap::new(), &std::collections::HashSet::new());
         assert_eq!(q.len(), 1);
         assert!(matches!(actions[0], LoopAction::Wait));
     }
@@ -2847,7 +2885,7 @@ mod tests {
     fn blocked_agent_reports_and_keeps_queue() {
         let states = vec![st("a", "blocked")];
         let mut q = vec!["p1".to_string()];
-        let actions = plan_actions(&states, &mut q, None, &HashMap::new());
+        let actions = plan_actions(&states, &mut q, None, &HashMap::new(), &std::collections::HashSet::new());
         assert!(matches!(&actions[0], LoopAction::Blocked { name } if name == "a"));
         assert_eq!(q.len(), 1);
     }
@@ -2856,7 +2894,7 @@ mod tests {
     fn empty_queue_with_nudge_nudges() {
         let states = vec![st("a", "idle")];
         let mut q: Vec<String> = vec![];
-        let actions = plan_actions(&states, &mut q, Some("proceed"), &HashMap::new());
+        let actions = plan_actions(&states, &mut q, Some("proceed"), &HashMap::new(), &std::collections::HashSet::new());
         assert!(matches!(&actions[0], LoopAction::Nudge { name } if name == "a"));
     }
 
@@ -2864,7 +2902,7 @@ mod tests {
     fn empty_queue_no_nudge_waits() {
         let states = vec![st("a", "done")];
         let mut q: Vec<String> = vec![];
-        let actions = plan_actions(&states, &mut q, None, &HashMap::new());
+        let actions = plan_actions(&states, &mut q, None, &HashMap::new(), &std::collections::HashSet::new());
         assert!(matches!(actions[0], LoopAction::Wait));
     }
 
@@ -2874,7 +2912,7 @@ mod tests {
     fn unknown_agent_keeps_queue() {
         let states = vec![st("a", "unknown")];
         let mut q = vec!["p1".to_string()];
-        let actions = plan_actions(&states, &mut q, None, &HashMap::new());
+        let actions = plan_actions(&states, &mut q, None, &HashMap::new(), &std::collections::HashSet::new());
         assert_eq!(q.len(), 1); // queue intact — unknown must never consume items
         assert!(matches!(actions[0], LoopAction::Wait));
     }
@@ -2883,7 +2921,7 @@ mod tests {
     fn unknown_with_nudge_no_send() {
         let states = vec![st("a", "unknown")];
         let mut q: Vec<String> = vec![];
-        let actions = plan_actions(&states, &mut q, Some("proceed"), &HashMap::new());
+        let actions = plan_actions(&states, &mut q, Some("proceed"), &HashMap::new(), &std::collections::HashSet::new());
         assert!(matches!(actions[0], LoopAction::Wait)); // no Nudge, no Send
     }
 
@@ -3384,7 +3422,7 @@ mod tests {
         // replaces it when the Send action is built
         let mut queue = vec![bead_prompt("bd-12", "fix auth flow")];
         let states = vec![st("flywheel-proj-oc", "idle")];
-        let actions = plan_actions(&states, &mut queue, None, &HashMap::new());
+        let actions = plan_actions(&states, &mut queue, None, &HashMap::new(), &std::collections::HashSet::new());
         match &actions[0] {
             LoopAction::Send { name, text } => {
                 assert_eq!(name, "flywheel-proj-oc");
@@ -3400,7 +3438,7 @@ mod tests {
     fn plan_actions_leaves_plain_prompts_untouched() {
         let mut queue = vec!["t1".to_string()];
         let states = vec![st("flywheel-proj-oc", "idle")];
-        let actions = plan_actions(&states, &mut queue, None, &HashMap::new());
+        let actions = plan_actions(&states, &mut queue, None, &HashMap::new(), &std::collections::HashSet::new());
         match &actions[0] {
             LoopAction::Send { text, .. } => assert_eq!(text, "t1"),
             other => panic!("expected Send, got {other:?}"),
@@ -3414,6 +3452,7 @@ mod tests {
             agent: "flywheel-proj-oc".into(),
             recent,
             urgent,
+            last_id: (urgent > 0).then(|| format!("urgent-{from}")),
             last_from: (!from.is_empty()).then(|| from.to_string()),
             last_subject: (!subj.is_empty()).then(|| subj.to_string()),
             thread_id: None,
@@ -3431,7 +3470,7 @@ mod tests {
         let mut queue = vec!["do the work".to_string()];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(2, 1, "PinkGorge", "[bd-1] need input"));
-        let actions = plan_actions(&states, &mut queue, None, &d);
+        let actions = plan_actions(&states, &mut queue, None, &d, &std::collections::HashSet::new());
         match &actions[0] {
             LoopAction::Send { text, .. } => {
                 assert!(
@@ -3448,7 +3487,7 @@ mod tests {
         let mut queue = vec!["do the work".to_string()];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(0, 0, "", ""));
-        let actions = plan_actions(&states, &mut queue, None, &d);
+        let actions = plan_actions(&states, &mut queue, None, &d, &std::collections::HashSet::new());
         match &actions[0] {
             LoopAction::Send { text, .. } => assert_eq!(text, "do the work"),
             other => panic!("expected Send, got {other:?}"),
@@ -3461,7 +3500,7 @@ mod tests {
         let mut queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] help needed"));
-        let actions = plan_actions(&states, &mut queue, None, &d);
+        let actions = plan_actions(&states, &mut queue, None, &d, &std::collections::HashSet::new());
         match &actions[0] {
             LoopAction::Send { text, .. } => {
                 assert!(
@@ -3479,7 +3518,7 @@ mod tests {
         let mut queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(0, 0, "", ""));
-        let actions = plan_actions(&states, &mut queue, None, &d);
+        let actions = plan_actions(&states, &mut queue, None, &d, &std::collections::HashSet::new());
         assert_eq!(actions[0], LoopAction::Wait);
     }
 
@@ -3490,10 +3529,38 @@ mod tests {
         let mut queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(3, 2, "PinkGorge", "[bd-1] urgent"));
-        let actions = plan_actions(&states, &mut queue, Some("proceed"), &d);
+        let actions = plan_actions(&states, &mut queue, Some("proceed"), &d, &std::collections::HashSet::new());
         match &actions[0] {
             LoopAction::Nudge { .. } => {}
             other => panic!("expected Nudge (orchestrator direction wins), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_actions_suppresses_wake_for_already_woken_agent() {
+        // wake dedup: the same urgent message id must NOT re-wake an agent
+        // every iteration — the digest still prefixes prompts, but the
+        // MAIL WAKE trigger is suppressed.
+        let mut queue: Vec<String> = Vec::new();
+        let states = vec![st("flywheel-proj-oc", "idle")];
+        let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] help"));
+        let mut suppressed = std::collections::HashSet::new();
+        suppressed.insert("flywheel-proj-oc".to_string());
+        let actions = plan_actions(&states, &mut queue, None, &d, &suppressed);
+        assert_eq!(actions[0], LoopAction::Wait, "already-woken agent must wait");
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn plan_actions_unsuppressed_wake_still_fires_for_new_urgent_id() {
+        // a NEW urgent message id (not in woken_for) wakes as before
+        let mut queue: Vec<String> = Vec::new();
+        let states = vec![st("flywheel-proj-oc", "idle")];
+        let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] new help"));
+        let actions = plan_actions(&states, &mut queue, None, &d, &std::collections::HashSet::new());
+        match &actions[0] {
+            LoopAction::Send { text, .. } => assert!(text.starts_with("MAIL WAKE:")),
+            other => panic!("expected wake Send, got {other:?}"),
         }
     }
 
@@ -3503,7 +3570,7 @@ mod tests {
         let mut queue = vec!["do the work".to_string()];
         let states = vec![st("flywheel-proj-oc", "working")];
         let d = digest_map(digest(5, 1, "PinkGorge", "[bd-1] input"));
-        let actions = plan_actions(&states, &mut queue, None, &d);
+        let actions = plan_actions(&states, &mut queue, None, &d, &std::collections::HashSet::new());
         assert_eq!(actions[0], LoopAction::Wait);
         assert_eq!(queue.len(), 1, "queue must not be consumed by a working agent");
     }
@@ -4086,7 +4153,7 @@ mod tests {
     }
 
     fn poll_dispatch(states: &[AgentState], queue: &mut Vec<String>) -> Vec<DispatchRec> {
-        plan_actions(states, queue, None, &HashMap::new())
+        plan_actions(states, queue, None, &HashMap::new(), &std::collections::HashSet::new())
             .iter()
             .filter_map(rec_from_action)
             .collect()
