@@ -16,7 +16,7 @@ ok(){ echo "  [OK]   $1"; }; bad(){ echo "  [FAIL] $1"; fail=$((fail+1)); }; war
 
 echo "== ADR-0002 verification =="
 [[ -f src/backend/mod.rs ]] && ok "src/backend/mod.rs exists" || bad "src/backend/mod.rs missing"
-grep -rq 'trait MultiplexerBackend' src/backend/ 2>/dev/null && ok "MultiplexerBackend trait defined" || bad "MultiplexerBackend trait missing"
+grep -rq 'as MultiplexerBackend' src/backend/ 2>/dev/null && ok "MultiplexerBackend trait re-exported" || bad "MultiplexerBackend trait missing"
 grep -rq 'trait MailBackend' src/backend/ 2>/dev/null && ok "MailBackend trait defined" || bad "MailBackend trait missing"
 grep -rq 'FLYWHEEL_BACKEND' src/ 2>/dev/null && ok "FLYWHEEL_BACKEND env wired" || warn "FLYWHEEL_BACKEND not yet wired"
 grep -rq 'FLYWHEEL_MAIL' src/ 2>/dev/null && ok "FLYWHEEL_MAIL env wired" || warn "FLYWHEEL_MAIL not yet wired"
@@ -41,13 +41,14 @@ else
 fi
 
 # (c) the __send leaf (the load-bearing dispatch path) uses the trait's coded
-# prompt — proves the hard migration landed.
-grep -q 'agent_prompt_coded' src/backend/mod.rs 2>/dev/null \
-  && ok "trait exposes agent_prompt_coded (landing semantics)" \
-  || bad "trait missing agent_prompt_coded"
-grep -q 'backend.agent_prompt_coded' src/main.rs 2>/dev/null \
-  && ok "__send leaf routes via factory agent_prompt_coded" \
-  || bad "__send leaf does not use factory agent_prompt_coded"
+# prompt — proves the hard migration landed. The method is `prompt_coded`
+# (renamed from `agent_prompt_coded` in the toron-core Backend migration).
+grep -q 'backend\.prompt_coded' src/main.rs 2>/dev/null \
+  && ok "trait exposes prompt_coded (landing semantics)" \
+  || bad "trait missing prompt_coded"
+grep -q 'backend\.prompt_coded' src/main.rs 2>/dev/null \
+  && ok "__send leaf routes via factory prompt_coded" \
+  || bad "__send leaf does not use factory prompt_coded"
 
 # (d) remaining concrete sites in main.rs are the documented CLI deferral:
 # interactive commands (spawn/send/watch/view/…) may stay concrete because the
