@@ -1241,6 +1241,23 @@ fn project_dir(cfg: &Config, project: &str) -> PathBuf {
     }
 }
 
+/// Fallible UTF-8 conversion of a filesystem path (193.1). Paths used as
+/// herdr cwd args and agent-mail keys must ROUND-TRIP — lossy conversion
+/// would silently corrupt them. The wire protocols are JSON (UTF-8), so a
+/// non-UTF-8 path is a clear error, never a panic and never silent
+/// corruption.
+fn utf8_path(p: &Path, what: &str) -> Result<String> {
+    p.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("{what} is not valid UTF-8: {p:?}"))
+}
+
+/// `project_dir` as a UTF-8 string (193.1): the project path is a real path
+/// (herdr cwd, agent-mail key) — propagate non-UTF-8 as an error.
+fn project_dir_str(cfg: &Config, project: &str) -> Result<String> {
+    utf8_path(&project_dir(cfg, project), &format!("project path for {project:?}"))
+}
+
 fn swarm_label(project: &str) -> String {
     let base = project.rsplit('/').next().unwrap_or(project).to_string();
     format!("flywheel-{base}")
@@ -2004,7 +2021,11 @@ fn cmd_spawn(
         .unwrap_or_else(|| swarm_label(project));
 
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    let (ws, root) = c.workspace_create(Some(dir.to_str().unwrap()), Some(&label), !no_focus)?;
+    let (ws, root) = c.workspace_create(
+        Some(&utf8_path(&dir, "workspace dir")?),
+        Some(&label),
+        !no_focus,
+    )?;
     println!(
         "{}",
         if no_focus {
@@ -2056,7 +2077,12 @@ fn cmd_spawn(
                 first = false;
                 prev.clone()
             } else {
-                let p = herdr_shim::pane_split(&mut c, &prev, "down", Some(dir.to_str().unwrap()))?;
+                let p = herdr_shim::pane_split(
+                    &mut c,
+                    &prev,
+                    "down",
+                    Some(&utf8_path(&dir, "workspace dir")?),
+                )?;
                 prev = p.pane_id.clone();
                 prev.clone()
             };
@@ -2187,7 +2213,7 @@ fn register_spawned_agent(cfg: &Config, project: &str, name: &str, kind: &str, p
         Some(k) => k.to_string(),
         None => return,
     };
-    let mut mail = match backend::mail_backend(cfg) {
+    let mail = match backend::mail_backend(cfg) {
         Ok(m) => m,
         Err(_) => return, // mail not configured — silent skip
     };
@@ -2508,6 +2534,25 @@ fn resolve_mail_target(target: &str) -> String {
 #[cfg(test)]
 mod agent_mail_name_tests {
     use super::*;
+
+    /// 193.1: a non-UTF-8 path converts to an actionable ERROR (never a
+    /// panic, never silent lossy corruption) — the herdr/mail wire protocols
+    /// are UTF-8, so a non-UTF-8 path is a clear failure.
+    #[test]
+    fn utf8_path_rejects_non_utf8_with_error() {
+        use std::ffi::OsString;
+        #[cfg(unix)]
+        use std::os::unix::ffi::OsStringExt;
+        // byte-string path: 0x66 'f', 0xFF (invalid UTF-8), "oo"
+        let bad = PathBuf::from(OsString::from_vec(vec![0x66, 0xFF, 0x6F, 0x6F]));
+        #[cfg(not(unix))]
+        let bad = PathBuf::from("plain-utf8"); // non-unix can't build non-UTF-8 paths
+        let err = utf8_path(&bad, "test path").unwrap_err();
+        assert!(err.to_string().contains("not valid UTF-8"), "actionable error: {err:#}");
+        // a valid path round-trips exactly
+        let good = PathBuf::from("/tmp/flywheel-utf8-ok");
+        assert_eq!(utf8_path(&good, "test path").unwrap(), "/tmp/flywheel-utf8-ok");
+    }
 
     /// The mapping is deterministic: same herdr name → same adjective+noun,
     /// every call (and across machines — no randomness, no time).
@@ -2950,7 +2995,12 @@ fn cmd_add(
             let ordinal = ordinals.entry(short.clone()).or_insert(0);
             *ordinal += 1;
             let name = agent_name_n(project, short, *ordinal);
-            let p = herdr_shim::pane_split(&mut c, &prev, "down", Some(dir.to_str().unwrap()))?;
+            let p = herdr_shim::pane_split(
+                &mut c,
+                &prev,
+                "down",
+                Some(&utf8_path(&dir, "workspace dir")?),
+            )?;
             prev = p.pane_id.clone();
             let agent = start_agent_with_retry(&mut c, &name, &kind, &prev, &[])?;
             register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
@@ -3388,7 +3438,7 @@ fn cmd_kill(cfg: &Config, project: &str, force: bool) -> Result<()> {
     let _ = std::fs::remove_dir_all(agentstate::project_state_dir(&project_dir(cfg, project)));
     // clear the identity files for the dead panes (best-effort — a missing
     // file is a no-op, so double-exit is harmless)
-    if let Ok(mut mail) = backend::mail_backend(cfg) && let Some(key) = project_dir(cfg, project).to_str() {
+    if let Ok(mail) = backend::mail_backend(cfg) && let Some(key) = project_dir(cfg, project).to_str() {
         for a in &agents {
             if let Err(e) = mail.clear_pane_identity(key, &a.pane_id) {
                 eprintln!(
@@ -3442,10 +3492,10 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
             config::config_file().display()
         )
     })?;
-    let mut mail = mail;
+    let mail = mail;
     let dir = project_dir(cfg, project);
-    let key = dir.to_str().unwrap();
-    mail.ensure_project(key)?;
+    let key = utf8_path(&dir, "project dir")?;
+    mail.ensure_project(&key)?;
     let bead_ids: Vec<String> = beads
         .split(',')
         .map(|s| s.trim().to_string())
@@ -3460,7 +3510,7 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
         msg.unwrap_or("Execute these beads per the standard lifecycle: claim -> reserve -> execute -> verify -> close -> sync.")
     );
     let targets: Vec<String> = if to == "all" {
-        let agents = mail.list_agents(key)?;
+        let agents = mail.list_agents(&key)?;
         agents
             .as_array()
             .map(|arr| {
@@ -3487,7 +3537,7 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
         project_base(project),
         bead_ids.join(", ")
     );
-    mail.send(key, &targets, &subject, &body, "high", true, None)?;
+    mail.send(&key, &targets, &subject, &body, "high", true, None)?;
     println!("assigned {} to {}", bead_ids.join(", "), targets.join(", "));
     Ok(())
 }
@@ -3528,10 +3578,11 @@ fn resolve_mail_actor(explicit: Option<&str>) -> Option<String> {
 
 /// Mail facade acting as resolved actor (registers identity best-effort).
 fn mail_as(cfg: &Config, project_key: &str, as_agent: Option<&str>) -> Result<mail_shim::Mail> {
-    let mut mail = mail_or_die(cfg)?;
-    if let Some(name) = resolve_mail_actor(as_agent) {
-        mail.name = name;
-    }
+    let mail = mail_or_die(cfg)?;
+    let mail = match resolve_mail_actor(as_agent) {
+        Some(name) => mail.with_name(name),
+        None => mail,
+    };
     // Ensure the actor exists so send/reserve/inbox don't 404 "Agent not found".
     let name = mail.name.clone();
     if let Err(e) = mail.register_agent(
@@ -3757,9 +3808,9 @@ fn cmd_xproj(cfg: &Config, cmd: &XprojCmd) -> Result<()> {
             to_project,
             reason,
         } => {
-            let mut mail = mail_or_die(cfg)?;
-            let key = project_dir(cfg, project).to_str().unwrap().to_string();
-            let to_key = project_dir(cfg, to_project).to_str().unwrap().to_string();
+            let mail = mail_or_die(cfg)?;
+            let key = project_dir_str(cfg, project)?;
+            let to_key = project_dir_str(cfg, to_project)?;
             mail.ensure_project(&key)?;
             let from = mail.name.clone();
             let to_mail = resolve_mail_target(to);
@@ -3775,8 +3826,8 @@ fn cmd_xproj(cfg: &Config, cmd: &XprojCmd) -> Result<()> {
             product,
             workers,
         } => {
-            let mut mail = mail_or_die(cfg)?;
-            let key = project_dir(cfg, project).to_str().unwrap().to_string();
+            let mail = mail_or_die(cfg)?;
+            let key = project_dir_str(cfg, project)?;
             mail.ensure_project(&key)?;
             let to_mail = resolve_mail_target(to);
             let ts = crate::state::now_iso().replace(['-', ':'], "");
@@ -3857,8 +3908,8 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             limit,
             as_agent,
         } => {
-            let key = project_dir(cfg, project).to_str().unwrap().to_string();
-            let mut mail = mail_as(cfg, &key, as_agent.as_deref())?;
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
             let name = mail.name.clone();
             let v = mail.inbox(&key, &name, *urgent, *limit)?;
@@ -3874,8 +3925,8 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             as_agent,
             thread_id,
         } => {
-            let key = project_dir(cfg, project).to_str().unwrap().to_string();
-            let mut mail = mail_as(cfg, &key, as_agent.as_deref())?;
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
             // herdr names resolve to their registered identities (bd-odc)
             let targets: Vec<String> = to
@@ -3901,15 +3952,15 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             reason,
             as_agent,
         } => {
-            let key = project_dir(cfg, project).to_str().unwrap().to_string();
-            let mut mail = mail_as(cfg, &key, as_agent.as_deref())?;
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
             let v = mail.reserve(&key, paths, *ttl_seconds, *exclusive, reason)?;
             print_json(&v);
         }
         MailCmd::Unlock { project, as_agent } => {
-            let key = project_dir(cfg, project).to_str().unwrap().to_string();
-            let mut mail = mail_as(cfg, &key, as_agent.as_deref())?;
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             let v = mail.release(&key)?;
             print_json(&v);
         }
@@ -3918,15 +3969,15 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             paths,
             as_agent,
         } => {
-            let key = project_dir(cfg, project).to_str().unwrap().to_string();
-            let mut mail = mail_as(cfg, &key, as_agent.as_deref())?;
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
             let v = mail.conflicts(&key, paths)?;
             print_json(&v);
         }
         MailCmd::Agents { project } => {
-            let key = project_dir(cfg, project).to_str().unwrap().to_string();
-            let mut mail = mail_or_die(cfg)?;
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_or_die(cfg)?;
             mail.ensure_project(&key)?;
             let v = mail.list_agents(&key)?;
             print_json(&v);
@@ -3938,44 +3989,45 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 to_project,
                 reason,
             } => {
-                let key = project_dir(cfg, project).to_str().unwrap().to_string();
-                let mut mail = mail_as(cfg, &key, None)?;
+                let key = project_dir_str(cfg, project)?;
+                let mail = mail_as(cfg, &key, None)?;
                 mail.ensure_project(&key)?;
                 let from = mail.name.clone();
                 let to_mail = resolve_mail_target(to);
                 let to_proj = to_project
                     .as_ref()
-                    .map(|p| project_dir(cfg, p).to_str().unwrap().to_string());
+                    .map(|p| project_dir_str(cfg, p))
+                    .transpose()?;
                 let v =
                     mail.request_contact(&key, &from, &to_mail, to_proj.as_deref(), reason, None)?;
                 print_json(&v);
             }
             MailContactCmd::Approve { project, from } => {
-                let key = project_dir(cfg, project).to_str().unwrap().to_string();
-                let mut mail = mail_as(cfg, &key, None)?;
+                let key = project_dir_str(cfg, project)?;
+                let mail = mail_as(cfg, &key, None)?;
                 let to = mail.name.clone();
                 let from_mail = resolve_mail_target(from);
                 let v = mail.respond_contact(&key, &to, &from_mail, true)?;
                 print_json(&v);
             }
             MailContactCmd::Deny { project, from } => {
-                let key = project_dir(cfg, project).to_str().unwrap().to_string();
-                let mut mail = mail_as(cfg, &key, None)?;
+                let key = project_dir_str(cfg, project)?;
+                let mail = mail_as(cfg, &key, None)?;
                 let to = mail.name.clone();
                 let from_mail = resolve_mail_target(from);
                 let v = mail.respond_contact(&key, &to, &from_mail, false)?;
                 print_json(&v);
             }
             MailContactCmd::List { project } => {
-                let key = project_dir(cfg, project).to_str().unwrap().to_string();
-                let mut mail = mail_as(cfg, &key, None)?;
+                let key = project_dir_str(cfg, project)?;
+                let mail = mail_as(cfg, &key, None)?;
                 let name = mail.name.clone();
                 let v = mail.list_contacts(&key, &name)?;
                 print_json(&v);
             }
             MailContactCmd::Policy { project, policy } => {
-                let key = project_dir(cfg, project).to_str().unwrap().to_string();
-                let mut mail = mail_as(cfg, &key, None)?;
+                let key = project_dir_str(cfg, project)?;
+                let mail = mail_as(cfg, &key, None)?;
                 let name = mail.name.clone();
                 let v = mail.set_contact_policy(&key, &name, policy)?;
                 print_json(&v);
@@ -3983,13 +4035,13 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         },
         MailCmd::Product { cmd } => match cmd {
             MailProductCmd::Ensure { name } => {
-                let mut mail = mail_or_die(cfg)?;
+                let mail = mail_or_die(cfg)?;
                 let v = mail.ensure_product(name)?;
                 print_json(&v);
             }
             MailProductCmd::Link { product, project } => {
-                let key = project_dir(cfg, project).to_str().unwrap().to_string();
-                let mut mail = mail_or_die(cfg)?;
+                let key = project_dir_str(cfg, project)?;
+                let mail = mail_or_die(cfg)?;
                 mail.ensure_project(&key)?;
                 let v = mail.products_link(product, &key)?;
                 print_json(&v);
@@ -3999,12 +4051,12 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 query,
                 limit,
             } => {
-                let mut mail = mail_or_die(cfg)?;
+                let mail = mail_or_die(cfg)?;
                 let v = mail.search_product(product, query, *limit)?;
                 print_json(&v);
             }
             MailProductCmd::Inbox { product, limit } => {
-                let mut mail = mail_or_die(cfg)?;
+                let mail = mail_or_die(cfg)?;
                 let name = mail.name.clone();
                 let v = mail.inbox_product(product, &name, *limit)?;
                 print_json(&v);
@@ -4123,7 +4175,7 @@ fn cmd_checkpoint(cfg: &Config, cmd: &CheckpointCmd) -> Result<()> {
                 msg,
                 Some(&ws_id),
                 cp_agents,
-                Some(project_dir(cfg, project).to_str().unwrap()),
+                Some(&project_dir_str(cfg, project)?),
             )?;
             log(
                 project,
@@ -4256,7 +4308,7 @@ fn cmd_changes(cfg: &Config, project: &str, since: usize) -> Result<()> {
             );
         }
     }
-    let head = state::git_head(project_dir(cfg, project).to_str().unwrap());
+    let head = state::git_head(&project_dir_str(cfg, project)?);
     if let Ok(h) = head {
         println!("git head: {}", dim(&h));
     }
@@ -4759,8 +4811,8 @@ fn cmd_loop(
                     any_blocked = true;
                     match on_blocked {
                         "mail" => {
-                            if let Ok(mut m) = mail_or_die(cfg) {
-                                let key = project_dir(cfg, project).to_str().unwrap().to_string();
+                            if let Ok(m) = mail_or_die(cfg) {
+                                let key = project_dir_str(cfg, project)?;
                                 let _ = m.ensure_project(&key);
                                 // the recipient is the agent's REGISTERED
                                 // agent-mail identity (bd-odc) — the herdr
@@ -5451,10 +5503,11 @@ fn boot_toron_server(port: u16) -> Result<()> {
         .stderr(std::process::Stdio::null());
     // preserve operator-key env so the full privileged surface works
     if std::env::var_os("TORON_OPERATOR_KEY").is_some() {
-        cmd.env(
-            "TORON_OPERATOR_KEY",
-            std::env::var("TORON_OPERATOR_KEY").unwrap(),
-        );
+        // 193.1: a non-UTF-8 key is an actionable error (never a panic —
+        // var().unwrap() would panic on a non-UTF-8 value).
+        let key = std::env::var("TORON_OPERATOR_KEY")
+            .with_context(|| "TORON_OPERATOR_KEY must be valid UTF-8 when set")?;
+        cmd.env("TORON_OPERATOR_KEY", key);
     }
     cmd.spawn()?;
     println!("booted toron serve --mcp-http {bind} (detached).");
@@ -5718,7 +5771,7 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
     }
 
     match mail_shim::Mail::from_config(Some(&cfg.toron_mail_config())) {
-        Ok(Some(mut m)) => match m.health() {
+        Ok(Some(m)) => match m.health() {
             Ok(_) => println!("agent-mail: {}", status_paint(AgentStatus::Idle)),
             Err(e) => {
                 ok = false;
@@ -5877,7 +5930,7 @@ fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
                 .map(|b| b.agent_list().is_ok())
                 .unwrap_or(false);
             let mail_health = backend::mail_backend(cfg)
-                .and_then(|mut m| m.health().map(|_| true))
+                .and_then(|m| m.health().map(|_| true))
                 .unwrap_or(false);
             print_json(&json!({
                 "multiplexer": {"name": mux, "source": mux_source, "healthy": mux_health},
@@ -7125,14 +7178,14 @@ fn cmd_debate(
     } else {
         "flywheel".to_string()
     };
-    let key = project_dir(cfg, &project).to_str().unwrap().to_string();
+                let key = project_dir_str(cfg, &project)?;
 
     // agent names: explicit or default to the swarm's first oc/pi/gk
     // (review-fix F7: bare shorts resolve to the spawned flywheel-<base>-<short>
     // so settle + mail addressing work against a default swarm)
     let (a, b, j) = resolve_debate_agents(&project, agent_a, agent_b, judge)?;
 
-    let mut mail = match backend::mail_backend(cfg) {
+    let mail = match backend::mail_backend(cfg) {
         Ok(m) => m,
         Err(e) => bail!("mail backend unavailable for debate: {e:#}"),
     };
@@ -7179,7 +7232,7 @@ fn cmd_debate(
         // full ack-checking is the loop's ack_overdue path)
         settle_agent(&*mux, speaker)?;
         // harvest the speaker's latest message in the thread
-        last_reply = harvest_latest(mail.as_mut(), &key, &thread, &resolve_mail_target(speaker))?;
+        last_reply = harvest_latest(mail.as_ref(), &key, &thread, &resolve_mail_target(speaker))?;
         println!("debate {thread}: {} replied (round {})", speaker, round);
     }
 
@@ -7197,7 +7250,7 @@ fn cmd_debate(
         Some(&thread),
     )?;
     settle_agent(&*mux, &j)?;
-    let verdict = harvest_latest(mail.as_mut(), &key, &thread, &resolve_mail_target(&j))?;
+    let verdict = harvest_latest(mail.as_ref(), &key, &thread, &resolve_mail_target(&j))?;
     println!(
         "debate {thread} verdict: {}",
         verdict.unwrap_or_else(|| "(no verdict harvested)".into())
@@ -7469,12 +7522,12 @@ fn cmd_plan_review(
         None => format!(".flywheel/plans/plan-{ts}.md"),
     };
 
-    let mut mail = match backend::mail_backend(cfg) {
+    let mail = match backend::mail_backend(cfg) {
         Ok(m) => m,
         Err(e) => bail!("mail backend unavailable for plan-review: {e:#}"),
     };
     let mux = backend::multiplexer_backend(cfg)?;
-    let key = project_dir(cfg, project).to_str().unwrap().to_string();
+    let key = project_dir_str(cfg, project)?;
     mail.ensure_project(&key)?;
 
     let mail_target = |agent: &str| resolve_mail_target(agent);
@@ -7502,7 +7555,7 @@ fn cmd_plan_review(
     settle_agent(&*mux, &planner)?;
     let planner_mail = mail_target(&planner);
     let plan_reply =
-        harvest_latest(mail.as_mut(), &key, &thread, &planner_mail)?.unwrap_or_default();
+        harvest_latest(mail.as_ref(), &key, &thread, &planner_mail)?.unwrap_or_default();
     current_path = extract_plan_path(&plan_reply, &current_path);
     let (_next_phase, action) = pri_after_plan(&current_path);
     let mut phase = PriPhase::AwaitingPlanReview;
@@ -7536,7 +7589,7 @@ fn cmd_plan_review(
                     Some(&thread),
                 )?;
                 settle_agent(&*mux, &planner)?;
-                let pr = harvest_latest(mail.as_mut(), &key, &thread, &mail_target(&planner))?
+                let pr = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&planner))?
                     .unwrap_or_default();
                 current_path = extract_plan_path(&pr, &current_path);
                 let (p2, a2) = pri_after_plan(&current_path);
@@ -7561,7 +7614,7 @@ fn cmd_plan_review(
                     Some(&thread),
                 )?;
                 settle_agent(&*mux, &reviewer)?;
-                let body = harvest_latest(mail.as_mut(), &key, &thread, &mail_target(&reviewer))?
+                let body = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&reviewer))?
                     .unwrap_or_default();
                 let token = parse_review_token(&body).ok_or_else(|| {
                     anyhow!(
@@ -7612,7 +7665,7 @@ fn cmd_plan_review(
                     Some(&thread),
                 )?;
                 settle_agent(&*mux, &reviewer)?;
-                let rev2 = harvest_latest(mail.as_mut(), &key, &thread, &mail_target(&reviewer))?
+                let rev2 = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&reviewer))?
                     .unwrap_or_default();
                 let token2 = parse_review_token(&rev2).ok_or_else(|| {
                     anyhow!("verify reply missing VERIFIED|REJECT: token: {rev2}")
@@ -7702,7 +7755,7 @@ pub fn extract_latest_body(v: &serde_json::Value) -> Option<String> {
 
 /// Harvest the latest message in a thread from a sender (recency-ranked).
 fn harvest_latest(
-    mail: &mut dyn backend::MailBackend,
+    mail: &dyn backend::MailBackend,
     key: &str,
     thread: &str,
     sender: &str,
@@ -8371,7 +8424,7 @@ fn cmd_internal_respawn(
         })
         .or_else(|| panes.first().map(|p| p.pane_id.clone()))
         .ok_or_else(|| anyhow!("no pane in {project} to split for respawn"))?;
-    let new_pane = backend.pane_split(&anchor, "down", Some(dir.to_str().unwrap()))?;
+    let new_pane = backend.pane_split(&anchor, "down", Some(&utf8_path(&dir, "workspace dir")?))?;
     if let Some(old) = &old_pane {
         // trait has no pane_close default; herdr Client has no typed helper —
         // best-effort close via the concrete client only when we have one.
@@ -8383,7 +8436,7 @@ fn cmd_internal_respawn(
     // pane-identity bridge bookkeeping (best-effort — never fail the respawn
     // on mail trouble): the old pane died (its identity file is stale), the
     // fresh pane must resolve to the same name (the agent keeps its identity)
-    if let Ok(mut mail) = backend::mail_backend(cfg) && let Some(key) = dir.to_str() {
+    if let Ok(mail) = backend::mail_backend(cfg) && let Some(key) = dir.to_str() {
         if let Some(old) = &old_pane && let Err(e) = mail.clear_pane_identity(key, old) {
             eprintln!("flywheel: mail clear_pane_identity failed for {old}: {e}");
         }
@@ -8407,14 +8460,14 @@ fn cmd_internal_respawn(
 /// Soft-fail: missing mail → empty list. Output: `{ "items": [ XprojInboxItem ] }`.
 fn cmd_internal_xproj_inbox(cfg: &Config, project: &str, limit: u32) -> Result<()> {
     // review-fix F6: the xproj-inbox leaf routes through the backend factory.
-    let mut mail = match backend::mail_backend(cfg) {
+    let mail = match backend::mail_backend(cfg) {
         Ok(m) => m,
         Err(_) => {
             print_json(&json!({ "items": [] }));
             return Ok(());
         }
     };
-    let key = project_dir(cfg, project).to_str().unwrap().to_string();
+    let key = project_dir_str(cfg, project)?;
     if mail.ensure_project(&key).is_err() {
         print_json(&json!({ "items": [] }));
         return Ok(());
@@ -8490,7 +8543,7 @@ fn cmd_internal_xproj_spawn(
             "[xproj] spawn FAILED for msg {message_id}: {e:#}. Requester {from}, recipe={recipe}, workers={workers}."
         ),
     };
-    if let Ok(mut mail) = backend::mail_backend(cfg) {
+    if let Ok(mail) = backend::mail_backend(cfg) {
         let key = project_dir(cfg, project)
             .to_str()
             .unwrap_or(project)
@@ -8536,7 +8589,7 @@ fn cmd_internal_xproj_spawn(
 /// an overnight loop (same standard as the lease-renewal heartbeat) — the
 /// leaf exits 0 with `{"ok": false, "error": ...}` and the next poll retries.
 fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str, tier: u32) -> Result<()> {
-    let mut mail = match backend::mail_backend(cfg) {
+    let mail = match backend::mail_backend(cfg) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("flywheel: mail backend unavailable for blocked alert to {name}: {e:#}");
@@ -8544,7 +8597,7 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str, tier: u32)
             return Ok(());
         }
     };
-    let key = project_dir(cfg, project).to_str().unwrap().to_string();
+    let key = project_dir_str(cfg, project)?;
     // the recipient is the agent's REGISTERED agent-mail identity (bd-odc) —
     // `name` is the herdr name, which is not a registrable identity
     let mail_target = resolve_mail_target(name);
@@ -8650,8 +8703,8 @@ fn cmd_internal_diagnose(cfg: &Config, project: &str, name: &str, reason: &str) 
         .and_then(|m| m.name.clone())
         .unwrap_or_else(|| "Flywheel".to_string());
     match backend::mail_backend(cfg) {
-        Ok(mut mail) => {
-            let key = project_dir(cfg, project).to_str().unwrap().to_string();
+        Ok(mail) => {
+            let key = project_dir_str(cfg, project)?;
             let subject = format!("[{project}] {name} unresponsive ({reason})");
             let body = format!(
                 "Agent **{name}** is unresponsive (`{reason}`).\n\n\
@@ -8701,8 +8754,8 @@ fn cmd_internal_diagnose(cfg: &Config, project: &str, name: &str, reason: &str) 
 /// treats a non-zero exit as a missed renew (log + continue), never a hard
 /// loop failure. Output: `{"ok": true, "renewed": N, "file_reservations": [...]}`.
 fn cmd_internal_renew_leases(cfg: &Config, project: &str, extend_seconds: u64) -> Result<()> {
-    let mut mail = backend::mail_backend(cfg)?;
-    let key = project_dir(cfg, project).to_str().unwrap().to_string();
+    let mail = backend::mail_backend(cfg)?;
+    let key = project_dir_str(cfg, project)?;
     mail.ensure_project(&key)?;
     // NOTE: MailBackend::name() returns the backend identifier ("agentmail"),
     // not the orchestrator's agent-mail identity — use the configured name so
