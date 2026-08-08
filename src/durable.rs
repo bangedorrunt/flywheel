@@ -1313,18 +1313,18 @@ fn digest_prefix(d: &MailDigest) -> Option<String> {
 }
 
 /// Wake prompt for an idle agent with urgent mail and an empty queue.
-/// Concrete + actionable: names the sender/thread and gives the exact MCP
-/// tools (toron is the one mail surface) — a vague "check your inbox" prompt
-/// gets acknowledged in-chat and never produces the actual mail reply
-/// (e2e-verified). The CLI has NO reply subcommand, so the wake references
-/// the toron MCP surface.
+/// Concrete + actionable: names the sender/thread and gives BOTH surfaces
+/// (toron MCP `reply_message` or `flywheel mail reply --message-id`) — a
+/// vague "check your inbox" prompt gets acknowledged in-chat and never
+/// produces the actual mail reply (e2e-verified).
 fn urgent_wake_prompt(d: &MailDigest) -> String {
     let mut line = format!(
         "MAIL WAKE: {} urgent message(s) in your inbox — a peer needs you. \
-         Fetch with toron `fetch_inbox` (agent={}, urgent_only=true), then \
-         REPLY to the most recent urgent one with toron `reply_message` using its thread_id \
-         (or send with the same thread_id). Your reply IS the work — do not just acknowledge in chat.",
+         Fetch with `flywheel mail inbox <project> --as {} --urgent`, then \
+         REPLY to the most recent urgent one with `flywheel mail reply <project> --message-id <id> --body '<answer>' --as {}` \
+         (or toron `reply_message` with the same thread_id). Your reply IS the work — do not just acknowledge in chat.",
         d.urgent,
+        d.agent,
         d.agent
     );
     if let Some(t) = &d.thread_id {
