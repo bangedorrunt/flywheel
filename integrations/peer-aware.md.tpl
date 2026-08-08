@@ -2,7 +2,7 @@
 
 The self-poll loop lives INSIDE the spawned agent (ADR-0001 §9.3). This
 template is the agent-side instruction: while working its primary task, the
-agent periodically checks its own agent-mail inbox and acts on urgent messages
+agent periodically checks its own toron inbox and acts on urgent messages
 from peers — waking them, replying, or escalating. No orchestrator in the
 peer-to-peer path.
 
@@ -18,7 +18,7 @@ Peer-awareness loop (run ON TOP of your primary task):
     2. For each URGENT message from a peer:
          - reply(P, ack) acknowledging you received it
          - if P needs help you can give: herdr agent prompt P '<help>' --wait
-         - else: escalate via agent-mail to the orchestrator/human
+         - else: escalate via toron mail to the orchestrator/human
     3. acknowledge_message on each ack_required message you have acted on
     4. update <last_poll> to the latest message timestamp you processed
 
