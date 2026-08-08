@@ -1,5 +1,14 @@
 # ADR-0003 — Reintroduce a Real agent-mail Backend (per-backend config, XDG, parity)
 
+> **Partially superseded 2026-08-09 (bd-adr7-mail-adapt-se2.3):** the
+> flywheel-local `MailBackend` trait this ADR's "first-class backend" describes
+> is DELETED. Both backends now implement the unified
+> `toron_core::mailbox::surface::MailSurface` trait (toron ADR-0007 D2/R1):
+> `AgentMailBackend` is an adapter (u64↔String ids only at the MCP edge), and
+> `ToronMailBackend` implements the same async trait. Config split, per-backend
+> routing, and the parity harness survive unchanged. See toron ADR-0007
+> Verification (se2.3) + `docs/parity/known-divergences.md §9`.
+
 | Field | Value |
 |-------|-------|
 | **Status** | Accepted (via 3-agent opencode debate, 2026-08-06) |
