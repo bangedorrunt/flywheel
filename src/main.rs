@@ -8,6 +8,7 @@ mod agentstate;
 mod backend;
 mod config;
 mod durable;
+mod fs_util;
 mod herdr_shim;
 mod mail_shim;
 mod mcp_http;
@@ -581,6 +582,10 @@ enum Commands {
         project: String,
         name: String,
         kind: String,
+        /// cg6.3: bypass the replay-idempotency guard (context_limit path —
+        /// an idle-but-exhausted agent is healthy and must still respawn).
+        #[arg(long)]
+        force: bool,
     },
 }
 fn cmd_internal_last_sent(_cfg: &Config, project: &str, name: &str, hash: u64) -> Result<()> {
@@ -1775,7 +1780,8 @@ fn main() {
             project,
             name,
             kind,
-        }) => cmd_internal_respawn(&cfg, project, name, kind),
+            force,
+        }) => cmd_internal_respawn(&cfg, project, name, kind, *force),
         None => {
             // no command: show concise help with examples
             print_concise_help();
@@ -8307,7 +8313,13 @@ fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
 
 /// internal leaf: close the agent's pane, split a fresh pane, restart the agent
 /// under the same name (fresh session context).
-fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> Result<()> {
+fn cmd_internal_respawn(
+    cfg: &Config,
+    project: &str,
+    name: &str,
+    kind: &str,
+    force: bool,
+) -> Result<()> {
     // review-fix F6: respawn routes through the backend factory (ADR-0002).
     let backend = backend::multiplexer_backend(cfg)?;
     let ws_id = find_workspace_dyn(&*backend, project)?;
@@ -8316,8 +8328,30 @@ fn cmd_internal_respawn(cfg: &Config, project: &str, name: &str, kind: &str) -> 
     // after they stop responding — the escalation path respawns exactly
     // those). The pane itself usually survives; split from any pane in the
     // workspace and skip closing an old pane we cannot identify.
-    let agent = backend
-        .agent_list()?
+    let agents = backend.agent_list()?;
+    // cg6.3: replay-idempotency guard — if an agent with this name already
+    // exists in this workspace with a HEALTHY status, the respawn already
+    // happened (crash-window replay of the same leaf, or a manual double
+    // call): no-op success instead of spawning a second twin. The
+    // context_limit carve-out (`--force`): an idle-but-exhausted agent is
+    // healthy and must still be respawned — its replay window (crash between
+    // the guard and the spawn) is a documented at-least-once residual.
+    if !force
+        && let Some(a) = agents.iter().find(|a| {
+            a.workspace_id == ws_id && a.name.as_deref() == Some(name)
+        })
+    {
+        let healthy = matches!(a.agent_status.as_str(), "idle" | "working" | "blocked");
+        if healthy {
+            print_json(&json!({
+                "already_exists": true,
+                "name": name,
+                "pane_id": a.pane_id,
+            }));
+            return Ok(());
+        }
+    }
+    let agent = agents
         .into_iter()
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name));
     let old_pane = agent.as_ref().map(|a| a.pane_id.clone());

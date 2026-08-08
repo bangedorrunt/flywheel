@@ -14,6 +14,21 @@
 //! only latency optimization. herdr has no since/seq replay. The heartbeat
 //! `__poll` (agent.list snapshot) is the correctness floor on every iteration
 //! and after crash-resume.
+//!
+//! **At-least-once + leaf idempotency (cg6.3):** leaves run under at-least-once
+//! delivery — a crash while a leaf is in flight re-invokes it on resume. Every
+//! SIDE-EFFECTING leaf is idempotent under that window:
+//! - `send_prompt` → the folded `__send` subprocess dedups via the
+//!   invocation-scoped `record_sent`/`should_resend` registry (main.rs);
+//! - `respawn_agent` → `__respawn` no-ops when an agent with the same name
+//!   already exists healthy in the workspace (main.rs; the `context_limit`
+//!   path passes `--force` and keeps a documented replay window);
+//! - `notify_blocked` → the persisted `last_ping_tier` marker gates the mail:
+//!   at most one ping per logical tier transition (durable.rs escalation
+//!   step);
+//! - `spawn_xproj` → the per-project `{project}.xproj-seen.jsonl` marker is
+//!   written BEFORE spawning: one swarm per message id.
+//!   Pure read leaves (poll_*) need no dedup — re-running them is harmless.
 
 use std::process::Command;
 
@@ -747,11 +762,21 @@ async fn read_output(args: ReadArgs) -> Result<ContextVerdict> {
 /// Replace an exhausted agent with a fresh instance in a new pane.
 /// Checkpointed. Logs a `Respawn` event (side effect inside the leaf so the
 /// log entry is checkpointed with the call).
+///
+/// cg6.3 replay-idempotency: `__respawn` no-ops when an agent with the same
+/// name already exists in a healthy state (the guard lives at the side
+/// effect). The context_limit path passes `--force`: an idle-but-exhausted
+/// agent is healthy and MUST still be respawned — its replay window is
+/// documented at `__respawn` (main.rs).
 #[function]
 async fn respawn_agent(args: RespawnArgs) -> Result<()> {
     let exe = self_exe().map_err(map_err)?;
-    let out = Command::new(&exe)
-        .args(["__respawn", &args.project, &args.name, &args.kind])
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__respawn", &args.project, &args.name, &args.kind]);
+    if args.reason == "context_limit" {
+        cmd.arg("--force");
+    }
+    let out = cmd
         .output()
         .map_err(|e| map_err(anyhow::anyhow!("__respawn spawn failed: {e}")))?;
     if !out.status.success() {
@@ -846,23 +871,29 @@ fn now_us_micros() -> i64 {
 }
 
 /// One escalation step (pure): derive the tier from the persisted
-/// first-blocked timestamp and increment the ping counter. Returns
-/// (tier 0..3, ping_count after increment). The leaf's state machine
-/// (cg6.1) — table-testable, deterministic from (first_blocked_ts, now).
+/// first-blocked timestamp and decide whether to MAIL. Returns
+/// (tier 0..3, ping_count, should_mail). cg6.3: the mail is gated on a
+/// TIER TRANSITION (`last_ping_tier` marker) — a replay re-execution at the
+/// same tier neither re-mails nor double-counts; at most one ping per
+/// logical tier transition (ADR-0001 §4.4's T0→T1→T2→T3 cadence).
 fn escalation_step(
     st: &mut crate::state::EscalationState,
     now_us: i64,
     interval_secs: u64,
-) -> (u32, u32) {
+) -> (u32, u32, bool) {
     let t = escalation_tier(st.first_blocked_ts, now_us, interval_secs);
-    st.ping_count = st.ping_count.saturating_add(1);
     let u = match t {
         EscalationTier::T0 => 0u32,
         EscalationTier::T1 => 1,
         EscalationTier::T2 => 2,
         EscalationTier::T3 => 3,
     };
-    (u, st.ping_count)
+    let should_mail = st.last_ping_tier != Some(u);
+    if should_mail {
+        st.ping_count = st.ping_count.saturating_add(1);
+        st.last_ping_tier = Some(u);
+    }
+    (u, st.ping_count, should_mail)
 }
 
 /// Load-or-init the escalation entry, run ONE escalation step, persist.
@@ -870,14 +901,16 @@ fn escalation_step(
 /// leaf (cg6.1). The tier derives from the PERSISTED first_blocked_ts (or the
 /// seed on a brand-new entry), never from a body-side re-read — replay of an
 /// in-flight leaf re-executes against the same persisted value, so the tier
-/// cannot jump across a crash boundary.
+/// cannot jump across a crash boundary. Returns (tier, ping_count,
+/// should_mail) — the mail decision comes from the persisted
+/// `last_ping_tier` marker (cg6.3), so a replay at the same tier no-ops.
 fn escalate_and_persist(
     project: &str,
     name: &str,
     first_blocked_seed: Option<i64>,
     interval_secs: u64,
     params: serde_json::Value,
-) -> anyhow::Result<(u32, u32)> {
+) -> anyhow::Result<(u32, u32, bool)> {
     let now_us = now_us_micros();
     let mut al = crate::state::load_active_loop(project)?
         .unwrap_or_else(|| crate::state::ActiveLoop::new("swarm-loop", params, crate::state::now_iso()));
@@ -887,11 +920,12 @@ fn escalate_and_persist(
         .or_insert_with(|| crate::state::EscalationState {
             first_blocked_ts: first_blocked_seed.unwrap_or(now_us),
             ping_count: 0,
+            last_ping_tier: None,
             last_tail: String::new(),
         });
-    let (tier, ping_count) = escalation_step(st, now_us, interval_secs);
+    let (tier, ping_count, should_mail) = escalation_step(st, now_us, interval_secs);
     crate::state::save_active_loop(project, &al)?;
-    Ok((tier, ping_count))
+    Ok((tier, ping_count, should_mail))
 }
 
 /// Notify a blocked agent via agent-mail. Checkpointed side effect — and
@@ -901,13 +935,14 @@ fn escalate_and_persist(
 /// workflow body only acts on the returned `EscalationOutcome`.
 ///
 /// At-least-once note (Resonate 0.6.0): a COMPLETED leaf invocation is never
-/// re-executed on replay (result checkpointed). The only double-ping window
-/// is a leaf IN-FLIGHT at crash; on re-execution the leaf derives from the
-/// persisted entry (same first_blocked_ts → same tier; ping_count advances
-/// from the persisted value, not from args) — the tier sequence cannot jump.
+/// re-executed on replay (result checkpointed). For an IN-FLIGHT leaf at
+/// crash, re-execution derives from the persisted entry — same
+/// first_blocked_ts → same tier, and the `last_ping_tier` marker (cg6.3)
+/// suppresses the duplicate mail: at most one ping per logical tier
+/// transition.
 #[function]
 async fn notify_blocked(args: NotifyArgs) -> Result<EscalationOutcome> {
-    let (tier, ping_count) = escalate_and_persist(
+    let (tier, ping_count, should_mail) = escalate_and_persist(
         &args.project,
         &args.name,
         args.first_blocked_ts,
@@ -915,22 +950,24 @@ async fn notify_blocked(args: NotifyArgs) -> Result<EscalationOutcome> {
         args.params,
     )
     .map_err(map_err)?;
-    let exe = self_exe().map_err(map_err)?;
-    let out = Command::new(&exe)
-        .args([
-            "__mail-blocked",
-            &args.project,
-            &args.name,
-            "--tier",
-            &tier.to_string(),
-        ])
-        .output()
-        .map_err(|e| map_err(anyhow::anyhow!("__mail-blocked spawn failed: {e}")))?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__mail-blocked failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+    if should_mail {
+        let exe = self_exe().map_err(map_err)?;
+        let out = Command::new(&exe)
+            .args([
+                "__mail-blocked",
+                &args.project,
+                &args.name,
+                "--tier",
+                &tier.to_string(),
+            ])
+            .output()
+            .map_err(|e| map_err(anyhow::anyhow!("__mail-blocked spawn failed: {e}")))?;
+        if !out.status.success() {
+            return Err(map_err(anyhow::anyhow!(
+                "__mail-blocked failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
     }
     Ok(EscalationOutcome { tier, ping_count })
 }
@@ -964,6 +1001,13 @@ async fn poll_xproj_inbox(args: XprojInboxArgs) -> Result<Vec<crate::XprojInboxI
 /// loop continues.
 #[function]
 async fn spawn_xproj(args: XprojSpawnArgs) -> Result<()> {
+    // cg6.3: at-most-once per request — mark BEFORE spawning so a crash-
+    // window replay no-ops instead of spawning two swarms for one [xproj]
+    // message (the loop's body-side seen_xproj set is re-seeded on replay).
+    if crate::state::xproj_seen_contains(&args.project, &args.message_id).map_err(map_err)? {
+        return Ok(());
+    }
+    crate::state::xproj_seen_mark(&args.project, &args.message_id).map_err(map_err)?;
     let exe = self_exe().map_err(map_err)?;
     let out = Command::new(&exe)
         .args([
@@ -4002,7 +4046,8 @@ mod resume_dedup_tests {
     }
 
     /// Pure: the step derives the tier from the persisted first-blocked
-    /// timestamp and increments the ping counter (saturating).
+    /// timestamp and mails ONCE per tier transition (cg6.3) — ping_count
+    /// increments only when a mail fires.
     #[test]
     fn escalation_step_bounds_tiers_and_increments_ping_count() {
         use crate::state::EscalationState;
@@ -4011,33 +4056,38 @@ mod resume_dedup_tests {
         let mut st = EscalationState {
             first_blocked_ts: 0,
             ping_count: 0,
+            last_ping_tier: None,
             last_tail: String::new(),
         };
-        // fresh: T0 + count 1
-        assert_eq!(escalation_step(&mut st, us(30), i), (0, 1));
-        // 2x interval: T1
-        assert_eq!(escalation_step(&mut st, us(60), i), (1, 2));
+        // fresh: T0 + count 1 + mail
+        assert_eq!(escalation_step(&mut st, us(30), i), (0, 1, true));
+        // 2x interval: T1 (transition → mail)
+        assert_eq!(escalation_step(&mut st, us(60), i), (1, 2, true));
         // 4x interval: T2
-        assert_eq!(escalation_step(&mut st, us(120), i), (2, 3));
+        assert_eq!(escalation_step(&mut st, us(120), i), (2, 3, true));
         // 8x interval: T3, bounded
-        assert_eq!(escalation_step(&mut st, i64::MAX, i), (3, 4));
+        assert_eq!(escalation_step(&mut st, i64::MAX, i), (3, 4, true));
+        // same tier again: NO mail, NO increment (cg6.3 — replay / same-tier tick)
+        assert_eq!(escalation_step(&mut st, i64::MAX, i), (3, 4, false));
         // overflow-safe: saturating add, never wraps
         let mut st2 = EscalationState {
             first_blocked_ts: 0,
             ping_count: u32::MAX,
+            last_ping_tier: None,
             last_tail: String::new(),
         };
-        assert_eq!(escalation_step(&mut st2, us(60), i), (1, u32::MAX));
+        assert_eq!(escalation_step(&mut st2, us(60), i), (1, u32::MAX, true));
     }
 
     /// Leaf-level (cg6.1): a fresh agent with no persisted entry starts at
-    /// T0 with ping_count 1 (first_blocked_ts seeded by the leaf).
+    /// T0 with ping_count 1 (first_blocked_ts seeded by the leaf; mails).
     #[test]
     fn escalate_and_persist_fresh_agent_starts_at_t0() {
         let _g = cg61_registry_guard();
         let project = cg61_test_project("fresh");
-        let (tier, count) = escalate_and_persist(&project, "agent-a", None, 30, json!({})).unwrap();
-        assert_eq!((tier, count), (0, 1), "first escalation is T0 + ping 1");
+        let (tier, count, mails) =
+            escalate_and_persist(&project, "agent-a", None, 30, json!({})).unwrap();
+        assert_eq!((tier, count, mails), (0, 1, true), "first escalation is T0 + ping 1 + mail");
         // the entry was persisted with the seeded timestamp
         let al = crate::state::load_active_loop(&project).unwrap().unwrap();
         let st = al.escalation.get("agent-a").expect("entry persisted");
@@ -4046,7 +4096,7 @@ mod resume_dedup_tests {
     }
 
     /// Leaf-level (cg6.1): a stale persisted first_blocked_ts (past the 8x
-    /// window) escalates straight to T3.
+    /// window) escalates straight to T3 (and mails — a tier transition).
     #[test]
     fn escalate_and_persist_stale_first_blocked_reaches_t3() {
         use crate::state::{ActiveLoop, EscalationState};
@@ -4059,36 +4109,46 @@ mod resume_dedup_tests {
             EscalationState {
                 first_blocked_ts: stale,
                 ping_count: 0,
+                last_ping_tier: None,
                 last_tail: String::new(),
             },
         );
         crate::state::save_active_loop(&project, &al).unwrap();
-        let (tier, count) = escalate_and_persist(&project, "agent-b", None, 30, json!({})).unwrap();
-        assert_eq!((tier, count), (3, 1), "stale first_blocked_ts → T3");
+        let (tier, count, mails) =
+            escalate_and_persist(&project, "agent-b", None, 30, json!({})).unwrap();
+        assert_eq!((tier, count, mails), (3, 1, true), "stale first_blocked_ts → T3 + mail");
         cg61_cleanup(&project);
     }
 
-    /// cg6.1 regression proof: re-execution (crash-window replay) derives the
-    /// tier from the PERSISTED first_blocked_ts, not from a fresh seed — the
-    /// tier cannot jump across the crash boundary and ping_count advances
-    /// from the persisted value.
+    /// cg6.1 + cg6.3 regression proof: re-execution (crash-window replay)
+    /// derives the tier from the PERSISTED first_blocked_ts — the tier cannot
+    /// jump across the crash boundary, and at the same tier the replay
+    /// neither re-mails nor double-counts (at most one ping per logical tier
+    /// transition).
     #[test]
     fn escalate_and_persist_replay_derives_from_persisted_first_blocked() {
         let _g = cg61_registry_guard();
         let project = cg61_test_project("replay");
         // seed ~1s ago: both executions land inside the T0 window
         let seed = now_us_micros() - 1_000_000;
-        let (t1, c1) = escalate_and_persist(&project, "agent-c", Some(seed), 30, json!({})).unwrap();
+        let (t1, c1, m1) =
+            escalate_and_persist(&project, "agent-c", Some(seed), 30, json!({})).unwrap();
         // "crash" — re-execution of the same leaf invocation, later wall-clock
-        let (t2, c2) = escalate_and_persist(&project, "agent-c", Some(seed), 30, json!({})).unwrap();
+        let (t2, c2, m2) =
+            escalate_and_persist(&project, "agent-c", Some(seed), 30, json!({})).unwrap();
         assert_eq!(t1, t2, "tier must not jump on replay");
-        assert_eq!(c1, 1);
-        assert_eq!(c2, 2, "ping_count advances from the PERSISTED value");
+        assert_eq!((c1, m1), (1, true));
+        assert_eq!(
+            (c2, m2),
+            (1, false),
+            "same-tier replay: no re-mail, no double-count (cg6.3)"
+        );
         // the persisted first_blocked_ts is the ORIGINAL seed, not a re-stamp
         let al = crate::state::load_active_loop(&project).unwrap().unwrap();
         let st = al.escalation.get("agent-c").unwrap();
         assert_eq!(st.first_blocked_ts, seed, "first_blocked_ts never re-seeded");
-        assert_eq!(st.ping_count, 2);
+        assert_eq!(st.ping_count, 1);
+        assert_eq!(st.last_ping_tier, Some(0), "T0 ping marked");
         cg61_cleanup(&project);
     }
 }
