@@ -684,7 +684,121 @@ enum MailCmd {
         #[arg(long = "as")]
         as_agent: Option<String>,
     },
-    /// per-agent mail digest: unread/urgent counts + last sender/subject
+    /// mark a message read (read receipt; the projection honors it once
+    /// read-state lands toron-side — bd-5icg)
+    Read {
+        project: String,
+        /// message id (toron hex event id)
+        #[arg(long = "message-id")]
+        message_id: String,
+        /// act as this registered agent (adjective+noun or herdr short name)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+    },
+    /// acknowledge a message that had ack_required=true
+    Ack {
+        project: String,
+        /// message id (toron hex event id)
+        #[arg(long = "message-id")]
+        message_id: String,
+        /// act as this registered agent (adjective+noun or herdr short name)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+    },
+    /// FTS5 search over the project's indexed messages
+    Search {
+        project: String,
+        /// FTS5 query (phrase/prefix/boolean; hyphenated ids are quoted)
+        query: String,
+        #[arg(long, default_value = "20")]
+        limit: u32,
+        /// filter by sender (adjective+noun or herdr name)
+        #[arg(long)]
+        sender: Option<String>,
+        /// filter by importance: low|normal|high|urgent
+        #[arg(long)]
+        importance: Option<String>,
+        /// filter to one thread (thread id or message id)
+        #[arg(long = "thread-id")]
+        thread_id: Option<String>,
+        /// newest first instead of relevance
+        #[arg(long)]
+        recency: bool,
+        /// include message bodies in results
+        #[arg(long)]
+        bodies: bool,
+    },
+    /// summarize a thread (participants, key points, action items)
+    Summarize {
+        project: String,
+        /// thread id or message id
+        #[arg(long = "thread-id")]
+        thread_id: String,
+        /// include up to 3 sample messages
+        #[arg(long)]
+        examples: bool,
+    },
+    /// resolve an agent's profile (npub, program, model, task)
+    Whois {
+        project: String,
+        /// agent (adjective+noun or herdr short name)
+        agent: String,
+    },
+    /// register/refresh an agent identity (upsert)
+    Register {
+        project: String,
+        /// agent name (adjective+noun; omit to auto-generate)
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value = "flywheel")]
+        program: String,
+        #[arg(long, default_value = "flywheel")]
+        model: String,
+        /// short task description shown in listings
+        #[arg(long)]
+        task: Option<String>,
+    },
+    /// renew this identity's file reservations (extend the TTL)
+    Renew {
+        project: String,
+        /// seconds to extend from the current expiry (default 3600)
+        #[arg(long, default_value = "3600")]
+        extend_seconds: u64,
+        /// restrict to these path patterns (default: all of this identity's)
+        #[arg(long)]
+        paths: Vec<String>,
+        /// act as this registered agent (adjective+noun or herdr short name)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+    },
+    /// operator force-release of a stale reservation (herdr-down / abandoned)
+    ForceUnlock {
+        project: String,
+        /// reservation id (toron kind-30031 event id)
+        #[arg(long = "reservation-id")]
+        reservation_id: String,
+        /// optional note for the released holder
+        #[arg(long)]
+        note: Option<String>,
+        /// act as this registered agent (adjective+noun or herdr short name)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+    },
+    /// build slots: acquire/renew/release the advisory 'cargo' slot
+    Slot {
+        #[command(subcommand)]
+        cmd: MailSlotCmd,
+    },
+    /// set this agent's inbound contact policy
+    Policy {
+        project: String,
+        /// policy: open|auto|contacts_only|block_all
+        #[arg(long)]
+        policy: String,
+        /// agent whose policy to set (default: config identity)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+    },    /// per-agent mail digest: unread/urgent counts + last sender/subject
     /// (orchestrator "who has mail" view; default = own identity)
     Digest {
         project: String,
@@ -887,6 +1001,43 @@ enum MailContactCmd {
         project: String,
         #[arg(long)]
         policy: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MailSlotCmd {
+    /// acquire the advisory build slot (exclusive recommended)
+    Acquire {
+        project: String,
+        #[arg(long, default_value = "cargo")]
+        slot: String,
+        #[arg(long)]
+        exclusive: bool,
+        #[arg(long, default_value = "1800")]
+        ttl_seconds: u64,
+        /// act as this registered agent (adjective+noun or herdr short name)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+    },
+    /// extend an active slot lease
+    Renew {
+        project: String,
+        #[arg(long, default_value = "cargo")]
+        slot: String,
+        #[arg(long, default_value = "1800")]
+        extend_seconds: u64,
+        /// act as this registered agent (adjective+noun or herdr short name)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+    },
+    /// release an active slot lease (non-destructive)
+    Release {
+        project: String,
+        #[arg(long, default_value = "cargo")]
+        slot: String,
+        /// act as this registered agent (adjective+noun or herdr short name)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
     },
 }
 
@@ -4108,6 +4259,181 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
             let v = mail.reply(&key, message_id, body, None)?;
+            print_json(&v);
+        }
+        MailCmd::Read {
+            project,
+            message_id,
+            as_agent,
+        } => {
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            let name = mail.name.clone();
+            let v = mail.mark_read(&key, &name, message_id)?;
+            print_json(&v);
+        }
+        MailCmd::Ack {
+            project,
+            message_id,
+            as_agent,
+        } => {
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            let name = mail.name.clone();
+            let v = mail.ack(&key, &name, message_id)?;
+            print_json(&v);
+        }
+        MailCmd::Search {
+            project,
+            query,
+            limit,
+            sender,
+            importance,
+            thread_id,
+            recency,
+            bodies,
+        } => {
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_or_die(cfg)?;
+            mail.ensure_project(&key)?;
+            let v = mail.search(
+                &key,
+                query,
+                *limit,
+                &mail_shim::MailSearchFilter {
+                    sender: sender.clone(),
+                    importance: importance.clone(),
+                    thread_id: thread_id.clone(),
+                    ranking: Some(if *recency { "recency" } else { "relevance" }.to_string()),
+                    include_body_md: *bodies,
+                    ..Default::default()
+                },
+            )?;
+            print_json(&v);
+        }
+        MailCmd::Summarize {
+            project,
+            thread_id,
+            examples,
+        } => {
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_or_die(cfg)?;
+            mail.ensure_project(&key)?;
+            let v = mail.summarize_thread(&key, thread_id, *examples)?;
+            print_json(&v);
+        }
+        MailCmd::Whois { project, agent } => {
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_or_die(cfg)?;
+            mail.ensure_project(&key)?;
+            let v = mail.whois(&key, agent)?;
+            print_json(&v);
+        }
+        MailCmd::Register {
+            project,
+            name,
+            program,
+            model,
+            task,
+        } => {
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_or_die(cfg)?;
+            mail.ensure_project(&key)?;
+            let name = name.clone().unwrap_or_default();
+            let v = mail.register_agent(
+                &key,
+                &name,
+                program,
+                model,
+                task.as_deref().unwrap_or("flywheel mail CLI actor"),
+            )?;
+            print_json(&v);
+        }
+        MailCmd::Renew {
+            project,
+            extend_seconds,
+            paths,
+            as_agent,
+        } => {
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            let name = mail.name.clone();
+            let v = mail.renew(&key, &name, *extend_seconds, Some(paths), None)?;
+            print_json(&v);
+        }
+        MailCmd::ForceUnlock {
+            project,
+            reservation_id,
+            note,
+            as_agent,
+        } => {
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            let name = mail.name.clone();
+            let v = mail.force_release_file_reservation(
+                &key,
+                &name,
+                reservation_id,
+                note.as_deref(),
+                false,
+            )?;
+            print_json(&v);
+        }
+        MailCmd::Slot { cmd } => match cmd {
+            MailSlotCmd::Acquire {
+                project,
+                slot,
+                exclusive,
+                ttl_seconds,
+                as_agent,
+            } => {
+                let key = project_dir_str(cfg, project)?;
+                let mail = mail_as(cfg, &key, as_agent.as_deref())?;
+                mail.ensure_project(&key)?;
+                let name = mail.name.clone();
+                let v = mail.acquire_slot(&key, &name, slot, *exclusive, *ttl_seconds)?;
+                print_json(&v);
+            }
+            MailSlotCmd::Renew {
+                project,
+                slot,
+                extend_seconds,
+                as_agent,
+            } => {
+                let key = project_dir_str(cfg, project)?;
+                let mail = mail_as(cfg, &key, as_agent.as_deref())?;
+                mail.ensure_project(&key)?;
+                let name = mail.name.clone();
+                let v = mail.renew_slot(&key, &name, slot, *extend_seconds)?;
+                print_json(&v);
+            }
+            MailSlotCmd::Release {
+                project,
+                slot,
+                as_agent,
+            } => {
+                let key = project_dir_str(cfg, project)?;
+                let mail = mail_as(cfg, &key, as_agent.as_deref())?;
+                mail.ensure_project(&key)?;
+                let name = mail.name.clone();
+                let v = mail.release_slot(&key, &name, slot)?;
+                print_json(&v);
+            }
+        },
+        MailCmd::Policy {
+            project,
+            policy,
+            as_agent,
+        } => {
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            let name = mail.name.clone();
+            let v = mail.set_contact_policy(&key, &name, policy)?;
             print_json(&v);
         }
         MailCmd::Digest {
