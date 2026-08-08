@@ -653,6 +653,14 @@ impl Mail {
         body: &str,
         to: Option<&[String]>,
     ) -> Result<Value> {
+        // toron's reply_message REQUIRES explicit recipients (no AM-style
+        // "default to original sender") — resolve the parent's sender from
+        // the inbox when the caller did not pass `to` (the common case:
+        // `flywheel mail reply --message-id X --body Y`).
+        let to: Option<Vec<String>> = match to {
+            Some(t) if !t.is_empty() => Some(t.to_vec()),
+            _ => self.parent_sender(project_key, message_id)?,
+        };
         match &self.backend {
             BackendKind::InProcess => {
                 // toron: the id IS the thread anchor (hex event id or the
@@ -660,7 +668,7 @@ impl Mail {
                 let result = block_on(mailbox().reply_message(&SendMessage {
                     project_slug: project_key.to_string(),
                     sender_name: self.name.clone(),
-                    to: to.map(|t| t.to_vec()).unwrap_or_default(),
+                    to: to.clone().unwrap_or_default(),
                     subject: String::new(),
                     body_md: body.to_string(),
                     thread_id: Some(message_id.to_string()),
@@ -673,7 +681,7 @@ impl Mail {
                 crate::backend::wire::reply_args(
                     project_key,
                     &self.name,
-                    &to.map(|t| t.to_vec()).unwrap_or_default(),
+                    &to.unwrap_or_default(),
                     // c3b.5: reply subject populated from the parent (`Re: `);
                     // was hardcoded `""` (unverified wire contract).
                     &self.parent_reply_subject(project_key, message_id)?,
@@ -683,6 +691,42 @@ impl Mail {
                 ),
             ),
         }
+    }
+
+    /// Resolve the sender of the message being replied to (for toron, which
+    /// requires explicit reply recipients). Looks the parent up in the
+    /// project inbox; returns `None` when the parent cannot be found (the
+    /// caller then fails with a clear message instead of a silent drop).
+    fn parent_sender(&self, project_key: &str, message_id: &str) -> Result<Option<Vec<String>>> {
+        let v = self.inbox_filtered(
+            project_key,
+            &self.name,
+            &MailInboxFilter {
+                unread_only: false,
+                include_bodies: false,
+                limit: 100,
+                ..Default::default()
+            },
+        )?;
+        let arr = v.as_array().cloned().unwrap_or_default();
+        for m in &arr {
+            let id = m
+                .get("id")
+                .or_else(|| m.get("message_id"))
+                .and_then(|i| i.as_str());
+            let thread = m.get("thread_id").and_then(|t| t.as_str());
+            if id == Some(message_id) || thread == Some(message_id) {
+                let sender = m
+                    .get("sender")
+                    .or_else(|| m.get("from"))
+                    .and_then(|s| s.as_str())
+                    .map(String::from);
+                if sender.is_some() {
+                    return Ok(sender.map(|s| vec![s]));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// c3b.5: resolve the `Re: <parent subject>` subject for a reply. Looks

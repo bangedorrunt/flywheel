@@ -289,11 +289,16 @@ fn default_xproj_limit() -> u32 {
 }
 
 /// Mail digest for one agent (loop-side wake signal, fed by `__mail-digest`).
+///
+/// Honest fields: toron's projection has NO read-state (`unread_only` is a
+/// documented no-op — "fresh on first read"), so the digest reports the
+/// RECENT inbox window plus URGENT (importance high|urgent) — both real
+/// message attributes. `urgent` is the wake trigger.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MailDigest {
     pub agent: String,
     #[serde(default)]
-    pub unread: usize,
+    pub recent: usize,
     #[serde(default)]
     pub urgent: usize,
     #[serde(default)]
@@ -304,7 +309,7 @@ pub struct MailDigest {
     pub thread_id: Option<String>,
 }
 
-/// Args for the mail-digest leaf: which agents' unread mail to summarize.
+/// Args for the mail-digest leaf: which agents' mail to summarize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailDigestArgs {
     pub project: String,
@@ -1242,11 +1247,12 @@ pub fn lease_renew_seconds(heartbeat_interval_secs: u64) -> u64 {
 /// templates (token-efficient: agents hold NO standing polling instructions;
 /// the orchestrator polls once per iteration):
 ///   - a dispatched prompt is prefixed with a compact mail line when the
-///     agent has unread mail (`[mail] 2 unread (last: X re: Y)`) so the
-///     agent wakes already knowing a peer asked it something;
-///   - an idle agent with URGENT unread mail and an empty queue gets a wake
+///     agent has recent mail (`[mail] 2 recent (1 urgent) (last: X re: Y)`)
+///     so the agent wakes already knowing a peer asked it something;
+///   - an idle agent with URGENT mail and an empty queue gets a wake
 ///     prompt instead of silent `Wait` — it is asked to check + reply, then
-///     await work. Urgent mail IS work.
+///     await work. Urgent mail IS work. (toron has no read-state: "recent"
+///     is the inbox projection window; "urgent" is importance high|urgent.)
 ///
 /// `DispatchImmediate` is the event-path twin of `Send` (bd-event-dispatch):
 /// same `__send` leaf, same FIFO pop, marked so the loop can track
@@ -1281,12 +1287,18 @@ pub enum LoopAction {
     Wait,
 }
 
-/// One-line mail digest prefix for a prompt, when the agent has unread mail.
+/// One-line mail digest prefix for a prompt, when the agent has recent mail.
+/// Uses `recent` (the honest toron projection window — there is no read
+/// state) and names the last sender/subject so the agent knows a peer asked
+/// it something.
 fn digest_prefix(d: &MailDigest) -> Option<String> {
-    if d.unread == 0 {
+    if d.recent == 0 {
         return None;
     }
-    let mut line = format!("[mail] {} unread", d.unread);
+    let mut line = format!("[mail] {} recent", d.recent);
+    if d.urgent > 0 {
+        line.push_str(&format!(" ({} urgent)", d.urgent));
+    }
     if let (Some(f), Some(s)) = (&d.last_from, &d.last_subject) {
         line.push_str(&format!(" (last: {f} re: {s})"));
     } else if let Some(f) = &d.last_from {
@@ -1295,14 +1307,26 @@ fn digest_prefix(d: &MailDigest) -> Option<String> {
     Some(line)
 }
 
-/// Wake prompt for an idle agent with urgent unread mail and an empty queue.
+/// Wake prompt for an idle agent with urgent mail and an empty queue.
+/// Concrete + actionable: names the sender/thread and gives the exact MCP
+/// tools (toron is the one mail surface) — a vague "check your inbox" prompt
+/// gets acknowledged in-chat and never produces the actual mail reply
+/// (e2e-verified). The CLI has NO reply subcommand, so the wake references
+/// the toron MCP surface.
 fn urgent_wake_prompt(d: &MailDigest) -> String {
     let mut line = format!(
-        "MAIL WAKE: {} urgent unread in your inbox. Check it and reply in-thread where needed, then await work.",
-        d.urgent
+        "MAIL WAKE: {} urgent message(s) in your inbox — a peer needs you. \
+         Fetch with toron `fetch_inbox` (agent={}, urgent_only=true), then \
+         REPLY to the most recent urgent one with toron `reply_message` using its thread_id \
+         (or send with the same thread_id). Your reply IS the work — do not just acknowledge in chat.",
+        d.urgent,
+        d.agent
     );
+    if let Some(t) = &d.thread_id {
+        line.push_str(&format!(" Latest urgent thread: {t}"));
+    }
     if let (Some(f), Some(s)) = (&d.last_from, &d.last_subject) {
-        line.push_str(&format!(" Latest: {f} re: {s}"));
+        line.push_str(&format!(" ({f} re: {s})"));
     }
     line
 }
@@ -1350,7 +1374,7 @@ pub fn plan_actions(
                 } else if let Some(d) = digests.get(&s.name)
                     && d.urgent > 0
                 {
-                    // urgent unread mail with nothing queued: wake the agent
+                    // urgent mail with nothing queued: wake the agent
                     // to handle it — mail IS work (loop-side wake, no
                     // per-agent polling template).
                     actions.push(LoopAction::Send {
@@ -2197,7 +2221,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // heartbeat path: full-snapshot reconciliation (skips agents already
         // dispatch-pending so event path and poll path don't double-feed)
         // Loop-side mail wake: fetch per-agent digests ONCE per iteration
-        // (checkpointed leaf). Idle agents with unread mail get the digest
+        // (checkpointed leaf). Idle agents with recent mail get the digest
         // prefixed to their next prompt; idle agents with URGENT mail and an
         // empty queue get woken directly. This replaces per-agent peer-poll
         // templates — agents hold no standing polling instructions.
@@ -3385,10 +3409,10 @@ mod tests {
 
     // ---- loop-side mail wake (replaces per-agent peer-poll templates) ----
 
-    fn digest(unread: usize, urgent: usize, from: &str, subj: &str) -> MailDigest {
+    fn digest(recent: usize, urgent: usize, from: &str, subj: &str) -> MailDigest {
         MailDigest {
             agent: "flywheel-proj-oc".into(),
-            unread,
+            recent,
             urgent,
             last_from: (!from.is_empty()).then(|| from.to_string()),
             last_subject: (!subj.is_empty()).then(|| subj.to_string()),
@@ -3411,7 +3435,7 @@ mod tests {
         match &actions[0] {
             LoopAction::Send { text, .. } => {
                 assert!(
-                    text.starts_with("[mail] 2 unread (last: PinkGorge re: [bd-1] need input)\ndo the work"),
+                    text.starts_with("[mail] 2 recent (1 urgent) (last: PinkGorge re: [bd-1] need input)\ndo the work"),
                     "digest must prefix the prompt: {text}"
                 );
             }
@@ -3420,7 +3444,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_actions_skips_digest_prefix_when_no_unread() {
+    fn plan_actions_skips_digest_prefix_when_no_mail() {
         let mut queue = vec!["do the work".to_string()];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(0, 0, "", ""));
@@ -3433,7 +3457,7 @@ mod tests {
 
     #[test]
     fn plan_actions_wakes_idle_agent_on_urgent_mail_with_empty_queue() {
-        // idle + urgent unread + empty queue → wake prompt, not silent Wait
+        // idle + urgent mail + empty queue → wake prompt, not silent Wait
         let mut queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] help needed"));
@@ -3441,7 +3465,7 @@ mod tests {
         match &actions[0] {
             LoopAction::Send { text, .. } => {
                 assert!(
-                    text.contains("MAIL WAKE: 1 urgent unread"),
+                    text.contains("MAIL WAKE: 1 urgent"),
                     "wake prompt must say urgent: {text}"
                 );
                 assert!(text.contains("PinkGorge re: [bd-1] help needed"));
