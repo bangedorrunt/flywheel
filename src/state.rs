@@ -91,6 +91,11 @@ pub struct EscalationState {
     /// Deterministic timestamp (Resonate ctx.now, µs). Never wall-clock.
     pub first_blocked_ts: i64,
     pub ping_count: u32,
+    /// The tier whose ping was last SENT (cg6.3): a replay re-execution at the
+    /// same tier must not re-mail — at most one ping per logical tier
+    /// transition. `None` = no ping sent yet.
+    #[serde(default)]
+    pub last_ping_tier: Option<u32>,
     #[serde(default)]
     pub last_tail: String,
 }
@@ -333,6 +338,41 @@ pub fn remove_active_loop(project: &str) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Per-project seen-marker file for cross-project spawns (cg6.3): one
+/// message_id per line. The `spawn_xproj` leaf marks BEFORE spawning so a
+/// crash-window replay no-ops instead of spawning two swarms for one request.
+pub fn xproj_seen_file(project: &str) -> PathBuf {
+    state_dir().join(format!("{project}.xproj-seen.jsonl"))
+}
+
+/// True when `message_id` was already marked (at-most-once dedup).
+pub fn xproj_seen_contains(project: &str, message_id: &str) -> Result<bool> {
+    let path = xproj_seen_file(project);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = std::fs::read_to_string(&path)?;
+    Ok(raw.lines().any(|l| l.trim() == message_id))
+}
+
+/// Mark `message_id` as spawned (idempotent append; one id per line).
+pub fn xproj_seen_mark(project: &str, message_id: &str) -> Result<()> {
+    if xproj_seen_contains(project, message_id)? {
+        return Ok(());
+    }
+    let path = xproj_seen_file(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    use std::io::Write;
+    writeln!(f, "{message_id}")?;
+    Ok(())
 }
 
 pub fn project_log_path(project: &str) -> PathBuf {
@@ -765,6 +805,7 @@ mod loops_schema_v2_tests {
             EscalationState {
                 first_blocked_ts: 1_700_000_000_000_000, // µs, ctx.now-shaped
                 ping_count: 2,
+                last_ping_tier: None,
                 last_tail: "stuck on cargo".into(),
             },
         );
@@ -1102,6 +1143,7 @@ mod loops_sidecar_tests {
             EscalationState {
                 first_blocked_ts: 1_700_000_000_000_000,
                 ping_count,
+                last_ping_tier: None,
                 last_tail: String::new(),
             },
         );
@@ -1241,6 +1283,25 @@ mod loops_sidecar_tests {
         remove_active_loop(&p).unwrap();
         assert!(!sidecar_file(&p).exists());
         remove_active_loop(&p).unwrap(); // idempotent
+    }
+
+    /// cg6.3: the xproj seen-marker dedups one message id — mark is
+    /// idempotent and no line is ever duplicated.
+    #[test]
+    fn xproj_seen_marker_dedups() {
+        let _g = loops_test_guard();
+        let project = test_project("xproj");
+        let id = "deadbeef-xproj-msg-1";
+        let path = xproj_seen_file(&project);
+        let _ = std::fs::remove_file(&path);
+        assert!(!xproj_seen_contains(&project, id).unwrap());
+        xproj_seen_mark(&project, id).unwrap();
+        assert!(xproj_seen_contains(&project, id).unwrap());
+        xproj_seen_mark(&project, id).unwrap(); // idempotent re-mark
+        xproj_seen_mark(&project, "second-msg-2").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 2, "no duplicate marker lines");
+        let _ = std::fs::remove_file(&path);
     }
 
     // ---- l4s.2: read failures propagate, never clobber ----
