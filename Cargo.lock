@@ -901,6 +901,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "evalexpr"
+version = "13.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25929004897f2bbab309121a60400d36992f6d911d09baa6c172f6cc55706601"
+
+[[package]]
 name = "event-listener"
 version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -970,6 +976,7 @@ dependencies = [
  "toml",
  "toron-core",
  "toron-mcp",
+ "toron-workflow",
  "ureq",
 ]
 
@@ -3065,6 +3072,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3753,7 +3773,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "toron-core"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3779,7 +3799,7 @@ dependencies = [
 
 [[package]]
 name = "toron-mcp"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -3791,6 +3811,23 @@ dependencies = [
  "tokio-util",
  "toron-core",
  "tracing",
+]
+
+[[package]]
+name = "toron-workflow"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "evalexpr",
+ "nostr-sdk",
+ "parking_lot",
+ "resonate-sdk 0.4.0",
+ "resonate-sdk-macros",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "toron-core",
 ]
 
 [[package]]
@@ -3986,6 +4023,12 @@ dependencies = [
  "crypto-common",
  "subtle",
 ]
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
