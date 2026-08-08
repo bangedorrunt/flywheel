@@ -345,15 +345,12 @@ impl Mail {
         &mut self,
         project_key: &str,
         agent_name: &str,
-        message_id: u64,
+        message_id: &str,
     ) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
-                let r = block_on(mailbox().mark_message_read(
-                    project_key,
-                    agent_name,
-                    &message_id.to_string(),
-                ))?;
+                // toron ids are hex event ids — pass through verbatim.
+                let r = block_on(mailbox().mark_message_read(project_key, agent_name, message_id))?;
                 Ok(r.to_json())
             }
             BackendKind::Remote(_) => self.call_remote(
@@ -361,21 +358,18 @@ impl Mail {
                 json!({
                     "project_key": project_key,
                     "agent_name": agent_name,
-                    "message_id": message_id as i64,
+                    "message_id": message_id.parse::<u64>().unwrap_or(0) as i64,
                 }),
             ),
         }
     }
 
     /// `acknowledge_message`.
-    pub fn ack(&mut self, project_key: &str, agent_name: &str, message_id: u64) -> Result<Value> {
+    pub fn ack(&mut self, project_key: &str, agent_name: &str, message_id: &str) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
-                let r = block_on(mailbox().acknowledge_message(
-                    project_key,
-                    agent_name,
-                    &message_id.to_string(),
-                ))?;
+                // toron ids are hex event ids — pass through verbatim.
+                let r = block_on(mailbox().acknowledge_message(project_key, agent_name, message_id))?;
                 Ok(r.to_json())
             }
             BackendKind::Remote(_) => self.call_remote(
@@ -383,7 +377,7 @@ impl Mail {
                 json!({
                     "project_key": project_key,
                     "agent_name": agent_name,
-                    "message_id": message_id as i64,
+                    "message_id": message_id.parse::<u64>().unwrap_or(0) as i64,
                 }),
             ),
         }
@@ -465,12 +459,14 @@ impl Mail {
     pub fn reply(
         &mut self,
         project_key: &str,
-        message_id: u64,
+        message_id: &str,
         body: &str,
         to: Option<&[String]>,
     ) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
+                // toron: the id IS the thread anchor (hex event id or the
+                // free-form thread id — both flow through the `thread` tag).
                 let result = block_on(mailbox().reply_message(&SendMessage {
                     project_slug: project_key.to_string(),
                     sender_name: self.name.clone(),

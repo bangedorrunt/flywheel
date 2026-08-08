@@ -550,7 +550,7 @@ enum Commands {
     #[command(name = "__xproj-spawn", hide = true)]
     __XprojSpawn {
         project: String,
-        message_id: u64,
+        message_id: String,
         thread_id: String,
         from: String,
         recipe: String,
@@ -1727,7 +1727,7 @@ fn main() {
         }) => cmd_internal_xproj_spawn(
             &cfg,
             project,
-            *message_id,
+            message_id.as_str(),
             thread_id,
             from,
             recipe,
@@ -3508,13 +3508,33 @@ pub struct XprojRequest {
 }
 
 /// One `[xproj]` inbox hit for the durable loop (bd-pattern-cross-project-swarm).
+///
+/// `id` is a String because the mail backend's id type varies: agent-mail
+/// emits u64 sequence numbers, toron emits hex event ids. Accept both on
+/// deserialize so the xproj fan-out works against either backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct XprojInboxItem {
-    pub id: u64,
+    #[serde(deserialize_with = "de_id_string")]
+    pub id: String,
     pub subject: String,
     pub body: String,
     pub thread_id: String,
     pub from: String,
+}
+
+/// Deserialize a message id that may arrive as a JSON number (agent-mail) or
+/// a string (toron hex event id). Both normalize to a string.
+pub fn de_id_string<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let v = serde_json::Value::deserialize(d)?;
+    match v {
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        _ => Err(D::Error::custom("message id must be a string or number")),
+    }
 }
 
 /// Build the worker queue prompt for a cross-project request.
@@ -3564,7 +3584,12 @@ pub fn extract_xproj_from_inbox(v: &serde_json::Value) -> Vec<XprojInboxItem> {
         if !combined.to_ascii_lowercase().contains("[xproj]") {
             continue;
         }
-        let id = m.get("id").and_then(|i| i.as_u64()).unwrap_or(0);
+        // id: agent-mail emits numbers, toron emits hex strings — accept both.
+        let id = match m.get("id") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            _ => String::new(),
+        };
         let thread_id = m
             .get("thread_id")
             .and_then(|t| t.as_str())
@@ -3590,8 +3615,8 @@ pub fn extract_xproj_from_inbox(v: &serde_json::Value) -> Vec<XprojInboxItem> {
 /// Filter unseen xproj items and produce (message_id, queue_prompt) pairs.
 pub fn xproj_prompts_for_unseen(
     items: &[XprojInboxItem],
-    seen: &std::collections::HashSet<u64>,
-) -> Vec<(u64, String)> {
+    seen: &std::collections::HashSet<String>,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for item in items {
         if seen.contains(&item.id) {
@@ -3599,7 +3624,7 @@ pub fn xproj_prompts_for_unseen(
         }
         let combined = format!("{}\n{}", item.subject, item.body);
         if let Some(req) = parse_xproj_request(&combined) {
-            out.push((item.id, xproj_queue_prompt(item, &req)));
+            out.push((item.id.clone(), xproj_queue_prompt(item, &req)));
         }
     }
     out
@@ -8339,7 +8364,7 @@ fn cmd_internal_xproj_inbox(cfg: &Config, project: &str, limit: u32) -> Result<(
 fn cmd_internal_xproj_spawn(
     cfg: &Config,
     project: &str,
-    message_id: u64,
+    message_id: &str,
     thread_id: &str,
     from: &str,
     recipe: &str,
@@ -8951,12 +8976,12 @@ mod xproj_tests {
         ]);
         let items = extract_xproj_from_inbox(&v);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].id, 2);
+        assert_eq!(items[0].id, "2");
         let mut seen = std::collections::HashSet::new();
         let prompts = xproj_prompts_for_unseen(&items, &seen);
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].1.contains("recipe=daily"));
-        seen.insert(2);
+        seen.insert("2".to_string());
         assert!(xproj_prompts_for_unseen(&items, &seen).is_empty());
     }
 }

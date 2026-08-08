@@ -237,7 +237,7 @@ pub trait MailBackend: Send + Sync {
     fn reply(
         &mut self,
         _project_key: &str,
-        _message_id: u64,
+        _message_id: &str,
         _body: &str,
         _to: Option<&[String]>,
     ) -> Result<Value> {
@@ -246,10 +246,10 @@ pub trait MailBackend: Send + Sync {
     fn inbox(&mut self, _project_key: &str, _agent: &str, _filter: &InboxFilter) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "inbox"))
     }
-    fn ack(&mut self, _project_key: &str, _agent: &str, _message_id: u64) -> Result<Value> {
+    fn ack(&mut self, _project_key: &str, _agent: &str, _message_id: &str) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "ack"))
     }
-    fn mark_read(&mut self, _project_key: &str, _agent: &str, _message_id: u64) -> Result<Value> {
+    fn mark_read(&mut self, _project_key: &str, _agent: &str, _message_id: &str) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "mark_read"))
     }
     fn reserve(

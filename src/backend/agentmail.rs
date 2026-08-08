@@ -129,7 +129,7 @@ impl MailBackend for AgentMailBackend {
     fn reply(
         &mut self,
         project_key: &str,
-        message_id: u64,
+        message_id: &str,
         body: &str,
         to: Option<&[String]>,
     ) -> Result<Value> {
@@ -143,7 +143,7 @@ impl MailBackend for AgentMailBackend {
                 "to": to.map(|t| t.to_vec()).unwrap_or_default(),
                 "subject": "",
                 "body_md": body,
-                "message_id": message_id as i64,
+                "message_id": message_id.parse::<u64>().unwrap_or(0) as i64,
             }),
         )
     }
@@ -163,24 +163,24 @@ impl MailBackend for AgentMailBackend {
         self.call("fetch_inbox", Value::Object(args))
     }
 
-    fn ack(&mut self, project_key: &str, agent: &str, message_id: u64) -> Result<Value> {
+    fn ack(&mut self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
         self.call(
             "acknowledge_message",
             json!({
                 "project_key": project_key,
                 "agent_name": agent,
-                "message_id": message_id as i64,
+                "message_id": message_id.parse::<u64>().unwrap_or(0) as i64,
             }),
         )
     }
 
-    fn mark_read(&mut self, project_key: &str, agent: &str, message_id: u64) -> Result<Value> {
+    fn mark_read(&mut self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
         self.call(
             "mark_message_read",
             json!({
                 "project_key": project_key,
                 "agent_name": agent,
-                "message_id": message_id as i64,
+                "message_id": message_id.parse::<u64>().unwrap_or(0) as i64,
             }),
         )
     }
