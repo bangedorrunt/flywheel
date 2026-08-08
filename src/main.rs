@@ -20,6 +20,7 @@ mod builtin_workflows;
 mod state;
 mod toron_embed;
 mod work;
+mod cron;
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -404,6 +405,14 @@ enum Commands {
     Workflow {
         #[command(subcommand)]
         cmd: WorkflowCmd,
+    },
+    /// Smart-cron surface (ADR-0005 Spec 3 / P4.6) — the flywheel half of
+    /// cron: registered schedules + schedule-triggered workflows, pause/
+    /// resume, status + history. The P4.3 cron manager drives ticks off this
+    /// registry; this CLI owns the catalog + control surface.
+    Cron {
+        #[command(subcommand)]
+        cmd: CronCmd,
     },
     /// N-round A/B debate + judge (ADR-0001 §9.1 — threaded, ack-gated)
     Debate {
@@ -1121,6 +1130,71 @@ enum WorkflowCmd {
     },
 }
 
+/// `flywheel cron` subcommands (ADR-0005 Spec 3, P4.6): the smart-cron
+/// catalog + control surface. The P4.3 cron manager (Resonate durable-sleep
+/// loop) drives ticks off the same `crons.toml` registry this CLI writes.
+#[derive(Subcommand)]
+enum CronCmd {
+    /// List registered crons + schedule-triggered workflows
+    List {
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one cron's registration + policy
+    Show {
+        /// cron name
+        name: String,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register a new cron bound to a workflow template
+    Add {
+        /// cron name (identifier used by pause/resume/history/status)
+        name: String,
+        /// workflow template to run on each tick
+        #[arg(long)]
+        template: String,
+        /// 5-field cron expression ("30 3 * * 0")
+        #[arg(long)]
+        cron: String,
+        /// owning profile (Spec 3: the fixer's identity)
+        #[arg(long)]
+        owner: String,
+        /// signing scope: host = operator identity, project = scoped agent
+        #[arg(long, value_parser = ["host", "project"])]
+        scope: Option<String>,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pause a cron (entry preserved; nothing fires)
+    Pause {
+        /// cron name
+        name: String,
+    },
+    /// Resume a paused cron
+    Resume {
+        /// cron name
+        name: String,
+    },
+    /// Status of every cron: paused | due | running | succeeded | failed
+    Status {
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run history for a cron (state-log scan + failure beads)
+    History {
+        /// cron name
+        name: String,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 fn parse_kind_count(s: &str) -> Result<(String, u32)> {
     let (k, v) = s
         .split_once('=')
@@ -1566,6 +1640,7 @@ fn main() {
         Some(Commands::Squad { cmd }) => cmd_squad(&cfg, cmd),
         Some(Commands::Runs { cmd }) => cmd_runs(&cfg, cmd),
         Some(Commands::Workflow { cmd }) => cmd_workflow(cmd),
+        Some(Commands::Cron { cmd }) => cmd_cron(cmd),
         Some(Commands::Debate {
             proposition,
             rounds,
@@ -6499,6 +6574,323 @@ fn cmd_workflow(cmd: &WorkflowCmd) -> Result<()> {
                 return Ok(());
             }
             print_json(&json!({ "workflow": name, "crew": members }));
+            Ok(())
+        }
+    }
+}
+
+/// `flywheel cron` — the smart-cron catalog + control surface (ADR-0005
+/// Spec 3 / P4.6). The merged view spans the `crons.toml` registry (written
+/// by `add`/`pause`/`resume`) and every schedule-triggered workflow in the
+/// catalog + built-ins. Status is derived from the state log; the P4.3
+/// durable-sleep manager will drive ticks off the same registry.
+fn cmd_cron(cmd: &CronCmd) -> Result<()> {
+    use cron::{CronEntry, Crons, derive_status, merged_entries, next_due, row_json};
+    use state::EventKind;
+    use toron_workflow::schema::{CronScope, Workflow};
+
+    /// The full workflow set (built-ins + catalog), mirroring cmd_workflow.
+    fn all_workflows() -> Result<BTreeMap<String, (Workflow, &'static str)>> {
+        let mut out: BTreeMap<String, (Workflow, &'static str)> = BTreeMap::new();
+        for (name, wf) in builtin_workflows::builtin_workflows() {
+            out.insert(name, (wf, "builtin"));
+        }
+        let cat = workflow_catalog::WorkflowCatalog::load()?;
+        for (name, wf) in cat.workflows {
+            out.insert(name, (wf, "catalog"));
+        }
+        Ok(out)
+    }
+
+    /// Last terminal status for a workflow from the state log, plus whether a
+    /// run is currently in flight (a workflow event with no terminal status).
+    fn last_run_state(name: &str) -> (Option<String>, bool) {
+        use state::read_log;
+        let dir = config::state_dir();
+        let mut last_status: Option<String> = None;
+        let mut in_flight = false;
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return (None, false);
+        };
+        for entry in entries.flatten() {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if !fname.ends_with(".jsonl") {
+                continue;
+            }
+            let project = fname.trim_end_matches(".jsonl").to_string();
+            let Ok(events) = read_log(&project) else {
+                continue;
+            };
+            for e in events {
+                if e.kind != EventKind::Workflow {
+                    continue;
+                }
+                let owner = e.data.get("workflow").and_then(Value::as_str);
+                if owner != Some(name) {
+                    continue;
+                }
+                match e.data.get("status").and_then(Value::as_str) {
+                    Some(s) if s == "failed" || s == "succeeded" => last_status = Some(s.to_string()),
+                    Some(s) if s == "running" => in_flight = true,
+                    _ => {}
+                }
+            }
+        }
+        (last_status, in_flight)
+    }
+
+    let render = |mc: &cron::MergedCron, json: bool| -> Result<()> {
+        let (last, in_flight) = last_run_state(&mc.entry.name);
+        let status = derive_status(mc.entry.enabled, in_flight, last.as_deref());
+        let due = next_due(&mc.entry.cron, chrono::Utc::now().timestamp());
+        let row = row_json(mc, status, due);
+        if json {
+            println!("{}", serde_json::to_string_pretty(&row)?);
+        } else {
+            println!(
+                "{:<28} {:<8} {:<8} {:<22} {:<6} {:<9} {:<8}",
+                mc.entry.name,
+                mc.entry.template,
+                mc.entry.cron,
+                mc.entry.owner,
+                match mc.entry.scope {
+                    CronScope::Host => "host",
+                    CronScope::Project => "project",
+                },
+                status,
+                if mc.entry.enabled { "on" } else { "paused" },
+            );
+        }
+        Ok(())
+    };
+
+    match cmd {
+        CronCmd::List { json } => {
+            let crons = Crons::load()?;
+            let all = all_workflows()?;
+            let merged = merged_entries(&crons, &all);
+            if merged.is_empty() {
+                println!("no crons defined");
+                return Ok(());
+            }
+            if *json {
+                let rows: Vec<Value> = merged
+                    .iter()
+                    .map(|mc| {
+                        let (last, in_flight) = last_run_state(&mc.entry.name);
+                        let status = derive_status(mc.entry.enabled, in_flight, last.as_deref());
+                        let due = next_due(&mc.entry.cron, chrono::Utc::now().timestamp());
+                        row_json(mc, status, due)
+                    })
+                    .collect();
+                print_json(&json!({ "crons": rows }));
+            } else {
+                println!(
+                    "{:<28} {:<8} {:<8} {:<22} {:<6} {:<9} {:<8}",
+                    "NAME", "TEMPLATE", "CRON", "OWNER", "SCOPE", "STATUS", "STATE"
+                );
+                for mc in &merged {
+                    render(mc, false)?;
+                }
+            }
+            Ok(())
+        }
+        CronCmd::Show { name, json } => {
+            let crons = Crons::load()?;
+            let all = all_workflows()?;
+            let merged = merged_entries(&crons, &all);
+            let mc = merged
+                .iter()
+                .find(|m| m.entry.name == *name)
+                .ok_or_else(|| anyhow!("unknown cron {name:?} (flywheel cron list)"))?;
+            if *json {
+                render(mc, true)?;
+            } else {
+                let (last, in_flight) = last_run_state(&mc.entry.name);
+                let status = derive_status(mc.entry.enabled, in_flight, last.as_deref());
+                let due = next_due(&mc.entry.cron, chrono::Utc::now().timestamp());
+                println!("name:     {}", mc.entry.name);
+                println!("template: {}", mc.entry.template);
+                println!("cron:     {}", mc.entry.cron);
+                println!("owner:    {}", mc.entry.owner);
+                println!(
+                    "scope:    {}",
+                    match mc.entry.scope {
+                        CronScope::Host => "host",
+                        CronScope::Project => "project",
+                    }
+                );
+                println!("source:   {}", mc.source);
+                println!("status:   {status}");
+                if let Some(d) = due {
+                    println!("next_due: {d}");
+                }
+                if let Some(wf) = all.get(&mc.entry.template) {
+                    if let Some(p) = &wf.0.policy {
+                        println!("policy:   {p:?}");
+                    }
+                }
+            }
+            Ok(())
+        }
+        CronCmd::Add {
+            name,
+            template,
+            cron,
+            owner,
+            scope,
+            json,
+        } => {
+            // fail-stop validation, mirroring lint_flywheel_tier: the template
+            // must resolve, the owner profile must exist, the cron must parse.
+            let all = all_workflows()?;
+            if !all.contains_key(template) {
+                bail!("template {template:?} does not resolve (flywheel workflow list)");
+            }
+            let profiles = profile::ProfileCatalog::load().unwrap_or_default();
+            if !profiles.get(owner).is_some() {
+                bail!("owner profile {owner:?} does not resolve (known: {})", profiles.names().join(", "));
+            }
+            let scope = match scope.as_deref() {
+                Some("host") | None => CronScope::Host,
+                Some("project") => CronScope::Project,
+                Some(other) => bail!("scope must be host or project, got {other:?}"),
+            };
+            let mut crons = Crons::load()?;
+            crons.upsert(CronEntry {
+                name: name.clone(),
+                template: template.clone(),
+                cron: cron.clone(),
+                owner: owner.clone(),
+                scope,
+                enabled: true,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })?;
+            crons.save()?;
+            if *json {
+                let entry = crons.get(name).unwrap();
+                print_json(&json!({
+                    "name": entry.name,
+                    "template": entry.template,
+                    "cron": entry.cron,
+                    "owner": entry.owner,
+                    "scope": match entry.scope { CronScope::Host => "host", CronScope::Project => "project" },
+                    "enabled": entry.enabled,
+                    "created_at": entry.created_at,
+                }));
+            } else {
+                println!("added cron {name} (template {template}, {cron}, owner {owner})");
+            }
+            Ok(())
+        }
+        CronCmd::Pause { name } => {
+            let mut crons = Crons::load()?;
+            crons.set_enabled(name, false)?;
+            crons.save()?;
+            println!("paused cron {name}");
+            Ok(())
+        }
+        CronCmd::Resume { name } => {
+            let mut crons = Crons::load()?;
+            crons.set_enabled(name, true)?;
+            crons.save()?;
+            println!("resumed cron {name}");
+            Ok(())
+        }
+        CronCmd::Status { json } => {
+            let crons = Crons::load()?;
+            let all = all_workflows()?;
+            let merged = merged_entries(&crons, &all);
+            if merged.is_empty() {
+                println!("no crons defined");
+                return Ok(());
+            }
+            let rows: Vec<Value> = merged
+                .iter()
+                .map(|mc| {
+                    let (last, in_flight) = last_run_state(&mc.entry.name);
+                    let status = derive_status(mc.entry.enabled, in_flight, last.as_deref());
+                    let due = next_due(&mc.entry.cron, chrono::Utc::now().timestamp());
+                    json!({
+                        "name": mc.entry.name,
+                        "status": status,
+                        "enabled": mc.entry.enabled,
+                        "next_due": due,
+                    })
+                })
+                .collect();
+            if *json {
+                print_json(&json!({ "crons": rows }));
+            } else {
+                println!("{:<28} {:<9} {:<8} {:<12}", "NAME", "STATUS", "STATE", "NEXT_DUE");
+                for row in &rows {
+                    println!(
+                        "{:<28} {:<9} {:<8} {}",
+                        row["name"].as_str().unwrap_or(""),
+                        row["status"].as_str().unwrap_or(""),
+                        if row["enabled"].as_bool().unwrap_or(false) { "on" } else { "paused" },
+                        row["next_due"].as_i64().unwrap_or(0),
+                    );
+                }
+            }
+            Ok(())
+        }
+        CronCmd::History { name, json } => {
+            use state::EventKind;
+            let dir = config::state_dir();
+            let mut rows: Vec<Value> = Vec::new();
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                print_json(&json!({ "cron": name, "runs": [] }));
+                return Ok(());
+            };
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if !fname.ends_with(".jsonl") {
+                    continue;
+                }
+                let project = fname.trim_end_matches(".jsonl").to_string();
+                let Ok(events) = state::read_log(&project) else {
+                    continue;
+                };
+                for e in events {
+                    if e.kind != EventKind::Workflow {
+                        continue;
+                    }
+                    let owner = e.data.get("workflow").and_then(Value::as_str);
+                    if owner != Some(name) {
+                        continue;
+                    }
+                    rows.push(json!({
+                        "ts": e.ts,
+                        "project": project,
+                        "run_id": e.data.get("run_id"),
+                        "status": e.data.get("status").and_then(Value::as_str).unwrap_or("done"),
+                        "crew": e.data.get("crew"),
+                        "bead": e.data.get("bead"),
+                    }));
+                }
+            }
+            rows.sort_by(|a, b| {
+                b.get("ts")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .cmp(a.get("ts").and_then(Value::as_str).unwrap_or(""))
+            });
+            if *json {
+                print_json(&json!({ "cron": name, "runs": rows }));
+            } else if rows.is_empty() {
+                println!("no runs recorded for cron {name}");
+            } else {
+                for row in &rows {
+                    println!(
+                        "{} {} {} {}",
+                        row["ts"].as_str().unwrap_or(""),
+                        row["run_id"].as_i64().unwrap_or(0),
+                        row["status"].as_str().unwrap_or(""),
+                        row["bead"].as_str().unwrap_or(""),
+                    );
+                }
+            }
             Ok(())
         }
     }
