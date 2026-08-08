@@ -99,6 +99,36 @@ pub struct ProfileCatalog {
     pub harnesses: BTreeMap<String, HarnessConfig>,
 }
 
+/// Spawn composition derived from a profile (ADR-0005 Spec 1): feeds
+/// `Backend::spawn` / `agent_start`. The `harness`/`model` map onto the
+/// 30013 content fields (`program`/`model`); `backend` selects the trait impl.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnSpec {
+    pub harness: String,
+    pub model: String,
+    pub backend: String,
+}
+
+/// Who signs the run's events (ADR-0005 Spec 1 resolution rule).
+///
+/// - `Operator` — host scope: the operator identity signs (cross-project
+///   maintenance).
+/// - `ProjectAgent` — project scope: the project's agent key signs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigningContext {
+    Operator(String),
+    ProjectAgent { npub: String, project_slug: String },
+}
+
+/// The result of `ProfileCatalog::resolve`: the agent npub to dispatch to +
+/// the spawn composition + the signing context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProfile {
+    pub npub: String,
+    pub spec: SpawnSpec,
+    pub signing: SigningContext,
+}
+
 impl ProfileCatalog {
     /// Load the catalog from `~/.config/flywheel/profiles.toml`, layered over
     /// the compiled-in defaults. Missing file -> defaults only (zero-config,
@@ -174,6 +204,58 @@ impl ProfileCatalog {
             .map(|p| p.backend.as_str())
             .filter(|s| !s.is_empty())
             .unwrap_or("herdr")
+    }
+
+    /// Resolve `@name` to a spawnable agent (ADR-0005 Spec 1 — the P2.3
+    /// resolver). **Scope order: project → host.**
+    ///
+    /// - **Project scope** (`project_scope: Some(slug)`): the profile's agent
+    ///   resolves via that project's kind-30013 (`d=project-slug:name`) —
+    ///   `project_resolver` looks the name up in the project's profile events.
+    ///   The run signs with the **project agent** key.
+    /// - **Host scope** (`project_scope: None`): the profile resolves via the
+    ///   **operator identity** (`operator_npub`). The run signs with the
+    ///   operator key.
+    /// - **Unknown name → error** (no silent fallback; AM-Rust parity).
+    ///
+    /// `project_resolver` is the DI seam (ADR-0005 Spec 4a): in production it
+    /// reads the project's kind-30013 events via
+    /// `toron_core::nostr::identity::resolve_name`; the engine never imports
+    /// flywheel. Tests inject a map.
+    pub fn resolve(
+        &self,
+        name: &str,
+        project_scope: Option<&str>,
+        operator_npub: &str,
+        project_resolver: &dyn Fn(&str, &str) -> Option<String>,
+    ) -> Result<ResolvedProfile, anyhow::Error> {
+        let profile = self
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown profile '@{name}' (flywheel profile list)"))?;
+        let spec = SpawnSpec {
+            harness: profile.harness.clone(),
+            model: profile.model.clone(),
+            backend: self.backend(name).to_string(),
+        };
+        match project_scope {
+            Some(slug) => {
+                let npub = project_resolver(slug, name)
+                    .ok_or_else(|| anyhow::anyhow!("profile '@{name}' not registered in project '{slug}'"))?;
+                Ok(ResolvedProfile {
+                    npub: npub.clone(),
+                    spec,
+                    signing: SigningContext::ProjectAgent {
+                        npub: npub.clone(),
+                        project_slug: slug.to_string(),
+                    },
+                })
+            }
+            None => Ok(ResolvedProfile {
+                npub: operator_npub.to_string(),
+                spec,
+                signing: SigningContext::Operator(operator_npub.to_string()),
+            }),
+        }
     }
 }
 
@@ -357,5 +439,69 @@ spawn_cmd = "hermes --project {project} --role {role}"
         let path = tmp_profiles_toml("this is [ not toml at all");
         let res = ProfileCatalog::load_from(Some(&path));
         assert!(res.is_err(), "malformed toml must error");
+    }
+
+    // ---- Profile::resolve (ADR-0005 Spec 1 resolution rule) ----
+
+    fn catalog() -> ProfileCatalog {
+        ProfileCatalog::load_from(None).expect("defaults")
+    }
+
+    fn no_project(_slug: &str, _name: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn resolve_project_scope_uses_project_30013_and_project_signing() {
+        let cat = catalog();
+        let project_resolver = |slug: &str, name: &str| {
+            assert_eq!(slug, "demo");
+            assert_eq!(name, "housekeeper");
+            Some("npub-project-agent".to_string())
+        };
+        let r = cat
+            .resolve("housekeeper", Some("demo"), "npub-operator", &project_resolver)
+            .expect("resolve");
+        assert_eq!(r.npub, "npub-project-agent");
+        assert_eq!(r.spec.harness, "pi");
+        assert_eq!(r.spec.model, "claude-sonnet-4");
+        assert_eq!(r.spec.backend, "herdr");
+        assert_eq!(
+            r.signing,
+            SigningContext::ProjectAgent {
+                npub: "npub-project-agent".into(),
+                project_slug: "demo".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_host_scope_uses_operator_identity() {
+        let cat = catalog();
+        let r = cat
+            .resolve("housekeeper", None, "npub-operator", &no_project)
+            .expect("resolve");
+        assert_eq!(r.npub, "npub-operator");
+        assert_eq!(r.signing, SigningContext::Operator("npub-operator".into()));
+        // backend defaults to herdr
+        assert_eq!(r.spec.backend, "herdr");
+    }
+
+    #[test]
+    fn resolve_unknown_profile_fails_fast() {
+        let cat = catalog();
+        let err = cat
+            .resolve("@ghost", None, "npub-operator", &no_project)
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown profile"), "{err}");
+    }
+
+    #[test]
+    fn resolve_project_scope_unregistered_name_fails_fast() {
+        let cat = catalog();
+        let err = cat
+            .resolve("coder", Some("demo"), "npub-operator", &no_project)
+            .unwrap_err();
+        assert!(err.to_string().contains("not registered"), "{err}");
     }
 }
