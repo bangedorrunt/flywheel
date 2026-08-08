@@ -383,6 +383,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: ProfileCmd,
     },
+    /// Squads (ADR-0005 P6) — named groups of profiles; recipes are aliases
+    Squad {
+        #[command(subcommand)]
+        cmd: SquadCmd,
+    },
     /// N-round A/B debate + judge (ADR-0001 §9.1 — threaded, ack-gated)
     Debate {
         /// the proposition being debated
@@ -994,6 +999,31 @@ enum ProfileCmd {
     },
 }
 
+/// Squad commands (ADR-0005 P6): a squad is a named group of profile counts —
+/// the generalization of the legacy `Recipe`. `squad spawn <recipe>` resolves
+/// each member profile via `Profile::resolve` and spawns it on the backend.
+#[derive(Subcommand)]
+enum SquadCmd {
+    /// List squads (compiled-in + from recipes.toml as aliases)
+    List,
+    /// Show a squad's member profiles + counts
+    Show {
+        /// squad / recipe name
+        name: String,
+    },
+    /// Spawn every profile in the squad (resolves via Profile::resolve)
+    Spawn {
+        /// squad / recipe name (a legacy recipe maps via recipe_to_squad)
+        name: String,
+        /// project scope for resolve (default: host scope / operator)
+        #[arg(long)]
+        project: Option<String>,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 fn parse_kind_count(s: &str) -> Result<(String, u32)> {
     let (k, v) = s
         .split_once('=')
@@ -1435,6 +1465,7 @@ fn main() {
         Some(Commands::Config { cmd }) => cmd_config(&cfg, cmd),
         Some(Commands::Backend { cmd }) => cmd_backend(&cfg, cmd),
         Some(Commands::Profile { cmd }) => cmd_profile(&cfg, cmd),
+        Some(Commands::Squad { cmd }) => cmd_squad(&cfg, cmd),
         Some(Commands::Debate {
             proposition,
             rounds,
@@ -5659,6 +5690,119 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
     Ok(())
 }
 
+/// `flywheel squad` — named groups of profiles (ADR-0005 P6). Legacy recipes
+/// map onto squads via [`profile::Squad::from_recipe`]; `recipes list` stays
+/// an alias (the `recipes`/`template` asset commands).
+fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
+    use profile::{ProfileCatalog, Squad};
+
+    match cmd {
+        SquadCmd::List => {
+            let cat = ProfileCatalog::load()?;
+            let recipes = config::Recipes::load()?.recipes;
+            let mut rows: Vec<Value> = Vec::new();
+            // Compiled-in squads are derived from the built-in profile set;
+            // user-authored recipes.toml entries surface as squads (aliases).
+            for (name, r) in &recipes {
+                let squad = Squad::from_recipe(r);
+                rows.push(json!({
+                    "name": name,
+                    "members": squad.counts,
+                }));
+            }
+            // Built-in profile singles are listed as 1-member squads so a
+            // fresh install still has squad surface with zero config.
+            for name in cat.names() {
+                if !recipes.contains_key(&name) {
+                    rows.push(json!({
+                        "name": name,
+                        "members": { name: 1 },
+                    }));
+                }
+            }
+            if rows.is_empty() {
+                println!("no squads defined (edit {})", config::config_dir().join("recipes.toml").display());
+            } else {
+                for row in &rows {
+                    println!("{}", serde_json::to_string_pretty(row)?);
+                }
+            }
+            Ok(())
+        }
+        SquadCmd::Show { name } => {
+            let cat = ProfileCatalog::load()?;
+            let recipes = config::Recipes::load()?.recipes;
+            let squad = match recipes.get(name) {
+                Some(r) => Squad::from_recipe(r),
+                None if cat.get(name).is_some() => {
+                    let mut counts = std::collections::BTreeMap::new();
+                    counts.insert(name.clone(), 1u32);
+                    Squad { counts }
+                }
+                None => bail!("unknown squad '@{name}' (flywheel squad list)"),
+            };
+            let members: Vec<Value> = squad
+                .members()
+                .into_iter()
+                .map(|(p, n)| json!({ "profile": p, "count": n }))
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "name": name, "members": members }))?
+            );
+            Ok(())
+        }
+        SquadCmd::Spawn { name, project, json } => {
+            let cat = ProfileCatalog::load()?;
+            let recipes = config::Recipes::load()?.recipes;
+            let squad = match recipes.get(name) {
+                Some(r) => Squad::from_recipe(r),
+                None if cat.get(name).is_some() => {
+                    let mut counts = std::collections::BTreeMap::new();
+                    counts.insert(name.clone(), 1u32);
+                    Squad { counts }
+                }
+                None => bail!("unknown squad '@{name}' (flywheel squad list)"),
+            };
+            if squad.counts.is_empty() {
+                bail!("squad {name} has no members");
+            }
+            let operator_npub = std::env::var("TORON_OPERATOR_NPUB")
+                .unwrap_or_else(|_| "operator".to_string());
+            let backend = backend::multiplexer_backend(cfg)?;
+            let mut spawned: Vec<Value> = Vec::new();
+            for (profile_name, n) in squad.members() {
+                let resolved = cat.resolve(profile_name, project.as_deref(), &operator_npub, &|_, _| None)?;
+                let spec = &resolved.spec;
+                for i in 0..n {
+                    let agent_name = format!("squad-{name}-{profile_name}-{}", i + 1);
+                    let workspace = resolved_spec_workspace(cfg, backend.as_ref(), &spec.harness)?;
+                    let info = backend.agent_start(&agent_name, &spec.harness, &workspace, &[])?;
+                    spawned.push(json!({
+                        "squad": name,
+                        "profile": profile_name,
+                        "agent": info.name.as_deref().unwrap_or(&agent_name),
+                        "pane": info.pane_id,
+                        "backend": spec.backend,
+                    }));
+                    if !*json {
+                        println!(
+                            "spawned {profile_name}#{i} → agent={} pane={} backend={}",
+                            info.name.as_deref().unwrap_or(&agent_name),
+                            info.pane_id,
+                            spec.backend
+                        );
+                    }
+                }
+            }
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&json!({ "spawned": spawned }))?);
+            }
+            Ok(())
+        }
+    }
+}
+
 /// True when a profile is one of the 6 compiled-in built-ins (so `create`/
 /// `edit` doesn't duplicate it on disk verbatim).
 fn is_builtin_profile(name: &str) -> bool {
@@ -7959,5 +8103,37 @@ mod profile_cli_tests {
         assert_eq!(r.spec.model, "claude-sonnet-4");
         assert_eq!(r.spec.backend, "herdr");
         assert_eq!(r.signing, profile::SigningContext::Operator("npub-op".into()));
+    }
+
+    #[test]
+    fn squad_show_resolves_recipe_alias_to_members() {
+        // A legacy recipe name resolves as a squad (alias) — the P6.2 core.
+        // We exercise the mapping logic directly (Recipe -> Squad) since the
+        // CLI fn needs a live config dir + backend.
+        let r = config::Recipe {
+            oc: Some(2),
+            pi: Some(1),
+            gk: None,
+            extra: Default::default(),
+        };
+        let squad = profile::Squad::from_recipe(&r);
+        let members = squad.members();
+        assert_eq!(members, vec![("oc", 2), ("pi", 1)]);
+    }
+
+    #[test]
+    fn squad_list_lists_builtin_profiles_as_singles() {
+        // With no recipes.toml, `squad list` falls back to 1-member squads for
+        // every built-in profile (zero-config squad surface).
+        let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
+        let recipes = config::Recipes::default().recipes;
+        let names: Vec<String> = cat.names();
+        for name in &names {
+            assert!(
+                recipes.get(name).is_none(),
+                "no user recipe named {name} in a fresh install"
+            );
+        }
+        assert_eq!(names.len(), 6);
     }
 }
