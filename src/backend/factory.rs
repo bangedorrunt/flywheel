@@ -346,11 +346,48 @@ mod tests {
         let _g = lock_env();
         unsafe { std::env::set_var("FLYWHEEL_MAIL", "toron") };
         let cfg = Config::default();
-        let mut b = super::mail_backend(&cfg).expect("toron facade constructs");
+        let b = super::mail_backend(&cfg).expect("toron facade constructs");
         assert_eq!(b.name(), "toron");
         match b.health() {
             Ok(_) => {}
             Err(e) => panic!("toron facade health() must delegate to in-process mailbox: {e:?}"),
+        }
+        unsafe { std::env::remove_var("FLYWHEEL_MAIL") };
+    }
+
+    /// c3b.2 AC2: `Arc<dyn MailBackend>` is constructible and callable from
+    /// multiple threads — the receiver change to `&self` is what makes the
+    /// backend shareable without a serializing Mutex (the durable loop's
+    /// natural shape for mail ops from multiple leaves).
+    #[cfg(feature = "mail-toron")]
+    #[test]
+    fn mail_backend_is_arc_shareable() {
+        use std::sync::Arc;
+        let _g = lock_env();
+        unsafe { std::env::set_var("FLYWHEEL_MAIL", "toron") };
+        let cfg = Config::default();
+        let b: Box<dyn MailBackend> = super::mail_backend(&cfg).expect("toron facade constructs");
+        let arc: Arc<dyn MailBackend> = Arc::from(b);
+        // Methods are callable through `&Arc` (deref to `&dyn MailBackend`),
+        // proving no `&mut self` receiver remains.
+        let name = arc.name();
+        assert_eq!(name, "toron", "name() through &Arc");
+        let agent = arc.agent_name();
+        assert!(!agent.is_empty(), "agent_name() must not be the empty trap");
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let arc = Arc::clone(&arc);
+                std::thread::spawn(move || match arc.health() {
+                    Ok(_) => true,
+                    Err(e) => {
+                        eprintln!("health from thread: {e:?}");
+                        false
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            assert!(h.join().expect("thread joins"), "health() via shared Arc");
         }
         unsafe { std::env::remove_var("FLYWHEEL_MAIL") };
     }

@@ -35,16 +35,6 @@ impl ToronMailBackend {
     pub fn new(mail: Mail) -> Self {
         Self { mail }
     }
-
-    fn unsupported(&self, method: &'static str) -> BackendError {
-        BackendError::Unsupported {
-            backend: "toron".to_string(),
-            method,
-            reason:
-                "not yet implemented on the toron backend; see the owning ADR-0001 Phase-3 bead"
-                    .to_string(),
-        }
-    }
 }
 
 impl MailBackend for ToronMailBackend {
@@ -56,18 +46,18 @@ impl MailBackend for ToronMailBackend {
         &self.mail.name
     }
 
-    fn health(&mut self) -> Result<Value> {
+    fn health(&self) -> Result<Value> {
         self.mail.health().map_err(BackendError::Other)
     }
 
-    fn ensure_project(&mut self, project_key: &str) -> Result<Value> {
+    fn ensure_project(&self, project_key: &str) -> Result<Value> {
         self.mail
             .ensure_project(project_key)
             .map_err(BackendError::Other)
     }
 
     fn register_agent(
-        &mut self,
+        &self,
         project_key: &str,
         name: &str,
         program: &str,
@@ -79,7 +69,7 @@ impl MailBackend for ToronMailBackend {
             .map_err(BackendError::Other)
     }
 
-    fn list_agents(&mut self, project_key: &str) -> Result<Value> {
+    fn list_agents(&self, project_key: &str) -> Result<Value> {
         self.mail
             .list_agents(project_key)
             .map_err(BackendError::Other)
@@ -87,7 +77,7 @@ impl MailBackend for ToronMailBackend {
 
     /// thread_id chains into a conversation thread (bd-mail-reply-thread).
     fn send(
-        &mut self,
+        &self,
         project_key: &str,
         to: &[String],
         subject: &str,
@@ -110,7 +100,7 @@ impl MailBackend for ToronMailBackend {
     }
 
     fn reply(
-        &mut self,
+        &self,
         project_key: &str,
         message_id: &str,
         body: &str,
@@ -121,7 +111,7 @@ impl MailBackend for ToronMailBackend {
             .map_err(BackendError::Other)
     }
 
-    fn inbox(&mut self, project_key: &str, agent: &str, filter: &InboxFilter) -> Result<Value> {
+    fn inbox(&self, project_key: &str, agent: &str, filter: &InboxFilter) -> Result<Value> {
         let mail_filter = crate::mail_shim::MailInboxFilter {
             urgent_only: filter.urgent_only,
             unread_only: filter.unread_only,
@@ -135,20 +125,20 @@ impl MailBackend for ToronMailBackend {
             .map_err(BackendError::Other)
     }
 
-    fn ack(&mut self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
+    fn ack(&self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
         self.mail
             .ack(project_key, agent, message_id)
             .map_err(BackendError::Other)
     }
 
-    fn mark_read(&mut self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
+    fn mark_read(&self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
         self.mail
             .mark_read(project_key, agent, message_id)
             .map_err(BackendError::Other)
     }
 
     fn reserve(
-        &mut self,
+        &self,
         project_key: &str,
         _agent: &str,
         paths: &[String],
@@ -164,13 +154,13 @@ impl MailBackend for ToronMailBackend {
             .map_err(BackendError::Other)
     }
 
-    fn release(&mut self, project_key: &str, _agent: &str) -> Result<Value> {
+    fn release(&self, project_key: &str, _agent: &str) -> Result<Value> {
         let _ = _agent;
         self.mail.release(project_key).map_err(BackendError::Other)
     }
 
     fn renew(
-        &mut self,
+        &self,
         project_key: &str,
         _agent: &str,
         extend_seconds: u64,
@@ -188,7 +178,7 @@ impl MailBackend for ToronMailBackend {
     }
 
     fn force_release_file_reservation(
-        &mut self,
+        &self,
         project_key: &str,
         agent: &str,
         file_reservation_id: u64,
@@ -209,14 +199,14 @@ impl MailBackend for ToronMailBackend {
             .map_err(BackendError::Other)
     }
 
-    fn conflicts(&mut self, project_key: &str, _agent: &str, paths: &[String]) -> Result<Value> {
+    fn conflicts(&self, project_key: &str, _agent: &str, paths: &[String]) -> Result<Value> {
         let _ = _agent;
         self.mail
             .conflicts(project_key, paths)
             .map_err(BackendError::Other)
     }
 
-    fn resolve_pane_identity(&mut self, project_key: &str, pane_id: &str) -> Result<Value> {
+    fn resolve_pane_identity(&self, project_key: &str, pane_id: &str) -> Result<Value> {
         // In-process read of the canonical identity file the bridge writes
         // (bd-mail-pane-identity-bridge). A missing identity surfaces as JSON
         // without `agent_name` — callers treat that as not-found.
@@ -226,7 +216,7 @@ impl MailBackend for ToronMailBackend {
     }
 
     fn write_pane_identity(
-        &mut self,
+        &self,
         project_key: &str,
         pane_id: &str,
         agent_name: &str,
@@ -238,7 +228,7 @@ impl MailBackend for ToronMailBackend {
         Ok(json!({ "path": path.to_string_lossy() }))
     }
 
-    fn clear_pane_identity(&mut self, project_key: &str, pane_id: &str) -> Result<Value> {
+    fn clear_pane_identity(&self, project_key: &str, pane_id: &str) -> Result<Value> {
         let path = self
             .mail
             .clear_pane_identity(project_key, pane_id)
@@ -246,7 +236,7 @@ impl MailBackend for ToronMailBackend {
         Ok(json!({ "path": path.to_string_lossy() }))
     }
 
-    fn cleanup_pane_identities(&mut self, project_key: &str) -> Result<Value> {
+    fn cleanup_pane_identities(&self, project_key: &str) -> Result<Value> {
         // ADR-0003 V6 surface restore: delegate to Mail::cleanup_pane_identities.
         self.mail
             .cleanup_pane_identities(project_key)
@@ -254,7 +244,7 @@ impl MailBackend for ToronMailBackend {
     }
 
     fn slot_acquire(
-        &mut self,
+        &self,
         project_key: &str,
         agent: &str,
         slot: &str,
@@ -269,7 +259,7 @@ impl MailBackend for ToronMailBackend {
             .map_err(BackendError::Other)
     }
 
-    fn slot_release(&mut self, project_key: &str, agent: &str, slot: &str) -> Result<Value> {
+    fn slot_release(&self, project_key: &str, agent: &str, slot: &str) -> Result<Value> {
         // bd-mail-build-slot-gating: delegate to Mail::release_slot. Must be
         // called after a build; the TTL auto-expires if forgotten.
         self.mail
@@ -278,7 +268,7 @@ impl MailBackend for ToronMailBackend {
     }
 
     fn slot_renew(
-        &mut self,
+        &self,
         project_key: &str,
         agent: &str,
         slot: &str,
@@ -292,7 +282,7 @@ impl MailBackend for ToronMailBackend {
     }
 
     fn search(
-        &mut self,
+        &self,
         project_key: &str,
         query: &str,
         limit: u32,
@@ -319,7 +309,7 @@ impl MailBackend for ToronMailBackend {
     }
 
     fn summarize_thread(
-        &mut self,
+        &self,
         project_key: &str,
         thread_id: &str,
         llm_mode: bool,
@@ -330,7 +320,7 @@ impl MailBackend for ToronMailBackend {
     }
 
     fn summarize_thread_product(
-        &mut self,
+        &self,
         product_key: &str,
         thread_id: &str,
         llm_mode: bool,
@@ -342,7 +332,7 @@ impl MailBackend for ToronMailBackend {
     }
 
     fn request_contact(
-        &mut self,
+        &self,
         project_key: &str,
         from_agent: &str,
         to_agent: &str,
@@ -355,7 +345,7 @@ impl MailBackend for ToronMailBackend {
     }
 
     fn respond_contact(
-        &mut self,
+        &self,
         project_key: &str,
         to_agent: &str,
         from_agent: &str,
@@ -366,14 +356,14 @@ impl MailBackend for ToronMailBackend {
             .map_err(BackendError::Other)
     }
 
-    fn list_contacts(&mut self, project_key: &str, agent: &str) -> Result<Value> {
+    fn list_contacts(&self, project_key: &str, agent: &str) -> Result<Value> {
         self.mail
             .list_contacts(project_key, agent)
             .map_err(BackendError::Other)
     }
 
     fn set_contact_policy(
-        &mut self,
+        &self,
         project_key: &str,
         agent: &str,
         policy: &str,
@@ -383,25 +373,25 @@ impl MailBackend for ToronMailBackend {
             .map_err(BackendError::Other)
     }
 
-    fn ensure_product(&mut self, product_key: &str) -> Result<Value> {
+    fn ensure_product(&self, product_key: &str) -> Result<Value> {
         self.mail
             .ensure_product(product_key)
             .map_err(BackendError::Other)
     }
 
-    fn products_link(&mut self, product_key: &str, project_key: &str) -> Result<Value> {
+    fn products_link(&self, product_key: &str, project_key: &str) -> Result<Value> {
         self.mail
             .products_link(product_key, project_key)
             .map_err(BackendError::Other)
     }
 
-    fn search_product(&mut self, product_key: &str, query: &str, limit: u32) -> Result<Value> {
+    fn search_product(&self, product_key: &str, query: &str, limit: u32) -> Result<Value> {
         self.mail
             .search_product(product_key, query, limit)
             .map_err(BackendError::Other)
     }
 
-    fn inbox_product(&mut self, product_key: &str, agent: &str, limit: u32) -> Result<Value> {
+    fn inbox_product(&self, product_key: &str, agent: &str, limit: u32) -> Result<Value> {
         self.mail
             .inbox_product(product_key, agent, limit)
             .map_err(BackendError::Other)

@@ -68,17 +68,17 @@ impl MailBackend for AgentMailBackend {
         &self.name
     }
 
-    fn health(&mut self) -> Result<Value> {
+    fn health(&self) -> Result<Value> {
         // BUG4: the MCP `health_check` tool, NOT a REST /health.
         self.call("health_check", json!({}))
     }
 
-    fn ensure_project(&mut self, project_key: &str) -> Result<Value> {
+    fn ensure_project(&self, project_key: &str) -> Result<Value> {
         self.call("ensure_project", json!({ "human_key": project_key }))
     }
 
     fn register_agent(
-        &mut self,
+        &self,
         project_key: &str,
         name: &str,
         program: &str,
@@ -97,12 +97,12 @@ impl MailBackend for AgentMailBackend {
         )
     }
 
-    fn list_agents(&mut self, project_key: &str) -> Result<Value> {
+    fn list_agents(&self, project_key: &str) -> Result<Value> {
         self.call("list_agents", json!({ "project_key": project_key }))
     }
 
     fn send(
-        &mut self,
+        &self,
         project_key: &str,
         to: &[String],
         subject: &str,
@@ -127,7 +127,7 @@ impl MailBackend for AgentMailBackend {
     }
 
     fn reply(
-        &mut self,
+        &self,
         project_key: &str,
         message_id: &str,
         body: &str,
@@ -152,7 +152,7 @@ impl MailBackend for AgentMailBackend {
         )
     }
 
-    fn inbox(&mut self, project_key: &str, agent: &str, filter: &InboxFilter) -> Result<Value> {
+    fn inbox(&self, project_key: &str, agent: &str, filter: &InboxFilter) -> Result<Value> {
         let mut args = serde_json::Map::new();
         args.insert("project_key".into(), json!(project_key));
         args.insert("agent_name".into(), json!(agent));
@@ -167,7 +167,7 @@ impl MailBackend for AgentMailBackend {
         self.call("fetch_inbox", Value::Object(args))
     }
 
-    fn ack(&mut self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
+    fn ack(&self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
         let id = message_id
             .parse::<u64>()
             .map_err(|e| anyhow::anyhow!("agent-mail message_id {message_id:?} is not a decimal id: {e}"))?;
@@ -181,7 +181,7 @@ impl MailBackend for AgentMailBackend {
         )
     }
 
-    fn mark_read(&mut self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
+    fn mark_read(&self, project_key: &str, agent: &str, message_id: &str) -> Result<Value> {
         let id = message_id
             .parse::<u64>()
             .map_err(|e| anyhow::anyhow!("agent-mail message_id {message_id:?} is not a decimal id: {e}"))?;
@@ -196,7 +196,7 @@ impl MailBackend for AgentMailBackend {
     }
 
     fn reserve(
-        &mut self,
+        &self,
         project_key: &str,
         _agent: &str,
         paths: &[String],
@@ -220,7 +220,7 @@ impl MailBackend for AgentMailBackend {
         )
     }
 
-    fn release(&mut self, project_key: &str, _agent: &str) -> Result<Value> {
+    fn release(&self, project_key: &str, _agent: &str) -> Result<Value> {
         let _ = _agent;
         self.call(
             "release_file_reservations",
@@ -229,7 +229,7 @@ impl MailBackend for AgentMailBackend {
     }
 
     fn renew(
-        &mut self,
+        &self,
         project_key: &str,
         agent: &str,
         extend_seconds: u64,
@@ -248,7 +248,7 @@ impl MailBackend for AgentMailBackend {
     }
 
     fn force_release_file_reservation(
-        &mut self,
+        &self,
         project_key: &str,
         agent: &str,
         file_reservation_id: u64,
@@ -267,7 +267,7 @@ impl MailBackend for AgentMailBackend {
         self.call("force_release_file_reservation", args)
     }
 
-    fn conflicts(&mut self, project_key: &str, _agent: &str, paths: &[String]) -> Result<Value> {
+    fn conflicts(&self, project_key: &str, _agent: &str, paths: &[String]) -> Result<Value> {
         let _ = _agent;
         self.call(
             "check_file_reservation_conflicts",
@@ -279,7 +279,7 @@ impl MailBackend for AgentMailBackend {
         )
     }
 
-    fn resolve_pane_identity(&mut self, project_key: &str, pane_id: &str) -> Result<Value> {
+    fn resolve_pane_identity(&self, project_key: &str, pane_id: &str) -> Result<Value> {
         self.call(
             "resolve_pane_identity",
             json!({ "project_key": project_key, "pane_id": pane_id }),
@@ -287,7 +287,7 @@ impl MailBackend for AgentMailBackend {
     }
 
     fn write_pane_identity(
-        &mut self,
+        &self,
         project_key: &str,
         pane_id: &str,
         agent_name: &str,
@@ -300,13 +300,13 @@ impl MailBackend for AgentMailBackend {
         Ok(json!({ "path": path.to_string_lossy() }))
     }
 
-    fn clear_pane_identity(&mut self, project_key: &str, pane_id: &str) -> Result<Value> {
+    fn clear_pane_identity(&self, project_key: &str, pane_id: &str) -> Result<Value> {
         let path = crate::mail_shim::clear_identity_for(project_key, pane_id)
             .map_err(BackendError::Other)?;
         Ok(json!({ "path": path.to_string_lossy() }))
     }
 
-    fn cleanup_pane_identities(&mut self, project_key: &str) -> Result<Value> {
+    fn cleanup_pane_identities(&self, project_key: &str) -> Result<Value> {
         self.call(
             "cleanup_pane_identities",
             json!({ "project_key": project_key }),
@@ -314,7 +314,7 @@ impl MailBackend for AgentMailBackend {
     }
 
     fn slot_acquire(
-        &mut self,
+        &self,
         project_key: &str,
         agent: &str,
         slot: &str,
@@ -333,7 +333,7 @@ impl MailBackend for AgentMailBackend {
         )
     }
 
-    fn slot_release(&mut self, project_key: &str, agent: &str, slot: &str) -> Result<Value> {
+    fn slot_release(&self, project_key: &str, agent: &str, slot: &str) -> Result<Value> {
         self.call(
             "release_build_slot",
             json!({
@@ -345,7 +345,7 @@ impl MailBackend for AgentMailBackend {
     }
 
     fn slot_renew(
-        &mut self,
+        &self,
         project_key: &str,
         agent: &str,
         slot: &str,
@@ -363,7 +363,7 @@ impl MailBackend for AgentMailBackend {
     }
 
     fn search(
-        &mut self,
+        &self,
         project_key: &str,
         query: &str,
         limit: u32,
@@ -398,7 +398,7 @@ impl MailBackend for AgentMailBackend {
     }
 
     fn summarize_thread(
-        &mut self,
+        &self,
         project_key: &str,
         thread_id: &str,
         llm_mode: bool,
@@ -414,7 +414,7 @@ impl MailBackend for AgentMailBackend {
     }
 
     fn summarize_thread_product(
-        &mut self,
+        &self,
         product_key: &str,
         thread_id: &str,
         llm_mode: bool,
@@ -430,7 +430,7 @@ impl MailBackend for AgentMailBackend {
     }
 
     fn request_contact(
-        &mut self,
+        &self,
         project_key: &str,
         from_agent: &str,
         to_agent: &str,
@@ -450,7 +450,7 @@ impl MailBackend for AgentMailBackend {
     }
 
     fn respond_contact(
-        &mut self,
+        &self,
         project_key: &str,
         to_agent: &str,
         from_agent: &str,
@@ -467,7 +467,7 @@ impl MailBackend for AgentMailBackend {
         )
     }
 
-    fn list_contacts(&mut self, project_key: &str, agent: &str) -> Result<Value> {
+    fn list_contacts(&self, project_key: &str, agent: &str) -> Result<Value> {
         self.call(
             "list_contacts",
             json!({ "project_key": project_key, "agent_name": agent }),
@@ -475,7 +475,7 @@ impl MailBackend for AgentMailBackend {
     }
 
     fn set_contact_policy(
-        &mut self,
+        &self,
         project_key: &str,
         agent: &str,
         policy: &str,
@@ -490,18 +490,18 @@ impl MailBackend for AgentMailBackend {
         )
     }
 
-    fn ensure_product(&mut self, product_key: &str) -> Result<Value> {
+    fn ensure_product(&self, product_key: &str) -> Result<Value> {
         self.call("ensure_product", json!({ "product_key": product_key }))
     }
 
-    fn products_link(&mut self, product_key: &str, project_key: &str) -> Result<Value> {
+    fn products_link(&self, product_key: &str, project_key: &str) -> Result<Value> {
         self.call(
             "products_link",
             json!({ "product_key": product_key, "project_key": project_key }),
         )
     }
 
-    fn search_product(&mut self, product_key: &str, query: &str, limit: u32) -> Result<Value> {
+    fn search_product(&self, product_key: &str, query: &str, limit: u32) -> Result<Value> {
         self.call(
             "search_messages_product",
             json!({
@@ -513,7 +513,7 @@ impl MailBackend for AgentMailBackend {
         )
     }
 
-    fn inbox_product(&mut self, product_key: &str, agent: &str, limit: u32) -> Result<Value> {
+    fn inbox_product(&self, product_key: &str, agent: &str, limit: u32) -> Result<Value> {
         self.call(
             "fetch_inbox_product",
             json!({
