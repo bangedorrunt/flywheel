@@ -6,7 +6,7 @@ command surface and a durable monitoring loop built on Resonate.
 ## Session facts
 
 - **Backends (ADR-0002):** pluggable multiplexer + mail via traits in `src/backend/`.
-  Defaults: herdr + agentmail. Discover: `flywheel backend list --json`.
+  Defaults: herdr + toron. Discover: `flywheel backend list --json`.
   Details: [Backends](#backends) below.
 - **herdr protocol v19** (default mux): unix socket JSON-RPC; event stream via
   `events.subscribe`. Loop = **event-wake + poll heartbeat** (ADR-0001).
@@ -14,6 +14,10 @@ command surface and a durable monitoring loop built on Resonate.
   legacy bd-era plugin, never wire it in).
 - Durable loop: Resonate server via launchd (`com.flywheel.resonate`,
   `http://localhost:8001`, sqlite at `~/.local/state/flywheel/resonate.db`).
+- Toron mail daemon: launchd `com.flywheel.toron` — `toron serve --mcp-http
+  127.0.0.1:18080` with `TORON_OPERATOR_KEY=~/.config/toron/operator_nsec`
+  + `TORON_KEY_PASSPHRASE=toron` env (plist: `~/Library/LaunchAgents/`).
+  The `[mail.toron] url` in config.toml points the default backend at it.
 - State/logs: `~/.local/state/flywheel/` (event logs, checkpoints, `loops.json`).
   - `loops.json` schema **v2** (`src/state.rs`, bd-loop-state-schema-v2): top-level
     `"schema": 2` + per-project `{ id, params, created, event_cursor?, escalation?,
@@ -45,19 +49,19 @@ Factory: `src/backend/factory.rs` → `Box<dyn MultiplexerBackend>` /
 | Var / key | Values | Default |
 |-----------|--------|---------|
 | `FLYWHEEL_BACKEND` / `[backend] multiplexer` | `herdr` \| `superlogical` \| `tmux` | `herdr` |
-| `FLYWHEEL_MAIL` / `[backend] mail` | `agentmail` \| `toron` | `agentmail` |
+| `FLYWHEEL_MAIL` / `[backend] mail` | `toron` \| `agentmail` | `toron` |
 | `FLYWHEEL_AGENTMAIL_URL` / `TOKEN` | feeds `[mail.agentmail]` only (ADR-0003 V3) | config.toml |
 | `FLYWHEEL_MAIL_NAME` | shared identity (`[agent_mail] name`) | `flywheel` |
 
-Mail transport is **per-backend** (ADR-0003): `[mail.agentmail]` = real
-mcp_agent_mail server (default `http://127.0.0.1:8765`); `[mail.toron]` =
-toron daemon (absent → embedded in-process). The legacy `[agent_mail] url`
-is not a routing source.
+Mail transport is **per-backend** (ADR-0003): `[mail.toron]` = toron daemon
+(absent → embedded in-process); `[mail.agentmail]` = real mcp_agent_mail
+server (default `http://127.0.0.1:8765`). The legacy `[agent_mail] url` is
+not a routing source.
 
 Copy `.env.example` → `.env` (gitignored). Never commit tokens.
 
 Cargo features: `backend-herdr`, `backend-superlogical`, `backend-tmux`,
-`mail-agentmail`, `mail-toron` (default = herdr + agentmail + serve).
+`mail-agentmail`, `mail-toron` (default = herdr + toron + agentmail + serve).
 
 ### Discovery
 
@@ -74,8 +78,8 @@ Spawned agents: run `flywheel backend list --json` if dispatch primitive is uncl
 
 | Phase | State | Action |
 |-------|--------|--------|
-| **R0** (now) | toron v0.1, superlogical pre-release | Traits + herdr/agentmail wraps; stubs reserve env names |
-| **R1** | toron-core ships | Real `ToronMailBackend`; flip `FLYWHEEL_MAIL=toron` when parity passes |
+| **R0** | toron v0.1, superlogical pre-release | Traits + herdr/agentmail wraps; stubs reserve env names |
+| **R1** (done) | toron-core ships | Real `ToronMailBackend`; default flipped to `FLYWHEEL_MAIL=toron` |
 | **R1.5** | toron `Backend` trait | Trait merge; delete flywheel `herdr.rs` when single source lands |
 | **R2** | superlogical SDK | Real `SuperlogicalBackend`; env flip |
 

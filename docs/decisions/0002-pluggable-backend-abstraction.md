@@ -68,11 +68,11 @@ The captain's directive — "configurable over `.env` is preferred" — sets the
 2. **`MailBackend` trait** (in `src/backend/mod.rs`): the coordination surface — the operations flywheel needs (the 14+ wrappers from ADR-0001 Phase 3: `ensure_project`, `register_agent`, `list_agents`, `send`, `reply`, `inbox`, `ack`, `mark_read`, `reserve`, `release`, `renew`, `conflicts`, `slot_acquire/release`, `search`, `summarize_thread`, `request_contact/respond`, `health`). **Not** the raw 38 MCP tools — flywheel's abstraction is operation-shaped. Implementations: `AgentMailMcpBackend` (default, wraps current `src/mail.rs` HTTP client), `ToronMailBackend` (future, in-process toron-core).
 3. **Env selection** (precedence: CLI flag > env var > `.env` file > `config.toml` > compile-time default):
    - `FLYWHEEL_BACKEND=herdr|superlogical|tmux` (default `herdr`)
-   - `FLYWHEEL_MAIL=agentmail|toron` (default `agentmail`)
+   - `FLYWHEEL_MAIL=toron|agentmail` (default `toron` since R1 — 2026-08-08)
    - `.env` loaded via `dotenvy` (project-local; gitignored).
-4. **Cargo feature flags** gate optional backends so the default build needs only herdr + agent-mail:
+4. **Cargo feature flags** gate optional backends so the default build needs only herdr + toron + agent-mail:
    - `backend-herdr` (default), `backend-superlogical` (off, future), `backend-tmux` (off, legacy)
-   - `mail-agentmail` (default), `mail-toron` (off, future)
+   - `mail-agentmail` (default), `mail-toron` (default since R1 — toron is the default *selection*, agentmail stays compiled in as opt-in)
    - A `dyn`-dispatch factory returns `Box<dyn MultiplexerBackend>` / `Box<dyn MailBackend>`; only the selected feature's impl is compiled in (dead-code elimination + faster builds).
 5. **Stub the not-yet-existing backends** (`SuperlogicalBackend`, `ToronMailBackend`) behind their features, returning `Unsupported`/`NotImplemented` with an actionable message ("superlogical SDK not yet released; set FLYWHEEL_BACKEND=herdr"). This reserves the env names + documents the future, without depending on unreleased code.
 
@@ -156,7 +156,7 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
 | Phase | When | What | Config state |
 |---|---|---|---|
 | **R0** (this ADR, now) | toron v0.1, superlogical pre-release | Introduce traits; wrap current clients as `HerdrBackend`/`AgentMailMcpBackend`; env+feature selection; migrate call sites to `Box<dyn Trait>`. **Zero behavior change.** Stub `Superlogical`/`Toron`/`Tmux`. | `FLYWHEEL_BACKEND=herdr` (default), `FLYWHEEL_MAIL=agentmail` (default) |
-| **R1** | toron-core ships (ADR-0003 v1) | Add `ToronMailBackend` (real impl: embed `toron-core` in-process). Flip default to `toron` when parity-conformance passes. Eventually **delete** `src/mail.rs` (toron-core owns it per ADR-0003). | `FLYWHEEL_MAIL=toron` |
+| **R1** (done, 2026-08-08) | toron-core ships (ADR-0003 v1) | Real `ToronMailBackend` (embeds `toron-core`); parity-conformance passed (bd-am5 live harness: AM 8765 + toron 18080); default flipped to `toron`. `src/mail.rs` deleted (bd-o8j.2/.3 — toron-core owns it per ADR-0003). | `FLYWHEEL_MAIL=toron` (default); `[mail.toron]` url/token for the daemon, absent → embedded in-process |
 | **R1.5** | toron-core `Backend` trait lands | Adopt toron-core's `Backend` trait (re-export or signature-merge); `HerdrBackend` moves into toron-core; **delete** `src/herdr.rs` (single herdr client, per ADR-0003 verification gate). | trait source = toron-core |
 | **R2** | superlogical releases | Add real `SuperlogicalBackend` (SDK/protocol TBD). | `FLYWHEEL_BACKEND=superlogical` |
 
@@ -195,7 +195,7 @@ ADR-0001's 23 beads currently name `src/herdr.rs` and `src/mail.rs` concretely. 
 ### Positive
 - **Backend swap = config flip + feature toggle**, not a rewrite. ADR-0001 beads survive the toron/superlogical migration.
 - **Trait signatures mirror toron** → R1.5 merge is mechanical.
-- **Feature flags** keep the default build lean (no toron/nostr-sdk dep until `mail-toron` enabled).
+- **Feature flags** keep optional backends opt-in (toron + agentmail are both default since R1 — the default *selection* is toron; superlogical/tmux stay lean until released).
 - **`.env`** gives project-local backend selection without editing config.toml or rebuilds.
 - **Honest stubs** document the future and give clear errors, not silent fallbacks.
 
@@ -219,7 +219,7 @@ Nine beads (see `.beads/`, dependency DAG in §9):
 2. **herdr-backend-impl** — wrap current `src/herdr.rs::Client` as `HerdrBackend: MultiplexerBackend`; move/re-export types; no behavior change.
 3. **agentmail-backend-impl** — wrap current `src/mail.rs::Mail` as `AgentMailMcpBackend: MailBackend`; no behavior change.
 4. **backend-env-config** — `.env` loader (`dotenvy`) + env-var resolution + config.toml field + precedence (flag>env>.env>config>default); `Config::backend`/`Config::mail_backend` fields.
-5. **cargo-feature-flags** — `backend-{herdr,superlogical,tmux}` + `mail-{agentmail,toron}` features in `Cargo.toml`; default = herdr+agentmail; factory `#[cfg(feature=...)]` gates.
+5. **cargo-feature-flags** — `backend-{herdr,superlogical,tmux}` + `mail-{agentmail,toron}` features in `Cargo.toml`; default = herdr+toron+agentmail (R0: herdr+agentmail); factory `#[cfg(feature=...)]` gates.
 6. **call-site-migration** — `main.rs`/`durable.rs` use `Box<dyn MultiplexerBackend>` + `Box<dyn MailBackend>` from the factory, not concrete `Client`/`Mail`. The loop holds trait objects.
 7. **toron-superlogical-stubs** — `SuperlogicalBackend`, `TmuxBackend`, `ToronMailBackend` stubs behind features, returning `Unsupported` with actionable messages; reserve env names.
 8. **backend-parity-test** — differential test: trait-routed calls produce byte-identical results to direct calls (no behavior regression from indirection); feature-combo matrix CI job.

@@ -5,15 +5,16 @@
 //!
 //! Selection precedence (flag > env > `.env` > config.toml > default):
 //! - `FLYWHEEL_BACKEND` (`herdr` default; `superlogical`/`tmux` future/stub)
-//! - `FLYWHEEL_MAIL`    (`agentmail` default; `toron` opt-in)
+//! - `FLYWHEEL_MAIL`    (`toron` default; `agentmail` opt-in)
 //!
 //! Mail backend routing (ADR-0003 V2/V3 — fixes the BUG1 shared-url misroute):
-//! each backend reads ONLY its own config section. `FLYWHEEL_MAIL=agentmail`
-//! → the REAL agent-mail server backend (`src/backend/agentmail.rs`), reading
-//! `[mail.agentmail]` (url default `http://127.0.0.1:8765`). `FLYWHEEL_MAIL=toron`
-//! → the toron facade (`src/backend/toron.rs` over `mail_shim::Mail`), reading
-//! `[mail.toron]` (absent → embedded in-process). The old `[agent_mail]` url
-//! is never a routing source.
+//! each backend reads ONLY its own config section. `FLYWHEEL_MAIL=toron`
+//! (the default) → the toron facade (`src/backend/toron.rs` over
+//! `mail_shim::Mail`), reading `[mail.toron]` (absent → embedded in-process).
+//! `FLYWHEEL_MAIL=agentmail` → the REAL agent-mail server backend
+//! (`src/backend/agentmail.rs`), reading `[mail.agentmail]` (url default
+//! `http://127.0.0.1:8765`). The old `[agent_mail]` url is never a routing
+//! source.
 //!
 //! Stub backends (`superlogical`, `tmux`) land in `bd-toron-superlogical-
 //! stubs` (R0.7); until then an unrecognized name returns a clear
@@ -28,7 +29,7 @@ use crate::mail_shim::Mail;
 /// Default multiplexer backend name.
 pub const DEFAULT_BACKEND: &str = "herdr";
 /// Default mail backend name.
-pub const DEFAULT_MAIL: &str = "agentmail";
+pub const DEFAULT_MAIL: &str = "toron";
 
 /// Resolve the active multiplexer backend name from config (precedence:
 /// `FLYWHEEL_BACKEND` env > `[backend] multiplexer` config field > default).
@@ -84,7 +85,7 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
     }
 }
 
-/// Construct the active mail backend. Default = agentmail; unrecognized →
+/// Construct the active mail backend. Default = toron; unrecognized →
 /// actionable error. The `mail-agentmail` cargo feature gates the agentmail
 /// impl; when it's off, the name falls through to `other` with a feature-aware
 /// error.
@@ -191,15 +192,15 @@ mod tests {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Defaults resolve to herdr + agentmail when nothing is set.
+    /// Defaults resolve to herdr + toron when nothing is set.
     #[test]
-    fn defaults_resolve_to_herdr_and_agentmail() {
+    fn defaults_resolve_to_herdr_and_toron() {
         let _g = _lock_env();
         std::env::remove_var("FLYWHEEL_BACKEND");
         std::env::remove_var("FLYWHEEL_MAIL");
         let cfg = Config::default();
         assert_eq!(resolve_backend_name(&cfg), "herdr");
-        assert_eq!(resolve_mail_name(&cfg), "agentmail");
+        assert_eq!(resolve_mail_name(&cfg), "toron");
     }
 
     /// Env overrides config (the precedence contract — flag wiring is R0.6).
@@ -278,19 +279,23 @@ mod tests {
         std::env::remove_var("FLYWHEEL_BACKEND");
     }
 
-    /// The default build compiles herdr + agentmail (the `default` feature set
-    /// is `["serve", "backend-herdr", "mail-agentmail"]`). This is the
-    /// feature-matrix contract — compiled_backends() must reflect the actual
-    /// cfg gates (it's what `flywheel backend list` will surface in R0.10).
+    /// The default build compiles herdr + toron + agentmail (the `default`
+    /// feature set is `["serve", "backend-herdr", "mail-agentmail",
+    /// "mail-toron"]`). This is the feature-matrix contract —
+    /// compiled_backends() must reflect the actual cfg gates (it's what
+    /// `flywheel backend list` will surface in R0.10).
     #[test]
-    fn default_build_compiles_herdr_and_agentmail() {
+    fn default_build_compiles_herdr_toron_and_agentmail() {
         let backends = super::compiled_backends();
         assert!(backends.contains(&"herdr"), "herdr missing: {backends:?}");
+        #[cfg(feature = "mail-toron")]
+        assert!(backends.contains(&"toron"), "toron missing: {backends:?}");
+        #[cfg(feature = "mail-agentmail")]
         assert!(
             backends.contains(&"agentmail"),
             "agentmail missing: {backends:?}"
         );
-        // superlogical/tmux/toron are opt-in: present IFF their feature is on
+        // superlogical/tmux are opt-in: present IFF their feature is on
         #[cfg(not(feature = "backend-superlogical"))]
         assert!(
             !backends.contains(&"superlogical"),
@@ -298,8 +303,6 @@ mod tests {
         );
         #[cfg(not(feature = "backend-tmux"))]
         assert!(!backends.contains(&"tmux"), "tmux should be opt-in");
-        #[cfg(not(feature = "mail-toron"))]
-        assert!(!backends.contains(&"toron"), "toron should be opt-in");
     }
 
     /// A backend name with its feature off produces the feature-aware error

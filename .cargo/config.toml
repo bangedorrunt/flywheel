@@ -1,0 +1,6 @@
+# Link with rust-lld instead of the Apple ld (ld-prime) on macOS.
+# ld-prime produces a "mis-aligned LINKEDIT string pool" dylib when relinking
+# proc-macro crates like sqlx-macros, breaking dlopen at compile time
+# (seen on Xcode CommandLineTools ld-27036.1 with rustc 1.97.0-nightly).
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "linker=rust-lld"]
