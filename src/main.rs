@@ -1194,6 +1194,10 @@ enum CronCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Start (or resume) the durable cron loops over the current registry
+    /// (P4.3 cron manager). Health-gate probes + `on_failure: bead` are live.
+    /// Blocks; Ctrl-C to stop.
+    Start,
 }
 
 fn parse_kind_count(s: &str) -> Result<(String, u32)> {
@@ -6799,6 +6803,13 @@ fn cmd_cron(cmd: &CronCmd) -> Result<()> {
                 }
             }
             Ok(())
+        }
+        CronCmd::Start => {
+            // Blocks until Ctrl-C: durable loops + policy-sink drain (bead
+            // side-effects). Run under the project dir so `br create` lands
+            // in the right .beads.
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(cron::start_loops())
         }
     }
 }

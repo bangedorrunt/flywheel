@@ -358,6 +358,229 @@ pub fn make_registry_manager(
     RegistryCronManager::new(workflows)
 }
 
+// ---- P4.5: wiring to the landed P4.3 cron manager (bd-p4-migrate-sagas-7rmo)
+//
+// The toron-workflow `CronManager` (Resonate durable-sleep loop) drives ticks
+// over a `CronRegistry` closure returning enabled `CronRegistration`s. This
+// section builds those registrations from the merged view (crons.toml +
+// schedule-triggered workflows in the catalog/built-ins), provides the
+// action runner (executes `call_webhook` health probes; records everything
+// else), and starts the loops. Failure policy (`on_failure: bead`) is
+// executed by draining the engine's `PolicySink` → `br create`.
+
+impl RegistryCronManager {
+    /// The enabled [`CronRegistration`]s the durable cron manager drives:
+    /// the merged view (registry + schedule workflows) with each cron's
+    /// `Workflow` resolved from the catalog/built-ins. Paused crons keep
+    /// their entry but are excluded (they still surface in `list`/`status`).
+    pub fn registrations(&self) -> Result<Vec<toron_workflow::CronRegistration>> {
+        self.registrations_from(&Crons::load()?)
+    }
+
+    /// Registrations from an explicit registry (tests pass a hermetic Crons;
+    /// the CLI uses the real config via [`Self::registrations`]).
+    pub fn registrations_from(
+        &self,
+        crons: &Crons,
+    ) -> Result<Vec<toron_workflow::CronRegistration>> {
+        let mut out = Vec::new();
+        for mc in merged_entries(crons, &self.workflows) {
+            let wf = self
+                .workflows
+                .get(&mc.entry.template)
+                .map(|(wf, _)| wf.clone())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "cron {:?}: template {:?} does not resolve",
+                        mc.entry.name,
+                        mc.entry.template
+                    )
+                })?;
+            out.push(toron_workflow::CronRegistration {
+                name: mc.entry.name.clone(),
+                cron: mc.entry.cron.clone(),
+                workflow: wf,
+                owner: mc.entry.owner.clone(),
+                scope: mc.entry.scope,
+                enabled: mc.entry.enabled,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// The flywheel action runner for cron runs (ADR-0005 Spec 3): executes
+/// `call_webhook` as a REAL health probe (the health-gate steps probe the
+/// saga's five services), records every other action (the P4 spawn-await
+/// binding is BlueOak's; cron-triggered workflows today are probe+policy
+/// surfaces).
+///
+/// Probe semantics: a reachable endpoint returns `{"ok":true,"status":N}`;
+/// an unreachable/erroring probe returns `Err` so a step with
+/// `on_error: fail_run` FAILS the run (the health-gate contract — a dead
+/// service is a failure, not a branch case).
+pub fn cron_runner() -> toron_workflow::ActionRunner {
+    use toron_workflow::schema::Action;
+    std::sync::Arc::new(|a: &Action| match a {
+        Action::CallWebhook { url, method, body } => {
+            let method = method.as_deref().unwrap_or("GET").to_ascii_uppercase();
+            let agent = ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(5))
+                .build();
+            let resp = match method.as_str() {
+                "POST" => {
+                    let b = body
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .unwrap_or(Value::Null);
+                    agent.post(url).send_json(b)
+                }
+                "PUT" => {
+                    let b = body
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .unwrap_or(Value::Null);
+                    agent.put(url).send_json(b)
+                }
+                "DELETE" => agent.delete(url).call(),
+                _ => agent.get(url).call(),
+            };
+            match resp {
+                Ok(r) => {
+                    let status = r.status();
+                    Ok(json!({ "ok": status >= 200 && status < 300, "status": status }))
+                }
+                Err(e) => Err(anyhow!("probe failed: {e}")),
+            }
+        }
+        other => Ok(json!({ "action": other.type_name(), "ok": true })),
+    })
+}
+
+/// Create a failure bead via `br create` (the `on_failure: bead` side effect,
+/// ADR-0005 Spec 3). The failure bundle becomes the bead description so the
+/// defined fixer (`housekeeper-diagnose`) can read it. Runs in the toron
+/// workspace (the default working dir of `flywheel cron start`). Returns the
+/// created bead id (from `br create --json`), or errors.
+pub fn spawn_failure_bead(bundle: &toron_workflow::FailureBundle) -> Result<String> {
+    use std::process::Command;
+    let (title, description) = failure_bead_fields(bundle);
+    let out = Command::new("br")
+        .args(["create", &title, "--type", "bug", "--priority", "1", "--description", &description, "--json"])
+        .output()
+        .map_err(|e| anyhow!("br create failed: {e}"))?;
+    if !out.status.success() {
+        bail!(
+            "br create failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    // `br create --json` returns the created issue; extract its id.
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let id: String = match serde_json::from_str::<Value>(raw.trim()) {
+        Ok(v) => {
+            let node = v
+                .get("issue")
+                .or_else(|| v.get("id"))
+                .or_else(|| v.as_array().and_then(|a| a.first()))
+                .cloned();
+            match node {
+                Some(n) => n
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(id unknown)")
+                    .to_string(),
+                None => "(id unknown)".to_string(),
+            }
+        }
+        Err(_) => "(id unknown)".to_string(),
+    };
+    Ok(id)
+}
+
+/// The bead's title + description derived from a failure bundle. The bundle is
+/// fully embedded so the defined fixer (`housekeeper-diagnose`) can triage
+/// without the original run context. Pure — unit-testable.
+pub fn failure_bead_fields(bundle: &toron_workflow::FailureBundle) -> (String, String) {
+    let title = format!(
+        "cron failure: {} ({}#{})",
+        bundle.workflow, bundle.run_id, bundle.consecutive
+    );
+    let description = format!(
+        "# Cron failure bead (ADR-0005 Spec 3, P4.4)\n\
+         \n- run_id: `{}`\n- workflow: `{}`\n- owner: `{}`\n- error: `{}`\n- failed_step: `{}`\n- consecutive: {}\n\
+         \nThe defined fixer (`housekeeper-diagnose`) reads this bundle and proposes a patch.",
+        bundle.run_id,
+        bundle.workflow,
+        bundle.owner,
+        bundle.error,
+        bundle.failed_step.as_deref().unwrap_or("(unknown)"),
+        bundle.consecutive,
+    );
+    (title, description)
+}
+
+/// Start (or resume) the durable cron loops over the current merged view.
+/// Idempotent: re-invoking `cron:{name}` resumes the same durable function
+/// (restart survival). Returns once every loop is started; the loops run on
+/// the engine's in-process Resonate runtime.
+///
+/// The health-gate + policy surface is live: `call_webhook` probes run, and
+/// `on_failure: bead` creates a `br` bead with the failure bundle. This is
+/// the P4.5 migration path — the old systemd timers stay until the workflows
+/// pass the same health-gates.
+pub async fn start_loops() -> Result<()> {
+    use toron_workflow::CronManager;
+
+    let manager = RegistryCronManager::load()?;
+    let registrations = manager.registrations()?;
+    if registrations.is_empty() {
+        bail!("no enabled crons registered (flywheel cron add/list)");
+    }
+    let engine = std::sync::Arc::new(
+        toron_workflow::WorkflowEngine::local(cron_runner()).map_err(|e| anyhow!("engine: {e}"))?,
+    );
+
+    let registry: toron_workflow::CronRegistry = {
+        let regs = registrations.clone();
+        std::sync::Arc::new(move || regs.clone())
+    };
+    let cron_mgr = CronManager::new(engine.clone(), registry)?;
+    cron_mgr.start().await?;
+
+    // Drain the policy sink: execute the embedding side effects (br create
+    // bead for `on_failure: bead`; escalate is logged — DM wiring is a
+    // follow-up). Runs until Ctrl-C.
+    let sink = engine.policy_sink().clone();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let drained: Vec<toron_workflow::PolicyEvent> = {
+            let mut guard = sink.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        for ev in drained {
+            match ev.action {
+                toron_workflow::schema::FailureAction::Bead => {
+                    match spawn_failure_bead(&ev.bundle) {
+                        Ok(id) => eprintln!(
+                            "cron {}({}): failure -> bead {id} ({}#{})",
+                            ev.cron, ev.tick, ev.bundle.workflow, ev.bundle.consecutive
+                        ),
+                        Err(e) => eprintln!(
+                            "cron {}({}): bead side-effect failed: {e}",
+                            ev.cron, ev.tick
+                        ),
+                    }
+                }
+                other => eprintln!(
+                    "cron {}({}): policy action {other:?} (side-effect not wired)",
+                    ev.cron, ev.tick
+                ),
+            }
+        }
+    }
+}
+
 impl CronManager for RegistryCronManager {
     fn list(&self) -> Result<Vec<MergedCron>> {
         self.merged()
@@ -844,5 +1067,246 @@ mod tests {
             "paused"
         );
         assert!(!dyn_mgr.list().unwrap()[0].entry.enabled);
+    }
+
+    /// P4.5: `registrations()` resolves each cron's Workflow from the
+    /// catalog/built-ins and excludes nothing (enabled flag preserved).
+    #[test]
+    fn registrations_resolve_workflows_from_catalog() {
+        use toron_workflow::schema::{Step, Trigger};
+
+        let mut workflows: BTreeMap<String, (Workflow, &'static str)> = BTreeMap::new();
+        workflows.insert(
+            "docker-upgrade".to_string(),
+            (
+                Workflow {
+                    name: "docker-upgrade".into(),
+                    description: None,
+                    trigger: Some(Trigger::Schedule {
+                        cron: "30 3 * * 0".to_string(),
+                        owner: Some("housekeeper".to_string()),
+                        scope: CronScope::Host,
+                    }),
+                    policy: None,
+                    guard: None,
+                    steps: vec![Step {
+                        name: None,
+                        guard: None,
+                        on_error: toron_workflow::schema::StepOnError::Continue,
+                        action: toron_workflow::schema::Action::Delay { secs: 0 },
+                    }],
+                    graph: None,
+                    inputs: vec![],
+                    crew: None,
+                },
+                "catalog",
+            ),
+        );
+        let mut crons = Crons::default();
+        let mut entry = sample("docker-upgrade");
+        entry.template = "docker-upgrade".to_string();
+        crons.upsert(entry).unwrap();
+        let mgr = make_registry_manager(workflows);
+
+        let regs = mgr.registrations_from(&crons).unwrap();
+        assert_eq!(regs.len(), 1);
+        let reg = &regs[0];
+        assert_eq!(reg.name, "docker-upgrade");
+        assert_eq!(reg.cron, "30 3 * * 0");
+        assert_eq!(reg.owner, "housekeeper");
+        assert_eq!(reg.scope, CronScope::Host);
+        assert!(reg.enabled);
+        assert_eq!(reg.workflow.name, "docker-upgrade");
+    }
+
+    /// P4.5: an unresolvable template fails registrations (fail-stop — the
+    /// durable loop must never start on a broken registration).
+    #[test]
+    fn registrations_fail_on_unresolved_template() {
+        let mut crons = Crons::default();
+        crons.upsert(sample("ghost-cron")).unwrap(); // template ghost-cron-wf
+        let mgr = make_registry_manager(BTreeMap::new());
+        assert!(mgr.registrations_from(&crons).is_err());
+    }
+
+    /// P4.5: `cron_runner()` executes a real `call_webhook` health probe
+    /// against a live listener (200 → ok:true; connection refused → ok:false),
+    /// and records non-webhook actions (no dispatch side-effects).
+    #[test]
+    fn cron_runner_probes_http_and_records_others() {
+        use std::net::TcpListener;
+        use toron_workflow::schema::Action;
+
+        fn serve(listener: std::net::TcpListener) {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || serve(listener));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let runner = cron_runner();
+        let ok = runner(&Action::CallWebhook {
+            url: format!("http://127.0.0.1:{port}/health"),
+            method: Some("GET".into()),
+            body: None,
+        })
+        .unwrap();
+        assert_eq!(ok["ok"], true, "live probe succeeds: {ok}");
+
+        // closed port → probe errors (a step with on_error: fail_run fails)
+        let dead_port = 1; // port 1 is not listening
+        let dead = runner(&Action::CallWebhook {
+            url: format!("http://127.0.0.1:{dead_port}/health"),
+            method: Some("GET".into()),
+            body: None,
+        });
+        assert!(dead.is_err(), "dead probe errors: {dead:?}");
+
+        // non-webhook actions are recorded, not dispatched
+        let rec = runner(&Action::SendDm {
+            to: "housekeeper".into(),
+            body: "x".into(),
+            project: None,
+        })
+        .unwrap();
+        assert_eq!(rec["action"], "send_dm");
+        assert_eq!(rec["ok"], true);
+    }
+
+    /// P4.5: the docker-upgrade health-gate — explicit probes for the five
+    /// saga services (aiostreams/resonate/honcho/pihole/dnscrypt), each with
+    /// `on_error: fail_run`. All up → run passes; any service down → run
+    /// fails (the sequencing gate: the workflow must pass the SAME health
+    /// gates as the bash saga before the systemd timer is disabled).
+    ///
+    /// NOTE: probes are EXPLICIT per-service steps, not a `foreach` — the
+    /// engine's foreach does not (yet) inject `{{item}}` into the template
+    /// context (engine-side gap, BlueOak's lane). The bash saga also checks
+    /// each service explicitly.
+    #[tokio::test]
+    async fn docker_upgrade_health_gate_fails_when_a_service_is_down() {
+        use toron_workflow::schema::{Action, Step, StepOnError};
+
+        // Five live listeners standing in for the saga's health-gated services.
+        // Each reads the request, then replies (a proper HTTP handshake — the
+        // bash saga's real services behave the same way).
+        fn serve(listener: std::net::TcpListener) {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        }
+        let mut ports = Vec::new();
+        for _ in 0..5 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            ports.push(listener.local_addr().unwrap().port());
+            std::thread::spawn(move || serve(listener));
+        }
+        // Let the listener threads reach accept() before the probes fire.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // One explicit probe step per service, each on_error: fail_run.
+        let probe_step = |name: &str, port: u16| Step {
+            name: Some(name.into()),
+            guard: None,
+            on_error: StepOnError::FailRun,
+            action: Action::CallWebhook {
+                url: format!("http://127.0.0.1:{port}/health"),
+                method: Some("GET".into()),
+                body: None,
+            },
+        };
+        let gate_wf = |services: &[u16]| Workflow {
+            name: "housekeeper-health-gate".into(),
+            description: None,
+            trigger: None,
+            policy: None,
+            guard: None,
+            steps: services
+                .iter()
+                .enumerate()
+                .map(|(i, p)| probe_step(&format!("probe-{i}"), *p))
+                .collect(),
+            graph: None,
+            inputs: vec![],
+            crew: None,
+        };
+
+        // All five up → pass.
+        let engine = toron_workflow::WorkflowEngine::local(cron_runner()).unwrap();
+        let all_up: Vec<u16> = ports.iter().map(|p| *p).collect();
+        let out = engine
+            .invoke("gate-all-up", gate_wf(&all_up), json!({}))
+            .await
+            .expect("gate runs");
+        assert!(
+            !out
+                .as_object()
+                .and_then(|o| o.get("status"))
+                .and_then(Value::as_str)
+                .is_some_and(|s| s == "failed"),
+            "all services up => gate passes: {out}"
+        );
+
+        // One dead service (e.g. honcho down) → gate fails.
+        let dead = ports.last().unwrap() + 1;
+        let mut with_dead = ports.clone();
+        with_dead[2] = dead;
+        let out2 = engine
+            .invoke("gate-one-down", gate_wf(&with_dead), json!({}))
+            .await
+            .expect("gate runs");
+        assert!(
+            out2
+                .as_object()
+                .and_then(|o| o.get("status"))
+                .and_then(Value::as_str)
+                .is_some_and(|s| s == "failed"),
+            "one service down => gate fails: {out2}"
+        );
+    }
+
+    /// P4.5 acceptance: `on_failure: bead` produces a DIAGNOSABLE bead — the
+    /// derived title + description carry the full failure bundle (run_id,
+    /// workflow, owner, error, failed_step, consecutive) so the defined fixer
+    /// (`housekeeper-diagnose`) can triage without the original run context.
+    #[test]
+    fn failure_bead_fields_carry_the_full_bundle() {
+        let bundle = toron_workflow::FailureBundle {
+            run_id: "cron:docker-upgrade:1786246200".into(),
+            workflow: "docker-upgrade".into(),
+            owner: "@housekeeper".into(),
+            error: "probe failed: connection refused to 127.0.0.1:8010".into(),
+            failed_step: Some("gate-honcho".into()),
+            consecutive: 2,
+        };
+        let (title, description) = failure_bead_fields(&bundle);
+
+        assert!(title.contains("docker-upgrade"), "title names the workflow");
+        assert!(title.contains("cron:docker-upgrade:1786246200"), "title carries run_id");
+        assert!(title.contains("#2"), "title carries streak");
+        assert!(description.contains("cron:docker-upgrade:1786246200"), "desc run_id");
+        assert!(description.contains("docker-upgrade"), "desc workflow");
+        assert!(description.contains("@housekeeper"), "desc owner");
+        assert!(
+            description.contains("connection refused to 127.0.0.1:8010"),
+            "desc error"
+        );
+        assert!(description.contains("gate-honcho"), "desc failed_step");
+        assert!(description.contains("consecutive: 2"), "desc streak");
     }
 }

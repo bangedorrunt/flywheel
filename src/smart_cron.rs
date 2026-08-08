@@ -295,4 +295,54 @@ mod tests {
             assert!(out.is_object() || out.is_null(), "{name} returns a value");
         }
     }
+
+    /// P4.5 acceptance (sequencing rule): the DEPLOYED docker-upgrade
+    /// workflow carries explicit health-gate probes for the saga's five
+    /// services (aiostreams/resonate/honcho/pihole/dnscrypt) — one
+    /// `call_webhook` step per service, each `on_error: fail_run`. A dead
+    /// service errors the step and FAILS the run (Spec 0) → `on_failure:
+    /// bead`. This asserts the artifact in `toron/workflows/docker-upgrade.yaml`
+    /// matches the const here, so drift between the deployable YAML and the
+    /// proven design is caught.
+    #[test]
+    fn deployed_docker_upgrade_yaml_carries_the_five_gates() {
+        use toron_workflow::schema::Action;
+
+        let yaml = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../toron/workflows/docker-upgrade.yaml"),
+        )
+        .expect("deployed docker-upgrade.yaml readable");
+
+        let wf = parse_workflow(&yaml).expect("deployed yaml parses");
+        // every health-gate step is a call_webhook with on_error: fail_run
+        let mut probe_count = 0;
+        for step in &wf.steps {
+            if let Action::CallWebhook { url, .. } = &step.action {
+                assert_eq!(
+                    step.on_error,
+                    toron_workflow::schema::StepOnError::FailRun,
+                    "gate {} must fail the run on a dead service",
+                    step.name.as_deref().unwrap_or("probe")
+                );
+                assert!(url.starts_with("http://127.0.0.1:"), "probe targets a host port: {url}");
+                probe_count += 1;
+            }
+        }
+        assert_eq!(probe_count, 5, "five saga health-gates");
+        // the schedule + policy are set (owner housekeeper, bead on failure)
+        match &wf.trigger {
+            Some(toron_workflow::schema::Trigger::Schedule { owner, scope, .. }) => {
+                assert_eq!(owner.as_deref(), Some("housekeeper"));
+                assert_eq!(*scope, toron_workflow::schema::CronScope::Host);
+            }
+            other => panic!("docker-upgrade must be a schedule trigger: {other:?}"),
+        }
+        let policy = wf.policy.expect("policy block present");
+        assert_eq!(
+            policy.on_failure,
+            toron_workflow::schema::FailureAction::Bead,
+            "on_failure: bead"
+        );
+    }
 }
