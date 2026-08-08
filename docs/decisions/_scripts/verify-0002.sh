@@ -9,6 +9,11 @@
 # shell to the binary which constructs via the factory), and the concrete
 # main.rs sites are bounded (interactive CLI commands are a documented
 # deferral, per ADR-0002 §3.1 amendment).
+# se2.3 (ADR-0007 MailSurface consume): the flywheel-local `MailBackend` trait
+# is DELETED — mail goes through toron-core's `MailSurface`, re-exported in
+# src/backend/mod.rs and consumed via mail_shim.rs; the factory's mail accessor
+# returns `Box<dyn MailSurface>`. The checks below assert that current shape
+# (and that the local trait does NOT re-appear).
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 pass=0; fail=0
@@ -17,7 +22,21 @@ ok(){ echo "  [OK]   $1"; }; bad(){ echo "  [FAIL] $1"; fail=$((fail+1)); }; war
 echo "== ADR-0002 verification =="
 [[ -f src/backend/mod.rs ]] && ok "src/backend/mod.rs exists" || bad "src/backend/mod.rs missing"
 grep -rq 'as MultiplexerBackend' src/backend/ 2>/dev/null && ok "MultiplexerBackend trait re-exported" || bad "MultiplexerBackend trait missing"
-grep -rq 'trait MailBackend' src/backend/ 2>/dev/null && ok "MailBackend trait defined" || bad "MailBackend trait missing"
+# (mail) the local `MailBackend` trait is DELETED by se2.3 (ADR-0007
+# MailSurface consume): the coordination-fabric trait is toron-core's
+# `MailSurface`, re-exported in src/backend/mod.rs and consumed by the
+# mail_shim facade. A local trait re-appearing is a regression.
+if grep -rq 'trait MailBackend' src/backend/ 2>/dev/null; then
+  bad "local trait MailBackend re-appeared (deleted by se2.3, ADR-0007)"
+else
+  ok "no local MailBackend trait (ADR-0007 MailSurface consume)"
+fi
+grep -q 'pub use toron_core::mailbox::surface' src/backend/mod.rs 2>/dev/null \
+  && ok "MailSurface re-exported from toron-core (src/backend/mod.rs)" \
+  || bad "MailSurface re-export missing from src/backend/mod.rs"
+grep -q 'toron_core::mailbox::Mailbox' src/mail_shim.rs 2>/dev/null \
+  && ok "mail_shim.rs consumes toron-core Mailbox" \
+  || bad "mail_shim.rs no longer consumes toron-core Mailbox"
 grep -rq 'FLYWHEEL_BACKEND' src/ 2>/dev/null && ok "FLYWHEEL_BACKEND env wired" || warn "FLYWHEEL_BACKEND not yet wired"
 grep -rq 'FLYWHEEL_MAIL' src/ 2>/dev/null && ok "FLYWHEEL_MAIL env wired" || warn "FLYWHEEL_MAIL not yet wired"
 grep -q 'backend-herdr' Cargo.toml 2>/dev/null && ok "cargo feature backend-herdr present" || warn "backend-herdr feature missing"
@@ -27,9 +46,9 @@ grep -q 'backend-superlogical' Cargo.toml 2>/dev/null && ok "cargo feature backe
 grep -rq -e '-> Result<Box<dyn MultiplexerBackend>>' src/backend/factory.rs 2>/dev/null \
   && ok "factory returns Box<dyn MultiplexerBackend>" \
   || bad "factory does not return Box<dyn MultiplexerBackend>"
-grep -rq -e '-> Result<Box<dyn MailBackend>>' src/backend/factory.rs 2>/dev/null \
-  && ok "factory returns Box<dyn MailBackend>" \
-  || bad "factory does not return Box<dyn MailBackend>"
+grep -rq -e '-> Result<Box<dyn MailSurface>>' src/backend/factory.rs 2>/dev/null \
+  && ok "factory returns Box<dyn MailSurface> (ADR-0007)" \
+  || bad "factory does not return Box<dyn MailSurface>"
 
 # (b) the durable loop is backend-agnostic: durable.rs (the Resonate workflow)
 # must never construct a concrete herdr client (it shells to the binary which
