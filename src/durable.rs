@@ -1056,6 +1056,10 @@ async fn spawn_xproj(args: XprojSpawnArgs) -> Result<()> {
         .output()
         .map_err(|e| map_err(anyhow::anyhow!("__xproj-spawn spawn failed: {e}")))?;
     if !out.status.success() {
+        // cg6.6: unmark so a FAILED spawn is retried next iteration — the
+        // marker file is the replay-dedup for SUCCESSFUL spawns only;
+        // leaving it would drop the request forever.
+        let _ = crate::state::xproj_seen_unmark(&args.project, &args.message_id);
         return Err(map_err(anyhow::anyhow!(
             "__xproj-spawn failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -1881,7 +1885,6 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             if seen_xproj.contains(&item.id) {
                 continue;
             }
-            seen_xproj.insert(item.id.clone());
             let combined = format!("{} {}", item.subject, item.body);
             let req = crate::parse_xproj_request(&combined);
             let action = if let Some(r) = req.filter(|r| !r.recipe.is_empty()) {
@@ -1899,10 +1902,18 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         },
                     )
                     .await;
-                if let Err(e) = &spawned {
-                    eprintln!("flywheel: __xproj-spawn failed for msg {}: {e}", item.id);
+                match &spawned {
+                    Ok(()) => {
+                        // cg6.6: mark seen only AFTER a successful spawn —
+                        // a failed request must be retried next iteration.
+                        seen_xproj.insert(item.id.clone());
+                        "spawned"
+                    }
+                    Err(e) => {
+                        eprintln!("flywheel: __xproj-spawn failed for msg {}: {e}", item.id);
+                        "failed"
+                    }
                 }
-                "spawned"
             } else {
                 // FALLBACK: an agent interprets the unparseable request.
                 let prompt = crate::xproj_queue_prompt(
@@ -1915,11 +1926,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     },
                 );
                 queue.push(prompt);
+                seen_xproj.insert(item.id.clone()); // queued = handled
                 "queued"
             };
-            // is1.4: the spawned/queued outcome is NOT logged body-side —
-            // spawn_xproj logs its own (checkpointed) event; the queued case
-            // is visible via the queue + this one-shot eprintln.
             eprintln!("flywheel: cross-project request msg {} {action}", item.id);
         }
 

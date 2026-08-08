@@ -375,6 +375,22 @@ pub fn xproj_seen_mark(project: &str, message_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove a seen-marker for `message_id` (cg6.6): a FAILED spawn must be
+/// retried, so the leaf unmarks what it marked before spawning. Rewrites the
+/// file without the line; missing file/line is a no-op.
+pub fn xproj_seen_unmark(project: &str, message_id: &str) -> Result<()> {
+    let path = xproj_seen_file(project);
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(&path)?;
+    let remaining: Vec<&str> = raw.lines().filter(|l| l.trim() != message_id).collect();
+    if remaining.len() == raw.lines().count() {
+        return Ok(()); // not marked — nothing to do
+    }
+    crate::fs_util::atomic_write(&path, remaining.join("\n").as_bytes())
+}
+
 pub fn project_log_path(project: &str) -> PathBuf {
     state_dir().join(format!("{project}.jsonl"))
 }
@@ -1310,6 +1326,30 @@ mod loops_sidecar_tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert_eq!(raw.lines().count(), 2, "no duplicate marker lines");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// cg6.6: a failed spawn unmarks — the request retries next iteration.
+    /// Unmark removes exactly its line; missing marker/file is a no-op.
+    #[test]
+    fn xproj_seen_unmark_removes_only_its_line() {
+        let _g = loops_test_guard();
+        let project = test_project("xproj-unmark");
+        let path = xproj_seen_file(&project);
+        let _ = std::fs::remove_file(&path);
+        xproj_seen_mark(&project, "msg-a").unwrap();
+        xproj_seen_mark(&project, "msg-b").unwrap();
+        xproj_seen_mark(&project, "msg-c").unwrap();
+
+        xproj_seen_unmark(&project, "msg-b").unwrap();
+        assert!(!xproj_seen_contains(&project, "msg-b").unwrap(), "unmarked");
+        assert!(xproj_seen_contains(&project, "msg-a").unwrap(), "siblings kept");
+        assert!(xproj_seen_contains(&project, "msg-c").unwrap(), "siblings kept");
+
+        // no-op paths: unmarked id, and a missing file.
+        xproj_seen_unmark(&project, "msg-b").unwrap();
+        xproj_seen_unmark(&project, "never-marked").unwrap();
+        let _ = std::fs::remove_file(&path);
+        xproj_seen_unmark(&project, "msg-a").unwrap(); // missing file → Ok
     }
 
     // ---- l4s.2: read failures propagate, never clobber ----
