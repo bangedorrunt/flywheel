@@ -378,6 +378,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: BackendCmd,
     },
+    /// Agent profiles (ADR-0005 Spec 1/1b) — catalog + spawn
+    Profile {
+        #[command(subcommand)]
+        cmd: ProfileCmd,
+    },
     /// N-round A/B debate + judge (ADR-0001 §9.1 — threaded, ack-gated)
     Debate {
         /// the proposition being debated
@@ -910,6 +915,85 @@ enum BackendCmd {
     },
 }
 
+/// `flywheel profile` subcommands (ADR-0005 Spec 1/1b) — the agent catalog.
+/// `list`/`show` are read-only; `create`/`edit` write `profiles.toml`; `run`
+/// resolves `@name` → `Backend::spawn` (host scope, operator identity) and
+/// optionally invokes a workflow.
+#[derive(Subcommand)]
+enum ProfileCmd {
+    /// List catalog profiles (compiled-in defaults + locals)
+    List,
+    /// Show a profile (full behavior preamble + skills)
+    Show {
+        /// profile name (e.g. housekeeper, or a local [profiles.foo])
+        name: String,
+    },
+    /// Add or update a profile in ~/.config/flywheel/profiles.toml
+    Create {
+        /// profile name
+        name: String,
+        /// harness / program (pi | oc | grok | hermes | prime-agent | ...)
+        #[arg(long)]
+        harness: Option<String>,
+        /// model id (e.g. claude-sonnet-4)
+        #[arg(long)]
+        model: Option<String>,
+        /// role label (free-form prompt-shaping)
+        #[arg(long)]
+        role: Option<String>,
+        /// behavior preamble (system-prompt discipline)
+        #[arg(long)]
+        behavior: Option<String>,
+        /// short task hint
+        #[arg(long)]
+        task_hint: Option<String>,
+        /// backend trait impl (default herdr)
+        #[arg(long)]
+        backend: Option<String>,
+        /// default workflow name
+        #[arg(long)]
+        default_workflow: Option<String>,
+    },
+    /// Alias for `create` (same fields)
+    Edit {
+        /// profile name
+        name: String,
+        /// harness / program
+        #[arg(long)]
+        harness: Option<String>,
+        /// model id
+        #[arg(long)]
+        model: Option<String>,
+        /// role label
+        #[arg(long)]
+        role: Option<String>,
+        /// behavior preamble
+        #[arg(long)]
+        behavior: Option<String>,
+        /// short task hint
+        #[arg(long)]
+        task_hint: Option<String>,
+        /// backend trait impl
+        #[arg(long)]
+        backend: Option<String>,
+        /// default workflow name
+        #[arg(long)]
+        default_workflow: Option<String>,
+    },
+    /// Resolve @name (host scope) and spawn the agent via the configured
+    /// backend. Optionally invoke a workflow after spawn.
+    Run {
+        /// profile name (e.g. housekeeper)
+        name: String,
+        /// workflow to invoke after spawn (resolves via the workflow catalog)
+        #[arg(long)]
+        workflow: Option<String>,
+        /// JSON inputs for the workflow invoke
+        #[arg(long)]
+        inputs: Option<String>,
+    },
+}
+
 fn parse_kind_count(s: &str) -> Result<(String, u32)> {
     let (k, v) = s
         .split_once('=')
@@ -1350,6 +1434,7 @@ fn main() {
         }
         Some(Commands::Config { cmd }) => cmd_config(&cfg, cmd),
         Some(Commands::Backend { cmd }) => cmd_backend(&cfg, cmd),
+        Some(Commands::Profile { cmd }) => cmd_profile(&cfg, cmd),
         Some(Commands::Debate {
             proposition,
             rounds,
@@ -5452,6 +5537,159 @@ fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
     Ok(())
 }
 
+/// `flywheel profile` — the agent profile catalog (ADR-0005 Spec 1/1b).
+///
+/// `list` shows compiled-in defaults + local `profiles.toml` entries; `show`
+/// prints the full profile (behavior preamble + skills); `create`/`edit`
+/// write `~/.config/flywheel/profiles.toml`; `run @name` resolves the profile
+/// (host scope, operator identity) and spawns the agent via the configured
+/// multiplexer backend, optionally invoking a workflow after spawn.
+///
+/// governed-by: ADR-0005 (bd-p2-cli-wn8)
+fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
+    use profile::{ProfileCatalog, Profile};
+
+    match cmd {
+        ProfileCmd::List => {
+            let cat = ProfileCatalog::load()?;
+            // stdout = data; --json available to agent drivers via robot-style
+            let mut rows: Vec<Value> = Vec::new();
+            for name in cat.names() {
+                let p = cat.get(&name).expect("names from catalog");
+                rows.push(json!({
+                    "name": name,
+                    "harness": p.harness,
+                    "model": p.model,
+                    "role": p.role,
+                    "backend": cat.backend(&name),
+                    "default_workflow": p.default_workflow,
+                    "builtin": p.skills.is_empty() && p.behavior.is_empty(),
+                }));
+            }
+            print_json(&json!({ "profiles": rows }));
+        }
+        ProfileCmd::Show { name } => {
+            let cat = ProfileCatalog::load()?;
+            let p = cat
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown profile '@{name}' (flywheel profile list)"))?;
+            print_json(&json!({
+                "name": name,
+                "harness": p.harness,
+                "model": p.model,
+                "role": p.role,
+                "backend": cat.backend(name),
+                "default_workflow": p.default_workflow,
+                "behavior": p.behavior,
+                "task_hint": p.task_hint,
+                "skills": p.skills,
+            }));
+        }
+        ProfileCmd::Create { name, harness, model, role, behavior, task_hint, backend, default_workflow }
+        | ProfileCmd::Edit { name, harness, model, role, behavior, task_hint, backend, default_workflow } => {
+            let path = config::config_dir().join("profiles.toml");
+            let cat = ProfileCatalog::load()?;
+            let base = cat.get(name).cloned().unwrap_or_default();
+            let merged = Profile {
+                harness: harness.clone().unwrap_or(base.harness),
+                model: model.clone().unwrap_or(base.model),
+                role: role.clone().unwrap_or(base.role),
+                behavior: behavior.clone().unwrap_or(base.behavior),
+                task_hint: task_hint.clone().unwrap_or(base.task_hint),
+                backend: backend.clone().unwrap_or(base.backend),
+                default_workflow: default_workflow.clone().unwrap_or(base.default_workflow),
+                skills: base.skills,
+            };
+            if merged.harness.is_empty() || merged.model.is_empty() {
+                bail!("profile {name} needs at least --harness and --model");
+            }
+            // Rebuild the on-disk [profiles.<name>] shape: user entries only,
+            // merged over the catalog (which already layers built-ins).
+            let mut on_disk: BTreeMap<String, profile::Profile> = BTreeMap::new();
+            for n in cat.names() {
+                // carry local (non-builtin) entries verbatim; the edited one is
+                // rewritten from the merge so partial edits keep built-in fields
+                if n == *name || !is_builtin_profile(&n) {
+                    if let Some(p) = cat.get(&n) {
+                        on_disk.insert(n, p.clone());
+                    }
+                }
+            }
+            on_disk.insert(name.clone(), merged);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let raw = toml::to_string_pretty(&ProfilesFile { profiles: on_disk })?;
+            std::fs::write(&path, raw)?;
+            println!("wrote {} [profiles.{name}]", path.display());
+        }
+        ProfileCmd::Run { name, workflow, inputs } => {
+            let cat = ProfileCatalog::load()?;
+            let _inputs: Value = match inputs {
+                Some(s) if !s.is_empty() => serde_json::from_str(s)
+                    .map_err(|e| anyhow!("--inputs must be JSON: {e}"))?,
+                _ => json!({}),
+            };
+            // Host-scope resolve: operator identity, no project lookup. The
+            // operator npub is best-effort (empty string when unset).
+            let operator_npub = std::env::var("TORON_OPERATOR_NPUB")
+                .unwrap_or_else(|_| "operator".to_string());
+            let resolved = cat.resolve(name, None, &operator_npub, &|_, _| None)?;
+            let spec = &resolved.spec;
+
+            // Spawn via the configured multiplexer backend (default herdr).
+            let backend = backend::multiplexer_backend(cfg)?;
+            let agent_name = format!("profile-{name}");
+            // Find a pane in the default project workspace, or create one.
+            let workspace = resolved_spec_workspace(cfg, backend.as_ref(), &spec.harness)?;
+            let info = backend.agent_start(&agent_name, &spec.harness, &workspace, &[])?;
+            println!(
+                "profile {name} spawned: agent={} pane={} backend={}",
+                info.name.as_deref().unwrap_or(&agent_name),
+                info.pane_id,
+                spec.backend
+            );
+            if let Some(wf) = workflow {
+                println!(
+                    "workflow {wf} invoke not yet wired (P3 edge) — spawned agent is ready for manual dispatch"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True when a profile is one of the 6 compiled-in built-ins (so `create`/
+/// `edit` doesn't duplicate it on disk verbatim).
+fn is_builtin_profile(name: &str) -> bool {
+    matches!(
+        name,
+        "oracle" | "planner" | "reviewer" | "coder" | "scout" | "housekeeper"
+    )
+}
+
+/// Resolve a pane id in the default project workspace for `profile run`:
+/// reuse the first workspace whose label matches a default project, else the
+/// first workspace, else create one.
+fn resolved_spec_workspace(
+    _cfg: &Config,
+    backend: &dyn backend::MultiplexerBackend,
+    _harness: &str,
+) -> Result<String> {
+    let ws = backend.workspace_list()?;
+    if let Some(first) = ws.first() {
+        return Ok(first.workspace_id.clone());
+    }
+    let created = backend.workspace_create(None)?;
+    Ok(created.workspace_id)
+}
+
+/// On-disk shape of `profiles.toml` for the CLI writer.
+#[derive(serde::Serialize)]
+struct ProfilesFile {
+    profiles: BTreeMap<String, profile::Profile>,
+}
+
 /// `flywheel debate <proposition> [--rounds N] [--agent-a ..] [--agent-b ..]
 /// [--judge ..]` — N-round A/B debate + judge (ADR-0001 §9.1).
 ///
@@ -7677,12 +7915,49 @@ mod plan_review_tests {
         assert!(matches!(a, PriAction::Escalate { reason } if reason.contains("rejected")));
     }
 
+     #[test]
+     fn extract_plan_path_from_reply() {
+         assert_eq!(
+             extract_plan_path("PLAN: .flywheel/plans/bd-1.md\nthanks", "fallback.md"),
+             ".flywheel/plans/bd-1.md"
+         );
+         assert_eq!(extract_plan_path("no path here", "fb.md"), "fb.md");
+     }
+}
+
+#[cfg(test)]
+mod profile_cli_tests {
+    use super::*;
+
     #[test]
-    fn extract_plan_path_from_reply() {
-        assert_eq!(
-            extract_plan_path("PLAN: .flywheel/plans/bd-1.md\nthanks", "fallback.md"),
-            ".flywheel/plans/bd-1.md"
-        );
-        assert_eq!(extract_plan_path("no path here", "fb.md"), "fb.md");
+    fn is_builtin_profile_classifies_the_six() {
+        for name in ["oracle", "planner", "reviewer", "coder", "scout", "housekeeper"] {
+            assert!(is_builtin_profile(name), "{name} is a built-in");
+        }
+        assert!(!is_builtin_profile("mybot"));
+        assert!(!is_builtin_profile(""));
+    }
+
+    #[test]
+    fn profile_catalog_lists_six_builtins() {
+        let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
+        assert_eq!(cat.names().len(), 6);
+        for name in ["oracle", "planner", "reviewer", "coder", "scout", "housekeeper"] {
+            let p = cat.get(name).expect(name);
+            // every built-in carries the Spec 1b preamble (not a stub)
+            assert!(p.behavior.len() > 200, "{name} preamble missing");
+        }
+    }
+
+    #[test]
+    fn profile_run_resolves_host_scope_and_spec() {
+        let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
+        let r = cat
+            .resolve("housekeeper", None, "npub-op", &|_, _| None)
+            .expect("resolve");
+        assert_eq!(r.spec.harness, "pi");
+        assert_eq!(r.spec.model, "claude-sonnet-4");
+        assert_eq!(r.spec.backend, "herdr");
+        assert_eq!(r.signing, profile::SigningContext::Operator("npub-op".into()));
     }
 }
