@@ -51,14 +51,18 @@ impl CrewPlan {
 /// - `crew: { role: count }` → that squad.
 /// - `crew: auto` → infer from the workflow's own `profile:` refs (a distinct
 ///   `profile: "@X"` adds a member of role X; `parallel over: "@crew.X"`
-///   raises the count to the declared/needed parallelism).
-/// - `crew` omitted → empty plan (each spawn standalone).
+///   raises the count to the declared/needed parallelism). Explicit opt-in:
+///   the built-in workflows ship with `crew: auto`.
+/// - `crew` omitted → EMPTY plan (each spawn standalone). A crew-less
+///   workflow must NOT silently spawn a crew even when its steps carry
+///   `profile: "@X"` refs — auto-inference is an explicit request (is1.1).
 pub fn plan_crew(workflow: &Workflow) -> CrewPlan {
     match &workflow.crew {
         Some(CrewSpec::Explicit(map)) => CrewPlan {
             members: map.clone(),
         },
-        Some(CrewSpec::Auto) | None => infer_auto(workflow),
+        Some(CrewSpec::Auto) => infer_auto(workflow),
+        None => CrewPlan::default(),
     }
 }
 
@@ -216,5 +220,37 @@ steps:
         .expect("parse");
         let plan = plan_crew(&wf);
         assert!(plan.members.is_empty());
+    }
+
+    /// is1.1 regression: a crew-LESS workflow whose steps carry
+    /// `profile: "@X"` refs must produce an EMPTY plan — auto-inference is an
+    /// explicit `crew: auto` opt-in, never a silent side effect of profile
+    /// refs (documented standalone contract).
+    #[test]
+    fn omitted_crew_with_profile_refs_stays_standalone() {
+        let wf = parse_workflow(
+            r##"
+name: plain-with-refs
+trigger:
+  type: webhook
+steps:
+  - name: a
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@reviewer" }
+  - name: b
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@oracle" }
+"##,
+        )
+        .expect("parse");
+        assert!(wf.crew.is_none(), "fixture has no crew");
+        let plan = plan_crew(&wf);
+        assert!(
+            plan.members.is_empty(),
+            "crew omitted => standalone, even with profile refs: {:?}",
+            plan.members
+        );
     }
 }
