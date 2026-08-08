@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use toron_workflow::engine::{ActionRunner, WorkflowEngine};
-use toron_workflow::schema::{Action, parse_workflow};
+use toron_workflow::schema::{Action, Workflow, parse_workflow};
 
 /// A no-op runner (returns Null for every action — the embedding's real
 /// runner is injected; this test exercises the engine, not the mailbox).
@@ -74,4 +74,87 @@ steps:
         output.get("plan").is_some(),
         "invoked workflow produced step output: {output}"
     );
+}
+
+/// The DEFERRED P3.2/3.7 item (re-executed in bd-p3-unified-engine-h3v): a
+/// legacy `workflows.toml` workflow — the exact `Send/Wait` shape
+/// `WorkflowCatalog::absorb` emits as `Action::DispatchJob{spec:{to,stage,msg}}`
+/// + `Action::Delay` — must round-trip through `WorkflowEngine::invoke`. This
+/// is the "send_wait_absorbed" integration test the closures deferred; it
+/// proves the thin-caller's foundation (absorbed catalog → engine) is real
+/// without touching main.rs or the captain's live workflows.
+#[tokio::test]
+async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
+    use std::sync::Mutex;
+    use toron_workflow::schema::Step;
+
+    // Capture the dispatch payloads so we assert the legacy Send semantics
+    // (to/stage/msg) survive absorption, not just that the engine runs.
+    let dispatches: Arc<Mutex<Vec<(String, serde_json::Value)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let captured = dispatches.clone();
+    let runner: ActionRunner = Arc::new(move |a: &Action| {
+        if let Action::DispatchJob { assignee, spec, .. } = a {
+            captured
+                .lock()
+                .unwrap()
+                .push((assignee.clone(), spec.clone()));
+            return Ok(serde_json::json!({ "ok": true, "assignee": assignee }));
+        }
+        Ok(serde_json::Value::Null)
+    });
+
+    // The absorbed-legacy workflow shape (mirrors absorb_workflow_steps):
+    // send-0 -> DispatchJob{to,spec:{to,stage,msg}}, wait-0 -> Delay.
+    let wf = Workflow {
+        name: "legacy-send-wait".into(),
+        description: Some("absorbed legacy workflows.toml workflow".into()),
+        trigger: None,
+        guard: None,
+        policy: None,
+        steps: vec![
+            Step {
+                name: Some("send-0".into()),
+                guard: None,
+                on_error: Default::default(),
+                action: Action::DispatchJob {
+                    assignee: "pi".into(),
+                    spec: serde_json::json!({
+                        "to": "pi",
+                        "stage": "p6",
+                        "msg": null,
+                    }),
+                    channel: None,
+                },
+            },
+            Step {
+                name: Some("wait-0".into()),
+                guard: None,
+                on_error: Default::default(),
+                action: Action::Delay { secs: 0 },
+            },
+        ],
+        graph: None,
+        crew: None,
+        inputs: vec![],
+    };
+
+    let engine = WorkflowEngine::local(runner).expect("engine");
+    let output = engine
+        .invoke("legacy-send-wait-1", wf, serde_json::json!({}))
+        .await
+        .expect("invoke absorbed legacy workflow");
+
+    // send-0 produced a step output (engine advanced past both steps).
+    assert!(output.get("send-0").is_some(), "send-0 step output: {output}");
+    assert!(output.get("wait-0").is_some(), "wait-0 step output: {output}");
+
+    // The legacy Send semantics survived absorption: one DispatchJob to pi
+    // carrying the p6 stage.
+    let jobs = dispatches.lock().unwrap();
+    assert_eq!(jobs.len(), 1, "one DispatchJob from the legacy Send step");
+    let (assignee, spec) = &jobs[0];
+    assert_eq!(assignee, "pi");
+    assert_eq!(spec["to"], "pi");
+    assert_eq!(spec["stage"], "p6");
 }
