@@ -122,7 +122,7 @@ impl McpClient {
     /// the server was unreachable; `Tool` errors mean it responded in error.
     pub fn call_tool(&self, name: &str, arguments: Value) -> std::result::Result<Value, McpError> {
         if self.initialized.get().is_none() {
-            self.initialize().map_err(McpError::Transport)?;
+            self.initialize()?;
             let _ = self.initialized.set(());
         }
         let result = self.post(
@@ -133,7 +133,12 @@ impl McpClient {
     }
 
     /// Run the `initialize` handshake (result is ignored — stateless mode).
-    fn initialize(&self) -> Result<()> {
+    ///
+    /// Propagates `post`'s `McpError` verbatim so a server that ANSWERS the
+    /// handshake with an error stays a `Tool` error instead of being relabeled
+    /// `Transport` (ADR-0003 V4: Transport = unreachable, Tool = responded in
+    /// error — conflating them sends operators chasing the wrong daemon).
+    fn initialize(&self) -> std::result::Result<(), McpError> {
         let mut params = serde_json::Map::new();
         params.insert("protocolVersion".into(), json!(PROTOCOL_VERSION));
         params.insert("capabilities".into(), json!({}));
@@ -141,9 +146,7 @@ impl McpClient {
             "clientInfo".into(),
             json!({ "name": "flywheel", "version": env!("CARGO_PKG_VERSION") }),
         );
-        self.post("initialize", Value::Object(params))
-            .map(|_| ())
-            .map_err(|e| e.into())
+        self.post("initialize", Value::Object(params)).map(|_| ())
     }
 
     /// Extract the tool's structured JSON from a `tools/call` result.
@@ -242,5 +245,156 @@ impl McpClient {
                 "{label} MCP {method}: no result in response"
             )))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    /// Serve one HTTP response per accepted connection. `respond` maps a
+    /// request body to the raw HTTP response bytes; the listener thread
+    /// accepts connections until the test drops the listener. The full
+    /// request (headers + Content-Length body) is read before responding so
+    /// the handshake is deterministic even when the client's request arrives
+    /// in multiple TCP segments under parallel test load.
+    fn serve_raw(respond: impl Fn(&[u8]) -> Vec<u8> + Send + 'static) -> String {
+        use std::io::Read as _;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Read until headers end AND the advertised body is complete.
+                loop {
+                    match s.read(&mut chunk) {
+                        Ok(0) => break, // peer closed: respond with what we have
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    }
+                    let head_done = buf.windows(4).any(|w| w == b"\r\n\r\n");
+                    if head_done {
+                        match content_length(&buf) {
+                            // Body complete once we have Content-Length bytes.
+                            Some(need) => {
+                                let head_end =
+                                    buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                                if buf.len() >= head_end + 4 + need {
+                                    break;
+                                }
+                            }
+                            // Headers done, no length header (ureq always sends
+                            // Content-Length for JSON) — don't spin.
+                            None => break,
+                        }
+                    }
+                }
+                let _ = s.write_all(&respond(&buf));
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// Content-Length of the HTTP request in `buf`, if the header is present.
+    fn content_length(buf: &[u8]) -> Option<usize> {
+        let head = std::str::from_utf8(buf).ok()?;
+        let head_end = head.find("\r\n\r\n")?;
+        head[..head_end].lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            if k.eq_ignore_ascii_case("content-length") {
+                v.trim().parse().ok()
+            } else {
+                None
+            }
+        })
+    }
+
+    fn http(status_line: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn initialize_http_error_stays_tool_not_transport() {
+        // A server that RESPONDS to the handshake with HTTP 400 is reachable —
+        // it rejected the request. Must classify as Tool (ADR-0003 V4), never
+        // as Transport ("server not reachable").
+        let base = serve_raw(|_| {
+            http(
+                "400 Bad Request",
+                r#"{"jsonrpc":"2.0","error":{"code":-32600,"message":"bad protocol"}}"#,
+            )
+        });
+        let client = McpClient::new(&base, None, ServerKind::AgentMail).expect("client");
+        let err = client.call_tool("health_check", json!({})).unwrap_err();
+        assert!(
+            matches!(err, McpError::Tool(_)),
+            "handshake rejection must be Tool, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("transport"),
+            "Tool error must not be labeled transport: {msg}"
+        );
+    }
+
+    #[test]
+    fn refused_connection_is_transport() {
+        // Bind, grab the port, drop the listener → connection refused.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let client = McpClient::new(&format!("http://127.0.0.1:{port}"), None, ServerKind::Toron)
+            .expect("client");
+        let err = client.call_tool("health_check", json!({})).unwrap_err();
+        assert!(
+            matches!(err, McpError::Transport(_)),
+            "refused connection must be Transport, got: {err}"
+        );
+    }
+
+    #[test]
+    fn healthy_server_handshakes_once_then_calls_tool() {
+        // Full happy path: initialize 200 → tools/call 200 with a text
+        // ContentBlock carrying the structured JSON. The initialized
+        // OnceLock must make the handshake run exactly once.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let inits = Arc::new(AtomicUsize::new(0));
+        let inits_closure = Arc::clone(&inits);
+        let base = serve_raw(move |req| {
+            let req = String::from_utf8_lossy(req);
+            if req.contains("\"initialize\"") {
+                inits_closure.fetch_add(1, Ordering::SeqCst);
+                http(
+                    "200 OK",
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2026-07-28","capabilities":{}}}"#,
+                )
+            } else {
+                http(
+                    "200 OK",
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"ok\":true}"}]}}"#,
+                )
+            }
+        });
+        let client = McpClient::new(&base, None, ServerKind::AgentMail).expect("client");
+        let out = client
+            .call_tool("health_check", json!({}))
+            .expect("tool call succeeds");
+        assert_eq!(out["ok"], true, "structured result parsed: {out}");
+        // Second call must NOT re-handshake (OnceLock).
+        let out2 = client
+            .call_tool("health_check", json!({}))
+            .expect("second tool call succeeds");
+        assert_eq!(out2["ok"], true);
+        assert_eq!(inits.load(Ordering::SeqCst), 1, "initialize runs once");
     }
 }

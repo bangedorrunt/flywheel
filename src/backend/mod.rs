@@ -154,16 +154,6 @@ impl BackendError {
             reason: format!("backend '{backend}' does not implement '{method}'"),
         }
     }
-
-    /// Helper for stub backends: a whole-backend reason (not per-method). Used
-    /// by the superlogical/tmux/toron stubs (bd-toron-superlogical-stubs).
-    pub(crate) fn stub(backend: &'static str, reason: &str) -> Self {
-        Self::Unsupported {
-            backend: backend.to_string(),
-            method: "(stub)",
-            reason: reason.to_string(),
-        }
-    }
 }
 
 /// Type alias so trait signatures read `Result<T>` and real impls get
@@ -175,6 +165,11 @@ pub type Result<T> = std::result::Result<T, BackendError>;
 /// (Nostr, in-process). Operation-shaped (the calls flywheel needs), not the
 /// raw 38 MCP tools. Each Phase-3 bead graduates a method from `Unsupported`
 /// to a real delegation + behavior (`bd-mail-register-on-spawn`, etc.).
+///
+/// Receivers are `&self` (c3b.2): no impl mutates state — backends use
+/// interior mutability (`OnceLock`/`AtomicU64` in the MCP client, the shared
+/// mailbox behind `Arc`). This makes `Arc<dyn MailBackend>` shareable across
+/// loop iterations without a serializing Mutex.
 pub trait MailBackend: Send + Sync {
     /// Stable backend identifier ("agentmail" | "toron").
     fn name(&self) -> &'static str;
@@ -183,18 +178,20 @@ pub trait MailBackend: Send + Sync {
     /// for (the `sender_name`/`agent_name` in agent-mail calls). Review-fix
     /// F6: the concrete `Mail.name` field is the identity; the trait must
     /// expose it so call sites (inbox, send) route through the factory.
-    fn agent_name(&self) -> &str {
-        ""
-    }
+    ///
+    /// REQUIRED (no default): a `""` default would let a backend silently
+    /// send/read mail as an EMPTY identity — a silent-wrong-behavior trap.
+    /// Both real impls override it; a new impl must too (compile-enforced).
+    fn agent_name(&self) -> &str;
 
-    fn health(&mut self) -> Result<Value> {
+    fn health(&self) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "health"))
     }
-    fn ensure_project(&mut self, _project_key: &str) -> Result<Value> {
+    fn ensure_project(&self, _project_key: &str) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "ensure_project"))
     }
     fn register_agent(
-        &mut self,
+        &self,
         _project_key: &str,
         _name: &str,
         _program: &str,
@@ -203,14 +200,14 @@ pub trait MailBackend: Send + Sync {
     ) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "register_agent"))
     }
-    fn list_agents(&mut self, _project_key: &str) -> Result<Value> {
+    fn list_agents(&self, _project_key: &str) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "list_agents"))
     }
     /// 7 params mirror agent-mail's `send_message` tool surface (separate,
     /// not a struct); loop callers construct them inline.
     #[allow(clippy::too_many_arguments)]
     fn send(
-        &mut self,
+        &self,
         _project_key: &str,
         _to: &[String],
         _subject: &str,
@@ -222,7 +219,7 @@ pub trait MailBackend: Send + Sync {
         Err(BackendError::unsupported(self.name(), "send"))
     }
     fn reply(
-        &mut self,
+        &self,
         _project_key: &str,
         _message_id: &str,
         _body: &str,
@@ -230,17 +227,17 @@ pub trait MailBackend: Send + Sync {
     ) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "reply"))
     }
-    fn inbox(&mut self, _project_key: &str, _agent: &str, _filter: &InboxFilter) -> Result<Value> {
+    fn inbox(&self, _project_key: &str, _agent: &str, _filter: &InboxFilter) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "inbox"))
     }
-    fn ack(&mut self, _project_key: &str, _agent: &str, _message_id: &str) -> Result<Value> {
+    fn ack(&self, _project_key: &str, _agent: &str, _message_id: &str) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "ack"))
     }
-    fn mark_read(&mut self, _project_key: &str, _agent: &str, _message_id: &str) -> Result<Value> {
+    fn mark_read(&self, _project_key: &str, _agent: &str, _message_id: &str) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "mark_read"))
     }
     fn reserve(
-        &mut self,
+        &self,
         _project_key: &str,
         _agent: &str,
         _paths: &[String],
@@ -250,11 +247,11 @@ pub trait MailBackend: Send + Sync {
     ) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "reserve"))
     }
-    fn release(&mut self, _project_key: &str, _agent: &str) -> Result<Value> {
+    fn release(&self, _project_key: &str, _agent: &str) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "release"))
     }
     fn renew(
-        &mut self,
+        &self,
         _project_key: &str,
         _agent: &str,
         _extend_seconds: u64,
@@ -267,7 +264,7 @@ pub trait MailBackend: Send + Sync {
     /// caller's responsibility — it is NOT gated behind the excluded
     /// operator-only macro/guard/create identities).
     fn force_release_file_reservation(
-        &mut self,
+        &self,
         _project_key: &str,
         _agent: &str,
         _file_reservation_id: u64,
@@ -284,7 +281,7 @@ pub trait MailBackend: Send + Sync {
     /// natively (ADR-0003 §G9); the agentmail backend delegates to the
     /// agent-mail MCP `resolve_pane_identity` tool, which reads the identity
     /// files the bridge writes (`bd-mail-pane-identity-bridge`, ADR-0001 A4).
-    fn resolve_pane_identity(&mut self, _project_key: &str, _pane_id: &str) -> Result<Value> {
+    fn resolve_pane_identity(&self, _project_key: &str, _pane_id: &str) -> Result<Value> {
         Err(BackendError::unsupported(
             self.name(),
             "resolve_pane_identity",
@@ -294,7 +291,7 @@ pub trait MailBackend: Send + Sync {
     /// not an MCP tool — herdr panes are not tmux panes, so agent-mail never
     /// writes identities for them; the bridge does (ADR-0001 A4).
     fn write_pane_identity(
-        &mut self,
+        &self,
         _project_key: &str,
         _pane_id: &str,
         _agent_name: &str,
@@ -305,7 +302,7 @@ pub trait MailBackend: Send + Sync {
         ))
     }
     /// Remove the per-pane identity file (pane exited / respawned).
-    fn clear_pane_identity(&mut self, _project_key: &str, _pane_id: &str) -> Result<Value> {
+    fn clear_pane_identity(&self, _project_key: &str, _pane_id: &str) -> Result<Value> {
         Err(BackendError::unsupported(
             self.name(),
             "clear_pane_identity",
@@ -313,17 +310,17 @@ pub trait MailBackend: Send + Sync {
     }
     /// Prune identities whose panes are absent from the live pane list
     /// (`cleanup_pane_identities`; ADR-0003 V6 surface restore).
-    fn cleanup_pane_identities(&mut self, _project_key: &str) -> Result<Value> {
+    fn cleanup_pane_identities(&self, _project_key: &str) -> Result<Value> {
         Err(BackendError::unsupported(
             self.name(),
             "cleanup_pane_identities",
         ))
     }
-    fn conflicts(&mut self, _project_key: &str, _agent: &str, _paths: &[String]) -> Result<Value> {
+    fn conflicts(&self, _project_key: &str, _agent: &str, _paths: &[String]) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "conflicts"))
     }
     fn slot_acquire(
-        &mut self,
+        &self,
         _project_key: &str,
         _agent: &str,
         _slot: &str,
@@ -332,14 +329,14 @@ pub trait MailBackend: Send + Sync {
     ) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "slot_acquire"))
     }
-    fn slot_release(&mut self, _project_key: &str, _agent: &str, _slot: &str) -> Result<Value> {
+    fn slot_release(&self, _project_key: &str, _agent: &str, _slot: &str) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "slot_release"))
     }
     /// Extend an active build-slot lease's TTL (`renew_build_slot`). Idempotent
     /// and safe to over-call (ADR-0003 V6 restores the full non-operator
     /// surface; the concrete `Mail` facade already wraps it as `renew_slot`).
     fn slot_renew(
-        &mut self,
+        &self,
         _project_key: &str,
         _agent: &str,
         _slot: &str,
@@ -348,7 +345,7 @@ pub trait MailBackend: Send + Sync {
         Err(BackendError::unsupported(self.name(), "slot_renew"))
     }
     fn search(
-        &mut self,
+        &self,
         _project_key: &str,
         _query: &str,
         _limit: u32,
@@ -357,7 +354,7 @@ pub trait MailBackend: Send + Sync {
         Err(BackendError::unsupported(self.name(), "search"))
     }
     fn summarize_thread(
-        &mut self,
+        &self,
         _project_key: &str,
         _thread_id: &str,
         _llm_mode: bool,
@@ -367,7 +364,7 @@ pub trait MailBackend: Send + Sync {
     /// Summarize a thread across a product's member projects
     /// (`summarize_thread_product`; ADR-0003 V6 surface restore).
     fn summarize_thread_product(
-        &mut self,
+        &self,
         _product_key: &str,
         _thread_id: &str,
         _llm_mode: bool,
@@ -378,7 +375,7 @@ pub trait MailBackend: Send + Sync {
         ))
     }
     fn request_contact(
-        &mut self,
+        &self,
         _project_key: &str,
         _from_agent: &str,
         _to_agent: &str,
@@ -388,7 +385,7 @@ pub trait MailBackend: Send + Sync {
         Err(BackendError::unsupported(self.name(), "request_contact"))
     }
     fn respond_contact(
-        &mut self,
+        &self,
         _project_key: &str,
         _to_agent: &str,
         _from_agent: &str,
@@ -396,27 +393,27 @@ pub trait MailBackend: Send + Sync {
     ) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "respond_contact"))
     }
-    fn list_contacts(&mut self, _project_key: &str, _agent: &str) -> Result<Value> {
+    fn list_contacts(&self, _project_key: &str, _agent: &str) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "list_contacts"))
     }
     fn set_contact_policy(
-        &mut self,
+        &self,
         _project_key: &str,
         _agent: &str,
         _policy: &str,
     ) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "set_contact_policy"))
     }
-    fn ensure_product(&mut self, _product_key: &str) -> Result<Value> {
+    fn ensure_product(&self, _product_key: &str) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "ensure_product"))
     }
-    fn products_link(&mut self, _product_key: &str, _project_key: &str) -> Result<Value> {
+    fn products_link(&self, _product_key: &str, _project_key: &str) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "products_link"))
     }
-    fn search_product(&mut self, _product_key: &str, _query: &str, _limit: u32) -> Result<Value> {
+    fn search_product(&self, _product_key: &str, _query: &str, _limit: u32) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "search_product"))
     }
-    fn inbox_product(&mut self, _product_key: &str, _agent: &str, _limit: u32) -> Result<Value> {
+    fn inbox_product(&self, _product_key: &str, _agent: &str, _limit: u32) -> Result<Value> {
         Err(BackendError::unsupported(self.name(), "inbox_product"))
     }
 }
@@ -440,6 +437,9 @@ mod trait_contract_tests {
     impl MailBackend for DummyMail {
         fn name(&self) -> &'static str {
             "dummy-mail"
+        }
+        fn agent_name(&self) -> &str {
+            "dummy-agent"
         }
     }
 

@@ -75,6 +75,9 @@ mod tests {
         fn name(&self) -> &'static str {
             "all-unsupported-mail"
         }
+        fn agent_name(&self) -> &str {
+            "all-unsupported-agent"
+        }
     }
 
     #[test]

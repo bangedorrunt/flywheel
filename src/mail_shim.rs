@@ -215,6 +215,14 @@ pub struct Mail {
 
 #[cfg_attr(not(feature = "mail-toron"), allow(dead_code))]
 impl Mail {
+    /// Rebind the facade's sender identity. Construction-time only: consumes
+    /// self so `Mail` stays `&self`-callable afterwards (c3b.2 — no interior
+    /// mutability needed; `name` is never written through `&self`).
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
+    }
+
     /// Construct the mail facade from `[agent_mail]` config. Picks the
     /// backend: `cfg.url` Some → remote-daemon (bd-o8j.3); None/unset →
     /// integrated in-process mailbox (default). The config section stays
@@ -273,7 +281,7 @@ impl Mail {
     }
 
     /// `health_check` (in-process) / `health_check` (remote).
-    pub fn health(&mut self) -> Result<Value> {
+    pub fn health(&self) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 let report = block_on(mailbox().health_check());
@@ -289,7 +297,7 @@ impl Mail {
     }
 
     /// `ensure_project`.
-    pub fn ensure_project(&mut self, project_key: &str) -> Result<Value> {
+    pub fn ensure_project(&self, project_key: &str) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 let state = block_on(mailbox().ensure_project(project_key))?;
@@ -302,7 +310,7 @@ impl Mail {
     }
 
     /// `list_agents` (project's registered identities).
-    pub fn list_agents(&mut self, project_key: &str) -> Result<Value> {
+    pub fn list_agents(&self, project_key: &str) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 let agents =
@@ -317,7 +325,7 @@ impl Mail {
 
     /// `register_agent` (upsert on the agent's key).
     pub fn register_agent(
-        &mut self,
+        &self,
         project_key: &str,
         name: &str,
         program: &str,
@@ -348,7 +356,7 @@ impl Mail {
 
     /// `fetch_inbox` (simple filter set).
     pub fn inbox(
-        &mut self,
+        &self,
         project_key: &str,
         agent_name: &str,
         _urgent_only: bool,
@@ -381,7 +389,7 @@ impl Mail {
     /// `ack_overdue_only` / `since_ts` have no toron projection yet — the
     /// supported subset (`unread_only`, `include_bodies`, `limit`) is applied.
     pub fn inbox_filtered(
-        &mut self,
+        &self,
         project_key: &str,
         agent_name: &str,
         filter: &MailInboxFilter,
@@ -412,7 +420,7 @@ impl Mail {
 
     /// `mark_message_read`.
     pub fn mark_read(
-        &mut self,
+        &self,
         project_key: &str,
         agent_name: &str,
         message_id: &str,
@@ -442,7 +450,7 @@ impl Mail {
     }
 
     /// `acknowledge_message`.
-    pub fn ack(&mut self, project_key: &str, agent_name: &str, message_id: &str) -> Result<Value> {
+    pub fn ack(&self, project_key: &str, agent_name: &str, message_id: &str) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 // toron ids are hex event ids — pass through verbatim.
@@ -469,7 +477,7 @@ impl Mail {
     /// returns the inbox (empty after all are acked), so the escalation
     /// protocol's "nothing overdue" branch behaves as before.
     #[allow(dead_code)] // consumed by the Phase-4 escalation protocol + live test
-    pub fn ack_overdue(&mut self, project_key: &str, agent_name: &str) -> Result<Value> {
+    pub fn ack_overdue(&self, project_key: &str, agent_name: &str) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 let msgs = block_on(mailbox().fetch_inbox(&FetchInbox {
@@ -495,7 +503,7 @@ impl Mail {
     /// `send_message`.
     #[allow(clippy::too_many_arguments)] // mirrors the MailBackend::send trait surface
     pub fn send(
-        &mut self,
+        &self,
         project_key: &str,
         to: &[String],
         subject: &str,
@@ -539,7 +547,7 @@ impl Mail {
 
     /// `reply_message` (threaded).
     pub fn reply(
-        &mut self,
+        &self,
         project_key: &str,
         message_id: &str,
         body: &str,
@@ -576,7 +584,7 @@ impl Mail {
 
     /// `summarize_thread`.
     pub fn summarize_thread(
-        &mut self,
+        &self,
         project_key: &str,
         thread_id: &str,
         llm_mode: bool,
@@ -606,7 +614,7 @@ impl Mail {
     /// `summarize_thread_product` — summarize a thread across a product's
     /// member projects (ADR-0003 V6 surface restore).
     pub fn summarize_thread_product(
-        &mut self,
+        &self,
         product_key: &str,
         thread_id: &str,
         llm_mode: bool,
@@ -631,7 +639,7 @@ impl Mail {
     /// `search_messages`. The JSON envelope is `{"result": [...]}` so
     /// `harvest_latest` (debate / plan-review) reads `result[0].body_md`.
     pub fn search(
-        &mut self,
+        &self,
         project_key: &str,
         query: &str,
         limit: u32,
@@ -724,7 +732,7 @@ impl Mail {
 
     /// `file_reservation_paths`.
     pub fn reserve(
-        &mut self,
+        &self,
         project_key: &str,
         paths: &[String],
         ttl_seconds: u64,
@@ -758,7 +766,7 @@ impl Mail {
     }
 
     /// `release_file_reservations`.
-    pub fn release(&mut self, project_key: &str) -> Result<Value> {
+    pub fn release(&self, project_key: &str) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 let r =
@@ -773,7 +781,7 @@ impl Mail {
     }
 
     /// `check_file_reservation_conflicts`.
-    pub fn conflicts(&mut self, project_key: &str, paths: &[String]) -> Result<Value> {
+    pub fn conflicts(&self, project_key: &str, paths: &[String]) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 let r = block_on(mailbox().check_file_reservation_conflicts(
@@ -797,7 +805,7 @@ impl Mail {
     /// `renew_file_reservations`. The response keeps the `file_reservations`
     /// envelope `list_own_reservations` parses (ids are toron hex event ids).
     pub fn renew(
-        &mut self,
+        &self,
         project_key: &str,
         agent_name: &str,
         extend_seconds: u64,
@@ -865,7 +873,7 @@ impl Mail {
     /// operator key (attached by `build_mailbox`); remote delegates to the
     /// daemon's tool.
     pub fn force_release_file_reservation(
-        &mut self,
+        &self,
         project_key: &str,
         agent_name: &str,
         file_reservation_id: &str,
@@ -903,7 +911,7 @@ impl Mail {
     /// no per-pane identity files (live herdr mapping), so in-process "prune"
     /// reports the stale names; without a herdr backend it returns the
     /// not-wired note (same contract as the toron-mcp tool).
-    pub fn cleanup_pane_identities(&mut self, _project_key: &str) -> Result<Value> {
+    pub fn cleanup_pane_identities(&self, _project_key: &str) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 match toron_core::backend::herdr::HerdrBackend::connect(None) {
@@ -927,7 +935,7 @@ impl Mail {
 
     /// `request_contact`.
     pub fn request_contact(
-        &mut self,
+        &self,
         project_key: &str,
         from_agent: &str,
         to_agent: &str,
@@ -963,7 +971,7 @@ impl Mail {
 
     /// `respond_contact`.
     pub fn respond_contact(
-        &mut self,
+        &self,
         project_key: &str,
         to_agent: &str,
         from_agent: &str,
@@ -993,7 +1001,7 @@ impl Mail {
     }
 
     /// `list_contacts`.
-    pub fn list_contacts(&mut self, project_key: &str, agent_name: &str) -> Result<Value> {
+    pub fn list_contacts(&self, project_key: &str, agent_name: &str) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 let links = block_on(mailbox().list_contacts(project_key, agent_name))?;
@@ -1008,7 +1016,7 @@ impl Mail {
 
     /// `set_contact_policy`.
     pub fn set_contact_policy(
-        &mut self,
+        &self,
         project_key: &str,
         agent_name: &str,
         policy: &str,
@@ -1037,7 +1045,7 @@ impl Mail {
     }
 
     /// `ensure_product`.
-    pub fn ensure_product(&mut self, product_key: &str) -> Result<Value> {
+    pub fn ensure_product(&self, product_key: &str) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 let info = block_on(mailbox().ensure_product(product_key, product_key))?;
@@ -1050,7 +1058,7 @@ impl Mail {
     }
 
     /// `products_link`.
-    pub fn products_link(&mut self, product_key: &str, project_key: &str) -> Result<Value> {
+    pub fn products_link(&self, product_key: &str, project_key: &str) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 let info = block_on(mailbox().products_link(product_key, project_key))?;
@@ -1064,7 +1072,7 @@ impl Mail {
     }
 
     /// `search_messages_product`.
-    pub fn search_product(&mut self, product_key: &str, query: &str, limit: u32) -> Result<Value> {
+    pub fn search_product(&self, product_key: &str, query: &str, limit: u32) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
                 let res = block_on(mailbox().search_messages_product(
@@ -1096,7 +1104,7 @@ impl Mail {
 
     /// `fetch_inbox_product`.
     pub fn inbox_product(
-        &mut self,
+        &self,
         product_key: &str,
         agent_name: &str,
         limit: u32,
@@ -1139,7 +1147,7 @@ impl Mail {
 
     /// `acquire_build_slot`.
     pub fn acquire_slot(
-        &mut self,
+        &self,
         project_key: &str,
         agent_name: &str,
         slot: &str,
@@ -1173,7 +1181,7 @@ impl Mail {
     /// `renew_build_slot` (ADR-0003 V6: the `MailBackend::slot_renew` surface
     /// consumes this; no longer dead code).
     pub fn renew_slot(
-        &mut self,
+        &self,
         project_key: &str,
         agent_name: &str,
         slot: &str,
@@ -1213,7 +1221,7 @@ impl Mail {
 
     /// `release_build_slot`.
     pub fn release_slot(
-        &mut self,
+        &self,
         project_key: &str,
         agent_name: &str,
         slot: &str,
@@ -1266,7 +1274,7 @@ impl Mail {
     /// (in-process read — the deleted HTTP client delegated to the agent-mail
     /// MCP tool, which read the same file). No file → a JSON without
     /// `agent_name` (callers treat that as not-found).
-    pub fn resolve_pane_identity(&mut self, project_key: &str, pane_id: &str) -> Result<Value> {
+    pub fn resolve_pane_identity(&self, project_key: &str, pane_id: &str) -> Result<Value> {
         let path = canonical_identity_path(project_key, pane_id);
         match std::fs::read_to_string(&path) {
             Ok(name) if !name.trim().is_empty() => Ok(json!({
@@ -1646,7 +1654,7 @@ mod tests {
             token: None,
             name: Some("smoke".into()),
         };
-        let mut mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
+        let mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
         let err = mail
             .ack("proj", "smoke", "a1b2c3d4e5f60718293a4b5c6d7e8f90")
             .expect_err("hex id forwarded; dead daemon must still fail the call");
@@ -1663,7 +1671,7 @@ mod tests {
             token: None,
             name: Some("smoke".into()),
         };
-        let mut mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
+        let mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
         let err = mail
             .mark_read("proj", "smoke", "a1b2c3d4e5f60718293a4b5c6d7e8f90")
             .expect_err("hex id forwarded; dead daemon must still fail the call");
@@ -1691,7 +1699,7 @@ mod tests {
             token: None,
             name: Some("smoke-test".into()),
         };
-        let mut mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
+        let mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
         let h = mail.health().expect("remote health");
         assert_eq!(h["transport"], json!("http"), "remote marker present");
         let agents = mail
