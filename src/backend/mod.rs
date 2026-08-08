@@ -179,7 +179,7 @@ mod trait_contract_tests {
     // the flywheel-side contract checks (factory constructability + re-export
     // dyn-compile).
 
-    use super::{MultiplexerBackend, mail_backend};
+    use super::MultiplexerBackend;
 
     struct DummyMux;
     impl MultiplexerBackend for DummyMux {
