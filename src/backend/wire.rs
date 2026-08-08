@@ -49,6 +49,11 @@ pub fn list_agents_args(project_key: &str) -> Value {
     json!({ "project_key": project_key })
 }
 
+/// `whois`.
+pub fn whois_args(project_key: &str, name: &str) -> Value {
+    json!({ "project_key": project_key, "name": name })
+}
+
 /// `send_message`.
 #[allow(clippy::too_many_arguments)] // mirrors the MailBackend::send trait surface
 pub fn send_args(

@@ -80,6 +80,7 @@ impl std::error::Error for McpError {}
 /// synchronous (`ureq`), matching flywheel's sync dispatch; `call_tool` runs
 /// the `initialize` handshake once on first use (stateless mode accepts
 /// requests without it, but the handshake is part of the MCP contract).
+#[derive(Debug)]
 pub struct McpClient {
     /// `{base}/mcp` — the Streamable HTTP mount both servers serve.
     endpoint: String,
@@ -91,6 +92,20 @@ pub struct McpClient {
     initialized: OnceLock<()>,
     /// Monotonic JSON-RPC id.
     next_id: std::sync::atomic::AtomicU64,
+}
+
+impl Clone for McpClient {
+    fn clone(&self) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            token: self.token.clone(),
+            kind: self.kind,
+            initialized: OnceLock::new(),
+            next_id: std::sync::atomic::AtomicU64::new(
+                self.next_id.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
 }
 
 impl McpClient {
