@@ -428,7 +428,7 @@ mod tests {
         let mail = Mail::from_config(None)
             .expect("from_config ok")
             .expect("Some");
-        let mut b = ToronMailBackend::new(mail);
+        let b = ToronMailBackend::new(mail);
         match b.renew("p", "a", 1200, None) {
             Err(BackendError::Other(_)) => {}
             Err(e) => panic!("renew should delegate (Other), got {e:?}"),
@@ -444,7 +444,7 @@ mod tests {
         let mail = Mail::from_config(None)
             .expect("from_config ok")
             .expect("Some");
-        let mut b = ToronMailBackend::new(mail);
+        let b = ToronMailBackend::new(mail);
         match b.resolve_pane_identity("p", "w1:p1") {
             Ok(v) => assert!(v.get("agent_name").is_none(), "no identity file"),
             Err(e) => panic!("resolve should be Ok(not-found), got {e:?}"),
@@ -460,7 +460,7 @@ mod tests {
         let mail = Mail::from_config(None)
             .expect("from_config ok")
             .expect("Some");
-        let mut b = ToronMailBackend::new(mail);
+        let b = ToronMailBackend::new(mail);
         for (method, res) in [
             ("slot_renew", b.slot_renew("p", "a", "slot-x", 120)),
             (
@@ -488,7 +488,7 @@ mod tests {
         let mail = Mail::from_config(None)
             .expect("from_config ok")
             .expect("Some");
-        let mut b = ToronMailBackend::new(mail);
+        let b = ToronMailBackend::new(mail);
         // (method, result, expected-ok) — never Unsupported, never panic.
         for (method, res, expected_ok) in [
             (

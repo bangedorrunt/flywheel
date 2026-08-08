@@ -99,7 +99,7 @@ mod tests {
 
     #[test]
     fn every_mail_default_method_is_unsupported_not_ok() {
-        let mut b = AllUnsupportedMail;
+        let b = AllUnsupportedMail;
         assert!(matches!(b.health(), Err(BackendError::Unsupported { .. })));
         assert!(matches!(
             b.ensure_project("p"),
@@ -568,7 +568,7 @@ mod tests {
     #[cfg(feature = "mail-toron")]
     #[ignore = "requires a live toron daemon (127.0.0.1:18080)"]
     fn live_toron_ack_hex_roundtrip() {
-        let mut b = live_backend(ParityKind::Toron);
+        let b = live_backend(ParityKind::Toron);
         let project = "/private/tmp/flywheel-ack-hex";
         let agent = "CoralFinch";
 

@@ -4,7 +4,7 @@
 //! works on a fresh install. Each built-in carries the EXACT YAML from ADR
 //! Spec 2b — purpose-named, composing profiles (Spec 1b) + stages (Spec 2a)
 //! + control-flow (Spec 4). The catalog loads these as the compiled-in
-//! defaults, overridable by `~/.config/flywheel/workflows/*.yaml`.
+//!   defaults, overridable by `~/.config/flywheel/workflows/*.yaml`.
 //!
 //! - `brainstorm` — graph: parallel spawn @oracle (over breadth) → @planner
 //!   reduce.
