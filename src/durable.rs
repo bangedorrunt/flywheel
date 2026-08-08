@@ -4056,15 +4056,14 @@ mod resume_dedup_tests {
 
     // ---- cg6.1: escalation state machine lives in the notify_blocked leaf ----
 
-    /// Serializes the cg6.1 persistence tests: `state_dir()` is fixed, so they
-    /// share the REAL loops.json — concurrent read-modify-write is exactly the
-    /// lost-update race l4s.1 fixes; the tests must not step on each other.
-    static LOOP_REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn cg61_registry_guard() -> std::sync::MutexGuard<'static, ()> {
-        LOOP_REGISTRY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// Serializes the cg6.1 persistence tests AND makes them hermetic
+    /// (193.2): the REAL state dir is shared with production loops and
+    /// sibling test processes — a v1 fixture left in it re-triggers the
+    /// sidecar migration mid-suite (the observed ENOENT flake). The guard
+    /// holds the crate-wide env lock + points XDG_STATE_HOME at a fresh
+    /// temp dir for the test's lifetime.
+    fn cg61_registry_guard() -> crate::config::TestStateHome {
+        crate::config::test_state_home()
     }
 
     /// Unique project slug for leaf-state tests (the state dir is the real

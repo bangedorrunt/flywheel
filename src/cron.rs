@@ -774,8 +774,12 @@ mod tests {
     /// neither corrupts the destination nor survives the save.
     #[test]
     fn save_to_is_atomic_leaves_no_temp() {
-        let path = tmp_path("atomic");
-        let _ = std::fs::remove_file(&path);
+        // Hermetic per-test dir (193.2): the temp root is shared across
+        // processes (sibling agents' cargo runs, cron_cli subprocesses) —
+        // stale-file names must not collide with other tests' artifacts.
+        let dir = tmp_path("atomic");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("crons.toml");
         let mut crons = Crons::default();
         crons.upsert(sample("atomic-cron")).unwrap();
         crons.save_to(&path).unwrap();
@@ -783,16 +787,15 @@ mod tests {
         // Simulated crash residue: a stale temp file must be ignored (the
         // atomic rename never touches it) and a fresh save must produce a
         // clean, loadable destination with no NEW temp leftovers.
-        let stale = path.with_file_name(format!(".{}.tmp-999999", "crons.toml"));
+        let stale = dir.join(".crons.toml.tmp-999999");
         std::fs::write(&stale, b"garbage").unwrap();
         crons.upsert(sample("atomic-cron-2")).unwrap();
         crons.save_to(&path).unwrap();
 
         let loaded = Crons::load_from(&path).unwrap();
         assert!(loaded.get("atomic-cron-2").is_some(), "fresh save intact");
-        let dir = path.parent().unwrap();
         let pid_tmp = format!(".crons.toml.tmp-{}", std::process::id());
-        let leftovers: Vec<_> = std::fs::read_dir(dir)
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -800,8 +803,7 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "no temps from this save: {leftovers:?}");
         assert!(stale.exists(), "pre-existing stale temp left inert, not clobbered");
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&stale);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// THE pause/resume acceptance: toggling `enabled` must never lose the
@@ -1253,8 +1255,25 @@ mod tests {
             ports.push(listener.local_addr().unwrap().port());
             std::thread::spawn(move || serve(listener));
         }
-        // Let the listener threads reach accept() before the probes fire.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Listener-readiness barrier (193.2 flake fix): a fixed sleep races
+        // parallel test load (sibling agents' cargo runs, the loop's own
+        // subprocesses) — accept() may not have been reached yet and the
+        // probe gets connection-refused. Poll until every listener accepts
+        // (bounded 5s), THEN build the workflow.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let ready = ports.iter().all(|p| {
+                std::net::TcpStream::connect(("127.0.0.1", *p)).is_ok()
+            });
+            if ready {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listeners did not accept within 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
 
         // One explicit probe step per service, each on_error: fail_run.
         let probe_step = |name: &str, port: u16| Step {
