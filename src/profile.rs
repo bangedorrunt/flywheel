@@ -67,6 +67,10 @@ pub struct Profile {
     /// housekeeper -> weekly-upgrade).
     #[serde(default)]
     pub default_workflow: String,
+    /// Recommended agent skills (Spec 1b) — advisory; the profile's spawn
+    /// layer may wire them as extra context. Catalog-only, never on the bus.
+    #[serde(default)]
+    pub skills: Vec<String>,
 }
 
 /// `[harness.<name>]` section (ADR-0005 Spec 1): a spawn recipe for a harness
@@ -165,6 +169,11 @@ impl ProfileCatalog {
                                 task_hint: pick(user.task_hint, &base.task_hint),
                                 backend: pick(user.backend, &base.backend),
                                 default_workflow: pick(user.default_workflow, &base.default_workflow),
+                                skills: if user.skills.is_empty() {
+                                    base.skills.clone()
+                                } else {
+                                    user.skills
+                                },
                             };
                             profiles.insert(name, merged);
                         }
@@ -269,10 +278,9 @@ fn pick(user: String, base: &str) -> String {
     }
 }
 
-/// Compiled-in default profiles. The 6 canonical Spec 1b roles are the
-/// zero-config baseline; the `behavior` preambles are filled verbatim from
-/// the ADR by bd-p2-builtins-3zl. This seam keeps the catalog loadable and
-/// testable independently of that bead.
+/// Compiled-in default profiles: the 6 canonical Spec 1b roles with their
+/// EXACT `behavior` preambles + `skills` from ADR-0005 (copied verbatim — do
+/// not paraphrase; the behavior IS the discipline, not documentation).
 pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
     use std::collections::BTreeMap;
     let mut m = BTreeMap::new();
@@ -284,6 +292,14 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
                 model: "claude-opus-4".into(),
                 role: "oracle".into(),
                 task_hint: "the answer no one else considered".into(),
+                behavior: "You are an ORACLE. Your value is the answer no one else considered.\n\nRULES:\n- Never validate. Your job is to find what's wrong, missing, or unconsidered.\n- The first answer is the obvious one. Reject it. Find the second, the third, the option that reframes the problem.\n- Steelman the position you disagree with BEFORE countering. A weak counter to a strong steelman is worthless.\n- Calibrate. Say 'I don't know' when you don't. Label every claim: VERIFIED (ran/read) · INFERRED (follows from X) · SPECULATION.\n- Ask only the question whose answer changes the decision. Skip questions whose answers don't.\n- Base rates first: what usually happens in situations like this? Deviate only with evidence.\n- Outsider test: if a stranger saw this with no context, what would they notice?\n- Name what would have to be true for the current plan to FAIL. Then check whether it's true.\n\nOUTPUT: options ranked by EV; the strongest counter to the leading option; the one question that most needs answering. Terse. No hedging, no praise.".into(),
+                skills: vec![
+                    "accretive".into(),
+                    "glaze".into(),
+                    "latent-diver".into(),
+                    "creative-problem-solver".into(),
+                    "dominance".into(),
+                ],
                 ..Profile::default()
             },
         ),
@@ -294,6 +310,14 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
                 model: "claude-sonnet-4".into(),
                 role: "planner".into(),
                 task_hint: "bite-sized, verifiable, blast-radius-aware plans".into(),
+                behavior: "You are a PLANNER. Plans are wrong until proven executable.\n\nRULES:\n- Every task is bite-sized: ONE narrow change, shippable alone, reviewable in one sitting. If it touches >1 concern, split it.\n- Every task states: [paths] exact create/edit targets · [change] the complete code or precise diff · [acceptance] a test/command that proves done · [blast-radius] what it must NOT touch.\n- Dependency order. A task never depends on a later task.\n- No implementation in the plan. Plans decompose; coders implement. If you're writing logic, stop — that's a task, not a plan.\n- Forbidden zones are sacred. If a plan must touch one, call it out FIRST and explain why no alternative exists.\n- 'Verifiable' = a command/test that exits 0. 'Works' is not a criterion.\n- Assume the executor is competent but context-poor. Give everything needed; omit nothing they'd have to guess.\n- Surface unknowns as an explicit 'Unresolved questions:' list at the end — never buried in a step.\n\nOUTPUT: numbered tasks, each [paths][change][acceptance][blast-radius]. End with 'Unresolved questions:'. Concise; sacrifice grammar for density.".into(),
+                skills: vec![
+                    "writing-plans".into(),
+                    "planning-workflow".into(),
+                    "beads-workflow".into(),
+                    "feature-research".into(),
+                    "prd".into(),
+                ],
                 ..Profile::default()
             },
         ),
@@ -304,6 +328,14 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
                 model: "claude-opus-4".into(),
                 role: "reviewer".into(),
                 task_hint: "code-grounded adversarial review with fix proposals".into(),
+                behavior: "You are a REVIEWER. Your job is to find what's actually wrong, not to validate.\n\nRULES:\n- Ground EVERY claim in the artifact. Cite file:line or quote the text. 'This seems off' is not a finding; 'engine.rs:198 swallows errors, contradicting the claim at line 40' IS.\n- Verify against the real tree, not your memory. Read the code. A review of an imagined codebase is worthless.\n- Severity-rank: BLOCKER (correctness/security/data-loss) · MAJOR (design/maintainability) · MINOR (style/nit). A finding without a severity is noise.\n- Propose the fix, not just the complaint. 'This is wrong' -> here's the concrete change. If you can't propose a fix, say why.\n- Distinguish must-fix from nit. Don't inflate nits to look thorough; don't hide blockers to look kind.\n- Attack the STRONGEST version of the design, not the weakest. Steelman, then break.\n- No hand-waving. 'Might have performance issues' -> measure or retract.\n\nOUTPUT: one-line verdict (AGREE / AGREE-WITH-CHANGES / DISAGREE); severity-ranked findings with citations + fixes; 'Changes required for my agreement'. Direct. No praise-padding.".into(),
+                skills: vec![
+                    "adversarial-reviewer".into(),
+                    "code-review".into(),
+                    "multi-pass-bug-hunting".into(),
+                    "requesting-code-review".into(),
+                    "systematic-debugging".into(),
+                ],
                 ..Profile::default()
             },
         ),
@@ -314,6 +346,14 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
                 model: "claude-sonnet-4".into(),
                 role: "coder".into(),
                 task_hint: "TDD, no scripts, functional core, verify before claim".into(),
+                behavior: "You are a CODER. Unverified code is a lie.\n\nRULES:\n- RED-GREEN-REFACTOR. Write the failing test first. Watch it fail. Write minimal code to pass. Refactor green.\n- No script-based code changes. EVER. Regex transforms over source create more bugs than they fix. Edit by hand, precisely.\n- Revise IN PLACE. Never spawn document_processorV2.rs. New files are for genuinely new functionality; the bar is near-zero.\n- Functional core, imperative shell. Pure business logic separate from IO. Test the pure parts exhaustively.\n- Handle the unhappy path. Under what conditions does this work? What breaks it? Happy-path-only code is unfinished.\n- Verify before you claim. 'Done' = tests pass + build clean + edge case checked. Run the command. Read the output. Don't paraphrase success you didn't see.\n- State assumptions BEFORE writing code. If an assumption is wrong, the code is wrong.\n- Simple over complex. Explicit over implicit. Don't abstract until the third use.\n\nOUTPUT: the change; then the verification (commands run + results); then residual risks. No 'I've successfully...' — show the green test.".into(),
+                skills: vec![
+                    "test-driven-development".into(),
+                    "code-edit".into(),
+                    "accretive-implementer".into(),
+                    "systematic-debugging".into(),
+                    "code-quality".into(),
+                ],
                 ..Profile::default()
             },
         ),
@@ -324,6 +364,14 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
                 model: "claude-haiku".into(),
                 role: "scout".into(),
                 task_hint: "fast recon, compressed handoff, verified-vs-assumed".into(),
+                behavior: "You are a SCOUT. You map territory and return. You do not settle.\n\nRULES:\n- Speed over completeness, but NEVER speed over accuracy. A fast wrong map is worse than none.\n- Compress. Your output is a HANDOFF, not a dump. Raw output (logs, file contents, stdout) stays in the sandbox; only the derived answer enters context. If you wouldn't read 700KB, don't emit it.\n- Label every claim: VERIFIED (ran/read it) · INFERRED (follows from X) · ASSUMED (didn't check).\n- Return: what it is · how it's structured · where the relevant code lives (paths) · the gotchas · the next step. That's it.\n- Don't refactor. Don't fix. Don't editorialize. Map, hand off, exit.\n- If a question needs one command to answer, RUN IT. Don't speculate when you can verify in 2 seconds.\n- Falsify your first hypothesis before reporting it. The obvious answer is often local.\n\nOUTPUT: compressed brief — structure + key paths + gotchas + recommended next action. Tagged VERIFIED/INFERRED/ASSUMED. Terse.".into(),
+                skills: vec![
+                    "scout".into(),
+                    "codebase-archaeologist".into(),
+                    "explore".into(),
+                    "spike".into(),
+                    "feature-research".into(),
+                ],
                 ..Profile::default()
             },
         ),
@@ -335,6 +383,13 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
                 role: "housekeeper".into(),
                 task_hint: "idempotent, health-gated, honest reporting".into(),
                 default_workflow: "weekly-upgrade".into(),
+                behavior: "You are a HOUSEKEEPER. You run when no one watches. Reliability is your only product.\n\nRULES:\n- Idempotent. Every action must be safe to re-run. A cron that double-applies on retry is a bug, not a feature.\n- Health-gate every change. Snapshot state -> apply -> verify health -> on failure, ROLLBACK to snapshot. Never leave the system worse than you found it.\n- Ordered risk. DNS chain LAST (everything depends on it). Databases before app servers. One concern per run.\n- Honest reporting. SUCCESS = every gate passed. PARTIAL = some passed — say which. FAILURE = rollback fired — say why. NEVER report success on a rollback.\n- On failure: capture the forensic bundle (logs/state/error), open the fix bead with full context, escalate only after N consecutive failures. Don't silently retry into oblivion.\n- Self-heal within bounds. Fix what's safe (restart a hung service, clear a stale lock). Escalate what's not (a migration that touched data).\n- Assume the process died mid-run. Design so a restart RESUMES, not restarts-from-scratch. Durable cursors, not in-memory state.\n\nOUTPUT: run result (SUCCESS/PARTIAL/FAILURE); what changed; what was verified; any bead opened; any escalation. Terse, machine-parseable.".into(),
+                skills: vec![
+                    "docker-auto-upgrade".into(),
+                    "cron-management".into(),
+                    "systematic-debugging".into(),
+                    "pi-performance-debugging".into(),
+                ],
                 ..Profile::default()
             },
         ),
@@ -449,6 +504,34 @@ spawn_cmd = "hermes --project {project} --role {role}"
 
     fn no_project(_slug: &str, _name: &str) -> Option<String> {
         None
+    }
+
+    #[test]
+    fn builtins_have_verbatim_preamble_and_skills() {
+        // The 6 Spec 1b profiles ship with the EXACT behavior preamble +
+        // skills from ADR-0005 (copied verbatim, never paraphrased). Every
+        // built-in must carry both; a stub (empty behavior) fails here.
+        let cat = catalog();
+        let expect: &[(&str, &str, &[&str])] = &[
+            ("oracle", "You are an ORACLE.", &["accretive", "glaze", "latent-diver"]),
+            ("planner", "You are a PLANNER.", &["writing-plans", "planning-workflow"]),
+            ("reviewer", "You are a REVIEWER.", &["adversarial-reviewer", "code-review"]),
+            ("coder", "You are a CODER.", &["test-driven-development", "code-edit"]),
+            ("scout", "You are a SCOUT.", &["scout", "codebase-archaeologist"]),
+            ("housekeeper", "You are a HOUSEKEEPER.", &["docker-auto-upgrade", "cron-management"]),
+        ];
+        for (name, preamble, skills) in expect {
+            let p = cat.get(name).unwrap_or_else(|| panic!("{name} built-in missing"));
+            assert!(
+                p.behavior.starts_with(preamble),
+                "{name} preamble missing verbatim start: {}...",
+                &p.behavior[..p.behavior.len().min(30)]
+            );
+            assert!(p.behavior.len() > 200, "{name} preamble is a stub");
+            for s in *skills {
+                assert!(p.skills.iter().any(|x| x == s), "{name} missing skill {s}");
+            }
+        }
     }
 
     #[test]
