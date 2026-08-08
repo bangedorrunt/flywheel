@@ -247,6 +247,7 @@ fn absorb_workflow_steps(name: &str, steps: &[LegacyStep]) -> (Workflow, Vec<Map
         trigger: None,
         guard: None,
         steps: unified,
+        graph: None,
         inputs: vec![InputDecl { name: "goal".into() }],
     };
     (wf, notes)
@@ -278,6 +279,7 @@ fn absorb_pipeline(name: &str, chain: &[String]) -> (Workflow, Option<MappingNot
         trigger: None,
         guard: None,
         steps,
+        graph: None,
         inputs: vec![InputDecl { name: "goal".into() }],
     };
     let note = MappingNote {
