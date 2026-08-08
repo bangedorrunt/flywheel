@@ -11,10 +11,17 @@ bad() { echo "  [FAIL] $1"; fail=$((fail+1)); }
 
 echo "== review-fix regression gate (bd-review-fix-epic-m0b) =="
 
-# F1: harvest_latest reads the reply BODY (search_messages must request it)
-grep -q 'include_body_md: bool' src/backend/mod.rs \
-  && ok "F1: SearchFilter carries include_body_md" \
-  || bad "F1: SearchFilter lost include_body_md"
+# F1: harvest_latest reads the reply BODY (search_messages must request it).
+# Post-se2.3 the local MailBackend trait is deleted (ADR-0007 MailSurface
+# consume) — the filter struct now lives in mail_shim.rs (MailSearchFilter)
+# and the wire args in backend/wire.rs (search_args). Both must carry
+# include_body_md; main.rs must request it (lines below).
+grep -q 'include_body_md: bool' src/mail_shim.rs \
+  && ok "F1: MailSearchFilter (mail_shim.rs) carries include_body_md" \
+  || bad "F1: MailSearchFilter lost include_body_md"
+grep -q 'include_body_md: bool' src/backend/wire.rs \
+  && ok "F1: search_args (backend/wire.rs) carries include_body_md" \
+  || bad "F1: search_args lost include_body_md"
 grep -q 'body_md' src/main.rs \
   && ok "F1: harvest reads body_md (extract_latest_body)" \
   || bad "F1: harvest body extraction missing"
