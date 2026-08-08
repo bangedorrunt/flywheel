@@ -388,6 +388,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: SquadCmd,
     },
+    /// Runs dashboard (ADR-0005 P6.3) — state + owner + per-run cost
+    Runs {
+        #[command(subcommand)]
+        cmd: RunsCmd,
+    },
     /// N-round A/B debate + judge (ADR-0001 §9.1 — threaded, ack-gated)
     Debate {
         /// the proposition being debated
@@ -1024,6 +1029,30 @@ enum SquadCmd {
     },
 }
 
+/// Runs view (ADR-0005 P6.3): the captain's daily dashboard over workflow /
+/// pipeline / loop runs recorded in the project log.
+#[derive(Subcommand)]
+enum RunsCmd {
+    /// List runs across projects: state + owner + per-run model/token cost
+    List,
+    /// Show one run's step trace / outputs
+    Show {
+        /// run id (the log entry id)
+        id: String,
+    },
+    /// Runs parked on approval / spawn-await (pending)
+    Pending,
+    /// Digest: failures + parked + broken > N runs, since a cutoff
+    Digest {
+        /// only consider entries after this time (ISO or "N[smhd]" ago)
+        #[arg(long)]
+        since: Option<String>,
+        /// a workflow/pipeline is "broken" after this many consecutive failures
+        #[arg(long, default_value_t = 3)]
+        broken_after: u32,
+    },
+}
+
 fn parse_kind_count(s: &str) -> Result<(String, u32)> {
     let (k, v) = s
         .split_once('=')
@@ -1466,6 +1495,7 @@ fn main() {
         Some(Commands::Backend { cmd }) => cmd_backend(&cfg, cmd),
         Some(Commands::Profile { cmd }) => cmd_profile(&cfg, cmd),
         Some(Commands::Squad { cmd }) => cmd_squad(&cfg, cmd),
+        Some(Commands::Runs { cmd }) => cmd_runs(&cfg, cmd),
         Some(Commands::Debate {
             proposition,
             rounds,
@@ -5801,6 +5831,221 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `flywheel runs` — the captain's daily dashboard (ADR-0005 P6.3). Reads the
+/// per-project JSONL logs (workflow/pipeline/loop events) and aggregates them
+/// into a run list with state + owner + advisory per-run cost.
+fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
+    use state::{EventKind, LogEntry};
+
+    /// All projects with a log under the state dir.
+    fn projects_with_logs() -> Vec<String> {
+        let mut out = Vec::new();
+        let dir = config::state_dir();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.ends_with(".jsonl") {
+                    out.push(name.trim_end_matches(".jsonl").to_string());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// All run-kind log entries across projects, newest first.
+    fn all_run_entries() -> Result<Vec<(String, LogEntry)>> {
+        let mut out = Vec::new();
+        for project in projects_with_logs() {
+            for e in state::read_log(&project)? {
+                match e.kind {
+                    EventKind::Workflow | EventKind::Pipeline | EventKind::Loop => {
+                        out.push((project.clone(), e));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out.sort_by(|a, b| b.1.ts.cmp(&a.1.ts));
+        Ok(out)
+    }
+
+    /// Advisory per-run cost (best-effort; 0 when unrecorded).
+    fn run_cost(e: &LogEntry) -> Value {
+        let tokens = e.data.get("tokens").and_then(Value::as_u64).unwrap_or(0);
+        let model = e.data.get("model").and_then(Value::as_str).unwrap_or("");
+        json!({ "tokens": tokens, "model": model })
+    }
+
+    /// Owner of a run (workflow / pipeline / loop / agent named in payload).
+    fn run_owner(e: &LogEntry) -> String {
+        ["workflow", "pipeline", "loop", "agent"]
+            .iter()
+            .find_map(|k| e.data.get(*k).and_then(Value::as_str).map(String::from))
+            .unwrap_or_default()
+    }
+
+    /// A run is pending when its payload carries a suspend/park marker.
+    fn is_pending(e: &LogEntry) -> bool {
+        e.data
+            .get("status")
+            .and_then(Value::as_str)
+            .map(|s| matches!(s, "pending" | "awaiting_approval" | "parked"))
+            .unwrap_or(false)
+    }
+
+    match cmd {
+        RunsCmd::List => {
+            let runs = all_run_entries()?;
+            if runs.is_empty() {
+                println!("no runs recorded");
+                return Ok(());
+            }
+            let rows: Vec<Value> = runs
+                .iter()
+                .map(|(project, e)| {
+                    json!({
+                        "id": format!("{project}:{}", &e.ts),
+                        "ts": e.ts,
+                        "project": project,
+                        "kind": format!("{:?}", e.kind).to_lowercase(),
+                        "owner": run_owner(e),
+                        "state": e.data.get("status").and_then(Value::as_str).unwrap_or("done"),
+                        "cost": run_cost(e),
+                    })
+                })
+                .collect();
+            for r in &rows {
+                println!("{}", serde_json::to_string_pretty(r)?);
+            }
+            Ok(())
+        }
+        RunsCmd::Show { id } => {
+            let runs = all_run_entries()?;
+            let hit = runs
+                .iter()
+                .find(|(project, e)| format!("{project}:{}", e.ts) == *id)
+                .ok_or_else(|| anyhow!("run not found: {id} (flywheel runs list)"))?;
+            print_json(&json!({
+                "id": id,
+                "project": hit.0,
+                "kind": format!("{:?}", hit.1.kind).to_lowercase(),
+                "ts": hit.1.ts,
+                "owner": run_owner(&hit.1),
+                "data": hit.1.data,
+            }));
+            Ok(())
+        }
+        RunsCmd::Pending => {
+            let runs = all_run_entries()?;
+            let pending: Vec<Value> = runs
+                .iter()
+                .filter(|(_, e)| is_pending(e))
+                .map(|(project, e)| {
+                    json!({
+                        "id": format!("{project}:{}", e.ts),
+                        "project": project,
+                        "kind": format!("{:?}", e.kind).to_lowercase(),
+                        "owner": run_owner(e),
+                        "ts": e.ts,
+                    })
+                })
+                .collect();
+            if pending.is_empty() {
+                println!("no pending runs");
+            } else {
+                for r in &pending {
+                    println!("{}", serde_json::to_string_pretty(r)?);
+                }
+            }
+            Ok(())
+        }
+        RunsCmd::Digest { since, broken_after } => {
+            let runs = all_run_entries()?;
+            let cutoff: Option<String> = match since {
+                Some(s)
+                    if s.ends_with('s')
+                        || s.ends_with('m')
+                        || s.ends_with('h')
+                        || s.ends_with('d') =>
+                {
+                    let (num, unit) = s.split_at(s.len() - 1);
+                    let n: u64 = num.parse().map_err(|_| anyhow!("bad --since {s}"))?;
+                    let secs = match unit {
+                        "s" => n,
+                        "m" => n * 60,
+                        "h" => n * 3600,
+                        "d" => n * 86400,
+                        _ => unreachable!(),
+                    };
+                    Some(now_minus(secs))
+                }
+                Some(s) => Some(s.clone()),
+                None => None,
+            };
+            let recent: Vec<(String, LogEntry)> = match &cutoff {
+                Some(c) => runs
+                    .iter()
+                    .filter(|(_, e)| e.ts >= *c)
+                    .cloned()
+                    .collect(),
+                None => runs.clone(),
+            };
+            let failed: Vec<Value> = recent
+                .iter()
+                .filter(|(_, e)| {
+                    e.data
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(|s| matches!(s, "failed" | "error"))
+                        .unwrap_or(false)
+                })
+                .map(|(project, e)| {
+                    json!({
+                        "id": format!("{project}:{}", e.ts),
+                        "project": project,
+                        "owner": run_owner(e),
+                        "ts": e.ts,
+                    })
+                })
+                .collect();
+            let parked = recent.iter().filter(|(_, e)| is_pending(e)).count();
+            let mut per_owner: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
+            for (_, e) in &recent {
+                let owner = run_owner(e);
+                let is_fail = e
+                    .data
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(|s| matches!(s, "failed" | "error"))
+                    .unwrap_or(false);
+                *per_owner.entry(owner).or_insert(0) += u32::from(is_fail);
+            }
+            let broken: Vec<Value> = per_owner
+                .iter()
+                .filter(|(_, n)| **n > *broken_after)
+                .map(|(owner, n)| json!({ "owner": owner, "failures": n }))
+                .collect();
+            print_json(&json!({
+                "since": cutoff,
+                "runs": recent.len(),
+                "failed": failed,
+                "parked": parked,
+                "broken_gt_n": broken,
+            }));
+            Ok(())
+        }
+    }
+}
+
+/// ISO timestamp `now - secs` (for `runs digest --since`).
+fn now_minus(secs: u64) -> String {
+    let (now, _) = state::utc_now();
+    let (y, mo, d, h, mi, s) = state::civil_from_unix(now.saturating_sub(secs));
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
 /// True when a profile is one of the 6 compiled-in built-ins (so `create`/

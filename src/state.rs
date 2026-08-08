@@ -546,7 +546,7 @@ fn compact_ts(secs: u64, ms: u32) -> String {
     format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}{ms:03}")
 }
 
-fn utc_now() -> (u64, u32) {
+pub(crate) fn utc_now() -> (u64, u32) {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => (d.as_secs(), d.subsec_millis()),
         Err(_) => (0, 0),
@@ -555,7 +555,7 @@ fn utc_now() -> (u64, u32) {
 
 /// Convert unix seconds to UTC civil time (year, month, day, h, m, s)
 /// via Howard Hinnant's days-from-civil algorithm.
-fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+pub(crate) fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let h = (rem / 3600) as u32;
@@ -911,5 +911,79 @@ mod last_sent_tests {
         assert!(find_last_sent(&v, "a", 22).is_none());
         assert!(find_last_sent(&v, "b", 22).is_some());
         assert!(find_last_sent(&v, "c", 11).is_none());
+    }
+
+    #[test]
+    fn run_log_classifies_pending_failed_and_owner() {
+        // Mirrors the P6.3 digest semantics: run-kind entries classify as
+        // pending / failed and carry an owner, non-run kinds are ignored.
+        let entries = vec![
+            LogEntry {
+                ts: "2026-08-08T01:00:00Z".into(),
+                kind: EventKind::Workflow,
+                project: "demo".into(),
+                data: serde_json::json!({ "workflow": "plan", "status": "done", "tokens": 1200 }),
+            },
+            LogEntry {
+                ts: "2026-08-08T01:05:00Z".into(),
+                kind: EventKind::Pipeline,
+                project: "demo".into(),
+                data: serde_json::json!({ "pipeline": "ship", "status": "awaiting_approval" }),
+            },
+            LogEntry {
+                ts: "2026-08-08T01:10:00Z".into(),
+                kind: EventKind::Loop,
+                project: "demo".into(),
+                data: serde_json::json!({ "loop": "nightly", "status": "failed" }),
+            },
+            // non-run kind: not a run
+            LogEntry {
+                ts: "2026-08-08T01:15:00Z".into(),
+                kind: EventKind::Send,
+                project: "demo".into(),
+                data: serde_json::json!({ "to": "scout", "stage": "recon" }),
+            },
+        ];
+        let runs: Vec<&LogEntry> = entries
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Workflow | EventKind::Pipeline | EventKind::Loop))
+            .collect();
+        assert_eq!(runs.len(), 3, "Send is not a run");
+
+        let pending = runs
+            .iter()
+            .filter(|e| {
+                e.data
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|s| matches!(s, "pending" | "awaiting_approval" | "parked"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(pending, 1, "awaiting_approval is pending");
+
+        let failed = runs
+            .iter()
+            .filter(|e| {
+                e.data
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|s| matches!(s, "failed" | "error"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(failed, 1, "failed loop classified");
+
+        // Owner extraction: workflow / pipeline / loop payload field.
+        let owners: Vec<&str> = runs
+            .iter()
+            .map(|e| {
+                ["workflow", "pipeline", "loop", "agent"]
+                    .iter()
+                    .find_map(|k| e.data.get(*k).and_then(serde_json::Value::as_str))
+                    .unwrap_or("")
+            })
+            .collect();
+        assert_eq!(owners, vec!["plan", "ship", "nightly"]);
     }
 }
