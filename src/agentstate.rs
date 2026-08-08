@@ -101,79 +101,24 @@ pub fn parse_state_file(content: &str) -> Option<AgentStateFile> {
 /// Parse an RFC3339 timestamp to unix seconds.
 ///
 /// Accepts the shapes `state::now_iso` produces (`2026-08-03T03:00:00Z`) plus
-/// the common RFC3339 variants: fractional seconds and `±HH:MM` offsets.
-/// Any other format → `None` (never panics).
+/// fractional seconds and `±HH:MM` offsets (chrono's strict RFC3339 parser;
+/// is1.2 — one calendar implementation in the crate). Any other format →
+/// `None` (never panics). Pre-1970 → `None` (the fresh/stale heuristic has no
+/// use for negative epochs). Leap-second `:60` timestamps are rejected by
+/// chrono (RFC3339-strict; the old hand-rolled parser tolerated them).
 pub fn parse_ts(ts: &str) -> Option<u64> {
-    let bytes = ts.as_bytes();
-    if bytes.len() < 20 {
+    // chrono's RFC3339 parser tolerates a SPACE date-time separator; the
+    // contract (`state::now_iso` shape) requires the literal 'T' — pin it.
+    if ts.as_bytes().get(10) != Some(&b'T') {
         return None;
     }
-    let y = parse_int(&bytes[0..4])?;
-    if bytes[4] != b'-' || bytes[7] != b'-' {
-        return None;
-    }
-    let mo = parse_int(&bytes[5..7])?;
-    let d = parse_int(&bytes[8..10])?;
-    if bytes[10] != b'T' && bytes[10] != b't' {
-        return None;
-    }
-    let h = parse_int(&bytes[11..13])?;
-    if bytes[13] != b':' {
-        return None;
-    }
-    let mi = parse_int(&bytes[14..16])?;
-    if bytes[16] != b':' {
-        return None;
-    }
-    let s = parse_int(&bytes[17..19])?;
-
-    let mut i = 19;
-    // optional fractional seconds (ignored for the unix value)
-    if i < bytes.len() && bytes[i] == b'.' {
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-    }
-    // timezone: Z | z | ±HH:MM
-    let mut offset_secs: i64 = 0;
-    if i < bytes.len() {
-        match bytes[i] {
-            b'Z' | b'z' => i += 1,
-            b'+' | b'-' => {
-                let sign: i64 = if bytes[i] == b'-' { -1 } else { 1 };
-                if i + 5 >= bytes.len() || bytes[i + 3] != b':' {
-                    return None;
-                }
-                let oh = parse_int(&bytes[i + 1..i + 3])?;
-                let om = parse_int(&bytes[i + 4..i + 6])?;
-                if oh > 23 || om > 59 {
-                    return None;
-                }
-                offset_secs = sign * (oh as i64 * 3600 + om as i64 * 60);
-                i += 6;
-            }
-            _ => return None,
-        }
-    }
-    if i != bytes.len() {
-        return None;
-    }
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
-        return None;
-    }
-    if h > 23 || mi > 59 || s > 60 {
-        return None;
-    }
-    if days_in_month(mo, is_leap(y as i64)) < d {
-        return None;
-    }
-    let days = days_from_civil(y as i64, mo, d);
-    let unix = days * 86_400 + h as i64 * 3600 + mi as i64 * 60 + s as i64 - offset_secs;
+    let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    let unix = dt.timestamp();
     if unix < 0 {
-        return None;
+        None
+    } else {
+        Some(unix as u64)
     }
-    Some(unix as u64)
 }
 
 /// Is the state file fresh relative to `now_unix` (seconds)? A file exactly
@@ -197,50 +142,6 @@ pub fn is_fresh(ts: &str, max_age: Duration) -> bool {
 }
 
 // ---- parsing helpers ----
-
-fn parse_int(b: &[u8]) -> Option<u32> {
-    if b.is_empty() || b.len() > 4 {
-        return None;
-    }
-    let mut v: u32 = 0;
-    for &c in b {
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        v = v * 10 + (c - b'0') as u32;
-    }
-    Some(v)
-}
-
-fn is_leap(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}
-
-fn days_in_month(m: u32, leap: bool) -> u32 {
-    match m {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if leap {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 0,
-    }
-}
-
-/// Hinnant days-from-civil: civil (y, m, d) → days since 1970-01-01.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u32; // [0, 399]
-    let mp = if m > 2 { m - 3 } else { m + 9 }; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    (era * 146097 + doe as i64) - 719_468
-}
 
 #[cfg(test)]
 mod tests {
@@ -357,6 +258,19 @@ mod tests {
     fn parse_ts_leap_year() {
         // 2024-02-29 is a leap day; 2024 is a leap year
         assert_eq!(parse_ts("2024-02-29T00:00:00Z"), Some(1_709_164_800));
+    }
+
+    /// is1.2 edge pins: epoch 0, leap-century boundary (2000 leap by 400-rule,
+    /// 2100 not), pre-1970 rejection.
+    #[test]
+    fn parse_ts_epoch_and_leap_century_boundaries() {
+        assert_eq!(parse_ts("1970-01-01T00:00:00Z"), Some(0));
+        // 2000-02-29 is a leap day (divisible by 400)
+        assert_eq!(parse_ts("2000-02-29T00:00:00Z"), Some(951_782_400));
+        // 2100-02-29 does not exist (century non-leap) — rejected
+        assert_eq!(parse_ts("2100-02-29T00:00:00Z"), None);
+        // pre-epoch — the fresh/stale heuristic returns None (never a respawn)
+        assert_eq!(parse_ts("1969-12-31T23:59:59Z"), None);
     }
 
     // ---- freshness ----

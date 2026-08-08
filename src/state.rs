@@ -701,26 +701,13 @@ pub(crate) fn utc_now() -> (u64, u32) {
     }
 }
 
-/// Convert unix seconds to UTC civil time (year, month, day, h, m, s)
-/// via Howard Hinnant's days-from-civil algorithm.
+/// Convert unix seconds to UTC civil time (year, month, day, h, m, s).
+/// chrono-backed (is1.2) — the crate's single calendar implementation.
 pub(crate) fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let h = (rem / 3600) as u32;
-    let mi = ((rem % 3600) / 60) as u32;
-    let s = (rem % 60) as u32;
-
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    let y = if mo <= 2 { y + 1 } else { y };
-    (y, mo, d, h, mi, s)
+    use chrono::{Datelike, Timelike};
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+    (dt.year() as i64, dt.month(), dt.day(), dt.hour(), dt.minute(), dt.second())
 }
 
 fn slugify(s: &str) -> String {
@@ -945,6 +932,16 @@ mod tests {
         assert_eq!(civil_from_unix(86_400), (1970, 1, 2, 0, 0, 0));
     }
 
+    /// is1.2 edge pins: leap day 2000-02-29 (400-year rule) matches chrono.
+    #[test]
+    fn civil_from_unix_leap_boundary() {
+        assert_eq!(civil_from_unix(951_782_400), (2000, 2, 29, 0, 0, 0));
+        // u64::MAX as i64 == -1 → 1969-12-31T23:59:59Z (the cast is intended:
+        // civil time of the pre-epoch second; callers never pass it, but the
+        // conversion must not panic)
+        assert_eq!(civil_from_unix(u64::MAX), (1969, 12, 31, 23, 59, 59));
+    }
+
     #[test]
     fn timestamps_are_iso_and_unique() {
         let iso = now_iso();
@@ -974,6 +971,86 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(a.sends, 3);
+    }
+
+    /// 193.3: the REAL aggregation — log_event → read_log → analytics()
+    /// counts kinds, by_day, first/last event, and state transitions.
+    #[test]
+    fn analytics_counts_real_log_entries() {
+        let _g = crate::config::test_state_home();
+        let project = format!("analytics-{}", std::process::id());
+        let _ = std::fs::remove_file(project_log_path(&project));
+        log_event(&project, EventKind::Send, json!({ "to": "a" })).unwrap();
+        log_event(&project, EventKind::Send, json!({ "to": "b" })).unwrap();
+        log_event(&project, EventKind::Interrupt, json!({})).unwrap();
+        log_event(&project, EventKind::Checkpoint, json!({})).unwrap();
+        log_event(&project, EventKind::Workflow, json!({ "workflow": "w" })).unwrap();
+        log_event(&project, EventKind::Pipeline, json!({ "pipeline": "p" })).unwrap();
+        log_event(&project, EventKind::Loop, json!({ "loop": "l" })).unwrap();
+        log_event(&project, EventKind::State, json!({ "state": "blocked" })).unwrap();
+        log_event(&project, EventKind::State, json!({ "state": "blocked" })).unwrap();
+        log_event(&project, EventKind::State, json!({ "state": "respawned" })).unwrap();
+
+        let a = analytics(&project).unwrap();
+        assert_eq!(a.sends, 2);
+        assert_eq!(a.interrupts, 1);
+        assert_eq!(a.checkpoints, 1);
+        assert_eq!(a.workflow_runs, 1);
+        assert_eq!(a.pipeline_runs, 1);
+        assert_eq!(a.loop_runs, 1);
+        assert_eq!(a.state_transitions.get("blocked"), Some(&2));
+        assert_eq!(a.state_transitions.get("respawned"), Some(&1));
+        assert_eq!(a.by_day.len(), 1, "all entries land in today's bucket");
+        assert_eq!(*a.by_day.values().next().unwrap(), 10);
+        assert!(a.first_event.is_some(), "first event recorded");
+        assert!(a.last_event.is_some(), "last event recorded");
+        assert_eq!(a.first_event, a.last_event, "same-second writes share ts");
+
+        // read_log round-trip: every written entry comes back.
+        let entries = read_log(&project).unwrap();
+        assert_eq!(entries.len(), 10);
+        assert_eq!(entries[0].kind, EventKind::Send);
+        assert_eq!(entries[9].kind, EventKind::State);
+        let _ = std::fs::remove_file(project_log_path(&project));
+    }
+
+    /// 193.3: checkpoint save/list/latest round-trip on disk (functional
+    /// core; the state dir is hermetic).
+    #[test]
+    fn checkpoints_save_list_latest_roundtrip() {
+        let _g = crate::config::test_state_home();
+        let project = format!("cp-{}", std::process::id());
+        let dir = project_checkpoint_dir(&project);
+        let _ = std::fs::remove_dir_all(&dir);
+        let p1 = save_checkpoint(
+            &project,
+            "first snapshot",
+            Some("ws-1"),
+            vec![CheckpointAgent {
+                name: "a".into(),
+                kind: "oc".into(),
+                status: AgentStatus::Idle,
+                pane_id: "%1".into(),
+            }],
+            None,
+        )
+        .unwrap();
+        let p2 = save_checkpoint(&project, "second snapshot", None, vec![], None).unwrap();
+        assert_ne!(p1, p2, "ms-resolution names never collide");
+        let list = list_checkpoints(&project).unwrap();
+        assert_eq!(list.len(), 2);
+        // Equal-second saves share `ts`, so sort order is not guaranteed —
+        // assert the SET of messages + per-entry fields.
+        let mut msgs: Vec<&str> = list.iter().map(|c| c.message.as_str()).collect();
+        msgs.sort_unstable();
+        assert_eq!(msgs, vec!["first snapshot", "second snapshot"]);
+        let second = list.iter().find(|c| c.message == "second snapshot").unwrap();
+        assert!(second.agents.is_empty());
+        let first = list.iter().find(|c| c.message == "first snapshot").unwrap();
+        assert_eq!(first.workspace_id.as_deref(), Some("ws-1"));
+        assert_eq!(first.agents[0].name, "a");
+        assert_eq!(first.agents[0].status, AgentStatus::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
