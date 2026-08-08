@@ -13,7 +13,7 @@
 //!
 //! gated by: cargo feature `backend-superlogical` (off by default).
 
-use crate::backend::{BackendError, MultiplexerBackend};
+use crate::backend::MultiplexerBackend;
 /// Stub superlogical backend. `name()` is the only override — every trait
 /// method inherits the default `BackendError::Unsupported` (which names this
 /// backend), so any use is an honest "not yet released" error.
@@ -29,9 +29,4 @@ impl MultiplexerBackend for SuperlogicalBackend {
     fn name(&self) -> &'static str {
         "superlogical"
     }
-}
-
-/// Convenience: the whole-backend Unsupported error the factory surfaces.
-pub fn stub_error() -> BackendError {
-    BackendError::stub("superlogical", SuperlogicalBackend::REASON)
 }
