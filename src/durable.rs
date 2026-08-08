@@ -229,8 +229,27 @@ pub fn send_prompt_argv(args: &SendArgs) -> Vec<String> {
 pub struct NotifyArgs {
     pub project: String,
     pub name: String,
-    /// escalation tier 0..3 (bd-blocked-escalation-protocol)
+    /// Seed for a FIRST escalation entry (None → the leaf stamps `now`).
+    /// The leaf loads the persisted entry when one exists — replay never
+    /// re-seeds, so the tier sequence is deterministic (cg6.1).
+    pub first_blocked_ts: Option<i64>,
+    /// Loop poll interval in seconds — the escalation tier thresholds
+    /// (2×/4×/8× interval) derive from it.
+    pub interval_secs: u64,
+    /// Loop params, preserved into a freshly-created registry entry
+    /// (parity with the pre-cg6.1 body-side first-init).
+    pub params: serde_json::Value,
+}
+
+/// What the `notify_blocked` leaf computed and persisted (cg6.1). The
+/// workflow body acts on these values — it never recomputes the tier.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EscalationOutcome {
+    /// Escalation tier 0..3, derived from the PERSISTED first-blocked
+    /// timestamp at leaf-execution time.
     pub tier: u32,
+    /// Ping count after this notification (persisted; starts at 1).
+    pub ping_count: u32,
 }
 
 /// Args for the diagnose leaf (read tail + health mail).
@@ -525,12 +544,11 @@ pub fn context_verdict(
     if terminal.contains("CONTEXT_LIMIT") {
         return ContextVerdict::Exhausted;
     }
-    if let Some(s) = state {
-        if s.context_pct >= 80
-            && crate::agentstate::is_fresh_at(&s.ts, now_unix, crate::agentstate::DEFAULT_MAX_AGE)
-        {
-            return ContextVerdict::Exhausted;
-        }
+    if let Some(s) = state
+        && s.context_pct >= 80
+        && crate::agentstate::is_fresh_at(&s.ts, now_unix, crate::agentstate::DEFAULT_MAX_AGE)
+    {
+        return ContextVerdict::Exhausted;
     }
     ContextVerdict::Healthy
 }
@@ -816,9 +834,87 @@ async fn send_prompt(args: SendArgs) -> Result<SendOutcome> {
     Ok(outcome)
 }
 
-/// Notify a blocked agent via agent-mail. Checkpointed side effect.
+/// Current wall-clock in microseconds since the epoch. Only called INSIDE
+/// leaves (cg6.1): leaf-side effects are checkpointed by Resonate, so a
+/// completed leaf's result is replayed as-is — the body must never read
+/// wall-clock directly (that was the replay-determinism bug).
+fn now_us_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
+/// One escalation step (pure): derive the tier from the persisted
+/// first-blocked timestamp and increment the ping counter. Returns
+/// (tier 0..3, ping_count after increment). The leaf's state machine
+/// (cg6.1) — table-testable, deterministic from (first_blocked_ts, now).
+fn escalation_step(
+    st: &mut crate::state::EscalationState,
+    now_us: i64,
+    interval_secs: u64,
+) -> (u32, u32) {
+    let t = escalation_tier(st.first_blocked_ts, now_us, interval_secs);
+    st.ping_count = st.ping_count.saturating_add(1);
+    let u = match t {
+        EscalationTier::T0 => 0u32,
+        EscalationTier::T1 => 1,
+        EscalationTier::T2 => 2,
+        EscalationTier::T3 => 3,
+    };
+    (u, st.ping_count)
+}
+
+/// Load-or-init the escalation entry, run ONE escalation step, persist.
+/// File I/O is legal here: this runs inside the checkpointed `notify_blocked`
+/// leaf (cg6.1). The tier derives from the PERSISTED first_blocked_ts (or the
+/// seed on a brand-new entry), never from a body-side re-read — replay of an
+/// in-flight leaf re-executes against the same persisted value, so the tier
+/// cannot jump across a crash boundary.
+fn escalate_and_persist(
+    project: &str,
+    name: &str,
+    first_blocked_seed: Option<i64>,
+    interval_secs: u64,
+    params: serde_json::Value,
+) -> anyhow::Result<(u32, u32)> {
+    let now_us = now_us_micros();
+    let mut al = crate::state::load_active_loop(project)?
+        .unwrap_or_else(|| crate::state::ActiveLoop::new("swarm-loop", params, crate::state::now_iso()));
+    let st = al
+        .escalation
+        .entry(name.to_string())
+        .or_insert_with(|| crate::state::EscalationState {
+            first_blocked_ts: first_blocked_seed.unwrap_or(now_us),
+            ping_count: 0,
+            last_tail: String::new(),
+        });
+    let (tier, ping_count) = escalation_step(st, now_us, interval_secs);
+    crate::state::save_active_loop(project, &al)?;
+    Ok((tier, ping_count))
+}
+
+/// Notify a blocked agent via agent-mail. Checkpointed side effect — and
+/// (cg6.1) the home of the ENTIRE escalation state machine: it loads or
+/// initializes the escalation entry, computes the tier from the persisted
+/// first_blocked_ts, increments + persists ping_count, then mails. The
+/// workflow body only acts on the returned `EscalationOutcome`.
+///
+/// At-least-once note (Resonate 0.6.0): a COMPLETED leaf invocation is never
+/// re-executed on replay (result checkpointed). The only double-ping window
+/// is a leaf IN-FLIGHT at crash; on re-execution the leaf derives from the
+/// persisted entry (same first_blocked_ts → same tier; ping_count advances
+/// from the persisted value, not from args) — the tier sequence cannot jump.
 #[function]
-async fn notify_blocked(args: NotifyArgs) -> Result<()> {
+async fn notify_blocked(args: NotifyArgs) -> Result<EscalationOutcome> {
+    let (tier, ping_count) = escalate_and_persist(
+        &args.project,
+        &args.name,
+        args.first_blocked_ts,
+        args.interval_secs,
+        args.params,
+    )
+    .map_err(map_err)?;
     let exe = self_exe().map_err(map_err)?;
     let out = Command::new(&exe)
         .args([
@@ -826,7 +922,7 @@ async fn notify_blocked(args: NotifyArgs) -> Result<()> {
             &args.project,
             &args.name,
             "--tier",
-            &args.tier.to_string(),
+            &tier.to_string(),
         ])
         .output()
         .map_err(|e| map_err(anyhow::anyhow!("__mail-blocked spawn failed: {e}")))?;
@@ -836,7 +932,7 @@ async fn notify_blocked(args: NotifyArgs) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(())
+    Ok(EscalationOutcome { tier, ping_count })
 }
 
 /// Scan orchestrator inbox for `[xproj]` requests. Soft-fail empty.
@@ -1534,13 +1630,13 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
 
     loop {
         iteration += 1;
-        if let Some(max) = params.max_iterations {
-            if iteration > max {
-                return Err(map_err(anyhow::anyhow!(
-                    "loop timed out after {max} polls (queue remaining: {})",
-                    queue.len()
-                )));
-            }
+        if let Some(max) = params.max_iterations
+            && iteration > max
+        {
+            return Err(map_err(anyhow::anyhow!(
+                "loop timed out after {max} polls (queue remaining: {})",
+                queue.len()
+            )));
         }
 
         // ---- event wake (latency optimization, forward-only) ----
@@ -1907,56 +2003,41 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 }
                 LoopAction::Blocked { name } => {
                     if params.on_blocked == "mail" {
-                        // bd-blocked-escalation-protocol: compute the tier from
-                        // the persisted first_blocked_ts (resume-continuous),
-                        // notify via the tiered leaf, persist the updated state.
-                        let now_us = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_micros() as i64)
-                            .unwrap_or(0);
-                        let (tier_u32, tier_enum) = {
-                            let mut al = crate::state::load_active_loop(&params.project)
-                                .map_err(map_err)?
-                                .unwrap_or_else(|| {
-                                    crate::state::ActiveLoop::new(
-                                        "swarm-loop".to_string(),
-                                        serde_json::to_value(&params)
-                                            .unwrap_or(serde_json::Value::Null),
-                                        crate::state::now_iso(),
-                                    )
-                                });
-                            let st = al.escalation.entry(name.clone()).or_insert_with(|| {
-                                crate::state::EscalationState {
-                                    first_blocked_ts: now_us,
-                                    ping_count: 0,
-                                    last_tail: String::new(),
-                                }
-                            });
-                            let t =
-                                escalation_tier(st.first_blocked_ts, now_us, params.interval_secs);
-                            st.ping_count = st.ping_count.saturating_add(1);
-                            let _ = crate::state::save_active_loop(&params.project, &al);
-                            let u = match t {
-                                EscalationTier::T0 => 0u32,
-                                EscalationTier::T1 => 1,
-                                EscalationTier::T2 => 2,
-                                EscalationTier::T3 => 3,
-                            };
-                            (u, t)
+                        // cg6.1: the ENTIRE escalation state machine lives in
+                        // the notify_blocked leaf (checkpointed by Resonate) —
+                        // it loads/initializes the escalation entry, computes
+                        // the tier from the PERSISTED first_blocked_ts,
+                        // increments + persists ping_count, and sends the
+                        // tiered mail. The body is pure orchestration: no
+                        // wall-clock reads, no escalation file I/O, no counter
+                        // mutation — crash-resume replay reproduces the
+                        // original tier sequence (a completed leaf result is
+                        // replayed, never re-executed; even an in-flight
+                        // re-execution derives from persisted state, so the
+                        // tier cannot jump).
+                        let out = ctx
+                            .run(
+                                notify_blocked,
+                                NotifyArgs {
+                                    project: params.project.clone(),
+                                    name: name.clone(),
+                                    first_blocked_ts: None,
+                                    interval_secs: params.interval_secs,
+                                    params: serde_json::to_value(&params)
+                                        .unwrap_or(serde_json::Value::Null),
+                                },
+                            )
+                            .await?;
+                        let tier_enum = match out.tier {
+                            0 => EscalationTier::T0,
+                            1 => EscalationTier::T1,
+                            2 => EscalationTier::T2,
+                            _ => EscalationTier::T3,
                         };
-                        ctx.run(
-                            notify_blocked,
-                            NotifyArgs {
-                                project: params.project.clone(),
-                                name: name.clone(),
-                                tier: tier_u32,
-                            },
-                        )
-                        .await?;
                         // review-fix F4: bounded halt at T3 — the escalation
                         // contract says the loop halts (bounded) once a blocked
-                        // agent exceeds the budget. Send the final T3 mail
-                        // (above), then exit with a distinguishable outcome so
+                        // agent exceeds the budget. The T3 mail was sent by the
+                        // leaf; exit with a distinguishable outcome so
                         // `flywheel loop` and the event log show WHY it stopped
                         // (vs a normal "complete"). T0/T1/T2 keep notifying.
                         if let Some(msg) = on_blocked_tier_exit(tier_enum, &params.on_blocked) {
@@ -1965,7 +2046,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 crate::state::EventKind::Loop,
                                 serde_json::json!({
                                     "status": "halted",
-                                    "tier": tier_u32,
+                                    "tier": out.tier,
                                     "name": name,
                                 }),
                             );
@@ -3717,5 +3798,123 @@ mod resume_dedup_tests {
         }
         // unknown mode string: never halts (defensive)
         assert_eq!(on_blocked_tier_exit(T3, "whatever"), None);
+    }
+
+    // ---- cg6.1: escalation state machine lives in the notify_blocked leaf ----
+
+    /// Serializes the cg6.1 persistence tests: `state_dir()` is fixed, so they
+    /// share the REAL loops.json — concurrent read-modify-write is exactly the
+    /// lost-update race l4s.1 fixes; the tests must not step on each other.
+    static LOOP_REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn cg61_registry_guard() -> std::sync::MutexGuard<'static, ()> {
+        LOOP_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Unique project slug for leaf-state tests (the state dir is the real
+    /// one; tests clean their own entry up).
+    fn cg61_test_project(tag: &str) -> String {
+        format!("cg6.1-{tag}-{}", std::process::id())
+    }
+
+    /// Remove a test loop's registry entry (best-effort cleanup).
+    fn cg61_cleanup(project: &str) {
+        if let Ok((_schema, mut map)) = crate::state::load_loops_registry() {
+            map.remove(project);
+            let _ = crate::state::save_loops_registry(&map);
+        }
+    }
+
+    /// Pure: the step derives the tier from the persisted first-blocked
+    /// timestamp and increments the ping counter (saturating).
+    #[test]
+    fn escalation_step_bounds_tiers_and_increments_ping_count() {
+        use crate::state::EscalationState;
+        let i = 30u64;
+        let us = |secs: i64| secs * 1_000_000;
+        let mut st = EscalationState {
+            first_blocked_ts: 0,
+            ping_count: 0,
+            last_tail: String::new(),
+        };
+        // fresh: T0 + count 1
+        assert_eq!(escalation_step(&mut st, us(30), i), (0, 1));
+        // 2x interval: T1
+        assert_eq!(escalation_step(&mut st, us(60), i), (1, 2));
+        // 4x interval: T2
+        assert_eq!(escalation_step(&mut st, us(120), i), (2, 3));
+        // 8x interval: T3, bounded
+        assert_eq!(escalation_step(&mut st, i64::MAX, i), (3, 4));
+        // overflow-safe: saturating add, never wraps
+        let mut st2 = EscalationState {
+            first_blocked_ts: 0,
+            ping_count: u32::MAX,
+            last_tail: String::new(),
+        };
+        assert_eq!(escalation_step(&mut st2, us(60), i), (1, u32::MAX));
+    }
+
+    /// Leaf-level (cg6.1): a fresh agent with no persisted entry starts at
+    /// T0 with ping_count 1 (first_blocked_ts seeded by the leaf).
+    #[test]
+    fn escalate_and_persist_fresh_agent_starts_at_t0() {
+        let _g = cg61_registry_guard();
+        let project = cg61_test_project("fresh");
+        let (tier, count) = escalate_and_persist(&project, "agent-a", None, 30, json!({})).unwrap();
+        assert_eq!((tier, count), (0, 1), "first escalation is T0 + ping 1");
+        // the entry was persisted with the seeded timestamp
+        let al = crate::state::load_active_loop(&project).unwrap().unwrap();
+        let st = al.escalation.get("agent-a").expect("entry persisted");
+        assert_eq!(st.ping_count, 1);
+        cg61_cleanup(&project);
+    }
+
+    /// Leaf-level (cg6.1): a stale persisted first_blocked_ts (past the 8x
+    /// window) escalates straight to T3.
+    #[test]
+    fn escalate_and_persist_stale_first_blocked_reaches_t3() {
+        use crate::state::{ActiveLoop, EscalationState};
+        let _g = cg61_registry_guard();
+        let project = cg61_test_project("stale");
+        let stale = now_us_micros() - 9 * 30 * 1_000_000; // 9 intervals ago
+        let mut al = ActiveLoop::new("swarm-loop", json!({}), crate::state::now_iso());
+        al.escalation.insert(
+            "agent-b".to_string(),
+            EscalationState {
+                first_blocked_ts: stale,
+                ping_count: 0,
+                last_tail: String::new(),
+            },
+        );
+        crate::state::save_active_loop(&project, &al).unwrap();
+        let (tier, count) = escalate_and_persist(&project, "agent-b", None, 30, json!({})).unwrap();
+        assert_eq!((tier, count), (3, 1), "stale first_blocked_ts → T3");
+        cg61_cleanup(&project);
+    }
+
+    /// cg6.1 regression proof: re-execution (crash-window replay) derives the
+    /// tier from the PERSISTED first_blocked_ts, not from a fresh seed — the
+    /// tier cannot jump across the crash boundary and ping_count advances
+    /// from the persisted value.
+    #[test]
+    fn escalate_and_persist_replay_derives_from_persisted_first_blocked() {
+        let _g = cg61_registry_guard();
+        let project = cg61_test_project("replay");
+        // seed ~1s ago: both executions land inside the T0 window
+        let seed = now_us_micros() - 1_000_000;
+        let (t1, c1) = escalate_and_persist(&project, "agent-c", Some(seed), 30, json!({})).unwrap();
+        // "crash" — re-execution of the same leaf invocation, later wall-clock
+        let (t2, c2) = escalate_and_persist(&project, "agent-c", Some(seed), 30, json!({})).unwrap();
+        assert_eq!(t1, t2, "tier must not jump on replay");
+        assert_eq!(c1, 1);
+        assert_eq!(c2, 2, "ping_count advances from the PERSISTED value");
+        // the persisted first_blocked_ts is the ORIGINAL seed, not a re-stamp
+        let al = crate::state::load_active_loop(&project).unwrap().unwrap();
+        let st = al.escalation.get("agent-c").unwrap();
+        assert_eq!(st.first_blocked_ts, seed, "first_blocked_ts never re-seeded");
+        assert_eq!(st.ping_count, 2);
+        cg61_cleanup(&project);
     }
 }
