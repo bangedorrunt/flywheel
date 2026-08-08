@@ -79,24 +79,17 @@ mod tests {
 
     #[test]
     fn every_mux_default_method_is_unsupported_not_ok() {
-        let mut b = AllUnsupportedMux;
+        let b = AllUnsupportedMux;
         // spot-check across the method categories (workspace/pane/agent/events)
-        assert!(matches!(
-            b.workspace_list(),
-            Err(BackendError::Unsupported { .. })
-        ));
-        assert!(matches!(
-            b.pane_split("p", "right", None),
-            Err(BackendError::Unsupported { .. })
-        ));
-        assert!(matches!(
-            b.agent_list(),
-            Err(BackendError::Unsupported { .. })
-        ));
-        assert!(matches!(
-            b.subscribe(&[]),
-            Err(BackendError::Unsupported { .. })
-        ));
+        // The unified trait (ADR-0005 P1) returns toron-core's machine-code
+        // BackendError; Unsupported is a code, not a variant.
+        let unsupported = |e: toron_core::backend::BackendError| {
+            e.code() == &toron_core::backend::error::BackendErrorCode::Unsupported
+        };
+        assert!(b.workspace_list().is_err_and(unsupported));
+        assert!(b.pane_split("p", "right", None).is_err_and(unsupported));
+        assert!(b.agent_list().is_err_and(unsupported));
+        assert!(b.subscribe(&[]).is_err_and(unsupported));
         // name() is the one non-default — it must succeed
         assert_eq!(b.name(), "all-unsupported-mux");
     }
