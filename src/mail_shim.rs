@@ -154,18 +154,32 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 #[cfg_attr(not(feature = "mail-toron"), allow(dead_code))]
 #[derive(Debug, Clone, Default)]
 pub struct MailInboxFilter {
-    /// Not yet applied by the toron projection (parity surface kept).
-    #[allow(dead_code)]
+    /// Keep only messages with importance ∈ {high, urgent} (c3b.3 — applied
+    /// by the toron projection; rows carry `importance`).
     pub urgent_only: bool,
     pub unread_only: bool,
-    /// Not yet applied by the toron projection (parity surface kept).
-    #[allow(dead_code)]
+    /// Not implementable on the toron projection (rows carry no ack_ts):
+    /// requesting it fails with an honest error, never a silent no-op (c3b.3).
     pub ack_overdue_only: bool,
     pub include_bodies: bool,
     pub limit: u32,
-    /// Not yet applied by the toron projection (parity surface kept).
-    #[allow(dead_code)]
+    /// Keep only messages with `created_ts_us` strictly newer than this
+    /// RFC3339 timestamp (c3b.3 — applied by the toron projection).
     pub since_ts: Option<String>,
+}
+
+/// c3b.3: parse an RFC3339 `since_ts` filter into epoch micros (the unit
+/// `InboxMessage.created_ts_us` uses). A bad timestamp is an error — never a
+/// silent "filter ignored".
+fn parse_since_ts_us(ts: &str) -> Result<i64> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|dt| dt.timestamp_micros())
+        .map_err(|e| anyhow!("inbox since_ts {ts:?} is not RFC3339: {e}"))
+}
+
+/// c3b.3: `urgent_only` membership — importance ∈ {high, urgent}.
+fn is_urgent(importance: &str) -> bool {
+    matches!(importance, "high" | "urgent")
 }
 
 /// Filter bag for `Mail::search` (review-fix F8: folds the 10 positional args
@@ -385,15 +399,30 @@ impl Mail {
         }
     }
 
-    /// `fetch_inbox` with the full filter bag. `urgent_only` /
-    /// `ack_overdue_only` / `since_ts` have no toron projection yet — the
-    /// supported subset (`unread_only`, `include_bodies`, `limit`) is applied.
+    /// `fetch_inbox` with the full filter bag (c3b.3). Applies every filter
+    /// the toron row model supports: `urgent_only` (rows carry `importance`)
+    /// and `since_ts` (rows carry `created_ts_us`), on top of the already-
+    /// supported `unread_only` / `include_bodies` / `limit`. `ack_overdue_only`
+    /// has NO toron projection (rows carry no ack_ts) — it fails with an
+    /// honest `Unsupported` instead of silently returning an unfiltered
+    /// inbox; the ack-SLA escalation uses the dedicated `ack_overdue()`.
     pub fn inbox_filtered(
         &self,
         project_key: &str,
         agent_name: &str,
         filter: &MailInboxFilter,
     ) -> Result<Value> {
+        if filter.ack_overdue_only {
+            return Err(anyhow!(
+                "toron inbox_filtered: ack_overdue_only is not supported by the toron projection \
+                 (inbox rows carry no ack_ts) — use the dedicated ack_overdue() surface"
+            ));
+        }
+        let since_us = filter
+            .since_ts
+            .as_deref()
+            .map(parse_since_ts_us)
+            .transpose()?;
         match &self.backend {
             BackendKind::InProcess => {
                 let msgs = block_on(mailbox().fetch_inbox(&FetchInbox {
@@ -403,18 +432,54 @@ impl Mail {
                     limit: Some(filter.limit as usize),
                     include_bodies: filter.include_bodies,
                 }))?;
-                Ok(Value::Array(msgs.iter().map(ToJson::to_json).collect()))
+                let rows = msgs
+                    .iter()
+                    .filter(|m| !filter.urgent_only || is_urgent(&m.importance))
+                    .filter(|m| match since_us {
+                        Some(s) => m.created_ts_us > s,
+                        None => true,
+                    })
+                    .map(ToJson::to_json)
+                    .collect();
+                Ok(Value::Array(rows))
             }
-            BackendKind::Remote(_) => self.call_remote(
-                "fetch_inbox",
-                json!({
-                    "project_key": project_key,
-                    "agent_name": agent_name,
-                    "limit": filter.limit,
-                    "include_bodies": filter.include_bodies,
-                    "unread_only": filter.unread_only,
-                }),
-            ),
+            BackendKind::Remote(_) => {
+                let v = self.call_remote(
+                    "fetch_inbox",
+                    json!({
+                        "project_key": project_key,
+                        "agent_name": agent_name,
+                        "limit": filter.limit,
+                        "include_bodies": filter.include_bodies,
+                        "unread_only": filter.unread_only,
+                    }),
+                )?;
+                // Same policy on the wire rows (InboxMessageOut carries
+                // `importance` + `created_ts_us`): filter client-side.
+                let rows = v
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|row| {
+                        !filter.urgent_only
+                            || row
+                                .get("importance")
+                                .and_then(Value::as_str)
+                                .map(is_urgent)
+                                .unwrap_or(false)
+                    })
+                    .filter(|row| match since_us {
+                        Some(s) => row
+                            .get("created_ts_us")
+                            .and_then(Value::as_i64)
+                            .map(|ts| ts > s)
+                            .unwrap_or(true),
+                        None => true,
+                    })
+                    .collect();
+                Ok(Value::Array(rows))
+            }
         }
     }
 
@@ -1706,5 +1771,165 @@ mod tests {
             .list_agents("/tmp/flywheel-remote-smoke")
             .expect("remote list_agents");
         assert_eq!(agents, json!([]), "fresh daemon mailbox has no agents");
+    }
+
+    /// c3b.3: `urgent_only` + `since_ts` filter the toron inbox; the row
+    /// model supports them (importance + created_ts_us). Seeded via real
+    /// send_message round trips so the projection is the code under test.
+    #[test]
+    fn inbox_filtered_applies_urgent_and_since_on_toron() {
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let project = format!("c3b3-filter-{}", std::process::id());
+        mail.ensure_project(&project).expect("project");
+        mail.register_agent(&project, "FilterSender", "opencode", "test", "seed")
+            .expect("sender registered");
+        mail.register_agent(&project, "FilterRecv", "opencode", "test", "seed")
+            .expect("recipient registered");
+        // The facade sends AS its own identity (`mail.name` = "flywheel") —
+        // it must be registered too or send_message fails on the local key.
+        mail.register_agent(&project, &mail.name, "opencode", "test", "seed")
+            .expect("facade identity registered");
+        let recv = vec!["FilterRecv".to_string()];
+
+        let send = |subject: &str, importance: &str| {
+            mail.send(&project, &recv, subject, "body", importance, false, None)
+                .expect("send ok");
+        };
+        send("urgent-note", "urgent");
+        send("high-note", "high");
+        send("normal-note", "normal");
+        send("low-note", "low");
+
+        // urgent_only: only high/urgent rows survive.
+        let urgent = mail
+            .inbox_filtered(
+                &project,
+                "FilterRecv",
+                &MailInboxFilter {
+                    urgent_only: true,
+                    include_bodies: false,
+                    limit: 100,
+                    ..Default::default()
+                },
+            )
+            .expect("filtered inbox");
+        let subjects: Vec<&str> = urgent
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["subject"].as_str())
+            .collect();
+        assert!(
+            subjects
+                .iter()
+                .all(|s| *s == "urgent-note" || *s == "high-note"),
+            "urgent_only keeps only high/urgent: {subjects:?}"
+        );
+        assert!(subjects.contains(&"urgent-note"), "urgent present");
+        assert!(subjects.contains(&"high-note"), "high present");
+
+        // since_ts: only rows strictly newer than the bound survive.
+        let since = chrono::Utc::now()
+            .checked_sub_signed(chrono::Duration::seconds(3600))
+            .expect("1h ago")
+            .to_rfc3339();
+        let recent = mail
+            .inbox_filtered(
+                &project,
+                "FilterRecv",
+                &MailInboxFilter {
+                    since_ts: Some(since),
+                    include_bodies: false,
+                    limit: 100,
+                    ..Default::default()
+                },
+            )
+            .expect("since-filtered inbox");
+        let recent_subjects: Vec<&str> = recent
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["subject"].as_str())
+            .collect();
+        assert_eq!(
+            recent_subjects.len(),
+            4,
+            "all four sent within the last hour: {recent_subjects:?}"
+        );
+
+        // since_ts in the future: nothing matches.
+        let future = chrono::Utc::now()
+            .checked_add_signed(chrono::Duration::seconds(3600))
+            .expect("1h ahead")
+            .to_rfc3339();
+        let none = mail
+            .inbox_filtered(
+                &project,
+                "FilterRecv",
+                &MailInboxFilter {
+                    since_ts: Some(future),
+                    include_bodies: false,
+                    limit: 100,
+                    ..Default::default()
+                },
+            )
+            .expect("future since-filtered inbox");
+        assert_eq!(
+            none.as_array().unwrap().len(),
+            0,
+            "nothing is newer than a future bound"
+        );
+    }
+
+    /// c3b.3: `ack_overdue_only` has no toron projection (rows carry no
+    /// ack_ts) — the request fails with an honest error naming the filter,
+    /// never a silent unfiltered inbox.
+    #[test]
+    fn inbox_filtered_ack_overdue_is_honest_unsupported() {
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let project = format!("c3b3-ackoverdue-{}", std::process::id());
+        mail.ensure_project(&project).expect("project");
+        let err = mail
+            .inbox_filtered(
+                &project,
+                "Nobody",
+                &MailInboxFilter {
+                    ack_overdue_only: true,
+                    include_bodies: false,
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .expect_err("ack_overdue_only must fail loudly");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ack_overdue_only") && msg.contains("ack_ts"),
+            "error names the filter + the missing data: {msg}"
+        );
+    }
+
+    /// c3b.3: a malformed `since_ts` is an error, never a silently-ignored
+    /// filter.
+    #[test]
+    fn inbox_filtered_bad_since_ts_is_an_error() {
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let project = format!("c3b3-badsince-{}", std::process::id());
+        mail.ensure_project(&project).expect("project");
+        let err = mail
+            .inbox_filtered(
+                &project,
+                "Nobody",
+                &MailInboxFilter {
+                    since_ts: Some("not-a-timestamp".into()),
+                    include_bodies: false,
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .expect_err("bad since_ts must fail loudly");
+        assert!(
+            err.to_string().contains("RFC3339"),
+            "names the parse failure: {err}"
+        );
     }
 }
