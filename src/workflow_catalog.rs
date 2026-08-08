@@ -419,4 +419,81 @@ timeout_ms = 500
         );
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// 193.3: the legacy Send + Wait branches map to unified steps with the
+    /// documented semantics — Send → dispatch_job (assignee + spec carries
+    /// to/stage/msg), Wait → delay shell + a MappingNote (flagged, never
+    /// dropped).
+    #[test]
+    fn absorb_send_and_wait_steps_map_to_unified() {
+        let dir = config_root("sendwait");
+        write(
+            &dir.join("workflows.toml"),
+            r#"[[daily]]
+type = "send"
+to = "oc"
+stage = "p1"
+msg = "hello"
+
+[[daily]]
+type = "wait"
+until = "done"
+timeout_ms = 500
+"#,
+        );
+        let raw = std::fs::read_to_string(dir.join("workflows.toml")).unwrap();
+        let legacy: LegacyWorkflows = toml::from_str(&raw).unwrap();
+        let (wf, notes) = absorb_workflow_steps("daily", legacy.workflows.get("daily").unwrap());
+        assert_eq!(wf.steps.len(), 2, "both legacy steps absorbed");
+        match &wf.steps[0].action {
+            Action::DispatchJob { assignee, spec, .. } => {
+                assert_eq!(assignee, "oc");
+                assert_eq!(spec["to"], "oc");
+                assert_eq!(spec["stage"], "p1");
+                assert_eq!(spec["msg"], "hello");
+            }
+            other => panic!("Send absorbed to DispatchJob, got {other:?}"),
+        }
+        match &wf.steps[1].action {
+            Action::Delay { secs } => assert_eq!(*secs, 1, "500ms rounds up"),
+            other => panic!("Wait absorbed to Delay, got {other:?}"),
+        }
+        assert!(
+            notes.iter().any(|n| n.legacy.contains("wait done")),
+            "Wait is flagged, never dropped: {notes:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 193.3: a legacy name colliding with a canonical YAML entry is
+    /// SHADOWED — canonical is the home; a mapping note records the shadow.
+    #[test]
+    fn canonical_shadows_legacy_collision() {
+        let dir = config_root("collide");
+        write(
+            &dir.join("workflows/triage.yaml"),
+            "name: triage\ntrigger:\n  type: webhook\nsteps:\n  - name: a\n    action: send_dm\n    to: pi\n    body: x\n",
+        );
+        write(
+            &dir.join("workflows.toml"),
+            r#"[[triage]]
+type = "send"
+to = "oc"
+msg = "legacy triage"
+"#,
+        );
+        let catalog = WorkflowCatalog::load_from(dir.clone()).unwrap();
+        assert!(catalog.workflows.contains_key("triage"));
+        assert_eq!(
+            catalog.workflows["triage"].steps[0].name.as_deref(),
+            Some("a"),
+            "canonical YAML wins the collision"
+        );
+        assert!(
+            catalog.notes.iter().any(|n| n.reason.contains("shadowed by canonical")),
+            "collision recorded: {:?}",
+            catalog.notes
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
