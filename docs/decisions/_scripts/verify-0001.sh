@@ -12,11 +12,14 @@ warn() { echo "  [WARN] $1"; }
 
 echo "== ADR-0001 verification =="
 
-# (a) protocol forward-compat: pin >= 19
-if grep -qE 'pub const HDR_PROTOCOL: u64 = (19|[2-9][0-9]);' src/herdr.rs; then
+# (a) protocol forward-compat: pin >= 19. The constant moved into the
+# toron-core path dependency when flywheel's own src/herdr.rs was deleted
+# (3f55c94); resolve the dir from Cargo.toml so the check stays honest.
+TORON_CORE_DIR=$(sed -n 's/.*toron-core = { path = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+if [ -n "$TORON_CORE_DIR" ] && grep -qE 'pub const HDR_PROTOCOL: u64 = (19|[2-9][0-9]);' "$TORON_CORE_DIR/src/backend/herdr.rs"; then
   ok "HDR_PROTOCOL >= 19"
 else
-  bad "HDR_PROTOCOL not >= 19 (see src/herdr.rs)"
+  bad "HDR_PROTOCOL not >= 19 (toron-core pins $(grep -oE 'pub const HDR_PROTOCOL: u64 = [0-9]+' "$TORON_CORE_DIR/src/backend/herdr.rs" 2>/dev/null || echo '?'); live herdr reports 19)"
 fi
 
 # (b) register-on-spawn wired into the spawn path

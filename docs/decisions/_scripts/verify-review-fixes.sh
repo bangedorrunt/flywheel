@@ -50,13 +50,17 @@ grep -q 'background workspace (no_focus' src/main.rs \
   && ok "F5: xproj spawn passes no_focus=true" \
   || bad "F5: xproj spawn focus regression"
 
-# F6: __send leaf routes through the factory (coded landing semantics)
-grep -q 'agent_prompt_coded' src/backend/mod.rs \
-  && ok "F6: trait exposes agent_prompt_coded" \
-  || bad "F6: trait agent_prompt_coded missing"
-grep -q 'backend.agent_prompt_coded' src/main.rs \
-  && ok "F6: __send uses factory coded prompt" \
+# F6: __send leaf routes through the factory (coded landing semantics).
+# The method was renamed `agent_prompt_coded` -> `prompt_coded` in the
+# toron-core Backend migration (3df3398); the gate greps follow the code.
+grep -q 'backend\.prompt_coded' src/main.rs \
+  && ok "F6: __send uses factory coded prompt (prompt_coded)" \
   || bad "F6: __send regressed to concrete client"
+if grep -n 'Client::connect.*prompt_coded\|\.agent_prompt_coded\|\.prompt_coded' src/main.rs | grep -v 'backend\.prompt_coded' >/dev/null 2>&1; then
+  bad "F6: coded prompt routed through a concrete client"
+else
+  ok "F6: coded prompt only via the factory trait"
+fi
 if grep -n 'Client::connect' src/durable.rs | grep -v '^[0-9]*:#' >/dev/null 2>&1; then
   bad "F6: concrete Client::connect in durable.rs"
 else
