@@ -245,6 +245,48 @@ Tiered by time blocked: T0 ping → T1 re-ping → T2 urgent → **T3 halts the 
 The T3 exit is a distinguishable `halted:` result, not a normal `complete`
 (review-fix F4, 2026-08-05).
 
+## Workflows, Cron, Recipes & Profiles (orchestration vocabulary)
+
+The declarative orchestration tier (ADR-0005) + its execution wiring (ADR-0010).
+A **profile** = role template (behavior + model + harness); a **recipe/squad** =
+group of profiles; a **workflow** = multi-step procedure using profiles; a **cron** =
+a workflow on a schedule. **Full authoring guide with basic + in-depth examples:
+[docs/workflow-authoring.md](docs/workflow-authoring.md).**
+
+| Verb | Command |
+|---|---|
+| **profile** | `flywheel profile {list, show, create, edit, run, remove}` — the 6 built-ins (oracle/planner/reviewer/coder/scout/housekeeper) + locals in `~/.config/flywheel/profiles.toml` |
+| **squad/recipe** | `flywheel squad {list, show, spawn, remove}` — `{profile: count}` groups; legacy `recipes list` stays an alias |
+| **workflow** | `flywheel workflow {list, show, lint, run, new, history, crew, remove}` — YAML in `~/.config/flywheel/workflows/`; `lint` is the fail-stop gate |
+| **cron** | `flywheel cron {list, show, add, pause, resume, status, history, start, remove}` — registry in `crons.toml`; `start` runs the durable loops |
+| **model** *(ADR-0010)* | `flywheel model {list, show, add, remove}` — registry in `~/.config/flywheel/models.toml` |
+| **runs** | `flywheel runs {list, show, pending, digest}` — observability: state + owner + per-run cost; headless run logs feed this |
+
+```bash
+# create → lint → run → remove
+flywheel workflow new upgrade-thing && $EDITOR ~/.config/flywheel/workflows/upgrade-thing.yaml
+flywheel workflow lint upgrade-thing
+flywheel workflow run upgrade-thing --execute --inputs '{"x":1}' --crew auto
+flywheel workflow remove upgrade-thing
+
+# a scheduled, unattended cron (defaults to headless — no workspace churn)
+flywheel cron add weekly-upgrade --template upgrade-thing --cron "30 3 * * 0" --owner housekeeper --mode headless
+flywheel cron start
+```
+
+**Status (ADR-0010, in-flight):** `--execute` (real runner), `--mode headless|pane`,
+`--model`, and `model {...}` land in the P10.1–P10.5 beads. Until P10.3, `workflow run`
+WITHOUT `--execute` is the no-op control-flow path; the **live swarm path stays
+`flywheel loop run <project> --work`**. `remove` is live now. Author workflows
+against the target surface (the guide documents it); each command goes live as its
+bead closes (ADR-0010 Verification gates).
+
+**Two execution models (ADR-0010 Spec E):** *pane* (interactive, durable promise,
+bus-auditable — you watch) vs *headless* (autonomous/cron, synchronous, local-only,
+logged to `runs/` — no one watches). Cron defaults to headless. Role-conditioning
+(profile `behavior` preamble prepended to every dispatch) + model injection apply to
+both.
+
 <!-- br-agent-instructions-v2 -->
 
 ---
