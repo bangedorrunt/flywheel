@@ -178,6 +178,23 @@ fn ensure_loops_migrated() -> Result<()> {
     }
     let raw = std::fs::read_to_string(&legacy)?;
     let (prior_schema, map) = parse_loops_registry(&raw);
+    // Distinguish "no content" (valid JSON object, zero loop entries) from
+    // "corrupt" (parse failure or non-object): only absence is lossless to
+    // delete. Corrupt files keep the rename-backup path below.
+    let parses_as_object = serde_json::from_str::<serde_json::Value>(&raw)
+        .map(|v| v.is_object())
+        .unwrap_or(false);
+    if map.is_empty() && parses_as_object {
+        // Empty legacy registry (e.g. `{}` or `{"schema":2}` after a clean
+        // shutdown): nothing to preserve — delete it so repeat migrations
+        // stop littering loops.json.migrated-* files (bd-fw-loop-status-stale-hjn).
+        match std::fs::remove_file(&legacy) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        return Ok(());
+    }
     if prior_schema < LOOPS_SCHEMA_VERSION {
         // Genuine v1 content (not absence — absence returns above): keep the
         // audit signal, now reworded for the sidecar split (l4s.2).
@@ -203,6 +220,36 @@ fn ensure_loops_migrated() -> Result<()> {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
+    }
+    // Sweep stale migration backups (litter fix): the sidecars hold the
+    // content, so the NEWEST .migrated-* marker is the single recoverable
+    // backup; older ones are duplicates of the same legacy file. Names are
+    // epoch seconds — fixed width, so lexicographic order is chronological.
+    if let Ok(rd) = std::fs::read_dir(legacy.parent().unwrap()) {
+        let mut markers: Vec<PathBuf> = rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with("loops.json.migrated-"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        // newest = largest epoch suffix; parse numerically (not lexicographic —
+        // timestamps are not fixed-width across eras).
+        markers.sort_by_key(|p| {
+            p.file_name()
+                .map(|n| {
+                    n.to_string_lossy()
+                        .trim_start_matches("loops.json.migrated-")
+                        .parse::<u64>()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0)
+        });
+        for old in markers.iter().take(markers.len().saturating_sub(1)) {
+            let _ = std::fs::remove_file(old);
+        }
     }
     Ok(())
 }
@@ -1407,6 +1454,106 @@ mod loops_sidecar_tests {
             let _ = std::fs::remove_file(sidecar_file(p));
             let _ = std::fs::remove_file(sidecar_file(p).with_extension("json.tmp"));
         }
+        for n in loops_dir_markers() {
+            if !pre_markers.contains(&n) {
+                let _ = std::fs::remove_file(loops_file().parent().unwrap().join(&n));
+            }
+        }
+        match pre_legacy {
+            Some(bytes) => std::fs::write(&legacy, bytes).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&legacy);
+            }
+        }
+    }
+
+    /// bd-fw-loop-status-stale-hjn: an EMPTY legacy loops.json (valid object,
+    /// zero entries) is deleted, not renamed — repeat migrations must not
+    /// litter loops.json.migrated-* files.
+    #[test]
+    fn empty_legacy_registry_is_deleted_not_renamed() {
+        let _g = loops_test_guard();
+        let legacy = loops_file();
+        let pre_legacy = std::fs::read_to_string(&legacy).ok();
+        let pre_markers = loops_dir_markers();
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "{\"schema\":2}").unwrap();
+        // migrate via read
+        let (_schema, loaded) = load_loops_registry().unwrap();
+        assert!(loaded.is_empty());
+        assert!(!legacy.exists(), "empty legacy deleted, not renamed");
+        assert_eq!(
+            loops_dir_markers(),
+            pre_markers,
+            "no new .migrated-* marker for empty content"
+        );
+        // corrupt content is NOT deleted (keeps the recoverable rename path)
+        std::fs::write(&legacy, "{not json").unwrap();
+        let (_schema, loaded) = load_loops_registry().unwrap();
+        assert!(loaded.is_empty());
+        assert!(
+            !legacy.exists(),
+            "corrupt legacy still renamed away (recoverable backup)"
+        );
+        let new_marker = loops_dir_markers()
+            .into_iter()
+            .any(|n| !pre_markers.contains(&n));
+        assert!(new_marker, "corrupt legacy keeps a .migrated-* marker");
+        // restore
+        for n in loops_dir_markers() {
+            if !pre_markers.contains(&n) {
+                let _ = std::fs::remove_file(loops_file().parent().unwrap().join(&n));
+            }
+        }
+        match pre_legacy {
+            Some(bytes) => std::fs::write(&legacy, bytes).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&legacy);
+            }
+        }
+    }
+
+    /// bd-fw-loop-status-stale-hjn: after a real migration only the NEWEST
+    /// .migrated-* backup survives — old litter is swept.
+    #[test]
+    fn migration_sweeps_old_backup_litter() {
+        let _g = loops_test_guard();
+        let p1 = test_project("sweep-a");
+        let legacy = loops_file();
+        let pre_legacy = std::fs::read_to_string(&legacy).ok();
+        let pre_markers = loops_dir_markers();
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        // seed old litter + a legacy file with real content
+        for ts in [1000u64, 2000, 3000] {
+            std::fs::write(
+                legacy.with_file_name(format!("loops.json.migrated-{ts}")),
+                "old",
+            )
+            .unwrap();
+        }
+        let mut map = BTreeMap::new();
+        map.insert(p1.clone(), make_loop(&p1, 3));
+        std::fs::write(&legacy, serialize_loops_registry(&map).unwrap()).unwrap();
+        let (_schema, loaded) = load_loops_registry().unwrap();
+        assert_eq!(loaded.len(), 1, "content migrated");
+        // exactly ONE marker remains (the newest = the one just created)
+        let markers = loops_dir_markers();
+        assert_eq!(markers.len(), pre_markers.len() + 1, "litter swept: {markers:?}");
+        let new_markers: Vec<String> = markers
+            .iter()
+            .filter(|n| !pre_markers.contains(n))
+            .cloned()
+            .collect();
+        assert_eq!(new_markers.len(), 1, "one new marker kept");
+        assert!(
+            !new_markers[0].contains("migrated-1000")
+                && !new_markers[0].contains("migrated-2000")
+                && !new_markers[0].contains("migrated-3000"),
+            "seeded old litter gone: {new_markers:?}"
+        );
+        // restore
+        let _ = std::fs::remove_file(sidecar_file(&p1));
+        let _ = std::fs::remove_file(sidecar_file(&p1).with_extension("json.tmp"));
         for n in loops_dir_markers() {
             if !pre_markers.contains(&n) {
                 let _ = std::fs::remove_file(loops_file().parent().unwrap().join(&n));
