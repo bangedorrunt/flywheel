@@ -222,57 +222,78 @@ fn spawn_crew_into(
                 *n
             };
             let name = crew_agent_name(wf_name, role, ordinal);
-            let pane_id = match &prev {
-                None => {
-                    // root pane of the workspace — list it by workspace id
-                    let panes = c.pane_list(Some(ws_id))?;
-                    panes
-                        .first()
-                        .map(|p| p.pane_id.clone())
-                        .ok_or_else(|| anyhow!("pane crew: no root pane in workspace {ws_id}"))?
-                }
-                Some(p) => {
-                    let split = crate::herdr_shim::pane_split(
-                        c,
-                        p,
-                        "down",
-                        Some(&crate::utf8_path(&dir, "workspace dir")?),
-                    )?;
-                    split.pane_id
-                }
-            };
-            // AGENT_ARG = per-harness model flag (headless.rs model_args).
-            let agent_args: Vec<String> = if profile.model.is_empty() {
-                vec![]
+            // --reuse / re-run idempotency: a registry entry for this name
+            // whose pane is STILL ALIVE binds instead of re-spawning (agent
+            // names are taken — re-spawning would fail with agent_name_taken).
+            // A stale entry (pane closed/respawned) is re-spawned: its pane
+            // is gone, and binding it would dispatch into a dead pane.
+            let live_panes = c.agent_list()?;
+            let existing = registry
+                .iter()
+                .find(|e| e.name == name)
+                .filter(|e| {
+                    live_panes
+                        .iter()
+                        .any(|a| a.pane_id == e.pane_id && a.workspace_id == ws_id)
+                })
+                .cloned();
+            let (agent_pane_id, name) = if let Some(e) = existing {
+                eprintln!("  crew {}: reusing {} ({}) @{}", label, name, e.pane_id, role);
+                (e.pane_id.clone(), name.clone())
             } else {
-                headless::model_args(harness, &profile.model)
+                let pane_id = match &prev {
+                    None => {
+                        // root pane of the workspace — list it by workspace id
+                        let panes = c.pane_list(Some(ws_id))?;
+                        panes
+                            .first()
+                            .map(|p| p.pane_id.clone())
+                            .ok_or_else(|| {
+                                anyhow!("pane crew: no root pane in workspace {ws_id}")
+                            })?
+                    }
+                    Some(p) => {
+                        let split = crate::herdr_shim::pane_split(
+                            c,
+                            p,
+                            "down",
+                            Some(&crate::utf8_path(&dir, "workspace dir")?),
+                        )?;
+                        split.pane_id
+                    }
+                };
+                // AGENT_ARG = per-harness model flag (headless.rs model_args).
+                let agent_args: Vec<String> = if profile.model.is_empty() {
+                    vec![]
+                } else {
+                    headless::model_args(harness, &profile.model)
+                };
+                let agent =
+                    crate::start_agent_with_retry(c, &name, harness, &pane_id, &agent_args)?;
+                crate::register_spawned_agent(cfg, project, &name, harness, &agent.pane_id);
+                // The first dispatch fires as soon as the engine runs step 1 —
+                // a still-booting agent rejects prompts (`agent_not_ready`).
+                // Wait for the pane to settle idle before returning
+                // (best-effort: a wait failure degrades to the __send landing
+                // semantics, which classify not-ready as a per-step error,
+                // never a panic).
+                if let Err(e) = c.agent_wait(&name, &[AgentStatus::Idle], Some(90_000)) {
+                    eprintln!(
+                        "flywheel: crew {name} readiness wait failed (dispatching anyway): {e}"
+                    );
+                }
+                (agent.pane_id.clone(), name.clone())
             };
-            let agent = crate::start_agent_with_retry(c, &name, harness, &pane_id, &agent_args)?;
-            crate::register_spawned_agent(cfg, project, &name, harness, &agent.pane_id);
-            // The first dispatch fires as soon as the engine runs step 1 —
-            // a still-booting agent rejects prompts (`agent_not_ready`).
-            // Wait for the pane to settle idle before returning (best-effort:
-            // a wait failure degrades to the __send landing semantics, which
-            // classify not-ready as a per-step error, never a panic).
-            if let Err(e) = c.agent_wait(
-                &name,
-                &[herdr_shim::AgentStatus::Idle],
-                Some(90_000),
-            ) {
-                eprintln!(
-                    "flywheel: crew {name} readiness wait failed (dispatching anyway): {e}"
-                );
-            }
-            prev = Some(agent.pane_id.clone());
+            prev = Some(agent_pane_id.clone());
             registry.retain(|e| e.name != name);
             registry.push(SpawnEntry {
-                pane_id: agent.pane_id.clone(),
+                pane_id: agent_pane_id.clone(),
                 name: name.clone(),
                 profile: Some(role.clone()),
             });
             eprintln!(
                 "  crew {}: {} ({}) @{}",
-                label, name, agent.pane_id, role
+                label, name, agent_pane_id, role
             );
         }
     }
@@ -331,31 +352,51 @@ pub fn pane_dispatch(
 
     // Subprocess-reuse (Spec A): the `__send` leaf owns the confirmed send
     // (landing wait, last-sent dedup, auto-heal) — no new dispatch code.
-    let mut cmd = Command::new(std::env::current_exe()?);
-    cmd.arg("__send")
-        .arg(project)
-        .arg(&entry.name)
-        .arg(&prompt)
-        .arg("--confirm");
-    let output = cmd
-        .output()
-        .with_context(|| format!("__send for @{profile_name} ({})", entry.name))?;
-    let raw = String::from_utf8_lossy(&output.stdout).to_string();
-    let trimmed = raw.trim();
-    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+    // A freshly spawned agent may still be booting when the first step
+    // fires: `agent_not_ready` is transient — retry with backoff (bounded;
+    // a persistent not-ready surfaces as a per-step error, never a hang).
+    let mut attempts = 0;
+    const MAX_ATTEMPTS: u32 = 6;
+    loop {
+        let mut cmd = Command::new(std::env::current_exe()?);
+        cmd.arg("__send")
+            .arg(project)
+            .arg(&entry.name)
+            .arg(&prompt)
+            .arg("--confirm");
+        let output = cmd
+            .output()
+            .with_context(|| format!("__send for @{profile_name} ({})", entry.name))?;
+        let raw = String::from_utf8_lossy(&output.stdout).to_string();
+        let trimmed = raw.trim();
+        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+            let transient = v
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(|r| r.contains("agent_not_ready"))
+                .unwrap_or(false);
+            if transient && attempts < MAX_ATTEMPTS {
+                attempts += 1;
+                eprintln!(
+                    "flywheel: @{profile_name} not ready (attempt {attempts}/{MAX_ATTEMPTS}) — retrying in 10s"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                continue;
+            }
+            return Ok(json!({
+                "profile": profile_name,
+                "agent": entry.name,
+                "send": v,
+            }));
+        }
+        let err = String::from_utf8_lossy(&output.stderr).to_string();
         return Ok(json!({
+            "ok": false,
+            "error": if err.trim().is_empty() { raw } else { err },
             "profile": profile_name,
             "agent": entry.name,
-            "send": v,
         }));
     }
-    let err = String::from_utf8_lossy(&output.stderr).to_string();
-    Ok(json!({
-        "ok": false,
-        "error": if err.trim().is_empty() { raw } else { err },
-        "profile": profile_name,
-        "agent": entry.name,
-    }))
 }
 
 #[cfg(test)]
