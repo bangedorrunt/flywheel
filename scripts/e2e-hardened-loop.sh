@@ -84,7 +84,7 @@ say "setup: $N_BEADS ready beads"
 # ===========================================================================
 say "=== scenario 1: baseline drain (all beads close, loop completes) ==="
 "$FW" spawn "$PROJ" --oc 2 >/dev/null 2>&1
-nohup "$FW" loop "$PROJ" --work --interval-active 15 >"$SCRATCH/loop1.log" 2>&1 &
+nohup "$FW" loop run "$PROJ" --work --interval-active 15 >"$SCRATCH/loop1.log" 2>&1 &
 LOOP_PID=$!
 # wait up to 10 min for the loop to complete
 for i in $(seq 1 120); do
@@ -102,7 +102,7 @@ else
   fail "expected 6 closed + complete; got closed=$CLOSED log=$(tail -1 "$SCRATCH/loop1.log")"
 fi
 # kill any leftover loop
-pkill -f "flywheel loop $PROJ" 2>/dev/null; sleep 1
+pkill -f "flywheel loop \(run \)\?$PROJ" 2>/dev/null; sleep 1
 INV_PRE=$(python3 -c "import json; d=json.load(open('$HOME/.local/state/flywheel/loops.json')); print(d.get('$PROJ',{}).get('id',''))")
 say "scenario 2: pre-run invocation=$INV_PRE"
 
@@ -114,7 +114,7 @@ for i in 1 2 3 4; do
     --type=task --priority=3 >/dev/null 2>&1)
 done
 SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-nohup "$FW" loop "$PROJ" --work --interval-active 15 >"$SCRATCH/loop2.log" 2>&1 &
+nohup "$FW" loop run "$PROJ" --work --interval-active 15 >"$SCRATCH/loop2.log" 2>&1 &
 LOOP_PID=$!
 # let the first bead land + close, then kill -9 mid-flight
 for i in $(seq 1 40); do
@@ -127,7 +127,7 @@ sleep 2
 INV_KILLED=$(python3 -c "import json; d=json.load(open('$HOME/.local/state/flywheel/loops.json')); print(d.get('$PROJ',{}).get('id',''))")
 say "scenario 2: killed loop mid-task; invocation of killed run=$INV_KILLED"
 # resume with the SAME command
-nohup "$FW" loop "$PROJ" --work --interval-active 15 >"$SCRATCH/loop2b.log" 2>&1 &
+nohup "$FW" loop run "$PROJ" --work --interval-active 15 >"$SCRATCH/loop2b.log" 2>&1 &
 LOOP_PID=$!
 for i in $(seq 1 120); do
   if ! kill -0 $LOOP_PID 2>/dev/null; then break; fi
@@ -146,7 +146,7 @@ elif [ "$CLOSED" = "4" ] && [ "$INV_RESUMED" != "$INV_KILLED" ]; then
 else
   fail "closed=$CLOSED killed=$INV_KILLED resumed=$INV_RESUMED"
 fi
-pkill -f "flywheel loop $PROJ" 2>/dev/null; sleep 1
+pkill -f "flywheel loop \(run \)\?$PROJ" 2>/dev/null; sleep 1
 
 # ===========================================================================
 say "=== scenario 3: context respawn via state file (fresh -> respawn, stale -> none) ==="
@@ -156,7 +156,7 @@ for i in 1 2; do
     --type=task --priority=3 >/dev/null 2>&1)
 done
 SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-nohup "$FW" loop "$PROJ" --work --interval-active 15 >"$SCRATCH/loop3.log" 2>&1 &
+nohup "$FW" loop run "$PROJ" --work --interval-active 15 >"$SCRATCH/loop3.log" 2>&1 &
 LOOP_PID=$!
 # wait for an idle agent, then hand-write a FRESH state file
 AGENT=""
@@ -201,7 +201,7 @@ if [ -n "$AGENT" ]; then
 else
   fail "no idle agent appeared"
 fi
-pkill -f "flywheel loop $PROJ" 2>/dev/null; sleep 1
+pkill -f "flywheel loop \(run \)\?$PROJ" 2>/dev/null; sleep 1
 
 # ===========================================================================
 say "=== scenario 4: blocked fast-alert (--on-blocked mail within ~2x active interval) ==="
@@ -237,7 +237,7 @@ except: pass")
 else
   fail "no agent for scenario 4"
 fi
-pkill -f "flywheel loop $PROJ" 2>/dev/null; sleep 1
+pkill -f "flywheel loop \(run \)\?$PROJ" 2>/dev/null; sleep 1
 
 # ===========================================================================
 say "=== scenario 5: frozen-agent escalation (SIGSTOP -> error -> respawn x3 -> hard-stop) ==="
@@ -247,7 +247,7 @@ for i in 1 2 3 4; do
     --type=task --priority=3 >/dev/null 2>&1)
 done
 SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-nohup "$FW" loop "$PROJ" --work --interval-active 15 >"$SCRATCH/loop5.log" 2>&1 &
+nohup "$FW" loop run "$PROJ" --work --interval-active 15 >"$SCRATCH/loop5.log" 2>&1 &
 LOOP_PID=$!
 # The escalation fires only when the agent record drops DURING a confirmed
 # send's wait (a drop before the poll means the loop never dispatches to the
@@ -322,7 +322,7 @@ if [ "$R" -ge 3 ]; then
 else
   fail "expected >=3 respawns; got $R"
 fi
-pkill -f "flywheel loop $PROJ" 2>/dev/null; sleep 1
+pkill -f "flywheel loop \(run \)\?$PROJ" 2>/dev/null; sleep 1
 sqlite3 "$HOME/.local/state/flywheel/resonate.db" "SELECT id FROM promises WHERE id LIKE 'swarm-loop:$PROJ:%' AND id NOT LIKE '%.%' AND state='pending'" 2>/dev/null | while read p; do resonate promises reject "$p" >/dev/null 2>&1; done
 
 # ===========================================================================

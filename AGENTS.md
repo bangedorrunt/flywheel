@@ -190,7 +190,7 @@ src/
   output.rs    # TTY-aware color, JSON printing
 ```
 
-The durable loop (`flywheel loop <project>`) is the orchestrator: **primary
+The durable loop (`flywheel loop run <project>`, legacy alias `flywheel loop <project>`) is the orchestrator: **primary
 signal** `__poll_events` (forward-only herdr subscribe); **correctness floor**
 `__poll` every iteration; dispatch via `__send`; durable sleep/checkpoint via
 Resonate. Crashes resume by re-running the same command (same invocation id

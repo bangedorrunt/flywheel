@@ -29,7 +29,7 @@ This is the **foundational coordination architecture** for everything the projec
 
 ### 2.1 What flywheel is
 
-flywheel is a Rust CLI: a **herdr-backed swarm orchestrator** with an NTM-parity command surface and a **durable monitoring loop** built on Resonate. The loop (`flywheel loop <project>` → `swarm_loop` workflow in `src/durable.rs`) is the orchestrator: it polls the swarm via the hidden `__poll` leaf, feeds queued instructions to idle agents via `__send`, sleeps durably, and exits when the queue drains. Crashes resume by re-running the same command.
+flywheel is a Rust CLI: a **herdr-backed swarm orchestrator** with an NTM-parity command surface and a **durable monitoring loop** built on Resonate. The loop (`flywheel loop run <project>` → `swarm_loop` workflow in `src/durable.rs`; bare `flywheel loop <project>` is accepted as a legacy alias) is the orchestrator: it polls the swarm via the hidden `__poll` leaf, feeds queued instructions to idle agents via `__send`, sleeps durably, and exits when the queue drains. Crashes resume by re-running the same command.
 
 ```
 src/

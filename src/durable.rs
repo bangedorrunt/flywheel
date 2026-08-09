@@ -2802,7 +2802,7 @@ pub async fn loop_status(cfg: &Config, project: &str) -> anyhow::Result<serde_js
     let Some(al) = crate::state::load_active_loop(project)? else {
         return Ok(serde_json::json!({
             "project": project,
-            "loop": "none recorded — run: flywheel loop <project>"
+            "loop": "none recorded — run: flywheel loop run <project>"
         }));
     };
     let rec = resonate
