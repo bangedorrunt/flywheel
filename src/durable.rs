@@ -2607,11 +2607,14 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     (None, None)
                 }
             };
+            // The thread head reports the MAIL identity (CalmGate), not the
+            // herdr name — verify against the resolved identity.
+            let mail_name = crate::resolve_mail_target(&herdr_name);
             match verify_reply(
                 exp.head.as_deref(),
                 newest_id.as_deref(),
                 author.as_deref(),
-                &herdr_name,
+                &mail_name,
                 exp.reminder_count,
             ) {
                 ReplyVerdict::Satisfied => {
@@ -2619,6 +2622,20 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         "flywheel: reply verified for {agent} in thread {}",
                         exp.thread
                     );
+                    // checkpointed cleanup: drop the (agent, thread)
+                    // expectation so it stops keeping the loop alive. The
+                    // file keys by the MAIL identity (agent), not the herdr
+                    // name — pass the file key.
+                    let _ = ctx
+                        .run(
+                            reply_settled,
+                            ReplySettledArgs {
+                                project: params.project.clone(),
+                                name: agent.clone(),
+                                thread: exp.thread.clone(),
+                            },
+                        )
+                        .await; // leaf errors logged inside; local retain below
                     satisfied_names.push(agent.clone());
                 }
                 ReplyVerdict::Reminded => {

@@ -123,15 +123,21 @@ fi
 
 # ---- T1: loop-side reply verification -------------------------------------
 if [ "$SKIP_T1" = "0" ] && [ -n "$SCRATCH" ]; then
-  say "=== T1: loop emits reply_missing when the asked thread did not move ==="
+  say "=== T1: loop-side reply verification (own thread) ==="
   EV_FILE="$EV_DIR/$SCRATCH.jsonl"
-  SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  "$FW" loop run "$SCRATCH" --interval 5 >/tmp/rv-loop.log 2>&1 &
-  LOOP_PID=$!
-  MISSING=0
-  for i in $(seq 1 16); do
-    sleep 15
-    MISSING=$(python3 -c "
+  # a FRESH collab ask (T4 already satisfied its own thread)
+  T1_COLLAB=$("$FW" collab "$SCRATCH" --to "flywheel-$SCRATCH-oc" --subject "rv-t1" --body "reply with the t1 magic word" --timeout-secs 3 2>&1)
+  T1_THREAD=$(echo "$T1_COLLAB" | grep -oE "collab-[0-9T]+" | head -1)
+  if [ -z "$T1_THREAD" ] || [ ! -s "$EV_DIR/expected-replies/$SCRATCH.json" ]; then
+    fail "T1: fresh collab did not record an expectation: $T1_COLLAB"
+  else
+    SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    "$FW" loop run "$SCRATCH" --interval 5 >/tmp/rv-loop.log 2>&1 &
+    LOOP_PID=$!
+    MISSING=0; RESOLVED=0
+    for i in $(seq 1 32); do   # 8 min window: live opencode agents are slow
+      sleep 15
+      MISSING=$(python3 -c "
 import json
 n=0
 for l in open('$EV_FILE'):
@@ -139,17 +145,48 @@ for l in open('$EV_FILE'):
     except: continue
     if d.get('kind')=='reply_missing' and d.get('ts','')>='$SINCE': n+=1
 print(n)" 2>/dev/null || echo 0)
-    ST=$("$FW" status "$SCRATCH" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['agents'][0]['status'])" 2>/dev/null)
-    [ "$MISSING" -ge 1 ] && break
-    [ "$ST" = "idle" ] || [ "$ST" = "done" ] && break
-  done
-  if [ "$MISSING" -ge 1 ]; then
-    pass "T1: reply_missing emitted ($MISSING) after the agent settled without replying"
-  else
-    fail "T1: no reply_missing within 240s (agent may have replied or still be working)"
+      RESOLVED=$(python3 -c "
+import json
+try:
+    entries=json.load(open('$EV_DIR/expected-replies/$SCRATCH.json'))
+    print(1 if len(entries)==0 else 0)
+except Exception:
+    print(0)" 2>/dev/null || echo 0)
+      [ "$MISSING" -ge 1 ] && break
+      [ "$RESOLVED" = "1" ] && break
+    done
+    say "T1 window done: reply_missing=$MISSING resolved=$RESOLVED (loop log: $(tail -1 /tmp/rv-loop.log))"
+    if [ "$MISSING" -ge 1 ]; then
+      pass "T1a: reply_missing emitted ($MISSING) — silent agent re-prompted once"
+      AGENT_MAIL=$("$FW" mail agents "$SCRATCH" 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(d[0]['name'])")
+      "$FW" mail reply "$SCRATCH" --message-id "$T1_THREAD" --body "reply after reminder" --as "$AGENT_MAIL" >/dev/null 2>&1
+      for i in $(seq 1 10); do
+        sleep 10
+        RESOLVED=$(python3 -c "
+import json
+try:
+    entries=json.load(open('$EV_DIR/expected-replies/$SCRATCH.json'))
+    print(1 if len(entries)==0 else 0)
+except Exception:
+    print(0)" 2>/dev/null || echo 0)
+        [ "$RESOLVED" = "1" ] && break
+      done
+      if [ "$RESOLVED" = "1" ]; then
+        pass "T1b: reply verified -> expectation entry removed (loop settled)"
+      else
+        fail "T1b: expectation still present after reply"
+      fi
+    elif [ "$RESOLVED" = "1" ]; then
+      pass "T1: expectation resolved (agent replied on its own — satisfied path)"
+    else
+      fail "T1: neither reply_missing nor resolution within 240s"
+    fi
+    [ -n "$LOOP_PID" ] && kill "$LOOP_PID" 2>/dev/null
   fi
 fi
 
-echo
 say "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" = "0" ]
