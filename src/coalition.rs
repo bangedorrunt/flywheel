@@ -370,10 +370,10 @@ impl CoalitionStore {
         for entry in std::fs::read_dir(&self.root)? {
             let Ok(entry) = entry else { continue };
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".json")
-                && let Ok(m) = self.load_manifest(name.trim_end_matches(".json"))
-            {
-                out.push(m);
+            if name.ends_with(".json") {
+                if let Ok(m) = self.load_manifest(&name.trim_end_matches(".json")) {
+                    out.push(m);
+                }
             }
         }
         out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
@@ -636,7 +636,7 @@ impl CoalitionStore {
                 created_at_secs: e.created_at.as_secs() as i64,
             })
             .collect();
-        views.sort_by_key(|v| std::cmp::Reverse(v.created_at_secs));
+        views.sort_by(|a, b| b.created_at_secs.cmp(&a.created_at_secs));
         let name = views
             .iter()
             .find(|v| v.kind == CHANNEL_METADATA)
