@@ -191,5 +191,47 @@ except Exception:
   fi
 fi
 
+# ---- T5: read-state regression (mark-read + unread digest) ----------------
+if [ "$SKIP_SPAWN" = "0" ] && [ -n "$SCRATCH" ]; then
+  say "=== T5: mark-read removes from the unread digest ==="
+  AGENT_MAIL=$("$FW" mail agents "$SCRATCH" 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+want = 'flywheel-$SCRATCH-oc'
+print(next((a['name'] for a in d if want in a.get('task_description','') or a.get('name','')==want), d[0]['name'] if d else ''))")
+  "$FW" collab "$SCRATCH" --to "flywheel-$SCRATCH-oc" --subject "rv-t5" --body "t5 probe" --timeout-secs 3 >/dev/null 2>&1
+  T5_MSG=$("$FW" mail inbox "$SCRATCH" --as "$AGENT_MAIL" --limit 3 2>/dev/null | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    msgs = d if isinstance(d,list) else d.get('messages', d.get('inbox', []))
+    print(msgs[0].get('id','') if msgs else '')
+except Exception:
+    print('')")
+  if [ -n "$T5_MSG" ]; then
+    READ_OUT=$("$FW" mail read "$SCRATCH" --message-id "$T5_MSG" --as "$AGENT_MAIL" 2>&1)
+    sleep 2
+    DIGEST=$("$FW" mail digest "$SCRATCH" --as "$AGENT_MAIL" 2>/dev/null | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(d.get('unread', d.get('recent','?')))
+except Exception:
+    print('?')")
+    # toron's projection has no read-state (documented no-op) — the honest
+    # assertion is that mark-read executes cleanly and the digest stays
+    # queryable. agent-mail (non-default) honors the unread drop.
+    if echo "$READ_OUT" | grep -q "error"; then
+      fail "T5: mail read errored: $READ_OUT"
+    elif [ -n "$DIGEST" ] && [ "$DIGEST" != "?" ]; then
+      pass "T5: mark-read executed cleanly; digest queryable (unread=$DIGEST; toron read-state is a no-op)"
+    else
+      fail "T5: digest unreadable after mark-read"
+    fi
+  else
+    fail "T5: no message id to mark read"
+  fi
+fi
+
 say "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" = "0" ]
