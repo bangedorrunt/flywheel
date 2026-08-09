@@ -194,8 +194,73 @@ pub fn spawn_registry_file(project: &str) -> PathBuf {
     agents_dir().join(format!("{}.json", state_key(project)))
 }
 
-/// One spawn-registry record: (pane_id, agent name).
-pub type SpawnEntry = (String, String);
+/// One spawn-registry record: (pane_id, agent name, optional crew profile).
+///
+/// The `profile` column (P10.3, bd-ghcj.1) lets the pane runner resolve
+/// `@role -> running pane`: a crew member spawned FOR a profile carries
+/// `profile: Some(role)`; ordinary swarm spawns leave it `None`. Pre-P10.3
+/// registry files (2-tuples) deserialize via the tolerant [`Deserialize`]
+/// impl below; new writes use the struct shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SpawnEntry {
+    /// the herdr pane id the agent runs in
+    pub pane_id: String,
+    /// the agent (herdr) name
+    pub name: String,
+    /// the crew profile this pane serves (`planner`, `coder`, ...); `None`
+    /// for plain swarm spawns (legacy shape).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
+impl SpawnEntry {
+    /// A legacy-format entry: pane + name, no profile.
+    pub fn legacy(pane_id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            pane_id: pane_id.into(),
+            name: name.into(),
+            profile: None,
+        }
+    }
+}
+
+/// Tolerant read of the spawn registry (bd-ghcj.1): pre-P10.3 files hold
+/// 2-tuples `[pane_id, name]`; P10.3 files hold the struct with `profile`.
+/// Both deserialize — an existing swarm's registry survives the upgrade.
+impl<'de> Deserialize<'de> for SpawnEntry {
+    fn deserialize<D>(d: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Legacy((String, String)),
+            New {
+                pane_id: String,
+                name: String,
+                #[serde(default)]
+                profile: Option<String>,
+            },
+        }
+        match Raw::deserialize(d)? {
+            Raw::Legacy((pane_id, name)) => Ok(SpawnEntry {
+                pane_id,
+                name,
+                profile: None,
+            }),
+            Raw::New {
+                pane_id,
+                name,
+                profile,
+            } => Ok(SpawnEntry {
+                pane_id,
+                name,
+                profile,
+            }),
+        }
+    }
+}
 
 /// Per-project spawn metadata (bd-vik): the workspace LABEL when a custom
 /// `--label` was used, so project-based discovery (find_workspace) still
@@ -1781,14 +1846,15 @@ mod loops_sidecar_tests {
     }
 
     /// bd-fw-name-binding-loss-7rc: the spawn registry (pane_id → name)
-    /// round-trips atomically and tolerates missing/corrupt files.
+    /// round-trips atomically and tolerates missing/corrupt files. P10.3
+    /// (bd-ghcj.1): entries carry an optional PROFILE column.
     #[test]
     fn spawn_registry_roundtrip() {
         let _g = loops_test_guard();
         let p = test_project("reg-a");
         let entries = vec![
-            ("w2A:p1".to_string(), "flywheel-reg-a-oc".to_string()),
-            ("w2A:p2".to_string(), "flywheel-reg-a-pi".to_string()),
+            SpawnEntry::legacy("w2A:p1", "flywheel-reg-a-oc"),
+            SpawnEntry::legacy("w2A:p2", "flywheel-reg-a-pi"),
         ];
         save_spawn_registry(&p, &entries).unwrap();
         assert_eq!(load_spawn_registry(&p), entries);
@@ -1803,6 +1869,45 @@ mod loops_sidecar_tests {
         // cleanup
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+    }
+
+    /// bd-ghcj.1: a PROFILE column on registry entries survives a round-trip,
+    /// and pre-P10.3 2-tuple files still load (tolerant Deserialize).
+    #[test]
+    fn spawn_registry_profile_column_roundtrip() {
+        let _g = loops_test_guard();
+        let p = test_project("reg-profile");
+        let entries = vec![
+            SpawnEntry {
+                pane_id: "w2A:p1".into(),
+                name: "crew-wf-planner-1".into(),
+                profile: Some("planner".into()),
+            },
+            SpawnEntry::legacy("w2A:p2", "flywheel-reg-profile-oc"),
+        ];
+        save_spawn_registry(&p, &entries).unwrap();
+        assert_eq!(load_spawn_registry(&p), entries);
+        let raw = std::fs::read_to_string(spawn_registry_file(&p)).unwrap();
+        assert!(raw.contains("profile"), "profile column serialized: {raw}");
+        // legacy 2-tuple file (pre-P10.3) deserializes to profile: None
+        let legacy_path = spawn_registry_file(&p);
+        std::fs::write(
+            &legacy_path,
+            r#"[["w9:p1","flywheel-x-oc"],["w9:p2","flywheel-x-pi"]]"#,
+        )
+        .unwrap();
+        let loaded = load_spawn_registry(&p);
+        assert_eq!(
+            loaded,
+            vec![
+                SpawnEntry::legacy("w9:p1", "flywheel-x-oc"),
+                SpawnEntry::legacy("w9:p2", "flywheel-x-pi"),
+            ]
+        );
+        assert!(loaded.iter().all(|e| e.profile.is_none()));
+        // cleanup
+        let _ = std::fs::remove_file(&legacy_path);
+        let _ = std::fs::remove_file(legacy_path.with_extension("json.tmp"));
     }
 
     /// bd-fw-stale-loop-processes: the pid registry round-trips atomically.

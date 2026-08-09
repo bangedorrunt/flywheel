@@ -102,8 +102,7 @@ fn str_field<'a>(v: &'a Value, keys: &[&str], op: &str) -> Result<&'a str, MailE
 }
 
 fn opt_str_field<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a str> {
-    keys.iter()
-        .find_map(|k| v.get(k).and_then(Value::as_str))
+    keys.iter().find_map(|k| v.get(k).and_then(Value::as_str))
 }
 
 fn opt_string_field(v: &Value, keys: &[&str]) -> Option<String> {
@@ -146,7 +145,11 @@ fn mail_item_from(v: &Value, op: &str) -> Result<MailItem, MailError> {
     Ok(MailItem {
         id: message_id_from(v.get("id").unwrap_or(&Value::Null), op)?,
         sender: str_field(v, &["from", "sender"], op)?.to_string(),
-        subject: v.get("subject").and_then(Value::as_str).unwrap_or("").to_string(),
+        subject: v
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         body_md: v
             .get("body_md")
             .and_then(Value::as_str)
@@ -160,7 +163,11 @@ fn mail_item_from(v: &Value, op: &str) -> Result<MailItem, MailError> {
         ack_required: v
             .get("ack_required")
             .and_then(Value::as_bool)
-            .or_else(|| v.get("ack_required").and_then(Value::as_u64).map(|n| n != 0))
+            .or_else(|| {
+                v.get("ack_required")
+                    .and_then(Value::as_u64)
+                    .map(|n| n != 0)
+            })
             .unwrap_or(false),
         thread_id: opt_string_field(v, &["thread_id"]).map(MessageId::from),
         created_ts_us: ts_us(v, &["created_ts_us", "created_ts"]),
@@ -187,7 +194,10 @@ fn send_receipt_from(v: &Value, op: &str) -> Result<SendReceipt, MailError> {
                     Ok(DeliveryLine {
                         recipient: opt_string_field(payload, &["recipient"]).unwrap_or_default(),
                         event_id: message_id_from(
-                            payload.get("event_id").or_else(|| payload.get("id")).unwrap_or(&Value::Null),
+                            payload
+                                .get("event_id")
+                                .or_else(|| payload.get("id"))
+                                .unwrap_or(&Value::Null),
                             op,
                         )?,
                     })
@@ -339,16 +349,12 @@ impl MailSurface for AgentMailBackend {
     async fn reply(&self, req: &ReplyMail) -> Result<SendReceipt, MailError> {
         // AM's reply_message takes the numeric `message_id` — a non-decimal
         // id is a caller bug: Err loudly, never 0 (se2.2).
-        let id = req
-            .thread_id
-            .as_str()
-            .parse::<u64>()
-            .map_err(|e| {
-                MailError::other(format!(
-                    "agent-mail reply: message_id {:?} is not a decimal id: {e}",
-                    req.thread_id.as_str()
-                ))
-            })?;
+        let id = req.thread_id.as_str().parse::<u64>().map_err(|e| {
+            MailError::other(format!(
+                "agent-mail reply: message_id {:?} is not a decimal id: {e}",
+                req.thread_id.as_str()
+            ))
+        })?;
         let v = self.call(
             "reply_message",
             wire::reply_args(
@@ -385,16 +391,12 @@ impl MailSurface for AgentMailBackend {
     }
 
     async fn acknowledge(&self, req: &ReceiptOp) -> Result<ReceiptOutcome, MailError> {
-        let id = req
-            .message_id
-            .as_str()
-            .parse::<u64>()
-            .map_err(|e| {
-                MailError::other(format!(
-                    "agent-mail ack: message_id {:?} is not a decimal id: {e}",
-                    req.message_id.as_str()
-                ))
-            })?;
+        let id = req.message_id.as_str().parse::<u64>().map_err(|e| {
+            MailError::other(format!(
+                "agent-mail ack: message_id {:?} is not a decimal id: {e}",
+                req.message_id.as_str()
+            ))
+        })?;
         let v = self.call(
             "acknowledge_message",
             wire::ack_args(&req.project, &req.agent, json!(id as i64)),
@@ -403,16 +405,12 @@ impl MailSurface for AgentMailBackend {
     }
 
     async fn mark_read(&self, req: &ReceiptOp) -> Result<ReceiptOutcome, MailError> {
-        let id = req
-            .message_id
-            .as_str()
-            .parse::<u64>()
-            .map_err(|e| {
-                MailError::other(format!(
-                    "agent-mail mark_read: message_id {:?} is not a decimal id: {e}",
-                    req.message_id.as_str()
-                ))
-            })?;
+        let id = req.message_id.as_str().parse::<u64>().map_err(|e| {
+            MailError::other(format!(
+                "agent-mail mark_read: message_id {:?} is not a decimal id: {e}",
+                req.message_id.as_str()
+            ))
+        })?;
         let v = self.call(
             "mark_message_read",
             wire::mark_read_args(&req.project, &req.agent, json!(id as i64)),
@@ -521,18 +519,21 @@ impl MailSurface for AgentMailBackend {
                                 "file_reservation_paths",
                             )?
                             .into_inner(),
-                            path_pattern: opt_string_field(g, &["path_pattern"]).unwrap_or_default(),
-                            exclusive: g.get("exclusive").and_then(Value::as_bool).unwrap_or(exclusive),
+                            path_pattern: opt_string_field(g, &["path_pattern"])
+                                .unwrap_or_default(),
+                            exclusive: g
+                                .get("exclusive")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(exclusive),
                             reason: opt_string_field(g, &["reason"]).unwrap_or_default(),
-                            expires_ts_us: g
-                                .get("expires_ts_us")
-                                .and_then(Value::as_i64)
-                                .or_else(|| {
-                                let iso = g.get("expires_ts").and_then(Value::as_str)?;
-                                chrono::DateTime::parse_from_rfc3339(iso)
-                                    .ok()
-                                    .map(|d| d.timestamp_micros())
-                            }),
+                            expires_ts_us: g.get("expires_ts_us").and_then(Value::as_i64).or_else(
+                                || {
+                                    let iso = g.get("expires_ts").and_then(Value::as_str)?;
+                                    chrono::DateTime::parse_from_rfc3339(iso)
+                                        .ok()
+                                        .map(|d| d.timestamp_micros())
+                                },
+                            ),
                         })
                     })
                     .collect::<Result<Vec<_>, MailError>>()
@@ -549,7 +550,33 @@ impl MailSurface for AgentMailBackend {
                         holders: c
                             .get("holders")
                             .and_then(Value::as_array)
-                            .map(|h| h.iter().filter_map(Value::as_str).map(String::from).collect())
+                            .map(|h| {
+                                h.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(String::from)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let soft_conflicts: Vec<toron_core::mailbox::reservations::PathConflict> = v
+            .get("soft_conflicts")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|c| toron_core::mailbox::reservations::PathConflict {
+                        path: opt_string_field(c, &["path"]).unwrap_or_default(),
+                        holders: c
+                            .get("holders")
+                            .and_then(Value::as_array)
+                            .map(|h| {
+                                h.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(String::from)
+                                    .collect()
+                            })
                             .unwrap_or_default(),
                     })
                     .collect()
@@ -558,6 +585,7 @@ impl MailSurface for AgentMailBackend {
         Ok(AcquireResult {
             granted,
             conflicts,
+            soft_conflicts,
         })
     }
 
@@ -581,7 +609,12 @@ impl MailSurface for AgentMailBackend {
                         holders: c
                             .get("holders")
                             .and_then(Value::as_array)
-                            .map(|h| h.iter().filter_map(Value::as_str).map(String::from).collect())
+                            .map(|h| {
+                                h.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(String::from)
+                                    .collect()
+                            })
                             .unwrap_or_default(),
                     })
                     .collect()
@@ -590,7 +623,33 @@ impl MailSurface for AgentMailBackend {
         let clear_paths = v
             .get("clear_paths")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let soft_conflicts: Vec<toron_core::mailbox::reservations::PathConflict> = v
+            .get("soft_conflicts")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|c| toron_core::mailbox::reservations::PathConflict {
+                        path: opt_string_field(c, &["path"]).unwrap_or_default(),
+                        holders: c
+                            .get("holders")
+                            .and_then(Value::as_array)
+                            .map(|h| {
+                                h.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(String::from)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(ConflictReport {
             conflict_free: v
@@ -609,6 +668,11 @@ impl MailSurface for AgentMailBackend {
                 .unwrap_or_else(|| conflicts.iter().map(|c| c.holders.len()).sum()),
             conflicts,
             clear_paths,
+            soft_conflicts,
+            has_soft_conflicts: v
+                .get("has_soft_conflicts")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 
@@ -634,15 +698,14 @@ impl MailSurface for AgentMailBackend {
                         path_pattern: opt_string_field(r, &["path_pattern"]).unwrap_or_default(),
                         exclusive: r.get("exclusive").and_then(Value::as_bool).unwrap_or(true),
                         reason: opt_string_field(r, &["reason"]).unwrap_or_default(),
-                        expires_ts_us: r
-                            .get("expires_ts_us")
-                            .and_then(Value::as_i64)
-                            .or_else(|| {
+                        expires_ts_us: r.get("expires_ts_us").and_then(Value::as_i64).or_else(
+                            || {
                                 let iso = r.get("expires_ts").and_then(Value::as_str)?;
                                 chrono::DateTime::parse_from_rfc3339(iso)
                                     .ok()
                                     .map(|d| d.timestamp_micros())
-                            }),
+                            },
+                        ),
                     })
                     .collect()
             })
@@ -706,13 +769,7 @@ impl MailSurface for AgentMailBackend {
     ) -> Result<AcquireBuildSlotResult, MailError> {
         let v = self.call(
             "acquire_build_slot",
-            wire::slot_acquire_args(
-                project,
-                agent,
-                slot,
-                exclusive,
-                ttl_secs.unwrap_or(3600),
-            ),
+            wire::slot_acquire_args(project, agent, slot, exclusive, ttl_secs.unwrap_or(3600)),
         )?;
         Ok(AcquireBuildSlotResult {
             granted: v
@@ -722,16 +779,18 @@ impl MailSurface for AgentMailBackend {
                     arr.iter()
                         .map(|g| toron_core::index::slots::GrantedSlot {
                             slot: opt_string_field(g, &["slot"]).unwrap_or_default(),
-                            exclusive: g.get("exclusive").and_then(Value::as_bool).unwrap_or(exclusive),
-                            expires_ts_us: g
-                                .get("expires_ts_us")
-                                .and_then(Value::as_i64)
-                                .or_else(|| {
-                                let iso = g.get("expires_ts").and_then(Value::as_str)?;
-                                chrono::DateTime::parse_from_rfc3339(iso)
-                                    .ok()
-                                    .map(|d| d.timestamp_micros())
-                            }),
+                            exclusive: g
+                                .get("exclusive")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(exclusive),
+                            expires_ts_us: g.get("expires_ts_us").and_then(Value::as_i64).or_else(
+                                || {
+                                    let iso = g.get("expires_ts").and_then(Value::as_str)?;
+                                    chrono::DateTime::parse_from_rfc3339(iso)
+                                        .ok()
+                                        .map(|d| d.timestamp_micros())
+                                },
+                            ),
                         })
                         .collect()
                 })
@@ -746,7 +805,12 @@ impl MailSurface for AgentMailBackend {
                             holders: c
                                 .get("holders")
                                 .and_then(Value::as_array)
-                                .map(|h| h.iter().filter_map(Value::as_str).map(String::from).collect())
+                                .map(|h| {
+                                    h.iter()
+                                        .filter_map(Value::as_str)
+                                        .map(String::from)
+                                        .collect()
+                                })
                                 .unwrap_or_default(),
                         })
                         .collect()
@@ -772,8 +836,16 @@ impl MailSurface for AgentMailBackend {
         Ok(Some(build_slot_from(&v, "renew_build_slot")?))
     }
 
-    async fn slot_release(&self, project: &str, agent: &str, slot: &str) -> Result<bool, MailError> {
-        let v = self.call("release_build_slot", wire::slot_release_args(project, agent, slot))?;
+    async fn slot_release(
+        &self,
+        project: &str,
+        agent: &str,
+        slot: &str,
+    ) -> Result<bool, MailError> {
+        let v = self.call(
+            "release_build_slot",
+            wire::slot_release_args(project, agent, slot),
+        )?;
         Ok(v.get("released").and_then(Value::as_bool).unwrap_or(true))
     }
 
@@ -790,7 +862,12 @@ impl MailSurface for AgentMailBackend {
             member_projects: v
                 .get("member_projects")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
                 .unwrap_or_default(),
             created: v.get("created").and_then(Value::as_bool).unwrap_or(false),
         })
@@ -812,7 +889,12 @@ impl MailSurface for AgentMailBackend {
             member_projects: v
                 .get("member_projects")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
                 .unwrap_or_default(),
             created: v.get("created").and_then(Value::as_bool).unwrap_or(false),
         })
@@ -910,7 +992,12 @@ impl MailSurface for AgentMailBackend {
         Ok(v.get("removed_paths")
             .or_else(|| v.get("pruned"))
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
@@ -937,17 +1024,19 @@ impl MailSurface for AgentMailBackend {
 
 fn receipt_outcome_from(v: &Value, op: &str) -> Result<ReceiptOutcome, MailError> {
     Ok(ReceiptOutcome {
-        message_id: message_id_from(
-            v.get("message_id").unwrap_or(&Value::Null),
-            op,
-        )?,
-        acknowledged: v.get("acknowledged").and_then(Value::as_bool).unwrap_or(false),
+        message_id: message_id_from(v.get("message_id").unwrap_or(&Value::Null), op)?,
+        acknowledged: v
+            .get("acknowledged")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         acknowledged_at_us: v
             .get("acknowledged_at_us")
             .and_then(Value::as_i64)
             .or_else(|| {
                 opt_string_field(v, &["acknowledged_at"]).and_then(|s| {
-                    chrono::DateTime::parse_from_rfc3339(&s).ok().map(|d| d.timestamp_micros())
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|d| d.timestamp_micros())
                 })
             }),
     })
@@ -963,7 +1052,9 @@ fn contact_link_from(v: &Value, _op: &str) -> Result<ContactLink, MailError> {
         to_pubkey: String::new(),
         to_project: opt_string_field(v, &["to_project"]),
         status: match status.as_str() {
-            "approved" | "accepted" | "accept" => toron_core::mailbox::contacts::LinkStatus::Approved,
+            "approved" | "accepted" | "accept" => {
+                toron_core::mailbox::contacts::LinkStatus::Approved
+            }
             "denied" | "rejected" | "deny" => toron_core::mailbox::contacts::LinkStatus::Denied,
             _ => toron_core::mailbox::contacts::LinkStatus::Pending,
         },
@@ -979,15 +1070,12 @@ fn build_slot_from(v: &Value, _op: &str) -> Result<BuildSlot, MailError> {
         agent_pubkey: String::new(),
         exclusive,
         status: toron_core::index::slots::SlotStatus::Active,
-        expires_ts_us: v
-            .get("expires_ts_us")
-            .and_then(Value::as_i64)
-            .or_else(|| {
-                let iso = v.get("expires_ts").and_then(Value::as_str)?;
-                chrono::DateTime::parse_from_rfc3339(iso)
-                    .ok()
-                    .map(|d| d.timestamp_micros())
-            }),
+        expires_ts_us: v.get("expires_ts_us").and_then(Value::as_i64).or_else(|| {
+            let iso = v.get("expires_ts").and_then(Value::as_str)?;
+            chrono::DateTime::parse_from_rfc3339(iso)
+                .ok()
+                .map(|d| d.timestamp_micros())
+        }),
     })
 }
 
@@ -999,7 +1087,12 @@ fn thread_summary_from(v: &Value, _op: &str) -> Result<ThreadSummary, MailError>
         v.get(key)
             .or_else(|| s.get(key))
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let count = s
@@ -1066,7 +1159,10 @@ mod tests {
         assert_eq!(item.id.as_str(), "7");
         assert_eq!(item.sender, "GreenCastle", "AM `from` → surface `sender`");
         assert!(item.ack_required);
-        assert_eq!(item.thread_id.map(|t| t.as_str().to_string()), Some("parity-thread-1".into()));
+        assert_eq!(
+            item.thread_id.map(|t| t.as_str().to_string()),
+            Some("parity-thread-1".into())
+        );
         assert!(item.created_ts_us > 0, "ISO created_ts parsed to µs");
     }
 
