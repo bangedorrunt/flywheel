@@ -6,23 +6,26 @@
 
 mod agentstate;
 mod backend;
+mod builtin_workflows;
 mod config;
+mod crew;
+mod cron;
 mod durable;
 mod fs_util;
+mod headless;
 mod herdr_shim;
 mod mail_shim;
 mod mcp_http;
+mod models;
 mod output;
 mod profile;
+mod run_log;
+mod smart_cron;
 mod stages;
-mod workflow_catalog;
-mod crew;
-mod builtin_workflows;
 mod state;
 mod toron_embed;
 mod work;
-mod cron;
-mod smart_cron;
+mod workflow_catalog;
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -31,17 +34,17 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use config::{Config, Recipe, WorkflowStep};
 use herdr_shim::{
-    classify_send_result, AgentInfo, AgentStatus, Client, SendVerdict, Subscription, WaitOptions,
+    AgentInfo, AgentStatus, Client, SendVerdict, Subscription, WaitOptions, classify_send_result,
 };
 use output::{die, dim, error, kind_paint, ok as paint_ok, print_json, status_paint};
-use state::{log_event, EventKind};
+use state::{EventKind, log_event};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -55,18 +58,16 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn stage_prompt(name: &str) -> Result<String> {
     let lib = stages::StageLibrary::load()?;
-    lib.resolve(name)
-        .map(|p| p.to_string())
-        .ok_or_else(|| {
-            anyhow!(
-                "unknown stage: {name} (known: {})",
-                lib.list()
-                    .iter()
-                    .map(|(n, a)| format!("{n} ({a})"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })
+    lib.resolve(name).map(|p| p.to_string()).ok_or_else(|| {
+        anyhow!(
+            "unknown stage: {name} (known: {})",
+            lib.list()
+                .iter()
+                .map(|(n, a)| format!("{n} ({a})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
 }
 
 // ---- CLI surface ----
@@ -420,6 +421,13 @@ enum Commands {
         #[command(subcommand)]
         cmd: WorkflowCmd,
     },
+    /// Model registry (ADR-0010 Spec D, P10.2) — `models.toml` ids with
+    /// provider/cost/caps/fallback; Profile.model resolves against it so the
+    /// per-harness model flag is real, not advisory.
+    Model {
+        #[command(subcommand)]
+        cmd: ModelCmd,
+    },
     /// Smart-cron surface (ADR-0005 Spec 3 / P4.6) — the flywheel half of
     /// cron: registered schedules + schedule-triggered workflows, pause/
     /// resume, status + history. The P4.3 cron manager drives ticks off this
@@ -561,10 +569,7 @@ enum Commands {
     },
     /// internal: mail digest for one agent (unread counts + last sender/subject)
     #[command(name = "__mail-digest", hide = true)]
-    __MailDigest {
-        project: String,
-        agent: String,
-    },
+    __MailDigest { project: String, agent: String },
     /// internal: newest message id + author from a thread BY a sender
     /// (bd-a7j reply verification — did the thread move after dispatch?)
     #[command(name = "__check-reply", hide = true)]
@@ -639,6 +644,25 @@ enum Commands {
         /// an idle-but-exhausted agent is healthy and must still respawn).
         #[arg(long)]
         force: bool,
+    },
+    /// internal: run one prompt headlessly through a harness (ADR-0010
+    /// Spec A/E leaf). The RUNNER preprends the role preamble — the leaf
+    /// stays dumb: resolve profile → harness, run, log, exit.
+    #[command(name = "__run-headless", hide = true)]
+    __RunHeadless {
+        /// profile name (`planner` or `@planner`)
+        profile: String,
+        /// the (already role-conditioned) prompt
+        prompt: String,
+        /// model override (defaults to the profile's model)
+        #[arg(long)]
+        model: Option<String>,
+        /// owning workflow name (run-log schema)
+        #[arg(long)]
+        workflow: Option<String>,
+        /// one JSON line for the parent runner (default: human summary)
+        #[arg(long)]
+        json: bool,
     },
 }
 fn cmd_internal_last_sent(_cfg: &Config, project: &str, name: &str, hash: u64) -> Result<()> {
@@ -881,7 +905,8 @@ enum MailCmd {
         /// agent whose policy to set (default: config identity)
         #[arg(long = "as")]
         as_agent: Option<String>,
-    },    /// per-agent mail digest: unread/urgent counts + last sender/subject
+    },
+    /// per-agent mail digest: unread/urgent counts + last sender/subject
     /// (orchestrator "who has mail" view; default = own identity)
     Digest {
         project: String,
@@ -1365,6 +1390,12 @@ enum ProfileCmd {
         #[arg(long)]
         inputs: Option<String>,
     },
+    /// Remove a local profile from ~/.config/flywheel/profiles.toml (built-ins
+    /// cannot be removed — override them via `create`/`edit` instead).
+    Remove {
+        /// profile name
+        name: String,
+    },
 }
 
 /// Squad commands (ADR-0005 P6): a squad is a named group of profile counts —
@@ -1389,6 +1420,11 @@ enum SquadCmd {
         /// JSON output for agent drivers
         #[arg(long)]
         json: bool,
+    },
+    /// Remove a squad/recipe from ~/.config/flywheel/recipes.toml.
+    Remove {
+        /// squad / recipe name
+        name: String,
     },
 }
 
@@ -1444,6 +1480,16 @@ enum WorkflowCmd {
         /// crew strategy: auto | <squad> (default auto)
         #[arg(long)]
         crew: Option<String>,
+        /// real execution (ADR-0010 Spec A): without it the action runner
+        /// records only — control-flow runs, side-effects are NOT dispatched
+        /// (the backward-compat default).
+        #[arg(long)]
+        execute: bool,
+        /// execution mode with --execute (ADR-0010 Spec E): `headless` runs
+        /// steps via the `__run-headless` subprocess; `pane` (crew dispatch)
+        /// lands in P10.3.
+        #[arg(long, value_parser = ["headless", "pane"], default_value = "headless")]
+        mode: String,
         /// JSON output for agent drivers
         #[arg(long)]
         json: bool,
@@ -1462,6 +1508,56 @@ enum WorkflowCmd {
     Crew {
         /// workflow name (built-in or catalog)
         name: String,
+    },
+    /// Remove a catalog workflow (deletes ~/.config/flywheel/workflows/<name>.yaml).
+    /// Built-in workflows cannot be removed — override via a catalog file of the
+    /// same name (catalog shadows built-ins).
+    Remove {
+        /// workflow name (catalog only)
+        name: String,
+    },
+}
+
+/// `flywheel model` subcommands (ADR-0010 Spec D, P10.2): the `models.toml`
+/// registry. Profile.model ids resolve against it for per-harness injection;
+/// unknown ids warn and pass through (never block a run).
+#[derive(Subcommand)]
+enum ModelCmd {
+    /// List registered model ids
+    List {
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one registry entry (provider, cost, caps, fallback)
+    Show {
+        /// model id (e.g. claude-sonnet-4)
+        id: String,
+    },
+    /// Add or update a registry entry in ~/.config/flywheel/models.toml
+    Add {
+        /// model id
+        id: String,
+        /// provider prefix (`anthropic` → opencode -m anthropic/<id>)
+        #[arg(long)]
+        provider: String,
+        /// input cost per million tokens (advisory)
+        #[arg(long, default_value_t = 0.0)]
+        cost_in_per_mtok: f64,
+        /// output cost per million tokens (advisory)
+        #[arg(long, default_value_t = 0.0)]
+        cost_out_per_mtok: f64,
+        /// harnesses this model supports (comma list; empty = all)
+        #[arg(long)]
+        caps: Option<String>,
+        /// fallback id when a harness is outside caps
+        #[arg(long)]
+        fallback: Option<String>,
+    },
+    /// Remove a registry entry
+    Remove {
+        /// model id
+        id: String,
     },
 }
 
@@ -1532,6 +1628,13 @@ enum CronCmd {
     /// (P4.3 cron manager). Health-gate probes + `on_failure: bead` are live.
     /// Blocks; Ctrl-C to stop.
     Start,
+    /// Remove a cron from the crons.toml registry. A cron whose source is a
+    /// workflow's `schedule` trigger cannot be removed here — edit/remove that
+    /// workflow instead.
+    Remove {
+        /// cron name
+        name: String,
+    },
 }
 
 fn parse_kind_count(s: &str) -> Result<(String, u32)> {
@@ -1566,7 +1669,10 @@ fn utf8_path(p: &Path, what: &str) -> Result<String> {
 /// `project_dir` as a UTF-8 string (193.1): the project path is a real path
 /// (herdr cwd, agent-mail key) — propagate non-UTF-8 as an error.
 fn project_dir_str(cfg: &Config, project: &str) -> Result<String> {
-    utf8_path(&project_dir(cfg, project), &format!("project path for {project:?}"))
+    utf8_path(
+        &project_dir(cfg, project),
+        &format!("project path for {project:?}"),
+    )
 }
 
 fn swarm_label(project: &str) -> String {
@@ -1700,7 +1806,14 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
         .map(|a| a.name.clone().unwrap_or_default())
         .collect();
     let want: Vec<WantToken> = if to == "all" {
-        avail.iter().cloned().map(|a| WantToken { name: a, broaden: false }).collect()
+        avail
+            .iter()
+            .cloned()
+            .map(|a| WantToken {
+                name: a,
+                broaden: false,
+            })
+            .collect()
     } else {
         to.split(',').map(|s| to_want_token(project, s)).collect()
     };
@@ -1729,10 +1842,7 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
 /// (they're herdr-specific and don't need backend-agnosticism yet — migrating
 /// them is churn with no payoff until superlogical ships). The two overloads
 /// share the helper bodies via macros-free duplication (small, narrow).
-fn find_workspace_dyn(
-    backend: &dyn backend::MultiplexerBackend,
-    project: &str,
-) -> Result<String> {
+fn find_workspace_dyn(backend: &dyn backend::MultiplexerBackend, project: &str) -> Result<String> {
     let label = swarm_label(project);
     let matches: Vec<herdr_shim::WorkspaceInfo> = backend
         .workspace_list()?
@@ -1791,7 +1901,14 @@ fn resolve_agents_dyn(
         .map(|a| a.name.clone().unwrap_or_default())
         .collect();
     let want: Vec<WantToken> = if to == "all" {
-        avail.iter().cloned().map(|a| WantToken { name: a, broaden: false }).collect()
+        avail
+            .iter()
+            .cloned()
+            .map(|a| WantToken {
+                name: a,
+                broaden: false,
+            })
+            .collect()
     } else {
         to.split(',').map(|s| to_want_token(project, s)).collect()
     };
@@ -2088,7 +2205,15 @@ fn main() {
             body,
             timeout_secs,
             as_agent,
-        }) => cmd_collab(&cfg, project, to, subject, body, *timeout_secs, as_agent.as_deref()),
+        }) => cmd_collab(
+            &cfg,
+            project,
+            to,
+            subject,
+            body,
+            *timeout_secs,
+            as_agent.as_deref(),
+        ),
         Some(Commands::Xproj { cmd }) => cmd_xproj(&cfg, cmd),
         Some(Commands::Worktree { cmd }) => cmd_worktree(&cfg, cmd),
         Some(Commands::Checkpoint { cmd }) => cmd_checkpoint(&cfg, cmd),
@@ -2121,6 +2246,7 @@ fn main() {
         Some(Commands::Squad { cmd }) => cmd_squad(&cfg, cmd),
         Some(Commands::Runs { cmd }) => cmd_runs(&cfg, cmd),
         Some(Commands::Workflow { cmd }) => cmd_workflow(cmd),
+        Some(Commands::Model { cmd }) => cmd_models(cmd),
         Some(Commands::Cron { cmd }) => cmd_cron(cmd),
         Some(Commands::Debate {
             proposition,
@@ -2273,6 +2399,19 @@ fn main() {
             kind,
             force,
         }) => cmd_internal_respawn(&cfg, project, name, kind, *force),
+        Some(Commands::__RunHeadless {
+            profile,
+            prompt,
+            model,
+            workflow,
+            json,
+        }) => cmd_internal_run_headless(
+            profile,
+            prompt,
+            model.as_deref(),
+            workflow.as_deref(),
+            *json,
+        ),
         None => {
             // no command: show concise help with examples
             print_concise_help();
@@ -2455,7 +2594,9 @@ fn recipe_counts(
         }
     }
     for (k, n) in [("oc", counts.oc), ("pi", counts.pi), ("gk", counts.gk)] {
-        if let Some(n) = n && n > 0 {
+        if let Some(n) = n
+            && n > 0
+        {
             out.push((k.into(), n));
         }
     }
@@ -2484,7 +2625,10 @@ fn peer_prompt_template(
 ) -> String {
     tpl.replace("{name}", name)
         .replace("{task}", "await the swarm loop's queue or help peers")
-        .replace("{poll_interval_minutes}", &poll_interval_minutes.to_string())
+        .replace(
+            "{poll_interval_minutes}",
+            &poll_interval_minutes.to_string(),
+        )
         .replace("{poll_budget_minutes}", &poll_budget_minutes.to_string())
         .replace("{max_peer_prompts}", &max_peer_prompts.to_string())
 }
@@ -2555,7 +2699,12 @@ fn cmd_spawn(
                 msg.push_str(&format!(
                     "
 projects available: {}",
-                    names.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
+                    names
+                        .iter()
+                        .take(10)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
         }
@@ -2593,7 +2742,12 @@ projects available: {}",
     if !orphans.is_empty() {
         let detail: Vec<String> = orphans
             .iter()
-            .map(|ws| format!("{} (label {:?}, {} panes)", ws.workspace_id, ws.label, ws.pane_count))
+            .map(|ws| {
+                format!(
+                    "{} (label {:?}, {} panes)",
+                    ws.workspace_id, ws.label, ws.pane_count
+                )
+            })
             .collect();
         if retire_orphans {
             eprintln!(
@@ -2757,7 +2911,9 @@ fn start_agent_with_retry(
     args: &[String],
 ) -> Result<AgentInfo> {
     for attempt in 0..30 {
-        if let Err(e) = c.agent_start(name, kind, pane_id, 45_000, args) && attempt == 0 {
+        if let Err(e) = c.agent_start(name, kind, pane_id, 45_000, args)
+            && attempt == 0
+        {
             eprintln!("agent.start error: {e:#}");
         }
         // a timeout can leave the agent already booted; check the registry.
@@ -2773,10 +2929,14 @@ fn start_agent_with_retry(
             // bd-w17): accept the pane match and apply the name ourselves —
             // name-based resolution (send/loop/status) depends on it
             if let Some(a) = agents.iter().find(|a| a.pane_id == pane_id) {
-                if a.name.as_deref() != Some(name) && let Err(e) = c.agent_rename(&a.pane_id, name) {
+                if a.name.as_deref() != Some(name)
+                    && let Err(e) = c.agent_rename(&a.pane_id, name)
+                {
                     eprintln!("agent.rename error: {e:#}");
                 }
-                if let Ok(agents) = c.agent_list() && let Some(a) = agents.iter().find(|a| a.pane_id == pane_id) {
+                if let Ok(agents) = c.agent_list()
+                    && let Some(a) = agents.iter().find(|a| a.pane_id == pane_id)
+                {
                     return Ok(a.clone());
                 }
             }
@@ -2799,7 +2959,9 @@ fn start_agent_with_retry_dyn(
     args: &[String],
 ) -> Result<AgentInfo> {
     for attempt in 0..30 {
-        if let Err(e) = backend.agent_start(name, kind, pane_id, args) && attempt == 0 {
+        if let Err(e) = backend.agent_start(name, kind, pane_id, args)
+            && attempt == 0
+        {
             eprintln!("agent.start error: {e:#}");
         }
         if let Ok(agents) = backend.agent_list() {
@@ -2813,7 +2975,9 @@ fn start_agent_with_retry_dyn(
                 if a.name.as_deref() != Some(name) {
                     let _ = backend.agent_rename(&a.pane_id, Some(name));
                 }
-                if let Ok(agents) = backend.agent_list() && let Some(a) = agents.iter().find(|a| a.pane_id == pane_id) {
+                if let Ok(agents) = backend.agent_list()
+                    && let Some(a) = agents.iter().find(|a| a.pane_id == pane_id)
+                {
                     return Ok(a.clone());
                 }
             }
@@ -2900,7 +3064,10 @@ fn register_spawned_agent(cfg: &Config, project: &str, name: &str, kind: &str, p
 fn valid_pair(s: &str, adjectives: &[&str], nouns: &[&str]) -> Option<String> {
     let lower = s.to_ascii_lowercase();
     for adj in adjectives {
-        if let Some(rest) = lower.strip_prefix(adj) && !rest.is_empty() && nouns.contains(&rest) {
+        if let Some(rest) = lower.strip_prefix(adj)
+            && !rest.is_empty()
+            && nouns.contains(&rest)
+        {
             let mut adj = (*adj).to_owned();
             adj.get_mut(0..1)?.make_ascii_uppercase();
             let mut noun = rest.to_owned();
@@ -3180,10 +3347,16 @@ mod agent_mail_name_tests {
         #[cfg(not(unix))]
         let bad = PathBuf::from("plain-utf8"); // non-unix can't build non-UTF-8 paths
         let err = utf8_path(&bad, "test path").unwrap_err();
-        assert!(err.to_string().contains("not valid UTF-8"), "actionable error: {err:#}");
+        assert!(
+            err.to_string().contains("not valid UTF-8"),
+            "actionable error: {err:#}"
+        );
         // a valid path round-trips exactly
         let good = PathBuf::from("/tmp/flywheel-utf8-ok");
-        assert_eq!(utf8_path(&good, "test path").unwrap(), "/tmp/flywheel-utf8-ok");
+        assert_eq!(
+            utf8_path(&good, "test path").unwrap(),
+            "/tmp/flywheel-utf8-ok"
+        );
     }
 
     /// The mapping is deterministic: same herdr name → same adjective+noun,
@@ -3568,35 +3741,56 @@ mod agent_mail_name_tests {
         // full spawned name passes through, no broadening (the fix for bd-bwf)
         assert_eq!(
             to_want_token("toron", "flywheel-toron-oc"),
-            WantToken { name: "flywheel-toron-oc".into(), broaden: false }
+            WantToken {
+                name: "flywheel-toron-oc".into(),
+                broaden: false
+            }
         );
         assert_eq!(
             to_want_token("toron", "flywheel-toron-oc2"),
-            WantToken { name: "flywheel-toron-oc2".into(), broaden: false }
+            WantToken {
+                name: "flywheel-toron-oc2".into(),
+                broaden: false
+            }
         );
         // numbered short: exact, no broadening to oc20
         assert_eq!(
             to_want_token("toron", "oc2"),
-            WantToken { name: "flywheel-toron-oc2".into(), broaden: false }
+            WantToken {
+                name: "flywheel-toron-oc2".into(),
+                broaden: false
+            }
         );
         // bare shorts expand to first ordinal AND broaden to numbered agents
         assert_eq!(
             to_want_token("toron", "oc"),
-            WantToken { name: "flywheel-toron-oc".into(), broaden: true }
+            WantToken {
+                name: "flywheel-toron-oc".into(),
+                broaden: true
+            }
         );
         assert_eq!(
             to_want_token("toron", "pi"),
-            WantToken { name: "flywheel-toron-pi".into(), broaden: true }
+            WantToken {
+                name: "flywheel-toron-pi".into(),
+                broaden: true
+            }
         );
         // raw pane id passes through
         assert_eq!(
             to_want_token("toron", "w1:p1"),
-            WantToken { name: "w1:p1".into(), broaden: false }
+            WantToken {
+                name: "w1:p1".into(),
+                broaden: false
+            }
         );
         // empty passes through (caller validates distinctness)
         assert_eq!(
             to_want_token("toron", ""),
-            WantToken { name: "".into(), broaden: false }
+            WantToken {
+                name: "".into(),
+                broaden: false
+            }
         );
     }
 }
@@ -3827,16 +4021,25 @@ fn spawn_kinds_from_log(project: &str) -> std::collections::HashMap<String, Stri
         if v.get("kind").and_then(serde_json::Value::as_str) != Some("spawn") {
             continue;
         }
-        let Some(agents) = v.get("data").and_then(|d| d.get("agents")).and_then(serde_json::Value::as_array) else {
+        let Some(agents) = v
+            .get("data")
+            .and_then(|d| d.get("agents"))
+            .and_then(serde_json::Value::as_array)
+        else {
             continue;
         };
         for a in agents {
-            let name = a.get("name").and_then(serde_json::Value::as_str).unwrap_or("");
+            let name = a
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
             let kind = a
                 .get("kind")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("opencode");
-            kinds.entry(name.to_string()).or_insert_with(|| kind.to_string());
+            kinds
+                .entry(name.to_string())
+                .or_insert_with(|| kind.to_string());
         }
         break; // last spawn event only
     }
@@ -3936,7 +4139,10 @@ fn rebind_from_registry(
 /// same work (bd-fw-send-bare-short-group). Numbered shorts (`oc2`) and
 /// concrete names match exactly one agent and never trigger this.
 fn bare_short_group_matches(project: &str, to: &str, names: &[String]) -> Option<Vec<String>> {
-    if !to.split(',').any(|t| to_want_token(project, t.trim()).broaden) {
+    if !to
+        .split(',')
+        .any(|t| to_want_token(project, t.trim()).broaden)
+    {
         return None;
     }
     let matched: Vec<String> = names
@@ -3991,12 +4197,8 @@ fn cmd_send(
         // its pane lost its name binding — restore from the spawn registry
         // (best-effort) and re-resolve before reporting the miss.
         for tok in to.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            let _ = rebind_from_registry(
-                &*backend::multiplexer_backend(cfg)?,
-                project,
-                tok,
-                &ws_id,
-            );
+            let _ =
+                rebind_from_registry(&*backend::multiplexer_backend(cfg)?, project, tok, &ws_id);
         }
         targets = resolve_agents(&mut c, &ws_id, project, to);
     }
@@ -4006,7 +4208,10 @@ fn cmd_send(
     // race one prompt across N agents (observed: 3 agents claimed the same
     // bead, duplicate commits). Refuse with guidance unless --force.
     if !force {
-        let names: Vec<String> = targets.iter().map(|a| agent_target(a).to_string()).collect();
+        let names: Vec<String> = targets
+            .iter()
+            .map(|a| agent_target(a).to_string())
+            .collect();
         if let Some(group) = bare_short_group_matches(project, to, &names) {
             bail!(
                 "--to {to} matches {} agents ({}): a bare short reaches the whole crew and would race one prompt across all of them. Use an exact name or numbered short (e.g. flywheel-{}-oc, oc2) to target one agent, or pass --force to broadcast deliberately.",
@@ -4066,7 +4271,13 @@ fn kill_key<'a>(keys: &[&'a str]) -> Option<&'a str> {
     keys.iter().find(|k| KILL_KEYS.contains(k)).copied()
 }
 
-fn cmd_interrupt(cfg: &Config, project: &str, to: &str, keys: &[String], force: bool) -> Result<()> {
+fn cmd_interrupt(
+    cfg: &Config,
+    project: &str,
+    to: &str,
+    keys: &[String],
+    force: bool,
+) -> Result<()> {
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
     let targets = resolve_agents(&mut c, &ws_id, project, to)?;
@@ -4075,9 +4286,7 @@ fn cmd_interrupt(cfg: &Config, project: &str, to: &str, keys: &[String], force: 
     } else {
         keys.iter().map(|s| s.as_str()).collect()
     };
-    if !force
-        && let Some(k) = kill_key(&keys)
-    {
+    if !force && let Some(k) = kill_key(&keys) {
         bail!(
             "--keys {k} TERMINATES the agent process (pane drops to a shell and the session binding is lost). Prefer the default Escape, which cancels the current tool call and returns to the prompt. Pass --force to send {k} deliberately."
         );
@@ -4118,8 +4327,9 @@ fn client_read_with_fallback(
             eprintln!(
                 "flywheel: {target} is working — {source} history unavailable (alternate screen); showing the visible buffer instead (attach for full history)"
             );
-            c.agent_read(target, "visible", lines)
-                .map_err(|e2| anyhow!("{target}: agent_not_idle fallback to visible failed: {e2} ({e})"))
+            c.agent_read(target, "visible", lines).map_err(|e2| {
+                anyhow!("{target}: agent_not_idle fallback to visible failed: {e2} ({e})")
+            })
         }
         Err(e) => Err(e.into()),
     }
@@ -4177,7 +4387,10 @@ fn cmd_watch(
         if std::io::stdout().is_terminal() {
             println!("{} {}", dim(&name), status_paint(st));
         }
-        if let Some(u) = until_status && st == u && all_matching(&mut c, &watch_names, u)? {
+        if let Some(u) = until_status
+            && st == u
+            && all_matching(&mut c, &watch_names, u)?
+        {
             return Ok(());
         }
     }
@@ -4355,7 +4568,9 @@ fn cmd_kill(cfg: &Config, project: &str, force: bool) -> Result<()> {
     let _ = std::fs::remove_dir_all(agentstate::project_state_dir(&project_dir(cfg, project)));
     // clear the identity files for the dead panes (best-effort — a missing
     // file is a no-op, so double-exit is harmless)
-    if let Ok(mail) = backend::mail_backend(cfg) && let Some(key) = project_dir(cfg, project).to_str() {
+    if let Ok(mail) = backend::mail_backend(cfg)
+        && let Some(key) = project_dir(cfg, project).to_str()
+    {
         for a in &agents {
             if let Err(e) = backend::run_mail(mail.clear_pane_identity(key, &a.pane_id)) {
                 eprintln!(
@@ -5362,9 +5577,12 @@ fn cmd_mail_watch(
             }))
     };
     let start = std::time::Instant::now();
-    let seen: Option<String> = latest(&mail)?
-        .and_then(|m| m.get("id").and_then(|i| i.as_str()).map(String::from));
-    eprintln!("flywheel: watching thread {thread_id} (latest {}); Ctrl-C to abort", seen.as_deref().unwrap_or("<none>"));
+    let seen: Option<String> =
+        latest(&mail)?.and_then(|m| m.get("id").and_then(|i| i.as_str()).map(String::from));
+    eprintln!(
+        "flywheel: watching thread {thread_id} (latest {}); Ctrl-C to abort",
+        seen.as_deref().unwrap_or("<none>")
+    );
     loop {
         std::thread::sleep(std::time::Duration::from_secs(interval_secs));
         if timeout_secs > 0 && start.elapsed().as_secs() >= timeout_secs {
@@ -5410,7 +5628,15 @@ fn cmd_collab(
         .split(',')
         .map(|s| resolve_mail_target(s.trim()))
         .collect();
-    let sent = mail.send(&key, &targets, subject, body, "urgent", true, Some(&thread_id))?;
+    let sent = mail.send(
+        &key,
+        &targets,
+        subject,
+        body,
+        "urgent",
+        true,
+        Some(&thread_id),
+    )?;
     let msg_id = sent
         .get("id")
         .or_else(|| sent.get("message_id"))
@@ -5446,7 +5672,8 @@ fn cmd_collab(
 
 // ---- worktree ----
 
-fn cmd_worktree(cfg: &Config, cmd: &WorktreeCmd) -> Result<()> {    let mut c = Client::connect(Some(&cfg.socket_path()))?;
+fn cmd_worktree(cfg: &Config, cmd: &WorktreeCmd) -> Result<()> {
+    let mut c = Client::connect(Some(&cfg.socket_path()))?;
     match cmd {
         WorktreeCmd::List { project } => {
             let ws_id = find_workspace(&mut c, project)?;
@@ -5696,7 +5923,9 @@ fn cmd_resume(cfg: &Config, project: &str, recipe: Option<&str>) -> Result<()> {
                 3,
             )?;
         } else {
-            bail!("workspace gone (run: flywheel spawn {project} --recipe <name> or flywheel resume {project} --recipe daily)");
+            bail!(
+                "workspace gone (run: flywheel spawn {project} --recipe <name> or flywheel resume {project} --recipe daily)"
+            );
         }
     }
     if let Some(cp) = latest {
@@ -5923,9 +6152,9 @@ fn plan_actions(
             AgentStatus::Idle | AgentStatus::Done => {
                 if !queue.is_empty() {
                     let text = queue.remove(0); // FIFO: stages in declared order
-                                                // bead/resume prompts carry a {AGENT_NAME} placeholder —
-                                                // substitute the receiving agent's herdr name (same
-                                                // contract as the durable loop's plan_actions)
+                    // bead/resume prompts carry a {AGENT_NAME} placeholder —
+                    // substitute the receiving agent's herdr name (same
+                    // contract as the durable loop's plan_actions)
                     actions.push(LoopAction::Send {
                         name: name.clone(),
                         text: text.replace("{AGENT_NAME}", name),
@@ -5997,7 +6226,11 @@ fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
     Ok(beads
         .into_iter()
         .map(|b| durable::ReadyBead {
-            id: b.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+            id: b
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
             title: b
                 .get("title")
                 .and_then(Value::as_str)
@@ -6020,7 +6253,11 @@ fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
     Ok(list
         .iter()
         .map(|b| durable::ReadyBead {
-            id: b.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+            id: b
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
             title: b
                 .get("title")
                 .and_then(Value::as_str)
@@ -6186,7 +6423,8 @@ fn cmd_loop(
     if let Some(prev) = state::register_loop(project, "", force)? {
         bail!(
             "a loop for {project} is already running (pid {}, started {}). Inspect: flywheel loop list; cleanup: flywheel loop prune; take over: flywheel loop run {project} --force.",
-            prev.pid, prev.started_at
+            prev.pid,
+            prev.started_at
         );
     }
     // --interval-active clamps to the 5s floor (consistent with the
@@ -6276,7 +6514,9 @@ fn cmd_loop(
 
     loop {
         // re-check deadline
-        if let Some(d) = deadline && std::time::Instant::now() >= d {
+        if let Some(d) = deadline
+            && std::time::Instant::now() >= d
+        {
             bail!(
                 "loop timed out after {}s (queue remaining: {})",
                 timeout_ms.unwrap_or(0) / 1000,
@@ -6291,16 +6531,14 @@ fn cmd_loop(
         if work {
             match load_inprogress_beads(cfg, project) {
                 Ok(inprog) => {
-                    let to_resume: Vec<String> =
-                        work_prompts(&inprog, &[], &mut assigned);
+                    let to_resume: Vec<String> = work_prompts(&inprog, &[], &mut assigned);
                     queue_items.extend(to_resume);
                 }
                 Err(e) => eprintln!("flywheel: br inprogress failed (continuing): {e:#}"),
             }
             match load_ready_beads(cfg, project) {
                 Ok(ready) => {
-                    let to_assign: Vec<String> =
-                        work_prompts(&[], &ready, &mut assigned);
+                    let to_assign: Vec<String> = work_prompts(&[], &ready, &mut assigned);
                     queue_items.extend(to_assign);
                 }
                 Err(e) => eprintln!("flywheel: br ready failed (continuing): {e:#}"),
@@ -6424,7 +6662,9 @@ fn cmd_loop(
         if once {
             println!("{}", dim("[loop] --once pass done"));
             if any_blocked && on_blocked == "continue" {
-                bail!("loop: agents blocked (on_blocked=continue; pass --on-blocked stop|mail to control)");
+                bail!(
+                    "loop: agents blocked (on_blocked=continue; pass --on-blocked stop|mail to control)"
+                );
             }
             return Ok(());
         }
@@ -6466,10 +6706,19 @@ mod loop_tests {
     #[test]
     fn work_prompts_resumes_inprogress_before_fresh() {
         let inprog = vec![
-            durable::ReadyBead { id: "bd-r1".into(), title: "resume me".into() },
-            durable::ReadyBead { id: "bd-r2".into(), title: "resume me too".into() },
+            durable::ReadyBead {
+                id: "bd-r1".into(),
+                title: "resume me".into(),
+            },
+            durable::ReadyBead {
+                id: "bd-r2".into(),
+                title: "resume me too".into(),
+            },
         ];
-        let ready = vec![durable::ReadyBead { id: "bd-f1".into(), title: "fresh".into() }];
+        let ready = vec![durable::ReadyBead {
+            id: "bd-f1".into(),
+            title: "fresh".into(),
+        }];
         let mut assigned = Vec::new();
         let prompts = work_prompts(&inprog, &ready, &mut assigned);
         // resume first, then fresh
@@ -6485,8 +6734,14 @@ mod loop_tests {
 
     #[test]
     fn work_prompts_skips_already_assigned() {
-        let inprog = vec![durable::ReadyBead { id: "bd-r1".into(), title: "x".into() }];
-        let ready = vec![durable::ReadyBead { id: "bd-r1".into(), title: "x".into() }];
+        let inprog = vec![durable::ReadyBead {
+            id: "bd-r1".into(),
+            title: "x".into(),
+        }];
+        let ready = vec![durable::ReadyBead {
+            id: "bd-r1".into(),
+            title: "x".into(),
+        }];
         let mut assigned = vec!["bd-r1".to_string()];
         let prompts = work_prompts(&inprog, &ready, &mut assigned);
         assert!(prompts.is_empty());
@@ -6494,7 +6749,10 @@ mod loop_tests {
 
     #[test]
     fn work_prompts_builds_self_contained_prompts() {
-        let ready = vec![durable::ReadyBead { id: "bd-42".into(), title: "fix auth".into() }];
+        let ready = vec![durable::ReadyBead {
+            id: "bd-42".into(),
+            title: "fix auth".into(),
+        }];
         let mut assigned = Vec::new();
         let prompts = work_prompts(&[], &ready, &mut assigned);
         assert_eq!(prompts.len(), 1);
@@ -6598,7 +6856,11 @@ mod loop_tests {
 
     #[test]
     fn legacy_loop_help_keeps_parent_context() {
-        let args = vec!["flywheel".to_string(), "loop".to_string(), "--help".to_string()];
+        let args = vec![
+            "flywheel".to_string(),
+            "loop".to_string(),
+            "--help".to_string(),
+        ];
         assert_eq!(rewrite_legacy_loop_args(&args), args);
         let args = vec!["flywheel".to_string(), "loop".to_string(), "-h".to_string()];
         assert_eq!(rewrite_legacy_loop_args(&args), args);
@@ -6614,7 +6876,11 @@ mod loop_tests {
 
     #[test]
     fn non_loop_commands_untouched() {
-        let args = vec!["flywheel".to_string(), "send".to_string(), "toron".to_string()];
+        let args = vec![
+            "flywheel".to_string(),
+            "send".to_string(),
+            "toron".to_string(),
+        ];
         assert_eq!(rewrite_legacy_loop_args(&args), args);
     }
 
@@ -6665,7 +6931,10 @@ mod loop_tests {
         let states = vec![st("a", AgentStatus::Done)];
         let mut q2: Vec<String> = vec![];
         let actions = plan_actions(&states, &mut q2, Some("continue"));
-        assert!(matches!(actions[0], LoopAction::Nudge { .. }), "{actions:?}");
+        assert!(
+            matches!(actions[0], LoopAction::Nudge { .. }),
+            "{actions:?}"
+        );
     }
 
     #[test]
@@ -6773,7 +7042,10 @@ mod loop_tests {
     fn name_matching_handles_numbered_agents() {
         let base = "flywheel-proj-";
         // bare short broadens: oc matches oc, oc2, oc10
-        let want_oc = WantToken { name: format!("{base}oc"), broaden: true };
+        let want_oc = WantToken {
+            name: format!("{base}oc"),
+            broaden: true,
+        };
         assert!(name_matches_want(&format!("{base}oc"), &want_oc));
         assert!(name_matches_want(&format!("{base}oc2"), &want_oc));
         assert!(name_matches_want(&format!("{base}oc10"), &want_oc));
@@ -6781,11 +7053,17 @@ mod loop_tests {
         assert!(!name_matches_want(&format!("{base}ocr"), &want_oc));
         assert!(!name_matches_want(&format!("{base}ocx"), &want_oc));
         // concrete full name is EXACT: flywheel-proj-oc must NOT match oc2
-        let want_exact = WantToken { name: format!("{base}oc"), broaden: false };
+        let want_exact = WantToken {
+            name: format!("{base}oc"),
+            broaden: false,
+        };
         assert!(name_matches_want(&format!("{base}oc"), &want_exact));
         assert!(!name_matches_want(&format!("{base}oc2"), &want_exact));
         // numbered short is exact too: oc2 must NOT match oc20
-        let want_oc2 = WantToken { name: format!("{base}oc2"), broaden: false };
+        let want_oc2 = WantToken {
+            name: format!("{base}oc2"),
+            broaden: false,
+        };
         assert!(name_matches_want(&format!("{base}oc2"), &want_oc2));
         assert!(!name_matches_want(&format!("{base}oc20"), &want_oc2));
     }
@@ -7080,7 +7358,9 @@ fn toron_setup_mcp(
                 changed.push(upsert_grok_toron(&p, url, dry_run)?);
             }
             other => {
-                eprintln!("flywheel: unknown agent kind '{other}' — use opencode,pi,grok (shorts oc,pi,gk)");
+                eprintln!(
+                    "flywheel: unknown agent kind '{other}' — use opencode,pi,grok (shorts oc,pi,gk)"
+                );
             }
         }
     }
@@ -7239,7 +7519,9 @@ fn load_json_or_default(path: &std::path::Path) -> Result<serde_json::Value> {
 }
 
 fn pretty_path(p: &std::path::Path) -> String {
-    if let Ok(h) = std::env::var("HOME") && let Ok(strip) = p.strip_prefix(&h) {
+    if let Ok(h) = std::env::var("HOME")
+        && let Ok(strip) = p.strip_prefix(&h)
+    {
         return format!("~/{}", strip.display());
     }
     p.display().to_string()
@@ -7744,7 +8026,7 @@ fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
 ///
 /// governed-by: ADR-0005 (bd-p2-cli-wn8)
 fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
-    use profile::{ProfileCatalog, Profile};
+    use profile::{Profile, ProfileCatalog};
 
     match cmd {
         ProfileCmd::List => {
@@ -7782,8 +8064,26 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 "skills": p.skills,
             }));
         }
-        ProfileCmd::Create { name, harness, model, role, behavior, task_hint, backend, default_workflow }
-        | ProfileCmd::Edit { name, harness, model, role, behavior, task_hint, backend, default_workflow } => {
+        ProfileCmd::Create {
+            name,
+            harness,
+            model,
+            role,
+            behavior,
+            task_hint,
+            backend,
+            default_workflow,
+        }
+        | ProfileCmd::Edit {
+            name,
+            harness,
+            model,
+            role,
+            behavior,
+            task_hint,
+            backend,
+            default_workflow,
+        } => {
             let path = config::config_dir().join("profiles.toml");
             let cat = ProfileCatalog::load()?;
             let base = cat.get(name).cloned().unwrap_or_default();
@@ -7806,7 +8106,9 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             for n in cat.names() {
                 // carry local (non-builtin) entries verbatim; the edited one is
                 // rewritten from the merge so partial edits keep built-in fields
-                if (n == *name || !is_builtin_profile(&n)) && let Some(p) = cat.get(&n) {
+                if (n == *name || !is_builtin_profile(&n))
+                    && let Some(p) = cat.get(&n)
+                {
                     on_disk.insert(n, p.clone());
                 }
             }
@@ -7818,17 +8120,22 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             std::fs::write(&path, raw)?;
             println!("wrote {} [profiles.{name}]", path.display());
         }
-        ProfileCmd::Run { name, workflow, inputs } => {
+        ProfileCmd::Run {
+            name,
+            workflow,
+            inputs,
+        } => {
             let cat = ProfileCatalog::load()?;
             let _inputs: Value = match inputs {
-                Some(s) if !s.is_empty() => serde_json::from_str(s)
-                    .map_err(|e| anyhow!("--inputs must be JSON: {e}"))?,
+                Some(s) if !s.is_empty() => {
+                    serde_json::from_str(s).map_err(|e| anyhow!("--inputs must be JSON: {e}"))?
+                }
                 _ => json!({}),
             };
             // Host-scope resolve: operator identity, no project lookup. The
             // operator npub is best-effort (empty string when unset).
-            let operator_npub = std::env::var("TORON_OPERATOR_NPUB")
-                .unwrap_or_else(|_| "operator".to_string());
+            let operator_npub =
+                std::env::var("TORON_OPERATOR_NPUB").unwrap_or_else(|_| "operator".to_string());
             let resolved = cat.resolve(name, None, &operator_npub, &|_, _| None)?;
             let spec = &resolved.spec;
 
@@ -7849,6 +8156,37 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                     "workflow {wf} invoke not yet wired (P3 edge) — spawned agent is ready for manual dispatch"
                 );
             }
+        }
+        ProfileCmd::Remove { name } => {
+            if is_builtin_profile(name) {
+                bail!(
+                    "cannot remove built-in profile {name:?} — override it via `flywheel profile create {name} ...` instead"
+                );
+            }
+            let path = config::config_dir().join("profiles.toml");
+            let cat = ProfileCatalog::load()?;
+            if cat.get(name).is_none() {
+                bail!("no profile named {name:?}");
+            }
+            // Rebuild the on-disk local entries WITHOUT the named one (mirrors
+            // create/edit: only non-builtin entries are persisted).
+            let mut on_disk: BTreeMap<String, profile::Profile> = BTreeMap::new();
+            for n in cat.names() {
+                if n != *name
+                    && !is_builtin_profile(&n)
+                    && let Some(p) = cat.get(&n)
+                {
+                    on_disk.insert(n, p.clone());
+                }
+            }
+            if on_disk.is_empty() {
+                // Removing the last local entry → drop the file (clean state).
+                let _ = std::fs::remove_file(&path);
+            } else {
+                let raw = toml::to_string_pretty(&ProfilesFile { profiles: on_disk })?;
+                std::fs::write(&path, raw)?;
+            }
+            println!("removed profile {name}");
         }
     }
     Ok(())
@@ -7885,7 +8223,10 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
                 }
             }
             if rows.is_empty() {
-                println!("no squads defined (edit {})", config::config_dir().join("recipes.toml").display());
+                println!(
+                    "no squads defined (edit {})",
+                    config::config_dir().join("recipes.toml").display()
+                );
             } else {
                 for row in &rows {
                     println!("{}", serde_json::to_string_pretty(row)?);
@@ -7916,7 +8257,11 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
             );
             Ok(())
         }
-        SquadCmd::Spawn { name, project, json } => {
+        SquadCmd::Spawn {
+            name,
+            project,
+            json,
+        } => {
             let cat = ProfileCatalog::load()?;
             let recipes = config::Recipes::load()?.recipes;
             let squad = match recipes.get(name) {
@@ -7931,12 +8276,15 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
             if squad.counts.is_empty() {
                 bail!("squad {name} has no members");
             }
-            let operator_npub = std::env::var("TORON_OPERATOR_NPUB")
-                .unwrap_or_else(|_| "operator".to_string());
+            let operator_npub =
+                std::env::var("TORON_OPERATOR_NPUB").unwrap_or_else(|_| "operator".to_string());
             let backend = backend::multiplexer_backend(cfg)?;
             let mut spawned: Vec<Value> = Vec::new();
             for (profile_name, n) in squad.members() {
-                let resolved = cat.resolve(profile_name, project.as_deref(), &operator_npub, &|_, _| None)?;
+                let resolved =
+                    cat.resolve(profile_name, project.as_deref(), &operator_npub, &|_, _| {
+                        None
+                    })?;
                 let spec = &resolved.spec;
                 for i in 0..n {
                     let agent_name = format!("squad-{name}-{profile_name}-{}", i + 1);
@@ -7960,8 +8308,27 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
                 }
             }
             if *json {
-                println!("{}", serde_json::to_string_pretty(&json!({ "spawned": spawned }))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({ "spawned": spawned }))?
+                );
             }
+            Ok(())
+        }
+        SquadCmd::Remove { name } => {
+            let mut recipes = config::Recipes::load()?;
+            if !recipes.recipes.contains_key(name) {
+                bail!("no squad/recipe named {name:?}");
+            }
+            recipes.recipes.remove(name);
+            let path = config::config_dir().join("recipes.toml");
+            if recipes.recipes.is_empty() {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                let raw = toml::to_string_pretty(&recipes)?;
+                std::fs::write(&path, raw)?;
+            }
+            println!("removed squad/recipe {name}");
             Ok(())
         }
     }
@@ -8058,19 +8425,42 @@ fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
         }
         RunsCmd::Show { id } => {
             let runs = all_run_entries()?;
-            let hit = runs
+            if let Some((project, e)) = runs
                 .iter()
                 .find(|(project, e)| format!("{project}:{}", e.ts) == *id)
-                .ok_or_else(|| anyhow!("run not found: {id} (flywheel runs list)"))?;
-            print_json(&json!({
-                "id": id,
-                "project": hit.0,
-                "kind": format!("{:?}", hit.1.kind).to_lowercase(),
-                "ts": hit.1.ts,
-                "owner": run_owner(&hit.1),
-                "data": hit.1.data,
-            }));
-            Ok(())
+            {
+                print_json(&json!({
+                    "id": id,
+                    "project": project,
+                    "kind": format!("{:?}", e.kind).to_lowercase(),
+                    "ts": e.ts,
+                    "owner": run_owner(e),
+                    "data": e.data,
+                }));
+                return Ok(());
+            }
+            // Headless run-log fallback (ADR-0010 Spec E, P10.1): headless
+            // runs live in `runs/<run_id>.jsonl`, not the state log.
+            if let Some(entry) = run_log::find_run(id) {
+                print_json(&json!({
+                    "run_id": entry.run_id,
+                    "ts": entry.ts,
+                    "workflow": entry.workflow,
+                    "profile": entry.profile,
+                    "harness": entry.harness,
+                    "model": entry.model,
+                    "mode": entry.mode,
+                    "status": entry.status,
+                    "tokens_in": entry.tokens_in,
+                    "tokens_out": entry.tokens_out,
+                    "duration_ms": entry.duration_ms,
+                    "prompt_hash": entry.prompt_hash,
+                    "response": entry.response,
+                    "error": entry.error,
+                }));
+                return Ok(());
+            }
+            bail!("run not found: {id} (flywheel runs list | headless run log)")
         }
         RunsCmd::Pending => {
             let runs = all_run_entries()?;
@@ -8096,7 +8486,10 @@ fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
             }
             Ok(())
         }
-        RunsCmd::Digest { since, broken_after } => {
+        RunsCmd::Digest {
+            since,
+            broken_after,
+        } => {
             let runs = all_run_entries()?;
             let cutoff: Option<String> = match since {
                 Some(s)
@@ -8120,11 +8513,7 @@ fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
                 None => None,
             };
             let recent: Vec<(String, LogEntry)> = match &cutoff {
-                Some(c) => runs
-                    .iter()
-                    .filter(|(_, e)| e.ts >= *c)
-                    .cloned()
-                    .collect(),
+                Some(c) => runs.iter().filter(|(_, e)| e.ts >= *c).cloned().collect(),
                 None => runs.clone(),
             };
             let failed: Vec<Value> = recent
@@ -8163,12 +8552,29 @@ fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
                 .filter(|(_, n)| **n > *broken_after)
                 .map(|(owner, n)| json!({ "owner": owner, "failures": n }))
                 .collect();
+            // Headless run logs (ADR-0010 Spec E, P10.1): failures since the
+            // cutoff are aggregated separately — they live in `runs/`, not
+            // the state log.
+            let headless_failed: Vec<Value> = run_log::failures_since(cutoff.as_deref())
+                .into_iter()
+                .map(|e| {
+                    json!({
+                        "run_id": e.run_id,
+                        "ts": e.ts,
+                        "workflow": e.workflow,
+                        "profile": e.profile,
+                        "status": e.status,
+                        "error": e.error,
+                    })
+                })
+                .collect();
             print_json(&json!({
                 "since": cutoff,
                 "runs": recent.len(),
                 "failed": failed,
                 "parked": parked,
                 "broken_gt_n": broken,
+                "headless_failed": headless_failed,
             }));
             Ok(())
         }
@@ -8180,9 +8586,111 @@ fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
 /// `builtin_workflows`) into the CLI: catalog listing, the fail-stop lint
 /// gate, engine-backed `run`, scaffolding, history, and the auto-crew
 /// preview.
+/// `flywheel model` — the models.toml registry (ADR-0010 Spec D, P10.2).
+fn cmd_models(cmd: &ModelCmd) -> Result<()> {
+    match cmd {
+        ModelCmd::List { json } => {
+            let reg = models::ModelRegistry::load()?;
+            let rows: Vec<Value> = reg
+                .models
+                .iter()
+                .map(|(id, e)| {
+                    json!({
+                        "id": id,
+                        "provider": e.provider,
+                        "cost_in_per_mtok": e.cost_in_per_mtok,
+                        "cost_out_per_mtok": e.cost_out_per_mtok,
+                        "caps": e.caps,
+                        "fallback": e.fallback,
+                    })
+                })
+                .collect();
+            if *json {
+                print_json(&json!({ "models": rows }));
+            } else if rows.is_empty() {
+                println!("no models registered (flywheel model add <id> --provider <p>)");
+            } else {
+                for r in &rows {
+                    println!(
+                        "{id:24} {provider:10} ${in_cost:.2}/${out_cost:.2} caps={caps:?} fb={fb:?}",
+                        id = r["id"].as_str().unwrap_or(""),
+                        provider = r["provider"].as_str().unwrap_or(""),
+                        in_cost = r["cost_in_per_mtok"].as_f64().unwrap_or(0.0),
+                        out_cost = r["cost_out_per_mtok"].as_f64().unwrap_or(0.0),
+                        caps = r["caps"]
+                            .as_array()
+                            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+                            .unwrap_or_default(),
+                        fb = r["fallback"].as_str(),
+                    );
+                }
+            }
+            Ok(())
+        }
+        ModelCmd::Show { id } => {
+            let reg = models::ModelRegistry::load()?;
+            match reg.get(id) {
+                Some(e) => print_json(&json!({
+                    "id": id,
+                    "provider": e.provider,
+                    "cost_in_per_mtok": e.cost_in_per_mtok,
+                    "cost_out_per_mtok": e.cost_out_per_mtok,
+                    "caps": e.caps,
+                    "fallback": e.fallback,
+                })),
+                None => bail!("no model named {id:?} (flywheel model list)"),
+            }
+            Ok(())
+        }
+        ModelCmd::Add {
+            id,
+            provider,
+            cost_in_per_mtok,
+            cost_out_per_mtok,
+            caps,
+            fallback,
+        } => {
+            if id.trim().is_empty() {
+                bail!("model id cannot be empty");
+            }
+            let mut reg = models::ModelRegistry::load()?;
+            let caps_list: Vec<String> = match caps {
+                Some(c) if !c.trim().is_empty() => c
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                _ => vec![],
+            };
+            reg.models.insert(
+                id.clone(),
+                models::ModelEntry {
+                    provider: provider.clone(),
+                    cost_in_per_mtok: *cost_in_per_mtok,
+                    cost_out_per_mtok: *cost_out_per_mtok,
+                    caps: caps_list,
+                    fallback: fallback.clone(),
+                },
+            );
+            reg.save()?;
+            println!("registered model {id} (provider {provider})");
+            Ok(())
+        }
+        ModelCmd::Remove { id } => {
+            let mut reg = models::ModelRegistry::load()?;
+            if reg.models.remove(id).is_none() {
+                bail!("no model named {id:?} (flywheel model list)");
+            }
+            reg.save()?;
+            println!("removed model {id}");
+            Ok(())
+        }
+    }
+}
+
 fn cmd_workflow(cmd: &WorkflowCmd) -> Result<()> {
     use toron_workflow::schema::{Action, CrewSpec, Workflow};
-    use toron_workflow::{lint_workflow, Level};
+    use toron_workflow::{Level, lint_workflow};
 
     /// The full workflow set: built-ins (compiled-in) + catalog (canonical
     /// YAML + absorbed legacy), name → (workflow, source).
@@ -8325,6 +8833,8 @@ fn cmd_workflow(cmd: &WorkflowCmd) -> Result<()> {
             name,
             inputs,
             crew,
+            execute,
+            mode,
             json,
         } => {
             let all = all_workflows()?;
@@ -8366,9 +8876,23 @@ fn cmd_workflow(cmd: &WorkflowCmd) -> Result<()> {
             // A recording action runner: flywheel's CLI run exercises the
             // engine (delays, approvals park durably, graph scheduling,
             // control-flow); action side-effects are recorded, not dispatched
-            // (herdr dispatch is the P4 spawn-await binding).
-            let runner: toron_workflow::ActionRunner =
-                Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+            // (herdr dispatch is the P4 spawn-await binding). With
+            // `--execute --mode headless` the real headless runner replaces
+            // it: spawn/dispatch_job steps run through `__run-headless`
+            // (ADR-0010 Spec A/E, P10.1). The pane runner lands in P10.3.
+            let runner: toron_workflow::ActionRunner = if *execute {
+                if mode != "headless" {
+                    bail!(
+                        "--mode pane execution lands in P10.3 (bd-ghcj.1); only --mode headless is real in P10.1"
+                    );
+                }
+                let catalog = profile::ProfileCatalog::load()?;
+                let wf_name = name.clone();
+                let inputs_c = inputs_value.clone();
+                Arc::new(move |a: &Action| headless_dispatch(&catalog, &wf_name, &inputs_c, a))
+            } else {
+                Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })))
+            };
             let rt = tokio::runtime::Runtime::new()?;
             let run_id = format!("fw-cli-{}", state::now_iso());
             let output = rt.block_on(async {
@@ -8486,6 +9010,24 @@ fn cmd_workflow(cmd: &WorkflowCmd) -> Result<()> {
             print_json(&json!({ "workflow": name, "crew": members }));
             Ok(())
         }
+        WorkflowCmd::Remove { name } => {
+            let all = all_workflows()?;
+            match all.get(name).map(|(_, s)| *s) {
+                Some("builtin") => bail!(
+                    "cannot remove built-in workflow {name:?} — override it via a catalog file of the same name in ~/.config/flywheel/workflows/"
+                ),
+                Some(_) => {
+                    let path = config::config_dir()
+                        .join("workflows")
+                        .join(format!("{name}.yaml"));
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("remove {}", path.display()))?;
+                    println!("removed workflow {name} ({})", path.display());
+                }
+                None => bail!("no workflow named {name:?}"),
+            }
+            Ok(())
+        }
     }
 }
 
@@ -8591,7 +9133,9 @@ fn cmd_cron(cmd: &CronCmd) -> Result<()> {
                 if let Some(d) = st.next_due {
                     println!("next_due: {d}");
                 }
-                if let Some(wf) = manager_workflow(name) && let Some(p) = &wf.policy {
+                if let Some(wf) = manager_workflow(name)
+                    && let Some(p) = &wf.policy
+                {
                     println!("policy:   {p:?}");
                 }
             }
@@ -8621,9 +9165,7 @@ fn cmd_cron(cmd: &CronCmd) -> Result<()> {
                 created_at: chrono::Utc::now().to_rfc3339(),
             })?;
             if *json {
-                let entry = manager
-                    .show(name)?
-                    .expect("added cron is present");
+                let entry = manager.show(name)?.expect("added cron is present");
                 let st = manager.status(name)?.expect("added cron has status");
                 render(&entry, &st, true)?;
             } else {
@@ -8663,13 +9205,20 @@ fn cmd_cron(cmd: &CronCmd) -> Result<()> {
             if *json {
                 print_json(&json!({ "crons": rows }));
             } else {
-                println!("{:<28} {:<9} {:<8} {:<12}", "NAME", "STATUS", "STATE", "NEXT_DUE");
+                println!(
+                    "{:<28} {:<9} {:<8} {:<12}",
+                    "NAME", "STATUS", "STATE", "NEXT_DUE"
+                );
                 for row in &rows {
                     println!(
                         "{:<28} {:<9} {:<8} {}",
                         row["name"].as_str().unwrap_or(""),
                         row["status"].as_str().unwrap_or(""),
-                        if row["enabled"].as_bool().unwrap_or(false) { "on" } else { "paused" },
+                        if row["enabled"].as_bool().unwrap_or(false) {
+                            "on"
+                        } else {
+                            "paused"
+                        },
                         row["next_due"].as_i64().unwrap_or(0),
                     );
                 }
@@ -8714,17 +9263,35 @@ fn cmd_cron(cmd: &CronCmd) -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(cron::start_loops())
         }
+        CronCmd::Remove { name } => {
+            // Registry-sourced crons (crons.toml) are removable here. A cron
+            // whose source is a workflow's `schedule` trigger is not — direct
+            // the user to edit/remove that workflow.
+            let mut crons = cron::Crons::load()?;
+            if crons.crons.remove(name).is_none() {
+                let manager = RegistryCronManager::load()?;
+                match manager.show(name)? {
+                    Some(mc) => bail!(
+                        "cron {name:?} is sourced from a workflow's schedule trigger (template {:?}) — edit/remove that workflow instead",
+                        mc.entry.template
+                    ),
+                    None => bail!("no cron named {name:?}"),
+                }
+            }
+            crons.save()?;
+            println!("removed cron {name}");
+            Ok(())
+        }
     }
 }
 
 /// Look up a workflow by name across the catalog for the `show` policy line.
 fn manager_workflow(name: &str) -> Option<toron_workflow::schema::Workflow> {
     let cat = workflow_catalog::WorkflowCatalog::load().ok()?;
-    cat.workflows.get(name).cloned().or_else(|| {
-        builtin_workflows::builtin_workflows()
-            .get(name)
-            .cloned()
-    })
+    cat.workflows
+        .get(name)
+        .cloned()
+        .or_else(|| builtin_workflows::builtin_workflows().get(name).cloned())
 }
 
 /// The flywheel-tier lint checks (the bead's fail-stop contract): profile
@@ -8831,7 +9398,9 @@ fn lint_flywheel_tier(name: &str, wf: &toron_workflow::schema::Workflow) -> usiz
             if let Some(profile) = spec.get("profile").and_then(|v| v.as_str()) {
                 check_profile(profile, profiles, blocking, emit);
             }
-            if let Some(stage) = spec.get("stage").and_then(|v| v.as_str()) && !stages.has(stage) {
+            if let Some(stage) = spec.get("stage").and_then(|v| v.as_str())
+                && !stages.has(stage)
+            {
                 emit(
                     &format!("stage {stage:?} does not resolve (semantic or p-code alias)"),
                     blocking,
@@ -8941,7 +9510,7 @@ fn cmd_debate(
     } else {
         "flywheel".to_string()
     };
-                let key = project_dir_str(cfg, &project)?;
+    let key = project_dir_str(cfg, &project)?;
 
     // agent names: explicit or default to the swarm's first oc/pi/gk
     // (review-fix F7: bare shorts resolve to the spawned flywheel-<base>-<short>
@@ -9309,7 +9878,16 @@ fn cmd_plan_review(
     let mut current_path = plan_path.clone();
 
     let open = pri_planner_prompt(feature, &current_path);
-    mail_send(&*mail, &key, &[mail_target(&planner)], &subject, &open, "high", true, Some(&thread))?;
+    mail_send(
+        &*mail,
+        &key,
+        &[mail_target(&planner)],
+        &subject,
+        &open,
+        "high",
+        true,
+        Some(&thread),
+    )?;
     settle_agent(&*mux, &planner)?;
     let planner_mail = mail_target(&planner);
     let plan_reply =
@@ -9337,7 +9915,16 @@ fn cmd_plan_review(
                     PriAction::PromptPlanner { msg } => msg.clone(),
                     _ => bail!("phase AwaitingPlan without PromptPlanner action: {action:?}"),
                 };
-                mail_send(&*mail, &key, &[mail_target(&planner)], &subject, &msg, "high", true, Some(&thread))?;
+                mail_send(
+                    &*mail,
+                    &key,
+                    &[mail_target(&planner)],
+                    &subject,
+                    &msg,
+                    "high",
+                    true,
+                    Some(&thread),
+                )?;
                 settle_agent(&*mux, &planner)?;
                 let pr = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&planner))?
                     .unwrap_or_default();
@@ -9354,7 +9941,16 @@ fn cmd_plan_review(
                         bail!("phase AwaitingPlanReview without PromptReviewer action: {action:?}")
                     }
                 };
-                mail_send(&*mail, &key, &[mail_target(&reviewer)], &subject, &msg, "high", true, Some(&thread))?;
+                mail_send(
+                    &*mail,
+                    &key,
+                    &[mail_target(&reviewer)],
+                    &subject,
+                    &msg,
+                    "high",
+                    true,
+                    Some(&thread),
+                )?;
                 settle_agent(&*mux, &reviewer)?;
                 let body = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&reviewer))?
                     .unwrap_or_default();
@@ -9377,7 +9973,16 @@ fn cmd_plan_review(
                         "phase AwaitingImplement without PromptImplementer action: {action:?}"
                     ),
                 };
-                mail_send(&*mail, &key, &[mail_target(&implementer)], &subject, &msg, "high", true, Some(&thread))?;
+                mail_send(
+                    &*mail,
+                    &key,
+                    &[mail_target(&implementer)],
+                    &subject,
+                    &msg,
+                    "high",
+                    true,
+                    Some(&thread),
+                )?;
                 settle_agent(&*mux, &implementer)?;
                 let (p2, a2) = pri_after_implement(&current_path);
                 phase = p2; // AwaitingVerify
@@ -9389,7 +9994,16 @@ fn cmd_plan_review(
                     PriAction::PromptReviewer { msg } => msg.clone(),
                     _ => bail!("phase AwaitingVerify without PromptReviewer action: {action:?}"),
                 };
-                mail_send(&*mail, &key, &[mail_target(&reviewer)], &subject, &msg, "high", true, Some(&thread))?;
+                mail_send(
+                    &*mail,
+                    &key,
+                    &[mail_target(&reviewer)],
+                    &subject,
+                    &msg,
+                    "high",
+                    true,
+                    Some(&thread),
+                )?;
                 settle_agent(&*mux, &reviewer)?;
                 let rev2 = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&reviewer))?
                     .unwrap_or_default();
@@ -9744,13 +10358,21 @@ fn summarize_status_event(
 ) -> Option<StatusEventItem> {
     use toron_core::backend::BackendEvent::*;
     let (event_type, pane_id, agent, status) = match ev {
-        AgentStatusChanged { pane, agent, status } => (
+        AgentStatusChanged {
+            pane,
+            agent,
+            status,
+        } => (
             "pane.agent_status_changed",
             pane.0.clone(),
             agent.clone(),
             status.as_str().to_string(),
         ),
-        AgentDetected { pane, agent, status } => (
+        AgentDetected {
+            pane,
+            agent,
+            status,
+        } => (
             "pane.agent_detected",
             pane.0.clone(),
             agent.clone(),
@@ -9958,11 +10580,7 @@ fn resolve_pane_id(agents: &[herdr_shim::AgentInfo], target: &str) -> Option<Str
 /// The wait-output mode for the `--regex` flag: herdr's literal-substring
 /// mode is spelled `match` in the leaf (mapped to `substring` in the client).
 fn wait_output_mode(regex: bool) -> &'static str {
-    if regex {
-        "regex"
-    } else {
-        "match"
-    }
+    if regex { "regex" } else { "match" }
 }
 
 /// The leaf's machine-readable output shape.
@@ -10078,9 +10696,9 @@ fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
     let text = match backend.agent_read(&target, "recent", 60) {
         Ok(v) => v,
         Err(e) if e.to_string().contains("agent_not_idle") => {
-            backend
-                .agent_read(&target, "visible", 60)
-                .map_err(|e2| anyhow!("{target}: agent_not_idle fallback to visible failed: {e2} ({e})"))?
+            backend.agent_read(&target, "visible", 60).map_err(|e2| {
+                anyhow!("{target}: agent_not_idle fallback to visible failed: {e2} ({e})")
+            })?
         }
         Err(e) => return Err(e.into()),
     }
@@ -10126,9 +10744,9 @@ fn cmd_internal_respawn(
     // healthy and must still be respawned — its replay window (crash between
     // the guard and the spawn) is a documented at-least-once residual.
     if !force
-        && let Some(a) = agents.iter().find(|a| {
-            a.workspace_id == ws_id && a.name.as_deref() == Some(name)
-        })
+        && let Some(a) = agents
+            .iter()
+            .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
     {
         let healthy = matches!(a.agent_status.as_str(), "idle" | "working" | "blocked");
         if healthy {
@@ -10167,11 +10785,17 @@ fn cmd_internal_respawn(
     // pane-identity bridge bookkeeping (best-effort — never fail the respawn
     // on mail trouble): the old pane died (its identity file is stale), the
     // fresh pane must resolve to the same name (the agent keeps its identity)
-    if let Ok(mail) = backend::mail_backend(cfg) && let Some(key) = dir.to_str() {
-        if let Some(old) = &old_pane && let Err(e) = backend::run_mail(mail.clear_pane_identity(key, old)) {
+    if let Ok(mail) = backend::mail_backend(cfg)
+        && let Some(key) = dir.to_str()
+    {
+        if let Some(old) = &old_pane
+            && let Err(e) = backend::run_mail(mail.clear_pane_identity(key, old))
+        {
             eprintln!("flywheel: mail clear_pane_identity failed for {old}: {e}");
         }
-        if let Err(e) = backend::run_mail(mail.write_pane_identity(key, &fresh.pane_id, &agent_mail_name(name))) {
+        if let Err(e) =
+            backend::run_mail(mail.write_pane_identity(key, &fresh.pane_id, &agent_mail_name(name)))
+        {
             eprintln!(
                 "flywheel: mail write_pane_identity failed for {name} on {}: {e}",
                 fresh.pane_id
@@ -10185,6 +10809,204 @@ fn cmd_internal_respawn(
         fresh.pane_id
     );
     Ok(())
+}
+
+/// internal leaf (ADR-0010 Spec E, P10.1): run one prompt headlessly through
+/// a harness and log it. The leaf stays DUMB — the runner preprends the role
+/// preamble; here: resolve profile → harness, run `harness -p --mode=json`,
+/// capture the JSON stream, write `runs/<run_id>.jsonl`, print the outcome.
+///
+/// Output (json mode): `{ ok, run_id, response, status, tokens_in,
+/// tokens_out, model, duration_ms, error? }` — the parent runner parses this
+/// one line as the step value.
+fn cmd_internal_run_headless(
+    profile_ref: &str,
+    prompt: &str,
+    model_override: Option<&str>,
+    workflow: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    use sha1::Digest;
+    let profile_name = headless::strip_profile_ref(profile_ref);
+    let catalog = profile::ProfileCatalog::load()?;
+    let profile = catalog
+        .get(profile_name)
+        .ok_or_else(|| anyhow!("unknown profile @{profile_name} (flywheel profile list)"))?;
+    if profile.harness.is_empty() {
+        bail!("profile @{profile_name} has no harness — cannot run headless");
+    }
+    let harness = profile.harness.as_str();
+    // Model resolution (P10.2): the effective id (flag override or the
+    // profile's), then the registry's per-harness injection form. Unknown
+    // ids warn + pass through — a run never blocks on the registry.
+    let model_id = model_override
+        .or_else(|| (!profile.model.is_empty()).then_some(profile.model.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let registry = models::ModelRegistry::load()?;
+    let model = if model_id.is_empty() {
+        String::new()
+    } else {
+        if registry.get(&model_id).is_none() {
+            eprintln!(
+                "flywheel: model {model_id:?} not in registry (flywheel model add) — passing through"
+            );
+        }
+        registry.resolve(&model_id, harness)
+    };
+
+    let argv = headless::build_argv(
+        harness,
+        (!model.is_empty()).then_some(model.as_str()),
+        prompt,
+    )
+    .map_err(|e| anyhow!("headless run for @{profile_name}: {e}"))?;
+    let started = std::time::Instant::now();
+    let output = Command::new(&argv[0])
+        .args(&argv[1..])
+        .output()
+        .with_context(|| format!("spawn {} for headless run", argv[0]))?;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // The harness's own parse (response/tokens/status) + the process-level
+    // truth (exit code, stderr fallback when the stream carries nothing).
+    let mut outcome = headless::parse_stream(&stdout, harness);
+    outcome.exit_code = output.status.code().unwrap_or(-1);
+    outcome.duration_ms = duration_ms;
+    if outcome.response.is_empty() && !stderr.trim().is_empty() {
+        outcome.error = Some(stderr.trim().to_string());
+    }
+    if output.status.code() != Some(0) && outcome.error.is_none() {
+        outcome.error = Some(format!("harness exited {}", output.status));
+    }
+    if outcome.error.is_some() {
+        outcome.status = "fail".into();
+    }
+
+    let mut hasher = sha1::Sha1::new();
+    sha1::Digest::update(&mut hasher, prompt.as_bytes());
+    let prompt_hash = hex::encode(sha1::Digest::finalize(hasher));
+
+    let entry = run_log::RunLogEntry {
+        run_id: run_log::new_run_id(),
+        ts: state::now_iso(),
+        workflow: workflow.unwrap_or("").to_string(),
+        cron: None,
+        profile: profile_name.to_string(),
+        harness: harness.to_string(),
+        model,
+        mode: "headless".into(),
+        prompt_hash,
+        response: outcome.response.clone(),
+        status: outcome.status.clone(),
+        tokens_in: outcome.tokens_in,
+        tokens_out: outcome.tokens_out,
+        duration_ms,
+        exit_code: outcome.exit_code,
+        error: outcome.error.clone(),
+    };
+    run_log::write_run(&entry)?;
+
+    if json {
+        let mut v = json!({
+            "ok": outcome.error.is_none(),
+            "run_id": entry.run_id,
+            "response": entry.response,
+            "status": entry.status,
+            "tokens_in": entry.tokens_in,
+            "tokens_out": entry.tokens_out,
+            "model": entry.model,
+            "duration_ms": entry.duration_ms,
+        });
+        if let Some(e) = &entry.error {
+            v["error"] = json!(e);
+        }
+        print_json(&v);
+    } else {
+        let status = if outcome.error.is_some() {
+            "FAIL"
+        } else {
+            "ok"
+        };
+        println!(
+            "headless run {} [{status}] {} tok={}+{} {}ms profile={}",
+            entry.run_id,
+            entry.harness,
+            entry.tokens_in,
+            entry.tokens_out,
+            entry.duration_ms,
+            entry.profile,
+        );
+        if let Some(e) = &entry.error {
+            eprintln!("headless run error: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// The headless ActionRunner dispatch (ADR-0010 Spec A headless row, P10.1):
+/// `dispatch_job` resolves the step profile, prepends the behavior preamble
+/// (Spec C), and shells out to the `__run-headless` leaf — subprocess-reuse,
+/// never an in-process herdr/toron client (Spec A). The leaf's JSON (one
+/// line) flows into `{{steps.<name>}}`; its run log carries response + usage.
+///
+/// Non-dispatch actions stay recorded, never dispatched (P10.1 scope).
+///
+/// **spawn carve-out:** `Action::Spawn` never reaches this runner — the
+/// engine handles it (`run_spawn`: durable promise + SpawnSink → kind-43001,
+/// ADR-0005 Spec 4a), and headless MUST NOT use the promise↔job binding
+/// (ADR-0010 Spec E). Headless spawn routing + the `await:false` detached
+/// branch land with the pane runner (P10.3, bd-ghcj.1). P10.1 headless is
+/// dispatch_job-driven — synchronous by engine design.
+fn headless_dispatch(
+    catalog: &profile::ProfileCatalog,
+    wf_name: &str,
+    inputs: &Value,
+    action: &toron_workflow::schema::Action,
+) -> Result<Value> {
+    let toron_workflow::schema::Action::DispatchJob { spec, .. } = action else {
+        // Recorded, not dispatched — the P10.1 backward-compat surface for
+        // non-headless actions (byte-identical to the no-op runner).
+        return Ok(json!({ "action": action.type_name() }));
+    };
+    let profile_ref = headless::dispatch_spec_profile(spec)
+        .ok_or_else(|| anyhow!("headless dispatch: dispatch_job spec has no profile"))?;
+    let profile_name = headless::strip_profile_ref(profile_ref);
+    let profile = catalog.get(profile_name).ok_or_else(|| {
+        anyhow!("headless dispatch: unknown profile @{profile_name} (flywheel profile list)")
+    })?;
+    // Role conditioning (Spec C): the authored preamble finally reaches the
+    // agent — prepended to the stage prompt (or the goal fallback).
+    let base = match headless::dispatch_spec_stage(spec) {
+        Some(s) => stage_prompt(s)?,
+        None => headless::base_prompt_for(wf_name, inputs),
+    };
+    let prompt = headless::conditioned_prompt(&profile.behavior, &base);
+
+    // Subprocess-reuse (Spec A): the leaf owns the harness call + run log.
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.arg("__run-headless")
+        .arg(profile_name)
+        .arg(&prompt)
+        .arg("--workflow")
+        .arg(wf_name);
+    if !profile.model.is_empty() {
+        cmd.arg("--model").arg(&profile.model);
+    }
+    let output = cmd
+        .output()
+        .with_context(|| format!("__run-headless for @{profile_name}"))?;
+    let raw = String::from_utf8_lossy(&output.stdout).to_string();
+    let trimmed = raw.trim();
+    // The leaf prints ONE json line on success / on captured failure. Any
+    // other output (spawn failure, panic) becomes a per-step error value.
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        return Ok(v);
+    }
+    let err = String::from_utf8_lossy(&output.stderr).to_string();
+    Ok(json!({ "ok": false, "error": if err.trim().is_empty() { raw } else { err } }))
 }
 
 /// internal leaf: scan orchestrator inbox for `[xproj]` swarm requests.
@@ -10544,46 +11366,46 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str, tier: u32)
     let out = (|| -> Result<backend::SendReceipt> {
         backend::run_mail(mail.ensure_project(&key)).map_err(|e| anyhow!("{e}"))?;
         match tier {
-        0 => mail_send(
-            &*mail,
-            &key,
-            std::slice::from_ref(&mail_target),
-            "[flywheel] you are blocked",
-            "The swarm loop detected you are blocked. Resolve or report the blocker.",
-            "high",
-            true,
-            Some(&thread),
-        ),
-        1 => mail_send(
-            &*mail,
-            &key,
-            std::slice::from_ref(&mail_target),
-            "[flywheel] still blocked — 2nd ping (high)",
-            "Still blocked after a full interval. Please resolve or report the blocker so the loop can continue.",
-            "high",
-            true,
-            Some(&thread),
-        ),
-        2 => mail_send(
-            &*mail,
-            &key,
-            std::slice::from_ref(&mail_target),
-            "[flywheel] URGENT: blocked — escalation",
-            "Still blocked after multiple pings. Escalating; human attention requested.",
-            "urgent",
-            true,
-            Some(&thread),
-        ),
-        _ => mail_send(
-            &*mail,
-            &key,
-            std::slice::from_ref(&mail_target),
-            "[flywheel] HALTS: blocked too long — human required",
-            "The swarm loop is halting because this agent stayed blocked past the escalation budget. Resolve the blocker, then re-run the loop.",
-            "urgent",
-            true,
-            Some(&thread),
-        ),
+            0 => mail_send(
+                &*mail,
+                &key,
+                std::slice::from_ref(&mail_target),
+                "[flywheel] you are blocked",
+                "The swarm loop detected you are blocked. Resolve or report the blocker.",
+                "high",
+                true,
+                Some(&thread),
+            ),
+            1 => mail_send(
+                &*mail,
+                &key,
+                std::slice::from_ref(&mail_target),
+                "[flywheel] still blocked — 2nd ping (high)",
+                "Still blocked after a full interval. Please resolve or report the blocker so the loop can continue.",
+                "high",
+                true,
+                Some(&thread),
+            ),
+            2 => mail_send(
+                &*mail,
+                &key,
+                std::slice::from_ref(&mail_target),
+                "[flywheel] URGENT: blocked — escalation",
+                "Still blocked after multiple pings. Escalating; human attention requested.",
+                "urgent",
+                true,
+                Some(&thread),
+            ),
+            _ => mail_send(
+                &*mail,
+                &key,
+                std::slice::from_ref(&mail_target),
+                "[flywheel] HALTS: blocked too long — human required",
+                "The swarm loop is halting because this agent stayed blocked past the escalation budget. Resolve the blocker, then re-run the loop.",
+                "urgent",
+                true,
+                Some(&thread),
+            ),
         }
     })();
     match out {
@@ -10742,10 +11564,10 @@ fn cmd_serve(cfg: &Config, port: u16) -> Result<()> {
 
 #[cfg(feature = "serve")]
 async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
+    use axum::Router;
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::routing::{get, post};
-    use axum::Router;
     use std::sync::Arc;
 
     #[derive(Clone)]
@@ -10856,7 +11678,9 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
         .with_state(st);
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    println!("flywheel serve on http://127.0.0.1:{port} (/health /api/v1/snapshot /api/v1/send /events /openapi.json)");
+    println!(
+        "flywheel serve on http://127.0.0.1:{port} (/health /api/v1/snapshot /api/v1/send /events /openapi.json)"
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -11357,14 +12181,14 @@ mod plan_review_tests {
         assert!(matches!(a, PriAction::Escalate { reason } if reason.contains("rejected")));
     }
 
-     #[test]
-     fn extract_plan_path_from_reply() {
-         assert_eq!(
-             extract_plan_path("PLAN: .flywheel/plans/bd-1.md\nthanks", "fallback.md"),
-             ".flywheel/plans/bd-1.md"
-         );
-         assert_eq!(extract_plan_path("no path here", "fb.md"), "fb.md");
-     }
+    #[test]
+    fn extract_plan_path_from_reply() {
+        assert_eq!(
+            extract_plan_path("PLAN: .flywheel/plans/bd-1.md\nthanks", "fallback.md"),
+            ".flywheel/plans/bd-1.md"
+        );
+        assert_eq!(extract_plan_path("no path here", "fb.md"), "fb.md");
+    }
 }
 
 #[cfg(test)]
@@ -11372,7 +12196,14 @@ mod profile_cli_tests {
     use super::*;
     #[test]
     fn is_builtin_profile_classifies_the_six() {
-        for name in ["oracle", "planner", "reviewer", "coder", "scout", "housekeeper"] {
+        for name in [
+            "oracle",
+            "planner",
+            "reviewer",
+            "coder",
+            "scout",
+            "housekeeper",
+        ] {
             assert!(is_builtin_profile(name), "{name} is a built-in");
         }
         assert!(!is_builtin_profile("mybot"));
@@ -11383,7 +12214,14 @@ mod profile_cli_tests {
     fn profile_catalog_lists_six_builtins() {
         let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
         assert_eq!(cat.names().len(), 6);
-        for name in ["oracle", "planner", "reviewer", "coder", "scout", "housekeeper"] {
+        for name in [
+            "oracle",
+            "planner",
+            "reviewer",
+            "coder",
+            "scout",
+            "housekeeper",
+        ] {
             let p = cat.get(name).expect(name);
             // every built-in carries the Spec 1b preamble (not a stub)
             assert!(p.behavior.len() > 200, "{name} preamble missing");
@@ -11399,7 +12237,10 @@ mod profile_cli_tests {
         assert_eq!(r.spec.harness, "pi");
         assert_eq!(r.spec.model, "claude-sonnet-4");
         assert_eq!(r.spec.backend, "herdr");
-        assert_eq!(r.signing, profile::SigningContext::Operator("npub-op".into()));
+        assert_eq!(
+            r.signing,
+            profile::SigningContext::Operator("npub-op".into())
+        );
     }
 
     #[test]
@@ -11441,7 +12282,10 @@ mod profile_cli_tests {
         let runs = snapshot_runs();
         for r in &runs {
             assert!(r.get("id").and_then(Value::as_str).is_some(), "id");
-            assert!(r.get("project").and_then(Value::as_str).is_some(), "project");
+            assert!(
+                r.get("project").and_then(Value::as_str).is_some(),
+                "project"
+            );
             assert!(r.get("kind").and_then(Value::as_str).is_some(), "kind");
             assert!(r.get("owner").and_then(Value::as_str).is_some(), "owner");
             assert!(r.get("state").and_then(Value::as_str).is_some(), "state");
