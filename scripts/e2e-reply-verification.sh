@@ -93,11 +93,13 @@ fi
 # ---- T4: collab round-trip (positive control) -----------------------------
 if [ "$SKIP_SPAWN" = "0" ] && [ -n "$SCRATCH" ]; then
   say "=== T4: collab ask -> agent replies -> thread head moves ==="
-  # the agent identity is the mail pair for the swarm agent
+  # the swarm agent's mail identity: the entry whose task references the
+  # herdr agent name (the list also contains the orchestrator identity)
   AGENT_MAIL=$("$FW" mail agents "$SCRATCH" 2>/dev/null | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
-print(d[0]['name'])")
+want = 'flywheel-$SCRATCH-oc'
+print(next((a['name'] for a in d if want in a.get('task_description','') or a.get('name','')==want), d[0]['name'] if d else ''))")
   COLLAB_OUT=$("$FW" collab "$SCRATCH" --to "flywheel-$SCRATCH-oc" --subject "rv-t4" --body "reply with magic word" --timeout-secs 3 2>&1)
   THREAD=$(echo "$COLLAB_OUT" | grep -oE "collab-[0-9T]+" | head -1)
   if [ -n "$THREAD" ] && [ -s "$EV_DIR/expected-replies/$SCRATCH.json" ]; then
@@ -161,7 +163,8 @@ except Exception:
       AGENT_MAIL=$("$FW" mail agents "$SCRATCH" 2>/dev/null | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
-print(d[0]['name'])")
+want = 'flywheel-$SCRATCH-oc'
+print(next((a['name'] for a in d if want in a.get('task_description','') or a.get('name','')==want), d[0]['name'] if d else ''))")
       "$FW" mail reply "$SCRATCH" --message-id "$T1_THREAD" --body "reply after reminder" --as "$AGENT_MAIL" >/dev/null 2>&1
       for i in $(seq 1 10); do
         sleep 10
