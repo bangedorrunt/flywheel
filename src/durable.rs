@@ -377,11 +377,19 @@ async fn run_leaf_cmd(
 /// swarm as settled) instead of crashing the whole invocation. This mirrors
 /// the `poll_events` leaf's soft-fail and fixes the "durable loop invocation
 /// failed: __poll failed" that killed a run after `flywheel kill <proj>`.
+///
+/// Build the argv for the `__poll` leaf invocation. Pure (testable without
+/// spawning a process). Regression pin for bd-fw-loop-durable-wrong-project:
+/// the leaf must poll the project passed in the loop args — never a default.
+pub fn poll_swarm_argv(project: &str, to: &str) -> Vec<String> {
+    vec!["__poll".to_string(), project.to_string(), to.to_string()]
+}
+
 #[function]
 async fn poll_swarm(args: PollArgs) -> Result<Vec<AgentState>> {
     let exe = self_exe().map_err(map_err)?;
     let mut cmd = Command::new(&exe);
-    cmd.args(["__poll", &args.project, &args.to]);
+    cmd.args(poll_swarm_argv(&args.project, &args.to));
     let out = run_leaf_cmd(cmd, "__poll").await?;
     if !out.status.success() {
         // Swarm gone / not spawned — soft-fail to empty so the loop settles
@@ -3663,6 +3671,19 @@ mod tests {
         let back: SendArgs = serde_json::from_value(v).unwrap();
         assert!(back.confirm);
         assert_eq!(back.confirm_timeout_ms, Some(45_000));
+    }
+
+    #[test]
+    fn poll_swarm_argv_uses_loop_project_not_default() {
+        // bd-fw-loop-durable-wrong-project regression: `flywheel loop toron`
+        // must poll "toron" — a hardcoded/default project would make every
+        // project's loop poll the wrong swarm (and log "no flywheel swarm
+        // for flywheel" while monitoring toron).
+        let argv = poll_swarm_argv("toron", "all");
+        assert_eq!(argv, vec!["__poll", "toron", "all"]);
+        assert_ne!(argv[1], "flywheel");
+        let argv = poll_swarm_argv("hachiko", "oc");
+        assert_eq!(argv, vec!["__poll", "hachiko", "oc"]);
     }
 
     #[test]
