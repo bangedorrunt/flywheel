@@ -478,6 +478,107 @@ pub fn trim_last_sent(records: &mut Vec<SentRecord>) {
     }
 }
 
+// ---- loop process registry (bd-fw-stale-loop-processes-gac) ----
+
+/// One entry in the live-loop pid registry (`loop-pids.json`). The registry
+/// exists so a second `flywheel loop run <project>` refuses to start while a live
+/// loop process for the same project exists — stale nohup'd loops can no
+/// longer accumulate and race new invocations (observed: 7 stale loops
+/// polling toron+flywheel, writing into each other's logs).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LoopPidEntry {
+    pub pid: u32,
+    pub started_at: String,
+    /// Filled by the durable runner once the invocation id exists; empty for
+    /// the brief pre-invocation window. The authoritative invocation for a
+    /// settled loop lives in `loops/<project>.json` (loop_status queries it).
+    #[serde(default)]
+    pub invocation: String,
+}
+
+fn loop_pids_file() -> PathBuf {
+    state_dir().join("loop-pids.json")
+}
+
+/// Load the pid registry. Missing/corrupt file → empty map (never an error —
+/// bookkeeping must not break the loop).
+pub fn load_loop_pids() -> BTreeMap<String, LoopPidEntry> {
+    let raw = std::fs::read_to_string(loop_pids_file()).unwrap_or_default();
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Persist the pid registry atomically (temp + rename).
+pub fn save_loop_pids(pids: &BTreeMap<String, LoopPidEntry>) -> Result<()> {
+    let path = loop_pids_file();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(pids)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Register this process as the loop owner for `project`. Returns the
+/// previous entry when a LIVE process already owns the project and `force`
+/// is false (the caller refuses). A dead pid is replaced silently (the stale
+/// loop is gone — its entry is litter, not a guard). `force=true` overwrites
+/// a live owner (deliberate takeover).
+pub fn register_loop(project: &str, invocation: &str, force: bool) -> Result<Option<LoopPidEntry>> {
+    let mut pids = load_loop_pids();
+    let mine = LoopPidEntry {
+        pid: std::process::id(),
+        started_at: now_iso(),
+        invocation: invocation.to_string(),
+    };
+    if !force
+        && let Some(prev) = pids.get(project)
+        && pid_alive(prev.pid)
+    {
+        return Ok(Some(prev.clone()));
+    }
+    if let Some(prev) = pids.get(project) {
+        if pid_alive(prev.pid) {
+            eprintln!(
+                "flywheel: --force taking over {project} loop from pid {}",
+                prev.pid
+            );
+        } else {
+            eprintln!(
+                "flywheel: replacing stale loop entry for {project} (pid {} dead)",
+                prev.pid
+            );
+        }
+    }
+    pids.insert(project.to_string(), mine);
+    save_loop_pids(&pids)?;
+    Ok(None)
+}
+
+/// Remove `project`'s entry ONLY when it still belongs to `pid` — a newer
+/// process must never be unregistered by an older one exiting late.
+pub fn unregister_loop(project: &str, pid: u32) {
+    let mut pids = load_loop_pids();
+    let remove = pids
+        .get(project)
+        .map(|e| e.pid == pid)
+        .unwrap_or(false);
+    if remove {
+        pids.remove(project);
+        let _ = save_loop_pids(&pids);
+    }
+}
+
+/// True when a process with this pid exists. Uses `ps -p` (portable on the
+/// macOS/Linux hosts this tool targets; no libc dependency).
+pub fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "pid="])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Find the newest record for (agent, prompt-hash). `bd-resume-dedup` uses
 /// this to decide whether a prompt was already delivered.
 pub fn find_last_sent<'a>(
@@ -1335,6 +1436,48 @@ mod loops_sidecar_tests {
         assert_eq!(load_active_loop("l4s1-no-such-project").unwrap(), None);
         remove_active_loop(&p1).unwrap();
         remove_active_loop(&p2).unwrap();
+    }
+
+    /// bd-fw-stale-loop-processes: the pid registry round-trips atomically.
+    #[test]
+    fn loop_pid_registry_roundtrip() {
+        let _g = loops_test_guard();
+        let p = test_project("pid-rt");
+        let e = LoopPidEntry {
+            pid: 4242,
+            started_at: now_iso(),
+            invocation: "swarm-loop:proj:1".into(),
+        };
+        let mut pids = BTreeMap::new();
+        pids.insert(p.clone(), e.clone());
+        save_loop_pids(&pids).unwrap();
+        let loaded = load_loop_pids();
+        assert_eq!(loaded.get(&p), Some(&e));
+        // unregister removes only matching pid
+        unregister_loop(&p, 9999);
+        assert_eq!(load_loop_pids().get(&p), Some(&e), "other pid must not unregister");
+        unregister_loop(&p, 4242);
+        assert!(!load_loop_pids().contains_key(&p));
+    }
+
+    /// bd-fw-stale-loop-processes: a dead pid entry is replaced silently by a
+    /// fresh registration; a live pid entry refuses unless force.
+    #[test]
+    fn loop_pid_registry_live_guard() {
+        let _g = loops_test_guard();
+        let p = test_project("pid-live");
+        // no prior entry → registers cleanly
+        assert!(register_loop(&p, "inv-1", false).unwrap().is_none());
+        let registered = load_loop_pids().get(&p).unwrap().clone();
+        assert_eq!(registered.pid, std::process::id());
+        // the registry's own pid is alive → a second registration refuses
+        let prev = register_loop(&p, "inv-2", false).unwrap().expect("live owner");
+        assert_eq!(prev.pid, std::process::id());
+        // force overwrites (takeover)
+        assert!(register_loop(&p, "inv-3", true).unwrap().is_none());
+        assert_eq!(load_loop_pids().get(&p).unwrap().invocation, "inv-3");
+        // cleanup
+        unregister_loop(&p, std::process::id());
     }
 
     /// l4s.1 AC1: 8 writers on 8 DIFFERENT projects, 50 saves each, run

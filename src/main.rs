@@ -202,57 +202,14 @@ enum Commands {
     /// Monitor a swarm: poll every N seconds, feed queued instructions to
     /// idle/finished agents, report blockers. Exits 0 when the queue is drained
     /// and the swarm settles. Runs as a durable Resonate workflow by default —
-    /// crashes resume via `flywheel loop <project>` (same invocation id).
+    /// crashes resume via `flywheel loop run <project>` (same invocation id).
+    /// For back-compat, the bare legacy form `flywheel loop <project>` is
+    /// rewritten to `loop run <project>` before parsing (see
+    /// `rewrite_legacy_loop_args`).
     Loop {
-        project: String,
-        /// poll interval in seconds (default 300 = 5 min); the SETTLED/base
-        /// cadence — used when nobody is working
-        #[arg(long, default_value = "300")]
-        interval: u64,
-        /// fast cadence while the swarm is working/blocked/unknown or right
-        /// after a dispatch (default 30s; floor 5s — values below are clamped
-        /// with a warning). Only affects the durable workflow; the sync loop
-        /// (--once/--local) polls at --interval.
-        #[arg(long, default_value = "30")]
-        interval_active: u64,
-        /// comma-separated instruction queue (stage names p1..p8 or raw prompts)
-        #[arg(long)]
-        queue: Option<String>,
-        /// use a workflow from workflows.toml as the instruction queue
-        #[arg(long)]
-        workflow: Option<String>,
-        /// text sent to idle agents when the queue is empty (default: none)
-        #[arg(long)]
-        nudge: Option<String>,
-        /// overall max runtime in ms before failing (default: none)
-        #[arg(long)]
-        timeout_ms: Option<u64>,
-        /// single poll pass then exit (cron-friendly)
-        #[arg(long)]
-        once: bool,
-        /// blocked-agent policy: continue|stop|mail (default continue)
-        #[arg(long, default_value = "continue")]
-        on_blocked: String,
-        /// agents to manage (default all)
-        #[arg(long, default_value = "all")]
-        to: String,
-        /// run the sync polling loop instead of the durable Resonate workflow
-        #[arg(long)]
-        local: bool,
-        /// bead-driven mode: source work from `br ready` each poll instead of
-        /// a static queue — feeds the swarm until the plan/beads are done
-        #[arg(long)]
-        work: bool,
-        /// send prompts without landing confirmation (escape hatch; confirm
-        /// is the default). Only affects the durable workflow.
-        #[arg(long)]
-        no_confirm: bool,
-        /// confirm timeout in ms for `__send --confirm` (default: leaf default 45s)
-        #[arg(long)]
-        confirm_timeout_ms: Option<u64>,
+        #[command(subcommand)]
+        cmd: LoopCmd,
     },
-    /// Query the state of a durable loop invocation on the Resonate server
-    LoopStatus { project: String },
     /// Zoom a pane (herdr pane.zoom)
     Zoom {
         project: String,
@@ -641,6 +598,72 @@ struct AgentCounts {
     pi: Option<u32>,
     #[arg(long)]
     gk: Option<u32>,
+}
+
+/// Subcommands of `flywheel loop` (bd-fw-stale-loop-processes-gac
+/// restructure): `run` (default), `status`, `list`, `prune`.
+#[derive(Subcommand)]
+enum LoopCmd {
+    /// Run the monitoring loop for a project (default subcommand — the bare
+    /// legacy form `flywheel loop <project>` is rewritten to this before
+    /// parsing, so both spellings work).
+    Run {
+        project: String,
+        /// poll interval in seconds (default 300 = 5 min); the SETTLED/base
+        /// cadence — used when nobody is working
+        #[arg(long, default_value = "300")]
+        interval: u64,
+        /// fast cadence while the swarm is working/blocked/unknown or right
+        /// after a dispatch (default 30s; floor 5s — values below are clamped
+        /// with a warning). Only affects the durable workflow; the sync loop
+        /// (--once/--local) polls at --interval.
+        #[arg(long, default_value = "30")]
+        interval_active: u64,
+        /// comma-separated instruction queue (stage names p1..p8 or raw prompts)
+        #[arg(long)]
+        queue: Option<String>,
+        /// use a workflow from workflows.toml as the instruction queue
+        #[arg(long)]
+        workflow: Option<String>,
+        /// text sent to idle agents when the queue is empty (default: none)
+        #[arg(long)]
+        nudge: Option<String>,
+        /// overall max runtime in ms before failing (default: none)
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+        /// single poll pass then exit (cron-friendly)
+        #[arg(long)]
+        once: bool,
+        /// blocked-agent policy: continue|stop|mail (default continue)
+        #[arg(long, default_value = "continue")]
+        on_blocked: String,
+        /// agents to manage (default all)
+        #[arg(long, default_value = "all")]
+        to: String,
+        /// run the sync polling loop instead of the durable Resonate workflow
+        #[arg(long)]
+        local: bool,
+        /// bead-driven mode: source work from `br ready` each poll instead of
+        /// a static queue — feeds the swarm until the plan/beads are done
+        #[arg(long)]
+        work: bool,
+        /// send prompts without landing confirmation (escape hatch; confirm
+        /// is the default). Only affects the durable workflow.
+        #[arg(long)]
+        no_confirm: bool,
+        /// confirm timeout in ms for `__send --confirm` (default: leaf default 45s)
+        #[arg(long)]
+        confirm_timeout_ms: Option<u64>,
+        /// take over the project from a live loop process instead of refusing
+        #[arg(long)]
+        force: bool,
+    },
+    /// Query the state of a durable loop invocation on the Resonate server
+    Status { project: String },
+    /// List registered loop processes (pid registry) with live/dead status
+    List,
+    /// Remove pid-registry entries whose process is dead (stale cleanup)
+    Prune,
 }
 
 #[derive(Subcommand)]
@@ -1749,8 +1772,32 @@ fn log(project: &str, kind: EventKind, data: Value) {
 
 // ---- main dispatch ----
 
+/// Rewrite the legacy bare form `flywheel loop <project> [flags]` into the
+/// canonical `flywheel loop run <project> [flags]` before clap parsing.
+/// `run` is the default subcommand; any first token after `loop` that is not
+/// a known subcommand name is treated as the project. Pure + unit-tested.
+fn rewrite_legacy_loop_args(args: &[String]) -> Vec<String> {
+    const SUBCOMMANDS: [&str; 4] = ["run", "status", "list", "prune"];
+    if args.len() >= 2
+        && args[1] == "loop"
+        // A flag (--help, -h, global options) keeps the parent context;
+        // anything else is the legacy positional project → default `run`.
+        && let Some(next) = args.get(2)
+        && !SUBCOMMANDS.contains(&next.as_str())
+        && !next.starts_with('-')
+    {
+        let mut out = args.to_vec();
+        out.insert(2, "run".to_string());
+        return out;
+    }
+    args.to_vec()
+}
+
 fn main() {
-    let cli = Cli::parse();
+    // clap parses from the raw argv; rewrite legacy `loop <project>` first.
+    let raw: Vec<String> = std::env::args().collect();
+    let rewritten = rewrite_legacy_loop_args(&raw);
+    let cli = Cli::parse_from(&rewritten);
 
     if cli.robot_capabilities {
         print_json(&json!({
@@ -1865,39 +1912,45 @@ fn main() {
             until,
             timeout_ms,
         }) => cmd_watch(&cfg, project, to, until.as_deref(), *timeout_ms),
-        Some(Commands::Loop {
-            project,
-            interval,
-            interval_active,
-            queue,
-            workflow,
-            nudge,
-            timeout_ms,
-            once,
-            on_blocked,
-            to,
-            local,
-            work,
-            no_confirm,
-            confirm_timeout_ms,
-        }) => cmd_loop(
-            &cfg,
-            project,
-            *interval,
-            *interval_active,
-            queue.as_deref(),
-            workflow.as_deref(),
-            nudge.as_deref(),
-            *timeout_ms,
-            *once,
-            *local,
-            *work,
-            on_blocked,
-            to,
-            *no_confirm,
-            *confirm_timeout_ms,
-        ),
-        Some(Commands::LoopStatus { project }) => cmd_loop_status(&cfg, project),
+        Some(Commands::Loop { cmd }) => match cmd {
+            LoopCmd::Run {
+                project,
+                interval,
+                interval_active,
+                queue,
+                workflow,
+                nudge,
+                timeout_ms,
+                once,
+                on_blocked,
+                to,
+                local,
+                work,
+                no_confirm,
+                confirm_timeout_ms,
+                force,
+            } => cmd_loop(
+                &cfg,
+                project,
+                *interval,
+                *interval_active,
+                queue.as_deref(),
+                workflow.as_deref(),
+                nudge.as_deref(),
+                *timeout_ms,
+                *once,
+                *local,
+                *work,
+                on_blocked,
+                to,
+                *no_confirm,
+                *confirm_timeout_ms,
+                *force,
+            ),
+            LoopCmd::Status { project } => cmd_loop_status(&cfg, project),
+            LoopCmd::List => cmd_loop_list(),
+            LoopCmd::Prune => cmd_loop_prune(),
+        },
         Some(Commands::Zoom { project, to, off }) => cmd_zoom(&cfg, project, to, *off),
         Some(Commands::Attach { project, to }) => cmd_attach(&cfg, project, to),
         Some(Commands::Kill { project, force }) => cmd_kill(&cfg, project, *force),
@@ -5509,6 +5562,66 @@ fn work_prompts(
     prompts
 }
 
+/// Unregisters this process's loop-pid entry on exit (any path). Only ever
+/// removes the entry when it still belongs to THIS pid — a newer loop that
+/// took over (--force) is never unregistered by the older process exiting
+/// late (bd-fw-stale-loop-processes-gac).
+struct LoopPidGuard {
+    project: String,
+    pid: u32,
+}
+
+impl Drop for LoopPidGuard {
+    fn drop(&mut self) {
+        state::unregister_loop(&self.project, self.pid);
+    }
+}
+
+/// `flywheel loop list`: show the pid registry with live/dead status.
+fn cmd_loop_list() -> Result<()> {
+    let pids = state::load_loop_pids();
+    if pids.is_empty() {
+        println!("no registered loops");
+        return Ok(());
+    }
+    let rows: Vec<Value> = pids
+        .iter()
+        .map(|(project, e)| {
+            json!({
+                "project": project,
+                "pid": e.pid,
+                "started_at": e.started_at,
+                "invocation": e.invocation,
+                "alive": state::pid_alive(e.pid),
+            })
+        })
+        .collect();
+    print_json(&json!({ "loops": rows }));
+    Ok(())
+}
+
+/// `flywheel loop prune`: drop pid-registry entries whose process is dead.
+fn cmd_loop_prune() -> Result<()> {
+    let mut pids = state::load_loop_pids();
+    let before = pids.len();
+    let dead: Vec<String> = pids
+        .iter()
+        .filter(|(_, e)| !state::pid_alive(e.pid))
+        .map(|(p, _)| p.clone())
+        .collect();
+    for p in &dead {
+        pids.remove(p);
+    }
+    state::save_loop_pids(&pids)?;
+    print_json(&json!({
+        "removed": dead,
+        "removed_count": dead.len(),
+        "remaining": pids.len(),
+        "pruned": before - pids.len(),
+    }));
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
 fn cmd_loop(
     cfg: &Config,
@@ -5526,9 +5639,25 @@ fn cmd_loop(
     to: &str,
     no_confirm: bool,
     confirm_timeout_ms: Option<u64>,
+    force: bool,
 ) -> Result<()> {
     if interval_secs < 5 {
         bail!("--interval must be >= 5 seconds");
+    }
+    // single-instance guard (bd-fw-stale-loop-processes-gac): refuse while a
+    // live loop process owns this project; --force takes over deliberately.
+    // The pid entry is unregistered on exit via LoopPidGuard (Drop), so a
+    // crashed loop leaves a stale entry that the next start replaces (dead
+    // pid = litter, not a guard).
+    let _guard = LoopPidGuard {
+        project: project.to_string(),
+        pid: std::process::id(),
+    };
+    if let Some(prev) = state::register_loop(project, "", force)? {
+        bail!(
+            "a loop for {project} is already running (pid {}, started {}). Inspect: flywheel loop list; cleanup: flywheel loop prune; take over: flywheel loop run {project} --force.",
+            prev.pid, prev.started_at
+        );
     }
     // --interval-active clamps to the 5s floor (consistent with the
     // workflow's INTERVAL_MIN) rather than erroring — the operator asked for
@@ -5568,7 +5697,7 @@ fn cmd_loop(
         };
         let rt = tokio::runtime::Runtime::new()?;
         println!(
-            "loop: durable swarm monitor for {} (resume: flywheel loop {project} with the same flags)",
+            "loop: durable swarm monitor for {} (resume: flywheel loop run {project} with the same flags)",
             dim(project)
         );
         let result = rt.block_on(durable::run_durable_loop(cfg, params))?;
@@ -5894,6 +6023,40 @@ mod loop_tests {
     fn bare_short_group_matches_single_agent_is_fine() {
         let names = vec!["flywheel-proj-oc".to_string()];
         assert!(bare_short_group_matches("proj", "oc", &names).is_none());
+    }
+
+    #[test]
+    fn legacy_loop_project_rewritten_to_run() {
+        let args = vec![
+            "flywheel".to_string(),
+            "loop".to_string(),
+            "toron".to_string(),
+            "--work".to_string(),
+        ];
+        let out = rewrite_legacy_loop_args(&args);
+        assert_eq!(out, vec!["flywheel", "loop", "run", "toron", "--work"]);
+    }
+
+    #[test]
+    fn legacy_loop_help_keeps_parent_context() {
+        let args = vec!["flywheel".to_string(), "loop".to_string(), "--help".to_string()];
+        assert_eq!(rewrite_legacy_loop_args(&args), args);
+        let args = vec!["flywheel".to_string(), "loop".to_string(), "-h".to_string()];
+        assert_eq!(rewrite_legacy_loop_args(&args), args);
+    }
+
+    #[test]
+    fn canonical_loop_subcommands_untouched() {
+        for sub in ["run", "status", "list", "prune"] {
+            let args = vec!["flywheel".to_string(), "loop".to_string(), sub.to_string()];
+            assert_eq!(rewrite_legacy_loop_args(&args), args, "{sub}");
+        }
+    }
+
+    #[test]
+    fn non_loop_commands_untouched() {
+        let args = vec!["flywheel".to_string(), "send".to_string(), "toron".to_string()];
+        assert_eq!(rewrite_legacy_loop_args(&args), args);
     }
 
     #[test]
@@ -8822,10 +8985,10 @@ fn cmd_tutorial() -> Result<()> {
         "flywheel — herdr swarm orchestrator\n\n\
          The daily loop (his P1→P8) — one durable command:\n\
          \x20 flywheel spawn <project> --oc=1 --pi=1 --gk=1\n\
-         \x20 flywheel loop <project> --queue p1,p2,p4,p5,p6,p8\n\
+         \x20 flywheel loop run <project> --queue p1,p2,p4,p5,p6,p8\n\
          \n\
          (kills crash-safe: restart the same command to resume;\n\
-         \x20 flywheel loop-status <project> to inspect)\n\
+         \x20 flywheel loop status <project> to inspect)\n\
          \n\
          One-shot variant: flywheel workflows run daily <project>\n\
          (define it in {})\n\n\

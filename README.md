@@ -40,10 +40,10 @@ migration path (R0→R2): `AGENTS.md` § Backends, `docs/decisions/0002-*.md`.
 
 ```bash
 flywheel spawn notetoself --oc=1 --pi=1 --gk=1   # 3-agent swarm
-flywheel loop notetoself --queue p1,p2,p4,p5,p6,p8   # durable orchestrator
+flywheel loop run notetoself --queue p1,p2,p4,p5,p6,p8   # durable orchestrator
 ```
 
-`flywheel loop` is the monitoring orchestrator: it polls the swarm every N
+`flywheel loop run` is the monitoring orchestrator: it polls the swarm every N
 seconds (default 300, `--interval`), feeds the queued instructions to
 idle/finished agents, reports blockers (`--on-blocked continue|stop|mail`),
 and exits 0 when the queue drains and the swarm settles. Idle agents with an
@@ -95,10 +95,12 @@ The loop runs as a **durable Resonate workflow** (requires a Resonate server,
 default `http://localhost:8001` — installed as the launchd service
 `com.flywheel.resonate`; sqlite state survives reboots).
 Every poll, send, and sleep is a checkpoint: kill the loop process mid-run and
-`flywheel loop <project>` with the same flags **resumes the same invocation**
-from its last checkpoint. State is queryable via `flywheel loop-status
-<project>`. `--local` runs the plain sync loop instead; `--once` does a single
-poll pass (cron-friendly).
+`flywheel loop run <project>` with the same flags **resumes the same
+invocation** from its last checkpoint (the bare legacy form
+`flywheel loop <project>` still works). State is queryable via
+`flywheel loop status <project>`; `flywheel loop list` shows the live-loop
+pid registry and `flywheel loop prune` cleans dead entries. `--local` runs the
+plain sync loop instead; `--once` does a single poll pass (cron-friendly).
 
 #### Poll cadence (durable workflow)
 
@@ -127,7 +129,7 @@ The same sequence as a one-shot workflow:
 | Group | Commands |
 |---|---|
 | Swarm lifecycle | `init spawn add list status kill attach zoom` |
-| Operator loop | `send interrupt view watch work loop loop-status` |
+| Operator loop | `send interrupt view watch work loop run/status/list/prune` |
 | Assignment | `assign` (agent-mail bead dispatch) |
 | Coordination | `mail inbox/send/locks/unlock/conflicts/agents` + `contact` + `product` |
 | Patterns | `debate`, `plan-review`, `xproj` (cross-project fan-out) |
