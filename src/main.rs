@@ -5363,6 +5363,110 @@ fn build_queue(queue: Option<&str>, workflow: Option<&str>) -> Result<Vec<String
     Ok(items)
 }
 
+/// Parse `br ready --json` (array) into `ReadyBead`s. Shared by the `__ready`
+/// leaf and the sync-loop `--work` source (single source of truth).
+fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
+    let v: Value =
+        serde_json::from_str(raw.trim()).map_err(|e| anyhow!("br ready bad JSON: {e}: {raw}"))?;
+    let beads: Vec<Value> = v.as_array().cloned().unwrap_or_default();
+    Ok(beads
+        .into_iter()
+        .map(|b| durable::ReadyBead {
+            id: b.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+            title: b
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect())
+}
+
+/// Parse `br list --status in_progress --json` (wrapped under "issues").
+/// Shared by the `__inprogress` leaf and the sync-loop `--work` source.
+fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
+    let v: Value =
+        serde_json::from_str(raw.trim()).map_err(|e| anyhow!("br list bad JSON: {e}: {raw}"))?;
+    let list: &Vec<Value> = v
+        .get("issues")
+        .and_then(Value::as_array)
+        .or_else(|| v.as_array())
+        .ok_or_else(|| anyhow!("br list output has no issues array: {raw}"))?;
+    Ok(list
+        .iter()
+        .map(|b| durable::ReadyBead {
+            id: b.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+            title: b
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect())
+}
+
+/// Run `br ready --json` in the project dir, returning the ready beads.
+/// Caller decides how to treat an error (the sync loop soft-fails).
+fn load_ready_beads(cfg: &Config, project: &str) -> Result<Vec<durable::ReadyBead>> {
+    let dir = project_dir(cfg, project);
+    let out = std::process::Command::new("br")
+        .args(["ready", "--json"])
+        .current_dir(&dir)
+        .output()
+        .map_err(|e| anyhow!("br not found: {e}"))?;
+    if !out.status.success() {
+        bail!(
+            "br ready failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    parse_ready_beads_json(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Run `br list --status in_progress --json` in the project dir.
+fn load_inprogress_beads(cfg: &Config, project: &str) -> Result<Vec<durable::ReadyBead>> {
+    let dir = project_dir(cfg, project);
+    let out = std::process::Command::new("br")
+        .args(["list", "--status", "in_progress", "--json"])
+        .current_dir(&dir)
+        .output()
+        .map_err(|e| anyhow!("br not found: {e}"))?;
+    if !out.status.success() {
+        bail!(
+            "br list failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    parse_inprogress_beads_json(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Sync-loop `--work` queue refresh (parity with the durable loop's
+/// bead-driven mode): resume interrupted in-progress beads first, then hand
+/// out fresh ready beads. Each bead is assigned at most once per loop run
+/// (the `assigned` set is per-invocation state). Pure — fully testable.
+fn work_prompts(
+    inprog: &[durable::ReadyBead],
+    ready: &[durable::ReadyBead],
+    assigned: &mut Vec<String>,
+) -> Vec<String> {
+    let mut prompts = Vec::new();
+    let mut fresh: Vec<&durable::ReadyBead> = Vec::new();
+    for bead in inprog {
+        if !assigned.contains(&bead.id) {
+            prompts.push(durable::resume_prompt(&bead.id, &bead.title));
+            fresh.push(bead);
+        }
+    }
+    for bead in ready {
+        if !assigned.contains(&bead.id) {
+            prompts.push(durable::bead_prompt(&bead.id, &bead.title));
+            fresh.push(bead);
+        }
+    }
+    assigned.extend(fresh.into_iter().map(|b| b.id.clone()));
+    prompts
+}
+
 #[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
 fn cmd_loop(
     cfg: &Config,
@@ -5435,7 +5539,11 @@ fn cmd_loop(
         return Ok(());
     }
 
-    if queue_items.is_empty() && nudge.is_none() {
+    // --work (bead-driven): the queue is sourced from `br ready` each poll, so
+    // the empty-queue warning only applies when NOT in work mode. Each bead is
+    // assigned at most once per loop run (bd-fw-loop-sync-work-zero-way).
+    let mut assigned: Vec<String> = Vec::new();
+    if queue_items.is_empty() && nudge.is_none() && !work {
         eprintln!("flywheel: no instructions queued and no --nudge — loop will only monitor");
     }
 
@@ -5473,6 +5581,29 @@ fn cmd_loop(
                 timeout_ms.unwrap_or(0) / 1000,
                 queue_items.len()
             );
+        }
+
+        // bead-driven mode (parity with the durable loop): refresh the queue
+        // from the tracker each poll — interrupted work first, then fresh
+        // ready beads. Soft-fail: a tracker hiccup yields no new work this
+        // tick, never a loop crash.
+        if work {
+            match load_inprogress_beads(cfg, project) {
+                Ok(inprog) => {
+                    let to_resume: Vec<String> =
+                        work_prompts(&inprog, &[], &mut assigned);
+                    queue_items.extend(to_resume);
+                }
+                Err(e) => eprintln!("flywheel: br inprogress failed (continuing): {e:#}"),
+            }
+            match load_ready_beads(cfg, project) {
+                Ok(ready) => {
+                    let to_assign: Vec<String> =
+                        work_prompts(&[], &ready, &mut assigned);
+                    queue_items.extend(to_assign);
+                }
+                Err(e) => eprintln!("flywheel: br ready failed (continuing): {e:#}"),
+            }
         }
 
         let agents = c
@@ -5629,6 +5760,73 @@ mod loop_tests {
         assert_eq!(clamp_active_interval(5), 5);
         assert_eq!(clamp_active_interval(15), 15);
         assert_eq!(clamp_active_interval(30), 30);
+    }
+
+    #[test]
+    fn work_prompts_resumes_inprogress_before_fresh() {
+        let inprog = vec![
+            durable::ReadyBead { id: "bd-r1".into(), title: "resume me".into() },
+            durable::ReadyBead { id: "bd-r2".into(), title: "resume me too".into() },
+        ];
+        let ready = vec![durable::ReadyBead { id: "bd-f1".into(), title: "fresh".into() }];
+        let mut assigned = Vec::new();
+        let prompts = work_prompts(&inprog, &ready, &mut assigned);
+        // resume first, then fresh
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts[0].contains("Resume bead bd-r1"));
+        assert!(prompts[1].contains("Resume bead bd-r2"));
+        assert!(prompts[2].contains("Execute bead bd-f1"));
+        assert_eq!(assigned, vec!["bd-r1", "bd-r2", "bd-f1"]);
+        // second call assigns nothing new (dedup)
+        let again = work_prompts(&inprog, &ready, &mut assigned);
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn work_prompts_skips_already_assigned() {
+        let inprog = vec![durable::ReadyBead { id: "bd-r1".into(), title: "x".into() }];
+        let ready = vec![durable::ReadyBead { id: "bd-r1".into(), title: "x".into() }];
+        let mut assigned = vec!["bd-r1".to_string()];
+        let prompts = work_prompts(&inprog, &ready, &mut assigned);
+        assert!(prompts.is_empty());
+    }
+
+    #[test]
+    fn work_prompts_builds_self_contained_prompts() {
+        let ready = vec![durable::ReadyBead { id: "bd-42".into(), title: "fix auth".into() }];
+        let mut assigned = Vec::new();
+        let prompts = work_prompts(&[], &ready, &mut assigned);
+        assert_eq!(prompts.len(), 1);
+        let p = &prompts[0];
+        assert!(p.contains("bd-42"));
+        assert!(p.contains("fix auth"));
+        // lifecycle contract present (grep-verifiable per beads workflow)
+        assert!(p.contains("br update bd-42 --claim"));
+    }
+
+    #[test]
+    fn parse_ready_beads_json_handles_array_shape() {
+        let raw = r#"[{"id":"bd-a","title":"one"},{"id":"bd-b","title":"two"}]"#;
+        let beads = parse_ready_beads_json(raw).unwrap();
+        assert_eq!(beads.len(), 2);
+        assert_eq!(beads[0].id, "bd-a");
+        assert_eq!(beads[1].title, "two");
+    }
+
+    #[test]
+    fn parse_inprogress_beads_json_handles_issues_wrapper() {
+        let raw = r#"{"issues":[{"id":"bd-c","title":"three"}],"total":1}"#;
+        let beads = parse_inprogress_beads_json(raw).unwrap();
+        assert_eq!(beads.len(), 1);
+        assert_eq!(beads[0].id, "bd-c");
+        // bare-array fallback (some br versions)
+        let beads = parse_inprogress_beads_json(r#"[{"id":"bd-d","title":"four"}]"#).unwrap();
+        assert_eq!(beads[0].id, "bd-d");
+    }
+
+    #[test]
+    fn parse_ready_beads_json_rejects_garbage() {
+        assert!(parse_ready_beads_json("not json").is_err());
     }
 
     #[test]
@@ -8995,32 +9193,10 @@ fn cmd_internal_wait_output(
 }
 
 fn cmd_internal_ready(cfg: &Config, project: &str) -> Result<()> {
-    let dir = project_dir(cfg, project);
-    let out = std::process::Command::new("br")
-        .args(["ready", "--json"])
-        .current_dir(&dir)
-        .output()
-        .map_err(|e| anyhow!("br not found: {e}"))?;
-    if !out.status.success() {
-        bail!(
-            "br ready failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let v: Value =
-        serde_json::from_str(raw.trim()).map_err(|e| anyhow!("br ready bad JSON: {e}: {raw}"))?;
-    let beads: Vec<Value> = v
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|b| {
-            json!({
-                "id": b.get("id").and_then(Value::as_str).unwrap_or(""),
-                "title": b.get("title").and_then(Value::as_str).unwrap_or("")
-            })
-        })
+    let beads = load_ready_beads(cfg, project)?;
+    let beads: Vec<Value> = beads
+        .iter()
+        .map(|b| json!({ "id": b.id, "title": b.title }))
         .collect();
     print_json(&json!({ "beads": beads }));
     Ok(())
@@ -9028,35 +9204,10 @@ fn cmd_internal_ready(cfg: &Config, project: &str) -> Result<()> {
 
 /// internal leaf: in-progress beads as [{id, title}] via `br list --status in_progress`.
 fn cmd_internal_inprogress(cfg: &Config, project: &str) -> Result<()> {
-    let dir = project_dir(cfg, project);
-    let out = std::process::Command::new("br")
-        .args(["list", "--status", "in_progress", "--json"])
-        .current_dir(&dir)
-        .output()
-        .map_err(|e| anyhow!("br not found: {e}"))?;
-    if !out.status.success() {
-        bail!(
-            "br list failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let v: Value =
-        serde_json::from_str(raw.trim()).map_err(|e| anyhow!("br list bad JSON: {e}: {raw}"))?;
-    // br list --json wraps issues under "issues"
-    let list: &Vec<Value> = v
-        .get("issues")
-        .and_then(Value::as_array)
-        .or_else(|| v.as_array())
-        .ok_or_else(|| anyhow!("br list output has no issues array: {raw}"))?;
-    let beads: Vec<Value> = list
+    let beads = load_inprogress_beads(cfg, project)?;
+    let beads: Vec<Value> = beads
         .iter()
-        .map(|b| {
-            json!({
-                "id": b.get("id").and_then(Value::as_str).unwrap_or(""),
-                "title": b.get("title").and_then(Value::as_str).unwrap_or("")
-            })
-        })
+        .map(|b| json!({ "id": b.id, "title": b.title }))
         .collect();
     print_json(&json!({ "beads": beads }));
     Ok(())
