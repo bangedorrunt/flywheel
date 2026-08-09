@@ -4037,12 +4037,36 @@ fn cmd_interrupt(cfg: &Config, project: &str, to: &str, keys: &[String], force: 
     Ok(())
 }
 
+/// bd-fw-view-alt-screen-blocked-ct9: a working agent's `recent` history is
+/// on the alternate screen and cannot be captured (herdr rejects with
+/// `agent_not_idle`). Fall back to the `visible` buffer with a note instead
+/// of failing the whole view. Never falls back when the caller explicitly
+/// asked for `visible`.
+fn client_read_with_fallback(
+    c: &mut Client,
+    target: &str,
+    source: &str,
+    lines: Option<u32>,
+) -> Result<String> {
+    match c.agent_read(target, source, lines) {
+        Ok(t) => Ok(t),
+        Err(e) if source != "visible" && e.to_string().contains("agent_not_idle") => {
+            eprintln!(
+                "flywheel: {target} is working — {source} history unavailable (alternate screen); showing the visible buffer instead (attach for full history)"
+            );
+            c.agent_read(target, "visible", lines)
+                .map_err(|e2| anyhow!("{target}: agent_not_idle fallback to visible failed: {e2} ({e})"))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn cmd_view(cfg: &Config, project: &str, to: &str, lines: Option<u32>, source: &str) -> Result<()> {
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
     let targets = resolve_agents(&mut c, &ws_id, project, to)?;
     for a in &targets {
-        let text = c.agent_read(agent_target(a), source, lines)?;
+        let text = client_read_with_fallback(&mut c, agent_target(a), source, lines)?;
         if std::io::stdout().is_terminal() && targets.len() > 1 {
             println!("--- {} ---", agent_target(a));
         }
@@ -9981,12 +10005,22 @@ fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
         .ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
     let target = agent_target(&agent).to_string();
-    let text = backend
-        .agent_read(&target, "recent", 60)?
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+    // bd-fw-view-alt-screen-blocked-ct9: a working agent's `recent` read is
+    // rejected (alternate screen) — fall back to the visible buffer so the
+    // loop's context guard still sees CONTEXT_LIMIT markers mid-task.
+    let text = match backend.agent_read(&target, "recent", 60) {
+        Ok(v) => v,
+        Err(e) if e.to_string().contains("agent_not_idle") => {
+            backend
+                .agent_read(&target, "visible", 60)
+                .map_err(|e2| anyhow!("{target}: agent_not_idle fallback to visible failed: {e2} ({e})"))?
+        }
+        Err(e) => return Err(e.into()),
+    }
+    .get("text")
+    .and_then(serde_json::Value::as_str)
+    .unwrap_or_default()
+    .to_string();
     // state-file fallback channel: parse the agent's state file when present.
     // Malformed/absent files yield null — never an error (the loop treats
     // null as "terminal channel only", identical to pre-zwa behavior).
