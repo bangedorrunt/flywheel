@@ -154,6 +154,11 @@ enum Commands {
     /// (bd-fw-name-binding-loss-7rc): panes whose agent restarted show
     /// name:null — this renames them back to their registered names.
     Rebind { project: String },
+    /// Recover a damaged swarm (bd-fw-interrupt-kills-agent-or3): for each
+    /// registered agent, restore the name binding if the pane survived, or
+    /// respawn the agent if it died. The durable loop self-heals on its own;
+    /// this is the CLI supervision counterpart.
+    Recover { project: String },
     /// Send a prompt to one or more agents (with optional wait)
     Send {
         project: String,
@@ -177,14 +182,21 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Interrupt an agent (sends Escape by default)
+    /// Interrupt an agent (sends Escape by default — cancels the current
+    /// tool call and returns to the prompt). Kill-style keys (ctrl+c) are
+    /// REFUSED unless --force: they terminate the agent process and drop the
+    /// pane to a shell (bd-fw-interrupt-kills-agent-or3).
     Interrupt {
         project: String,
         #[arg(long, default_value = "oc")]
         to: String,
-        /// key names to send instead of Escape (repeatable)
+        /// key names to send instead of Escape (repeatable); ctrl+c requires
+        /// --force
         #[arg(long)]
         keys: Vec<String>,
+        /// allow kill-style keys (ctrl+c terminates the agent process)
+        #[arg(long)]
+        force: bool,
     },
     /// Read an agent's terminal output
     View {
@@ -1975,6 +1987,7 @@ fn main() {
         Some(Commands::List { all }) => cmd_list(&cfg, *all),
         Some(Commands::Status { project }) => cmd_status(&cfg, project.as_deref()),
         Some(Commands::Rebind { project }) => cmd_rebind(&cfg, project),
+        Some(Commands::Recover { project }) => cmd_recover(&cfg, project),
         Some(Commands::Send {
             project,
             msg,
@@ -1993,7 +2006,12 @@ fn main() {
             *timeout_ms,
             *force,
         ),
-        Some(Commands::Interrupt { project, to, keys }) => cmd_interrupt(&cfg, project, to, keys),
+        Some(Commands::Interrupt {
+            project,
+            to,
+            keys,
+            force,
+        }) => cmd_interrupt(&cfg, project, to, keys, *force),
         Some(Commands::View {
             project,
             to,
@@ -3729,6 +3747,94 @@ fn cmd_rebind(cfg: &Config, project: &str) -> Result<()> {
     Ok(())
 }
 
+/// Agent kinds recorded by the last spawn event in the project's event log
+/// (name → kind). Used by `flywheel recover` to respawn dead agents with the
+/// right kind. Falls back to `opencode` for names not in the log.
+fn spawn_kinds_from_log(project: &str) -> std::collections::HashMap<String, String> {
+    let mut kinds = std::collections::HashMap::new();
+    let path = crate::config::state_dir().join(format!("{project}.jsonl"));
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return kinds;
+    };
+    for line in raw.lines().rev() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("kind").and_then(serde_json::Value::as_str) != Some("spawn") {
+            continue;
+        }
+        let Some(agents) = v.get("data").and_then(|d| d.get("agents")).and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for a in agents {
+            let name = a.get("name").and_then(serde_json::Value::as_str).unwrap_or("");
+            let kind = a
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("opencode");
+            kinds.entry(name.to_string()).or_insert_with(|| kind.to_string());
+        }
+        break; // last spawn event only
+    }
+    kinds
+}
+
+/// bd-fw-interrupt-kills-agent-or3 (c): CLI supervision counterpart to the
+/// durable loop's self-heal — for every registered agent, restore the name
+/// binding if the pane survived, or respawn the agent (with its spawn-time
+/// kind) if it died. Reports what was done per agent.
+fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
+    let backend = backend::multiplexer_backend(cfg)?;
+    let ws_id = find_workspace_dyn(&*backend, project)?;
+    let entries = state::load_spawn_registry(project);
+    if entries.is_empty() {
+        eprintln!(
+            "flywheel: no spawn registry for {project} — re-run `flywheel spawn {project}` to record pane→name bindings"
+        );
+        print_json(&json!({ "project": project, "recovered": 0, "registry": "empty" }));
+        return Ok(());
+    }
+    let kinds = spawn_kinds_from_log(project);
+    let agents = backend.agent_list()?;
+    let mut recovered: Vec<Value> = Vec::new();
+    let mut healthy = 0usize;
+    for (pane_id, name) in &entries {
+        let live = agents
+            .iter()
+            .find(|a| a.pane_id == *pane_id && a.workspace_id == ws_id);
+        match live {
+            Some(a) if a.name.as_deref() == Some(name) => {
+                healthy += 1; // pane + binding intact
+            }
+            Some(a) => {
+                // pane survived, binding lost → restore it (7rc path)
+                let was = a.name.clone().unwrap_or_else(|| "<null>".to_string());
+                backend.agent_rename(pane_id, Some(name))?;
+                recovered.push(json!({
+                    "name": name, "pane_id": pane_id, "action": "rebound", "was": was
+                }));
+            }
+            None => {
+                // agent died (or pane is gone) → respawn with spawn-time kind
+                let kind = kinds.get(name).map(String::as_str).unwrap_or("opencode");
+                match start_agent_with_retry_dyn(&*backend, name, kind, pane_id, &[]) {
+                    Ok(a) => recovered.push(json!({
+                        "name": name, "pane_id": a.pane_id, "action": "respawned", "kind": kind
+                    })),
+                    Err(e) => eprintln!("flywheel: recover {name} failed: {e:#}"),
+                }
+            }
+        }
+    }
+    print_json(&json!({
+        "project": project,
+        "healthy": healthy,
+        "recovered": recovered.len(),
+        "details": recovered,
+    }));
+    Ok(())
+}
+
 /// bd-fw-name-binding-loss-7rc: restore a lost name binding from the spawn
 /// registry. Used by `__send` when a target name is not live: if the registry
 /// records a pane for that name and the pane still exists (agent restarted →
@@ -3887,7 +3993,16 @@ fn cmd_send(
 
 // ---- interrupt / view / watch / zoom / attach / kill ----
 
-fn cmd_interrupt(cfg: &Config, project: &str, to: &str, keys: &[String]) -> Result<()> {
+/// Kill-style key names that terminate the agent process (not just cancel
+/// the current call). Guarded behind --force (bd-fw-interrupt-kills-agent-or3).
+const KILL_KEYS: [&str; 4] = ["ctrl+c", "ctrl-c", "^c", "C-c"];
+
+/// The first kill-style key in the set, if any (pure — unit-tested).
+fn kill_key<'a>(keys: &[&'a str]) -> Option<&'a str> {
+    keys.iter().find(|k| KILL_KEYS.contains(k)).copied()
+}
+
+fn cmd_interrupt(cfg: &Config, project: &str, to: &str, keys: &[String], force: bool) -> Result<()> {
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
     let targets = resolve_agents(&mut c, &ws_id, project, to)?;
@@ -3896,16 +4011,28 @@ fn cmd_interrupt(cfg: &Config, project: &str, to: &str, keys: &[String]) -> Resu
     } else {
         keys.iter().map(|s| s.as_str()).collect()
     };
+    if !force
+        && let Some(k) = kill_key(&keys)
+    {
+        bail!(
+            "--keys {k} TERMINATES the agent process (pane drops to a shell and the session binding is lost). Prefer the default Escape, which cancels the current tool call and returns to the prompt. Pass --force to send {k} deliberately."
+        );
+    }
+    let is_kill = kill_key(&keys).is_some();
     for a in &targets {
         c.agent_send_keys(agent_target(a), &keys)?;
         if std::io::stdout().is_terminal() {
-            println!("interrupted {}", dim(agent_target(a)));
+            println!(
+                "interrupted {} ({})",
+                dim(agent_target(a)),
+                if is_kill { "kill keys" } else { "soft" }
+            );
         }
     }
     log(
         project,
         EventKind::Interrupt,
-        json!({ "to": to, "keys": keys }),
+        json!({ "to": to, "keys": keys, "kill": is_kill }),
     );
     Ok(())
 }
@@ -6335,6 +6462,18 @@ mod loop_tests {
     fn bare_short_group_matches_single_agent_is_fine() {
         let names = vec!["flywheel-proj-oc".to_string()];
         assert!(bare_short_group_matches("proj", "oc", &names).is_none());
+    }
+
+    #[test]
+    fn kill_key_detects_only_kill_keys() {
+        // bd-fw-interrupt-kills-agent-or3: ctrl+c variants are kill keys;
+        // Escape and other soft keys are not.
+        assert_eq!(kill_key(&["Escape"]), None);
+        assert_eq!(kill_key(&["ctrl+c"]), Some("ctrl+c"));
+        assert_eq!(kill_key(&["ctrl-c"]), Some("ctrl-c"));
+        assert_eq!(kill_key(&["^c"]), Some("^c"));
+        assert_eq!(kill_key(&["Escape", "ctrl+c"]), Some("ctrl+c"));
+        assert_eq!(kill_key(&[]), None);
     }
 
     #[test]
