@@ -69,6 +69,10 @@ pub struct CoalitionManifest {
     /// Bead ids tracked for the beads-closed disband gate (may be empty).
     #[serde(default)]
     pub beads: Vec<String>,
+    /// The repo whose `.beads` holds the tracked beads (br resolves its
+    /// workspace from cwd; the coalition CLI often runs from another repo).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracker_repo: Option<String>,
     /// Formation timestamp (RFC3339).
     pub created_at: String,
     /// `active` | `closed`.
@@ -239,6 +243,7 @@ impl CoalitionStore {
         captain: &str,
         members: &[String],
         beads: &[String],
+        tracker: Option<&str>,
     ) -> Result<CoalitionManifest> {
         // Goal must be a known workflow + pass the engine-tier lint gate
         // (mirrors `workflow run`'s fail-stop).
@@ -329,6 +334,7 @@ impl CoalitionStore {
             channel_id,
             channel_name: goal.to_string(),
             beads: beads.to_vec(),
+            tracker_repo: tracker.map(str::to_string),
             created_at: crate::state::now_iso(),
             status: "active".into(),
             closed_at: None,
@@ -346,7 +352,7 @@ impl CoalitionStore {
         let channel = self.channel_view(&manifest.channel_id);
         let intents = self.member_intents(&manifest)?;
         let reservations = self.member_reservations(&manifest)?;
-        let beads = bead_statuses(&manifest.beads);
+        let beads = bead_statuses(&manifest.beads, manifest.tracker_repo.as_deref());
         Ok(CoalitionStatus {
             id: manifest.id.clone(),
             goal: manifest.goal.clone(),
@@ -370,10 +376,10 @@ impl CoalitionStore {
         for entry in std::fs::read_dir(&self.root)? {
             let Ok(entry) = entry else { continue };
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".json") {
-                if let Ok(m) = self.load_manifest(&name.trim_end_matches(".json")) {
-                    out.push(m);
-                }
+            if name.ends_with(".json")
+                && let Ok(m) = self.load_manifest(name.trim_end_matches(".json"))
+            {
+                out.push(m);
             }
         }
         out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
@@ -384,13 +390,20 @@ impl CoalitionStore {
     /// reservations (best-effort per member), post the channel close
     /// message. With `beads_closed` and a tracked bead list, the gate
     /// requires every bead to be closed first.
-    pub fn disband(&self, id: &str, beads_closed: bool, reason: Option<&str>) -> Result<()> {
+    pub fn disband(
+        &self,
+        id: &str,
+        beads_closed: bool,
+        reason: Option<&str>,
+        tracker_override: Option<&str>,
+    ) -> Result<()> {
         let mut manifest = self.load_manifest(id)?;
         if manifest.status == "closed" {
             return Ok(()); // idempotent
         }
         if beads_closed && !manifest.beads.is_empty() {
-            for b in bead_statuses(&manifest.beads) {
+            let tracker = tracker_override.or(manifest.tracker_repo.as_deref());
+            for b in bead_statuses(&manifest.beads, tracker) {
                 if b.status != "closed" {
                     bail!(
                         "beads-closed gate: bead {} is {}, not closed — disband aborted",
@@ -636,7 +649,7 @@ impl CoalitionStore {
                 created_at_secs: e.created_at.as_secs() as i64,
             })
             .collect();
-        views.sort_by(|a, b| b.created_at_secs.cmp(&a.created_at_secs));
+        views.sort_by_key(|v| std::cmp::Reverse(v.created_at_secs));
         let name = views
             .iter()
             .find(|v| v.kind == CHANNEL_METADATA)
@@ -766,37 +779,45 @@ fn channel_tag(event: &toron_core::nostr_sdk::nostr::Event) -> Option<String> {
         .and_then(|t| t.as_slice().get(1).map(|s| s.to_string()))
 }
 
-/// Best-effort `br show <id>` status probe per tracked bead. `br` absent or
-/// failing → `unknown` (the beads-closed gate then refuses to pass).
-fn bead_statuses(beads: &[String]) -> Vec<BeadStatus> {
-    beads
-        .iter()
-        .map(|id| BeadStatus {
-            id: id.clone(),
-            status: bead_status(id),
-        })
-        .collect()
-}
-
-fn bead_status(id: &str) -> String {
-    let out = std::process::Command::new("br")
-        .args(["show", id, "--json"])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            if s.contains("\"status\":\"closed\"") {
-                "closed".into()
-            } else if s.contains("\"status\":\"open\"") || s.contains("\"status\":\"in_progress\"")
-            {
-                "open".into()
-            } else {
-                "unknown".into()
-            }
-        }
-        _ => "unknown".into(),
+    /// Best-effort `br show <id>` status probe per tracked bead. `br` absent
+    /// or failing → `unknown` (the beads-closed gate then refuses to pass).
+    /// `tracker_repo` = the repo whose `.beads` the probe must use (br
+    /// resolves its workspace from cwd; the coalition CLI often runs from a
+    /// different repo).
+    fn bead_statuses(beads: &[String], tracker_repo: Option<&str>) -> Vec<BeadStatus> {
+        beads
+            .iter()
+            .map(|id| BeadStatus {
+                id: id.clone(),
+                status: bead_status(id, tracker_repo),
+            })
+            .collect()
     }
-}
+
+    fn bead_status(id: &str, tracker_repo: Option<&str>) -> String {
+        let mut cmd = std::process::Command::new("br");
+        cmd.args(["show", id, "--json"]);
+        if let Some(repo) = tracker_repo {
+            cmd.current_dir(repo);
+        }
+        match cmd.output() {
+            Ok(o) if o.status.success() => parse_br_status(&String::from_utf8_lossy(&o.stdout)),
+            _ => "unknown".into(),
+        }
+    }
+
+    /// Pure parser for `br show <id> --json` stdout (the unit-test surface).
+    fn parse_br_status(stdout: &str) -> String {
+        if stdout.contains("\"status\":\"closed\"") {
+            "closed".into()
+        } else if stdout.contains("\"status\":\"open\"")
+            || stdout.contains("\"status\":\"in_progress\"")
+        {
+            "open".into()
+        } else {
+            "unknown".into()
+        }
+    }
 
 #[cfg(test)]
 mod tests {
@@ -813,7 +834,7 @@ mod tests {
 
     #[test]
     fn test_channel_tag_extraction() {
-        use toron_core::nostr_sdk::nostr::{Event, EventId, Keys, Tag, Timestamp};
+        use toron_core::nostr_sdk::nostr::{Keys, Tag, Timestamp};
         let keys = Keys::generate();
         let ev = build_event(
             &keys,
@@ -824,13 +845,53 @@ mod tests {
         )
         .expect("build");
         assert_eq!(channel_tag(&ev), Some("coal-1".to_string()));
-        let _ = EventId::from_hex(&ev.id.to_hex());
     }
 
     #[test]
     fn test_bead_status_parsing() {
         // No br in a hermetic test env → unknown; the parser handles it.
-        let status = bead_status("bd-does-not-exist");
+        let status = bead_status("bd-does-not-exist", None);
         assert!(status == "unknown" || status == "closed" || status == "open", "{status}");
+    }
+
+    /// The pure parser: closed / open / in_progress / garbage.
+    #[test]
+    fn parse_br_status_classifies_output() {
+        assert_eq!(parse_br_status(r#"[{"id":"bd-x","status":"closed"}]"#), "closed");
+        assert_eq!(
+            parse_br_status(r#"[{"id":"bd-x","status":"in_progress"}]"#),
+            "open",
+            "in_progress counts as open for the gate"
+        );
+        assert_eq!(parse_br_status(r#"[{"id":"bd-x","status":"open"}]"#), "open");
+        assert_eq!(parse_br_status(r#"{"error":{"code":"ISSUE_NOT_FOUND"}}"#), "unknown");
+        assert_eq!(parse_br_status(""), "unknown");
+        assert_eq!(parse_br_status("garbage"), "unknown");
+    }
+
+    /// The manifest round-trips the tracker repo (the beads-closed gate's
+    /// probe cwd) — a coalition formed with --tracker survives save/load.
+    #[test]
+    fn manifest_roundtrips_tracker_repo() {
+        let mut m = CoalitionManifest {
+            id: "coal-x".into(),
+            goal: "beads".into(),
+            run_id: "coal-coal-x".into(),
+            captain: "oc".into(),
+            members: vec!["oc".into(), "pi".into()],
+            channel_id: "coal-x".into(),
+            channel_name: "beads".into(),
+            beads: vec!["bd-x".into()],
+            tracker_repo: Some("/tmp/tracker".into()),
+            created_at: "2026-08-09T00:00:00Z".into(),
+            status: "active".into(),
+            closed_at: None,
+            close_reason: None,
+        };
+        m.channel_id = "coal-x".into();
+        let s = serde_json::to_string(&m).unwrap();
+        let back: CoalitionManifest = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.tracker_repo.as_deref(), Some("/tmp/tracker"));
+        assert_eq!(back.id, "coal-x");
     }
 }
