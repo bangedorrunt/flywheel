@@ -3433,6 +3433,33 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
 // ---- send ----
 
 #[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
+/// If `to` contains a bare kind short (`oc`/`pi`/`gk`) that matches MORE than
+/// one agent, return the matched names. A bare short broadens to the whole
+/// crew (`oc` → oc, oc2, oc3) — one prompt sent to all of them races the
+/// same work (bd-fw-send-bare-short-group). Numbered shorts (`oc2`) and
+/// concrete names match exactly one agent and never trigger this.
+fn bare_short_group_matches(project: &str, to: &str, names: &[String]) -> Option<Vec<String>> {
+    if !to.split(',').any(|t| to_want_token(project, t.trim()).broaden) {
+        return None;
+    }
+    let matched: Vec<String> = names
+        .iter()
+        .filter(|n| {
+            to.split(',').any(|t| {
+                let w = to_want_token(project, t.trim());
+                name_matches_want(n, &w)
+            })
+        })
+        .cloned()
+        .collect();
+    if matched.len() > 1 {
+        Some(matched)
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
 fn cmd_send(
     cfg: &Config,
     project: &str,
@@ -3462,6 +3489,21 @@ fn cmd_send(
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
     let targets = resolve_agents(&mut c, &ws_id, project, to)?;
+
+    // bd-fw-send-bare-short-group: a bare short reaching the whole crew would
+    // race one prompt across N agents (observed: 3 agents claimed the same
+    // bead, duplicate commits). Refuse with guidance unless --force.
+    if !force {
+        let names: Vec<String> = targets.iter().map(|a| agent_target(a).to_string()).collect();
+        if let Some(group) = bare_short_group_matches(project, to, &names) {
+            bail!(
+                "--to {to} matches {} agents ({}): a bare short reaches the whole crew and would race one prompt across all of them. Use an exact name or numbered short (e.g. flywheel-{}-oc, oc2) to target one agent, or pass --force to broadcast deliberately.",
+                group.len(),
+                group.join(", "),
+                project_base(project)
+            );
+        }
+    }
 
     let timeout = timeout_ms.or_else(|| wait.then(|| cfg.timeout_ms()));
     let mut results: Vec<Value> = Vec::new();
@@ -5827,6 +5869,44 @@ mod loop_tests {
     #[test]
     fn parse_ready_beads_json_rejects_garbage() {
         assert!(parse_ready_beads_json("not json").is_err());
+    }
+
+    #[test]
+    fn bare_short_group_matches_detects_crew() {
+        let names = vec![
+            "flywheel-proj-oc".to_string(),
+            "flywheel-proj-oc2".to_string(),
+            "flywheel-proj-oc3".to_string(),
+        ];
+        let group = bare_short_group_matches("proj", "oc", &names).expect("oc broadens");
+        assert_eq!(group.len(), 3);
+        assert!(group.contains(&"flywheel-proj-oc".to_string()));
+        assert!(group.contains(&"flywheel-proj-oc3".to_string()));
+        // numbered short is exact — no group
+        assert!(bare_short_group_matches("proj", "oc2", &names).is_none());
+        // concrete name is exact — no group
+        assert!(bare_short_group_matches("proj", "flywheel-proj-oc", &names).is_none());
+        // "all" is not a bare short — no group
+        assert!(bare_short_group_matches("proj", "all", &names).is_none());
+    }
+
+    #[test]
+    fn bare_short_group_matches_single_agent_is_fine() {
+        let names = vec!["flywheel-proj-oc".to_string()];
+        assert!(bare_short_group_matches("proj", "oc", &names).is_none());
+    }
+
+    #[test]
+    fn bare_short_group_matches_comma_list() {
+        let names = vec![
+            "flywheel-proj-oc".to_string(),
+            "flywheel-proj-oc2".to_string(),
+            "flywheel-proj-pi".to_string(),
+        ];
+        // oc,pi → oc matches oc+oc2, pi matches pi → all three matched
+        let group = bare_short_group_matches("proj", "oc,pi", &names).unwrap();
+        assert_eq!(group.len(), 3);
+        assert!(group.contains(&"flywheel-proj-pi".to_string()));
     }
 
     #[test]
