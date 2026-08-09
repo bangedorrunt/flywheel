@@ -163,6 +163,44 @@ fn sidecar_file(project: &str) -> PathBuf {
     loops_dir().join(format!("{project}.json"))
 }
 
+/// Directory of the per-project spawn registry (pane_id → agent name).
+/// Written at spawn; used by `flywheel rebind` and the send auto-heal path
+/// (bd-fw-name-binding-loss-7rc) to restore a name binding an agent lost
+/// when its session restarted in the pane (herdr shows name:null, and name
+/// resolution silently misses).
+pub fn agents_dir() -> PathBuf {
+    state_dir().join("agents")
+}
+
+pub fn spawn_registry_file(project: &str) -> PathBuf {
+    agents_dir().join(format!("{project}.json"))
+}
+
+/// One spawn-registry record: (pane_id, agent name).
+pub type SpawnEntry = (String, String);
+
+/// Atomically persist the project's pane→name registry.
+pub fn save_spawn_registry(project: &str, entries: &[SpawnEntry]) -> Result<()> {
+    let path = spawn_registry_file(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_string_pretty(entries)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Read the project's pane→name registry (missing/corrupt → empty).
+pub fn load_spawn_registry(project: &str) -> Vec<SpawnEntry> {
+    let path = spawn_registry_file(project);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return vec![];
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
 /// One-time migration of the legacy SHARED `loops.json` into per-project
 /// sidecars (l4s.1): each entry becomes `loops/<project>.json` (atomic
 /// temp+rename), then the legacy file is renamed to
@@ -1583,6 +1621,31 @@ mod loops_sidecar_tests {
         assert_eq!(load_active_loop("l4s1-no-such-project").unwrap(), None);
         remove_active_loop(&p1).unwrap();
         remove_active_loop(&p2).unwrap();
+    }
+
+    /// bd-fw-name-binding-loss-7rc: the spawn registry (pane_id → name)
+    /// round-trips atomically and tolerates missing/corrupt files.
+    #[test]
+    fn spawn_registry_roundtrip() {
+        let _g = loops_test_guard();
+        let p = test_project("reg-a");
+        let entries = vec![
+            ("w2A:p1".to_string(), "flywheel-reg-a-oc".to_string()),
+            ("w2A:p2".to_string(), "flywheel-reg-a-pi".to_string()),
+        ];
+        save_spawn_registry(&p, &entries).unwrap();
+        assert_eq!(load_spawn_registry(&p), entries);
+        // overwrite atomically
+        save_spawn_registry(&p, &entries[..1]).unwrap();
+        assert_eq!(load_spawn_registry(&p), entries[..1]);
+        // missing → empty; corrupt → empty
+        assert!(load_spawn_registry("l4s1-no-such-project").is_empty());
+        let path = spawn_registry_file(&p);
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(load_spawn_registry(&p).is_empty());
+        // cleanup
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.tmp"));
     }
 
     /// bd-fw-stale-loop-processes: the pid registry round-trips atomically.

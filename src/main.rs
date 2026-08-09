@@ -146,6 +146,10 @@ enum Commands {
     },
     /// Show one swarm's agents and states
     Status { project: Option<String> },
+    /// Restore lost agent name bindings from the spawn registry
+    /// (bd-fw-name-binding-loss-7rc): panes whose agent restarted show
+    /// name:null — this renames them back to their registered names.
+    Rebind { project: String },
     /// Send a prompt to one or more agents (with optional wait)
     Send {
         project: String,
@@ -1881,6 +1885,7 @@ fn main() {
         }) => cmd_add(&cfg, project, counts, kinds),
         Some(Commands::List { all }) => cmd_list(&cfg, *all),
         Some(Commands::Status { project }) => cmd_status(&cfg, project.as_deref()),
+        Some(Commands::Rebind { project }) => cmd_rebind(&cfg, project),
         Some(Commands::Send {
             project,
             msg,
@@ -2378,6 +2383,8 @@ fn cmd_spawn(
     );
 
     let mut spawned: Vec<Value> = Vec::new();
+    // bd-fw-name-binding-loss-7rc: pane→name pairs for the spawn registry.
+    let mut registry: Vec<state::SpawnEntry> = Vec::new();
     let mut prev = root.pane_id.clone();
     let mut first = true;
     // ordinals per kind across the whole plan (recipe + flags may repeat a kind)
@@ -2438,6 +2445,7 @@ fn cmd_spawn(
             // name in mail. Best-effort: mail-not-configured is NOT a spawn
             // failure (silent skip); a registration error is a warning.
             register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
+            registry.push((agent.pane_id.clone(), name));
             println!(
                 "  {} {}",
                 kind_paint(&kind),
@@ -2456,6 +2464,14 @@ fn cmd_spawn(
             "workspace_id": ws.workspace_id, "label": label, "agents": spawned
         }),
     );
+
+    // bd-fw-name-binding-loss-7rc: persist pane→name bindings so a lost name
+    // (agent restarted in its pane) can be restored by `flywheel rebind` or
+    // the __send auto-heal. Best-effort — a registry failure is not a spawn
+    // failure.
+    if let Err(e) = state::save_spawn_registry(project, &registry) {
+        eprintln!("flywheel: cannot save spawn registry: {e:#}");
+    }
 
     println!(
         "swarm ready: flywheel {} {} {}",
@@ -3483,6 +3499,83 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// bd-fw-name-binding-loss-7rc: reconcile the spawn registry (pane_id → name)
+/// against live panes. A pane whose agent restarted shows `name:null` (or a
+/// changed name) — this renames it back to its registered name so send /
+/// status / loop resolution works again.
+fn cmd_rebind(cfg: &Config, project: &str) -> Result<()> {
+    let backend = backend::multiplexer_backend(cfg)?;
+    let ws_id = find_workspace_dyn(&*backend, project)?;
+    let entries = state::load_spawn_registry(project);
+    if entries.is_empty() {
+        eprintln!(
+            "flywheel: no spawn registry for {project} — re-run `flywheel spawn {project}` to record pane→name bindings"
+        );
+        print_json(&json!({ "project": project, "rebound": 0, "registry": "empty" }));
+        return Ok(());
+    }
+    let agents = backend.agent_list()?;
+    let mut rebound: Vec<Value> = Vec::new();
+    let mut ok_count = 0usize;
+    let mut stale = 0usize;
+    for (pane_id, name) in &entries {
+        let Some(a) = agents
+            .iter()
+            .find(|a| a.pane_id == *pane_id && a.workspace_id == ws_id)
+        else {
+            stale += 1; // pane gone (respawned) — a fresh pane carries its name
+            continue;
+        };
+        if a.name.as_deref() == Some(name) {
+            ok_count += 1;
+            continue;
+        }
+        let was = a.name.clone().unwrap_or_else(|| "<null>".to_string());
+        if let Err(e) = backend.agent_rename(pane_id, Some(name)) {
+            eprintln!("flywheel: rebind {pane_id} → {name} failed: {e:#}");
+        } else {
+            rebound.push(json!({ "pane_id": pane_id, "was": was, "now": name }));
+        }
+    }
+    print_json(&json!({
+        "project": project,
+        "workspace_id": ws_id,
+        "ok": ok_count,
+        "rebound": rebound.len(),
+        "rebound_details": rebound,
+        "stale_entries": stale,
+    }));
+    Ok(())
+}
+
+/// bd-fw-name-binding-loss-7rc: restore a lost name binding from the spawn
+/// registry. Used by `__send` when a target name is not live: if the registry
+/// records a pane for that name and the pane still exists (agent restarted →
+/// name:null), rename it back and return true so the caller re-resolves.
+fn rebind_from_registry(
+    backend: &dyn backend::MultiplexerBackend,
+    project: &str,
+    name: &str,
+    ws_id: &str,
+) -> Result<bool> {
+    let entries = state::load_spawn_registry(project);
+    let Some((pane_id, _)) = entries.iter().find(|(_, n)| n == name) else {
+        return Ok(false);
+    };
+    let agents = backend.agent_list()?;
+    let Some(a) = agents
+        .iter()
+        .find(|a| a.pane_id == *pane_id && a.workspace_id == ws_id)
+    else {
+        return Ok(false); // pane gone (respawned) — normal resolution finds the new pane
+    };
+    if a.name.as_deref() == Some(name) {
+        return Ok(true);
+    }
+    backend.agent_rename(pane_id, Some(name))?;
+    Ok(true)
+}
+
 // ---- send ----
 
 #[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
@@ -3541,7 +3634,22 @@ fn cmd_send(
 
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
-    let targets = resolve_agents(&mut c, &ws_id, project, to)?;
+    let mut targets = resolve_agents(&mut c, &ws_id, project, to);
+    if targets.is_err() {
+        // bd-fw-name-binding-loss-7rc auto-heal: an agent that restarted in
+        // its pane lost its name binding — restore from the spawn registry
+        // (best-effort) and re-resolve before reporting the miss.
+        for tok in to.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let _ = rebind_from_registry(
+                &*backend::multiplexer_backend(cfg)?,
+                project,
+                tok,
+                &ws_id,
+            );
+        }
+        targets = resolve_agents(&mut c, &ws_id, project, to);
+    }
+    let targets = targets?;
 
     // bd-fw-send-bare-short-group: a bare short reaching the whole crew would
     // race one prompt across N agents (observed: 3 agents claimed the same
@@ -9306,11 +9414,22 @@ fn cmd_internal_send(
     // superlogical later) with byte-identical landing classification.
     let backend = backend::multiplexer_backend(cfg)?;
     let ws_id = find_workspace_dyn(&*backend, project)?;
-    let agent = backend
+    let mut agent = backend
         .agent_list()?
         .into_iter()
-        .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
-        .ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
+        .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name));
+    if agent.is_none() {
+        // bd-fw-name-binding-loss-7rc auto-heal: an agent that restarted in
+        // its pane lost its name binding (name:null) and name resolution
+        // misses — restore from the spawn registry, then re-resolve.
+        if rebind_from_registry(&*backend, project, name, &ws_id)? {
+            agent = backend
+                .agent_list()?
+                .into_iter()
+                .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name));
+        }
+    }
+    let agent = agent.ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
     let target = agent_target(&agent).to_string();
 
     // last-sent registry: record what was delivered (or attempted). Best-
