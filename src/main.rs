@@ -548,6 +548,41 @@ enum Commands {
         project: String,
         agent: String,
     },
+    /// internal: newest message id + author from a thread BY a sender
+    /// (bd-a7j reply verification — did the thread move after dispatch?)
+    #[command(name = "__check-reply", hide = true)]
+    __CheckReply {
+        project: String,
+        name: String,
+        thread: String,
+    },
+    /// internal: the project's expected-reply entries (checkpointed leaf —
+    /// collab may have written new ones while the loop runs)
+    #[command(name = "__expected-replies", hide = true)]
+    __ExpectedReplies { project: String },
+    /// internal: log ReplyMissing + dispatch the concrete reminder send
+    /// (one checkpointed leaf; the send itself recurses into __send)
+    #[command(name = "__remind-reply", hide = true)]
+    __RemindReply {
+        project: String,
+        name: String,
+        thread: String,
+        /// reminder ordinal (0 = first)
+        #[arg(long, default_value_t = 0)]
+        reminder_count: u32,
+        #[arg(long)]
+        invocation: Option<String>,
+        #[arg(long)]
+        iteration: Option<u64>,
+    },
+    /// internal: drop a satisfied expected-reply entry (checkpointed leaf so
+    /// the workflow body never writes files — bd-a7j)
+    #[command(name = "__reply-settled", hide = true)]
+    __ReplySettled {
+        project: String,
+        name: String,
+        thread: String,
+    },
     /// internal: spawn the swarm for a parsed `[xproj]` request (full loop branch)
     #[command(name = "__xproj-spawn", hide = true)]
     __XprojSpawn {
@@ -2136,6 +2171,41 @@ fn main() {
         Some(Commands::__MailDigest { project, agent }) => {
             cmd_internal_mail_digest(&cfg, project, agent)
         }
+        Some(Commands::__CheckReply {
+            project,
+            name,
+            thread,
+        }) => cmd_internal_check_reply(&cfg, project, name, thread),
+        Some(Commands::__ReplySettled {
+            project,
+            name,
+            thread,
+        }) => match state::remove_expected_reply(project, name, thread) {
+            Ok(()) => {
+                print_json(&json!({ "ok": true, "removed": { "agent": name, "thread": thread } }));
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
+        Some(Commands::__ExpectedReplies { project }) => {
+            print_json(&json!({ "entries": state::load_expected_replies(project) }));
+            Ok(())
+        }
+        Some(Commands::__RemindReply {
+            project,
+            name,
+            thread,
+            reminder_count,
+            invocation,
+            iteration,
+        }) => cmd_internal_remind_reply(
+            project,
+            name,
+            thread,
+            *reminder_count,
+            invocation.as_deref(),
+            *iteration,
+        ),
         Some(Commands::__XprojSpawn {
             project,
             message_id,
@@ -3003,7 +3073,7 @@ fn agent_mail_name(herdr_name: &str) -> String {
 /// through unchanged: it is either an already-valid identity (the mapping is
 /// idempotent for those) or a recipient the server will reject honestly.
 /// Pure — no registry round trips.
-fn resolve_mail_target(target: &str) -> String {
+pub(crate) fn resolve_mail_target(target: &str) -> String {
     if target.contains('-') {
         agent_mail_name(target)
     } else {
@@ -5132,6 +5202,26 @@ fn cmd_collab(
         .and_then(|i| i.as_str())
         .unwrap_or(&thread_id)
         .to_string();
+    // bd-a7j: record the reply expectation so a durable loop run verifies the
+    // thread actually moved after the agent settles (re-prompt + escalate on
+    // silence). Best-effort — a registry write failure must not lose the ask.
+    {
+        let mut entries = state::load_expected_replies(project);
+        let ts = crate::state::now_iso();
+        for t in &targets {
+            let agent = t.clone();
+            entries.retain(|e| e.agent != agent); // one outstanding ask per agent
+            entries.push(state::ExpectedReply {
+                agent,
+                thread: thread_id.clone(),
+                head: Some(msg_id.clone()),
+                created_ts: ts.clone(),
+            });
+        }
+        if let Err(e) = state::save_expected_replies(project, &entries) {
+            eprintln!("flywheel: cannot save expected-reply registry: {e:#}");
+        }
+    }
     eprintln!(
         "flywheel: asked {} (thread {thread_id}, msg {msg_id}); waiting up to {timeout_secs}s for the reply…",
         targets.join(", ")
@@ -9953,6 +10043,110 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
         "last_subject": last.and_then(|m| m.get("subject").and_then(|s| s.as_str())),
         "thread_id": last.and_then(|m| m.get("thread_id").and_then(|t| t.as_str())),
     }));
+    Ok(())
+}
+
+/// bd-a7j: newest (message id, sender) in a thread from a sender —
+/// recency-ranked, so `verify` = "did the thread move after dispatch?".
+///
+/// NOTE: the toron-core search sender filter currently binds a NAME against
+/// the `sender_pubkey` column (returns nothing), so the thread is fetched
+/// without the sender filter and filtered by sender client-side. The thread
+/// is small (a collab question + replies); recency rank keeps the newest.
+fn thread_head(
+    mail: &dyn backend::MailSurface,
+    key: &str,
+    thread: &str,
+    sender: &str,
+) -> Result<Option<(String, String)>> {
+    let items = backend::run_mail(mail.search(&backend::SearchQuery {
+        project: key.to_string(),
+        query: String::new(),
+        limit: Some(20),
+        thread_id: Some(thread.to_string()),
+        ranking: Some("recency".to_string()),
+        include_body_md: true,
+        ..Default::default()
+    }))?;
+    Ok(items
+        .iter()
+        .find(|m| m.sender == sender)
+        .map(|m| (m.id.to_string(), m.sender.clone())))
+}
+
+/// bd-a7j leaf: newest message id + author in `thread` BY `name` (or nulls).
+/// Soft — any mail failure prints nulls ("no reply yet"), mirroring the
+/// digest leaf's resilience: verification failures degrade, never abort.
+fn cmd_internal_check_reply(cfg: &Config, project: &str, name: &str, thread: &str) -> Result<()> {
+    let zero = json!({ "newest_id": null, "author": null });
+    let mail = match backend::mail_backend(cfg) {
+        Ok(m) => m,
+        Err(_) => {
+            print_json(&zero);
+            return Ok(());
+        }
+    };
+    let key = project_dir_str(cfg, project)?;
+    if backend::run_mail(mail.ensure_project(&key)).is_err() {
+        print_json(&zero);
+        return Ok(());
+    }
+    match thread_head(&*mail, &key, thread, &resolve_mail_target(name)) {
+        Ok(Some((id, author))) => print_json(&json!({ "newest_id": id, "author": author })),
+        _ => print_json(&zero),
+    }
+    Ok(())
+}
+
+/// bd-a7j leaf: log `reply_missing` (checkpointed) and dispatch the CONCRETE
+/// reminder by recursing into the `__send` path (same landing semantics,
+/// last-sent dedup, confirm handling). One leaf = one checkpointed unit, so
+/// crash-resume can neither double-log nor skip the reminder.
+fn cmd_internal_remind_reply(
+    project: &str,
+    name: &str,
+    thread: &str,
+    reminder_count: u32,
+    invocation: Option<&str>,
+    iteration: Option<u64>,
+) -> Result<()> {
+    log(
+        project,
+        EventKind::ReplyMissing,
+        json!({
+            "agent": name,
+            "thread": thread,
+            "reminder": reminder_count + 1,
+        }),
+    );
+    // concrete reminder (the MAIL WAKE lesson: vague prompts get
+    // acknowledged in chat, not acted on — name the thread and the command).
+    let reminder = format!(
+        "REMINDER: your reply is still missing in thread {thread} — send it now via: flywheel mail reply {project} --message-id {thread} --body [your reply] (do not just acknowledge; the orchestrator verifies the thread moved)"
+    );
+    // recurse into the __send path so the reminder gets identical landing
+    // semantics + resume-dedup as any other dispatch.
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("__send").arg(project).arg(name).arg(&reminder);
+    cmd.arg("--confirm");
+    if let Some(inv) = invocation {
+        cmd.arg("--invocation").arg(inv);
+        if let Some(it) = iteration {
+            cmd.arg("--iteration").arg(it.to_string());
+        }
+    }
+    let out = cmd.output()?;
+    if !out.status.success() {
+        bail!(
+            "__remind-reply: __send failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(raw.trim())
+        .map_err(|e| anyhow!("__remind-reply: bad __send JSON: {e}: {raw}"))?;
+    print_json(&v);
     Ok(())
 }
 

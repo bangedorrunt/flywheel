@@ -241,6 +241,113 @@ pub fn send_prompt_argv(args: &SendArgs) -> Vec<String> {
     argv
 }
 
+/// bd-a7j: one in-flight reply expectation the workflow is verifying.
+/// Workflow-local + rebuilt from the checkpointed `load_expected_replies`
+/// leaf each iteration, so replay reproduces the same decisions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpectedReplyRun {
+    pub thread: String,
+    /// message id of the question (the reply must differ from it)
+    pub head: Option<String>,
+    /// 0 = not reminded yet, 1 = reminded once (next silence escalates)
+    pub reminder_count: u32,
+}
+
+/// bd-a7j: pure decision — did the asked thread move after dispatch?
+/// `newest_id`/`author` come from the checkpointed check-reply leaf; `head`
+/// is the question's message id. A reply satisfies iff it is a NEW message
+/// from the asked agent; silence after one reminder escalates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyVerdict {
+    Satisfied,
+    Reminded,
+    Escalate,
+}
+
+pub fn verify_reply(
+    head: Option<&str>,
+    newest_id: Option<&str>,
+    author: Option<&str>,
+    agent: &str,
+    reminder_count: u32,
+) -> ReplyVerdict {
+    match (newest_id, author) {
+        // a new message (≠ the question) from the asked agent = moved
+        (Some(nid), Some(auth)) if auth == agent && Some(nid) != head => ReplyVerdict::Satisfied,
+        _ if reminder_count == 0 => ReplyVerdict::Reminded,
+        _ => ReplyVerdict::Escalate,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpectedArgs {
+    pub project: String,
+}
+
+pub fn load_expected_replies_argv(args: &ExpectedArgs) -> Vec<String> {
+    vec!["__expected-replies".to_string(), args.project.clone()]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckReplyArgs {
+    pub project: String,
+    pub name: String,
+    pub thread: String,
+}
+
+pub fn check_reply_argv(args: &CheckReplyArgs) -> Vec<String> {
+    vec![
+        "__check-reply".to_string(),
+        args.project.clone(),
+        args.name.clone(),
+        args.thread.clone(),
+    ]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemindArgs {
+    pub project: String,
+    pub name: String,
+    pub thread: String,
+    pub reminder_count: u32,
+    pub invocation: String,
+    pub iteration: u64,
+}
+
+pub fn remind_reply_argv(args: &RemindArgs) -> Vec<String> {
+    let mut argv = vec![
+        "__remind-reply".to_string(),
+        args.project.clone(),
+        args.name.clone(),
+        args.thread.clone(),
+        "--reminder-count".to_string(),
+        args.reminder_count.to_string(),
+    ];
+    if !args.invocation.is_empty() {
+        argv.push("--invocation".to_string());
+        argv.push(args.invocation.clone());
+        argv.push("--iteration".to_string());
+        argv.push(args.iteration.to_string());
+    }
+    argv
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplySettledArgs {
+    pub project: String,
+    pub name: String,
+    pub thread: String,
+}
+
+pub fn reply_settled_argv(args: &ReplySettledArgs) -> Vec<String> {
+    vec![
+        "__reply-settled".to_string(),
+        args.project.clone(),
+        args.name.clone(),
+        args.thread.clone(),
+    ]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotifyArgs {
     pub project: String,
@@ -1018,6 +1125,92 @@ fn escalate_and_persist(
 /// first_blocked_ts → same tier, and the `last_ping_tier` marker (cg6.3)
 /// suppresses the duplicate mail: at most one ping per logical tier
 /// transition.
+/// bd-a7j leaf: reload the project's expected-reply entries through a
+/// checkpointed subprocess (collab may have written new ones mid-run).
+#[function]
+async fn load_expected_replies(args: ExpectedArgs) -> Result<Vec<crate::state::ExpectedReply>> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(load_expected_replies_argv(&args));
+    let out = run_leaf_cmd(cmd, "__expected-replies").await?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__expected-replies failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(raw.trim())
+        .map_err(|e| map_err(anyhow::anyhow!("__expected-replies bad JSON: {e}: {raw}")))?;
+    Ok(v.get("entries")
+        .and_then(|e| serde_json::from_value(e.clone()).ok())
+        .unwrap_or_default())
+}
+
+/// bd-a7j leaf: newest (message id, author) in the thread from the asked
+/// agent. Checkpointed — replay sees the same head, so reminder/escalation
+/// decisions reproduce exactly.
+#[function]
+async fn check_reply(args: CheckReplyArgs) -> Result<(Option<String>, Option<String>)> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(check_reply_argv(&args));
+    let out = run_leaf_cmd(cmd, "__check-reply").await?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__check-reply failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(raw.trim())
+        .map_err(|e| map_err(anyhow::anyhow!("__check-reply bad JSON: {e}: {raw}")))?;
+    Ok((
+        v.get("newest_id").and_then(serde_json::Value::as_str).map(String::from),
+        v.get("author").and_then(serde_json::Value::as_str).map(String::from),
+    ))
+}
+
+/// bd-a7j leaf: log `reply_missing` + dispatch the concrete reminder
+/// (checkpointed unit — the event and the send land together or not at all;
+/// the send recurses into `__send` with the loop invocation, so the last-sent
+/// registry dedups re-fires on crash-resume).
+#[function]
+async fn remind_reply(args: RemindArgs) -> Result<SendOutcome> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(remind_reply_argv(&args));
+    let out = run_leaf_cmd(cmd, "__remind-reply").await?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__remind-reply failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let outcome: SendOutcome = serde_json::from_str(raw.trim())
+        .map_err(|e| map_err(anyhow::anyhow!("__remind-reply bad JSON: {e}: {raw}")))?;
+    Ok(outcome)
+}
+
+/// bd-a7j leaf: drop a satisfied (agent, thread) expectation so it stops
+/// keeping the loop alive. Checkpointed — the workflow body never writes
+/// files (cg6.1 discipline).
+#[function]
+async fn reply_settled(args: ReplySettledArgs) -> Result<()> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(reply_settled_argv(&args));
+    let out = run_leaf_cmd(cmd, "__reply-settled").await?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__reply-settled failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 #[function]
 async fn notify_blocked(args: NotifyArgs) -> Result<EscalationOutcome> {
     let (tier, ping_count, should_mail) = escalate_and_persist(
@@ -1932,6 +2125,11 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         std::collections::HashMap::new();
     // pane_exited names observed this iteration (event path feeds heal step)
     let mut exited_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // bd-a7j: outstanding expected replies (agent → thread/head/reminder).
+    // Rebuilt each iteration from the checkpointed load_expected_replies
+    // leaf; only ever mutated in-run (never written to files by the body).
+    let mut expected_replies: std::collections::HashMap<String, ExpectedReplyRun> =
+        std::collections::HashMap::new();
     // best-effort in-run event cursor (bd-event-subscribe-reactor). NOT used
     // for crash recovery — heartbeat __poll is the floor. Survives within a
     // single workflow run via local state; loops.json event_cursor is optional.
@@ -2322,6 +2520,143 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             ));
         }
 
+        // ---- bd-a7j: reply verification --------------------------------
+        // A dispatched ask (collab question) carries an expected reply;
+        // once the agent settles (idle/done) verify the thread actually
+        // moved. Silent → one concrete reminder, then the blocked-escalation
+        // path (T0-T3). Everything here runs through checkpointed leaves —
+        // replay reproduces identical verdicts and the reminder is deduped
+        // by the last-sent registry (same invocation + text).
+        let expected_entries = match ctx
+            .run(
+                load_expected_replies,
+                ExpectedArgs {
+                    project: params.project.clone(),
+                },
+            )
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("flywheel: expected-replies leaf failed (continuing): {e}");
+                vec![]
+            }
+        };
+        // reconcile workflow-local state with the (possibly updated) file:
+        // keep reminder counts for unchanged expectations, reset for new
+        // questions (a fresh collab ask starts a fresh reminder budget).
+        let mut next_expected: std::collections::HashMap<String, ExpectedReplyRun> =
+            std::collections::HashMap::new();
+        for e in expected_entries {
+            let run = expected_replies.get(&e.agent).cloned().unwrap_or(ExpectedReplyRun {
+                thread: e.thread.clone(),
+                head: e.head.clone(),
+                reminder_count: 0,
+            });
+            let run = if run.thread == e.thread {
+                run
+            } else {
+                ExpectedReplyRun {
+                    thread: e.thread.clone(),
+                    head: e.head.clone(),
+                    reminder_count: 0,
+                }
+            };
+            next_expected.insert(e.agent.clone(), run);
+        }
+        expected_replies = next_expected;
+
+        let mut satisfied_names: Vec<String> = Vec::new();
+        let mut escalate_names: Vec<String> = Vec::new();
+        for (agent, exp) in expected_replies.iter_mut() {
+            // The file stores the MAIL identity (collab resolved it); the
+            // swarm states use herdr names — map one to the other so the
+            // settle check, the thread check, and the reminder target agree.
+            let herdr_name = states
+                .iter()
+                .find(|s| {
+                    s.name == *agent || crate::resolve_mail_target(&s.name) == *agent
+                })
+                .map(|s| s.name.clone());
+            let Some(herdr_name) = herdr_name else {
+                continue; // agent not in this swarm (or expectation stale)
+            };
+            if dispatch_pending.contains(&herdr_name) {
+                continue; // just dispatched this iteration — give it time
+            }
+            let settled = states.iter().any(|s| {
+                s.name == herdr_name && matches!(s.status.as_str(), "idle" | "done")
+            });
+            if !settled {
+                continue; // working/blocked/unknown — not settled yet
+            }
+            let (newest_id, author) = match ctx
+                .run(
+                    check_reply,
+                    CheckReplyArgs {
+                        project: params.project.clone(),
+                        name: herdr_name.clone(),
+                        thread: exp.thread.clone(),
+                    },
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("flywheel: check-reply leaf failed for {agent} (continuing): {e}");
+                    (None, None)
+                }
+            };
+            match verify_reply(
+                exp.head.as_deref(),
+                newest_id.as_deref(),
+                author.as_deref(),
+                &herdr_name,
+                exp.reminder_count,
+            ) {
+                ReplyVerdict::Satisfied => {
+                    eprintln!(
+                        "flywheel: reply verified for {agent} in thread {}",
+                        exp.thread
+                    );
+                    satisfied_names.push(agent.clone());
+                }
+                ReplyVerdict::Reminded => {
+                    let _ = ctx
+                        .run(
+                            remind_reply,
+                            RemindArgs {
+                                project: params.project.clone(),
+                                name: herdr_name.clone(),
+                                thread: exp.thread.clone(),
+                                reminder_count: exp.reminder_count,
+                                invocation: params.invocation.clone(),
+                                iteration,
+                            },
+                        )
+                        .await; // leaf logs ReplyMissing + sends; errors logged inside
+                    exp.reminder_count = 1;
+                }
+                ReplyVerdict::Escalate => {
+                    // hand the silent agent to the existing blocked-escalation
+                    // path (notify_blocked → T0-T3) — a missing reply is a
+                    // form of block.
+                    escalate_names.push(herdr_name.clone());
+                }
+            }
+        }
+        expected_replies.retain(|a, _| !satisfied_names.contains(a));
+        if !escalate_names.is_empty() {
+            eprintln!(
+                "flywheel: reply still missing after reminder for {} — escalating",
+                escalate_names.join(", ")
+            );
+            for n in &escalate_names {
+                blocked_names.push(n.clone());
+                actions.push(LoopAction::Blocked { name: n.clone() });
+            }
+        }
+
         let mut any_work = false;
         for action in &actions {
             match action {
@@ -2625,7 +2960,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // loop would declare "complete" while the swarm is mid-work.
         let all_settled = all_settled(&states);
 
-        if queue.is_empty() && all_settled && !any_work && inprogress_empty {
+        if queue.is_empty()
+            && all_settled
+            && !any_work
+            && inprogress_empty
+            && expected_replies.is_empty()
+        {
             return Ok("complete".to_string());
         }
 
@@ -2680,8 +3020,17 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     let url = cfg
         .resonate_url()
         .unwrap_or_else(|| "http://localhost:8001".to_string());
+    // bd-fw-durable-worker-errors-65a: a worker polls its GROUP anycast —
+    // the default group accumulates STALE pending invocations (killed runs
+    // from previous days), and a fresh worker would execute every one of
+    // them: replaying their checkpointed children against the CURRENT leaf
+    // sequence causes child-id collisions (one leaf reads another's stored
+    // result → serialization errors) and cross-project dispatch. A
+    // per-project group scopes the worker to its own task.
+    let base = params.project.rsplit('/').next().unwrap_or(&params.project);
     let resonate = Resonate::new(ResonateConfig {
         url: Some(url.clone()),
+        group: Some(format!("flywheel-{base}")),
         ..Default::default()
     });
 
@@ -2721,6 +3070,18 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     resonate
         .register(poll_inprogress)
         .map_err(|e| anyhow::anyhow!("register poll_inprogress: {e}"))?;
+    resonate
+        .register(load_expected_replies)
+        .map_err(|e| anyhow::anyhow!("register load_expected_replies: {e}"))?;
+    resonate
+        .register(check_reply)
+        .map_err(|e| anyhow::anyhow!("register check_reply: {e}"))?;
+    resonate
+        .register(remind_reply)
+        .map_err(|e| anyhow::anyhow!("register remind_reply: {e}"))?;
+    resonate
+        .register(reply_settled)
+        .map_err(|e| anyhow::anyhow!("register reply_settled: {e}"))?;
     resonate
         .register(read_output)
         .map_err(|e| anyhow::anyhow!("register read_output: {e}"))?;
@@ -2817,6 +3178,112 @@ pub async fn loop_status(cfg: &Config, project: &str) -> anyhow::Result<serde_js
         "state": format!("{:?}", rec.state),
         "value": rec.value,
     }))
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod reply_verify_tests {
+    use super::*;
+
+    fn v(
+        head: Option<&str>,
+        newest: Option<&str>,
+        author: Option<&str>,
+        agent: &str,
+        reminded: u32,
+    ) -> ReplyVerdict {
+        verify_reply(head, newest, author, agent, reminded)
+    }
+
+    /// bd-a7j: a NEW message from the asked agent satisfies the expectation —
+    /// even when the head (question id) was never recorded.
+    #[test]
+    fn new_message_from_agent_satisfies() {
+        assert!(matches!(
+            v(Some("q1"), Some("r1"), Some("oc"), "oc", 0),
+            ReplyVerdict::Satisfied
+        ));
+        match v(None, Some("r1"), Some("oc"), "oc", 3) {
+            ReplyVerdict::Satisfied => {}
+            other => panic!("any agent message satisfies when head is unknown: {other:?}"),
+        }
+    }
+
+    /// bd-a7j: the question itself (same id) does NOT satisfy — that is the
+    /// captain's own message, not a reply.
+    #[test]
+    fn question_itself_does_not_satisfy() {
+        assert!(matches!(
+            v(Some("q1"), Some("q1"), Some("oc"), "oc", 0),
+            ReplyVerdict::Reminded
+        ));
+    }
+
+    /// bd-a7j: another agent's message does not satisfy (wrong sender).
+    #[test]
+    fn other_agents_message_does_not_satisfy() {
+        assert!(matches!(
+            v(Some("q1"), Some("r1"), Some("pi"), "oc", 0),
+            ReplyVerdict::Reminded
+        ));
+    }
+
+    /// bd-a7j: silence → first remind, second silence escalates.
+    #[test]
+    fn silence_reminds_once_then_escalates() {
+        assert!(matches!(
+            v(Some("q1"), None, None, "oc", 0),
+            ReplyVerdict::Reminded
+        ));
+        assert!(matches!(
+            v(Some("q1"), None, None, "oc", 1),
+            ReplyVerdict::Escalate
+        ));
+        match v(Some("q1"), Some("r1"), Some("pi"), "oc", 1) {
+            ReplyVerdict::Escalate => {}
+            other => panic!("escalation fires when reminded once and still wrong: {other:?}"),
+        }
+    }
+
+    /// bd-a7j: argv builders round-trip the leaf contract.
+    #[test]
+    fn reply_leaf_argv_roundtrips() {
+        let ra = RemindArgs {
+            project: "proj".into(),
+            name: "oc".into(),
+            thread: "t1".into(),
+            reminder_count: 0,
+            invocation: "inv".into(),
+            iteration: 7,
+        };
+        let argv = remind_reply_argv(&ra);
+        assert_eq!(
+            argv,
+            vec![
+                "__remind-reply", "proj", "oc", "t1", "--reminder-count", "0",
+                "--invocation", "inv", "--iteration", "7"
+            ]
+        );
+        let ca = CheckReplyArgs {
+            project: "proj".into(),
+            name: "oc".into(),
+            thread: "t1".into(),
+        };
+        assert_eq!(
+            check_reply_argv(&ca),
+            vec!["__check-reply", "proj", "oc", "t1"]
+        );
+        let ea = ExpectedArgs {
+            project: "proj".into(),
+        };
+        assert_eq!(load_expected_replies_argv(&ea), vec!["__expected-replies", "proj"]);
+        let sa = ReplySettledArgs {
+            project: "proj".into(),
+            name: "oc".into(),
+            thread: "t1".into(),
+        };
+        assert_eq!(reply_settled_argv(&sa), vec!["__reply-settled", "proj", "oc", "t1"]);
+    }
 }
 
 #[cfg(test)]
