@@ -1446,6 +1446,18 @@ enum SquadCmd {
 /// auto-proposer here (P11.3b).
 #[derive(Subcommand)]
 enum CoalitionCmd {
+    /// Register an agent identity in the coalition's toron project (members
+    /// must be registered before `form`; profiles are not agents).
+    Register {
+        /// agent name (key name in the project's agents dir)
+        name: String,
+        /// toron project slug (default: toron)
+        #[arg(long, default_value = "toron")]
+        project: String,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
     /// Form a captain-led coalition around a goal workflow: lint gate, start
     /// the goal run, create the NIP-29 channel, write the manifest.
     Form {
@@ -1463,6 +1475,10 @@ enum CoalitionCmd {
         /// bead ids tracked for the beads-closed disband gate (comma list)
         #[arg(long)]
         beads: Option<String>,
+        /// the repo whose .beads holds the tracked beads (br resolves its
+        /// workspace from cwd; default: none — probe from the current dir)
+        #[arg(long)]
+        tracker: Option<String>,
         /// JSON output for agent drivers
         #[arg(long)]
         json: bool,
@@ -1634,6 +1650,10 @@ enum CoalitionCmd {
         beads_closed: bool,
         #[arg(long)]
         reason: Option<String>,
+        /// override the tracker repo recorded at form (br cwd for the
+        /// beads-closed probe)
+        #[arg(long)]
+        tracker: Option<String>,
         /// toron project slug (default: toron)
         #[arg(long, default_value = "toron")]
         project: String,
@@ -8495,12 +8515,23 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
     }
 
     match cmd {
+        CoalitionCmd::Register { name, project, json } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            store.register_agent(name)?;
+            if *json {
+                print_json(&json!({ "registered": name, "project": project }));
+            } else {
+                println!("registered agent {name} in project {project}");
+            }
+            Ok(())
+        }
         CoalitionCmd::Form {
             goal,
             crews,
             as_agent,
             project,
             beads,
+            tracker,
             json,
         } => {
             let members = squad_members(crews)?;
@@ -8515,7 +8546,7 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                 })
                 .unwrap_or_default();
             let store = CoalitionStore::open(project, coalitions_root())?;
-            let m = store.form(goal, as_agent, &members, &beads)?;
+            let m = store.form(goal, as_agent, &members, &beads, tracker.as_deref())?;
             if *json {
                 print_json(&serde_json::to_value(&m)?);
             } else {
@@ -8724,11 +8755,12 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
             id,
             beads_closed,
             reason,
+            tracker,
             project,
             json,
         } => {
             let store = CoalitionStore::open(project, coalitions_root())?;
-            store.disband(id, *beads_closed, reason.as_deref())?;
+            store.disband(id, *beads_closed, reason.as_deref(), tracker.as_deref())?;
             if *json {
                 print_json(&json!({ "disbanded": id }));
             } else {
