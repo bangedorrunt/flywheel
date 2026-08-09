@@ -3119,9 +3119,12 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
             al.id
         }
         _ => {
+            // The invocation id must be path-safe: an ABSOLUTE project path
+            // contains slashes that break the promise id on the server —
+            // use the project base (last path segment) instead.
+            let id_project = params.project.rsplit('/').next().unwrap_or(&params.project);
             let fresh = format!(
-                "swarm-loop:{}:{}",
-                params.project,
+                "swarm-loop:{id_project}:{}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())

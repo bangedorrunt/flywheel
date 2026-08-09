@@ -162,8 +162,23 @@ pub fn loops_dir() -> PathBuf {
     state_dir().join("loops")
 }
 
+/// Filesystem-safe state key for a project. Relative project names are used
+/// verbatim (all existing state files keep their names); ABSOLUTE paths
+/// (mktemp-style scratch projects) would collapse every per-project sidecar
+/// onto `<abs-path>.json` (PathBuf::join discards the base) — they get a
+/// slug: base name + short hash of the full path (unique per project).
+pub fn state_key(project: &str) -> String {
+    if project.contains('/') {
+        let base = project.rsplit('/').next().unwrap_or(project);
+        let h = fnv1a64(project);
+        format!("{base}-{:08x}", (h & 0xffff_ffff) as u32)
+    } else {
+        project.to_string()
+    }
+}
+
 fn sidecar_file(project: &str) -> PathBuf {
-    loops_dir().join(format!("{project}.json"))
+    loops_dir().join(format!("{}.json", state_key(project)))
 }
 
 /// Directory of the per-project spawn registry (pane_id → agent name).
@@ -176,7 +191,7 @@ pub fn agents_dir() -> PathBuf {
 }
 
 pub fn spawn_registry_file(project: &str) -> PathBuf {
-    agents_dir().join(format!("{project}.json"))
+    agents_dir().join(format!("{}.json", state_key(project)))
 }
 
 /// One spawn-registry record: (pane_id, agent name).
@@ -186,7 +201,7 @@ pub type SpawnEntry = (String, String);
 /// `--label` was used, so project-based discovery (find_workspace) still
 /// resolves the swarm after a custom-label spawn.
 pub fn spawn_meta_file(project: &str) -> PathBuf {
-    agents_dir().join(format!("{project}.meta.json"))
+    agents_dir().join(format!("{}.meta.json", state_key(project)))
 }
 
 /// Persist the custom label for a project (best-effort; spawn succeeds even
@@ -234,7 +249,7 @@ pub fn expected_replies_dir() -> PathBuf {
 }
 
 pub fn expected_reply_file(project: &str) -> PathBuf {
-    expected_replies_dir().join(format!("{project}.json"))
+    expected_replies_dir().join(format!("{}.json", state_key(project)))
 }
 
 /// Atomically replace the project's expected-reply set (collab writes the
@@ -524,7 +539,7 @@ pub fn remove_active_loop(project: &str) -> Result<()> {
 /// message_id per line. The `spawn_xproj` leaf marks BEFORE spawning so a
 /// crash-window replay no-ops instead of spawning two swarms for one request.
 pub fn xproj_seen_file(project: &str) -> PathBuf {
-    state_dir().join(format!("{project}.xproj-seen.jsonl"))
+    state_dir().join(format!("{}.xproj-seen.jsonl", state_key(project)))
 }
 
 /// True when `message_id` was already marked (at-most-once dedup).
@@ -576,7 +591,7 @@ pub fn project_log_path(project: &str) -> PathBuf {
 }
 
 pub fn project_checkpoint_dir(project: &str) -> PathBuf {
-    state_dir().join("checkpoints").join(project)
+    state_dir().join("checkpoints").join(state_key(project))
 }
 
 // ---- last-sent registry (bd-last-sent-registry) ----
@@ -618,7 +633,7 @@ pub const LAST_SENT_CAP: usize = 50;
 pub fn last_sent_file(project: &str) -> PathBuf {
     state_dir()
         .join("last_sent")
-        .join(format!("{project}.json"))
+        .join(format!("{}.json", state_key(project)))
 }
 
 /// Load the project's sent records. Missing or corrupt files yield an empty
@@ -1716,6 +1731,21 @@ mod loops_sidecar_tests {
         assert_eq!(load_active_loop("l4s1-no-such-project").unwrap(), None);
         remove_active_loop(&p1).unwrap();
         remove_active_loop(&p2).unwrap();
+    }
+
+    /// Absolute project paths must not collapse the per-project sidecars
+    /// onto <abs-path>.json — state_key slugs them; relative names pass
+    /// through verbatim (existing state files keep their names).
+    #[test]
+    fn state_key_slugs_absolute_paths_keeps_relative() {
+        assert_eq!(state_key("toron"), "toron");
+        assert_eq!(state_key("verify2"), "verify2");
+        let a = state_key("/var/folders/x/tmp/proj-a");
+        assert!(a.starts_with("proj-a-"), "{a}");
+        assert!(!a.contains('/'), "slug must be path-safe: {a}");
+        let b = state_key("/var/folders/y/tmp/proj-a");
+        assert_ne!(a, b, "same base, different path -> different keys");
+        assert_eq!(state_key("/var/folders/x/tmp/proj-a"), a, "deterministic");
     }
 
     /// bd-a7j: the expected-reply registry round-trips; remove drops only
