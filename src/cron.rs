@@ -27,6 +27,11 @@ pub struct CronEntry {
     pub cron: String,
     /// owning profile (Spec 3: the fixer's identity)
     pub owner: String,
+    /// execution mode (P10.4): headless = the __run-headless subprocess
+    /// runner (autonomous/cron; no workspace churn); pane = the P10.3 pane
+    /// runner (interactive; not yet wired — records until P10.3 lands).
+    #[serde(default)]
+    pub mode: CronMode,
     /// signing scope: host = operator identity, project = scoped agent
     #[serde(default)]
     pub scope: CronScope,
@@ -37,6 +42,19 @@ pub struct CronEntry {
     /// RFC3339 creation stamp
     #[serde(default)]
     pub created_at: String,
+}
+
+/// How a cron's workflow executes each tick (ADR-0010 Spec E).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CronMode {
+    /// Autonomous: steps dispatch through the `__run-headless` subprocess
+    /// and log to `runs/<run_id>.jsonl` — no herdr pane, no workspace churn.
+    #[default]
+    Headless,
+    /// Interactive: the P10.3 pane runner (crew dispatch). Until P10.3
+    /// lands this is the recording runner (entry preserved, nothing real).
+    Pane,
 }
 
 fn default_enabled() -> bool {
@@ -147,6 +165,7 @@ pub fn merged_entries(
                     template: name.clone(),
                     cron: cron.clone(),
                     owner: owner.clone().unwrap_or_default(),
+                    mode: CronMode::Headless,
                     scope: *scope,
                     enabled: true,
                     created_at: String::new(),
@@ -264,6 +283,10 @@ pub fn row_json(mc: &MergedCron, status: &str, next_due_ts: Option<i64>) -> Valu
         },
         "source": mc.source,
         "enabled": mc.entry.enabled,
+        "mode": match mc.entry.mode {
+            CronMode::Headless => "headless",
+            CronMode::Pane => "pane",
+        },
         "status": status,
         "next_due": next_due_ts,
     })
@@ -421,42 +444,71 @@ impl RegistryCronManager {
 /// an unreachable/erroring probe returns `Err` so a step with
 /// `on_error: fail_run` FAILS the run (the health-gate contract — a dead
 /// service is a failure, not a branch case).
-pub fn cron_runner() -> toron_workflow::ActionRunner {
+/// The per-cron action runner (P10.4): the mode decides how a tick's
+/// workflow dispatches.
+///
+/// - `Headless` → the P10.1 headless runner: dispatch/spawn steps shell out
+///   to the `__run-headless` leaf (role-conditioned, registry-injected
+///   model) and log to `runs/<run_id>.jsonl` with the cron name attributed.
+/// - `Pane` → the recording runner (webhook probes + recorded actions).
+///   The P10.3 pane runner replaces this when it lands.
+///
+/// The runner closes over the cron entry because the engine's
+/// [`toron_workflow::ActionRunner`] receives only the action — cron context
+/// cannot flow through the engine. `start_loops` therefore builds one engine
+/// per cron.
+pub fn cron_runner(entry: &CronEntry) -> toron_workflow::ActionRunner {
     use toron_workflow::schema::Action;
-    std::sync::Arc::new(|a: &Action| match a {
-        Action::CallWebhook { url, method, body } => {
-            let method = method.as_deref().unwrap_or("GET").to_ascii_uppercase();
-            let agent = ureq::AgentBuilder::new()
-                .timeout(std::time::Duration::from_secs(5))
-                .build();
-            let resp = match method.as_str() {
-                "POST" => {
-                    let b = body
-                        .as_deref()
-                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                        .unwrap_or(Value::Null);
-                    agent.post(url).send_json(b)
+    match entry.mode {
+        CronMode::Pane => {
+            // Recording runner (the pre-P10.4 behavior): webhook probes hit
+            // the network, everything else records. P10.3 swaps this for the
+            // pane dispatch.
+            std::sync::Arc::new(|a: &Action| match a {
+                Action::CallWebhook { url, method, body } => {
+                    let method = method.as_deref().unwrap_or("GET").to_ascii_uppercase();
+                    let agent = ureq::AgentBuilder::new()
+                        .timeout(std::time::Duration::from_secs(5))
+                        .build();
+                    let resp = match method.as_str() {
+                        "POST" => {
+                            let b = body
+                                .as_deref()
+                                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                                .unwrap_or(Value::Null);
+                            agent.post(url).send_json(b)
+                        }
+                        "PUT" => {
+                            let b = body
+                                .as_deref()
+                                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                                .unwrap_or(Value::Null);
+                            agent.put(url).send_json(b)
+                        }
+                        "DELETE" => agent.delete(url).call(),
+                        _ => agent.get(url).call(),
+                    };
+                    match resp {
+                        Ok(r) => {
+                            let status = r.status();
+                            Ok(json!({ "ok": (200..300).contains(&status), "status": status }))
+                        }
+                        Err(e) => Err(anyhow!("probe failed: {e}")),
+                    }
                 }
-                "PUT" => {
-                    let b = body
-                        .as_deref()
-                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                        .unwrap_or(Value::Null);
-                    agent.put(url).send_json(b)
-                }
-                "DELETE" => agent.delete(url).call(),
-                _ => agent.get(url).call(),
-            };
-            match resp {
-                Ok(r) => {
-                    let status = r.status();
-                    Ok(json!({ "ok": (200..300).contains(&status), "status": status }))
-                }
-                Err(e) => Err(anyhow!("probe failed: {e}")),
-            }
+                other => Ok(json!({ "action": other.type_name(), "ok": true })),
+            })
         }
-        other => Ok(json!({ "action": other.type_name(), "ok": true })),
-    })
+        CronMode::Headless => {
+            let catalog = crate::profile::ProfileCatalog::load().unwrap_or_default();
+            let name = entry.name.clone();
+            let template = entry.template.clone();
+            let inputs = Value::Null;
+            std::sync::Arc::new(move |a: &Action| {
+                crate::headless_dispatch(&catalog, &template, &inputs, Some(&name), a)
+            })
+        }
+    }
 }
 
 /// Create a failure bead via `br create` (the `on_failure: bead` side effect,
@@ -539,48 +591,68 @@ pub async fn start_loops() -> Result<()> {
     if registrations.is_empty() {
         bail!("no enabled crons registered (flywheel cron add/list)");
     }
-    let engine = std::sync::Arc::new(
-        toron_workflow::WorkflowEngine::local(cron_runner()).map_err(|e| anyhow!("engine: {e}"))?,
-    );
 
-    let registry: toron_workflow::CronRegistry = {
-        let regs = registrations.clone();
-        std::sync::Arc::new(move || regs.clone())
-    };
-    let cron_mgr = CronManager::new(engine.clone(), registry)?;
-    cron_mgr.start().await?;
+    // One engine + manager PER cron (P10.4): the ActionRunner receives only
+    // the action, so the per-cron mode/name must be closed over at engine
+    // construction. Each engine's runner dispatches headless (or records for
+    // pane-mode crons); the durable loop id `cron:{name}` is unchanged.
+    let mut drain_tasks = Vec::new();
+    for reg in registrations.iter().filter(|r| r.enabled) {
+        let entry = manager
+            .show(&reg.name)?
+            .map(|m| m.entry)
+            .ok_or_else(|| anyhow!("cron {:?} vanished between load and start", reg.name))?;
+        let engine = std::sync::Arc::new(
+            toron_workflow::WorkflowEngine::local(cron_runner(&entry))
+                .map_err(|e| anyhow!("engine for cron {}: {e}", reg.name))?,
+        );
 
-    // Drain the policy sink: execute the embedding side effects (br create
-    // bead for `on_failure: bead`; escalate is logged — DM wiring is a
-    // follow-up). Runs until Ctrl-C.
-    let sink = engine.policy_sink().clone();
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let drained: Vec<toron_workflow::PolicyEvent> = {
-            let mut guard = sink.lock().await;
-            std::mem::take(&mut *guard)
-        };
-        for ev in drained {
-            match ev.action {
-                toron_workflow::schema::FailureAction::Bead => {
-                    match spawn_failure_bead(&ev.bundle) {
-                        Ok(id) => eprintln!(
-                            "cron {}({}): failure -> bead {id} ({}#{})",
-                            ev.cron, ev.tick, ev.bundle.workflow, ev.bundle.consecutive
-                        ),
-                        Err(e) => eprintln!(
-                            "cron {}({}): bead side-effect failed: {e}",
+        let cron_mgr = CronManager::new(engine.clone(), {
+            let regs = registrations.clone();
+            let name = reg.name.clone();
+            std::sync::Arc::new(move || {
+                regs.iter().filter(|&r| r.name == name).cloned().collect()
+            })
+        })?;
+        let sink = engine.policy_sink().clone();
+        drain_tasks.push(tokio::spawn(async move {
+            let _ = cron_mgr.start().await;
+            // Drain the policy sink for THIS cron's engine (bead side-effect
+            // for `on_failure: bead`). Runs until Ctrl-C.
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let drained: Vec<toron_workflow::PolicyEvent> = {
+                    let mut guard = sink.lock().await;
+                    std::mem::take(&mut *guard)
+                };
+                for ev in drained {
+                    match ev.action {
+                        toron_workflow::schema::FailureAction::Bead => {
+                            match spawn_failure_bead(&ev.bundle) {
+                                Ok(id) => eprintln!(
+                                    "cron {}({}): failure -> bead {id} ({}#{})",
+                                    ev.cron, ev.tick, ev.bundle.workflow, ev.bundle.consecutive
+                                ),
+                                Err(e) => eprintln!(
+                                    "cron {}({}): bead side-effect failed: {e}",
+                                    ev.cron, ev.tick
+                                ),
+                            }
+                        }
+                        other => eprintln!(
+                            "cron {}({}): policy action {other:?} (side-effect not wired)",
                             ev.cron, ev.tick
                         ),
                     }
                 }
-                other => eprintln!(
-                    "cron {}({}): policy action {other:?} (side-effect not wired)",
-                    ev.cron, ev.tick
-                ),
             }
-        }
+        }));
     }
+
+    for h in drain_tasks {
+        let _ = h.await;
+    }
+    Ok(())
 }
 
 impl CronManager for RegistryCronManager {
@@ -725,6 +797,21 @@ fn cron_history(name: &str) -> Vec<CronRun> {
             });
         }
     }
+    // P10.4: headless runs land in `runs/<run_id>.jsonl` (the __run-headless
+    // leaf) with the cron name on the entry — the same history surface must
+    // read them, or cron outcomes would be invisible here.
+    for hl in crate::run_log::read_runs() {
+        if hl.cron.as_deref() != Some(name) {
+            continue;
+        }
+        rows.push(CronRun {
+            ts: hl.ts.clone(),
+            project: String::new(),
+            run_id: Some(hl.run_id.clone()),
+            status: hl.status.clone(),
+            bead: None,
+        });
+    }
     rows.sort_by(|a, b| b.ts.cmp(&a.ts));
     rows
 }
@@ -744,6 +831,7 @@ mod tests {
             template: format!("{name}-wf"),
             cron: "30 3 * * 0".to_string(),
             owner: "housekeeper".to_string(),
+            mode: CronMode::Headless,
             scope: CronScope::Host,
             enabled: true,
             created_at: "2026-08-08T00:00:00Z".to_string(),
@@ -768,6 +856,82 @@ mod tests {
         assert!(got.enabled);
         let _ = std::fs::remove_file(&path);
     }
+
+    /// A cron registered BEFORE the mode field existed (no `mode` key in
+    /// crons.toml) defaults to headless — the P10.4 backward-compat contract.
+    #[test]
+    fn cron_mode_defaults_to_headless_when_field_missing() {
+        let path = tmp_path("mode-default");
+        let _ = std::fs::remove_file(&path);
+        let raw = r#"
+[legacy-cron]
+name = "legacy-cron"
+template = "beads"
+cron = "30 3 * * 0"
+owner = "housekeeper"
+"#;
+        std::fs::write(&path, raw).unwrap();
+        let loaded = Crons::load_from(&path).unwrap();
+        let got = loaded.get("legacy-cron").unwrap();
+        assert_eq!(got.mode, CronMode::Headless, "missing mode = headless default");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `--mode pane` round-trips through crons.toml byte-for-byte.
+    #[test]
+    fn cron_mode_roundtrips_pane() {
+        let path = tmp_path("mode-pane");
+        let _ = std::fs::remove_file(&path);
+        let mut e = sample("weekly-x");
+        e.mode = CronMode::Pane;
+        let mut crons = Crons::default();
+        crons.upsert(e.clone()).unwrap();
+        crons.save_to(&path).unwrap();
+        let loaded = Crons::load_from(&path).unwrap();
+        assert_eq!(loaded.get("weekly-x"), Some(&e));
+        assert_eq!(loaded.get("weekly-x").unwrap().mode, CronMode::Pane);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The agent-driver row carries the mode (the `cron list/status --json`
+    /// surface must show how a cron will execute).
+    #[test]
+    fn row_json_includes_mode() {
+        let mut e = sample("weekly-x");
+        e.mode = CronMode::Pane;
+        let mc = MergedCron {
+            entry: e,
+            source: "cron",
+        };
+        let row = row_json(&mc, "due", Some(1_700_000_000));
+        assert_eq!(row.get("mode").and_then(Value::as_str), Some("pane"));
+        let e2 = sample("weekly-x");
+        let mc2 = MergedCron {
+            entry: e2,
+            source: "cron",
+        };
+        let row2 = row_json(&mc2, "due", None);
+        assert_eq!(row2.get("mode").and_then(Value::as_str), Some("headless"));
+    }
+
+    /// The pane-mode runner stays recording (no subprocess, no herdr) — the
+    /// P10.3 pane dispatch is a later bead; headless is the only REAL path.
+    #[test]
+    fn pane_mode_runner_records_actions() {
+        use toron_workflow::schema::Action;
+        let mut e = sample("weekly-x");
+        e.mode = CronMode::Pane;
+        let runner = cron_runner(&e);
+        let out = runner(&Action::DispatchJob {
+            assignee: "x".into(),
+            spec: serde_json::json!({ "profile": "@planner" }),
+            channel: None,
+        })
+        .unwrap();
+        assert_eq!(out.get("action").and_then(Value::as_str), Some("dispatch_job"));
+        assert_eq!(out.get("ok"), Some(&Value::Bool(true)), "recorded, not dispatched");
+    }
+
 
     /// l4s.3: save_to writes ATOMICALLY — the destination is either the old
     /// or the new content, never torn; a stale temp file from a "crash"
@@ -1192,7 +1356,11 @@ mod tests {
         std::thread::spawn(move || serve(listener));
         std::thread::sleep(std::time::Duration::from_millis(20));
 
-        let runner = cron_runner();
+        // The probe behavior lives on the recording (pane) runner — headless
+        // mode dispatches to __run-headless instead.
+        let mut entry = sample("probe");
+        entry.mode = CronMode::Pane;
+        let runner = cron_runner(&entry);
         let ok = runner(&Action::CallWebhook {
             url: format!("http://127.0.0.1:{port}/health"),
             method: Some("GET".into()),
@@ -1303,7 +1471,9 @@ mod tests {
         };
 
         // All five up → pass.
-        let engine = toron_workflow::WorkflowEngine::local(cron_runner()).unwrap();
+        let mut entry = sample("gate");
+        entry.mode = CronMode::Pane;
+        let engine = toron_workflow::WorkflowEngine::local(cron_runner(&entry)).unwrap();
         let all_up: Vec<u16> = ports.to_vec();
         let out = engine
             .invoke("gate-all-up", gate_wf(&all_up), json!({}))
