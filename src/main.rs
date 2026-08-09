@@ -6088,6 +6088,28 @@ mod loop_tests {
     }
 
     #[test]
+    fn done_agent_pops_queue_like_idle() {
+        // bd-fw-done-agents-idle-only-iq3: a task-completed agent takes the
+        // next bead — dispatch must include `done`, not only `idle`.
+        let states = vec![st("a", AgentStatus::Done)];
+        let mut q = vec!["p1".into(), "p6".into()];
+        let actions = plan_actions(&states, &mut q, None);
+        assert_eq!(q.len(), 1);
+        match &actions[0] {
+            LoopAction::Send { name, text } => {
+                assert_eq!(name, "a");
+                assert_eq!(text, "p1");
+            }
+            other => panic!("expected Send for done agent, got {other:?}"),
+        }
+        // and it takes a nudge when the queue is empty
+        let states = vec![st("a", AgentStatus::Done)];
+        let mut q2: Vec<String> = vec![];
+        let actions = plan_actions(&states, &mut q2, Some("continue"));
+        assert!(matches!(actions[0], LoopAction::Nudge { .. }), "{actions:?}");
+    }
+
+    #[test]
     fn sync_loop_substitutes_agent_name_at_dispatch() {
         // the sync loop (--once/--local) dispatches the same bead prompts —
         // the {AGENT_NAME} placeholder must resolve to the receiving agent
