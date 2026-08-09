@@ -117,6 +117,10 @@ enum Commands {
         /// do not focus the new workspace
         #[arg(long)]
         no_focus: bool,
+        /// skip the post-spawn visibility check (scripts; not recommended —
+        /// a silent registry-write failure leaves panes invisible to list/send)
+        #[arg(long)]
+        no_verify: bool,
         /// spawn agents with the peer-aware self-poll template (ADR-0001 §9.3)
         #[arg(long)]
         peer_aware: bool,
@@ -1518,6 +1522,29 @@ fn swarm_label(project: &str) -> String {
     format!("flywheel-{base}")
 }
 
+/// bd-vik C: normalize a user-supplied workspace label to a slug —
+/// lowercase ASCII alphanumerics + hyphens, runs collapsed, trimmed. Pure +
+/// unit-tested. Returns (slug, changed) so the caller can warn.
+fn slugify_label(label: &str) -> (String, bool) {
+    let mut slug = String::with_capacity(label.len());
+    let mut last_dash = false;
+    for ch in label.chars() {
+        let ok = ch.is_ascii_alphanumeric();
+        if ok {
+            slug.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash && !slug.is_empty() {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    let changed = slug != label;
+    (slug, changed)
+}
+
 fn agent_name(project: &str, short: &str) -> String {
     agent_name_n(project, short, 1)
 }
@@ -1577,6 +1604,19 @@ fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
         .filter(|ws| ws.label == label)
         .collect();
     if matches.is_empty() {
+        // bd-vik: a custom --label detaches the workspace from the default
+        // `flywheel-<base>` label — resolve through the spawn metadata so
+        // project-based commands (send/status/kill/loop) still find it.
+        if let Some(meta_label) = state::load_spawn_meta(project) {
+            let m2: Vec<herdr_shim::WorkspaceInfo> = c
+                .workspace_list()?
+                .into_iter()
+                .filter(|ws| ws.label == meta_label)
+                .collect();
+            if !m2.is_empty() {
+                return Ok(m2[0].workspace_id.clone());
+            }
+        }
         bail!("no flywheel swarm for {project} (run: flywheel spawn {project})")
     }
     // duplicate labels (a stale workspace from a dropped agent vs the live
@@ -1648,6 +1688,18 @@ fn find_workspace_dyn(
         .filter(|ws| ws.label == label)
         .collect();
     if matches.is_empty() {
+        // bd-vik: custom --label detaches the workspace from the default
+        // `flywheel-<base>` label — resolve through the spawn metadata.
+        if let Some(meta_label) = state::load_spawn_meta(project) {
+            let m2: Vec<herdr_shim::WorkspaceInfo> = backend
+                .workspace_list()?
+                .into_iter()
+                .filter(|ws| ws.label == meta_label)
+                .collect();
+            if !m2.is_empty() {
+                return Ok(m2[0].workspace_id.clone());
+            }
+        }
         bail!("no flywheel swarm for {project} (run: flywheel spawn {project})")
     }
     if matches.len() > 1 {
@@ -1861,6 +1913,7 @@ fn main() {
             kinds,
             label,
             no_focus,
+            no_verify,
             peer_aware,
             peer_poll_interval_minutes,
             peer_poll_budget_minutes,
@@ -1873,6 +1926,7 @@ fn main() {
             kinds,
             label.as_deref(),
             *no_focus,
+            *no_verify,
             *peer_aware,
             *peer_poll_interval_minutes,
             *peer_poll_budget_minutes,
@@ -2350,6 +2404,7 @@ fn cmd_spawn(
     kinds: &[(String, u32)],
     label_override: Option<&str>,
     no_focus: bool,
+    no_verify: bool,
     peer_aware: bool,
     peer_poll_interval_minutes: u32,
     peer_poll_budget_minutes: u32,
@@ -2357,15 +2412,54 @@ fn cmd_spawn(
 ) -> Result<()> {
     let dir = project_dir(cfg, project);
     if !dir.exists() {
-        bail!(
+        // bd-vik B: fail BEFORE any herdr side effect, and name the valid
+        // projects so an invented project name is a fast, clear mistake.
+        let mut msg = format!(
             "project dir missing: {} (run: flywheel init {project})",
             dir.display()
         );
+        if let Some(parent) = dir.parent().filter(|p| p.is_dir())
+            && let Ok(rd) = std::fs::read_dir(parent)
+        {
+            let mut names: Vec<String> = rd
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().to_str().map(String::from))
+                .filter(|n| !n.starts_with('.'))
+                .collect();
+            names.sort();
+            if !names.is_empty() {
+                msg.push_str(&format!(
+                    "
+projects available: {}",
+                    names.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
+        bail!("{msg}");
     }
     let plan = recipe_counts(recipe, counts, kinds)?;
     let label = label_override
         .map(String::from)
         .unwrap_or_else(|| swarm_label(project));
+    // bd-vik C: labels are workspace metadata — normalize to a slug
+    // (lowercase alphanumerics + hyphens) and warn when changed.
+    let (label, changed) = slugify_label(&label);
+    if changed && label_override.is_some() {
+        eprintln!(
+            "flywheel: label {label_override:?} normalized to {label:?} (slugs: lowercase + hyphens)"
+        );
+    }
+    if label.is_empty() {
+        bail!("workspace label must contain at least one alphanumeric character");
+    }
+    // bd-vik: record the custom label so project-based discovery still works
+    // after a custom-label spawn (find_workspace falls back to this).
+    if label_override.is_some()
+        && let Err(e) = state::save_spawn_meta(project, &label)
+    {
+        eprintln!("flywheel: cannot save spawn label metadata: {e:#}");
+    }
 
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let (ws, root) = c.workspace_create(
@@ -2471,6 +2565,23 @@ fn cmd_spawn(
     // failure.
     if let Err(e) = state::save_spawn_registry(project, &registry) {
         eprintln!("flywheel: cannot save spawn registry: {e:#}");
+    }
+
+    // bd-vik A: post-spawn visibility check — herdr's session registry
+    // (session.json) can silently fail to persist, leaving the panes LIVE but
+    // invisible to list/send/status. Verify the exact workspace_id we just
+    // created is visible from the same view list/send use; fail loudly with
+    // recovery steps instead of silent success.
+    if !no_verify {
+        let listed = c.workspace_list()?;
+        let created_id = ws.workspace_id.clone();
+        if !listed.iter().any(|lws| lws.workspace_id == created_id) {
+            bail!(
+                "spawn created workspace {created_id} but `flywheel list` cannot see it — herdr's session registry (session.json) failed to persist the workspace.
+recovery: restart herdr (launchctl kickstart -k gui/$(id -u)/com.herdr... or `herdr restart`), then re-run: flywheel spawn {project}
+the panes may still be live in herdr; `--no-verify` skips this check in scripts"
+            );
+        }
     }
 
     println!(
@@ -5273,6 +5384,7 @@ fn cmd_resume(cfg: &Config, project: &str, recipe: Option<&str>) -> Result<()> {
                 None,
                 false,
                 false,
+                false,
                 5,
                 30,
                 3,
@@ -5338,6 +5450,7 @@ fn cmd_asset(cfg: &Config, kind: &str, cmd: &AssetCmd) -> Result<()> {
                 Some(name),
                 &[],
                 None,
+                false,
                 false,
                 false,
                 5,
@@ -5458,6 +5571,7 @@ fn cmd_ensemble(cfg: &Config, project: &str, recipe: &str, workflow: &str) -> Re
         Some(recipe),
         &[],
         None,
+        false,
         false,
         false,
         5,
@@ -6131,6 +6245,23 @@ mod loop_tests {
     fn bare_short_group_matches_single_agent_is_fine() {
         let names = vec!["flywheel-proj-oc".to_string()];
         assert!(bare_short_group_matches("proj", "oc", &names).is_none());
+    }
+
+    #[test]
+    fn slugify_label_normalizes() {
+        // bd-vik C: labels become lowercase alphanumerics + hyphens
+        let (s, changed) = slugify_label("ADR-0008-debate");
+        assert_eq!(s, "adr-0008-debate");
+        assert!(changed);
+        let (s, _) = slugify_label("My Cool  Label!");
+        assert_eq!(s, "my-cool-label");
+        let (s, _) = slugify_label("--leading-and-trailing--");
+        assert_eq!(s, "leading-and-trailing");
+        let (s, changed) = slugify_label("flywheel-toron");
+        assert_eq!(s, "flywheel-toron");
+        assert!(!changed, "already a slug");
+        let (s, _) = slugify_label("!!!");
+        assert_eq!(s, "", "no alphanumerics -> empty (caller rejects)");
     }
 
     #[test]
@@ -9898,6 +10029,7 @@ fn cmd_internal_xproj_spawn(
             &[],
             None,
             true,  // background workspace (no_focus — must not steal terminal focus)
+            false, // skip post-spawn visibility verify (background xproj spawn)
             false, // not peer-aware by default
             5,
             30,
