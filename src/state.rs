@@ -63,6 +63,9 @@ pub enum EventKind {
     Resume,
     Respawn,
     SkippedDup,
+    /// bd-a7j: a dispatched prompt expected a thread reply that never arrived
+    /// (logged on each reminder / escalation handoff)
+    ReplyMissing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +211,67 @@ pub fn load_spawn_meta(project: &str) -> Option<String> {
     v.get("label")
         .and_then(|l| l.as_str())
         .map(String::from)
+}
+
+/// bd-a7j: an outstanding expected reply — written by `flywheel collab`
+/// (which knows the thread it created), read by the durable loop each
+/// iteration to verify the thread actually moved before settling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExpectedReply {
+    /// agent (herdr name) that was asked to reply in-thread
+    pub agent: String,
+    /// thread id the reply must land in
+    pub thread: String,
+    /// message id of the question (the reply must differ from it)
+    pub head: Option<String>,
+    /// iso timestamp (informational)
+    pub created_ts: String,
+}
+
+/// Per-project expected-reply file: `expected-replies/<project>.json`.
+pub fn expected_replies_dir() -> PathBuf {
+    state_dir().join("expected-replies")
+}
+
+pub fn expected_reply_file(project: &str) -> PathBuf {
+    expected_replies_dir().join(format!("{project}.json"))
+}
+
+/// Atomically replace the project's expected-reply set (collab writes the
+/// whole set on each collab call; the loop's `__reply-settled` leaf rewrites
+/// it minus a satisfied entry).
+pub fn save_expected_replies(project: &str, entries: &[ExpectedReply]) -> Result<()> {
+    let path = expected_reply_file(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_string_pretty(entries)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Read the project's expected replies (missing/corrupt → empty).
+pub fn load_expected_replies(project: &str) -> Vec<ExpectedReply> {
+    let path = expected_reply_file(project);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return vec![];
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Remove one (agent, thread) entry — used by the checkpointed
+/// `__reply-settled` leaf so satisfied expectations stop keeping the loop
+/// alive, without the workflow body writing files.
+pub fn remove_expected_reply(project: &str, agent: &str, thread: &str) -> Result<()> {
+    let mut entries = load_expected_replies(project);
+    let before = entries.len();
+    entries.retain(|e| !(e.agent == agent && e.thread == thread));
+    if entries.len() == before {
+        return Ok(()); // nothing to do
+    }
+    save_expected_replies(project, &entries)
 }
 
 /// Atomically persist the project's pane→name registry.
@@ -1652,6 +1716,38 @@ mod loops_sidecar_tests {
         assert_eq!(load_active_loop("l4s1-no-such-project").unwrap(), None);
         remove_active_loop(&p1).unwrap();
         remove_active_loop(&p2).unwrap();
+    }
+
+    /// bd-a7j: the expected-reply registry round-trips; remove drops only
+    /// the (agent, thread) pair.
+    #[test]
+    fn expected_reply_registry_roundtrip() {
+        let _g = loops_test_guard();
+        let p = test_project("exp-a");
+        let mk = |agent: &str, thread: &str| ExpectedReply {
+            agent: agent.to_string(),
+            thread: thread.to_string(),
+            head: Some(format!("q-{agent}-{thread}")),
+            created_ts: now_iso(),
+        };
+        let entries = vec![mk("oc", "t1"), mk("oc", "t2"), mk("pi", "t1")];
+        save_expected_replies(&p, &entries).unwrap();
+        assert_eq!(load_expected_replies(&p), entries);
+        // remove one (agent, thread) pair only
+        remove_expected_reply(&p, "oc", "t1").unwrap();
+        let left = load_expected_replies(&p);
+        assert_eq!(left.len(), 2);
+        assert!(!left.iter().any(|e| e.agent == "oc" && e.thread == "t1"));
+        assert!(left.iter().any(|e| e.agent == "oc" && e.thread == "t2"));
+        assert!(left.iter().any(|e| e.agent == "pi" && e.thread == "t1"));
+        // missing file → empty; corrupt → empty
+        assert!(load_expected_replies("l4s1-no-such-project").is_empty());
+        let path = expected_reply_file(&p);
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(load_expected_replies(&p).is_empty());
+        // cleanup
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.tmp"));
     }
 
     /// bd-fw-name-binding-loss-7rc: the spawn registry (pane_id → name)
