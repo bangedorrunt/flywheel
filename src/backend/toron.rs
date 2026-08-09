@@ -24,7 +24,6 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::backend::AgentProfile;
 use crate::backend::{
     AcquireBuildSlotResult, AcquireResult, BuildSlot, ConflictReport, ContactLink, ContactRequest,
     ContactResponse, DeliveryLine, InboxQuery, MailError, MailItem, MailSurface, MessageId,
@@ -32,6 +31,7 @@ use crate::backend::{
     RenewResult, ReplyMail, SearchQuery, SendMail, SendReceipt, ThreadSummary, WhoIs,
 };
 use crate::mail_shim::{Mail, MailInboxFilter, MailSearchFilter};
+use crate::backend::AgentProfile;
 use toron_core::mailbox::unwrap::ContactPolicy;
 
 /// Toron mail backend: delegates to the toron `Mail` facade (`Mail::from_config`
@@ -119,7 +119,10 @@ fn send_receipt_from(v: Value) -> Result<SendReceipt, MailError> {
 /// `exclusive`/`reason` are absent from the envelope — defaulted honestly
 /// (the renewal never changes them).
 fn renew_result_from(v: Value) -> Result<RenewResult, MailError> {
-    let renewed = v.get("renewed").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let renewed = v
+        .get("renewed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
     let reservations = v
         .get("file_reservations")
         .or_else(|| v.get("reservations"))
@@ -127,11 +130,7 @@ fn renew_result_from(v: Value) -> Result<RenewResult, MailError> {
         .map(|arr| {
             arr.iter()
                 .map(|r| toron_core::mailbox::reservations::GrantedReservation {
-                    id: r
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
+                    id: r.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
                     path_pattern: r
                         .get("path_pattern")
                         .and_then(Value::as_str)
@@ -194,15 +193,7 @@ impl MailSurface for ToronMailBackend {
             req.thread_id.clone(),
         );
         let v = run_facade(mail, move |m| {
-            m.send(
-                &project,
-                &to,
-                &subject,
-                &body,
-                &importance,
-                ack,
-                thread.as_deref(),
-            )
+            m.send(&project, &to, &subject, &body, &importance, ack, thread.as_deref())
         })
         .await?;
         send_receipt_from(v)
@@ -309,10 +300,7 @@ impl MailSurface for ToronMailBackend {
             req.from_agent.clone(),
             req.accept,
         );
-        let v = run_facade(mail, move |m| {
-            m.respond_contact(&project, &to, &from, accept)
-        })
-        .await?;
+        let v = run_facade(mail, move |m| m.respond_contact(&project, &to, &from, accept)).await?;
         into_typed(v, "respond_contact")
     }
 
@@ -335,10 +323,7 @@ impl MailSurface for ToronMailBackend {
     ) -> Result<(), MailError> {
         let mail = self.mail.clone();
         let (project, agent, policy) = (project.to_string(), agent.to_string(), policy);
-        let v = run_facade(mail, move |m| {
-            m.set_contact_policy(&project, &agent, policy.as_str())
-        })
-        .await?;
+        let v = run_facade(mail, move |m| m.set_contact_policy(&project, &agent, policy.as_str())).await?;
         let _ = v;
         Ok(())
     }
@@ -387,10 +372,7 @@ impl MailSurface for ToronMailBackend {
         into_typed(v, "health")
     }
 
-    async fn ensure_project(
-        &self,
-        human_key: &str,
-    ) -> Result<toron_core::mailbox::infra::ProjectState, MailError> {
+    async fn ensure_project(&self, human_key: &str) -> Result<toron_core::mailbox::infra::ProjectState, MailError> {
         let mail = self.mail.clone();
         let key = human_key.to_string();
         let v = run_facade(mail, move |m| m.ensure_project(&key)).await?;
@@ -506,10 +488,7 @@ impl MailSurface for ToronMailBackend {
             ttl_secs.unwrap_or(3600),
             exclusive,
         );
-        let v = run_facade(mail, move |m| {
-            m.acquire_slot(&project, &agent, &slot, exclusive, ttl)
-        })
-        .await?;
+        let v = run_facade(mail, move |m| m.acquire_slot(&project, &agent, &slot, exclusive, ttl)).await?;
         into_typed(v, "slot_acquire")
     }
 
@@ -535,12 +514,7 @@ impl MailSurface for ToronMailBackend {
         Ok(Some(into_typed(v, "slot_renew")?))
     }
 
-    async fn slot_release(
-        &self,
-        project: &str,
-        agent: &str,
-        slot: &str,
-    ) -> Result<bool, MailError> {
+    async fn slot_release(&self, project: &str, agent: &str, slot: &str) -> Result<bool, MailError> {
         let mail = self.mail.clone();
         let (project, agent, slot) = (project.to_string(), agent.to_string(), slot.to_string());
         let v = run_facade(mail, move |m| m.release_slot(&project, &agent, &slot)).await?;
@@ -668,24 +642,16 @@ impl MailSurface for ToronMailBackend {
         let mail = self.mail.clone();
         let (project, pane_id) = (project.to_string(), pane_id.to_string());
         let v = run_facade(mail, move |m| m.resolve_pane_identity(&project, &pane_id)).await?;
-        Ok(v.get("agent_name")
-            .and_then(Value::as_str)
-            .map(String::from))
+        Ok(v.get("agent_name").and_then(Value::as_str).map(String::from))
     }
 
     async fn cleanup_pane_identities(&self, project: &str) -> Result<Vec<String>, MailError> {
         let mail = self.mail.clone();
         let project = project.to_string();
         let v = run_facade(mail, move |m| m.cleanup_pane_identities(&project)).await?;
-        Ok(v.get("pruned")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default())
+        Ok(v.get("pruned").and_then(Value::as_array).map(|a| {
+            a.iter().filter_map(Value::as_str).map(String::from).collect()
+        }).unwrap_or_default())
     }
 
     async fn write_pane_identity(
@@ -695,11 +661,9 @@ impl MailSurface for ToronMailBackend {
         agent: &str,
     ) -> Result<(), MailError> {
         let mail = self.mail.clone();
-        let (project, pane_id, agent) =
-            (project.to_string(), pane_id.to_string(), agent.to_string());
+        let (project, pane_id, agent) = (project.to_string(), pane_id.to_string(), agent.to_string());
         run_facade(mail, move |m| {
-            m.write_pane_identity(&project, &pane_id, &agent)
-                .map(|_| ())
+            m.write_pane_identity(&project, &pane_id, &agent).map(|_| ())
         })
         .await
     }
@@ -756,10 +720,7 @@ mod tests {
         assert_eq!(r.id.as_str(), "abc123", "id = first delivery's event id");
 
         let bad = serde_json::json!({ "count": "nope" });
-        assert!(
-            send_receipt_from(bad).is_err(),
-            "shape mismatch is an error"
-        );
+        assert!(send_receipt_from(bad).is_err(), "shape mismatch is an error");
     }
 
     /// Renew envelope → RenewResult: `file_reservations` (facade) and
