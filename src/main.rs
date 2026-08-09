@@ -121,6 +121,11 @@ enum Commands {
         /// a silent registry-write failure leaves panes invisible to list/send)
         #[arg(long)]
         no_verify: bool,
+        /// close pre-existing workspaces for this project (stale panes from
+        /// a killed swarm race the new one — bd-fw-stale-workspace-panes-hgp).
+        /// Without this, spawn REFUSES when one exists.
+        #[arg(long)]
+        retire_orphans: bool,
         /// spawn agents with the peer-aware self-poll template (ADR-0001 §9.3)
         #[arg(long)]
         peer_aware: bool,
@@ -1961,6 +1966,7 @@ fn main() {
             label,
             no_focus,
             no_verify,
+            retire_orphans,
             peer_aware,
             peer_poll_interval_minutes,
             peer_poll_budget_minutes,
@@ -1974,6 +1980,7 @@ fn main() {
             label.as_deref(),
             *no_focus,
             *no_verify,
+            *retire_orphans,
             *peer_aware,
             *peer_poll_interval_minutes,
             *peer_poll_budget_minutes,
@@ -2484,6 +2491,33 @@ fn peer_prompt_template(
 
 /// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
 #[allow(clippy::too_many_arguments)]
+/// bd-fw-stale-workspace-panes-hgp: pre-existing herdr workspaces that
+/// belong to this project — label matches the swarm label (`flywheel-<base>`)
+/// or the project base (`toron` — the w17 shape), or they host agents named
+/// `flywheel-<base>-*`. Spawning over these is the stale-pane race.
+fn project_workspaces(c: &mut Client, project: &str) -> Result<Vec<herdr_shim::WorkspaceInfo>> {
+    let base = project_base(project);
+    let label = swarm_label(project);
+    let prefix = format!("flywheel-{base}-");
+    let ws_list = c.workspace_list()?;
+    let agents = c.agent_list().unwrap_or_default();
+    Ok(ws_list
+        .into_iter()
+        .filter(|ws| {
+            ws.label == label
+                || ws.label == base
+                || agents.iter().any(|a| {
+                    a.workspace_id == ws.workspace_id
+                        && a.name
+                            .as_deref()
+                            .map(|n| n.starts_with(&prefix))
+                            .unwrap_or(false)
+                })
+        })
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
 fn cmd_spawn(
     cfg: &Config,
     project: &str,
@@ -2493,6 +2527,7 @@ fn cmd_spawn(
     label_override: Option<&str>,
     no_focus: bool,
     no_verify: bool,
+    retire_orphans: bool,
     peer_aware: bool,
     peer_poll_interval_minutes: u32,
     peer_poll_budget_minutes: u32,
@@ -2550,6 +2585,35 @@ projects available: {}",
     }
 
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
+    // bd-fw-stale-workspace-panes-hgp: refuse to spawn over pre-existing
+    // workspaces of this project (stale panes from a killed swarm keep
+    // executing the same bead backlog and race the new swarm). --retire-orphans
+    // closes them first — the explicit escape hatch.
+    let orphans = project_workspaces(&mut c, project)?;
+    if !orphans.is_empty() {
+        let detail: Vec<String> = orphans
+            .iter()
+            .map(|ws| format!("{} (label {:?}, {} panes)", ws.workspace_id, ws.label, ws.pane_count))
+            .collect();
+        if retire_orphans {
+            eprintln!(
+                "flywheel: closing {} pre-existing workspace(s) for {project}: {}",
+                orphans.len(),
+                detail.join(", ")
+            );
+            for ws in &orphans {
+                if let Err(e) = c.workspace_close(&ws.workspace_id) {
+                    eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
+                }
+            }
+        } else {
+            bail!(
+                "found {} pre-existing workspace(s) for {project} — stale panes from a killed swarm would race the new one: {}. Close them first (flywheel kill {project} or herdr workspace close <id>), or pass --retire-orphans to close them automatically.",
+                orphans.len(),
+                detail.join(", ")
+            );
+        }
+    }
     let (ws, root) = c.workspace_create(
         Some(&utf8_path(&dir, "workspace dir")?),
         Some(&label),
@@ -5626,6 +5690,7 @@ fn cmd_resume(cfg: &Config, project: &str, recipe: Option<&str>) -> Result<()> {
                 false,
                 false,
                 false,
+                false,
                 5,
                 30,
                 3,
@@ -5691,6 +5756,7 @@ fn cmd_asset(cfg: &Config, kind: &str, cmd: &AssetCmd) -> Result<()> {
                 Some(name),
                 &[],
                 None,
+                false,
                 false,
                 false,
                 false,
@@ -5812,6 +5878,7 @@ fn cmd_ensemble(cfg: &Config, project: &str, recipe: &str, workflow: &str) -> Re
         Some(recipe),
         &[],
         None,
+        false,
         false,
         false,
         false,
@@ -10397,6 +10464,7 @@ fn cmd_internal_xproj_spawn(
             None,
             true,  // background workspace (no_focus — must not steal terminal focus)
             false, // skip post-spawn visibility verify (background xproj spawn)
+            false, // retire orphan workspaces (xproj spawns are additive)
             false, // not peer-aware by default
             5,
             30,
