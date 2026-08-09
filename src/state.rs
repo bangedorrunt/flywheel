@@ -179,6 +179,37 @@ pub fn spawn_registry_file(project: &str) -> PathBuf {
 /// One spawn-registry record: (pane_id, agent name).
 pub type SpawnEntry = (String, String);
 
+/// Per-project spawn metadata (bd-vik): the workspace LABEL when a custom
+/// `--label` was used, so project-based discovery (find_workspace) still
+/// resolves the swarm after a custom-label spawn.
+pub fn spawn_meta_file(project: &str) -> PathBuf {
+    agents_dir().join(format!("{project}.meta.json"))
+}
+
+/// Persist the custom label for a project (best-effort; spawn succeeds even
+/// if this write fails).
+pub fn save_spawn_meta(project: &str, label: &str) -> Result<()> {
+    let path = spawn_meta_file(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_string_pretty(&serde_json::json!({ "label": label }))?;
+    let tmp = path.with_extension("meta.json.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Read the custom label recorded for a project (missing/corrupt → None).
+pub fn load_spawn_meta(project: &str) -> Option<String> {
+    let path = spawn_meta_file(project);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("label")
+        .and_then(|l| l.as_str())
+        .map(String::from)
+}
+
 /// Atomically persist the project's pane→name registry.
 pub fn save_spawn_registry(project: &str, entries: &[SpawnEntry]) -> Result<()> {
     let path = spawn_registry_file(project);
