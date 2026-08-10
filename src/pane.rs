@@ -93,6 +93,33 @@ pub fn resolve_pane_entry<'a>(
         .or_else(|| entries.iter().find(|e| e.name == profile))
 }
 
+/// bd-lvyi: resolve a per-step harness override to a crew pane running THAT
+/// harness. The pane's `harness` column is authoritative; a legacy entry
+/// without one (pre-bd-lvyi registry) falls back to its profile's harness
+/// via the catalog. `None` → no pane of the override harness exists.
+pub fn resolve_pane_by_harness<'a>(
+    entries: &'a [SpawnEntry],
+    harness: &str,
+) -> Option<&'a SpawnEntry> {
+    entries.iter().find(|e| {
+        if let Some(h) = &e.harness {
+            return h == harness;
+        }
+        // Legacy entry (no harness column): the catalog resolves the
+        // profile's harness — the pane was spawned with it. A catalog load
+        // failure degrades to `false` (no match) rather than panicking.
+        let Some(profile_name) = e.profile.as_deref() else {
+            return false;
+        };
+        match crate::profile::ProfileCatalog::load() {
+            Ok(catalog) => catalog
+                .get(profile_name)
+                .is_some_and(|p| p.harness == harness),
+            Err(_) => false,
+        }
+    })
+}
+
 /// Fail-fast guard: pane mode needs a non-empty crew plan (pure, tested).
 pub fn ensure_crew(plan: &CrewPlan, wf_name: &str) -> Result<()> {
     if plan.members.is_empty() {
@@ -301,6 +328,7 @@ fn spawn_crew_into(
                 pane_id: agent_pane_id.clone(),
                 name: name.clone(),
                 profile: Some(role.clone()),
+                harness: Some(harness.clone()),
             });
             eprintln!(
                 "  crew {}: {} ({}) @{}",
@@ -353,43 +381,65 @@ pub fn pane_dispatch(
     let profile = catalog.get(profile_name).ok_or_else(|| {
         anyhow!("pane dispatch: unknown profile @{profile_name} (flywheel profile list)")
     })?;
-    // bd-42fs step 5: a per-step harness override (spec.harness) is honored
-    // by the HEADLESS runner; the pane crew is pre-spawned from the
-    // profile's harness, so an override that differs from the profile's
-    // harness cannot be satisfied by an existing pane — fail clearly
-    // (the override is a headless-path feature; pane crews run the profile
-    // harness).
-    if harness_override_conflicts(&profile.harness, headless::dispatch_spec_harness(spec)) {
-        let h = headless::dispatch_spec_harness(spec).unwrap_or("");
-        bail!(
-            "pane dispatch: step @{profile_name} overrides harness={h} but the crew pane runs {} (profile harness) — per-step harness overrides land in --mode headless; pane crews spawn per profile",
-            profile.harness
-        );
+    // bd-42fs step 5 / bd-lvyi: a per-step harness override (spec.harness)
+    // resolves to a crew pane OF THAT HARNESS when one exists (the crew
+    // pre-spawns per profile, but a squad can contain a pane whose harness
+    // matches the override — e.g. a debate squad with an opencode reviewer
+    // pane); error clearly when no pane of the overridden harness exists.
+    // Crew pre-spawn stays profile-based; the override only reroutes THIS
+    // step's dispatch.
+    let mut override_entry: Option<&SpawnEntry> = None;
+    if let Some(override_h) = headless::dispatch_spec_harness(spec)
+        && harness_override_conflicts(&profile.harness, Some(override_h))
+    {
+        match resolve_pane_by_harness(entries, override_h) {
+            Some(e) => {
+                eprintln!(
+                    "pane dispatch: step @{profile_name} overrides harness={override_h} — dispatching to {} ({}, runs {override_h})",
+                    e.name, e.pane_id
+                );
+                override_entry = Some(e);
+            }
+            None => bail!(
+                "pane dispatch: step @{profile_name} overrides harness={override_h} but no crew pane runs it (panes: {}) — per-step harness overrides land in --mode headless, or spawn a squad containing a {override_h} pane",
+                entries
+                    .iter()
+                    .map(|e| format!("{}={}", e.name, e.harness.as_deref().unwrap_or("?")))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
     }
-    // Role conditioning (Spec C): preamble prepended to the stage prompt (or
-    // the goal fallback) — identical to the headless runner.
+    // Role conditioning (Spec C): the behavior preamble is prepended INSIDE
+    // `__send --profile` (bd-gsvn.1) — the ONE conditioning site shared by
+    // the pane runner and both loop paths. The runner passes the raw stage
+    // prompt (or goal fallback) and the profile name.
     let base = match headless::dispatch_spec_stage(spec) {
         Some(s) => crate::stage_prompt(s)?,
         None => headless::base_prompt_for(wf_name, inputs),
     };
-    let prompt = headless::conditioned_prompt(&profile.behavior, &base);
-    // @role -> running pane: profile column first, name fallback.
-    let entry = resolve_pane_entry(entries, profile_name).ok_or_else(|| {
-        anyhow!(
-            "pane dispatch: no crew pane for @{profile_name} (spawned: {})",
-            entries
-                .iter()
-                .map(|e| e.profile.as_deref().unwrap_or(&e.name))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })?;
+    let prompt = base;
+    // @role -> running pane: a per-step harness override's matched pane
+    // wins; otherwise profile column first, name fallback.
+    let entry = override_entry
+        .or_else(|| resolve_pane_entry(entries, profile_name))
+        .ok_or_else(|| {
+            anyhow!(
+                "pane dispatch: no crew pane for @{profile_name} (spawned: {})",
+                entries
+                    .iter()
+                    .map(|e| e.profile.as_deref().unwrap_or(&e.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
 
     // Subprocess-reuse (Spec A): the `__send` leaf owns the confirmed send
-    // (landing wait, last-sent dedup, auto-heal) — no new dispatch code.
-    // A freshly spawned agent may still be booting when the first step
-    // fires: `agent_not_ready` is transient — retry with backoff (bounded;
-    // a persistent not-ready surfaces as a per-step error, never a hang).
+    // (landing wait, last-sent dedup, auto-heal, Spec C conditioning) — no
+    // new dispatch code. A freshly spawned agent may still be booting when
+    // the first step fires: `agent_not_ready` is transient — retry with
+    // backoff (bounded; a persistent not-ready surfaces as a per-step error,
+    // never a hang).
     let mut attempts = 0;
     const MAX_ATTEMPTS: u32 = 6;
     loop {
@@ -398,7 +448,9 @@ pub fn pane_dispatch(
             .arg(project)
             .arg(&entry.name)
             .arg(&prompt)
-            .arg("--confirm");
+            .arg("--confirm")
+            .arg("--profile")
+            .arg(profile_name);
         let output = cmd
             .output()
             .with_context(|| format!("__send for @{profile_name} ({})", entry.name))?;
@@ -447,11 +499,13 @@ mod tests {
                 pane_id: "w1:p1".into(),
                 name: "crew-wf-planner".into(),
                 profile: Some("planner".into()),
+                harness: Some("omp".into()),
             },
             SpawnEntry {
                 pane_id: "w1:p2".into(),
                 name: "crew-wf-coder".into(),
                 profile: Some("coder".into()),
+                harness: Some("omp".into()),
             },
             SpawnEntry::legacy("w1:p3", "plain-agent"),
         ];
@@ -461,6 +515,59 @@ mod tests {
         assert_eq!(e.name, "plain-agent");
         assert_eq!(e.profile, None);
         assert!(resolve_pane_entry(&entries, "ghost").is_none());
+    }
+
+    /// bd-lvyi: a per-step harness override resolves to a crew pane OF THAT
+    /// HARNESS (the `harness` column), not the step profile's pane.
+    #[test]
+    fn resolve_pane_by_harness_finds_override_harness_pane() {
+        let entries = vec![
+            SpawnEntry {
+                pane_id: "w1:p1".into(),
+                name: "crew-wf-reviewer".into(),
+                profile: Some("reviewer".into()),
+                harness: Some("omp".into()),
+            },
+            SpawnEntry {
+                pane_id: "w1:p2".into(),
+                name: "crew-wf-scout".into(),
+                profile: Some("scout".into()),
+                harness: Some("opencode".into()),
+            },
+        ];
+        let e = resolve_pane_by_harness(&entries, "opencode").expect("opencode pane");
+        assert_eq!(e.name, "crew-wf-scout");
+        assert_eq!(e.harness.as_deref(), Some("opencode"));
+        assert!(resolve_pane_by_harness(&entries, "grok").is_none());
+        assert!(resolve_pane_by_harness(&entries, "").is_none());
+    }
+
+    /// bd-lvyi: a legacy SpawnEntry (no harness column, pre-bd-lvyi registry)
+    /// resolves via its profile's harness through the catalog; an entry with
+    /// neither harness nor profile never matches.
+    #[test]
+    fn resolve_pane_by_harness_legacy_entry_falls_back_to_profile() {
+        let entries = vec![
+            SpawnEntry::legacy("w1:p1", "legacy-omp-agent"),
+            SpawnEntry {
+                pane_id: "w1:p2".into(),
+                name: "crew-wf-coder".into(),
+                profile: Some("coder".into()),
+                harness: Some("omp".into()),
+            },
+            SpawnEntry::legacy("w1:p3", "plain"),
+        ];
+        // Legacy entries have profile=None → never match (honest: unknown).
+        assert!(
+            resolve_pane_by_harness(&entries, "omp").is_some(),
+            "coder's omp column matches"
+        );
+        let matched = resolve_pane_by_harness(&entries, "omp").expect("omp pane");
+        assert_eq!(matched.name, "crew-wf-coder");
+        assert!(
+            resolve_pane_by_harness(&entries, "opencode").is_none(),
+            "no opencode pane"
+        );
     }
 
     /// P10.3: crew agent names are role-ordinal-suffixed, slugged + lowercased

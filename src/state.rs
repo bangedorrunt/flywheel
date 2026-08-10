@@ -211,6 +211,12 @@ pub struct SpawnEntry {
     /// for plain swarm spawns (legacy shape).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// the harness this pane runs (bd-lvyi per-step override resolution:
+    /// a step overriding harness dispatches to a pane of that harness if
+    /// one exists). `None` for legacy entries — resolved from the profile
+    /// via the catalog at dispatch time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
 }
 
 impl SpawnEntry {
@@ -220,6 +226,7 @@ impl SpawnEntry {
             pane_id: pane_id.into(),
             name: name.into(),
             profile: None,
+            harness: None,
         }
     }
 }
@@ -241,6 +248,8 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 name: String,
                 #[serde(default)]
                 profile: Option<String>,
+                #[serde(default)]
+                harness: Option<String>,
             },
         }
         match Raw::deserialize(d)? {
@@ -248,15 +257,18 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 pane_id,
                 name,
                 profile: None,
+                harness: None,
             }),
             Raw::New {
                 pane_id,
                 name,
                 profile,
+                harness,
             } => Ok(SpawnEntry {
                 pane_id,
                 name,
                 profile,
+                harness,
             }),
         }
     }
@@ -1882,15 +1894,30 @@ mod loops_sidecar_tests {
                 pane_id: "w2A:p1".into(),
                 name: "crew-wf-planner-1".into(),
                 profile: Some("planner".into()),
+                harness: Some("omp".into()),
             },
             SpawnEntry::legacy("w2A:p2", "flywheel-reg-profile-oc"),
         ];
         save_spawn_registry(&p, &entries).unwrap();
         assert_eq!(load_spawn_registry(&p), entries);
+        let legacy_path = spawn_registry_file(&p);
         let raw = std::fs::read_to_string(spawn_registry_file(&p)).unwrap();
         assert!(raw.contains("profile"), "profile column serialized: {raw}");
-        // legacy 2-tuple file (pre-P10.3) deserializes to profile: None
-        let legacy_path = spawn_registry_file(&p);
+        assert!(
+            raw.contains("harness"),
+            "harness column serialized (bd-lvyi): {raw}"
+        );
+        // a P10.3-style file WITHOUT the harness column (pre-bd-lvyi) still
+        // deserializes — harness: None
+        std::fs::write(
+            &legacy_path,
+            r#"[{"pane_id":"w8:p1","name":"crew-wf-planner-1","profile":"planner"}]"#,
+        )
+        .unwrap();
+        let loaded = load_spawn_registry(&p);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].profile.as_deref(), Some("planner"));
+        assert_eq!(loaded[0].harness, None, "absent column -> None");
         std::fs::write(
             &legacy_path,
             r#"[["w9:p1","flywheel-x-oc"],["w9:p2","flywheel-x-pi"]]"#,
@@ -1905,6 +1932,7 @@ mod loops_sidecar_tests {
             ]
         );
         assert!(loaded.iter().all(|e| e.profile.is_none()));
+        assert!(loaded.iter().all(|e| e.harness.is_none()));
         // cleanup
         let _ = std::fs::remove_file(&legacy_path);
         let _ = std::fs::remove_file(legacy_path.with_extension("json.tmp"));
