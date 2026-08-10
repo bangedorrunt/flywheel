@@ -586,7 +586,6 @@ impl MailSurface for AgentMailBackend {
             granted,
             conflicts,
             soft_conflicts,
-            proposal: None,
         })
     }
 
