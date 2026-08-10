@@ -79,3 +79,11 @@ If the loop's `--on-blocked mail` is active, a blocked agent gets tiered pings (
 - Always use `--json` on br commands for structured output.
 - Sync + commit `.beads/` before ending any working session.
 - Do not delete files without explicit permission.
+
+# Enforced rules (dispatch lessons, 2026-08-10 — the loop enforces the criticals)
+
+- **MUST claim a bead via br before working it** (`br update <id> --claim --actor "$AGENT_NAME"`). NEVER work unclaimed — an unclaimed bead looks ready to the swarm and gets double-dispatched.
+- **MUST reserve files via toron before editing** (`flywheel mail locks --paths <globs> --exclusive --reason <bead-id>`). An unreserved edit can collide with a peer.
+- **MUST verify the acceptance gate BEFORE closing**: run the gate, and the close reason MUST cite the command + result that proves it (e.g. "gate: cargo test -p flywheel -> 487 passed"). A close without gate-evidence in the reason is FLAGGED — the loop enforces this (close-evidence rule).
+- **NEVER leave a bead in_progress without a resume path.** A strand (in_progress + no live agent on it) stalls the whole batch — the loop auto-reclaims stranded beads to ready (stranded-reclaim rule), but do not create the strand in the first place: finish, close, or reopen the bead before ending work on it.
+- **If you cannot finish a bead** (blocker, context exhaustion): do NOT leave it in_progress silently — reopen it (`br update <id> --status open`) or set blocked with a comment, so the loop re-dispatches it.

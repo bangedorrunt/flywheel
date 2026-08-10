@@ -91,6 +91,31 @@ impl StageLibrary {
                 "p8",
                 "Now, based on your knowledge of the project, commit all changed files now in a series of logically connected groupings with super detailed commit messages for each and then push. Take your time to do it right. Don't edit the code at all. Don't commit obviously ephemeral files. Use ultrathink.",
             ),
+            (
+                "repo-map",
+                "p3",
+                "Cold-start mapping (onboard step 1): read AGENTS.md and the top-level docs in this repo, list the crate/module structure and the main entry points, and trace how the pieces connect (entry points, core modules, tests, build/test/lint commands). Produce a concise map the newcomer can act from — paths, responsibilities, conventions, and the exact commands to build, test, and lint.",
+            ),
+            (
+                "seed-first-task",
+                "p7",
+                "Onboard step 2: from the repo map produced in the previous step, seed the newcomer's context — summarize the map, state the conventions they MUST follow (TDD, skills, code style), and propose ONE narrow first task with [paths] [change] [acceptance] so they can start immediately.",
+            ),
+            (
+                "bv-triage",
+                "p9",
+                "Deep-triage step 1: run `bv --robot-triage` (and `br ready --json` for the actionable subset) over this project's beads, then produce a compact summary: counts by status/priority, the top actionable items, blockers, and any cycles or stale items worth attention.",
+            ),
+            (
+                "prioritize-assign",
+                "p10",
+                "Deep-triage step 2: from the bv-triage summary, prioritize the actionable backlog in dependency order and assign each item to an owner (agent identity registered in the project). Output an ordered, owned list the crew can execute.",
+            ),
+            (
+                "spawn-crew",
+                "p11",
+                "Deep-triage step 3: spawn the assigned crew for the prioritized backlog — `flywheel spawn <project> --recipe <squad>` (or the explicit counts) and hand each owner their assigned items. Confirm the panes are up and the crew is ready before finishing.",
+            ),
         ];
         let mut stages = BTreeMap::new();
         for (name, alias, prompt) in defaults {
@@ -119,8 +144,8 @@ impl StageLibrary {
             #[serde(default)]
             stages: BTreeMap<String, Stage>,
         }
-        let user: UserStages = toml::from_str(&raw)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let user: UserStages =
+            toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
         for (name, stage) in user.stages {
             self.stages.insert(name, stage);
         }
@@ -173,7 +198,9 @@ mod tests {
     fn stage_alias_p6_equals_systematic_execute() {
         let lib = StageLibrary::compiled_in();
         let by_alias = lib.resolve("p6").expect("p6 resolves");
-        let by_semantic = lib.resolve("systematic-execute").expect("semantic resolves");
+        let by_semantic = lib
+            .resolve("systematic-execute")
+            .expect("semantic resolves");
         assert_eq!(by_alias, by_semantic, "p6 == systematic-execute");
     }
 
@@ -184,6 +211,24 @@ mod tests {
         let lib = StageLibrary::compiled_in();
         for code in ["p1", "p2", "p4", "p5", "p6", "p8"] {
             assert!(lib.has(code), "compiled-in stage {code} resolves");
+        }
+    }
+
+    /// bd-oj9o #2: the onboard + triage-deep workflows resolve their stages.
+    #[test]
+    fn onboard_and_triage_deep_stages_resolve() {
+        let lib = StageLibrary::compiled_in();
+        for semantic in [
+            "repo-map",
+            "seed-first-task",
+            "bv-triage",
+            "prioritize-assign",
+            "spawn-crew",
+        ] {
+            assert!(
+                lib.resolve(semantic).is_some(),
+                "stage {semantic} resolves (bd-oj9o #2)"
+            );
         }
     }
 
