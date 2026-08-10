@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelEntry {
     /// Provider prefix for harnesses that want `provider/model` (opencode,
-    /// pi). `omp`/`grok` take the bare id.
+    /// pi, omp — omp routes `--model=provider/id` through its provider
+    /// catalog, verified 2026-08-10). `grok` takes the bare id.
     pub provider: String,
     /// Advisory per-mtok cost (run-cost reporting; 0 = unknown).
     #[serde(default)]
@@ -34,25 +35,34 @@ pub struct ModelEntry {
     /// unsupported harness resolves to `fallback` (or the id, passthrough).
     #[serde(default)]
     pub caps: Vec<String>,
-    /// Alternative id to use when `caps` excludes the harness (optional).
+    /// Alternative id to use when `caps` excludes the harness (optional) —
+    /// ALSO the retry-on-429 fallback (bd-42fs): a rate-limited run retries
+    /// with this model instead of failing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
+    /// Thinking/effort level for harnesses that take one (`omp
+    /// --thinking=<level>`: minimal|low|medium|high|xhigh|max). Advisory —
+    /// absent = harness default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 impl ModelEntry {
-    /// The injection string for one harness: `provider/ID` for opencode+pi,
-    /// the bare ID for omp+grok (verified against each binary's `--help`,
-    /// 2026-08-09). Unknown harness: id passthrough (never block).
+    /// The injection string for one harness: `provider/ID` for opencode+pi
+    /// and omp (omp's provider catalog needs the prefix — `zai/glm-5.2`,
+    /// `opencode-go/deepseek-v4-flash`, `opencode/big-pickle`, verified
+    /// 2026-08-10); the bare ID for grok. Unknown harness: id passthrough
+    /// (never block).
     pub fn flag_for(&self, id: &str, harness: &str) -> String {
         match harness {
-            "opencode" | "pi" => {
+            "grok" => id.to_string(),
+            _ => {
                 if self.provider.is_empty() {
                     id.to_string()
                 } else {
                     format!("{}/{}", self.provider, id)
                 }
             }
-            _ => id.to_string(),
         }
     }
 }
@@ -160,6 +170,7 @@ mod tests {
             cost_out_per_mtok: 15.0,
             caps: vec![],
             fallback: None,
+            effort: None,
         }
     }
 
@@ -186,8 +197,9 @@ mod tests {
         assert_eq!(reg.resolve("gpt-5.2", "omp"), "gpt-5.2");
     }
 
-    /// Per-harness injection forms: opencode + pi get `provider/id`, omp +
-    /// grok get the bare id.
+    /// Per-harness injection forms (bd-42fs): opencode + pi + omp get
+    /// `provider/id` (omp's provider catalog needs the prefix — verified
+    /// 2026-08-10); grok gets the bare id.
     #[test]
     fn flag_for_injects_per_harness() {
         let e = sample_entry();
@@ -199,8 +211,32 @@ mod tests {
             e.flag_for("claude-sonnet-4", "pi"),
             "anthropic/claude-sonnet-4"
         );
-        assert_eq!(e.flag_for("claude-sonnet-4", "omp"), "claude-sonnet-4");
+        assert_eq!(
+            e.flag_for("claude-sonnet-4", "omp"),
+            "anthropic/claude-sonnet-4",
+            "omp needs the provider prefix"
+        );
         assert_eq!(e.flag_for("claude-sonnet-4", "grok"), "claude-sonnet-4");
+    }
+
+    /// bd-42fs: an unknown model passes through for omp (no provider entry)
+    /// — never blocks, and the effort field is advisory-optional.
+    #[test]
+    fn effort_field_is_optional_and_resolve_unknown_passes_through() {
+        let _g = with_config_dir();
+        let reg = ModelRegistry::default();
+        assert_eq!(reg.resolve("no-such-model", "omp"), "no-such-model");
+        let e = ModelEntry {
+            provider: "zai".into(),
+            cost_in_per_mtok: 0.0,
+            cost_out_per_mtok: 0.0,
+            caps: vec![],
+            fallback: Some("grok-4.5".into()),
+            effort: Some("high".into()),
+        };
+        assert_eq!(e.effort.as_deref(), Some("high"));
+        assert_eq!(e.fallback.as_deref(), Some("grok-4.5"));
+        assert_eq!(e.flag_for("glm-5.2", "omp"), "zai/glm-5.2");
     }
 
     /// Known registry id resolves to the injected form.
@@ -213,7 +249,11 @@ mod tests {
             reg.resolve("claude-sonnet-4", "opencode"),
             "anthropic/claude-sonnet-4"
         );
-        assert_eq!(reg.resolve("claude-sonnet-4", "omp"), "claude-sonnet-4");
+        assert_eq!(
+            reg.resolve("claude-sonnet-4", "omp"),
+            "anthropic/claude-sonnet-4",
+            "omp needs the provider prefix (bd-42fs)"
+        );
     }
 
     /// Unknown id passes through untouched (never blocks).
@@ -238,6 +278,7 @@ mod tests {
                 cost_out_per_mtok: 15.0,
                 caps: vec!["opencode".into()],
                 fallback: Some("claude-opus-4".into()),
+                effort: None,
             },
         );
         reg.models.insert(
@@ -248,6 +289,7 @@ mod tests {
                 cost_out_per_mtok: 25.0,
                 caps: vec![],
                 fallback: None,
+                effort: None,
             },
         );
         assert_eq!(
@@ -275,6 +317,7 @@ mod tests {
                 cost_out_per_mtok: 10.0,
                 caps: vec!["omp".into()],
                 fallback: None,
+                effort: None,
             },
         );
         assert_eq!(reg.resolve("gpt-5.2", "grok"), "gpt-5.2");
