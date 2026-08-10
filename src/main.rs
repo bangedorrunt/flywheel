@@ -1479,12 +1479,17 @@ enum CoalitionCmd {
     Form {
         /// goal workflow name (must pass the lint gate)
         goal: String,
-        /// crew: <squad> (recipes.toml) or a single profile name
+        /// crew: comma-separated squads (recipes.toml) / profile names —
+        /// one per project for cross-project coalitions (bd-hkw5.3)
         #[arg(long)]
         crews: String,
         /// act as this agent (the captain; must be a member)
         #[arg(long = "as")]
         as_agent: String,
+        /// cross-project scoping: <member>=<project> (repeatable; absent
+        /// members default to --project) (bd-hkw5.3)
+        #[arg(long = "member-project")]
+        member_project: Vec<String>,
         /// toron project slug (default: toron)
         #[arg(long, default_value = "toron")]
         project: String,
@@ -1698,6 +1703,32 @@ enum CoalitionCmd {
         /// beads-closed probe)
         #[arg(long)]
         tracker: Option<String>,
+        /// toron project slug (default: toron)
+        #[arg(long, default_value = "toron")]
+        project: String,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+    /// Dispatch a headless leaf worker (bd-hkw5.2): the captain pre-splits
+    /// a non-overlapping scope; the leaf runs it one-shot (ADR-0010 Spec A
+    /// subprocess-reuse), logs to runs/, and posts the result to the
+    /// coalition channel. Leaf semantics — no intent-declare/negotiate.
+    Leaf {
+        /// coalition id
+        id: String,
+        /// the acting member (leaf worker; must be a member)
+        #[arg(long = "as")]
+        as_agent: String,
+        /// profile ref the leaf runs under (@planner)
+        #[arg(long)]
+        profile: String,
+        /// the captain's pre-split, non-overlapping scope
+        #[arg(long)]
+        scope: String,
+        /// per-dispatch harness override (pi|omp|opencode|grok)
+        #[arg(long)]
+        harness: Option<String>,
         /// toron project slug (default: toron)
         #[arg(long, default_value = "toron")]
         project: String,
@@ -8674,19 +8705,29 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
 
     /// Resolve a crew spec to member profile names (same rule as
     /// `workflow run --crew`): recipes.toml squad, else a single profile.
+    /// Comma-separated crews (bd-hkw5.3): multiple squads/profiles — the
+    /// cross-project coalition's crews from different repos.
     fn squad_members(crews: &str) -> Result<Vec<String>> {
-        let cat = profile::ProfileCatalog::load()?;
-        let recipes = config::Recipes::load()?.recipes;
-        let counts = match recipes.get(crews) {
-            Some(r) => profile::Squad::from_recipe(r).counts,
-            None if cat.get(crews).is_some() => {
-                let mut m = std::collections::BTreeMap::new();
-                m.insert(crews.to_string(), 1u32);
-                m
+        let mut out: Vec<String> = Vec::new();
+        for crew in crews.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+            let cat = profile::ProfileCatalog::load()?;
+            let recipes = config::Recipes::load()?.recipes;
+            let counts = match recipes.get(crew) {
+                Some(r) => profile::Squad::from_recipe(r).counts,
+                None if cat.get(crew).is_some() => {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(crew.to_string(), 1u32);
+                    m
+                }
+                None => bail!("unknown squad {crew:?} (flywheel squad list)"),
+            };
+            for m in counts.keys() {
+                if !out.contains(m) {
+                    out.push(m.clone());
+                }
             }
-            None => bail!("unknown squad {crews:?} (flywheel squad list)"),
-        };
-        Ok(counts.keys().cloned().collect())
+        }
+        Ok(out)
     }
 
     fn coalitions_root() -> std::path::PathBuf {
@@ -8738,12 +8779,32 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
             goal,
             crews,
             as_agent,
+            member_project,
             project,
             beads,
             tracker,
             json,
         } => {
             let members = squad_members(crews)?;
+            let member_projects: BTreeMap<String, String> = member_project
+                .iter()
+                .map(|kv| {
+                    let (member, proj) = kv
+                        .split_once('=')
+                        .ok_or_else(|| anyhow!("--member-project expects <member>=<project>, got {kv:?}"))?;
+                    if member.is_empty() || proj.is_empty() {
+                        return Err(anyhow!(
+                            "--member-project expects <member>=<project>, got {kv:?}"
+                        ));
+                    }
+                    if !members.contains(&member.to_string()) {
+                        return Err(anyhow!(
+                            "--member-project member {member} is not in crew {crews:?}"
+                        ));
+                    }
+                    Ok((member.to_string(), proj.to_string()))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
             let beads: Vec<String> = beads
                 .as_deref()
                 .map(|s| {
@@ -8755,7 +8816,14 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                 })
                 .unwrap_or_default();
             let store = CoalitionStore::open(project, coalitions_root())?;
-            let m = store.form(goal, as_agent, &members, &beads, tracker.as_deref())?;
+            let m = store.form(
+                goal,
+                as_agent,
+                &members,
+                &member_projects,
+                &beads,
+                tracker.as_deref(),
+            )?;
             if *json {
                 print_json(&serde_json::to_value(&m)?);
             } else {
@@ -8767,6 +8835,11 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                     m.channel_id,
                     m.run_id
                 );
+                if !m.member_projects.is_empty() {
+                    for (member, proj) in &m.member_projects {
+                        println!("  {member} -> project {proj}");
+                    }
+                }
             }
             Ok(())
         }
@@ -8785,6 +8858,9 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                     st.run_id,
                     st.run.as_ref().map(|r| r.status.as_str()).unwrap_or("unknown")
                 );
+                for (member, proj) in &st.member_projects {
+                    println!("  {member} -> project {proj}");
+                }
                 println!(
                     "  channel: {} ({} event(s) on bus)",
                     st.channel.channel_id,
@@ -9037,6 +9113,43 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                 print_json(&json!({ "disbanded": id }));
             } else {
                 println!("coalition {id} disbanded");
+            }
+            Ok(())
+        }
+        CoalitionCmd::Leaf {
+            id,
+            as_agent,
+            profile,
+            scope,
+            harness,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let leaf = store.dispatch_leaf(
+                id,
+                as_agent,
+                profile,
+                scope,
+                harness.as_deref(),
+            )?;
+            if *json {
+                print_json(&serde_json::to_value(&leaf)?);
+            } else {
+                println!(
+                    "leaf @{} run {} [{}] {} tok={}+{} {}ms (result posted to coalition {})",
+                    leaf.profile,
+                    leaf.run_id,
+                    leaf.status,
+                    leaf.model,
+                    leaf.tokens_in,
+                    leaf.tokens_out,
+                    leaf.duration_ms,
+                    id
+                );
+                if let Some(e) = &leaf.error {
+                    eprintln!("leaf error: {e}");
+                }
             }
             Ok(())
         }
