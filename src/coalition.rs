@@ -16,19 +16,35 @@
 //! primary | manual fallback) closes the coalition: channel close post,
 //! member-held reservations released, manifest marked closed.
 //!
+//! **Auto-collab (P11.3b, bd-foh8.4):** [`CoalitionStore::detect`] reads the
+//! intent board and runs the tiered rule proposer (split-by-directory /
+//! sequence-by-dependency / merge) from `intent.rs`; [`CoalitionStore::auto_coalesce`]
+//! forms an ad-hoc coalition for overlapping UNaffiliated crews on
+//! non-trivial source. The soft-conflict freeze path surfaces the detector's
+//! proposals instead of leaving negotiation purely manual.
+//!
+//! **Leaf workers (bd-hkw5.2, ADR-0011 Spec 5 reopen):**
+//! [`CoalitionStore::dispatch_leaf`] runs a headless crew as a coalition
+//! LEAF worker: the captain pre-splits a non-overlapping scope, the leaf
+//! receives it, runs one-shot (the `__run-headless` subprocess, ADR-0010
+//! Spec A), the run logs to `runs/`, and the result lands in the coalition
+//! channel (kind-42 board post). No intent-declare/negotiate — leaf
+//! semantics. [`CoalitionStore::post_leaf_result`] is the hermetic channel
+//! post (the testable half).
+//!
 //! Channel events are signed by the in-process operator key (the captain is
 //! the operator authority, ADR-0011 Spec 6) and project-scoped (`#t`) — the
 //! mailbox bus persists them (InProcessBus + SQLite under `TORON_DATA_DIR`).
 //!
-//! governed-by: ADR-0011 (Spec 1, 2, 6)
+//! governed-by: ADR-0011 (Spec 1, 2, 5, 6)
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 
 use toron_core::bus::{Bus, InProcessBus};
@@ -69,6 +85,16 @@ pub struct CoalitionManifest {
     /// Bead ids tracked for the beads-closed disband gate (may be empty).
     #[serde(default)]
     pub beads: Vec<String>,
+    /// The repo whose `.beads` holds the tracked beads (br resolves its
+    /// workspace from cwd; the coalition CLI often runs from another repo).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracker_repo: Option<String>,
+    /// Cross-project coalitions (bd-hkw5.3): member -> toron project slug.
+    /// Intents/reservations are project-scoped in the mailbox; each crew's
+    /// collab ops land in ITS repo's namespace. Members absent from the map
+    /// default to the store's project (single-project behavior unchanged).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub member_projects: BTreeMap<String, String>,
     /// Formation timestamp (RFC3339).
     pub created_at: String,
     /// `active` | `closed`.
@@ -113,6 +139,9 @@ pub struct CoalitionStatus {
     pub run_id: String,
     pub captain: String,
     pub members: Vec<String>,
+    /// Cross-project scoping: member -> project slug (absent = store project).
+    #[serde(default)]
+    pub member_projects: BTreeMap<String, String>,
     pub status: String,
     pub closed_at: Option<String>,
     pub close_reason: Option<String>,
@@ -121,6 +150,23 @@ pub struct CoalitionStatus {
     pub intents: Vec<IntentReservation>,
     pub reservations: Vec<Reservation>,
     pub beads: Vec<BeadStatus>,
+}
+
+/// One headless leaf-worker dispatch (bd-hkw5.2): the run-log id + the
+/// outcome as the leaf reported it (ADR-0010 Spec E fields).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeafDispatch {
+    pub run_id: String,
+    pub profile: String,
+    pub scope: String,
+    pub status: String,
+    pub ok: bool,
+    pub response: String,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub model: String,
+    pub duration_ms: u64,
+    pub error: Option<String>,
 }
 
 /// Shared tokio runtime (one per process, mirroring the mail shim).
@@ -233,12 +279,19 @@ impl CoalitionStore {
     /// (engine-tier gate), validate every member is a registered agent,
     /// start the goal run (engine invoke, recording runner), publish the
     /// NIP-29 channel (kind-40 + 41) to the bus, write the manifest.
+    ///
+    /// Cross-project (bd-hkw5.3): `member_projects` maps a member to the
+    /// toron project slug their intents/reservations scope to (absent =
+    /// the store's project). Each member must be registered in their OWN
+    /// project.
     pub fn form(
         &self,
         goal: &str,
         captain: &str,
         members: &[String],
+        member_projects: &BTreeMap<String, String>,
         beads: &[String],
+        tracker: Option<&str>,
     ) -> Result<CoalitionManifest> {
         // Goal must be a known workflow + pass the engine-tier lint gate
         // (mirrors `workflow run`'s fail-stop).
@@ -252,21 +305,37 @@ impl CoalitionStore {
             bail!("goal workflow {goal:?} has {blocking} blocking lint issue(s) — refusing to form");
         }
 
-        // Members must be registered agents (they sign intents/acquires).
-        let registered: Vec<String> = runtime()?
-            .block_on(self.mailbox.list_agents(&self.project, ListAgentsOptions::default()))
-            .map_err(|e| anyhow!("list agents in project {}: {e}", self.project))?
-            .into_iter()
-            .map(|a| a.name)
+        // Members must be registered agents IN THEIR OWN PROJECT (a member
+        // listed in `member_projects` with project P must exist in P; others
+        // in the store's project). Registration is per (project, agent).
+        let project_of = |member: &str| -> &str {
+            member_projects
+                .get(member)
+                .map(String::as_str)
+                .unwrap_or(&self.project)
+        };
+        let distinct_projects: BTreeSet<&str> =
+            members.iter().map(|m| project_of(m)).collect();
+        let mut registered: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for project in &distinct_projects {
+            let names: Vec<String> = runtime()?
+                .block_on(self.mailbox.list_agents(project, ListAgentsOptions::default()))
+                .map_err(|e| anyhow!("list agents in project {project}: {e}"))?
+                .into_iter()
+                .map(|a| a.name)
+                .collect();
+            registered.insert(project, names);
+        }
+        let missing: Vec<&String> = members
+            .iter()
+            .filter(|m| !registered.get(project_of(m)).is_some_and(|n| n.contains(m)))
             .collect();
-        let missing: Vec<&String> = members.iter().filter(|m| !registered.contains(m)).collect();
         if !missing.is_empty() {
             bail!(
-                "coalition members not registered in project {}: {} (coalition register / flywheel mail register)",
-                self.project,
+                "coalition members not registered in their project: {} (coalition register / flywheel mail register — register each crew in its own project)",
                 missing
                     .iter()
-                    .map(|m| m.as_str())
+                    .map(|m| format!("{m}@{}", project_of(m)))
                     .collect::<Vec<_>>()
                     .join(", ")
             );
@@ -329,6 +398,8 @@ impl CoalitionStore {
             channel_id,
             channel_name: goal.to_string(),
             beads: beads.to_vec(),
+            tracker_repo: tracker.map(str::to_string),
+            member_projects: member_projects.clone(),
             created_at: crate::state::now_iso(),
             status: "active".into(),
             closed_at: None,
@@ -346,13 +417,14 @@ impl CoalitionStore {
         let channel = self.channel_view(&manifest.channel_id);
         let intents = self.member_intents(&manifest)?;
         let reservations = self.member_reservations(&manifest)?;
-        let beads = bead_statuses(&manifest.beads);
+        let beads = bead_statuses(&manifest.beads, manifest.tracker_repo.as_deref());
         Ok(CoalitionStatus {
             id: manifest.id.clone(),
             goal: manifest.goal.clone(),
             run_id: manifest.run_id.clone(),
             captain: manifest.captain.clone(),
             members: manifest.members.clone(),
+            member_projects: manifest.member_projects.clone(),
             status: manifest.status.clone(),
             closed_at: manifest.closed_at.clone(),
             close_reason: manifest.close_reason.clone(),
@@ -370,10 +442,10 @@ impl CoalitionStore {
         for entry in std::fs::read_dir(&self.root)? {
             let Ok(entry) = entry else { continue };
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".json") {
-                if let Ok(m) = self.load_manifest(&name.trim_end_matches(".json")) {
-                    out.push(m);
-                }
+            if name.ends_with(".json")
+                && let Ok(m) = self.load_manifest(name.trim_end_matches(".json"))
+            {
+                out.push(m);
             }
         }
         out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
@@ -384,13 +456,20 @@ impl CoalitionStore {
     /// reservations (best-effort per member), post the channel close
     /// message. With `beads_closed` and a tracked bead list, the gate
     /// requires every bead to be closed first.
-    pub fn disband(&self, id: &str, beads_closed: bool, reason: Option<&str>) -> Result<()> {
+    pub fn disband(
+        &self,
+        id: &str,
+        beads_closed: bool,
+        reason: Option<&str>,
+        tracker_override: Option<&str>,
+    ) -> Result<()> {
         let mut manifest = self.load_manifest(id)?;
         if manifest.status == "closed" {
             return Ok(()); // idempotent
         }
         if beads_closed && !manifest.beads.is_empty() {
-            for b in bead_statuses(&manifest.beads) {
+            let tracker = tracker_override.or(manifest.tracker_repo.as_deref());
+            for b in bead_statuses(&manifest.beads, tracker) {
                 if b.status != "closed" {
                     bail!(
                         "beads-closed gate: bead {} is {}, not closed — disband aborted",
@@ -401,21 +480,23 @@ impl CoalitionStore {
             }
         }
         // Release member-held reservations (best-effort: a member without a
-        // local key is skipped with a warning, not an error).
+        // local key is skipped with a warning, not an error). Cross-project
+        // (bd-hkw5.3): each member's leases are released in THEIR project.
         for member in &manifest.members {
+            let project = self.project_of(&manifest, member);
             match runtime()?.block_on(
                 self.mailbox
-                    .release_file_reservations(&self.project, member, &[]),
+                    .release_file_reservations(&project, member, &[]),
             ) {
                 Ok(r) if r.released > 0 => {
                     eprintln!(
-                        "coalition disband: released {} lease(s) held by {member}",
+                        "coalition disband: released {} lease(s) held by {member} in {project}",
                         r.released
                     );
                 }
                 Ok(_) => {}
                 Err(e) => eprintln!(
-                    "coalition disband: could not release {member}'s reservations: {e}"
+                    "coalition disband: could not release {member}'s reservations in {project}: {e}"
                 ),
             }
         }
@@ -438,7 +519,9 @@ impl CoalitionStore {
     // ------------------------------------------------------------------
 
     /// `coalition intent <id> <paths...>`: declare `status:intent` into the
-    /// board (P11.2). The acting agent must be a member.
+    /// board (P11.2). The acting agent must be a member. Cross-project
+    /// (bd-hkw5.3): the intent lands in the member's OWN project (the
+    /// manifest's `member_projects` map; absent = the store's project).
     pub fn declare_intent(
         &self,
         id: &str,
@@ -447,10 +530,11 @@ impl CoalitionStore {
         reason: Option<&str>,
         ttl_secs: Option<u64>,
     ) -> Result<IntentResult> {
-        self.require_active_member(id, agent)?;
+        let manifest = self.require_active_member(id, agent)?;
+        let project = self.project_of(&manifest, agent);
         runtime()?
             .block_on(self.mailbox.declare_intent(
-                &self.project,
+                &project,
                 agent,
                 paths,
                 reason,
@@ -461,7 +545,10 @@ impl CoalitionStore {
 
     /// `coalition reserve <id> <paths...>`: acquire leases (P11.2). A
     /// soft-conflict FREEZE (another member's in-TTL intent) appears in
-    /// `soft_conflicts` — the manual-collab trigger.
+    /// `soft_conflicts` — the P11.3b detector's trigger: on freeze, the
+    /// tiered rule-proposer proposes the split (instead of manual-only
+    /// negotiation). `proposal` is `Some` exactly when the freeze fired and
+    /// the detector found a rule for it.
     pub fn reserve(
         &self,
         id: &str,
@@ -471,20 +558,40 @@ impl CoalitionStore {
         exclusive: bool,
         reason: Option<&str>,
     ) -> Result<AcquireResult> {
-        self.require_active_member(id, agent)?;
-        runtime()?
+        let manifest = self.require_active_member(id, agent)?;
+        let project = self.project_of(&manifest, agent);
+        let result = runtime()?
             .block_on(self.mailbox.file_reservation_paths(
-                &self.project,
+                &project,
                 agent,
                 paths,
                 ttl_secs,
                 exclusive,
                 reason,
             ))
-            .map_err(|e| anyhow!("reserve: {e}"))
+            .map_err(|e| anyhow!("reserve: {e}"))?;
+        // P11.3b: on a soft-conflict FREEZE, run the detector over the board
+        // and attach the rule-split proposal for the frozen paths (the
+        // P11.2 manual negotiation stays the dispute backstop when a
+        // proposal is rejected). Best-effort: a detector failure does not
+        // fail the reserve.
+        if !result.soft_conflicts.is_empty()
+            && let Ok(report) = self.detect()
+            && let Some(p) = report.proposals.first()
+        {
+            return Ok(AcquireResult {
+                soft_conflicts: result.soft_conflicts,
+                proposal: Some(serde_json::to_value(p)?),
+                ..result
+            });
+        }
+        Ok(result)
     }
 
     /// `coalition negotiate request`: ask the holder to release/defer (P11.2).
+    /// Cross-project (bd-hkw5.3): routed to the TARGET's project (where the
+    /// reservation lives); the sender must hold a key there too (the
+    /// mailbox resolves keys per (project, agent)).
     pub fn negotiate_request(
         &self,
         id: &str,
@@ -498,9 +605,10 @@ impl CoalitionStore {
         if !manifest.members.contains(&target_agent.to_string()) {
             bail!("negotiate target {target_agent} is not a coalition member");
         }
+        let project = self.project_of(&manifest, target_agent);
         runtime()?
             .block_on(self.mailbox.request_release(&RequestRelease {
-                project_slug: self.project.clone(),
+                project_slug: project.clone(),
                 sender_name: agent.to_string(),
                 target_agent: target_agent.to_string(),
                 reservation_id: reservation_id.to_string(),
@@ -510,7 +618,8 @@ impl CoalitionStore {
             .map_err(|e| anyhow!("negotiate request: {e}"))
     }
 
-    /// `coalition negotiate respond`: the holder answers (P11.2).
+    /// `coalition negotiate respond`: the holder answers (P11.2). Routed to
+    /// the responding agent's own project.
     pub fn negotiate_respond(
         &self,
         id: &str,
@@ -519,10 +628,11 @@ impl CoalitionStore {
         decision: ReleaseDecision,
         note: Option<&str>,
     ) -> Result<SendResult> {
-        self.require_active_member(id, agent)?;
+        let manifest = self.require_active_member(id, agent)?;
+        let project = self.project_of(&manifest, agent);
         runtime()?
             .block_on(self.mailbox.respond_request_release(&ReleaseResponse {
-                project_slug: self.project.clone(),
+                project_slug: project.clone(),
                 sender_name: agent.to_string(),
                 request_message_id: request_message_id.to_string(),
                 decision,
@@ -531,7 +641,8 @@ impl CoalitionStore {
             .map_err(|e| anyhow!("negotiate respond: {e}"))
     }
 
-    /// `coalition negotiate status`: resolution of a request (P11.2).
+    /// `coalition negotiate status`: resolution of a request (P11.2). Routed
+    /// to the requester's own project.
     pub fn negotiate_status(
         &self,
         id: &str,
@@ -539,9 +650,10 @@ impl CoalitionStore {
         request_message_id: &str,
         window_secs: Option<u64>,
     ) -> Result<RequestReleaseStatus> {
-        self.require_active_member(id, agent)?;
+        let manifest = self.require_active_member(id, agent)?;
+        let project = self.project_of(&manifest, agent);
         Ok(runtime()?.block_on(self.mailbox.request_release_status(
-            &self.project,
+            &project,
             agent,
             request_message_id,
             window_secs,
@@ -549,7 +661,7 @@ impl CoalitionStore {
     }
 
     /// `coalition negotiate escalate`: captain DM after the tier window
-    /// (P11.2).
+    /// (P11.2). Routed to the requester's own project.
     pub fn negotiate_escalate(
         &self,
         id: &str,
@@ -557,15 +669,208 @@ impl CoalitionStore {
         request_message_id: &str,
         note: Option<&str>,
     ) -> Result<()> {
-        self.require_active_member(id, agent)?;
+        let manifest = self.require_active_member(id, agent)?;
+        let project = self.project_of(&manifest, agent);
         runtime()?
             .block_on(self.mailbox.escalate_request_release(
-                &self.project,
+                &project,
                 agent,
                 request_message_id,
                 note,
             ))
             .map_err(|e| anyhow!("negotiate escalate: {e}"))
+    }
+
+    // ------------------------------------------------------------------
+    // Leaf workers (bd-hkw5.2): headless crews as coalition leaves
+    // ------------------------------------------------------------------
+
+    /// `coalition leaf <id> --as <member> --profile @X --scope <pre-split>`:
+    /// dispatch a headless leaf worker (ADR-0011 Spec 5 reopen). The captain
+    /// pre-splits a non-overlapping scope; the leaf receives it, runs
+    /// ONE-SHOT via the `__run-headless` subprocess (ADR-0010 Spec A
+    /// subprocess-reuse — never an in-process herdr/toron client), the run
+    /// logs to `runs/`, and the result lands in the coalition channel
+    /// (kind-42 board post). No intent-declare/negotiate — leaf semantics.
+    ///
+    /// The leaf runs as the acting MEMBER (must be a member of an active
+    /// coalition); `profile` is the profile ref (`@planner`) whose harness +
+    /// behavior the leaf runs under.
+    pub fn dispatch_leaf(
+        &self,
+        id: &str,
+        agent: &str,
+        profile: &str,
+        scope: &str,
+        harness_override: Option<&str>,
+    ) -> Result<LeafDispatch> {
+        let manifest = self.require_active_member(id, agent)?;
+        let catalog = crate::profile::ProfileCatalog::load()?;
+        let profile_name = crate::headless::strip_profile_ref(profile);
+        let profile_entry = catalog
+            .get(profile_name)
+            .ok_or_else(|| anyhow!("leaf dispatch: unknown profile @{profile_name} (flywheel profile list)"))?;
+
+        // Leaf prompt: the profile's behavior preamble, then the leaf mission
+        // (coalition context + the captain's pre-split scope).
+        let base = leaf_prompt(&manifest.id, &manifest.goal, scope);
+        let prompt = crate::headless::conditioned_prompt(&profile_entry.behavior, &base);
+
+        // Subprocess-reuse (Spec A): the __run-headless leaf owns the harness
+        // call + run log. --json keeps the outcome machine-readable.
+        let mut cmd = std::process::Command::new(std::env::current_exe()?);
+        cmd.arg("__run-headless")
+            .arg(profile_name)
+            .arg(&prompt)
+            .arg("--workflow")
+            .arg(&manifest.goal)
+            .arg("--json");
+        if let Some(h) = harness_override.filter(|h| !h.trim().is_empty()) {
+            cmd.arg("--harness").arg(h);
+        }
+        if !profile_entry.model.is_empty() {
+            cmd.arg("--model").arg(&profile_entry.model);
+        }
+        let output = cmd
+            .output()
+            .with_context(|| format!("__run-headless for coalition leaf @{profile_name}"))?;
+        let raw = String::from_utf8_lossy(&output.stdout).to_string();
+        let trimmed = raw.trim();
+        let value: Value = if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+            v
+        } else {
+            let err = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(anyhow!(
+                "coalition leaf @{profile_name}: leaf failed ({}): {}",
+                if err.trim().is_empty() { "no JSON on stdout" } else { "stderr" },
+                if err.trim().is_empty() { trimmed } else { err.trim() }
+            ));
+        };
+        let outcome = leaf_outcome(&value);
+        let outcome = LeafDispatch {
+            profile: profile_name.to_string(),
+            scope: scope.to_string(),
+            ..outcome
+        };
+
+        // The result lands in the coalition: kind-42 board post on the
+        // coalition channel (the GATE's "result lands in the coalition").
+        self.post_leaf_result(id, agent, profile, scope, &outcome)?;
+        Ok(outcome)
+    }
+
+    /// The hermetic half of [`CoalitionStore::dispatch_leaf`]: post a leaf
+    /// outcome as a kind-42 board event on the coalition channel (the
+    /// channel lands the result where `coalition status` / members can see
+    /// it). Membership-gated. Pure-ish: no subprocess, no run-log write —
+    /// the testable surface.
+    pub fn post_leaf_result(
+        &self,
+        id: &str,
+        agent: &str,
+        profile: &str,
+        scope: &str,
+        outcome: &LeafDispatch,
+    ) -> Result<()> {
+        let manifest = self.require_active_member(id, agent)?;
+        let content = json!({
+            "leaf-result": true,
+            "agent": agent,
+            "profile": profile,
+            "scope": scope,
+            "run_id": outcome.run_id,
+            "status": outcome.status,
+            "ok": outcome.ok,
+        })
+        .to_string();
+        self.publish_channel_event(CHANNEL_MESSAGE, &manifest.channel_id, &content)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Auto-collab (P11.3b, bd-foh8.4): detector + tiered proposer
+    // ------------------------------------------------------------------
+
+    /// The intent board as the detector's view: active `status:intent`
+    /// declarations in the project (all crews, not just this coalition's
+    /// members — overlaps with outsiders are the auto-coalesce trigger).
+    pub fn board(&self) -> Result<Vec<crate::intent::IntentView>> {
+        let intents = runtime()?
+            .block_on(self.mailbox.active_intents(&self.project))
+            .map_err(|e| anyhow!("active intents: {e}"))?;
+        Ok(intents
+            .into_iter()
+            .map(|i| crate::intent::IntentView {
+                agent: i.agent_name,
+                path: i.path_pattern,
+                reason: i.reason,
+            })
+            .collect())
+    }
+
+    /// Run the detector over the intent board: overlaps + tiered rule-split
+    /// proposals + the auto-coalesce gate. `is_affiliated` decides whether a
+    /// crew already belongs to a coalition (project-wide manifest scan).
+    pub fn detect(&self) -> Result<crate::intent::DetectionReport> {
+        let board = self.board()?;
+        let active_coalitions = self.list()?;
+        let report = crate::intent::run_detector(&board, &|agent| {
+            active_coalitions
+                .iter()
+                .any(|m| m.status == "active" && m.members.iter().any(|x| x == agent))
+        });
+        Ok(report)
+    }
+
+    /// Auto-coalesce: form an ad-hoc coalition around the goal workflow for
+    /// EVERY non-trivial overlap between unaffiliated crews the detector
+    /// found. The coalition binds the two crews' members; the captain is the
+    /// first member of the pair. Idempotent per (goal, members) — re-detection
+    /// does not duplicate.
+    ///
+    /// Returns the manifests of the formed coalitions (the detector's
+    /// `auto_coalesce` list drives it; empty overlap list → empty result).
+    pub fn auto_coalesce(
+        &self,
+        goal: &str,
+        captain: &str,
+        report: &crate::intent::DetectionReport,
+    ) -> Result<Vec<CoalitionManifest>> {
+        let mut formed = Vec::new();
+        // Idempotency key: (goal, member set) — coalition ids are
+        // timestamped (unique per formation), so dedupe on the SIGNATURE
+        // against the PERSISTENT registry (a re-detection must not
+        // duplicate an already-formed pair, even across CLI invocations).
+        let existing = self.list()?;
+        for o in &report.auto_coalesce {
+            if !o.non_trivial {
+                continue;
+            }
+            // Members: the two overlapping crews' agents, deduped + the
+            // captain first (captain must be a member).
+            let mut members: Vec<String> = vec![captain.to_string()];
+            for m in [o.a.clone(), o.b.clone()] {
+                if !members.contains(&m) {
+                    members.push(m);
+                }
+            }
+            let already = existing.iter().any(|m| {
+                m.status == "active"
+                    && m.goal == goal
+                    && m.members.len() == members.len()
+                    && m.members.iter().all(|x| members.contains(x))
+            });
+            if already {
+                continue;
+            }
+            // The overlap pair is the board's evidence; the goal workflow
+            // must exist (lint gate inside form). Auto-coalesce is
+            // single-project (the board is project-scoped) — no
+            // member_projects mapping.
+            let manifest = self.form(goal, captain, &members, &BTreeMap::new(), &[], None)?;
+            formed.push(manifest);
+        }
+        Ok(formed)
     }
 
     // ------------------------------------------------------------------
@@ -587,25 +892,57 @@ impl CoalitionStore {
     }
 
     /// Member intents (the board, P11.2 `active_intents`, member-filtered).
+    /// Cross-project (bd-hkw5.3): fans across the distinct projects the
+    /// members scope to, then member-filters.
     fn member_intents(&self, manifest: &CoalitionManifest) -> Result<Vec<IntentReservation>> {
-        let intents = runtime()?
-            .block_on(self.mailbox.active_intents(&self.project))
-            .map_err(|e| anyhow!("active intents: {e}"))?;
-        Ok(intents
+        let mut out = Vec::new();
+        for project in self.distinct_member_projects(manifest) {
+            let intents = runtime()?
+                .block_on(self.mailbox.active_intents(&project))
+                .map_err(|e| anyhow!("active intents in {project}: {e}"))?;
+            out.extend(intents);
+        }
+        Ok(out
             .into_iter()
             .filter(|i| manifest.members.contains(&i.agent_name))
             .collect())
     }
 
     /// Member-held reservations (P11.2 `active_reservations`, member-filtered).
+    /// Cross-project (bd-hkw5.3): fans across the distinct projects the
+    /// members scope to, then member-filters.
     fn member_reservations(&self, manifest: &CoalitionManifest) -> Result<Vec<Reservation>> {
-        let res = runtime()?
-            .block_on(self.mailbox.active_reservations(&self.project))
-            .map_err(|e| anyhow!("active reservations: {e}"))?;
-        Ok(res
+        let mut out = Vec::new();
+        for project in self.distinct_member_projects(manifest) {
+            let res = runtime()?
+                .block_on(self.mailbox.active_reservations(&project))
+                .map_err(|e| anyhow!("active reservations in {project}: {e}"))?;
+            out.extend(res);
+        }
+        Ok(out
             .into_iter()
             .filter(|r| manifest.members.contains(&r.agent_name))
             .collect())
+    }
+
+    /// The project a member's collab ops scope to (bd-hkw5.3): the
+    /// manifest's `member_projects` map, else the store's project.
+    fn project_of(&self, manifest: &CoalitionManifest, member: &str) -> String {
+        manifest
+            .member_projects
+            .get(member)
+            .cloned()
+            .unwrap_or_else(|| self.project.clone())
+    }
+
+    /// Distinct projects across the coalition's members (bd-hkw5.3): the
+    /// union of the map's values + the store's project (members without an
+    /// entry). Empty map = the store's project only.
+    fn distinct_member_projects(&self, manifest: &CoalitionManifest) -> BTreeSet<String> {
+        let mut projects: BTreeSet<String> =
+            manifest.member_projects.values().cloned().collect();
+        projects.insert(self.project.clone());
+        projects
     }
 
     /// NIP-29 channel view: replay kind-40/41/42 events (project-scoped)
@@ -636,7 +973,7 @@ impl CoalitionStore {
                 created_at_secs: e.created_at.as_secs() as i64,
             })
             .collect();
-        views.sort_by(|a, b| b.created_at_secs.cmp(&a.created_at_secs));
+        views.sort_by_key(|v| std::cmp::Reverse(v.created_at_secs));
         let name = views
             .iter()
             .find(|v| v.kind == CHANNEL_METADATA)
@@ -719,6 +1056,45 @@ impl CoalitionStore {
     }
 }
 
+/// The leaf worker's mission prompt (pure): coalition context + the
+/// captain's pre-split scope. The scope is the work; the framing tells the
+/// leaf it is one-shot with no negotiation (leaf semantics, ADR-0011
+/// Spec 5).
+pub fn leaf_prompt(coalition_id: &str, goal: &str, scope: &str) -> String {
+    format!(
+        "Coalition leaf worker for {goal} (coalition {coalition_id}).\n\
+         You received a pre-split, non-overlapping scope. Run it one-shot, no \
+         negotiation. Post your result to the coalition channel when done.\n\n\
+         Scope:\n{scope}"
+    )
+}
+
+/// Parse the `__run-headless --json` leaf outcome into a [`LeafDispatch`]
+/// (pure; the JSON shape is the leaf's output contract). A missing
+/// `run_id`/`status` defaults honestly (`unknown`) rather than panicking.
+pub fn leaf_outcome(value: &Value) -> LeafDispatch {
+    fn s(v: &Value, key: &str) -> String {
+        v.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
+    }
+    fn u(v: &Value, key: &str) -> u64 {
+        v.get(key).and_then(Value::as_u64).unwrap_or(0)
+    }
+    let status = s(value, "status");
+    LeafDispatch {
+        run_id: s(value, "run_id"),
+        profile: String::new(),
+        scope: String::new(),
+        status: if status.is_empty() { "unknown".into() } else { status },
+        ok: value.get("ok").and_then(Value::as_bool).unwrap_or(false),
+        response: s(value, "response"),
+        tokens_in: u(value, "tokens_in"),
+        tokens_out: u(value, "tokens_out"),
+        model: s(value, "model"),
+        duration_ms: u(value, "duration_ms"),
+        error: value.get("error").and_then(Value::as_str).map(str::to_string),
+    }
+}
+
 /// Coalition id: goal slug + compact timestamp (unique per formation).
 fn coalition_id(goal: &str) -> String {
     let ts = crate::state::now_iso().replace(['-', ':', 'T', 'Z'], "").replace('.', "");
@@ -766,37 +1142,45 @@ fn channel_tag(event: &toron_core::nostr_sdk::nostr::Event) -> Option<String> {
         .and_then(|t| t.as_slice().get(1).map(|s| s.to_string()))
 }
 
-/// Best-effort `br show <id>` status probe per tracked bead. `br` absent or
-/// failing → `unknown` (the beads-closed gate then refuses to pass).
-fn bead_statuses(beads: &[String]) -> Vec<BeadStatus> {
-    beads
-        .iter()
-        .map(|id| BeadStatus {
-            id: id.clone(),
-            status: bead_status(id),
-        })
-        .collect()
-}
-
-fn bead_status(id: &str) -> String {
-    let out = std::process::Command::new("br")
-        .args(["show", id, "--json"])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            if s.contains("\"status\":\"closed\"") {
-                "closed".into()
-            } else if s.contains("\"status\":\"open\"") || s.contains("\"status\":\"in_progress\"")
-            {
-                "open".into()
-            } else {
-                "unknown".into()
-            }
-        }
-        _ => "unknown".into(),
+    /// Best-effort `br show <id>` status probe per tracked bead. `br` absent
+    /// or failing → `unknown` (the beads-closed gate then refuses to pass).
+    /// `tracker_repo` = the repo whose `.beads` the probe must use (br
+    /// resolves its workspace from cwd; the coalition CLI often runs from a
+    /// different repo).
+    fn bead_statuses(beads: &[String], tracker_repo: Option<&str>) -> Vec<BeadStatus> {
+        beads
+            .iter()
+            .map(|id| BeadStatus {
+                id: id.clone(),
+                status: bead_status(id, tracker_repo),
+            })
+            .collect()
     }
-}
+
+    fn bead_status(id: &str, tracker_repo: Option<&str>) -> String {
+        let mut cmd = std::process::Command::new("br");
+        cmd.args(["show", id, "--json"]);
+        if let Some(repo) = tracker_repo {
+            cmd.current_dir(repo);
+        }
+        match cmd.output() {
+            Ok(o) if o.status.success() => parse_br_status(&String::from_utf8_lossy(&o.stdout)),
+            _ => "unknown".into(),
+        }
+    }
+
+    /// Pure parser for `br show <id> --json` stdout (the unit-test surface).
+    fn parse_br_status(stdout: &str) -> String {
+        if stdout.contains("\"status\":\"closed\"") {
+            "closed".into()
+        } else if stdout.contains("\"status\":\"open\"")
+            || stdout.contains("\"status\":\"in_progress\"")
+        {
+            "open".into()
+        } else {
+            "unknown".into()
+        }
+    }
 
 #[cfg(test)]
 mod tests {
@@ -813,7 +1197,7 @@ mod tests {
 
     #[test]
     fn test_channel_tag_extraction() {
-        use toron_core::nostr_sdk::nostr::{Event, EventId, Keys, Tag, Timestamp};
+        use toron_core::nostr_sdk::nostr::{Keys, Tag, Timestamp};
         let keys = Keys::generate();
         let ev = build_event(
             &keys,
@@ -824,13 +1208,466 @@ mod tests {
         )
         .expect("build");
         assert_eq!(channel_tag(&ev), Some("coal-1".to_string()));
-        let _ = EventId::from_hex(&ev.id.to_hex());
     }
 
     #[test]
     fn test_bead_status_parsing() {
         // No br in a hermetic test env → unknown; the parser handles it.
-        let status = bead_status("bd-does-not-exist");
+        let status = bead_status("bd-does-not-exist", None);
         assert!(status == "unknown" || status == "closed" || status == "open", "{status}");
+    }
+
+    /// The pure parser: closed / open / in_progress / garbage.
+    #[test]
+    fn parse_br_status_classifies_output() {
+        assert_eq!(parse_br_status(r#"[{"id":"bd-x","status":"closed"}]"#), "closed");
+        assert_eq!(
+            parse_br_status(r#"[{"id":"bd-x","status":"in_progress"}]"#),
+            "open",
+            "in_progress counts as open for the gate"
+        );
+        assert_eq!(parse_br_status(r#"[{"id":"bd-x","status":"open"}]"#), "open");
+        assert_eq!(parse_br_status(r#"{"error":{"code":"ISSUE_NOT_FOUND"}}"#), "unknown");
+        assert_eq!(parse_br_status(""), "unknown");
+        assert_eq!(parse_br_status("garbage"), "unknown");
+    }
+
+    /// The manifest round-trips the tracker repo (the beads-closed gate's
+    /// probe cwd) — a coalition formed with --tracker survives save/load.
+    #[test]
+    fn manifest_roundtrips_tracker_repo() {
+        let mut m = CoalitionManifest {
+            id: "coal-x".into(),
+            goal: "beads".into(),
+            run_id: "coal-coal-x".into(),
+            captain: "oc".into(),
+            members: vec!["oc".into(), "pi".into()],
+            channel_id: "coal-x".into(),
+            channel_name: "beads".into(),
+            beads: vec!["bd-x".into()],
+            tracker_repo: Some("/tmp/tracker".into()),
+            member_projects: BTreeMap::new(),
+            created_at: "2026-08-09T00:00:00Z".into(),
+            status: "active".into(),
+            closed_at: None,
+            close_reason: None,
+        };
+        m.channel_id = "coal-x".into();
+        let s = serde_json::to_string(&m).unwrap();
+        let back: CoalitionManifest = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.tracker_repo.as_deref(), Some("/tmp/tracker"));
+        assert_eq!(back.id, "coal-x");
+        assert!(back.member_projects.is_empty());
+    }
+
+    /// P11.3b e2e (bd-foh8.4, hermetic mailbox): two crews declare
+    /// overlapping intents on a source dir → the detector proposes a rule
+    /// split + flags the pair for auto-coalesce; a README overlap does NOT
+    /// coalesce. `auto_coalesce` forms an ad-hoc coalition binding both.
+    #[test]
+    fn detector_e2e_overlap_proposes_and_coalesces() {
+        let root = std::env::temp_dir().join(format!("fw-coal-det-{}", uuid::Uuid::new_v4()));
+        let data = std::env::temp_dir().join(format!("fw-coal-det-data-{}", uuid::Uuid::new_v4()));
+        let store = CoalitionStore::open_at("det-e2e", root.clone(), data.clone())
+            .expect("open hermetic store");
+        store.register_agent("oc").expect("register oc");
+        store.register_agent("pi").expect("register pi");
+
+        // Crew oc intends a broad source glob; crew pi intends a subpath
+        // (literal — mailbox overlap semantics are glob-vs-path).
+        runtime()
+            .unwrap()
+            .block_on(store.mailbox.declare_intent(
+                "det-e2e",
+                "oc",
+                &["src/**".into()],
+                Some("bd-a"),
+                None,
+            ))
+            .expect("oc intent");
+        runtime()
+            .unwrap()
+            .block_on(store.mailbox.declare_intent(
+                "det-e2e",
+                "pi",
+                &["src/workflow/engine.rs".into()],
+                Some("bd-b"),
+                None,
+            ))
+            .expect("pi intent");
+        // Crew gk intends a doc path (trivial — never coalesces).
+        store.register_agent("gk").expect("register gk");
+        runtime()
+            .unwrap()
+            .block_on(store.mailbox.declare_intent(
+                "det-e2e",
+                "gk",
+                &["docs/guide.md".into()],
+                None,
+                None,
+            ))
+            .expect("gk intent");
+
+        let report = store.detect().expect("detect");
+        let pairs: Vec<String> = report
+            .overlaps
+            .iter()
+            .map(|o| format!("{}<->{}", o.a, o.b))
+            .collect();
+        assert!(
+            pairs.iter().any(|p| {
+                let mut parts = p.split("<->");
+                let (a, b) = (parts.next().unwrap(), parts.next().unwrap());
+                (a == "oc" && b == "pi") || (a == "pi" && b == "oc")
+            }),
+            "oc<->pi overlap expected, got {pairs:?}"
+        );
+        assert!(
+            report
+                .proposals
+                .iter()
+                .any(|p| {
+                    let same_pair = (p.agents[0] == "oc" && p.agents[1] == "pi")
+                        || (p.agents[0] == "pi" && p.agents[1] == "oc");
+                    same_pair && p.kind == crate::intent::ProposalKind::SequenceByDependency
+                }),
+            "{:?}",
+            report.proposals
+        );
+        // gk's trivial overlap never coalesces.
+        assert!(
+            report
+                .auto_coalesce
+                .iter()
+                .all(|o| o.a != "gk" && o.b != "gk"),
+            "trivial overlap must not coalesce: {:?}",
+            report.auto_coalesce
+        );
+        assert_eq!(report.auto_coalesce.len(), 1, "{:?}", report.auto_coalesce);
+
+        // Auto-coalesce forms an ad-hoc coalition binding the pair. Goal
+        // must be a dispatch-only workflow (a request_approval step would
+        // park the recording run durably — `beads` is dispatch-only).
+        let formed = store
+            .auto_coalesce("beads", "oc", &report)
+            .expect("auto-coalesce");
+        assert_eq!(formed.len(), 1, "one ad-hoc coalition formed");
+        assert_eq!(formed[0].members, vec!["oc".to_string(), "pi".to_string()]);
+        assert_eq!(formed[0].status, "active");
+        assert!(
+            formed[0].member_projects.is_empty(),
+            "auto-coalesce stays single-project"
+        );
+        // Idempotent: a second pass forms nothing new.
+        let again = store.auto_coalesce("beads", "oc", &report).expect("again");
+        assert!(again.is_empty(), "idempotent per formation");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// P11.3b e2e (bd-foh8.4): an ALREADY-affiliated crew does not
+    /// auto-coalesce — affiliation is the gate.
+    #[test]
+    fn detector_e2e_affiliated_crew_does_not_coalesce() {
+        let root = std::env::temp_dir().join(format!("fw-coal-aff-{}", uuid::Uuid::new_v4()));
+        let data = std::env::temp_dir().join(format!("fw-coal-aff-data-{}", uuid::Uuid::new_v4()));
+        let store = CoalitionStore::open_at("det-aff", root.clone(), data.clone())
+            .expect("open hermetic store");
+        store.register_agent("oc").expect("register oc");
+        store.register_agent("pi").expect("register pi");
+        // oc is already in a coalition with pi.
+        store
+            .form("beads", "oc", &["oc".into(), "pi".into()], &BTreeMap::new(), &[], None)
+            .expect("form coalition");
+        runtime()
+            .unwrap()
+            .block_on(store.mailbox.declare_intent(
+                "det-aff",
+                "oc",
+                &["src/**".into()],
+                None,
+                None,
+            ))
+            .expect("oc intent");
+        runtime()
+            .unwrap()
+            .block_on(store.mailbox.declare_intent(
+                "det-aff",
+                "pi",
+                &["src/foo.rs".into()],
+                None,
+                None,
+            ))
+            .expect("pi intent");
+
+        let report = store.detect().expect("detect");
+        assert_eq!(report.overlaps.len(), 1, "{:?}", report.overlaps);
+        assert!(
+            report.auto_coalesce.is_empty(),
+            "affiliated crews must NOT auto-coalesce: {:?}",
+            report.auto_coalesce
+        );
+        // The rule-split proposal still fires (detection is affiliation-blind).
+        assert!(!report.proposals.is_empty(), "{:?}", report.proposals);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// Cross-project coalitions (bd-hkw5.3) e2e (hermetic mailbox): crews
+    /// from two toron projects form ONE coalition. Each member's intents +
+    /// reservations land in THEIR OWN project (repo namespace); status fans
+    /// both boards; disband releases reservations in BOTH projects.
+    #[test]
+    fn xproj_coalition_scopes_intents_per_project_and_disband_cleans_both() {
+        let root = std::env::temp_dir().join(format!("fw-coal-xproj-{}", uuid::Uuid::new_v4()));
+        let data = std::env::temp_dir().join(format!("fw-coal-xproj-data-{}", uuid::Uuid::new_v4()));
+        let store = CoalitionStore::open_at("proj-a", root.clone(), data.clone())
+            .expect("open hermetic store");
+
+        // Crew oc lives in proj-a (the store's project); crew pi lives in
+        // proj-b (a second project in the same mailbox bus).
+        store.register_agent("oc").expect("register oc in proj-a");
+        let pi_profile = toron_core::nostr::identity::AgentProfile {
+            name: "pi".into(),
+            program: Some("opencode".into()),
+            model: None,
+            persona: None,
+            task_description: None,
+        };
+        runtime()
+            .unwrap()
+            .block_on(store.mailbox.register_agent("proj-b", &pi_profile))
+            .expect("register pi in proj-b");
+
+        // Form a coalition binding BOTH crews; oc maps to proj-a (implicit),
+        // pi maps to proj-b.
+        let member_projects = BTreeMap::from([("pi".to_string(), "proj-b".to_string())]);
+        let m = store
+            .form(
+                "beads",
+                "oc",
+                &["oc".into(), "pi".into()],
+                &member_projects,
+                &[],
+                None,
+            )
+            .expect("form xproj coalition");
+        assert_eq!(m.members.len(), 2);
+        assert_eq!(m.member_projects.get("pi").map(String::as_str), Some("proj-b"));
+        assert!(m.member_projects.get("oc").is_none(), "oc defaults to store project");
+
+        // Each crew declares an intent in ITS OWN project via the store
+        // (project_of routes the member).
+        store
+            .declare_intent(&m.id, "oc", &["src/toron/**".into()], Some("crew-a"), None)
+            .expect("oc intent in proj-a");
+        store
+            .declare_intent(&m.id, "pi", &["src/flywheel/**".into()], Some("crew-b"), None)
+            .expect("pi intent in proj-b");
+
+        // The boards are project-scoped: oc's intent is NOT visible in
+        // proj-b; pi's is NOT visible in proj-a.
+        let intents_a = runtime()
+            .unwrap()
+            .block_on(store.mailbox.active_intents("proj-a"))
+            .expect("proj-a board");
+        let intents_b = runtime()
+            .unwrap()
+            .block_on(store.mailbox.active_intents("proj-b"))
+            .expect("proj-b board");
+        assert!(
+            intents_a.iter().any(|i| i.agent_name == "oc" && i.path_pattern == "src/toron/**"),
+            "oc's intent must be on the proj-a board: {intents_a:?}"
+        );
+        assert!(
+            !intents_a.iter().any(|i| i.agent_name == "pi"),
+            "pi's intent must NOT leak into proj-a: {intents_a:?}"
+        );
+        assert!(
+            intents_b.iter().any(|i| i.agent_name == "pi" && i.path_pattern == "src/flywheel/**"),
+            "pi's intent must be on the proj-b board: {intents_b:?}"
+        );
+        assert!(
+            !intents_b.iter().any(|i| i.agent_name == "oc"),
+            "oc's intent must NOT leak into proj-b: {intents_b:?}"
+        );
+
+        // Status fans BOTH projects' boards into one coalition view.
+        let st = store.status(&m.id).expect("status");
+        assert_eq!(st.intents.len(), 2, "status fans both boards: {:?}", st.intents);
+        assert_eq!(st.member_projects.get("pi").map(String::as_str), Some("proj-b"));
+
+        // Both crews hold reservations in their own projects.
+        store
+            .reserve(&m.id, "oc", &["src/toron/engine.rs".into()], None, true, Some("crew-a"))
+            .expect("oc reserve");
+        store
+            .reserve(&m.id, "pi", &["src/flywheel/engine.rs".into()], None, true, Some("crew-b"))
+            .expect("pi reserve");
+        let held_a = runtime()
+            .unwrap()
+            .block_on(store.mailbox.active_reservations("proj-a"))
+            .expect("proj-a holds");
+        let held_b = runtime()
+            .unwrap()
+            .block_on(store.mailbox.active_reservations("proj-b"))
+            .expect("proj-b holds");
+        assert!(held_a.iter().any(|r| r.agent_name == "oc"), "{held_a:?}");
+        assert!(held_b.iter().any(|r| r.agent_name == "pi"), "{held_b:?}");
+        assert!(!held_a.iter().any(|r| r.agent_name == "pi"), "no cross-project leak: {held_a:?}");
+
+        // Disband cleans BOTH projects.
+        store.disband(&m.id, false, Some("gate"), None).expect("disband");
+        assert_eq!(store.status(&m.id).expect("status").status, "closed");
+        let held_a_after = runtime()
+            .unwrap()
+            .block_on(store.mailbox.active_reservations("proj-a"))
+            .expect("proj-a after disband");
+        let held_b_after = runtime()
+            .unwrap()
+            .block_on(store.mailbox.active_reservations("proj-b"))
+            .expect("proj-b after disband");
+        assert!(held_a_after.is_empty(), "proj-a cleaned: {held_a_after:?}");
+        assert!(held_b_after.is_empty(), "proj-b cleaned: {held_b_after:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// Cross-project coalitions (bd-hkw5.3): a member must be registered in
+    /// the project it is scoped to — form refuses an unregistered crew.
+    #[test]
+    fn xproj_coalition_requires_member_registered_in_own_project() {
+        let root = std::env::temp_dir().join(format!("fw-coal-xproj-rej-{}", uuid::Uuid::new_v4()));
+        let data = std::env::temp_dir().join(format!("fw-coal-xproj-rej-data-{}", uuid::Uuid::new_v4()));
+        let store = CoalitionStore::open_at("proj-a", root.clone(), data.clone())
+            .expect("open hermetic store");
+        store.register_agent("oc").expect("register oc in proj-a");
+        // pi is NOT registered in proj-b.
+        let err = store
+            .form(
+                "beads",
+                "oc",
+                &["oc".into(), "pi".into()],
+                &BTreeMap::from([("pi".to_string(), "proj-b".to_string())]),
+                &[],
+                None,
+            )
+            .expect_err("form must refuse pi@proj-b (unregistered)");
+        assert!(
+            err.to_string().contains("not registered in their project"),
+            "got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// bd-hkw5.2: the leaf mission prompt carries coalition context + the
+    /// pre-split scope (the leaf knows what it runs and that it is one-shot).
+    #[test]
+    fn leaf_prompt_carries_coalition_context_and_scope() {
+        let p = leaf_prompt("coal-1", "beads", "split: crates/toron-core/src/mailbox/");
+        assert!(p.contains("coal-1"), "{p}");
+        assert!(p.contains("beads"), "{p}");
+        assert!(p.contains("split: crates/toron-core/src/mailbox/"), "{p}");
+        assert!(p.contains("one-shot"), "{p}");
+        assert!(p.contains("no negotiation"), "{p}");
+    }
+
+    /// bd-hkw5.2: the leaf JSON contract parses into a LeafDispatch —
+    /// success fields flow, missing status defaults to `unknown`, errors
+    /// surface.
+    #[test]
+    fn leaf_outcome_parses_success_and_failure() {
+        let ok = leaf_outcome(&json!({
+            "ok": true,
+            "run_id": "hl-20260810-1",
+            "response": "done",
+            "status": "success",
+            "tokens_in": 100,
+            "tokens_out": 20,
+            "model": "glm-5.2",
+            "duration_ms": 1500,
+        }));
+        assert_eq!(ok.run_id, "hl-20260810-1");
+        assert_eq!(ok.status, "success");
+        assert!(ok.ok);
+        assert_eq!(ok.response, "done");
+        assert_eq!(ok.tokens_in, 100);
+        assert_eq!(ok.model, "glm-5.2");
+
+        let err = leaf_outcome(&json!({
+            "ok": false,
+            "run_id": "hl-20260810-2",
+            "status": "fail",
+            "error": "model 404",
+        }));
+        assert_eq!(err.status, "fail");
+        assert!(!err.ok);
+        assert_eq!(err.error.as_deref(), Some("model 404"));
+
+        // Missing status -> honest "unknown" (never a panic).
+        let bare = leaf_outcome(&json!({ "ok": true }));
+        assert_eq!(bare.status, "unknown");
+        assert_eq!(bare.run_id, "");
+    }
+
+    /// bd-hkw5.2 GATE (hermetic half): a leaf outcome posted via
+    /// `post_leaf_result` lands as a kind-42 board event on the coalition
+    /// channel — visible in `coalition status` — and non-members are
+    /// refused. (The subprocess half, `dispatch_leaf`, shells out to
+    /// `__run-headless`; the channel landing is this pure surface.)
+    #[test]
+    fn leaf_result_lands_in_coalition_channel() {
+        let root = std::env::temp_dir().join(format!("fw-coal-leaf-{}", uuid::Uuid::new_v4()));
+        let data = std::env::temp_dir().join(format!("fw-coal-leaf-data-{}", uuid::Uuid::new_v4()));
+        let store = CoalitionStore::open_at("leaf-e2e", root.clone(), data.clone())
+            .expect("open hermetic store");
+        store.register_agent("oc").expect("register oc");
+        store.register_agent("pi").expect("register pi");
+        let m = store
+            .form("beads", "oc", &["oc".into(), "pi".into()], &BTreeMap::new(), &[], None)
+            .expect("form");
+
+        let outcome = LeafDispatch {
+            run_id: "hl-20260810-99".into(),
+            profile: "planner".into(),
+            scope: "split: src/".into(),
+            status: "success".into(),
+            ok: true,
+            response: "split done".into(),
+            tokens_in: 10,
+            tokens_out: 5,
+            model: "glm-5.2".into(),
+            duration_ms: 900,
+            error: None,
+        };
+        store
+            .post_leaf_result(&m.id, "oc", "@planner", "split: src/", &outcome)
+            .expect("post leaf result");
+
+        // The result lands in the coalition: the channel carries a kind-42
+        // leaf-result board event.
+        let st = store.status(&m.id).expect("status");
+        let leaf_event = st
+            .channel
+            .events
+            .iter()
+            .find(|e| e.kind == CHANNEL_MESSAGE && e.content.contains("leaf-result"))
+            .expect("kind-42 leaf-result board event");
+        assert!(leaf_event.content.contains("hl-20260810-99"), "{leaf_event:?}");
+        assert!(leaf_event.content.contains("success"), "{leaf_event:?}");
+
+        // Non-member is refused at the gate.
+        let err = store
+            .post_leaf_result(&m.id, "gk", "@planner", "split: src/", &outcome)
+            .expect_err("gk is not a member");
+        assert!(err.to_string().contains("not a member"), "got: {err}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
     }
 }
