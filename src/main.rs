@@ -15,6 +15,7 @@ mod durable;
 mod fs_util;
 mod headless;
 mod herdr_shim;
+mod intent;
 mod mail_shim;
 mod mcp_http;
 mod models;
@@ -1446,6 +1447,18 @@ enum SquadCmd {
 /// auto-proposer here (P11.3b).
 #[derive(Subcommand)]
 enum CoalitionCmd {
+    /// Register an agent identity in the coalition's toron project (members
+    /// must be registered before `form`; profiles are not agents).
+    Register {
+        /// agent name (key name in the project's agents dir)
+        name: String,
+        /// toron project slug (default: toron)
+        #[arg(long, default_value = "toron")]
+        project: String,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
     /// Form a captain-led coalition around a goal workflow: lint gate, start
     /// the goal run, create the NIP-29 channel, write the manifest.
     Form {
@@ -1463,6 +1476,10 @@ enum CoalitionCmd {
         /// bead ids tracked for the beads-closed disband gate (comma list)
         #[arg(long)]
         beads: Option<String>,
+        /// the repo whose .beads holds the tracked beads (br resolves its
+        /// workspace from cwd; default: none — probe from the current dir)
+        #[arg(long)]
+        tracker: Option<String>,
         /// JSON output for agent drivers
         #[arg(long)]
         json: bool,
@@ -1623,6 +1640,34 @@ enum CoalitionCmd {
         #[arg(long)]
         json: bool,
     },
+    /// P11.3b detector: scan the intent board for overlapping crews and
+    /// propose tiered rule-splits (split-by-directory / sequence-by-
+    /// dependency / merge) + flag auto-coalesce candidates (non-trivial
+    /// source overlaps between unaffiliated crews).
+    Detect {
+        /// toron project slug (default: toron)
+        #[arg(long, default_value = "toron")]
+        project: String,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+    /// P11.3b auto-coalesce: form an ad-hoc coalition around a goal workflow
+    /// for every non-trivial overlap the detector flagged between
+    /// unaffiliated crews.
+    AutoCoalesce {
+        /// goal workflow name (must pass the lint gate)
+        goal: String,
+        /// act as this agent (the captain; must be a member)
+        #[arg(long = "as")]
+        as_agent: String,
+        /// toron project slug (default: toron)
+        #[arg(long, default_value = "toron")]
+        project: String,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
     /// Disband a coalition: beads-closed gate (when tracked), member
     /// reservations released, channel close post, manifest closed.
     Disband {
@@ -1634,6 +1679,10 @@ enum CoalitionCmd {
         beads_closed: bool,
         #[arg(long)]
         reason: Option<String>,
+        /// override the tracker repo recorded at form (br cwd for the
+        /// beads-closed probe)
+        #[arg(long)]
+        tracker: Option<String>,
         /// toron project slug (default: toron)
         #[arg(long, default_value = "toron")]
         project: String,
@@ -8495,12 +8544,23 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
     }
 
     match cmd {
+        CoalitionCmd::Register { name, project, json } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            store.register_agent(name)?;
+            if *json {
+                print_json(&json!({ "registered": name, "project": project }));
+            } else {
+                println!("registered agent {name} in project {project}");
+            }
+            Ok(())
+        }
         CoalitionCmd::Form {
             goal,
             crews,
             as_agent,
             project,
             beads,
+            tracker,
             json,
         } => {
             let members = squad_members(crews)?;
@@ -8515,7 +8575,7 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                 })
                 .unwrap_or_default();
             let store = CoalitionStore::open(project, coalitions_root())?;
-            let m = store.form(goal, as_agent, &members, &beads)?;
+            let m = store.form(goal, as_agent, &members, &beads, tracker.as_deref())?;
             if *json {
                 print_json(&serde_json::to_value(&m)?);
             } else {
@@ -8720,15 +8780,79 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
             }
             Ok(())
         }
-        CoalitionCmd::Disband {
-            id,
-            beads_closed,
-            reason,
+        CoalitionCmd::Detect { project, json } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let report = store.detect()?;
+            if *json {
+                print_json(&serde_json::to_value(&report)?);
+            } else {
+                if report.overlaps.is_empty() {
+                    println!("no intent overlaps on the board");
+                }
+                for o in &report.overlaps {
+                    let tag = if o.non_trivial { "source" } else { "trivial" };
+                    println!("overlap: {} <-> {} ({tag})", o.a, o.b);
+                    println!("  {} : {}", o.a, o.path_a);
+                    println!("  {} : {}", o.b, o.path_b);
+                }
+                for p in &report.proposals {
+                    println!(
+                        "proposal [{tier}/{kind}]: {} <-> {} — {}",
+                        p.agents[0],
+                        p.agents[1],
+                        p.rationale,
+                        tier = p.tier,
+                        kind = serde_json::to_string(&p.kind)
+                            .unwrap_or_default()
+                            .trim_matches('"')
+                    );
+                }
+                for c in &report.auto_coalesce {
+                    println!("auto-coalesce candidate: {} <-> {} (non-trivial source)", c.a, c.b);
+                }
+            }
+            Ok(())
+        }
+        CoalitionCmd::AutoCoalesce {
+            goal,
+            as_agent,
             project,
             json,
         } => {
             let store = CoalitionStore::open(project, coalitions_root())?;
-            store.disband(id, *beads_closed, reason.as_deref())?;
+            let report = store.detect()?;
+            if report.auto_coalesce.is_empty() {
+                if *json {
+                    print_json(&json!({ "formed": [] }));
+                } else {
+                    println!("no auto-coalesce candidates (no non-trivial unaffiliated overlap)");
+                }
+                return Ok(());
+            }
+            let formed = store.auto_coalesce(goal, as_agent, &report)?;
+            if *json {
+                print_json(&serde_json::to_value(&formed)?);
+            } else {
+                for m in &formed {
+                    println!(
+                        "formed coalition {} (goal {goal}, members {})",
+                        m.id,
+                        m.members.join(", ")
+                    );
+                }
+            }
+            Ok(())
+        }
+        CoalitionCmd::Disband {
+            id,
+            beads_closed,
+            reason,
+            tracker,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            store.disband(id, *beads_closed, reason.as_deref(), tracker.as_deref())?;
             if *json {
                 print_json(&json!({ "disbanded": id }));
             } else {
