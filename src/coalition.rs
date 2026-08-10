@@ -16,6 +16,13 @@
 //! primary | manual fallback) closes the coalition: channel close post,
 //! member-held reservations released, manifest marked closed.
 //!
+//! **Auto-collab (P11.3b, bd-foh8.4):** [`CoalitionStore::detect`] reads the
+//! intent board and runs the tiered rule proposer (split-by-directory /
+//! sequence-by-dependency / merge) from `intent.rs`; [`CoalitionStore::auto_coalesce`]
+//! forms an ad-hoc coalition for overlapping UNaffiliated crews on
+//! non-trivial source. The soft-conflict freeze path surfaces the detector's
+//! proposals instead of leaving negotiation purely manual.
+//!
 //! Channel events are signed by the in-process operator key (the captain is
 //! the operator authority, ADR-0011 Spec 6) and project-scoped (`#t`) — the
 //! mailbox bus persists them (InProcessBus + SQLite under `TORON_DATA_DIR`).
@@ -474,7 +481,10 @@ impl CoalitionStore {
 
     /// `coalition reserve <id> <paths...>`: acquire leases (P11.2). A
     /// soft-conflict FREEZE (another member's in-TTL intent) appears in
-    /// `soft_conflicts` — the manual-collab trigger.
+    /// `soft_conflicts` — the P11.3b detector's trigger: on freeze, the
+    /// tiered rule-proposer proposes the split (instead of manual-only
+    /// negotiation). `proposal` is `Some` exactly when the freeze fired and
+    /// the detector found a rule for it.
     pub fn reserve(
         &self,
         id: &str,
@@ -485,7 +495,7 @@ impl CoalitionStore {
         reason: Option<&str>,
     ) -> Result<AcquireResult> {
         self.require_active_member(id, agent)?;
-        runtime()?
+        let result = runtime()?
             .block_on(self.mailbox.file_reservation_paths(
                 &self.project,
                 agent,
@@ -494,7 +504,23 @@ impl CoalitionStore {
                 exclusive,
                 reason,
             ))
-            .map_err(|e| anyhow!("reserve: {e}"))
+            .map_err(|e| anyhow!("reserve: {e}"))?;
+        // P11.3b: on a soft-conflict FREEZE, run the detector over the board
+        // and attach the rule-split proposal for the frozen paths (the
+        // P11.2 manual negotiation stays the dispute backstop when a
+        // proposal is rejected). Best-effort: a detector failure does not
+        // fail the reserve.
+        if !result.soft_conflicts.is_empty()
+            && let Ok(report) = self.detect()
+            && let Some(p) = report.proposals.first()
+        {
+            return Ok(AcquireResult {
+                soft_conflicts: result.soft_conflicts,
+                proposal: Some(serde_json::to_value(p)?),
+                ..result
+            });
+        }
+        Ok(result)
     }
 
     /// `coalition negotiate request`: ask the holder to release/defer (P11.2).
@@ -579,6 +605,90 @@ impl CoalitionStore {
                 note,
             ))
             .map_err(|e| anyhow!("negotiate escalate: {e}"))
+    }
+
+    // ------------------------------------------------------------------
+    // Auto-collab (P11.3b, bd-foh8.4): detector + tiered proposer
+    // ------------------------------------------------------------------
+
+    /// The intent board as the detector's view: active `status:intent`
+    /// declarations in the project (all crews, not just this coalition's
+    /// members — overlaps with outsiders are the auto-coalesce trigger).
+    pub fn board(&self) -> Result<Vec<crate::intent::IntentView>> {
+        let intents = runtime()?
+            .block_on(self.mailbox.active_intents(&self.project))
+            .map_err(|e| anyhow!("active intents: {e}"))?;
+        Ok(intents
+            .into_iter()
+            .map(|i| crate::intent::IntentView {
+                agent: i.agent_name,
+                path: i.path_pattern,
+                reason: i.reason,
+            })
+            .collect())
+    }
+
+    /// Run the detector over the intent board: overlaps + tiered rule-split
+    /// proposals + the auto-coalesce gate. `is_affiliated` decides whether a
+    /// crew already belongs to a coalition (project-wide manifest scan).
+    pub fn detect(&self) -> Result<crate::intent::DetectionReport> {
+        let board = self.board()?;
+        let active_coalitions = self.list()?;
+        let report = crate::intent::run_detector(&board, &|agent| {
+            active_coalitions
+                .iter()
+                .any(|m| m.status == "active" && m.members.iter().any(|x| x == agent))
+        });
+        Ok(report)
+    }
+
+    /// Auto-coalesce: form an ad-hoc coalition around the goal workflow for
+    /// EVERY non-trivial overlap between unaffiliated crews the detector
+    /// found. The coalition binds the two crews' members; the captain is the
+    /// first member of the pair. Idempotent per (goal, members) — re-detection
+    /// does not duplicate.
+    ///
+    /// Returns the manifests of the formed coalitions (the detector's
+    /// `auto_coalesce` list drives it; empty overlap list → empty result).
+    pub fn auto_coalesce(
+        &self,
+        goal: &str,
+        captain: &str,
+        report: &crate::intent::DetectionReport,
+    ) -> Result<Vec<CoalitionManifest>> {
+        let mut formed = Vec::new();
+        // Idempotency key: (goal, member set) — coalition ids are
+        // timestamped (unique per formation), so dedupe on the SIGNATURE
+        // against the PERSISTENT registry (a re-detection must not
+        // duplicate an already-formed pair, even across CLI invocations).
+        let existing = self.list()?;
+        for o in &report.auto_coalesce {
+            if !o.non_trivial {
+                continue;
+            }
+            // Members: the two overlapping crews' agents, deduped + the
+            // captain first (captain must be a member).
+            let mut members: Vec<String> = vec![captain.to_string()];
+            for m in [o.a.clone(), o.b.clone()] {
+                if !members.contains(&m) {
+                    members.push(m);
+                }
+            }
+            let already = existing.iter().any(|m| {
+                m.status == "active"
+                    && m.goal == goal
+                    && m.members.len() == members.len()
+                    && m.members.iter().all(|x| members.contains(x))
+            });
+            if already {
+                continue;
+            }
+            // The overlap pair is the board's evidence; the goal workflow
+            // must exist (lint gate inside form).
+            let manifest = self.form(goal, captain, &members, &[], None)?;
+            formed.push(manifest);
+        }
+        Ok(formed)
     }
 
     // ------------------------------------------------------------------
@@ -893,5 +1003,156 @@ mod tests {
         let back: CoalitionManifest = serde_json::from_str(&s).unwrap();
         assert_eq!(back.tracker_repo.as_deref(), Some("/tmp/tracker"));
         assert_eq!(back.id, "coal-x");
+    }
+
+    /// P11.3b e2e (bd-foh8.4, hermetic mailbox): two crews declare
+    /// overlapping intents on a source dir → the detector proposes a rule
+    /// split + flags the pair for auto-coalesce; a README overlap does NOT
+    /// coalesce. `auto_coalesce` forms an ad-hoc coalition binding both.
+    #[test]
+    fn detector_e2e_overlap_proposes_and_coalesces() {
+        let root = std::env::temp_dir().join(format!("fw-coal-det-{}", uuid::Uuid::new_v4()));
+        let data = std::env::temp_dir().join(format!("fw-coal-det-data-{}", uuid::Uuid::new_v4()));
+        let store = CoalitionStore::open_at("det-e2e", root.clone(), data.clone())
+            .expect("open hermetic store");
+        store.register_agent("oc").expect("register oc");
+        store.register_agent("pi").expect("register pi");
+
+        // Crew oc intends a broad source glob; crew pi intends a subpath
+        // (literal — mailbox overlap semantics are glob-vs-path).
+        runtime()
+            .unwrap()
+            .block_on(store.mailbox.declare_intent(
+                "det-e2e",
+                "oc",
+                &["src/**".into()],
+                Some("bd-a"),
+                None,
+            ))
+            .expect("oc intent");
+        runtime()
+            .unwrap()
+            .block_on(store.mailbox.declare_intent(
+                "det-e2e",
+                "pi",
+                &["src/workflow/engine.rs".into()],
+                Some("bd-b"),
+                None,
+            ))
+            .expect("pi intent");
+        // Crew gk intends a doc path (trivial — never coalesces).
+        store.register_agent("gk").expect("register gk");
+        runtime()
+            .unwrap()
+            .block_on(store.mailbox.declare_intent(
+                "det-e2e",
+                "gk",
+                &["docs/guide.md".into()],
+                None,
+                None,
+            ))
+            .expect("gk intent");
+
+        let report = store.detect().expect("detect");
+        let pairs: Vec<String> = report
+            .overlaps
+            .iter()
+            .map(|o| format!("{}<->{}", o.a, o.b))
+            .collect();
+        assert!(
+            pairs.iter().any(|p| {
+                let mut parts = p.split("<->");
+                let (a, b) = (parts.next().unwrap(), parts.next().unwrap());
+                (a == "oc" && b == "pi") || (a == "pi" && b == "oc")
+            }),
+            "oc<->pi overlap expected, got {pairs:?}"
+        );
+        assert!(
+            report
+                .proposals
+                .iter()
+                .any(|p| {
+                    let same_pair = (p.agents[0] == "oc" && p.agents[1] == "pi")
+                        || (p.agents[0] == "pi" && p.agents[1] == "oc");
+                    same_pair && p.kind == crate::intent::ProposalKind::SequenceByDependency
+                }),
+            "{:?}",
+            report.proposals
+        );
+        // gk's trivial overlap never coalesces.
+        assert!(
+            report
+                .auto_coalesce
+                .iter()
+                .all(|o| o.a != "gk" && o.b != "gk"),
+            "trivial overlap must not coalesce: {:?}",
+            report.auto_coalesce
+        );
+        assert_eq!(report.auto_coalesce.len(), 1, "{:?}", report.auto_coalesce);
+
+        // Auto-coalesce forms an ad-hoc coalition binding the pair. Goal
+        // must be a dispatch-only workflow (a request_approval step would
+        // park the recording run durably — `beads` is dispatch-only).
+        let formed = store
+            .auto_coalesce("beads", "oc", &report)
+            .expect("auto-coalesce");
+        assert_eq!(formed.len(), 1, "one ad-hoc coalition formed");
+        assert_eq!(formed[0].members, vec!["oc".to_string(), "pi".to_string()]);
+        assert_eq!(formed[0].status, "active");
+        // Idempotent: a second pass forms nothing new.
+        let again = store.auto_coalesce("beads", "oc", &report).expect("again");
+        assert!(again.is_empty(), "idempotent per formation");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// P11.3b e2e (bd-foh8.4): an ALREADY-affiliated crew does not
+    /// auto-coalesce — affiliation is the gate.
+    #[test]
+    fn detector_e2e_affiliated_crew_does_not_coalesce() {
+        let root = std::env::temp_dir().join(format!("fw-coal-aff-{}", uuid::Uuid::new_v4()));
+        let data = std::env::temp_dir().join(format!("fw-coal-aff-data-{}", uuid::Uuid::new_v4()));
+        let store = CoalitionStore::open_at("det-aff", root.clone(), data.clone())
+            .expect("open hermetic store");
+        store.register_agent("oc").expect("register oc");
+        store.register_agent("pi").expect("register pi");
+        // oc is already in a coalition with pi.
+        store
+            .form("beads", "oc", &["oc".into(), "pi".into()], &[], None)
+            .expect("form coalition");
+        runtime()
+            .unwrap()
+            .block_on(store.mailbox.declare_intent(
+                "det-aff",
+                "oc",
+                &["src/**".into()],
+                None,
+                None,
+            ))
+            .expect("oc intent");
+        runtime()
+            .unwrap()
+            .block_on(store.mailbox.declare_intent(
+                "det-aff",
+                "pi",
+                &["src/foo.rs".into()],
+                None,
+                None,
+            ))
+            .expect("pi intent");
+
+        let report = store.detect().expect("detect");
+        assert_eq!(report.overlaps.len(), 1, "{:?}", report.overlaps);
+        assert!(
+            report.auto_coalesce.is_empty(),
+            "affiliated crews must NOT auto-coalesce: {:?}",
+            report.auto_coalesce
+        );
+        // The rule-split proposal still fires (detection is affiliation-blind).
+        assert!(!report.proposals.is_empty(), "{:?}", report.proposals);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
     }
 }
