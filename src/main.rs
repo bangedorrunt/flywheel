@@ -1375,6 +1375,15 @@ enum ProfileCmd {
         /// high|xhigh|max (bd-42fs)
         #[arg(long)]
         effort: Option<String>,
+        /// omp role model for lightweight tasks (--smol=, bd-gsvn.2)
+        #[arg(long)]
+        smol: Option<String>,
+        /// omp role model for slow/thorough reasoning (--slow=, bd-gsvn.2)
+        #[arg(long)]
+        slow: Option<String>,
+        /// omp role model for architectural planning (--plan=, bd-gsvn.2)
+        #[arg(long)]
+        plan: Option<String>,
     },
     /// Alias for `create` (same fields)
     Edit {
@@ -1405,6 +1414,15 @@ enum ProfileCmd {
         /// high|xhigh|max (bd-42fs)
         #[arg(long)]
         effort: Option<String>,
+        /// omp role model for lightweight tasks (--smol=, bd-gsvn.2)
+        #[arg(long)]
+        smol: Option<String>,
+        /// omp role model for slow/thorough reasoning (--slow=, bd-gsvn.2)
+        #[arg(long)]
+        slow: Option<String>,
+        /// omp role model for architectural planning (--plan=, bd-gsvn.2)
+        #[arg(long)]
+        plan: Option<String>,
     },
     /// Resolve @name (host scope) and spawn the agent via the configured
     /// backend. Optionally invoke a workflow after spawn.
@@ -8538,6 +8556,9 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                     "harness": p.harness,
                     "model": p.model,
                     "effort": p.effort,
+                    "smol": p.smol,
+                    "slow": p.slow,
+                    "plan": p.plan,
                     "role": p.role,
                     "backend": cat.backend(&name),
                     "default_workflow": p.default_workflow,
@@ -8556,6 +8577,9 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 "harness": p.harness,
                 "model": p.model,
                 "effort": p.effort,
+                "smol": p.smol,
+                "slow": p.slow,
+                "plan": p.plan,
                 "role": p.role,
                 "backend": cat.backend(name),
                 "default_workflow": p.default_workflow,
@@ -8574,6 +8598,9 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             backend,
             default_workflow,
             effort,
+            smol,
+            slow,
+            plan,
         }
         | ProfileCmd::Edit {
             name,
@@ -8585,6 +8612,9 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             backend,
             default_workflow,
             effort,
+            smol,
+            slow,
+            plan,
         } => {
             let path = config::config_dir().join("profiles.toml");
             let cat = ProfileCatalog::load()?;
@@ -8593,6 +8623,9 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 harness: harness.clone().unwrap_or(base.harness),
                 model: model.clone().unwrap_or(base.model),
                 effort: effort.clone().unwrap_or(base.effort),
+                smol: smol.clone().unwrap_or(base.smol),
+                slow: slow.clone().unwrap_or(base.slow),
+                plan: plan.clone().unwrap_or(base.plan),
                 role: role.clone().unwrap_or(base.role),
                 behavior: behavior.clone().unwrap_or(base.behavior),
                 task_hint: task_hint.clone().unwrap_or(base.task_hint),
@@ -11961,16 +11994,35 @@ fn cmd_internal_run_headless(
         registry.resolve(&model_id, harness)
     };
 
+    // bd-gsvn.2: the omp role models (--smol/--slow/--plan) resolve through
+    // the registry the same way as `model` (provider/id form for omp); an
+    // unknown role id passes through verbatim, never blocking the run.
+    let resolve_role = |id: &str| -> String {
+        if id.is_empty() {
+            return String::new();
+        }
+        if registry.get(id).is_none() {
+            eprintln!("flywheel: role model {id:?} not in registry (flywheel model add) — passing through");
+        }
+        registry.resolve(id, harness)
+    };
+    let role_smol = resolve_role(&profile.smol);
+    let role_slow = resolve_role(&profile.slow);
+    let role_plan = resolve_role(&profile.plan);
+
     // bd-42fs retry-on-429: a rate-limited run (HTTP 429 in the harness
     // error stream or stderr) retries ONCE with the model's registry
     // `fallback` (oracle glm-5.2 -> grok, on the grok harness). Thin
     // dynamic-routing slice; the transition is logged via the run entry's
     // `model` (the actual used id).
     let run_once = |harness: &str, model_id: &str, model: &str, effort: &str| -> Result<RunAttempt> {
-        let argv = headless::build_argv(
+        let argv = headless::build_argv_roles(
             harness,
             (!model.is_empty()).then_some(model),
             (!effort.is_empty()).then_some(effort),
+            &role_smol,
+            &role_slow,
+            &role_plan,
             prompt,
         )
         .map_err(|e| anyhow!("headless run for @{profile_name}: {e}"))?;

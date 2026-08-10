@@ -50,11 +50,34 @@ pub fn model_args(harness: &str, model: &str, effort: Option<&str>) -> Vec<Strin
     }
 }
 
-/// Build the argv for one harness (pure — the P10.1 unit surface).
-pub fn build_argv(
+/// The omp role-model flags (`--smol=<id>` / `--slow=<id>` / `--plan=<id>`,
+/// bd-gsvn.2). omp-only — other harnesses use `model` for every role and get
+/// no role flags (per-harness gate: absent role ids emit nothing). Each role
+/// id is emitted verbatim; registry resolution happens before this (the
+/// caller passes the resolved provider/id form like `model_args`).
+pub fn role_model_args(harness: &str, smol: &str, slow: &str, plan: &str) -> Vec<String> {
+    if harness != "omp" {
+        return vec![];
+    }
+    let mut args = Vec::new();
+    for (flag, id) in [("--smol", smol), ("--slow", slow), ("--plan", plan)] {
+        if !id.is_empty() {
+            args.push(format!("{flag}={id}"));
+        }
+    }
+    args
+}
+
+/// `build_argv` + the omp role models (`--smol`/`--slow`/`--plan`,
+/// bd-gsvn.2). The spawn + headless paths pass the profile's role fields;
+/// other harnesses ignore them (per-harness gate inside `role_model_args`).
+pub fn build_argv_roles(
     harness: &str,
     model: Option<&str>,
     effort: Option<&str>,
+    smol: &str,
+    slow: &str,
+    plan: &str,
     prompt: &str,
 ) -> Result<Vec<String>> {
     let mut argv: Vec<String> = Vec::new();
@@ -70,6 +93,7 @@ pub fn build_argv(
             if let Some(m) = model {
                 argv.extend(model_args("omp", m, effort));
             }
+            argv.extend(role_model_args("omp", smol, slow, plan));
         }
         "opencode" => {
             argv.extend(["opencode", "run", "--format", "json"].map(String::from));
@@ -279,7 +303,7 @@ mod tests {
     #[test]
     fn pi_argv_with_model() {
         assert_eq!(
-            build_argv("pi", Some("google/gemini-2.5-flash"), None, "hello").unwrap(),
+            build_argv_roles("pi", Some("google/gemini-2.5-flash"), None, "", "", "", "hello").unwrap(),
             vec![
                 "pi".to_string(),
                 "-p".into(),
@@ -295,7 +319,7 @@ mod tests {
     #[test]
     fn pi_argv_without_model() {
         assert_eq!(
-            build_argv("pi", None, None, "hello").unwrap(),
+            build_argv_roles("pi", None, None, "", "", "", "hello").unwrap(),
             vec![
                 "pi".to_string(),
                 "-p".into(),
@@ -309,7 +333,7 @@ mod tests {
     #[test]
     fn omp_argv_uses_equals_form() {
         assert_eq!(
-            build_argv("omp", Some("gpt-5.2"), None, "hi").unwrap(),
+            build_argv_roles("omp", Some("gpt-5.2"), None, "", "", "", "hi").unwrap(),
             vec![
                 "omp".to_string(),
                 "-p".into(),
@@ -323,7 +347,7 @@ mod tests {
     #[test]
     fn opencode_argv_uses_run_with_json_format() {
         assert_eq!(
-            build_argv("opencode", Some("anthropic/claude-sonnet-4"), None, "hi").unwrap(),
+            build_argv_roles("opencode", Some("anthropic/claude-sonnet-4"), None, "", "", "", "hi").unwrap(),
             vec![
                 "opencode".to_string(),
                 "run".into(),
@@ -339,7 +363,7 @@ mod tests {
     #[test]
     fn grok_argv_uses_streaming_messages_json() {
         assert_eq!(
-            build_argv("grok", Some("grok-4"), None, "hi").unwrap(),
+            build_argv_roles("grok", Some("grok-4"), None, "", "", "", "hi").unwrap(),
             vec![
                 "grok".to_string(),
                 "--single=hi".into(),
@@ -353,7 +377,7 @@ mod tests {
 
     #[test]
     fn unknown_harness_is_an_error() {
-        let err = build_argv("hermes", None, None, "hi").unwrap_err();
+        let err = build_argv_roles("hermes", None, None, "", "", "", "hi").unwrap_err();
         assert!(err.to_string().contains("hermes"), "{err}");
     }
 
@@ -375,6 +399,66 @@ mod tests {
         );
         assert_eq!(model_args("pi", "glm-5.2", None), vec!["--model", "glm-5.2"]);
         assert!(model_args("hermes", "x", None).is_empty(), "unknown harness: no model args");
+    }
+
+    /// bd-gsvn.2: omp role models inject as `--smol/--slow/--plan`; every
+    /// other harness gets NO role flags (it uses `model` for all roles).
+    #[test]
+    fn role_model_args_omp_only_and_per_id() {
+        // omp with all three roles.
+        assert_eq!(
+            role_model_args("omp", "smol-1", "slow-1", "plan-1"),
+            vec!["--smol=smol-1", "--slow=slow-1", "--plan=plan-1"]
+        );
+        // absent roles emit nothing.
+        assert_eq!(role_model_args("omp", "", "", ""), Vec::<String>::new());
+        assert_eq!(role_model_args("omp", "smol-1", "", "plan-1"), vec!["--smol=smol-1", "--plan=plan-1"]);
+        // non-omp harnesses: never.
+        for h in ["opencode", "grok", "pi", "hermes"] {
+            assert_eq!(role_model_args(h, "s", "l", "p"), Vec::<String>::new(), "{h}");
+        }
+    }
+
+    /// bd-gsvn.2: the full omp argv carries model + effort + all three role
+    /// models in flag order; a non-omp harness ignores the roles entirely.
+    #[test]
+    fn build_argv_roles_injects_omp_role_models() {
+        assert_eq!(
+            build_argv_roles(
+                "omp",
+                Some("glm-5.2"),
+                Some("max"),
+                "smol-1",
+                "slow-1",
+                "plan-1",
+                "hi",
+            )
+            .unwrap(),
+            vec![
+                "omp".to_string(),
+                "-p".into(),
+                "--mode=json".into(),
+                "--model=glm-5.2".into(),
+                "--thinking=max".into(),
+                "--smol=smol-1".into(),
+                "--slow=slow-1".into(),
+                "--plan=plan-1".into(),
+                "hi".into(),
+            ]
+        );
+        // opencode ignores roles (uses -m for everything).
+        assert_eq!(
+            build_argv_roles("opencode", Some("claude-sonnet-4"), None, "s", "l", "p", "hi").unwrap(),
+            vec![
+                "opencode".to_string(),
+                "run".into(),
+                "--format".into(),
+                "json".into(),
+                "-m".into(),
+                "claude-sonnet-4".into(),
+                "hi".into(),
+            ]
+        );
     }
 
     /// The real pi JSON stream shape (verified against pi 2026-08-09):
