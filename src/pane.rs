@@ -266,7 +266,11 @@ fn spawn_crew_into(
                 let agent_args: Vec<String> = if profile.model.is_empty() {
                     vec![]
                 } else {
-                    headless::model_args(harness, &profile.model)
+                    headless::model_args(
+                        harness,
+                        &profile.model,
+                        (!profile.effort.is_empty()).then_some(profile.effort.as_str()),
+                    )
                 };
                 let agent =
                     crate::start_agent_with_retry(c, &name, harness, &pane_id, &agent_args)?;
@@ -303,6 +307,17 @@ fn spawn_crew_into(
     Ok(registry)
 }
 
+/// bd-42fs step 5: does a per-step harness override conflict with the
+/// profile's harness? Pane crews pre-spawn per profile, so an override that
+/// differs cannot be satisfied by an existing pane — the headless runner is
+/// the override surface. Pure + unit-tested.
+pub fn harness_override_conflicts(profile_harness: &str, spec_harness: Option<&str>) -> bool {
+    match spec_harness {
+        Some(h) if !h.trim().is_empty() => h != profile_harness,
+        _ => false,
+    }
+}
+
 /// The pane ActionRunner dispatch (ADR-0010 Spec A pane row, P10.3): a
 /// `dispatch_job` step resolves its `@profile` to a running crew pane, gets
 /// the profile behavior preamble prepended (Spec C — same conditioning as
@@ -331,6 +346,19 @@ pub fn pane_dispatch(
     let profile = catalog.get(profile_name).ok_or_else(|| {
         anyhow!("pane dispatch: unknown profile @{profile_name} (flywheel profile list)")
     })?;
+    // bd-42fs step 5: a per-step harness override (spec.harness) is honored
+    // by the HEADLESS runner; the pane crew is pre-spawned from the
+    // profile's harness, so an override that differs from the profile's
+    // harness cannot be satisfied by an existing pane — fail clearly
+    // (the override is a headless-path feature; pane crews run the profile
+    // harness).
+    if harness_override_conflicts(&profile.harness, headless::dispatch_spec_harness(spec)) {
+        let h = headless::dispatch_spec_harness(spec).unwrap_or("");
+        bail!(
+            "pane dispatch: step @{profile_name} overrides harness={h} but the crew pane runs {} (profile harness) — per-step harness overrides land in --mode headless; pane crews spawn per profile",
+            profile.harness
+        );
+    }
     // Role conditioning (Spec C): preamble prepended to the stage prompt (or
     // the goal fallback) — identical to the headless runner.
     let base = match headless::dispatch_spec_stage(spec) {
@@ -442,6 +470,20 @@ mod tests {
         assert!(long.len() <= 32, "name too long: {long} ({})", long.len());
         let short = crew_agent_name("wf", "reviewer", 1);
         assert!(short.len() <= 32);
+    }
+
+    /// bd-42fs step 5: a per-step harness override that differs from the
+    /// profile's harness is a pane-path conflict (headless honors it; the
+    /// pane crew is pre-spawned per profile). Same-harness overrides and
+    /// absent overrides never conflict.
+    #[test]
+    fn harness_override_conflicts_only_when_different() {
+        assert!(harness_override_conflicts("omp", Some("opencode")));
+        assert!(harness_override_conflicts("omp", Some("grok")));
+        assert!(!harness_override_conflicts("omp", Some("omp")));
+        assert!(!harness_override_conflicts("omp", None));
+        assert!(!harness_override_conflicts("omp", Some("")));
+        assert!(!harness_override_conflicts("opencode", Some("opencode")));
     }
 
     /// P10.3: an empty crew plan refuses pane mode (fail-fast, clear error).
