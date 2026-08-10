@@ -134,6 +134,14 @@ pub struct PollKindArgs {
     pub name: String,
 }
 
+/// Args for the `__profile` leaf (bd-gsvn.1): the profile name an agent
+/// serves, resolved from the spawn registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileArgs {
+    pub project: String,
+    pub name: String,
+}
+
 /// Args for the `__poll_events` leaf (bd-event-subscribe-reactor).
 /// Simple identifier params only — Resonate constraint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +220,11 @@ pub struct SendArgs {
     pub invocation: String,
     /// loop iteration at send time (last-sent registry bookkeeping)
     pub iteration: u64,
+    /// profile name whose behavior preamble conditions the prompt (Spec C,
+    /// bd-gsvn.1). Empty = raw send (plain swarm agents — byte-identical
+    /// pre-migration behavior).
+    #[serde(default)]
+    pub profile: String,
 }
 
 /// Build the argv for the `__send` leaf invocation.
@@ -237,6 +250,10 @@ pub fn send_prompt_argv(args: &SendArgs) -> Vec<String> {
         argv.push(args.invocation.clone());
         argv.push("--iteration".to_string());
         argv.push(args.iteration.to_string());
+    }
+    if !args.profile.is_empty() {
+        argv.push("--profile".to_string());
+        argv.push(args.profile.clone());
     }
     argv
 }
@@ -904,6 +921,28 @@ async fn poll_kind(args: PollKindArgs) -> Result<String> {
             "__kind failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The profile name an agent serves (bd-gsvn.1), from the spawn registry.
+/// Checkpointed leaf — the workflow body never reads files directly (replay
+/// determinism). Empty = plain swarm agent (no profile → raw dispatch).
+#[function]
+async fn resolve_agent_profile(args: ProfileArgs) -> Result<String> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__profile", &args.project, &args.name]);
+    let out = run_leaf_cmd(cmd, "__profile").await?;
+    if !out.status.success() {
+        // A registry hiccup must not stall dispatch: an empty profile keeps
+        // the send raw (byte-identical legacy path). Never a leaf failure.
+        eprintln!(
+            "flywheel: __profile failed for {} (sending raw): {}",
+            args.name,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return Ok(String::new());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -2728,6 +2767,16 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 confirm_timeout_ms: params.confirm_timeout_ms,
                                 invocation: params.invocation.clone(),
                                 iteration,
+                                profile: ctx
+                                    .run(
+                                        resolve_agent_profile,
+                                        ProfileArgs {
+                                            project: params.project.clone(),
+                                            name: name.clone(),
+                                        },
+                                    )
+                                    .await
+                                    .unwrap_or_default(),
                             },
                         )
                         .await
@@ -2856,6 +2905,16 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                     confirm_timeout_ms: params.confirm_timeout_ms,
                                     invocation: params.invocation.clone(),
                                     iteration,
+                                    profile: ctx
+                                        .run(
+                                            resolve_agent_profile,
+                                            ProfileArgs {
+                                                project: params.project.clone(),
+                                                name: name.clone(),
+                                            },
+                                        )
+                                        .await
+                                        .unwrap_or_default(),
                                 },
                             )
                             .await
@@ -3105,6 +3164,9 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     resonate
         .register(poll_kind)
         .map_err(|e| anyhow::anyhow!("register poll_kind: {e}"))?;
+    resonate
+        .register(resolve_agent_profile)
+        .map_err(|e| anyhow::anyhow!("register resolve_agent_profile: {e}"))?;
     resonate
         .register(respawn_agent)
         .map_err(|e| anyhow::anyhow!("register respawn_agent: {e}"))?;
@@ -4153,6 +4215,7 @@ mod tests {
             confirm_timeout_ms: Some(45_000),
             invocation: "inv-1".into(),
             iteration: 3,
+            profile: String::new(),
         };
         let v = serde_json::to_value(&a).unwrap();
         let back: SendArgs = serde_json::from_value(v).unwrap();
@@ -4184,6 +4247,7 @@ mod tests {
             confirm_timeout_ms: Some(45_000),
             invocation: "inv-1".into(),
             iteration: 3,
+            profile: String::new(),
         };
         assert_eq!(
             send_prompt_argv(&args),
@@ -4209,6 +4273,7 @@ mod tests {
             confirm_timeout_ms: None,
             invocation: "inv-1".into(),
             iteration: 3,
+            profile: String::new(),
         };
         assert_eq!(
             send_prompt_argv(&args_no_ms),
@@ -4233,6 +4298,7 @@ mod tests {
             confirm_timeout_ms: None,
             invocation: "inv-1".into(),
             iteration: 3,
+            profile: String::new(),
         };
         assert_eq!(
             send_prompt_argv(&args_legacy),
@@ -4261,10 +4327,44 @@ mod tests {
             confirm_timeout_ms: Some(45_000),
             invocation: String::new(),
             iteration: 3,
+            profile: String::new(),
         };
         assert_eq!(
             send_prompt_argv(&args),
             vec!["__send", "p", "a", "t", "--confirm", "45000"]
+        );
+    }
+
+    /// bd-gsvn.1: a resolved profile rides the argv as `--profile <name>`
+    /// (appended after the registry flags); empty profile → no flag
+    /// (byte-identical legacy argv).
+    #[test]
+    fn send_prompt_argv_profile_flag() {
+        let args = SendArgs {
+            project: "p".into(),
+            name: "a".into(),
+            text: "t".into(),
+            confirm: true,
+            confirm_timeout_ms: None,
+            invocation: "inv-1".into(),
+            iteration: 3,
+            profile: "planner".into(),
+        };
+        assert_eq!(
+            send_prompt_argv(&args),
+            vec![
+                "__send",
+                "p",
+                "a",
+                "t",
+                "--confirm",
+                "--invocation",
+                "inv-1",
+                "--iteration",
+                "3",
+                "--profile",
+                "planner",
+            ]
         );
     }
 
