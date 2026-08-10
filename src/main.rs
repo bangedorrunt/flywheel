@@ -778,6 +778,11 @@ enum LoopCmd {
         /// confirm timeout in ms for `__send --confirm` (default: leaf default 45s)
         #[arg(long)]
         confirm_timeout_ms: Option<u64>,
+        /// run the loop as a WorkflowEngine durable function (bd-e0xk
+        /// coexistence path): dispatches run as `loop-dispatch` engine
+        /// workflows instead of the imperative body's send leaf
+        #[arg(long)]
+        engine: bool,
         /// take over the project from a live loop process instead of refusing
         #[arg(long)]
         force: bool,
@@ -2542,6 +2547,7 @@ fn main() {
                 work,
                 no_confirm,
                 confirm_timeout_ms,
+                engine,
                 force,
             } => cmd_loop(
                 &cfg,
@@ -2559,6 +2565,7 @@ fn main() {
                 to,
                 *no_confirm,
                 *confirm_timeout_ms,
+                *engine,
                 *force,
             ),
             LoopCmd::Status { project } => cmd_loop_status(&cfg, project),
@@ -7170,6 +7177,7 @@ fn cmd_loop(
     to: &str,
     no_confirm: bool,
     confirm_timeout_ms: Option<u64>,
+    engine: bool,
     force: bool,
 ) -> Result<()> {
     if interval_secs < 5 {
@@ -7226,12 +7234,26 @@ fn cmd_loop(
             invocation: String::new(),
             unknown_diagnose_threshold: cfg.unknown_diagnose_threshold(),
             respawn_budget: cfg.respawn_budget(),
+            resonate_url: String::new(),
         };
         let rt = tokio::runtime::Runtime::new()?;
-        println!(
-            "loop: durable swarm monitor for {} (resume: flywheel loop run {project} with the same flags)",
-            dim(project)
-        );
+        if engine {
+            // bd-e0xk: the loop as a WorkflowEngine durable function — the
+            // coexistence path. Dispatches run as `loop-dispatch` engine
+            // workflows (unified vocabulary); poll + plan phases unchanged.
+            println!(
+                "loop: engine-backed swarm monitor for {} (bd-e0xk coexistence path; resume: flywheel loop run {project} --engine)",
+                dim(project)
+            );
+            let result = rt.block_on(durable::run_engine_loop(cfg, params))?;
+            println!("loop: {result}");
+            log(
+                project,
+                EventKind::Loop,
+                json!({ "status": "complete", "engine": true, "result": result }),
+            );
+            return Ok(());
+        }
         let result = rt.block_on(durable::run_durable_loop(cfg, params))?;
         println!("loop: {result}");
         log(

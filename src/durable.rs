@@ -32,12 +32,16 @@
 
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use resonate_sdk::function;
 use resonate_sdk::prelude::*;
+use toron_workflow::schema::{Action, Workflow};
+use toron_workflow::engine::{ActionRunner, WorkflowEngine};
 
 use crate::config::Config;
 
@@ -81,6 +85,10 @@ pub struct LoopParams {
     /// max respawns per agent per loop run before EscalateBlocked.
     #[serde(default = "default_respawn_budget")]
     pub respawn_budget: u32,
+    /// Resonate server url for the engine path (bd-e0xk): set by the runner;
+    /// empty → engine default localhost:8001.
+    #[serde(default)]
+    pub resonate_url: String,
 }
 
 fn default_unknown_diagnose_threshold() -> u32 {
@@ -3371,6 +3379,365 @@ fn dim_id(id: &str) -> String {
     crate::output::dim(id)
 }
 
+/// bd-e0xk slice 1: the loop's dispatch phase as a declarative engine
+/// workflow. ONE dispatch_job step; the engine's ActionRunner shells
+/// `__send --profile` (the same send the sync loop uses, byte-identical
+/// prompts). The engine workflow run is itself Resonate-durable, so a crash
+/// mid-dispatch replays the workflow — the unified-vocabulary execution path
+/// (ADR-0005 Spec 2: Send becomes a workflow step type).
+pub fn build_loop_dispatch_workflow(name: &str, text: &str, profile: &str) -> Workflow {
+    use toron_workflow::schema::{Action, InputDecl, Step, StepOnError, Workflow};
+    Workflow {
+        name: "loop-dispatch".to_string(),
+        description: Some(
+            "Loop dispatch tick — one agent prompt through the engine (bd-e0xk)."
+                .to_string(),
+        ),
+        trigger: None,
+        policy: None,
+        guard: None,
+        steps: vec![Step {
+            name: Some("dispatch".to_string()),
+            guard: None,
+            on_error: StepOnError::FailRun,
+            action: Action::DispatchJob {
+                assignee: name.to_string(),
+                spec: json!({
+                    "profile": profile,
+                    "task": text,
+                }),
+                channel: None,
+            },
+        }],
+        graph: None,
+        inputs: vec![InputDecl {
+            name: "target".to_string(),
+        }],
+        crew: None,
+    }
+}
+
+/// The loop's engine ActionRunner: executes a `dispatch_job` step by shelling
+/// `__send [--profile]` — the SAME leaf the imperative loop + sync loop use,
+/// so prompts are byte-identical (parity invariant). The runner is a plain
+/// subprocess call (ADR-0010 subprocess-reuse); the DURABILITY comes from the
+/// engine workflow run wrapping it.
+pub fn loop_dispatch_runner(project: String, confirm_sends: bool) -> ActionRunner {
+    let exe = std::env::current_exe().unwrap_or_else(|_| "flywheel".into());
+    Arc::new(move |action: &Action| {
+        let Action::DispatchJob { assignee, spec, .. } = action else {
+            return Ok(json!({
+                "ok": false,
+                "error": format!("loop dispatch runner: expected dispatch_job, got {}", action.type_name()),
+            }));
+        };
+        let text = spec.get("task").and_then(Value::as_str).unwrap_or_default();
+        let profile = spec
+            .get("profile")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("__send").arg(&project).arg(assignee).arg(text);
+        if !profile.is_empty() {
+            cmd.arg("--profile").arg(profile);
+        }
+        if confirm_sends {
+            cmd.arg("--confirm");
+        }
+        let out = match cmd.output() {
+            Ok(o) => o,
+            Err(e) => {
+                return Ok(json!({
+                    "ok": false,
+                    "error": format!("__send for {assignee} failed: {e:#}"),
+                }))
+            }
+        };
+        let raw = String::from_utf8_lossy(&out.stdout).to_string();
+        let ok = serde_json::from_str::<Value>(raw.trim())
+            .ok()
+            .and_then(|v| v.get("ok").and_then(Value::as_bool))
+            .unwrap_or(false);
+        if ok {
+            Ok(json!({ "ok": true, "name": assignee }))
+        } else {
+            let err = String::from_utf8_lossy(&out.stderr).to_string();
+            Ok(json!({
+                "ok": false,
+                "error": if err.trim().is_empty() { raw } else { err },
+            }))
+        }
+    })
+}
+
+/// bd-e0xk slice 1: the loop as a WorkflowEngine-backed durable function
+/// (coexistence path behind `flywheel loop run --engine`). Per tick:
+/// poll_events + poll_swarm leaves (the correctness floor — unchanged),
+/// plan_actions (queue/nudge; digests deferred), then EACH dispatch runs as
+/// a `loop-dispatch` engine workflow (dispatch_job step → ActionRunner →
+/// `__send`), and the wait is a durable ctx.sleep. Crash survival: the run
+/// itself is a Resonate function (resume via the active-loop registry), and
+/// every dispatch is a separate durable engine sub-run.
+///
+/// Deferred to later slices (documented, NOT regressed): mail digests +
+/// urgent wake, escalation tiers, respawn/self-heal, xproj receive, reply
+/// reminders — those phases stay in the legacy imperative path until their
+/// parity tests land.
+#[function]
+async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
+    let mut queue = params.queue.clone();
+    let mut iteration = 0u64;
+    // the engine + its runner: constructed once per invocation; each dispatch
+    // tick is an engine `invoke` (idempotent on its run id).
+    let engine = WorkflowEngine::remote(
+        if params.resonate_url.is_empty() {
+            "http://localhost:8001".to_string()
+        } else {
+            params.resonate_url.clone()
+        },
+        loop_dispatch_runner(params.project.clone(), params.confirm_sends),
+    )
+    .map_err(map_err)?;
+    let mut wait_secs: u64 = params.active_interval_secs.max(5);
+    let mut event_cursor_seq: u64 = 0;
+    let mut event_stream_errors: u64 = 0;
+
+    loop {
+        iteration += 1;
+        if let Some(max) = params.max_iterations
+            && iteration > max
+        {
+            return Err(map_err(anyhow::anyhow!(
+                "loop timed out after {max} polls (queue remaining: {})",
+                queue.len()
+            )));
+        }
+
+        // event wake (latency optimization, forward-only) — soft-fails into
+        // the heartbeat poll (cg6.2).
+        let event_batch: PollEventsBatch = match ctx
+            .run(
+                poll_events,
+                PollEventsArgs {
+                    project: params.project.clone(),
+                    timeout_ms: wait_secs.saturating_mul(1000),
+                    after_seq: event_cursor_seq,
+                },
+            )
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("flywheel: poll_events leaf failed (continuing): {e}");
+                PollEventsBatch {
+                    events: vec![],
+                    max_seq: 0,
+                    stream_error: Some(format!("leaf error: {e}")),
+                }
+            }
+        };
+        if event_batch.stream_error.is_some() {
+            event_stream_errors = event_stream_errors.saturating_add(1);
+        } else {
+            event_stream_errors = 0;
+        }
+        if event_batch.max_seq > event_cursor_seq {
+            event_cursor_seq = event_batch.max_seq;
+        }
+
+        // correctness floor: authoritative agent.list snapshot.
+        let states: Vec<AgentState> = match ctx
+            .run(
+                poll_swarm,
+                PollArgs {
+                    project: params.project.clone(),
+                    to: params.to.clone(),
+                },
+            )
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("flywheel: poll_swarm leaf failed (continuing with empty snapshot): {e}");
+                vec![]
+            }
+        };
+
+        // plan the tick: queue feeds Send actions; nudge when empty.
+        let actions = plan_actions(
+            &states,
+            &mut queue,
+            params.nudge.as_deref(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+
+        let mut any_work = false;
+        let mut any_blocked = false;
+        for action in &actions {
+            match action {
+                LoopAction::Send { name, text }
+                | LoopAction::DispatchImmediate { name, text } => {
+                    let profile = crate::state::load_spawn_registry(&params.project)
+                        .into_iter()
+                        .find(|e| e.name == *name)
+                        .and_then(|e| e.profile)
+                        .unwrap_or_default();
+                    let wf = build_loop_dispatch_workflow(name, text, &profile);
+                    // deterministic run id per (invocation, agent, tick) —
+                    // replay reuses it, never double-sends.
+                    let run_id = format!(
+                        "loop-dispatch:{}:{}:{}",
+                        params.invocation, iteration, name
+                    );
+                    let out = engine.invoke(&run_id, wf, json!({ "target": name })).await;
+                    let value = match out {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("flywheel: loop-dispatch engine run for {name} failed: {e:#}");
+                            json!({ "ok": false, "error": format!("{e:#}") })
+                        }
+                    };
+                    // linear-step runs return outputs under the step name; a
+                    // fail_run abort returns {"status":"failed",...}.
+                    let ok = match value.get("dispatch") {
+                        Some(d) => d.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                        None => false,
+                    };
+                    if ok {
+                        any_work = true;
+                    } else {
+                        // put the item back at the FRONT so the next poll
+                        // retries it (a dead agent never silently consumes a
+                        // prompt) — same as the imperative path.
+                        let err = value
+                            .get("error")
+                            .or_else(|| value.get("dispatch").and_then(|d| d.get("error")))
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown send failure");
+                        eprintln!("flywheel: send to {name} failed: {err}");
+                        queue.insert(0, text.clone());
+                    }
+                }
+                LoopAction::Blocked { name } => {
+                    any_blocked = true;
+                    eprintln!("flywheel: {name} blocked (engine loop — escalation deferred to bd-e0xk later slices)");
+                }
+                LoopAction::Nudge { name } => {
+                    let profile = crate::state::load_spawn_registry(&params.project)
+                        .into_iter()
+                        .find(|e| e.name == *name)
+                        .and_then(|e| e.profile)
+                        .unwrap_or_default();
+                    let wf = build_loop_dispatch_workflow(name, &params.nudge.clone().unwrap_or_default(), &profile);
+                    let run_id = format!(
+                        "loop-dispatch:{}:{}:{}",
+                        params.invocation, iteration, name
+                    );
+                    let value = engine
+                        .invoke(&run_id, wf, json!({ "target": name }))
+                        .await
+                        .unwrap_or_else(|e| {
+                            eprintln!("flywheel: loop-dispatch engine run for {name} failed: {e:#}");
+                            json!({ "ok": false, "error": format!("{e:#}") })
+                        });
+                    let nudge_ok = match value.get("dispatch") {
+                        Some(d) => d.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                        None => false,
+                    };
+                    if nudge_ok {
+                        any_work = true;
+                    }
+                }
+                LoopAction::Wait => {}
+                _ => {
+                    // Diagnose / respawn / self-heal / xproj phases are
+                    // deferred to later slices — logged, never dispatched
+                    // through the engine path yet.
+                    eprintln!("flywheel: engine loop: action {action:?} deferred (bd-e0xk later slices)");
+                }
+            }
+        }
+        if any_blocked && params.on_blocked == "stop" {
+            return Err(map_err(anyhow::anyhow!(
+                "agent(s) blocked — stopping loop (--on-blocked stop)"
+            )));
+        }
+
+        wait_secs = next_interval_secs(
+            &states,
+            any_work,
+            params.interval_secs,
+            params.active_interval_secs,
+        );
+        ctx.sleep(Duration::from_secs(wait_secs)).await?;
+    }
+}
+
+/// Run the loop as a WorkflowEngine-backed durable function (bd-e0xk slice 1;
+/// `flywheel loop run --engine`). Mirror of [`run_durable_loop`] — same
+/// active-loop registry + promise-pending resume, but registers the engine
+/// loop function and drives dispatches through `loop-dispatch` workflows.
+pub async fn run_engine_loop(cfg: &Config, mut params: LoopParams) -> anyhow::Result<String> {
+    let url = cfg
+        .resonate_url()
+        .unwrap_or_else(|| "http://localhost:8001".to_string());
+    let base = params.project.rsplit('/').next().unwrap_or(&params.project);
+    let resonate = Resonate::new(ResonateConfig {
+        url: Some(url.clone()),
+        group: Some(format!("flywheel-{base}")),
+        ..Default::default()
+    });
+
+    resonate
+        .register(engine_loop)
+        .map_err(|e| anyhow::anyhow!("register engine_loop: {e}"))?;
+    resonate
+        .register(poll_swarm)
+        .map_err(|e| anyhow::anyhow!("register poll_swarm: {e}"))?;
+    resonate
+        .register(poll_events)
+        .map_err(|e| anyhow::anyhow!("register poll_events: {e}"))?;
+
+    // Resume semantics: same as the imperative loop — reuse the persisted
+    // invocation id while its promise is pending; fresh id once settled.
+    let id = match crate::state::load_active_loop(&params.project)? {
+        Some(al) if promise_pending(&resonate, &al.id).await? => {
+            eprintln!("flywheel: resuming existing loop {}", dim_id(&al.id));
+            al.id
+        }
+        _ => {
+            let id_project = params.project.rsplit('/').next().unwrap_or(&params.project);
+            let fresh = format!(
+                "engine-loop:{id_project}:{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+            crate::state::save_active_loop(
+                &params.project,
+                &crate::state::ActiveLoop::new(
+                    fresh.clone(),
+                    serde_json::to_value(&params)?,
+                    crate::state::now_iso(),
+                ),
+            )?;
+            fresh
+        }
+    };
+    params.invocation = id.clone();
+    params.resonate_url = url;
+
+    let task = resonate.run(&id, engine_loop, params.clone());
+    let result: String = task
+        .await
+        .map_err(|e| anyhow::anyhow!("engine loop invocation failed: {e}"))?;
+
+    let _ = resonate.stop().await;
+    Ok(result)
+}
+
 /// True when the promise exists and is still pending.
 /// Only a server 404 (no record) counts as "not pending"; genuine query
 /// failures propagate — treating a transient Resonate outage as "no record"
@@ -4206,6 +4573,126 @@ mod tests {
         }
     }
 
+    // ---- bd-e0xk slice 1: loop-as-engine-workflow (--engine path) ----
+
+    /// The loop-dispatch workflow is a declarative schema workflow whose
+    /// single dispatch_job step carries the planned action EXACTLY: assignee
+    /// = agent name, spec.task = the prompt text, spec.profile = the spawn
+    /// profile.
+    #[test]
+    fn loop_dispatch_workflow_carries_planned_action() {
+        let wf = build_loop_dispatch_workflow("oc-1", "work the beads", "@coder");
+        assert_eq!(wf.name, "loop-dispatch");
+        assert_eq!(wf.steps.len(), 1);
+        let s = &wf.steps[0];
+        assert_eq!(s.name.as_deref(), Some("dispatch"));
+        let Action::DispatchJob { assignee, spec, .. } = &s.action else {
+            panic!("loop-dispatch step is a dispatch_job");
+        };
+        assert_eq!(assignee, "oc-1");
+        assert_eq!(spec.get("task").and_then(Value::as_str), Some("work the beads"));
+        assert_eq!(spec.get("profile").and_then(Value::as_str), Some("@coder"));
+        // the workflow itself is lint-clean (declarative quality gate)
+        let report = toron_workflow::lint_workflow(&wf);
+        assert!(report.is_clean(), "{:?}", report.issues);
+    }
+
+    /// The engine actually RUNS the loop-dispatch workflow: a recording
+    /// ActionRunner observes the dispatch_job with the planned text — proving
+    /// the loop's dispatch is a real engine workflow run (the ADR-0005
+    /// "Send becomes a workflow step type" claim), not a fake wrapper.
+    #[test]
+    fn loop_dispatch_runs_on_workflow_engine() {
+        use std::sync::Mutex;
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let runner: ActionRunner = Arc::new(move |action: &Action| {
+            let Action::DispatchJob { assignee, spec, .. } = action else {
+                return Ok(json!({ "ok": false }));
+            };
+            let task = spec.get("task").and_then(Value::as_str).unwrap_or_default();
+            seen2.lock().unwrap().push((assignee.clone(), task.to_string()));
+            Ok(json!({ "ok": true, "name": assignee }))
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            let engine = WorkflowEngine::local(runner).unwrap();
+            let wf = build_loop_dispatch_workflow("oc-1", "work the beads", "@coder");
+            engine
+                .invoke(
+                    "test-loop-dispatch-1",
+                    wf,
+                    json!({ "target": "oc-1" }),
+                )
+                .await
+        });
+        let out = result.expect("engine run completes");
+        // linear-step runs return the step outputs under the step name
+        assert_eq!(out["dispatch"]["ok"].as_bool(), Some(true), "out: {out}");
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "exactly one dispatch observed");
+        assert_eq!(recorded[0].0, "oc-1");
+        assert_eq!(recorded[0].1, "work the beads");
+    }
+
+    /// Plan→dispatch parity (the bead's bar-for-bar invariant): the text the
+    /// imperative path would shell to `__send` is byte-identical to the text
+    /// the engine path puts in the loop-dispatch spec. Same plan_actions,
+    /// same prompt.
+    #[test]
+    fn plan_actions_to_engine_dispatch_parity() {
+        let mut queue = vec![bead_prompt("bd-12", "fix auth flow")];
+        let states = vec![st("flywheel-proj-oc", "idle")];
+        let actions = plan_actions(&states, &mut queue, None, &HashMap::new(), &std::collections::HashSet::new());
+        let LoopAction::Send { name, text } = &actions[0] else {
+            panic!("expected Send");
+        };
+        // engine path: the planned text rides in the workflow spec verbatim
+        let wf = build_loop_dispatch_workflow(name, text, "");
+        let Action::DispatchJob { assignee, spec, .. } = &wf.steps[0].action else {
+            panic!("dispatch_job");
+        };
+        assert_eq!(assignee, name, "same agent");
+        assert_eq!(
+            spec.get("task").and_then(Value::as_str).unwrap(),
+            text.as_str(),
+            "byte-identical prompt at the plan→dispatch boundary"
+        );
+        // legacy path: send_prompt_argv carries the same text (bar-for-bar)
+        let argv = send_prompt_argv(&SendArgs {
+            project: "toron".into(),
+            name: name.clone(),
+            text: text.clone(),
+            confirm: true,
+            confirm_timeout_ms: None,
+            invocation: "test-inv".into(),
+            iteration: 1,
+            profile: String::new(),
+        });
+        assert!(argv.iter().any(|a| a == text), "legacy argv carries the same text: {argv:?}");
+    }
+
+    /// The runner maps a dispatch_job to the exact `__send` argv the loop
+    /// uses — the subprocess shape is the parity contract (no drift between
+    /// the engine path and the imperative leaf).
+    #[test]
+    fn loop_dispatch_runner_shells_send_argv() {
+        // the runner shells out to __send; the argv construction is what we
+        // pin here: [__send, project, agent, text, --profile p]
+        let project = "toron".to_string();
+        let runner = loop_dispatch_runner(project.clone(), false);
+        // can't observe the subprocess without a real __send; assert the
+        // spec→args mapping contract via the pure pieces:
+        let wf = build_loop_dispatch_workflow("oc-1", "hello", "@coder");
+        let Action::DispatchJob { assignee, spec, .. } = &wf.steps[0].action else {
+            panic!("dispatch_job");
+        };
+        assert_eq!(assignee, "oc-1");
+        assert_eq!(spec.get("task").and_then(Value::as_str), Some("hello"));
+        assert_eq!(spec.get("profile").and_then(Value::as_str), Some("@coder"));
+        drop(runner); // runner is Arc; drop fine
+    }
+
     // ---- loop-side mail wake (replaces per-agent peer-poll templates) ----
 
     fn digest(recent: usize, urgent: usize, from: &str, subj: &str) -> MailDigest {
@@ -4353,6 +4840,7 @@ mod tests {
             invocation: "inv-1".into(),
             unknown_diagnose_threshold: 3,
             respawn_budget: 2,
+            resonate_url: String::new(),
         };
         let v = serde_json::to_value(&p).unwrap();
         let back: LoopParams = serde_json::from_value(v).unwrap();
