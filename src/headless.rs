@@ -33,64 +33,44 @@ pub struct HarnessOutcome {
 /// The model flag args for one harness (`-m ID` / `--model ID` / `--model=ID`),
 /// matching each binary's `--help` (verified 2026-08-09). Shared by the
 /// headless argv builder and the pane-runner spawn path (P10.3, bd-ghcj.1).
-/// omp also carries the thinking/effort flag (`--thinking=<level>`,
-/// bd-42fs) when an effort is given.
-pub fn model_args(harness: &str, model: &str, effort: Option<&str>) -> Vec<String> {
+pub fn model_args(harness: &str, model: &str) -> Vec<String> {
     match harness {
         "opencode" | "grok" => vec!["-m".to_string(), model.to_string()],
-        "omp" => {
-            let mut args = vec![format!("--model={model}")];
-            if let Some(e) = effort.filter(|e| !e.is_empty()) {
-                args.push(format!("--thinking={e}"));
-            }
-            args
-        }
+        "omp" => vec![format!("--model={model}")],
         "pi" => vec!["--model".to_string(), model.to_string()],
         _ => vec![],
     }
 }
 
 /// Build the argv for one harness (pure — the P10.1 unit surface).
-pub fn build_argv(
-    harness: &str,
-    model: Option<&str>,
-    effort: Option<&str>,
-    prompt: &str,
-) -> Result<Vec<String>> {
+pub fn build_argv(harness: &str, model: Option<&str>, prompt: &str) -> Result<Vec<String>> {
     let mut argv: Vec<String> = Vec::new();
     match harness {
         "pi" => {
             argv.extend(["pi", "-p", "--mode", "json"].map(String::from));
             if let Some(m) = model {
-                argv.extend(model_args("pi", m, None));
+                argv.extend(model_args("pi", m));
             }
         }
         "omp" => {
             argv.extend(["omp", "-p", "--mode=json"].map(String::from));
             if let Some(m) = model {
-                argv.extend(model_args("omp", m, effort));
+                argv.extend(model_args("omp", m));
             }
         }
         "opencode" => {
             argv.extend(["opencode", "run", "--format", "json"].map(String::from));
             if let Some(m) = model {
-                argv.extend(model_args("opencode", m, None));
+                argv.extend(model_args("opencode", m));
             }
         }
         "grok" => {
-            // `-p` alone fails this grok build ("a value is required for
-            // '--single <PROMPT>'"); the prompt must ride the `--single`
-            // value. Build it here (the prompt is appended at the end for
-            // the other harnesses).
-            let single = format!("--single={prompt}");
             argv.extend(
-                ["grok", &single, "--output-format", "streaming-messages-json"]
-                    .map(String::from),
+                ["grok", "-p", "--output-format", "streaming-messages-json"].map(String::from),
             );
             if let Some(m) = model {
-                argv.extend(model_args("grok", m, None));
+                argv.extend(model_args("grok", m));
             }
-            return Ok(argv);
         }
         other => {
             bail!("unsupported harness for headless run: {other} (pi | omp | opencode | grok)")
@@ -213,14 +193,6 @@ pub fn dispatch_spec_stage(spec: &Value) -> Option<&str> {
     spec.get("stage").and_then(Value::as_str)
 }
 
-/// The task text in a dispatch spec (`spec.task`): an inline instruction that
-/// replaces the workflow-default base prompt (bd-m7ac weekly-review — scouts
-/// and the oracle carry their mission inline). `None` when absent (the
-/// stage/base-prompt fallback applies).
-pub fn dispatch_spec_task(spec: &Value) -> Option<&str> {
-    spec.get("task").and_then(Value::as_str)
-}
-
 /// The base prompt for a headless dispatch with no explicit stage: the
 /// workflow's `goal` input when present, else a workflow-named default.
 pub fn base_prompt_for(wf_name: &str, inputs: &Value) -> String {
@@ -228,39 +200,6 @@ pub fn base_prompt_for(wf_name: &str, inputs: &Value) -> String {
         Some(goal) if !goal.trim().is_empty() => format!("Goal: {goal}"),
         _ => format!("Execute the next step of workflow {wf_name}"),
     }
-}
-
-/// Render a dispatch-spec extra (`spec.plan`, `spec.prompt`, `spec.task`)
-/// against the run inputs: `{{inputs.X}}` refs resolve to the input value;
-/// an unresolvable ref stays literal (never drops the text). Empty result →
-/// `None` (no extra to append).
-pub fn spec_extra(spec: &Value, key: &str, inputs: &Value) -> Option<String> {
-    let raw = spec.get(key).and_then(Value::as_str)?.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let mut out = raw.to_string();
-    while let Some(start) = out.find("{{inputs.") {
-        let rest = &out[start + "{{inputs.".len()..];
-        let Some(end) = rest.find("}}") else {
-            break;
-        };
-        let name = &rest[..end];
-        match inputs.get(name).and_then(Value::as_str) {
-            Some(v) => {
-                let rendered = v.to_string();
-                out.replace_range(start..start + "{{inputs.".len() + end + 2, &rendered);
-                // The rendered value could itself contain a ref — restart the
-                // scan; an unresolvable ref (replaced by itself) must NOT
-                // loop forever.
-                if out[start..].starts_with("{{inputs.") {
-                    break;
-                }
-            }
-            None => break,
-        }
-    }
-    Some(out)
 }
 
 #[cfg(test)]
@@ -271,7 +210,7 @@ mod tests {
     #[test]
     fn pi_argv_with_model() {
         assert_eq!(
-            build_argv("pi", Some("google/gemini-2.5-flash"), None, "hello").unwrap(),
+            build_argv("pi", Some("google/gemini-2.5-flash"), "hello").unwrap(),
             vec![
                 "pi".to_string(),
                 "-p".into(),
@@ -287,7 +226,7 @@ mod tests {
     #[test]
     fn pi_argv_without_model() {
         assert_eq!(
-            build_argv("pi", None, None, "hello").unwrap(),
+            build_argv("pi", None, "hello").unwrap(),
             vec![
                 "pi".to_string(),
                 "-p".into(),
@@ -301,7 +240,7 @@ mod tests {
     #[test]
     fn omp_argv_uses_equals_form() {
         assert_eq!(
-            build_argv("omp", Some("gpt-5.2"), None, "hi").unwrap(),
+            build_argv("omp", Some("gpt-5.2"), "hi").unwrap(),
             vec![
                 "omp".to_string(),
                 "-p".into(),
@@ -315,7 +254,7 @@ mod tests {
     #[test]
     fn opencode_argv_uses_run_with_json_format() {
         assert_eq!(
-            build_argv("opencode", Some("anthropic/claude-sonnet-4"), None, "hi").unwrap(),
+            build_argv("opencode", Some("anthropic/claude-sonnet-4"), "hi").unwrap(),
             vec![
                 "opencode".to_string(),
                 "run".into(),
@@ -331,42 +270,35 @@ mod tests {
     #[test]
     fn grok_argv_uses_streaming_messages_json() {
         assert_eq!(
-            build_argv("grok", Some("grok-4"), None, "hi").unwrap(),
+            build_argv("grok", Some("grok-4"), "hi").unwrap(),
             vec![
                 "grok".to_string(),
-                "--single=hi".into(),
+                "-p".into(),
                 "--output-format".into(),
                 "streaming-messages-json".into(),
                 "-m".into(),
                 "grok-4".into(),
+                "hi".into(),
             ]
         );
     }
 
     #[test]
     fn unknown_harness_is_an_error() {
-        let err = build_argv("hermes", None, None, "hi").unwrap_err();
+        let err = build_argv("hermes", None, "hi").unwrap_err();
         assert!(err.to_string().contains("hermes"), "{err}");
     }
 
     /// P10.3 (bd-ghcj.1): the model-flag args are per-harness, shared with
     /// the pane-runner spawn path (opencode/grok `-m`, omp `--model=`, pi
-    /// `--model`). bd-42fs: omp carries `--thinking=<effort>` when given.
+    /// `--model`).
     #[test]
     fn model_args_follow_harness_forms() {
-        assert_eq!(model_args("opencode", "claude-sonnet-4", None), vec!["-m", "claude-sonnet-4"]);
-        assert_eq!(model_args("grok", "grok-4", None), vec!["-m", "grok-4"]);
-        assert_eq!(model_args("omp", "gpt-5.2", None), vec!["--model=gpt-5.2"]);
-        assert_eq!(
-            model_args("omp", "glm-5.2", Some("max")),
-            vec!["--model=glm-5.2", "--thinking=max"]
-        );
-        assert_eq!(
-            model_args("omp", "deepseek-v4-flash", Some("high")),
-            vec!["--model=deepseek-v4-flash", "--thinking=high"]
-        );
-        assert_eq!(model_args("pi", "glm-5.2", None), vec!["--model", "glm-5.2"]);
-        assert!(model_args("hermes", "x", None).is_empty(), "unknown harness: no model args");
+        assert_eq!(model_args("opencode", "claude-sonnet-4"), vec!["-m", "claude-sonnet-4"]);
+        assert_eq!(model_args("grok", "grok-4"), vec!["-m", "grok-4"]);
+        assert_eq!(model_args("omp", "gpt-5.2"), vec!["--model=gpt-5.2"]);
+        assert_eq!(model_args("pi", "glm-5.2"), vec!["--model", "glm-5.2"]);
+        assert!(model_args("hermes", "x").is_empty(), "unknown harness: no model args");
     }
 
     /// The real pi JSON stream shape (verified against pi 2026-08-09):
@@ -418,18 +350,6 @@ mod tests {
         assert_eq!(strip_profile_ref("planner"), "planner");
     }
 
-    /// bd-m7ac: `spec.task` (the inline mission) resolves from the dispatch
-    /// spec; absent tasks fall back to the stage/base-prompt path.
-    #[test]
-    fn dispatch_spec_task_resolves_inline_mission() {
-        let with_task = json!({ "profile": "@scout", "task": "Map toron gaps." });
-        assert_eq!(dispatch_spec_task(&with_task), Some("Map toron gaps."));
-        assert_eq!(dispatch_spec_profile(&with_task), Some("@scout"));
-        let no_task = json!({ "profile": "@planner" });
-        assert_eq!(dispatch_spec_task(&no_task), None);
-        assert_eq!(dispatch_spec_task(&json!({})), None);
-    }
-
     #[test]
     fn conditioned_prompt_prepends_behavior() {
         let out = conditioned_prompt("You are a PLANNER.", "Goal: X");
@@ -463,34 +383,5 @@ mod tests {
             base_prompt_for("beads", &json!({})),
             "Execute the next step of workflow beads"
         );
-    }
-
-    /// `spec.plan` resolves `{{inputs.plan}}` against the run inputs (the
-    /// beads workflow's plan reaches the planner headlessly — bd-oj9o).
-    #[test]
-    fn spec_extra_renders_inputs_ref() {
-        let spec = json!({ "profile": "@planner", "plan": "{{inputs.plan}}" });
-        let inputs = json!({ "plan": "1. fix auth 2. ship" });
-        assert_eq!(
-            spec_extra(&spec, "plan", &inputs).as_deref(),
-            Some("1. fix auth 2. ship")
-        );
-    }
-
-    /// An unresolvable ref stays literal — the text is never dropped.
-    #[test]
-    fn spec_extra_keeps_unresolved_ref_literal() {
-        let spec = json!({ "plan": "Work from {{inputs.missing}}" });
-        assert_eq!(
-            spec_extra(&spec, "plan", &json!({})).as_deref(),
-            Some("Work from {{inputs.missing}}")
-        );
-    }
-
-    /// Missing or empty extra → None (nothing appended to the prompt).
-    #[test]
-    fn spec_extra_none_when_absent_or_empty() {
-        assert_eq!(spec_extra(&json!({}), "plan", &json!({})), None);
-        assert_eq!(spec_extra(&json!({ "plan": "  " }), "plan", &json!({})), None);
     }
 }
