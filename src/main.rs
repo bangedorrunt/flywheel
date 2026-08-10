@@ -15,6 +15,7 @@ mod durable;
 mod fs_util;
 mod headless;
 mod herdr_shim;
+mod intent;
 mod mail_shim;
 mod mcp_http;
 mod models;
@@ -380,13 +381,16 @@ enum Commands {
     },
     /// Environment + toolchain health check
     Deps,
-    /// Generate the beads-agent integration instructions for an agent kind.
-    /// Omit KIND to list the available kinds. Re-run after a flywheel rebuild
-    /// to refresh the generated instructions with newer workflow changes.
+    /// Generate the beads-agent integration prompts for an agent kind.
+    /// Writes 5 files (beads-{triage,execute,review,commit,create}.md) into
+    /// the tool's prompts dir. Omit KIND to list the available kinds.
+    /// Re-run after a flywheel rebuild to refresh the generated prompts.
     Integration {
-        /// agent kind: opencode|pi|grok (shorts oc|pi|gk accepted); omit to list
+        /// agent kind: opencode|pi|grok|omp (shorts oc|pi|gk accepted);
+        /// omit to list kinds
         kind: Option<String>,
-        /// write the integration to this file instead of stdout
+        /// write the 5 prompt files into this directory instead of the
+        /// tool's conventional prompts dir
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -436,6 +440,12 @@ enum Commands {
     Model {
         #[command(subcommand)]
         cmd: ModelCmd,
+    },
+    /// Slash commands (bd-oj9o #3) — shortcuts for the popular user-facing
+    /// workflows (debate, plan-review, brainstorm); cron excluded.
+    Slash {
+        #[command(subcommand)]
+        cmd: SlashCmd,
     },
     /// Smart-cron surface (ADR-0005 Spec 3 / P4.6) — the flywheel half of
     /// cron: registered schedules + schedule-triggered workflows, pause/
@@ -1363,6 +1373,10 @@ enum ProfileCmd {
         /// default workflow name
         #[arg(long)]
         default_workflow: Option<String>,
+        /// thinking/effort level for omp (--thinking=): minimal|low|medium|
+        /// high|xhigh|max (bd-42fs)
+        #[arg(long)]
+        effort: Option<String>,
     },
     /// Alias for `create` (same fields)
     Edit {
@@ -1389,6 +1403,10 @@ enum ProfileCmd {
         /// default workflow name
         #[arg(long)]
         default_workflow: Option<String>,
+        /// thinking/effort level for omp (--thinking=): minimal|low|medium|
+        /// high|xhigh|max (bd-42fs)
+        #[arg(long)]
+        effort: Option<String>,
     },
     /// Resolve @name (host scope) and spawn the agent via the configured
     /// backend. Optionally invoke a workflow after spawn.
@@ -1446,6 +1464,18 @@ enum SquadCmd {
 /// auto-proposer here (P11.3b).
 #[derive(Subcommand)]
 enum CoalitionCmd {
+    /// Register an agent identity in the coalition's toron project (members
+    /// must be registered before `form`; profiles are not agents).
+    Register {
+        /// agent name (key name in the project's agents dir)
+        name: String,
+        /// toron project slug (default: toron)
+        #[arg(long, default_value = "toron")]
+        project: String,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
     /// Form a captain-led coalition around a goal workflow: lint gate, start
     /// the goal run, create the NIP-29 channel, write the manifest.
     Form {
@@ -1463,6 +1493,10 @@ enum CoalitionCmd {
         /// bead ids tracked for the beads-closed disband gate (comma list)
         #[arg(long)]
         beads: Option<String>,
+        /// the repo whose .beads holds the tracked beads (br resolves its
+        /// workspace from cwd; default: none — probe from the current dir)
+        #[arg(long)]
+        tracker: Option<String>,
         /// JSON output for agent drivers
         #[arg(long)]
         json: bool,
@@ -1623,6 +1657,34 @@ enum CoalitionCmd {
         #[arg(long)]
         json: bool,
     },
+    /// P11.3b detector: scan the intent board for overlapping crews and
+    /// propose tiered rule-splits (split-by-directory / sequence-by-
+    /// dependency / merge) + flag auto-coalesce candidates (non-trivial
+    /// source overlaps between unaffiliated crews).
+    Detect {
+        /// toron project slug (default: toron)
+        #[arg(long, default_value = "toron")]
+        project: String,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+    /// P11.3b auto-coalesce: form an ad-hoc coalition around a goal workflow
+    /// for every non-trivial overlap the detector flagged between
+    /// unaffiliated crews.
+    AutoCoalesce {
+        /// goal workflow name (must pass the lint gate)
+        goal: String,
+        /// act as this agent (the captain; must be a member)
+        #[arg(long = "as")]
+        as_agent: String,
+        /// toron project slug (default: toron)
+        #[arg(long, default_value = "toron")]
+        project: String,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
     /// Disband a coalition: beads-closed gate (when tracked), member
     /// reservations released, channel close post, manifest closed.
     Disband {
@@ -1634,6 +1696,10 @@ enum CoalitionCmd {
         beads_closed: bool,
         #[arg(long)]
         reason: Option<String>,
+        /// override the tracker repo recorded at form (br cwd for the
+        /// beads-closed probe)
+        #[arg(long)]
+        tracker: Option<String>,
         /// toron project slug (default: toron)
         #[arg(long, default_value = "toron")]
         project: String,
@@ -1750,6 +1816,122 @@ enum WorkflowCmd {
     },
 }
 
+/// `flywheel slash` — shortcuts for the POPULAR user-facing workflows
+/// (bd-oj9o #3): `flywheel slash debate --inputs '{"proposal":"X"}'` ≡
+/// `flywheel workflow run debate --inputs {proposal: X}`. Behind-the-scenes
+/// workflows (cron, triage) deliberately get NO slash commands.
+#[derive(Subcommand)]
+enum SlashCmd {
+    /// List the registered slash commands
+    List {
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run one slash command: `slash <name> [--inputs JSON] [--execute]
+    /// [--mode headless|pane] [--json]` (any subcommand-looking arg is
+    /// captured here — names are dynamic).
+    #[command(external_subcommand)]
+    Run(Vec<String>),
+}
+
+/// Parse the external-subcommand args: `<name> [--inputs JSON] [--execute]
+/// [--mode M] [--json]`. Pure (the unit-test surface).
+fn parse_slash_args(args: &[String]) -> Result<(String, Option<String>, bool, String, bool)> {
+    let mut it = args.iter();
+    let name = it.next().cloned().ok_or_else(|| {
+        anyhow!("slash needs a command name (flywheel slash list)")
+    })?;
+    let mut inputs = None;
+    let mut execute = false;
+    let mut mode = "headless".to_string();
+    let mut json = false;
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--inputs" => {
+                inputs = Some(
+                    it.next()
+                        .cloned()
+                        .ok_or_else(|| anyhow!("--inputs needs a JSON value"))?,
+                );
+            }
+            "--execute" => execute = true,
+            "--mode" => {
+                mode = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("--mode needs headless|pane"))?;
+                if mode != "headless" && mode != "pane" {
+                    bail!("--mode must be headless or pane, got {mode:?}");
+                }
+            }
+            "--json" => json = true,
+            other => bail!("unknown slash flag {other:?} (--inputs | --execute | --mode | --json)"),
+        }
+    }
+    Ok((name, inputs, execute, mode, json))
+}
+
+/// The registered slash commands: name → target workflow. Only POPULAR
+/// user-facing workflows (bd-oj9o #3); cron/behind-the-scenes excluded.
+fn slash_commands() -> BTreeMap<&'static str, &'static str> {
+    let mut m = BTreeMap::new();
+    m.insert("debate", "debate");
+    m.insert("plan-review", "plan-review");
+    m.insert("brainstorm", "brainstorm");
+    m
+}
+
+/// `flywheel slash` — alias surface over `workflow run` for the popular
+/// workflows.
+fn cmd_slash(cfg: &Config, cmd: &SlashCmd) -> Result<()> {
+    match cmd {
+        SlashCmd::List { json } => {
+            let rows: Vec<Value> = slash_commands()
+                .iter()
+                .map(|(name, target)| json!({ "slash": name, "workflow": target }))
+                .collect();
+            if *json {
+                print_json(&json!({ "slash": rows }));
+            } else if rows.is_empty() {
+                println!("no slash commands registered");
+            } else {
+                for r in &rows {
+                    println!(
+                        "/{slash:12} -> workflow {workflow}",
+                        slash = r["slash"].as_str().unwrap_or(""),
+                        workflow = r["workflow"].as_str().unwrap_or(""),
+                    );
+                }
+            }
+            Ok(())
+        }
+        SlashCmd::Run(args) => {
+            let (name, inputs, execute, mode, json) = parse_slash_args(args)?;
+            let target = slash_commands()
+                .get(name.as_str())
+                .copied()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no slash command /{name} (flywheel slash list — only popular user-facing workflows get slash commands)"
+                    )
+                })?;
+            cmd_workflow(cfg, &WorkflowCmd::Run {
+                name: target.to_string(),
+                inputs,
+                crew: None,
+                execute,
+                mode,
+                project: None,
+                reuse: None,
+                retain: false,
+                retire_orphans: false,
+                json,
+            })
+        }
+    }
+}
+
 /// `flywheel model` subcommands (ADR-0010 Spec D, P10.2): the `models.toml`
 /// registry. Profile.model ids resolve against it for per-harness injection;
 /// unknown ids warn and pass through (never block a run).
@@ -1782,9 +1964,14 @@ enum ModelCmd {
         /// harnesses this model supports (comma list; empty = all)
         #[arg(long)]
         caps: Option<String>,
-        /// fallback id when a harness is outside caps
+        /// fallback id when a harness is outside caps — ALSO the retry-on-429
+        /// fallback (bd-42fs)
         #[arg(long)]
         fallback: Option<String>,
+        /// thinking/effort level for omp (--thinking=): minimal|low|medium|
+        /// high|xhigh|max (bd-42fs)
+        #[arg(long)]
+        effort: Option<String>,
     },
     /// Remove a registry entry
     Remove {
@@ -2485,6 +2672,7 @@ fn main() {
         Some(Commands::Runs { cmd }) => cmd_runs(&cfg, cmd),
         Some(Commands::Workflow { cmd }) => cmd_workflow(&cfg, cmd),
         Some(Commands::Model { cmd }) => cmd_models(cmd),
+        Some(Commands::Slash { cmd }) => cmd_slash(&cfg, cmd),
         Some(Commands::Cron { cmd }) => cmd_cron(cmd),
         Some(Commands::Debate {
             proposition,
@@ -7481,59 +7669,128 @@ fn kind_notes(kind: &str) -> Option<&'static str> {
         "grok" => Some(
             "- Config + sessions: ~/.grok (active sessions in ~/.grok/active_sessions.json).\n- Landing latency can be higher: the orchestrator's confirm wait covers it — you\n  only need to reach working/blocked, not finish, for the send to count as landed.",
         ),
+        "omp" => Some(
+            "- Config + sessions: ~/.omp (agent sessions under ~/.omp/agent/sessions/).\n- Prompts live in ~/.omp/agent/prompts/beads-*.md (generated — re-run `flywheel\n  integration omp` after a rebuild to refresh; never hand-edit the generated files).",
+        ),
         _ => None,
     }
 }
 
 /// The shared beads-agent BODY — the lifecycle, coordination rules, and
-/// context contract that all three agent kinds follow. Per-kind frontmatter
-/// and notes live in the wrappers below. Edit the templates in
+/// context contract that all agent kinds follow. Every phase prompt embeds
+/// this body (single source of truth); per-phase focus + per-tool frontmatter
+/// live in the phase/frontmatter templates below. Edit the templates in
 /// `integrations/` and rebuild — re-run `flywheel integration <kind>` after
-/// a rebuild to update the installed subagent files.
+/// a rebuild to update the installed prompt files.
 const INTEGRATION_BODY: &str = include_str!("../integrations/beads-body.md.tpl");
 
-/// Per-kind subagent wrappers: frontmatter (tool-specific format) + {{BODY}}.
-fn integration_wrapper(kind: &str) -> Option<&'static str> {
+/// The canonical 5-command set: phase name → description (frontmatter).
+/// Each phase prompt = per-tool frontmatter + phase focus + the shared body.
+const PROMPT_PHASES: &[(&str, &str)] = &[
+    (
+        "triage",
+        "Find ready bead work — triage the tracker for open, unblocked, dependency-ordered tasks.",
+    ),
+    (
+        "execute",
+        "Execute one ready bead end-to-end — claim, reserve, announce, implement, verify, close, sync, handoff.",
+    ),
+    (
+        "review",
+        "Review a bead's work for compliance before closing — does it actually satisfy the acceptance criteria?",
+    ),
+    (
+        "commit",
+        "Close a completed bead and sync the tracker — close with honest reason, export, commit .beads/, hand off.",
+    ),
+    (
+        "create",
+        "Create a new bead from a plan, suggestion, or discovered work — granular, dependency-ordered, self-documenting.",
+    ),
+];
+
+/// Per-tool prompt frontmatter (tool-specific format) + {{PHASE_DESCRIPTION}}.
+fn prompt_frontmatter(kind: &str) -> Option<&'static str> {
     match kind {
-        "opencode" => Some(include_str!("../integrations/opencode-beads.md.tpl")),
-        "pi" => Some(include_str!("../integrations/pi-beads.md.tpl")),
-        "grok" => Some(include_str!("../integrations/grok-beads.md.tpl")),
+        "opencode" => Some(include_str!("../integrations/prompts/frontmatter-opencode.md.tpl")),
+        "pi" => Some(include_str!("../integrations/prompts/frontmatter-pi.md.tpl")),
+        "grok" => Some(include_str!("../integrations/prompts/frontmatter-grok.md.tpl")),
+        "omp" => Some(include_str!("../integrations/prompts/frontmatter-omp.md.tpl")),
         _ => None,
     }
 }
 
-/// Render the beads SUBAGENT definition for one agent kind. Pure: `version`
-/// and `generated` are injected by the caller (deterministic tests).
-fn render_integration(kind: &str, version: &str, generated: &str) -> Result<String> {
-    let wrapper = integration_wrapper(kind)
-        .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok)"))?;
+/// Per-phase prompt template: `{{TOOL_FRONTMATTER}}` + phase focus +
+/// `{{BODY}}` (the shared body).
+fn prompt_phase_template(phase: &str) -> Option<&'static str> {
+    match phase {
+        "triage" => Some(include_str!("../integrations/prompts/beads-triage.md.tpl")),
+        "execute" => Some(include_str!("../integrations/prompts/beads-execute.md.tpl")),
+        "review" => Some(include_str!("../integrations/prompts/beads-review.md.tpl")),
+        "commit" => Some(include_str!("../integrations/prompts/beads-commit.md.tpl")),
+        "create" => Some(include_str!("../integrations/prompts/beads-create.md.tpl")),
+        _ => None,
+    }
+}
+
+/// The prompts directory for one agent kind (the dir the 5 command files
+/// are written into). Purely conventional per tool.
+pub fn prompts_dir(kind: &str) -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let home = std::path::Path::new(&home);
+    Some(match kind {
+        "opencode" => home.join(".config/opencode/command"),
+        "pi" => home.join(".pi/agent/prompts"),
+        "grok" => home.join(".grok/prompts"),
+        "omp" => home.join(".omp/agent/prompts"),
+        _ => return None,
+    })
+}
+
+/// Render one phase prompt for one agent kind. Pure: `version` and
+/// `generated` are injected by the caller (deterministic tests).
+fn render_prompt(kind: &str, phase: &str, version: &str, generated: &str) -> Result<String> {
+    let frontmatter = prompt_frontmatter(kind)
+        .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp)"))?;
+    let phase_tpl = prompt_phase_template(phase)
+        .ok_or_else(|| anyhow!("unknown phase: {phase} (known: triage, execute, review, commit, create)"))?;
+    let (_, description) = PROMPT_PHASES
+        .iter()
+        .find(|(p, _)| *p == phase)
+        .expect("phase in table");
     let notes = kind_notes(kind).unwrap_or_default();
     let body = INTEGRATION_BODY
         .replace("{{KIND_NOTES}}", notes)
         .replace("{{VERSION}}", version)
         .replace("{{GENERATED}}", generated);
-    Ok(wrapper
+    Ok(phase_tpl
+        .replace("{{TOOL_FRONTMATTER}}", &frontmatter.replace("{{PHASE_DESCRIPTION}}", description))
         .replace("{{BODY}}", &body)
         .replace("{{VERSION}}", version)
         .replace("{{GENERATED}}", generated))
 }
 
-/// `flywheel integration [KIND] [--out PATH]` — generate the beads-agent
-/// integration instructions for opencode/pi/grok agents. With no KIND, list
-/// the available kinds. With `--out`, write the rendered file instead of
-/// stdout (e.g. append it to a project's AGENTS.md).
+/// `flywheel integration [KIND] [--out PATH]` — generate the 5 beads prompt
+/// files (beads-{triage,execute,review,commit,create}.md) for one agent kind
+/// (opencode/pi/grok/omp), each from the shared beads-body. With no KIND,
+/// list the available kinds. With `--out <dir>`, write the 5 files into that
+/// directory instead of the tool's conventional prompts dir.
+///
+/// The beads SUBAGENT (agents/beads.md) is retired (bd-ra0g.1): the loop
+/// drives panes via its self-contained dispatch prompt, and nothing
+/// load-bearing loads the subagent — prompts are the delivery surface now.
 fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
     let Some(kind) = kind else {
-        println!("flywheel beads-agent subagents (flywheel {VERSION}):");
-        for (k, path) in [
-            ("opencode", "~/.config/opencode/agents/beads.md"),
-            ("pi", "~/.pi/agent/agents/beads.md"),
-            ("grok", "~/.grok/agents/beads.md"),
-        ] {
-            println!("  {k:9} flywheel integration {k} --out {path}");
+        println!("flywheel beads prompts (flywheel {VERSION}):");
+        println!("  5 commands per kind: beads-{{triage,execute,review,commit,create}}.md");
+        for (k, _) in [("opencode", ""), ("pi", ""), ("grok", ""), ("omp", "")] {
+            let dir = prompts_dir(k)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<HOME>/.config/...".to_string());
+            println!("  {k:9} flywheel integration {k}   -> {dir}/beads-*.md");
         }
         println!(
-            "templates: integrations/opencode-beads.md.tpl, pi-beads.md.tpl, grok-beads.md.tpl + beads-body.md.tpl — edit, rebuild, re-run to update"
+            "templates: integrations/beads-body.md.tpl + integrations/prompts/*.tpl — edit, rebuild, re-run to update"
         );
         return Ok(());
     };
@@ -7543,18 +7800,31 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
         "gk" => "grok",
         other => other,
     };
-    let rendered = render_integration(kind, VERSION, &state::now_iso())?;
-    match out {
-        Some(path) => {
-            std::fs::write(path, &rendered)?;
-            println!(
-                "wrote {} ({} bytes)",
-                dim(&path.display().to_string()),
-                rendered.len()
-            );
-        }
-        None => print!("{rendered}"),
+    let dir = match out {
+        Some(p) => p.to_path_buf(),
+        None => prompts_dir(kind)
+            .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp)"))?,
+    };
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create prompts dir {}", dir.display()))?;
+    let generated = state::now_iso();
+    let mut written = 0usize;
+    for (phase, _) in PROMPT_PHASES {
+        let rendered = render_prompt(kind, phase, VERSION, &generated)?;
+        let path = dir.join(format!("beads-{phase}.md"));
+        std::fs::write(&path, &rendered)
+            .with_context(|| format!("write {}", path.display()))?;
+        println!(
+            "wrote {} ({} bytes)",
+            dim(&path.display().to_string()),
+            rendered.len()
+        );
+        written += 1;
     }
+    println!(
+        "flywheel integration {kind}: {written} prompt file(s) in {}",
+        dim(&dir.display().to_string())
+    );
     Ok(())
 }
 
@@ -8282,6 +8552,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                     "name": name,
                     "harness": p.harness,
                     "model": p.model,
+                    "effort": p.effort,
                     "role": p.role,
                     "backend": cat.backend(&name),
                     "default_workflow": p.default_workflow,
@@ -8299,6 +8570,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 "name": name,
                 "harness": p.harness,
                 "model": p.model,
+                "effort": p.effort,
                 "role": p.role,
                 "backend": cat.backend(name),
                 "default_workflow": p.default_workflow,
@@ -8316,6 +8588,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             task_hint,
             backend,
             default_workflow,
+            effort,
         }
         | ProfileCmd::Edit {
             name,
@@ -8326,6 +8599,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             task_hint,
             backend,
             default_workflow,
+            effort,
         } => {
             let path = config::config_dir().join("profiles.toml");
             let cat = ProfileCatalog::load()?;
@@ -8333,6 +8607,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             let merged = Profile {
                 harness: harness.clone().unwrap_or(base.harness),
                 model: model.clone().unwrap_or(base.model),
+                effort: effort.clone().unwrap_or(base.effort),
                 role: role.clone().unwrap_or(base.role),
                 behavior: behavior.clone().unwrap_or(base.behavior),
                 task_hint: task_hint.clone().unwrap_or(base.task_hint),
@@ -8495,12 +8770,23 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
     }
 
     match cmd {
+        CoalitionCmd::Register { name, project, json } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            store.register_agent(name)?;
+            if *json {
+                print_json(&json!({ "registered": name, "project": project }));
+            } else {
+                println!("registered agent {name} in project {project}");
+            }
+            Ok(())
+        }
         CoalitionCmd::Form {
             goal,
             crews,
             as_agent,
             project,
             beads,
+            tracker,
             json,
         } => {
             let members = squad_members(crews)?;
@@ -8515,7 +8801,7 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                 })
                 .unwrap_or_default();
             let store = CoalitionStore::open(project, coalitions_root())?;
-            let m = store.form(goal, as_agent, &members, &beads)?;
+            let m = store.form(goal, as_agent, &members, &beads, tracker.as_deref())?;
             if *json {
                 print_json(&serde_json::to_value(&m)?);
             } else {
@@ -8720,15 +9006,79 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
             }
             Ok(())
         }
-        CoalitionCmd::Disband {
-            id,
-            beads_closed,
-            reason,
+        CoalitionCmd::Detect { project, json } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let report = store.detect()?;
+            if *json {
+                print_json(&serde_json::to_value(&report)?);
+            } else {
+                if report.overlaps.is_empty() {
+                    println!("no intent overlaps on the board");
+                }
+                for o in &report.overlaps {
+                    let tag = if o.non_trivial { "source" } else { "trivial" };
+                    println!("overlap: {} <-> {} ({tag})", o.a, o.b);
+                    println!("  {} : {}", o.a, o.path_a);
+                    println!("  {} : {}", o.b, o.path_b);
+                }
+                for p in &report.proposals {
+                    println!(
+                        "proposal [{tier}/{kind}]: {} <-> {} — {}",
+                        p.agents[0],
+                        p.agents[1],
+                        p.rationale,
+                        tier = p.tier,
+                        kind = serde_json::to_string(&p.kind)
+                            .unwrap_or_default()
+                            .trim_matches('"')
+                    );
+                }
+                for c in &report.auto_coalesce {
+                    println!("auto-coalesce candidate: {} <-> {} (non-trivial source)", c.a, c.b);
+                }
+            }
+            Ok(())
+        }
+        CoalitionCmd::AutoCoalesce {
+            goal,
+            as_agent,
             project,
             json,
         } => {
             let store = CoalitionStore::open(project, coalitions_root())?;
-            store.disband(id, *beads_closed, reason.as_deref())?;
+            let report = store.detect()?;
+            if report.auto_coalesce.is_empty() {
+                if *json {
+                    print_json(&json!({ "formed": [] }));
+                } else {
+                    println!("no auto-coalesce candidates (no non-trivial unaffiliated overlap)");
+                }
+                return Ok(());
+            }
+            let formed = store.auto_coalesce(goal, as_agent, &report)?;
+            if *json {
+                print_json(&serde_json::to_value(&formed)?);
+            } else {
+                for m in &formed {
+                    println!(
+                        "formed coalition {} (goal {goal}, members {})",
+                        m.id,
+                        m.members.join(", ")
+                    );
+                }
+            }
+            Ok(())
+        }
+        CoalitionCmd::Disband {
+            id,
+            beads_closed,
+            reason,
+            tracker,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            store.disband(id, *beads_closed, reason.as_deref(), tracker.as_deref())?;
             if *json {
                 print_json(&json!({ "disbanded": id }));
             } else {
@@ -9209,6 +9559,7 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                     "cost_out_per_mtok": e.cost_out_per_mtok,
                     "caps": e.caps,
                     "fallback": e.fallback,
+                    "effort": e.effort,
                 })),
                 None => bail!("no model named {id:?} (flywheel model list)"),
             }
@@ -9221,6 +9572,7 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
             cost_out_per_mtok,
             caps,
             fallback,
+            effort,
         } => {
             if id.trim().is_empty() {
                 bail!("model id cannot be empty");
@@ -9242,6 +9594,7 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                     cost_out_per_mtok: *cost_out_per_mtok,
                     caps: caps_list,
                     fallback: fallback.clone(),
+                    effort: effort.clone(),
                 },
             );
             reg.save()?;
@@ -11477,6 +11830,16 @@ fn cmd_internal_respawn(
 /// Output (json mode): `{ ok, run_id, response, status, tokens_in,
 /// tokens_out, model, duration_ms, error? }` — the parent runner parses this
 /// one line as the step value.
+/// bd-42fs: is a headless outcome rate-limited (HTTP 429 in the harness
+/// error stream or stderr)? Pure — the retry-on-429 trigger.
+fn is_rate_limited(outcome: &headless::HarnessOutcome) -> bool {
+    outcome
+        .error
+        .as_deref()
+        .map(|e| e.contains("429") || e.to_lowercase().contains("rate limit"))
+        .unwrap_or(false)
+}
+
 fn cmd_internal_run_headless(
     profile_ref: &str,
     prompt: &str,
@@ -11486,6 +11849,14 @@ fn cmd_internal_run_headless(
     json: bool,
 ) -> Result<()> {
     use sha1::Digest;
+
+    /// One harness invocation attempt (bd-42fs retry-on-429 support).
+    struct RunAttempt {
+        model_id: String,
+        model: String,
+        outcome: headless::HarnessOutcome,
+        rate_limited: bool,
+    }
     let profile_name = headless::strip_profile_ref(profile_ref);
     let catalog = profile::ProfileCatalog::load()?;
     let profile = catalog
@@ -11514,35 +11885,83 @@ fn cmd_internal_run_headless(
         registry.resolve(&model_id, harness)
     };
 
-    let argv = headless::build_argv(
-        harness,
-        (!model.is_empty()).then_some(model.as_str()),
-        prompt,
-    )
-    .map_err(|e| anyhow!("headless run for @{profile_name}: {e}"))?;
-    let started = std::time::Instant::now();
-    let output = Command::new(&argv[0])
-        .args(&argv[1..])
-        .output()
-        .with_context(|| format!("spawn {} for headless run", argv[0]))?;
-    let duration_ms = started.elapsed().as_millis() as u64;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    // bd-42fs retry-on-429: a rate-limited run (HTTP 429 in the harness
+    // error stream or stderr) retries ONCE with the model's registry
+    // `fallback` (oracle glm-5.2 -> grok, on the grok harness). Thin
+    // dynamic-routing slice; the transition is logged via the run entry's
+    // `model` (the actual used id).
+    let run_once = |harness: &str, model_id: &str, model: &str, effort: &str| -> Result<RunAttempt> {
+        let argv = headless::build_argv(
+            harness,
+            (!model.is_empty()).then_some(model),
+            (!effort.is_empty()).then_some(effort),
+            prompt,
+        )
+        .map_err(|e| anyhow!("headless run for @{profile_name}: {e}"))?;
+        let started = std::time::Instant::now();
+        let output = Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .with_context(|| format!("spawn {} for headless run", argv[0]))?;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    // The harness's own parse (response/tokens/status) + the process-level
-    // truth (exit code, stderr fallback when the stream carries nothing).
-    let mut outcome = headless::parse_stream(&stdout, harness);
-    outcome.exit_code = output.status.code().unwrap_or(-1);
-    outcome.duration_ms = duration_ms;
-    if outcome.response.is_empty() && !stderr.trim().is_empty() {
-        outcome.error = Some(stderr.trim().to_string());
+        let mut outcome = headless::parse_stream(&stdout, harness);
+        outcome.exit_code = output.status.code().unwrap_or(-1);
+        outcome.duration_ms = duration_ms;
+        if outcome.response.is_empty() && !stderr.trim().is_empty() {
+            outcome.error = Some(stderr.trim().to_string());
+        }
+        if output.status.code() != Some(0) && outcome.error.is_none() {
+            outcome.error = Some(format!("harness exited {}", output.status));
+        }
+        if outcome.error.is_some() {
+            outcome.status = "fail".into();
+        }
+        let rate_limited = is_rate_limited(&outcome);
+        Ok(RunAttempt {
+            model_id: model_id.to_string(),
+            model: model.to_string(),
+            outcome,
+            rate_limited,
+        })
+    };
+
+    let mut attempt = run_once(harness, &model_id, &model, &profile.effort)?;
+    let mut retried_fallback = false;
+    if attempt.rate_limited && !model_id.is_empty() {
+        // fallback = the registry's `fallback` for the primary id; absent ->
+        // no retry. A fallback whose entry provider is `grok` runs on the
+        // GROK HARNESS (the decided oracle fallback: glm-5.2 -> grok, the
+        // premium lane) — the model flag is the bare id there.
+        let fallback_entry = registry.get(&model_id).and_then(|e| e.fallback.clone());
+        if let Some(fallback_id) = fallback_entry {
+            eprintln!(
+                "flywheel: @{profile_name} rate-limited on {model_id} (429) — retrying with fallback {fallback_id}"
+            );
+            let fb_entry = registry.get(&fallback_id);
+            let fb_harness = if fb_entry.map(|e| e.provider.as_str()) == Some("grok") {
+                "grok"
+            } else {
+                harness
+            };
+            let fb_model = registry.resolve(&fallback_id, fb_harness);
+            match run_once(fb_harness, &fallback_id, &fb_model, &profile.effort) {
+                Ok(fb) => {
+                    attempt = fb;
+                    retried_fallback = true;
+                }
+                Err(e) => eprintln!("flywheel: fallback run {fallback_id} failed: {e:#}"),
+            }
+        }
     }
-    if output.status.code() != Some(0) && outcome.error.is_none() {
-        outcome.error = Some(format!("harness exited {}", output.status));
-    }
-    if outcome.error.is_some() {
-        outcome.status = "fail".into();
-    }
+    let RunAttempt {
+        model_id: used_model_id,
+        model: used_model,
+        outcome,
+        ..
+    } = attempt;
 
     let mut hasher = sha1::Sha1::new();
     sha1::Digest::update(&mut hasher, prompt.as_bytes());
@@ -11555,14 +11974,14 @@ fn cmd_internal_run_headless(
         cron: cron.map(str::to_string),
         profile: profile_name.to_string(),
         harness: harness.to_string(),
-        model,
+        model: used_model,
         mode: "headless".into(),
         prompt_hash,
         response: outcome.response.clone(),
         status: outcome.status.clone(),
         tokens_in: outcome.tokens_in,
         tokens_out: outcome.tokens_out,
-        duration_ms,
+        duration_ms: outcome.duration_ms,
         exit_code: outcome.exit_code,
         error: outcome.error.clone(),
     };
@@ -11577,6 +11996,8 @@ fn cmd_internal_run_headless(
             "tokens_in": entry.tokens_in,
             "tokens_out": entry.tokens_out,
             "model": entry.model,
+            "model_id": used_model_id,
+            "retried_fallback": retried_fallback,
             "duration_ms": entry.duration_ms,
         });
         if let Some(e) = &entry.error {
@@ -11590,13 +12011,18 @@ fn cmd_internal_run_headless(
             "ok"
         };
         println!(
-            "headless run {} [{status}] {} tok={}+{} {}ms profile={}",
+            "headless run {} [{status}] {} tok={}+{} {}ms profile={}{}",
             entry.run_id,
             entry.harness,
             entry.tokens_in,
             entry.tokens_out,
             entry.duration_ms,
             entry.profile,
+            if retried_fallback {
+                format!(" (fallback {used_model_id})")
+            } else {
+                String::new()
+            },
         );
         if let Some(e) = &entry.error {
             eprintln!("headless run error: {e}");
@@ -11638,11 +12064,28 @@ pub(crate) fn headless_dispatch(
         anyhow!("headless dispatch: unknown profile @{profile_name} (flywheel profile list)")
     })?;
     // Role conditioning (Spec C): the authored preamble finally reaches the
-    // agent — prepended to the stage prompt (or the goal fallback).
-    let base = match headless::dispatch_spec_stage(spec) {
-        Some(s) => stage_prompt(s)?,
-        None => headless::base_prompt_for(wf_name, inputs),
+    // agent — prepended to the stage prompt (or the goal fallback). The
+    // inline `spec.task` (bd-m7ac) wins over the stage: a dispatch with an
+    // explicit mission carries it verbatim.
+    let mut base = match headless::dispatch_spec_task(spec) {
+        Some(task) if !task.trim().is_empty() => task.to_string(),
+        _ => match headless::dispatch_spec_stage(spec) {
+            Some(s) => stage_prompt(s)?,
+            None => headless::base_prompt_for(wf_name, inputs),
+        },
     };
+    // Workflow-context extras (bd-oj9o): `spec.plan` / `spec.project` carry
+    // the run's inputs into the dispatch prompt — the beads plan reaches the
+    // planner, the onboard/triage-deep project reaches the crew. Unresolvable
+    // refs stay literal; nothing is dropped.
+    for key in ["plan", "project"] {
+        if let Some(extra) = headless::spec_extra(spec, key, inputs) {
+            base.push_str("\n\n");
+            base.push_str(key);
+            base.push_str(": ");
+            base.push_str(&extra);
+        }
+    }
     let prompt = headless::conditioned_prompt(&profile.behavior, &base);
 
     // Subprocess-reuse (Spec A): the leaf owns the harness call + run log.
@@ -12437,12 +12880,15 @@ mod integration_tests {
     use super::*;
 
     #[test]
-    fn render_produces_subagent_with_frontmatter_and_body() {
-        let out = render_integration("opencode", "9.9.9", "2026-08-04T00:00:00Z").unwrap();
-        // subagent shape: YAML frontmatter naming the beads agent
+    fn render_prompt_has_frontmatter_phase_and_body() {
+        let out = render_prompt("opencode", "execute", "9.9.9", "2026-08-04T00:00:00Z").unwrap();
+        // prompt shape: YAML frontmatter with the phase description
         assert!(out.starts_with("---\n"));
-        assert!(out.contains("name: beads"));
-        // version + generated stamps in the frontmatter comment
+        assert!(out.contains("Execute one ready bead end-to-end"));
+        // phase focus section
+        assert!(out.contains("# Beads execute"));
+        assert!(out.contains("## This command's focus"));
+        // version + generated stamps
         assert!(out.contains("flywheel 9.9.9"));
         assert!(out.contains("2026-08-04T00:00:00Z"));
         // the shared body's lifecycle
@@ -12455,6 +12901,22 @@ mod integration_tests {
         assert!(!out.contains("{{BODY}}"));
         assert!(!out.contains("{{KIND_NOTES}}"));
         assert!(!out.contains("{{VERSION}}"));
+        assert!(!out.contains("{{TOOL_FRONTMATTER}}"));
+        assert!(!out.contains("{{PHASE_DESCRIPTION}}"));
+    }
+
+    #[test]
+    fn render_all_five_phases_exist_per_kind() {
+        for kind in ["opencode", "pi", "grok", "omp"] {
+            for phase in ["triage", "execute", "review", "commit", "create"] {
+                let out = render_prompt(kind, phase, "0.1.0", "ts").unwrap();
+                assert!(
+                    out.contains(&format!("# Beads {phase}")),
+                    "{kind}/{phase} heading"
+                );
+                assert!(out.starts_with("---"), "{kind}/{phase} frontmatter");
+            }
+        }
     }
 
     #[test]
@@ -12463,8 +12925,9 @@ mod integration_tests {
             ("opencode", "~/.config/opencode"),
             ("pi", "~/.pi"),
             ("grok", "~/.grok"),
+            ("omp", "~/.omp"),
         ] {
-            let out = render_integration(kind, "0.1.0", "ts").unwrap();
+            let out = render_prompt(kind, "execute", "0.1.0", "ts").unwrap();
             assert!(out.contains(cfg), "{kind} should mention {cfg}");
             assert!(out.starts_with("---"), "{kind} frontmatter");
         }
@@ -12472,12 +12935,13 @@ mod integration_tests {
 
     #[test]
     fn render_rejects_unknown_kind() {
-        assert!(render_integration("claude", "0.1.0", "ts").is_err());
+        assert!(render_prompt("claude", "execute", "0.1.0", "ts").is_err());
+        assert!(render_prompt("opencode", "bogus", "0.1.0", "ts").is_err());
     }
 
     #[test]
     fn render_contains_lifecycle_and_context_contract() {
-        let out = render_integration("pi", "0.1.0", "ts").unwrap();
+        let out = render_prompt("pi", "execute", "0.1.0", "ts").unwrap();
         assert!(out.contains("br update bd-<id> --claim"));
         assert!(out.contains("br sync --flush-only"));
         assert!(out.contains("CONTEXT_LIMIT"));
@@ -12485,6 +12949,111 @@ mod integration_tests {
         assert!(out.contains("bv --robot-triage"));
         assert!(out.contains("file_reservation_paths"));
         assert!(out.contains("Never use `bd`"));
+    }
+
+    #[test]
+    fn prompts_dir_maps_each_kind() {
+        // config tests mutate HOME under the env lock and leave it removed —
+        // pin HOME for the mapping's lifetime (never read the ambient value).
+        let _g = crate::config::lock_env();
+        let home = std::env::temp_dir().join(format!("fw-prompts-home-{}", std::process::id()));
+        unsafe { std::env::set_var("HOME", &home) };
+        for (kind, sub) in [
+            ("opencode", ".config/opencode/command"),
+            ("pi", ".pi/agent/prompts"),
+            ("grok", ".grok/prompts"),
+            ("omp", ".omp/agent/prompts"),
+        ] {
+            let p = prompts_dir(kind).expect(kind);
+            assert!(
+                p.ends_with(sub),
+                "{kind}: {} should end with {sub}",
+                p.display()
+            );
+            assert!(!p.to_string_lossy().is_empty());
+        }
+        assert!(prompts_dir("claude").is_none());
+        unsafe { std::env::remove_var("HOME") };
+    }
+}
+
+#[cfg(test)]
+mod headless_retry_tests {
+    use super::*;
+
+    fn outcome_with_error(err: Option<&str>) -> headless::HarnessOutcome {
+        headless::HarnessOutcome {
+            response: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            status: if err.is_some() { "fail".into() } else { "success".into() },
+            model: String::new(),
+            duration_ms: 0,
+            exit_code: if err.is_some() { 1 } else { 0 },
+            error: err.map(str::to_string),
+        }
+    }
+
+    /// bd-42fs: HTTP 429 (in the harness error stream or stderr) is the
+    /// retry-on-429 trigger; other errors are not.
+    #[test]
+    fn rate_limit_predicate_classifies_429() {
+        assert!(is_rate_limited(&outcome_with_error(Some("Error: 429 Too Many Requests"))));
+        assert!(is_rate_limited(&outcome_with_error(Some("rate limit exceeded"))));
+        assert!(is_rate_limited(&outcome_with_error(Some("RATE LIMIT"))));
+        assert!(is_rate_limited(&outcome_with_error(Some("{\"error\":{\"code\":429}}"))));
+        assert!(!is_rate_limited(&outcome_with_error(Some("model not found"))));
+        assert!(!is_rate_limited(&outcome_with_error(Some("401 unauthorized"))));
+        assert!(!is_rate_limited(&outcome_with_error(None)));
+    }
+
+    /// bd-42fs: the oracle's fallback chain resolves — glm-5.2 (zai) with a
+    /// 429 retries on grok-4.5 (the registry fallback), injected for the
+    /// grok harness (bare id).
+    #[test]
+    fn oracle_fallback_resolves_via_registry() {
+        let _g = crate::config::lock_env();
+        let mut reg = models::ModelRegistry::default();
+        reg.models.insert(
+            "glm-5.2".into(),
+            models::ModelEntry {
+                provider: "zai".into(),
+                cost_in_per_mtok: 0.0,
+                cost_out_per_mtok: 0.0,
+                caps: vec![],
+                fallback: Some("grok-4.5".into()),
+                effort: Some("max".into()),
+            },
+        );
+        reg.models.insert(
+            "grok-4.5".into(),
+            models::ModelEntry {
+                provider: "grok".into(),
+                cost_in_per_mtok: 0.0,
+                cost_out_per_mtok: 0.0,
+                caps: vec![],
+                fallback: None,
+                effort: Some("max".into()),
+            },
+        );
+        let fb = reg
+            .get("glm-5.2")
+            .and_then(|e| e.fallback.clone())
+            .expect("fallback declared");
+        assert_eq!(fb, "grok-4.5");
+        assert_eq!(
+            reg.resolve(&fb, "grok"),
+            "grok-4.5",
+            "grok takes the bare id"
+        );
+        assert_eq!(
+            reg.resolve(&fb, "omp"),
+            "grok/grok-4.5",
+            "omp prefixes the provider"
+        );
+        // no fallback declared -> no retry (empty).
+        let no_fb = reg.get("grok-4.5").and_then(|e| e.fallback.clone());
+        assert!(no_fb.is_none());
     }
 }
 
@@ -12897,8 +13466,8 @@ mod profile_cli_tests {
         let r = cat
             .resolve("housekeeper", None, "npub-op", &|_, _| None)
             .expect("resolve");
-        assert_eq!(r.spec.harness, "pi");
-        assert_eq!(r.spec.model, "claude-sonnet-4");
+        assert_eq!(r.spec.harness, "omp");
+        assert_eq!(r.spec.model, "deepseek-v4-flash");
         assert_eq!(r.spec.backend, "herdr");
         assert_eq!(
             r.signing,
@@ -13096,5 +13665,62 @@ steps:
                 "built-in {name} fails flywheel-tier lint (profile/stage/inputs)"
             );
         }
+    }
+
+    /// bd-oj9o #3: the slash registry holds exactly the POPULAR user-facing
+    /// workflows — debate, plan-review, brainstorm. Behind-the-scenes
+    /// workflows (cron, beads, goal, triage) get NO slash commands.
+    #[test]
+    fn slash_registry_is_the_popular_set() {
+        let cmds = slash_commands();
+        assert_eq!(cmds.len(), 3, "exactly three slash commands");
+        for name in ["debate", "plan-review", "brainstorm"] {
+            assert!(cmds.contains_key(name), "/{name} registered");
+            assert!(
+                builtin_workflows::builtin_workflows().contains_key(cmds[name]),
+                "/{name} targets a real workflow"
+            );
+        }
+        for excluded in ["beads", "goal", "triage", "cron", "onboard", "triage-deep"] {
+            assert!(!cmds.contains_key(excluded), "/{excluded} must NOT be a slash command");
+        }
+    }
+
+    /// bd-oj9o #3: an unknown slash command is an actionable error, not a
+    /// silent passthrough to `workflow run`.
+    #[test]
+    fn slash_unknown_name_is_actionable_error() {
+        let target = slash_commands().get("does-not-exist").copied();
+        assert!(target.is_none(), "unknown slash name resolves to nothing");
+        let (name, _, _, _, _) = parse_slash_args(&["does-not-exist".into()]).unwrap();
+        let err = cmd_slash(
+            &Config::load().expect("test config"),
+            &SlashCmd::Run(vec![name]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no slash command"), "{err}");
+    }
+
+    /// bd-oj9o #3: the external-subcommand args parse into the workflow-run
+    /// shape (`slash debate --inputs {...} --execute`).
+    #[test]
+    fn slash_args_parse_name_and_flags() {
+        let (name, inputs, execute, mode, json) = parse_slash_args(&[
+            "debate".into(),
+            "--inputs".into(),
+            r#"{"proposal":"x"}"#.into(),
+            "--execute".into(),
+            "--mode".into(),
+            "pane".into(),
+            "--json".into(),
+        ])
+        .unwrap();
+        assert_eq!(name, "debate");
+        assert_eq!(inputs.as_deref(), Some(r#"{"proposal":"x"}"#));
+        assert!(execute);
+        assert_eq!(mode, "pane");
+        assert!(json);
+        assert!(parse_slash_args(&[]).is_err(), "no name is an error");
+        assert!(parse_slash_args(&["debate".into(), "--bogus".into()]).is_err());
     }
 }
