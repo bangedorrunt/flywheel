@@ -15,6 +15,7 @@ mod durable;
 mod fs_util;
 mod headless;
 mod herdr_shim;
+mod intent;
 mod mail_shim;
 mod mcp_http;
 mod models;
@@ -1632,6 +1633,34 @@ enum CoalitionCmd {
     },
     /// List coalitions (id, goal, status).
     List {
+        /// toron project slug (default: toron)
+        #[arg(long, default_value = "toron")]
+        project: String,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+    /// P11.3b detector: scan the intent board for overlapping crews and
+    /// propose tiered rule-splits (split-by-directory / sequence-by-
+    /// dependency / merge) + flag auto-coalesce candidates (non-trivial
+    /// source overlaps between unaffiliated crews).
+    Detect {
+        /// toron project slug (default: toron)
+        #[arg(long, default_value = "toron")]
+        project: String,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+    /// P11.3b auto-coalesce: form an ad-hoc coalition around a goal workflow
+    /// for every non-trivial overlap the detector flagged between
+    /// unaffiliated crews.
+    AutoCoalesce {
+        /// goal workflow name (must pass the lint gate)
+        goal: String,
+        /// act as this agent (the captain; must be a member)
+        #[arg(long = "as")]
+        as_agent: String,
         /// toron project slug (default: toron)
         #[arg(long, default_value = "toron")]
         project: String,
@@ -8746,6 +8775,69 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                         m.status,
                         m.goal,
                         m.members.len()
+                    );
+                }
+            }
+            Ok(())
+        }
+        CoalitionCmd::Detect { project, json } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let report = store.detect()?;
+            if *json {
+                print_json(&serde_json::to_value(&report)?);
+            } else {
+                if report.overlaps.is_empty() {
+                    println!("no intent overlaps on the board");
+                }
+                for o in &report.overlaps {
+                    let tag = if o.non_trivial { "source" } else { "trivial" };
+                    println!("overlap: {} <-> {} ({tag})", o.a, o.b);
+                    println!("  {} : {}", o.a, o.path_a);
+                    println!("  {} : {}", o.b, o.path_b);
+                }
+                for p in &report.proposals {
+                    println!(
+                        "proposal [{tier}/{kind}]: {} <-> {} — {}",
+                        p.agents[0],
+                        p.agents[1],
+                        p.rationale,
+                        tier = p.tier,
+                        kind = serde_json::to_string(&p.kind)
+                            .unwrap_or_default()
+                            .trim_matches('"')
+                    );
+                }
+                for c in &report.auto_coalesce {
+                    println!("auto-coalesce candidate: {} <-> {} (non-trivial source)", c.a, c.b);
+                }
+            }
+            Ok(())
+        }
+        CoalitionCmd::AutoCoalesce {
+            goal,
+            as_agent,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let report = store.detect()?;
+            if report.auto_coalesce.is_empty() {
+                if *json {
+                    print_json(&json!({ "formed": [] }));
+                } else {
+                    println!("no auto-coalesce candidates (no non-trivial unaffiliated overlap)");
+                }
+                return Ok(());
+            }
+            let formed = store.auto_coalesce(goal, as_agent, &report)?;
+            if *json {
+                print_json(&serde_json::to_value(&formed)?);
+            } else {
+                for m in &formed {
+                    println!(
+                        "formed coalition {} (goal {goal}, members {})",
+                        m.id,
+                        m.members.join(", ")
                     );
                 }
             }
