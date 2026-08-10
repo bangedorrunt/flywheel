@@ -262,8 +262,9 @@ fn spawn_crew_into(
                         split.pane_id
                     }
                 };
-                // AGENT_ARG = per-harness model flag (headless.rs model_args).
-                let agent_args: Vec<String> = if profile.model.is_empty() {
+                // AGENT_ARG = per-harness model flag (headless.rs model_args)
+                // + the omp role models (--smol/--slow/--plan, bd-gsvn.2).
+                let mut agent_args: Vec<String> = if profile.model.is_empty() {
                     vec![]
                 } else {
                     headless::model_args(
@@ -272,6 +273,12 @@ fn spawn_crew_into(
                         (!profile.effort.is_empty()).then_some(profile.effort.as_str()),
                     )
                 };
+                agent_args.extend(headless::role_model_args(
+                    harness,
+                    &profile.smol,
+                    &profile.slow,
+                    &profile.plan,
+                ));
                 let agent =
                     crate::start_agent_with_retry(c, &name, harness, &pane_id, &agent_args)?;
                 crate::register_spawned_agent(cfg, project, &name, harness, &agent.pane_id);
