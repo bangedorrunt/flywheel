@@ -6,15 +6,22 @@
 //! + control-flow (Spec 4). The catalog loads these as the compiled-in
 //!   defaults, overridable by `~/.config/flywheel/workflows/*.yaml`.
 //!
-//! - `brainstorm` — graph: parallel spawn @oracle (over breadth) → @planner
-//!   reduce.
-//! - `plan` — spawn @planner → request_approval gate.
-//! - `beads` — spawn @planner stage:systematic-execute.
-//! - `debate` — graph: parallel spawn @reviewer (over panel) → @oracle
-//!   decide.
-//! - `goal` — meta: call_workflow brainstorm→plan→beads→spawn @coder→
-//!   @reviewer→triage.
-//! - `triage` — the canonical message_posted reactive workflow.
+//! - `brainstorm` — graph: parallel dispatch @oracle (over 3) → @planner
+//!   reduce (task consumes {{steps.diverge}}; fail_run on reduce).
+//! - `plan` — dispatch @planner (task carries {{inputs.goal}}; fail_run on
+//!   decompose) → request_approval gate.
+//! - `beads` — dispatch @planner stage:systematic-execute (spec.plan carries
+//!   the plan; fail_run on create).
+//! - `debate` — graph: parallel dispatch @reviewer (over 2) → @oracle decide
+//!   (task consumes {{steps.briefs}}; fail_run on decide).
+//! - `goal` — meta: call_workflow brainstorm→plan→beads→dispatch @coder
+//!   stage:systematic-execute→@reviewer stage:code-review→@housekeeper
+//!   stage:commit-and-push; each dispatch carries the prior step's output via
+//!   spec.plan, each fails the run on error.
+//! - `triage` — the canonical message_posted reactive workflow (payload
+//!   fields only: {{trigger.content}} / {{trigger.id}} — no subject).
+//! - `onboard` / `triage-deep` — cold-start + deep-backlog chains; each step
+//!   consumes the prior step's output via spec.plan, fail_run on every step.
 //!
 //! governed-by: ADR-0005 Spec 2b, P3.5
 
@@ -39,12 +46,13 @@ graph:
     diverge:
       action: parallel
       over: "3"
-      each: { action: dispatch_job, assignee: x, spec: { profile: "@oracle", prompt: "{{inputs.question}}" } }
+      each: { action: dispatch_job, assignee: x, spec: { profile: "@oracle", task: "Diverge on the question — surface ideas, angles, and options: {{inputs.question}}" } }
     reduce:
       action: dispatch_job
       assignee: x
-      spec: { profile: "@planner" }
+      spec: { profile: "@planner", task: "Reduce these oracle outputs into ranked options for: {{inputs.question}}\n\nOracle outputs: {{steps.diverge}}" }
       needs: [diverge]
+      on_error: fail_run
 "##,
     ),
     (
@@ -61,7 +69,8 @@ steps:
   - name: decompose
     action: dispatch_job
     assignee: x
-    spec: { profile: "@planner" }
+    spec: { profile: "@planner", task: "Decompose this goal into a bead-ready plan (tasks, subtasks, dependency structure): {{inputs.goal}}" }
+    on_error: fail_run
   - name: gate
     action: request_approval
     message: "Approve plan for {{inputs.goal}}?"
@@ -82,6 +91,7 @@ steps:
     action: dispatch_job
     assignee: x
     spec: { profile: "@planner", stage: "systematic-execute", plan: "{{inputs.plan}}" }
+    on_error: fail_run
 "##,
     ),
     (
@@ -99,12 +109,13 @@ graph:
     briefs:
       action: parallel
       over: "2"
-      each: { action: dispatch_job, assignee: x, spec: { profile: "@reviewer", harness: "opencode", prompt: "{{inputs.proposal}}" } }
+      each: { action: dispatch_job, assignee: x, spec: { profile: "@reviewer", harness: "opencode", task: "Brief on the proposal from your adversarial angle: {{inputs.proposal}}" } }
     decide:
       action: dispatch_job
       assignee: x
-      spec: { profile: "@oracle" }
+      spec: { profile: "@oracle", task: "Adjudicate the briefs and decide on: {{inputs.proposal}}\n\nReviewer briefs: {{steps.briefs}}" }
       needs: [briefs]
+      on_error: fail_run
 "##,
     ),
     (
@@ -133,15 +144,18 @@ steps:
   - name: build
     action: dispatch_job
     assignee: x
-    spec: { profile: "@coder", stage: "systematic-execute" }
+    spec: { profile: "@coder", stage: "systematic-execute", plan: "{{steps.track}}" }
+    on_error: fail_run
   - name: review
     action: dispatch_job
     assignee: x
-    spec: { profile: "@reviewer", harness: "opencode" }
+    spec: { profile: "@reviewer", harness: "opencode", stage: "code-review", plan: "{{steps.build}}" }
+    on_error: fail_run
   - name: ship
-    action: call_workflow
-    workflow: triage
-    inputs: { target: "{{inputs.objective}}" }
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@housekeeper", stage: "commit-and-push", plan: "{{steps.build}}" }
+    on_error: fail_run
 "##,
     ),
     (
@@ -157,7 +171,7 @@ steps:
   - name: ack
     action: send_dm
     to: "operator"
-    body: "Received {{trigger.subject}}"
+    body: "Received {{trigger.content}}"
   - name: dispatch
     action: dispatch_job
     assignee: "x"
@@ -179,6 +193,7 @@ steps:
     action: dispatch_job
     assignee: x
     spec: { profile: "@reviewer", harness: "opencode", stage: "plan-review", plan: "{{inputs.plan}}" }
+    on_error: fail_run
 "##,
     ),
     (
@@ -196,10 +211,12 @@ steps:
     action: dispatch_job
     assignee: x
     spec: { profile: "@scout", stage: "repo-map", project: "{{inputs.project}}" }
+    on_error: fail_run
   - name: seed
     action: dispatch_job
     assignee: x
-    spec: { profile: "@planner", stage: "seed-first-task", project: "{{inputs.project}}" }
+    spec: { profile: "@planner", stage: "seed-first-task", plan: "{{steps.map}}", project: "{{inputs.project}}" }
+    on_error: fail_run
 "##,
     ),
     (
@@ -217,14 +234,17 @@ steps:
     action: dispatch_job
     assignee: x
     spec: { profile: "@scout", stage: "bv-triage", project: "{{inputs.project}}" }
+    on_error: fail_run
   - name: prioritize
     action: dispatch_job
     assignee: x
-    spec: { profile: "@planner", stage: "prioritize-assign", project: "{{inputs.project}}" }
+    spec: { profile: "@planner", stage: "prioritize-assign", plan: "{{steps.triage}}", project: "{{inputs.project}}" }
+    on_error: fail_run
   - name: spawn
     action: dispatch_job
     assignee: x
-    spec: { profile: "@housekeeper", stage: "spawn-crew", project: "{{inputs.project}}" }
+    spec: { profile: "@housekeeper", stage: "spawn-crew", plan: "{{steps.prioritize}}", project: "{{inputs.project}}" }
+    on_error: fail_run
 "##,
     ),
     (
@@ -537,5 +557,230 @@ mod tests {
             Some("@housekeeper"),
             "triage dispatches via a profile, not a hardcoded name"
         );
+    }
+
+    /// bd-h4fc: the reducer/decider steps consume the fan-out outputs
+    /// ({{steps.diverge}} / {{steps.briefs}}) — without the reference the
+    /// planner/oracle decide blind (the ADR-0005 Spec 2b `inputs.ideas` /
+    /// `inputs.arguments` parity under the dispatch_job shape).
+    #[test]
+    fn fanout_outputs_reach_reducers() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        for (name, node, token) in [
+            ("brainstorm", "reduce", "{{steps.diverge}}"),
+            ("debate", "decide", "{{steps.briefs}}"),
+        ] {
+            let g = wfs[name].graph.as_ref().expect("graph present");
+            let Action::DispatchJob { spec, .. } = &g.nodes[node].action else {
+                panic!("{name}.{node} is a dispatch_job");
+            };
+            let task = spec
+                .get("task")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("{name}.{node} has a task"));
+            assert!(
+                task.contains(token),
+                "{name}.{node} consumes the fan-out ({token}): {task}"
+            );
+        }
+    }
+
+    /// bd-h4fc: no dispatch spec uses the dead `prompt` key — headless
+    /// dispatch reads task/stage/base only, so `spec.prompt` would silently
+    /// drop the mission (the brainstorm/diverge + debate/briefs regression).
+    #[test]
+    fn no_dispatch_spec_uses_dead_prompt_key() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        fn scan_action(action: &Action, wf: &str, dead: &mut Vec<String>) {
+            match action {
+                Action::DispatchJob { spec, .. } => {
+                    if spec.get("prompt").is_some() {
+                        dead.push(wf.to_string());
+                    }
+                }
+                Action::Parallel { each, .. } => scan_action(&each.action, wf, dead),
+                Action::Retry { step, .. } => scan_action(&step.action, wf, dead),
+                Action::Branch { then, else_steps, .. } => {
+                    for s in then.iter().chain(else_steps.iter()) {
+                        scan_action(&s.action, wf, dead);
+                    }
+                }
+                Action::Foreach { each, .. } => scan_action(&each.action, wf, dead),
+                _ => {}
+            }
+        }
+        let mut dead = Vec::new();
+        for (name, wf) in &wfs {
+            for step in &wf.steps {
+                scan_action(&step.action, name, &mut dead);
+            }
+            if let Some(g) = &wf.graph {
+                for node in g.nodes.values() {
+                    scan_action(&node.action, name, &mut dead);
+                }
+            }
+        }
+        assert!(dead.is_empty(), "dispatch specs with dead prompt key: {dead:?}");
+    }
+
+    /// bd-h4fc: the goal meta-chain carries context forward — build gets the
+    /// tracked plan ({{steps.track}}), review gets the build output
+    /// ({{steps.build}}) with the opencode harness, and ship is a real
+    /// commit-and-push dispatch (NOT a triage call — triage templates
+    /// trigger.subject/id which do not exist on the invoke path).
+    #[test]
+    fn goal_carries_context_through_chain() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let goal = &wfs["goal"];
+        for (step_name, plan_token, harness) in [
+            ("build", "{{steps.track}}", None),
+            ("review", "{{steps.build}}", Some("opencode")),
+            ("ship", "{{steps.build}}", None),
+        ] {
+            let step = goal
+                .steps
+                .iter()
+                .find(|s| s.name.as_deref() == Some(step_name))
+                .unwrap_or_else(|| panic!("goal.{step_name} present"));
+            let Action::DispatchJob { spec, .. } = &step.action else {
+                panic!("goal.{step_name} is a dispatch_job");
+            };
+            assert_eq!(
+                spec.get("plan").and_then(Value::as_str),
+                Some(plan_token),
+                "goal.{step_name} carries the prior output"
+            );
+            if let Some(h) = harness {
+                assert_eq!(
+                    spec.get("harness").and_then(Value::as_str),
+                    Some(h),
+                    "goal.{step_name} keeps the harness override"
+                );
+            }
+            assert_eq!(
+                spec.get("profile").and_then(Value::as_str).unwrap(),
+                match step_name {
+                    "build" => "@coder",
+                    "review" => "@reviewer",
+                    _ => "@housekeeper",
+                }
+            );
+        }
+        let ship = goal
+            .steps
+            .iter()
+            .find(|s| s.name.as_deref() == Some("ship"))
+            .unwrap();
+        let Action::DispatchJob { spec, .. } = &ship.action else {
+            panic!("ship is a dispatch_job, not call_workflow triage");
+        };
+        assert_eq!(
+            spec.get("stage").and_then(Value::as_str),
+            Some("commit-and-push"),
+            "ship reuses the commit-and-push stage"
+        );
+        assert!(
+            !BUILTIN_WORKFLOWS_YAML
+                .iter()
+                .find(|(n, _)| *n == "goal")
+                .unwrap()
+                .1
+                .contains("workflow: triage"),
+            "goal.ship must not call triage (invoke-path templates would render empty)"
+        );
+    }
+
+    /// bd-h4fc: every decisive step fails the run on error (on_error:
+    /// fail_run) — a failed synthesis/tracking/build must not pass silently
+    /// as a success.
+    #[test]
+    fn decisive_steps_fail_run() {
+        use toron_workflow::schema::StepOnError;
+        let wfs = builtin_workflows();
+        fn step_errors(wf: &toron_workflow::schema::Workflow) -> Vec<(String, bool)> {
+            let mut out = Vec::new();
+            for s in &wf.steps {
+                out.push((
+                    s.name.clone().unwrap_or_else(|| s.action.type_name().into()),
+                    s.on_error == StepOnError::FailRun,
+                ));
+            }
+            if let Some(g) = &wf.graph {
+                for (n, node) in &g.nodes {
+                    out.push((n.clone(), node.on_error == StepOnError::FailRun));
+                }
+            }
+            out
+        }
+        let checks: &[(&str, &[&str])] = &[
+            ("brainstorm", &["reduce"]),
+            ("plan", &["decompose"]),
+            ("beads", &["create"]),
+            ("debate", &["decide"]),
+            ("goal", &["build", "review", "ship"]),
+            ("plan-review", &["review"]),
+            ("onboard", &["map", "seed"]),
+            ("triage-deep", &["triage", "prioritize", "spawn"]),
+        ];
+        for (name, must_fail) in checks {
+            let errors = step_errors(&wfs[*name]);
+            for m in *must_fail {
+                let (_, fail) = errors
+                    .iter()
+                    .find(|(n, _)| n == m)
+                    .unwrap_or_else(|| panic!("{name}.{m} exists"));
+                assert!(*fail, "{name}.{m} must be on_error: fail_run");
+            }
+        }
+    }
+
+    /// bd-h4fc: the reactive triage workflow templates ONLY payload fields
+    /// that always exist on message_posted (content/id) — the former
+    /// {{trigger.subject}} rendered an empty ack body even reactively.
+    #[test]
+    fn triage_uses_resolvable_payload_fields() {
+        let yaml = BUILTIN_WORKFLOWS_YAML
+            .iter()
+            .find(|(n, _)| *n == "triage")
+            .map(|(_, y)| *y)
+            .unwrap();
+        assert!(
+            !yaml.contains("{{trigger.subject}}"),
+            "triage must not template trigger.subject (absent from the payload)"
+        );
+        assert!(yaml.contains("{{trigger.content}}"), "ack uses content");
+        assert!(yaml.contains("{{trigger.id}}"), "dispatch uses id");
+    }
+
+    /// bd-h4fc: onboard + triage-deep chains consume the prior step's output
+    /// via spec.plan — a cold-start seed without the map, or a crew spawn
+    /// without the prioritized list, was a disconnected dispatch.
+    #[test]
+    fn onboard_and_triage_deep_chain_outputs() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        for (name, step_name, token) in [
+            ("onboard", "seed", "{{steps.map}}"),
+            ("triage-deep", "prioritize", "{{steps.triage}}"),
+            ("triage-deep", "spawn", "{{steps.prioritize}}"),
+        ] {
+            let wf = &wfs[name];
+            let step = wf
+                .steps
+                .iter()
+                .find(|s| s.name.as_deref() == Some(step_name))
+                .unwrap_or_else(|| panic!("{name}.{step_name} present"));
+            let Action::DispatchJob { spec, .. } = &step.action else {
+                panic!("{name}.{step_name} is a dispatch_job");
+            };
+            assert_eq!(
+                spec.get("plan").and_then(Value::as_str),
+                Some(token),
+                "{name}.{step_name} consumes the prior step output"
+            );
+        }
     }
 }
