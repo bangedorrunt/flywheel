@@ -533,6 +533,10 @@ enum Commands {
         /// loop iteration at send time (last-sent registry bookkeeping)
         #[arg(long)]
         iteration: Option<u64>,
+        /// profile name whose behavior preamble conditions the prompt
+        /// (Spec C, bd-gsvn.1). Empty = raw text (plain swarm sends).
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// internal: block until a pane's output matches a pattern
     #[command(name = "__wait-output", hide = true)]
@@ -644,6 +648,10 @@ enum Commands {
     /// internal: agent kind as text (durable workflow leaf)
     #[command(name = "__kind", hide = true)]
     __Kind { project: String, name: String },
+    /// internal: profile name for an agent from the spawn registry
+    /// (durable workflow leaf, bd-gsvn.1 — empty when none)
+    #[command(name = "__profile", hide = true)]
+    __Profile { project: String, name: String },
     /// internal: recent agent output as text (durable workflow leaf)
     #[command(name = "__read", hide = true)]
     __Read { project: String, name: String },
@@ -1523,13 +1531,16 @@ enum CoalitionCmd {
         json: bool,
     },
     /// Full coalition view: manifest + run + channel + intents + reservations
-    /// + bead gate.
+    /// + frozen paths + in-flight negotiations + bead gate.
     Status {
         /// coalition id (from form / list)
         id: String,
         /// toron project slug (default: toron)
         #[arg(long, default_value = "toron")]
         project: String,
+        /// compact one-line-per-member digest (bd-hkw5.1)
+        #[arg(long)]
+        digest: bool,
         /// JSON output for agent drivers
         #[arg(long)]
         json: bool,
@@ -2653,6 +2664,7 @@ fn main() {
             confirm,
             invocation,
             iteration,
+            profile,
         }) => cmd_internal_send(
             &cfg,
             project,
@@ -2661,6 +2673,7 @@ fn main() {
             *confirm,
             invocation.as_deref(),
             *iteration,
+            profile.as_deref(),
         ),
         Some(Commands::__MailBlocked {
             project,
@@ -2748,6 +2761,7 @@ fn main() {
         }) => cmd_internal_last_sent(&cfg, project, name, *hash),
         Some(Commands::__Inprogress { project }) => cmd_internal_inprogress(&cfg, project),
         Some(Commands::__Kind { project, name }) => cmd_internal_kind(&cfg, project, name),
+        Some(Commands::__Profile { project, name }) => cmd_internal_profile(&cfg, project, name),
         Some(Commands::__Read { project, name }) => cmd_internal_read(&cfg, project, name),
         Some(Commands::__Respawn {
             project,
@@ -6947,8 +6961,32 @@ fn cmd_loop(
         for action in &actions {
             match action {
                 LoopAction::Send { name, text } => {
-                    if let Err(e) = c.agent_prompt(name, text, None) {
-                        eprintln!("flywheel: send to {name} failed: {e:#}");
+                    // bd-gsvn.1: the sync loop routes through the same
+                    // dispatch leaf as the durable loop + pane runner —
+                    // __send --profile conditions the prompt with the
+                    // agent's profile behavior preamble (Spec C) and logs
+                    // the run. A plain swarm agent (no profile in the spawn
+                    // registry) sends raw, byte-identical to legacy.
+                    let agent_profile = state::load_spawn_registry(&project_dir_str(cfg, project)?)
+                        .into_iter()
+                        .find(|e| e.name == *name)
+                        .and_then(|e| e.profile)
+                        .unwrap_or_default();
+                    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+                    cmd.arg("__send").arg(project).arg(name).arg(text);
+                    if !agent_profile.is_empty() {
+                        cmd.arg("--profile").arg(&agent_profile);
+                    }
+                    let out = cmd
+                        .output()
+                        .map_err(|e| anyhow::anyhow!("__send for {name} failed: {e:#}"))?;
+                    let raw = String::from_utf8_lossy(&out.stdout).to_string();
+                    let ok = serde_json::from_str::<Value>(raw.trim())
+                        .ok()
+                        .and_then(|v| v.get("ok").and_then(Value::as_bool))
+                        .unwrap_or(false);
+                    if !ok {
+                        eprintln!("flywheel: send to {name} failed: {raw}");
                         // the item was already popped by plan_actions — put it
                         // back at the FRONT so the next poll retries it (a
                         // dead agent never silently consumes a prompt)
@@ -8876,11 +8914,48 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
             }
             Ok(())
         }
-        CoalitionCmd::Status { id, project, json } => {
+        CoalitionCmd::Status { id, project, json, digest } => {
             let store = CoalitionStore::open(project, coalitions_root())?;
             let st = store.status(id)?;
             if *json {
                 print_json(&serde_json::to_value(&st)?);
+            } else if *digest {
+                // bd-hkw5.1 digest mode: one line per member + the board
+                // heat (intents / frozen / negotiations) — the captain's
+                // quick scan.
+                println!("coalition {} [{}] goal {} captain {}", st.id, st.status, st.goal, st.captain);
+                let mut by_member: std::collections::BTreeMap<String, (usize, usize, usize)> =
+                    std::collections::BTreeMap::new();
+                for i in &st.intents {
+                    by_member.entry(i.agent_name.clone()).or_default().0 += 1;
+                }
+                for r in &st.reservations {
+                    by_member.entry(r.agent_name.clone()).or_default().1 += 1;
+                }
+                for f in &st.frozen {
+                    by_member.entry(f.agent.clone()).or_default().2 += 1;
+                }
+                for m in &st.members {
+                    let (intents, held, frozen) =
+                        by_member.get(m).copied().unwrap_or((0, 0, 0));
+                    println!(
+                        "  {} [{}] intents {} held {} frozen {}",
+                        m,
+                        st.roles.get(m).map(String::as_str).unwrap_or("member"),
+                        intents,
+                        held,
+                        frozen
+                    );
+                }
+                println!(
+                    "  negotiations: {} | channel events: {} | run: {}",
+                    st.negotiations.len(),
+                    st.channel.events.len(),
+                    st.run.as_ref().map(|r| r.status.as_str()).unwrap_or("unknown")
+                );
+                for n in &st.negotiations {
+                    println!("    {} -> {}: {} ({})", n.requester, n.holder, n.path, n.status);
+                }
             } else {
                 println!(
                     "coalition {} [{}] goal {} captain {}",
@@ -8900,15 +8975,47 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                     st.channel.events.len()
                 );
                 println!(
-                    "  intents: {} | reservations: {}",
+                    "  intents: {} | reservations: {} | frozen: {} | negotiations: {}",
                     st.intents.len(),
-                    st.reservations.len()
+                    st.reservations.len(),
+                    st.frozen.len(),
+                    st.negotiations.len()
                 );
                 for i in &st.intents {
-                    println!("    intent {}: {} @ {}", i.agent_name, i.path_pattern, i.reason);
+                    // TTL (bd-hkw5.1): intent expiry as epoch µs (None = no
+                    // expiry), plus the declared TTL.
+                    let ttl = i
+                        .expires_ts_us
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "none".into());
+                    println!(
+                        "    intent {}: {} @ {} (ttl {}s, expires {})",
+                        i.agent_name, i.path_pattern, i.reason, i.ttl_secs, ttl
+                    );
                 }
                 for r in &st.reservations {
-                    println!("    held {}: {}", r.agent_name, r.path_pattern);
+                    println!(
+                        "    held {}: {} (expires {})",
+                        r.agent_name,
+                        r.path_pattern,
+                        r.expires_ts_us
+                            .map(|t| t.to_string())
+                            .unwrap_or_else(|| "none".into())
+                    );
+                }
+                for f in &st.frozen {
+                    println!(
+                        "    FROZEN {}: {} (overlaps {})",
+                        f.agent,
+                        f.path,
+                        f.holders.join(", ")
+                    );
+                }
+                for n in &st.negotiations {
+                    println!(
+                        "    negotiate {} -> {}: {} ({})",
+                        n.requester, n.holder, n.path, n.status
+                    );
                 }
                 for b in &st.beads {
                     println!("    bead {}: {}", b.id, b.status);
@@ -9958,10 +10065,15 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             };
             let rt = tokio::runtime::Runtime::new()?;
             let run_id = format!("fw-cli-{}", state::now_iso());
+            // bd-gsvn.3: resolve elastic fan-out refs (`parallel over:
+            // "@crew.<role>"`) to concrete counts from the crew plan BEFORE
+            // invoke — the engine parses `over` as a number (default 1), so
+            // an unresolved @crew.X would silently degrade to one copy.
+            let invoke_wf = crew::resolve_crew_fanouts(&wf, &crew_plan);
             let output = rt.block_on(async {
                 let engine = toron_workflow::WorkflowEngine::local(runner)?;
                 engine
-                    .invoke(&run_id, wf.clone(), inputs_value.clone())
+                    .invoke(&run_id, invoke_wf, inputs_value.clone())
                     .await
             })?;
             // P10.3 lifecycle: ephemeral default — reap the crew workspace
@@ -11570,7 +11682,33 @@ fn cmd_internal_send(
     confirm_ms: Option<u64>,
     invocation: Option<&str>,
     iteration: Option<u64>,
+    profile: Option<&str>,
 ) -> Result<()> {
+    // bd-gsvn.1: Spec C role conditioning lands in __send — the ONE dispatch
+    // leaf shared by the pane runner and both loop paths. When a profile is
+    // given, the behavior preamble is prepended (conditioned_prompt) and the
+    // send is logged to runs/ (mode: pane). No profile = raw text, exactly
+    // the pre-migration behavior (plain swarm sends byte-identical).
+    let profile_name = profile.filter(|p| !p.is_empty());
+    let profile_obj = match profile_name {
+        Some(p) => {
+            let catalog = profile::ProfileCatalog::load()?;
+            match catalog.get(p) {
+                Some(pr) => Some((p.to_string(), pr.harness.clone(), pr.model.clone(), pr.behavior.clone())),
+                None => {
+                    eprintln!("flywheel: __send --profile {p} unknown (flywheel profile list) — sending raw");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let send_text = match &profile_obj {
+        Some((_, _, _, behavior)) => headless::conditioned_prompt(behavior, text),
+        None => text.to_string(),
+    };
+    let started = std::time::Instant::now();
+
     // resume-dedup (bd-resume-dedup): a landed record for THIS invocation
     // means the prompt was delivered before a crash — skip the herdr call
     // entirely. The __send subprocess is the idempotency boundary: it runs
@@ -11637,8 +11775,11 @@ fn cmd_internal_send(
     let Some(timeout_ms) = confirm_ms else {
         // legacy fire-and-forget path — a successful herdr call means the
         // prompt was written to the agent's terminal
-        backend.prompt(&target, text, None)?;
+        backend.prompt(&target, &send_text, None)?;
         record(true, false);
+        if let Some((pname, _, _, _)) = &profile_obj {
+            log_engine_dispatch(project, pname, text, &send_text, started, true);
+        }
         print_json(&json!({ "ok": true, "name": name }));
         return Ok(());
     };
@@ -11651,7 +11792,7 @@ fn cmd_internal_send(
     };
     // review-fix F6: PromptLanding carries status XOR code; classify
     // identically to the concrete path (landed → status, else code).
-    let landing = backend.prompt_coded(&target, text, Some(&wait))?;
+    let landing = backend.prompt_coded(&target, &send_text, Some(&wait))?;
     let verdict = classify_send_result(landing.code.as_deref(), landing.status);
     let (landed, status, reason) = match verdict {
         SendVerdict::Landed(st) => (
@@ -11666,11 +11807,60 @@ fn cmd_internal_send(
     // cg6.5: a timeout is AMBIGUOUS (the prompt may have started) — record it
     // as such so resume never re-delegates a possibly-mid-flight prompt.
     record(landed, reason == "timeout");
+    if let Some((pname, _, _, _)) = &profile_obj {
+        log_engine_dispatch(project, pname, text, &send_text, started, landed);
+    }
     print_json(&json!({
         "ok": true, "name": name, "landed": landed,
         "status": status, "reason": reason,
     }));
     Ok(())
+}
+
+/// bd-gsvn.1: write the runs/ entry for a profile-conditioned loop/pane
+/// dispatch (mode: pane — the engine's pane-runner logging gain). The
+/// entry's `prompt_hash` covers the CONDITIONED text (what the agent
+/// actually received); `model`/`harness` come from the profile.
+fn log_engine_dispatch(
+    project: &str,
+    profile_name: &str,
+    raw_text: &str,
+    sent_text: &str,
+    started: std::time::Instant,
+    landed: bool,
+) {
+    use sha1::Digest;
+    let _ = project;
+    let mut hasher = sha1::Sha1::new();
+    sha1::Digest::update(&mut hasher, sent_text.as_bytes());
+    let prompt_hash = hex::encode(sha1::Digest::finalize(hasher));
+    let (harness, model) = profile::ProfileCatalog::load()
+        .ok()
+        .and_then(|cat| cat.get(profile_name).cloned())
+        .map(|p| (p.harness, p.model))
+        .unwrap_or_default();
+    let entry = run_log::RunLogEntry {
+        run_id: run_log::new_run_id(),
+        ts: state::now_iso(),
+        workflow: String::new(),
+        cron: None,
+        profile: profile_name.to_string(),
+        harness,
+        model,
+        mode: "pane".into(),
+        prompt_hash,
+        response: String::new(),
+        status: if landed { "success".into() } else { "fail".into() },
+        tokens_in: 0,
+        tokens_out: 0,
+        duration_ms: started.elapsed().as_millis() as u64,
+        exit_code: if landed { 0 } else { 1 },
+        error: None,
+    };
+    if let Err(e) = run_log::write_run(&entry) {
+        eprintln!("flywheel: cannot write run log for @{profile_name}: {e:#}");
+    }
+    let _ = raw_text;
 }
 
 /// internal leaf: ready beads as [{id, title}] via `br ready --json`.
@@ -11787,6 +11977,26 @@ fn cmd_internal_kind(cfg: &Config, project: &str, name: &str) -> Result<()> {
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
         .ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
     println!("{}", agent.agent.as_deref().unwrap_or("unknown"));
+    Ok(())
+}
+
+/// internal leaf: the profile name an agent serves, from the spawn registry
+/// (bd-gsvn.1). Empty line when the agent has no profile (plain swarm
+/// spawns — byte-identical pre-migration behavior). Registry read only —
+/// never consults herdr.
+fn cmd_internal_profile(cfg: &Config, project: &str, name: &str) -> Result<()> {
+    let dir = project_dir(cfg, project);
+    let key = match dir.to_str() {
+        Some(k) => k.to_string(),
+        None => return Ok(()),
+    };
+    let registry = state::load_spawn_registry(&key);
+    let profile = registry
+        .iter()
+        .find(|e| e.name == name)
+        .and_then(|e| e.profile.clone())
+        .unwrap_or_default();
+    println!("{profile}");
     Ok(())
 }
 

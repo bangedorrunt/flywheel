@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use toron_workflow::schema::{Action, CrewSpec, Workflow};
+use toron_workflow::schema::{Action, CrewSpec, Step, Workflow};
 
 /// A computed crew: role → member count, ready for the orchestrator to spawn
 /// via `ProfileCatalog::resolve` + `Backend::spawn`.
@@ -36,7 +36,6 @@ impl CrewPlan {
     /// Resolve the fan-out count for a `parallel over: "@crew.<role>"` step.
     /// `@crew.coder` → the coder member count (1 if the role isn't in the
     /// crew); a bare `N` stays `N` (elastic).
-    #[cfg(test)]
     pub fn fanout_count(&self, over: &str) -> u32 {
         if let Some(role) = over.trim().strip_prefix("@crew.") {
             self.members.get(role).copied().unwrap_or(1).max(1)
@@ -44,6 +43,71 @@ impl CrewPlan {
             over.trim().parse().unwrap_or(1).max(1)
         }
     }
+}
+
+/// Resolve a workflow's elastic fan-out refs (`parallel over: "@crew.<role>"`)
+/// to concrete counts from the crew plan (bd-gsvn.3). The engine's
+/// `run_parallel` parses `over` as a number and defaults to 1 — an unresol-
+/// ved `@crew.X` would silently degrade to a single copy. This rewrite makes
+/// the fan-out elastic BEFORE invoke; each parallel copy is a durable child
+/// promise (crash-safe mid-fanout resume is the engine's existing `ctx.run`
+/// semantics). Bare `N` and non-parallel actions pass through untouched.
+pub fn resolve_crew_fanouts(workflow: &Workflow, plan: &CrewPlan) -> Workflow {
+    fn resolve_over(over: &str, plan: &CrewPlan) -> String {
+        if over.trim().starts_with("@crew.") {
+            plan.fanout_count(over).to_string()
+        } else {
+            over.to_string()
+        }
+    }
+    fn resolve_step(step: &Step, plan: &CrewPlan) -> Step {
+        let mut step = step.clone();
+        step.action = resolve_action(&step.action, plan);
+        step
+    }
+    fn resolve_steps(steps: &[Step], plan: &CrewPlan) -> Vec<Step> {
+        steps.iter().map(|s| resolve_step(s, plan)).collect()
+    }
+    fn resolve_action(action: &Action, plan: &CrewPlan) -> Action {
+        match action {
+            Action::Parallel { over, each } => Action::Parallel {
+                over: resolve_over(over, plan),
+                each: Box::new(resolve_step(each, plan)),
+            },
+            Action::Retry {
+                max_attempts,
+                backoff_secs,
+                step,
+            } => Action::Retry {
+                max_attempts: *max_attempts,
+                backoff_secs: *backoff_secs,
+                step: Box::new(resolve_step(step, plan)),
+            },
+            Action::Branch {
+                if_guard,
+                then,
+                else_steps,
+            } => Action::Branch {
+                if_guard: if_guard.clone(),
+                then: resolve_steps(then, plan),
+                else_steps: resolve_steps(else_steps, plan),
+            },
+            Action::Foreach { over, each } => Action::Foreach {
+                over: over.clone(),
+                each: Box::new(resolve_step(each, plan)),
+            },
+            other => other.clone(),
+        }
+    }
+
+    let mut wf = workflow.clone();
+    wf.steps = resolve_steps(&wf.steps, plan);
+    if let Some(graph) = &mut wf.graph {
+        for node in graph.nodes.values_mut() {
+            node.action = resolve_action(&node.action, plan);
+        }
+    }
+    wf
 }
 
 /// Compute the crew plan for a workflow (ADR-0005 Spec 4c).
@@ -200,6 +264,148 @@ steps:
         assert_eq!(plan.fanout_count("4"), 4);
         // Unknown crew role → 1 (safe default).
         assert_eq!(plan.fanout_count("@crew.ghost"), 1);
+    }
+
+    /// bd-gsvn.3: `resolve_crew_fanouts` substitutes `@crew.<role>` refs with
+    /// the plan's concrete counts (steps + graph, nested in retry/branch),
+    /// leaving elastic `N` and non-parallel actions untouched.
+    #[test]
+    fn resolve_crew_fanouts_substitutes_crew_refs() {
+        use toron_workflow::schema::Action;
+        let wf = parse_workflow(
+            r##"
+name: ship
+trigger:
+  type: webhook
+crew: { coder: 2, reviewer: 1 }
+steps:
+  - name: build
+    action: parallel
+    over: "@crew.coder"
+    each: { action: send_dm, to: x, body: y }
+  - name: elastic
+    action: parallel
+    over: "4"
+    each: { action: send_dm, to: x, body: y }
+  - name: retry-build
+    action: retry
+    max_attempts: 2
+    backoff_secs: 1
+    step:
+      name: inner
+      action: parallel
+      over: "@crew.reviewer"
+      each: { action: send_dm, to: x, body: y }
+  - name: gate
+    action: branch
+    if: "1 == 1"
+    then:
+      - name: t
+        action: parallel
+        over: "@crew.coder"
+        each: { action: send_dm, to: x, body: y }
+    else:
+      - name: e
+        action: parallel
+        over: "@crew.ghost"
+        each: { action: send_dm, to: x, body: y }
+"##,
+        )
+        .expect("parse");
+        let plan = plan_crew(&wf);
+        let resolved = resolve_crew_fanouts(&wf, &plan);
+
+        fn parallel_overs(step: &Step, out: &mut Vec<String>) {
+            match &step.action {
+                Action::Parallel { over, each } => {
+                    out.push(over.clone());
+                    parallel_overs(each, out);
+                }
+                Action::Retry { step, .. } => parallel_overs(step, out),
+                Action::Branch { then, else_steps, .. } => {
+                    for s in then.iter().chain(else_steps.iter()) {
+                        parallel_overs(s, out);
+                    }
+                }
+                Action::Foreach { each, .. } => parallel_overs(each, out),
+                _ => {}
+            }
+        }
+        let mut overs = Vec::new();
+        for step in &resolved.steps {
+            parallel_overs(step, &mut overs);
+        }
+        assert_eq!(
+            overs,
+            vec![
+                "2".to_string(),          // @crew.coder -> 2
+                "4".to_string(),          // elastic N untouched
+                "1".to_string(),          // @crew.reviewer -> 1 (nested retry)
+                "2".to_string(),          // @crew.coder (branch then)
+                "1".to_string(),          // @crew.ghost -> 1 (safe default)
+            ],
+            "all @crew refs substituted, elastic N preserved: {overs:?}"
+        );
+        // The ORIGINAL workflow is untouched (resolve is a pure rewrite).
+        let mut orig = Vec::new();
+        for step in &wf.steps {
+            parallel_overs(step, &mut orig);
+        }
+        assert_eq!(orig[0], "@crew.coder");
+    }
+
+    /// bd-gsvn.3: graph nodes are resolved too, not just linear steps.
+    #[test]
+    fn resolve_crew_fanouts_applies_to_graph_nodes() {
+        use toron_workflow::schema::Action;
+        let wf = parse_workflow(
+            r##"
+name: ship
+trigger:
+  type: webhook
+crew: { coder: 3 }
+graph:
+  nodes:
+    build:
+      action: parallel
+      over: "@crew.coder"
+      each: { action: send_dm, to: x, body: y }
+    ship:
+      action: send_dm
+      to: x
+      body: done
+      needs: [build]
+"##,
+        )
+        .expect("parse");
+        let plan = plan_crew(&wf);
+        let resolved = resolve_crew_fanouts(&wf, &plan);
+        let graph = resolved.graph.as_ref().expect("graph");
+        match &graph.nodes["build"].action {
+            Action::Parallel { over, .. } => assert_eq!(over, "3"),
+            other => panic!("build should stay parallel, got {other:?}"),
+        }
+        // A graph WITHOUT the fan-out ref resolves to the same shape.
+        let bare = parse_workflow(
+            r##"
+name: ship
+trigger:
+  type: webhook
+crew: { coder: 3 }
+graph:
+  nodes:
+    build:
+      action: parallel
+      over: "2"
+      each: { action: send_dm, to: x, body: y }
+"##,
+        )
+        .expect("parse");
+        let r2 = resolve_crew_fanouts(&bare, &plan_crew(&bare));
+        match &r2.graph.as_ref().unwrap().nodes["build"].action {
+            Action::Parallel { over, .. } => assert_eq!(over, "2", "elastic N untouched"),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     /// No crew → empty plan (each spawn standalone).
