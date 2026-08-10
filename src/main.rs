@@ -381,13 +381,16 @@ enum Commands {
     },
     /// Environment + toolchain health check
     Deps,
-    /// Generate the beads-agent integration instructions for an agent kind.
-    /// Omit KIND to list the available kinds. Re-run after a flywheel rebuild
-    /// to refresh the generated instructions with newer workflow changes.
+    /// Generate the beads-agent integration prompts for an agent kind.
+    /// Writes 5 files (beads-{triage,execute,review,commit,create}.md) into
+    /// the tool's prompts dir. Omit KIND to list the available kinds.
+    /// Re-run after a flywheel rebuild to refresh the generated prompts.
     Integration {
-        /// agent kind: opencode|pi|grok (shorts oc|pi|gk accepted); omit to list
+        /// agent kind: opencode|pi|grok|omp (shorts oc|pi|gk accepted);
+        /// omit to list kinds
         kind: Option<String>,
-        /// write the integration to this file instead of stdout
+        /// write the 5 prompt files into this directory instead of the
+        /// tool's conventional prompts dir
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -7530,59 +7533,128 @@ fn kind_notes(kind: &str) -> Option<&'static str> {
         "grok" => Some(
             "- Config + sessions: ~/.grok (active sessions in ~/.grok/active_sessions.json).\n- Landing latency can be higher: the orchestrator's confirm wait covers it — you\n  only need to reach working/blocked, not finish, for the send to count as landed.",
         ),
+        "omp" => Some(
+            "- Config + sessions: ~/.omp (agent sessions under ~/.omp/agent/sessions/).\n- Prompts live in ~/.omp/agent/prompts/beads-*.md (generated — re-run `flywheel\n  integration omp` after a rebuild to refresh; never hand-edit the generated files).",
+        ),
         _ => None,
     }
 }
 
 /// The shared beads-agent BODY — the lifecycle, coordination rules, and
-/// context contract that all three agent kinds follow. Per-kind frontmatter
-/// and notes live in the wrappers below. Edit the templates in
+/// context contract that all agent kinds follow. Every phase prompt embeds
+/// this body (single source of truth); per-phase focus + per-tool frontmatter
+/// live in the phase/frontmatter templates below. Edit the templates in
 /// `integrations/` and rebuild — re-run `flywheel integration <kind>` after
-/// a rebuild to update the installed subagent files.
+/// a rebuild to update the installed prompt files.
 const INTEGRATION_BODY: &str = include_str!("../integrations/beads-body.md.tpl");
 
-/// Per-kind subagent wrappers: frontmatter (tool-specific format) + {{BODY}}.
-fn integration_wrapper(kind: &str) -> Option<&'static str> {
+/// The canonical 5-command set: phase name → description (frontmatter).
+/// Each phase prompt = per-tool frontmatter + phase focus + the shared body.
+const PROMPT_PHASES: &[(&str, &str)] = &[
+    (
+        "triage",
+        "Find ready bead work — triage the tracker for open, unblocked, dependency-ordered tasks.",
+    ),
+    (
+        "execute",
+        "Execute one ready bead end-to-end — claim, reserve, announce, implement, verify, close, sync, handoff.",
+    ),
+    (
+        "review",
+        "Review a bead's work for compliance before closing — does it actually satisfy the acceptance criteria?",
+    ),
+    (
+        "commit",
+        "Close a completed bead and sync the tracker — close with honest reason, export, commit .beads/, hand off.",
+    ),
+    (
+        "create",
+        "Create a new bead from a plan, suggestion, or discovered work — granular, dependency-ordered, self-documenting.",
+    ),
+];
+
+/// Per-tool prompt frontmatter (tool-specific format) + {{PHASE_DESCRIPTION}}.
+fn prompt_frontmatter(kind: &str) -> Option<&'static str> {
     match kind {
-        "opencode" => Some(include_str!("../integrations/opencode-beads.md.tpl")),
-        "pi" => Some(include_str!("../integrations/pi-beads.md.tpl")),
-        "grok" => Some(include_str!("../integrations/grok-beads.md.tpl")),
+        "opencode" => Some(include_str!("../integrations/prompts/frontmatter-opencode.md.tpl")),
+        "pi" => Some(include_str!("../integrations/prompts/frontmatter-pi.md.tpl")),
+        "grok" => Some(include_str!("../integrations/prompts/frontmatter-grok.md.tpl")),
+        "omp" => Some(include_str!("../integrations/prompts/frontmatter-omp.md.tpl")),
         _ => None,
     }
 }
 
-/// Render the beads SUBAGENT definition for one agent kind. Pure: `version`
-/// and `generated` are injected by the caller (deterministic tests).
-fn render_integration(kind: &str, version: &str, generated: &str) -> Result<String> {
-    let wrapper = integration_wrapper(kind)
-        .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok)"))?;
+/// Per-phase prompt template: `{{TOOL_FRONTMATTER}}` + phase focus +
+/// `{{BODY}}` (the shared body).
+fn prompt_phase_template(phase: &str) -> Option<&'static str> {
+    match phase {
+        "triage" => Some(include_str!("../integrations/prompts/beads-triage.md.tpl")),
+        "execute" => Some(include_str!("../integrations/prompts/beads-execute.md.tpl")),
+        "review" => Some(include_str!("../integrations/prompts/beads-review.md.tpl")),
+        "commit" => Some(include_str!("../integrations/prompts/beads-commit.md.tpl")),
+        "create" => Some(include_str!("../integrations/prompts/beads-create.md.tpl")),
+        _ => None,
+    }
+}
+
+/// The prompts directory for one agent kind (the dir the 5 command files
+/// are written into). Purely conventional per tool.
+pub fn prompts_dir(kind: &str) -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let home = std::path::Path::new(&home);
+    Some(match kind {
+        "opencode" => home.join(".config/opencode/command"),
+        "pi" => home.join(".pi/agent/prompts"),
+        "grok" => home.join(".grok/prompts"),
+        "omp" => home.join(".omp/agent/prompts"),
+        _ => return None,
+    })
+}
+
+/// Render one phase prompt for one agent kind. Pure: `version` and
+/// `generated` are injected by the caller (deterministic tests).
+fn render_prompt(kind: &str, phase: &str, version: &str, generated: &str) -> Result<String> {
+    let frontmatter = prompt_frontmatter(kind)
+        .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp)"))?;
+    let phase_tpl = prompt_phase_template(phase)
+        .ok_or_else(|| anyhow!("unknown phase: {phase} (known: triage, execute, review, commit, create)"))?;
+    let (_, description) = PROMPT_PHASES
+        .iter()
+        .find(|(p, _)| *p == phase)
+        .expect("phase in table");
     let notes = kind_notes(kind).unwrap_or_default();
     let body = INTEGRATION_BODY
         .replace("{{KIND_NOTES}}", notes)
         .replace("{{VERSION}}", version)
         .replace("{{GENERATED}}", generated);
-    Ok(wrapper
+    Ok(phase_tpl
+        .replace("{{TOOL_FRONTMATTER}}", &frontmatter.replace("{{PHASE_DESCRIPTION}}", description))
         .replace("{{BODY}}", &body)
         .replace("{{VERSION}}", version)
         .replace("{{GENERATED}}", generated))
 }
 
-/// `flywheel integration [KIND] [--out PATH]` — generate the beads-agent
-/// integration instructions for opencode/pi/grok agents. With no KIND, list
-/// the available kinds. With `--out`, write the rendered file instead of
-/// stdout (e.g. append it to a project's AGENTS.md).
+/// `flywheel integration [KIND] [--out PATH]` — generate the 5 beads prompt
+/// files (beads-{triage,execute,review,commit,create}.md) for one agent kind
+/// (opencode/pi/grok/omp), each from the shared beads-body. With no KIND,
+/// list the available kinds. With `--out <dir>`, write the 5 files into that
+/// directory instead of the tool's conventional prompts dir.
+///
+/// The beads SUBAGENT (agents/beads.md) is retired (bd-ra0g.1): the loop
+/// drives panes via its self-contained dispatch prompt, and nothing
+/// load-bearing loads the subagent — prompts are the delivery surface now.
 fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
     let Some(kind) = kind else {
-        println!("flywheel beads-agent subagents (flywheel {VERSION}):");
-        for (k, path) in [
-            ("opencode", "~/.config/opencode/agents/beads.md"),
-            ("pi", "~/.pi/agent/agents/beads.md"),
-            ("grok", "~/.grok/agents/beads.md"),
-        ] {
-            println!("  {k:9} flywheel integration {k} --out {path}");
+        println!("flywheel beads prompts (flywheel {VERSION}):");
+        println!("  5 commands per kind: beads-{{triage,execute,review,commit,create}}.md");
+        for (k, _) in [("opencode", ""), ("pi", ""), ("grok", ""), ("omp", "")] {
+            let dir = prompts_dir(k)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<HOME>/.config/...".to_string());
+            println!("  {k:9} flywheel integration {k}   -> {dir}/beads-*.md");
         }
         println!(
-            "templates: integrations/opencode-beads.md.tpl, pi-beads.md.tpl, grok-beads.md.tpl + beads-body.md.tpl — edit, rebuild, re-run to update"
+            "templates: integrations/beads-body.md.tpl + integrations/prompts/*.tpl — edit, rebuild, re-run to update"
         );
         return Ok(());
     };
@@ -7592,18 +7664,31 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
         "gk" => "grok",
         other => other,
     };
-    let rendered = render_integration(kind, VERSION, &state::now_iso())?;
-    match out {
-        Some(path) => {
-            std::fs::write(path, &rendered)?;
-            println!(
-                "wrote {} ({} bytes)",
-                dim(&path.display().to_string()),
-                rendered.len()
-            );
-        }
-        None => print!("{rendered}"),
+    let dir = match out {
+        Some(p) => p.to_path_buf(),
+        None => prompts_dir(kind)
+            .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp)"))?,
+    };
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create prompts dir {}", dir.display()))?;
+    let generated = state::now_iso();
+    let mut written = 0usize;
+    for (phase, _) in PROMPT_PHASES {
+        let rendered = render_prompt(kind, phase, VERSION, &generated)?;
+        let path = dir.join(format!("beads-{phase}.md"));
+        std::fs::write(&path, &rendered)
+            .with_context(|| format!("write {}", path.display()))?;
+        println!(
+            "wrote {} ({} bytes)",
+            dim(&path.display().to_string()),
+            rendered.len()
+        );
+        written += 1;
     }
+    println!(
+        "flywheel integration {kind}: {written} prompt file(s) in {}",
+        dim(&dir.display().to_string())
+    );
     Ok(())
 }
 
@@ -12561,12 +12646,15 @@ mod integration_tests {
     use super::*;
 
     #[test]
-    fn render_produces_subagent_with_frontmatter_and_body() {
-        let out = render_integration("opencode", "9.9.9", "2026-08-04T00:00:00Z").unwrap();
-        // subagent shape: YAML frontmatter naming the beads agent
+    fn render_prompt_has_frontmatter_phase_and_body() {
+        let out = render_prompt("opencode", "execute", "9.9.9", "2026-08-04T00:00:00Z").unwrap();
+        // prompt shape: YAML frontmatter with the phase description
         assert!(out.starts_with("---\n"));
-        assert!(out.contains("name: beads"));
-        // version + generated stamps in the frontmatter comment
+        assert!(out.contains("Execute one ready bead end-to-end"));
+        // phase focus section
+        assert!(out.contains("# Beads execute"));
+        assert!(out.contains("## This command's focus"));
+        // version + generated stamps
         assert!(out.contains("flywheel 9.9.9"));
         assert!(out.contains("2026-08-04T00:00:00Z"));
         // the shared body's lifecycle
@@ -12579,6 +12667,22 @@ mod integration_tests {
         assert!(!out.contains("{{BODY}}"));
         assert!(!out.contains("{{KIND_NOTES}}"));
         assert!(!out.contains("{{VERSION}}"));
+        assert!(!out.contains("{{TOOL_FRONTMATTER}}"));
+        assert!(!out.contains("{{PHASE_DESCRIPTION}}"));
+    }
+
+    #[test]
+    fn render_all_five_phases_exist_per_kind() {
+        for kind in ["opencode", "pi", "grok", "omp"] {
+            for phase in ["triage", "execute", "review", "commit", "create"] {
+                let out = render_prompt(kind, phase, "0.1.0", "ts").unwrap();
+                assert!(
+                    out.contains(&format!("# Beads {phase}")),
+                    "{kind}/{phase} heading"
+                );
+                assert!(out.starts_with("---"), "{kind}/{phase} frontmatter");
+            }
+        }
     }
 
     #[test]
@@ -12587,8 +12691,9 @@ mod integration_tests {
             ("opencode", "~/.config/opencode"),
             ("pi", "~/.pi"),
             ("grok", "~/.grok"),
+            ("omp", "~/.omp"),
         ] {
-            let out = render_integration(kind, "0.1.0", "ts").unwrap();
+            let out = render_prompt(kind, "execute", "0.1.0", "ts").unwrap();
             assert!(out.contains(cfg), "{kind} should mention {cfg}");
             assert!(out.starts_with("---"), "{kind} frontmatter");
         }
@@ -12596,12 +12701,13 @@ mod integration_tests {
 
     #[test]
     fn render_rejects_unknown_kind() {
-        assert!(render_integration("claude", "0.1.0", "ts").is_err());
+        assert!(render_prompt("claude", "execute", "0.1.0", "ts").is_err());
+        assert!(render_prompt("opencode", "bogus", "0.1.0", "ts").is_err());
     }
 
     #[test]
     fn render_contains_lifecycle_and_context_contract() {
-        let out = render_integration("pi", "0.1.0", "ts").unwrap();
+        let out = render_prompt("pi", "execute", "0.1.0", "ts").unwrap();
         assert!(out.contains("br update bd-<id> --claim"));
         assert!(out.contains("br sync --flush-only"));
         assert!(out.contains("CONTEXT_LIMIT"));
@@ -12609,6 +12715,31 @@ mod integration_tests {
         assert!(out.contains("bv --robot-triage"));
         assert!(out.contains("file_reservation_paths"));
         assert!(out.contains("Never use `bd`"));
+    }
+
+    #[test]
+    fn prompts_dir_maps_each_kind() {
+        // config tests mutate HOME under the env lock and leave it removed —
+        // pin HOME for the mapping's lifetime (never read the ambient value).
+        let _g = crate::config::lock_env();
+        let home = std::env::temp_dir().join(format!("fw-prompts-home-{}", std::process::id()));
+        unsafe { std::env::set_var("HOME", &home) };
+        for (kind, sub) in [
+            ("opencode", ".config/opencode/command"),
+            ("pi", ".pi/agent/prompts"),
+            ("grok", ".grok/prompts"),
+            ("omp", ".omp/agent/prompts"),
+        ] {
+            let p = prompts_dir(kind).expect(kind);
+            assert!(
+                p.ends_with(sub),
+                "{kind}: {} should end with {sub}",
+                p.display()
+            );
+            assert!(!p.to_string_lossy().is_empty());
+        }
+        assert!(prompts_dir("claude").is_none());
+        unsafe { std::env::remove_var("HOME") };
     }
 }
 
