@@ -121,6 +121,11 @@ pub struct AgentState {
 pub struct ReadyBead {
     pub id: String,
     pub title: String,
+    /// The bead's assignee (bd-627z.1): `Some` for in_progress beads (who
+    /// holds it), `None` for ready beads. The stranded-reclaim + scoped
+    /// completion decision reads it.
+    #[serde(default)]
+    pub assignee: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -697,6 +702,11 @@ async fn poll_ready(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .to_string(),
+            assignee: b
+                .get("assignee")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         });
     }
     Ok(out_beads)
@@ -905,8 +915,66 @@ async fn poll_inprogress(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .to_string(),
+            assignee: b
+                .get("assignee")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         })
         .collect())
+}
+
+/// Args for the `__reclaim-stranded` leaf (bd-627z.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReclaimArgs {
+    pub project: String,
+    pub live: Vec<String>,
+}
+
+/// Result of one `__reclaim-stranded` call: which beads were re-opened to
+/// ready (the loop re-dispatches them this poll) and which failed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReclaimResult {
+    #[serde(default)]
+    pub reclaimed: Vec<String>,
+    #[serde(default)]
+    pub failed: Vec<serde_json::Value>,
+}
+
+/// Reclaim stranded in_progress beads (bd-627z.1): each in_progress bead
+/// whose assignee is NOT a live agent is re-opened to ready via the
+/// `__reclaim-stranded` leaf. Checkpointed. Returns the reclaimed ids.
+#[function]
+async fn reclaim_stranded(args: ReclaimArgs) -> Result<ReclaimResult> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__reclaim-stranded", &args.project, "--live", &args.live.join(",")]);
+    let out = run_leaf_cmd(cmd, "__reclaim-stranded").await?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__reclaim-stranded failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(raw.trim())
+        .map_err(|e| map_err(anyhow::anyhow!("__reclaim-stranded bad JSON: {e}: {raw}")))?;
+    Ok(ReclaimResult {
+        reclaimed: v
+            .get("reclaimed")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        failed: v
+            .get("failed")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    })
 }
 
 /// Agent kind (opencode/pi/grok) for respawn. Checkpointed.
@@ -1764,6 +1832,42 @@ pub fn all_settled(states: &[AgentState]) -> bool {
         .all(|s| matches!(s.status.as_str(), "idle" | "done"))
 }
 
+/// Stranded-bead detection (bd-627z.1): an in_progress bead whose assignee is
+/// NOT a live swarm agent. Live = the herdr agent names polled this tick
+/// (captain, dead agents, and unknown identities are NOT live — their beads
+/// would stall the batch forever).
+///
+/// A bead with NO assignee is not stranded (nobody claims it — it is an
+/// anomaly the tracker owns, not a stuck lane). Pure — the unit surface for
+/// the reclaim decision.
+pub fn stranded_beads<'a>(inprogress: &'a [ReadyBead], live_names: &[String]) -> Vec<&'a ReadyBead> {
+    inprogress
+        .iter()
+        .filter(|b| match &b.assignee {
+            Some(a) => !live_names.iter().any(|l| l == a),
+            None => false,
+        })
+        .collect()
+}
+
+/// Scoped completion guard (bd-627z.1): are there in_progress beads that
+/// BLOCK completion — i.e. in-progress beads held by LIVE agents? Stranded
+/// beads (non-live assignee) do NOT block: they are being reclaimed
+/// (re-opened to ready + re-dispatched), so they must not keep the loop from
+/// resolving once everything else is done. Pure — the unit surface for the
+/// completion re-check.
+pub fn blocking_inprogress<'a>(inprogress: &'a [ReadyBead], live_names: &[String]) -> Vec<&'a ReadyBead> {
+    inprogress
+        .iter()
+        .filter(|b| match &b.assignee {
+            Some(a) => live_names.iter().any(|l| l == a),
+            // No assignee: treat as blocking (an unowned in-progress bead is
+            // not reclaimable by assignee — the tracker must resolve it).
+            None => true,
+        })
+        .collect()
+}
+
 /// Adaptive poll cadence: fast while the swarm is busy, slow when settled.
 ///
 /// A dispatch this iteration (`dispatched`) forces the active cadence: the
@@ -2407,7 +2511,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // checkpointed poll results)
         if params.work {
             // interrupted work first: an in-progress bead's agent went idle —
-            // resume it before handing out fresh beads
+            // resume it before handing out fresh beads. bd-627z.1: live names
+            // = the polled swarm; stranded beads (assignee NOT live) are
+            // RECLAIMED (re-opened to ready + re-dispatched) instead of being
+            // resumed or left to stall the batch.
             let inprog: Vec<ReadyBead> = match ctx
                 .run(
                     poll_inprogress,
@@ -2425,9 +2532,41 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     vec![]
                 }
             };
+            let live_names: Vec<String> = states.iter().map(|s| s.name.clone()).collect();
+            let stranded: Vec<String> = stranded_beads(&inprog, &live_names)
+                .into_iter()
+                .map(|b| b.id.clone())
+                .collect();
+            if !stranded.is_empty() {
+                match ctx
+                    .run(
+                        reclaim_stranded,
+                        ReclaimArgs {
+                            project: params.project.clone(),
+                            live: live_names.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(r) => {
+                        // Reclaimed beads return to ready → re-dispatched
+                        // below (same poll) — the strand is healed in one
+                        // cycle. Reclaim failures are logged, not fatal.
+                        for id in &r.reclaimed {
+                            eprintln!("flywheel: reclaimed stranded bead {id} (re-dispatching)");
+                        }
+                        for f in &r.failed {
+                            eprintln!("flywheel: reclaim failed for {f}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("flywheel: reclaim_stranded leaf failed (continuing): {e}");
+                    }
+                }
+            }
             let to_resume: Vec<&ReadyBead> = inprog
                 .iter()
-                .filter(|b| !assigned.contains(&b.id))
+                .filter(|b| !assigned.contains(&b.id) && !stranded.contains(&b.id))
                 .collect();
             for bead in to_resume {
                 queue.push(resume_prompt(&bead.id, &bead.title));
@@ -3006,9 +3145,13 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             }
         }
 
-        // work mode completion guard: a stranded in-progress bead (interrupted
-        // agent) must keep the loop alive — re-prompt it next poll.
-        let inprogress_empty = if params.work {
+        // work mode completion guard (bd-627z.1): an in-progress bead held by
+        // a LIVE agent must keep the loop alive — re-prompt it next poll.
+        // Stranded beads (assignee not live) do NOT block: they were reclaimed
+        // (re-opened to ready + re-dispatched) earlier this poll, so they are
+        // no longer in-progress — and a reclaim failure must not stall the
+        // batch forever (the loop resolves; the tracker owns strays).
+        let inprogress_blocking = if params.work {
             match ctx
                 .run(
                     poll_inprogress,
@@ -3018,16 +3161,20 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 )
                 .await
             {
-                Ok(bs) => bs.is_empty(),
+                Ok(bs) => {
+                    let live_names: Vec<String> =
+                        states.iter().map(|s| s.name.clone()).collect();
+                    !blocking_inprogress(&bs, &live_names).is_empty()
+                }
                 Err(e) => {
                     // cg6.2: a leaf hiccup must not crash the completion
-                    // check — treat as non-empty so the loop keeps polling.
+                    // check — treat as blocking so the loop keeps polling.
                     eprintln!("flywheel: poll_inprogress leaf failed (completion guard): {e}");
-                    false
+                    true
                 }
             }
         } else {
-            true
+            false
         };
 
         // settled = no work was dispatched this iteration AND everyone idle/done.
@@ -3039,7 +3186,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         if queue.is_empty()
             && all_settled
             && !any_work
-            && inprogress_empty
+            && !inprogress_blocking
             && expected_replies.is_empty()
         {
             return Ok("complete".to_string());
@@ -3146,6 +3293,9 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     resonate
         .register(poll_inprogress)
         .map_err(|e| anyhow::anyhow!("register poll_inprogress: {e}"))?;
+    resonate
+        .register(reclaim_stranded)
+        .map_err(|e| anyhow::anyhow!("register reclaim_stranded: {e}"))?;
     resonate
         .register(load_expected_replies)
         .map_err(|e| anyhow::anyhow!("register load_expected_replies: {e}"))?;
@@ -3499,6 +3649,60 @@ mod tests {
         // gracefully instead of crashing the durable invocation with
         // "__poll failed". This is the invariant the soft-fail relies on.
         assert!(all_settled(&[][..]));
+    }
+
+    // ---- bd-627z.1: stranded reclaim + scoped completion ----
+
+    fn rb(id: &str, assignee: Option<&str>) -> ReadyBead {
+        ReadyBead {
+            id: id.into(),
+            title: String::new(),
+            assignee: assignee.map(str::to_string),
+        }
+    }
+
+    /// A bead held by a NON-live assignee (captain, dead agent, unknown
+    /// identity) is stranded — reclaim it.
+    #[test]
+    fn stranded_beads_flag_non_live_assignees() {
+        let live = vec!["oc".to_string(), "pi".to_string()];
+        let inprog = vec![
+            rb("bd-1", Some("oc")),   // live — not stranded
+            rb("bd-2", Some("captain")), // non-live — stranded
+            rb("bd-3", Some("ghost")),   // dead agent — stranded
+            rb("bd-4", None),            // no assignee — NOT stranded (tracker owns)
+        ];
+        let stranded = stranded_beads(&inprog, &live);
+        let ids: Vec<&str> = stranded.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, vec!["bd-2", "bd-3"], "{ids:?}");
+    }
+
+    /// Stranded beads do NOT block completion; live-held and unowned
+    /// in-progress beads DO.
+    #[test]
+    fn blocking_inprogress_counts_live_and_unowned_only() {
+        let live = vec!["oc".to_string()];
+        let inprog = vec![
+            rb("bd-1", Some("oc")),     // live — blocks
+            rb("bd-2", Some("captain")), // stranded — does NOT block
+            rb("bd-3", None),            // unowned — blocks (tracker resolves)
+        ];
+        let blocking = blocking_inprogress(&inprog, &live);
+        let ids: Vec<&str> = blocking.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, vec!["bd-1", "bd-3"], "{ids:?}");
+    }
+
+    /// All stranded → nothing blocks → the loop may complete once the rest
+    /// of the conditions hold (the strand was reclaimed this poll).
+    #[test]
+    fn blocking_inprogress_empty_when_all_stranded() {
+        let live = vec!["oc".to_string()];
+        let inprog = vec![
+            rb("bd-1", Some("captain")),
+            rb("bd-2", Some("ghost")),
+        ];
+        assert!(blocking_inprogress(&inprog, &live).is_empty());
+        assert!(!stranded_beads(&inprog, &live).is_empty(), "they ARE stranded");
     }
 
     // ---- adaptive poll interval (bd-adaptive-interval) ----

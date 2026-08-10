@@ -574,6 +574,139 @@ pub fn failure_bead_fields(bundle: &toron_workflow::FailureBundle) -> (String, S
     (title, description)
 }
 
+/// The synthesized improvement idea the weekly-review oracle produced
+/// (bd-m7ac). Parsed from the cron tick's workflow output — the oracle node's
+/// `response` carries `{"idea": {...}}` or `{"idea": null}` (honest skip).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewIdea {
+    pub title: String,
+    pub what: String,
+    pub why: String,
+    pub ev: String,
+    pub blast_radius: String,
+    pub acceptance: String,
+}
+
+/// Extract the weekly-review idea from a tick's workflow output (bd-m7ac).
+///
+/// Shape: the run output is the graph's step map (`{"oracle": {...}}`); the
+/// oracle node's headless dispatch returns `{"response": "<idea json>"}`.
+/// `{"idea": null}` (or a missing/empty idea) yields `None` — no bead, honest.
+///
+/// Pure — unit-testable, no IO.
+pub fn review_idea_from_output(output: &serde_json::Value) -> Option<ReviewIdea> {
+    let oracle = output.get("oracle")?;
+    let response = oracle.get("response").and_then(serde_json::Value::as_str)?;
+    let parsed: serde_json::Value = serde_json::from_str(response.trim()).ok()?;
+    let idea = parsed.get("idea")?;
+    if idea.is_null() {
+        return None;
+    }
+    let s = |k: &str| idea.get(k).and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+    let title = s("title");
+    if title.trim().is_empty() {
+        return None;
+    }
+    Some(ReviewIdea {
+        title,
+        what: s("what"),
+        why: s("why"),
+        ev: s("ev"),
+        blast_radius: s("blast_radius"),
+        acceptance: s("acceptance"),
+    })
+}
+
+/// The review bead's title + description (bd-m7ac). The idea is embedded so
+/// the captain can triage implement-or-close from `br list` alone. Pure.
+pub fn review_bead_fields(idea: &ReviewIdea, date: &str) -> (String, String) {
+    let title = format!("weekly-review {}: {}", date, idea.title);
+    let description = format!(
+        "# Weekly review (bd-m7ac smart-cron, {date})\n\
+         \n## What\n{}\n\
+         \n## Why\n{}\n\
+         \n## EV\n{}\n\
+         \n## Blast radius\n{}\n\
+         \n## Acceptance\n{}\n\
+         \nCaptain triages: implement or close. Tagged `weekly-review`.",
+        idea.what,
+        idea.why,
+        idea.ev,
+        idea.blast_radius,
+        idea.acceptance,
+    );
+    (title, description)
+}
+
+/// Create the weekly-review follow-up bead via `br create` (bd-m7ac): EXACTLY
+/// ONE bead tagged `weekly-review,<date>`, or `Ok(None)` when the oracle
+/// found nothing worth proposing (honest, not forced). The date is the tick's
+/// calendar date (the cron label + title context). Returns the bead id.
+pub fn spawn_review_bead(output: &serde_json::Value, tick_ts: i64) -> Result<Option<String>> {
+    use std::process::Command;
+    let Some(idea) = review_idea_from_output(output) else {
+        return Ok(None);
+    };
+    let date = tick_date(tick_ts);
+    let (title, description) = review_bead_fields(&idea, &date);
+    let out = Command::new("br")
+        .args([
+            "create",
+            &title,
+            "--type",
+            "feature",
+            "--priority",
+            "2",
+            "--description",
+            &description,
+            "--labels",
+            &format!("weekly-review,{date}"),
+            "--json",
+        ])
+        .output()
+        .map_err(|e| anyhow!("br create (weekly-review) failed: {e}"))?;
+    if !out.status.success() {
+        bail!(
+            "br create (weekly-review) failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let id: String = match serde_json::from_str::<Value>(raw.trim()) {
+        Ok(v) => {
+            let node = v
+                .get("issue")
+                .or_else(|| v.get("id"))
+                .or_else(|| v.as_array().and_then(|a| a.first()))
+                .cloned();
+            match node {
+                Some(n) => n
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(id unknown)")
+                    .to_string(),
+                None => "(id unknown)".to_string(),
+            }
+        }
+        Err(_) => "(id unknown)".to_string(),
+    };
+    Ok(Some(id))
+}
+
+/// The tick's calendar date (`YYYY-MM-DD`) from its unix timestamp — the
+/// weekly-review cron's per-tick label. Pure.
+pub fn tick_date(tick_ts: i64) -> String {
+    use chrono::TimeZone;
+    if tick_ts < 0 {
+        return "unknown".to_string();
+    }
+    chrono::Utc
+        .timestamp_opt(tick_ts, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Start (or resume) the durable cron loops over the current merged view.
 /// Idempotent: re-invoking `cron:{name}` resumes the same durable function
 /// (restart survival). Returns once every loop is started; the loops run on
@@ -626,6 +759,39 @@ pub async fn start_loops() -> Result<()> {
                     std::mem::take(&mut *guard)
                 };
                 for ev in drained {
+                    // bd-m7ac: the weekly-review cron's SUCCESS side-effect —
+                    // its tick output carries the oracle's idea. EXACTLY ONE
+                    // bead tagged weekly-review+date; None (no bead) when the
+                    // oracle honestly found nothing worth proposing. Failure
+                    // events for the same cron still take the failure-bead
+                    // path below (the output won't parse as an idea).
+                    if ev.bundle.workflow == "weekly-review"
+                        && ev.output.as_ref().is_some()
+                    {
+                        let out = ev.output.as_ref().unwrap();
+                        if let Some(idea) = review_idea_from_output(out) {
+                            match spawn_review_bead(out, ev.tick) {
+                                Ok(Some(id)) => eprintln!(
+                                    "cron {}({}): weekly-review -> bead {id} (\"{}\")",
+                                    ev.cron, ev.tick, idea.title
+                                ),
+                                Ok(None) => eprintln!(
+                                    "cron {}({}): weekly-review found nothing worth proposing — no bead",
+                                    ev.cron, ev.tick
+                                ),
+                                Err(e) => eprintln!(
+                                    "cron {}({}): weekly-review bead side-effect failed: {e}",
+                                    ev.cron, ev.tick
+                                ),
+                            }
+                            continue;
+                        }
+                        eprintln!(
+                            "cron {}({}): weekly-review output carried no idea — no bead",
+                            ev.cron, ev.tick
+                        );
+                        continue;
+                    }
                     match ev.action {
                         toron_workflow::schema::FailureAction::Bead => {
                             match spawn_failure_bead(&ev.bundle) {
@@ -1534,5 +1700,86 @@ owner = "housekeeper"
         );
         assert!(description.contains("gate-honcho"), "desc failed_step");
         assert!(description.contains("consecutive: 2"), "desc streak");
+    }
+
+    // ---- bd-m7ac: weekly-review bead extraction ----
+
+    /// The oracle's `{"idea": {...}}` in the tick output extracts cleanly.
+    #[test]
+    fn review_idea_extracts_from_oracle_output() {
+        let output = serde_json::json!({
+            "oracle": {
+                "response": r#"{"idea": {"title": "Soft-conflict freeze suggestion", "what": "Propose splits", "why": "Less griefing", "ev": "High", "blast_radius": "flywheel", "acceptance": "one test"}}"#
+            }
+        });
+        let idea = review_idea_from_output(&output).expect("idea present");
+        assert_eq!(idea.title, "Soft-conflict freeze suggestion");
+        assert_eq!(idea.what, "Propose splits");
+        assert_eq!(idea.why, "Less griefing");
+        assert_eq!(idea.ev, "High");
+        assert_eq!(idea.blast_radius, "flywheel");
+        assert_eq!(idea.acceptance, "one test");
+    }
+
+    /// `{"idea": null}` (the honest no-proposal contract) → no bead.
+    #[test]
+    fn review_idea_null_is_no_bead() {
+        let output = serde_json::json!({
+            "oracle": { "response": r#"{"idea": null}"# }
+        });
+        assert!(review_idea_from_output(&output).is_none(), "null idea -> None");
+    }
+
+    /// Missing oracle node / missing response / malformed JSON / empty title
+    /// all degrade to None (never a forced bead).
+    #[test]
+    fn review_idea_degradations_are_none() {
+        assert!(review_idea_from_output(&serde_json::json!({})).is_none());
+        assert!(review_idea_from_output(&serde_json::json!({"oracle": {}})).is_none());
+        assert!(
+            review_idea_from_output(&serde_json::json!({
+                "oracle": { "response": "not json at all" }
+            }))
+            .is_none()
+        );
+        assert!(
+            review_idea_from_output(&serde_json::json!({
+                "oracle": { "response": r#"{"idea": {"title": "  "}}"# }
+            }))
+            .is_none(),
+            "whitespace title -> None"
+        );
+    }
+
+    /// The review bead's fields carry the date + the full idea (captain can
+    /// triage implement-or-close from `br list` alone).
+    #[test]
+    fn review_bead_fields_carry_idea_and_date() {
+        let idea = ReviewIdea {
+            title: "Detector escalation arm".into(),
+            what: "Wire the LLM planner".into(),
+            why: "Rules-only splits miss cases".into(),
+            ev: "Medium".into(),
+            blast_radius: "flywheel/src/intent.rs".into(),
+            acceptance: "Rejecting a rule-split fires the planner".into(),
+        };
+        let (title, description) = review_bead_fields(&idea, "2026-08-10");
+        assert_eq!(title, "weekly-review 2026-08-10: Detector escalation arm");
+        assert!(description.contains("## What"), "what section");
+        assert!(description.contains("Wire the LLM planner"), "what body");
+        assert!(description.contains("## Why"), "why section");
+        assert!(description.contains("## EV"), "ev section");
+        assert!(description.contains("## Blast radius"), "blast radius section");
+        assert!(description.contains("## Acceptance"), "acceptance section");
+        assert!(description.contains("weekly-review"), "tag hint");
+    }
+
+    /// The tick's unix timestamp formats to its calendar date.
+    #[test]
+    fn tick_date_formats_calendar_date() {
+        // 2026-08-10T01:00:00Z
+        assert_eq!(tick_date(1786323600), "2026-08-10");
+        assert_eq!(tick_date(0), "1970-01-01");
+        assert_eq!(tick_date(-5), "unknown", "pre-epoch degrades safely");
     }
 }
