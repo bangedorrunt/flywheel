@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 
-use toron_workflow::schema::{Workflow, parse_workflow};
+use toron_workflow::schema::{parse_workflow, Workflow};
 
 /// The compiled-in built-in workflows, name → YAML text.
 pub const BUILTIN_WORKFLOWS_YAML: &[(&str, &str)] = &[
@@ -34,13 +34,12 @@ trigger:
 crew: auto
 inputs:
   - name: question
-  - name: breadth
 graph:
   nodes:
     diverge:
       action: parallel
-      over: "1"
-      each: { action: dispatch_job, assignee: x, spec: { profile: "@oracle" } }
+      over: "3"
+      each: { action: dispatch_job, assignee: x, spec: { profile: "@oracle", prompt: "{{inputs.question}}" } }
     reduce:
       action: dispatch_job
       assignee: x
@@ -82,7 +81,7 @@ steps:
   - name: create
     action: dispatch_job
     assignee: x
-    spec: { profile: "@planner", stage: "systematic-execute" }
+    spec: { profile: "@planner", stage: "systematic-execute", plan: "{{inputs.plan}}" }
 "##,
     ),
     (
@@ -95,13 +94,12 @@ trigger:
 crew: auto
 inputs:
   - name: proposal
-  - name: panel
 graph:
   nodes:
     briefs:
       action: parallel
-      over: "1"
-      each: { action: dispatch_job, assignee: x, spec: { profile: "@reviewer" } }
+      over: "2"
+      each: { action: dispatch_job, assignee: x, spec: { profile: "@reviewer", prompt: "{{inputs.proposal}}" } }
     decide:
       action: dispatch_job
       assignee: x
@@ -158,12 +156,114 @@ guard: "trigger.channel == '#support'"
 steps:
   - name: ack
     action: send_dm
-    to: "pi-alpha"
+    to: "operator"
     body: "Received {{trigger.subject}}"
   - name: dispatch
     action: dispatch_job
-    assignee: "oc-beta"
-    spec: { task: "triage {{trigger.id}}" }
+    assignee: "x"
+    spec: { profile: "@housekeeper", task: "triage {{trigger.id}}" }
+"##,
+    ),
+    (
+        "plan-review",
+        r##"
+name: plan-review
+description: Review a plan bead-by-bead before implementation — the p5 stage.
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: plan
+steps:
+  - name: review
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@reviewer", stage: "plan-review", plan: "{{inputs.plan}}" }
+"##,
+    ),
+    (
+        "onboard",
+        r##"
+name: onboard
+description: Cold-start a newcomer — map the repo, seed context, propose the first task.
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: project
+steps:
+  - name: map
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@scout", stage: "repo-map", project: "{{inputs.project}}" }
+  - name: seed
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@planner", stage: "seed-first-task", project: "{{inputs.project}}" }
+"##,
+    ),
+    (
+        "triage-deep",
+        r##"
+name: triage-deep
+description: Deep backlog triage — bv robot-triage, prioritize + assign, spawn the crew.
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: project
+steps:
+  - name: triage
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@scout", stage: "bv-triage", project: "{{inputs.project}}" }
+  - name: prioritize
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@planner", stage: "prioritize-assign", project: "{{inputs.project}}" }
+  - name: spawn
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@housekeeper", stage: "spawn-crew", project: "{{inputs.project}}" }
+"##,
+    ),
+    (
+        "weekly-review",
+        r##"
+name: weekly-review
+description: "Weekly repo review — scout fan-out, oracle synthesis, exactly ONE follow-up bead (bd-m7ac)."
+trigger:
+  type: schedule
+  cron: "0 4 * * 0"
+  owner: oracle
+  scope: project
+policy:
+  on_failure: bead
+  on_repeat_failure: escalate
+  repeat_threshold: 3
+  on_success: log
+  max_retries: 1
+  no_claim_timeout: 600
+inputs:
+  - name: goal
+graph:
+  nodes:
+    scout-fanout:
+      action: parallel
+      over: "3"
+      each:
+        action: dispatch_job
+        assignee: x
+        spec:
+          profile: "@scout"
+          task: "Scout the toron + flywheel repos: (1) internal gaps — code health, deferred ADR-0005/0010/0011 items still open, open seams, test gaps; (2) upstream parity — Dicklesworthstone/mcp_agent_mail_rust and block/buzz patterns not yet ported. Return COMPRESSED findings JSON: [{area, finding, evidence, ev}]. No academic literature."
+    oracle:
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@oracle"
+        task: "Synthesize the scout findings: {{steps.scout-fanout}}. Rank by EV + project-fit. Pick the SINGLE best improvement idea (feature / design pattern / bug fix). Output JSON: {\"idea\": {\"title\": ..., \"what\": ..., \"why\": ..., \"ev\": ..., \"blast_radius\": ..., \"acceptance\": ...}} — or {\"idea\": null} if nothing worth proposing (honest, not forced)."
+      needs: [scout-fanout]
 "##,
     ),
 ];
@@ -189,25 +289,49 @@ pub fn builtin_workflows() -> BTreeMap<String, Workflow> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use toron_workflow::schema::CrewSpec;
+    use serde_json::Value;
     use toron_workflow::lint_yaml;
+    use toron_workflow::schema::CrewSpec;
 
     /// All built-ins parse (ADR-0005 Spec 2b acceptance).
     #[test]
     fn all_builtins_parse() {
         let wfs = builtin_workflows();
-        assert_eq!(wfs.len(), BUILTIN_WORKFLOWS_YAML.len(), "all built-ins load");
-        for name in ["brainstorm", "plan", "beads", "debate", "goal", "triage"] {
+        assert_eq!(
+            wfs.len(),
+            BUILTIN_WORKFLOWS_YAML.len(),
+            "all built-ins load"
+        );
+        for name in [
+            "brainstorm",
+            "plan",
+            "beads",
+            "debate",
+            "goal",
+            "triage",
+            "plan-review",
+            "onboard",
+            "triage-deep",
+        ] {
             assert!(wfs.contains_key(name), "built-in {name} present");
         }
     }
 
-    /// The five purpose-named workflows declare `crew: auto` (zero-config,
+    /// The purpose-named workflows declare `crew: auto` (zero-config,
     /// auto-crew — Spec 4c). `triage` is the reactive one (no crew).
     #[test]
     fn purpose_named_workflows_are_crew_auto() {
         let wfs = builtin_workflows();
-        for name in ["brainstorm", "plan", "beads", "debate", "goal"] {
+        for name in [
+            "brainstorm",
+            "plan",
+            "beads",
+            "debate",
+            "goal",
+            "plan-review",
+            "onboard",
+            "triage-deep",
+        ] {
             assert_eq!(
                 wfs[name].crew,
                 Some(CrewSpec::Auto),
@@ -249,5 +373,124 @@ mod tests {
                 report.issues
             );
         }
+    }
+
+    /// bd-m7ac: weekly-review is a schedule-triggered graph — parallel
+    /// scouts (3 elastic copies) feeding an oracle node that needs them.
+    #[test]
+    fn weekly_review_is_scout_fanout_to_oracle() {
+        use toron_workflow::schema::{Action, Trigger};
+        let wfs = builtin_workflows();
+        let wr = &wfs["weekly-review"];
+        // schedule trigger, project scope, owner oracle
+        match &wr.trigger {
+            Some(Trigger::Schedule { cron, owner, scope }) => {
+                assert_eq!(cron, "0 4 * * 0");
+                assert_eq!(owner.as_deref(), Some("oracle"));
+                assert_eq!(*scope, toron_workflow::schema::CronScope::Project);
+            }
+            other => panic!("weekly-review must be schedule-triggered: {other:?}"),
+        }
+        // graph: scout-fanout (parallel @scout) -> oracle (@oracle, needs scouts)
+        let g = wr.graph.as_ref().expect("graph present");
+        let fanout = &g.nodes["scout-fanout"];
+        assert!(matches!(fanout.action, Action::Parallel { .. }));
+        let oracle = &g.nodes["oracle"];
+        assert!(matches!(oracle.action, Action::DispatchJob { .. }));
+        assert!(oracle.needs.contains(&"scout-fanout".to_string()));
+        // the oracle's task templates the scout outputs (the synthesis input)
+        let Action::DispatchJob { spec, .. } = &oracle.action else {
+            unreachable!()
+        };
+        let task = spec
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .expect("oracle task present");
+        assert!(
+            task.contains("{{steps.scout-fanout}}"),
+            "oracle consumes scout findings"
+        );
+        assert!(task.contains("idea"), "oracle outputs the idea contract");
+    }
+
+    /// bd-oj9o #2: the cold-start + deep-triage workflows exist, and the
+    /// plan-review workflow (slash target) exists.
+    #[test]
+    fn onboard_triage_deep_plan_review_present() {
+        let wfs = builtin_workflows();
+        for name in ["onboard", "triage-deep", "plan-review"] {
+            assert!(wfs.contains_key(name), "built-in {name} present (bd-oj9o)");
+        }
+    }
+
+    /// bd-oj9o #1: brainstorm/debate actually fan out (over > 1) — the dead
+    /// `breadth`/`panel` inputs were replaced by a real parallel fan-out.
+    #[test]
+    fn brainstorm_and_debate_fan_out() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        for (name, node) in [("brainstorm", "diverge"), ("debate", "briefs")] {
+            let wf = &wfs[name];
+            let g = wf
+                .graph
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} has a graph"));
+            let n = g
+                .nodes
+                .get(node)
+                .unwrap_or_else(|| panic!("{name}.{node} node exists"));
+            let Action::Parallel { over, .. } = &n.action else {
+                panic!("{name}.{node} is a parallel action");
+            };
+            let copies: usize = over.trim().parse().unwrap_or(1);
+            assert!(
+                copies > 1,
+                "{name} must fan out over {copies} (parallelism is the point)"
+            );
+        }
+    }
+
+    /// bd-oj9o #1: the beads workflow carries the plan into the dispatch
+    /// spec ({{inputs.plan}} → rendered into the headless prompt).
+    #[test]
+    fn beads_dispatch_carries_plan_input() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let beads = &wfs["beads"];
+        let Action::DispatchJob { spec, .. } = &beads.steps[0].action else {
+            panic!("beads step 0 is a dispatch_job");
+        };
+        assert_eq!(
+            spec.get("plan").and_then(Value::as_str),
+            Some("{{inputs.plan}}"),
+            "beads dispatch spec carries the plan input"
+        );
+    }
+
+    /// bd-oj9o #1: the reactive triage workflow has no hardcoded agent
+    /// names (pi-alpha/oc-beta are spawn-dependent and break any real
+    /// swarm) — ack goes to the operator, dispatch is profile-based.
+    #[test]
+    fn triage_has_no_hardcoded_agent_names() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let triage = &wfs["triage"];
+        let yaml = BUILTIN_WORKFLOWS_YAML
+            .iter()
+            .find(|(n, _)| *n == "triage")
+            .map(|(_, y)| *y)
+            .unwrap();
+        assert!(
+            !yaml.contains("pi-alpha") && !yaml.contains("oc-beta"),
+            "triage must not hardcode agent names"
+        );
+        let Action::DispatchJob { spec, .. } = &triage.steps[1].action else {
+            panic!("triage step 1 is a dispatch_job");
+        };
+        assert_eq!(
+            spec.get("profile").and_then(Value::as_str),
+            Some("@housekeeper"),
+            "triage dispatches via a profile, not a hardcoded name"
+        );
     }
 }
