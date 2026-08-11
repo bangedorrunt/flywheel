@@ -363,6 +363,7 @@ pub fn builtin_workflows() -> BTreeMap<String, Workflow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crew;
     use serde_json::Value;
     use toron_workflow::lint_yaml;
     use toron_workflow::schema::CrewSpec;
@@ -450,6 +451,102 @@ mod tests {
                 .all(|s| !matches!(&s.action, Action::RequestApproval { .. })),
             "plan-direct must not carry the plan approval gate"
         );
+    }
+
+    // ---- bd-2pcq Tier B: composition invariants (STEER-COMPOSE /
+    //      WORKFLOW-COMPOSE) ----
+
+    /// STEER-COMPOSE (bd-2pcq #7): the goal workflows' arm selection is
+    /// structural — goal = bead-tracked chain (brainstorm → plan → beads),
+    /// goal-direct = direct chain (brainstorm → plan-direct, no beads). The
+    /// steer surface picks the arm by workflow NAME (goal vs goal-direct);
+    /// this pins that the names carry the right composition.
+    #[test]
+    fn steer_compose_arm_selection_is_structural() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let goal = &wfs["goal"];
+        let direct = &wfs["goal-direct"];
+
+        // Tracked arm: the chain includes the beads (tracker) step.
+        let goal_calls: Vec<&str> = goal
+            .steps
+            .iter()
+            .filter_map(|s| match &s.action {
+                Action::CallWorkflow { workflow, .. } => Some(workflow.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            goal_calls.contains(&"beads"),
+            "tracked arm chains the tracker: {goal_calls:?}"
+        );
+        // Direct arm: NEVER calls beads.
+        let direct_calls: Vec<&str> = direct
+            .steps
+            .iter()
+            .filter_map(|s| match &s.action {
+                Action::CallWorkflow { workflow, .. } => Some(workflow.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !direct_calls.contains(&"beads"),
+            "direct arm must not chain the tracker: {direct_calls:?}"
+        );
+        // Both arms declare crew: auto (the steer surface composes the crew
+        // strategy at invoke: auto | <squad>).
+        assert_eq!(goal.crew, Some(CrewSpec::Auto));
+        assert_eq!(direct.crew, Some(CrewSpec::Auto));
+    }
+
+    /// WORKFLOW-COMPOSE (bd-2pcq #6): the call_workflow chain resolves across
+    /// the catalog+builtins resolver — every sub-workflow name referenced by
+    /// the steer arms must exist as a built-in (the resolver returns a
+    /// definition, never "unknown workflow").
+    #[test]
+    fn workflow_compose_chain_resolves_against_builtins() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        for arm in ["goal", "goal-direct"] {
+            for s in &wfs[arm].steps {
+                if let Action::CallWorkflow { workflow, .. } = &s.action {
+                    assert!(
+                        wfs.contains_key(workflow),
+                        "{arm} composes {workflow} which must be a built-in"
+                    );
+                }
+            }
+        }
+        // The direct arm's plan companion is gate-free AND resolves.
+        assert!(wfs.contains_key("plan-direct"), "plan-direct built-in present");
+    }
+
+    /// STEER-COMPOSE crew strategy (bd-2pcq #7): the composed goal/direct
+    /// fleet includes the sub-workflow roles — a steer run spawns the WHOLE
+    /// fleet (oracle/planner from brainstorm + planner from plan-direct +
+    /// own coder/reviewer/housekeeper), never "no crew pane" on the first
+    /// composed dispatch. (The recursive inference itself is unit-tested in
+    /// crew.rs; this pins the end-to-end builtin composition.)
+    #[test]
+    fn steer_compose_crew_strategy_resolves_full_fleet() {
+        let wfs = builtin_workflows();
+        let resolve = |sub: &str| wfs.get(sub).cloned();
+        for arm in ["goal", "goal-direct"] {
+            let plan = crew::plan_crew_with(&wfs[arm], &resolve);
+            for role in ["planner", "coder", "reviewer", "housekeeper"] {
+                assert!(
+                    plan.members.contains_key(role),
+                    "{arm} fleet must include {role}: {:?}",
+                    plan.members
+                );
+            }
+            assert!(
+                plan.members.contains_key("oracle"),
+                "{arm} fleet must include oracle (brainstorm diverge): {:?}",
+                plan.members
+            );
+        }
     }
 
     /// The purpose-named workflows declare `crew: auto` (zero-config,
