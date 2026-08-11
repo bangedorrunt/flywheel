@@ -125,9 +125,11 @@ enum Commands {
         /// a silent registry-write failure leaves panes invisible to list/send)
         #[arg(long)]
         no_verify: bool,
-        /// close pre-existing workspaces for this project (stale panes from
-        /// a killed swarm race the new one — bd-fw-stale-workspace-panes-hgp).
-        /// Without this, spawn REFUSES when one exists.
+        /// close pre-existing FLYWHEEL-OWNED workspaces for this project
+        /// (stale panes from a killed swarm race the new one —
+        /// bd-fw-stale-workspace-panes-hgp + bd-627z.3). Without this, spawn
+        /// REFUSES when one exists; foreign workspaces (captain/omp sessions)
+        /// are never closed — they only warn.
         #[arg(long)]
         retire_orphans: bool,
         /// spawn agents with the peer-aware self-poll template (ADR-0001 §9.3)
@@ -645,6 +647,16 @@ enum Commands {
     /// internal: list in-progress beads as JSON (durable workflow leaf)
     #[command(name = "__inprogress", hide = true)]
     __Inprogress { project: String },
+    /// internal: reclaim stranded in-progress beads (bd-627z.1) — re-open
+    /// each whose assignee is not in the live agent list (durable workflow
+    /// leaf; emits `{"reclaimed": [ids], "failed": [{id, error}]}`)
+    #[command(name = "__reclaim-stranded", hide = true)]
+    __ReclaimStranded {
+        project: String,
+        /// comma-separated live agent names (the polled swarm)
+        #[arg(long)]
+        live: String,
+    },
     /// internal: agent kind as text (durable workflow leaf)
     #[command(name = "__kind", hide = true)]
     __Kind { project: String, name: String },
@@ -766,6 +778,11 @@ enum LoopCmd {
         /// confirm timeout in ms for `__send --confirm` (default: leaf default 45s)
         #[arg(long)]
         confirm_timeout_ms: Option<u64>,
+        /// run the loop as a WorkflowEngine durable function (bd-e0xk
+        /// coexistence path): dispatches run as `loop-dispatch` engine
+        /// workflows instead of the imperative body's send leaf
+        #[arg(long)]
+        engine: bool,
         /// take over the project from a live loop process instead of refusing
         #[arg(long)]
         force: bool,
@@ -1922,65 +1939,82 @@ enum ModelCmd {
     },
 }
 
-/// `flywheel cron` subcommands (ADR-0005 Spec 3, P4.6): the smart-cron
-/// catalog + control surface. The P4.3 cron manager (Resonate durable-sleep
-/// loop) drives ticks off the same `crons.toml` registry this CLI writes.
+/// `flywheel cron` subcommands (ADR-0012 Spec 1/4, P12.3): the standalone
+/// cron surface over cron YAMLs. Crons are YAML files in three tiers —
+/// per-project > global > built-in — with a shared CronSpec body on the
+/// toron-workflow engine. `lint`/`run` validate + test a cron on demand;
+/// `start` drives the durable loops; pause/resume/remove mutate the tier's
+/// YAML (built-ins are read-only; shadow by a user YAML instead).
 #[derive(Subcommand)]
 enum CronCmd {
-    /// List registered crons + schedule-triggered workflows
+    /// List resolved crons (per-project > global > built-in) with source +
+    /// scope
     List {
         /// JSON output for agent drivers
         #[arg(long)]
         json: bool,
+        /// project whose .flywheel/crons tier applies (default: detect from cwd)
+        #[arg(long)]
+        project: Option<String>,
     },
-    /// Show one cron's registration + policy
+    /// Show one cron's resolved definition (spec + source + scope)
     Show {
         /// cron name
         name: String,
         /// JSON output for agent drivers
         #[arg(long)]
         json: bool,
+        /// project whose .flywheel/crons tier applies (default: detect from cwd)
+        #[arg(long)]
+        project: Option<String>,
     },
-    /// Register a new cron bound to a workflow template
-    Add {
-        /// cron name (identifier used by pause/resume/history/status)
+    /// Lint cron YAML(s): engine tier (schedule parse, policy sanity, step/
+    /// graph checks) + flywheel tier (owner-profile resolution). Exit 0
+    /// clean, 1 on any blocking issue, 2 on a parse failure.
+    Lint {
+        /// lint only this cron (name), else every resolved cron
+        name: Option<String>,
+        /// project whose .flywheel/crons tier applies (default: detect from cwd)
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Run a cron's body on demand (testing): lint gate first, then the spec
+    /// steps through the shared engine with the spec's mode runner.
+    Run {
+        /// cron name (resolved tier)
         name: String,
-        /// workflow template to run on each tick
+        /// project whose .flywheel/crons tier applies (default: detect from cwd)
         #[arg(long)]
-        template: String,
-        /// 5-field cron expression ("30 3 * * 0")
-        #[arg(long)]
-        cron: String,
-        /// owning profile (Spec 3: the fixer's identity)
-        #[arg(long)]
-        owner: String,
-        /// execution mode (P10.4): headless = __run-headless subprocess
-        /// runner (default; no workspace churn); pane = P10.3 pane runner
-        /// (recording until P10.3 lands)
-        #[arg(long, value_parser = ["headless", "pane"], default_value = "headless")]
-        mode: String,
-        /// signing scope: host = operator identity, project = scoped agent
-        #[arg(long, value_parser = ["host", "project"])]
-        scope: Option<String>,
+        project: Option<String>,
         /// JSON output for agent drivers
         #[arg(long)]
         json: bool,
     },
-    /// Pause a cron (entry preserved; nothing fires)
+    /// Pause a cron (entry preserved; nothing fires) — persists `enabled:
+    /// false` in the tier's YAML
     Pause {
         /// cron name
         name: String,
+        /// project whose .flywheel/crons tier applies (default: detect from cwd)
+        #[arg(long)]
+        project: Option<String>,
     },
-    /// Resume a paused cron
+    /// Resume a paused cron (removes the `enabled: false` marker)
     Resume {
         /// cron name
         name: String,
+        /// project whose .flywheel/crons tier applies (default: detect from cwd)
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Status of every cron: paused | due | running | succeeded | failed
     Status {
         /// JSON output for agent drivers
         #[arg(long)]
         json: bool,
+        /// project whose .flywheel/crons tier applies (default: detect from cwd)
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Run history for a cron (state-log scan + failure beads)
     History {
@@ -1990,16 +2024,23 @@ enum CronCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Start (or resume) the durable cron loops over the current registry
-    /// (P4.3 cron manager). Health-gate probes + `on_failure: bead` are live.
-    /// Blocks; Ctrl-C to stop.
-    Start,
-    /// Remove a cron from the crons.toml registry. A cron whose source is a
-    /// workflow's `schedule` trigger cannot be removed here — edit/remove that
-    /// workflow instead.
+    /// Start (or resume) the durable cron loops over the resolved crons.
+    /// Health-gate probes + `on_failure: bead` are live. Blocks; Ctrl-C to
+    /// stop.
+    Start {
+        /// project whose .flywheel/crons tier applies (default: detect from cwd)
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Remove a cron definition (user tiers only; built-ins are read-only).
+    /// Removing a project-tier cron reveals the global/built-in definition
+    /// it shadowed.
     Remove {
         /// cron name
         name: String,
+        /// project whose .flywheel/crons tier applies (default: detect from cwd)
+        #[arg(long)]
+        project: Option<String>,
     },
 }
 
@@ -2530,6 +2571,7 @@ fn main() {
                 work,
                 no_confirm,
                 confirm_timeout_ms,
+                engine,
                 force,
             } => cmd_loop(
                 &cfg,
@@ -2547,6 +2589,7 @@ fn main() {
                 to,
                 *no_confirm,
                 *confirm_timeout_ms,
+                *engine,
                 *force,
             ),
             LoopCmd::Status { project } => cmd_loop_status(&cfg, project),
@@ -2614,7 +2657,7 @@ fn main() {
         Some(Commands::Runs { cmd }) => cmd_runs(&cfg, cmd),
         Some(Commands::Workflow { cmd }) => cmd_workflow(&cfg, cmd),
         Some(Commands::Model { cmd }) => cmd_models(cmd),
-        Some(Commands::Cron { cmd }) => cmd_cron(cmd),
+        Some(Commands::Cron { cmd }) => cmd_cron(&cfg, cmd),
         Some(Commands::Debate {
             proposition,
             rounds,
@@ -2760,6 +2803,9 @@ fn main() {
             hash,
         }) => cmd_internal_last_sent(&cfg, project, name, *hash),
         Some(Commands::__Inprogress { project }) => cmd_internal_inprogress(&cfg, project),
+        Some(Commands::__ReclaimStranded { project, live }) => {
+            cmd_internal_reclaim_stranded(&cfg, project, live)
+        }
         Some(Commands::__Kind { project, name }) => cmd_internal_kind(&cfg, project, name),
         Some(Commands::__Profile { project, name }) => cmd_internal_profile(&cfg, project, name),
         Some(Commands::__Read { project, name }) => cmd_internal_read(&cfg, project, name),
@@ -3009,30 +3055,213 @@ fn peer_prompt_template(
 
 /// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
 #[allow(clippy::too_many_arguments)]
-/// bd-fw-stale-workspace-panes-hgp: pre-existing herdr workspaces that
-/// belong to this project — label matches the swarm label (`flywheel-<base>`)
-/// or the project base (`toron` — the w17 shape), or they host agents named
-/// `flywheel-<base>-*`. Spawning over these is the stale-pane race.
-pub(crate) fn project_workspaces(c: &mut Client, project: &str) -> Result<Vec<herdr_shim::WorkspaceInfo>> {
+/// bd-fw-stale-workspace-panes-hgp + bd-627z.3: pre-existing herdr
+/// workspaces that share this project's label or host its agents, split by
+/// origin. Flywheel-owned workspaces (default swarm label `flywheel-<base>`,
+/// a recorded custom spawn label, or hosting agents named `flywheel-<base>-*`)
+/// are the stale-pane race; a foreign workspace (captain/omp session, another
+/// tool) that merely shares the project-base label is NOT — it must not block
+/// a spawn (warn + proceed, never closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceOrigin {
+    Owned,
+    Foreign,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WorkspaceSplit {
+    pub owned: Vec<herdr_shim::WorkspaceInfo>,
+    pub foreign: Vec<herdr_shim::WorkspaceInfo>,
+}
+
+/// bd-627z.3: classify one workspace by origin. `None` = unrelated (skip).
+/// Owned wins over Foreign when both signals collide (a flywheel marker on a
+/// base-labeled workspace is still a flywheel workspace).
+fn classify_workspace_origin(
+    project: &str,
+    ws: &herdr_shim::WorkspaceInfo,
+    agents: &[herdr_shim::AgentInfo],
+    spawn_label: Option<&str>,
+) -> Option<WorkspaceOrigin> {
     let base = project_base(project);
     let label = swarm_label(project);
     let prefix = format!("flywheel-{base}-");
+    let hosts_agents = agents.iter().any(|a| {
+        a.workspace_id == ws.workspace_id
+            && a.name
+                .as_deref()
+                .map(|n| n.starts_with(&prefix))
+                .unwrap_or(false)
+    });
+    if ws.label == label
+        || hosts_agents
+        || spawn_label == Some(ws.label.as_str())
+    {
+        Some(WorkspaceOrigin::Owned)
+    } else if ws.label == base {
+        Some(WorkspaceOrigin::Foreign)
+    } else {
+        None
+    }
+}
+
+/// bd-627z.3: pure partition of the workspace list into owned/foreign.
+fn partition_workspaces(
+    project: &str,
+    ws_list: Vec<herdr_shim::WorkspaceInfo>,
+    agents: &[herdr_shim::AgentInfo],
+    spawn_label: Option<&str>,
+) -> WorkspaceSplit {
+    let mut split = WorkspaceSplit::default();
+    for ws in ws_list {
+        match classify_workspace_origin(project, &ws, agents, spawn_label) {
+            Some(WorkspaceOrigin::Owned) => split.owned.push(ws),
+            Some(WorkspaceOrigin::Foreign) => split.foreign.push(ws),
+            None => {}
+        }
+    }
+    split
+}
+
+pub(crate) fn project_workspaces(c: &mut Client, project: &str) -> Result<WorkspaceSplit> {
     let ws_list = c.workspace_list()?;
     let agents = c.agent_list().unwrap_or_default();
-    Ok(ws_list
-        .into_iter()
-        .filter(|ws| {
-            ws.label == label
-                || ws.label == base
-                || agents.iter().any(|a| {
-                    a.workspace_id == ws.workspace_id
-                        && a.name
-                            .as_deref()
-                            .map(|n| n.starts_with(&prefix))
-                            .unwrap_or(false)
-                })
-        })
-        .collect())
+    Ok(partition_workspaces(
+        project,
+        ws_list,
+        &agents,
+        state::load_spawn_meta(project).as_deref(),
+    ))
+}
+
+#[cfg(test)]
+mod workspace_origin_tests {
+    use super::*;
+    use crate::herdr_shim::{AgentInfo, WorkspaceInfo};
+
+    fn ws(id: &str, label: &str, panes: u64) -> WorkspaceInfo {
+        WorkspaceInfo {
+            workspace_id: id.to_string(),
+            number: 0,
+            label: label.to_string(),
+            focused: false,
+            pane_count: panes,
+            tab_count: 0,
+            active_tab_id: String::new(),
+            agent_status: AgentStatus::Idle,
+            cwd: None,
+        }
+    }
+
+    fn agent(name: &str, workspace_id: &str) -> AgentInfo {
+        AgentInfo {
+            agent: Some("opencode".into()),
+            agent_status: AgentStatus::Idle,
+            cwd: None,
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: true,
+            launch_pending: false,
+            name: Some(name.to_string()),
+            pane_id: format!("{workspace_id}:p1"),
+            revision: 1,
+            state_change_seq: 0,
+            state_labels: serde_json::Map::new(),
+            tab_id: "t1".into(),
+            terminal_id: "term_1".into(),
+            terminal_title: None,
+            workspace_id: workspace_id.to_string(),
+        }
+    }
+
+    // bd-627z.3 gate: a foreign workspace (captain/omp session labeled like
+    // the project) is NOT flywheel-owned — spawn must warn + proceed.
+    #[test]
+    fn base_label_alone_is_foreign() {
+        let w = ws("w17", "toron", 2);
+        assert_eq!(
+            classify_workspace_origin("toron", &w, &[], None),
+            Some(WorkspaceOrigin::Foreign)
+        );
+    }
+
+    #[test]
+    fn swarm_label_is_owned() {
+        let w = ws("w2A", "flywheel-toron", 3);
+        assert_eq!(
+            classify_workspace_origin("toron", &w, &[], None),
+            Some(WorkspaceOrigin::Owned)
+        );
+    }
+
+    #[test]
+    fn flywheel_prefixed_agents_mark_owned() {
+        let w = ws("w9", "custom-swarm-label", 1);
+        let agents = vec![agent("flywheel-toron-oc", "w9")];
+        assert_eq!(
+            classify_workspace_origin("toron", &w, &agents, None),
+            Some(WorkspaceOrigin::Owned)
+        );
+    }
+
+    #[test]
+    fn recorded_spawn_meta_label_marks_owned() {
+        let w = ws("w9", "my-special-label", 1);
+        assert_eq!(
+            classify_workspace_origin("toron", &w, &[], Some("my-special-label")),
+            Some(WorkspaceOrigin::Owned)
+        );
+    }
+
+    #[test]
+    fn unrelated_workspace_is_skipped() {
+        let w = ws("w1", "scratchpad", 1);
+        assert_eq!(classify_workspace_origin("toron", &w, &[], None), None);
+    }
+
+    #[test]
+    fn base_label_with_plain_agent_stays_foreign() {
+        let w = ws("w17", "toron", 1);
+        let agents = vec![agent("oc", "w17")];
+        assert_eq!(
+            classify_workspace_origin("toron", &w, &agents, None),
+            Some(WorkspaceOrigin::Foreign)
+        );
+    }
+
+    #[test]
+    fn spawn_meta_beats_base_label() {
+        let w = ws("w2B", "toron", 1);
+        assert_eq!(
+            classify_workspace_origin("toron", &w, &[], Some("toron")),
+            Some(WorkspaceOrigin::Owned)
+        );
+    }
+
+    #[test]
+    fn flywheel_agents_beat_base_label() {
+        let w = ws("w17", "toron", 1);
+        let agents = vec![agent("flywheel-toron-oc", "w17")];
+        assert_eq!(
+            classify_workspace_origin("toron", &w, &agents, None),
+            Some(WorkspaceOrigin::Owned)
+        );
+    }
+
+    #[test]
+    fn partition_splits_owned_foreign_and_drops_unrelated() {
+        let ws_list = vec![
+            ws("wA", "flywheel-toron", 2),
+            ws("wB", "toron", 1),
+            ws("wC", "scratch", 1),
+        ];
+        let split = partition_workspaces("toron", ws_list, &[], None);
+        assert_eq!(split.owned.len(), 1);
+        assert_eq!(split.owned[0].workspace_id, "wA");
+        assert_eq!(split.foreign.len(), 1);
+        assert_eq!(split.foreign[0].workspace_id, "wB");
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
@@ -3108,11 +3337,31 @@ projects available: {}",
     }
 
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    // bd-fw-stale-workspace-panes-hgp: refuse to spawn over pre-existing
-    // workspaces of this project (stale panes from a killed swarm keep
-    // executing the same bead backlog and race the new swarm). --retire-orphans
-    // closes them first — the explicit escape hatch.
-    let orphans = project_workspaces(&mut c, project)?;
+    // bd-fw-stale-workspace-panes-hgp + bd-627z.3: refuse to spawn over
+    // pre-existing FLYWHEEL-OWNED workspaces of this project (stale panes from
+    // a killed swarm keep executing the same bead backlog and race the new
+    // swarm). --retire-orphans closes them first — the explicit escape hatch.
+    // A foreign workspace (captain/omp session labeled like the project) is
+    // NOT the stale-pane race — warn and proceed, never close it.
+    let split = project_workspaces(&mut c, project)?;
+    if !split.foreign.is_empty() {
+        let detail: Vec<String> = split
+            .foreign
+            .iter()
+            .map(|ws| {
+                format!(
+                    "{} (label {:?}, {} panes)",
+                    ws.workspace_id, ws.label, ws.pane_count
+                )
+            })
+            .collect();
+        eprintln!(
+            "flywheel: warn: {} foreign workspace(s) share the {project} label but are not flywheel-owned — leaving them alone: {}",
+            split.foreign.len(),
+            detail.join(", ")
+        );
+    }
+    let orphans = split.owned;
     if !orphans.is_empty() {
         let detail: Vec<String> = orphans
             .iter()
@@ -3218,8 +3467,18 @@ projects available: {}",
             // spawned agent as an agent-mail identity so it's addressable by
             // name in mail. Best-effort: mail-not-configured is NOT a spawn
             // failure (silent skip); a registration error is a warning.
-            register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
-            registry.push(state::SpawnEntry::legacy(agent.pane_id.clone(), name));
+            // bd-627z.4: the returned identity is PINNED in the spawn
+            // registry (pane → identity) so assign resolves deterministically.
+            let mail_identity = register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
+            let entry = match &mail_identity {
+                Some(mid) => state::SpawnEntry::with_mail_identity(
+                    agent.pane_id.clone(),
+                    name.clone(),
+                    mid.clone(),
+                ),
+                None => state::SpawnEntry::legacy(agent.pane_id.clone(), name.clone()),
+            };
+            registry.push(entry);
             println!(
                 "  {} {}",
                 kind_paint(&kind),
@@ -3370,19 +3629,55 @@ fn start_agent_with_retry_dyn(
 /// error, the spawn still succeeded — log a warning and continue. The agent
 /// becomes addressable by name in mail once registered.
 ///
+/// bd-627z.2: a CONFIGURED-but-unreachable daemon (the [mail.toron] url is
+/// set, the daemon is down) is NOT a silent skip — it gets a prominent
+/// warning that the agents will have no mail identities until the daemon
+/// recovers, with the remediation (start the daemon; the loop/assign
+/// auto-registers on first contact once it is back).
+///
+/// bd-627z.4: returns the DETERMINISTIC mail identity (adjective+noun) so
+/// the spawn caller can pin it in the spawn registry (pane → identity) —
+/// assign then resolves through that map and the identity never shifts.
+///
 /// governed-by: ADR-0001 (bd-mail-register-on-spawn, bd-mail-pane-identity-bridge), ADR-0002 (factory)
-pub(crate) fn register_spawned_agent(cfg: &Config, project: &str, name: &str, kind: &str, pane_id: &str) {
-    let key = match project_dir(cfg, project).to_str() {
-        Some(k) => k.to_string(),
-        None => return,
-    };
+pub(crate) fn register_spawned_agent(
+    cfg: &Config,
+    project: &str,
+    name: &str,
+    kind: &str,
+    pane_id: &str,
+) -> Option<String> {
+    let key = project_dir(cfg, project).to_str().map(str::to_string)?;
     let mail = match backend::mail_backend(cfg) {
         Ok(m) => m,
-        Err(_) => return, // mail not configured — silent skip
+        Err(_) => return None, // mail not configured — silent skip
+    };
+    // bd-627z.2: configured-remote (a [mail.toron] url is set) but the
+    // daemon is unreachable → loud warning, not the old silent eprintln.
+    // The in-process embedded mailbox cannot be down, so this only fires
+    // for the remote-daemon mode (where a down daemon is a real ops event).
+    let daemon_mode = cfg
+        .toron_mail_config()
+        .url
+        .as_deref()
+        .map(|u| !u.is_empty())
+        .unwrap_or(false);
+    let warn_no_identities = |e: &backend::MailError| {
+        if daemon_mode {
+            eprintln!(
+                "\n!!! WARNING: the toron mail daemon is unreachable — spawned \
+                 agents will have NO mail identities until it recovers.\n\
+                 Fix: start the daemon (toron serve), then the next assign / \
+                 loop dispatch auto-registers each identity on first contact.\n\
+                 (register_agent failed for {name}: {e})\n"
+            );
+        } else {
+            eprintln!("flywheel: mail register_agent failed for {name}: {e}");
+        }
     };
     if let Err(e) = backend::run_mail(mail.ensure_project(&key)) {
-        eprintln!("flywheel: mail ensure_project failed for {name}: {e}");
-        return;
+        warn_no_identities(&e);
+        return None;
     }
     // bd-odc fix: agent-mail's register_agent REJECTS non-adjective+noun
     // names, and flywheel spawns `flywheel-<base>-<kind>` names. Map to a
@@ -3401,7 +3696,10 @@ pub(crate) fn register_spawned_agent(cfg: &Config, project: &str, name: &str, ki
         // Best-effort: a registration failure must never fail the spawn. The
         // pane-identity bridge below still works (the identity file is the
         // pane→name source the server reads, registration or not).
-        eprintln!("flywheel: mail register_agent failed for {name}: {e}");
+        // bd-627z.2: a configured-but-down daemon gets the loud identity
+        // warning (agents will have no mail identities until it recovers).
+        warn_no_identities(&e);
+        return None;
     }
     // bridge the identity to the herdr pane (best-effort, like register).
     // The file holds the REGISTERED identity (the mapped adjective+noun) so
@@ -3410,6 +3708,7 @@ pub(crate) fn register_spawned_agent(cfg: &Config, project: &str, name: &str, ki
     if let Err(e) = backend::run_mail(mail.write_pane_identity(&key, pane_id, &mail_name)) {
         eprintln!("flywheel: mail write_pane_identity failed for {name} on {pane_id}: {e}");
     }
+    Some(mail_name)
 }
 
 /// Deterministic herdr-agent-name → agent-mail adjective+noun mapping.
@@ -3702,6 +4001,30 @@ pub(crate) fn resolve_mail_target(target: &str) -> String {
     } else {
         target.to_string()
     }
+}
+
+/// bd-627z.4: resolve a mail-recipient specifier THROUGH the spawn registry
+/// first — the identity pinned at spawn (pane → adjective+noun) wins over
+/// the pure hash mapping. Numbered agents (oc2/oc3/...) keep the SAME
+/// identity across calls, restarts, and daemon restarts because the binding
+/// is recorded at spawn, not re-derived from the (renumberable) herdr name.
+/// Falls back to [`resolve_mail_target`] when the registry has no pin.
+///
+/// Registry-miss reasons (the bead's clear-error contract): the target was
+/// never spawned in this project, or it is already an identity name. The
+/// caller decides how to surface those.
+pub(crate) fn resolve_mail_target_registry(project: &str, target: &str) -> String {
+    let entries = state::load_spawn_registry(project);
+    for e in &entries {
+        if e.name == target {
+            if let Some(mid) = &e.mail_identity {
+                return mid.clone();
+            }
+            // Legacy entry (no pin): fall through to the hash mapping.
+            break;
+        }
+    }
+    resolve_mail_target(target)
 }
 
 #[cfg(test)]
@@ -4076,6 +4399,66 @@ mod agent_mail_name_tests {
         assert_eq!(resolve_mail_target(""), "");
     }
 
+    /// bd-627z.4 GATE: the spawn-registry pin wins over the pure hash —
+    /// two resolves of the SAME agent return the SAME identity, the pin
+    /// survives a reload (daemon-restart equivalent), and an unpinned agent
+    /// falls back to the deterministic hash mapping (still stable).
+    #[test]
+    fn registry_pin_is_deterministic_and_survives_reload() {
+        let _g = crate::config::lock_env();
+        let dir = std::env::temp_dir().join(format!("fw-reg-pin-{}", uuid::Uuid::new_v4()));
+        unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
+
+        let project = "/tmp/fw-regpin-proj";
+        let entries = vec![
+            state::SpawnEntry::with_mail_identity(
+                "w3:p1",
+                "flywheel-fw-regpin-oc2",
+                "DustySparrow",
+            ),
+            state::SpawnEntry::with_mail_identity(
+                "w3:p2",
+                "flywheel-fw-regpin-oc3",
+                "RoseDune",
+            ),
+        ];
+        state::save_spawn_registry(project, &entries).expect("save");
+
+        // Same agent → same identity, every call.
+        assert_eq!(
+            resolve_mail_target_registry(project, "flywheel-fw-regpin-oc2"),
+            "DustySparrow"
+        );
+        assert_eq!(
+            resolve_mail_target_registry(project, "flywheel-fw-regpin-oc2"),
+            "DustySparrow"
+        );
+        assert_eq!(
+            resolve_mail_target_registry(project, "flywheel-fw-regpin-oc3"),
+            "RoseDune"
+        );
+
+        // The pin survives a full reload (fresh load from disk = the
+        // daemon-restart / re-dispatch equivalent — no shifting).
+        let entries2 = state::load_spawn_registry(project);
+        assert_eq!(entries2.len(), 2);
+        assert_eq!(
+            resolve_mail_target_registry(project, "flywheel-fw-regpin-oc2"),
+            "DustySparrow",
+            "binding persists across reloads"
+        );
+
+        // Unpinned agent → deterministic hash fallback (stable per name).
+        let hashed = resolve_mail_target_registry(project, "flywheel-fw-regpin-gk");
+        assert_eq!(
+            resolve_mail_target_registry(project, "flywheel-fw-regpin-gk"),
+            hashed,
+            "fallback is stable"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// review-fix F7: bare shorts resolve to the spawned herdr name; concrete
     /// names pass through unchanged.
     #[test]
@@ -4221,7 +4604,9 @@ fn cmd_add(
             )?;
             prev = p.pane_id.clone();
             let agent = start_agent_with_retry(&mut c, &name, &kind, &prev, &[])?;
-            register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
+            // bd-627z.4: register + pin the mail identity (the add path's
+            // registry persists on the next spawn/rebind save).
+            let _ = register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
             println!("  {} {}", kind_paint(&kind), agent.pane_id);
             spawned
                 .push(json!({ "name": agent.name, "kind": agent.agent, "pane_id": agent.pane_id }));
@@ -5029,11 +5414,12 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
             })
             .unwrap_or_default()
     } else {
-        // explicit targets: herdr agent names map to their registered
-        // agent-mail identities (bd-odc); already-valid identities pass
-        // through unchanged
+        // explicit targets: herdr agent names resolve through the spawn
+        // registry (bd-627z.4 — the pinned pane→identity binding, so the
+        // same agent gets the same identity every call); already-valid
+        // identities pass through unchanged (bd-odc)
         to.split(',')
-            .map(|s| resolve_mail_target(s.trim()))
+            .map(|s| resolve_mail_target_registry(project, s.trim()))
             .collect()
     };
     if targets.is_empty() {
@@ -5046,7 +5432,29 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
         project_base(project),
         bead_ids.join(", ")
     );
-    mail.send(&key, &targets, &subject, &body, "high", true, None)?;
+    // bd-627z.2: first-contact auto-register backstop. If the daemon was down
+    // at spawn, the agents have no identities yet; assign auto-registers each
+    // resolved target on first use (idempotent upsert) so lane assignment
+    // never needs manual iterative registration. Best-effort: a registration
+    // failure (daemon still down) keeps the send attempt + actionable error.
+    for t in &targets {
+        if let Err(e) = mail.register_agent(&key, t, "opencode", "opencode", "flywheel mail CLI actor")
+        {
+            eprintln!("flywheel: assign auto-register of {t} failed (continuing): {e:#}");
+        }
+    }
+    if let Err(e) = mail.send(&key, &targets, &subject, &body, "high", true, None) {
+        // bd-627z.2: actionable errors — never a bare "unknown recipient".
+        let msg = format!("{e:#}");
+        if msg.contains("unknown recipient") {
+            bail!(
+                "assign failed: {msg} — auto-registration ran for each target; if it \
+                 could not register, the toron mail daemon may be down (start it: toron \
+                 serve) then retry the assign"
+            );
+        }
+        return Err(e);
+    }
     println!("assigned {} to {}", bead_ids.join(", "), targets.join(", "));
     Ok(())
 }
@@ -6613,6 +7021,11 @@ fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
+            assignee: b
+                .get("assignee")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         })
         .collect())
 }
@@ -6640,6 +7053,11 @@ fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
+            assignee: b
+                .get("assignee")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         })
         .collect())
 }
@@ -6783,6 +7201,7 @@ fn cmd_loop(
     to: &str,
     no_confirm: bool,
     confirm_timeout_ms: Option<u64>,
+    engine: bool,
     force: bool,
 ) -> Result<()> {
     if interval_secs < 5 {
@@ -6839,12 +7258,26 @@ fn cmd_loop(
             invocation: String::new(),
             unknown_diagnose_threshold: cfg.unknown_diagnose_threshold(),
             respawn_budget: cfg.respawn_budget(),
+            resonate_url: String::new(),
         };
         let rt = tokio::runtime::Runtime::new()?;
-        println!(
-            "loop: durable swarm monitor for {} (resume: flywheel loop run {project} with the same flags)",
-            dim(project)
-        );
+        if engine {
+            // bd-e0xk: the loop as a WorkflowEngine durable function — the
+            // coexistence path. Dispatches run as `loop-dispatch` engine
+            // workflows (unified vocabulary); poll + plan phases unchanged.
+            println!(
+                "loop: engine-backed swarm monitor for {} (bd-e0xk coexistence path; resume: flywheel loop run {project} --engine)",
+                dim(project)
+            );
+            let result = rt.block_on(durable::run_engine_loop(cfg, params))?;
+            println!("loop: {result}");
+            log(
+                project,
+                EventKind::Loop,
+                json!({ "status": "complete", "engine": true, "result": result }),
+            );
+            return Ok(());
+        }
         let result = rt.block_on(durable::run_durable_loop(cfg, params))?;
         println!("loop: {result}");
         log(
@@ -7110,15 +7543,18 @@ mod loop_tests {
             durable::ReadyBead {
                 id: "bd-r1".into(),
                 title: "resume me".into(),
+                assignee: None,
             },
             durable::ReadyBead {
                 id: "bd-r2".into(),
                 title: "resume me too".into(),
+                assignee: None,
             },
         ];
         let ready = vec![durable::ReadyBead {
             id: "bd-f1".into(),
             title: "fresh".into(),
+            assignee: None,
         }];
         let mut assigned = Vec::new();
         let prompts = work_prompts(&inprog, &ready, &mut assigned);
@@ -7138,10 +7574,12 @@ mod loop_tests {
         let inprog = vec![durable::ReadyBead {
             id: "bd-r1".into(),
             title: "x".into(),
+            assignee: None,
         }];
         let ready = vec![durable::ReadyBead {
             id: "bd-r1".into(),
             title: "x".into(),
+            assignee: None,
         }];
         let mut assigned = vec!["bd-r1".to_string()];
         let prompts = work_prompts(&inprog, &ready, &mut assigned);
@@ -7153,6 +7591,7 @@ mod loop_tests {
         let ready = vec![durable::ReadyBead {
             id: "bd-42".into(),
             title: "fix auth".into(),
+            assignee: None,
         }];
         let mut assigned = Vec::new();
         let prompts = work_prompts(&[], &ready, &mut assigned);
@@ -7182,6 +7621,23 @@ mod loop_tests {
         // bare-array fallback (some br versions)
         let beads = parse_inprogress_beads_json(r#"[{"id":"bd-d","title":"four"}]"#).unwrap();
         assert_eq!(beads[0].id, "bd-d");
+    }
+
+    /// bd-627z.1: the in-progress parser carries the assignee (drives the
+    /// stranded-reclaim + scoped-completion decision); absent/empty → None.
+    #[test]
+    fn parse_inprogress_beads_json_carries_assignee() {
+        let raw = r#"{"issues":[
+            {"id":"bd-a","title":"one","assignee":"oc"},
+            {"id":"bd-b","title":"two","assignee":"captain"},
+            {"id":"bd-c","title":"three"},
+            {"id":"bd-d","title":"four","assignee":""}
+        ]}"#;
+        let beads = parse_inprogress_beads_json(raw).unwrap();
+        assert_eq!(beads[0].assignee.as_deref(), Some("oc"));
+        assert_eq!(beads[1].assignee.as_deref(), Some("captain"));
+        assert_eq!(beads[2].assignee, None, "absent assignee -> None");
+        assert_eq!(beads[3].assignee, None, "empty assignee -> None");
     }
 
     #[test]
@@ -7703,15 +8159,21 @@ fn prompt_phase_template(phase: &str) -> Option<&'static str> {
     }
 }
 
-/// The workflow slash-command set (bd-oj9o #3): command name → (target
-/// workflow, frontmatter description). ONLY the POPULAR user-facing
-/// workflows — debate, plan-review, brainstorm. Behind-the-scenes workflows
-/// (cron, triage, beads, goal) deliberately get NO command templates.
+/// The workflow slash-command set (bd-oj9o #3, bd-ucd4): command name →
+/// (target workflow, frontmatter description). The POPULAR user-facing
+/// workflows — debate, plan, plan-review, brainstorm, onboard, triage-deep.
+/// Behind-the-scenes workflows (cron, beads, goal) deliberately get NO
+/// command templates.
 const PROMPT_WORKFLOWS: &[(&str, &str, &str)] = &[
     (
         "debate",
         "debate",
         "Run the debate workflow — adversarial synthesis: reviewers brief, an oracle decides.",
+    ),
+    (
+        "plan",
+        "plan",
+        "Run the plan workflow — goal → bead-ready plan via the planner.",
     ),
     (
         "plan-review",
@@ -7723,6 +8185,16 @@ const PROMPT_WORKFLOWS: &[(&str, &str, &str)] = &[
         "brainstorm",
         "Run the brainstorm workflow — divergent ideation: oracles fan out, a planner reduces.",
     ),
+    (
+        "onboard",
+        "onboard",
+        "Run the onboard workflow — cold-start a newcomer: repo map, seed context, first task.",
+    ),
+    (
+        "triage",
+        "triage-deep",
+        "Run the triage-deep workflow — bv robot-triage, prioritize + assign, spawn the crew.",
+    ),
 ];
 
 /// Per-workflow command template: `{{TOOL_FRONTMATTER}}` + the workflow
@@ -7731,8 +8203,11 @@ const PROMPT_WORKFLOWS: &[(&str, &str, &str)] = &[
 fn prompt_workflow_template(name: &str) -> Option<&'static str> {
     match name {
         "debate" => Some(include_str!("../integrations/prompts/workflow-debate.md.tpl")),
+        "plan" => Some(include_str!("../integrations/prompts/workflow-plan.md.tpl")),
         "plan-review" => Some(include_str!("../integrations/prompts/workflow-plan-review.md.tpl")),
         "brainstorm" => Some(include_str!("../integrations/prompts/workflow-brainstorm.md.tpl")),
+        "onboard" => Some(include_str!("../integrations/prompts/workflow-onboard.md.tpl")),
+        "triage" => Some(include_str!("../integrations/prompts/workflow-triage.md.tpl")),
         _ => None,
     }
 }
@@ -10247,194 +10722,265 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
     }
 }
 
-/// `flywheel cron` — the smart-cron catalog + control surface (ADR-0005
-/// Spec 3 / P4.6). The merged view spans the `crons.toml` registry (written
-/// by `add`/`pause`/`resume`) and every schedule-triggered workflow in the
-/// catalog + built-ins. Status is derived from the state log; the P4.3
-/// durable-sleep manager will drive ticks off the same registry.
-fn cmd_cron(cmd: &CronCmd) -> Result<()> {
-    use cron::{CronManager, CronStatus, MergedCron, RegistryCronManager, row_json};
-    use toron_workflow::schema::CronScope;
+/// `flywheel cron` — the standalone cron surface (ADR-0012 Spec 1/4,
+/// P12.3). Crons are YAML files in three tiers (per-project > global >
+/// built-in) with a shared CronSpec body on the toron-workflow engine.
+/// Status is derived from the state log + run log.
+fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
+    use toron_workflow::lint::{lint_cron, Level};
 
-    /// The manager the CLI drives. Today: the registry-backed manager
-    /// (crons.toml + catalog + state log). When P4.3 lands, swap in the
-    /// durable-sleep cron manager — the CLI compiles against [`CronManager`],
-    /// never against a concrete impl.
-    fn make_manager() -> Result<Box<dyn CronManager>> {
-        Ok(Box::new(RegistryCronManager::load()?))
-    }
-
-    fn render(mc: &MergedCron, st: &CronStatus, json: bool) -> Result<()> {
-        let row = row_json(mc, st.status, st.next_due);
-        if json {
-            println!("{}", serde_json::to_string_pretty(&row)?);
-        } else {
-            println!(
-                "{:<28} {:<8} {:<8} {:<22} {:<6} {:<9} {:<8}",
-                mc.entry.name,
-                mc.entry.template,
-                mc.entry.cron,
-                mc.entry.owner,
-                match mc.entry.scope {
-                    CronScope::Host => "host",
-                    CronScope::Project => "project",
+    /// Lint one cron: engine tier (schedule parse, policy sanity, step/graph
+    /// checks — P1) + flywheel tier (owner-profile resolution against the
+    /// ProfileCatalog). Returns the blocking (Error-level) count.
+    fn lint_one(name: &str, spec: &toron_workflow::schema::CronSpec) -> usize {
+        let report = lint_cron(spec);
+        let mut blocking = report
+            .issues
+            .iter()
+            .filter(|i| i.level == Level::Error)
+            .count();
+        for issue in &report.issues {
+            eprintln!(
+                "[{name}] {:>7} {}",
+                if issue.level == Level::Error {
+                    "error"
+                } else {
+                    "warning"
                 },
-                st.status,
-                if mc.entry.enabled { "on" } else { "paused" },
+                issue.message
             );
         }
-        Ok(())
+        // Flywheel tier: the ENGINE cannot resolve owner profiles (no
+        // dependency inversion — it never imports flywheel's
+        // ProfileCatalog). Owned here, fail-stop (ADR-0012: cron lint
+        // validates owner-profile resolution).
+        let profiles = profile::ProfileCatalog::load().unwrap_or_default();
+        let owner = spec.owner.trim_start_matches('@');
+        if !owner.is_empty() && profiles.get(owner).is_none() {
+            eprintln!(
+                "[{name}]    error owner profile {owner:?} does not resolve (known: {})",
+                profiles.names().join(", ")
+            );
+            blocking += 1;
+        }
+        blocking
     }
 
-    let manager = make_manager()?;
+    /// The resolved cron by name (fail-stop on unknown).
+    fn resolve<'a>(rows: &'a [cron::CronRow], name: &str) -> Result<&'a cron::CronRow> {
+        rows.iter()
+            .find(|r| r.name() == name)
+            .ok_or_else(|| anyhow!("no cron named {name:?} (flywheel cron list)"))
+    }
 
     match cmd {
-        CronCmd::List { json } => {
-            let merged = manager.list()?;
-            if merged.is_empty() {
+        CronCmd::List { json, project } => {
+            let rows = cron::load_crons(cfg, project.as_deref())?;
+            if rows.is_empty() {
                 println!("no crons defined");
                 return Ok(());
             }
-            let statuses = manager.status_all()?;
-            if *json {
-                let rows: Vec<Value> = merged
-                    .iter()
-                    .map(|mc| {
-                        let st = statuses
-                            .iter()
-                            .find(|s| s.name == mc.entry.name)
-                            .expect("status for every listed cron");
-                        row_json(mc, st.status, st.next_due)
-                    })
-                    .collect();
-                print_json(&json!({ "crons": rows }));
-            } else {
-                println!(
-                    "{:<28} {:<8} {:<8} {:<22} {:<6} {:<9} {:<8}",
-                    "NAME", "TEMPLATE", "CRON", "OWNER", "SCOPE", "STATUS", "STATE"
-                );
-                for mc in &merged {
-                    let st = statuses
-                        .iter()
-                        .find(|s| s.name == mc.entry.name)
-                        .expect("status for every listed cron");
-                    render(mc, st, false)?;
-                }
-            }
-            Ok(())
-        }
-        CronCmd::Show { name, json } => {
-            let mc = manager
-                .show(name)?
-                .ok_or_else(|| anyhow!("unknown cron {name:?} (flywheel cron list)"))?;
-            let st = manager
-                .status(name)?
-                .ok_or_else(|| anyhow!("unknown cron {name:?} (flywheel cron list)"))?;
-            if *json {
-                render(&mc, &st, true)?;
-            } else {
-                println!("name:     {}", mc.entry.name);
-                println!("template: {}", mc.entry.template);
-                println!("cron:     {}", mc.entry.cron);
-                println!("owner:    {}", mc.entry.owner);
-                println!(
-                    "scope:    {}",
-                    match mc.entry.scope {
-                        CronScope::Host => "host",
-                        CronScope::Project => "project",
-                    }
-                );
-                println!("source:   {}", mc.source);
-                println!("status:   {}", st.status);
-                if let Some(d) = st.next_due {
-                    println!("next_due: {d}");
-                }
-                if let Some(wf) = manager_workflow(name)
-                    && let Some(p) = &wf.policy
-                {
-                    println!("policy:   {p:?}");
-                }
-            }
-            Ok(())
-        }
-        CronCmd::Add {
-            name,
-            template,
-            cron,
-            owner,
-            mode,
-            scope,
-            json,
-        } => {
-            let scope = match scope.as_deref() {
-                Some("host") | None => CronScope::Host,
-                Some("project") => CronScope::Project,
-                Some(other) => bail!("scope must be host or project, got {other:?}"),
-            };
-            let mode = match mode.as_str() {
-                "headless" => cron::CronMode::Headless,
-                "pane" => cron::CronMode::Pane,
-                other => bail!("mode must be headless or pane, got {other:?}"),
-            };
-            let mut manager = manager;
-            manager.add(cron::CronEntry {
-                name: name.clone(),
-                template: template.clone(),
-                cron: cron.clone(),
-                owner: owner.clone(),
-                mode,
-                scope,
-                enabled: true,
-                created_at: chrono::Utc::now().to_rfc3339(),
-            })?;
-            if *json {
-                let entry = manager.show(name)?.expect("added cron is present");
-                let st = manager.status(name)?.expect("added cron has status");
-                render(&entry, &st, true)?;
-            } else {
-                println!("added cron {name} (template {template}, {cron}, owner {owner})");
-            }
-            Ok(())
-        }
-        CronCmd::Pause { name } => {
-            let mut manager = manager;
-            manager.set_enabled(name, false)?;
-            println!("paused cron {name}");
-            Ok(())
-        }
-        CronCmd::Resume { name } => {
-            let mut manager = manager;
-            manager.set_enabled(name, true)?;
-            println!("resumed cron {name}");
-            Ok(())
-        }
-        CronCmd::Status { json } => {
-            let statuses = manager.status_all()?;
-            if statuses.is_empty() {
-                println!("no crons defined");
-                return Ok(());
-            }
-            let rows: Vec<Value> = statuses
+            let mut rows: Vec<Value> = rows
                 .iter()
-                .map(|st| {
-                    json!({
-                        "name": st.name,
-                        "status": st.status,
-                        "enabled": st.enabled,
-                        "next_due": st.next_due,
-                    })
+                .map(|row| {
+                    let (last, in_flight) = cron::last_run_state(row.name());
+                    let status = cron::derive_status(
+                        row.enabled(),
+                        in_flight,
+                        last.as_deref(),
+                    );
+                    let next_due = cron::next_due(row.cron(), cron::now_ts());
+                    cron::cron_row_json(row, status, next_due)
                 })
                 .collect();
+            rows.sort_by(|a, b| {
+                a["name"]
+                    .as_str()
+                    .cmp(&b["name"].as_str())
+            });
             if *json {
                 print_json(&json!({ "crons": rows }));
             } else {
                 println!(
-                    "{:<28} {:<9} {:<8} {:<12}",
-                    "NAME", "STATUS", "STATE", "NEXT_DUE"
+                    "{:<28} {:<22} {:<16} {:<7} {:<8} {:<9} {:<6} {:<7}",
+                    "NAME", "OWNER", "SCHEDULE", "SCOPE", "SOURCE", "STATUS", "STEPS", "STATE"
                 );
                 for row in &rows {
                     println!(
-                        "{:<28} {:<9} {:<8} {}",
+                        "{:<28} {:<22} {:<16} {:<7} {:<8} {:<9} {:<6} {}",
+                        row["name"].as_str().unwrap_or(""),
+                        row["owner"].as_str().unwrap_or(""),
+                        row["schedule"].as_str().unwrap_or(""),
+                        row["scope"].as_str().unwrap_or(""),
+                        row["source"].as_str().unwrap_or(""),
+                        row["status"].as_str().unwrap_or(""),
+                        row["steps"].as_i64().unwrap_or(0),
+                        if row["enabled"].as_bool().unwrap_or(false) {
+                            "on"
+                        } else {
+                            "paused"
+                        },
+                    );
+                }
+            }
+            Ok(())
+        }
+        CronCmd::Show { name, json, project } => {
+            let rows = cron::load_crons(cfg, project.as_deref())?;
+            let row = resolve(&rows, name)?;
+            let (last, in_flight) = cron::last_run_state(name);
+            let status = cron::derive_status(row.enabled(), in_flight, last.as_deref());
+            let next_due = cron::next_due(row.cron(), cron::now_ts());
+            if *json {
+                print_json(&cron::cron_row_json(row, status, next_due));
+            } else {
+                println!("name:     {}", row.name());
+                println!("schedule: {}", row.cron());
+                println!("owner:    {}", row.owner());
+                println!(
+                    "scope:    {}",
+                    match row.scope() {
+                        toron_workflow::schema::CronScope::Host => "host",
+                        toron_workflow::schema::CronScope::Project => "project",
+                    }
+                );
+                println!("source:   {}", row.source_label());
+                println!(
+                    "mode:     {}",
+                    match row.spec.mode {
+                        toron_workflow::schema::CronMode::Headless => "headless",
+                        toron_workflow::schema::CronMode::Pane => "pane",
+                    }
+                );
+                println!("status:   {status}");
+                if let Some(d) = next_due {
+                    println!("next_due: {d}");
+                }
+                if let Some(p) = &row.spec.policy {
+                    println!("policy:   {p:?}");
+                }
+                if let Some(d) = &row.spec.description {
+                    println!("desc:     {d}");
+                }
+                for (i, s) in row.spec.steps.iter().enumerate() {
+                    let n = s.name.clone().unwrap_or_else(|| "<unnamed>".to_string());
+                    println!("step {i}:   {n} ({})", s.action.type_name());
+                }
+            }
+            Ok(())
+        }
+        CronCmd::Lint { name, project } => {
+            let rows = cron::load_crons(cfg, project.as_deref())?;
+            match name {
+                Some(n) => {
+                    let row = resolve(&rows, n)?;
+                    let blocking = lint_one(n, &row.spec);
+                    if blocking > 0 {
+                        std::process::exit(1);
+                    }
+                    println!("cron {n} lints clean (source {})", row.source_label());
+                    Ok(())
+                }
+                None => {
+                    let mut blocking_total = 0;
+                    for row in &rows {
+                        blocking_total += lint_one(row.name(), &row.spec);
+                    }
+                    if blocking_total > 0 {
+                        std::process::exit(1);
+                    }
+                    println!("lint clean: {} cron(s)", rows.len());
+                    Ok(())
+                }
+            }
+        }
+        CronCmd::Run { name, project, json } => {
+            let rows = cron::load_crons(cfg, project.as_deref())?;
+            let row = resolve(&rows, name)?.clone();
+            let source = row.source_label().to_string();
+            // Fail-stop gate: lint before running (ADR-0012 — run is for
+            // testing; a cron that does not lint cannot run).
+            let blocking = lint_one(name, &row.spec);
+            if blocking > 0 {
+                bail!("cron {name:?} has {blocking} blocking lint issue(s) — refusing to run");
+            }
+            let spec = row.spec;
+            // The tick body: the SAME spec-derived workflow the durable loop
+            // fires (one engine, two input types — ADR-0012 Spec 2).
+            let wf = toron_workflow::cron::spec_tick_workflow(&spec);
+            let runner = cron::spec_runner(&spec);
+            let rt = tokio::runtime::Runtime::new()?;
+            let run_id = format!("cron-run-{}", state::now_iso());
+            let output = rt.block_on(async {
+                let engine = toron_workflow::WorkflowEngine::local(runner)?;
+                engine.invoke(&run_id, wf, json!({})).await
+            })?;
+            log(
+                "workflow",
+                EventKind::Workflow,
+                json!({
+                    "workflow": name,
+                    "status": "done",
+                    "run_id": run_id,
+                    "cron": name,
+                }),
+            );
+            if *json {
+                print_json(&json!({
+                    "cron": name,
+                    "run_id": run_id,
+                    "source": source,
+                    "output": output,
+                }));
+            } else {
+                println!("cron {name} ran (run_id {run_id}, source {source})");
+                print_json(&output);
+            }
+            Ok(())
+        }
+        CronCmd::Pause { name, project } => {
+            cron::set_cron_enabled(cfg, project.as_deref(), name, false)?;
+            println!("paused cron {name}");
+            Ok(())
+        }
+        CronCmd::Resume { name, project } => {
+            cron::set_cron_enabled(cfg, project.as_deref(), name, true)?;
+            println!("resumed cron {name}");
+            Ok(())
+        }
+        CronCmd::Status { json, project } => {
+            let rows = cron::load_crons(cfg, project.as_deref())?;
+            if rows.is_empty() {
+                println!("no crons defined");
+                return Ok(());
+            }
+            let mut rows: Vec<Value> = rows
+                .iter()
+                .map(|row| {
+                    let (last, in_flight) = cron::last_run_state(row.name());
+                    let status = cron::derive_status(
+                        row.enabled(),
+                        in_flight,
+                        last.as_deref(),
+                    );
+                    let next_due = cron::next_due(row.cron(), cron::now_ts());
+                    json!({
+                        "name": row.name(),
+                        "status": status,
+                        "enabled": row.enabled(),
+                        "next_due": next_due,
+                        "source": row.source_label(),
+                    })
+                })
+                .collect();
+            rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+            if *json {
+                print_json(&json!({ "crons": rows }));
+            } else {
+                println!("{:<28} {:<9} {:<8} {:<12} {:<8}", "NAME", "STATUS", "STATE", "NEXT_DUE", "SOURCE");
+                for row in &rows {
+                    println!(
+                        "{:<28} {:<9} {:<8} {} {:<8}",
                         row["name"].as_str().unwrap_or(""),
                         row["status"].as_str().unwrap_or(""),
                         if row["enabled"].as_bool().unwrap_or(false) {
@@ -10443,13 +10989,14 @@ fn cmd_cron(cmd: &CronCmd) -> Result<()> {
                             "paused"
                         },
                         row["next_due"].as_i64().unwrap_or(0),
+                        row["source"].as_str().unwrap_or(""),
                     );
                 }
             }
             Ok(())
         }
         CronCmd::History { name, json } => {
-            let runs = manager.history(name)?;
+            let runs = cron::cron_history(name);
             let rows: Vec<Value> = runs
                 .iter()
                 .map(|r| {
@@ -10479,42 +11026,19 @@ fn cmd_cron(cmd: &CronCmd) -> Result<()> {
             }
             Ok(())
         }
-        CronCmd::Start => {
+        CronCmd::Start { project } => {
             // Blocks until Ctrl-C: durable loops + policy-sink drain (bead
             // side-effects). Run under the project dir so `br create` lands
             // in the right .beads.
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(cron::start_loops())
+            rt.block_on(cron::start_loops(cfg, project.as_deref()))
         }
-        CronCmd::Remove { name } => {
-            // Registry-sourced crons (crons.toml) are removable here. A cron
-            // whose source is a workflow's `schedule` trigger is not — direct
-            // the user to edit/remove that workflow.
-            let mut crons = cron::Crons::load()?;
-            if crons.crons.remove(name).is_none() {
-                let manager = RegistryCronManager::load()?;
-                match manager.show(name)? {
-                    Some(mc) => bail!(
-                        "cron {name:?} is sourced from a workflow's schedule trigger (template {:?}) — edit/remove that workflow instead",
-                        mc.entry.template
-                    ),
-                    None => bail!("no cron named {name:?}"),
-                }
-            }
-            crons.save()?;
+        CronCmd::Remove { name, project } => {
+            cron::remove_cron(cfg, project.as_deref(), name)?;
             println!("removed cron {name}");
             Ok(())
         }
     }
-}
-
-/// Look up a workflow by name across the catalog for the `show` policy line.
-fn manager_workflow(name: &str) -> Option<toron_workflow::schema::Workflow> {
-    let cat = workflow_catalog::WorkflowCatalog::load().ok()?;
-    cat.workflows
-        .get(name)
-        .cloned()
-        .or_else(|| builtin_workflows::builtin_workflows().get(name).cloned())
 }
 
 /// The flywheel-tier lint checks (the bead's fail-stop contract): profile
@@ -11956,14 +12480,65 @@ fn cmd_internal_ready(cfg: &Config, project: &str) -> Result<()> {
     Ok(())
 }
 
-/// internal leaf: in-progress beads as [{id, title}] via `br list --status in_progress`.
+/// internal leaf: in-progress beads as [{id, title, assignee}] via
+/// `br list --status in_progress --json` (bd-627z.1: assignee drives the
+/// stranded-reclaim + scoped-completion decision).
 fn cmd_internal_inprogress(cfg: &Config, project: &str) -> Result<()> {
     let beads = load_inprogress_beads(cfg, project)?;
     let beads: Vec<Value> = beads
         .iter()
-        .map(|b| json!({ "id": b.id, "title": b.title }))
+        .map(|b| {
+            json!({ "id": b.id, "title": b.title, "assignee": b.assignee })
+        })
         .collect();
     print_json(&json!({ "beads": beads }));
+    Ok(())
+}
+
+/// internal leaf (bd-627z.1): re-open stranded in_progress beads to ready.
+/// A bead is stranded when its assignee is NOT one of the `--live` agent
+/// names (captain, dead agent, unknown identity) — it would stall the batch
+/// forever. Reclaim = `br update <id> --status open --assignee ""` so the
+/// bead returns to the ready pool and the loop re-dispatches it.
+///
+/// Emits `{"reclaimed": [ids], "failed": [{"id", "error"}]}` — the durable
+/// loop re-dispatches reclaimed ids this poll.
+fn cmd_internal_reclaim_stranded(cfg: &Config, project: &str, live: &str) -> Result<()> {
+    let live_names: Vec<String> = live
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let beads = load_inprogress_beads(cfg, project)?;
+    let stranded: Vec<durable::ReadyBead> = beads
+        .into_iter()
+        .filter(|b| match &b.assignee {
+            Some(a) => !live_names.iter().any(|l| l == a),
+            None => false,
+        })
+        .collect();
+    let dir = project_dir(cfg, project);
+    let mut reclaimed: Vec<String> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
+    for b in &stranded {
+        let out = std::process::Command::new("br")
+            .args(["update", &b.id, "--status", "open", "--assignee", ""])
+            .current_dir(&dir)
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                eprintln!("flywheel: reclaimed stranded bead {} (assignee {:?})", b.id, b.assignee);
+                reclaimed.push(b.id.clone());
+            }
+            Ok(o) => failed.push(json!({
+                "id": b.id,
+                "error": String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            })),
+            Err(e) => failed.push(json!({ "id": b.id, "error": format!("br not found: {e}") })),
+        }
+    }
+    print_json(&json!({ "reclaimed": reclaimed, "failed": failed }));
     Ok(())
 }
 
@@ -12498,6 +13073,22 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
         return Ok(());
     }
     let name = resolve_mail_target(&key_name);
+    // bd-627z.2: first-contact auto-register backstop for the loop's dispatch
+    // path. A spawn that ran while the daemon was down left the agent without
+    // an identity; the first digest poll (the loop's first contact with the
+    // agent's mailbox) registers the expected identity so inbox/send never
+    // 404 "Agent not found". Idempotent upsert; best-effort — a failure just
+    // zeroes the digest and the loop retries next poll.
+    let auto_profile = backend::AgentProfile {
+        name: name.clone(),
+        program: Some("opencode".into()),
+        model: Some("opencode".into()),
+        persona: None,
+        task_description: Some("flywheel mail CLI actor".into()),
+    };
+    if let Err(e) = backend::run_mail(mail.register_agent(&key, &auto_profile)) {
+        eprintln!("flywheel: mail digest auto-register of {name} failed (zeroing digest): {e}");
+    }
     // toron's projection has NO read-state: `unread_only` is a documented
     // no-op ("fresh on first read"). Fetch the RECENT inbox (limit 10) and
     // report `recent` + `urgent` (importance high|urgent) — both honest;
@@ -13287,24 +13878,35 @@ mod integration_tests {
         assert!(render_prompt("opencode", "bogus", "0.1.0", "ts").is_err());
     }
 
-    /// bd-oj9o #3: the workflow command set is EXACTLY the popular
-    /// user-facing workflows (debate, plan-review, brainstorm) — the same
-    /// rule as the builtin set. Behind-the-scenes workflows (cron, beads,
-    /// goal, triage) get no command templates.
+    /// bd-oj9o #3 + bd-ucd4: the workflow command set is EXACTLY the popular
+    /// user-facing workflows (debate, plan, plan-review, brainstorm, onboard,
+    /// triage) — the same rule as the builtin set. Behind-the-scenes
+    /// workflows (cron, beads, goal) get no command templates.
     #[test]
-    fn workflow_command_set_is_the_popular_three() {
-        assert_eq!(PROMPT_WORKFLOWS.len(), 3, "exactly three workflow commands");
+    fn workflow_command_set_is_the_popular_six() {
+        assert_eq!(PROMPT_WORKFLOWS.len(), 6, "exactly six workflow commands");
         let names: Vec<&str> = PROMPT_WORKFLOWS.iter().map(|(n, _, _)| *n).collect();
-        assert_eq!(names, ["debate", "plan-review", "brainstorm"]);
+        assert_eq!(
+            names,
+            ["debate", "plan", "plan-review", "brainstorm", "onboard", "triage"]
+        );
         for (name, target, description) in PROMPT_WORKFLOWS {
-            assert_eq!(name, target, "/{name} targets the same-named workflow");
             assert!(
                 builtin_workflows::builtin_workflows().contains_key(*target),
-                "/{name} targets a real built-in workflow"
+                "/{name} targets a real built-in workflow ({target})"
             );
             assert!(!description.is_empty(), "/{name} has a description");
         }
-        for excluded in ["beads", "goal", "triage", "cron", "onboard", "triage-deep"] {
+        // triage maps to the triage-deep workflow (the command name is the
+        // user-facing short form).
+        assert_eq!(
+            PROMPT_WORKFLOWS
+                .iter()
+                .find(|(n, _, _)| *n == "triage")
+                .map(|(_, t, _)| *t),
+            Some("triage-deep")
+        );
+        for excluded in ["beads", "goal", "cron"] {
             assert!(
                 !names.contains(&excluded),
                 "/{excluded} must NOT be a workflow command (behind-the-scenes)"

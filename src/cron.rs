@@ -1,12 +1,17 @@
-//! The flywheel cron registry (ADR-0005 Spec 3 — smart cron, flywheel half).
+//! The flywheel cron registry (ADR-0005 Spec 3 / ADR-0012 — smart cron,
+//! flywheel half).
 //!
-//! Owns the CLI/catalog surface: registration (`crons.toml` persistence),
-//! pause/resume (toggle without losing entry state), the merged view of
-//! registered crons + schedule-triggered workflows, next-due computation and
-//! status derivation. The P4.3 cron manager (Resonate durable-sleep loop)
-//! drives ticks off this same registry — the CLI never writes engine state.
+//! Two surfaces:
+//! - The ADR-0012 cron YAML surface (P12.3, bd-25g7.3): crons are YAML
+//!   files in three tiers — per-project > global > built-in — with a shared
+//!   [`CronSpec`] body on the toron-workflow engine. pause/resume persists
+//!   `enabled` in the tier's YAML; built-ins are read-only.
+//! - The legacy crons.toml registry surface (ADR-0005 Spec 3): merged view
+//!   of registered crons + schedule-triggered workflows, next-due
+//!   computation and status derivation. The P4.3 cron manager drives ticks
+//!   off this registry until P4 (bd-25g7.4) migrates it to cron YAMLs.
 //!
-//! governed-by: ADR-0005 Spec 3
+//! governed-by: ADR-0005 Spec 3, ADR-0012 Spec 4
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,7 +19,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use toron_workflow::schema::{CronScope, Workflow};
+use toron_workflow::schema::{CronScope, CronSpec, Workflow};
 
 /// One registered cron: a schedule bound to a workflow template.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -74,6 +79,7 @@ pub fn crons_file() -> PathBuf {
     crate::config::config_dir().join("crons.toml")
 }
 
+#[allow(dead_code)] // legacy crons.toml write surface — P4 (bd-25g7.4) migrates/retires
 impl Crons {
     /// Load the registry from the real XDG path (missing file = empty).
     pub fn load() -> Result<Self> {
@@ -131,6 +137,7 @@ impl Crons {
 
 /// A cron as surfaced by `flywheel cron list`: a registry entry OR a
 /// schedule-triggered workflow from the catalog/built-ins.
+#[allow(dead_code)] // legacy merged view — P4 (bd-25g7.4) migrates/retires
 #[derive(Debug, Clone)]
 pub struct MergedCron {
     pub entry: CronEntry,
@@ -176,6 +183,265 @@ pub fn merged_entries(
     }
     out.sort_by(|a, b| a.entry.name.cmp(&b.entry.name));
     out
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0012 Spec 4: user dirs + precedence (P12.3, bd-25g7.3). Crons are YAML
+// files in three tiers; per-project > global > built-in. The spec IS the
+// source — pause/resume only toggles `enabled` in the tier's YAML file.
+// ---------------------------------------------------------------------------
+
+/// Where a cron definition lives (ADR-0012 Spec 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronSource {
+    /// Compiled-in (read-only; a user tier shadows by name).
+    Builtin,
+    /// `~/.config/flywheel/crons/<name>.yaml` (cross-project maintenance).
+    Global,
+    /// `<project>/.flywheel/crons/<name>.yaml` (project-scoped automation).
+    Project,
+}
+
+impl CronSource {
+    /// The `cron list` source label.
+    pub fn label(self) -> &'static str {
+        match self {
+            CronSource::Builtin => "builtin",
+            CronSource::Global => "global",
+            CronSource::Project => "project",
+        }
+    }
+}
+
+/// One resolved cron: the parsed spec + its tier + its on-disk path.
+/// Built-ins carry a synthetic (empty) path — they are read-only.
+#[derive(Debug, Clone)]
+pub struct CronRow {
+    pub spec: CronSpec,
+    pub source: CronSource,
+    pub path: PathBuf,
+}
+
+impl CronRow {
+    pub fn name(&self) -> &str {
+        &self.spec.name
+    }
+    pub fn cron(&self) -> &str {
+        &self.spec.schedule
+    }
+    pub fn owner(&self) -> &str {
+        &self.spec.owner
+    }
+    pub fn scope(&self) -> CronScope {
+        self.spec.scope
+    }
+    pub fn enabled(&self) -> bool {
+        self.spec.enabled
+    }
+    pub fn source_label(&self) -> &'static str {
+        self.source.label()
+    }
+}
+
+/// The compiled-in (read-only) cron tier. Today: the built-in
+/// schedule-triggered workflows (weekly-review) converted to [`CronSpec`] —
+/// a schedule-triggered workflow IS the pre-ADR-0012 spelling of a built-in
+/// cron. A user-tier YAML shadows it by name.
+pub fn builtin_crons() -> BTreeMap<String, CronSpec> {
+    let mut out = BTreeMap::new();
+    for (name, wf) in crate::builtin_workflows::builtin_workflows() {
+        let Some(Trigger::Schedule { cron, owner, scope }) = &wf.trigger else {
+            continue;
+        };
+        out.insert(
+            name.clone(),
+            CronSpec {
+                name: name.clone(),
+                description: wf.description.clone(),
+                schedule: cron.clone(),
+                owner: owner.clone().unwrap_or_default(),
+                scope: *scope,
+                mode: toron_workflow::schema::CronMode::Headless,
+                enabled: true,
+                policy: wf.policy.as_ref().map(|p| toron_workflow::schema::CronSpecPolicy {
+                    on_failure: p.on_failure,
+                    on_repeat_failure: p.on_repeat_failure,
+                    repeat_threshold: p.repeat_threshold,
+                    on_success: p.on_success,
+                    max_retries: p.max_retries,
+                    no_claim_timeout: p.no_claim_timeout,
+                    catchup: toron_workflow::schema::CronCatchup::Latest,
+                }),
+                steps: wf.steps.clone(),
+                graph: wf.graph.clone(),
+            },
+        );
+    }
+    out
+}
+
+/// The global tier dir: `~/.config/flywheel/crons/`.
+pub fn global_crons_dir() -> PathBuf {
+    crate::config::config_dir().join("crons")
+}
+
+/// The per-project tier dir: `<project>/.flywheel/crons/` (project resolved
+/// under the workspace root; absolute project paths pass through).
+pub fn project_crons_dir(cfg: &crate::config::Config, project: &str) -> PathBuf {
+    let p = PathBuf::from(project);
+    let p = if p.is_absolute() {
+        p
+    } else {
+        cfg.workspace_root().join(project)
+    };
+    p.join(".flywheel").join("crons")
+}
+
+/// The project a cron invocation targets: an explicit `--project` wins;
+/// otherwise detect from cwd — a path under the workspace root maps to the
+/// relative project name (running outside any project = no project tier).
+pub fn detect_project(cfg: &crate::config::Config, explicit: Option<&str>) -> Option<String> {
+    if let Some(p) = explicit {
+        return Some(p.to_string());
+    }
+    let cwd = std::env::current_dir().ok()?;
+    let rel = cwd.strip_prefix(cfg.workspace_root()).ok()?;
+    let first = rel.components().next()?.as_os_str().to_str()?;
+    if first.is_empty() {
+        None
+    } else {
+        Some(first.to_string())
+    }
+}
+
+/// Load every cron across the three tiers with precedence: per-project >
+/// global > built-in (ADR-0012 Spec 4). A higher tier with the same name
+/// SHADOWS the lower tier entirely — list shows only the winner.
+pub fn load_crons(cfg: &crate::config::Config, project: Option<&str>) -> Result<Vec<CronRow>> {
+    let mut out: BTreeMap<String, CronRow> = BTreeMap::new();
+    for (name, spec) in builtin_crons() {
+        out.insert(
+            name.clone(),
+            CronRow {
+                spec,
+                source: CronSource::Builtin,
+                path: PathBuf::new(),
+            },
+        );
+    }
+    scan_tier(&mut out, &global_crons_dir(), CronSource::Global)?;
+    if let Some(p) = detect_project(cfg, project) {
+        scan_tier(&mut out, &project_crons_dir(cfg, &p), CronSource::Project)?;
+    }
+    Ok(out.into_values().collect())
+}
+
+/// Scan one tier dir, inserting (or shadowing) its crons by name. A missing
+/// tier dir is an EMPTY tier, never an error.
+fn scan_tier(out: &mut BTreeMap<String, CronRow>, dir: &Path, source: CronSource) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("read {}", path.display()))?;
+        let spec = toron_workflow::schema::parse_cron(&raw)
+            .map_err(|e| anyhow!("parse {}: {e}", path.display()))?;
+        out.insert(
+            spec.name.clone(),
+            CronRow {
+                spec,
+                source,
+                path,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Pause (false) / resume (true) a cron by name (ADR-0012 Spec 4). Only
+/// user-tier crons are mutable — built-ins are read-only (shadow by a user
+/// YAML instead). The toggle persists as `enabled: false` in the tier's YAML;
+/// the definition is otherwise preserved (pause/resume never drops state).
+pub fn set_cron_enabled(
+    cfg: &crate::config::Config,
+    project: Option<&str>,
+    name: &str,
+    enabled: bool,
+) -> Result<()> {
+    let rows = load_crons(cfg, project)?;
+    let row = rows
+        .iter()
+        .find(|r| r.name() == name)
+        .ok_or_else(|| anyhow!("no cron named {name:?} (flywheel cron list)"))?;
+    match row.source {
+        CronSource::Builtin => bail!(
+            "cron {name:?} is a built-in (read-only) — override by writing {}/<name>.yaml",
+            global_crons_dir().display()
+        ),
+        CronSource::Global | CronSource::Project => {}
+    }
+    let mut spec = row.spec.clone();
+    spec.enabled = enabled;
+    let raw = serde_yaml::to_string(&spec)
+        .with_context(|| format!("serialize {}", row.path.display()))?;
+    crate::fs_util::atomic_write(&row.path, raw.as_bytes())
+        .with_context(|| format!("write {}", row.path.display()))?;
+    Ok(())
+}
+
+/// Remove a cron definition (user tiers only; built-ins are read-only).
+/// Removing a project-tier cron reveals the global/built-in definition it
+/// shadowed.
+pub fn remove_cron(
+    cfg: &crate::config::Config,
+    project: Option<&str>,
+    name: &str,
+) -> Result<()> {
+    let rows = load_crons(cfg, project)?;
+    let row = rows
+        .iter()
+        .find(|r| r.name() == name)
+        .ok_or_else(|| anyhow!("no cron named {name:?} (flywheel cron list)"))?;
+    match row.source {
+        CronSource::Builtin => bail!(
+            "cron {name:?} is a built-in (read-only) — shadow by writing {}/<name>.yaml",
+            global_crons_dir().display()
+        ),
+        CronSource::Global | CronSource::Project => {
+            std::fs::remove_file(&row.path)
+                .with_context(|| format!("remove {}", row.path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// The `--json` row shape for `cron list`/`status` over the ADR-0012 cron
+/// YAMLs (agent-driver surface): the resolved source + scope included.
+pub fn cron_row_json(row: &CronRow, status: &str, next_due_ts: Option<i64>) -> Value {
+    json!({
+        "name": row.name(),
+        "schedule": row.cron(),
+        "owner": row.owner(),
+        "scope": match row.scope() {
+            CronScope::Host => "host",
+            CronScope::Project => "project",
+        },
+        "source": row.source_label(),
+        "enabled": row.enabled(),
+        "mode": match row.spec.mode {
+            toron_workflow::schema::CronMode::Headless => "headless",
+            toron_workflow::schema::CronMode::Pane => "pane",
+        },
+        "steps": row.spec.steps.len(),
+        "graph_nodes": row.spec.graph.as_ref().map(|g| g.nodes.len()),
+        "status": status,
+        "next_due": next_due_ts,
+    })
 }
 
 use toron_workflow::schema::Trigger;
@@ -250,7 +516,7 @@ fn dow_ordinal(d: &str) -> String {
 }
 
 /// Current wall-clock as unix seconds.
-fn now_ts() -> i64 {
+pub fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
@@ -271,6 +537,7 @@ pub fn derive_status(enabled: bool, in_flight: bool, last_status: Option<&str>) 
 }
 
 /// The `--json` row shape for list/status (agent-driver surface).
+#[allow(dead_code)] // legacy merged-row shape — P4 (bd-25g7.4) migrates/retires
 pub fn row_json(mc: &MergedCron, status: &str, next_due_ts: Option<i64>) -> Value {
     json!({
         "name": mc.entry.name,
@@ -294,6 +561,7 @@ pub fn row_json(mc: &MergedCron, status: &str, next_due_ts: Option<i64>) -> Valu
 
 /// A cron's derived status row (Spec 3): paused | due | running | succeeded |
 /// failed, plus the next-due tick for the scheduler.
+#[allow(dead_code)] // legacy derived-status row — P4 (bd-25g7.4) migrates/retires
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronStatus {
     pub name: String,
@@ -325,6 +593,7 @@ pub struct CronRun {
 ///
 /// `add` MUST fail closed on an unresolvable template / unparsable cron /
 /// unknown owner (the lint-gate contract); the CLI does not re-validate.
+#[allow(dead_code)] // legacy manager contract — P4 (bd-25g7.4) migrates/retires
 pub trait CronManager {
     /// The merged view: registry entries + schedule-triggered workflows.
     fn list(&self) -> Result<Vec<MergedCron>>;
@@ -460,45 +729,7 @@ impl RegistryCronManager {
 pub fn cron_runner(entry: &CronEntry) -> toron_workflow::ActionRunner {
     use toron_workflow::schema::Action;
     match entry.mode {
-        CronMode::Pane => {
-            // Recording runner (the pre-P10.4 behavior): webhook probes hit
-            // the network, everything else records. P10.3 swaps this for the
-            // pane dispatch.
-            std::sync::Arc::new(|a: &Action| match a {
-                Action::CallWebhook { url, method, body } => {
-                    let method = method.as_deref().unwrap_or("GET").to_ascii_uppercase();
-                    let agent = ureq::AgentBuilder::new()
-                        .timeout(std::time::Duration::from_secs(5))
-                        .build();
-                    let resp = match method.as_str() {
-                        "POST" => {
-                            let b = body
-                                .as_deref()
-                                .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                                .unwrap_or(Value::Null);
-                            agent.post(url).send_json(b)
-                        }
-                        "PUT" => {
-                            let b = body
-                                .as_deref()
-                                .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                                .unwrap_or(Value::Null);
-                            agent.put(url).send_json(b)
-                        }
-                        "DELETE" => agent.delete(url).call(),
-                        _ => agent.get(url).call(),
-                    };
-                    match resp {
-                        Ok(r) => {
-                            let status = r.status();
-                            Ok(json!({ "ok": (200..300).contains(&status), "status": status }))
-                        }
-                        Err(e) => Err(anyhow!("probe failed: {e}")),
-                    }
-                }
-                other => Ok(json!({ "action": other.type_name(), "ok": true })),
-            })
-        }
+        CronMode::Pane => recording_runner(),
         CronMode::Headless => {
             let catalog = crate::profile::ProfileCatalog::load().unwrap_or_default();
             let name = entry.name.clone();
@@ -508,6 +739,65 @@ pub fn cron_runner(entry: &CronEntry) -> toron_workflow::ActionRunner {
                 crate::headless_dispatch(&catalog, &template, &inputs, Some(&name), a)
             })
         }
+    }
+}
+
+/// The recording runner (the pre-P10.4 behavior): webhook probes hit the
+/// network, everything else records. Shared by the pane-mode legacy runner
+/// and the ADR-0012 pane-mode spec runner.
+fn recording_runner() -> toron_workflow::ActionRunner {
+    use toron_workflow::schema::Action;
+    std::sync::Arc::new(|a: &Action| match a {
+        Action::CallWebhook { url, method, body } => {
+            let method = method.as_deref().unwrap_or("GET").to_ascii_uppercase();
+            let agent = ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(5))
+                .build();
+            let resp = match method.as_str() {
+                "POST" => {
+                    let b = body
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .unwrap_or(Value::Null);
+                    agent.post(url).send_json(b)
+                }
+                "PUT" => {
+                    let b = body
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .unwrap_or(Value::Null);
+                    agent.put(url).send_json(b)
+                }
+                "DELETE" => agent.delete(url).call(),
+                _ => agent.get(url).call(),
+            };
+            match resp {
+                Ok(r) => {
+                    let status = r.status();
+                    Ok(json!({ "ok": (200..300).contains(&status), "status": status }))
+                }
+                Err(e) => Err(anyhow!("probe failed: {e}")),
+            }
+        }
+        other => Ok(json!({ "action": other.type_name(), "ok": true })),
+    })
+}
+
+/// The action runner for a [`CronSpec`] (ADR-0012 Spec 2 — one engine, two
+/// input types): headless = real `__run-headless` dispatch (the default);
+/// pane = the recording runner (webhook probes + recorded actions).
+pub fn spec_runner(spec: &CronSpec) -> toron_workflow::ActionRunner {
+    use toron_workflow::schema::{Action, CronMode as SpecMode};
+    match spec.mode {
+        SpecMode::Headless => {
+            let catalog = crate::profile::ProfileCatalog::load().unwrap_or_default();
+            let name = spec.name.clone();
+            let inputs = Value::Null;
+            std::sync::Arc::new(move |a: &Action| {
+                crate::headless_dispatch(&catalog, &name, &inputs, Some(&name), a)
+            })
+        }
+        SpecMode::Pane => recording_runner(),
     }
 }
 
@@ -574,29 +864,196 @@ pub fn failure_bead_fields(bundle: &toron_workflow::FailureBundle) -> (String, S
     (title, description)
 }
 
-/// Start (or resume) the durable cron loops over the current merged view.
-/// Idempotent: re-invoking `cron:{name}` resumes the same durable function
-/// (restart survival). Returns once every loop is started; the loops run on
-/// the engine's in-process Resonate runtime.
+/// The synthesized improvement idea the weekly-review oracle produced
+/// (bd-m7ac). Parsed from the cron tick's workflow output — the oracle node's
+/// `response` carries `{"idea": {...}}` or `{"idea": null}` (honest skip).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewIdea {
+    pub title: String,
+    pub what: String,
+    pub why: String,
+    pub ev: String,
+    pub blast_radius: String,
+    pub acceptance: String,
+}
+
+/// Extract the weekly-review idea from a tick's workflow output (bd-m7ac).
+///
+/// Shape: the run output is the graph's step map (`{"oracle": {...}}`); the
+/// oracle node's headless dispatch returns `{"response": "<idea json>"}`.
+/// `{"idea": null}` (or a missing/empty idea) yields `None` — no bead, honest.
+///
+/// Pure — unit-testable, no IO.
+pub fn review_idea_from_output(output: &serde_json::Value) -> Option<ReviewIdea> {
+    let oracle = output.get("oracle")?;
+    let response = oracle.get("response").and_then(serde_json::Value::as_str)?;
+    let parsed: serde_json::Value = serde_json::from_str(response.trim()).ok()?;
+    let idea = parsed.get("idea")?;
+    if idea.is_null() {
+        return None;
+    }
+    let s = |k: &str| idea.get(k).and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+    let title = s("title");
+    if title.trim().is_empty() {
+        return None;
+    }
+    Some(ReviewIdea {
+        title,
+        what: s("what"),
+        why: s("why"),
+        ev: s("ev"),
+        blast_radius: s("blast_radius"),
+        acceptance: s("acceptance"),
+    })
+}
+
+/// The review bead's title + description (bd-m7ac). The idea is embedded so
+/// the captain can triage implement-or-close from `br list` alone. Pure.
+pub fn review_bead_fields(idea: &ReviewIdea, date: &str) -> (String, String) {
+    let title = format!("weekly-review {}: {}", date, idea.title);
+    let description = format!(
+        "# Weekly review (bd-m7ac smart-cron, {date})\n\
+         \n## What\n{}\n\
+         \n## Why\n{}\n\
+         \n## EV\n{}\n\
+         \n## Blast radius\n{}\n\
+         \n## Acceptance\n{}\n\
+         \nCaptain triages: implement or close. Tagged `weekly-review`.",
+        idea.what,
+        idea.why,
+        idea.ev,
+        idea.blast_radius,
+        idea.acceptance,
+    );
+    (title, description)
+}
+
+/// Create the weekly-review follow-up bead via `br create` (bd-m7ac): EXACTLY
+/// ONE bead tagged `weekly-review,<date>`, or `Ok(None)` when the oracle
+/// found nothing worth proposing (honest, not forced). The date is the tick's
+/// calendar date (the cron label + title context). Returns the bead id.
+pub fn spawn_review_bead(output: &serde_json::Value, tick_ts: i64) -> Result<Option<String>> {
+    use std::process::Command;
+    let Some(idea) = review_idea_from_output(output) else {
+        return Ok(None);
+    };
+    let date = tick_date(tick_ts);
+    let (title, description) = review_bead_fields(&idea, &date);
+    let out = Command::new("br")
+        .args([
+            "create",
+            &title,
+            "--type",
+            "feature",
+            "--priority",
+            "2",
+            "--description",
+            &description,
+            "--labels",
+            &format!("weekly-review,{date}"),
+            "--json",
+        ])
+        .output()
+        .map_err(|e| anyhow!("br create (weekly-review) failed: {e}"))?;
+    if !out.status.success() {
+        bail!(
+            "br create (weekly-review) failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let id: String = match serde_json::from_str::<Value>(raw.trim()) {
+        Ok(v) => {
+            let node = v
+                .get("issue")
+                .or_else(|| v.get("id"))
+                .or_else(|| v.as_array().and_then(|a| a.first()))
+                .cloned();
+            match node {
+                Some(n) => n
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(id unknown)")
+                    .to_string(),
+                None => "(id unknown)".to_string(),
+            }
+        }
+        Err(_) => "(id unknown)".to_string(),
+    };
+    Ok(Some(id))
+}
+
+/// The tick's calendar date (`YYYY-MM-DD`) from its unix timestamp — the
+/// weekly-review cron's per-tick label. Pure.
+pub fn tick_date(tick_ts: i64) -> String {
+    use chrono::TimeZone;
+    if tick_ts < 0 {
+        return "unknown".to_string();
+    }
+    chrono::Utc
+        .timestamp_opt(tick_ts, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Start (or resume) the durable cron loops over the current cron set —
+/// the ADR-0012 cron YAMLs (per-project > global > built-in) PLUS the legacy
+/// crons.toml/schedule-workflow registrations (P4 migrates those).
+/// Idempotent: re-invoking `cron-spec:{name}` / `cron:{name}` resumes the
+/// same durable function (restart survival). Returns once every loop is
+/// started; the loops run on the engine's in-process Resonate runtime.
 ///
 /// The health-gate + policy surface is live: `call_webhook` probes run, and
 /// `on_failure: bead` creates a `br` bead with the failure bundle. This is
 /// the P4.5 migration path — the old systemd timers stay until the workflows
 /// pass the same health-gates.
-pub async fn start_loops() -> Result<()> {
-    use toron_workflow::CronManager;
+pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> Result<()> {
+    use toron_workflow::{CronManager, CronSpecRegistration, CronSpecRegistry};
 
     let manager = RegistryCronManager::load()?;
     let registrations = manager.registrations()?;
-    if registrations.is_empty() {
-        bail!("no enabled crons registered (flywheel cron add/list)");
+    let rows = load_crons(cfg, project)?;
+    if registrations.is_empty() && !rows.iter().any(|r| r.enabled()) {
+        bail!("no enabled crons defined (flywheel cron list)");
     }
 
     // One engine + manager PER cron (P10.4): the ActionRunner receives only
     // the action, so the per-cron mode/name must be closed over at engine
-    // construction. Each engine's runner dispatches headless (or records for
-    // pane-mode crons); the durable loop id `cron:{name}` is unchanged.
+    // construction. The durable loop ids `cron-spec:{name}` (ADR-0012 YAML
+    // crons) and `cron:{name}` (legacy registrations) are unchanged.
     let mut drain_tasks = Vec::new();
+
+    // ADR-0012 YAML crons: the spec IS the registration (schedule + owner +
+    // policy + steps body all from the YAML, one engine two input types).
+    for row in rows.iter().filter(|r| r.enabled()) {
+        let engine = std::sync::Arc::new(
+            toron_workflow::WorkflowEngine::local(spec_runner(&row.spec))
+                .map_err(|e| anyhow!("engine for cron {}: {e}", row.name()))?,
+        );
+        let cron_mgr = CronManager::with_spec_registry(
+            engine.clone(),
+            std::sync::Arc::new(Vec::<toron_workflow::CronRegistration>::new),
+            Some({
+                let spec = row.spec.clone();
+                let spec_registry: CronSpecRegistry = std::sync::Arc::new(move || {
+                    vec![CronSpecRegistration {
+                        spec: spec.clone(),
+                        enabled: true,
+                        start_ts: None,
+                    }]
+                });
+                spec_registry
+            }),
+        )?;
+        let sink = engine.policy_sink().clone();
+        drain_tasks.push(tokio::spawn(async move {
+            let _ = cron_mgr.start().await;
+            drain_policy_sink(sink).await;
+        }));
+    }
+
+    // Legacy crons.toml + schedule-workflow registrations (P4 migrates).
     for reg in registrations.iter().filter(|r| r.enabled) {
         let entry = manager
             .show(&reg.name)?
@@ -606,7 +1063,6 @@ pub async fn start_loops() -> Result<()> {
             toron_workflow::WorkflowEngine::local(cron_runner(&entry))
                 .map_err(|e| anyhow!("engine for cron {}: {e}", reg.name))?,
         );
-
         let cron_mgr = CronManager::new(engine.clone(), {
             let regs = registrations.clone();
             let name = reg.name.clone();
@@ -617,35 +1073,7 @@ pub async fn start_loops() -> Result<()> {
         let sink = engine.policy_sink().clone();
         drain_tasks.push(tokio::spawn(async move {
             let _ = cron_mgr.start().await;
-            // Drain the policy sink for THIS cron's engine (bead side-effect
-            // for `on_failure: bead`). Runs until Ctrl-C.
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                let drained: Vec<toron_workflow::PolicyEvent> = {
-                    let mut guard = sink.lock().await;
-                    std::mem::take(&mut *guard)
-                };
-                for ev in drained {
-                    match ev.action {
-                        toron_workflow::schema::FailureAction::Bead => {
-                            match spawn_failure_bead(&ev.bundle) {
-                                Ok(id) => eprintln!(
-                                    "cron {}({}): failure -> bead {id} ({}#{})",
-                                    ev.cron, ev.tick, ev.bundle.workflow, ev.bundle.consecutive
-                                ),
-                                Err(e) => eprintln!(
-                                    "cron {}({}): bead side-effect failed: {e}",
-                                    ev.cron, ev.tick
-                                ),
-                            }
-                        }
-                        other => eprintln!(
-                            "cron {}({}): policy action {other:?} (side-effect not wired)",
-                            ev.cron, ev.tick
-                        ),
-                    }
-                }
-            }
+            drain_policy_sink(sink).await;
         }));
     }
 
@@ -653,6 +1081,67 @@ pub async fn start_loops() -> Result<()> {
         let _ = h.await;
     }
     Ok(())
+}
+
+/// Drain a cron engine's policy sink (bead side-effects) until Ctrl-C. The
+/// weekly-review SUCCESS side-effect (bd-m7ac): its tick output carries the
+/// oracle's idea — EXACTLY ONE bead tagged weekly-review+date; None (no bead)
+/// when the oracle honestly found nothing worth proposing. Failure events for
+/// the same cron still take the failure-bead path below (the output won't
+/// parse as an idea).
+async fn drain_policy_sink(sink: toron_workflow::PolicySink) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let drained: Vec<toron_workflow::PolicyEvent> = {
+            let mut guard = sink.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        for ev in drained {
+            if ev.bundle.workflow == "weekly-review" && ev.output.as_ref().is_some() {
+                let out = ev.output.as_ref().unwrap();
+                if let Some(idea) = review_idea_from_output(out) {
+                    match spawn_review_bead(out, ev.tick) {
+                        Ok(Some(id)) => eprintln!(
+                            "cron {}({}): weekly-review -> bead {id} (\"{}\")",
+                            ev.cron, ev.tick, idea.title
+                        ),
+                        Ok(None) => eprintln!(
+                            "cron {}({}): weekly-review found nothing worth proposing — no bead",
+                            ev.cron, ev.tick
+                        ),
+                        Err(e) => eprintln!(
+                            "cron {}({}): weekly-review bead side-effect failed: {e}",
+                            ev.cron, ev.tick
+                        ),
+                    }
+                    continue;
+                }
+                eprintln!(
+                    "cron {}({}): weekly-review output carried no idea — no bead",
+                    ev.cron, ev.tick
+                );
+                continue;
+            }
+            match ev.action {
+                toron_workflow::schema::FailureAction::Bead => {
+                    match spawn_failure_bead(&ev.bundle) {
+                        Ok(id) => eprintln!(
+                            "cron {}({}): failure -> bead {id} ({}#{})",
+                            ev.cron, ev.tick, ev.bundle.workflow, ev.bundle.consecutive
+                        ),
+                        Err(e) => eprintln!(
+                            "cron {}({}): bead side-effect failed: {e}",
+                            ev.cron, ev.tick
+                        ),
+                    }
+                }
+                other => eprintln!(
+                    "cron {}({}): policy action {other:?} (side-effect not wired)",
+                    ev.cron, ev.tick
+                ),
+            }
+        }
+    }
 }
 
 impl CronManager for RegistryCronManager {
@@ -706,6 +1195,7 @@ impl CronManager for RegistryCronManager {
 }
 
 /// Derive a [`CronStatus`] row for a merged cron (registry state + state log).
+#[allow(dead_code)] // legacy — P4 (bd-25g7.4) migrates/retires
 fn cron_status(mc: &MergedCron) -> CronStatus {
     let (last, in_flight) = last_run_state(&mc.entry.name);
     let status = derive_status(mc.entry.enabled, in_flight, last.as_deref());
@@ -719,7 +1209,7 @@ fn cron_status(mc: &MergedCron) -> CronStatus {
 }
 
 /// Last terminal status + in-flight flag for a workflow from the state log.
-fn last_run_state(name: &str) -> (Option<String>, bool) {
+pub fn last_run_state(name: &str) -> (Option<String>, bool) {
     let dir = crate::config::state_dir();
     let mut last_status: Option<String> = None;
     let mut in_flight = false;
@@ -756,7 +1246,7 @@ fn last_run_state(name: &str) -> (Option<String>, bool) {
 }
 
 /// Run history for a workflow from the state log (+ failure beads).
-fn cron_history(name: &str) -> Vec<CronRun> {
+pub fn cron_history(name: &str) -> Vec<CronRun> {
     let dir = crate::config::state_dir();
     let mut rows: Vec<CronRun> = Vec::new();
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1534,5 +2024,86 @@ owner = "housekeeper"
         );
         assert!(description.contains("gate-honcho"), "desc failed_step");
         assert!(description.contains("consecutive: 2"), "desc streak");
+    }
+
+    // ---- bd-m7ac: weekly-review bead extraction ----
+
+    /// The oracle's `{"idea": {...}}` in the tick output extracts cleanly.
+    #[test]
+    fn review_idea_extracts_from_oracle_output() {
+        let output = serde_json::json!({
+            "oracle": {
+                "response": r#"{"idea": {"title": "Soft-conflict freeze suggestion", "what": "Propose splits", "why": "Less griefing", "ev": "High", "blast_radius": "flywheel", "acceptance": "one test"}}"#
+            }
+        });
+        let idea = review_idea_from_output(&output).expect("idea present");
+        assert_eq!(idea.title, "Soft-conflict freeze suggestion");
+        assert_eq!(idea.what, "Propose splits");
+        assert_eq!(idea.why, "Less griefing");
+        assert_eq!(idea.ev, "High");
+        assert_eq!(idea.blast_radius, "flywheel");
+        assert_eq!(idea.acceptance, "one test");
+    }
+
+    /// `{"idea": null}` (the honest no-proposal contract) → no bead.
+    #[test]
+    fn review_idea_null_is_no_bead() {
+        let output = serde_json::json!({
+            "oracle": { "response": r#"{"idea": null}"# }
+        });
+        assert!(review_idea_from_output(&output).is_none(), "null idea -> None");
+    }
+
+    /// Missing oracle node / missing response / malformed JSON / empty title
+    /// all degrade to None (never a forced bead).
+    #[test]
+    fn review_idea_degradations_are_none() {
+        assert!(review_idea_from_output(&serde_json::json!({})).is_none());
+        assert!(review_idea_from_output(&serde_json::json!({"oracle": {}})).is_none());
+        assert!(
+            review_idea_from_output(&serde_json::json!({
+                "oracle": { "response": "not json at all" }
+            }))
+            .is_none()
+        );
+        assert!(
+            review_idea_from_output(&serde_json::json!({
+                "oracle": { "response": r#"{"idea": {"title": "  "}}"# }
+            }))
+            .is_none(),
+            "whitespace title -> None"
+        );
+    }
+
+    /// The review bead's fields carry the date + the full idea (captain can
+    /// triage implement-or-close from `br list` alone).
+    #[test]
+    fn review_bead_fields_carry_idea_and_date() {
+        let idea = ReviewIdea {
+            title: "Detector escalation arm".into(),
+            what: "Wire the LLM planner".into(),
+            why: "Rules-only splits miss cases".into(),
+            ev: "Medium".into(),
+            blast_radius: "flywheel/src/intent.rs".into(),
+            acceptance: "Rejecting a rule-split fires the planner".into(),
+        };
+        let (title, description) = review_bead_fields(&idea, "2026-08-10");
+        assert_eq!(title, "weekly-review 2026-08-10: Detector escalation arm");
+        assert!(description.contains("## What"), "what section");
+        assert!(description.contains("Wire the LLM planner"), "what body");
+        assert!(description.contains("## Why"), "why section");
+        assert!(description.contains("## EV"), "ev section");
+        assert!(description.contains("## Blast radius"), "blast radius section");
+        assert!(description.contains("## Acceptance"), "acceptance section");
+        assert!(description.contains("weekly-review"), "tag hint");
+    }
+
+    /// The tick's unix timestamp formats to its calendar date.
+    #[test]
+    fn tick_date_formats_calendar_date() {
+        // 2026-08-10T01:00:00Z
+        assert_eq!(tick_date(1786323600), "2026-08-10");
+        assert_eq!(tick_date(0), "1970-01-01");
+        assert_eq!(tick_date(-5), "unknown", "pre-epoch degrades safely");
     }
 }

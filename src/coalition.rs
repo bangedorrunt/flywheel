@@ -131,6 +131,32 @@ pub struct BeadStatus {
     pub status: String,
 }
 
+/// A frozen path (bd-hkw5.1 observability): a member's in-TTL intent
+/// overlaps another agent's active lease — the soft-conflict FREEZE tier
+/// (ADR-0011 Spec 4). Frozen paths are the coalition's contention surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenPath {
+    /// The contested path glob.
+    pub path: String,
+    /// The member whose intent is frozen.
+    pub agent: String,
+    /// Holders of the overlapping active leases (intent or held).
+    pub holders: Vec<String>,
+}
+
+/// An in-flight request-release negotiation (bd-hkw5.1 observability,
+/// ADR-0011 Spec 6): the requester asked the holder to release/defer a
+/// lease. `status` = `pending` | `responded` | `escalation_due` | `unknown`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NegotiationView {
+    pub requester: String,
+    pub holder: String,
+    /// The contested path (from the request subject).
+    pub path: String,
+    pub message_id: String,
+    pub status: String,
+}
+
 /// Full `coalition status <id>` view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoalitionStatus {
@@ -142,6 +168,9 @@ pub struct CoalitionStatus {
     /// Cross-project scoping: member -> project slug (absent = store project).
     #[serde(default)]
     pub member_projects: BTreeMap<String, String>,
+    /// member -> role (`captain` | `member`).
+    #[serde(default)]
+    pub roles: BTreeMap<String, String>,
     pub status: String,
     pub closed_at: Option<String>,
     pub close_reason: Option<String>,
@@ -149,6 +178,12 @@ pub struct CoalitionStatus {
     pub channel: ChannelView,
     pub intents: Vec<IntentReservation>,
     pub reservations: Vec<Reservation>,
+    /// Frozen paths (soft-conflict intents), bd-hkw5.1.
+    #[serde(default)]
+    pub frozen: Vec<FrozenPath>,
+    /// In-flight request-release negotiations, bd-hkw5.1.
+    #[serde(default)]
+    pub negotiations: Vec<NegotiationView>,
     pub beads: Vec<BeadStatus>,
 }
 
@@ -417,7 +452,19 @@ impl CoalitionStore {
         let channel = self.channel_view(&manifest.channel_id);
         let intents = self.member_intents(&manifest)?;
         let reservations = self.member_reservations(&manifest)?;
+        let frozen = self.frozen_paths(&manifest)?;
+        let negotiations = self.in_flight_negotiations(&manifest)?;
         let beads = bead_statuses(&manifest.beads, manifest.tracker_repo.as_deref());
+        let roles = manifest
+            .members
+            .iter()
+            .map(|m| {
+                (
+                    m.clone(),
+                    if m == &manifest.captain { "captain".into() } else { "member".into() },
+                )
+            })
+            .collect();
         Ok(CoalitionStatus {
             id: manifest.id.clone(),
             goal: manifest.goal.clone(),
@@ -425,6 +472,7 @@ impl CoalitionStore {
             captain: manifest.captain.clone(),
             members: manifest.members.clone(),
             member_projects: manifest.member_projects.clone(),
+            roles,
             status: manifest.status.clone(),
             closed_at: manifest.closed_at.clone(),
             close_reason: manifest.close_reason.clone(),
@@ -432,6 +480,8 @@ impl CoalitionStore {
             channel,
             intents,
             reservations,
+            frozen,
+            negotiations,
             beads,
         })
     }
@@ -512,6 +562,147 @@ impl CoalitionStore {
         manifest.close_reason = Some(reason.unwrap_or("disbanded").to_string());
         self.save_manifest(&manifest)?;
         Ok(())
+    }
+
+    /// `coalition join <id> --as <agent>`: add a late member to an ACTIVE
+    /// coalition (bd-hkw5.4, ADR-0011 dynamic membership). The joiner is
+    /// registered in their project (default: the store's project) if absent,
+    /// appended to the manifest's members (+ `member_projects` when a
+    /// different project is named), and a `member-joined` channel post lands
+    /// on the coalition board. From then on every membership-gated op
+    /// (status/board read, declare_intent, reserve, leaf) accepts the joiner.
+    ///
+    /// Idempotent: a member already in the manifest is a no-op success.
+    ///
+    /// `#[allow(dead_code)]` (bd-hkw5.4): the CLI surface (`coalition
+    /// join`/`leave` subcommands) lives in main.rs — held by the orchestrator
+    /// during this bead's window; the store methods + hermetic GATE tests are
+    /// the landed slice, wired by the main.rs holder next.
+    #[allow(dead_code)]
+    pub fn join(
+        &self,
+        id: &str,
+        agent: &str,
+        member_project: Option<&str>,
+    ) -> Result<CoalitionManifest> {
+        let mut manifest = self.load_manifest(id)?;
+        if manifest.status != "active" {
+            bail!(
+                "coalition {id} is {} — join requires an active coalition",
+                manifest.status
+            );
+        }
+        if manifest.members.contains(&agent.to_string()) {
+            return Ok(manifest); // already a member — idempotent
+        }
+        let project = member_project.unwrap_or(&self.project).to_string();
+        // The joiner must exist as an agent in THEIR project (same gate as
+        // `form`); registration is idempotent (upsert).
+        self.register_agent_in(agent, &project)?;
+        let registered: Vec<String> = runtime()?
+            .block_on(self.mailbox.list_agents(&project, ListAgentsOptions::default()))
+            .map_err(|e| anyhow!("list agents in project {project}: {e}"))?
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        if !registered.contains(&agent.to_string()) {
+            bail!("join: agent {agent} not registered in project {project}");
+        }
+        manifest.members.push(agent.to_string());
+        if member_project.is_some() {
+            manifest
+                .member_projects
+                .insert(agent.to_string(), project.clone());
+        }
+        // The join is observable on the coalition board (kind-42 post).
+        let _ = self.publish_channel_event(
+            CHANNEL_MESSAGE,
+            &manifest.channel_id,
+            &json!({
+                "member-joined": agent,
+                "project": project,
+                "members": manifest.members.len(),
+            })
+            .to_string(),
+        );
+        self.save_manifest(&manifest)?;
+        Ok(manifest)
+    }
+
+    /// `coalition leave <id> --as <agent>`: remove a member from an ACTIVE
+    /// coalition (bd-hkw5.4, ADR-0011 dynamic membership). The departed
+    /// member is dropped from the manifest (+ `member_projects`), their held
+    /// reservations are released best-effort in THEIR project (mirrors the
+    /// disband cleanup), and a `member-left` channel post lands on the board.
+    ///
+    /// Intent-cleanup on leave: the departed member's `status:intent`
+    /// declarations clear WITHOUT manual cleanup — intents carry NIP-40
+    /// expiration (INTENT_TTL_SECS) in toron-core, so they auto-expire; held
+    /// leases are released here. `member_intents`/`member_reservations` stop
+    /// surfacing the departed member immediately (the members filter).
+    ///
+    /// `#[allow(dead_code)]` — same main.rs wiring note as `join`.
+    #[allow(dead_code)]
+    pub fn leave(&self, id: &str, agent: &str) -> Result<CoalitionManifest> {
+        let mut manifest = self.load_manifest(id)?;
+        if manifest.status != "active" {
+            bail!(
+                "coalition {id} is {} — leave requires an active coalition",
+                manifest.status
+            );
+        }
+        if !manifest.members.contains(&agent.to_string()) {
+            return Ok(manifest); // already gone — idempotent
+        }
+        let project = self.project_of(&manifest, agent);
+        // Release the departed member's held leases in their project
+        // (best-effort: a member without a local key is skipped with a
+        // warning, never an error — same posture as disband).
+        match runtime()?.block_on(
+            self.mailbox
+                .release_file_reservations(&project, agent, &[]),
+        ) {
+            Ok(r) if r.released > 0 => {
+                eprintln!(
+                    "coalition leave: released {} lease(s) held by {agent} in {project}",
+                    r.released
+                );
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "coalition leave: could not release {agent}'s reservations in {project}: {e}"
+            ),
+        }
+        manifest.members.retain(|m| m != agent);
+        manifest.member_projects.remove(agent);
+        let _ = self.publish_channel_event(
+            CHANNEL_MESSAGE,
+            &manifest.channel_id,
+            &json!({
+                "member-left": agent,
+                "project": project,
+                "members": manifest.members.len(),
+            })
+            .to_string(),
+        );
+        self.save_manifest(&manifest)?;
+        Ok(manifest)
+    }
+
+    /// Register an agent in an arbitrary project (join's per-project gate).
+    fn register_agent_in(&self, agent: &str, project: &str) -> Result<()> {
+        use toron_core::nostr::identity::AgentProfile;
+        let profile = AgentProfile {
+            name: agent.to_string(),
+            program: Some("opencode".into()),
+            model: None,
+            persona: None,
+            task_description: None,
+        };
+        runtime()?
+            .block_on(self.mailbox.register_agent(project, &profile))
+            .map(|_| ())
+            .map_err(|e| anyhow!("register agent {agent} in {project}: {e}"))
     }
 
     // ------------------------------------------------------------------
@@ -933,6 +1124,84 @@ impl CoalitionStore {
             .get(member)
             .cloned()
             .unwrap_or_else(|| self.project.clone())
+    }
+
+    /// Frozen paths (bd-hkw5.1): a member's in-TTL intent that SOFT-conflicts
+    /// with another agent's active lease (ADR-0011 Spec 4 freeze tier). The
+    /// conflict probe is per-member-best-effort: a member without a local key
+    /// in the store's data dir (e.g. an xproj member registered elsewhere)
+    /// contributes no frozen paths — status never fails on observability.
+    fn frozen_paths(&self, manifest: &CoalitionManifest) -> Result<Vec<FrozenPath>> {
+        let mut out = Vec::new();
+        for intent in self.member_intents(manifest)? {
+            let project = self.project_of(manifest, &intent.agent_name);
+            let report = runtime()?
+                .block_on(self.mailbox.check_file_reservation_conflicts(
+                    &project,
+                    &intent.agent_name,
+                    std::slice::from_ref(&intent.path_pattern),
+                ))
+                .map_err(|e| anyhow!("frozen-path probe for {}: {e}", intent.agent_name))?;
+            for soft in &report.soft_conflicts {
+                out.push(FrozenPath {
+                    path: soft.path.clone(),
+                    agent: intent.agent_name.clone(),
+                    holders: soft.holders.clone(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// In-flight request-release negotiations (bd-hkw5.1, ADR-0011 Spec 6):
+    /// the members' inboxes carry the typed kind-14 request DMs; each
+    /// `[request-release]` row becomes a negotiation view with its resolved
+    /// status (pending | responded | escalation_due | unknown). Best-effort:
+    /// a member whose inbox cannot be fetched (no local key) contributes
+    /// nothing.
+    fn in_flight_negotiations(&self, manifest: &CoalitionManifest) -> Result<Vec<NegotiationView>> {
+        use toron_core::mailbox::{FetchInbox, RequestReleaseStatus};
+        let mut out = Vec::new();
+        for member in &manifest.members {
+            let project = self.project_of(manifest, member);
+            let inbox = runtime()?
+                .block_on(self.mailbox.fetch_inbox(&FetchInbox {
+                    project_slug: project.clone(),
+                    agent_name: member.clone(),
+                    unread_only: false,
+                    limit: Some(30),
+                    include_bodies: false,
+                }))
+                .map_err(|e| anyhow!("negotiation probe inbox for {member}: {e}"))?;
+            for m in inbox {
+                let Some(path) = m.subject.strip_prefix("[request-release]") else {
+                    continue;
+                };
+                let path = path.trim().to_string();
+                // The requester is the row's sender; status resolves from
+                // the requester's perspective (the window tier).
+                let status = runtime()?.block_on(self.mailbox.request_release_status(
+                    &project,
+                    &m.sender,
+                    &m.id,
+                    None,
+                ));
+                let status = match status {
+                    RequestReleaseStatus::Pending { .. } => "pending",
+                    RequestReleaseStatus::Responded { .. } => "responded",
+                    RequestReleaseStatus::EscalationDue { .. } => "escalation_due",
+                    RequestReleaseStatus::Unknown => "unknown",
+                };
+                out.push(NegotiationView {
+                    requester: m.sender,
+                    holder: member.clone(),
+                    path,
+                    message_id: m.id,
+                    status: status.into(),
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Distinct projects across the coalition's members (bd-hkw5.3): the
@@ -1666,6 +1935,219 @@ mod tests {
             .post_leaf_result(&m.id, "gk", "@planner", "split: src/", &outcome)
             .expect_err("gk is not a member");
         assert!(err.to_string().contains("not a member"), "got: {err}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// bd-hkw5.1 GATE (hermetic): the deepened status shows roles, intent
+    /// TTL, frozen paths (soft conflicts), in-flight negotiations, and the
+    /// full view survives JSON round-trips (agents parse it clean).
+    #[test]
+    fn status_observability_shows_roles_ttl_frozen_negotiations() {
+        let root = std::env::temp_dir().join(format!("fw-coal-obs-{}", uuid::Uuid::new_v4()));
+        let data = std::env::temp_dir().join(format!("fw-coal-obs-data-{}", uuid::Uuid::new_v4()));
+        let store = CoalitionStore::open_at("obs-e2e", root.clone(), data.clone())
+            .expect("open hermetic store");
+        store.register_agent("oc").expect("register oc");
+        store.register_agent("pi").expect("register pi");
+        let m = store
+            .form("beads", "oc", &["oc".into(), "pi".into()], &BTreeMap::new(), &[], None)
+            .expect("form");
+
+        // oc declares a broad intent; pi declares an overlapping subpath —
+        // the soft-conflict freeze fires on pi's (and oc's) intent.
+        store
+            .declare_intent(&m.id, "oc", &["src/**".into()], Some("bd-a"), Some(300))
+            .expect("oc intent with TTL");
+        store
+            .declare_intent(&m.id, "pi", &["src/engine.rs".into()], Some("bd-b"), Some(300))
+            .expect("pi intent");
+
+        // oc holds a lease; pi asks oc to release it (in-flight negotiation).
+        let res = store
+            .reserve(&m.id, "oc", &["src/guard.rs".into()], Some(600), true, Some("bd-a"))
+            .expect("oc reserve");
+        let reservation_id = res.granted[0].id.clone();
+        store
+            .negotiate_request(
+                &m.id,
+                "pi",
+                "oc",
+                &reservation_id,
+                ReleaseAsk::Release,
+                Some("hand it over"),
+            )
+            .expect("pi requests release");
+
+        let st = store.status(&m.id).expect("status");
+
+        // Roles: captain vs member.
+        assert_eq!(st.roles.get("oc").map(String::as_str), Some("captain"));
+        assert_eq!(st.roles.get("pi").map(String::as_str), Some("member"));
+
+        // Intents carry TTL + expiry (epoch µs).
+        let oc_intent = st
+            .intents
+            .iter()
+            .find(|i| i.agent_name == "oc")
+            .expect("oc intent in status");
+        assert!(oc_intent.expires_ts_us.is_some(), "intent expiry present");
+        assert!(oc_intent.ttl_secs > 0, "intent ttl present");
+
+        // Frozen paths: pi's overlapping intent is frozen against oc's lease.
+        assert!(
+            st.frozen.iter().any(|f| f.agent == "pi" && f.path == "src/engine.rs"),
+            "pi's intent frozen: {:?}",
+            st.frozen
+        );
+
+        // In-flight negotiation: pi -> oc on the contested lease.
+        assert!(
+            st.negotiations
+                .iter()
+                .any(|n| n.requester == "pi" && n.holder == "oc" && n.path == "src/guard.rs"),
+            "negotiation visible: {:?}",
+            st.negotiations
+        );
+
+        // Rich JSON parses clean (the agent surface).
+        let value = serde_json::to_value(&st).expect("status serializes");
+        let back: CoalitionStatus = serde_json::from_value(value).expect("status deserializes");
+        assert_eq!(back.frozen.len(), st.frozen.len());
+        assert_eq!(back.negotiations.len(), st.negotiations.len());
+        assert_eq!(back.roles.get("oc").map(String::as_str), Some("captain"));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// bd-hkw5.4 join-mid-goal GATE (hermetic mailbox): a crew joins an
+    /// ACTIVE coalition mid-goal, reads the intent board (status shows the
+    /// existing members' intents), and acquires a NON-OVERLAPPING scope
+    /// (reserve succeeds against a path the incumbent never touched). The
+    /// join is idempotent and a non-member still cannot reserve.
+    #[test]
+    fn dynamic_join_reads_board_and_acquires_non_overlapping_scope() {
+        let root = std::env::temp_dir().join(format!("fw-coal-join-{}", uuid::Uuid::new_v4()));
+        let data = std::env::temp_dir().join(format!("fw-coal-join-data-{}", uuid::Uuid::new_v4()));
+        let store = CoalitionStore::open_at("join-e2e", root.clone(), data.clone())
+            .expect("open hermetic store");
+        store.register_agent("oc").expect("register oc");
+        store.register_agent("pi").expect("register pi");
+
+        // Form with oc + pi; pi declares an intent on the board.
+        let m = store
+            .form("beads", "oc", &["oc".into(), "pi".into()], &BTreeMap::new(), &[], None)
+            .expect("form");
+        store.declare_intent(&m.id, "pi", &["src/engine.rs".into()], Some("pi-wip"), None)
+            .expect("pi intent");
+
+        // gk joins mid-goal (registers itself via join, idempotent on re-join).
+        let joined = store.join(&m.id, "gk", None).expect("gk joins");
+        assert!(joined.members.contains(&"gk".to_string()), "{joined:?}");
+        let again = store.join(&m.id, "gk", None).expect("gk joins again");
+        assert_eq!(again.members.len(), joined.members.len(), "idempotent join");
+
+        // Board read: the late joiner sees the incumbent's intent.
+        let st = store.status(&m.id).expect("status after join");
+        assert!(
+            st.intents.iter().any(|i| i.agent_name == "pi" && i.path_pattern == "src/engine.rs"),
+            "late joiner reads the board: {:?}",
+            st.intents
+        );
+        assert!(st.members.contains(&"gk".to_string()), "gk in status");
+
+        // Non-overlapping scope: gk reserves a path pi never touched — no
+        // hard conflict, lease granted.
+        let got = store
+            .reserve(&m.id, "gk", &["src/workflow/**".into()], Some(120), true, Some("gk-slice"))
+            .expect("gk reserves non-overlapping scope");
+        assert!(got.conflicts.is_empty(), "{got:?}");
+        assert!(
+            got.granted.iter().any(|g| g.path_pattern == "src/workflow/**"),
+            "gk lease granted: {:?}",
+            got.granted
+        );
+
+        // An outsider (never joined) still cannot reserve.
+        let err = store.reserve(&m.id, "outsider", &["src/other.rs".into()], None, true, None);
+        assert!(err.is_err(), "non-member reserve denied");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// bd-hkw5.4 leave GATE (hermetic mailbox): a departed crew's intents
+    /// clear WITHOUT manual cleanup — leave drops the member from the
+    /// manifest (status stops surfacing their intents/reservations), releases
+    /// their held leases in their project, and their `status:intent`
+    /// declarations auto-expire via NIP-40 TTL (toron-core semantics, verified
+    /// here by the intent disappearing from the member-filtered board after
+    /// leave + the TTL window).
+    #[test]
+    fn dynamic_leave_clears_departed_member_without_manual_cleanup() {
+        let root = std::env::temp_dir().join(format!("fw-coal-leave-{}", uuid::Uuid::new_v4()));
+        let data = std::env::temp_dir().join(format!("fw-coal-leave-data-{}", uuid::Uuid::new_v4()));
+        let store = CoalitionStore::open_at("leave-e2e", root.clone(), data.clone())
+            .expect("open hermetic store");
+        store.register_agent("oc").expect("register oc");
+        store.register_agent("pi").expect("register pi");
+
+        let m = store
+            .form("beads", "oc", &["oc".into(), "pi".into()], &BTreeMap::new(), &[], None)
+            .expect("form");
+        store.declare_intent(&m.id, "pi", &["src/engine.rs".into()], Some("pi-wip"), Some(1))
+            .expect("pi intent (1s TTL)");
+        store
+            .reserve(&m.id, "pi", &["src/guard.rs".into()], Some(120), true, Some("pi-hold"))
+            .expect("pi reserves");
+
+        // pi leaves (ungraceful — no manual cleanup call).
+        let after = store.leave(&m.id, "pi").expect("pi leaves");
+        assert!(!after.members.contains(&"pi".to_string()), "{after:?}");
+
+        // Status no longer surfaces the departed member's intents or leases.
+        let st = store.status(&m.id).expect("status after leave");
+        assert!(!st.members.contains(&"pi".to_string()), "{st:?}");
+        assert!(
+            !st.intents.iter().any(|i| i.agent_name == "pi"),
+            "departed intents not surfaced: {:?}",
+            st.intents
+        );
+        assert!(
+            !st.reservations.iter().any(|r| r.agent_name == "pi"),
+            "departed leases released: {:?}",
+            st.reservations
+        );
+
+        // Held leases physically released in the mailbox (leave cleanup).
+        let held = runtime()
+            .unwrap()
+            .block_on(store.mailbox.active_reservations("leave-e2e"))
+            .expect("active reservations");
+        assert!(
+            !held.iter().any(|r| r.agent_name == "pi"),
+            "pi's lease physically released: {held:?}"
+        );
+
+        // The departed member's intent auto-expires via NIP-40 (TTL) — no
+        // manual cleanup: wait out the 1s TTL, then the intent is gone from
+        // the project-wide board (the auto-expire mechanism clears it).
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let board = store.board().expect("board");
+        assert!(
+            !board.iter().any(|i| i.agent == "pi" && i.path == "src/engine.rs"),
+            "pi's intent auto-expired off the board: {board:?}"
+        );
+
+        // Rejoin after leave works (membership is dynamic both ways).
+        let rejoined = store.join(&m.id, "pi", None).expect("pi rejoins");
+        assert!(rejoined.members.contains(&"pi".to_string()), "{rejoined:?}");
+
+        // Leave is idempotent on a departed member.
+        let again = store.leave(&m.id, "pi").expect("leave again");
+        assert!(!again.members.contains(&"pi".to_string()));
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);
