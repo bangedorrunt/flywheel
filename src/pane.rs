@@ -137,11 +137,9 @@ pub fn ensure_crew(plan: &CrewPlan, wf_name: &str) -> Result<()> {
 /// [`PaneRunCtx`] for the runner and the run-end reap decision.
 ///
 /// Stale-workspace protection mirrors `cmd_spawn` (bd-fw-stale-workspace-panes
-/// -hgp + bd-627z.3): a pre-existing FLYWHEEL-OWNED project workspace blocks
-/// the spawn unless `--retire-orphans` closes it first; a foreign workspace
-/// (captain/omp session labeled like the project) only warns — with
-/// `--reuse WORKSPACE` the named workspace is bound instead (never blocked,
-/// never reaped).
+/// -hgp): a pre-existing project workspace blocks the spawn unless
+/// `--retire-orphans` closes it first — with `--reuse WORKSPACE` the named
+/// workspace is bound instead (never blocked, never reaped).
 #[allow(clippy::too_many_arguments)] // one param per CLI flag, mirrors cmd_spawn
 pub fn pre_spawn_crew(
     cfg: &Config,
@@ -163,48 +161,22 @@ pub fn pre_spawn_crew(
         );
     }
     let label = crate::swarm_label(project);
-    let split = crate::project_workspaces(&mut c, project)?;
+    let orphans = crate::project_workspaces(&mut c, project)?;
 
     // --reuse: bind the named workspace (caller-owned, never reaped, and the
     // orphan guard skips it — it IS the target).
     if let Some(ws_id) = reuse {
-        if !split
-            .owned
-            .iter()
-            .chain(&split.foreign)
-            .any(|ws| ws.workspace_id == ws_id)
-        {
+        if !orphans.iter().any(|ws| ws.workspace_id == ws_id) {
             bail!("--reuse workspace {ws_id} not found for {project}");
         }
         let entries = spawn_crew_into(
-            cfg, project, wf_name, plan, catalog, &mut c, ws_id, &label,
+            cfg, project, wf_name, plan, catalog, &mut c, &ws_id, &label,
         )?;
         return Ok(PaneRunCtx {
             workspace_id: ws_id.to_string(),
             entries,
             retained: true,
         });
-    }
-    let orphans = split.owned;
-
-    // bd-627z.3: a foreign workspace (captain/omp session labeled like the
-    // project) is not the stale-pane race — warn and proceed, never close it.
-    if !split.foreign.is_empty() {
-        let detail: Vec<String> = split
-            .foreign
-            .iter()
-            .map(|ws| {
-                format!(
-                    "{} (label {:?}, {} panes)",
-                    ws.workspace_id, ws.label, ws.pane_count
-                )
-            })
-            .collect();
-        eprintln!(
-            "flywheel: warn: {} foreign workspace(s) share the {project} label but are not flywheel-owned — leaving them alone: {}",
-            split.foreign.len(),
-            detail.join(", ")
-        );
     }
 
     // Fresh workspace: stale panes would race the new crew — same contract as
@@ -244,7 +216,6 @@ pub fn pre_spawn_crew(
 
 /// The actual pane splits + agent starts for one workspace (shared by the
 /// fresh-spawn and --reuse paths). Returns the registry entries.
-#[allow(clippy::too_many_arguments)] // one param per caller mirror, mirrors cmd_spawn
 fn spawn_crew_into(
     cfg: &Config,
     project: &str,
@@ -337,7 +308,7 @@ fn spawn_crew_into(
                 ));
                 let agent =
                     crate::start_agent_with_retry(c, &name, harness, &pane_id, &agent_args)?;
-                let _ = crate::register_spawned_agent(cfg, project, &name, harness, &agent.pane_id);
+                crate::register_spawned_agent(cfg, project, &name, harness, &agent.pane_id);
                 // The first dispatch fires as soon as the engine runs step 1 —
                 // a still-booting agent rejects prompts (`agent_not_ready`).
                 // Wait for the pane to settle idle before returning
@@ -353,15 +324,11 @@ fn spawn_crew_into(
             };
             prev = Some(agent_pane_id.clone());
             registry.retain(|e| e.name != name);
-            // bd-627z.4: pin the registered mail identity at spawn so assign
-            // resolves this pane's agent deterministically.
-            let mail_identity = crate::register_spawned_agent(cfg, project, &name, harness, &agent_pane_id);
             registry.push(SpawnEntry {
                 pane_id: agent_pane_id.clone(),
                 name: name.clone(),
                 profile: Some(role.clone()),
                 harness: Some(harness.clone()),
-                mail_identity,
             });
             eprintln!(
                 "  crew {}: {} ({}) @{}",
@@ -533,14 +500,12 @@ mod tests {
                 name: "crew-wf-planner".into(),
                 profile: Some("planner".into()),
                 harness: Some("omp".into()),
-                mail_identity: None,
             },
             SpawnEntry {
                 pane_id: "w1:p2".into(),
                 name: "crew-wf-coder".into(),
                 profile: Some("coder".into()),
                 harness: Some("omp".into()),
-                mail_identity: None,
             },
             SpawnEntry::legacy("w1:p3", "plain-agent"),
         ];
@@ -562,14 +527,12 @@ mod tests {
                 name: "crew-wf-reviewer".into(),
                 profile: Some("reviewer".into()),
                 harness: Some("omp".into()),
-                mail_identity: None,
             },
             SpawnEntry {
                 pane_id: "w1:p2".into(),
                 name: "crew-wf-scout".into(),
                 profile: Some("scout".into()),
                 harness: Some("opencode".into()),
-                mail_identity: None,
             },
         ];
         let e = resolve_pane_by_harness(&entries, "opencode").expect("opencode pane");
@@ -591,7 +554,6 @@ mod tests {
                 name: "crew-wf-coder".into(),
                 profile: Some("coder".into()),
                 harness: Some("omp".into()),
-                mail_identity: None,
             },
             SpawnEntry::legacy("w1:p3", "plain"),
         ];

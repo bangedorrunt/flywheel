@@ -293,21 +293,18 @@ both.
 
 ## Beads Workflow Integration
 
-Bead/issue work is delivered via **slash commands** (triage → claim → reserve →
-announce → execute → verify → close → sync → handoff): `/beads-triage`,
-`/beads-execute`, `/beads-review`, `/beads-commit`, `/beads-create` — the
-`prompts/beads-*.md` files per tool (opencode/pi/grok/omp). GENERATED from the
-shared body (`integrations/beads-body.md.tpl`) — regenerate after any flywheel
-rebuild so they stay current with the workflow:
+Bead/issue work in this project is delegated to the **`beads` subagent**
+(triage → claim → reserve → announce → execute → verify → close → sync →
+handoff). The subagent definition is GENERATED — regenerate it after any
+flywheel rebuild so it stays current with the workflow:
 
 ```bash
-flywheel integration opencode   # -> prompts/beads-{triage,execute,review,commit,create}.md
-flywheel integration pi         # -> ~/.pi/agent/prompts/beads-*.md
-flywheel integration grok       # -> ~/.grok/prompts/beads-*.md
-flywheel integration omp        # -> ~/.omp/agent/prompts/beads-*.md
+flywheel integration opencode   # -> ~/.config/opencode/agents/beads.md
+flywheel integration pi         # -> ~/.pi/agent/agents/beads.md
+flywheel integration grok       # -> ~/.grok/agents/beads.md
 ```
 
-### Essential Commands (the lifecycle the slash commands drive)
+### Essential Commands (same surface the subagent uses)
 
 ```bash
 br ready --json                    # ready work (open, unblocked, not deferred)
