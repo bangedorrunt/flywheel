@@ -159,6 +159,60 @@ steps:
 "##,
     ),
     (
+        "goal-direct",
+        r##"
+name: goal-direct
+description: "Captain-free DIRECT arm of goal (bd-t86p) — brainstorm → plan → build → review → ship with NO bead tracking and NO plan approval gate: non-bead targets flow straight to the coder. `flywheel steer \"<target>\" --direct` runs this."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: objective
+steps:
+  - name: ideate
+    action: call_workflow
+    workflow: brainstorm
+    inputs: { question: "{{inputs.objective}}" }
+  - name: plan
+    action: call_workflow
+    workflow: plan-direct
+    inputs: { goal: "{{inputs.objective}}" }
+  - name: build
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@coder", stage: "systematic-execute", plan: "{{steps.plan}}" }
+    on_error: fail_run
+  - name: review
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@reviewer", stage: "code-review", plan: "{{steps.build}}" }
+    on_error: fail_run
+  - name: ship
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@housekeeper", stage: "commit-and-push", plan: "{{steps.build}}" }
+    on_error: fail_run
+"##,
+    ),
+    (
+        "plan-direct",
+        r##"
+name: plan-direct
+description: "Goal → execution plan WITHOUT the approval gate (bd-t86p): the captain-free companion to `plan`. The plan gate is the one interactive checkpoint; a steer --direct run must not park on it — the captain already stated the target."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: goal
+steps:
+  - name: decompose
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@planner", task: "Decompose this goal into an execution plan (tasks, subtasks, dependency structure) — direct mode, no tracker, no approval: {{inputs.goal}}" }
+    on_error: fail_run
+"##,
+    ),
+    (
         "triage",
         r##"
 name: triage
@@ -335,6 +389,67 @@ mod tests {
         ] {
             assert!(wfs.contains_key(name), "built-in {name} present");
         }
+    }
+
+    /// bd-t86p: the goal DIRECT arm is a built-in (`goal-direct` + its
+    /// gate-free `plan-direct` companion). Both parse, lint clean, and
+    /// declare crew: auto — the captain-free compose surface needs
+    /// zero-config auto-crew like the parent goal.
+    #[test]
+    fn goal_direct_arm_is_crew_auto_and_lint_clean() {
+        let wfs = builtin_workflows();
+        for name in ["goal-direct", "plan-direct"] {
+            let wf = &wfs[name];
+            assert_eq!(
+                wf.crew,
+                Some(CrewSpec::Auto),
+                "{name} is crew: auto (captain-free zero-config)"
+            );
+            let report = toron_workflow::lint_workflow(wf);
+            assert!(
+                report.is_clean(),
+                "{name} must lint clean (the steer gate): {:?}",
+                report.issues
+            );
+        }
+    }
+
+    /// bd-t86p: goal-direct is goal MINUS the tracker + the plan gate — the
+    /// direct arm's steps are ideate/plan/build/review/ship (no `beads`
+    /// call, and `plan-direct` has no `request_approval` step). This pins
+    /// the autonomous contract: a steer --direct run never parks on an
+    /// approval or depends on the tracker.
+    #[test]
+    fn goal_direct_skips_tracker_and_approval_gate() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+
+        // goal-direct: no call to the `beads` workflow (the tracker).
+        let direct = &wfs["goal-direct"];
+        let step_names: Vec<&str> = direct
+            .steps
+            .iter()
+            .filter_map(|s| s.name.as_deref())
+            .collect();
+        assert_eq!(step_names, vec!["ideate", "plan", "build", "review", "ship"]);
+        for s in &direct.steps {
+            if let Action::CallWorkflow { workflow, .. } = &s.action {
+                assert_ne!(
+                    workflow.as_str(), "beads",
+                    "goal-direct must not call the beads workflow"
+                );
+            }
+        }
+
+        // plan-direct: the decompose dispatch, NO request_approval gate.
+        let plan_direct = &wfs["plan-direct"];
+        assert!(
+            plan_direct
+                .steps
+                .iter()
+                .all(|s| !matches!(&s.action, Action::RequestApproval { .. })),
+            "plan-direct must not carry the plan approval gate"
+        );
     }
 
     /// The purpose-named workflows declare `crew: auto` (zero-config,
