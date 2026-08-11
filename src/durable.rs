@@ -3521,6 +3521,18 @@ pub fn loop_dispatch_runner(project: String, confirm_sends: bool) -> ActionRunne
 async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     let mut queue = params.queue.clone();
     let mut iteration = 0u64;
+    // bd-3aen parity: bead-driven mode tracks which beads were handed out
+    // (mirrors swarm_loop's assigned-set; deterministic across replays).
+    let mut assigned: Vec<String> = Vec::new();
+    // per-agent consecutive send-failure count (send-stall escalation).
+    let mut send_failures: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    // self-heal state per agent (bd-event-self-heal parity).
+    let mut heal_states: std::collections::HashMap<String, HealState> =
+        std::collections::HashMap::new();
+    // per-agent herdr kind learned from polls — needed to respawn an agent.
+    let mut agent_kinds: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     // the engine + its runner: constructed once per invocation; each dispatch
     // tick is an engine `invoke` (idempotent on its run id).
     let engine = WorkflowEngine::remote(
@@ -3597,15 +3609,155 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             }
         };
 
-        // plan the tick: queue feeds Send actions; nudge when empty.
         clear_stale_landed_for_idle(&params.project, &params.invocation, &states);
-        let actions = plan_actions(
+        clear_live_failures(&mut send_failures, &states);
+        learn_kinds(&mut agent_kinds, &states);
+
+        // self-heal (bd-event-self-heal): diagnose → respawn (budgeted) →
+        // blocked. Same phase as the imperative loop.
+        let mut exited_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for ev in &event_batch.events {
+            if ev.event_type == "pane.exited" {
+                if let Some(n) = name_for_pane(&states, &ev.pane_id) {
+                    exited_names.insert(n);
+                } else if let Some(a) = &ev.agent {
+                    let hits: Vec<_> = states.iter().filter(|s| s.kind == *a).collect();
+                    if hits.len() == 1 {
+                        exited_names.insert(hits[0].name.clone());
+                    }
+                }
+            }
+        }
+        let mut heal_actions: Vec<LoopAction> = Vec::new();
+        for s in &states {
+            let exited = exited_names.contains(&s.name);
+            let hs = heal_states.entry(s.name.clone()).or_default();
+            match self_heal_step(
+                hs,
+                &s.status,
+                exited,
+                params.unknown_diagnose_threshold,
+                params.respawn_budget,
+            ) {
+                HealAction::None => {}
+                HealAction::Diagnose => {
+                    let reason = if exited {
+                        "pane_exited"
+                    } else {
+                        "unknown-stuck"
+                    };
+                    heal_actions.push(LoopAction::Diagnose {
+                        name: s.name.clone(),
+                        reason: reason.into(),
+                    });
+                }
+                HealAction::Respawn => {
+                    heal_actions.push(LoopAction::Respawn {
+                        name: s.name.clone(),
+                        reason: if exited {
+                            "pane_exited".into()
+                        } else {
+                            "unknown-stuck".into()
+                        },
+                    });
+                }
+                HealAction::EscalateBlocked => {
+                    heal_actions.push(LoopAction::Blocked {
+                        name: s.name.clone(),
+                    });
+                }
+            }
+        }
+
+        // bead-driven mode: refresh the instruction queue from the tracker
+        // each poll — same sourcing as the imperative loop (bd-3aen parity).
+        if params.work {
+            let inprog: Vec<ReadyBead> = match ctx
+                .run(
+                    poll_inprogress,
+                    ReadyArgs {
+                        project: params.project.clone(),
+                    },
+                )
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("flywheel: poll_inprogress leaf failed (continuing): {e}");
+                    vec![]
+                }
+            };
+            let live_names: Vec<String> = states.iter().map(|s| s.name.clone()).collect();
+            let stranded: Vec<String> = stranded_beads(&inprog, &live_names)
+                .into_iter()
+                .map(|b| b.id.clone())
+                .collect();
+            if !stranded.is_empty() {
+                match ctx
+                    .run(
+                        reclaim_stranded,
+                        ReclaimArgs {
+                            project: params.project.clone(),
+                            live: live_names.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(r) => {
+                        for id in &r.reclaimed {
+                            eprintln!("flywheel: reclaimed stranded bead {id} (re-dispatching)");
+                        }
+                        for f in &r.failed {
+                            eprintln!("flywheel: reclaim failed for {f}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("flywheel: reclaim_stranded leaf failed (continuing): {e}");
+                    }
+                }
+            }
+            let to_resume: Vec<&ReadyBead> = inprog
+                .iter()
+                .filter(|b| !assigned.contains(&b.id) && !stranded.contains(&b.id))
+                .collect();
+            for bead in to_resume {
+                queue.push(resume_prompt(&bead.id, &bead.title));
+                assigned.push(bead.id.clone());
+            }
+
+            let ready: Vec<ReadyBead> = match ctx
+                .run(
+                    poll_ready,
+                    ReadyArgs {
+                        project: params.project.clone(),
+                    },
+                )
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("flywheel: poll_ready leaf failed (continuing): {e}");
+                    vec![]
+                }
+            };
+            let to_assign: Vec<&ReadyBead> =
+                ready.iter().filter(|b| !assigned.contains(&b.id)).collect();
+            for bead in to_assign {
+                queue.push(bead_prompt(&bead.id, &bead.title));
+                assigned.push(bead.id.clone());
+            }
+        }
+
+        // plan the tick: queue feeds Send actions; nudge when empty.
+        let mut actions: Vec<LoopAction> = heal_actions;
+        actions.extend(plan_actions(
             &states,
             &mut queue,
             params.nudge.as_deref(),
             &HashMap::new(),
             &std::collections::HashSet::new(),
-        );
+        ));
 
         let mut any_work = false;
         let mut any_blocked = false;
@@ -3613,6 +3765,40 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             match action {
                 LoopAction::Send { name, text }
                 | LoopAction::DispatchImmediate { name, text } => {
+                    // context guard: if the idle agent is context-exhausted,
+                    // respawn a fresh instance instead of delegating to it
+                    let verdict = match ctx
+                        .run(
+                            read_output,
+                            ReadArgs {
+                                project: params.project.clone(),
+                                name: name.clone(),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!(
+                                "flywheel: read_output leaf failed for {name} (continuing): {e}"
+                            );
+                            ContextVerdict::Healthy
+                        }
+                    };
+                    if verdict == ContextVerdict::Exhausted {
+                        respawn_and_requeue(
+                            ctx,
+                            &params,
+                            &mut queue,
+                            &agent_kinds,
+                            name,
+                            Some(text),
+                            "context_limit",
+                            0,
+                        )
+                        .await;
+                        continue;
+                    }
                     let profile = crate::state::load_spawn_registry(&params.project)
                         .into_iter()
                         .find(|e| e.name == *name)
@@ -3635,28 +3821,68 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     };
                     // linear-step runs return outputs under the step name; a
                     // fail_run abort returns {"status":"failed",...}.
-                    let ok = match value.get("dispatch") {
-                        Some(d) => d.get("ok").and_then(Value::as_bool).unwrap_or(false),
-                        None => false,
-                    };
-                    if ok {
-                        any_work = true;
-                    } else {
-                        // put the item back at the FRONT so the next poll
-                        // retries it (a dead agent never silently consumes a
-                        // prompt) — same as the imperative path.
-                        let err = value
-                            .get("error")
-                            .or_else(|| value.get("dispatch").and_then(|d| d.get("error")))
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown send failure");
-                        eprintln!("flywheel: send to {name} failed: {err}");
-                        queue.insert(0, text.clone());
+                    let outcome = engine_dispatch_outcome(name, &value);
+                    any_work = true;
+                    match handle_send_result(&mut send_failures, name, &outcome) {
+                        Escalation::Accept => {}
+                        Escalation::FailStop => {
+                            return Err(map_err(anyhow::anyhow!(
+                                "{}",
+                                failstop_message(name, outcome.reason.as_deref())
+                            )));
+                        }
+                        Escalation::RespawnAndRequeue => {
+                            let attempts = send_failures.get(name).copied().unwrap_or(0);
+                            let reason = outcome.reason.as_deref().unwrap_or("stalled");
+                            respawn_and_requeue(
+                                ctx,
+                                &params,
+                                &mut queue,
+                                &agent_kinds,
+                                name,
+                                Some(text),
+                                reason,
+                                attempts,
+                            )
+                            .await;
+                        }
                     }
                 }
                 LoopAction::Blocked { name } => {
                     any_blocked = true;
-                    eprintln!("flywheel: {name} blocked (engine loop — escalation deferred to bd-e0xk later slices)");
+                    if params.on_blocked == "mail" {
+                        let out = match ctx
+                            .run(
+                                notify_blocked,
+                                NotifyArgs {
+                                    project: params.project.clone(),
+                                    name: name.clone(),
+                                    first_blocked_ts: None,
+                                    interval_secs: params.interval_secs,
+                                    params: serde_json::to_value(&params)
+                                        .unwrap_or(serde_json::Value::Null),
+                                },
+                            )
+                            .await
+                        {
+                            Ok(o) => o,
+                            Err(e) => {
+                                eprintln!(
+                                    "flywheel: notify_blocked leaf failed for {name} (continuing): {e}"
+                                );
+                                continue;
+                            }
+                        };
+                        let tier_enum = match out.tier {
+                            0 => EscalationTier::T0,
+                            1 => EscalationTier::T1,
+                            2 => EscalationTier::T2,
+                            _ => EscalationTier::T3,
+                        };
+                        if let Some(msg) = on_blocked_tier_exit(tier_enum, &params.on_blocked) {
+                            return Ok(msg);
+                        }
+                    }
                 }
                 LoopAction::Nudge { name } => {
                     let profile = crate::state::load_spawn_registry(&params.project)
@@ -3676,27 +3902,116 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             eprintln!("flywheel: loop-dispatch engine run for {name} failed: {e:#}");
                             json!({ "ok": false, "error": format!("{e:#}") })
                         });
-                    let nudge_ok = match value.get("dispatch") {
-                        Some(d) => d.get("ok").and_then(Value::as_bool).unwrap_or(false),
-                        None => false,
-                    };
-                    if nudge_ok {
-                        any_work = true;
+                    let outcome = engine_dispatch_outcome(name, &value);
+                    any_work = true;
+                    match handle_send_result(&mut send_failures, name, &outcome) {
+                        Escalation::Accept => {}
+                        Escalation::FailStop => {
+                            return Err(map_err(anyhow::anyhow!(
+                                "{}",
+                                failstop_message(name, outcome.reason.as_deref())
+                            )));
+                        }
+                        Escalation::RespawnAndRequeue => {
+                            let attempts = send_failures.get(name).copied().unwrap_or(0);
+                            let reason = outcome.reason.as_deref().unwrap_or("stalled");
+                            respawn_and_requeue(
+                                ctx,
+                                &params,
+                                &mut queue,
+                                &agent_kinds,
+                                name,
+                                None,
+                                reason,
+                                attempts,
+                            )
+                            .await;
+                        }
                     }
                 }
-                LoopAction::Wait => {}
-                _ => {
-                    // Diagnose / respawn / self-heal / xproj phases are
-                    // deferred to later slices — logged, never dispatched
-                    // through the engine path yet.
-                    eprintln!("flywheel: engine loop: action {action:?} deferred (bd-e0xk later slices)");
+                LoopAction::Diagnose { name, reason } => {
+                    let diag = ctx
+                        .run(
+                            diagnose_agent,
+                            DiagnoseArgs {
+                                project: params.project.clone(),
+                                name: name.clone(),
+                                reason: reason.clone(),
+                            },
+                        )
+                        .await;
+                    let hs = heal_states.entry(name.clone()).or_default();
+                    match diag {
+                        Ok(_) => apply_diagnose_outcome(hs, true),
+                        Err(e) => {
+                            eprintln!(
+                                "flywheel: diagnose_agent leaf failed for {name} (heal state untouched): {e}"
+                            );
+                        }
+                    }
+                    any_work = true;
                 }
+                LoopAction::Respawn { name, reason } => {
+                    let attempts = heal_states
+                        .get(name)
+                        .map(|h| u64::from(h.respawn_count))
+                        .unwrap_or(1);
+                    respawn_and_requeue(
+                        ctx,
+                        &params,
+                        &mut queue,
+                        &agent_kinds,
+                        name,
+                        None,
+                        reason,
+                        attempts,
+                    )
+                    .await;
+                    any_work = true;
+                }
+                LoopAction::Wait => {}
             }
         }
         if any_blocked && params.on_blocked == "stop" {
             return Err(map_err(anyhow::anyhow!(
                 "agent(s) blocked — stopping loop (--on-blocked stop)"
             )));
+        }
+
+        // work mode completion guard (bd-627z.1): an in-progress bead held by
+        // a LIVE agent must keep the loop alive — re-prompt it next poll.
+        let inprogress_blocking = if params.work {
+            match ctx
+                .run(
+                    poll_inprogress,
+                    ReadyArgs {
+                        project: params.project.clone(),
+                    },
+                )
+                .await
+            {
+                Ok(bs) => {
+                    let live_names: Vec<String> =
+                        states.iter().map(|s| s.name.clone()).collect();
+                    !blocking_inprogress(&bs, &live_names).is_empty()
+                }
+                Err(e) => {
+                    eprintln!("flywheel: poll_inprogress leaf failed (completion guard): {e}");
+                    true
+                }
+            }
+        } else {
+            false
+        };
+
+        let all_settled = all_settled(&states);
+
+        if queue.is_empty()
+            && all_settled
+            && !any_work
+            && !inprogress_blocking
+        {
+            return Ok("complete".to_string());
         }
 
         wait_secs = next_interval_secs(
@@ -3706,6 +4021,42 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             params.active_interval_secs,
         );
         ctx.sleep(Duration::from_secs(wait_secs)).await?;
+    }
+}
+
+/// Map an engine `loop-dispatch` run's output to the escalation vocabulary.
+/// The runner returns `{ok: true, name}` on success and `{ok: false, error}`
+/// on failure — the same landing classification the imperative send_prompt
+/// leaf produces (bd-3aen parity).
+fn engine_dispatch_outcome(name: &str, value: &Value) -> SendOutcome {
+    let ok = match value.get("dispatch") {
+        Some(d) => d.get("ok").and_then(Value::as_bool).unwrap_or(false),
+        None => false,
+    };
+    if ok {
+        SendOutcome {
+            ok: true,
+            name: name.to_string(),
+            landed: Some(true),
+            status: None,
+            reason: None,
+            deduped: false,
+        }
+    } else {
+        let err = value
+            .get("error")
+            .or_else(|| value.get("dispatch").and_then(|d| d.get("error")))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown send failure")
+            .to_string();
+        SendOutcome {
+            ok: false,
+            name: name.to_string(),
+            landed: Some(false),
+            status: None,
+            reason: Some(err),
+            deduped: false,
+        }
     }
 }
 
@@ -3733,6 +4084,33 @@ pub async fn run_engine_loop(cfg: &Config, mut params: LoopParams) -> anyhow::Re
     resonate
         .register(poll_events)
         .map_err(|e| anyhow::anyhow!("register poll_events: {e}"))?;
+    // bd-3aen parity: the engine loop now drives the same phases as the
+    // imperative loop (work-mode sourcing, context guard, escalation,
+    // self-heal) — register every leaf it shells.
+    resonate
+        .register(poll_ready)
+        .map_err(|e| anyhow::anyhow!("register poll_ready: {e}"))?;
+    resonate
+        .register(poll_inprogress)
+        .map_err(|e| anyhow::anyhow!("register poll_inprogress: {e}"))?;
+    resonate
+        .register(reclaim_stranded)
+        .map_err(|e| anyhow::anyhow!("register reclaim_stranded: {e}"))?;
+    resonate
+        .register(read_output)
+        .map_err(|e| anyhow::anyhow!("register read_output: {e}"))?;
+    resonate
+        .register(poll_kind)
+        .map_err(|e| anyhow::anyhow!("register poll_kind: {e}"))?;
+    resonate
+        .register(respawn_agent)
+        .map_err(|e| anyhow::anyhow!("register respawn_agent: {e}"))?;
+    resonate
+        .register(diagnose_agent)
+        .map_err(|e| anyhow::anyhow!("register diagnose_agent: {e}"))?;
+    resonate
+        .register(notify_blocked)
+        .map_err(|e| anyhow::anyhow!("register notify_blocked: {e}"))?;
 
     // Resume semantics: same as the imperative loop — reuse the persisted
     // invocation id while its promise is pending; fresh id once settled.

@@ -201,6 +201,12 @@ pub fn spawn_registry_file(project: &str) -> PathBuf {
 /// `profile: Some(role)`; ordinary swarm spawns leave it `None`. Pre-P10.3
 /// registry files (2-tuples) deserialize via the tolerant [`Deserialize`]
 /// impl below; new writes use the struct shape.
+///
+/// The `mail_identity` column (bd-627z.4) pins the agent's registered
+/// agent-mail identity (adjective+noun) to the pane/name AT SPAWN TIME.
+/// `assign` resolves through this map, so a numbered agent (oc2/oc3/...) keeps
+/// the SAME identity across calls and restarts — the deterministic binding
+/// instead of re-hashing the (renumberable) herdr name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SpawnEntry {
     /// the herdr pane id the agent runs in
@@ -217,6 +223,11 @@ pub struct SpawnEntry {
     /// via the catalog at dispatch time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
+    /// the registered agent-mail identity (adjective+noun) pinned at spawn
+    /// (bd-627z.4). `None` for pre-bd-627z.4 entries — assign falls back to
+    /// the deterministic hash mapping for those.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mail_identity: Option<String>,
 }
 
 impl SpawnEntry {
@@ -227,6 +238,22 @@ impl SpawnEntry {
             name: name.into(),
             profile: None,
             harness: None,
+            mail_identity: None,
+        }
+    }
+
+    /// Full entry: pane + name + the pinned mail identity (bd-627z.4).
+    pub fn with_mail_identity(
+        pane_id: impl Into<String>,
+        name: impl Into<String>,
+        mail_identity: impl Into<String>,
+    ) -> Self {
+        Self {
+            pane_id: pane_id.into(),
+            name: name.into(),
+            profile: None,
+            harness: None,
+            mail_identity: Some(mail_identity.into()),
         }
     }
 }
@@ -250,6 +277,8 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 profile: Option<String>,
                 #[serde(default)]
                 harness: Option<String>,
+                #[serde(default)]
+                mail_identity: Option<String>,
             },
         }
         match Raw::deserialize(d)? {
@@ -258,17 +287,20 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 name,
                 profile: None,
                 harness: None,
+                mail_identity: None,
             }),
             Raw::New {
                 pane_id,
                 name,
                 profile,
                 harness,
+                mail_identity,
             } => Ok(SpawnEntry {
                 pane_id,
                 name,
                 profile,
                 harness,
+                mail_identity,
             }),
         }
     }
@@ -1895,6 +1927,7 @@ mod loops_sidecar_tests {
                 name: "crew-wf-planner-1".into(),
                 profile: Some("planner".into()),
                 harness: Some("omp".into()),
+                mail_identity: None,
             },
             SpawnEntry::legacy("w2A:p2", "flywheel-reg-profile-oc"),
         ];
@@ -1918,6 +1951,7 @@ mod loops_sidecar_tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].profile.as_deref(), Some("planner"));
         assert_eq!(loaded[0].harness, None, "absent column -> None");
+        assert_eq!(loaded[0].mail_identity, None, "absent column -> None");
         std::fs::write(
             &legacy_path,
             r#"[["w9:p1","flywheel-x-oc"],["w9:p2","flywheel-x-pi"]]"#,
@@ -1936,6 +1970,37 @@ mod loops_sidecar_tests {
         // cleanup
         let _ = std::fs::remove_file(&legacy_path);
         let _ = std::fs::remove_file(legacy_path.with_extension("json.tmp"));
+    }
+
+    /// bd-627z.4: the MAIL IDENTITY column survives a round-trip (the
+    /// deterministic pane→identity pin assign resolves through), and
+    /// pre-bd-627z.4 files (no column) still load with mail_identity: None.
+    #[test]
+    fn spawn_registry_mail_identity_column_roundtrip() {
+        let _g = loops_test_guard();
+        let p = test_project("reg-mail-id");
+        let entries = vec![
+            SpawnEntry::with_mail_identity("w3:p1", "flywheel-reg-mail-oc2", "DustySparrow"),
+            SpawnEntry::with_mail_identity("w3:p2", "flywheel-reg-mail-oc3", "RoseDune"),
+        ];
+        save_spawn_registry(&p, &entries).unwrap();
+        assert_eq!(load_spawn_registry(&p), entries, "identity pin round-trips");
+
+        // A pre-bd-627z.4 file (pane+name+profile only) still loads —
+        // mail_identity: None → assign falls back to the hash mapping.
+        let path = spawn_registry_file(&p);
+        std::fs::write(
+            &path,
+            r#"[{"pane_id":"w9:p1","name":"flywheel-x-oc2","profile":"coder","harness":"omp"}]"#,
+        )
+        .unwrap();
+        let loaded = load_spawn_registry(&p);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "flywheel-x-oc2");
+        assert_eq!(loaded[0].mail_identity, None, "absent column -> None");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.tmp"));
     }
 
     /// bd-fw-stale-loop-processes: the pid registry round-trips atomically.
