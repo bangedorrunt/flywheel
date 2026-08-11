@@ -196,22 +196,25 @@ pub fn renew_args(
     args
 }
 
-/// `force_release_file_reservation`. The id type diverges per backend
-/// (agent-mail: numeric; toron daemon: string) — the caller passes the
-/// already-coerced value, the key maps once here.
+/// `force_release_file_reservation`. bd-cumj: the daemon resolves the active
+/// lease by path (+ optional holder) itself — no caller-supplied event id.
 pub fn force_release_args(
     project_key: &str,
     agent_name: &str,
-    file_reservation_id: Value,
+    path: &str,
+    holder: Option<&str>,
     note: Option<&str>,
     notify_previous: bool,
 ) -> Value {
     let mut args = json!({
         "project_key": project_key,
         "agent_name": agent_name,
-        "file_reservation_id": file_reservation_id,
+        "path": path,
         "notify_previous": notify_previous,
     });
+    if let Some(h) = holder {
+        args["holder"] = json!(h);
+    }
     if let Some(n) = note {
         args["note"] = json!(n);
     }
