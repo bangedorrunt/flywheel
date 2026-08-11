@@ -157,6 +157,17 @@ pub struct LoopConfig {
     pub unknown_diagnose_threshold: Option<u32>,
     /// max respawns per agent per loop run before escalate-blocked (default 2)
     pub respawn_budget: Option<u32>,
+    /// consecutive `unknown` polls treated as DETECTION GRACE (bd-bvwf.5):
+    /// an unknown agent younger than this is presumed detecting (fresh
+    /// spawn / mid-identification), never Diagnosed or Respawnd. Default 6
+    /// (~3min at the 30s active cadence — herdr takes 30-60s to classify a
+    /// fresh pane).
+    pub unknown_detect_grace_polls: Option<u32>,
+    /// completion drain-grace polls (bd-bvwf.3): the completion condition
+    /// must hold for grace+1 consecutive polls before the loop exits — the
+    /// extra poll catches a bead unblocked by the last closure (dependency
+    /// chain) without a manual restart. Default 1.
+    pub drain_grace_polls: Option<u32>,
 }
 
 impl Config {
@@ -174,6 +185,22 @@ impl Config {
             .as_ref()
             .and_then(|l| l.respawn_budget)
             .unwrap_or(2)
+    }
+
+    /// Detection-grace polls (default 6).
+    pub fn unknown_detect_grace_polls(&self) -> u32 {
+        self.r#loop
+            .as_ref()
+            .and_then(|l| l.unknown_detect_grace_polls)
+            .unwrap_or(6)
+    }
+
+    /// Completion drain-grace polls (default 1).
+    pub fn drain_grace_polls(&self) -> u32 {
+        self.r#loop
+            .as_ref()
+            .and_then(|l| l.drain_grace_polls)
+            .unwrap_or(1)
     }
 
     pub fn load() -> Result<Self> {

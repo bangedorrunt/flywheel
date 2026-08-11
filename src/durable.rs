@@ -85,6 +85,17 @@ pub struct LoopParams {
     /// max respawns per agent per loop run before EscalateBlocked.
     #[serde(default = "default_respawn_budget")]
     pub respawn_budget: u32,
+    /// consecutive `unknown` polls treated as DETECTION GRACE (bd-bvwf.5):
+    /// below this, an unknown agent is presumed detecting (fresh spawn /
+    /// mid-identification) — no Diagnose, no Respawn. 0 = old behavior.
+    #[serde(default = "default_unknown_detect_grace_polls")]
+    pub unknown_detect_grace_polls: u32,
+    /// completion drain-grace polls (bd-bvwf.3): the completion condition
+    /// must hold for grace+1 consecutive polls before the loop exits — the
+    /// extra poll catches a bead unblocked by the last closure (dependency
+    /// chain) without a manual restart.
+    #[serde(default = "default_drain_grace_polls")]
+    pub drain_grace_polls: u32,
     /// Resonate server url for the engine path (bd-e0xk): set by the runner;
     /// empty → engine default localhost:8001.
     #[serde(default)]
@@ -97,6 +108,14 @@ fn default_unknown_diagnose_threshold() -> u32 {
 
 fn default_respawn_budget() -> u32 {
     DEFAULT_RESPAWN_BUDGET
+}
+
+fn default_unknown_detect_grace_polls() -> u32 {
+    DEFAULT_UNKNOWN_DETECT_GRACE_POLLS
+}
+
+fn default_drain_grace_polls() -> u32 {
+    DEFAULT_DRAIN_GRACE_POLLS
 }
 
 fn default_true() -> bool {
@@ -1918,6 +1937,14 @@ pub fn blocking_inprogress<'a>(inprogress: &'a [ReadyBead], live_names: &[String
 /// agent `working`, `blocked`, or `unknown` → `active_secs`; a fully
 /// idle/done (or empty) swarm → `base_secs`. Clamped to >= 5s.
 ///
+/// `pending_work` (bd-bvwf.2 — detection-retry): work is queued but NO agent
+/// is classified (all `unknown`, or the swarm is empty — a freshly spawned
+/// crew is not yet in herdr's agent.list). The first poll after a fresh spawn
+/// otherwise sees an empty/unknown swarm and falls to `base_secs`, stranding
+/// the first bead for a full settled interval while herdr identifies the
+/// panes. With pending work and nothing classified, the loop re-polls on the
+/// ACTIVE cadence until detection completes.
+///
 /// `unknown` counts as unsettled BY DESIGN: an unknown-heavy swarm is a swarm
 /// needing repair (`bd-unknown-respawn`), and repairs must proceed on the
 /// active cadence. An all-unknown swarm therefore polls at 30s rather than
@@ -1933,14 +1960,19 @@ pub fn blocking_inprogress<'a>(inprogress: &'a [ReadyBead], live_names: &[String
 pub fn next_interval_secs(
     states: &[AgentState],
     dispatched: bool,
+    pending_work: bool,
     base_secs: u64,
     active_secs: u64,
 ) -> u64 {
     const INTERVAL_MIN: u64 = 5;
+    let classified = states
+        .iter()
+        .any(|s| matches!(s.status.as_str(), "idle" | "done"));
     let busy = dispatched
         || states
             .iter()
-            .any(|s| matches!(s.status.as_str(), "working" | "blocked" | "unknown"));
+            .any(|s| matches!(s.status.as_str(), "working" | "blocked" | "unknown"))
+        || (pending_work && !classified);
     let chosen = if busy { active_secs } else { base_secs };
     chosen.max(INTERVAL_MIN)
 }
@@ -2100,6 +2132,19 @@ pub const DEFAULT_UNKNOWN_DIAGNOSE_THRESHOLD: u32 = 3;
 /// Max respawns per agent per loop run before escalate-to-blocked.
 pub const DEFAULT_RESPAWN_BUDGET: u32 = 2;
 
+/// Consecutive `unknown` polls treated as DETECTION GRACE (bd-bvwf.5).
+/// Default 6 (~3min at the 30s active cadence — herdr takes 30-60s to
+/// classify a fresh pane): an unknown agent younger than this is presumed
+/// detecting, never Diagnosed or Respawnd. A genuinely dead pane is caught
+/// by the `pane.exited` event (immediate ladder) or by grace exhaustion.
+pub const DEFAULT_UNKNOWN_DETECT_GRACE_POLLS: u32 = 6;
+
+/// Completion drain-grace polls (bd-bvwf.3). Default 1: the completion
+/// condition must hold TWO consecutive polls before exit — the second poll
+/// re-sources `br ready` and catches a bead unblocked by the last closure
+/// (dependency chain), so the loop drives the whole chain in one run.
+pub const DEFAULT_DRAIN_GRACE_POLLS: u32 = 1;
+
 /// Legacy alias: old tests/callers used a hard respawn threshold of 2.
 /// Per-agent self-heal bookkeeping (bd-event-self-heal-unknown).
 /// Survives within a run; optionally mirrored into `loops.json` `respawn`.
@@ -2134,21 +2179,26 @@ pub enum HealAction {
     EscalateBlocked,
 }
 
-/// Pure self-heal step (bd-event-self-heal-unknown).
+/// Pure self-heal step (bd-event-self-heal-unknown + bd-bvwf.5).
 ///
 /// | input | action |
 /// |-------|--------|
 /// | classified (not unknown, not exited) | reset episode counters; keep `respawn_count` |
+/// | unknown × `detect_grace` | None — presumed DETECTING (fresh spawn / mid-identification); the loop re-polls on the active cadence instead |
 /// | unknown × diagnose_threshold | Diagnose, set `awaiting_clear` |
 /// | unknown while `awaiting_clear` | Respawn (if budget), else EscalateBlocked |
-/// | `exited=true` first time | Diagnose immediately |
+/// | `exited=true` first time | Diagnose immediately (definitive death — pane gone, not detection) |
 /// | `exited=true` after diagnose / again | Respawn or EscalateBlocked |
 ///
-/// `respawn_budget` caps Respawn per agent for the whole loop run.
+/// `respawn_budget` caps Respawn per agent for the whole loop run. A
+/// genuinely dead pane is caught by the `pane.exited` event (immediate
+/// ladder) or by grace exhaustion — a WORKING agent that polls unknown for a
+/// few polls is never touched.
 pub fn self_heal_step(
     hs: &mut HealState,
     status: &str,
     exited: bool,
+    detect_grace: u32,
     diagnose_threshold: u32,
     respawn_budget: u32,
 ) -> HealAction {
@@ -2184,6 +2234,13 @@ pub fn self_heal_step(
 
     // unknown path
     hs.unknown_count = hs.unknown_count.saturating_add(1);
+
+    // detection grace (bd-bvwf.5): young unknown = still detecting. Never
+    // diagnose/respawn inside the window — the loop re-polls on the active
+    // cadence until the pane classifies.
+    if hs.unknown_count <= detect_grace {
+        return HealAction::None;
+    }
 
     if hs.awaiting_clear {
         // diagnosed last tick; still unknown → respawn
@@ -2322,6 +2379,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     let mut event_stream_errors: u64 = 0;
     // adaptive wait for the next poll_events block (starts active)
     let mut wait_secs: u64 = params.active_interval_secs.max(5);
+    // consecutive completion-condition holds (bd-bvwf.3 drain-grace): the
+    // loop exits only when the condition holds drain_grace_polls+1 times.
+    let mut complete_holds: u32 = 0;
     // agents that received DispatchImmediate and await working confirmation
     // (bd-event-dispatch double-dispatch guard)
     let mut dispatch_pending: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2510,6 +2570,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 hs,
                 &s.status,
                 exited,
+                params.unknown_detect_grace_polls,
                 params.unknown_diagnose_threshold,
                 params.respawn_budget,
             ) {
@@ -3225,56 +3286,70 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // loop would declare "complete" while the swarm is mid-work.
         let all_settled = all_settled(&states);
 
-        if queue.is_empty()
+        // completion drain-grace (bd-bvwf.3): the condition must hold for
+        // grace+1 CONSECUTIVE polls. The first hold short-sleeps and loops
+        // once more — the re-source of `br ready` on that pass catches a bead
+        // whose dependency was released by the last closure (chain step), so
+        // the loop drives the WHOLE chain in one run instead of exiting
+        // between steps.
+        let complete_now = queue.is_empty()
             && all_settled
             && !any_work
             && !inprogress_blocking
-            && expected_replies.is_empty()
-        {
-            return Ok("complete".to_string());
-        }
-
-        // Lease renewal heartbeat (bd-mail-lease-renewal-durable): extend the
-        // orchestrator's own file reservations by 4× the base interval each
-        // tick. Best-effort BY DESIGN — agent-mail being unreachable must not
-        // kill an overnight run; a missed renew is recoverable next tick
-        // (idempotent: renewing a fresh lease is a no-op). `ctx.run` makes it
-        // a checkpointed side effect, so crash-resume renews without
-        // duplicating reservations.
-        match ctx
-            .run(
-                renew_leases,
-                RenewLeaseArgs {
-                    project: params.project.clone(),
-                    extend_seconds: lease_renew_seconds(params.interval_secs),
-                },
-            )
-            .await
-        {
-            Ok(v) => {
-                let renewed = v.get("renewed").and_then(Value::as_u64).unwrap_or(0);
-                // is1.4: quiet at idle — only print when something renewed.
-                if renewed > 0 {
-                    eprintln!("flywheel: renewed {renewed} lease(s)");
-                }
+            && expected_replies.is_empty();
+        if complete_now {
+            complete_holds += 1;
+            if complete_holds > params.drain_grace_polls {
+                return Ok("complete".to_string());
             }
-            Err(e) => eprintln!("flywheel: lease renew failed (continuing): {e}"),
-        }
+            // grace pass: short wait (active cadence), then re-poll + re-source
+            wait_secs = params.active_interval_secs.clamp(5, 30);
+        } else {
+            complete_holds = 0;
 
-        // Adaptive wait for the NEXT poll_events block. We already blocked
-        // inside poll_events for wait_secs (or woke early on events), so there
-        // is no trailing ctx.sleep — that would double the idle latency.
-        // Resonate still checkpoints each leaf; crash mid-wait re-runs the
-        // leaf (fresh forward-only subscription — correct).
-        wait_secs = next_interval_secs(
-            &states,
-            any_work,
-            params.interval_secs,
-            params.active_interval_secs,
-        );
-        // if events woke us, tighten the next wait so we re-sample promptly
-        if !event_batch.events.is_empty() {
-            wait_secs = wait_secs.min(params.active_interval_secs).max(5);
+            // Lease renewal heartbeat (bd-mail-lease-renewal-durable): extend
+            // the orchestrator's own file reservations by 4× the base interval
+            // each tick. Best-effort BY DESIGN — agent-mail being unreachable
+            // must not kill an overnight run; a missed renew is recoverable
+            // next tick (idempotent: renewing a fresh lease is a no-op).
+            // `ctx.run` makes it a checkpointed side effect, so crash-resume
+            // renews without duplicating reservations.
+            match ctx
+                .run(
+                    renew_leases,
+                    RenewLeaseArgs {
+                        project: params.project.clone(),
+                        extend_seconds: lease_renew_seconds(params.interval_secs),
+                    },
+                )
+                .await
+            {
+                Ok(v) => {
+                    let renewed = v.get("renewed").and_then(Value::as_u64).unwrap_or(0);
+                    // is1.4: quiet at idle — only print when something renewed.
+                    if renewed > 0 {
+                        eprintln!("flywheel: renewed {renewed} lease(s)");
+                    }
+                }
+                Err(e) => eprintln!("flywheel: lease renew failed (continuing): {e}"),
+            }
+
+            // Adaptive wait for the NEXT poll_events block. We already blocked
+            // inside poll_events for wait_secs (or woke early on events), so
+            // there is no trailing ctx.sleep — that would double the idle
+            // latency. Resonate still checkpoints each leaf; crash mid-wait
+            // re-runs the leaf (fresh forward-only subscription — correct).
+            wait_secs = next_interval_secs(
+                &states,
+                any_work,
+                !queue.is_empty(),
+                params.interval_secs,
+                params.active_interval_secs,
+            );
+            // if events woke us, tighten the next wait so we re-sample promptly
+            if !event_batch.events.is_empty() {
+                wait_secs = wait_secs.min(params.active_interval_secs).max(5);
+            }
         }
     }
 }
@@ -3399,6 +3474,12 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     // the workflow must know its own invocation id for the last-sent registry
     // (bd-resume-dedup filters records to the SAME invocation)
     params.invocation = id.clone();
+
+    // bd-bvwf.4: verify ownership right before the durable run — a newer
+    // process may have taken over the pid registry while this one resolved
+    // its invocation; the loser must never resume the same promise (two
+    // loops = double sends).
+    crate::state::ensure_loop_owner(&params.project)?;
 
     let task = resonate.run(&id, swarm_loop, params.clone());
     let result: String = task
@@ -3545,6 +3626,8 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     )
     .map_err(map_err)?;
     let mut wait_secs: u64 = params.active_interval_secs.max(5);
+    // consecutive completion-condition holds (bd-bvwf.3 drain-grace).
+    let mut complete_holds: u32 = 0;
     let mut event_cursor_seq: u64 = 0;
     let mut event_stream_errors: u64 = 0;
 
@@ -3637,6 +3720,7 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 hs,
                 &s.status,
                 exited,
+                params.unknown_detect_grace_polls,
                 params.unknown_diagnose_threshold,
                 params.respawn_budget,
             ) {
@@ -4006,20 +4090,29 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
 
         let all_settled = all_settled(&states);
 
-        if queue.is_empty()
+        // completion drain-grace (bd-bvwf.3): hold for grace+1 consecutive
+        // polls — the extra pass re-sources `br ready` and catches a bead
+        // unblocked by the last closure (dependency chain).
+        let complete_now = queue.is_empty()
             && all_settled
             && !any_work
-            && !inprogress_blocking
-        {
-            return Ok("complete".to_string());
+            && !inprogress_blocking;
+        if complete_now {
+            complete_holds += 1;
+            if complete_holds > params.drain_grace_polls {
+                return Ok("complete".to_string());
+            }
+            wait_secs = params.active_interval_secs.clamp(5, 30);
+        } else {
+            complete_holds = 0;
+            wait_secs = next_interval_secs(
+                &states,
+                any_work,
+                !queue.is_empty(),
+                params.interval_secs,
+                params.active_interval_secs,
+            );
         }
-
-        wait_secs = next_interval_secs(
-            &states,
-            any_work,
-            params.interval_secs,
-            params.active_interval_secs,
-        );
         ctx.sleep(Duration::from_secs(wait_secs)).await?;
     }
 }
@@ -4141,6 +4234,12 @@ pub async fn run_engine_loop(cfg: &Config, mut params: LoopParams) -> anyhow::Re
     };
     params.invocation = id.clone();
     params.resonate_url = url;
+
+    // bd-bvwf.4: verify ownership right before the durable run — a newer
+    // process may have taken over the pid registry while this one resolved
+    // its invocation; the loser must never resume the same promise (two
+    // loops = double sends).
+    crate::state::ensure_loop_owner(&params.project)?;
 
     let task = resonate.run(&id, engine_loop, params.clone());
     let result: String = task
@@ -4490,19 +4589,19 @@ mod tests {
     #[test]
     fn next_interval_working_is_active() {
         let states = vec![st("a", "working")];
-        assert_eq!(next_interval_secs(&states, false, 300, 30), 30);
+        assert_eq!(next_interval_secs(&states, false, false, 300, 30), 30);
     }
 
     #[test]
     fn next_interval_blocked_is_active() {
         let states = vec![st("a", "blocked")];
-        assert_eq!(next_interval_secs(&states, false, 300, 30), 30);
+        assert_eq!(next_interval_secs(&states, false, false, 300, 30), 30);
     }
 
     #[test]
     fn next_interval_all_idle_is_base() {
         let states = vec![st("a", "idle"), st("b", "done")];
-        assert_eq!(next_interval_secs(&states, false, 300, 30), 300);
+        assert_eq!(next_interval_secs(&states, false, false, 300, 30), 300);
     }
 
     #[test]
@@ -4511,13 +4610,13 @@ mod tests {
         // will be working during the sleep — a dispatch must force the active
         // cadence or the swarm drains at base speed
         let states = vec![st("a", "idle")];
-        assert_eq!(next_interval_secs(&states, true, 300, 30), 30);
+        assert_eq!(next_interval_secs(&states, true, false, 300, 30), 30);
     }
 
     #[test]
     fn next_interval_all_done_is_base() {
         let states = vec![st("a", "done")];
-        assert_eq!(next_interval_secs(&states, false, 300, 30), 300);
+        assert_eq!(next_interval_secs(&states, false, false, 300, 30), 300);
     }
 
     #[test]
@@ -4525,22 +4624,42 @@ mod tests {
         // unknown counts as unsettled → active cadence, so pending repairs
         // (bd-unknown-respawn) proceed promptly
         let states = vec![st("a", "unknown")];
-        assert_eq!(next_interval_secs(&states, false, 300, 30), 30);
+        assert_eq!(next_interval_secs(&states, false, false, 300, 30), 30);
     }
 
     #[test]
     fn next_interval_empty_is_base() {
         let states = vec![];
-        assert_eq!(next_interval_secs(&states, false, 300, 30), 300);
+        assert_eq!(next_interval_secs(&states, false, false, 300, 30), 300);
+    }
+
+    /// bd-bvwf.2 detection-retry: pending work + NO classified agent (empty
+    /// or all-unknown swarm — a freshly spawned crew herdr has not identified
+    /// yet) → ACTIVE cadence, so the loop re-polls in ~30s instead of the
+    /// settled 300s and dispatches the moment detection completes.
+    #[test]
+    fn next_interval_pending_work_with_unclassified_swarm_is_active() {
+        // empty poll (agents not yet in herdr's agent.list)
+        let empty = vec![];
+        assert_eq!(next_interval_secs(&empty, false, true, 300, 30), 30);
+        // all-unknown poll
+        let unknown = vec![st("a", "unknown"), st("b", "unknown")];
+        assert_eq!(next_interval_secs(&unknown, false, true, 300, 30), 30);
+        // pending work + a CLASSIFIED idle agent → base cadence is fine
+        // (the dispatch this iteration already forces active via any_work)
+        let idle = vec![st("a", "idle")];
+        assert_eq!(next_interval_secs(&idle, false, true, 300, 30), 300);
+        // no pending work + empty swarm → settled base (nothing to do)
+        assert_eq!(next_interval_secs(&empty, false, false, 300, 30), 300);
     }
 
     #[test]
     fn next_interval_clamps_to_interval_min() {
         let states = vec![st("a", "working")];
-        assert_eq!(next_interval_secs(&states, false, 300, 2), 5);
+        assert_eq!(next_interval_secs(&states, false, false, 300, 2), 5);
         // base below the floor also clamps
         let idle = vec![st("a", "idle")];
-        assert_eq!(next_interval_secs(&idle, false, 3, 30), 5);
+        assert_eq!(next_interval_secs(&idle, false, false, 3, 30), 5);
     }
 
     // ---- send-stall escalation (bd-send-stall-escalation) ----
@@ -5253,6 +5372,8 @@ mod tests {
             invocation: "inv-1".into(),
             unknown_diagnose_threshold: 3,
             respawn_budget: 2,
+            unknown_detect_grace_polls: 6,
+            drain_grace_polls: 1,
             resonate_url: String::new(),
         };
         let v = serde_json::to_value(&p).unwrap();
@@ -5266,6 +5387,8 @@ mod tests {
         assert_eq!(back.invocation, "inv-1");
         assert_eq!(back.unknown_diagnose_threshold, 3);
         assert_eq!(back.respawn_budget, 2);
+        assert_eq!(back.unknown_detect_grace_polls, 6);
+        assert_eq!(back.drain_grace_polls, 1);
     }
 
     #[test]
@@ -5714,21 +5837,21 @@ mod tests {
         let mut hs = HealState::default();
         // threshold 3: first two unknowns → None
         assert_eq!(
-            self_heal_step(&mut hs, "unknown", false, 3, 2),
+            self_heal_step(&mut hs, "unknown", false, 0, 3, 2),
             HealAction::None
         );
         assert_eq!(
-            self_heal_step(&mut hs, "unknown", false, 3, 2),
+            self_heal_step(&mut hs, "unknown", false, 0, 3, 2),
             HealAction::None
         );
         assert_eq!(
-            self_heal_step(&mut hs, "unknown", false, 3, 2),
+            self_heal_step(&mut hs, "unknown", false, 0, 3, 2),
             HealAction::Diagnose
         );
         assert!(hs.awaiting_clear);
         // still unknown after diagnose → respawn
         assert_eq!(
-            self_heal_step(&mut hs, "unknown", false, 3, 2),
+            self_heal_step(&mut hs, "unknown", false, 0, 3, 2),
             HealAction::Respawn
         );
         assert_eq!(hs.respawn_count, 1);
@@ -5738,11 +5861,11 @@ mod tests {
     fn self_heal_exited_diagnose_immediate() {
         let mut hs = HealState::default();
         assert_eq!(
-            self_heal_step(&mut hs, "working", true, 3, 2),
+            self_heal_step(&mut hs, "working", true, 0, 3, 2),
             HealAction::Diagnose
         );
         assert_eq!(
-            self_heal_step(&mut hs, "unknown", true, 3, 2),
+            self_heal_step(&mut hs, "unknown", true, 0, 3, 2),
             HealAction::Respawn
         );
     }
@@ -5755,7 +5878,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            self_heal_step(&mut hs, "unknown", false, 3, 2),
+            self_heal_step(&mut hs, "unknown", false, 0, 3, 2),
             HealAction::EscalateBlocked
         );
     }
@@ -5769,7 +5892,7 @@ mod tests {
             respawn_count: 1,
         };
         assert_eq!(
-            self_heal_step(&mut hs, "idle", false, 3, 2),
+            self_heal_step(&mut hs, "idle", false, 0, 3, 2),
             HealAction::None
         );
         assert_eq!(hs.unknown_count, 0);
@@ -5780,14 +5903,55 @@ mod tests {
     #[test]
     fn self_heal_flicker_never_diagnoses() {
         let mut hs = HealState::default();
-        self_heal_step(&mut hs, "unknown", false, 3, 2);
-        self_heal_step(&mut hs, "idle", false, 3, 2); // flicker reset
-        self_heal_step(&mut hs, "unknown", false, 3, 2);
+        self_heal_step(&mut hs, "unknown", false, 0, 3, 2);
+        self_heal_step(&mut hs, "idle", false, 0, 3, 2); // flicker reset
+        self_heal_step(&mut hs, "unknown", false, 0, 3, 2);
         assert_eq!(hs.unknown_count, 1);
         assert_eq!(
-            self_heal_step(&mut hs, "unknown", false, 3, 2),
+            self_heal_step(&mut hs, "unknown", false, 0, 3, 2),
             HealAction::None
         );
+    }
+
+    /// bd-bvwf.5: a WORKING agent polling unknown for a few polls (fresh
+    /// spawn detection) is never Diagnosed or Respawnd inside the grace
+    /// window — detection latency is not death.
+    #[test]
+    fn self_heal_detect_grace_never_touches_young_unknown() {
+        let mut hs = HealState::default();
+        // grace=6: six consecutive unknown polls all → None, no diagnose,
+        // no respawn (the working pane keeps working undisturbed)
+        for _ in 0..6 {
+            assert_eq!(
+                self_heal_step(&mut hs, "unknown", false, 6, 3, 2),
+                HealAction::None
+            );
+        }
+        assert_eq!(hs.diagnose_count, 0);
+        assert_eq!(hs.respawn_count, 0);
+        // once classification lands, the episode resets (still no heal)
+        assert_eq!(self_heal_step(&mut hs, "working", false, 6, 3, 2), HealAction::None);
+        assert_eq!(hs.unknown_count, 0);
+        // grace=0 preserves the old immediate ladder
+        let mut old = HealState::default();
+        assert_eq!(
+            self_heal_step(&mut old, "unknown", false, 0, 3, 2),
+            HealAction::None
+        );
+    }
+
+    /// bd-bvwf.5: after the grace window, the ladder resumes — a persistently
+    /// unknown agent is diagnosed, then respawned (budgeted).
+    #[test]
+    fn self_heal_after_grace_diagnose_then_respawn() {
+        let mut hs = HealState::default();
+        for _ in 0..6 {
+            assert_eq!(self_heal_step(&mut hs, "unknown", false, 6, 3, 2), HealAction::None);
+        }
+        assert_eq!(self_heal_step(&mut hs, "unknown", false, 6, 3, 2), HealAction::Diagnose);
+        assert!(hs.awaiting_clear);
+        assert_eq!(self_heal_step(&mut hs, "unknown", false, 6, 3, 2), HealAction::Respawn);
+        assert_eq!(hs.respawn_count, 1);
     }
 
     #[test]
@@ -6010,12 +6174,12 @@ mod tests {
         let mut hs = HealState::default();
         for _ in 0..2 {
             assert_eq!(
-                self_heal_step(&mut hs, "unknown", false, 3, 2),
+                self_heal_step(&mut hs, "unknown", false, 0, 3, 2),
                 HealAction::None
             );
         }
         assert_eq!(
-            self_heal_step(&mut hs, "unknown", false, 3, 2),
+            self_heal_step(&mut hs, "unknown", false, 0, 3, 2),
             HealAction::Diagnose
         );
         let states = vec![st_pane("a", "unknown", "%1")];
