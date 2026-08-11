@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use toron_workflow::schema::{Action, CrewSpec, Step, Workflow};
+use toron_workflow::schema::{Action, CrewSpec, InputDecl, Step, StepOnError, Workflow};
 
 /// A computed crew: role → member count, ready for the orchestrator to spawn
 /// via `ProfileCatalog::resolve` + `Backend::spawn`.
@@ -122,6 +122,122 @@ pub fn resolve_crew_fanouts(workflow: &Workflow, plan: &CrewPlan) -> Workflow {
 ///   `profile: "@X"` refs — auto-inference is an explicit request (is1.1).
 pub fn plan_crew(workflow: &Workflow) -> CrewPlan {
     plan_crew_with(workflow, &|_| None)
+}
+
+/// One compose part: a dispatch part (`role:stage` — a `@role` agent runs the
+/// named stage) or a workflow part (`workflow:name` — a `call_workflow`
+/// sub-run). Parsed from `flywheel workflow compose --parts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposePart {
+    /// `role:stage` → a dispatch_job step (profile @role, stage prompt).
+    Dispatch { role: String, stage: String },
+    /// `workflow:name` → a call_workflow step (resolved at invoke).
+    CallWorkflow { name: String },
+}
+
+/// Parse one compose part token (`role:stage` | `workflow:name`). Pure —
+/// the unit surface for the compose CLI's deterministic arm (bd-8xca).
+pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
+    let t = token.trim();
+    let Some((kind, value)) = t.split_once(':') else {
+        return Err(format!(
+            "compose part {token:?} must be `role:stage` or `workflow:name`"
+        ));
+    };
+    match kind.trim() {
+        "workflow" => {
+            let name = value.trim();
+            if name.is_empty() {
+                return Err(format!("compose part {token:?}: empty workflow name"));
+            }
+            Ok(ComposePart::CallWorkflow { name: name.to_string() })
+        }
+        role => {
+            let role = role.trim();
+            let stage = value.trim();
+            if role.is_empty() || stage.is_empty() {
+                return Err(format!(
+                    "compose part {token:?}: role and stage must be non-empty"
+                ));
+            }
+            Ok(ComposePart::Dispatch {
+                role: role.to_string(),
+                stage: stage.to_string(),
+            })
+        }
+    }
+}
+
+/// bd-8xca deterministic arm: assemble a NEW workflow from existing parts.
+/// `base` (optional) contributes its steps FIRST (the captain extends an
+/// existing shape); then each part becomes a step — `role:stage` → a
+/// dispatch_job (profile `@role`, stage `stage`), `workflow:name` → a
+/// call_workflow. `crew: auto` (the composed fleet is inferred from the
+/// parts). Pure + testable.
+pub fn compose_workflow(
+    name: &str,
+    objective: &str,
+    base: Option<&Workflow>,
+    parts: &[ComposePart],
+) -> Workflow {
+    let mut steps: Vec<Step> = base.map(|b| b.steps.clone()).unwrap_or_default();
+    let mut ordinal = 0u32;
+    for part in parts {
+        ordinal += 1;
+        let step_name = match part {
+            ComposePart::Dispatch { role, stage } => {
+                let slug = format!("{role}-{stage}")
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                    .collect::<String>();
+                let mut s = Step {
+                    name: Some(slug),
+                    guard: None,
+                    on_error: StepOnError::Continue,
+                    action: Action::DispatchJob {
+                        assignee: "x".to_string(),
+                        spec: serde_json::json!({
+                            "profile": format!("@{role}"),
+                            "stage": stage,
+                            "task": objective,
+                        }),
+                        channel: None,
+                    },
+                };
+                // deterministic unique names across repeated roles
+                s.name = Some(format!("{}-{ordinal}", s.name.unwrap_or_default()));
+                steps.push(s);
+                continue;
+            }
+            ComposePart::CallWorkflow { name: sub } => {
+                Action::CallWorkflow {
+                    workflow: sub.clone(),
+                    inputs: serde_json::json!({ "goal": objective }),
+                }
+            }
+        };
+        steps.push(Step {
+            name: Some(format!("part-{ordinal}")),
+            guard: None,
+            on_error: StepOnError::Continue,
+            action: step_name,
+        });
+    }
+    Workflow {
+        name: name.to_string(),
+        description: Some(format!(
+            "Runtime-composed workflow for: {objective} (bd-8xca deterministic arm)"
+        )),
+        trigger: None,
+        policy: None,
+        guard: None,
+        steps,
+        graph: None,
+        inputs: vec![InputDecl {
+            name: "objective".to_string(),
+        }],
+        crew: Some(CrewSpec::Auto),
+    }
 }
 
 /// bd-t86p: like [`plan_crew`] but recurses into `call_workflow` targets so a
@@ -229,6 +345,7 @@ fn infer_auto(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use toron_workflow::schema::parse_workflow;
 
     /// `crew: auto` infers members from the workflow's profile refs
@@ -355,6 +472,105 @@ steps:
         // the leaf role found exactly once.
         let plan = plan_crew_with(&wf, &resolve);
         assert_eq!(plan.members.get("coder"), Some(&1), "{:?}", plan.members);
+    }
+
+    // ---- bd-8xca: runtime composition (deterministic arm) ----
+
+    /// Parse: `role:stage` → dispatch; `workflow:name` → call_workflow;
+    /// malformed tokens error.
+    #[test]
+    fn compose_part_parses_dispatch_and_workflow() {
+        use toron_workflow::schema::Action;
+        assert_eq!(
+            parse_compose_part("scout:fresh-eyes-explore").unwrap(),
+            ComposePart::Dispatch {
+                role: "scout".into(),
+                stage: "fresh-eyes-explore".into(),
+            }
+        );
+        assert_eq!(
+            parse_compose_part("workflow:weekly-review").unwrap(),
+            ComposePart::CallWorkflow {
+                name: "weekly-review".into(),
+            }
+        );
+        assert!(parse_compose_part("nonsense").is_err(), "no colon errors");
+        assert!(parse_compose_part(":stage").is_err(), "empty role errors");
+        assert!(parse_compose_part("workflow:").is_err(), "empty name errors");
+    }
+
+    /// The deterministic arm assembles a NEW workflow from parts: dispatch
+    /// parts become dispatch_job steps (@role + stage), workflow parts become
+    /// call_workflow steps, the objective flows into each; crew:auto + the
+    /// objective input declared. Lint-clean (the compose gate).
+    #[test]
+    fn compose_workflow_assembles_parts_and_lints_clean() {
+        use toron_workflow::schema::Action;
+        let parts = vec![
+            ComposePart::Dispatch {
+                role: "scout".into(),
+                stage: "fresh-eyes-explore".into(),
+            },
+            ComposePart::CallWorkflow {
+                name: "weekly-review".into(),
+            },
+        ];
+        let wf = compose_workflow("composed-x", "validate the new exchange", None, &parts);
+        assert_eq!(wf.name, "composed-x");
+        assert_eq!(wf.steps.len(), 2);
+        assert_eq!(wf.crew, Some(CrewSpec::Auto));
+        assert!(matches!(
+            &wf.steps[0].action,
+            Action::DispatchJob { spec, .. }
+                if spec.get("profile").and_then(Value::as_str) == Some("@scout")
+                    && spec.get("stage").and_then(Value::as_str) == Some("fresh-eyes-explore")
+        ));
+        assert!(matches!(
+            &wf.steps[1].action,
+            Action::CallWorkflow { workflow, .. } if workflow == "weekly-review"
+        ));
+        // The compose gate: lint clean.
+        let report = toron_workflow::lint_workflow(&wf);
+        assert!(
+            report.is_clean(),
+            "composed workflow must lint clean: {:?}",
+            report.issues
+        );
+        // crew:auto infers the fleet from the parts (scout + weekly-review's
+        // oracle/scout fan-out).
+        let plan = plan_crew_with(&wf, &|_| None);
+        assert!(plan.members.contains_key("scout"), "{:?}", plan.members);
+    }
+
+    /// A base workflow seeds the composition: base steps first, then parts.
+    #[test]
+    fn compose_workflow_seeds_from_base() {
+        use toron_workflow::schema::Action;
+        let base = parse_workflow(
+            r##"
+name: triage
+trigger: { type: webhook }
+crew: auto
+steps:
+  - name: gate
+    action: send_dm
+    to: operator
+    body: "start"
+"##,
+        )
+        .expect("base");
+        let parts = vec![ComposePart::Dispatch {
+            role: "coder".into(),
+            stage: "systematic-execute".into(),
+        }];
+        let wf = compose_workflow("composed-base", "harden the loop", Some(&base), &parts);
+        assert_eq!(wf.steps.len(), 2, "base step + one part");
+        assert!(matches!(&wf.steps[0].action, Action::SendDm { .. }));
+        assert!(matches!(
+            &wf.steps[1].action,
+            Action::DispatchJob { spec, .. }
+                if spec.get("profile").and_then(Value::as_str) == Some("@coder")
+        ));
     }
 
     /// Explicit `crew: { role: count }` spawns the squad (row `crew_explicit`).

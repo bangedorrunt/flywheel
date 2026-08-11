@@ -1908,6 +1908,34 @@ enum WorkflowCmd {
         /// workflow name (must be a valid identifier)
         name: String,
     },
+    /// Runtime workflow composition (bd-8xca): assemble a NEW workflow from
+    /// existing parts — `role:stage` dispatch parts and `workflow:name`
+    /// call_workflow parts — around a target, lint it, and (with --run)
+    /// execute it durably. The deterministic arm (default) assembles from
+    /// the parts spec; `--agent` lets a planner agent author the workflow
+    /// from the target + catalog.
+    Compose {
+        /// the objective/target the composed workflow executes
+        target: String,
+        /// optional base workflow whose steps seed the composition
+        #[arg(long)]
+        base: Option<String>,
+        /// parts spec: comma-separated `role:stage` or `workflow:name`
+        #[arg(long, value_delimiter = ',')]
+        parts: Vec<String>,
+        /// planner arm: an agent authors the workflow from the target
+        #[arg(long)]
+        agent: bool,
+        /// run the composed workflow (lint gate first, pane mode)
+        #[arg(long)]
+        run: bool,
+        /// pane mode: the project whose workspace hosts the crew
+        #[arg(long)]
+        project: Option<String>,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Run history for a workflow (from the state log)
     History {
         /// workflow name
@@ -10806,6 +10834,187 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             );
             std::fs::write(&path, scaffold)?;
             println!("wrote {}", path.display());
+            Ok(())
+        }
+        WorkflowCmd::Compose {
+            target,
+            base,
+            parts,
+            agent,
+            run,
+            project,
+            json,
+        } => {
+            // bd-8xca deterministic arm: assemble from the parts spec.
+            // `--agent` (planner arm) is a follow-on headless authoring pass
+            // that REUSES this assembler's lint+run path; the deterministic
+            // assembly is the pure core (unit-tested in crew.rs).
+            if *agent {
+                bail!(
+                    "workflow compose --agent (planner-authored) is not yet wired — use the deterministic arm: --parts \"role:stage,workflow:name\""
+                );
+            }
+            if parts.is_empty() {
+                bail!("workflow compose needs --parts (role:stage or workflow:name)");
+            }
+            let all = all_workflows()?;
+            let base_wf = match base.as_deref() {
+                Some(b) => Some(resolve_workflow(b, &all)?.clone()),
+                None => None,
+            };
+            let mut parsed: Vec<crew::ComposePart> = Vec::new();
+            for token in parts {
+                parsed.push(crew::parse_compose_part(token).map_err(anyhow::Error::msg)?);
+            }
+            let wf_name = format!("composed-{}", state::now_iso().replace([':', '-', '.'], ""));
+            let composed = crew::compose_workflow(&wf_name, target, base_wf.as_ref(), &parsed);
+
+            // Fail-stop gate: lint before run / emit.
+            let blocking = lint_one(&wf_name, &composed);
+            if blocking > 0 {
+                bail!(
+                    "composed workflow {wf_name:?} has {blocking} blocking lint issue(s) — refusing to run"
+                );
+            }
+
+            // The crew plan (auto-inferred from the composed parts) — the
+            // captain's fleet preview + the run's spawn.
+            let resolve = |sub: &str| all.get(sub).map(|(w, _)| w.clone());
+            let crew_plan = crew::plan_crew_with(&composed, &resolve);
+
+            if !*run {
+                if *json {
+                    print_json(&json!({
+                        "workflow": wf_name,
+                        "target": target,
+                        "crew": crew_plan.members,
+                        "composed": &composed,
+                    }));
+                } else {
+                    println!("composed workflow {wf_name} (lint clean):");
+                    for s in &composed.steps {
+                        println!(
+                            "  - {} ({})",
+                            s.name.as_deref().unwrap_or("<unnamed>"),
+                            match &s.action {
+                                Action::DispatchJob { spec, .. } => spec
+                                    .get("profile")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("dispatch"),
+                                Action::CallWorkflow { workflow, .. } => workflow.as_str(),
+                                other => other.type_name(),
+                            }
+                        );
+                    }
+                    print_json(&json!({
+                        "workflow": wf_name,
+                        "target": target,
+                        "crew": crew_plan.members,
+                    }));
+                }
+                return Ok(());
+            }
+
+            // Run the composed workflow: the same pane machinery as
+            // steer/workflow run — lint passed, spawn the inferred crew +
+            // dispatch each step via __send, reap on end. The composed struct
+            // is invoked directly (the engine takes ANY Workflow).
+            let project_name = project.as_deref().unwrap_or("flywheel");
+            let catalog = profile::ProfileCatalog::load()?;
+            let ctx = pane::pre_spawn_crew(
+                cfg,
+                project_name,
+                &wf_name,
+                &crew_plan,
+                &catalog,
+                None,
+                false,
+                true,
+            )?;
+            let entries = ctx.entries.clone();
+            let project_c = project_name.to_string();
+            let wf_name_c = wf_name.clone();
+            let inputs_c = json!({ "objective": target });
+            let runner: toron_workflow::ActionRunner = {
+                let entries = entries.clone();
+                let inputs_c = inputs_c.clone();
+                Arc::new(move |a: &Action| {
+                    pane::pane_dispatch(
+                        &catalog,
+                        &project_c,
+                        &wf_name_c,
+                        &inputs_c,
+                        &entries,
+                        a,
+                    )
+                })
+            };
+            let rt = tokio::runtime::Runtime::new()?;
+            let run_id = format!("fw-composed-{}", state::now_iso());
+            let invoke_wf = crew::resolve_crew_fanouts(&composed, &crew_plan);
+            let workflow_resolver: toron_workflow::WorkflowResolver =
+                Arc::new(|sub: &str| {
+                    let cat = workflow_catalog::WorkflowCatalog::load().ok()?;
+                    cat.workflows
+                        .get(sub)
+                        .cloned()
+                        .or_else(|| {
+                            builtin_workflows::builtin_workflows().get(sub).cloned()
+                        })
+                });
+            let profile_resolver: toron_workflow::ProfileResolver =
+                Arc::new(|_p: &str| None);
+            let output = rt.block_on(async {
+                let engine = toron_workflow::WorkflowEngine::local_with_resolvers(
+                    runner,
+                    profile_resolver,
+                    workflow_resolver,
+                )?;
+                engine
+                    .invoke(&run_id, invoke_wf, inputs_c.clone())
+                    .await
+            })?;
+            let mut reaped = false;
+            if !ctx.retained {
+                let mut c = Client::connect(Some(&cfg.socket_path()))?;
+                match c.workspace_close(&ctx.workspace_id) {
+                    Ok(_) => reaped = true,
+                    Err(e) => eprintln!(
+                        "flywheel: workspace close {} failed: {e:#}",
+                        ctx.workspace_id
+                    ),
+                }
+            }
+            log(
+                "workflow",
+                EventKind::Workflow,
+                json!({
+                    "workflow": wf_name,
+                    "status": "done",
+                    "crew": crew_plan.members,
+                    "run_id": run_id,
+                    "mode": "pane",
+                    "panes": entries.len(),
+                    "reaped": reaped,
+                }),
+            );
+            if *json {
+                print_json(&json!({
+                    "workflow": wf_name,
+                    "run_id": run_id,
+                    "crew": crew_plan.members,
+                    "mode": "pane",
+                    "output": output,
+                    "workspace_id": ctx.workspace_id,
+                    "reaped": reaped,
+                }));
+            } else {
+                println!(
+                    "composed workflow {wf_name} ran (run_id {run_id}, crew {} member(s), mode pane)",
+                    crew_plan.members.len()
+                );
+                print_json(&output);
+            }
             Ok(())
         }
         WorkflowCmd::History { name } => {
