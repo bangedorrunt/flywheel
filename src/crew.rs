@@ -121,18 +121,43 @@ pub fn resolve_crew_fanouts(workflow: &Workflow, plan: &CrewPlan) -> Workflow {
 ///   workflow must NOT silently spawn a crew even when its steps carry
 ///   `profile: "@X"` refs — auto-inference is an explicit request (is1.1).
 pub fn plan_crew(workflow: &Workflow) -> CrewPlan {
+    plan_crew_with(workflow, &|_| None)
+}
+
+/// bd-t86p: like [`plan_crew`] but recurses into `call_workflow` targets so a
+/// COMPOSED workflow's crew includes the sub-workflows' roles (goal-direct
+/// composes brainstorm → oracle+planner → plan-direct → planner → own
+/// coder/reviewer/housekeeper; crew:auto must spawn the WHOLE fleet or the
+/// first @planner/@oracle step fails "no crew pane"). The resolver returns the
+/// target workflow by name (catalog + builtins); `None` = unresolvable
+/// sub-workflow (its roles are unknowable — skip, today's behavior).
+/// Cycle-guarded: a visited set prevents infinite recursion on workflow
+/// cycles (goal → plan → ... → goal).
+pub fn plan_crew_with(
+    workflow: &Workflow,
+    resolve: &dyn Fn(&str) -> Option<Workflow>,
+) -> CrewPlan {
     match &workflow.crew {
         Some(CrewSpec::Explicit(map)) => CrewPlan {
             members: map.clone(),
         },
-        Some(CrewSpec::Auto) => infer_auto(workflow),
+        Some(CrewSpec::Auto) => {
+            let mut visited = std::collections::HashSet::new();
+            infer_auto(workflow, resolve, &mut visited)
+        }
         None => CrewPlan::default(),
     }
 }
 
 /// Auto-infer the crew from the workflow's own steps/graph (zero-config:
-/// `flywheel workflow run debate` spawns reviewers + oracle automatically).
-fn infer_auto(workflow: &Workflow) -> CrewPlan {
+/// `flywheel workflow run debate` spawns reviewers + oracle automatically),
+/// PLUS the roles of composed sub-workflows (bd-t86p — see
+/// [`plan_crew_with`]). Cycle-guarded via `visited`.
+fn infer_auto(
+    workflow: &Workflow,
+    resolve: &dyn Fn(&str) -> Option<Workflow>,
+    visited: &mut std::collections::HashSet<String>,
+) -> CrewPlan {
     let mut counts: BTreeMap<String, u32> = BTreeMap::new();
 
     fn bump_role(role: &str, counts: &mut BTreeMap<String, u32>) {
@@ -148,34 +173,53 @@ fn infer_auto(workflow: &Workflow) -> CrewPlan {
             counts.entry(role.to_string()).or_insert(0);
         }
     }
-    fn scan_action(action: &Action, counts: &mut BTreeMap<String, u32>) {
+    fn scan_action(
+        action: &Action,
+        counts: &mut BTreeMap<String, u32>,
+        resolve: &dyn Fn(&str) -> Option<Workflow>,
+        visited: &mut std::collections::HashSet<String>,
+    ) {
         match action {
             Action::DispatchJob { spec, .. } => {
                 if let Some(role) = spec.get("profile").and_then(|p| p.as_str()) {
                     bump_role(role, counts);
                 }
             }
-            Action::Parallel { over, each } => {
-                bump_fanout(over, counts);
-                scan_action(&each.action, counts);
-            }
-            Action::Retry { step, .. } => scan_action(&step.action, counts),
-            Action::Branch { then, else_steps, .. } => {
-                for s in then.iter().chain(else_steps.iter()) {
-                    scan_action(&s.action, counts);
+            // bd-t86p: the composed sub-workflow's roles belong to the crew.
+            // Guard against cycles (visited) so goal → plan → … → goal cannot
+            // recurse forever.
+            Action::CallWorkflow { workflow, .. } => {
+                if visited.insert(workflow.clone())
+                    && let Some(sub) = resolve(workflow)
+                {
+                    let sub_plan = infer_auto(&sub, resolve, visited);
+                    for (role, count) in sub_plan.members {
+                        *counts.entry(role).or_insert(0) =
+                            counts.get(&role).copied().unwrap_or(0).max(count);
+                    }
                 }
             }
-            Action::Foreach { each, .. } => scan_action(&each.action, counts),
+            Action::Parallel { over, each } => {
+                bump_fanout(over, counts);
+                scan_action(&each.action, counts, resolve, visited);
+            }
+            Action::Retry { step, .. } => scan_action(&step.action, counts, resolve, visited),
+            Action::Branch { then, else_steps, .. } => {
+                for s in then.iter().chain(else_steps.iter()) {
+                    scan_action(&s.action, counts, resolve, visited);
+                }
+            }
+            Action::Foreach { each, .. } => scan_action(&each.action, counts, resolve, visited),
             _ => {}
         }
     }
 
     for step in &workflow.steps {
-        scan_action(&step.action, &mut counts);
+        scan_action(&step.action, &mut counts, resolve, visited);
     }
     if let Some(graph) = &workflow.graph {
         for node in graph.nodes.values() {
-            scan_action(&node.action, &mut counts);
+            scan_action(&node.action, &mut counts, resolve, visited);
         }
     }
 
@@ -216,6 +260,101 @@ steps:
         let plan = plan_crew(&wf);
         assert_eq!(plan.members.get("reviewer"), Some(&2), "{:?}", plan.members);
         assert_eq!(plan.members.get("oracle"), Some(&1), "{:?}", plan.members);
+    }
+
+    /// bd-t86p: crew:auto on a COMPOSED workflow (call_workflow steps) must
+    /// include the sub-workflows' roles — goal-direct composes brainstorm
+    /// (oracle+planner) and plan-direct (planner) on top of its own
+    /// coder/reviewer/housekeeper; without recursion the first @oracle/@planner
+    /// dispatch fails "no crew pane".
+    #[test]
+    fn crew_auto_recurses_into_call_workflow_targets() {
+        let wf = parse_workflow(
+            r##"
+name: goal-direct
+trigger:
+  type: webhook
+crew: auto
+steps:
+  - name: ideate
+    action: call_workflow
+    workflow: brainstorm
+  - name: build
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@coder" }
+"##,
+        )
+        .expect("parse");
+        let resolve = |sub: &str| match sub {
+            "brainstorm" => Some(
+                parse_workflow(
+                    r##"
+name: brainstorm
+trigger: { type: webhook }
+crew: auto
+steps:
+  - name: diverge
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@oracle" }
+  - name: reduce
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@planner" }
+"##,
+                )
+                .expect("sub"),
+            ),
+            _ => None,
+        };
+        let plan = plan_crew_with(&wf, &resolve);
+        assert_eq!(plan.members.get("coder"), Some(&1), "{:?}", plan.members);
+        assert_eq!(plan.members.get("oracle"), Some(&1), "sub-workflow oracle: {:?}", plan.members);
+        assert_eq!(plan.members.get("planner"), Some(&1), "sub-workflow planner: {:?}", plan.members);
+    }
+
+    /// bd-t86p cycle guard: a workflow that composes itself (or a cycle
+    /// goal → plan → … → goal) must terminate, not recurse forever.
+    #[test]
+    fn crew_auto_cycle_guard_terminates() {
+        let wf = parse_workflow(
+            r##"
+name: a
+trigger: { type: webhook }
+crew: auto
+steps:
+  - name: self
+    action: call_workflow
+    workflow: b
+"##,
+        )
+        .expect("parse");
+        let b = parse_workflow(
+            r##"
+name: b
+trigger: { type: webhook }
+crew: auto
+steps:
+  - name: back
+    action: call_workflow
+    workflow: a
+  - name: leaf
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@coder" }
+"##,
+        )
+        .expect("b");
+        let resolve = |sub: &str| match sub {
+            "a" => Some(wf.clone()),
+            "b" => Some(b.clone()),
+            _ => None,
+        };
+        // Would stack-overflow without the visited guard; must terminate with
+        // the leaf role found exactly once.
+        let plan = plan_crew_with(&wf, &resolve);
+        assert_eq!(plan.members.get("coder"), Some(&1), "{:?}", plan.members);
     }
 
     /// Explicit `crew: { role: count }` spawns the squad (row `crew_explicit`).

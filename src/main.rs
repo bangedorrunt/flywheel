@@ -428,6 +428,38 @@ enum Commands {
         #[command(subcommand)]
         cmd: RunsCmd,
     },
+    /// Captain-free steering (bd-t86p): ONE compose call at a target —
+    /// `flywheel steer "<objective>"` drives the crew to completion with
+    /// zero manual per-bead dispatch. Bead-tracked by default (goal →
+    /// brainstorm → plan → beads → build → review → ship); `--direct` skips
+    /// the tracker (non-bead targets: the plan flows straight to the coder,
+    /// no approval gate — truly autonomous).
+    Steer {
+        /// the objective/target ("implement the auth refactor")
+        objective: String,
+        /// direct-dispatch arm: skip bead tracking + the plan approval gate
+        /// (non-bead targets)
+        #[arg(long)]
+        direct: bool,
+        /// crew strategy: auto | <squad> (default auto)
+        #[arg(long)]
+        crew: Option<String>,
+        /// pane mode: the project whose workspace hosts the crew
+        #[arg(long)]
+        project: Option<String>,
+        /// pane mode: bind to an existing workspace id instead of spawning
+        #[arg(long)]
+        reuse: Option<String>,
+        /// pane mode: keep the crew workspace after the run (default: reap)
+        #[arg(long)]
+        retain: bool,
+        /// pane mode: close pre-existing workspaces before spawning
+        #[arg(long)]
+        retire_orphans: bool,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
     /// Unified workflow surface (ADR-0005 Spec 5 / P3.7) — catalog, lint,
     /// run, scaffold, history, and auto-crew preview. One vocabulary, one
     /// engine: built-ins + canonical `workflows/*.yaml` + absorbed legacy
@@ -2659,6 +2691,26 @@ fn main() {
         Some(Commands::Squad { cmd }) => cmd_squad(&cfg, cmd),
         Some(Commands::Coalition { cmd }) => cmd_coalition(cmd),
         Some(Commands::Runs { cmd }) => cmd_runs(&cfg, cmd),
+        Some(Commands::Steer {
+            objective,
+            direct,
+            crew,
+            project,
+            reuse,
+            retain,
+            retire_orphans,
+            json,
+        }) => cmd_steer(
+            &cfg,
+            objective,
+            *direct,
+            crew.as_deref(),
+            project.as_deref(),
+            reuse.as_deref(),
+            *retain,
+            *retire_orphans,
+            *json,
+        ),
         Some(Commands::Workflow { cmd }) => cmd_workflow(&cfg, cmd),
         Some(Commands::Model { cmd }) => cmd_models(cmd),
         Some(Commands::Cron { cmd }) => cmd_cron(&cfg, cmd),
@@ -10347,6 +10399,44 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one param per CLI flag, mirrors cmd_spawn
+fn cmd_steer(
+    cfg: &Config,
+    objective: &str,
+    direct: bool,
+    crew: Option<&str>,
+    project: Option<&str>,
+    reuse: Option<&str>,
+    retain: bool,
+    retire_orphans: bool,
+    json: bool,
+) -> Result<()> {
+    if objective.trim().is_empty() {
+        bail!("steer: objective must not be empty");
+    }
+    // bd-t86p: ONE compose call — the goal workflow (bead-tracked) or its
+    // direct arm (non-bead targets: no tracker, no plan approval gate). The
+    // delegate is the full `workflow run --execute --mode pane` machinery:
+    // lint gate, crew auto-infer, pane pre-spawn, step dispatch via __send,
+    // reap-on-end — byte-identical to running `workflow run goal` by hand,
+    // with the objective pre-filled.
+    let wf_name = if direct { "goal-direct" } else { "goal" };
+    let inputs = serde_json::json!({ "objective": objective });
+    let run = WorkflowCmd::Run {
+        name: wf_name.to_string(),
+        inputs: Some(inputs.to_string()),
+        crew: crew.map(String::from),
+        execute: true,
+        mode: "pane".to_string(),
+        project: project.map(String::from),
+        reuse: reuse.map(String::from),
+        retain,
+        retire_orphans,
+        json,
+    };
+    cmd_workflow(cfg, &run)
+}
+
 fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
     use toron_workflow::schema::{Action, CrewSpec, Workflow};
     use toron_workflow::{Level, lint_workflow};
@@ -10513,10 +10603,24 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 }
                 _ => json!({}),
             };
-            // Crew resolution: auto → infer from the workflow; <squad> →
-            // explicit role:count. Used for the preview + the engine invoke.
+            // Crew resolution: auto → infer from the workflow (recursing into
+            // call_workflow sub-workflows — bd-t86p: the composed fleet);
+            // <squad> → explicit role:count. Used for the preview + the
+            // engine invoke.
+            let workflow_resolver: toron_workflow::WorkflowResolver =
+                Arc::new(|sub: &str| {
+                    let cat = workflow_catalog::WorkflowCatalog::load().ok()?;
+                    cat.workflows
+                        .get(sub)
+                        .cloned()
+                        .or_else(|| {
+                            builtin_workflows::builtin_workflows().get(sub).cloned()
+                        })
+                });
             let crew_plan = match crew.as_deref() {
-                None | Some("auto") => crew::plan_crew(&wf),
+                None | Some("auto") => {
+                    crew::plan_crew_with(&wf, &|sub| workflow_resolver(sub))
+                }
                 Some(squad) => {
                     let cat = profile::ProfileCatalog::load()?;
                     let recipes = config::Recipes::load()?.recipes;
@@ -10597,8 +10701,21 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // invoke — the engine parses `over` as a number (default 1), so
             // an unresolved @crew.X would silently degrade to one copy.
             let invoke_wf = crew::resolve_crew_fanouts(&wf, &crew_plan);
+            // bd-t86p: the goal/direct meta-workflows COMPOSE via
+            // call_workflow — inject the catalog+builtin resolver so
+            // brainstorm/plan/beads/plan-direct resolve (the cron path got
+            // this in bd-8wvz; the workflow-run path must too, else
+            // call_workflow returns "unknown workflow" and the steer chain
+            // silently no-ops the ideate/plan steps). The same resolver
+            // already fed crew inference above.
+            let profile_resolver: toron_workflow::ProfileResolver =
+                Arc::new(|_p: &str| None);
             let output = rt.block_on(async {
-                let engine = toron_workflow::WorkflowEngine::local(runner)?;
+                let engine = toron_workflow::WorkflowEngine::local_with_resolvers(
+                    runner,
+                    profile_resolver,
+                    workflow_resolver,
+                )?;
                 engine
                     .invoke(&run_id, invoke_wf, inputs_value.clone())
                     .await
@@ -10740,7 +10857,10 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
         WorkflowCmd::Crew { name } => {
             let all = all_workflows()?;
             let wf = resolve_workflow(name, &all)?;
-            let plan = crew::plan_crew(wf);
+            let resolve = |sub: &str| {
+                all.get(sub).map(|(w, _)| w.clone())
+            };
+            let plan = crew::plan_crew_with(wf, &resolve);
             let members: Vec<Value> = plan
                 .members
                 .iter()
