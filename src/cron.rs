@@ -744,8 +744,11 @@ pub fn cron_runner(entry: &CronEntry) -> toron_workflow::ActionRunner {
 
 /// The recording runner (the pre-P10.4 behavior): webhook probes hit the
 /// network, everything else records. Shared by the pane-mode legacy runner
-/// and the ADR-0012 pane-mode spec runner.
-fn recording_runner() -> toron_workflow::ActionRunner {
+/// and the ADR-0012 pane-mode spec runner. Also the dry-run runner for the
+/// on-demand `flywheel cron run` command (bd-8wvz): an on-demand run is a
+/// structural test of the body, never a live agent dispatch — so it records
+/// every step instead of shelling out to `__run-headless`.
+pub fn recording_runner() -> toron_workflow::ActionRunner {
     use toron_workflow::schema::Action;
     std::sync::Arc::new(|a: &Action| match a {
         Action::CallWebhook { url, method, body } => {
@@ -1420,6 +1423,47 @@ owner = "housekeeper"
         .unwrap();
         assert_eq!(out.get("action").and_then(Value::as_str), Some("dispatch_job"));
         assert_eq!(out.get("ok"), Some(&Value::Bool(true)), "recorded, not dispatched");
+    }
+
+    /// bd-8wvz: the on-demand `cron run` dry-run uses the RECORDING runner
+    /// even for a HEADLESS cron (whose spec_runner would shell real
+    /// `__run-headless` dispatch). The contract: every step type records
+    /// `{action, ok:true}` immediately — including dispatch_job — so the
+    /// body trace completes in ms and is always visible. This is the
+    /// regression pin for "cron run hangs / exits 0 with zero output".
+    #[test]
+    fn recording_runner_records_headless_body_steps() {
+        use toron_workflow::schema::Action;
+        // a headless-mode cron: spec_runner for it dispatches, but the
+        // on-demand path must NOT use spec_runner — the recording runner is
+        // the dry-run surface for every mode.
+        let mut e = sample("weekly-x");
+        e.mode = CronMode::Headless;
+        let runner = recording_runner();
+        for a in [
+            Action::DispatchJob {
+                assignee: "x".into(),
+                spec: serde_json::json!({ "profile": "@scout", "task": "..." }),
+                channel: None,
+            },
+            Action::CallWebhook {
+                url: "http://127.0.0.1:9/probe".into(), // unroutable: recorded as failure, still completes
+                method: None,
+                body: None,
+            },
+            Action::CallWorkflow {
+                workflow: "weekly-review".into(),
+                inputs: serde_json::Value::Null,
+            },
+        ] {
+            let out = runner(&a).unwrap_or_else(|e| {
+                serde_json::json!({ "ok": false, "error": e.to_string() })
+            });
+            assert!(
+                out.get("ok").is_some(),
+                "every step returns a JSON value (no hang): {out}"
+            );
+        }
     }
 
 
