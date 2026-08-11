@@ -987,6 +987,7 @@ dependencies = [
  "resonate-sdk 0.6.0",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha1",
  "tempfile",
  "tokio",
