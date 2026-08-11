@@ -826,8 +826,10 @@ pub fn save_loop_pids(pids: &BTreeMap<String, LoopPidEntry>) -> Result<()> {
 /// Register this process as the loop owner for `project`. Returns the
 /// previous entry when a LIVE process already owns the project and `force`
 /// is false (the caller refuses). A dead pid is replaced silently (the stale
-/// loop is gone — its entry is litter, not a guard). `force=true` overwrites
-/// a live owner (deliberate takeover).
+/// loop is gone — its entry is litter, not a guard). `force=true` TERMINATES
+/// the previous live process (bd-bvwf.4 — a takeover must never coexist:
+/// two loops on one project race polls + double-dispatch), then overwrites
+/// the registry.
 pub fn register_loop(project: &str, invocation: &str, force: bool) -> Result<Option<LoopPidEntry>> {
     let mut pids = load_loop_pids();
     let mine = LoopPidEntry {
@@ -844,9 +846,10 @@ pub fn register_loop(project: &str, invocation: &str, force: bool) -> Result<Opt
     if let Some(prev) = pids.get(project) {
         if pid_alive(prev.pid) {
             eprintln!(
-                "flywheel: --force taking over {project} loop from pid {}",
+                "flywheel: --force taking over {project} loop from pid {} (terminating)",
                 prev.pid
             );
+            terminate_loop_pid(prev.pid);
         } else {
             eprintln!(
                 "flywheel: replacing stale loop entry for {project} (pid {} dead)",
@@ -857,6 +860,48 @@ pub fn register_loop(project: &str, invocation: &str, force: bool) -> Result<Opt
     pids.insert(project.to_string(), mine);
     save_loop_pids(&pids)?;
     Ok(None)
+}
+
+/// Terminate a live loop process (bd-bvwf.4): SIGTERM, then SIGKILL after a
+/// ~3s grace if it is still alive. Never touches a dead pid. Best-effort —
+/// a failure to kill is logged, not fatal (the registry takeover proceeds;
+/// the stray is a supervision concern).
+pub fn terminate_loop_pid(pid: u32) {
+    if !pid_alive(pid) {
+        return;
+    }
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status();
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if !pid_alive(pid) {
+            return;
+        }
+    }
+    eprintln!("flywheel: pid {pid} ignored SIGTERM — sending SIGKILL");
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status();
+}
+
+/// Verify this process still OWNS the project's loop entry (bd-bvwf.4). A
+/// newer process may have taken over the registry between this process's
+/// registration and its invocation start (or the entry was overwritten while
+/// a stale process lingered) — the loser must NOT start its durable run, or
+/// two loops would resume the same invocation and double-send.
+pub fn ensure_loop_owner(project: &str) -> Result<()> {
+    let pids = load_loop_pids();
+    let mine = std::process::id();
+    match pids.get(project) {
+        Some(e) if e.pid == mine => Ok(()),
+        Some(e) => bail!(
+            "loop ownership for {project} taken over by pid {} (started {}) — refusing to run; if that process is a stale stray, run: flywheel loop prune",
+            e.pid,
+            e.started_at
+        ),
+        None => bail!("loop pid registry has no entry for {project} — refusing to run"),
+    }
 }
 
 /// Remove `project`'s entry ONLY when it still belongs to `pid` — a newer
@@ -873,14 +918,19 @@ pub fn unregister_loop(project: &str, pid: u32) {
     }
 }
 
-/// True when a process with this pid exists. Uses `ps -p` (portable on the
-/// macOS/Linux hosts this tool targets; no libc dependency).
+/// True when a process with this pid exists and is NOT a zombie. Uses
+/// `ps -p` (portable on the macOS/Linux hosts this tool targets; no libc
+/// dependency). A Z (zombie) process is DEAD for our purposes: it cannot
+/// poll, and it lingers in `ps` only until its parent reaps it — treating it
+/// as alive would let a stale registry entry block a takeover forever.
 pub fn pid_alive(pid: u32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "pid="])
+    let out = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .map(|o| o.stdout)
+        .unwrap_or_default();
+    let stat = String::from_utf8_lossy(&out).trim().to_string();
+    !stat.is_empty() && !stat.starts_with('Z')
 }
 
 /// Find the newest record for (agent, prompt-hash). `bd-resume-dedup` uses
@@ -2038,11 +2088,72 @@ mod loops_sidecar_tests {
         // the registry's own pid is alive → a second registration refuses
         let prev = register_loop(&p, "inv-2", false).unwrap().expect("live owner");
         assert_eq!(prev.pid, std::process::id());
-        // force overwrites (takeover)
+        // cleanup the self entry before the takeover case
+        unregister_loop(&p, std::process::id());
+
+        // force takeover TERMINATES the previous live process (bd-bvwf.4) —
+        // a takeover must never leave two loops on one project. A real child
+        // stands in for the stale loop (never the test process itself).
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let child_pid = child.id();
+        let mut pids = load_loop_pids();
+        pids.insert(
+            p.clone(),
+            LoopPidEntry {
+                pid: child_pid,
+                started_at: now_iso(),
+                invocation: "inv-2".into(),
+            },
+        );
+        save_loop_pids(&pids).unwrap();
+        assert!(pid_alive(child_pid), "child is the live loop");
         assert!(register_loop(&p, "inv-3", true).unwrap().is_none());
+        assert!(!pid_alive(child_pid), "--force terminates the old loop process");
         assert_eq!(load_loop_pids().get(&p).unwrap().invocation, "inv-3");
         // cleanup
         unregister_loop(&p, std::process::id());
+    }
+
+    /// bd-bvwf.4: a loop process verifies it STILL owns the registry entry
+    /// right before starting its durable run — a newer process that took
+    /// over (or a pruned/stale entry) refuses the loser.
+    #[test]
+    fn ensure_loop_owner_guards_takeover() {
+        let _g = loops_test_guard();
+        let p = test_project("pid-owner");
+        // own pid → owner
+        register_loop(&p, "inv-1", false).unwrap();
+        assert!(ensure_loop_owner(&p).is_ok(), "own entry passes");
+        unregister_loop(&p, std::process::id());
+
+        // no entry → refuse (never run unowned — the registry is the guard)
+        assert!(ensure_loop_owner(&p).is_err(), "no entry refuses");
+
+        // a foreign live pid owns it → refuse (a newer process took over)
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let child_pid = child.id();
+        let mut pids = load_loop_pids();
+        pids.insert(
+            p.clone(),
+            LoopPidEntry {
+                pid: child_pid,
+                started_at: now_iso(),
+                invocation: "inv-other".into(),
+            },
+        );
+        save_loop_pids(&pids).unwrap();
+        assert!(ensure_loop_owner(&p).is_err(), "foreign live owner refuses");
+        // cleanup
+        unregister_loop(&p, child_pid);
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &child_pid.to_string()])
+            .status();
     }
 
     /// l4s.1 AC1: 8 writers on 8 DIFFERENT projects, 50 saves each, run

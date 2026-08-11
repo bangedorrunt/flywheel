@@ -7258,6 +7258,8 @@ fn cmd_loop(
             invocation: String::new(),
             unknown_diagnose_threshold: cfg.unknown_diagnose_threshold(),
             respawn_budget: cfg.respawn_budget(),
+            unknown_detect_grace_polls: cfg.unknown_detect_grace_polls(),
+            drain_grace_polls: cfg.drain_grace_polls(),
             resonate_url: String::new(),
         };
         let rt = tokio::runtime::Runtime::new()?;
@@ -10911,8 +10913,23 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
             let runner = cron::spec_runner(&spec);
             let rt = tokio::runtime::Runtime::new()?;
             let run_id = format!("cron-run-{}", state::now_iso());
+            // ADR-0012: the cron body composes workflows via call_workflow —
+            // resolve them against the flywheel catalog + built-ins.
+            let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(|name: &str| {
+                let cat = workflow_catalog::WorkflowCatalog::load().ok()?;
+                cat.workflows
+                    .get(name)
+                    .cloned()
+                    .or_else(|| builtin_workflows::builtin_workflows().get(name).cloned())
+            });
+            let profile_resolver: toron_workflow::ProfileResolver =
+                Arc::new(|_name: &str| None);
             let output = rt.block_on(async {
-                let engine = toron_workflow::WorkflowEngine::local(runner)?;
+                let engine = toron_workflow::WorkflowEngine::local_with_resolvers(
+                    runner,
+                    profile_resolver,
+                    workflow_resolver,
+                )?;
                 engine.invoke(&run_id, wf, json!({})).await
             })?;
             log(
