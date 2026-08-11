@@ -10910,7 +10910,13 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
             // The tick body: the SAME spec-derived workflow the durable loop
             // fires (one engine, two input types — ADR-0012 Spec 2).
             let wf = toron_workflow::cron::spec_tick_workflow(&spec);
-            let runner = cron::spec_runner(&spec);
+            // bd-8wvz: on-demand `cron run` is a structural DRY-RUN of the
+            // body, never a live agent dispatch. The production durable loop
+            // (start_loops -> spec_runner -> headless_dispatch) owns real
+            // dispatch; here the recording runner completes immediately and
+            // prints the step-output map so the run is always visible (never
+            // exit 0 with zero output).
+            let runner = cron::recording_runner();
             let rt = tokio::runtime::Runtime::new()?;
             let run_id = format!("cron-run-{}", state::now_iso());
             // ADR-0012: the cron body composes workflows via call_workflow —
@@ -10924,13 +10930,26 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
             });
             let profile_resolver: toron_workflow::ProfileResolver =
                 Arc::new(|_name: &str| None);
+            // bd-8wvz: even a dry-run must never hang — a body with
+            // `delay`/`request_approval`/`spawn` steps parks on a promise the
+            // recording runner cannot resolve. 25s cap → explicit timeout
+            // error, never a silent never-returning command.
             let output = rt.block_on(async {
                 let engine = toron_workflow::WorkflowEngine::local_with_resolvers(
                     runner,
                     profile_resolver,
                     workflow_resolver,
                 )?;
-                engine.invoke(&run_id, wf, json!({})).await
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(25),
+                    engine.invoke(&run_id, wf, json!({})),
+                )
+                .await
+                .map_err(|_elapsed| {
+                    anyhow::anyhow!(
+                        "cron {name} on-demand dry-run timed out after 25s (a delay/approval/spawn step parks the body — the scheduled durable-loop path is the real execution)"
+                    )
+                })?
             })?;
             log(
                 "workflow",
@@ -10947,10 +10966,13 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
                     "cron": name,
                     "run_id": run_id,
                     "source": source,
+                    "dry_run": true,
                     "output": output,
                 }));
             } else {
-                println!("cron {name} ran (run_id {run_id}, source {source})");
+                println!(
+                    "cron {name} dry-run ok (run_id {run_id}, source {source}) — no live dispatch; recorded steps:"
+                );
                 print_json(&output);
             }
             Ok(())
