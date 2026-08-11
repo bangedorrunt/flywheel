@@ -133,8 +133,9 @@ The same sequence as a one-shot workflow:
 | Assignment | `assign` (agent-mail bead dispatch) |
 | Coordination | `mail inbox/send/locks/unlock/conflicts/agents` + `contact` + `product` |
 | Patterns | `debate`, `plan-review`, `xproj` (cross-project fan-out) |
+| Orchestration (ADR-0005/0010/0011/0012) | `workflow {new,lint,run,list,show,history,crew,remove}` · `cron {lint,run,list,show,pause,resume,status,history,start,remove}` (standalone YAMLs) · `coalition {form,status,list,intent,reserve,negotiate-*,detect,auto-coalesce,disband}` · `squad` · `profile` · `model` · `stage` · `runs` |
 | Durability | `checkpoint timeline audit history changes resume analytics` |
-| Assets | `recipes workflows pipeline template ensemble` |
+| Legacy assets | `recipes workflows pipeline template ensemble` (absorbed into the unified vocabulary above) |
 | Safety | `safety guards policy` |
 | Ops | `deps config upgrade tutorial serve` |
 | Automation | `--robot-snapshot --robot-status --robot-capabilities` (+ `--json` everywhere) |
@@ -206,6 +207,9 @@ with **`__poll` heartbeat** as the correctness floor (no event replay). See
 | Plan→review→implement | `flywheel plan-review <project> "<feature>"` | APPROVE/CHANGES/VERIFIED/REJECT; paper-first |
 | Cross-project | `flywheel xproj send …` | product + contact; subject `[xproj]`; `--to-project` is routing context (delivery is name-based after `xproj request --to-project` handshake) |
 | Peer-triggered | spawn with peer-aware prompt | peer mail wakes idle peer |
+| **Workflow run** (ADR-0010) | `flywheel workflow run <name> --execute --mode headless|pane` | declarative multi-step procedure; role-conditioned + model-injected dispatch; `runs/` logged when headless |
+| **Coalition** (ADR-0011) | `flywheel coalition form <goal> --crews <squad>` | steer+collab layers; intent-based coordination (declare → soft-conflict → propose → negotiate); captain-formed + auto-coalesce |
+| **Cron** (ADR-0012) | `flywheel cron start` (drives cron YAMLs) | standalone scheduled primitive distinct from workflow; body composes workflows; Resonate `ctx.sleep` durable-sleep |
 
 Full recipe catalog: [docs/collab/recipes.md](docs/collab/recipes.md). Agent
 contracts (ack, lease renew, build-slot, pane safety): `AGENTS.md`.
@@ -230,11 +234,23 @@ Versioning: semantic (MAJOR breaking / MINOR features / PATCH fixes);
 0 ok · 1 herdr/server error · 2 usage error. stdout = data, stderr = messages,
 `--json` for machine output (color auto-disabled when piped / `NO_COLOR`).
 
-## Roadmap (v2)
+## Roadmap (v3)
 
-- checkpoint → respawn fidelity (store spawn spec), timeline rendering polish
-- policy approval workflow (prompt-based approvals, not just deny-guards)
-- `serve` SSE on live `events.subscribe` (loop already event-driven; serve may lag)
-- R1 toron mail embed + R2 superlogical multiplexer (ADR-0002)
+**Shipped (2026-08):** ADR-0010 execution wiring (real runner `--execute`, headless/pane modes,
+model registry + per-role models + retry-on-429, per-step harness override) · ADR-0011 coalitions
+(steer+collab layers, intent protocol, soft-conflict, auto-coalesce) · ADR-0012 standalone cron
+(distinct YAML type, user dirs, Resonate durable-sleep) · loop role-conditioning (`__send
+--profile`) + the stale-landed dedup fix.
+
+**Remaining:**
+- **Loop `--engine` parity gate** (`bd-3aen`) — run the 6 `scripts/e2e-hardened-loop.sh` scenarios
+  bar-for-bar on `--engine` vs legacy; then the full loop-as-durable-workflow migration + legacy
+  removal.
+- **Loop reliability** (`bd-bvwf.1–.5`) — orphan-workspace accumulation, first-poll-before-
+  detection, loop-exits-between-chain-steps, stray/duplicate loop processes, unknown-agent stall.
+- **On-demand `cron run` completion** (`bd-...`) — the run invokes the body but the recording
+  runner + composed pipeline does not complete; the scheduled durable loop is the real path.
+- **Deferred backlog** (`bd-rwbn`, ❄) — pa (prime-agent) harness, metered dynamic model routing,
+  model governance (rate-limits/budgets), deep federation.
 
 Feedback: open an issue at https://github.com/bangedorrunt/flywheel/issues

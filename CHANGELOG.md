@@ -7,7 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ✨ Added
+
+- **Standalone cron CLI (ADR-0012, `bd-25g7.3`, 2026-08-11)** — `flywheel cron` operates on the
+  new cron YAMLs (`CronSpec`): `lint` (fail-stop; engine + flywheel tiers), `run` (on-demand, via
+  the shared engine with `call_workflow` resolution), `list` (source + scope + steps), `show`,
+  `pause`/`resume`, `status`, `history`, `start`, `remove`. User dirs: global
+  `~/.config/flywheel/crons/` + per-project `.flywheel/crons/`, precedence project > global >
+  builtin. The weekly-review cron migrated to a standalone YAML (bd-25g7.4/6); crons.toml retired.
+- **Coalition CLI (ADR-0011, `bd-foh8.3a`, 2026-08-10)** — `flywheel coalition
+  {register,form,status,list,intent,reserve,detect,auto-coalesce,negotiate-*,disband}` over the
+  intent/soft-conflict substrate.
+- **Crew/agent model rework (`bd-42fs`, 2026-08-10)** — all profiles default harness `omp`;
+  per-role models (oracle=glm-5.2/max/fb grok-4.5, planner/coder/reviewer/housekeeper=
+  deepseek-v4-flash, scout=big-pickle), effort-tuned, retry-on-429 fallback wired. Per-step
+  harness override (`spec.harness`) for review workflows.
+- **Authoring guide + references** — `docs/workflow-authoring.md` + the skill references
+  (workflow-authoring, coalition-orchestration, cron-authoring standalone model).
+
 ### 🐛 Fixes
+
+- **Loop stale-landed dedup (`bd-dedup-stale`, 2026-08-11)** — a re-queued (un-claimed) bead kept
+  its stale `landed` dedup record, so the loop dedup-skipped its re-dispatch forever.
+  `clear_stale_landed_for_idle` invalidates landed records (same invocation) for idle/done agents
+  before each dispatch; working/blocked/unknown preserved (crash-resume dedup intact). 3 new
+  `keep_landed_record` tests; 515 flywheel tests pass.
+- **`cron run` `call_workflow` resolution (2026-08-11)** — the on-demand cron run injected the
+  WorkflowResolver + ProfileResolver (`local_with_resolvers`) so a cron body's `call_workflow`
+  resolves against the catalog/built-ins.
 
 - **Live toron ↔ agent-mail search parity** (2026-08-08) — toron's
   unwrap-loop projection now attributes inbound gift-wraps to their project

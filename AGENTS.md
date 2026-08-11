@@ -247,18 +247,18 @@ The T3 exit is a distinguishable `halted:` result, not a normal `complete`
 
 ## Workflows, Cron, Recipes & Profiles (orchestration vocabulary)
 
-The declarative orchestration tier (ADR-0005) + its execution wiring (ADR-0010).
+The declarative orchestration tier (ADR-0005) + execution wiring (ADR-0010) + coalitions (ADR-0011) + standalone cron (ADR-0012).
 A **profile** = role template (behavior + model + harness); a **recipe/squad** =
 group of profiles; a **workflow** = multi-step procedure using profiles; a **cron** =
-a workflow on a schedule. **Full authoring guide with basic + in-depth examples:
-[docs/workflow-authoring.md](docs/workflow-authoring.md).**
+a FIRST-CLASS scheduled primitive DISTINCT from workflow, with a body composing
+workflows. **Full authoring guide: [docs/workflow-authoring.md](docs/workflow-authoring.md).**
 
 | Verb | Command |
 |---|---|
 | **profile** | `flywheel profile {list, show, create, edit, run, remove}` — the 6 built-ins (oracle/planner/reviewer/coder/scout/housekeeper) + locals in `~/.config/flywheel/profiles.toml` |
 | **squad/recipe** | `flywheel squad {list, show, spawn, remove}` — `{profile: count}` groups; legacy `recipes list` stays an alias |
 | **workflow** | `flywheel workflow {list, show, lint, run, new, history, crew, remove}` — YAML in `~/.config/flywheel/workflows/`; `lint` is the fail-stop gate |
-| **cron** | `flywheel cron {list, show, add, pause, resume, status, history, start, remove}` — registry in `crons.toml`; `start` runs the durable loops |
+| **cron** *(ADR-0012)* | `flywheel cron {lint, run, list, show, pause, resume, status, history, start, remove}` — standalone cron YAMLs in `~/.config/flywheel/crons/` + `<project>/.flywheel/crons/` (precedence project > global > builtin); `lint` is the fail-stop gate; `start` runs the durable loops (Resonate `ctx.sleep`, not systemd) |
 | **model** *(ADR-0010)* | `flywheel model {list, show, add, remove}` — registry in `~/.config/flywheel/models.toml` |
 | **runs** | `flywheel runs {list, show, pending, digest}` — observability: state + owner + per-run cost; headless run logs feed this |
 
@@ -269,17 +269,18 @@ flywheel workflow lint upgrade-thing
 flywheel workflow run upgrade-thing --execute --inputs '{"x":1}' --crew auto
 flywheel workflow remove upgrade-thing
 
-# a scheduled, unattended cron (defaults to headless — no workspace churn)
-flywheel cron add weekly-upgrade --template upgrade-thing --cron "30 3 * * 0" --owner housekeeper --mode headless
-flywheel cron start
+# a scheduled, unattended cron — a STANDALONE YAML (ADR-0012), not a workflow
+# ~/.config/flywheel/crons/weekly-upgrade.yaml:
+#   name: weekly-upgrade / schedule: "30 3 * * 0" / owner: housekeeper / mode: headless
+#   policy: {on_failure: bead, catchup: latest} / steps: [call_workflow: upgrade-thing]
+flywheel cron lint weekly-upgrade        # fail-stop gate
+flywheel cron start                      # durable loops (Resonate ctx.sleep, not systemd)
 ```
 
-**Status (ADR-0010, in-flight):** `--execute` (real runner), `--mode headless|pane`,
-`--model`, and `model {...}` land in the P10.1–P10.5 beads. Until P10.3, `workflow run`
-WITHOUT `--execute` is the no-op control-flow path; the **live swarm path stays
-`flywheel loop run <project> --work`**. `remove` is live now. Author workflows
-against the target surface (the guide documents it); each command goes live as its
-bead closes (ADR-0010 Verification gates).
+**Status (ADR-0010/0011/0012):** implemented + live — `--execute`, `--mode headless|pane`,
+`--model`, `model {...}`, `coalition {...}` (steer+collab layers, intent protocol), and the
+standalone cron YAMLs (weekly-review migrated; crons.toml retired). The **live swarm path stays
+`flywheel loop run <project> --work`**; `workflow run --execute` is the declarative path.
 
 **Two execution models (ADR-0010 Spec E):** *pane* (interactive, durable promise,
 bus-auditable — you watch) vs *headless* (autonomous/cron, synchronous, local-only,
@@ -293,18 +294,21 @@ both.
 
 ## Beads Workflow Integration
 
-Bead/issue work in this project is delegated to the **`beads` subagent**
-(triage → claim → reserve → announce → execute → verify → close → sync →
-handoff). The subagent definition is GENERATED — regenerate it after any
-flywheel rebuild so it stays current with the workflow:
+Bead/issue work is delivered via **slash commands** (triage → claim → reserve →
+announce → execute → verify → close → sync → handoff): `/beads-triage`,
+`/beads-execute`, `/beads-review`, `/beads-commit`, `/beads-create` — the
+`prompts/beads-*.md` files per tool (opencode/pi/grok/omp). GENERATED from the
+shared body (`integrations/beads-body.md.tpl`) — regenerate after any flywheel
+rebuild so they stay current with the workflow:
 
 ```bash
-flywheel integration opencode   # -> ~/.config/opencode/agents/beads.md
-flywheel integration pi         # -> ~/.pi/agent/agents/beads.md
-flywheel integration grok       # -> ~/.grok/agents/beads.md
+flywheel integration opencode   # -> prompts/beads-{triage,execute,review,commit,create}.md
+flywheel integration pi         # -> ~/.pi/agent/prompts/beads-*.md
+flywheel integration grok       # -> ~/.grok/prompts/beads-*.md
+flywheel integration omp        # -> ~/.omp/agent/prompts/beads-*.md
 ```
 
-### Essential Commands (same surface the subagent uses)
+### Essential Commands (the lifecycle the slash commands drive)
 
 ```bash
 br ready --json                    # ready work (open, unblocked, not deferred)
