@@ -96,6 +96,12 @@ pub struct LoopParams {
     /// chain) without a manual restart.
     #[serde(default = "default_drain_grace_polls")]
     pub drain_grace_polls: u32,
+    /// claim-watch nudge cadence (bd-efk1): consecutive polls a dispatched
+    /// bead may stay UNCLAIMED while its agent is engaged before the loop
+    /// sends a claim-focused nudge. Default 2 (~60s at the 30s active
+    /// cadence — the crew-execution gate's 60s claim bound).
+    #[serde(default = "default_claim_nudge_after_polls")]
+    pub claim_nudge_after_polls: u32,
     /// Resonate server url for the engine path (bd-e0xk): set by the runner;
     /// empty → engine default localhost:8001.
     #[serde(default)]
@@ -116,6 +122,10 @@ fn default_unknown_detect_grace_polls() -> u32 {
 
 fn default_drain_grace_polls() -> u32 {
     DEFAULT_DRAIN_GRACE_POLLS
+}
+
+fn default_claim_nudge_after_polls() -> u32 {
+    DEFAULT_CLAIM_NUDGE_AFTER_POLLS
 }
 
 fn default_true() -> bool {
@@ -1704,6 +1714,189 @@ fn urgent_wake_prompt(d: &MailDigest) -> String {
     line
 }
 
+// ---- bd-efk1: crew-execution contract watchdog --------------------------
+// Dispatched agents ENGAGE (status = working) but do NOT reliably run the
+// bead lifecycle: br update --claim / br close rarely happen autonomously.
+// The loop can be perfect and the crew still won't close beads if the agents
+// don't execute the contract. This watchdog closes the loop-side gap:
+//   1. Every dispatched bead prompt is recorded (bead id → agent) at send
+//      landing.
+//   2. Each poll (work mode), the tracker snapshots (ready = unclaimed,
+//      inprogress = claimed) are reconciled against the watch:
+//      - a bead still UNCLAIMED while its agent is working/blocked/unknown
+//        gets a CLAIM NUDGE after `nudge_after_polls` consecutive polls
+//        (a short "run br update <id> --claim now" prompt — NOT a full
+//        re-dispatch);
+//      - a bead still unclaimed whose agent settled (idle/done/gone) is
+//        REDISPATCHED (re-queued at the FRONT — another agent takes it);
+//      - a bead CLAIMED but whose assignee is idle/done without closing gets
+//        a CLOSE NUDGE once (option C), then a resume-prompt redispatch if
+//        it stays unclosed;
+//      - a bead in neither snapshot is closed → dropped from the watch.
+//   3. The completion guard requires the watch to be EMPTY in work mode: a
+//      dispatched-but-unclaimed bead keeps the loop alive (the old code
+//      declared "complete" while such a bead sat open in `br ready`).
+// Pure + deterministic (unit-tested below); the loops only wire the
+// decisions into their action/queue plumbing.
+
+/// One dispatched bead's claim-watch entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimWatch {
+    /// the agent the bead prompt was dispatched to (herdr name)
+    pub agent: String,
+    /// consecutive polls the bead has stayed UNCLAIMED (still in `br ready`)
+    /// while the dispatched agent is engaged
+    pub unclaimed_polls: u32,
+    /// a close-nudge was already sent for a claimed-but-unclosed bead
+    /// (nudge once; escalate to redispatch if it stays unclosed)
+    pub close_nudged: bool,
+    /// polls since the close-nudge while the bead stayed unclosed
+    pub close_polls: u32,
+}
+
+/// One watchdog decision for a watched bead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimWatchAction {
+    /// send a claim-focused nudge to the dispatched agent (short, explicit).
+    NudgeClaim { agent: String, bead_id: String },
+    /// the dispatched agent settled without claiming — re-queue the full
+    /// bead prompt at the FRONT so another agent takes it.
+    RedispatchBead { bead_id: String, title: String },
+    /// the bead was claimed but its assignee is idle/done without closing —
+    /// send a close-focused nudge to the assignee.
+    NudgeClose { agent: String, bead_id: String, title: String },
+    /// claimed-but-unclosed after the close nudge — re-queue a RESUME prompt
+    /// so a fresh agent finishes + closes it.
+    RedispatchResume { bead_id: String, title: String },
+}
+
+/// Extract the bead id from a dispatched bead/resume prompt, if any.
+/// `bead_prompt` starts with "Execute bead bd-XXX: ..."; `resume_prompt`
+/// with "Resume bead bd-XXX: ...". Plain prompts (nudges, mail wakes) yield
+/// `None` — the watchdog only tracks bead dispatches.
+pub fn bead_id_from_prompt(text: &str) -> Option<&str> {
+    let rest = text
+        .strip_prefix("Execute bead ")
+        .or_else(|| text.strip_prefix("Resume bead "))?;
+    let id = rest.split(':').next().unwrap_or(rest).trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+/// The claim-focused nudge prompt (bd-efk1 option A): one explicit command,
+/// not the dense lifecycle. The agent is WORKING — it just never claimed.
+pub fn claim_nudge_prompt(bead_id: &str) -> String {
+    format!(
+        "CLAIM REQUIRED: bead {bead_id} is still unclaimed in the tracker and you were dispatched it. \
+         Run NOW: `br update {bead_id} --claim --actor \"$AGENT_NAME\" --json` (cd to the repo holding .beads/), \
+         then continue the execution prompt you already received. Do NOT work an unclaimed bead."
+    )
+}
+
+/// The close-focused nudge prompt (bd-efk1 option C): the bead is claimed but
+/// the assignee settled without closing it.
+pub fn close_nudge_prompt(bead_id: &str, title: &str) -> String {
+    format!(
+        "CLOSE REQUIRED: bead {bead_id} ({title}) is still in_progress and your lane is idle. \
+         Finish + verify the acceptance gate, then close it with the gate-evidence reason: \
+         `br close {bead_id} --actor \"$AGENT_NAME\" --reason \"<command + result>\"`, `br sync --flush-only` + commit. \
+         If you CANNOT finish, reopen it (`br update {bead_id} --status open --actor \"$AGENT_NAME\"`) so the loop re-dispatches it."
+    )
+}
+
+/// One claim-watch reconcile step (pure — the unit surface). Mutates
+/// `watch` and returns the actions the loop must take this poll.
+///
+/// `nudge_after_polls`: consecutive unclaimed polls before a claim nudge.
+pub fn claim_watch_step(
+    watch: &mut std::collections::HashMap<String, ClaimWatch>,
+    ready: &[ReadyBead],
+    inprogress: &[ReadyBead],
+    states: &[AgentState],
+    nudge_after_polls: u32,
+) -> Vec<ClaimWatchAction> {
+    let mut actions = Vec::new();
+    let mut drop = Vec::new();
+    let nudge_after = nudge_after_polls.max(1);
+    for (bead_id, cw) in watch.iter_mut() {
+        let in_ready = ready.iter().find(|b| b.id == *bead_id);
+        let claimed = inprogress.iter().find(|b| b.id == *bead_id);
+        match (in_ready, claimed) {
+            // still unclaimed
+            (Some(rb), None) => {
+                let st = states
+                    .iter()
+                    .find(|s| s.name == cw.agent)
+                    .map(|s| s.status.as_str());
+                match st {
+                    // engaged but never claimed → nudge after N polls
+                    Some("working") | Some("blocked") | Some("unknown") => {
+                        cw.unclaimed_polls += 1;
+                        if cw.unclaimed_polls >= nudge_after {
+                            cw.unclaimed_polls = 0;
+                            actions.push(ClaimWatchAction::NudgeClaim {
+                                agent: cw.agent.clone(),
+                                bead_id: bead_id.clone(),
+                            });
+                        }
+                    }
+                    // settled (idle/done) or agent gone → redispatch
+                    _ => {
+                        drop.push(bead_id.clone());
+                        actions.push(ClaimWatchAction::RedispatchBead {
+                            bead_id: bead_id.clone(),
+                            title: rb.title.clone(),
+                        });
+                    }
+                }
+            }
+            // claimed
+            (_, Some(cb)) => {
+                let assignee = cb.assignee.clone().unwrap_or_else(|| cw.agent.clone());
+                let live = states.iter().any(|s| s.name == assignee);
+                let settled = states
+                    .iter()
+                    .find(|s| s.name == assignee)
+                    .map(|s| matches!(s.status.as_str(), "idle" | "done"))
+                    .unwrap_or(false);
+                if live && settled {
+                    if !cw.close_nudged {
+                        cw.close_nudged = true;
+                        cw.close_polls = 0;
+                        actions.push(ClaimWatchAction::NudgeClose {
+                            agent: assignee,
+                            bead_id: bead_id.clone(),
+                            title: cb.title.clone(),
+                        });
+                    } else {
+                        cw.close_polls += 1;
+                        if cw.close_polls >= nudge_after {
+                            drop.push(bead_id.clone());
+                            actions.push(ClaimWatchAction::RedispatchResume {
+                                bead_id: bead_id.clone(),
+                                title: cb.title.clone(),
+                            });
+                        }
+                    }
+                }
+                // assignee working/blocked → claimed work in flight, keep
+                // watching (the in-progress completion guard owns liveness)
+            }
+            // closed (neither snapshot) → done, drop
+            (None, None) => {
+                drop.push(bead_id.clone());
+            }
+        }
+    }
+    for id in drop {
+        watch.remove(&id);
+    }
+    actions
+}
+
 pub fn plan_actions(
     states: &[AgentState],
     queue: &mut Vec<String>,
@@ -2145,6 +2338,12 @@ pub const DEFAULT_UNKNOWN_DETECT_GRACE_POLLS: u32 = 6;
 /// (dependency chain), so the loop drives the whole chain in one run.
 pub const DEFAULT_DRAIN_GRACE_POLLS: u32 = 1;
 
+/// Claim-watch nudge cadence (bd-efk1). Default 2: a dispatched bead may
+/// stay unclaimed for ~2 active polls (≈60s at the 30s active cadence —
+/// the crew-execution gate's 60s claim bound) before the loop nudges the
+/// working agent to `br update --claim` it.
+pub const DEFAULT_CLAIM_NUDGE_AFTER_POLLS: u32 = 2;
+
 /// Legacy alias: old tests/callers used a hard respawn threshold of 2.
 /// Per-agent self-heal bookkeeping (bd-event-self-heal-unknown).
 /// Survives within a run; optionally mirrored into `loops.json` `respawn`.
@@ -2382,6 +2581,16 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // consecutive completion-condition holds (bd-bvwf.3 drain-grace): the
     // loop exits only when the condition holds drain_grace_polls+1 times.
     let mut complete_holds: u32 = 0;
+    // bd-efk1: dispatched-bead claim watch (bead id → dispatch state). The
+    // crew-execution watchdog: agents ENGAGE but skip the br lifecycle; the
+    // watch catches unclaimed/ unclosed beads and nudges or re-dispatches.
+    let mut claim_watch: std::collections::HashMap<String, ClaimWatch> =
+        std::collections::HashMap::new();
+    // bd-efk1: claim-watch nudge sends collected during work-mode sourcing,
+    // merged into the action list AFTER plan_actions (they target specific
+    // agents — including WORKING ones — and must not be double-filtered by
+    // the dispatch-pending retention applied to poll_actions).
+    let mut watch_sends: Vec<LoopAction> = Vec::new();
     // agents that received DispatchImmediate and await working confirmation
     // (bd-event-dispatch double-dispatch guard)
     let mut dispatch_pending: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2697,6 +2906,44 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 queue.push(bead_prompt(&bead.id, &bead.title));
                 assigned.push(bead.id.clone());
             }
+
+            // bd-efk1: crew-execution watchdog — reconcile the dispatched
+            // bead watch against the fresh tracker snapshots. Unclaimed
+            // beads get a claim nudge (engaged agent) or a re-dispatch
+            // (settled agent); claimed-but-unclosed beads get a close nudge
+            // then a resume re-dispatch. The nudge Sends target specific
+            // agents (bypass plan_actions — they fire even for WORKING
+            // agents); re-dispatches re-enter the queue at the FRONT so the
+            // next idle agent takes them.
+            let watch_actions = claim_watch_step(
+                &mut claim_watch,
+                &ready,
+                &inprog,
+                &states,
+                params.claim_nudge_after_polls,
+            );
+            for a in watch_actions {
+                match a {
+                    ClaimWatchAction::NudgeClaim { agent, bead_id } => {
+                        watch_sends.push(LoopAction::Send {
+                            name: agent,
+                            text: claim_nudge_prompt(&bead_id),
+                        });
+                    }
+                    ClaimWatchAction::RedispatchBead { bead_id, title } => {
+                        queue.insert(0, bead_prompt(&bead_id, &title));
+                    }
+                    ClaimWatchAction::NudgeClose { agent, bead_id, title } => {
+                        watch_sends.push(LoopAction::Send {
+                            name: agent,
+                            text: close_nudge_prompt(&bead_id, &title),
+                        });
+                    }
+                    ClaimWatchAction::RedispatchResume { bead_id, title } => {
+                        queue.insert(0, resume_prompt(&bead_id, &title));
+                    }
+                }
+            }
         }
 
         let mut blocked_names: Vec<String> = Vec::new();
@@ -2791,6 +3038,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             }
         }
         actions.extend(poll_actions);
+        // bd-efk1: claim-watch nudges fire AFTER the poll plan (they target
+        // specific agents — possibly WORKING ones — so they must survive the
+        // dispatch-pending retention applied above).
+        actions.append(&mut watch_sends);
 
         // with on_blocked=stop, the loop must not dispatch any more work this
         // iteration — check the blocker before any side effect fires
@@ -3044,7 +3295,22 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     // failure counter; a skipped item never fails)
                     any_work = true;
                     match handle_send_result(&mut send_failures, name, &outcome) {
-                        Escalation::Accept => {}
+                        Escalation::Accept => {
+                            // bd-efk1: record the dispatched bead (if the
+                            // prompt is a bead/resume prompt) so the
+                            // claim-watch can reconcile it next poll. Only on
+                            // Accept — a failed send never reached the agent.
+                            if let Some(id) = bead_id_from_prompt(text) {
+                                claim_watch
+                                    .entry(id.to_string())
+                                    .or_insert_with(|| ClaimWatch {
+                                        agent: name.clone(),
+                                        unclaimed_polls: 0,
+                                        close_nudged: false,
+                                        close_polls: 0,
+                                    });
+                            }
+                        }
                         Escalation::FailStop => {
                             return Err(map_err(anyhow::anyhow!(
                                 "{}",
@@ -3296,7 +3562,15 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             && all_settled
             && !any_work
             && !inprogress_blocking
-            && expected_replies.is_empty();
+            && expected_replies.is_empty()
+            // bd-efk1: in work mode, a dispatched-but-unclaimed bead is OPEN
+            // WORK — the queue drained but the bead still sits in `br ready`.
+            // The old guard declared "complete" while the crew left beads
+            // unclaimed (bv in_progress_count = 0 despite working agents);
+            // the claim-watch must be EMPTY (every dispatched bead claimed
+            // AND closed, or re-dispatched) before the loop may exit. Only
+            // in work mode — non-work queues may hold arbitrary prompts.
+            && (!params.work || claim_watch.is_empty());
         if complete_now {
             complete_holds += 1;
             if complete_holds > params.drain_grace_polls {
@@ -3630,6 +3904,11 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     let mut complete_holds: u32 = 0;
     let mut event_cursor_seq: u64 = 0;
     let mut event_stream_errors: u64 = 0;
+    // bd-efk1 parity: the engine loop carries the same crew-execution
+    // claim-watch (dispatched bead → agent) + nudge sends as swarm_loop.
+    let mut claim_watch: std::collections::HashMap<String, ClaimWatch> =
+        std::collections::HashMap::new();
+    let mut watch_sends: Vec<LoopAction> = Vec::new();
 
     loop {
         iteration += 1;
@@ -3831,6 +4110,38 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 queue.push(bead_prompt(&bead.id, &bead.title));
                 assigned.push(bead.id.clone());
             }
+
+            // bd-efk1 parity: same crew-execution watchdog as swarm_loop —
+            // reconcile the dispatched-bead watch against fresh snapshots.
+            let watch_actions = claim_watch_step(
+                &mut claim_watch,
+                &ready,
+                &inprog,
+                &states,
+                params.claim_nudge_after_polls,
+            );
+            for a in watch_actions {
+                match a {
+                    ClaimWatchAction::NudgeClaim { agent, bead_id } => {
+                        watch_sends.push(LoopAction::Send {
+                            name: agent,
+                            text: claim_nudge_prompt(&bead_id),
+                        });
+                    }
+                    ClaimWatchAction::RedispatchBead { bead_id, title } => {
+                        queue.insert(0, bead_prompt(&bead_id, &title));
+                    }
+                    ClaimWatchAction::NudgeClose { agent, bead_id, title } => {
+                        watch_sends.push(LoopAction::Send {
+                            name: agent,
+                            text: close_nudge_prompt(&bead_id, &title),
+                        });
+                    }
+                    ClaimWatchAction::RedispatchResume { bead_id, title } => {
+                        queue.insert(0, resume_prompt(&bead_id, &title));
+                    }
+                }
+            }
         }
 
         // plan the tick: queue feeds Send actions; nudge when empty.
@@ -3842,6 +4153,9 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             &HashMap::new(),
             &std::collections::HashSet::new(),
         ));
+        // bd-efk1 parity: claim-watch nudges fire after the poll plan
+        // (they target specific agents — possibly WORKING ones).
+        actions.append(&mut watch_sends);
 
         let mut any_work = false;
         let mut any_blocked = false;
@@ -3908,7 +4222,20 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     let outcome = engine_dispatch_outcome(name, &value);
                     any_work = true;
                     match handle_send_result(&mut send_failures, name, &outcome) {
-                        Escalation::Accept => {}
+                        Escalation::Accept => {
+                            // bd-efk1 parity: record the dispatched bead so
+                            // the claim-watch reconciles it next poll.
+                            if let Some(id) = bead_id_from_prompt(text) {
+                                claim_watch
+                                    .entry(id.to_string())
+                                    .or_insert_with(|| ClaimWatch {
+                                        agent: name.clone(),
+                                        unclaimed_polls: 0,
+                                        close_nudged: false,
+                                        close_polls: 0,
+                                    });
+                            }
+                        }
                         Escalation::FailStop => {
                             return Err(map_err(anyhow::anyhow!(
                                 "{}",
@@ -4096,7 +4423,10 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         let complete_now = queue.is_empty()
             && all_settled
             && !any_work
-            && !inprogress_blocking;
+            && !inprogress_blocking
+            // bd-efk1 parity: dispatched-but-unclaimed beads block
+            // completion (work-mode only — see swarm_loop).
+            && (!params.work || claim_watch.is_empty());
         if complete_now {
             complete_holds += 1;
             if complete_holds > params.drain_grace_polls {
@@ -5355,6 +5685,211 @@ mod tests {
         assert_eq!(queue.len(), 1, "queue must not be consumed by a working agent");
     }
 
+    // ---- bd-efk1: crew-execution claim watchdog (pure surface) ----
+
+    fn rb2(id: &str, title: &str) -> ReadyBead {
+        ReadyBead {
+            id: id.to_string(),
+            title: title.to_string(),
+            assignee: None,
+        }
+    }
+
+    fn rb_assignee(id: &str, title: &str, assignee: &str) -> ReadyBead {
+        ReadyBead {
+            id: id.to_string(),
+            title: title.to_string(),
+            assignee: Some(assignee.to_string()),
+        }
+    }
+
+    fn cw(agent: &str) -> ClaimWatch {
+        ClaimWatch {
+            agent: agent.to_string(),
+            unclaimed_polls: 0,
+            close_nudged: false,
+            close_polls: 0,
+        }
+    }
+
+    #[test]
+    fn bead_id_from_prompt_extracts_execute_and_resume() {
+        assert_eq!(
+            bead_id_from_prompt("Execute bead bd-12: fix auth flow"),
+            Some("bd-12")
+        );
+        assert_eq!(
+            bead_id_from_prompt("Resume bead bd-bvwf.1: loop reliability"),
+            Some("bd-bvwf.1")
+        );
+        assert_eq!(bead_id_from_prompt("p1"), None, "plain stage prompts are not tracked");
+        assert_eq!(
+            bead_id_from_prompt("MAIL WAKE: 1 urgent message..."),
+            None,
+            "mail wakes are not tracked"
+        );
+        // an edge id with a colon in the title must stop at the first colon
+        assert_eq!(
+            bead_id_from_prompt("Execute bead bd-x: title: with colon"),
+            Some("bd-x")
+        );
+    }
+
+    #[test]
+    fn claim_nudge_prompt_is_claim_focused() {
+        let p = claim_nudge_prompt("bd-12");
+        assert!(p.contains("br update bd-12 --claim"), "explicit claim command: {p}");
+        assert!(p.contains("bd-12"), "names the bead");
+    }
+
+    #[test]
+    fn close_nudge_prompt_commands_close_or_reopen() {
+        let p = close_nudge_prompt("bd-12", "fix auth");
+        assert!(p.contains("br close bd-12"), "explicit close command: {p}");
+        assert!(p.contains("--status open"), "reopen fallback: {p}");
+    }
+
+    /// A dispatched bead that is STILL unclaimed (in `br ready`) while its
+    /// agent is WORKING accumulates unclaimed polls; after the nudge
+    /// threshold it produces a claim-focused nudge to THAT agent (not a
+    /// re-dispatch — the agent is engaged, it just never claimed).
+    #[test]
+    fn claim_watch_nudges_working_agent_after_threshold() {
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-12".into(), cw("oc-1"));
+        let ready = vec![rb2("bd-12", "fix auth")];
+        let inprogress = vec![];
+        let states = vec![st("oc-1", "working")];
+
+        // below threshold: keep watching, no action
+        let actions = claim_watch_step(&mut watch, &ready, &inprogress, &states, 2);
+        assert!(actions.is_empty(), "no nudge before threshold: {actions:?}");
+        assert_eq!(watch.get("bd-12").unwrap().unclaimed_polls, 1);
+
+        // at threshold: claim nudge to the dispatched agent
+        let actions = claim_watch_step(&mut watch, &ready, &inprogress, &states, 2);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        match &actions[0] {
+            ClaimWatchAction::NudgeClaim { agent, bead_id } => {
+                assert_eq!(agent, "oc-1");
+                assert_eq!(bead_id, "bd-12");
+            }
+            other => panic!("expected NudgeClaim, got {other:?}"),
+        }
+        // counter resets after the nudge (next nudge needs a fresh window)
+        assert_eq!(watch.get("bd-12").unwrap().unclaimed_polls, 0);
+    }
+
+    /// A dispatched bead whose agent SETTLED (idle/done) without claiming is
+    /// re-dispatched: the entry drops from the watch and a fresh bead prompt
+    /// is queued at the FRONT (another agent takes it).
+    #[test]
+    fn claim_watch_redispatch_when_agent_settled_without_claim() {
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-12".into(), cw("oc-1"));
+        let ready = vec![rb2("bd-12", "fix auth")];
+        let inprogress = vec![];
+        let states = vec![st("oc-1", "idle")]; // settled, never claimed
+
+        let actions = claim_watch_step(&mut watch, &ready, &inprogress, &states, 2);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(
+            matches!(&actions[0], ClaimWatchAction::RedispatchBead { bead_id, title }
+                if bead_id == "bd-12" && title == "fix auth"),
+            "{:?}",
+            actions[0]
+        );
+        assert!(watch.is_empty(), "settled-without-claim drops the watch entry");
+    }
+
+    /// A claimed bead (in `br inprogress`) whose assignee is idle/done
+    /// without closing gets a CLOSE nudge once (option C), then — if it
+    /// STILL stays unclosed past the threshold — a resume re-dispatch.
+    #[test]
+    fn claim_watch_close_nudge_then_resume_redispatch() {
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-12".into(), cw("oc-1"));
+        let ready = vec![];
+        let inprogress = vec![rb_assignee("bd-12", "fix auth", "oc-1")];
+        let states = vec![st("oc-1", "done")]; // claimed but never closed
+
+        // first poll: close nudge once
+        let actions = claim_watch_step(&mut watch, &ready, &inprogress, &states, 2);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        match &actions[0] {
+            ClaimWatchAction::NudgeClose { agent, bead_id, title } => {
+                assert_eq!(agent, "oc-1");
+                assert_eq!(bead_id, "bd-12");
+                assert_eq!(title, "fix auth");
+            }
+            other => panic!("expected NudgeClose, got {other:?}"),
+        }
+        assert!(watch.get("bd-12").unwrap().close_nudged);
+
+        // still unclosed: polls accumulate (no repeated nudge)
+        let actions = claim_watch_step(&mut watch, &ready, &inprogress, &states, 2);
+        assert!(actions.is_empty(), "no repeat close nudge: {actions:?}");
+
+        // past the threshold (nudge_after more polls): resume re-dispatch
+        let actions = claim_watch_step(&mut watch, &ready, &inprogress, &states, 2);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(
+            matches!(&actions[0], ClaimWatchAction::RedispatchResume { bead_id, title }
+                if bead_id == "bd-12" && title == "fix auth"),
+            "{:?}",
+            actions[0]
+        );
+        assert!(watch.is_empty());
+    }
+
+    /// A claimed bead whose assignee is WORKING stays watched (work in
+    /// flight) — no close nudge, no redispatch.
+    #[test]
+    fn claim_watch_working_assignee_no_close_nudge() {
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-12".into(), cw("oc-1"));
+        let ready = vec![];
+        let inprogress = vec![rb_assignee("bd-12", "fix auth", "oc-1")];
+        let states = vec![st("oc-1", "working")];
+        let actions = claim_watch_step(&mut watch, &ready, &inprogress, &states, 2);
+        assert!(actions.is_empty(), "no nudge while claimed work is in flight: {actions:?}");
+        assert!(watch.contains_key("bd-12"), "keep watching");
+    }
+
+    /// A bead that vanished from BOTH snapshots is closed — the watch entry
+    /// drops (the lifecycle completed; nothing left to enforce).
+    #[test]
+    fn claim_watch_drops_closed_bead() {
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-12".into(), cw("oc-1"));
+        let actions = claim_watch_step(&mut watch, &[], &[], &[], 2);
+        assert!(actions.is_empty());
+        assert!(watch.is_empty(), "closed bead drops from the watch");
+    }
+
+    /// An unclaimed bead whose dispatched agent is GONE (not in the poll)
+    /// is re-dispatched — a dead lane must not strand the bead.
+    #[test]
+    fn claim_watch_redispatch_when_agent_gone() {
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-12".into(), cw("oc-1"));
+        let ready = vec![rb2("bd-12", "fix auth")];
+        let actions = claim_watch_step(&mut watch, &ready, &[], &[], 2);
+        assert!(
+            matches!(&actions[0], ClaimWatchAction::RedispatchBead { bead_id, .. }
+                if bead_id == "bd-12"),
+            "{:?}",
+            actions[0]
+        );
+        assert!(watch.is_empty());
+    }
+
     #[test]
     fn params_serde_roundtrip() {
         let p = LoopParams {
@@ -5374,6 +5909,7 @@ mod tests {
             respawn_budget: 2,
             unknown_detect_grace_polls: 6,
             drain_grace_polls: 1,
+            claim_nudge_after_polls: 2,
             resonate_url: String::new(),
         };
         let v = serde_json::to_value(&p).unwrap();

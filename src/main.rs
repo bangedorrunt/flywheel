@@ -7260,6 +7260,7 @@ fn cmd_loop(
             respawn_budget: cfg.respawn_budget(),
             unknown_detect_grace_polls: cfg.unknown_detect_grace_polls(),
             drain_grace_polls: cfg.drain_grace_polls(),
+            claim_nudge_after_polls: cfg.claim_nudge_after_polls(),
             resonate_url: String::new(),
         };
         let rt = tokio::runtime::Runtime::new()?;

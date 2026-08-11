@@ -168,6 +168,11 @@ pub struct LoopConfig {
     /// extra poll catches a bead unblocked by the last closure (dependency
     /// chain) without a manual restart. Default 1.
     pub drain_grace_polls: Option<u32>,
+    /// claim-watch nudge cadence (bd-efk1): consecutive polls a dispatched
+    /// bead may stay UNCLAIMED while its agent is engaged before the loop
+    /// sends a claim-focused nudge. Default 2 (~60s at the 30s active
+    /// cadence). 0/absent → the default.
+    pub claim_nudge_after_polls: Option<u32>,
 }
 
 impl Config {
@@ -201,6 +206,15 @@ impl Config {
             .as_ref()
             .and_then(|l| l.drain_grace_polls)
             .unwrap_or(1)
+    }
+
+    /// Claim-watch nudge cadence (default 2 — see
+    /// [`crate::durable::DEFAULT_CLAIM_NUDGE_AFTER_POLLS`]).
+    pub fn claim_nudge_after_polls(&self) -> u32 {
+        self.r#loop
+            .as_ref()
+            .and_then(|l| l.claim_nudge_after_polls)
+            .unwrap_or(crate::durable::DEFAULT_CLAIM_NUDGE_AFTER_POLLS)
     }
 
     pub fn load() -> Result<Self> {
