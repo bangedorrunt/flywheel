@@ -113,11 +113,13 @@ fn send_receipt_from(v: Value) -> Result<SendReceipt, MailError> {
     })
 }
 
-/// `renew` envelope: the facade emits `{renewed, file_reservations:[{id,
-/// path_pattern, old_expires_ts, new_expires_ts}]}` (AM-parity shape); the
-/// surface `RenewResult` wants `{renewed, reservations: [GrantedReservation]}`.
-/// `exclusive`/`reason` are absent from the envelope — defaulted honestly
-/// (the renewal never changes them).
+/// `renew` envelope → `RenewResult` (AM-parity shape + bd-evqs reason).
+/// The facade emits `{renewed, file_reservations:[{id, path_pattern, reason,
+/// old_expires_ts, new_expires_ts}]}`; the surface wants `{renewed,
+/// reservations: [GrantedReservation]}`. `exclusive` is absent from the
+/// envelope — defaulted honestly (the renewal never changes it). `reason`
+/// (bd-evqs) rides through so the loop's closed-bead sweep can release stale
+/// leases.
 fn renew_result_from(v: Value) -> Result<RenewResult, MailError> {
     let renewed = v.get("renewed").and_then(Value::as_u64).unwrap_or(0) as usize;
     let reservations = v
@@ -138,7 +140,7 @@ fn renew_result_from(v: Value) -> Result<RenewResult, MailError> {
                         .unwrap_or("")
                         .to_string(),
                     exclusive: true,
-                    reason: String::new(),
+                    reason: r.get("reason").and_then(Value::as_str).unwrap_or("").to_string(),
                     expires_ts_us: r
                         .get("new_expires_ts")
                         .and_then(Value::as_str)
@@ -471,21 +473,30 @@ impl MailSurface for ToronMailBackend {
         &self,
         project: &str,
         requestor: &str,
-        reservation_id: &str,
+        path: &str,
+        holder: Option<&str>,
         note: Option<&str>,
         notify_previous: bool,
     ) -> Result<(), MailError> {
         let mail = self.mail.clone();
-        let (project, requestor, id, note, notify) = (
+        let (project, requestor, path, holder, note, notify) = (
             project.to_string(),
             requestor.to_string(),
-            reservation_id.to_string(),
+            path.to_string(),
+            holder.map(str::to_string),
             note.unwrap_or("").to_string(),
             notify_previous,
         );
         run_facade(mail, move |m| {
-            m.force_release_file_reservation(&project, &requestor, &id, Some(&note), notify)
-                .map(|_| ())
+            m.force_release_file_reservation(
+                &project,
+                &requestor,
+                &path,
+                holder.as_deref(),
+                if note.is_empty() { None } else { Some(&note) },
+                notify,
+            )
+            .map(|_| ())
         })
         .await
     }
@@ -771,6 +782,7 @@ mod tests {
             "file_reservations": [{
                 "id": "deadbeef",
                 "path_pattern": "src/**",
+                "reason": "bd-oj9o",
                 "old_expires_ts": "",
                 "new_expires_ts": "1786200000000000",
             }],
@@ -783,5 +795,37 @@ mod tests {
             Some(1786200000000000),
             "new_expires_ts parses as i64, never unwrap_or(0)"
         );
+        // bd-evqs: the reason (owning bead id) must survive the envelope —
+        // the loop's closed-bead sweep reads it to release stale leases.
+        assert_eq!(r.reservations[0].reason, "bd-oj9o");
+    }
+
+    /// bd-evqs: the daemon's `reservations` shape also carries reason (the
+    /// daemon MCP `GrantedReservationOut` includes it).
+    #[test]
+    fn renew_result_reason_survives_daemon_shape() {
+        let v = serde_json::json!({
+            "renewed": 2,
+            "reservations": [
+                {
+                    "id": "abc",
+                    "path_pattern": "src/a.rs",
+                    "exclusive": true,
+                    "reason": "bd-12",
+                    "expires_ts_us": 1786200000000000i64,
+                },
+                {
+                    "id": "def",
+                    "path_pattern": "src/b.rs",
+                    "exclusive": false,
+                    "reason": "",
+                    "expires_ts_us": 1786200000000000i64,
+                },
+            ],
+        });
+        let r = renew_result_from(v).expect("convert");
+        assert_eq!(r.renewed, 2);
+        assert_eq!(r.reservations[0].reason, "bd-12");
+        assert_eq!(r.reservations[1].reason, "", "missing reason stays empty");
     }
 }

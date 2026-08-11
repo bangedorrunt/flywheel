@@ -926,9 +926,13 @@ enum MailCmd {
     /// operator force-release of a stale reservation (herdr-down / abandoned)
     ForceUnlock {
         project: String,
-        /// reservation id (toron kind-30031 event id)
-        #[arg(long = "reservation-id")]
-        reservation_id: String,
+        /// path (or glob) of the stale reservation to revoke — the daemon
+        /// resolves the active lease on this path itself (bd-cumj)
+        #[arg(long = "paths", value_name = "PATH")]
+        path: String,
+        /// holder agent name to disambiguate (optional)
+        #[arg(long)]
+        holder: Option<String>,
         /// optional note for the released holder
         #[arg(long)]
         note: Option<String>,
@@ -5965,7 +5969,8 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         }
         MailCmd::ForceUnlock {
             project,
-            reservation_id,
+            path,
+            holder,
             note,
             as_agent,
         } => {
@@ -5976,7 +5981,8 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let v = mail.force_release_file_reservation(
                 &key,
                 &name,
-                reservation_id,
+                &path,
+                holder.as_deref(),
                 note.as_deref(),
                 false,
             )?;
@@ -8748,6 +8754,49 @@ mod mail_name_tests {
             ..Default::default()
         };
         assert_eq!(orchestrator_mail_name(&cfg), "flywheel");
+    }
+}
+
+/// bd-evqs: reason → bead-id parsing for the closed-bead renewal sweep.
+#[cfg(test)]
+mod renew_sweep_tests {
+    use super::*;
+
+    #[test]
+    fn bead_id_from_reason_parses_bd_ids() {
+        assert_eq!(bead_id_from_reason("bd-oj9o"), Some("bd-oj9o"));
+        assert_eq!(bead_id_from_reason("bd-oj9o "), Some("bd-oj9o"), "trailing space trimmed");
+        assert_eq!(bead_id_from_reason("  bd-12  "), Some("bd-12"), "leading space trimmed");
+        assert_eq!(bead_id_from_reason("bd-12: fix auth"), Some("bd-12"), "first token wins");
+    }
+
+    #[test]
+    fn bead_id_from_reason_rejects_non_beads() {
+        assert_eq!(bead_id_from_reason(""), None);
+        assert_eq!(bead_id_from_reason("src/foo.rs"), None, "paths are not beads");
+        assert_eq!(bead_id_from_reason("orchestrator-lock"), None);
+        assert_eq!(bead_id_from_reason("bd-"), None, "bare prefix is not an id");
+        assert_eq!(bead_id_from_reason("my-bd-12"), None, "prefix must start the token");
+    }
+
+    /// The sweep predicate: a reservation is stale when its reason parses to
+    /// a bead id that is in the CLOSED set. (The filter closure lives in
+    /// cmd_internal_renew_leases; this pins the parse + set membership that
+    /// drives it.)
+    #[test]
+    fn closed_set_membership_drives_stale_filter() {
+        let closed: std::collections::HashSet<String> =
+            ["bd-oj9o".to_string(), "bd-12".to_string()].into();
+        let stale: Vec<&str> = ["bd-oj9o", "bd-99", "src/foo.rs", ""]
+            .iter()
+            .filter(|r| {
+                bead_id_from_reason(r)
+                    .map(|id| closed.contains(id))
+                    .unwrap_or(false)
+            })
+            .copied()
+            .collect();
+        assert_eq!(stale, vec!["bd-oj9o"], "only closed-bead reasons are stale");
     }
 }
 
@@ -13618,6 +13667,40 @@ fn cmd_internal_renew_leases(cfg: &Config, project: &str, extend_seconds: u64) -
     let agent = orchestrator_mail_name(cfg);
     let v = backend::run_mail(mail.renew_reservations(&key, &agent, &[], extend_seconds))
         .map_err(|e| anyhow!("mail backend: {e}"))?;
+
+    // bd-evqs: release reservations whose owning bead is CLOSED. The renewal
+    // storm: the loop renewed a lease for bead bd-oj9o (long closed) 1218
+    // times — the renew path never looked at the reason. A reservation whose
+    // reason is a bead id that is now CLOSED is stale by definition (the work
+    // it guarded is done); release it here so the next tick has nothing to
+    // renew. Best-effort: br being unavailable (scratch projects, no .beads)
+    // keeps today's behavior (renew all, no sweep).
+    let mut released_closed: Vec<String> = Vec::new();
+    if let Ok(closed) = load_closed_bead_ids(cfg, project) {
+        let stale: Vec<String> = v
+            .reservations
+            .iter()
+            .filter(|r| {
+                bead_id_from_reason(&r.reason)
+                    .map(|id| closed.contains(id))
+                    .unwrap_or(false)
+            })
+            .map(|r| r.path_pattern.clone())
+            .collect();
+        for path in &stale {
+            match backend::run_mail(mail.release_reservations(&key, &agent, std::slice::from_ref(path))) {
+                Ok(rel) if rel.released > 0 => {
+                    eprintln!("flywheel: released stale reservation {path} (owning bead closed)");
+                    released_closed.push(path.clone());
+                }
+                Ok(_) => {
+                    eprintln!("flywheel: release of stale reservation {path} reported 0 released");
+                }
+                Err(e) => eprintln!("flywheel: release of stale reservation {path} failed (continuing): {e}"),
+            }
+        }
+    }
+
     // Surface `RenewResult` → the AM-parity `file_reservations` envelope
     // `list_own_reservations` / older CLI consumers parse.
     let envelope = json!({
@@ -13634,9 +13717,57 @@ fn cmd_internal_renew_leases(cfg: &Config, project: &str, extend_seconds: u64) -
         "ok": true,
         "renewed": v.renewed,
         "agent": agent,
+        "released_closed": released_closed,
         "file_reservations": reservations,
     }));
     Ok(())
+}
+
+/// Parse a reservation reason as a bead id, if the reason names one.
+/// Reasons are the bead id verbatim (`bd-oj9o`) or free text; only
+/// `bd-<id>`-shaped reasons are treated as bead refs (bd-evqs — the sweep
+/// must never guess that an arbitrary reason is a bead).
+pub fn bead_id_from_reason(reason: &str) -> Option<&str> {
+    let t = reason.trim();
+    let id = t.split_whitespace().next().unwrap_or(t);
+    // strip trailing punctuation ("bd-12:" or "bd-12," from free-text reasons)
+    let id = id.trim_end_matches([':', ',', ';', ')']);
+    if id.starts_with("bd-") && id.len() > 3 {
+        Some(id)
+    } else {
+        None
+    }
+}
+
+/// Load the set of CLOSED bead ids in the project (`br list --all --json`,
+/// status == "closed"). Soft-fail: a missing .beads / br error yields an
+/// empty set (the sweep no-ops, renew-all preserved).
+fn load_closed_bead_ids(cfg: &Config, project: &str) -> Result<std::collections::HashSet<String>> {
+    let dir = project_dir(cfg, project);
+    let out = std::process::Command::new("br")
+        .args(["list", "--all", "--json"])
+        .current_dir(&dir)
+        .output()
+        .map_err(|e| anyhow!("br not found: {e}"))?;
+    if !out.status.success() {
+        bail!(
+            "br list --all failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(raw.trim())?;
+    let mut closed = std::collections::HashSet::new();
+    if let Some(issues) = v.get("issues").and_then(Value::as_array) {
+        for b in issues {
+            let id = b.get("id").and_then(Value::as_str).unwrap_or("");
+            let status = b.get("status").and_then(Value::as_str).unwrap_or("");
+            if status == "closed" && !id.is_empty() {
+                closed.insert(id.to_string());
+            }
+        }
+    }
+    Ok(closed)
 }
 
 // ---- serve (feature: serve) ----

@@ -742,22 +742,19 @@ impl MailSurface for AgentMailBackend {
 
     async fn force_release(
         &self,
-        project: &str,
-        requestor: &str,
-        reservation_id: &str,
-        note: Option<&str>,
-        notify_previous: bool,
+        _project: &str,
+        _requestor: &str,
+        _path: &str,
+        _holder: Option<&str>,
+        _note: Option<&str>,
+        _notify_previous: bool,
     ) -> Result<(), MailError> {
-        let id = reservation_id.parse::<u64>().map_err(|e| {
-            MailError::other(format!(
-                "agent-mail force_release: file_reservation_id {reservation_id:?} is not a decimal id: {e}"
-            ))
-        })?;
-        let _ = self.call(
-            "force_release_file_reservation",
-            wire::force_release_args(project, requestor, json!(id as i64), note, notify_previous),
-        )?;
-        Ok(())
+        // bd-cumj: force-release now resolves by path via the toron daemon.
+        // The legacy agent-mail backend's API is numeric-id-based and cannot
+        // resolve a lease by path — toron is the supported backend for this.
+        Err(MailError::other(
+            "path-based force_release is unsupported on the legacy agent-mail backend (use the toron backend)",
+        ))
     }
 
     async fn slot_acquire(

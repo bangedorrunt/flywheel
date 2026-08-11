@@ -985,6 +985,12 @@ impl Mail {
                     "file_reservations": r.reservations.iter().map(|res| json!({
                         "id": res.id,
                         "path_pattern": res.path_pattern,
+                        // bd-evqs: the reason (owning bead id) rides through
+                        // the renew envelope so the loop can release
+                        // reservations whose bead is CLOSED — the renewal
+                        // storm fix needs the holder to know WHAT each lease
+                        // is for.
+                        "reason": res.reason,
                         "old_expires_ts": "",
                         "new_expires_ts": res.expires_ts_us.map(|u| u.to_string()).unwrap_or_default(),
                     })).collect::<Vec<Value>>(),
@@ -1012,6 +1018,10 @@ impl Mail {
                                 json!({
                                     "id": r.get("id").cloned().unwrap_or(json!(0)),
                                     "path_pattern": r.get("path_pattern").cloned().unwrap_or(json!("")),
+                                    // bd-evqs: keep the reason through the
+                                    // remap (the loop's closed-bead sweep
+                                    // reads it to release stale leases).
+                                    "reason": r.get("reason").cloned().unwrap_or(json!("")),
                                     "old_expires_ts": "",
                                     "new_expires_ts": r.get("expires_ts_us")
                                         .and_then(Value::as_u64)
@@ -1029,14 +1039,16 @@ impl Mail {
     }
 
     /// `force_release_file_reservation` — operator force-release of a stale
-    /// reservation (ADR-0003 V6 surface restore). In-process requires the
-    /// operator key (attached by `build_mailbox`); remote delegates to the
-    /// daemon's tool.
+    /// reservation (ADR-0003 V6 surface restore). bd-cumj: resolves the lease
+    /// by `path` (+ optional `holder`) — no caller-supplied event id. In-process
+    /// requires the operator key (attached by `build_mailbox`); remote delegates
+    /// to the daemon's tool.
     pub fn force_release_file_reservation(
         &self,
         project_key: &str,
         agent_name: &str,
-        file_reservation_id: &str,
+        path: &str,
+        holder: Option<&str>,
         note: Option<&str>,
         notify_previous: bool,
     ) -> Result<Value> {
@@ -1045,7 +1057,8 @@ impl Mail {
                 block_on(mailbox().force_release_file_reservation(
                     project_key,
                     agent_name,
-                    file_reservation_id,
+                    path,
+                    holder,
                     note,
                     notify_previous,
                 ))?;
@@ -1056,7 +1069,8 @@ impl Mail {
                 crate::backend::wire::force_release_args(
                     project_key,
                     agent_name,
-                    json!(file_reservation_id),
+                    path,
+                    holder,
                     note,
                     notify_previous,
                 ),
