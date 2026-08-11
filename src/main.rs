@@ -14856,3 +14856,97 @@ steps:
     }
 
 }
+
+/// bd-bvwf.1 regression: --retire-orphans must catch orphan workspaces from
+/// prior spawns (not just the default-label one). An orphan with a DIFFERENT
+/// label that still hosts a `flywheel-<base>-*` agent is classified Owned and
+/// retired; the loop's poll filters to the active workspace so orphans never
+/// enter the dispatch decision.
+#[cfg(test)]
+mod bd_bvwf1_orphan_workspaces {
+    use super::{classify_workspace_origin, partition_workspaces, WorkspaceOrigin};
+    use crate::herdr_shim::{AgentInfo, WorkspaceInfo};
+
+    fn ws(id: &str, label: &str) -> WorkspaceInfo {
+        serde_json::from_value(serde_json::json!({
+            "workspace_id": id,
+            "number": 1,
+            "label": label,
+            "focused": false,
+            "pane_count": 1,
+            "tab_count": 1,
+            "active_tab_id": "t",
+            "agent_status": "idle",
+        }))
+        .expect("ws")
+    }
+
+    fn agent(ws_id: &str, name: Option<&str>) -> AgentInfo {
+        serde_json::from_value(serde_json::json!({
+            "agent": null,
+            "agent_status": "idle",
+            "cwd": null,
+            "display_agent": null,
+            "focused": false,
+            "foreground_cwd": null,
+            "interactive_ready": false,
+            "launch_pending": false,
+            "name": name,
+            "pane_id": format!("{ws_id}:p1"),
+            "revision": 1,
+            "state_change_seq": 0,
+            "state_labels": {},
+            "tab_id": "t",
+            "terminal_id": "x",
+            "terminal_title": null,
+            "workspace_id": ws_id,
+        }))
+        .expect("agent")
+    }
+
+    /// An orphan workspace with a NON-default label (e.g. a custom spawn) that
+    /// hosts a `flywheel-<base>-*` agent is Owned — retired by --retire-orphans.
+    /// (The original bug: only the default-label workspace was closed.)
+    #[test]
+    fn orphan_hosting_managed_agent_is_owned() {
+        let project = "/path/to/toron";
+        // default-label workspace (always owned)
+        let default_ws = ws("w-default", "flywheel-toron");
+        // orphan: different label, but hosts a managed agent
+        let orphan_ws = ws("w-orphan", "custom-swarm-label");
+        let agents = vec![
+            agent("w-orphan", Some("flywheel-toron-oc")),
+            agent("w-foreign", Some("omp")),
+        ];
+        assert_eq!(
+            classify_workspace_origin(project, &default_ws, &agents, None),
+            Some(WorkspaceOrigin::Owned)
+        );
+        assert_eq!(
+            classify_workspace_origin(project, &orphan_ws, &agents, None),
+            Some(WorkspaceOrigin::Owned),
+            "orphan hosting a flywheel-<base>-* agent is Owned (retired)"
+        );
+    }
+
+    /// partition_workspaces groups the default + orphan into `owned` and a
+    /// base-labeled foreign session into `foreign`; unrelated workspaces drop.
+    #[test]
+    fn partition_owns_default_and_orphan_foreign_is_base_label() {
+        let project = "/path/to/toron";
+        let ws_list = vec![
+            ws("w-default", "flywheel-toron"),
+            ws("w-orphan", "custom-swarm-label"),
+            ws("w-captain", "toron"),
+            ws("w-unrelated", "some-other-project"),
+        ];
+        let agents = vec![agent("w-orphan", Some("flywheel-toron-oc2"))];
+        let split = partition_workspaces(project, ws_list, &agents, None);
+        let owned_ids: Vec<&str> = split.owned.iter().map(|w| w.workspace_id.as_str()).collect();
+        let foreign_ids: Vec<&str> =
+            split.foreign.iter().map(|w| w.workspace_id.as_str()).collect();
+        assert_eq!(owned_ids, vec!["w-default", "w-orphan"], "default + orphan owned");
+        assert_eq!(foreign_ids, vec!["w-captain"], "base-label session is foreign");
+        // unrelated workspace is neither (None) — never blocks or closes.
+    }
+}
