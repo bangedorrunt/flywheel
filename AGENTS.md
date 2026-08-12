@@ -327,7 +327,7 @@ bv --robot-triage | --robot-next   # graph-aware picks; NEVER bare bv
 
 1. **Triage** — `bv --robot-triage` / `br ready --json`; respect priority + dependency order.
 2. **Claim** — `br update <id> --claim --actor "$AGENT_NAME" --json`. Never work unclaimed.
-3. **Reserve** — toron `file_reservation_paths` (exclusive) for files you will touch. (`flywheel mail locks <project> --as YOUR_NAME` is the CLI equivalent.)
+3. **Reserve** — toron `file_reservation_paths` (exclusive) for files you will touch. (`flywheel mail locks reserve <project> --as YOUR_NAME` is the CLI equivalent; `flywheel mail locks list <project>` shows the board.)
 4. **Announce** — toron: which bead, which files, expected outcome (`flywheel mail send` / `toron_send_message`, thread-id = bead id).
 5. **Execute one narrow slice** — the bead is self-contained; no scope creep.
 6. **Quality gates** — narrowest test/lint/typecheck for the slice.

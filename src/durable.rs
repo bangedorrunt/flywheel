@@ -768,7 +768,7 @@ pub fn bead_prompt(id: &str, title: &str) -> String {
     // Mail backend is toron by default (`flywheel mail` → [backend] mail=toron).
     // ALWAYS pass --as <mail identity> so peer collab is not CoralFinch-collapsed.
     // Prefer mail name from spawn (adjective+noun); herdr name also maps via --as.
-    let template = r#"Execute bead {id}: {title}. Mail: toron via `flywheel mail`. Lifecycle: claim (`br update {id} --claim --actor "$AGENT_NAME" --json`) → reserve `flywheel mail locks <project> --as YOUR_MAIL_NAME --paths <files> --exclusive --reason {id} --ttl-seconds 7200` → announce `flywheel mail send <project> --as YOUR_MAIL_NAME --to all --thread-id {id} --subject '[{id}] starting' --body '<plan>'` → execute one narrow slice → verify AC → close with honest reason → `br sync --flush-only` + commit `.beads/` → `flywheel mail unlock <project> --as YOUR_MAIL_NAME` → `flywheel mail send ... --thread-id {id} --subject '[{id}] done'`. YOUR_MAIL_NAME = registered adjective+noun (DustySparrow/…) or set FLYWHEEL_MAIL_AS. Renew your own file reservations while working (toron `renew_file_reservations` or `flywheel mail locks` — extend the TTL before it lapses — the orchestrator cannot renew on your behalf), so long edits never lose their lease. When a message has ack_required=true, call `acknowledge_message` (toron) after acting on it — the orchestrator cannot ack on your behalf. Peer blocks: reply on same --thread-id, never steal reserved files. If your session context usage exceeds about 80%: write `{"context_pct": <pct>, "ts": "<now RFC3339>"}` to `.flywheel/agent-state/{AGENT_NAME}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you. If {id} already claimed, next from `br ready --json`."#;
+    let template = r#"Execute bead {id}: {title}. Mail: toron via `flywheel mail`. Lifecycle: claim (`br update {id} --claim --actor "$AGENT_NAME" --json`) → reserve `flywheel mail locks reserve <project> --as YOUR_MAIL_NAME --paths <files> --exclusive --reason {id} --ttl-seconds 7200` → announce `flywheel mail send <project> --as YOUR_MAIL_NAME --to all --thread-id {id} --subject '[{id}] starting' --body '<plan>'` → execute one narrow slice → verify AC → close with honest reason → `br sync --flush-only` + commit `.beads/` → `flywheel mail unlock <project> --as YOUR_MAIL_NAME` → `flywheel mail send ... --thread-id {id} --subject '[{id}] done'`. YOUR_MAIL_NAME = registered adjective+noun (DustySparrow/…) or set FLYWHEEL_MAIL_AS. Renew your own file reservations while working (toron `renew_file_reservations` or `flywheel mail renew` — extend the TTL before it lapses — the orchestrator cannot renew on your behalf), so long edits never lose their lease. When a message has ack_required=true, call `acknowledge_message` (toron) after acting on it — the orchestrator cannot ack on your behalf. Peer blocks: reply on same --thread-id, never steal reserved files. If your session context usage exceeds about 80%: write `{"context_pct": <pct>, "ts": "<now RFC3339>"}` to `.flywheel/agent-state/{AGENT_NAME}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you. If {id} already claimed, next from `br ready --json`."#;
     template.replace("{id}", id).replace("{title}", title)
 }
 
@@ -1619,6 +1619,36 @@ async fn renew_leases(args: RenewLeaseArgs) -> Result<Value> {
         .map_err(|e| map_err(anyhow::anyhow!("__renew-leases bad JSON: {e}: {stdout}")))
 }
 
+/// Args for the [`release_bead_locks`] leaf.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseBeadLocksArgs {
+    pub project: String,
+    pub bead_id: String,
+}
+
+/// Release every live file reservation whose reason is the closed bead id
+/// (bd-h3oj release-on-bead-close). Checkpointed side effect: the leaf calls
+/// `__release-bead-locks` in a fresh process, so a crash between ticks is
+/// resumed idempotently (a no-op release is fine). Best-effort by contract:
+/// the caller logs a failure and continues — a failed release is recoverable
+/// on a later tick and must never kill the loop.
+#[function]
+async fn release_bead_locks(args: ReleaseBeadLocksArgs) -> Result<Value> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__release-bead-locks", &args.project, &args.bead_id]);
+    let out = run_leaf_cmd(cmd, "__release-bead-locks").await?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__release-bead-locks failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout)
+        .map_err(|e| map_err(anyhow::anyhow!("__release-bead-locks bad JSON: {e}: {stdout}")))
+}
+
 /// Lease TTL policy for loop-made reservations: an initial TTL of
 /// Renewal extension per heartbeat tick: `4 × heartbeat_interval`, floored at
 /// agent-mail's 60s `extend_seconds` minimum — never compute tiny extensions.
@@ -1740,7 +1770,8 @@ fn urgent_wake_prompt(d: &MailDigest) -> String {
 //      - a bead CLAIMED but whose assignee is idle/done without closing gets
 //        a CLOSE NUDGE once (option C), then a resume-prompt redispatch if
 //        it stays unclosed;
-//      - a bead in neither snapshot is closed → dropped from the watch.
+//      - a bead in neither snapshot is closed → its file reservations are
+//        released (bd-h3oj) and the watch entry drops.
 //   3. The completion guard requires the watch to be EMPTY in work mode: a
 //      dispatched-but-unclaimed bead keeps the loop alive (the old code
 //      declared "complete" while such a bead sat open in `br ready`).
@@ -1776,6 +1807,10 @@ pub enum ClaimWatchAction {
     /// claimed-but-unclosed after the close nudge — re-queue a RESUME prompt
     /// so a fresh agent finishes + closes it.
     RedispatchResume { bead_id: String, title: String },
+    /// the bead left both tracker snapshots — it is CLOSED; its file
+    /// reservations (reason == bead id) must be released (bd-h3oj
+    /// release-on-bead-close: never let a closed bead's locks linger to TTL).
+    ReleaseReservations { bead_id: String },
 }
 
 /// Extract the bead id from a dispatched bead/resume prompt, if any.
@@ -1893,8 +1928,12 @@ pub fn claim_watch_step(
                 // assignee working/blocked → claimed work in flight, keep
                 // watching (the in-progress completion guard owns liveness)
             }
-            // closed (neither snapshot) → done, drop
+            // closed (neither snapshot) → the lifecycle completed: release
+            // the bead's file reservations (bd-h3oj), then drop the watch.
             (None, None) => {
+                actions.push(ClaimWatchAction::ReleaseReservations {
+                    bead_id: bead_id.clone(),
+                });
                 drop.push(bead_id.clone());
             }
         }
@@ -2093,20 +2132,24 @@ pub fn all_settled(states: &[AgentState]) -> bool {
         .all(|s| matches!(s.status.as_str(), "idle" | "done"))
 }
 
-/// Stranded-bead detection (bd-627z.1): an in_progress bead whose assignee is
-/// NOT a live swarm agent. Live = the herdr agent names polled this tick
-/// (captain, dead agents, and unknown identities are NOT live — their beads
-/// would stall the batch forever).
+/// Stranded-bead detection (bd-627z.1, bd-qk9q): an in_progress bead whose
+/// assignee is NOT a live swarm agent is stranded. Live = the herdr agent
+/// names polled this tick (captain, dead agents, and unknown identities are
+/// NOT live — their beads would stall the batch forever).
 ///
-/// A bead with NO assignee is not stranded (nobody claims it — it is an
-/// anomaly the tracker owns, not a stuck lane). Pure — the unit surface for
-/// the reclaim decision.
+/// An in_progress bead with NO assignee IS stranded (bd-qk9q): nobody holds
+/// it, no agent is working it, and nothing else will ever close it — the
+/// bd-bvwf.1 strand was exactly this. Reclaim re-opens it to ready so the
+/// loop re-dispatches it. Presence-based, NOT status-based: an assignee
+/// present in the polled swarm is live regardless of status (unknown included
+/// — bd-bvwf.5: reclaim targets GONE/absent agents, never unknown-but-present
+/// ones). Pure — the unit surface for the reclaim decision.
 pub fn stranded_beads<'a>(inprogress: &'a [ReadyBead], live_names: &[String]) -> Vec<&'a ReadyBead> {
     inprogress
         .iter()
         .filter(|b| match &b.assignee {
             Some(a) => !live_names.iter().any(|l| l == a),
-            None => false,
+            None => true,
         })
         .collect()
 }
@@ -2122,8 +2165,11 @@ pub fn blocking_inprogress<'a>(inprogress: &'a [ReadyBead], live_names: &[String
         .iter()
         .filter(|b| match &b.assignee {
             Some(a) => live_names.iter().any(|l| l == a),
-            // No assignee: treat as blocking (an unowned in-progress bead is
-            // not reclaimable by assignee — the tracker must resolve it).
+            // No assignee: treat as blocking until reclaimed. bd-qk9q — the
+            // strand is resolved BY the reclaim (unowned => stranded => back
+            // to ready this poll), so blocking here is conservative, never a
+            // deadlock: a reclaim failure must not let the loop falsely
+            // complete while an unresolved in-progress bead exists.
             None => true,
         })
         .collect()
@@ -2950,6 +2996,27 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     ClaimWatchAction::RedispatchResume { bead_id, title } => {
                         queue.insert(0, resume_prompt(&bead_id, &title));
                     }
+                    ClaimWatchAction::ReleaseReservations { bead_id } => {
+                        // bd-h3oj: the bead closed — release its file
+                        // reservations (reason == bead id) so they never
+                        // linger to TTL. Checkpointed leaf; best-effort:
+                        // a failed release must not kill the loop.
+                        match ctx
+                            .run(
+                                release_bead_locks,
+                                ReleaseBeadLocksArgs {
+                                    project: params.project.clone(),
+                                    bead_id: bead_id.clone(),
+                                },
+                            )
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(e) => eprintln!(
+                                "flywheel: release of closed bead {bead_id} locks failed (continuing): {e}"
+                            ),
+                        }
+                    }
                 }
             }
         }
@@ -3687,6 +3754,9 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
         .register(renew_leases)
         .map_err(|e| anyhow::anyhow!("register renew_leases: {e}"))?;
     resonate
+        .register(release_bead_locks)
+        .map_err(|e| anyhow::anyhow!("register release_bead_locks: {e}"))?;
+    resonate
         .register(poll_ready)
         .map_err(|e| anyhow::anyhow!("register poll_ready: {e}"))?;
     resonate
@@ -4174,6 +4244,26 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     ClaimWatchAction::RedispatchResume { bead_id, title } => {
                         queue.insert(0, resume_prompt(&bead_id, &title));
                     }
+                    ClaimWatchAction::ReleaseReservations { bead_id } => {
+                        // bd-h3oj: the bead closed — release its file
+                        // reservations (reason == bead id). Checkpointed
+                        // leaf; best-effort, never kill the loop.
+                        match ctx
+                            .run(
+                                release_bead_locks,
+                                ReleaseBeadLocksArgs {
+                                    project: params.project.clone(),
+                                    bead_id: bead_id.clone(),
+                                },
+                            )
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(e) => eprintln!(
+                                "flywheel: release of closed bead {bead_id} locks failed (continuing): {e}"
+                            ),
+                        }
+                    }
                 }
             }
         }
@@ -4554,6 +4644,9 @@ pub async fn run_engine_loop(cfg: &Config, mut params: LoopParams) -> anyhow::Re
         .register(reclaim_stranded)
         .map_err(|e| anyhow::anyhow!("register reclaim_stranded: {e}"))?;
     resonate
+        .register(release_bead_locks)
+        .map_err(|e| anyhow::anyhow!("register release_bead_locks: {e}"))?;
+    resonate
         .register(read_output)
         .map_err(|e| anyhow::anyhow!("register read_output: {e}"))?;
     resonate
@@ -4910,11 +5003,40 @@ mod tests {
             rb("bd-1", Some("oc")),   // live — not stranded
             rb("bd-2", Some("captain")), // non-live — stranded
             rb("bd-3", Some("ghost")),   // dead agent — stranded
-            rb("bd-4", None),            // no assignee — NOT stranded (tracker owns)
+            rb("bd-4", None),            // unowned — stranded (bd-qk9q: nobody holds it)
         ];
         let stranded = stranded_beads(&inprog, &live);
         let ids: Vec<&str> = stranded.iter().map(|b| b.id.as_str()).collect();
-        assert_eq!(ids, vec!["bd-2", "bd-3"], "{ids:?}");
+        assert_eq!(ids, vec!["bd-2", "bd-3", "bd-4"], "{ids:?}");
+    }
+
+    /// bd-qk9q regression pin: an in_progress bead with NO assignee (flipped
+    /// in_progress without --claim, or claimed then abandoned) has no live
+    /// agent working it and nothing else will ever close it — the loop must
+    /// reclaim it. This is the bd-bvwf.1 strand: the old `None => false`
+    /// carve-out left it in_progress forever while `blocking_inprogress`
+    /// treated it as blocking, stalling the batch.
+    #[test]
+    fn stranded_beads_reclaims_unowned_inprogress() {
+        let live = vec!["oc".to_string()];
+        let inprog = vec![rb("bd-1", None)];
+        let ids: Vec<&str> = stranded_beads(&inprog, &live)
+            .iter()
+            .map(|b| b.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["bd-1"]);
+    }
+
+    /// bd-bvwf.5 guard: a PRESENT-but-unknown assignee is NOT stranded — an
+    /// unknown agent may still be alive (detection grace pending); reclaim
+    /// targets GONE/absent agents only (bd-qk9q fix direction #3).
+    #[test]
+    fn stranded_beads_keeps_present_unknown_assignees() {
+        let live = vec!["oc".to_string()];
+        let inprog = vec![rb("bd-1", Some("oc"))];
+        assert!(stranded_beads(&inprog, &live).is_empty());
+        let absent = vec![rb("bd-2", Some("ghost"))];
+        assert_eq!(stranded_beads(&absent, &live).len(), 1, "absent agent IS stranded");
     }
 
     /// Stranded beads do NOT block completion; live-held and unowned
@@ -5899,8 +6021,35 @@ mod tests {
             std::collections::HashMap::new();
         watch.insert("bd-12".into(), cw("oc-1"));
         let actions = claim_watch_step(&mut watch, &[], &[], &[], 2);
-        assert!(actions.is_empty());
         assert!(watch.is_empty(), "closed bead drops from the watch");
+        assert!(
+            matches!(&actions[0], ClaimWatchAction::ReleaseReservations { bead_id }
+                if bead_id == "bd-12"),
+            "close drop fires the release: {:?}",
+            actions
+        );
+    }
+
+    /// bd-h3oj: the moment a watched bead leaves both snapshots (closed),
+    /// the watchdog asks for its file reservations to be released — exactly
+    /// once (the watch entry drops, so no repeat fire).
+    #[test]
+    fn claim_watch_close_drops_release_fires_once() {
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-77".into(), cw("oc-1"));
+        let actions = claim_watch_step(&mut watch, &[], &[], &[], 2);
+        assert_eq!(actions.len(), 1, "one release action: {actions:?}");
+        assert!(
+            matches!(&actions[0], ClaimWatchAction::ReleaseReservations { bead_id }
+                if bead_id == "bd-77"),
+            "{:?}",
+            actions[0]
+        );
+        // Second poll: the entry is gone — no re-fire.
+        let actions = claim_watch_step(&mut watch, &[], &[], &[], 2);
+        assert!(actions.is_empty(), "no repeat release: {actions:?}");
+        assert!(watch.is_empty());
     }
 
     /// An unclaimed bead whose dispatched agent is GONE (not in the poll)

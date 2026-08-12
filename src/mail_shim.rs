@@ -40,7 +40,7 @@ use tokio::runtime::Runtime;
 
 use toron_core::mailbox::{
     ContactPolicy, FetchInbox, ListAgentsOptions, RequestContact, RespondContact, SearchMessages,
-    SendMessage,
+    SendMessage, overlaps,
 };
 use toron_core::nostr::identity::AgentProfile;
 use toron_mcp::ToJson;
@@ -939,6 +939,38 @@ impl Mail {
         }
     }
 
+    /// `release_by_reason` (bd-h3oj): operator-signed revocation of every
+    /// live lease whose `reason` tag is the bead id — the loop-side
+    /// after-close hook. `released == 0` is a clean no-op.
+    pub fn release_by_reason(
+        &self,
+        project_key: &str,
+        requestor_name: &str,
+        bead_id: &str,
+        notify_previous: bool,
+    ) -> Result<Value> {
+        match &self.backend {
+            BackendKind::InProcess => {
+                let r = block_on(mailbox().release_by_reason(
+                    project_key,
+                    requestor_name,
+                    bead_id,
+                    notify_previous,
+                ))?;
+                Ok(r.to_json())
+            }
+            BackendKind::Remote(_) => self.call_remote(
+                "release_file_reservations_by_reason",
+                crate::backend::wire::release_by_reason_args(
+                    project_key,
+                    requestor_name,
+                    bead_id,
+                    notify_previous,
+                ),
+            ),
+        }
+    }
+
     /// `check_file_reservation_conflicts` (agent-scoped).
     pub fn conflicts_for(
         &self,
@@ -959,6 +991,48 @@ impl Mail {
                 "check_file_reservation_conflicts",
                 crate::backend::wire::conflicts_args(project_key, agent_name, paths),
             ),
+        }
+    }
+
+    /// `active_reservations` (bd-dsu1 operator lock board): every active
+    /// held lease in the project as JSON rows — path, holder, exclusive,
+    /// reason, expiry, reservation id (the kind-30031 event id needed for
+    /// diagnostics). Optional filters: `holder` (exact agent name) and
+    /// `path` (glob overlap — shows the holders of one path). Read-only:
+    /// never registers or publishes.
+    pub fn list_active(
+        &self,
+        project_key: &str,
+        holder: Option<&str>,
+        path: Option<&str>,
+    ) -> Result<Value> {
+        match &self.backend {
+            BackendKind::InProcess => {
+                let rows = block_on(mailbox().active_reservations(project_key))?;
+                let reservations: Vec<Value> = rows
+                    .into_iter()
+                    .filter(|r| holder.map_or(true, |h| r.agent_name == h))
+                    .filter(|r| path.map_or(true, |p| overlaps(&r.path_pattern, p)))
+                    .map(|r| {
+                        json!({
+                            "id": r.id,
+                            "path": r.path_pattern,
+                            "holder": r.agent_name,
+                            "exclusive": r.exclusive,
+                            "reason": r.reason,
+                            "expires_ts_us": r.expires_ts_us,
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "project": project_key,
+                    "count": reservations.len(),
+                    "reservations": reservations,
+                }))
+            }
+            BackendKind::Remote(_) => Err(anyhow::anyhow!(
+                "locks list requires the in-process toron mailbox (the remote-daemon MCP surface has no active_reservations tool)"
+            )),
         }
     }
 
@@ -1826,6 +1900,51 @@ mod tests {
         });
         let out = list_own_reservations(&resp);
         assert_eq!(out[0].id, "42");
+    }
+
+    /// bd-dsu1: the operator lock board dumps every active lease (id +
+    /// holder) and filters by holder / path-glob overlap. Read-only — no
+    /// project creation, no identity registration.
+    #[test]
+    fn list_active_boards_and_filters() {
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let project = "locks-list-board";
+        mail.ensure_project(project).expect("ensure");
+        for name in ["BlueLake", "RoseDune"] {
+            mail.register_agent(project, name, "test", "test", "bd-dsu1 test")
+                .expect("register");
+        }
+        mail.reserve(project, "BlueLake", &["src/**".into()], 3600, true, "bd-dsu1")
+            .expect("BlueLake hold");
+        mail.reserve(project, "RoseDune", &["docs/**".into()], 3600, true, "bd-dsu1")
+            .expect("RoseDune hold");
+
+        let board = mail.list_active(project, None, None).expect("board");
+        assert_eq!(
+            board["count"].as_u64().unwrap_or(0),
+            2,
+            "both leases on the board: {board}"
+        );
+        for row in board["reservations"].as_array().expect("rows") {
+            assert!(
+                !row["id"].as_str().unwrap_or("").is_empty(),
+                "row carries the reservation id: {row}"
+            );
+            assert!(!row["holder"].as_str().unwrap_or("").is_empty(), "row names its holder: {row}");
+            assert!(row["exclusive"].as_bool().unwrap_or(false), "exclusive flag present: {row}");
+            assert_eq!(row["reason"].as_str().unwrap_or(""), "bd-dsu1");
+        }
+
+        let blue = mail.list_active(project, Some("BlueLake"), None).expect("holder filter");
+        assert_eq!(blue["count"].as_u64().unwrap_or(0), 1, "holder filter narrows: {blue}");
+        assert_eq!(blue["reservations"][0]["path"].as_str().unwrap_or(""), "src/**");
+
+        let src = mail.list_active(project, None, Some("src/lib.rs")).expect("path filter");
+        assert_eq!(src["count"].as_u64().unwrap_or(0), 1, "glob overlap narrows: {src}");
+        assert_eq!(src["reservations"][0]["holder"].as_str().unwrap_or(""), "BlueLake");
+
+        let none = mail.list_active(project, Some("Nobody"), None).expect("no match");
+        assert_eq!(none["count"].as_u64().unwrap_or(0), 0, "unknown holder → empty board");
     }
 
     /// se2.2: the remote edge is the toron daemon — a hex message id must be
