@@ -46,7 +46,6 @@ use config::{Config, Recipe, WorkflowStep};
 use herdr_shim::{
     AgentInfo, AgentStatus, Client, SendVerdict, Subscription, WaitOptions, classify_send_result,
 };
-use toron_core::backend::error::BackendErrorCode;
 use output::{die, dim, error, kind_paint, ok as paint_ok, print_json, status_paint};
 use state::{EventKind, log_event};
 
@@ -193,11 +192,6 @@ enum Commands {
         /// bypass the policy deny-pattern guard
         #[arg(long)]
         force: bool,
-        /// bd-rdy: on agent_prompt_stalled (after one automatic retry),
-        /// respawn the agent under the same name and re-send instead of
-        /// failing with recovery guidance
-        #[arg(long)]
-        respawn_on_stall: bool,
     },
     /// Interrupt an agent (sends Escape by default — cancels the current
     /// tool call and returns to the prompt). Kill-style keys (ctrl+c) are
@@ -771,8 +765,7 @@ struct AgentCounts {
 }
 
 /// Subcommands of `flywheel loop` (bd-fw-stale-loop-processes-gac
-/// restructure): `run` (default), `status`, `list`, `prune`; operator
-/// stale-view `stale` + explicit clear `clear` (bd-ghcl).
+/// restructure): `run` (default), `status`, `list`, `prune`.
 #[derive(Subcommand)]
 enum LoopCmd {
     /// Run the monitoring loop for a project (default subcommand — the bare
@@ -840,24 +833,6 @@ enum LoopCmd {
     List,
     /// Remove pid-registry entries whose process is dead (stale cleanup)
     Prune,
-    /// Inspect the resonate server's PENDING loop invocations with an
-    /// owner-pid liveness verdict (live loop vs stale). No --project = all
-    /// projects (bd-ghcl)
-    Stale {
-        /// project (base name or path); default: all projects
-        #[arg(long)]
-        project: Option<String>,
-    },
-    /// Explicitly reject a project's stale PENDING loop invocations on the
-    /// resonate server. Refuses when the owner pid is ALIVE (a live loop is
-    /// not stale). --all clears every project's stale invocations (bd-ghcl)
-    Clear {
-        /// project (base name or path); optional with --all
-        project: Option<String>,
-        /// clear stale invocations for ALL projects
-        #[arg(long)]
-        all: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -2471,9 +2446,8 @@ fn resolve_agents_dyn(
 /// A normalized `--to` token: the concrete agent name to match against, plus
 /// whether the token was a BARE kind short (`oc`/`pi`/`gk`) that may broaden
 /// to all numbered agents of that kind. Concrete names (`flywheel-<base>-oc`,
-/// `flywheel-<base>-oc2`), numbered shorts (`oc1`/`oc2`), pane ids, and mail
-/// identities match EXACTLY — a full name never silently drags in oc2/oc3,
-/// and a numbered short always means exactly one agent.
+/// `flywheel-<base>-oc2`), numbered shorts (`oc2`), pane ids, and mail
+/// identities match EXACTLY — a full name never silently drags in oc2/oc3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WantToken {
     name: String,
@@ -2488,32 +2462,12 @@ fn to_want_token(project: &str, token: &str) -> WantToken {
             broaden: false,
         }
     } else {
-        // bd-vr9: a digit-suffixed short is a 1-indexed numbered shorthand —
-        // `oc1` means the FIRST oc agent, which keeps the bare name
-        // (`flywheel-<base>-oc`, no digit suffix). Rewriting through the
-        // ordinal keeps oc2/oc3 meaning and gives oc1 the same clean
-        // single-agent target. `oc` (bare) stays the broadcast shorthand.
-        let name = split_numbered_short(t)
-            .map(|(base, ord)| agent_name_n(project, &base, ord))
-            .unwrap_or_else(|| agent_name(project, t));
         let broaden = matches!(t, "oc" | "pi" | "gk") && t.chars().all(|c| c.is_ascii_lowercase());
-        WantToken { name, broaden }
+        WantToken {
+            name: agent_name(project, t),
+            broaden,
+        }
     }
-}
-
-/// Split a trailing digit suffix off a kind short (`oc2` -> ("oc", 2)).
-/// None for anything that is not an all-lowercase kind short with a non-empty
-/// numeric suffix (`1`, `o2c`, `oc2x`, bare `oc`).
-fn split_numbered_short(t: &str) -> Option<(String, u32)> {
-    let base_len = t.trim_end_matches(|c: char| c.is_ascii_digit()).len();
-    if base_len == 0 || base_len == t.len() {
-        return None;
-    }
-    let (base, ord) = t.split_at(base_len);
-    if !base.chars().all(|c| c.is_ascii_lowercase()) {
-        return None;
-    }
-    Some((base.to_string(), ord.parse().ok()?))
 }
 
 /// Exact match, or — for BARE kind shorts only — a digit-suffixed ordinal of
@@ -2549,7 +2503,7 @@ fn log(project: &str, kind: EventKind, data: Value) {
 /// `run` is the default subcommand; any first token after `loop` that is not
 /// a known subcommand name is treated as the project. Pure + unit-tested.
 fn rewrite_legacy_loop_args(args: &[String]) -> Vec<String> {
-    const SUBCOMMANDS: [&str; 6] = ["run", "status", "list", "prune", "stale", "clear"];
+    const SUBCOMMANDS: [&str; 4] = ["run", "status", "list", "prune"];
     if args.len() >= 2
         && args[1] == "loop"
         // A flag (--help, -h, global options) keeps the parent context;
@@ -2667,7 +2621,6 @@ fn main() {
             wait,
             timeout_ms,
             force,
-            respawn_on_stall,
         }) => cmd_send(
             &cfg,
             project,
@@ -2677,7 +2630,6 @@ fn main() {
             *wait,
             *timeout_ms,
             *force,
-            *respawn_on_stall,
         ),
         Some(Commands::Interrupt {
             project,
@@ -2737,8 +2689,6 @@ fn main() {
             LoopCmd::Status { project } => cmd_loop_status(&cfg, project),
             LoopCmd::List => cmd_loop_list(),
             LoopCmd::Prune => cmd_loop_prune(),
-            LoopCmd::Stale { project } => cmd_loop_stale(&cfg, project.as_deref()),
-            LoopCmd::Clear { project, all } => cmd_loop_clear(&cfg, project.as_deref(), *all),
         },
         Some(Commands::Zoom { project, to, off }) => cmd_zoom(&cfg, project, to, *off),
         Some(Commands::Attach { project, to }) => cmd_attach(&cfg, project, to),
@@ -4717,99 +4667,6 @@ mod agent_mail_name_tests {
             }
         );
     }
-
-    /// bd-vr9: `oc1` is the numbered shorthand for the FIRST oc agent, which
-    /// keeps the bare name (`flywheel-<base>-oc`, no digit suffix). A bare
-    /// `oc` stays the broadcast shorthand; `oc2`/`oc3` keep their meaning.
-    #[test]
-    fn to_want_token_numbered_short_oc1_maps_to_first_agent() {
-        assert_eq!(
-            to_want_token("toron", "oc1"),
-            WantToken {
-                name: "flywheel-toron-oc".into(),
-                broaden: false
-            }
-        );
-        assert_eq!(
-            to_want_token("toron", "oc2"),
-            WantToken {
-                name: "flywheel-toron-oc2".into(),
-                broaden: false
-            }
-        );
-        assert_eq!(
-            to_want_token("toron", "oc3"),
-            WantToken {
-                name: "flywheel-toron-oc3".into(),
-                broaden: false
-            }
-        );
-        assert_eq!(
-            to_want_token("toron", "pi1"),
-            WantToken {
-                name: "flywheel-toron-pi".into(),
-                broaden: false
-            }
-        );
-        // bare short is still the broadcast shorthand
-        assert_eq!(
-            to_want_token("toron", "oc"),
-            WantToken {
-                name: "flywheel-toron-oc".into(),
-                broaden: true
-            }
-        );
-    }
-
-    #[test]
-    fn split_numbered_short_rules() {
-        assert_eq!(split_numbered_short("oc2"), Some(("oc".to_string(), 2)));
-        assert_eq!(split_numbered_short("oc1"), Some(("oc".to_string(), 1)));
-        assert_eq!(split_numbered_short("pi3"), Some(("pi".to_string(), 3)));
-        // no trailing digits, digits-only, non-lowercase, or interior digits
-        assert_eq!(split_numbered_short("oc"), None);
-        assert_eq!(split_numbered_short("1"), None);
-        assert_eq!(split_numbered_short("OC2"), None);
-        assert_eq!(split_numbered_short("o2c"), None);
-        assert_eq!(split_numbered_short("oc2x"), None);
-    }
-
-    /// bd-vr9: an `oc1` want matches exactly the first (bare-named) agent —
-    /// never its numbered siblings.
-    #[test]
-    fn name_matches_want_oc1_is_single_agent() {
-        let want = to_want_token("toron", "oc1");
-        assert!(!want.broaden);
-        assert!(name_matches_want("flywheel-toron-oc", &want));
-        assert!(!name_matches_want("flywheel-toron-oc2", &want));
-        assert!(!name_matches_want("flywheel-toron-oc3", &want));
-    }
-
-    /// bd-kme: view output must be readable — ANSI escapes (color codes,
-    /// alternate-screen enter/leave, OSC title), and the box-drawing/block
-    /// glyphs of opencode's TUI are stripped, real text preserved.
-    #[test]
-    fn sanitize_pane_text_strips_ansi_and_tui_chrome() {
-        // color codes
-        assert_eq!(
-            sanitize_pane_text("hello \x1b[31mred\x1b[0m world"),
-            "hello red world"
-        );
-        // alternate-screen enter/leave sequences
-        assert_eq!(sanitize_pane_text("\x1b[?1049hfoo\x1b[?1049l"), "foo");
-        // OSC title to BEL
-        assert_eq!(sanitize_pane_text("\x1b]0;opencode title\x07bar"), "bar");
-        // bare two-char escape (RI)
-        assert_eq!(sanitize_pane_text("\x1bMfoo"), "foo");
-        // box-drawing pane borders and block-element fill
-        assert_eq!(sanitize_pane_text("┌──┐\n│hi│\n└──┘"), "\nhi\n");
-        assert_eq!(sanitize_pane_text("▀▄█block"), "block");
-        // plain text unchanged
-        assert_eq!(
-            sanitize_pane_text("status: idle\noutput ok"),
-            "status: idle\noutput ok"
-        );
-    }
 }
 
 // ---- add ----
@@ -5066,47 +4923,10 @@ fn spawn_kinds_from_log(project: &str) -> std::collections::HashMap<String, Stri
     kinds
 }
 
-/// bd-1np: probe one registered agent's process liveness via herdr
-/// `pane.process_info` — pane existence is NOT liveness (a dead agent's pane
-/// still lists in herdr with the binding intact). `Some(true)` = process
-/// alive, `Some(false)` = provably dead, `None` = probe unavailable or
-/// inconclusive (the caller falls back to legacy pane-existence
-/// classification — never a confident "healthy").
-fn probe_agent_liveness(
-    probe: &mut Option<herdr_shim::Client>,
-    pane_id: &str,
-    kind: &str,
-    name: &str,
-) -> Option<bool> {
-    let c = probe.as_mut()?;
-    match herdr_shim::pane_process_info(c, pane_id) {
-        Ok(pi) => herdr_shim::pane_agent_alive(&pi, kind),
-        Err(e) => {
-            eprintln!("flywheel: recover liveness probe for {name} failed: {e:#}");
-            None
-        }
-    }
-}
-
-/// One agent's recovery decision in `cmd_recover` (bd-1np): healthy, rebind
-/// (pane survived, binding lost), or respawn (pane/process gone) with the
-/// reason recorded in the report.
-enum RecoverDecision<'a> {
-    Healthy,
-    Rebind { was: String },
-    Respawn { reason: &'a str },
-}
-
 /// bd-fw-interrupt-kills-agent-or3 (c): CLI supervision counterpart to the
 /// durable loop's self-heal — for every registered agent, restore the name
 /// binding if the pane survived, or respawn the agent (with its spawn-time
 /// kind) if it died. Reports what was done per agent.
-///
-/// bd-1np: an intact pane + binding is healthy ONLY if the process inside is
-/// alive. Each seemingly-healthy agent is liveness-probed via herdr
-/// `pane.process_info` (agent binary in the foreground process group); a pane
-/// whose process died (shell owns the foreground) is respawned in place, not
-/// classified healthy.
 fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
     let backend = backend::multiplexer_backend(cfg)?;
     let ws_id = find_workspace_dyn(&*backend, project)?;
@@ -5120,62 +4940,31 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
     }
     let kinds = spawn_kinds_from_log(project);
     let agents = backend.agent_list()?;
-    // bd-1np: concrete herdr client for the process-liveness probe — the
-    // backend trait has no `pane.process_info`. Only the herdr backend can
-    // probe; other backends fall back to pane-existence classification.
-    let mut probe = (backend.name() == "herdr")
-        .then(|| Client::connect(Some(&cfg.socket_path())).ok())
-        .flatten();
     let mut recovered: Vec<Value> = Vec::new();
     let mut healthy = 0usize;
     for entry in &entries {
         let (pane_id, name) = (&entry.pane_id, &entry.name);
-        let kind = kinds.get(name).map(String::as_str).unwrap_or("opencode");
         let live = agents
             .iter()
             .find(|a| a.pane_id == *pane_id && a.workspace_id == ws_id);
-        let decision = match live {
+        match live {
             Some(a) if a.name.as_deref() == Some(name) => {
-                // pane + binding intact — liveness-probe the process inside.
-                match probe_agent_liveness(&mut probe, pane_id, kind, name) {
-                    // provably dead: respawn in the same pane (its shell is
-                    // back at the prompt). Some(false) is the bd-1np signal.
-                    Some(false) => RecoverDecision::Respawn {
-                        reason: "process-dead",
-                    },
-                    // alive, or probe unavailable/inconclusive → legacy
-                    // healthy classification (probe error ≠ dead — never
-                    // respawn an agent on a failed probe).
-                    _ => RecoverDecision::Healthy,
-                }
+                healthy += 1; // pane + binding intact
             }
             Some(a) => {
                 // pane survived, binding lost → restore it (7rc path)
-                RecoverDecision::Rebind {
-                    was: a.name.clone().unwrap_or_else(|| "<null>".to_string()),
-                }
-            }
-            None => RecoverDecision::Respawn {
-                reason: "agent-gone",
-            },
-        };
-        match decision {
-            RecoverDecision::Healthy => {
-                healthy += 1; // pane + binding + live process
-            }
-            RecoverDecision::Rebind { was } => {
+                let was = a.name.clone().unwrap_or_else(|| "<null>".to_string());
                 backend.agent_rename(pane_id, Some(name))?;
                 recovered.push(json!({
                     "name": name, "pane_id": pane_id, "action": "rebound", "was": was
                 }));
             }
-            RecoverDecision::Respawn { reason } => {
-                // agent died (or its process died — bd-1np) → respawn with
-                // spawn-time kind, reusing the surviving pane.
+            None => {
+                // agent died (or pane is gone) → respawn with spawn-time kind
+                let kind = kinds.get(name).map(String::as_str).unwrap_or("opencode");
                 match start_agent_with_retry_dyn(&*backend, name, kind, pane_id, &[]) {
                     Ok(a) => recovered.push(json!({
-                        "name": name, "pane_id": a.pane_id, "action": "respawned",
-                        "kind": kind, "reason": reason
+                        "name": name, "pane_id": a.pane_id, "action": "respawned", "kind": kind
                     })),
                     Err(e) => eprintln!("flywheel: recover {name} failed: {e:#}"),
                 }
@@ -5262,7 +5051,6 @@ fn cmd_send(
     wait: bool,
     timeout_ms: Option<u64>,
     force: bool,
-    respawn_on_stall: bool,
 ) -> Result<()> {
     let text = match (stage, msg) {
         (Some(s), _) => stage_prompt(s)?,
@@ -5305,7 +5093,7 @@ fn cmd_send(
             .collect();
         if let Some(group) = bare_short_group_matches(project, to, &names) {
             bail!(
-                "--to {to} matches {} agents ({}): a bare short reaches the whole crew and would race one prompt across all of them. Use an exact name or numbered short (e.g. flywheel-{}-oc, oc1, oc2) to target one agent, or pass --force to broadcast deliberately.",
+                "--to {to} matches {} agents ({}): a bare short reaches the whole crew and would race one prompt across all of them. Use an exact name or numbered short (e.g. flywheel-{}-oc, oc2) to target one agent, or pass --force to broadcast deliberately.",
                 group.len(),
                 group.join(", "),
                 project_base(project)
@@ -5322,41 +5110,7 @@ fn cmd_send(
             timeout_ms: timeout,
             until: vec![AgentStatus::Idle, AgentStatus::Done, AgentStatus::Blocked],
         });
-        // bd-rdy: stall auto-recovery on the interactive send --wait path. The
-        // durable loop escalates stalls (respawn → requeue, bd-send-stall-
-        // escalation); the CLI counterpart is one retry after a short delay,
-        // then either a same-name respawn (--respawn-on-stall) or an
-        // actionable error naming the recovery commands.
-        let target = agent_target(a).to_string();
-        let name = a.name.clone().unwrap_or_else(|| target.clone());
-        let mut stalls_seen = 0usize;
-        let agent = loop {
-            match c.agent_prompt(&target, &text, wait_opts.clone()) {
-                Ok(agent) => break agent,
-                Err(e) => match stall_step(&e.code, stalls_seen, respawn_on_stall) {
-                    None => return Err(e.into()),
-                    Some(StallStep::Retry) => {
-                        eprintln!(
-                            "flywheel: {target} agent_prompt_stalled — retrying once in {STALL_RETRY_DELAY_SECS}s"
-                        );
-                        std::thread::sleep(Duration::from_secs(STALL_RETRY_DELAY_SECS));
-                        stalls_seen += 1;
-                    }
-                    Some(StallStep::Respawn) => {
-                        let kinds = spawn_kinds_from_log(project);
-                        let kind = kinds.get(&name).map(String::as_str).unwrap_or("opencode");
-                        eprintln!(
-                            "flywheel: {target} stalled again — respawning ({kind}) and re-sending (--respawn-on-stall)"
-                        );
-                        cmd_internal_respawn(cfg, project, &name, kind, true)?;
-                        stalls_seen += 1;
-                    }
-                    Some(StallStep::GiveUp) => {
-                        return Err(stall_giveup_error(&target, project));
-                    }
-                },
-            }
-        };
+        let agent = c.agent_prompt(agent_target(a), &text, wait_opts)?;
         let status = agent.agent_status.as_str();
         if std::io::stdout().is_terminal() {
             println!(
@@ -5383,119 +5137,6 @@ fn cmd_send(
         print_json(&json!({ "results": results }));
     }
     Ok(())
-}
-
-// ---- send --wait stall recovery (bd-rdy) ----
-
-/// Delay before the single automatic retry after `agent_prompt_stalled`.
-const STALL_RETRY_DELAY_SECS: u64 = 10;
-
-/// One step of the send --wait stall-recovery ladder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StallStep {
-    /// First stall: wait, then re-send once.
-    Retry,
-    /// Second stall with --respawn-on-stall: respawn under the same name,
-    /// then re-send.
-    Respawn,
-    /// Exhausted: fail with actionable recovery guidance.
-    GiveUp,
-}
-
-/// bd-rdy: pure stall-classification for the interactive send --wait path.
-/// `stalls_seen` = stalls already consumed (0 = first stall). Returns None
-/// for non-stall codes so the caller propagates the backend error unchanged.
-fn stall_step(
-    code: &BackendErrorCode,
-    stalls_seen: usize,
-    respawn_on_stall: bool,
-) -> Option<StallStep> {
-    if *code != BackendErrorCode::AgentPromptStalled {
-        return None;
-    }
-    match stalls_seen {
-        0 => Some(StallStep::Retry),
-        1 if respawn_on_stall => Some(StallStep::Respawn),
-        _ => Some(StallStep::GiveUp),
-    }
-}
-
-/// bd-rdy: the give-up error for a twice-stalled send — names the recovery
-/// commands instead of silently dropping the prompt.
-fn stall_giveup_error(target: &str, project: &str) -> anyhow::Error {
-    anyhow!(
-        "agent {target} produced no observed state change twice (agent_prompt_stalled) — the agent is not responding. {}\nAlternatively re-run with --respawn-on-stall to respawn {target} under the same name and re-send automatically.",
-        stall_recovery_hint(project),
-    )
-}
-
-/// bd-rdy: actionable recovery options for a stalled swarm.
-fn stall_recovery_hint(project: &str) -> String {
-    format!(
-        "Recovery options:\n  flywheel recover {project}   respawn dead agents from the spawn registry\n  flywheel kill {project} --force   hard-reset the swarm"
-    )
-}
-
-#[cfg(test)]
-mod send_stall_recovery_tests {
-    use super::*;
-
-    #[test]
-    fn first_stall_always_retries() {
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 0, false),
-            Some(StallStep::Retry)
-        );
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 0, true),
-            Some(StallStep::Retry)
-        );
-    }
-
-    #[test]
-    fn second_stall_respawns_only_with_flag() {
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 1, true),
-            Some(StallStep::Respawn)
-        );
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 1, false),
-            Some(StallStep::GiveUp)
-        );
-    }
-
-    #[test]
-    fn exhausted_stall_always_gives_up() {
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 2, true),
-            Some(StallStep::GiveUp)
-        );
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 2, false),
-            Some(StallStep::GiveUp)
-        );
-    }
-
-    #[test]
-    fn non_stall_errors_propagate() {
-        assert_eq!(stall_step(&BackendErrorCode::Timeout, 0, false), None);
-        assert_eq!(stall_step(&BackendErrorCode::Other("agent_not_found".into()), 1, true), None);
-    }
-
-    #[test]
-    fn giveup_error_names_recovery_commands() {
-        let msg = stall_giveup_error("flywheel-demo-oc", "demo").to_string();
-        assert!(msg.contains("agent_prompt_stalled"), "{msg}");
-        assert!(msg.contains("flywheel recover demo"), "{msg}");
-        assert!(msg.contains("flywheel kill demo --force"), "{msg}");
-        assert!(msg.contains("--respawn-on-stall"), "{msg}");
-    }
-
-    #[test]
-    fn retry_delay_constant_is_short() {
-        // one retry must not block the interactive CLI for minutes
-        assert!(STALL_RETRY_DELAY_SECS <= 30);
-    }
 }
 
 // ---- interrupt / view / watch / zoom / attach / kill ----
@@ -5548,114 +5189,29 @@ fn cmd_interrupt(
     Ok(())
 }
 
-/// bd-kme: opencode (and other TUI harnesses) render on the terminal's
-/// alternate screen. herdr's pane capture returns that raw rendering — ANSI
-/// escape sequences plus box-drawing/block glyphs that are TUI chrome, not
-/// agent output. Strip both so `flywheel view` shows readable text.
-fn sanitize_pane_text(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            // consume the escape plus its payload: CSI (`\x1b[params F`),
-            // OSC (`\x1b]...` to BEL/ST), or a bare two-char sequence
-            '\x1b' => match chars.peek() {
-                Some('[') => {
-                    chars.next();
-                    for c in chars.by_ref() {
-                        if ('\x40'..='\x7e').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next();
-                    loop {
-                        match chars.next() {
-                            None | Some('\x07') => break,
-                            Some('\x1b') => {
-                                if chars.peek() == Some(&'\\') {
-                                    chars.next();
-                                }
-                                break;
-                            }
-                            Some(_) => {}
-                        }
-                    }
-                }
-                Some(_) => {
-                    chars.next();
-                }
-                None => {}
-            },
-            c if is_tui_chrome(c) => {}
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// Alternate-screen TUI chrome: box-drawing (U+2500..=U+257F) and block
-/// elements (U+2580..=U+259F) — pane borders and fill, not agent output.
-/// Legit prose almost never uses these; the cost of a false positive is one
-/// missing glyph versus every TUI view being unreadable.
-fn is_tui_chrome(c: char) -> bool {
-    ('\u{2500}'..='\u{257f}').contains(&c) || ('\u{2580}'..='\u{259f}').contains(&c)
-}
-
-/// One read with a socket-closed retry: herdr can drop the connection while
-/// capturing an alternate-screen buffer (`io: herdr socket closed while
-/// waiting for response`). Retry once on a fresh connection before the
-/// caller decides to degrade.
-fn agent_read_resilient(
+/// bd-fw-view-alt-screen-blocked-ct9: a working agent's `recent` history is
+/// on the alternate screen and cannot be captured (herdr rejects with
+/// `agent_not_idle`). Fall back to the `visible` buffer with a note instead
+/// of failing the whole view. Never falls back when the caller explicitly
+/// asked for `visible`.
+fn client_read_with_fallback(
     c: &mut Client,
-    socket_path: &str,
     target: &str,
     source: &str,
     lines: Option<u32>,
 ) -> Result<String> {
     match c.agent_read(target, source, lines) {
         Ok(t) => Ok(t),
-        Err(e) if e.to_string().contains("socket closed") => {
-            eprintln!(
-                "flywheel: herdr socket closed while reading {target} ({source}); retrying on a fresh connection"
-            );
-            let mut fresh = Client::connect(Some(socket_path))?;
-            fresh
-                .agent_read(target, source, lines)
-                .map_err(|e2| anyhow!("{target}: socket-closed retry failed: {e2} (original: {e})"))
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// bd-fw-view-alt-screen-blocked-ct9: a working agent's `recent` history is
-/// on the alternate screen and cannot be captured (herdr rejects with
-/// `agent_not_idle`). Fall back to the `visible` buffer with a note instead
-/// of failing the whole view. Never falls back when the caller explicitly
-/// asked for `visible`.
-/// bd-kme: output is sanitized (ANSI + TUI chrome stripped) and socket-closed
-/// read failures retry once on a fresh connection before degrading.
-fn client_read_with_fallback(
-    c: &mut Client,
-    socket_path: &str,
-    target: &str,
-    source: &str,
-    lines: Option<u32>,
-) -> Result<String> {
-    let text = match agent_read_resilient(c, socket_path, target, source, lines) {
-        Ok(t) => t,
         Err(e) if source != "visible" && e.to_string().contains("agent_not_idle") => {
             eprintln!(
                 "flywheel: {target} is working — {source} history unavailable (alternate screen); showing the visible buffer instead (attach for full history)"
             );
-            agent_read_resilient(c, socket_path, target, "visible", lines).map_err(|e2| {
+            c.agent_read(target, "visible", lines).map_err(|e2| {
                 anyhow!("{target}: agent_not_idle fallback to visible failed: {e2} ({e})")
-            })?
+            })
         }
-        Err(e) => return Err(e),
-    };
-    Ok(sanitize_pane_text(&text))
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn cmd_view(cfg: &Config, project: &str, to: &str, lines: Option<u32>, source: &str) -> Result<()> {
@@ -5663,8 +5219,7 @@ fn cmd_view(cfg: &Config, project: &str, to: &str, lines: Option<u32>, source: &
     let ws_id = find_workspace(&mut c, project)?;
     let targets = resolve_agents(&mut c, &ws_id, project, to)?;
     for a in &targets {
-        let text =
-            client_read_with_fallback(&mut c, &cfg.socket_path(), agent_target(a), source, lines)?;
+        let text = client_read_with_fallback(&mut c, agent_target(a), source, lines)?;
         if std::io::stdout().is_terminal() && targets.len() > 1 {
             println!("--- {} ---", agent_target(a));
         }
@@ -6539,7 +6094,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let v = mail.force_release_file_reservation(
                 &key,
                 &name,
-                path,
+                &path,
                 holder.as_deref(),
                 note.as_deref(),
                 false,
@@ -8307,7 +7862,7 @@ mod loop_tests {
 
     #[test]
     fn canonical_loop_subcommands_untouched() {
-        for sub in ["run", "status", "list", "prune", "stale", "clear"] {
+        for sub in ["run", "status", "list", "prune"] {
             let args = vec!["flywheel".to_string(), "loop".to_string(), sub.to_string()];
             assert_eq!(rewrite_legacy_loop_args(&args), args, "{sub}");
         }
@@ -12870,24 +12425,6 @@ fn cmd_tutorial() -> Result<()> {
 fn cmd_loop_status(cfg: &Config, project: &str) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let v = rt.block_on(durable::loop_status(cfg, project))?;
-    print_json(&v);
-    Ok(())
-}
-
-/// `flywheel loop stale [--project P]` (bd-ghcl): operator view of the
-/// resonate server's pending loop invocations with owner-pid verdicts.
-fn cmd_loop_stale(cfg: &Config, project: Option<&str>) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let v = rt.block_on(durable::loop_stale(cfg, project))?;
-    print_json(&v);
-    Ok(())
-}
-
-/// `flywheel loop clear <project> [--all]` (bd-ghcl): reject a project's
-/// stale pending loop invocations; refuses live-loop owners.
-fn cmd_loop_clear(cfg: &Config, project: Option<&str>, all: bool) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let v = rt.block_on(durable::loop_clear(cfg, project, all))?;
     print_json(&v);
     Ok(())
 }
