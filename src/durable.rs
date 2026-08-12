@@ -2655,8 +2655,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // while blind and aborts loudly after DEFAULT_LEAF_FAILURE_ABORT_POLLS.
     let mut blind_complete_failures: u32 = 0;
     // bd-87hq: did any critical leaf (poll_events/poll_swarm/poll_ready/
-    // poll_inprogress/expected-replies) fail THIS iteration?
-    let mut critical_leaf_failed_this_iter: bool = false;
+    // poll_inprogress/expected-replies) fail THIS iteration? No initializer —
+    // the loop resets it to false on every iteration before any read.
+    let mut critical_leaf_failed_this_iter: bool;
     // bd-efk1: dispatched-bead claim watch (bead id → dispatch state). The
     // crew-execution watchdog: agents ENGAGE but skip the br lifecycle; the
     // watch catches unclaimed/ unclosed beads and nudges or re-dispatches.
