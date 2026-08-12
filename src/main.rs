@@ -48,7 +48,6 @@ use herdr_shim::{
 };
 use output::{die, dim, error, kind_paint, ok as paint_ok, print_json, status_paint};
 use state::{EventKind, log_event};
-use toron_core::backend::error::BackendErrorCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -193,11 +192,6 @@ enum Commands {
         /// bypass the policy deny-pattern guard
         #[arg(long)]
         force: bool,
-        /// bd-rdy: on agent_prompt_stalled (after one automatic retry),
-        /// respawn the agent under the same name and re-send instead of
-        /// failing with recovery guidance
-        #[arg(long)]
-        respawn_on_stall: bool,
     },
     /// Interrupt an agent (sends Escape by default — cancels the current
     /// tool call and returns to the prompt). Kill-style keys (ctrl+c) are
@@ -2627,7 +2621,6 @@ fn main() {
             wait,
             timeout_ms,
             force,
-            respawn_on_stall,
         }) => cmd_send(
             &cfg,
             project,
@@ -2637,7 +2630,6 @@ fn main() {
             *wait,
             *timeout_ms,
             *force,
-            *respawn_on_stall,
         ),
         Some(Commands::Interrupt {
             project,
@@ -5059,7 +5051,6 @@ fn cmd_send(
     wait: bool,
     timeout_ms: Option<u64>,
     force: bool,
-    respawn_on_stall: bool,
 ) -> Result<()> {
     let text = match (stage, msg) {
         (Some(s), _) => stage_prompt(s)?,
@@ -5119,41 +5110,7 @@ fn cmd_send(
             timeout_ms: timeout,
             until: vec![AgentStatus::Idle, AgentStatus::Done, AgentStatus::Blocked],
         });
-        // bd-rdy: stall auto-recovery on the interactive send --wait path. The
-        // durable loop escalates stalls (respawn → requeue, bd-send-stall-
-        // escalation); the CLI counterpart is one retry after a short delay,
-        // then either a same-name respawn (--respawn-on-stall) or an
-        // actionable error naming the recovery commands.
-        let target = agent_target(a).to_string();
-        let name = a.name.clone().unwrap_or_else(|| target.clone());
-        let mut stalls_seen = 0usize;
-        let agent = loop {
-            match c.agent_prompt(&target, &text, wait_opts.clone()) {
-                Ok(agent) => break agent,
-                Err(e) => match stall_step(&e.code, stalls_seen, respawn_on_stall) {
-                    None => return Err(e.into()),
-                    Some(StallStep::Retry) => {
-                        eprintln!(
-                            "flywheel: {target} agent_prompt_stalled — retrying once in {STALL_RETRY_DELAY_SECS}s"
-                        );
-                        std::thread::sleep(Duration::from_secs(STALL_RETRY_DELAY_SECS));
-                        stalls_seen += 1;
-                    }
-                    Some(StallStep::Respawn) => {
-                        let kinds = spawn_kinds_from_log(project);
-                        let kind = kinds.get(&name).map(String::as_str).unwrap_or("opencode");
-                        eprintln!(
-                            "flywheel: {target} stalled again — respawning ({kind}) and re-sending (--respawn-on-stall)"
-                        );
-                        cmd_internal_respawn(cfg, project, &name, kind, true)?;
-                        stalls_seen += 1;
-                    }
-                    Some(StallStep::GiveUp) => {
-                        return Err(stall_giveup_error(&target, project));
-                    }
-                },
-            }
-        };
+        let agent = c.agent_prompt(agent_target(a), &text, wait_opts)?;
         let status = agent.agent_status.as_str();
         if std::io::stdout().is_terminal() {
             println!(
@@ -5180,116 +5137,6 @@ fn cmd_send(
         print_json(&json!({ "results": results }));
     }
     Ok(())
-}
-
-// ---- send --wait stall recovery (bd-rdy) ----
-
-/// Delay before the single automatic retry after `agent_prompt_stalled`.
-const STALL_RETRY_DELAY_SECS: u64 = 10;
-
-/// One step of the send --wait stall-recovery ladder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StallStep {
-    /// First stall: wait, then re-send once.
-    Retry,
-    /// Second stall with --respawn-on-stall: respawn under the same name,
-    /// then re-send.
-    Respawn,
-    /// Exhausted: fail with actionable recovery guidance.
-    GiveUp,
-}
-
-/// bd-rdy: pure stall-classification for the interactive send --wait path.
-/// `stalls_seen` = stalls already consumed (0 = first stall). Returns None
-/// for non-stall codes so the caller propagates the backend error unchanged.
-fn stall_step(
-    code: &BackendErrorCode,
-    stalls_seen: usize,
-    respawn_on_stall: bool,
-) -> Option<StallStep> {
-    if *code != BackendErrorCode::AgentPromptStalled {
-        return None;
-    }
-    match stalls_seen {
-        0 => Some(StallStep::Retry),
-        1 if respawn_on_stall => Some(StallStep::Respawn),
-        _ => Some(StallStep::GiveUp),
-    }
-}
-
-/// bd-rdy: the give-up error for a twice-stalled send — names the recovery
-/// commands instead of silently dropping the prompt.
-fn stall_giveup_error(target: &str, project: &str) -> anyhow::Error {
-    anyhow!(
-        "agent {target} produced no observed state change twice (agent_prompt_stalled) — the agent is not responding. {}\nAlternatively re-run with --respawn-on-stall to respawn {target} under the same name and re-send automatically.",
-        stall_recovery_hint(project),
-    )
-}
-
-/// bd-rdy: actionable recovery options for a stalled swarm.
-fn stall_recovery_hint(project: &str) -> String {
-    format!(
-        "Recovery options:\n  flywheel recover {project}   respawn dead agents from the spawn registry\n  flywheel kill {project} --force   hard-reset the swarm"
-    )
-}
-
-#[cfg(test)]
-mod send_stall_recovery_tests {
-    use super::*;
-
-    #[test]
-    fn first_stall_always_retries() {
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 0, false),
-            Some(StallStep::Retry)
-        );
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 0, true),
-            Some(StallStep::Retry)
-        );
-    }
-
-    #[test]
-    fn second_stall_respawns_only_with_flag() {
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 1, true),
-            Some(StallStep::Respawn)
-        );
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 1, false),
-            Some(StallStep::GiveUp)
-        );
-    }
-
-    #[test]
-    fn exhausted_stall_always_gives_up() {
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 2, true),
-            Some(StallStep::GiveUp)
-        );
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 2, false),
-            Some(StallStep::GiveUp)
-        );
-    }
-
-    #[test]
-    fn non_stall_errors_propagate() {
-        assert_eq!(stall_step(&BackendErrorCode::Timeout, 0, false), None);
-        assert_eq!(
-            stall_step(&BackendErrorCode::Other("agent_not_found".into()), 1, true),
-            None
-        );
-    }
-
-    #[test]
-    fn giveup_error_names_recovery_commands() {
-        let msg = stall_giveup_error("flywheel-demo-oc", "demo").to_string();
-        assert!(msg.contains("agent_prompt_stalled"), "{msg}");
-        assert!(msg.contains("flywheel recover demo"), "{msg}");
-        assert!(msg.contains("flywheel kill demo --force"), "{msg}");
-        assert!(msg.contains("--respawn-on-stall"), "{msg}");
-    }
 }
 
 // ---- interrupt / view / watch / zoom / attach / kill ----
