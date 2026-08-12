@@ -7348,6 +7348,7 @@ fn cmd_loop(
             drain_grace_polls: cfg.drain_grace_polls(),
             claim_nudge_after_polls: cfg.claim_nudge_after_polls(),
             resonate_url: String::new(),
+            force,
         };
         let rt = tokio::runtime::Runtime::new()?;
         if engine {
