@@ -3942,20 +3942,20 @@ fn fresh_loop_id(
     )?;
     Ok(fresh)
 }
-/// Does a durable-promise id belong to `base`'s loop invocations? Matches
-/// `swarm-loop:{base}:…` and the engine-loop variant whose label segment
-/// contains `base` (e.g. `engine-loop:fw-{base}-N:…`). ROOT invocations only —
-/// child promises carry a `.` separator (`<root>.1`) and must NOT be cleared
-/// (they belong to a live/existing invocation's checkpoint tree).
+/// Does a durable-promise id belong to `base`'s loop invocations? Both the
+/// durable and engine loops build their invocation id via `fresh_loop_id`,
+/// which uses the project's last path segment (`base`) — so ids are exactly
+/// `swarm-loop:{base}:<ts>` / `engine-loop:{base}:<ts>`. Exact colon-delimited
+/// prefix match: base `toron` never matches `toron-x` (boundary at the colon).
+/// ROOT invocations only — child promises carry a `.` separator (`<root>.1`)
+/// and belong to a live invocation's checkpoint tree, never cleared.
 fn id_is_project_loop(id: &str, base: &str) -> bool {
     if id.contains('.') {
         return false;
     }
-    if id.starts_with(&format!("swarm-loop:{base}:")) {
-        return true;
-    }
-    id.strip_prefix("engine-loop:")
-        .is_some_and(|rest| rest.contains(base))
+    let swarm = format!("swarm-loop:{base}:");
+    let engine = format!("engine-loop:{base}:");
+    id.starts_with(&swarm) || id.starts_with(&engine)
 }
 
 /// bd-87hq: reject stale PENDING loop invocations for `base` on the resonate
@@ -5018,9 +5018,9 @@ mod tests {
             "swarm-loop:toron:1786511691522556000",
             "toron"
         ));
-        // engine-loop variant whose label contains base
+        // engine-loop variant: same base (last path segment) via fresh_loop_id
         assert!(id_is_project_loop(
-            "engine-loop:fw-toron-3:1786511691522556000",
+            "engine-loop:toron:1786511691522556000",
             "toron"
         ));
         // other project's invocations are NOT matched
@@ -5029,7 +5029,17 @@ mod tests {
             "toron"
         ));
         assert!(!id_is_project_loop(
-            "engine-loop:fw-other-1:1786511691522556000",
+            "engine-loop:flywheel:1786511691522556000",
+            "toron"
+        ));
+        // prefix collision: base `toron` must NOT match a `toron-x` project
+        // (colon-delimited boundary)
+        assert!(!id_is_project_loop(
+            "swarm-loop:toron-x:1786511691522556000",
+            "toron"
+        ));
+        assert!(!id_is_project_loop(
+            "engine-loop:toron-x:1786511691522556000",
             "toron"
         ));
         // child promises (durable-call results) carry a '.' — must NOT match
