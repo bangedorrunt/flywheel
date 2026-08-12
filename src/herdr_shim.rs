@@ -705,6 +705,103 @@ pub fn worktree_list(c: &mut Client, workspace_id: Option<&str>) -> Result<Vec<W
 }
 
 // ---------------------------------------------------------------------------
+// Process liveness probe (bd-1np): `pane.process_info`.
+// ---------------------------------------------------------------------------
+
+/// One foreground process in a pane (`pane.process_info`).
+///
+/// The agent process (opencode/pi/grok/omp) appears here with `pid ==
+/// foreground_process_group_id` while it runs; when the process dies the pane
+/// falls back to the shell prompt and the agent binary disappears from the
+/// list. This is the ground-truth liveness signal `flywheel recover` probes
+/// (a pane can exist in herdr while the process inside it is dead).
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneProcessInfoProcess {
+    pub pid: u64,
+    pub name: String,
+    #[serde(default)]
+    pub argv0: Option<String>,
+}
+
+/// Result of `pane.process_info` (bd-1np). `foreground_processes` lists the
+/// processes in the pane's foreground process group — a live agent process is
+/// the group leader (`pid == foreground_process_group_id`); the `shell_pid`
+/// is the pane's shell, which reclaims the foreground after the agent exits.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneProcessInfo {
+    pub pane_id: String,
+    #[serde(default)]
+    pub foreground_process_group_id: Option<u64>,
+    #[serde(default)]
+    pub shell_pid: Option<u64>,
+    #[serde(default)]
+    pub foreground_processes: Vec<PaneProcessInfoProcess>,
+}
+
+/// `pane.process_info` — delegation over `Client::call`.
+pub fn pane_process_info(c: &mut Client, pane_id: &str) -> Result<PaneProcessInfo> {
+    let res = c.call("pane.process_info", json!({ "pane_id": pane_id }))?;
+    serde_json::from_value(res.get("process_info").cloned().unwrap_or(res))
+        .context("parse pane.process_info result")
+}
+
+/// Known agent-kind → process-name mapping for the liveness probe (bd-1np).
+/// These are the canonical executables herdr launches per kind
+/// (`herdr agent start --kind <KIND>`); the foreground process's `name` /
+/// `argv0` matches one of these while the agent lives.
+pub fn kind_process_names(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "opencode" => &["opencode"],
+        "pi" => &["pi", "gemini"],
+        "grok" => &["grok", "grok-build"],
+        "omp" => &["omp"],
+        // unknown kind — no process-name mapping; the caller must treat the
+        // probe as inconclusive rather than false-negative "healthy".
+        _ => &[],
+    }
+}
+
+/// Pure liveness verdict from a `pane.process_info` snapshot (bd-1np).
+///
+/// The agent process is alive iff its binary appears in the pane's foreground
+/// processes (herdr's process-info lists the whole foreground group; the live
+/// agent is its leader). Rules:
+/// - binary match → `Some(true)` (ground truth, no other check needed);
+/// - no binary match AND the pane's shell owns the foreground group
+///   (`fgpgid == shell_pid`) → the agent is gone and the pane returned to the
+///   shell prompt → `Some(false)`;
+/// - no binary match, foreground NOT shell-owned (e.g. orphaned MCP server
+///   children linger after the agent died) → the agent binary is absent →
+///   `Some(false)` for a known kind;
+/// - unknown kind (no process-name mapping) with no other signal → `None`
+///   (inconclusive — the caller falls back to legacy pane-existence
+///   semantics; a dead pane must never be confidently "healthy").
+pub fn pane_agent_alive(info: &PaneProcessInfo, kind: &str) -> Option<bool> {
+    let names = kind_process_names(kind);
+    let binary_hit = names.iter().any(|n| {
+        info.foreground_processes
+            .iter()
+            .any(|p| p.name == *n || p.argv0.as_deref() == Some(*n))
+    });
+    if binary_hit {
+        return Some(true);
+    }
+    let shell_owns_foreground = match (info.foreground_process_group_id, info.shell_pid) {
+        (Some(fg), Some(shell)) => fg == shell,
+        _ => false,
+    };
+    if shell_owns_foreground {
+        return Some(false);
+    }
+    if names.is_empty() {
+        return None;
+    }
+    Some(false)
+}
+
+// ---------------------------------------------------------------------------
 // Subscription stream adapter.
 // ---------------------------------------------------------------------------
 
@@ -799,5 +896,113 @@ impl EventStream {
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
         self.timeout = timeout;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod process_liveness_tests {
+    use super::{kind_process_names, pane_agent_alive, PaneProcessInfo, PaneProcessInfoProcess};
+
+    fn proc(name: &str, pid: u64) -> PaneProcessInfoProcess {
+        PaneProcessInfoProcess {
+            pid,
+            name: name.to_string(),
+            argv0: Some(name.to_string()),
+        }
+    }
+
+    fn info(
+        fgpgid: Option<u64>,
+        shell_pid: Option<u64>,
+        procs: Vec<PaneProcessInfoProcess>,
+    ) -> PaneProcessInfo {
+        PaneProcessInfo {
+            pane_id: "w1:p1".to_string(),
+            foreground_process_group_id: fgpgid,
+            shell_pid,
+            foreground_processes: procs,
+        }
+    }
+
+    /// Live agent: the agent binary leads the foreground group (pid == fgpgid).
+    #[test]
+    fn live_opencode_classified_alive() {
+        let i = info(
+            Some(100),
+            Some(50),
+            vec![
+                proc("opencode", 100),
+                proc("node", 101),
+                proc("uv", 102),
+            ],
+        );
+        assert_eq!(pane_agent_alive(&i, "opencode"), Some(true));
+    }
+
+    /// Dead process: pane exists but the shell owns the foreground — the
+    /// exact bd-1np false-negative shape (pane present, process gone).
+    #[test]
+    fn dead_process_shell_foreground_classified_dead() {
+        let i = info(Some(50), Some(50), vec![proc("zsh", 50)]);
+        assert_eq!(pane_agent_alive(&i, "opencode"), Some(false));
+    }
+
+    /// Dead process with orphaned children still listed (MCP servers linger
+    /// after the agent died): no agent binary, foreground not shell-owned.
+    #[test]
+    fn dead_process_orphan_children_classified_dead() {
+        let i = info(Some(103), Some(50), vec![proc("node", 103), proc("uv", 104)]);
+        assert_eq!(pane_agent_alive(&i, "opencode"), Some(false));
+    }
+
+    /// Empty foreground list: nothing running.
+    #[test]
+    fn empty_foreground_classified_dead() {
+        let i = info(Some(50), Some(50), vec![]);
+        assert_eq!(pane_agent_alive(&i, "opencode"), Some(false));
+    }
+
+    /// Unknown kind with no other signal: inconclusive, never "healthy".
+    #[test]
+    fn unknown_kind_inconclusive() {
+        let i = info(Some(200), Some(50), vec![proc("mystery-agent", 200)]);
+        assert_eq!(pane_agent_alive(&i, "mystery-kind"), None);
+    }
+
+    /// Unknown kind but shell owns the foreground: still provably dead.
+    #[test]
+    fn unknown_kind_shell_foreground_dead() {
+        let i = info(Some(50), Some(50), vec![proc("zsh", 50)]);
+        assert_eq!(pane_agent_alive(&i, "mystery-kind"), Some(false));
+    }
+
+    /// Kind aliases: grok's binary can be grok-build.
+    #[test]
+    fn kind_alias_matches() {
+        let i = info(Some(300), Some(50), vec![proc("grok-build", 300)]);
+        assert_eq!(pane_agent_alive(&i, "grok"), Some(true));
+    }
+
+    /// Argv0-only match (name may be a comm name like python3.14t).
+    #[test]
+    fn argv0_match_counts() {
+        let i = info(
+            Some(400),
+            Some(50),
+            vec![PaneProcessInfoProcess {
+                pid: 400,
+                name: "opencode".to_string(),
+                argv0: Some("/opt/bin/opencode".to_string()),
+            }],
+        );
+        assert_eq!(pane_agent_alive(&i, "opencode"), Some(true));
+    }
+
+    #[test]
+    fn kind_names_mapping_has_all_four() {
+        assert!(kind_process_names("opencode").contains(&"opencode"));
+        assert!(kind_process_names("pi").contains(&"pi"));
+        assert!(kind_process_names("grok").contains(&"grok"));
+        assert!(kind_process_names("omp").contains(&"omp"));
     }
 }
