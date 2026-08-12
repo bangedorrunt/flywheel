@@ -501,6 +501,26 @@ impl MailSurface for ToronMailBackend {
         .await
     }
 
+    async fn release_by_reason(
+        &self,
+        project: &str,
+        requestor: &str,
+        bead_id: &str,
+        notify_previous: bool,
+    ) -> Result<ReleaseResult, MailError> {
+        let mail = self.mail.clone();
+        let (project, requestor, bead_id) = (
+            project.to_string(),
+            requestor.to_string(),
+            bead_id.to_string(),
+        );
+        let v = run_facade(mail, move |m| {
+            m.release_by_reason(&project, &requestor, &bead_id, notify_previous)
+        })
+        .await?;
+        into_typed(v, "release_by_reason")
+    }
+
     async fn slot_acquire(
         &self,
         project: &str,
