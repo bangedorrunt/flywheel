@@ -178,6 +178,22 @@ pub fn release_args(project_key: &str, agent_name: &str) -> Value {
     json!({ "project_key": project_key, "agent_name": agent_name })
 }
 
+/// `release_file_reservations_by_reason` (bd-h3oj — additive daemon tool):
+/// revoke every live lease whose reason is the bead id.
+pub fn release_by_reason_args(
+    project_key: &str,
+    requestor_name: &str,
+    bead_id: &str,
+    notify_previous: bool,
+) -> Value {
+    json!({
+        "project_key": project_key,
+        "agent_name": requestor_name,
+        "bead_id": bead_id,
+        "notify_previous": notify_previous,
+    })
+}
+
 /// `renew_file_reservations`.
 pub fn renew_args(
     project_key: &str,
