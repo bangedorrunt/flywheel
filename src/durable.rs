@@ -3861,15 +3861,8 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     // resume REPLAYS the killed run's checkpointed state (stranded beads, no
     // agent knowledge from the fresh spawn) instead of starting clean. --force
     // means "take over deliberately" — fresh state, not a zombie replay.
-    // bd-87hq: --force takeover also clears the project's OTHER stale pending
-    // loop invocations on the server, not just the one active entry. Killed
-    // runs accumulate pending roots; the worker's group anycast replays them,
-    // and replaying their checkpointed children against the CURRENT leaf
-    // sequence causes child-id collisions (one leaf reads another's stored
-    // result → the poll_* serde errors). A clean slate prevents the replay.
-    if params.force {
-        clear_stale_loop_invocations(&resonate, base).await;
-    }
+    // (stale-loop clearing happens after the id is chosen, below, so the
+    // resumed invocation itself is preserved — bd-87hq.)
     let id = match crate::state::load_active_loop(&params.project)? {
         Some(al) if !params.force && promise_pending(&resonate, &al.id).await? => {
             eprintln!("flywheel: resuming existing loop {}", dim_id(&al.id));
@@ -3889,6 +3882,15 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
         }
         _ => fresh_loop_id(&params.project, &serde_json::to_value(&params)?, "swarm-loop")?,
     };
+
+    // bd-87hq: clear the project's OTHER stale pending loop invocations on the
+    // server (killed/abandoned runs). The worker's group anycast replays them,
+    // and replaying their checkpointed children against the CURRENT leaf
+    // sequence causes child-id collisions — one leaf reads another's stored
+    // result → the poll_* serialization errors. Preserve `id` (the invocation
+    // this run owns/resumes); reject the rest. Unconditional so a plain
+    // `flywheel loop run` is safe, not only --force.
+    clear_stale_loop_invocations(&resonate, base, Some(&id)).await;
 
     // the workflow must know its own invocation id for the last-sent registry
     // (bd-resume-dedup filters records to the SAME invocation)
@@ -3940,11 +3942,15 @@ fn fresh_loop_id(
     )?;
     Ok(fresh)
 }
-
 /// Does a durable-promise id belong to `base`'s loop invocations? Matches
 /// `swarm-loop:{base}:…` and the engine-loop variant whose label segment
-/// contains `base` (e.g. `engine-loop:fw-{base}-N:…`).
+/// contains `base` (e.g. `engine-loop:fw-{base}-N:…`). ROOT invocations only —
+/// child promises carry a `.` separator (`<root>.1`) and must NOT be cleared
+/// (they belong to a live/existing invocation's checkpoint tree).
 fn id_is_project_loop(id: &str, base: &str) -> bool {
+    if id.contains('.') {
+        return false;
+    }
     if id.starts_with(&format!("swarm-loop:{base}:")) {
         return true;
     }
@@ -3959,7 +3965,7 @@ fn id_is_project_loop(id: &str, base: &str) -> bool {
 /// one leaf reads another's stored result → the `poll_*` serialization errors
 /// (`missing field name`, `invalid type: map, expected a sequence`, …).
 /// Clearing them gives the worker a clean slate. Best-effort: logs + continues.
-async fn clear_stale_loop_invocations(resonate: &Resonate, base: &str) {
+async fn clear_stale_loop_invocations(resonate: &Resonate, base: &str, except: Option<&str>) {
     let mut cursor: Option<String> = None;
     let mut cleared = 0u32;
     loop {
@@ -3975,6 +3981,9 @@ async fn clear_stale_loop_invocations(resonate: &Resonate, base: &str) {
             }
         };
         for p in &result.promises {
+            if Some(p.id.as_str()) == except {
+                continue;
+            }
             if !id_is_project_loop(&p.id, base) {
                 continue;
             }
@@ -3994,7 +4003,7 @@ async fn clear_stale_loop_invocations(resonate: &Resonate, base: &str) {
     }
     if cleared > 0 {
         eprintln!(
-            "flywheel: --force cleared {} stale pending loop invocation(s) for {base}",
+            "flywheel: cleared {} stale pending loop invocation(s) for {base}",
             cleared
         );
     }
@@ -5023,9 +5032,19 @@ mod tests {
             "engine-loop:fw-other-1:1786511691522556000",
             "toron"
         ));
+        // child promises (durable-call results) carry a '.' — must NOT match
+        // (they belong to a live invocation's checkpoint tree, never cleared).
+        assert!(!id_is_project_loop(
+            "swarm-loop:toron:1786511691522556000.1",
+            "toron"
+        ));
+        assert!(!id_is_project_loop(
+            "swarm-loop:toron:1786511691522556000.2.3",
+            "toron"
+        ));
         // non-loop promises are never matched
         assert!(!id_is_project_loop("cron:weekly-review", "toron"));
-        assert!(!id_is_project_loop("wf-graph-fanout-1.2.run_workflow", "toron"));
+        assert!(!id_is_project_loop("wf-graph-fanout-1", "toron"));
     }
 
     fn pev(event_type: &str, pane: &str, status: &str, seq: u64) -> PollEvent {
