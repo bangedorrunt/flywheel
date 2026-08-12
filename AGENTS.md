@@ -196,21 +196,6 @@ signal** `__poll_events` (forward-only herdr subscribe); **correctness floor**
 Resonate. Crashes resume by re-running the same command (same invocation id
 while pending). Verify: `docs/decisions/_scripts/verify-0001.sh`.
 
-**Stale pending invocations self-clean (bd-87hq)**: the loop checkpoints on the
-Resonate server (default `http://localhost:8001`, launchd
-`com.flywheel.resonate`, sqlite `~/.local/state/flywheel/resonate.db`). Killed
-runs (SIGKILL/crash) leave their root invocation PENDING; the worker's group
-anycast replays them, and replaying their checkpointed children against the
-CURRENT leaf sequence causes child-id collisions → one leaf reads another's
-stored result → `poll_*` serde errors (`missing field name`, `invalid type:
-map, expected a sequence`) → the loop continues empty and exits "complete"
-dispatching nothing. Every `loop run` now rejects stale pending project loop
-ROOT invocations first (`swarm-loop:{base}:<ts>` / `engine-loop:{base}:<ts>`,
-exact colon-delimited prefix, roots only — children carry a `.`, never
-cleared), preserving the resumed id. `--force` additionally rejects a
-corrupted active invocation and starts fresh. Diagnose:
-`resonate promises search -S http://127.0.0.1:8001 --state pending`.
-
 ### Agent contracts (spawn prompts)
 
 Baked into `bead_prompt` / `resume_prompt` (`src/durable.rs`):
