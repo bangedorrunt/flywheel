@@ -614,12 +614,17 @@ impl Mail {
         ack: bool,
         thread_id: Option<&str>,
     ) -> Result<Value> {
+        // bd-pncn: `all` (the broadcast token) is expanded to the project's
+        // registered roster BEFORE the backend call — the toron surfaces
+        // (in-process mailbox + daemon tool) reject a literal "all"
+        // recipient. Zero registered agents is a clear error.
+        let targets = self.expand_broadcast(project_key, to)?;
         match &self.backend {
             BackendKind::InProcess => {
                 let result = block_on(mailbox().send_message(&SendMessage {
                     project_slug: project_key.to_string(),
                     sender_name: self.name.clone(),
-                    to: to.to_vec(),
+                    to: targets,
                     subject: subject.to_string(),
                     body_md: body.to_string(),
                     importance: Some(importance.to_string()),
@@ -633,7 +638,7 @@ impl Mail {
                 let args = crate::backend::wire::send_args(
                     project_key,
                     &self.name,
-                    to,
+                    &targets,
                     subject,
                     body,
                     importance,
@@ -643,6 +648,37 @@ impl Mail {
                 self.call_remote("send_message", args)
             }
         }
+    }
+
+    /// bd-pncn: expand the `all` broadcast token into the project's
+    /// registered agent roster (backend-agnostic — `list_agents` serves both
+    /// the in-process mailbox and the remote daemon). Explicit recipients
+    /// pass through untouched; an explicit name also present in the roster
+    /// is deduped (one gift-wrap per agent). Errors when the roster is empty.
+    fn expand_broadcast(&self, project_key: &str, to: &[String]) -> Result<Vec<String>> {
+        let has_broadcast = to.iter().any(|t| t.trim() == "all");
+        if !has_broadcast {
+            return Ok(to.to_vec());
+        }
+        let roster = self.list_agents(project_key, None)?;
+        let mut out: Vec<String> = roster
+            .as_array()
+            .ok_or_else(|| anyhow!("list_agents returned a non-array: {roster}"))?
+            .iter()
+            .filter_map(|a| a.get("name").and_then(Value::as_str).map(String::from))
+            .collect();
+        if out.is_empty() {
+            bail!(
+                "cannot broadcast to 'all': project {project_key} has zero registered agents (register agents first, or name recipients explicitly)"
+            );
+        }
+        for t in to {
+            let t = t.trim();
+            if t != "all" && !out.iter().any(|n| n == t) {
+                out.push(t.to_string());
+            }
+        }
+        Ok(out)
     }
 
     /// `reply_message` (threaded).
@@ -1945,6 +1981,99 @@ mod tests {
 
         let none = mail.list_active(project, Some("Nobody"), None).expect("no match");
         assert_eq!(none["count"].as_u64().unwrap_or(0), 0, "unknown holder → empty board");
+    }
+
+    /// bd-pncn: `--to all` broadcasts to every registered agent's inbox
+    /// (roster expansion), not a literal "all" recipient.
+    #[test]
+    fn send_to_all_broadcasts_to_every_registered_agent() {
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let project = "broadcast-all";
+        mail.ensure_project(project).expect("ensure");
+        for name in ["flywheel", "BlueLake", "RoseDune"] {
+            mail.register_agent(project, name, "test", "test", "bd-pncn test")
+                .expect("register");
+        }
+        let v = mail
+            .send(
+                project,
+                &["all".into()],
+                "br",
+                "broadcast body",
+                "normal",
+                false,
+                Some("bd-pncn"),
+            )
+            .expect("broadcast");
+        assert_eq!(
+            v["count"].as_u64().unwrap_or(0),
+            3,
+            "one delivery per registered agent: {v}"
+        );
+        for name in ["BlueLake", "RoseDune"] {
+            let inbox = mail.inbox(project, name, false, 10).expect("inbox");
+            assert!(
+                inbox
+                    .as_array()
+                    .expect("rows")
+                    .iter()
+                    .any(|m| m["subject"] == "br"),
+                "{name} inbox sees the broadcast: {inbox}"
+            );
+        }
+    }
+
+    /// bd-pncn: zero registered agents → clear error, never a silent no-op.
+    #[test]
+    fn send_to_all_with_zero_agents_errors() {
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let project = "broadcast-empty";
+        mail.ensure_project(project).expect("ensure");
+        let err = mail
+            .send(project, &["all".into()], "br", "x", "normal", false, None)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("zero registered agents"),
+            "clear error names the problem: {msg}"
+        );
+    }
+
+    /// bd-pncn: `all` + explicit recipients → each agent delivered exactly
+    /// once (dedupe).
+    #[test]
+    fn send_to_all_plus_explicit_dedupes() {
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let project = "broadcast-dedupe";
+        mail.ensure_project(project).expect("ensure");
+        for name in ["flywheel", "BlueLake", "RoseDune"] {
+            mail.register_agent(project, name, "test", "test", "bd-pncn test")
+                .expect("register");
+        }
+        let v = mail
+            .send(
+                project,
+                &["all".into(), "BlueLake".into()],
+                "br",
+                "x",
+                "normal",
+                false,
+                None,
+            )
+            .expect("send");
+        assert_eq!(v["count"].as_u64().unwrap_or(0), 3, "deduped: {v}");
+        let recipients: Vec<&str> = v["deliveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["payload"]["recipient"].as_str())
+            .collect();
+        assert_eq!(recipients.len(), 3);
+        assert_eq!(
+            recipients.iter().filter(|r| **r == "BlueLake").count(),
+            1,
+            "no double-delivery: {recipients:?}"
+        );
     }
 
     /// se2.2: the remote edge is the toron daemon — a hex message id must be
