@@ -109,6 +109,24 @@ fn opt_string_field(v: &Value, keys: &[&str]) -> Option<String> {
     opt_str_field(v, keys).map(String::from)
 }
 
+fn string_array_field(v: &Value, keys: &[&str]) -> Vec<String> {
+    keys.iter()
+        .find_map(|k| v.get(k).and_then(Value::as_array))
+        .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+/// Map one JSON conflict object to `PathConflict` (bd-dsu1 API ripple: the
+/// struct gained `reservation_ids` — the kind-30031 event ids of the
+/// conflicting leases, parallel to `holders`; absent on the wire = empty).
+fn path_conflict(c: &Value) -> toron_core::mailbox::reservations::PathConflict {
+    toron_core::mailbox::reservations::PathConflict {
+        path: opt_string_field(c, &["path"]).unwrap_or_default(),
+        holders: string_array_field(c, &["holders"]),
+        reservation_ids: string_array_field(c, &["reservation_ids"]),
+    }
+}
+
 fn bool_field(v: &Value, keys: &[&str], op: &str) -> Result<bool, MailError> {
     for k in keys {
         if let Some(b) = v.get(k).and_then(Value::as_bool) {
@@ -545,19 +563,7 @@ impl MailSurface for AgentMailBackend {
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
-                    .map(|c| toron_core::mailbox::reservations::PathConflict {
-                        path: opt_string_field(c, &["path"]).unwrap_or_default(),
-                        holders: c
-                            .get("holders")
-                            .and_then(Value::as_array)
-                            .map(|h| {
-                                h.iter()
-                                    .filter_map(Value::as_str)
-                                    .map(String::from)
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    })
+                    .map(path_conflict)
                     .collect()
             })
             .unwrap_or_default();
@@ -566,19 +572,7 @@ impl MailSurface for AgentMailBackend {
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
-                    .map(|c| toron_core::mailbox::reservations::PathConflict {
-                        path: opt_string_field(c, &["path"]).unwrap_or_default(),
-                        holders: c
-                            .get("holders")
-                            .and_then(Value::as_array)
-                            .map(|h| {
-                                h.iter()
-                                    .filter_map(Value::as_str)
-                                    .map(String::from)
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    })
+                    .map(path_conflict)
                     .collect()
             })
             .unwrap_or_default();
@@ -605,19 +599,7 @@ impl MailSurface for AgentMailBackend {
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
-                    .map(|c| toron_core::mailbox::reservations::PathConflict {
-                        path: opt_string_field(c, &["path"]).unwrap_or_default(),
-                        holders: c
-                            .get("holders")
-                            .and_then(Value::as_array)
-                            .map(|h| {
-                                h.iter()
-                                    .filter_map(Value::as_str)
-                                    .map(String::from)
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    })
+                    .map(path_conflict)
                     .collect()
             })
             .unwrap_or_default();
@@ -636,19 +618,7 @@ impl MailSurface for AgentMailBackend {
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
-                    .map(|c| toron_core::mailbox::reservations::PathConflict {
-                        path: opt_string_field(c, &["path"]).unwrap_or_default(),
-                        holders: c
-                            .get("holders")
-                            .and_then(Value::as_array)
-                            .map(|h| {
-                                h.iter()
-                                    .filter_map(Value::as_str)
-                                    .map(String::from)
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    })
+                    .map(path_conflict)
                     .collect()
             })
             .unwrap_or_default();
@@ -754,6 +724,21 @@ impl MailSurface for AgentMailBackend {
         // resolve a lease by path — toron is the supported backend for this.
         Err(MailError::other(
             "path-based force_release is unsupported on the legacy agent-mail backend (use the toron backend)",
+        ))
+    }
+
+    async fn release_by_reason(
+        &self,
+        _project: &str,
+        _requestor: &str,
+        _bead_id: &str,
+        _notify_previous: bool,
+    ) -> Result<ReleaseResult, MailError> {
+        // bd-h3oj: release-on-bead-close needs reason-scoped revocation,
+        // which the legacy agent-mail backend's numeric-id API cannot
+        // express — toron is the supported backend for this.
+        Err(MailError::other(
+            "release_by_reason is unsupported on the legacy agent-mail backend (use the toron backend)",
         ))
     }
 
