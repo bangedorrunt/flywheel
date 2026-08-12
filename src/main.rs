@@ -765,7 +765,8 @@ struct AgentCounts {
 }
 
 /// Subcommands of `flywheel loop` (bd-fw-stale-loop-processes-gac
-/// restructure): `run` (default), `status`, `list`, `prune`.
+/// restructure): `run` (default), `status`, `list`, `prune`; operator
+/// stale-view `stale` + explicit clear `clear` (bd-ghcl).
 #[derive(Subcommand)]
 enum LoopCmd {
     /// Run the monitoring loop for a project (default subcommand — the bare
@@ -833,6 +834,24 @@ enum LoopCmd {
     List,
     /// Remove pid-registry entries whose process is dead (stale cleanup)
     Prune,
+    /// Inspect the resonate server's PENDING loop invocations with an
+    /// owner-pid liveness verdict (live loop vs stale). No --project = all
+    /// projects (bd-ghcl)
+    Stale {
+        /// project (base name or path); default: all projects
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Explicitly reject a project's stale PENDING loop invocations on the
+    /// resonate server. Refuses when the owner pid is ALIVE (a live loop is
+    /// not stale). --all clears every project's stale invocations (bd-ghcl)
+    Clear {
+        /// project (base name or path); optional with --all
+        project: Option<String>,
+        /// clear stale invocations for ALL projects
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2503,7 +2522,7 @@ fn log(project: &str, kind: EventKind, data: Value) {
 /// `run` is the default subcommand; any first token after `loop` that is not
 /// a known subcommand name is treated as the project. Pure + unit-tested.
 fn rewrite_legacy_loop_args(args: &[String]) -> Vec<String> {
-    const SUBCOMMANDS: [&str; 4] = ["run", "status", "list", "prune"];
+    const SUBCOMMANDS: [&str; 6] = ["run", "status", "list", "prune", "stale", "clear"];
     if args.len() >= 2
         && args[1] == "loop"
         // A flag (--help, -h, global options) keeps the parent context;
@@ -2689,6 +2708,8 @@ fn main() {
             LoopCmd::Status { project } => cmd_loop_status(&cfg, project),
             LoopCmd::List => cmd_loop_list(),
             LoopCmd::Prune => cmd_loop_prune(),
+            LoopCmd::Stale { project } => cmd_loop_stale(&cfg, project.as_deref()),
+            LoopCmd::Clear { project, all } => cmd_loop_clear(&cfg, project.as_deref(), *all),
         },
         Some(Commands::Zoom { project, to, off }) => cmd_zoom(&cfg, project, to, *off),
         Some(Commands::Attach { project, to }) => cmd_attach(&cfg, project, to),
@@ -7862,7 +7883,7 @@ mod loop_tests {
 
     #[test]
     fn canonical_loop_subcommands_untouched() {
-        for sub in ["run", "status", "list", "prune"] {
+        for sub in ["run", "status", "list", "prune", "stale", "clear"] {
             let args = vec!["flywheel".to_string(), "loop".to_string(), sub.to_string()];
             assert_eq!(rewrite_legacy_loop_args(&args), args, "{sub}");
         }
@@ -12425,6 +12446,24 @@ fn cmd_tutorial() -> Result<()> {
 fn cmd_loop_status(cfg: &Config, project: &str) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let v = rt.block_on(durable::loop_status(cfg, project))?;
+    print_json(&v);
+    Ok(())
+}
+
+/// `flywheel loop stale [--project P]` (bd-ghcl): operator view of the
+/// resonate server's pending loop invocations with owner-pid verdicts.
+fn cmd_loop_stale(cfg: &Config, project: Option<&str>) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let v = rt.block_on(durable::loop_stale(cfg, project))?;
+    print_json(&v);
+    Ok(())
+}
+
+/// `flywheel loop clear <project> [--all]` (bd-ghcl): reject a project's
+/// stale pending loop invocations; refuses live-loop owners.
+fn cmd_loop_clear(cfg: &Config, project: Option<&str>, all: bool) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let v = rt.block_on(durable::loop_clear(cfg, project, all))?;
     print_json(&v);
     Ok(())
 }
