@@ -4009,6 +4009,257 @@ async fn clear_stale_loop_invocations(resonate: &Resonate, base: &str, except: O
     }
 }
 
+// ---- operator loop-stale surface (bd-ghcl) ----
+// The self-heal above clears on loop START; `loop stale` / `loop clear`
+// give the operator the view + explicit clear WITHOUT starting a loop.
+
+/// A parsed root loop-invocation id: the project base + the id's embedded
+/// timestamp (nanos since epoch — `fresh_loop_id` stamps it).
+struct LoopInvocationId<'a> {
+    base: &'a str,
+    ts_nanos: u128,
+}
+
+/// Parse a pending promise id into its loop-invocation parts. None for
+/// non-loop ids and child promises (`<root>.N` — those belong to a live
+/// invocation's checkpoint tree, never cleared). Mirrors the roots-only +
+/// prefix rules of `id_is_project_loop`, but derives the base from the id
+/// itself so the all-projects operator views work.
+fn parse_loop_invocation_id(id: &str) -> Option<LoopInvocationId<'_>> {
+    if id.contains('.') {
+        return None;
+    }
+    let (prefix, rest) = id.split_once(':')?;
+    if prefix != "swarm-loop" && prefix != "engine-loop" {
+        return None;
+    }
+    let (base, ts) = rest.rsplit_once(':')?;
+    if base.is_empty() {
+        return None;
+    }
+    Some(LoopInvocationId {
+        base,
+        ts_nanos: ts.parse().ok()?,
+    })
+}
+
+/// Seconds since the invocation's embedded timestamp.
+fn invocation_age_secs(ts_nanos: u128) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    (now.saturating_sub(ts_nanos) / 1_000_000_000) as u64
+}
+
+/// Owner-pid liveness verdict for a pending loop invocation, from the pid
+/// registry (`loop-pids.json`):
+/// - an entry whose invocation field matches this id names the owning
+///   process — alive = live loop, dead pid = genuinely stale;
+/// - otherwise fall back to project ownership: an alive pid registered for
+///   `base` is a live loop whose invocation is simply unrecorded yet (the
+///   registry is written with an empty invocation at registration; the
+///   durable runner may fill it later). A dead pid = the loop is gone.
+/// - no entry at all = stale (the owning process unregistered on exit).
+#[derive(Debug, PartialEq)]
+enum OwnerVerdict {
+    Live { pid: u32 },
+    StaleDead { pid: u32 },
+    Unregistered,
+}
+
+fn owner_verdict(
+    registry: &std::collections::BTreeMap<String, crate::state::LoopPidEntry>,
+    base: &str,
+    invocation: &str,
+) -> OwnerVerdict {
+    for entry in registry.values() {
+        if !entry.invocation.is_empty() && entry.invocation == invocation {
+            return if crate::state::pid_alive(entry.pid) {
+                OwnerVerdict::Live { pid: entry.pid }
+            } else {
+                OwnerVerdict::StaleDead { pid: entry.pid }
+            };
+        }
+    }
+    for (project, entry) in registry {
+        let key_base = project.rsplit('/').next().unwrap_or(project.as_str());
+        if key_base == base {
+            return if crate::state::pid_alive(entry.pid) {
+                OwnerVerdict::Live { pid: entry.pid }
+            } else {
+                OwnerVerdict::StaleDead { pid: entry.pid }
+            };
+        }
+    }
+    OwnerVerdict::Unregistered
+}
+
+fn verdict_label(verdict: &OwnerVerdict) -> (&'static str, Option<u32>) {
+    match verdict {
+        OwnerVerdict::Live { pid } => ("live", Some(*pid)),
+        OwnerVerdict::StaleDead { pid } => ("stale-dead", Some(*pid)),
+        OwnerVerdict::Unregistered => ("stale-unregistered", None),
+    }
+}
+
+/// Group per-project stale rows into the operator view: one entry per
+/// project, invocations sorted oldest-first, projects alphabetical.
+fn group_stale_by_project(rows: Vec<Value>) -> Value {
+    let mut projects: Vec<(String, Vec<Value>)> = Vec::new();
+    for row in rows {
+        let proj = row["project"].as_str().unwrap_or_default().to_string();
+        match projects.iter_mut().find(|(p, _)| *p == proj) {
+            Some((_, invs)) => invs.push(row),
+            None => projects.push((proj, vec![row])),
+        }
+    }
+    for (_, invs) in &mut projects {
+        invs.sort_by(|a, b| {
+            b["age_secs"]
+                .as_u64()
+                .unwrap_or(0)
+                .cmp(&a["age_secs"].as_u64().unwrap_or(0))
+        });
+    }
+    projects.sort_by(|a, b| a.0.cmp(&b.0));
+    json!({
+        "projects": projects.into_iter().map(|(project, invocations)| {
+            json!({ "project": project, "invocations": invocations })
+        }).collect::<Vec<_>>()
+    })
+}
+
+/// `flywheel loop stale [--project P]`: inspect the resonate server's
+/// PENDING loop invocations. Per project: id, age, owner-pid liveness
+/// verdict. No filter = all projects. Pure read — never mutates server
+/// state.
+pub async fn loop_stale(cfg: &Config, project: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    let url = cfg
+        .resonate_url()
+        .unwrap_or_else(|| "http://localhost:8001".to_string());
+    let resonate = Resonate::new(ResonateConfig {
+        url: Some(url),
+        ..Default::default()
+    });
+    let want_base = project.map(|p| p.rsplit('/').next().unwrap_or(p).to_string());
+    let registry = crate::state::load_loop_pids();
+    let mut rows: Vec<Value> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let result = resonate
+            .promises
+            .search(Some("pending"), None, Some(200), cursor.as_deref())
+            .await
+            .map_err(|e| anyhow::anyhow!("stale-loop search: {e}"))?;
+        for p in &result.promises {
+            let Some(parsed) = parse_loop_invocation_id(&p.id) else {
+                continue;
+            };
+            if want_base.as_ref().is_some_and(|want| parsed.base != *want) {
+                continue;
+            }
+            let verdict = owner_verdict(&registry, parsed.base, &p.id);
+            let (label, owner_pid) = verdict_label(&verdict);
+            rows.push(json!({
+                "project": parsed.base,
+                "id": p.id,
+                "age_secs": invocation_age_secs(parsed.ts_nanos),
+                "verdict": label,
+                "owner_pid": owner_pid,
+            }));
+        }
+        match result.cursor {
+            Some(c) if !c.is_empty() => cursor = Some(c),
+            _ => break,
+        }
+    }
+    let _ = resonate.stop().await;
+    Ok(group_stale_by_project(rows))
+}
+
+/// `flywheel loop clear <project> [--all]`: explicitly reject a project's
+/// stale PENDING loop invocations on the resonate server (or all projects
+/// with `--all`). Reuses the roots-only rules above. REFUSES when the
+/// owner pid is ALIVE — a live loop is not stale. Stale = dead owner pid
+/// or no registry entry.
+pub async fn loop_clear(
+    cfg: &Config,
+    project: Option<&str>,
+    all: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let want_base = if all {
+        None
+    } else {
+        Some(
+            project
+                .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
+                .ok_or_else(|| anyhow::anyhow!("flywheel loop clear needs <project> or --all"))?,
+        )
+    };
+    let url = cfg
+        .resonate_url()
+        .unwrap_or_else(|| "http://localhost:8001".to_string());
+    let resonate = Resonate::new(ResonateConfig {
+        url: Some(url),
+        ..Default::default()
+    });
+    let registry = crate::state::load_loop_pids();
+    let mut cleared: Vec<Value> = Vec::new();
+    let mut refused: Vec<Value> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let result = resonate
+            .promises
+            .search(Some("pending"), None, Some(200), cursor.as_deref())
+            .await
+            .map_err(|e| anyhow::anyhow!("stale-loop search: {e}"))?;
+        for p in &result.promises {
+            let Some(parsed) = parse_loop_invocation_id(&p.id) else {
+                continue;
+            };
+            if want_base.as_ref().is_some_and(|want| parsed.base != *want) {
+                continue;
+            }
+            match owner_verdict(&registry, parsed.base, &p.id) {
+                OwnerVerdict::Live { pid } => {
+                    refused.push(json!({
+                        "id": p.id,
+                        "project": parsed.base,
+                        "reason": "owner pid alive (live loop is not stale)",
+                        "owner_pid": pid,
+                    }));
+                }
+                _ => {
+                    let value = resonate_sdk::types::Value::from_serializable(serde_json::json!({
+                        "rejected": "operator-clear"
+                    }))
+                    .unwrap_or_default();
+                    match resonate.promises.reject(&p.id, value).await {
+                        Ok(_) => cleared.push(json!({ "id": p.id, "project": parsed.base })),
+                        Err(e) => refused.push(json!({
+                            "id": p.id,
+                            "project": parsed.base,
+                            "reason": format!("reject failed: {e}"),
+                        })),
+                    }
+                }
+            }
+        }
+        match result.cursor {
+            Some(c) if !c.is_empty() => cursor = Some(c),
+            _ => break,
+        }
+    }
+    let _ = resonate.stop().await;
+    Ok(json!({
+        "cleared": cleared,
+        "cleared_count": cleared.len(),
+        "refused": refused,
+        "refused_count": refused.len(),
+    }))
+}
+
 /// bd-e0xk slice 1: the loop's dispatch phase as a declarative engine
 /// workflow. ONE dispatch_job step; the engine's ActionRunner shells
 /// `__send --profile` (the same send the sync loop uses, byte-identical
@@ -5055,6 +5306,173 @@ mod tests {
         // non-loop promises are never matched
         assert!(!id_is_project_loop("cron:weekly-review", "toron"));
         assert!(!id_is_project_loop("wf-graph-fanout-1", "toron"));
+    }
+
+    // ---- bd-ghcl: loop stale/clear operator surface ----
+
+    #[test]
+    fn parse_loop_invocation_id_extracts_base_and_ts() {
+        let p = parse_loop_invocation_id("swarm-loop:toron:1786511691522556000").unwrap();
+        assert_eq!(p.base, "toron");
+        assert_eq!(p.ts_nanos, 1786511691522556000);
+        let e = parse_loop_invocation_id("engine-loop:flywheel:1786511691522556000").unwrap();
+        assert_eq!(e.base, "flywheel");
+        assert!(e.ts_nanos > 0);
+    }
+
+    #[test]
+    fn parse_loop_invocation_id_rejects_children_and_non_loops() {
+        // children carry '.' — belong to a live checkpoint tree, never cleared
+        assert!(parse_loop_invocation_id("swarm-loop:toron:1786511691522556000.1").is_none());
+        assert!(parse_loop_invocation_id("swarm-loop:toron:1786511691522556000.2.3").is_none());
+        // non-loop ids
+        assert!(parse_loop_invocation_id("cron:weekly-review").is_none());
+        assert!(parse_loop_invocation_id("wf-graph-fanout-1").is_none());
+        assert!(parse_loop_invocation_id("").is_none());
+        // garbage timestamp
+        assert!(parse_loop_invocation_id("swarm-loop:toron:not-a-ts").is_none());
+        // empty base
+        assert!(parse_loop_invocation_id("swarm-loop::1786511691522556000").is_none());
+    }
+
+    #[test]
+    fn invocation_age_secs_is_bounded_and_non_negative() {
+        // a recent id (10s ago) → ~10s age; a future id → 0 (saturating)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let age = invocation_age_secs(now - 10_000_000_000);
+        assert!(age >= 9 && age <= 11, "age {age} should be ~10s");
+        assert_eq!(invocation_age_secs(now + 60_000_000_000), 0);
+    }
+
+    #[test]
+    fn owner_verdict_dead_pid_is_stale() {
+        let mut reg = std::collections::BTreeMap::new();
+        reg.insert(
+            "toron".to_string(),
+            crate::state::LoopPidEntry {
+                pid: 99_999_999, // cannot exist as a live process
+                started_at: "t".to_string(),
+                invocation: "swarm-loop:toron:1786511691522556000".to_string(),
+            },
+        );
+        assert_eq!(
+            owner_verdict(&reg, "toron", "swarm-loop:toron:1786511691522556000"),
+            OwnerVerdict::StaleDead { pid: 99_999_999 }
+        );
+    }
+
+    #[test]
+    fn owner_verdict_alive_pid_is_live() {
+        let mut reg = std::collections::BTreeMap::new();
+        let me = std::process::id();
+        reg.insert(
+            "toron".to_string(),
+            crate::state::LoopPidEntry {
+                pid: me,
+                started_at: "t".to_string(),
+                invocation: "swarm-loop:toron:1786511691522556000".to_string(),
+            },
+        );
+        assert_eq!(
+            owner_verdict(&reg, "toron", "swarm-loop:toron:1786511691522556000"),
+            OwnerVerdict::Live { pid: me }
+        );
+    }
+
+    #[test]
+    fn owner_verdict_alive_pid_with_empty_invocation_is_live() {
+        // The registry is written with an EMPTY invocation at registration
+        // (cmd_loop register_loop(project, "", force)) — a pending invocation
+        // for the same project base with an alive registered pid is a LIVE
+        // loop, not stale. Clearing it would break the running loop (bd-ghcl).
+        let mut reg = std::collections::BTreeMap::new();
+        let me = std::process::id();
+        reg.insert(
+            "toron".to_string(),
+            crate::state::LoopPidEntry {
+                pid: me,
+                started_at: "t".to_string(),
+                invocation: String::new(),
+            },
+        );
+        assert_eq!(
+            owner_verdict(&reg, "toron", "swarm-loop:toron:1786511691522556000"),
+            OwnerVerdict::Live { pid: me }
+        );
+        // registry key may be a full path — match on the last segment
+        let mut reg_path = std::collections::BTreeMap::new();
+        reg_path.insert(
+            "/Users/x/workspace/toron".to_string(),
+            crate::state::LoopPidEntry {
+                pid: me,
+                started_at: "t".to_string(),
+                invocation: String::new(),
+            },
+        );
+        assert_eq!(
+            owner_verdict(&reg_path, "toron", "engine-loop:toron:123"),
+            OwnerVerdict::Live { pid: me }
+        );
+        // dead registered pid for the base = stale (loop is gone)
+        let mut reg_dead = std::collections::BTreeMap::new();
+        reg_dead.insert(
+            "toron".to_string(),
+            crate::state::LoopPidEntry {
+                pid: 99_999_999,
+                started_at: "t".to_string(),
+                invocation: String::new(),
+            },
+        );
+        assert_eq!(
+            owner_verdict(&reg_dead, "toron", "swarm-loop:toron:1786511691522556000"),
+            OwnerVerdict::StaleDead { pid: 99_999_999 }
+        );
+    }
+
+    #[test]
+    fn owner_verdict_unregistered_is_stale() {
+        let reg = std::collections::BTreeMap::new();
+        assert_eq!(
+            owner_verdict(&reg, "toron", "swarm-loop:toron:1786511691522556000"),
+            OwnerVerdict::Unregistered
+        );
+        // registry entry for a DIFFERENT project does not match
+        let mut reg2 = std::collections::BTreeMap::new();
+        reg2.insert(
+            "flywheel".to_string(),
+            crate::state::LoopPidEntry {
+                pid: std::process::id(),
+                started_at: "t".to_string(),
+                invocation: "engine-loop:toron:123".to_string(),
+            },
+        );
+        assert_eq!(
+            owner_verdict(&reg2, "toron", "swarm-loop:toron:1786511691522556000"),
+            OwnerVerdict::Unregistered
+        );
+    }
+
+    #[test]
+    fn group_stale_by_project_aggregates_all_projects() {
+        let rows = vec![
+            json!({"project": "flywheel", "id": "swarm-loop:flywheel:1", "age_secs": 500, "verdict": "stale-dead", "owner_pid": 42}),
+            json!({"project": "toron", "id": "swarm-loop:toron:2", "age_secs": 1000, "verdict": "stale-unregistered", "owner_pid": null}),
+            json!({"project": "toron", "id": "swarm-loop:toron:1", "age_secs": 100, "verdict": "live", "owner_pid": 7}),
+        ];
+        let out = group_stale_by_project(rows);
+        let projects = out["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 2, "two distinct projects");
+        // alphabetical: flywheel first
+        assert_eq!(projects[0]["project"], "flywheel");
+        assert_eq!(projects[1]["project"], "toron");
+        // toron invocations sorted oldest-first (age desc)
+        let toron_invs = projects[1]["invocations"].as_array().unwrap();
+        assert_eq!(toron_invs[0]["age_secs"], 1000);
+        assert_eq!(toron_invs[1]["age_secs"], 100);
+        assert_eq!(projects[0]["invocations"].as_array().unwrap().len(), 1);
     }
 
     fn pev(event_type: &str, pane: &str, status: &str, seq: u64) -> PollEvent {
