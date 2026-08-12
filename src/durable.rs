@@ -106,6 +106,14 @@ pub struct LoopParams {
     /// empty → engine default localhost:8001.
     #[serde(default)]
     pub resonate_url: String,
+    /// force takeover (bd-bvwf.4 + bd-e131): with --force the loop REJECTS a
+    /// stale pending invocation instead of resuming it — a killed loop's
+    /// promise stays pending on the server forever, and a plain resume
+    /// REPLAYS the killed run's checkpointed state (stranded beads, no agent
+    /// knowledge) instead of starting fresh. `#[serde(default)]` keeps saved
+    /// params loadable.
+    #[serde(default)]
+    pub force: bool,
 }
 
 fn default_unknown_diagnose_threshold() -> u32 {
@@ -3716,33 +3724,31 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     // is still pending (crash resume); once it settles (complete/blocked/failed),
     // a fresh id starts a new run. SDK 0.6.0 does not support version-based
     // re-invocation, so ids must change.
+    //
+    // bd-bvwf.4/bd-e131 force-takeover: with --force the loop REJECTS a stale
+    // pending invocation instead of resuming it. A killed loop (SIGKILL/crash)
+    // never settles its promise — it stays pending on the server, and a plain
+    // resume REPLAYS the killed run's checkpointed state (stranded beads, no
+    // agent knowledge from the fresh spawn) instead of starting clean. --force
+    // means "take over deliberately" — fresh state, not a zombie replay.
     let id = match crate::state::load_active_loop(&params.project)? {
-        Some(al) if promise_pending(&resonate, &al.id).await? => {
+        Some(al) if !params.force && promise_pending(&resonate, &al.id).await? => {
             eprintln!("flywheel: resuming existing loop {}", dim_id(&al.id));
             al.id
         }
-        _ => {
-            // The invocation id must be path-safe: an ABSOLUTE project path
-            // contains slashes that break the promise id on the server —
-            // use the project base (last path segment) instead.
-            let id_project = params.project.rsplit('/').next().unwrap_or(&params.project);
-            let fresh = format!(
-                "swarm-loop:{id_project}:{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
+        Some(al) if params.force && promise_pending(&resonate, &al.id).await? => {
+            eprintln!(
+                "flywheel: --force rejecting stale loop invocation {} (fresh run)",
+                dim_id(&al.id)
             );
-            crate::state::save_active_loop(
-                &params.project,
-                &crate::state::ActiveLoop::new(
-                    fresh.clone(),
-                    serde_json::to_value(&params)?,
-                    crate::state::now_iso(),
-                ),
-            )?;
-            fresh
+            let v = resonate_sdk::types::Value::from_serializable(serde_json::json!({
+                "rejected": "force-takeover",
+            }))
+            .unwrap_or_default();
+            let _ = resonate.promises.reject(&al.id, v).await;
+            fresh_loop_id(&params.project, &serde_json::to_value(&params)?, "swarm-loop")?
         }
+        _ => fresh_loop_id(&params.project, &serde_json::to_value(&params)?, "swarm-loop")?,
     };
 
     // the workflow must know its own invocation id for the last-sent registry
@@ -3766,6 +3772,34 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
 
 fn dim_id(id: &str) -> String {
     crate::output::dim(id)
+}
+
+/// A genuinely fresh loop invocation id (path-safe: an ABSOLUTE project path
+/// contains slashes that break the promise id on the server — use the project
+/// base, last path segment) + persisted active-loop record. Shared by the
+/// durable + engine loops (bd-e131 force-takeover fresh-run path).
+fn fresh_loop_id(
+    project: &str,
+    params: &serde_json::Value,
+    prefix: &str,
+) -> anyhow::Result<String> {
+    let id_project = project.rsplit('/').next().unwrap_or(project);
+    let fresh = format!(
+        "{prefix}:{id_project}:{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    crate::state::save_active_loop(
+        project,
+        &crate::state::ActiveLoop::new(
+            fresh.clone(),
+            params.clone(),
+            crate::state::now_iso(),
+        ),
+    )?;
+    Ok(fresh)
 }
 
 /// bd-e0xk slice 1: the loop's dispatch phase as a declarative engine
@@ -4537,30 +4571,27 @@ pub async fn run_engine_loop(cfg: &Config, mut params: LoopParams) -> anyhow::Re
 
     // Resume semantics: same as the imperative loop — reuse the persisted
     // invocation id while its promise is pending; fresh id once settled.
+    // bd-bvwf.4/bd-e131: --force rejects a stale pending invocation (a
+    // killed loop's promise never settles; a plain resume replays the killed
+    // run's checkpointed state instead of starting clean).
     let id = match crate::state::load_active_loop(&params.project)? {
-        Some(al) if promise_pending(&resonate, &al.id).await? => {
+        Some(al) if !params.force && promise_pending(&resonate, &al.id).await? => {
             eprintln!("flywheel: resuming existing loop {}", dim_id(&al.id));
             al.id
         }
-        _ => {
-            let id_project = params.project.rsplit('/').next().unwrap_or(&params.project);
-            let fresh = format!(
-                "engine-loop:{id_project}:{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
+        Some(al) if params.force && promise_pending(&resonate, &al.id).await? => {
+            eprintln!(
+                "flywheel: --force rejecting stale loop invocation {} (fresh run)",
+                dim_id(&al.id)
             );
-            crate::state::save_active_loop(
-                &params.project,
-                &crate::state::ActiveLoop::new(
-                    fresh.clone(),
-                    serde_json::to_value(&params)?,
-                    crate::state::now_iso(),
-                ),
-            )?;
-            fresh
+            let v = resonate_sdk::types::Value::from_serializable(serde_json::json!({
+                "rejected": "force-takeover",
+            }))
+            .unwrap_or_default();
+            let _ = resonate.promises.reject(&al.id, v).await;
+            fresh_loop_id(&params.project, &serde_json::to_value(&params)?, "engine-loop")?
         }
+        _ => fresh_loop_id(&params.project, &serde_json::to_value(&params)?, "engine-loop")?,
     };
     params.invocation = id.clone();
     params.resonate_url = url;
@@ -5911,6 +5942,7 @@ mod tests {
             drain_grace_polls: 1,
             claim_nudge_after_polls: 2,
             resonate_url: String::new(),
+            force: false,
         };
         let v = serde_json::to_value(&p).unwrap();
         let back: LoopParams = serde_json::from_value(v).unwrap();
