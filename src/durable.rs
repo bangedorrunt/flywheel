@@ -730,13 +730,21 @@ async fn poll_ready(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
     let raw = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(raw.trim())
         .map_err(|e| map_err(anyhow::anyhow!("__ready bad JSON: {e}: {raw}")))?;
+    parse_bead_list(&v, "__ready").map_err(map_err)
+}
+
+/// Parse the `{"beads": [...]}` leaf output shared by `__ready` (id/title)
+/// and `__inprogress` (id/title/assignee) into `ReadyBead` rows. Pure —
+/// bd-87hq regression pin: the producer emitters (cmd_internal_ready /
+/// cmd_internal_inprogress in main.rs) and this consumer must never drift.
+fn parse_bead_list(v: &serde_json::Value, what: &str) -> anyhow::Result<Vec<ReadyBead>> {
     let beads = v
         .get("beads")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| map_err(anyhow::anyhow!("__ready missing beads: {raw}")))?;
-    let mut out_beads = Vec::with_capacity(beads.len());
-    for b in beads {
-        out_beads.push(ReadyBead {
+        .ok_or_else(|| anyhow::anyhow!("{what} missing beads: {v}"))?;
+    Ok(beads
+        .iter()
+        .map(|b| ReadyBead {
             id: b
                 .get("id")
                 .and_then(serde_json::Value::as_str)
@@ -752,9 +760,25 @@ async fn poll_ready(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
                 .and_then(serde_json::Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
-        });
-    }
-    Ok(out_beads)
+        })
+        .collect())
+}
+
+/// Parse the `{"entries": [...]}` leaf output of `__expected-replies`. Pure —
+/// bd-87hq regression pin (producer: cmd_internal_expected_replies).
+fn parse_expected_reply_entries(v: &serde_json::Value) -> Vec<crate::state::ExpectedReply> {
+    v.get("entries")
+        .and_then(|e| serde_json::from_value(e.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Parse the `{"newest_id": ..., "author": ...}` leaf output of
+/// `__check-reply`. Pure — bd-87hq regression pin.
+fn parse_reply_check(v: &serde_json::Value) -> (Option<String>, Option<String>) {
+    (
+        v.get("newest_id").and_then(serde_json::Value::as_str).map(String::from),
+        v.get("author").and_then(serde_json::Value::as_str).map(String::from),
+    )
 }
 
 /// The prompt given to an agent for a ready bead: self-contained + lifecycle.
@@ -976,30 +1000,7 @@ async fn poll_inprogress(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
     let raw = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(raw.trim())
         .map_err(|e| map_err(anyhow::anyhow!("__inprogress bad JSON: {e}: {raw}")))?;
-    let beads = v
-        .get("beads")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| map_err(anyhow::anyhow!("__inprogress missing beads: {raw}")))?;
-    Ok(beads
-        .iter()
-        .map(|b| ReadyBead {
-            id: b
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            title: b
-                .get("title")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            assignee: b
-                .get("assignee")
-                .and_then(serde_json::Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-        })
-        .collect())
+    parse_bead_list(&v, "__inprogress").map_err(map_err)
 }
 
 /// Args for the `__reclaim-stranded` leaf (bd-627z.1).
@@ -1327,9 +1328,7 @@ async fn load_expected_replies(args: ExpectedArgs) -> Result<Vec<crate::state::E
     let raw = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(raw.trim())
         .map_err(|e| map_err(anyhow::anyhow!("__expected-replies bad JSON: {e}: {raw}")))?;
-    Ok(v.get("entries")
-        .and_then(|e| serde_json::from_value(e.clone()).ok())
-        .unwrap_or_default())
+    Ok(parse_expected_reply_entries(&v))
 }
 
 /// bd-a7j leaf: newest (message id, author) in the thread from the asked
@@ -1350,10 +1349,7 @@ async fn check_reply(args: CheckReplyArgs) -> Result<(Option<String>, Option<Str
     let raw = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(raw.trim())
         .map_err(|e| map_err(anyhow::anyhow!("__check-reply bad JSON: {e}: {raw}")))?;
-    Ok((
-        v.get("newest_id").and_then(serde_json::Value::as_str).map(String::from),
-        v.get("author").and_then(serde_json::Value::as_str).map(String::from),
-    ))
+    Ok(parse_reply_check(&v))
 }
 
 /// bd-a7j leaf: log `reply_missing` + dispatch the concrete reminder
@@ -2392,6 +2388,25 @@ pub const DEFAULT_UNKNOWN_DETECT_GRACE_POLLS: u32 = 6;
 /// (dependency chain), so the loop drives the whole chain in one run.
 pub const DEFAULT_DRAIN_GRACE_POLLS: u32 = 1;
 
+/// bd-87hq: consecutive blind-completion iterations before the loop aborts.
+/// The stale-checkpoint signature (a previous binary's checkpointed leaf
+/// results no longer deserialize) is: every critical leaf fails while the
+/// world looks EMPTY — the loop would declare "complete" having dispatched
+/// nothing. This many consecutive empty-looking-but-leaf-failing iterations
+/// (≈2-3min at the active cadence) abort with --force advice instead.
+pub const DEFAULT_LEAF_FAILURE_ABORT_POLLS: u32 = 3;
+
+/// bd-87hq: pure completion-gate accounting — how many consecutive
+/// "empty world + failing leaves" iterations have accumulated. Reset the
+/// moment the world is either visible (no leaf failure) or non-empty.
+fn blind_completion_count(complete_now: bool, leaf_failed: bool, consecutive: u32) -> u32 {
+    if complete_now && leaf_failed {
+        consecutive.saturating_add(1)
+    } else {
+        0
+    }
+}
+
 /// Claim-watch nudge cadence (bd-efk1). Default 2: a dispatched bead may
 /// stay unclaimed for ~2 active polls (≈60s at the 30s active cadence —
 /// the crew-execution gate's 60s claim bound) before the loop nudges the
@@ -2635,6 +2650,13 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // consecutive completion-condition holds (bd-bvwf.3 drain-grace): the
     // loop exits only when the condition holds drain_grace_polls+1 times.
     let mut complete_holds: u32 = 0;
+    // bd-87hq: consecutive "empty world + critical leaf failed" iterations
+    // (stale-checkpoint signature). The loop refuses to declare "complete"
+    // while blind and aborts loudly after DEFAULT_LEAF_FAILURE_ABORT_POLLS.
+    let mut blind_complete_failures: u32 = 0;
+    // bd-87hq: did any critical leaf (poll_events/poll_swarm/poll_ready/
+    // poll_inprogress/expected-replies) fail THIS iteration?
+    let mut critical_leaf_failed_this_iter: bool = false;
     // bd-efk1: dispatched-bead claim watch (bead id → dispatch state). The
     // crew-execution watchdog: agents ENGAGE but skip the br lifecycle; the
     // watch catches unclaimed/ unclosed beads and nudges or re-dispatches.
@@ -2660,6 +2682,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
 
     loop {
         iteration += 1;
+        // bd-87hq: per-iteration critical-leaf failure flag (reset each poll)
+        critical_leaf_failed_this_iter = false;
         if let Some(max) = params.max_iterations
             && iteration > max
         {
@@ -2687,6 +2711,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             Err(e) => {
                 // cg6.2: leaf errors never abort the loop — a transport
                 // hiccup degrades to the heartbeat fallback this tick.
+                // bd-87hq: a REPLAY deserialization failure (stale
+                // checkpoint) fails here too — flag it for the completion
+                // gate.
+                critical_leaf_failed_this_iter = true;
                 eprintln!("flywheel: poll_events leaf failed (continuing): {e}");
                 PollEventsBatch {
                     events: vec![],
@@ -2730,7 +2758,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             Err(e) => {
                 // cg6.2: the correctness floor must not be a crash point —
                 // a transient herdr failure yields an empty snapshot; the
-                // next tick re-polls.
+                // next tick re-polls. bd-87hq: flag for the completion gate.
+                critical_leaf_failed_this_iter = true;
                 eprintln!("flywheel: poll_swarm leaf failed (continuing with empty snapshot): {e}");
                 vec![]
             }
@@ -2949,7 +2978,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             {
                 Ok(b) => b,
                 Err(e) => {
-                    // cg6.2: leaf errors never abort the loop.
+                    // cg6.2: leaf errors never abort the loop. bd-87hq:
+                    // flag for the completion gate.
+                    critical_leaf_failed_this_iter = true;
                     eprintln!("flywheel: poll_ready leaf failed (continuing): {e}");
                     vec![]
                 }
@@ -3145,6 +3176,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         {
             Ok(e) => e,
             Err(e) => {
+                // bd-87hq: flag expected-replies failures for the gate too
+                // (part of the stale-checkpoint signature per the symptom).
+                critical_leaf_failed_this_iter = true;
                 eprintln!("flywheel: expected-replies leaf failed (continuing): {e}");
                 vec![]
             }
@@ -3613,6 +3647,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 Err(e) => {
                     // cg6.2: a leaf hiccup must not crash the completion
                     // check — treat as blocking so the loop keeps polling.
+                    // bd-87hq: flag for the completion gate.
+                    critical_leaf_failed_this_iter = true;
                     eprintln!("flywheel: poll_inprogress leaf failed (completion guard): {e}");
                     true
                 }
@@ -3647,14 +3683,38 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // in work mode — non-work queues may hold arbitrary prompts.
             && (!params.work || claim_watch.is_empty());
         if complete_now {
-            complete_holds += 1;
-            if complete_holds > params.drain_grace_polls {
-                return Ok("complete".to_string());
+            // bd-87hq: never certify completion on a poll that could not
+            // see the swarm/queue. The stale-checkpoint signature is EXACTLY
+            // "every critical leaf fails while the world looks empty" — the
+            // loop would exit "complete" having dispatched nothing (the
+            // reported symptom). Count consecutive blind iterations; abort
+            // loudly after the threshold with --force advice.
+            blind_complete_failures =
+                blind_completion_count(complete_now, critical_leaf_failed_this_iter, blind_complete_failures);
+            if critical_leaf_failed_this_iter {
+                complete_holds = 0;
+                if blind_complete_failures >= DEFAULT_LEAF_FAILURE_ABORT_POLLS {
+                    return Err(map_err(anyhow::anyhow!(
+                        "loop abort: {blind_complete_failures} consecutive critical-leaf failures while the world looked empty (poll_events/poll_swarm/poll_ready/poll_inprogress/expected-replies). This is the stale-checkpoint signature — a previous binary's checkpointed leaf results no longer deserialize. Re-run with --force to reject the stale invocation and start fresh."
+                    )));
+                }
+                eprintln!(
+                    "flywheel: WARN {blind_complete_failures}/{} consecutive critical-leaf failures with an empty world — refusing to declare complete while blind (stale checkpointed invocation?); aborting after the threshold. Re-run with --force.",
+                    DEFAULT_LEAF_FAILURE_ABORT_POLLS
+                );
+                wait_secs = params.active_interval_secs.clamp(5, 30);
+            } else {
+                complete_holds += 1;
+                if complete_holds > params.drain_grace_polls {
+                    return Ok("complete".to_string());
+                }
+                // grace pass: short wait (active cadence), then re-poll + re-source
+                wait_secs = params.active_interval_secs.clamp(5, 30);
             }
-            // grace pass: short wait (active cadence), then re-poll + re-source
-            wait_secs = params.active_interval_secs.clamp(5, 30);
         } else {
             complete_holds = 0;
+            // bd-87hq: a visible/non-empty world resets the blind-failure count
+            blind_complete_failures = 0;
 
             // Lease renewal heartbeat (bd-mail-lease-renewal-durable): extend
             // the orchestrator's own file reservations by 4× the base interval
@@ -3801,6 +3861,15 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     // resume REPLAYS the killed run's checkpointed state (stranded beads, no
     // agent knowledge from the fresh spawn) instead of starting clean. --force
     // means "take over deliberately" — fresh state, not a zombie replay.
+    // bd-87hq: --force takeover also clears the project's OTHER stale pending
+    // loop invocations on the server, not just the one active entry. Killed
+    // runs accumulate pending roots; the worker's group anycast replays them,
+    // and replaying their checkpointed children against the CURRENT leaf
+    // sequence causes child-id collisions (one leaf reads another's stored
+    // result → the poll_* serde errors). A clean slate prevents the replay.
+    if params.force {
+        clear_stale_loop_invocations(&resonate, base).await;
+    }
     let id = match crate::state::load_active_loop(&params.project)? {
         Some(al) if !params.force && promise_pending(&resonate, &al.id).await? => {
             eprintln!("flywheel: resuming existing loop {}", dim_id(&al.id));
@@ -3870,6 +3939,65 @@ fn fresh_loop_id(
         ),
     )?;
     Ok(fresh)
+}
+
+/// Does a durable-promise id belong to `base`'s loop invocations? Matches
+/// `swarm-loop:{base}:…` and the engine-loop variant whose label segment
+/// contains `base` (e.g. `engine-loop:fw-{base}-N:…`).
+fn id_is_project_loop(id: &str, base: &str) -> bool {
+    if id.starts_with(&format!("swarm-loop:{base}:")) {
+        return true;
+    }
+    id.strip_prefix("engine-loop:")
+        .is_some_and(|rest| rest.contains(base))
+}
+
+/// bd-87hq: reject stale PENDING loop invocations for `base` on the resonate
+/// server. Killed/abandoned loop runs leave pending root promises; the
+/// worker's group anycast replays them, and replaying their checkpointed
+/// children against the CURRENT leaf sequence causes child-id collisions —
+/// one leaf reads another's stored result → the `poll_*` serialization errors
+/// (`missing field name`, `invalid type: map, expected a sequence`, …).
+/// Clearing them gives the worker a clean slate. Best-effort: logs + continues.
+async fn clear_stale_loop_invocations(resonate: &Resonate, base: &str) {
+    let mut cursor: Option<String> = None;
+    let mut cleared = 0u32;
+    loop {
+        let result = match resonate
+            .promises
+            .search(Some("pending"), None, Some(200), cursor.as_deref())
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("flywheel: stale-loop search failed (continuing): {e}");
+                return;
+            }
+        };
+        for p in &result.promises {
+            if !id_is_project_loop(&p.id, base) {
+                continue;
+            }
+            let value = resonate_sdk::types::Value::from_serializable(serde_json::json!({
+                "rejected": "stale-loop-takeover"
+            }))
+            .unwrap_or_default();
+            match resonate.promises.reject(&p.id, value).await {
+                Ok(_) => cleared += 1,
+                Err(e) => eprintln!("flywheel: stale-loop reject {} failed: {e}", p.id),
+            }
+        }
+        match result.cursor {
+            Some(c) if !c.is_empty() => cursor = Some(c),
+            _ => break,
+        }
+    }
+    if cleared > 0 {
+        eprintln!(
+            "flywheel: --force cleared {} stale pending loop invocation(s) for {base}",
+            cleared
+        );
+    }
 }
 
 /// bd-e0xk slice 1: the loop's dispatch phase as a declarative engine
@@ -4872,6 +5000,32 @@ mod tests {
             kind: "opencode".to_string(),
             pane_id: pane.to_string(),
         }
+    }
+
+    #[test]
+    fn id_is_project_loop_matches_own_project_only() {
+        // swarm-loop:{base}:<ts>
+        assert!(id_is_project_loop(
+            "swarm-loop:toron:1786511691522556000",
+            "toron"
+        ));
+        // engine-loop variant whose label contains base
+        assert!(id_is_project_loop(
+            "engine-loop:fw-toron-3:1786511691522556000",
+            "toron"
+        ));
+        // other project's invocations are NOT matched
+        assert!(!id_is_project_loop(
+            "swarm-loop:flywheel:1786511691522556000",
+            "toron"
+        ));
+        assert!(!id_is_project_loop(
+            "engine-loop:fw-other-1:1786511691522556000",
+            "toron"
+        ));
+        // non-loop promises are never matched
+        assert!(!id_is_project_loop("cron:weekly-review", "toron"));
+        assert!(!id_is_project_loop("wf-graph-fanout-1.2.run_workflow", "toron"));
     }
 
     fn pev(event_type: &str, pane: &str, status: &str, seq: u64) -> PollEvent {
@@ -6438,6 +6592,93 @@ mod tests {
     #[test]
     fn parse_poll_events_batch_rejects_garbage() {
         assert!(parse_poll_events_batch("{not json", 0).is_err());
+    }
+
+    // ---- bd-87hq: producer→consumer leaf-shape pins ----
+    // Every test below feeds the EXACT JSON the leaf emitters in main.rs
+    // print into the durable.rs consumer parsers. A shape drift between the
+    // two (the reported symptom: every leaf "missing field name" / "expected
+    // a sequence" / "expected struct PollEventsBatch") fails these pins.
+
+    #[test]
+    fn leaf_shape_poll_entry_matches_emitter_array() {
+        // cmd_internal_poll emits [name, status, kind, pane_id] (4-tuples).
+        let v: serde_json::Value =
+            serde_json::from_str(r#"[["flywheel-toron-oc","working","opencode","w3H:p1"]]"#)
+                .unwrap();
+        let states: Vec<AgentState> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(parse_poll_entry)
+            .collect::<anyhow::Result<_>>()
+            .unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].name, "flywheel-toron-oc");
+        assert_eq!(states[0].status, "working");
+        assert_eq!(states[0].kind, "opencode");
+        assert_eq!(states[0].pane_id, "w3H:p1");
+    }
+
+    #[test]
+    fn leaf_shape_ready_beads_matches_emitter() {
+        // cmd_internal_ready emits {"beads": [{"id","title"}]}.
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"beads":[{"id":"bd-25g7.2","title":"Engine cron path"}]}"#)
+                .unwrap();
+        let beads = parse_bead_list(&v, "__ready").unwrap();
+        assert_eq!(beads.len(), 1);
+        assert_eq!(beads[0].id, "bd-25g7.2");
+        assert_eq!(beads[0].title, "Engine cron path");
+        assert_eq!(beads[0].assignee, None, "ready beads carry no assignee");
+    }
+
+    #[test]
+    fn leaf_shape_inprogress_beads_matches_emitter() {
+        // cmd_internal_inprogress emits {"beads": [{"id","title","assignee"}]}.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"beads":[{"id":"bd-25g7.2","title":"Engine cron path","assignee":"DustySparrow"}]}"#,
+        )
+        .unwrap();
+        let beads = parse_bead_list(&v, "__inprogress").unwrap();
+        assert_eq!(beads[0].assignee.as_deref(), Some("DustySparrow"));
+    }
+
+    #[test]
+    fn leaf_shape_expected_replies_matches_emitter() {
+        // __expected-replies emits {"entries": [{"agent","thread","head","created_ts"}]}.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"entries":[{"agent":"flywheel-toron-oc","thread":"bd-1","head":"abc","created_ts":"2026-08-12T00:00:00Z"}]}"#,
+        )
+        .unwrap();
+        let entries = parse_expected_reply_entries(&v);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].agent, "flywheel-toron-oc");
+        assert_eq!(entries[0].thread, "bd-1");
+        assert_eq!(entries[0].head.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn leaf_shape_check_reply_matches_emitter() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"newest_id":"def","author":"RoseDune"}"#).unwrap();
+        let (newest, author) = parse_reply_check(&v);
+        assert_eq!(newest.as_deref(), Some("def"));
+        assert_eq!(author.as_deref(), Some("RoseDune"));
+    }
+
+    #[test]
+    fn blind_completion_count_accumulates_only_on_empty_and_failing() {
+        // Stale-checkpoint signature: empty world + failing leaves.
+        assert_eq!(blind_completion_count(true, true, 0), 1);
+        assert_eq!(blind_completion_count(true, true, 2), 3);
+        // A visible world (leaf ok) resets.
+        assert_eq!(blind_completion_count(true, false, 2), 0);
+        // A non-empty world (completion not met) resets even on leaf failure.
+        assert_eq!(blind_completion_count(false, true, 2), 0);
+        // Abort threshold: DEFAULT_LEAF_FAILURE_ABORT_POLLS consecutive
+        // blind iterations trip the abort (the loop body returns Err).
+        assert!(DEFAULT_LEAF_FAILURE_ABORT_POLLS >= 3, "abort is not instant");
     }
 
     // ---- bd-event-dispatch-zero-latency: route_event ----
