@@ -84,7 +84,7 @@ impl StageLibrary {
             (
                 "systematic-execute",
                 "p6",
-                "OK, so start systematically and methodically and meticulously and diligently executing those remaining beads tasks that you created in the optimal logical order! For each bead follow the FULL lifecycle: triage (`bv --robot-triage` / `br ready --json`) -> claim (`br update --claim --actor \"$AGENT_NAME\" --json`; never work unclaimed) -> reserve via `flywheel mail locks --as YOUR_MAIL_NAME` (toron mail backend) -> announce on `--thread-id <bead-id>` with `--as YOUR_MAIL_NAME` -> execute one narrow slice -> quality gates -> verify acceptance criteria -> close with an honest reason (`br close`) -> `br sync --flush-only` + commit `.beads/` -> unlock + handoff on same thread. Prefer delegating to the `beads` subagent when available.",
+                "OK, so start systematically and methodically and meticulously and diligently executing those remaining beads tasks that you created in the optimal logical order! For each bead follow the FULL lifecycle: triage (`bv --robot-triage` / `br ready --json`) -> claim (`br update --claim --actor \"$AGENT_NAME\" --json`; never work unclaimed) -> reserve via `flywheel mail locks reserve --as YOUR_MAIL_NAME` (toron mail backend) -> announce on `--thread-id <bead-id>` with `--as YOUR_MAIL_NAME` -> execute one narrow slice -> quality gates -> verify acceptance criteria -> close with an honest reason (`br close`) -> `br sync --flush-only` + commit `.beads/` -> unlock + handoff on same thread. Prefer delegating to the `beads` subagent when available.",
             ),
             (
                 "commit-and-push",

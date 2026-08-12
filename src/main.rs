@@ -673,6 +673,14 @@ enum Commands {
         project: String,
         extend_seconds: u64,
     },
+    /// internal: release every live file reservation whose reason is the
+    /// bead id (bd-h3oj release-on-bead-close; durable workflow leaf —
+    /// idempotent, `released == 0` is a clean no-op)
+    #[command(name = "__release-bead-locks", hide = true)]
+    __ReleaseBeadLocks {
+        project: String,
+        bead_id: String,
+    },
     /// internal: list ready beads as JSON (durable workflow leaf)
     #[command(name = "__ready", hide = true)]
     __Ready { project: String },
@@ -1034,20 +1042,10 @@ enum MailCmd {
         #[arg(long = "thread-id")]
         thread_id: Option<String>,
     },
-    /// reserve files (advisory locks)
+    /// reserve / inspect file locks (advisory; subcommands: reserve, list, show)
     Locks {
-        project: String,
-        #[arg(long)]
-        paths: Vec<String>,
-        #[arg(long, default_value = "7200")]
-        ttl_seconds: u64,
-        #[arg(long)]
-        exclusive: bool,
-        #[arg(long, default_value = "flywheel")]
-        reason: String,
-        /// hold locks as this agent (crew must pass --as $AGENT_NAME)
-        #[arg(long = "as")]
-        as_agent: Option<String>,
+        #[command(subcommand)]
+        cmd: MailLockCmd,
     },
     /// release this identity's reservations
     Unlock {
@@ -1155,6 +1153,38 @@ enum ToronMailCmd {
         agent: String,
         #[arg(long)]
         limit: Option<usize>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MailLockCmd {
+    /// reserve files (advisory locks)
+    Reserve {
+        project: String,
+        #[arg(long)]
+        paths: Vec<String>,
+        #[arg(long, default_value = "7200")]
+        ttl_seconds: u64,
+        #[arg(long)]
+        exclusive: bool,
+        #[arg(long, default_value = "flywheel")]
+        reason: String,
+        /// hold locks as this agent (crew must pass --as $AGENT_NAME)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+    },
+    /// dump the active lock board (path, holder, exclusive, reason, expires, id)
+    List {
+        project: String,
+        /// filter to one holder's leases
+        #[arg(long)]
+        holder: Option<String>,
+    },
+    /// show the holders of one path/glob (glob-overlap match)
+    Show {
+        project: String,
+        /// path or glob whose holders to show
+        path: String,
     },
 }
 
@@ -2873,6 +2903,9 @@ fn main() {
             project,
             extend_seconds,
         }) => cmd_internal_renew_leases(&cfg, project, *extend_seconds),
+        Some(Commands::__ReleaseBeadLocks { project, bead_id }) => {
+            cmd_internal_release_bead_locks(&cfg, project, bead_id)
+        }
         Some(Commands::__WaitOutput {
             project,
             target,
@@ -6193,21 +6226,35 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             )?;
             print_json(&v);
         }
-        MailCmd::Locks {
-            project,
-            paths,
-            ttl_seconds,
-            exclusive,
-            reason,
-            as_agent,
-        } => {
-            let key = project_dir_str(cfg, project)?;
-            let mail = mail_as(cfg, &key, as_agent.as_deref())?;
-            mail.ensure_project(&key)?;
-            let agent = as_agent.clone().unwrap_or_else(|| mail.name.clone());
-            let v = mail.reserve(&key, &agent, paths, *ttl_seconds, *exclusive, reason)?;
-            print_json(&v);
-        }
+        MailCmd::Locks { cmd } => match cmd {
+            MailLockCmd::Reserve {
+                project,
+                paths,
+                ttl_seconds,
+                exclusive,
+                reason,
+                as_agent,
+            } => {
+                let key = project_dir_str(cfg, project)?;
+                let mail = mail_as(cfg, &key, as_agent.as_deref())?;
+                mail.ensure_project(&key)?;
+                let agent = as_agent.clone().unwrap_or_else(|| mail.name.clone());
+                let v = mail.reserve(&key, &agent, paths, *ttl_seconds, *exclusive, reason)?;
+                print_json(&v);
+            }
+            MailLockCmd::List { project, holder } => {
+                let key = project_dir_str(cfg, project)?;
+                let mail = mail_or_die(cfg)?;
+                let v = mail.list_active(&key, holder.as_deref(), None)?;
+                print_json(&v);
+            }
+            MailLockCmd::Show { project, path } => {
+                let key = project_dir_str(cfg, project)?;
+                let mail = mail_or_die(cfg)?;
+                let v = mail.list_active(&key, None, Some(path))?;
+                print_json(&v);
+            }
+        },
         MailCmd::Unlock { project, as_agent } => {
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
@@ -12362,7 +12409,9 @@ fn cmd_tutorial() -> Result<()> {
          Coordination:\n\
          \x20 - flywheel mail inbox <project>  agent-mail inbox\n\
          \x20 - flywheel assign <project> --to all --beads bd-1,bd-2\n\
-         \x20 - flywheel mail locks <project> --paths src/foo.rs --exclusive\n\n\
+         \x20 - flywheel mail locks reserve <project> --paths src/foo.rs --exclusive\n\
+         \x20 - flywheel mail locks list <project>      who holds what (lock board)\n\
+         \x20 - flywheel mail unlock <project>          release your locks\n\n\
          Automation:\n\
          \x20 - flywheel --robot-snapshot     full JSON state\n\
          \x20 - flywheel serve                REST + SSE (port 7337)\n",
@@ -12914,11 +12963,16 @@ fn cmd_internal_inprogress(cfg: &Config, project: &str) -> Result<()> {
     Ok(())
 }
 
-/// internal leaf (bd-627z.1): re-open stranded in_progress beads to ready.
-/// A bead is stranded when its assignee is NOT one of the `--live` agent
-/// names (captain, dead agent, unknown identity) — it would stall the batch
-/// forever. Reclaim = `br update <id> --status open --assignee ""` so the
-/// bead returns to the ready pool and the loop re-dispatches it.
+/// internal leaf (bd-627z.1, bd-qk9q): re-open stranded in_progress beads to
+/// ready. A bead is stranded when its assignee is NOT one of the `--live`
+/// agent names (captain, dead agent, unknown identity) — it would stall the
+/// batch forever. An in_progress bead with NO assignee is stranded too
+/// (bd-qk9q: nobody holds it, no agent works it, nothing else closes it —
+/// the bd-bvwf.1 strand). Presence-based, never status-based: an assignee in
+/// the live list is live regardless of status (bd-bvwf.5: no reclaim of
+/// unknown-but-present agents). Reclaim = `br update <id> --status open
+/// --assignee ""` so the bead returns to the ready pool and the loop
+/// re-dispatches it.
 ///
 /// Emits `{"reclaimed": [ids], "failed": [{"id", "error"}]}` — the durable
 /// loop re-dispatches reclaimed ids this poll.
@@ -12934,7 +12988,7 @@ fn cmd_internal_reclaim_stranded(cfg: &Config, project: &str, live: &str) -> Res
         .into_iter()
         .filter(|b| match &b.assignee {
             Some(a) => !live_names.iter().any(|l| l == a),
-            None => false,
+            None => true,
         })
         .collect();
     let dir = project_dir(cfg, project);
@@ -14049,6 +14103,26 @@ fn cmd_internal_renew_leases(cfg: &Config, project: &str, extend_seconds: u64) -
         "agent": agent,
         "released_closed": released_closed,
         "file_reservations": reservations,
+    }));
+    Ok(())
+}
+
+/// `__release-bead-locks` leaf (bd-h3oj): operator-signed revocation of
+/// every live reservation whose reason is the closed bead id. Emits
+/// `{"bead_id": ..., "released": n}` for the durable loop's checkpoint.
+fn cmd_internal_release_bead_locks(cfg: &Config, project: &str, bead_id: &str) -> Result<()> {
+    let mail = backend::mail_backend(cfg)?;
+    let key = project_dir_str(cfg, project)?;
+    backend::run_mail(mail.ensure_project(&key))?;
+    let requestor = orchestrator_mail_name(cfg);
+    let v = backend::run_mail(mail.release_by_reason(&key, &requestor, bead_id, true))
+        .map_err(|e| anyhow!("mail backend: {e}"))?;
+    if v.released > 0 {
+        eprintln!("flywheel: released {} reservation(s) for closed bead {bead_id}", v.released);
+    }
+    print_json(&json!({
+        "bead_id": bead_id,
+        "released": v.released,
     }));
     Ok(())
 }
