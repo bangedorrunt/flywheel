@@ -216,22 +216,9 @@ fn runtime() -> Result<&'static Runtime> {
         .map_err(|e| anyhow!("{e}"))
 }
 
-/// Durable mailbox roots (mirrors the mail shim): `TORON_DATA_DIR` (or the
-/// `TORON_MCP_DATA_DIR` alias) pins the root; else a per-process temp dir.
+/// Durable mailbox roots: same XDG/D3 resolution as the mail shim.
 fn mailbox_roots() -> (PathBuf, PathBuf) {
-    for var in ["TORON_DATA_DIR", "TORON_MCP_DATA_DIR"] {
-        if let Ok(dir) = std::env::var(var) {
-            let dir = dir.trim();
-            if !dir.is_empty() {
-                let root = PathBuf::from(dir);
-                return (root.clone(), root.join("flywheel-mail.sqlite"));
-            }
-        }
-    }
-    (
-        std::env::temp_dir().join("flywheel-mail"),
-        std::env::temp_dir().join(format!("flywheel-mail-{}.sqlite", std::process::id())),
-    )
+    crate::mail_shim::mailbox_roots()
 }
 
 /// The coalition store: durable mailbox + bus + manifest registry.
@@ -393,7 +380,10 @@ impl CoalitionStore {
             let runner: toron_workflow::ActionRunner = Arc::new(|a: &toron_workflow::Action| {
                 Ok(json!({ "action": a.type_name() }))
             });
-            let engine = toron_workflow::WorkflowEngine::local(runner)?;
+            let engine = toron_workflow::WorkflowEngine::local_with(
+                runner,
+                crate::profile::ProfileCatalog::catalog_profile_resolver(),
+            )?;
             engine.invoke(&run_id, wf.clone(), json!({})).await
         })?;
         run_log::write_run(&run_log::RunLogEntry {
@@ -1454,6 +1444,33 @@ fn channel_tag(event: &toron_core::nostr_sdk::nostr::Event) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-t9ey leftover: coalition mailbox must share the durable XDG root,
+    /// never a per-pid temp sqlite.
+    #[test]
+    fn mailbox_roots_follow_xdg_not_per_pid() {
+        let _g = crate::config::lock_env();
+        unsafe {
+            std::env::remove_var("TORON_DATA_DIR");
+            std::env::remove_var("TORON_MCP_DATA_DIR");
+            std::env::set_var("XDG_DATA_HOME", "/tmp/fw-coalition-xdg");
+        }
+        let (data_dir, db) = mailbox_roots();
+        assert_eq!(
+            data_dir,
+            PathBuf::from("/tmp/fw-coalition-xdg/toron"),
+            "coalition mailbox must use resolve_data_root"
+        );
+        assert!(
+            !db.to_string_lossy()
+                .contains(&std::process::id().to_string()),
+            "must not be per-pid: {}",
+            db.display()
+        );
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
 
     #[test]
     fn test_coalition_id_is_slugged_and_unique() {
