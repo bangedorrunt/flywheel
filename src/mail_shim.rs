@@ -98,10 +98,10 @@ fn mailbox() -> &'static toron_core::mailbox::Mailbox {
 /// durable D3 root via `toron_core::config::resolve_data_root` (ADR-0007
 /// D3) — `TORON_DATA_DIR` > `$XDG_DATA_HOME/toron` > `~/.local/share/toron`
 /// > relative `toron-data`. NEVER a per-pid temp root: separate flywheel
-/// invocations share one durable mailbox. The `TORON_MCP_DATA_DIR` alias
-/// stays as the explicit demo/test isolation override. The SQLite index
-/// lives at the root. Returns (data_dir, sqlite db path).
-fn mailbox_roots() -> (PathBuf, PathBuf) {
+/// > invocations share one durable mailbox. The `TORON_MCP_DATA_DIR` alias
+/// > stays as the explicit demo/test isolation override. The SQLite index
+/// > lives at the root. Returns (data_dir, sqlite db path).
+pub(crate) fn mailbox_roots() -> (PathBuf, PathBuf) {
     // `TORON_DATA_DIR` wins (blank counts as unset — flywheel's old trim
     // semantics); `TORON_MCP_DATA_DIR` is the demo/test isolation alias;
     // otherwise the durable D3 default via resolve_data_root.
