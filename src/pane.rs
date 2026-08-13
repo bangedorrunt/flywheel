@@ -785,6 +785,19 @@ pub fn launch_spawn_job(
     }))
 }
 
+/// `Resonate::local` requires an entered Tokio runtime. Pane-mode keeps the
+/// engine alive across `invoke` so the spawn drainer can share it — enter
+/// the caller's runtime before construct, then drop the guard and `block_on`.
+pub fn local_engine(
+    rt: &tokio::runtime::Runtime,
+    runner: toron_workflow::ActionRunner,
+    profile: toron_workflow::ProfileResolver,
+    workflow: toron_workflow::WorkflowResolver,
+) -> Result<toron_workflow::WorkflowEngine> {
+    let _enter = rt.enter();
+    toron_workflow::WorkflowEngine::local_with_resolvers(runner, profile, workflow)
+}
+
 /// bd-omwg: the pane-mode spawn drainer thread. Polls the engine's SpawnSink
 /// while `invoke` runs (an `await: true` run parks on its job promise until
 /// the drainer settles it), launches each job through [`launch_spawn_job`],
@@ -1226,6 +1239,31 @@ steps:
         assert_eq!(
             output["job"]["result"]["pane"], "w1:p9",
             "job receipt captured, not a fake: {output}"
+        );
+    }
+
+    #[test]
+    fn local_engine_constructs_under_entered_runtime() {
+        let runner = std::sync::Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let profile: toron_workflow::ProfileResolver = std::sync::Arc::new(|_| None);
+        let workflow: toron_workflow::WorkflowResolver = std::sync::Arc::new(|_| None);
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        assert!(
+            local_engine(&rt, runner, profile, workflow).is_ok(),
+            "Resonate::local must succeed after Runtime::enter"
+        );
+    }
+
+    #[test]
+    fn local_engine_without_runtime_panics() {
+        let runner = std::sync::Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = toron_workflow::WorkflowEngine::local(runner);
+        }))
+        .is_err();
+        assert!(
+            panicked,
+            "Resonate::local must refuse to construct off-runtime"
         );
     }
 }
