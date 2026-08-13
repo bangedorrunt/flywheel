@@ -12770,13 +12770,12 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let mut spawn_receipts: Vec<Value> = vec![];
             let output = match pane_ctx.as_ref() {
                 Some(pane_ctx) => {
-                    let engine = std::sync::Arc::new(
-                        toron_workflow::WorkflowEngine::local_with_resolvers(
-                            runner,
-                            profile_resolver,
-                            workflow_resolver,
-                        )?,
-                    );
+                    let engine = std::sync::Arc::new(pane::local_engine(
+                        &rt,
+                        runner,
+                        profile_resolver,
+                        workflow_resolver,
+                    )?);
                     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let drainer = pane::start_spawn_drainer(
                         cfg.clone(),
@@ -13066,7 +13065,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // alive across invoke so the drainer thread can launch a real
             // pane per spawned job and settle await:true promises.
             let mut spawn_receipts: Vec<Value> = vec![];
-            let engine = std::sync::Arc::new(toron_workflow::WorkflowEngine::local_with_resolvers(
+            let engine = std::sync::Arc::new(pane::local_engine(
+                &rt,
                 runner,
                 profile_resolver,
                 workflow_resolver,
