@@ -15,7 +15,7 @@
 //! - **Lifecycle**: ephemeral default (the caller reaps the workspace at run
 //!   end) + `--reuse WORKSPACE` (bind to the caller's workspace, never reap)
 //!   + `--retain` (keep the spawned workspace). herdr owns the panes — they
-//!     survive a flywheel crash; the spawn registry re-binds them.
+//!   survive a flywheel crash; the spawn registry re-binds them.
 //!
 //! governed-by: ADR-0010 (Spec A, Spec C, Spec E), ADR-0005 (Spec 1, Spec 4c)
 
@@ -362,7 +362,6 @@ fn spawn_crew_into(
                 profile: Some(role.clone()),
                 harness: Some(harness.clone()),
                 mail_identity,
-                skills_injected: false,
             });
             eprintln!(
                 "  crew {}: {} ({}) @{}",
@@ -535,7 +534,6 @@ mod tests {
                 profile: Some("planner".into()),
                 harness: Some("omp".into()),
                 mail_identity: None,
-                skills_injected: false,
             },
             SpawnEntry {
                 pane_id: "w1:p2".into(),
@@ -543,7 +541,6 @@ mod tests {
                 profile: Some("coder".into()),
                 harness: Some("omp".into()),
                 mail_identity: None,
-                skills_injected: false,
             },
             SpawnEntry::legacy("w1:p3", "plain-agent"),
         ];
@@ -566,7 +563,6 @@ mod tests {
                 profile: Some("reviewer".into()),
                 harness: Some("omp".into()),
                 mail_identity: None,
-                skills_injected: false,
             },
             SpawnEntry {
                 pane_id: "w1:p2".into(),
@@ -574,7 +570,6 @@ mod tests {
                 profile: Some("scout".into()),
                 harness: Some("opencode".into()),
                 mail_identity: None,
-                skills_injected: false,
             },
         ];
         let e = resolve_pane_by_harness(&entries, "opencode").expect("opencode pane");
@@ -597,7 +592,6 @@ mod tests {
                 profile: Some("coder".into()),
                 harness: Some("omp".into()),
                 mail_identity: None,
-                skills_injected: false,
             },
             SpawnEntry::legacy("w1:p3", "plain"),
         ];

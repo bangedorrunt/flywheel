@@ -15,7 +15,7 @@
 //! governed-by: ADR-0005 Spec 3, ADR-0012 Spec 4
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn flywheel() -> &'static str {
@@ -23,7 +23,6 @@ fn flywheel() -> &'static str {
 }
 
 struct Hermetic {
-    #[expect(dead_code, reason = "keeps the temp dir alive for the hermetic env's lifetime")]
     dir: tempfile::TempDir,
     config_home: PathBuf,
     state_home: PathBuf,
