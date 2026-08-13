@@ -792,7 +792,7 @@ pub fn bead_prompt(id: &str, title: &str) -> String {
     // Mail backend is toron by default (`flywheel mail` → [backend] mail=toron).
     // ALWAYS pass --as <mail identity> so peer collab is not CoralFinch-collapsed.
     // Prefer mail name from spawn (adjective+noun); herdr name also maps via --as.
-    let template = r#"Execute bead {id}: {title}. Mail: toron via `flywheel mail`. Lifecycle: claim (`br update {id} --claim --actor "$AGENT_NAME" --json`) → reserve `flywheel mail locks reserve <project> --as YOUR_MAIL_NAME --paths <files> --exclusive --reason {id} --ttl-seconds 7200` → announce `flywheel mail send <project> --as YOUR_MAIL_NAME --to all --thread-id {id} --subject '[{id}] starting' --body '<plan>'` → execute one narrow slice → verify AC → close with honest reason → `br sync --flush-only` + commit `.beads/` → `flywheel mail unlock <project> --as YOUR_MAIL_NAME` → `flywheel mail send ... --thread-id {id} --subject '[{id}] done'`. YOUR_MAIL_NAME = registered adjective+noun (DustySparrow/…) or set FLYWHEEL_MAIL_AS. Renew your own file reservations while working (toron `renew_file_reservations` or `flywheel mail renew` — extend the TTL before it lapses — the orchestrator cannot renew on your behalf), so long edits never lose their lease. When a message has ack_required=true, call `acknowledge_message` (toron) after acting on it — the orchestrator cannot ack on your behalf. Peer blocks: reply on same --thread-id, never steal reserved files. DO NOT create new beads — work the assigned bead only; report scope gaps in the thread, not as new beads. If your session context usage exceeds about 80%: write `{"context_pct": <pct>, "ts": "<now RFC3339>"}` to `.flywheel/agent-state/{AGENT_NAME}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you. If {id} already claimed, next from `br ready --json`."#;
+    let template = r#"Execute bead {id}: {title}. Mail: toron via `flywheel mail`. Lifecycle: claim (`br update {id} --claim --actor "$AGENT_NAME" --json`) → reserve `flywheel mail locks reserve <project> --as YOUR_MAIL_NAME --paths <files> --exclusive --reason {id} --ttl-seconds 7200` → announce `flywheel mail send <project> --as YOUR_MAIL_NAME --to all --thread-id {id} --subject '[{id}] starting' --body '<plan>'` → execute one narrow slice → verify AC → close with honest reason → `br sync --flush-only` + commit `.beads/` → `flywheel mail unlock <project> --as YOUR_MAIL_NAME` → `flywheel mail send ... --thread-id {id} --subject '[{id}] done'`. YOUR_MAIL_NAME = registered adjective+noun (DustySparrow/…) or set FLYWHEEL_MAIL_AS. Renew your own file reservations while working (toron `renew_file_reservations` or `flywheel mail renew` — extend the TTL before it lapses — the orchestrator cannot renew on your behalf), so long edits never lose their lease. When a message has ack_required=true, call `acknowledge_message` (toron) after acting on it — the orchestrator cannot ack on your behalf. Peer blocks: reply on same --thread-id, never steal reserved files. If your session context usage exceeds about 80%: write `{"context_pct": <pct>, "ts": "<now RFC3339>"}` to `.flywheel/agent-state/{AGENT_NAME}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you. If {id} already claimed, next from `br ready --json`."#;
     template.replace("{id}", id).replace("{title}", title)
 }
 
@@ -802,15 +802,6 @@ pub fn resume_prompt(id: &str, title: &str) -> String {
     format!(
         "Resume bead {id}: {title}. Still in_progress — finish, verify AC, close honestly, `br sync --flush-only` + commit `.beads/`. Mail: toron via `flywheel mail`: renew your own file reservations with `--as YOUR_MAIL_NAME` (toron `renew_file_reservations` — extend the TTL before it lapses — the orchestrator cannot renew on your behalf), keep using `--thread-id {id}` for peer updates. Never release another agent's exclusive lock. When a message has ack_required=true, call `acknowledge_message` (toron) after acting on it — the orchestrator cannot ack on your behalf. If your session context usage exceeds about 80%: write `{{\"context_pct\": <pct>, \"ts\": \"<now RFC3339>\"}}` to `.flywheel/agent-state/{{AGENT_NAME}}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you."
     )
-}
-
-/// Bead-creation flood verdict (bd-eign.2): more than 3 previously-unassigned
-/// ready beads arriving in ONE poll is the runaway-create signature (the
-/// 40-junk-beads-in-4-min incident, RC2). The loop derives `new_ready` from
-/// checkpointed poll results (`ready` minus `assigned`), so the verdict is
-/// deterministic across replays. PURE + unit-tested.
-pub fn bead_flood_verdict(new_ready: usize) -> bool {
-    new_ready > 3
 }
 
 /// Exhaustion verdict from the two context channels.
@@ -2664,9 +2655,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // while blind and aborts loudly after DEFAULT_LEAF_FAILURE_ABORT_POLLS.
     let mut blind_complete_failures: u32 = 0;
     // bd-87hq: did any critical leaf (poll_events/poll_swarm/poll_ready/
-    // poll_inprogress/expected-replies) fail THIS iteration? No initializer —
-    // the loop resets it to false on every iteration before any read.
-    let mut critical_leaf_failed_this_iter: bool;
+    // poll_inprogress/expected-replies) fail THIS iteration?
+    let mut critical_leaf_failed_this_iter: bool = false;
     // bd-efk1: dispatched-bead claim watch (bead id → dispatch state). The
     // crew-execution watchdog: agents ENGAGE but skip the br lifecycle; the
     // watch catches unclaimed/ unclosed beads and nudges or re-dispatches.
@@ -2997,22 +2987,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             };
             let to_assign: Vec<&ReadyBead> =
                 ready.iter().filter(|b| !assigned.contains(&b.id)).collect();
-            // bd-eign.2: bead-creation flood guard — >3 new ready beads in
-            // ONE poll is the runaway-create signature (40 junk beads in
-            // ~4 min, RC2). CRITICAL warn + PAUSE dispatch this poll: feeding
-            // the flood (each dispatch prompts "claim a bead") doubles the
-            // creates. Deterministic: to_assign derives from checkpointed
-            // poll results, so replays reach the same verdict.
-            if bead_flood_verdict(to_assign.len()) {
-                eprintln!(
-                    "flywheel: CRITICAL: {} new ready beads this poll — runaway bead creation suspected (bd-eign.2). Pausing dispatch this poll; queue not fed.",
-                    to_assign.len()
-                );
-            } else {
-                for bead in to_assign {
-                    queue.push(bead_prompt(&bead.id, &bead.title));
-                    assigned.push(bead.id.clone());
-                }
+            for bead in to_assign {
+                queue.push(bead_prompt(&bead.id, &bead.title));
+                assigned.push(bead.id.clone());
             }
 
             // bd-efk1: crew-execution watchdog — reconcile the dispatched
@@ -3981,19 +3958,6 @@ fn id_is_project_loop(id: &str, base: &str) -> bool {
     id.starts_with(&swarm) || id.starts_with(&engine)
 }
 
-/// bd-gny: the guard's pure selection core — which pending promises are
-/// stale-loop reject candidates for `base`. The `except` invocation (the one
-/// this run resumes/owns) is preserved; child promises (`.N`, a live
-/// checkpoint tree) and other projects' invocations are never candidates.
-/// Extracted from `clear_stale_loop_invocations` so the stale-root rejection
-/// is deterministically testable without a Resonate server.
-fn stale_loop_reject_ids<'a>(ids: &[&'a str], base: &str, except: Option<&str>) -> Vec<&'a str> {
-    ids.iter()
-        .copied()
-        .filter(|id| Some(*id) != except && id_is_project_loop(id, base))
-        .collect()
-}
-
 /// bd-87hq: reject stale PENDING loop invocations for `base` on the resonate
 /// server. Killed/abandoned loop runs leave pending root promises; the
 /// worker's group anycast replays them, and replaying their checkpointed
@@ -4016,19 +3980,20 @@ async fn clear_stale_loop_invocations(resonate: &Resonate, base: &str, except: O
                 return;
             }
         };
-        let ids: Vec<&str> = result
-            .promises
-            .iter()
-            .map(|p| p.id.as_str())
-            .collect();
-        let value = resonate_sdk::types::Value::from_serializable(serde_json::json!({
-            "rejected": "stale-loop-takeover"
-        }))
-        .unwrap_or_default();
-        for id in stale_loop_reject_ids(&ids, base, except) {
-            match resonate.promises.reject(id, value.clone()).await {
+        for p in &result.promises {
+            if Some(p.id.as_str()) == except {
+                continue;
+            }
+            if !id_is_project_loop(&p.id, base) {
+                continue;
+            }
+            let value = resonate_sdk::types::Value::from_serializable(serde_json::json!({
+                "rejected": "stale-loop-takeover"
+            }))
+            .unwrap_or_default();
+            match resonate.promises.reject(&p.id, value).await {
                 Ok(_) => cleared += 1,
-                Err(e) => eprintln!("flywheel: stale-loop reject {id} failed: {e}"),
+                Err(e) => eprintln!("flywheel: stale-loop reject {} failed: {e}", p.id),
             }
         }
         match result.cursor {
@@ -4888,23 +4853,6 @@ async fn promise_pending(resonate: &Resonate, id: &str) -> anyhow::Result<bool> 
     }
 }
 
-/// bd-gny: verdict over the promise state + loop-process liveness. The
-/// monitor loop's promise stays PENDING for its entire lifetime (it resolves
-/// only when the loop ends), so the raw state alone cannot distinguish a
-/// healthy running loop from an orphaned invocation left behind by a killed
-/// process — the source of the "stuck in Pending forever" confusion.
-fn loop_verdict(state: Option<&PromiseState>, process_alive: bool) -> &'static str {
-    match (state, process_alive) {
-        (Some(PromiseState::Pending), true) => "running",
-        (Some(PromiseState::Pending), false) => "stale",
-        (Some(PromiseState::Resolved), _) => "complete",
-        (Some(PromiseState::Rejected), _) => "failed",
-        (Some(PromiseState::RejectedCanceled), _) => "canceled",
-        (Some(PromiseState::RejectedTimedout), _) => "timed-out",
-        (None, _) => "stale",
-    }
-}
-
 /// Query the current state of a durable loop invocation.
 pub async fn loop_status(cfg: &Config, project: &str) -> anyhow::Result<serde_json::Value> {
     let url = cfg
@@ -4920,218 +4868,18 @@ pub async fn loop_status(cfg: &Config, project: &str) -> anyhow::Result<serde_js
             "loop": "none recorded — run: flywheel loop run <project>"
         }));
     };
-    // bd-gny: a promise the server no longer has (404) is not an error — it is
-    // the definitive stale signal. Any other query failure still propagates.
-    let rec = match resonate.promises.get(&al.id).await {
-        Ok(rec) => Some(rec),
-        Err(Error::ServerError { code: 404, .. }) => None,
-        Err(e) => return Err(anyhow::anyhow!("query {}: {e}", al.id)),
-    };
+    let rec = resonate
+        .promises
+        .get(&al.id)
+        .await
+        .map_err(|e| anyhow::anyhow!("query {}: {e}", al.id))?;
     let _ = resonate.stop().await;
-    let pid_entry = crate::state::load_loop_pids().get(project).cloned();
-    let process_alive = pid_entry
-        .as_ref()
-        .map(|e| crate::state::pid_alive(e.pid))
-        .unwrap_or(false);
     Ok(serde_json::json!({
         "project": project,
         "id": al.id,
-        "state": rec
-            .as_ref()
-            .map(|r| format!("{:?}", r.state))
-            .unwrap_or_else(|| "absent".to_string()),
-        "verdict": loop_verdict(rec.as_ref().map(|r| &r.state), process_alive),
-        "pid": pid_entry.as_ref().map(|e| e.pid),
-        "process_alive": process_alive,
-        "started_at": pid_entry.as_ref().map(|e| e.started_at.clone()),
-        "value": rec.map(|r| r.value),
+        "state": format!("{:?}", rec.state),
+        "value": rec.value,
     }))
-}
-
-/// Is `id` a ROOT loop invocation (`swarm-loop:*` / `engine-loop:*`)? Child
-/// promises carry a `.` separator (`<root>.1`) and belong to a live
-/// invocation's checkpoint tree, never reported or rejected by the doctor.
-/// Global form of `id_is_project_loop` (no project base scoping).
-fn is_loop_invocation(id: &str) -> bool {
-    if id.contains('.') {
-        return false;
-    }
-    id.starts_with("swarm-loop:") || id.starts_with("engine-loop:")
-}
-
-/// bd-eign.4: `flywheel loop doctor` — infrastructure diagnostics + repair.
-/// Checks: (1) Resonate connectivity, (2) stale pending loop invocations
-/// (killed runs leave `swarm-loop:*`/`engine-loop:*` roots pending forever),
-/// (3) orphaned loop PIDs (pid-registry entries whose process is dead),
-/// (4) loops.json consistency (registry entries vs live processes + promises).
-/// `fix=true` rejects stale invocations and prunes orphaned pid entries.
-/// A failed check is recorded in the report, never a hard error — the doctor
-/// must diagnose a broken stack, not fail on it.
-pub async fn loop_doctor(cfg: &Config, fix: bool) -> anyhow::Result<serde_json::Value> {
-    let url = cfg
-        .resonate_url()
-        .unwrap_or_else(|| "http://localhost:8001".to_string());
-    let resonate = Resonate::new(ResonateConfig {
-        url: Some(url.clone()),
-        ..Default::default()
-    });
-
-    // (1) connectivity — the search is the ping.
-    let connectivity = match resonate.promises.search(Some("pending"), None, Some(1), None).await {
-        Ok(_) => json!({"ok": true, "url": url, "error": null}),
-        Err(e) => json!({"ok": false, "url": url, "error": e.to_string()}),
-    };
-    let server_up = connectivity["ok"] == true;
-
-    // (2) stale pending loop invocations — page through all pending roots.
-    let mut stale_ids: Vec<String> = Vec::new();
-    let mut rejected: Vec<String> = Vec::new();
-    if server_up {
-        let mut cursor: Option<String> = None;
-        loop {
-            let result = match resonate
-                .promises
-                .search(Some("pending"), None, Some(200), cursor.as_deref())
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("flywheel: doctor: pending search failed: {e}");
-                    break;
-                }
-            };
-            stale_ids.extend(
-                result
-                    .promises
-                    .iter()
-                    .filter(|p| is_loop_invocation(&p.id))
-                    .map(|p| p.id.clone()),
-            );
-            match result.cursor {
-                Some(c) if !c.is_empty() => cursor = Some(c),
-                _ => break,
-            }
-        }
-        stale_ids.sort();
-        if fix {
-            let v = resonate_sdk::types::Value::from_serializable(serde_json::json!({
-                "rejected": "loop-doctor",
-            }))
-            .unwrap_or_default();
-            for id in &stale_ids {
-                match resonate.promises.reject(id, v.clone()).await {
-                    Ok(_) => rejected.push(id.clone()),
-                    Err(e) => eprintln!("flywheel: doctor: reject {id} failed: {e}"),
-                }
-            }
-        }
-    }
-
-    // (4) loops.json consistency — per-project entries vs process + promise.
-    // Query promises while the client is still live.
-    let pids = crate::state::load_loop_pids();
-    let (_schema, loops) = crate::state::load_loops_registry()?;
-    let mut registry: Vec<serde_json::Value> = Vec::new();
-    for (project, al) in &loops {
-        let pid_entry = pids.get(project);
-        let process_alive = pid_entry
-            .map(|e| crate::state::pid_alive(e.pid))
-            .unwrap_or(false);
-        let promise = if server_up {
-            match resonate.promises.get(&al.id).await {
-                Ok(rec) => format!("{:?}", rec.state),
-                Err(Error::ServerError { code: 404, .. }) => "absent".to_string(),
-                Err(e) => format!("query-error: {e}"),
-            }
-        } else {
-            "unchecked".to_string()
-        };
-        let verdict = if !process_alive {
-            "orphaned-process"
-        } else if promise == "Pending" {
-            "running"
-        } else {
-            "no-pending-promise"
-        };
-        registry.push(json!({
-            "project": project,
-            "invocation": al.id,
-            "pid": pid_entry.map(|e| e.pid),
-            "process_alive": process_alive,
-            "promise": promise,
-            "verdict": verdict,
-        }));
-    }
-    let _ = resonate.stop().await;
-
-    // (3) orphaned loop PIDs — registry entries whose process is dead.
-    let mut orphaned: Vec<serde_json::Value> = Vec::new();
-    let mut pruned: Vec<String> = Vec::new();
-    for (project, e) in &pids {
-        if !crate::state::pid_alive(e.pid) {
-            orphaned.push(json!({
-                "project": project,
-                "pid": e.pid,
-                "started_at": e.started_at,
-                "invocation": e.invocation,
-            }));
-            if fix {
-                pruned.push(project.clone());
-            }
-        }
-    }
-    if fix && !pruned.is_empty() {
-        let mut remaining = pids.clone();
-        for p in &pruned {
-            remaining.remove(p);
-        }
-        crate::state::save_loop_pids(&remaining)?;
-    }
-
-    Ok(json!({
-        "fix": fix,
-        "resonate": connectivity,
-        "stale_invocations": {
-            "count": stale_ids.len(),
-            "ids": stale_ids,
-        },
-        "orphaned_pids": {
-            "count": orphaned.len(),
-            "entries": orphaned,
-        },
-        "registry": {
-            "count": registry.len(),
-            "entries": registry,
-        },
-        "fixed": {
-            "rejected": rejected,
-            "pruned": pruned,
-        },
-    }))
-}
-
-#[cfg(test)]
-mod loop_doctor_tests {
-    use super::is_loop_invocation;
-
-    #[test]
-    fn root_loop_invocations_match() {
-        assert!(is_loop_invocation("swarm-loop:flywheel:123"));
-        assert!(is_loop_invocation("engine-loop:flywheel:456"));
-    }
-
-    #[test]
-    fn child_promises_never_match() {
-        assert!(!is_loop_invocation("swarm-loop:flywheel:123.1"));
-        assert!(!is_loop_invocation("engine-loop:flywheel:456.7.2"));
-    }
-
-    #[test]
-    fn foreign_ids_never_match() {
-        assert!(!is_loop_invocation("other-workflow:flywheel:123"));
-        assert!(!is_loop_invocation("swarm-loop"));
-        assert!(!is_loop_invocation("flywheel-loop:flywheel:123"));
-    }
 }
 
 #[cfg(test)]
@@ -5307,83 +5055,6 @@ mod tests {
         // non-loop promises are never matched
         assert!(!id_is_project_loop("cron:weekly-review", "toron"));
         assert!(!id_is_project_loop("wf-graph-fanout-1", "toron"));
-    }
-
-    #[test]
-    fn stale_loop_reject_ids_skips_owned_foreign_and_children() {
-        let ids: Vec<&str> = vec![
-            "swarm-loop:flywheel:1786557202790124000",
-            "swarm-loop:flywheel:1786557202790124001",
-            "swarm-loop:toron:1786512214561650000",
-            "swarm-loop:flywheel:1786557202790124000.1",
-            "engine-loop:flywheel:1786557202790124002",
-        ];
-        // the invocation this run owns/resumes is preserved
-        let rejected = stale_loop_reject_ids(&ids, "flywheel", Some("swarm-loop:flywheel:1786557202790124000"));
-        assert_eq!(
-            rejected,
-            vec![
-                "swarm-loop:flywheel:1786557202790124001",
-                "engine-loop:flywheel:1786557202790124002"
-            ]
-        );
-        // no owned invocation: every stale root is a reject candidate
-        let rejected = stale_loop_reject_ids(&ids, "flywheel", None);
-        assert_eq!(
-            rejected,
-            vec![
-                "swarm-loop:flywheel:1786557202790124000",
-                "swarm-loop:flywheel:1786557202790124001",
-                "engine-loop:flywheel:1786557202790124002"
-            ]
-        );
-        // foreign project + child (live checkpoint tree) never rejected
-        let rejected = stale_loop_reject_ids(&ids, "toron", None);
-        assert_eq!(rejected, vec!["swarm-loop:toron:1786512214561650000"]);
-    }
-
-    #[test]
-    fn loop_verdict_pending_plus_alive_is_running() {
-        assert_eq!(
-            loop_verdict(Some(&PromiseState::Pending), true),
-            "running",
-            "a pending promise with a live loop process is a healthy running loop"
-        );
-    }
-
-    #[test]
-    fn loop_verdict_pending_without_process_is_stale() {
-        assert_eq!(
-            loop_verdict(Some(&PromiseState::Pending), false),
-            "stale",
-            "a pending promise with no live process is an orphaned invocation \
-             (killed loop, promise never settled) — the bd-gny stuck report"
-        );
-    }
-
-    #[test]
-    fn loop_verdict_absent_promise_is_stale() {
-        assert_eq!(
-            loop_verdict(None, true),
-            "stale",
-            "a state file pointing at a promise the server no longer has is stale"
-        );
-        assert_eq!(loop_verdict(None, false), "stale");
-    }
-
-    #[test]
-    fn loop_verdict_settled_states_ignore_liveness() {
-        assert_eq!(loop_verdict(Some(&PromiseState::Resolved), true), "complete");
-        assert_eq!(loop_verdict(Some(&PromiseState::Resolved), false), "complete");
-        assert_eq!(loop_verdict(Some(&PromiseState::Rejected), true), "failed");
-        assert_eq!(
-            loop_verdict(Some(&PromiseState::RejectedCanceled), false),
-            "canceled"
-        );
-        assert_eq!(
-            loop_verdict(Some(&PromiseState::RejectedTimedout), false),
-            "timed-out"
-        );
     }
 
     fn pev(event_type: &str, pane: &str, status: &str, seq: u64) -> PollEvent {
@@ -6098,28 +5769,6 @@ mod tests {
             LoopAction::Send { text, .. } => assert_eq!(text, "t1"),
             other => panic!("expected Send, got {other:?}"),
         }
-    }
-
-    /// bd-eign.2: >3 new ready beads in one poll = runaway create flood;
-    /// 0-3 is normal dispatch volume.
-    #[test]
-    fn bead_flood_verdict_threshold() {
-        assert!(!bead_flood_verdict(0));
-        assert!(!bead_flood_verdict(3));
-        assert!(bead_flood_verdict(4));
-        assert!(bead_flood_verdict(40));
-    }
-
-    /// bd-eign.2: the dispatch prompt forbids creating new beads — the agent
-    /// must report scope gaps in the thread, not spawn tracker work.
-    #[test]
-    fn bead_prompt_forbids_creating_new_beads() {
-        let p = bead_prompt("bd-12", "fix auth flow");
-        assert!(p.contains("DO NOT create new beads"), "prompt must forbid bead creation: {p}");
-        assert!(
-            p.contains("report scope gaps in the thread"),
-            "prompt must redirect scope gaps to the thread: {p}"
-        );
     }
 
     // ---- bd-e0xk slice 1: loop-as-engine-workflow (--engine path) ----
@@ -7058,7 +6707,7 @@ mod tests {
         assert_eq!(blind_completion_count(false, true, 2), 0);
         // Abort threshold: DEFAULT_LEAF_FAILURE_ABORT_POLLS consecutive
         // blind iterations trip the abort (the loop body returns Err).
-        const { assert!(DEFAULT_LEAF_FAILURE_ABORT_POLLS >= 3, "abort is not instant") };
+        assert!(DEFAULT_LEAF_FAILURE_ABORT_POLLS >= 3, "abort is not instant");
     }
 
     // ---- bd-event-dispatch-zero-latency: route_event ----
