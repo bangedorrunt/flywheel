@@ -11,3 +11,7 @@
 # agent private keys (ncryptsec) + archive lock — NEVER commit
 agents/
 .archive.lock
+
+# mailbox archive leaked into the source worktree (durable root is XDG)
+messages/
+.projected/
