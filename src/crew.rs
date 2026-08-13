@@ -120,7 +120,6 @@ pub fn resolve_crew_fanouts(workflow: &Workflow, plan: &CrewPlan) -> Workflow {
 /// - `crew` omitted → EMPTY plan (each spawn standalone). A crew-less
 ///   workflow must NOT silently spawn a crew even when its steps carry
 ///   `profile: "@X"` refs — auto-inference is an explicit request (is1.1).
-#[allow(dead_code)]
 pub fn plan_crew(workflow: &Workflow) -> CrewPlan {
     plan_crew_with(workflow, &|_| None)
 }
@@ -481,6 +480,7 @@ steps:
     /// malformed tokens error.
     #[test]
     fn compose_part_parses_dispatch_and_workflow() {
+        use toron_workflow::schema::Action;
         assert_eq!(
             parse_compose_part("scout:fresh-eyes-explore").unwrap(),
             ComposePart::Dispatch {
