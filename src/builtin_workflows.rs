@@ -22,6 +22,9 @@
 //!   fields only: {{trigger.content}} / {{trigger.id}} — no subject).
 //! - `onboard` / `triage-deep` — cold-start + deep-backlog chains; each step
 //!   consumes the prior step's output via spec.plan, fail_run on every step.
+//! - `captain-audit` — read-only analysis (bd-wsui): scout → oracle →
+//!   reviewer graph, no beads, no repo edits, report written to
+//!   `{{inputs.report_path}}`.
 //!
 //! governed-by: ADR-0005 Spec 2b, P3.5
 
@@ -302,6 +305,45 @@ steps:
 "##,
     ),
     (
+        "captain-audit",
+        r##"
+name: captain-audit
+description: "Captain audit (bd-wsui) — read-only analysis of a topic within a scope: scout gathers evidence, oracle synthesizes, reviewer challenges. ANALYSIS ONLY: no beads, no repo edits; the final report is written to report_path."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: topic
+  - name: scope
+  - name: report_path
+graph:
+  nodes:
+    gather:
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@scout"
+        task: "ANALYSIS ONLY — no beads, no repo edits. Audit topic: {{inputs.topic}}. Scope: {{inputs.scope}}. Gather in-scope evidence and findings. Return COMPRESSED findings JSON: [{area, finding, evidence, ev}]."
+    synthesize:
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@oracle"
+        task: "ANALYSIS ONLY — no beads, no repo edits. Audit topic: {{inputs.topic}}. Synthesize the scout findings into the audit report: {{steps.gather}}. Write the full report markdown to: {{inputs.report_path}}."
+      needs: [gather]
+      on_error: fail_run
+    challenge:
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@reviewer"
+        harness: "opencode"
+        task: "ANALYSIS ONLY — no beads, no repo edits. Challenge the synthesized report: {{steps.synthesize}}. Audit topic: {{inputs.topic}}. Check evidence, gaps, and overclaiming; append your adversarial verdict section to the report at: {{inputs.report_path}}."
+      needs: [synthesize]
+      on_error: fail_run
+"##,
+    ),
+    (
         "weekly-review",
         r##"
 name: weekly-review
@@ -387,6 +429,7 @@ mod tests {
             "plan-review",
             "onboard",
             "triage-deep",
+            "captain-audit",
         ] {
             assert!(wfs.contains_key(name), "built-in {name} present");
         }
@@ -604,7 +647,7 @@ mod tests {
                 _ => {}
             }
         }
-        for name in ["debate", "goal", "plan-review"] {
+        for name in ["debate", "goal", "plan-review", "captain-audit"] {
             let mut found = 0;
             for step in &wfs[name].steps {
                 scan_action(&step.action, name, &mut found);
@@ -990,6 +1033,98 @@ mod tests {
                 spec.get("plan").and_then(Value::as_str),
                 Some(token),
                 "{name}.{step_name} consumes the prior step output"
+            );
+        }
+    }
+
+    /// bd-wsui: captain-audit is the read-only analysis workflow — crew:
+    /// auto graph (scout → oracle → reviewer), inputs topic/scope/
+    /// report_path, every prompt ANALYSIS ONLY (no beads, no repo edits),
+    /// and the report lands at {{inputs.report_path}}.
+    #[test]
+    fn captain_audit_is_analysis_only_chain_to_report_path() {
+        use toron_workflow::schema::{Action, StepOnError};
+        let wfs = builtin_workflows();
+        let ca = &wfs["captain-audit"];
+
+        // crew: auto + lint clean (the run gate).
+        assert_eq!(ca.crew, Some(CrewSpec::Auto), "captain-audit is crew: auto");
+        let report = toron_workflow::lint_workflow(ca);
+        assert!(
+            report.is_clean(),
+            "captain-audit must lint clean: {:?}",
+            report.issues
+        );
+
+        // inputs: topic, scope, report_path.
+        let inputs: Vec<&str> = ca.inputs.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(inputs, vec!["topic", "scope", "report_path"]);
+
+        // graph chain: gather (@scout) → synthesize (@oracle, needs gather)
+        // → challenge (@reviewer, needs synthesize, opencode harness).
+        let g = ca.graph.as_ref().expect("captain-audit has a graph");
+        let gather = &g.nodes["gather"];
+        let Action::DispatchJob { spec, .. } = &gather.action else {
+            panic!("gather is a dispatch_job");
+        };
+        assert_eq!(spec.get("profile").and_then(Value::as_str), Some("@scout"));
+        let synthesize = &g.nodes["synthesize"];
+        let Action::DispatchJob { spec, .. } = &synthesize.action else {
+            panic!("synthesize is a dispatch_job");
+        };
+        assert_eq!(
+            spec.get("profile").and_then(Value::as_str),
+            Some("@oracle")
+        );
+        assert!(synthesize.needs.contains(&"gather".to_string()));
+        assert_eq!(synthesize.on_error, StepOnError::FailRun);
+        let challenge = &g.nodes["challenge"];
+        let Action::DispatchJob { spec, .. } = &challenge.action else {
+            panic!("challenge is a dispatch_job");
+        };
+        assert_eq!(
+            spec.get("profile").and_then(Value::as_str),
+            Some("@reviewer")
+        );
+        assert_eq!(
+            spec.get("harness").and_then(Value::as_str),
+            Some("opencode"),
+            "reviewer step pins the opencode harness (bd-42fs policy)"
+        );
+        assert!(challenge.needs.contains(&"synthesize".to_string()));
+        assert_eq!(challenge.on_error, StepOnError::FailRun);
+
+        // every prompt is ANALYSIS ONLY, no beads, no repo edits; the
+        // report is written to {{inputs.report_path}}.
+        let yaml = BUILTIN_WORKFLOWS_YAML
+            .iter()
+            .find(|(n, _)| *n == "captain-audit")
+            .map(|(_, y)| *y)
+            .unwrap();
+        for needle in [
+            "ANALYSIS ONLY",
+            "no beads",
+            "no repo edits",
+            "{{inputs.topic}}",
+            "{{inputs.scope}}",
+            "{{inputs.report_path}}",
+        ] {
+            assert!(yaml.contains(needle), "captain-audit carries {needle:?}");
+        }
+    }
+
+    /// bd-wsui: the captain-audit auto-crew resolves to EXACTLY the audit
+    /// trio — scout + oracle + reviewer (no extras, no missing).
+    #[test]
+    fn captain_audit_crew_is_scout_oracle_reviewer() {
+        let wfs = builtin_workflows();
+        let plan = crew::plan_crew_with(&wfs["captain-audit"], &|_| None);
+        assert_eq!(plan.members.len(), 3, "exactly the audit trio");
+        for role in ["scout", "oracle", "reviewer"] {
+            assert!(
+                plan.members.contains_key(role),
+                "captain-audit fleet includes {role}: {:?}",
+                plan.members
             );
         }
     }

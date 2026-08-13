@@ -241,6 +241,86 @@ pub fn compose_workflow(
     }
 }
 
+/// bd-u4cu planner arm: the headless planner's authoring prompt — the target
+/// plus the catalog (workflows, profiles, stages) the authored YAML may
+/// reference, so it can lint clean against the same gate as the
+/// deterministic arm. Pure + testable; the harness subprocess stays in the
+/// CLI shell.
+pub fn planner_authoring_prompt(
+    objective: &str,
+    workflows: &[(&str, &str)],
+    profiles: &[&str],
+    stages: &[(&str, &str)],
+) -> String {
+    let mut wf_rows = String::new();
+    for (name, desc) in workflows {
+        wf_rows.push_str(&format!("- {name}: {desc}\n"));
+    }
+    let mut profile_rows = String::new();
+    for p in profiles {
+        profile_rows.push_str(&format!("- @{p}\n"));
+    }
+    let mut stage_rows = String::new();
+    for (name, desc) in stages {
+        stage_rows.push_str(&format!("- {name}: {desc}\n"));
+    }
+    format!(
+        "You are the workflow composer. Author a NEW flywheel workflow YAML for this target:\n\
+         TARGET: {objective}\n\
+         \n\
+         Building blocks:\n\
+         - dispatch_job steps: `action: dispatch_job, assignee: x, spec: {{ profile: \"@<profile>\", stage: \"<stage>\", task: \"...\" }}`\n\
+         - call_workflow steps: `action: call_workflow, workflow: <name>, inputs: {{ goal: \"...\" }}`\n\
+         - send_dm / delay steps are also available\n\
+         \n\
+         AVAILABLE PROFILES:\n{profile_rows}\
+         AVAILABLE STAGES:\n{stage_rows}\
+         AVAILABLE WORKFLOWS (call_workflow targets):\n{wf_rows}\
+         \n\
+         Reply with ONE YAML document only (a ```yaml fenced block is fine):\n\
+         - top-level keys: name, description, crew: auto, inputs, steps\n\
+         - reference the target via {{{{inputs.objective}}}} and declare it in `inputs:`\n\
+         - only use profiles/stages/workflows listed above — anything else fails lint\n"
+    )
+}
+
+/// bd-u4cu planner arm: extract the authored Workflow YAML from the
+/// planner's response (fenced ```yaml block or bare document), parse it, and
+/// stamp the caller's composed name over the authored one. Pure + testable.
+/// Errors are caller-facing (the compose gate bails, never dispatches).
+pub fn parse_planner_workflow(response: &str, name: &str) -> Result<Workflow, String> {
+    let response = response.trim();
+    if response.is_empty() {
+        return Err("planner returned an empty response".into());
+    }
+    let yaml = extract_fenced_yaml(response).unwrap_or_else(|| response.to_string());
+    let mut wf = toron_workflow::schema::parse_workflow(&yaml)
+        .map_err(|e| format!("planner-authored YAML does not parse as a workflow: {e}"))?;
+    // The run's composed name is decided by the caller (composed-<ts>); the
+    // authored doc's own name is discarded so lint + preview + run_id all
+    // key on one identity.
+    wf.name = name.to_string();
+    Ok(wf)
+}
+
+/// The first ```fenced block of a response, or `None` when unfenced.
+fn extract_fenced_yaml(response: &str) -> Option<String> {
+    let lines: Vec<&str> = response.lines().collect();
+    let mut open: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim().starts_with("```") {
+            match open {
+                None => open = Some(i),
+                Some(o) => {
+                    let body = lines[o + 1..i].join("\n");
+                    return Some(body.trim().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// bd-t86p: like [`plan_crew`] but recurses into `call_workflow` targets so a
 /// COMPOSED workflow's crew includes the sub-workflows' roles (goal-direct
 /// composes brainstorm → oracle+planner → plan-direct → planner → own
@@ -888,5 +968,75 @@ steps:
         let plan2 = plan_crew(&wf2);
         assert_eq!(plan2.members.get("coder"), Some(&1), "{:?}", plan2.members);
         assert_eq!(plan2.members.get("scout"), Some(&1), "{:?}", plan2.members);
+    }
+
+    // ---- bd-u4cu: workflow compose --agent (planner arm) ----
+
+    /// The planner's authoring prompt carries the target + the catalog
+    /// (workflows, profiles, stages) the authored YAML may reference.
+    #[test]
+    fn planner_authoring_prompt_carries_target_and_catalog() {
+        let prompt = planner_authoring_prompt(
+            "harden the loop",
+            &[
+                ("weekly-review", "periodic review"),
+                ("plan", "goal to plan"),
+            ],
+            &["planner", "coder"],
+            &[
+                ("fresh-eyes-explore", "fresh eyes"),
+                ("plan-workflow", "plan a workflow"),
+            ],
+        );
+        assert!(prompt.contains("harden the loop"), "{prompt}");
+        assert!(prompt.contains("weekly-review: periodic review"), "{prompt}");
+        assert!(prompt.contains("@planner"), "{prompt}");
+        assert!(prompt.contains("fresh-eyes-explore"), "{prompt}");
+        assert!(prompt.contains("call_workflow"), "{prompt}");
+    }
+
+    /// Valid planner YAML (fenced) parses; the composed run name is stamped
+    /// over the authored name; the engine lint gate is clean.
+    #[test]
+    fn planner_valid_yaml_parses_and_lints_clean() {
+        let response = "Here is the workflow:\n\n```yaml\n\
+            name: planner-draft\n\
+            description: authored\n\
+            crew: auto\n\
+            inputs:\n  - name: objective\n\
+            steps:\n  - name: plan\n\
+            \x20   action: dispatch_job\n\
+            \x20   assignee: x\n\
+            \x20   spec:\n\
+            \x20     profile: \"@planner\"\n\
+            \x20     task: \"plan the target\"\n\
+            ```\n";
+        let wf = parse_planner_workflow(response, "composed-x").expect("valid yaml parses");
+        assert_eq!(wf.name, "composed-x");
+        let report = toron_workflow::lint_workflow(&wf);
+        assert!(
+            report.is_clean(),
+            "authored workflow must lint clean: {:?}",
+            report.issues
+        );
+    }
+
+    /// Bare (unfenced) YAML from the planner is accepted too.
+    #[test]
+    fn planner_bare_yaml_parses() {
+        let response = "name: draft\ndescription: \"\"\ncrew: auto\nsteps:\n  - name: s1\n    action: send_dm\n    to: operator\n    body: start\n";
+        let wf = parse_planner_workflow(response, "composed-x").expect("bare yaml parses");
+        assert_eq!(wf.name, "composed-x");
+        assert_eq!(wf.steps.len(), 1);
+    }
+
+    /// Garbage from the planner bails — never dispatched.
+    #[test]
+    fn planner_garbage_rejected() {
+        assert!(parse_planner_workflow("this is not yaml: [", "composed-x").is_err());
+        assert!(parse_planner_workflow("", "composed-x").is_err());
+        assert!(parse_planner_workflow("   \n\t\n", "composed-x").is_err());
+        // Valid YAML that is NOT a workflow (no name) is rejected too.
+        assert!(parse_planner_workflow("foo: bar\nbaz: 1\n", "composed-x").is_err());
     }
 }
