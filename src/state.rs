@@ -2094,7 +2094,7 @@ mod loops_sidecar_tests {
         // force takeover TERMINATES the previous live process (bd-bvwf.4) —
         // a takeover must never leave two loops on one project. A real child
         // stands in for the stale loop (never the test process itself).
-        let child = std::process::Command::new("sleep")
+        let mut child = std::process::Command::new("sleep")
             .arg("60")
             .spawn()
             .expect("spawn sleep");
@@ -2114,6 +2114,7 @@ mod loops_sidecar_tests {
         assert!(!pid_alive(child_pid), "--force terminates the old loop process");
         assert_eq!(load_loop_pids().get(&p).unwrap().invocation, "inv-3");
         // cleanup
+        let _ = child.wait();
         unregister_loop(&p, std::process::id());
     }
 
@@ -2133,7 +2134,7 @@ mod loops_sidecar_tests {
         assert!(ensure_loop_owner(&p).is_err(), "no entry refuses");
 
         // a foreign live pid owns it → refuse (a newer process took over)
-        let child = std::process::Command::new("sleep")
+        let mut child = std::process::Command::new("sleep")
             .arg("60")
             .spawn()
             .expect("spawn sleep");
@@ -2154,6 +2155,7 @@ mod loops_sidecar_tests {
         let _ = std::process::Command::new("kill")
             .args(["-KILL", &child_pid.to_string()])
             .status();
+        let _ = child.wait();
     }
 
     /// l4s.1 AC1: 8 writers on 8 DIFFERENT projects, 50 saves each, run
