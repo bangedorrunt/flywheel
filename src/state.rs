@@ -256,6 +256,25 @@ impl SpawnEntry {
             mail_identity: Some(mail_identity.into()),
         }
     }
+
+    /// Profile-driven entry (bd-eign.9/13): the pane serves `profile` under
+    /// harness `harness`; `cmd_send`/`__send` condition prompts with the
+    /// profile's behavior preamble + skill injection from these columns.
+    pub fn profiled(
+        pane_id: impl Into<String>,
+        name: impl Into<String>,
+        profile: impl Into<String>,
+        harness: impl Into<String>,
+        mail_identity: Option<String>,
+    ) -> Self {
+        Self {
+            pane_id: pane_id.into(),
+            name: name.into(),
+            profile: Some(profile.into()),
+            harness: Some(harness.into()),
+            mail_identity,
+        }
+    }
 }
 
 /// Tolerant read of the spawn registry (bd-ghcj.1): pre-P10.3 files hold
@@ -420,6 +439,36 @@ pub fn load_spawn_registry(project: &str) -> Vec<SpawnEntry> {
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
+/// Project-local pane→name bindings (bd-eign.3 A): mirrors the spawn
+/// registry but lives INSIDE the project (`.flywheel/agent-names.json`),
+/// so a lost state dir cannot lose the binding. `cmd_recover` falls back
+/// to this file when the registry is empty.
+pub fn agent_names_file(dir: &std::path::Path) -> PathBuf {
+    dir.join(".flywheel").join("agent-names.json")
+}
+
+/// Atomically persist the project-local pane→name mapping.
+pub fn save_agent_names(dir: &std::path::Path, entries: &[SpawnEntry]) -> Result<()> {
+    let path = agent_names_file(dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_string_pretty(entries)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Read the project-local pane→name mapping (missing/corrupt → empty).
+pub fn load_agent_names(dir: &std::path::Path) -> Vec<SpawnEntry> {
+    let path = agent_names_file(dir);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return vec![];
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
 /// One-time migration of the legacy SHARED `loops.json` into per-project
 /// sidecars (l4s.1): each entry becomes `loops/<project>.json` (atomic
 /// temp+rename), then the legacy file is renamed to
@@ -516,9 +565,7 @@ fn ensure_loops_migrated() -> Result<()> {
 /// Migrates a legacy shared `loops.json` on first access, then scans the
 /// per-project sidecars (l4s.1). Missing dir → empty map, schema v2.
 /// Sidecars that fail to deserialize are skipped (logged to stderr).
-/// Test-only since the sidecar migration (l4s.1): no production caller reads
-/// the whole registry.
-#[cfg(test)]
+/// Production caller since bd-eign.4 (`flywheel loop doctor` registry check).
 pub fn load_loops_registry() -> Result<(u32, BTreeMap<String, ActiveLoop>)> {
     ensure_loops_migrated()?;
     let dir = loops_dir();
@@ -1965,6 +2012,31 @@ mod loops_sidecar_tests {
         let _ = std::fs::remove_file(path.with_extension("json.tmp"));
     }
 
+    /// bd-eign.3 A: the project-local agent-names mirror round-trips and
+    /// lives at `.flywheel/agent-names.json` inside the PROJECT dir (not the
+    /// state dir) — a state-dir wipe must not lose the binding.
+    #[test]
+    fn agent_names_roundtrip_in_project_dir() {
+        let _g = loops_test_guard();
+        let dir = std::env::temp_dir().join(format!("fw-agent-names-{}", std::process::id()));
+        let entries = vec![
+            SpawnEntry::legacy("w2A:p1", "flywheel-reg-a-oc"),
+            SpawnEntry::legacy("w2A:p2", "flywheel-reg-a-pi"),
+        ];
+        save_agent_names(&dir, &entries).unwrap();
+        assert!(agent_names_file(&dir).ends_with(".flywheel/agent-names.json"));
+        assert!(agent_names_file(&dir).starts_with(&dir));
+        assert_eq!(load_agent_names(&dir), entries);
+        // missing → empty
+        let empty_dir = std::env::temp_dir().join(format!("fw-agent-names-none-{}", std::process::id()));
+        assert!(load_agent_names(&empty_dir).is_empty());
+        // cleanup
+        let _ = std::fs::remove_file(agent_names_file(&dir));
+        let _ = std::fs::remove_file(dir.join(".flywheel").join("agent-names.json.tmp"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty_dir);
+    }
+
     /// bd-ghcj.1: a PROFILE column on registry entries survives a round-trip,
     /// and pre-P10.3 2-tuple files still load (tolerant Deserialize).
     #[test]
@@ -2094,7 +2166,7 @@ mod loops_sidecar_tests {
         // force takeover TERMINATES the previous live process (bd-bvwf.4) —
         // a takeover must never leave two loops on one project. A real child
         // stands in for the stale loop (never the test process itself).
-        let child = std::process::Command::new("sleep")
+        let mut child = std::process::Command::new("sleep")
             .arg("60")
             .spawn()
             .expect("spawn sleep");
@@ -2114,6 +2186,7 @@ mod loops_sidecar_tests {
         assert!(!pid_alive(child_pid), "--force terminates the old loop process");
         assert_eq!(load_loop_pids().get(&p).unwrap().invocation, "inv-3");
         // cleanup
+        let _ = child.wait();
         unregister_loop(&p, std::process::id());
     }
 
@@ -2133,7 +2206,7 @@ mod loops_sidecar_tests {
         assert!(ensure_loop_owner(&p).is_err(), "no entry refuses");
 
         // a foreign live pid owns it → refuse (a newer process took over)
-        let child = std::process::Command::new("sleep")
+        let mut child = std::process::Command::new("sleep")
             .arg("60")
             .spawn()
             .expect("spawn sleep");
@@ -2154,6 +2227,7 @@ mod loops_sidecar_tests {
         let _ = std::process::Command::new("kill")
             .args(["-KILL", &child_pid.to_string()])
             .status();
+        let _ = child.wait();
     }
 
     /// l4s.1 AC1: 8 writers on 8 DIFFERENT projects, 50 saves each, run
