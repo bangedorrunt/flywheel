@@ -34,7 +34,7 @@ pub struct CronEntry {
     pub owner: String,
     /// execution mode (P10.4): headless = the __run-headless subprocess
     /// runner (autonomous/cron; no workspace churn); pane = the P10.3 pane
-    /// runner (interactive; not yet wired — records until P10.3 lands).
+    /// runner (crew dispatch; empty spawn registry = fail-fast, bd-5qls).
     #[serde(default)]
     pub mode: CronMode,
     /// signing scope: host = operator identity, project = scoped agent
@@ -57,8 +57,9 @@ pub enum CronMode {
     /// and log to `runs/<run_id>.jsonl` — no herdr pane, no workspace churn.
     #[default]
     Headless,
-    /// Interactive: the P10.3 pane runner (crew dispatch). Until P10.3
-    /// lands this is the recording runner (entry preserved, nothing real).
+    /// Interactive: the P10.3 pane runner (crew dispatch via `__send`).
+    /// `dispatch_job` steps dispatch to running crew panes (bd-5qls); an
+    /// empty crew registry is a per-step fail-fast error, never a record.
     Pane,
 }
 
@@ -658,9 +659,10 @@ pub fn make_registry_manager(
 // over a `CronRegistry` closure returning enabled `CronRegistration`s. This
 // section builds those registrations from the merged view (crons.toml +
 // schedule-triggered workflows in the catalog/built-ins), provides the
-// action runner (executes `call_webhook` health probes; records everything
-// else), and starts the loops. Failure policy (`on_failure: bead`) is
-// executed by draining the engine's `PolicySink` → `br create`.
+// per-mode action runner (`call_webhook` probes; headless dispatch /
+// pane dispatch / recorded dry-run), and starts the loops. Failure policy
+// (`on_failure: bead`) is executed by draining the engine's `PolicySink`
+// → `br create`.
 
 impl RegistryCronManager {
     /// The enabled [`CronRegistration`]s the durable cron manager drives:
@@ -705,9 +707,8 @@ impl RegistryCronManager {
 
 /// The flywheel action runner for cron runs (ADR-0005 Spec 3): executes
 /// `call_webhook` as a REAL health probe (the health-gate steps probe the
-/// saga's five services), records every other action (the P4 spawn-await
-/// binding is BlueOak's; cron-triggered workflows today are probe+policy
-/// surfaces).
+/// saga's five services). Everything else is mode-dependent — headless
+/// dispatches, pane dispatches, dry-run records.
 ///
 /// Probe semantics: a reachable endpoint returns `{"ok":true,"status":N}`;
 /// an unreachable/erroring probe returns `Err` so a step with
@@ -719,8 +720,11 @@ impl RegistryCronManager {
 /// - `Headless` → the P10.1 headless runner: dispatch/spawn steps shell out
 ///   to the `__run-headless` leaf (role-conditioned, registry-injected
 ///   model) and log to `runs/<run_id>.jsonl` with the cron name attributed.
-/// - `Pane` → the recording runner (webhook probes + recorded actions).
-///   The P10.3 pane runner replaces this when it lands.
+/// - `Pane` → the P10.3 pane runner (bd-5qls): `dispatch_job` steps resolve
+///   their `@profile` to a running crew pane and dispatch via the loop's
+///   `__send` leaf. Crew entries come from the cron project's spawn
+///   registry (default project `flywheel`); an empty registry is fail-fast —
+///   the step errors, never records.
 ///
 /// The runner closes over the cron entry because the engine's
 /// [`toron_workflow::ActionRunner`] receives only the action — cron context
@@ -729,7 +733,16 @@ impl RegistryCronManager {
 pub fn cron_runner(entry: &CronEntry) -> toron_workflow::ActionRunner {
     use toron_workflow::schema::Action;
     match entry.mode {
-        CronMode::Pane => recording_runner(),
+        CronMode::Pane => {
+            let catalog = crate::profile::ProfileCatalog::load().unwrap_or_default();
+            let project = "flywheel";
+            let entries = crate::state::load_spawn_registry(project);
+            let name = entry.name.clone();
+            let inputs = Value::Null;
+            std::sync::Arc::new(move |a: &Action| {
+                crate::pane::pane_dispatch(&catalog, project, &name, &inputs, &entries, a)
+            })
+        }
         CronMode::Headless => {
             let catalog = crate::profile::ProfileCatalog::load().unwrap_or_default();
             let name = entry.name.clone();
@@ -742,12 +755,11 @@ pub fn cron_runner(entry: &CronEntry) -> toron_workflow::ActionRunner {
     }
 }
 
-/// The recording runner (the pre-P10.4 behavior): webhook probes hit the
-/// network, everything else records. Shared by the pane-mode legacy runner
-/// and the ADR-0012 pane-mode spec runner. Also the dry-run runner for the
-/// on-demand `flywheel cron run` command (bd-8wvz): an on-demand run is a
-/// structural test of the body, never a live agent dispatch — so it records
-/// every step instead of shelling out to `__run-headless`.
+/// The recording runner: webhook probes hit the network, everything else
+/// records. The dry-run runner for the on-demand `flywheel cron run` command
+/// (bd-8wvz): an on-demand run is a structural test of the body, never a
+/// live agent dispatch — so it records every step instead of shelling out.
+/// Pane crons no longer use this runner (bd-5qls — they dispatch).
 pub fn recording_runner() -> toron_workflow::ActionRunner {
     use toron_workflow::schema::Action;
     std::sync::Arc::new(|a: &Action| match a {
@@ -788,7 +800,8 @@ pub fn recording_runner() -> toron_workflow::ActionRunner {
 
 /// The action runner for a [`CronSpec`] (ADR-0012 Spec 2 — one engine, two
 /// input types): headless = real `__run-headless` dispatch (the default);
-/// pane = the recording runner (webhook probes + recorded actions).
+/// pane = the P10.3 pane dispatch (bd-5qls) — crew panes from the cron
+/// project's spawn registry, empty registry fail-fast.
 pub fn spec_runner(spec: &CronSpec) -> toron_workflow::ActionRunner {
     use toron_workflow::schema::{Action, CronMode as SpecMode};
     match spec.mode {
@@ -800,7 +813,16 @@ pub fn spec_runner(spec: &CronSpec) -> toron_workflow::ActionRunner {
                 crate::headless_dispatch(&catalog, &name, &inputs, Some(&name), a)
             })
         }
-        SpecMode::Pane => recording_runner(),
+        SpecMode::Pane => {
+            let catalog = crate::profile::ProfileCatalog::load().unwrap_or_default();
+            let project = "flywheel";
+            let entries = crate::state::load_spawn_registry(project);
+            let name = spec.name.clone();
+            let inputs = Value::Null;
+            std::sync::Arc::new(move |a: &Action| {
+                crate::pane::pane_dispatch(&catalog, project, &name, &inputs, &entries, a)
+            })
+        }
     }
 }
 
@@ -1031,8 +1053,11 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
     // policy + steps body all from the YAML, one engine two input types).
     for row in rows.iter().filter(|r| r.enabled()) {
         let engine = std::sync::Arc::new(
-            toron_workflow::WorkflowEngine::local(spec_runner(&row.spec))
-                .map_err(|e| anyhow!("engine for cron {}: {e}", row.name()))?,
+            toron_workflow::WorkflowEngine::local_with(
+                spec_runner(&row.spec),
+                crate::profile::ProfileCatalog::catalog_profile_resolver(),
+            )
+            .map_err(|e| anyhow!("engine for cron {}: {e}", row.name()))?,
         );
         let cron_mgr = CronManager::with_spec_registry(
             engine.clone(),
@@ -1063,8 +1088,11 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
             .map(|m| m.entry)
             .ok_or_else(|| anyhow!("cron {:?} vanished between load and start", reg.name))?;
         let engine = std::sync::Arc::new(
-            toron_workflow::WorkflowEngine::local(cron_runner(&entry))
-                .map_err(|e| anyhow!("engine for cron {}: {e}", reg.name))?,
+            toron_workflow::WorkflowEngine::local_with(
+                cron_runner(&entry),
+                crate::profile::ProfileCatalog::catalog_profile_resolver(),
+            )
+            .map_err(|e| anyhow!("engine for cron {}: {e}", reg.name))?,
         );
         let cron_mgr = CronManager::new(engine.clone(), {
             let regs = registrations.clone();
@@ -1407,22 +1435,35 @@ owner = "housekeeper"
         assert_eq!(row2.get("mode").and_then(Value::as_str), Some("headless"));
     }
 
-    /// The pane-mode runner stays recording (no subprocess, no herdr) — the
-    /// P10.3 pane dispatch is a later bead; headless is the only REAL path.
+    /// The pane-mode runner DISPATCHES through `pane_dispatch` (bd-5qls) — a
+    /// `dispatch_job` step is never recorded. With an empty crew registry
+    /// (no panes spawned for the cron project) it fails fast with the pane
+    /// dispatch error instead of fabricating `{action, ok:true}`.
     #[test]
-    fn pane_mode_runner_records_actions() {
+    fn pane_mode_runner_dispatches_not_records() {
         use toron_workflow::schema::Action;
+        // Hermetic XDG: no catalog, no spawn registry → the dispatch path
+        // must fail fast (the recording runner would return Ok).
+        let _g = crate::config::lock_env();
+        let dir = tmp_path("pane-dispatch-xdg");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
         let mut e = sample("weekly-x");
         e.mode = CronMode::Pane;
         let runner = cron_runner(&e);
-        let out = runner(&Action::DispatchJob {
+        let err = runner(&Action::DispatchJob {
             assignee: "x".into(),
             spec: serde_json::json!({ "profile": "@planner" }),
             channel: None,
         })
-        .unwrap();
-        assert_eq!(out.get("action").and_then(Value::as_str), Some("dispatch_job"));
-        assert_eq!(out.get("ok"), Some(&Value::Bool(true)), "recorded, not dispatched");
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("pane dispatch"),
+            "dispatch path failed fast, not recorded: {err}"
+        );
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// bd-8wvz: the on-demand `cron run` dry-run uses the RECORDING runner
@@ -1890,11 +1931,10 @@ owner = "housekeeper"
         std::thread::spawn(move || serve(listener));
         std::thread::sleep(std::time::Duration::from_millis(20));
 
-        // The probe behavior lives on the recording (pane) runner — headless
-        // mode dispatches to __run-headless instead.
-        let mut entry = sample("probe");
-        entry.mode = CronMode::Pane;
-        let runner = cron_runner(&entry);
+        // The probe behavior lives on the recording runner (the dry-run
+        // surface) — pane mode dispatches (bd-5qls), headless shells out to
+        // __run-headless.
+        let runner = recording_runner();
         let ok = runner(&Action::CallWebhook {
             url: format!("http://127.0.0.1:{port}/health"),
             method: Some("GET".into()),
@@ -2004,10 +2044,10 @@ owner = "housekeeper"
             crew: None,
         };
 
-        // All five up → pass.
-        let mut entry = sample("gate");
-        entry.mode = CronMode::Pane;
-        let engine = toron_workflow::WorkflowEngine::local(cron_runner(&entry)).unwrap();
+        // All five up → pass. The probe surface is the recording runner
+        // (dry-run); pane mode dispatches (bd-5qls).
+        let engine =
+            toron_workflow::WorkflowEngine::local(recording_runner()).unwrap();
         let all_up: Vec<u16> = ports.to_vec();
         let out = engine
             .invoke("gate-all-up", gate_wf(&all_up), json!({}))
