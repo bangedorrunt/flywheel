@@ -18,8 +18,8 @@
 //!      instead of splitting (first finisher releases, second proceeds);
 //!   3. **merge** — identical path sets from the same goal → one crew holds
 //!      the merged set, the other stands down.
-//!   Rules are pure + unit-tested; the LLM planner arm (a P10.1 headless run)
-//!   fires ONLY when a crew rejects the rule-split (wired by the caller).
+//!      Rules are pure + unit-tested; the LLM planner arm (a P10.1 headless run)
+//!      fires ONLY when a crew rejects the rule-split (wired by the caller).
 //! - **Auto-coalesce gate** [`auto_coalesce`]: overlap on NON-TRIVIAL source
 //!   between two crews that are NOT already in a coalition → the detector
 //!   proposes an ad-hoc coalition + the split. Trivial overlap never
