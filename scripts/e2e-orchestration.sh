@@ -1,10 +1,10 @@
 #!/bin/bash
 # e2e-orchestration — the LIVE orchestration-hardening suite (bd-e131).
 #
-# 11 named scenarios, each = one beaded gate, run against a throwaway scratch
+# 13 named scenarios, each = one beaded gate, run against a throwaway scratch
 # project with a REAL swarm + REAL dispatch. Extends e2e-hardened-loop.sh
 # (which keeps its 6 loop-reliability scenarios); this suite adds the
-# captain-compose + crew-execution + cron + coalition gates.
+# captain-compose + crew-execution + cron + coalition + decide/profile gates.
 #
 # Requirements: flywheel (current build), herdr server up, br on PATH,
 # Resonate server up (com.flywheel.resonate), toron daemon up.
@@ -298,6 +298,33 @@ scenario_11_steer_monitor() { # bd-t86p
   "$FW" kill "$PROJ" --force >/dev/null 2>&1
 }
 
+scenario_12_decide() { # captain classifier — no dispatch
+  say "--- scenario 12: DECIDE (audit / ready-beads / implement+gate)"
+  local a b c
+  a=$("$FW" decide "audit the mailbox" --json 2>&1)
+  echo "$a" | grep -q '"primitive": "captain-audit"' || { fail "S12 audit: $a"; return; }
+  b=$("$FW" decide "work the ready beads" --json --ready-beads 2 2>&1)
+  echo "$b" | grep -q '"primitive": "loop-work"' || { fail "S12 loop-work: $b"; return; }
+  c=$("$FW" decide "implement this with a review gate" --json 2>&1)
+  echo "$c" | grep -q '"primitive": "steer"' || { fail "S12 steer: $c"; return; }
+  pass "S12: decide table (captain-audit, loop-work, steer)"
+}
+
+scenario_13_profile_spawn() { # never --oc when --profile
+  say "--- scenario 13: SPAWN --profile coder (not --oc)"
+  scratch s13 || { fail "S13 setup"; return; }
+  # launch_pending may make spawn exit 1 (swarm not ready). Pane must still exist.
+  "$FW" spawn "$PROJ" --profile coder --settle-secs 0 --no-verify --no-focus --retire-orphans >/dev/null 2>&1 || true
+  local st
+  st=$("$FW" status 2>/dev/null)
+  if echo "$st" | grep -q coder && ! echo "$st" | grep -qE '"name": "flywheel-.*-oc"'; then
+    pass "S13: profiled coder pane, no extra bare-oc harness"
+  else
+    fail "S13: expected coder pane without bare -oc: $(echo "$st" | tr '\n' ' ' | head -c 240)"
+  fi
+  "$FW" kill "$PROJ" --force --force-working >/dev/null 2>&1
+}
+
 # ===========================================================================
 run_scenario() {
   case "$1" in
@@ -312,6 +339,8 @@ run_scenario() {
     9) scenario_9_captain_steer_direct ;;
     10) scenario_10_workflow_composition ;;
     11) scenario_11_steer_monitor ;;
+    12) scenario_12_decide ;;
+    13) scenario_13_profile_spawn ;;
     *) fail "unknown scenario $1" ;;
   esac
 }
@@ -319,7 +348,7 @@ run_scenario() {
 if [ "$ONLY" != "all" ]; then
   run_scenario "$ONLY"
 else
-  for n in 1 2 3 4 5 6 7 8 9 10 11; do run_scenario "$n"; done
+  for n in 1 2 3 4 5 6 7 8 9 10 11 12 13; do run_scenario "$n"; done
 fi
 
 ELAPSED=$(( $(date +%s) - START ))
