@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | Proposed |
+| **Status** | Accepted (2026-08-13; implemented + gated; captain audit flipped Proposed → Accepted) |
 | **Date** | 2026-08-05 |
 | **Decision Maker** | Captain (bangedorrunt) |
 | **Supersedes** | Informal decisions baked into the prior `bd-herdr-automation-hardening-*` epic (send-confirm, unknown-skip, adaptive-interval, `bd-protocol-v18-kkd`) |
