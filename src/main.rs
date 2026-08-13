@@ -179,6 +179,26 @@ enum Commands {
     },
     /// Show one swarm's agents and states
     Status { project: Option<String> },
+    /// Classify a target into one captain primitive (no dispatch)
+    Decide {
+        /// free-text target / intent
+        target: String,
+        /// ready-bead count from `br ready`
+        #[arg(long, default_value_t = 0)]
+        ready_beads: u32,
+        /// profiled panes already up
+        #[arg(long, default_value_t = 0)]
+        profiled_panes: u32,
+        /// agents still launch_pending
+        #[arg(long, default_value_t = 0)]
+        launch_pending: u32,
+        /// file-contention signal
+        #[arg(long)]
+        contention: bool,
+        /// machine JSON (primitive, reason, argv)
+        #[arg(long)]
+        json: bool,
+    },
     /// Restore lost agent name bindings from the spawn registry
     /// (bd-fw-name-binding-loss-7rc): panes whose agent restarted show
     /// name:null — this renames them back to their registered names.
@@ -2746,6 +2766,21 @@ fn main() {
         }) => cmd_add(&cfg, project, counts, kinds),
         Some(Commands::List { all }) => cmd_list(&cfg, *all),
         Some(Commands::Status { project }) => cmd_status(&cfg, project.as_deref()),
+        Some(Commands::Decide {
+            target,
+            ready_beads,
+            profiled_panes,
+            launch_pending,
+            contention,
+            json,
+        }) => cmd_decide(
+            target,
+            *ready_beads,
+            *profiled_panes,
+            *launch_pending,
+            *contention,
+            *json,
+        ),
         Some(Commands::Rebind { project }) => cmd_rebind(&cfg, project),
         Some(Commands::Recover { project }) => cmd_recover(&cfg, project),
         Some(Commands::Send {
@@ -5938,6 +5973,36 @@ fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
         }
     } else {
         print_json(&json!({ "workspaces": rows }));
+    }
+    Ok(())
+}
+
+/// Classify only. Never dispatches.
+fn cmd_decide(
+    target: &str,
+    ready_beads: u32,
+    profiled_panes: u32,
+    launch_pending: u32,
+    contention: bool,
+    json: bool,
+) -> Result<()> {
+    let d = decide::decide(
+        target,
+        &decide::Snapshot {
+            ready_bead_count: ready_beads,
+            profiled_panes,
+            launch_pending,
+            contention,
+        },
+    );
+    if json {
+        print_json(&serde_json::json!({
+            "primitive": d.primitive,
+            "reason": d.reason,
+            "argv": d.argv,
+        }));
+    } else {
+        println!("{}\n{}\n{}", d.primitive, d.reason, d.argv.join(" "));
     }
     Ok(())
 }
