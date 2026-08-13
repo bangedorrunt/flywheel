@@ -15,7 +15,7 @@
 //! - **Lifecycle**: ephemeral default (the caller reaps the workspace at run
 //!   end) + `--reuse WORKSPACE` (bind to the caller's workspace, never reap)
 //!   + `--retain` (keep the spawned workspace). herdr owns the panes — they
-//!   survive a flywheel crash; the spawn registry re-binds them.
+//!     survive a flywheel crash; the spawn registry re-binds them.
 //!
 //! governed-by: ADR-0010 (Spec A, Spec C, Spec E), ADR-0005 (Spec 1, Spec 4c)
 
@@ -362,6 +362,7 @@ fn spawn_crew_into(
                 profile: Some(role.clone()),
                 harness: Some(harness.clone()),
                 mail_identity,
+                skills_injected: false,
             });
             eprintln!(
                 "  crew {}: {} ({}) @{}",

@@ -49,6 +49,69 @@ pub fn parse_protocol(raw: &str) -> Option<u64> {
         .and_then(|v| v.get("protocol").and_then(Value::as_u64))
 }
 
+/// Strip terminal control sequences and TUI box-drawing chrome from a pane
+/// read (bd-3hd).
+///
+/// herdr's `strip_ansi` (sent on every `agent.read`) only removes CSI color
+/// codes; the `visible` source keeps the full alternate-screen render —
+/// opencode's TUI border glyphs (┏━┃┗ etc) plus cursor/hyperlink sequences —
+/// so reads of a working agent are still garbled. This runs on ALL read
+/// sources (recent, visible, recent-unwrapped) at the flywheel boundary.
+///
+/// Removed:
+/// - CSI sequences: `ESC [` + params/intermediates + final byte (colors,
+///   cursor moves, erase, SGR...);
+/// - OSC sequences: `ESC ]` ... terminated by `ESC \` (ST) or BEL (hyperlinks,
+///   titles, clipboard);
+/// - other one-shot escapes: `ESC` + single char (`ESC 7`/`ESC 8` save-restore,
+///   `ESC M`, `ESC =`...);
+/// - box-drawing + block-element glyphs (U+2500..U+259F) that form TUI borders
+///   (─│┃┏┓┗┛┣┫┳┻╋═║╔╗╚╝╠╣╦╩╬ ▀▄█░▒▓). Content is preserved verbatim.
+pub fn sanitize_pane_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    loop {
+                        match chars.next() {
+                            Some('\u{07}') => break,
+                            Some('\u{1b}') => {
+                                if chars.peek() == Some(&'\\') {
+                                    chars.next();
+                                }
+                                break;
+                            }
+                            Some(_) => {}
+                            None => break,
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        if ('\u{2500}'..='\u{259f}').contains(&c) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Resolve which of several same-label workspaces a project actually maps
 /// to. Single match wins; with duplicates (a stale workspace left behind by
 /// a dropped agent vs the live spawn — bd-nil), prefer the workspace holding
@@ -705,6 +768,217 @@ pub fn worktree_list(c: &mut Client, workspace_id: Option<&str>) -> Result<Vec<W
 }
 
 // ---------------------------------------------------------------------------
+// Process liveness probe (bd-1np): `pane.process_info`.
+// ---------------------------------------------------------------------------
+
+/// One foreground process in a pane (`pane.process_info`).
+///
+/// The agent process (opencode/pi/grok/omp) appears here with `pid ==
+/// foreground_process_group_id` while it runs; when the process dies the pane
+/// falls back to the shell prompt and the agent binary disappears from the
+/// list. This is the ground-truth liveness signal `flywheel recover` probes
+/// (a pane can exist in herdr while the process inside it is dead).
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneProcessInfoProcess {
+    pub pid: u64,
+    pub name: String,
+    #[serde(default)]
+    pub argv0: Option<String>,
+}
+
+/// Result of `pane.process_info` (bd-1np). `foreground_processes` lists the
+/// processes in the pane's foreground process group — a live agent process is
+/// the group leader (`pid == foreground_process_group_id`); the `shell_pid`
+/// is the pane's shell, which reclaims the foreground after the agent exits.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneProcessInfo {
+    pub pane_id: String,
+    #[serde(default)]
+    pub foreground_process_group_id: Option<u64>,
+    #[serde(default)]
+    pub shell_pid: Option<u64>,
+    #[serde(default)]
+    pub foreground_processes: Vec<PaneProcessInfoProcess>,
+}
+
+/// `pane.process_info` — delegation over `Client::call`.
+pub fn pane_process_info(c: &mut Client, pane_id: &str) -> Result<PaneProcessInfo> {
+    let res = c.call("pane.process_info", json!({ "pane_id": pane_id }))?;
+    serde_json::from_value(res.get("process_info").cloned().unwrap_or(res))
+        .context("parse pane.process_info result")
+}
+
+/// Known agent-kind → process-name mapping for the liveness probe (bd-1np).
+/// These are the canonical executables herdr launches per kind
+/// (`herdr agent start --kind <KIND>`); the foreground process's `name` /
+/// `argv0` matches one of these while the agent lives.
+pub fn kind_process_names(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "opencode" => &["opencode"],
+        "pi" => &["pi", "gemini"],
+        "grok" => &["grok", "grok-build"],
+        "omp" => &["omp"],
+        // unknown kind — no process-name mapping; the caller must treat the
+        // probe as inconclusive rather than false-negative "healthy".
+        _ => &[],
+    }
+}
+
+/// Pure liveness verdict from a `pane.process_info` snapshot (bd-1np).
+///
+/// The agent process is alive iff its binary appears in the pane's foreground
+/// processes (herdr's process-info lists the whole foreground group; the live
+/// agent is its leader). Rules:
+/// - binary match → `Some(true)` (ground truth, no other check needed);
+/// - no binary match AND the pane's shell owns the foreground group
+///   (`fgpgid == shell_pid`) → the agent is gone and the pane returned to the
+///   shell prompt → `Some(false)`;
+/// - no binary match, foreground NOT shell-owned (e.g. orphaned MCP server
+///   children linger after the agent died) → the agent binary is absent →
+///   `Some(false)` for a known kind;
+/// - unknown kind (no process-name mapping) with no other signal → `None`
+///   (inconclusive — the caller falls back to legacy pane-existence
+///   semantics; a dead pane must never be confidently "healthy").
+pub fn pane_agent_alive(info: &PaneProcessInfo, kind: &str) -> Option<bool> {
+    let names = kind_process_names(kind);
+    let binary_hit = names.iter().any(|n| {
+        info.foreground_processes
+            .iter()
+            .any(|p| p.name == *n || p.argv0.as_deref() == Some(*n))
+    });
+    if binary_hit {
+        return Some(true);
+    }
+    let shell_owns_foreground = match (info.foreground_process_group_id, info.shell_pid) {
+        (Some(fg), Some(shell)) => fg == shell,
+        _ => false,
+    };
+    if shell_owns_foreground {
+        return Some(false);
+    }
+    if names.is_empty() {
+        return None;
+    }
+    Some(false)
+}
+
+/// Spawn-to-dispatch readiness gate (bd-eign.6): poll `pane.process_info`
+/// until the agent's binary appears in the pane's foreground process group.
+///
+/// herdr's `agent.start` returns once the launch command is dispatched, NOT
+/// when the agent TUI is ready to receive input — during the 2-30s boot
+/// window (config load, MCP server spawn, model connect) the foreground
+/// process is the shell or a startup command, and a prompt dispatched in
+/// that window is lost to the shell. The agent process becomes the
+/// foreground group leader exactly when its TUI owns the pane, so its
+/// presence is the readiness signal.
+///
+/// Polls every 500ms until the agent appears (→ `Ok(true)`), the probe
+/// errors continuously, or `timeout` elapses (→ `Ok(false)` — the caller
+/// warns; the pane may still boot late, but dispatch now risks the race).
+pub fn wait_agent_foreground(
+    c: &mut Client,
+    pane_id: &str,
+    kind: &str,
+    name: &str,
+    timeout: Duration,
+) -> Result<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_err: Option<String> = None;
+    while std::time::Instant::now() < deadline {
+        match pane_process_info(c, pane_id) {
+            Ok(pi) => {
+                if pane_agent_alive(&pi, kind) == Some(true) {
+                    return Ok(true);
+                }
+            }
+            Err(e) => last_err = Some(format!("{e:#}")),
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    if let Some(e) = last_err {
+        eprintln!("flywheel: readiness gate for {name} ({pane_id}): last probe error: {e}");
+    }
+    Ok(false)
+}
+
+// ---------------------------------------------------------------------------
+// Responsiveness probe (bd-a8i): `state_change_seq` over `agent.list`.
+// ---------------------------------------------------------------------------
+
+/// Responsiveness verdict for a live-but-possibly-frozen agent (bd-a8i).
+///
+/// `pane_agent_alive` proves the process exists and owns the foreground
+/// group; a frozen agent (stuck TUI, no event-loop progress) still passes
+/// that check. Responsiveness uses herdr's per-pane `state_change_seq`: a
+/// live agent's state counter advances on every state change, so a seq that
+/// does NOT advance across a full window while the agent reports Idle is a
+/// frozen process — provably unresponsive, needs respawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Responsiveness {
+    Responsive,
+    Unresponsive,
+    Inconclusive,
+}
+
+/// Pure verdict from two `state_change_seq` samples + idle status (bd-a8i).
+///
+/// - seq advanced → `Responsive` (state demonstrably changed);
+/// - seq regressed → `Inconclusive` (the counter is monotonic per pane; a
+///   regression means the samples are unreliable);
+/// - window too short (`elapsed_secs == 0`) → `Inconclusive` (no time to
+///   observe a change — never declare frozen on a sub-second window);
+/// - seq frozen + agent Idle → `Unresponsive` (alive as a PID, dead to
+///   input — the exact bd-a8i shape);
+/// - seq frozen + agent not Idle → `Inconclusive` (Working/Blocked agents
+///   may legitimately hold the counter; never respawn on ambiguous evidence).
+pub fn responsiveness_verdict(
+    old_seq: u64,
+    new_seq: u64,
+    elapsed_secs: u64,
+    idle: bool,
+) -> Responsiveness {
+    if new_seq > old_seq {
+        return Responsiveness::Responsive;
+    }
+    if new_seq < old_seq || elapsed_secs == 0 {
+        return Responsiveness::Inconclusive;
+    }
+    if idle {
+        Responsiveness::Unresponsive
+    } else {
+        Responsiveness::Inconclusive
+    }
+}
+
+/// Two-sample responsiveness probe over `agent.list` (bd-a8i): read the
+/// pane's `state_change_seq` + idle status, wait `window`, read again, then
+/// classify with the pure verdict. `Inconclusive` when either sample is
+/// unavailable (agent vanished mid-probe) — the caller must NOT respawn on
+/// inconclusive evidence.
+pub fn probe_agent_responsiveness(
+    c: &mut Client,
+    pane_id: &str,
+    window: Duration,
+) -> Responsiveness {
+    let sample = |c: &mut Client| -> Option<(u64, bool)> {
+        let agents = c.agent_list().ok()?;
+        let a = agents.iter().find(|a| a.pane_id == pane_id)?;
+        Some((a.state_change_seq, a.agent_status == AgentStatus::Idle))
+    };
+    let Some((old_seq, idle)) = sample(c) else {
+        return Responsiveness::Inconclusive;
+    };
+    std::thread::sleep(window);
+    let Some((new_seq, _)) = sample(c) else {
+        return Responsiveness::Inconclusive;
+    };
+    responsiveness_verdict(old_seq, new_seq, window.as_secs(), idle)
+}
+
+// ---------------------------------------------------------------------------
 // Subscription stream adapter.
 // ---------------------------------------------------------------------------
 
@@ -799,5 +1073,258 @@ impl EventStream {
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
         self.timeout = timeout;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod process_liveness_tests {
+    use super::{PaneProcessInfo, PaneProcessInfoProcess, kind_process_names, pane_agent_alive};
+
+    fn proc(name: &str, pid: u64) -> PaneProcessInfoProcess {
+        PaneProcessInfoProcess {
+            pid,
+            name: name.to_string(),
+            argv0: Some(name.to_string()),
+        }
+    }
+
+    fn info(
+        fgpgid: Option<u64>,
+        shell_pid: Option<u64>,
+        procs: Vec<PaneProcessInfoProcess>,
+    ) -> PaneProcessInfo {
+        PaneProcessInfo {
+            pane_id: "w1:p1".to_string(),
+            foreground_process_group_id: fgpgid,
+            shell_pid,
+            foreground_processes: procs,
+        }
+    }
+
+    /// Live agent: the agent binary leads the foreground group (pid == fgpgid).
+    #[test]
+    fn live_opencode_classified_alive() {
+        let i = info(
+            Some(100),
+            Some(50),
+            vec![proc("opencode", 100), proc("node", 101), proc("uv", 102)],
+        );
+        assert_eq!(pane_agent_alive(&i, "opencode"), Some(true));
+    }
+
+    /// Dead process: pane exists but the shell owns the foreground — the
+    /// exact bd-1np false-negative shape (pane present, process gone).
+    #[test]
+    fn dead_process_shell_foreground_classified_dead() {
+        let i = info(Some(50), Some(50), vec![proc("zsh", 50)]);
+        assert_eq!(pane_agent_alive(&i, "opencode"), Some(false));
+    }
+
+    /// Dead process with orphaned children still listed (MCP servers linger
+    /// after the agent died): no agent binary, foreground not shell-owned.
+    #[test]
+    fn dead_process_orphan_children_classified_dead() {
+        let i = info(
+            Some(103),
+            Some(50),
+            vec![proc("node", 103), proc("uv", 104)],
+        );
+        assert_eq!(pane_agent_alive(&i, "opencode"), Some(false));
+    }
+
+    /// Empty foreground list: nothing running.
+    #[test]
+    fn empty_foreground_classified_dead() {
+        let i = info(Some(50), Some(50), vec![]);
+        assert_eq!(pane_agent_alive(&i, "opencode"), Some(false));
+    }
+
+    /// Unknown kind with no other signal: inconclusive, never "healthy".
+    #[test]
+    fn unknown_kind_inconclusive() {
+        let i = info(Some(200), Some(50), vec![proc("mystery-agent", 200)]);
+        assert_eq!(pane_agent_alive(&i, "mystery-kind"), None);
+    }
+
+    /// Unknown kind but shell owns the foreground: still provably dead.
+    #[test]
+    fn unknown_kind_shell_foreground_dead() {
+        let i = info(Some(50), Some(50), vec![proc("zsh", 50)]);
+        assert_eq!(pane_agent_alive(&i, "mystery-kind"), Some(false));
+    }
+
+    /// Kind aliases: grok's binary can be grok-build.
+    #[test]
+    fn kind_alias_matches() {
+        let i = info(Some(300), Some(50), vec![proc("grok-build", 300)]);
+        assert_eq!(pane_agent_alive(&i, "grok"), Some(true));
+    }
+
+    /// Argv0-only match (name may be a comm name like python3.14t).
+    #[test]
+    fn argv0_match_counts() {
+        let i = info(
+            Some(400),
+            Some(50),
+            vec![PaneProcessInfoProcess {
+                pid: 400,
+                name: "opencode".to_string(),
+                argv0: Some("/opt/bin/opencode".to_string()),
+            }],
+        );
+        assert_eq!(pane_agent_alive(&i, "opencode"), Some(true));
+    }
+
+    #[test]
+    fn kind_names_mapping_has_all_four() {
+        assert!(kind_process_names("opencode").contains(&"opencode"));
+        assert!(kind_process_names("pi").contains(&"pi"));
+        assert!(kind_process_names("grok").contains(&"grok"));
+        assert!(kind_process_names("omp").contains(&"omp"));
+    }
+}
+
+#[cfg(test)]
+mod sanitize_pane_text_tests {
+    use super::sanitize_pane_text;
+
+    #[test]
+    fn strips_csi_color_sequences() {
+        assert_eq!(
+            sanitize_pane_text("\u{1b}[31mred\u{1b}[0m and \u{1b}[1;32mbold green\u{1b}[m"),
+            "red and bold green"
+        );
+    }
+
+    #[test]
+    fn strips_csi_cursor_and_erase_sequences() {
+        assert_eq!(
+            sanitize_pane_text("a\u{1b}[2Kb\u{1b}[1;1Hc"),
+            "abc"
+        );
+    }
+
+    #[test]
+    fn strips_osc_hyperlink_with_st_terminator() {
+        assert_eq!(
+            sanitize_pane_text("\u{1b}]8;;https://example.com\u{1b}\\link\u{1b}]8;;\u{1b}\\more"),
+            "linkmore"
+        );
+    }
+
+    #[test]
+    fn strips_osc_title_with_bel_terminator() {
+        assert_eq!(
+            sanitize_pane_text("before\u{1b}]0;term-title\u{07}after"),
+            "beforeafter"
+        );
+    }
+
+    #[test]
+    fn strips_one_shot_escapes() {
+        assert_eq!(
+            sanitize_pane_text("abc\u{1b}7def\u{1b}8ghi\u{1b}=j"),
+            "abcdefghij"
+        );
+    }
+
+    #[test]
+    fn strips_box_drawing_border_glyphs() {
+        let border = "┏━━━━━━┓\n┃ ok   ┃\n┗━━━━━━┛";
+        assert_eq!(sanitize_pane_text(border), "\n ok   \n");
+    }
+
+    #[test]
+    fn strips_double_line_and_heavy_box_glyphs() {
+        assert_eq!(sanitize_pane_text("╔═══╗ ║ ╠ ╣ ╦ ╩ ╬"), "      ");
+    }
+
+    #[test]
+    fn strips_block_element_and_shade_glyphs() {
+        assert_eq!(sanitize_pane_text("▀▄█░▒▓text"), "text");
+    }
+
+    #[test]
+    fn mixed_garbled_tui_output_becomes_readable() {
+        let raw = "\u{1b}[2J\u{1b}[H╔═╗ \u{1b}[1;32mREADY\u{1b}[0m ═╝\u{1b}[?25l";
+        assert_eq!(sanitize_pane_text(raw), " READY ");
+    }
+
+    #[test]
+    fn plain_content_unchanged() {
+        assert_eq!(sanitize_pane_text("hello world"), "hello world");
+    }
+
+    #[test]
+    fn empty_string_unchanged() {
+        assert_eq!(sanitize_pane_text(""), "");
+    }
+
+    #[test]
+    fn unterminated_csi_dropped() {
+        assert_eq!(sanitize_pane_text("lead\u{1b}[31m"), "lead");
+    }
+}
+
+#[cfg(test)]
+mod responsiveness_tests {
+    use super::{Responsiveness, responsiveness_verdict};
+
+    /// Seq advanced across the window: state changed, so the agent is
+    /// responsive whatever the idle status or window length.
+    #[test]
+    fn advanced_seq_responsive() {
+        assert_eq!(
+            responsiveness_verdict(10, 11, 3, true),
+            Responsiveness::Responsive
+        );
+        assert_eq!(
+            responsiveness_verdict(10, 11, 0, true),
+            Responsiveness::Responsive
+        );
+        assert_eq!(
+            responsiveness_verdict(10, 42, 3, false),
+            Responsiveness::Responsive
+        );
+    }
+
+    /// The bd-a8i shape: seq frozen + Idle across a full window — alive as a
+    /// PID, unresponsive to input, needs respawn.
+    #[test]
+    fn frozen_seq_idle_unresponsive() {
+        assert_eq!(
+            responsiveness_verdict(10, 10, 3, true),
+            Responsiveness::Unresponsive
+        );
+    }
+
+    /// Frozen seq but the agent reports non-idle: Working/Blocked agents may
+    /// legitimately hold the counter — never respawn on ambiguous evidence.
+    #[test]
+    fn frozen_seq_busy_inconclusive() {
+        assert_eq!(
+            responsiveness_verdict(10, 10, 3, false),
+            Responsiveness::Inconclusive
+        );
+    }
+
+    /// Sub-second window: not enough time to observe a change — a frozen
+    /// agent must not be declared from a near-zero window.
+    #[test]
+    fn zero_window_inconclusive() {
+        assert_eq!(
+            responsiveness_verdict(10, 10, 0, true),
+            Responsiveness::Inconclusive
+        );
+    }
+
+    /// Seq regression: the per-pane counter is monotonic; a regression means
+    /// the samples are unreliable, so the verdict is inconclusive.
+    #[test]
+    fn regressed_seq_inconclusive() {
+        assert_eq!(
+            responsiveness_verdict(10, 9, 3, true),
+            Responsiveness::Inconclusive
+        );
     }
 }
