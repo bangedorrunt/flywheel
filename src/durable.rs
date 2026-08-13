@@ -2655,8 +2655,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // while blind and aborts loudly after DEFAULT_LEAF_FAILURE_ABORT_POLLS.
     let mut blind_complete_failures: u32 = 0;
     // bd-87hq: did any critical leaf (poll_events/poll_swarm/poll_ready/
-    // poll_inprogress/expected-replies) fail THIS iteration?
-    let mut critical_leaf_failed_this_iter: bool = false;
+    // poll_inprogress/expected-replies) fail THIS iteration? No initializer —
+    // the loop resets it to false on every iteration before any read.
+    let mut critical_leaf_failed_this_iter: bool;
     // bd-efk1: dispatched-bead claim watch (bead id → dispatch state). The
     // crew-execution watchdog: agents ENGAGE but skip the br lifecycle; the
     // watch catches unclaimed/ unclosed beads and nudges or re-dispatches.
@@ -3958,6 +3959,19 @@ fn id_is_project_loop(id: &str, base: &str) -> bool {
     id.starts_with(&swarm) || id.starts_with(&engine)
 }
 
+/// bd-gny: the guard's pure selection core — which pending promises are
+/// stale-loop reject candidates for `base`. The `except` invocation (the one
+/// this run resumes/owns) is preserved; child promises (`.N`, a live
+/// checkpoint tree) and other projects' invocations are never candidates.
+/// Extracted from `clear_stale_loop_invocations` so the stale-root rejection
+/// is deterministically testable without a Resonate server.
+fn stale_loop_reject_ids<'a>(ids: &[&'a str], base: &str, except: Option<&str>) -> Vec<&'a str> {
+    ids.iter()
+        .copied()
+        .filter(|id| Some(*id) != except && id_is_project_loop(id, base))
+        .collect()
+}
+
 /// bd-87hq: reject stale PENDING loop invocations for `base` on the resonate
 /// server. Killed/abandoned loop runs leave pending root promises; the
 /// worker's group anycast replays them, and replaying their checkpointed
@@ -3980,20 +3994,19 @@ async fn clear_stale_loop_invocations(resonate: &Resonate, base: &str, except: O
                 return;
             }
         };
-        for p in &result.promises {
-            if Some(p.id.as_str()) == except {
-                continue;
-            }
-            if !id_is_project_loop(&p.id, base) {
-                continue;
-            }
-            let value = resonate_sdk::types::Value::from_serializable(serde_json::json!({
-                "rejected": "stale-loop-takeover"
-            }))
-            .unwrap_or_default();
-            match resonate.promises.reject(&p.id, value).await {
+        let ids: Vec<&str> = result
+            .promises
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        let value = resonate_sdk::types::Value::from_serializable(serde_json::json!({
+            "rejected": "stale-loop-takeover"
+        }))
+        .unwrap_or_default();
+        for id in stale_loop_reject_ids(&ids, base, except) {
+            match resonate.promises.reject(id, value.clone()).await {
                 Ok(_) => cleared += 1,
-                Err(e) => eprintln!("flywheel: stale-loop reject {} failed: {e}", p.id),
+                Err(e) => eprintln!("flywheel: stale-loop reject {id} failed: {e}"),
             }
         }
         match result.cursor {
@@ -4853,6 +4866,23 @@ async fn promise_pending(resonate: &Resonate, id: &str) -> anyhow::Result<bool> 
     }
 }
 
+/// bd-gny: verdict over the promise state + loop-process liveness. The
+/// monitor loop's promise stays PENDING for its entire lifetime (it resolves
+/// only when the loop ends), so the raw state alone cannot distinguish a
+/// healthy running loop from an orphaned invocation left behind by a killed
+/// process — the source of the "stuck in Pending forever" confusion.
+fn loop_verdict(state: Option<&PromiseState>, process_alive: bool) -> &'static str {
+    match (state, process_alive) {
+        (Some(PromiseState::Pending), true) => "running",
+        (Some(PromiseState::Pending), false) => "stale",
+        (Some(PromiseState::Resolved), _) => "complete",
+        (Some(PromiseState::Rejected), _) => "failed",
+        (Some(PromiseState::RejectedCanceled), _) => "canceled",
+        (Some(PromiseState::RejectedTimedout), _) => "timed-out",
+        (None, _) => "stale",
+    }
+}
+
 /// Query the current state of a durable loop invocation.
 pub async fn loop_status(cfg: &Config, project: &str) -> anyhow::Result<serde_json::Value> {
     let url = cfg
@@ -4868,17 +4898,31 @@ pub async fn loop_status(cfg: &Config, project: &str) -> anyhow::Result<serde_js
             "loop": "none recorded — run: flywheel loop run <project>"
         }));
     };
-    let rec = resonate
-        .promises
-        .get(&al.id)
-        .await
-        .map_err(|e| anyhow::anyhow!("query {}: {e}", al.id))?;
+    // bd-gny: a promise the server no longer has (404) is not an error — it is
+    // the definitive stale signal. Any other query failure still propagates.
+    let rec = match resonate.promises.get(&al.id).await {
+        Ok(rec) => Some(rec),
+        Err(Error::ServerError { code: 404, .. }) => None,
+        Err(e) => return Err(anyhow::anyhow!("query {}: {e}", al.id)),
+    };
     let _ = resonate.stop().await;
+    let pid_entry = crate::state::load_loop_pids().get(project).cloned();
+    let process_alive = pid_entry
+        .as_ref()
+        .map(|e| crate::state::pid_alive(e.pid))
+        .unwrap_or(false);
     Ok(serde_json::json!({
         "project": project,
         "id": al.id,
-        "state": format!("{:?}", rec.state),
-        "value": rec.value,
+        "state": rec
+            .as_ref()
+            .map(|r| format!("{:?}", r.state))
+            .unwrap_or_else(|| "absent".to_string()),
+        "verdict": loop_verdict(rec.as_ref().map(|r| &r.state), process_alive),
+        "pid": pid_entry.as_ref().map(|e| e.pid),
+        "process_alive": process_alive,
+        "started_at": pid_entry.as_ref().map(|e| e.started_at.clone()),
+        "value": rec.map(|r| r.value),
     }))
 }
 
@@ -5055,6 +5099,83 @@ mod tests {
         // non-loop promises are never matched
         assert!(!id_is_project_loop("cron:weekly-review", "toron"));
         assert!(!id_is_project_loop("wf-graph-fanout-1", "toron"));
+    }
+
+    #[test]
+    fn stale_loop_reject_ids_skips_owned_foreign_and_children() {
+        let ids: Vec<&str> = vec![
+            "swarm-loop:flywheel:1786557202790124000",
+            "swarm-loop:flywheel:1786557202790124001",
+            "swarm-loop:toron:1786512214561650000",
+            "swarm-loop:flywheel:1786557202790124000.1",
+            "engine-loop:flywheel:1786557202790124002",
+        ];
+        // the invocation this run owns/resumes is preserved
+        let rejected = stale_loop_reject_ids(&ids, "flywheel", Some("swarm-loop:flywheel:1786557202790124000"));
+        assert_eq!(
+            rejected,
+            vec![
+                "swarm-loop:flywheel:1786557202790124001",
+                "engine-loop:flywheel:1786557202790124002"
+            ]
+        );
+        // no owned invocation: every stale root is a reject candidate
+        let rejected = stale_loop_reject_ids(&ids, "flywheel", None);
+        assert_eq!(
+            rejected,
+            vec![
+                "swarm-loop:flywheel:1786557202790124000",
+                "swarm-loop:flywheel:1786557202790124001",
+                "engine-loop:flywheel:1786557202790124002"
+            ]
+        );
+        // foreign project + child (live checkpoint tree) never rejected
+        let rejected = stale_loop_reject_ids(&ids, "toron", None);
+        assert_eq!(rejected, vec!["swarm-loop:toron:1786512214561650000"]);
+    }
+
+    #[test]
+    fn loop_verdict_pending_plus_alive_is_running() {
+        assert_eq!(
+            loop_verdict(Some(&PromiseState::Pending), true),
+            "running",
+            "a pending promise with a live loop process is a healthy running loop"
+        );
+    }
+
+    #[test]
+    fn loop_verdict_pending_without_process_is_stale() {
+        assert_eq!(
+            loop_verdict(Some(&PromiseState::Pending), false),
+            "stale",
+            "a pending promise with no live process is an orphaned invocation \
+             (killed loop, promise never settled) — the bd-gny stuck report"
+        );
+    }
+
+    #[test]
+    fn loop_verdict_absent_promise_is_stale() {
+        assert_eq!(
+            loop_verdict(None, true),
+            "stale",
+            "a state file pointing at a promise the server no longer has is stale"
+        );
+        assert_eq!(loop_verdict(None, false), "stale");
+    }
+
+    #[test]
+    fn loop_verdict_settled_states_ignore_liveness() {
+        assert_eq!(loop_verdict(Some(&PromiseState::Resolved), true), "complete");
+        assert_eq!(loop_verdict(Some(&PromiseState::Resolved), false), "complete");
+        assert_eq!(loop_verdict(Some(&PromiseState::Rejected), true), "failed");
+        assert_eq!(
+            loop_verdict(Some(&PromiseState::RejectedCanceled), false),
+            "canceled"
+        );
+        assert_eq!(
+            loop_verdict(Some(&PromiseState::RejectedTimedout), false),
+            "timed-out"
+        );
     }
 
     fn pev(event_type: &str, pane: &str, status: &str, seq: u64) -> PollEvent {
