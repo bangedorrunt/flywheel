@@ -2376,26 +2376,23 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
             .map(|a| WantToken {
                 name: a,
                 broaden: false,
+                short: None,
+                ordinal: 1,
             })
             .collect()
     } else {
         to.split(',').map(|s| to_want_token(project, s)).collect()
     };
-    let matched: Vec<AgentInfo> = in_ws
-        .into_iter()
-        .filter(|a| {
-            a.name
-                .as_deref()
-                .map(|n| want.iter().any(|w| name_matches_want(n, w)))
-                .unwrap_or(false)
-        })
-        .collect();
-    if matched.is_empty() {
+    // bd-4pxy: name-based resolution is canonical; a short with no name hit
+    // falls back to the ordinal-th agent of that kind.
+    let idx = match_indices(&in_ws, &want);
+    if idx.is_empty() {
         bail!(
             "no agents match --to {to} in {project} (available: {})",
             avail.join(", ")
         );
     }
+    let matched: Vec<AgentInfo> = idx.iter().map(|&i| in_ws[i].clone()).collect();
     Ok(matched)
 }
 
@@ -2459,26 +2456,23 @@ fn resolve_agents_dyn(
             .map(|a| WantToken {
                 name: a,
                 broaden: false,
+                short: None,
+                ordinal: 1,
             })
             .collect()
     } else {
         to.split(',').map(|s| to_want_token(project, s)).collect()
     };
-    let matched: Vec<AgentInfo> = in_ws
-        .into_iter()
-        .filter(|a| {
-            a.name
-                .as_deref()
-                .map(|n| want.iter().any(|w| name_matches_want(n, w)))
-                .unwrap_or(false)
-        })
-        .collect();
-    if matched.is_empty() {
+    // bd-4pxy: name-based resolution is canonical; a short with no name hit
+    // falls back to the ordinal-th agent of that kind.
+    let idx = match_indices(&in_ws, &want);
+    if idx.is_empty() {
         bail!(
             "no agents match --to {to} in {project} (available: {})",
             avail.join(", ")
         );
     }
+    let matched: Vec<AgentInfo> = idx.iter().map(|&i| in_ws[i].clone()).collect();
     Ok(matched)
 }
 
@@ -2503,6 +2497,13 @@ fn resolve_agents_dyn(
 struct WantToken {
     name: String,
     broaden: bool,
+    /// The kind short when the token WAS a short (`omp1` → `omp`): the
+    /// kind-based fallback for agents whose NAME diverges from their kind
+    /// (bd-4pxy — an omp agent named `flywheel-<base>-coder`). `None` for
+    /// concrete names, pane ids, and mail identities.
+    short: Option<String>,
+    /// 1-based ordinal of the kind short (`omp1` → 1, `omp2` → 2).
+    ordinal: u32,
 }
 
 fn to_want_token(project: &str, token: &str) -> WantToken {
@@ -2511,6 +2512,8 @@ fn to_want_token(project: &str, token: &str) -> WantToken {
         WantToken {
             name: t.to_string(),
             broaden: false,
+            short: None,
+            ordinal: 1,
         }
     } else if let Some((kind, ordinal)) = split_short_ordinal(t) {
         // bd-eign.14: a numbered short resolves to THAT ordinal's agent —
@@ -2519,12 +2522,16 @@ fn to_want_token(project: &str, token: &str) -> WantToken {
         WantToken {
             name: agent_name_n(project, kind, ordinal),
             broaden: false,
+            short: Some(kind.to_string()),
+            ordinal,
         }
     } else {
         let broaden = matches!(t, "oc" | "pi" | "gk") && t.chars().all(|c| c.is_ascii_lowercase());
         WantToken {
             name: agent_name(project, t),
             broaden,
+            short: Some(t.to_string()),
+            ordinal: 1,
         }
     }
 }
@@ -2555,6 +2562,55 @@ fn name_matches_want(name: &str, want: &WantToken) -> bool {
                 .next()
                 .map(|c| c.is_ascii_digit())
                 .unwrap_or(false))
+}
+
+/// The `ordinal`-th (1-based) agent of `kind` in list order — the kind
+/// fallback for `--to` resolution (bd-4pxy): a short's NAME target may not
+/// exist (an omp agent named `flywheel-<base>-coder`), but the herdr kind
+/// is stable. `None` when fewer than `ordinal` agents run that kind.
+fn kind_nth_index(agents: &[AgentInfo], kind: &str, ordinal: u32) -> Option<usize> {
+    agents
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.agent.as_deref() == Some(kind))
+        .nth(ordinal.saturating_sub(1) as usize)
+        .map(|(i, _)| i)
+}
+
+/// Indices of agents matched by the `--to` wants (bd-4pxy): name-based
+/// resolution is canonical (exact, numbered, or broadened); when a short's
+/// name target matches NOTHING, fall back to the ordinal-th agent OF THAT
+/// KIND. Order preserved, deduped. Pure — shared by the CLI and the
+/// backend-factory resolution paths.
+fn match_indices(agents: &[AgentInfo], wants: &[WantToken]) -> Vec<usize> {
+    let mut out = vec![false; agents.len()];
+    for want in wants {
+        let name_hits: Vec<usize> = agents
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| {
+                a.name
+                    .as_deref()
+                    .map(|n| name_matches_want(n, want))
+                    .unwrap_or(false)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if !name_hits.is_empty() {
+            for i in name_hits {
+                out[i] = true;
+            }
+        } else if let Some(short) = &want.short
+            && let Some(i) = kind_nth_index(agents, short, want.ordinal)
+        {
+            out[i] = true;
+        }
+    }
+    out.iter()
+        .enumerate()
+        .filter(|(_, hit)| **hit)
+        .map(|(i, _)| i)
+        .collect()
 }
 
 fn agent_target(a: &AgentInfo) -> &str {
@@ -4343,6 +4399,33 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
         }
     }
 
+    // bd-4pxy: spawn readiness — "swarm ready" must never print while an
+    // agent is still launch_pending (herdr: the launcher command has not
+    // finished; a harness that cannot start stays pending). Wait briefly,
+    // then FAIL naming the field + the pending agents (a silent ready is
+    // the bug that produced dead sends).
+    if !no_verify {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let agents = c.agent_list()?;
+            let pending: Vec<AgentInfo> = agents
+                .iter()
+                .filter(|a| a.workspace_id == ws.workspace_id && a.launch_pending)
+                .cloned()
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "{}",
+                    launch_pending_error(&pending).expect("pending non-empty here")
+                );
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
     println!(
         "swarm ready: flywheel {} {} {}",
         kind_paint("send"),
@@ -5320,22 +5403,29 @@ mod agent_mail_name_tests {
             to_want_token("toron", "flywheel-toron-oc"),
             WantToken {
                 name: "flywheel-toron-oc".into(),
-                broaden: false
+                broaden: false,
+                short: None,
+                ordinal: 1,
             }
         );
         assert_eq!(
             to_want_token("toron", "flywheel-toron-oc2"),
             WantToken {
                 name: "flywheel-toron-oc2".into(),
-                broaden: false
+                broaden: false,
+                short: None,
+                ordinal: 1,
             }
         );
-        // numbered short: exact, no broadening to oc20
+        // numbered short: exact, no broadening to oc20; carries kind+ordinal
+        // for the bd-4pxy kind fallback
         assert_eq!(
             to_want_token("toron", "oc2"),
             WantToken {
                 name: "flywheel-toron-oc2".into(),
-                broaden: false
+                broaden: false,
+                short: Some("oc".into()),
+                ordinal: 2,
             }
         );
         // bd-eign.14: oc1 (the first oc agent) resolves — the first agent
@@ -5344,21 +5434,27 @@ mod agent_mail_name_tests {
             to_want_token("toron", "oc1"),
             WantToken {
                 name: "flywheel-toron-oc".into(),
-                broaden: false
+                broaden: false,
+                short: Some("oc".into()),
+                ordinal: 1,
             }
         );
         assert_eq!(
             to_want_token("toron", "pi2"),
             WantToken {
                 name: "flywheel-toron-pi2".into(),
-                broaden: false
+                broaden: false,
+                short: Some("pi".into()),
+                ordinal: 2,
             }
         );
         assert_eq!(
             to_want_token("toron", "gk1"),
             WantToken {
                 name: "flywheel-toron-gk".into(),
-                broaden: false
+                broaden: false,
+                short: Some("gk".into()),
+                ordinal: 1,
             }
         );
         // a bare digit is not a numbered short (no kind prefix)
@@ -5366,7 +5462,9 @@ mod agent_mail_name_tests {
             to_want_token("toron", "2"),
             WantToken {
                 name: "flywheel-toron-2".into(),
-                broaden: false
+                broaden: false,
+                short: Some("2".into()),
+                ordinal: 1,
             }
         );
         // bare shorts expand to first ordinal AND broaden to numbered agents
@@ -5374,14 +5472,18 @@ mod agent_mail_name_tests {
             to_want_token("toron", "oc"),
             WantToken {
                 name: "flywheel-toron-oc".into(),
-                broaden: true
+                broaden: true,
+                short: Some("oc".into()),
+                ordinal: 1,
             }
         );
         assert_eq!(
             to_want_token("toron", "pi"),
             WantToken {
                 name: "flywheel-toron-pi".into(),
-                broaden: true
+                broaden: true,
+                short: Some("pi".into()),
+                ordinal: 1,
             }
         );
         // raw pane id passes through
@@ -5389,7 +5491,9 @@ mod agent_mail_name_tests {
             to_want_token("toron", "w1:p1"),
             WantToken {
                 name: "w1:p1".into(),
-                broaden: false
+                broaden: false,
+                short: None,
+                ordinal: 1,
             }
         );
         // empty passes through (caller validates distinctness)
@@ -5397,7 +5501,9 @@ mod agent_mail_name_tests {
             to_want_token("toron", ""),
             WantToken {
                 name: "".into(),
-                broaden: false
+                broaden: false,
+                short: None,
+                ordinal: 1,
             }
         );
     }
@@ -5485,7 +5591,15 @@ fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
         let ws_agents: Vec<Value> = agents
             .iter()
             .filter(|a| a.workspace_id == ws.workspace_id)
-            .map(|a| json!({ "name": a.name, "kind": a.agent, "status": a.agent_status.as_str() }))
+            .map(|a| {
+                json!({
+                    "name": a.name, "kind": a.agent,
+                    // bd-4pxy: a launch_pending agent is NOT idle — it is
+                    // still booting (the status must never mask the boot).
+                    "status": status_label(a.launch_pending, a.agent_status.as_str()),
+                    "launch_pending": a.launch_pending,
+                })
+            })
             .collect();
         rows.push(json!({
             "workspace_id": ws.workspace_id,
@@ -5541,8 +5655,11 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
         .iter()
         .map(|a| {
             json!({
-                "name": a.name, "kind": a.agent, "status": a.agent_status.as_str(),
-                "pane_id": a.pane_id, "cwd": a.cwd, "workspace_id": ws_id
+                "name": a.name, "kind": a.agent,
+                // bd-4pxy: a launch_pending agent is NOT idle — still booting.
+                "status": status_label(a.launch_pending, a.agent_status.as_str()),
+                "pane_id": a.pane_id, "cwd": a.cwd, "workspace_id": ws_id,
+                "launch_pending": a.launch_pending,
             })
         })
         .collect();
@@ -5956,12 +6073,28 @@ fn cmd_send(
         // escalation); the CLI counterpart is one retry after a short delay,
         // then either a same-name respawn (--respawn-on-stall) or an
         // actionable error naming the recovery commands.
-        let target = agent_target(a).to_string();
+        let mut target = agent_target(a).to_string();
         let name = a.name.clone().unwrap_or_else(|| target.clone());
         let mut stalls_seen = 0usize;
+        // bd-4pxy: a still-booting agent rejects name-addressed prompts with
+        // `agent_not_ready`; herdr accepts pane ids, so retry once via the
+        // pane before giving up (bounded — never an infinite loop).
+        let mut pane_retried = false;
         let agent = loop {
             match c.agent_prompt(&target, &text, wait_opts.clone()) {
                 Ok(agent) => break agent,
+                Err(e) if is_agent_not_ready(&e.code) => {
+                    match not_ready_retry_target(&target, a, pane_retried) {
+                        Some(pane) => {
+                            pane_retried = true;
+                            eprintln!(
+                                "flywheel: {target} agent_not_ready — retrying via pane id {pane}"
+                            );
+                            target = pane;
+                        }
+                        None => return Err(e.into()),
+                    }
+                }
                 Err(e) => match stall_step(&e.code, stalls_seen, respawn_on_stall) {
                     None => return Err(e.into()),
                     Some(StallStep::Retry) => {
@@ -6063,6 +6196,186 @@ fn stall_recovery_hint(project: &str) -> String {
     format!(
         "Recovery options:\n  flywheel recover {project}   respawn dead agents from the spawn registry\n  flywheel kill {project} --force   hard-reset the swarm"
     )
+}
+
+/// bd-4pxy: herdr reports `agent_not_ready` when a still-booting agent
+/// rejects a prompt addressed by NAME. herdr accepts pane ids too, and a
+/// booting agent answers its pane even before the name binding settles —
+/// so the send path retries once via the pane id. `None` when the pane-id
+/// retry already happened (bounded — never an infinite retry loop).
+fn not_ready_retry_target(name_used: &str, agent: &AgentInfo, pane_retried: bool) -> Option<String> {
+    if pane_retried || name_used == agent.pane_id {
+        None
+    } else {
+        Some(agent.pane_id.clone())
+    }
+}
+
+/// bd-4pxy: herdr's `agent_not_ready` protocol code arrives unmapped
+/// (BackendErrorCode::Other). Everything else (stalls, timeouts, connect)
+/// keeps its existing handling.
+fn is_agent_not_ready(code: &BackendErrorCode) -> bool {
+    matches!(code, BackendErrorCode::Other(c) if c == "agent_not_ready")
+}
+
+/// bd-4pxy: a launch_pending agent is NOT idle — it is still booting
+/// (status surfaces must not report it as idle).
+fn status_label(launch_pending: bool, status: &str) -> String {
+    if launch_pending {
+        "launching".to_string()
+    } else {
+        status.to_string()
+    }
+}
+
+/// bd-4pxy: the spawn-readiness failure — names the `launch_pending` field
+/// and every agent still pending. `None` when all agents are launch-ready.
+fn launch_pending_error(agents: &[AgentInfo]) -> Option<String> {
+    let pending: Vec<&AgentInfo> = agents
+        .iter()
+        .filter(|a| a.launch_pending)
+        .collect();
+    if pending.is_empty() {
+        return None;
+    }
+    let list = pending
+        .iter()
+        .map(|a| {
+            format!(
+                "{} ({})",
+                a.name.as_deref().unwrap_or("<unnamed>"),
+                a.pane_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "swarm not ready: launch_pending=true for {} — agent(s) still booting; wait and re-run, or check the agent logs (a harness that cannot start stays launch_pending)",
+        list
+    ))
+}
+
+#[cfg(test)]
+mod bd_4pxy_tests {
+    use super::*;
+
+    fn agent(
+        kind: Option<&str>,
+        name: Option<&str>,
+        ws: &str,
+        pending: bool,
+        status: AgentStatus,
+    ) -> AgentInfo {
+        AgentInfo {
+            agent: kind.map(String::from),
+            agent_status: status,
+            cwd: None,
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: true,
+            launch_pending: pending,
+            name: name.map(String::from),
+            pane_id: format!("{ws}:p1"),
+            revision: 0,
+            state_change_seq: 0,
+            state_labels: serde_json::Map::new(),
+            tab_id: "t1".into(),
+            terminal_id: "term".into(),
+            terminal_title: None,
+            workspace_id: ws.to_string(),
+        }
+    }
+
+    #[test]
+    fn is_agent_not_ready_matches_protocol_code() {
+        assert!(is_agent_not_ready(&BackendErrorCode::Other("agent_not_ready".into())));
+        assert!(!is_agent_not_ready(&BackendErrorCode::AgentPromptStalled));
+        assert!(!is_agent_not_ready(&BackendErrorCode::Other("agent_prompt_stalled".into())));
+        assert!(!is_agent_not_ready(&BackendErrorCode::Timeout));
+    }
+
+    #[test]
+    fn not_ready_retry_target_pane_once() {
+        let a = agent(Some("omp"), Some("flywheel-flywheel-coder"), "w1", false, AgentStatus::Idle);
+        // first not-ready on the NAME → retry via the pane id
+        assert_eq!(
+            not_ready_retry_target("flywheel-flywheel-coder", &a, false),
+            Some("w1:p1".to_string())
+        );
+        // pane-id retry already consumed → bounded, no third attempt
+        assert_eq!(not_ready_retry_target("w1:p1", &a, true), None);
+        // an unnamed agent already prompts by pane id → no retry
+        let unnamed = agent(Some("omp"), None, "w1", false, AgentStatus::Idle);
+        assert_eq!(not_ready_retry_target("w1:p1", &unnamed, false), None);
+    }
+
+    #[test]
+    fn status_label_launch_pending_is_not_idle() {
+        assert_eq!(status_label(true, AgentStatus::Idle.as_str()), "launching");
+        assert_eq!(status_label(false, AgentStatus::Idle.as_str()), "idle");
+        assert_eq!(status_label(false, AgentStatus::Working.as_str()), "working");
+    }
+
+    #[test]
+    fn launch_pending_error_names_field_and_agent() {
+        let pending = agent(Some("omp"), Some("flywheel-flywheel-coder"), "w1", true, AgentStatus::Idle);
+        let ready = agent(Some("oc"), Some("flywheel-flywheel-oc"), "w1", false, AgentStatus::Idle);
+        let msg = launch_pending_error(&[pending, ready]).expect("pending agent names the error");
+        assert!(msg.contains("launch_pending"), "{msg}");
+        assert!(msg.contains("flywheel-flywheel-coder"), "{msg}");
+        assert!(msg.contains("w1:p1"), "{msg}");
+        let all_ready = agent(Some("oc"), Some("flywheel-flywheel-oc"), "w1", false, AgentStatus::Idle);
+        assert!(launch_pending_error(&[all_ready]).is_none());
+    }
+
+    #[test]
+    fn want_token_omp1_carries_kind_and_ordinal() {
+        let w = to_want_token("flywheel", "omp1");
+        assert_eq!(w.short.as_deref(), Some("omp"));
+        assert_eq!(w.ordinal, 1);
+        assert_eq!(w.name, "flywheel-flywheel-omp");
+        let w = to_want_token("flywheel", "omp2");
+        assert_eq!(w.short.as_deref(), Some("omp"));
+        assert_eq!(w.ordinal, 2);
+        let w = to_want_token("flywheel", "flywheel-flywheel-coder");
+        assert!(w.short.is_none(), "concrete name carries no kind short");
+        let w = to_want_token("flywheel", "w1:p1");
+        assert!(w.short.is_none(), "pane id carries no kind short");
+    }
+
+    #[test]
+    fn match_indices_kind_fallback_resolves_omp1() {
+        // the bd-4pxy witness shape: an omp agent NAMED flywheel-<base>-coder
+        let omp1 = agent(Some("omp"), Some("flywheel-flywheel-coder"), "w1", false, AgentStatus::Idle);
+        let omp2 = agent(Some("omp"), Some("flywheel-flywheel-doer"), "w1", false, AgentStatus::Idle);
+        let oc = agent(Some("oc"), Some("flywheel-flywheel-oc"), "w1", false, AgentStatus::Idle);
+        let agents = vec![omp1, omp2, oc];
+        // --to omp1: name flywheel-flywheel-omp does not exist → first kind=omp
+        assert_eq!(match_indices(&agents, &[to_want_token("flywheel", "omp1")]), vec![0]);
+        // --to omp2 → second kind=omp
+        assert_eq!(match_indices(&agents, &[to_want_token("flywheel", "omp2")]), vec![1]);
+        // bare --to omp → first kind=omp (no flywheel-flywheel-omp name)
+        assert_eq!(match_indices(&agents, &[to_want_token("flywheel", "omp")]), vec![0]);
+    }
+
+    #[test]
+    fn match_indices_name_match_beats_kind_fallback() {
+        let oc = agent(Some("oc"), Some("flywheel-flywheel-oc"), "w1", false, AgentStatus::Idle);
+        let omp = agent(Some("omp"), Some("flywheel-flywheel-coder"), "w1", false, AgentStatus::Idle);
+        let agents = vec![oc, omp];
+        // --to oc1 resolves by NAME (exists) — kind fallback must not add a
+        // second, differently-named kind=oc agent
+        assert_eq!(match_indices(&agents, &[to_want_token("flywheel", "oc1")]), vec![0]);
+    }
+
+    #[test]
+    fn match_indices_broaden_keeps_whole_crew() {
+        let oc = agent(Some("oc"), Some("flywheel-flywheel-oc"), "w1", false, AgentStatus::Idle);
+        let oc2 = agent(Some("oc"), Some("flywheel-flywheel-oc2"), "w1", false, AgentStatus::Idle);
+        let agents = vec![oc, oc2];
+        assert_eq!(match_indices(&agents, &[to_want_token("flywheel", "oc")]), vec![0, 1]);
+    }
 }
 
 #[cfg(test)]
@@ -9184,6 +9497,8 @@ mod loop_tests {
         let want_oc = WantToken {
             name: format!("{base}oc"),
             broaden: true,
+            short: None,
+            ordinal: 1,
         };
         assert!(name_matches_want(&format!("{base}oc"), &want_oc));
         assert!(name_matches_want(&format!("{base}oc2"), &want_oc));
@@ -9195,6 +9510,8 @@ mod loop_tests {
         let want_exact = WantToken {
             name: format!("{base}oc"),
             broaden: false,
+            short: None,
+            ordinal: 1,
         };
         assert!(name_matches_want(&format!("{base}oc"), &want_exact));
         assert!(!name_matches_want(&format!("{base}oc2"), &want_exact));
@@ -9202,6 +9519,8 @@ mod loop_tests {
         let want_oc2 = WantToken {
             name: format!("{base}oc2"),
             broaden: false,
+            short: None,
+            ordinal: 1,
         };
         assert!(name_matches_want(&format!("{base}oc2"), &want_oc2));
         assert!(!name_matches_want(&format!("{base}oc20"), &want_oc2));
@@ -14163,8 +14482,20 @@ fn cmd_internal_send(
 
     let Some(timeout_ms) = confirm_ms else {
         // legacy fire-and-forget path — a successful herdr call means the
-        // prompt was written to the agent's terminal
-        backend.prompt(&target, &send_text, None)?;
+        // prompt was written to the agent's terminal. bd-4pxy: a booting
+        // agent rejects name-addressed prompts — retry once via the pane id.
+        match backend.prompt(&target, &send_text, None) {
+            Ok(_) => {}
+            Err(e) if is_agent_not_ready(&e.code) => {
+                if let Some(pane) = not_ready_retry_target(&target, &agent, false) {
+                    eprintln!("flywheel: {name} agent_not_ready — retrying via pane id {pane}");
+                    backend.prompt(&pane, &send_text, None)?;
+                } else {
+                    return Err(e.into());
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
         record(true, false);
         if let Some((pname, _, _, _, _)) = &profile_obj {
             log_engine_dispatch(project, pname, text, &send_text, started, true);
@@ -14181,7 +14512,17 @@ fn cmd_internal_send(
     };
     // review-fix F6: PromptLanding carries status XOR code; classify
     // identically to the concrete path (landed → status, else code).
+    // bd-4pxy: `agent_not_ready` (a booting agent) → retry once via the
+    // pane id before classifying.
     let landing = backend.prompt_coded(&target, &send_text, Some(&wait))?;
+    let landing = if landing.code.as_deref() == Some("agent_not_ready")
+        && let Some(pane) = not_ready_retry_target(&target, &agent, false)
+    {
+        eprintln!("flywheel: {name} agent_not_ready — retrying via pane id {pane}");
+        backend.prompt_coded(&pane, &send_text, Some(&wait))?
+    } else {
+        landing
+    };
     let verdict = classify_send_result(landing.code.as_deref(), landing.status);
     let (landed, status, reason) = match verdict {
         SendVerdict::Landed(st) => (
