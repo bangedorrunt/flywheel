@@ -2063,6 +2063,7 @@ mod loops_sidecar_tests {
                 profile: Some("planner".into()),
                 harness: Some("omp".into()),
                 mail_identity: None,
+                skills_injected: false,
             },
             SpawnEntry::legacy("w2A:p2", "flywheel-reg-profile-oc"),
         ];
@@ -2074,6 +2075,10 @@ mod loops_sidecar_tests {
         assert!(
             raw.contains("harness"),
             "harness column serialized (bd-lvyi): {raw}"
+        );
+        assert!(
+            raw.contains("skills_injected"),
+            "skills_injected column serialized (bd-eign.10): {raw}"
         );
         // a P10.3-style file WITHOUT the harness column (pre-bd-lvyi) still
         // deserializes — harness: None
@@ -2087,6 +2092,10 @@ mod loops_sidecar_tests {
         assert_eq!(loaded[0].profile.as_deref(), Some("planner"));
         assert_eq!(loaded[0].harness, None, "absent column -> None");
         assert_eq!(loaded[0].mail_identity, None, "absent column -> None");
+        assert!(
+            !loaded[0].skills_injected,
+            "absent column -> false (bd-eign.10)"
+        );
         std::fs::write(
             &legacy_path,
             r#"[["w9:p1","flywheel-x-oc"],["w9:p2","flywheel-x-pi"]]"#,

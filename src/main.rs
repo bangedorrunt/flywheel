@@ -13531,7 +13531,7 @@ fn cmd_internal_send(
         // prompt was written to the agent's terminal
         backend.prompt(&target, &send_text, None)?;
         record(true, false);
-        if let Some((pname, _, _, _)) = &profile_obj {
+        if let Some((pname, _, _, _, _)) = &profile_obj {
             log_engine_dispatch(project, pname, text, &send_text, started, true);
         }
         print_json(&json!({ "ok": true, "name": name }));
@@ -13561,7 +13561,7 @@ fn cmd_internal_send(
     // cg6.5: a timeout is AMBIGUOUS (the prompt may have started) — record it
     // as such so resume never re-delegates a possibly-mid-flight prompt.
     record(landed, reason == "timeout");
-    if let Some((pname, _, _, _)) = &profile_obj {
+    if let Some((pname, _, _, _, _)) = &profile_obj {
         log_engine_dispatch(project, pname, text, &send_text, started, landed);
     }
     print_json(&json!({

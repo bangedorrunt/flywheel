@@ -535,6 +535,7 @@ mod tests {
                 profile: Some("planner".into()),
                 harness: Some("omp".into()),
                 mail_identity: None,
+                skills_injected: false,
             },
             SpawnEntry {
                 pane_id: "w1:p2".into(),
@@ -542,6 +543,7 @@ mod tests {
                 profile: Some("coder".into()),
                 harness: Some("omp".into()),
                 mail_identity: None,
+                skills_injected: false,
             },
             SpawnEntry::legacy("w1:p3", "plain-agent"),
         ];
@@ -564,6 +566,7 @@ mod tests {
                 profile: Some("reviewer".into()),
                 harness: Some("omp".into()),
                 mail_identity: None,
+                skills_injected: false,
             },
             SpawnEntry {
                 pane_id: "w1:p2".into(),
@@ -571,6 +574,7 @@ mod tests {
                 profile: Some("scout".into()),
                 harness: Some("opencode".into()),
                 mail_identity: None,
+                skills_injected: false,
             },
         ];
         let e = resolve_pane_by_harness(&entries, "opencode").expect("opencode pane");
@@ -593,6 +597,7 @@ mod tests {
                 profile: Some("coder".into()),
                 harness: Some("omp".into()),
                 mail_identity: None,
+                skills_injected: false,
             },
             SpawnEntry::legacy("w1:p3", "plain"),
         ];
