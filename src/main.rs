@@ -3769,6 +3769,273 @@ mod profile_run_spawn_tests {
 }
 
 #[cfg(test)]
+mod internal_respawn_tests {
+    use super::*;
+    use crate::backend::MultiplexerBackend;
+    use crate::config::lock_env;
+    use crate::herdr_shim::{PaneInfo, WorkspaceInfo};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Hermetic cfg: temp workspace root + temp XDG dirs. `XDG_CONFIG_HOME`
+    /// isolates the profile catalog (profiles.toml), `XDG_STATE_HOME` the
+    /// state dir (spawn registry).
+    fn hermetic() -> (Config, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let state_home = dir.path().join("state");
+        let config_home = dir.path().join("config");
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &config_home) };
+        std::fs::create_dir_all(config_home.join("flywheel")).expect("config dir");
+        let cfg = Config {
+            workspace_root: Some(dir.path().join("ws").to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        (cfg, dir)
+    }
+
+    fn write_profiles_toml(dir: &tempfile::TempDir) {
+        std::fs::write(
+            dir.path().join("config/flywheel/profiles.toml"),
+            "[profiles.omp-coder]\nharness = \"omp\"\nmodel = \"glm-5.2\"\neffort = \"max\"\nsmol = \"glm-4.5-air\"\n",
+        )
+        .expect("profiles.toml");
+    }
+
+    fn agent(name: &str, pane: &str, ws: &str, status: AgentStatus) -> AgentInfo {
+        AgentInfo {
+            agent: Some(name.to_string()),
+            agent_status: status,
+            cwd: None,
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: false,
+            launch_pending: false,
+            name: Some(name.to_string()),
+            pane_id: pane.to_string(),
+            revision: 0,
+            state_change_seq: 0,
+            state_labels: serde_json::Map::new(),
+            tab_id: "t1".into(),
+            terminal_id: "term".into(),
+            terminal_title: None,
+            workspace_id: ws.to_string(),
+        }
+    }
+
+    fn pane(ws: &str, n: u32) -> PaneInfo {
+        PaneInfo {
+            pane_id: format!("{ws}:p{n}"),
+            terminal_id: format!("term-{n}"),
+            workspace_id: ws.into(),
+            tab_id: format!("{ws}:t1"),
+            focused: false,
+            agent_status: AgentStatus::Idle,
+            revision: 0,
+            title: None,
+            cwd: None,
+            agent: None,
+            agent_session: None,
+            display_agent: None,
+            foreground_cwd: None,
+            label: None,
+            scroll: None,
+            state_labels: serde_json::Map::new(),
+            terminal_title: None,
+            terminal_title_stripped: None,
+            tokens: serde_json::Map::new(),
+        }
+    }
+
+    fn workspace(label: &str) -> WorkspaceInfo {
+        WorkspaceInfo {
+            workspace_id: "wA".into(),
+            number: 1,
+            label: label.into(),
+            focused: false,
+            pane_count: 1,
+            tab_count: 1,
+            active_tab_id: "wA:t1".into(),
+            agent_status: AgentStatus::Idle,
+            cwd: None,
+        }
+    }
+
+    struct MockMux {
+        ws_label: String,
+        agents: Mutex<Vec<AgentInfo>>,
+        started: Mutex<Vec<StartedAgent>>,
+        splits: AtomicUsize,
+        closes: AtomicUsize,
+    }
+
+    /// (name, kind, pane_id, args) captured from each `agent_start`.
+    type StartedAgent = (String, String, String, Vec<String>);
+
+    impl MockMux {
+        fn new(ws_label: &str, agents: Vec<AgentInfo>) -> Self {
+            Self {
+                ws_label: ws_label.into(),
+                agents: Mutex::new(agents),
+                started: Mutex::new(Vec::new()),
+                splits: AtomicUsize::new(0),
+                closes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl MultiplexerBackend for MockMux {
+        fn name(&self) -> &'static str {
+            "mock-mux"
+        }
+        fn workspace_list(
+            &self,
+        ) -> Result<Vec<WorkspaceInfo>, toron_core::backend::BackendError> {
+            Ok(vec![workspace(&self.ws_label)])
+        }
+        fn pane_list(
+            &self,
+            _workspace_id: Option<&str>,
+        ) -> Result<Vec<PaneInfo>, toron_core::backend::BackendError> {
+            Ok(self
+                .agents
+                .lock()
+                .expect("mock agents lock")
+                .iter()
+                .map(|a| pane(&a.workspace_id, 1))
+                .collect())
+        }
+        fn pane_split(
+            &self,
+            _parent_pane_id: &str,
+            _direction: &str,
+            _cwd: Option<&str>,
+        ) -> Result<PaneInfo, toron_core::backend::BackendError> {
+            self.splits.fetch_add(1, Ordering::SeqCst);
+            Ok(pane("wA", 2))
+        }
+        fn pane_close(&self, _pane_id: &str) -> Result<(), toron_core::backend::BackendError> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn agent_list(&self) -> Result<Vec<AgentInfo>, toron_core::backend::BackendError> {
+            Ok(self.agents.lock().expect("mock agents lock").clone())
+        }
+        fn agent_start(
+            &self,
+            name: &str,
+            kind: &str,
+            pane_id: &str,
+            args: &[String],
+        ) -> Result<AgentInfo, toron_core::backend::BackendError> {
+            self.started
+                .lock()
+                .expect("mock started lock")
+                .push((name.into(), kind.into(), pane_id.into(), args.to_vec()));
+            let mut agents = self.agents.lock().expect("mock agents lock");
+            agents.push(agent(name, pane_id, "wA", AgentStatus::Idle));
+            Ok(agents.last().expect("just pushed").clone())
+        }
+        fn agent_rename(
+            &self,
+            _target: &str,
+            _new_name: Option<&str>,
+        ) -> Result<(), toron_core::backend::BackendError> {
+            Ok(())
+        }
+    }
+
+    /// bd-ude8: an omp respawn must re-inject the profile's model/effort
+    /// launch args (never the empty `&[]` argv) AND restart in the SAME
+    /// pane — `pane.close` on the old pane delivers a PTY stdin EOF that
+    /// kills omp-in-herdr before it boots.
+    #[test]
+    fn omp_respawn_reinjects_args_and_stays_in_pane() {
+        let _g = lock_env();
+        let (cfg, dir) = hermetic();
+        write_profiles_toml(&dir);
+        record_spawn_entry(
+            &cfg,
+            "demo",
+            state::SpawnEntry::profiled("wA:p1", "profile-coder", "omp-coder", "omp", None),
+        );
+        let mux = MockMux::new(
+            "flywheel-demo",
+            vec![agent("profile-coder", "wA:p1", "wA", AgentStatus::Idle)],
+        );
+
+        respawn_with_backend(&mux, &cfg, "demo", "profile-coder", "omp", true).expect("respawn ok");
+
+        assert_eq!(mux.splits.load(Ordering::SeqCst), 0, "omp respawn must NOT split a new pane");
+        assert_eq!(mux.closes.load(Ordering::SeqCst), 0, "omp respawn must NOT pane.close (PTY stdin EOF kills omp)");
+        let started = mux.started.lock().expect("mock started lock");
+        assert_eq!(started.len(), 1);
+        let (name, kind, pane_id, args) = &started[0];
+        assert_eq!(name, "profile-coder");
+        assert_eq!(kind, "omp");
+        assert_eq!(pane_id, "wA:p1", "omp restarts in the SAME pane");
+        assert!(!args.is_empty(), "omp respawn argv must be non-empty");
+        assert!(
+            args.iter().any(|a| a.contains("glm-5.2")),
+            "omp model flag present: {args:?}"
+        );
+    }
+
+    /// bd-ude8: non-omp kinds keep the split+close cycle.
+    #[test]
+    fn non_omp_respawn_splits_and_closes_old_pane() {
+        let _g = lock_env();
+        let (cfg, _dir) = hermetic();
+        let mux = MockMux::new(
+            "flywheel-demo",
+            vec![agent("flywheel-demo-oc", "wA:p1", "wA", AgentStatus::Idle)],
+        );
+
+        respawn_with_backend(&mux, &cfg, "demo", "flywheel-demo-oc", "opencode", true)
+            .expect("respawn ok");
+
+        assert_eq!(mux.splits.load(Ordering::SeqCst), 1, "non-omp respawn splits a fresh pane");
+        assert_eq!(mux.closes.load(Ordering::SeqCst), 1, "non-omp respawn closes the old pane");
+        let started = mux.started.lock().expect("mock started lock");
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].2, "wA:p2", "agent starts on the fresh split pane");
+        assert!(
+            started[0].3.is_empty(),
+            "unprofiled agent has no registry profile → unchanged empty argv"
+        );
+    }
+
+    /// bd-ude8: respawn argv comes ONLY from the registry-pinned profile —
+    /// legacy entries (no profile) and unknown names keep the empty argv.
+    #[test]
+    fn respawn_args_only_from_registry_pinned_profile() {
+        let _g = lock_env();
+        let (cfg, dir) = hermetic();
+        write_profiles_toml(&dir);
+        let key = project_dir_str(&cfg, "demo").expect("key");
+        state::save_spawn_registry(
+            &key,
+            &[
+                state::SpawnEntry::profiled("wA:p1", "profile-coder", "omp-coder", "omp", None),
+                state::SpawnEntry::legacy("wA:p2", "flywheel-demo-oc"),
+            ],
+        )
+        .expect("registry");
+
+        let omp = respawn_launch_args(&cfg, "demo", "profile-coder", "omp");
+        assert!(!omp.is_empty(), "profiled agent re-injects its launch args");
+        assert!(omp.iter().any(|a| a.contains("glm-5.2")), "model flag: {omp:?}");
+
+        let legacy = respawn_launch_args(&cfg, "demo", "flywheel-demo-oc", "opencode");
+        assert!(legacy.is_empty(), "legacy entry (no profile) → empty argv");
+
+        let unknown = respawn_launch_args(&cfg, "demo", "no-such-agent", "pi");
+        assert!(unknown.is_empty(), "unknown agent → empty argv");
+    }
+}
+
+#[cfg(test)]
 mod profile_workflow_invoke_tests {
     use super::*;
 
@@ -14836,7 +15103,21 @@ fn cmd_internal_respawn(
 ) -> Result<()> {
     // review-fix F6: respawn routes through the backend factory (ADR-0002).
     let backend = backend::multiplexer_backend(cfg)?;
-    let ws_id = find_workspace_dyn(&*backend, project)?;
+    respawn_with_backend(&*backend, cfg, project, name, kind, force)
+}
+
+/// Testable core of `cmd_internal_respawn` (bd-ude8): the mux backend is
+/// injected so the omp same-pane path and the argv re-injection are unit-
+/// observable; the factory stays at the wrapper.
+fn respawn_with_backend(
+    backend: &dyn backend::MultiplexerBackend,
+    cfg: &Config,
+    project: &str,
+    name: &str,
+    kind: &str,
+    force: bool,
+) -> Result<()> {
+    let ws_id = find_workspace_dyn(backend, project)?;
     let dir = project_dir(cfg, project);
     // The agent record may already be gone (herdr drops dead agents ~0.5s
     // after they stop responding — the escalation path respawns exactly
@@ -14869,30 +15150,46 @@ fn cmd_internal_respawn(
         .into_iter()
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name));
     let old_pane = agent.as_ref().map(|a| a.pane_id.clone());
-    let panes = backend.pane_list(Some(&ws_id))?;
-    let anchor = old_pane
-        .as_ref()
-        .and_then(|old| {
-            panes
-                .iter()
-                .find(|p| &p.pane_id != old)
-                .map(|p| p.pane_id.clone())
-        })
-        .or_else(|| panes.first().map(|p| p.pane_id.clone()))
-        .ok_or_else(|| anyhow!("no pane in {project} to split for respawn"))?;
-    let new_pane = backend.pane_split(&anchor, "down", Some(&utf8_path(&dir, "workspace dir")?))?;
-    if let Some(old) = &old_pane {
-        // trait has no pane_close default; herdr Client has no typed helper —
-        // best-effort close via the concrete client only when we have one.
-        if let Ok(mut c) = Client::connect(Some(&cfg.socket_path())) {
-            let _ = c.call("pane.close", json!({ "pane_id": old }));
+    // bd-ude8: omp must restart in the SAME pane — a fresh split is
+    // unnecessary and `pane.close` on the old pane (PTY stdin EOF) kills
+    // the respawned omp before it boots. Other kinds keep split+close.
+    let same_pane = kind == "omp";
+    let new_pane = if same_pane {
+        old_pane.clone().ok_or_else(|| {
+            anyhow!("omp respawn for {name} in {project}: no live pane to restart in")
+        })?
+    } else {
+        let panes = backend.pane_list(Some(&ws_id))?;
+        let anchor = old_pane
+            .as_ref()
+            .and_then(|old| {
+                panes
+                    .iter()
+                    .find(|p| &p.pane_id != old)
+                    .map(|p| p.pane_id.clone())
+            })
+            .or_else(|| panes.first().map(|p| p.pane_id.clone()))
+            .ok_or_else(|| anyhow!("no pane in {project} to split for respawn"))?;
+        let pane =
+            backend.pane_split(&anchor, "down", Some(&utf8_path(&dir, "workspace dir")?))?;
+        // best-effort close of the dead pane via the backend trait (herdr
+        // implements it with the same `pane.close` RPC).
+        if let Some(old) = &old_pane {
+            let _ = backend.pane_close(old);
         }
-    }
-    let fresh = start_agent_with_retry_dyn(&*backend, name, kind, &new_pane.pane_id, &[])?;
+        pane.pane_id
+    };
+    // bd-ude8: re-inject the profile's model/effort/role launch args on
+    // respawn — the old `&[]` argv made the respawned agent fall back to
+    // harness defaults (and omp-in-herdr got no flags at all).
+    let args = respawn_launch_args(cfg, project, name, kind);
+    let fresh = start_agent_with_retry_dyn(backend, name, kind, &new_pane, &args)?;
     // pane-identity bridge bookkeeping (best-effort — never fail the respawn
-    // on mail trouble): the old pane died (its identity file is stale), the
-    // fresh pane must resolve to the same name (the agent keeps its identity)
-    if let Ok(mail) = backend::mail_backend(cfg)
+    // on mail trouble): a same-pane respawn keeps its identity (the pane
+    // never died); the split path clears the dead pane's stale identity and
+    // pins the fresh pane to the same name (the agent keeps its identity)
+    if !same_pane
+        && let Ok(mail) = backend::mail_backend(cfg)
         && let Some(key) = dir.to_str()
     {
         if let Some(old) = &old_pane
@@ -14916,6 +15213,32 @@ fn cmd_internal_respawn(
         fresh.pane_id
     );
     Ok(())
+}
+
+/// bd-ude8: respawn argv = the agent's registry-pinned profile launch args
+/// (bd-eign.9 / bd-l2ky parity — the SAME args as the original spawn, never
+/// an empty list for a profiled agent). No registry entry, or an entry
+/// without a profile (legacy) → empty argv (plain swarm agents keep harness
+/// defaults — unchanged). Never fails the respawn on catalog trouble.
+fn respawn_launch_args(cfg: &Config, project: &str, name: &str, kind: &str) -> Vec<String> {
+    let Ok(key) = project_dir_str(cfg, project) else {
+        return Vec::new();
+    };
+    let profile_name = match state::load_spawn_registry(&key)
+        .into_iter()
+        .find(|e| e.name == name)
+        .and_then(|e| e.profile)
+    {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let Ok(catalog) = profile::ProfileCatalog::load() else {
+        return Vec::new();
+    };
+    catalog
+        .get(&profile_name)
+        .map(|p| profile_launch_args(kind, p))
+        .unwrap_or_default()
 }
 
 /// internal leaf (ADR-0010 Spec E, P10.1): run one prompt headlessly through
