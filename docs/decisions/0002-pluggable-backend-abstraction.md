@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | Proposed |
+| **Status** | Accepted (2026-08-13; implemented; captain audit flipped Proposed → Accepted) |
 | **Date** | 2026-08-05 |
 | **Decision Maker** | Captain (bangedorrunt) |
 | **Relates to** | ADR-0001 (collaboration spine — its beads target these traits), toron ADR-0003 (the future embedded core), superlogical.com (future multiplexer) |
