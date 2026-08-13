@@ -74,6 +74,40 @@ fn collab_recipes_are_wired_into_the_cli() {
     assert!(catalog.is_file(), "docs/collab/recipes.md missing");
 }
 
+/// bd-eign.14: feature logic must be REACHABLE from the CLI — the flags that
+/// gate spawn settle, profile-driven spawns, and send stall-respawn appear in
+/// --help. Guards the failure mode this bead exists for: logic present and
+/// unit-tested, flag never wired (cargo test + clippy both green regardless).
+#[test]
+fn cli_surface_exposes_gated_features() {
+    let exe = flywheel();
+
+    let spawn_help = String::from_utf8_lossy(
+        &Command::new(exe)
+            .args(["spawn", "--help"])
+            .output()
+            .expect("spawn --help")
+            .stdout,
+    )
+    .to_string();
+    for flag in ["--settle-secs", "--profile", "--count"] {
+        assert!(spawn_help.contains(flag), "spawn --help must expose {flag}");
+    }
+
+    let send_help = String::from_utf8_lossy(
+        &Command::new(exe)
+            .args(["send", "--help"])
+            .output()
+            .expect("send --help")
+            .stdout,
+    )
+    .to_string();
+    assert!(
+        send_help.contains("--respawn-on-stall"),
+        "send --help must expose --respawn-on-stall"
+    );
+}
+
 /// Pure xproj parse path (no infra) — dual-project e2e unit layer.
 #[test]
 fn xproj_parse_contract_for_receiver_loop() {

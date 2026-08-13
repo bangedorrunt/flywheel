@@ -1047,8 +1047,8 @@ impl Mail {
                 let rows = block_on(mailbox().active_reservations(project_key))?;
                 let reservations: Vec<Value> = rows
                     .into_iter()
-                    .filter(|r| holder.map_or(true, |h| r.agent_name == h))
-                    .filter(|r| path.map_or(true, |p| overlaps(&r.path_pattern, p)))
+                    .filter(|r| holder.is_none_or(|h| r.agent_name == h))
+                    .filter(|r| path.is_none_or(|p| overlaps(&r.path_pattern, p)))
                     .map(|r| {
                         json!({
                             "id": r.id,
