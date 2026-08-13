@@ -20,11 +20,6 @@
 //! they bridge flywheel's own herdr panes, which only the local process sees.
 //!
 //! Known limitations (reported, not papered over):
-//! - the in-process mailbox is per-process by default: state does not survive
-//!   separate flywheel invocations unless `TORON_DATA_DIR` (or the
-//!   `TORON_MCP_DATA_DIR` alias) is set — the explicit durable root
-//!   (se2.1 Phase A; Phase B makes `$XDG_DATA_HOME/toron` the default, gated
-//!   on toron R2.0 KDF);
 //! - toron message ids are hex event ids, not u64 sequence numbers;
 //! - `ensure_product` needs an operator key; `demo_mailbox` has none.
 //!
@@ -58,8 +53,9 @@ static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
 /// (ADR-0003 Decision 3A). Mirrors `toron_mcp::demo_mailbox` (InProcessBus +
 /// SQLite index) but WITH an operator key, so write paths (`ensure_project`,
 /// send, register) work — the demo mailbox is operator-less and would reject
-/// every `ensure_project` on first use. Root dirs honor `TORON_DATA_DIR` /
-/// `TORON_MCP_DATA_DIR` when set (se2.1 Phase A).
+/// every `ensure_project` on first use. Root dirs follow the durable D3
+/// resolution (bd-t9ey): `$XDG_DATA_HOME/toron` / `~/.local/share/toron` by
+/// default, `TORON_DATA_DIR` / `TORON_MCP_DATA_DIR` override.
 static MAILBOX: OnceLock<Result<toron_core::mailbox::Mailbox, String>> = OnceLock::new();
 
 fn runtime() -> Result<&'static Runtime> {
@@ -98,25 +94,44 @@ fn mailbox() -> &'static toron_core::mailbox::Mailbox {
     }
 }
 
-/// Root dirs for the in-process mailbox (se2.1 Phase A): `TORON_DATA_DIR`
-/// (or the `TORON_MCP_DATA_DIR` alias) when set — explicit durable root for
-/// tests/prod, with the SQLite index beside it. Default stays per-invocation
-/// temp until Phase B flips it to `$XDG_DATA_HOME/toron` (gated on toron
-/// R2.0 KDF). Returns (data_dir, sqlite db path).
+/// Root dirs for the in-process mailbox (se2.1 Phase B, bd-t9ey): the
+/// durable D3 root via `toron_core::config::resolve_data_root` (ADR-0007
+/// D3) — `TORON_DATA_DIR` > `$XDG_DATA_HOME/toron` > `~/.local/share/toron`
+/// > relative `toron-data`. NEVER a per-pid temp root: separate flywheel
+/// invocations share one durable mailbox. The `TORON_MCP_DATA_DIR` alias
+/// stays as the explicit demo/test isolation override. The SQLite index
+/// lives at the root. Returns (data_dir, sqlite db path).
 fn mailbox_roots() -> (PathBuf, PathBuf) {
-    for var in ["TORON_DATA_DIR", "TORON_MCP_DATA_DIR"] {
-        if let Ok(dir) = std::env::var(var) {
-            let dir = dir.trim();
-            if !dir.is_empty() {
-                let root = PathBuf::from(dir);
-                return (root.clone(), root.join("flywheel-mail.sqlite"));
-            }
-        }
+    // `TORON_DATA_DIR` wins (blank counts as unset — flywheel's old trim
+    // semantics); `TORON_MCP_DATA_DIR` is the demo/test isolation alias;
+    // otherwise the durable D3 default via resolve_data_root.
+    let toron_data_dir = std::env::var("TORON_DATA_DIR")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    if toron_data_dir.is_none()
+        && let Ok(dir) = std::env::var("TORON_MCP_DATA_DIR")
+        && !dir.trim().is_empty()
+    {
+        let root = PathBuf::from(dir.trim());
+        return (root.clone(), root.join("flywheel-mail.sqlite"));
     }
-    (
-        std::env::temp_dir().join("flywheel-mail"),
-        std::env::temp_dir().join(format!("flywheel-mail-{}.sqlite", std::process::id())),
-    )
+    let env = toron_core::config::DataRootEnv {
+        toron_data_dir,
+        xdg_data_home: env_non_empty_os("XDG_DATA_HOME"),
+        home: env_non_empty_os("HOME"),
+    };
+    let root = toron_core::config::resolve_data_root(&env);
+    (root.clone(), root.join("flywheel-mail.sqlite"))
+}
+
+/// Mirror of toron's `env_non_empty` for the ambient os-string vars: empty
+/// counts as unset, so `resolve_data_root` never sees a blank root.
+fn env_non_empty_os(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 async fn build_mailbox() -> anyhow::Result<toron_core::mailbox::Mailbox> {
@@ -1859,8 +1874,11 @@ mod tests {
         );
     }
 
-    /// se2.1 Phase A: `TORON_DATA_DIR` (and the `TORON_MCP_DATA_DIR` alias)
-    /// override the per-invocation temp default; unset/blank → temp.
+    /// se2.1 Phase B (bd-t9ey): the default root is DURABLE and XDG-based —
+    /// `$XDG_DATA_HOME/toron` / `~/.local/share/toron` via
+    /// `toron_core::config::resolve_data_root` (ADR-0007 D3) — NEVER a
+    /// per-pid temp `flywheel-mail-{pid}.sqlite`. `TORON_DATA_DIR` still
+    /// wins; `TORON_MCP_DATA_DIR` stays the demo/test isolation alias.
     #[test]
     fn mailbox_roots_env_and_default() {
         // Env mutation is process-global — serialize under the crate-wide
@@ -1869,6 +1887,7 @@ mod tests {
         let _g = crate::config::lock_env();
         unsafe { std::env::set_var("TORON_DATA_DIR", "/tmp/flywheel-se2.1-durable") };
         unsafe { std::env::set_var("TORON_MCP_DATA_DIR", "/tmp/flywheel-se2.1-mcp") };
+        unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/flywheel-se2.1-xdg") };
         let (data_dir, db) = mailbox_roots();
         assert_eq!(data_dir, PathBuf::from("/tmp/flywheel-se2.1-durable"));
         assert_eq!(
@@ -1892,11 +1911,28 @@ mod tests {
         unsafe { std::env::remove_var("TORON_DATA_DIR") };
         unsafe { std::env::remove_var("TORON_MCP_DATA_DIR") };
         let (data_dir, db) = mailbox_roots();
-        assert_eq!(data_dir, std::env::temp_dir().join("flywheel-mail"));
+        assert_eq!(data_dir, PathBuf::from("/tmp/flywheel-se2.1-xdg/toron"));
         assert_eq!(
             db,
-            std::env::temp_dir().join(format!("flywheel-mail-{}.sqlite", std::process::id()))
+            PathBuf::from("/tmp/flywheel-se2.1-xdg/toron/flywheel-mail.sqlite")
         );
+        assert!(
+            !db.to_string_lossy()
+                .contains(&format!("flywheel-mail-{}", std::process::id())),
+            "no pid-scoped sqlite"
+        );
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        unsafe { std::env::set_var("HOME", "/tmp/flywheel-se2.1-home") };
+        let (data_dir, _) = mailbox_roots();
+        assert_eq!(data_dir, PathBuf::from("/tmp/flywheel-se2.1-home/.local/share/toron"));
+        unsafe { std::env::remove_var("HOME") };
+        let (data_dir, db) = mailbox_roots();
+        assert_eq!(
+            data_dir,
+            PathBuf::from("toron-data"),
+            "no env at all → D3 relative fallback, never temp"
+        );
+        assert_eq!(db, PathBuf::from("toron-data/flywheel-mail.sqlite"));
     }
 
     /// se2.2: toron reservation ids are hex event ids — `list_own_reservations`

@@ -3496,6 +3496,265 @@ mod spawn_profile_plan_tests {
 }
 
 #[cfg(test)]
+mod profile_run_spawn_tests {
+    use super::*;
+    use crate::config::lock_env;
+
+    fn profile(harness: &str, model: &str) -> profile::Profile {
+        profile::Profile {
+            harness: harness.into(),
+            model: model.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Hermetic cfg: temp workspace root; the state dir must be isolated via
+    /// XDG_STATE_HOME (state::state_dir honors it — config.rs 193.2), and
+    /// the env lock serializes against other env-mutating tests.
+    fn hermetic() -> (Config, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let state_home = dir.path().join("state");
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+        let cfg = Config {
+            workspace_root: Some(dir.path().join("ws").to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        (cfg, dir)
+    }
+
+    #[test]
+    fn profile_run_launch_args_non_empty_for_known_profile() {
+        // bd-l2ky: `profile run coder` must launch with the SAME args as
+        // `spawn --profile coder` — model + effort, never an empty arg list.
+        let mut coder = profile("omp", "glm-5.2");
+        coder.effort = "max".into();
+        let args = profile_launch_args("omp", &coder);
+        assert!(!args.is_empty(), "known profile must inject model/effort args");
+        assert!(
+            args.iter().any(|a| a.contains("glm-5.2")),
+            "model flag present: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.contains("max")),
+            "effort flag present: {args:?}"
+        );
+    }
+
+    /// bd-ude8: `resolved_spec_workspace` must return a PANE id — `profile
+    /// run`/`squad spawn` hand it to `agent_start` as the pane, and herdr
+    /// rejects a workspace id with `agent_pane_not_found`.
+    #[test]
+    fn resolved_spec_workspace_returns_pane_id() {
+        use crate::backend::MultiplexerBackend;
+        use crate::herdr_shim::{PaneInfo, WorkspaceInfo};
+        use toron_core::backend::types::AgentStatus;
+
+        struct MockMux {
+            ws: Vec<WorkspaceInfo>,
+            panes: Vec<PaneInfo>,
+            created: Vec<String>,
+        }
+        impl MultiplexerBackend for MockMux {
+            fn name(&self) -> &'static str {
+                "mock-mux"
+            }
+            fn workspace_list(
+                &self,
+            ) -> Result<Vec<WorkspaceInfo>, toron_core::backend::BackendError> {
+                Ok(self.ws.clone())
+            }
+            fn workspace_create(
+                &self,
+                _label: Option<&str>,
+            ) -> Result<WorkspaceInfo, toron_core::backend::BackendError> {
+                let id = "ws-1".to_string();
+                Ok(WorkspaceInfo {
+                    workspace_id: id,
+                    number: 1,
+                    label: "mock".into(),
+                    focused: false,
+                    pane_count: 1,
+                    tab_count: 1,
+                    active_tab_id: "t1".into(),
+                    agent_status: AgentStatus::Idle,
+                    cwd: None,
+                })
+            }
+            fn pane_list(
+                &self,
+                workspace_id: Option<&str>,
+            ) -> Result<Vec<PaneInfo>, toron_core::backend::BackendError> {
+                let ws = workspace_id.unwrap_or_default();
+                Ok(self
+                    .panes
+                    .iter()
+                    .filter(|p| p.workspace_id == ws)
+                    .cloned()
+                    .collect())
+            }
+        }
+        fn pane(ws: &str, n: u32) -> PaneInfo {
+            PaneInfo {
+                pane_id: format!("{ws}:p{n}"),
+                terminal_id: format!("term-{n}"),
+                workspace_id: ws.into(),
+                tab_id: format!("{ws}:t1"),
+                focused: false,
+                agent_status: AgentStatus::Idle,
+                revision: 0,
+                title: None,
+                cwd: None,
+                agent: None,
+                agent_session: None,
+                display_agent: None,
+                foreground_cwd: None,
+                label: None,
+                scroll: None,
+                state_labels: serde_json::Map::new(),
+                terminal_title: None,
+                terminal_title_stripped: None,
+                tokens: serde_json::Map::new(),
+            }
+        }
+        let _g = lock_env();
+        let (cfg, _dir) = hermetic();
+
+        // existing workspace -> first PANE of it, not the workspace id
+        let mux = MockMux {
+            ws: vec![WorkspaceInfo {
+                workspace_id: "wA".into(),
+                number: 1,
+                label: "proj".into(),
+                focused: false,
+                pane_count: 1,
+                tab_count: 1,
+                active_tab_id: "wA:t1".into(),
+                agent_status: AgentStatus::Idle,
+                cwd: None,
+            }],
+            panes: vec![pane("wA", 1)],
+            created: Vec::new(),
+        };
+        let got = resolved_spec_workspace(&cfg, &mux, "omp").expect("resolves");
+        assert_eq!(got, "wA:p1", "must return a pane id, not workspace id");
+
+        // no workspace -> create one and return its root pane
+        let mux2 = MockMux {
+            ws: vec![],
+            panes: vec![pane("ws-1", 1)],
+            created: vec!["ws-1".into()],
+        };
+        let got2 = resolved_spec_workspace(&cfg, &mux2, "omp").expect("resolves");
+        assert_eq!(got2, "ws-1:p1", "created workspace's root pane");
+    }
+
+    #[test]
+    fn record_spawn_entry_records_profile_for_conditioning() {
+        // bd-l2ky: after `profile run` / `squad spawn`, __send --profile and
+        // the loop must resolve the agent's profile from the spawn registry.
+        let _g = lock_env();
+        let (cfg, _dir) = hermetic();
+        let entry = state::SpawnEntry::profiled(
+            "w1:p1",
+            "profile-coder",
+            "coder",
+            "omp",
+            Some("loud-lion".into()),
+        );
+        record_spawn_entry(&cfg, "flywheel", entry);
+        let key = project_dir_str(&cfg, "flywheel").expect("key");
+        let registry = state::load_spawn_registry(&key);
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry[0].name, "profile-coder");
+        assert_eq!(registry[0].profile.as_deref(), Some("coder"));
+        assert_eq!(registry[0].harness.as_deref(), Some("omp"));
+    }
+
+    #[test]
+    fn record_spawn_entry_preserves_others_and_replaces_same_name() {
+        // bd-l2ky: the merge must not clobber unrelated agents (a squad
+        // spawn appends per member); a re-spawn of the same name replaces
+        // its own row only.
+        let _g = lock_env();
+        let (cfg, _dir) = hermetic();
+        record_spawn_entry(
+            &cfg,
+            "flywheel",
+            state::SpawnEntry::profiled("w1:p1", "profile-coder", "coder", "omp", None),
+        );
+        record_spawn_entry(
+            &cfg,
+            "flywheel",
+            state::SpawnEntry::profiled("w1:p2", "profile-planner", "planner", "omp", None),
+        );
+        record_spawn_entry(
+            &cfg,
+            "flywheel",
+            state::SpawnEntry::profiled("w1:p9", "profile-coder", "coder", "omp", None),
+        );
+        let key = project_dir_str(&cfg, "flywheel").expect("key");
+        let registry = state::load_spawn_registry(&key);
+        assert_eq!(registry.len(), 2, "coder row replaced, planner preserved");
+        let coder = registry
+            .iter()
+            .find(|e| e.name == "profile-coder")
+            .expect("coder row present");
+        assert_eq!(coder.pane_id, "w1:p9", "re-spawn replaces the same-name row");
+        assert_eq!(coder.profile.as_deref(), Some("coder"));
+        assert!(
+            registry.iter().any(|e| e.name == "profile-planner"),
+            "unrelated rows preserved"
+        );
+    }
+}
+
+#[cfg(test)]
+mod profile_workflow_invoke_tests {
+    use super::*;
+
+    /// bd-6zsl: `profile run --workflow` must ATTEMPT a real run — the
+    /// invoke command is a pane-mode Run with --execute against the spawned
+    /// agent's workspace (--reuse, never reaped), not a "not yet wired"
+    /// message.
+    #[test]
+    fn invoke_attempts_pane_run_in_spawned_workspace() {
+        let cmd = profile_workflow_invoke("weekly-review", Some("{\"goal\":\"x\"}"), "ws-1");
+        let WorkflowCmd::Run {
+            name,
+            inputs,
+            execute,
+            mode,
+            project,
+            reuse,
+            ..
+        } = cmd
+        else {
+            panic!("expected a Run command");
+        };
+        assert_eq!(name, "weekly-review");
+        assert_eq!(inputs.as_deref(), Some("{\"goal\":\"x\"}"));
+        assert!(execute, "invoke must execute, not record");
+        assert_eq!(mode, "pane");
+        assert_eq!(project.as_deref(), Some("flywheel"));
+        assert_eq!(reuse.as_deref(), Some("ws-1"));
+    }
+
+    /// No inputs → the workflow runs with the engine default ({}).
+    #[test]
+    fn invoke_without_inputs_runs_default() {
+        let cmd = profile_workflow_invoke("plan", None, "ws-1");
+        let WorkflowCmd::Run {
+            inputs, execute, ..
+        } = cmd
+        else {
+            panic!("expected a Run command");
+        };
+        assert!(inputs.is_none());
+        assert!(execute);
+    }
+}
+
+#[cfg(test)]
 mod workspace_origin_tests {
     use super::*;
     use crate::herdr_shim::{AgentInfo, WorkspaceInfo};
@@ -9127,6 +9386,11 @@ const PROMPT_WORKFLOWS: &[(&str, &str, &str)] = &[
         "triage-deep",
         "Run the triage-deep workflow — bv robot-triage, prioritize + assign, spawn the crew.",
     ),
+    (
+        "captain-audit",
+        "captain-audit",
+        "Run the captain-audit workflow — read-only analysis: scout gathers evidence, oracle synthesizes, reviewer challenges; the report is written to report_path.",
+    ),
 ];
 
 /// Per-workflow command template: `{{TOOL_FRONTMATTER}}` + the workflow
@@ -9140,6 +9404,9 @@ fn prompt_workflow_template(name: &str) -> Option<&'static str> {
         "brainstorm" => Some(include_str!("../integrations/prompts/workflow-brainstorm.md.tpl")),
         "onboard" => Some(include_str!("../integrations/prompts/workflow-onboard.md.tpl")),
         "triage" => Some(include_str!("../integrations/prompts/workflow-triage.md.tpl")),
+        "captain-audit" => {
+            Some(include_str!("../integrations/prompts/workflow-captain-audit.md.tpl"))
+        }
         _ => None,
     }
 }
@@ -10166,19 +10433,48 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             // Spawn via the configured multiplexer backend (default herdr).
             let backend = backend::multiplexer_backend(cfg)?;
             let agent_name = format!("profile-{name}");
+            // bd-l2ky: launch with the profile's model/effort args — the
+            // same profile_launch_args as `spawn --profile` (bd-eign.9),
+            // never an empty arg list.
+            let profile = cat.get(name).expect("resolve validated the profile above");
+            let args = profile_launch_args(&spec.harness, profile);
             // Find a pane in the default project workspace, or create one.
             let workspace = resolved_spec_workspace(cfg, backend.as_ref(), &spec.harness)?;
-            let info = backend.agent_start(&agent_name, &spec.harness, &workspace, &[])?;
+            let info = backend.agent_start(&agent_name, &spec.harness, &workspace, &args)?;
             println!(
                 "profile {name} spawned: agent={} pane={} backend={}",
                 info.name.as_deref().unwrap_or(&agent_name),
                 info.pane_id,
                 spec.backend
             );
+            // bd-l2ky: record the profiled entry under the orchestrator's
+            // host project (host-scope spawn, debate convention) so the
+            // loop's `__send --profile` / conditioning resolves this agent.
+            let host_project = "flywheel";
+            let mail_identity = register_spawned_agent(
+                cfg,
+                host_project,
+                &agent_name,
+                &spec.harness,
+                &info.pane_id,
+            );
+            record_spawn_entry(
+                cfg,
+                host_project,
+                state::SpawnEntry::profiled(
+                    &info.pane_id,
+                    &agent_name,
+                    name,
+                    &spec.harness,
+                    mail_identity,
+                ),
+            );
             if let Some(wf) = workflow {
-                println!(
-                    "workflow {wf} invoke not yet wired (P3 edge) — spawned agent is ready for manual dispatch"
-                );
+                // bd-6zsl: invoke the workflow against the spawned agent —
+                // pane mode, --reuse the agent's workspace (same panes, the
+                // crew lands beside the profile agent; never reaped).
+                let invoke = profile_workflow_invoke(&wf, inputs.as_deref(), &workspace);
+                cmd_workflow(cfg, &invoke)?;
             }
         }
         ProfileCmd::Remove { name } => {
@@ -10834,16 +11130,46 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
                 std::env::var("TORON_OPERATOR_NPUB").unwrap_or_else(|_| "operator".to_string());
             let backend = backend::multiplexer_backend(cfg)?;
             let mut spawned: Vec<Value> = Vec::new();
+            // Registry key for the spawn entries: the squad's project, else
+            // the orchestrator's host project (host-scope, debate convention).
+            let project_key = project.as_deref().unwrap_or("flywheel");
             for (profile_name, n) in squad.members() {
                 let resolved =
                     cat.resolve(profile_name, project.as_deref(), &operator_npub, &|_, _| {
                         None
                     })?;
                 let spec = &resolved.spec;
+                // bd-l2ky: launch with the member profile's model/effort args
+                // — the same profile_launch_args as `spawn --profile`
+                // (bd-eign.9), never an empty arg list.
+                let profile = cat
+                    .get(profile_name)
+                    .expect("resolve validated the profile above");
                 for i in 0..n {
                     let agent_name = format!("squad-{name}-{profile_name}-{}", i + 1);
                     let workspace = resolved_spec_workspace(cfg, backend.as_ref(), &spec.harness)?;
-                    let info = backend.agent_start(&agent_name, &spec.harness, &workspace, &[])?;
+                    let args = profile_launch_args(&spec.harness, profile);
+                    let info = backend.agent_start(&agent_name, &spec.harness, &workspace, &args)?;
+                    // bd-l2ky: record the profiled entry so __send --profile
+                    // and loop conditioning resolve this member.
+                    let mail_identity = register_spawned_agent(
+                        cfg,
+                        project_key,
+                        &agent_name,
+                        &spec.harness,
+                        &info.pane_id,
+                    );
+                    record_spawn_entry(
+                        cfg,
+                        project_key,
+                        state::SpawnEntry::profiled(
+                            &info.pane_id,
+                            &agent_name,
+                            profile_name,
+                            &spec.harness,
+                            mail_identity,
+                        ),
+                    );
                     spawned.push(json!({
                         "squad": name,
                         "profile": profile_name,
@@ -11308,6 +11634,56 @@ fn cmd_steer(
     cmd_workflow(cfg, &run)
 }
 
+/// `profile run --workflow` (bd-6zsl): the invoke command — run the named
+/// workflow in pane mode against the spawned agent's workspace (--reuse
+/// binds the crew into the SAME workspace; the caller's workspace is never
+/// reaped). Pane mode is the only fit: the profile agent is a live pane.
+fn profile_workflow_invoke(name: &str, inputs: Option<&str>, workspace: &str) -> WorkflowCmd {
+    WorkflowCmd::Run {
+        name: name.to_string(),
+        inputs: inputs.map(str::to_string),
+        crew: None,
+        execute: true,
+        mode: "pane".to_string(),
+        project: Some("flywheel".to_string()),
+        reuse: Some(workspace.to_string()),
+        retain: false,
+        retire_orphans: false,
+        json: false,
+    }
+}
+
+/// Planner arm (bd-u4cu): run the planner profile headlessly via the
+/// `__run-headless` leaf and return its response text (the authored workflow
+/// YAML). A failed leaf (`ok: false`) or a non-JSON/non-string leaf bails —
+/// a broken authoring never reaches the lint gate.
+fn planner_author_response(wf_name: &str, prompt: &str) -> Result<String> {
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.arg("__run-headless")
+        .arg("planner")
+        .arg(prompt)
+        .arg("--workflow")
+        .arg(wf_name)
+        .arg("--json");
+    let output = cmd
+        .output()
+        .with_context(|| "planner headless authoring run")?;
+    let raw = String::from_utf8_lossy(&output.stdout).to_string();
+    let v: Value = serde_json::from_str(raw.trim())
+        .map_err(|e| anyhow!("planner authoring leaf returned non-JSON: {e}"))?;
+    if v.get("ok").and_then(Value::as_bool) != Some(true) {
+        let err = v
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown leaf error");
+        bail!("planner authoring failed: {err}");
+    }
+    v.get("response")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("planner authoring leaf returned no response"))
+}
+
 fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
     use toron_workflow::schema::{Action, CrewSpec, Workflow};
     use toron_workflow::{Level, lint_workflow};
@@ -11689,28 +12065,53 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             json,
         } => {
             // bd-8xca deterministic arm: assemble from the parts spec.
-            // `--agent` (planner arm) is a follow-on headless authoring pass
-            // that REUSES this assembler's lint+run path; the deterministic
-            // assembly is the pure core (unit-tested in crew.rs).
-            if *agent {
+            // `--agent` (planner arm, bd-u4cu): a headless planner-profile
+            // run authors a Workflow YAML from the target + the workflow
+            // catalog; the authored workflow goes through the SAME lint→run
+            // path as the deterministic assembly. The arms are exclusive.
+            if *agent && (!parts.is_empty() || base.is_some()) {
                 bail!(
-                    "workflow compose --agent (planner-authored) is not yet wired — use the deterministic arm: --parts \"role:stage,workflow:name\""
+                    "workflow compose: choose one arm — --agent (planner-authored) or --parts/--base (deterministic)"
                 );
             }
-            if parts.is_empty() {
-                bail!("workflow compose needs --parts (role:stage or workflow:name)");
+            if !*agent && parts.is_empty() {
+                bail!("workflow compose needs --parts (role:stage or workflow:name) or --agent");
             }
             let all = all_workflows()?;
-            let base_wf = match base.as_deref() {
-                Some(b) => Some(resolve_workflow(b, &all)?.clone()),
-                None => None,
-            };
-            let mut parsed: Vec<crew::ComposePart> = Vec::new();
-            for token in parts {
-                parsed.push(crew::parse_compose_part(token).map_err(anyhow::Error::msg)?);
-            }
             let wf_name = format!("composed-{}", state::now_iso().replace([':', '-', '.'], ""));
-            let composed = crew::compose_workflow(&wf_name, target, base_wf.as_ref(), &parsed);
+            let composed = if *agent {
+                // Planner arm: author from the target + catalog (workflows,
+                // profiles, stages). The planner's response is the ONLY
+                // source of the workflow — a failed run or garbage YAML
+                // bails below (lint gate), never dispatching.
+                let wf_rows: Vec<(&str, &str)> = all
+                    .iter()
+                    .map(|(n, (w, _))| (n.as_str(), w.description.as_deref().unwrap_or("")))
+                    .collect();
+                let profile_names = profile::ProfileCatalog::load()?.names();
+                let profile_refs: Vec<&str> = profile_names.iter().map(String::as_str).collect();
+                let stage_lib = stages::StageLibrary::load()?;
+                let stage_rows = stage_lib.list();
+                let prompt = crew::planner_authoring_prompt(
+                    target,
+                    &wf_rows,
+                    &profile_refs,
+                    &stage_rows,
+                );
+                let response = planner_author_response(&wf_name, &prompt)?;
+                crew::parse_planner_workflow(&response, &wf_name)
+                    .map_err(|e| anyhow!("planner-authored workflow invalid: {e}"))?
+            } else {
+                let base_wf = match base.as_deref() {
+                    Some(b) => Some(resolve_workflow(b, &all)?.clone()),
+                    None => None,
+                };
+                let mut parsed: Vec<crew::ComposePart> = Vec::new();
+                for token in parts {
+                    parsed.push(crew::parse_compose_part(token).map_err(anyhow::Error::msg)?);
+                }
+                crew::compose_workflow(&wf_name, target, base_wf.as_ref(), &parsed)
+            };
 
             // Fail-stop gate: lint before run / emit.
             let blocking = lint_one(&wf_name, &composed);
@@ -12464,20 +12865,45 @@ fn is_builtin_profile(name: &str) -> bool {
     )
 }
 
-/// Resolve a pane id in the default project workspace for `profile run`:
-/// reuse the first workspace whose label matches a default project, else the
-/// first workspace, else create one.
+/// Resolve a pane id in the default project workspace for `profile run` /
+/// `squad spawn`: reuse the first workspace, else create one, then return a
+/// PANE id inside it — `agent_start` takes a pane id, never a workspace id
+/// (bd-ude8: herdr rejects a workspace id with `agent_pane_not_found`).
 fn resolved_spec_workspace(
     _cfg: &Config,
     backend: &dyn backend::MultiplexerBackend,
     _harness: &str,
 ) -> Result<String> {
-    let ws = backend.workspace_list()?;
-    if let Some(first) = ws.first() {
-        return Ok(first.workspace_id.clone());
+    let ws_id = match backend.workspace_list()?.first() {
+        Some(first) => first.workspace_id.clone(),
+        None => backend.workspace_create(None)?.workspace_id,
+    };
+    let panes = backend.pane_list(Some(&ws_id))?;
+    panes
+        .first()
+        .map(|p| p.pane_id.clone())
+        .ok_or_else(|| anyhow::anyhow!("no pane in workspace {ws_id} for profile spawn"))
+}
+
+/// Merge one entry into the project's spawn registry (bd-l2ky): preserve
+/// entries for other agents, replace the same name. Shared by `profile run`
+/// and `squad spawn` so `__send --profile` and loop conditioning resolve
+/// the agent's profile (bd-gsvn.1). Best-effort — a registry failure is not
+/// a spawn failure (cmd_spawn precedent).
+pub(crate) fn record_spawn_entry(cfg: &Config, project: &str, entry: state::SpawnEntry) {
+    let key = match project_dir_str(cfg, project) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("flywheel: cannot record spawn entry for {project}: {e:#}");
+            return;
+        }
+    };
+    let mut registry = state::load_spawn_registry(&key);
+    registry.retain(|e| e.name != entry.name);
+    registry.push(entry);
+    if let Err(e) = state::save_spawn_registry(&key, &registry) {
+        eprintln!("flywheel: cannot save spawn registry: {e:#}");
     }
-    let created = backend.workspace_create(None)?;
-    Ok(created.workspace_id)
 }
 
 /// On-disk shape of `profiles.toml` for the CLI writer.
@@ -15323,12 +15749,20 @@ mod integration_tests {
     /// triage) — the same rule as the builtin set. Behind-the-scenes
     /// workflows (cron, beads, goal) get no command templates.
     #[test]
-    fn workflow_command_set_is_the_popular_six() {
-        assert_eq!(PROMPT_WORKFLOWS.len(), 6, "exactly six workflow commands");
+    fn workflow_command_set_is_the_popular_workflows() {
+        assert_eq!(PROMPT_WORKFLOWS.len(), 7, "exactly seven workflow commands");
         let names: Vec<&str> = PROMPT_WORKFLOWS.iter().map(|(n, _, _)| *n).collect();
         assert_eq!(
             names,
-            ["debate", "plan", "plan-review", "brainstorm", "onboard", "triage"]
+            [
+                "debate",
+                "plan",
+                "plan-review",
+                "brainstorm",
+                "onboard",
+                "triage",
+                "captain-audit"
+            ]
         );
         for (name, target, description) in PROMPT_WORKFLOWS {
             assert!(
