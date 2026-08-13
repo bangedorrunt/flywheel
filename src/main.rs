@@ -300,6 +300,10 @@ enum Commands {
         /// skip the confirmation prompt
         #[arg(long)]
         force: bool,
+        /// required when any agent is still `working` (cargo test / long
+        /// jobs routinely exceed 15m — a plain --force used to reap them)
+        #[arg(long)]
+        force_working: bool,
     },
     /// Work-graph surfaces (bv/br pass-through)
     Work {
@@ -2306,27 +2310,35 @@ fn agent_ordinal(name: &str, project: &str, short: &str) -> Option<u32> {
 }
 
 /// Resolve a herdr workspace for a project by label; error if missing.
+/// Labels that resolve `project` for status/send/kill: default swarm
+/// label, spawn-meta custom label, the raw token, and its slug.
+/// Captains pass `--label flywheel-omp-repro` then `status flywheel-omp-repro`
+/// — that must hit, not only `flywheel-<dir>`.
+fn workspace_label_aliases(project: &str, spawn_meta: Option<&str>) -> Vec<String> {
+    let mut out = vec![swarm_label(project)];
+    if let Some(meta) = spawn_meta
+        && !out.iter().any(|l| l == meta)
+    {
+        out.push(meta.to_string());
+    }
+    if !out.iter().any(|l| l == project) {
+        out.push(project.to_string());
+    }
+    let (slug, _) = slugify_label(project);
+    if !slug.is_empty() && !out.iter().any(|l| l == &slug) {
+        out.push(slug);
+    }
+    out
+}
+
 fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
-    let label = swarm_label(project);
+    let aliases = workspace_label_aliases(project, state::load_spawn_meta(project).as_deref());
     let matches: Vec<herdr_shim::WorkspaceInfo> = c
         .workspace_list()?
         .into_iter()
-        .filter(|ws| ws.label == label)
+        .filter(|ws| aliases.iter().any(|a| a == &ws.label))
         .collect();
     if matches.is_empty() {
-        // bd-vik: a custom --label detaches the workspace from the default
-        // `flywheel-<base>` label — resolve through the spawn metadata so
-        // project-based commands (send/status/kill/loop) still find it.
-        if let Some(meta_label) = state::load_spawn_meta(project) {
-            let m2: Vec<herdr_shim::WorkspaceInfo> = c
-                .workspace_list()?
-                .into_iter()
-                .filter(|ws| ws.label == meta_label)
-                .collect();
-            if !m2.is_empty() {
-                return Ok(m2[0].workspace_id.clone());
-            }
-        }
         bail!("no flywheel swarm for {project} (run: flywheel spawn {project})")
     }
     // duplicate labels (a stale workspace from a dropped agent vs the live
@@ -2395,25 +2407,13 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
 /// them is churn with no payoff until superlogical ships). The two overloads
 /// share the helper bodies via macros-free duplication (small, narrow).
 fn find_workspace_dyn(backend: &dyn backend::MultiplexerBackend, project: &str) -> Result<String> {
-    let label = swarm_label(project);
+    let aliases = workspace_label_aliases(project, state::load_spawn_meta(project).as_deref());
     let matches: Vec<herdr_shim::WorkspaceInfo> = backend
         .workspace_list()?
         .into_iter()
-        .filter(|ws| ws.label == label)
+        .filter(|ws| aliases.iter().any(|a| a == &ws.label))
         .collect();
     if matches.is_empty() {
-        // bd-vik: custom --label detaches the workspace from the default
-        // `flywheel-<base>` label — resolve through the spawn metadata.
-        if let Some(meta_label) = state::load_spawn_meta(project) {
-            let m2: Vec<herdr_shim::WorkspaceInfo> = backend
-                .workspace_list()?
-                .into_iter()
-                .filter(|ws| ws.label == meta_label)
-                .collect();
-            if !m2.is_empty() {
-                return Ok(m2[0].workspace_id.clone());
-            }
-        }
         bail!("no flywheel swarm for {project} (run: flywheel spawn {project})")
     }
     if matches.len() > 1 {
@@ -2779,7 +2779,11 @@ fn main() {
         },
         Some(Commands::Zoom { project, to, off }) => cmd_zoom(&cfg, project, to, *off),
         Some(Commands::Attach { project, to }) => cmd_attach(&cfg, project, to),
-        Some(Commands::Kill { project, force }) => cmd_kill(&cfg, project, *force),
+        Some(Commands::Kill {
+            project,
+            force,
+            force_working,
+        }) => cmd_kill(&cfg, project, *force, *force_working),
         Some(Commands::Work { cmd }) => cmd_work(&cfg, cmd),
         Some(Commands::Assign {
             project,
@@ -3718,7 +3722,12 @@ mod profile_workflow_invoke_tests {
     /// message.
     #[test]
     fn invoke_attempts_pane_run_in_spawned_workspace() {
-        let cmd = profile_workflow_invoke("weekly-review", Some("{\"goal\":\"x\"}"), "ws-1");
+        let cmd = profile_workflow_invoke(
+            "weekly-review",
+            Some("{\"goal\":\"x\"}"),
+            "ws-1",
+            "toron",
+        );
         let WorkflowCmd::Run {
             name,
             inputs,
@@ -3735,14 +3744,14 @@ mod profile_workflow_invoke_tests {
         assert_eq!(inputs.as_deref(), Some("{\"goal\":\"x\"}"));
         assert!(execute, "invoke must execute, not record");
         assert_eq!(mode, "pane");
-        assert_eq!(project.as_deref(), Some("flywheel"));
+        assert_eq!(project.as_deref(), Some("toron"));
         assert_eq!(reuse.as_deref(), Some("ws-1"));
     }
 
     /// No inputs → the workflow runs with the engine default ({}).
     #[test]
     fn invoke_without_inputs_runs_default() {
-        let cmd = profile_workflow_invoke("plan", None, "ws-1");
+        let cmd = profile_workflow_invoke("plan", None, "ws-1", "toron");
         let WorkflowCmd::Run {
             inputs, execute, ..
         } = cmd
@@ -3751,6 +3760,66 @@ mod profile_workflow_invoke_tests {
         };
         assert!(inputs.is_none());
         assert!(execute);
+    }
+}
+
+#[cfg(test)]
+mod steer_safety_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_label_aliases_include_raw_label_and_slug() {
+        let aliases = workspace_label_aliases("flywheel-omp-repro", None);
+        assert!(
+            aliases.iter().any(|a| a == "flywheel-omp-repro"),
+            "raw token must resolve: {aliases:?}"
+        );
+        assert!(
+            aliases.iter().any(|a| a == "flywheel-flywheel-omp-repro"
+                || a.starts_with("flywheel-")),
+            "default swarm label present: {aliases:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_label_aliases_include_spawn_meta() {
+        let aliases = workspace_label_aliases("flywheel", Some("captain-audit"));
+        assert!(
+            aliases.iter().any(|a| a == "captain-audit"),
+            "custom --label must resolve: {aliases:?}"
+        );
+    }
+
+    #[test]
+    fn working_agent_names_only_working() {
+        use crate::herdr_shim::{AgentInfo, AgentStatus};
+        fn agent(name: &str, status: AgentStatus) -> AgentInfo {
+            AgentInfo {
+                agent: None,
+                agent_status: status,
+                cwd: None,
+                display_agent: None,
+                focused: false,
+                foreground_cwd: None,
+                interactive_ready: true,
+                launch_pending: false,
+                name: Some(name.into()),
+                pane_id: format!("p-{name}"),
+                revision: 0,
+                state_change_seq: 0,
+                state_labels: serde_json::Map::new(),
+                tab_id: "t".into(),
+                terminal_id: "term".into(),
+                terminal_title: None,
+                workspace_id: "w".into(),
+            }
+        }
+        let names = working_agent_names(&[
+            agent("oc", AgentStatus::Working),
+            agent("oc2", AgentStatus::Idle),
+            agent("oc3", AgentStatus::Done),
+        ]);
+        assert_eq!(names, vec!["oc".to_string()]);
     }
 }
 
@@ -6352,7 +6421,21 @@ fn cmd_attach(cfg: &Config, project: &str, to: &str) -> Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-fn cmd_kill(cfg: &Config, project: &str, force: bool) -> Result<()> {
+/// Names of agents still in `working`. Kill must not reap these unless
+/// `--force-working` — cargo test routinely exceeds 15m.
+fn working_agent_names(agents: &[AgentInfo]) -> Vec<String> {
+    agents
+        .iter()
+        .filter(|a| a.agent_status == herdr_shim::AgentStatus::Working)
+        .map(|a| {
+            a.name
+                .clone()
+                .unwrap_or_else(|| a.pane_id.clone())
+        })
+        .collect()
+}
+
+fn cmd_kill(cfg: &Config, project: &str, force: bool, force_working: bool) -> Result<()> {
     if !force {
         if std::io::stdin().is_terminal() {
             eprintln!("close swarm for {project}? [y/N] ");
@@ -6378,6 +6461,14 @@ fn cmd_kill(cfg: &Config, project: &str, force: bool) -> Result<()> {
         .into_iter()
         .filter(|a| a.workspace_id == ws_id)
         .collect();
+    let working = working_agent_names(&agents);
+    if !working.is_empty() && !force_working {
+        bail!(
+            "refuse kill: {} agent(s) still working ({}). Long jobs (cargo test) often exceed 15m. Pass --force-working to reap anyway.",
+            working.len(),
+            working.join(", ")
+        );
+    }
     c.workspace_close(&ws_id)?;
     // tidy-up: drop the project's agent state files (stale context signals
     // must not survive into the next spawn — freshness only protects so much)
@@ -10473,7 +10564,12 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 // bd-6zsl: invoke the workflow against the spawned agent —
                 // pane mode, --reuse the agent's workspace (same panes, the
                 // crew lands beside the profile agent; never reaped).
-                let invoke = profile_workflow_invoke(&wf, inputs.as_deref(), &workspace);
+                let invoke = profile_workflow_invoke(
+                    &wf,
+                    inputs.as_deref(),
+                    &workspace,
+                    host_project,
+                );
                 cmd_workflow(cfg, &invoke)?;
             }
         }
@@ -11638,14 +11734,19 @@ fn cmd_steer(
 /// workflow in pane mode against the spawned agent's workspace (--reuse
 /// binds the crew into the SAME workspace; the caller's workspace is never
 /// reaped). Pane mode is the only fit: the profile agent is a live pane.
-fn profile_workflow_invoke(name: &str, inputs: Option<&str>, workspace: &str) -> WorkflowCmd {
+fn profile_workflow_invoke(
+    name: &str,
+    inputs: Option<&str>,
+    workspace: &str,
+    project: &str,
+) -> WorkflowCmd {
     WorkflowCmd::Run {
         name: name.to_string(),
         inputs: inputs.map(str::to_string),
         crew: None,
         execute: true,
         mode: "pane".to_string(),
-        project: Some("flywheel".to_string()),
+        project: Some(project.to_string()),
         reuse: Some(workspace.to_string()),
         retain: false,
         retire_orphans: false,
@@ -11665,6 +11766,14 @@ fn planner_author_response(wf_name: &str, prompt: &str) -> Result<String> {
         .arg("--workflow")
         .arg(wf_name)
         .arg("--json");
+    // Same model injection as headless_dispatch — without it the planner
+    // harness starts on its default (often wrong / missing).
+    if let Ok(cat) = profile::ProfileCatalog::load()
+        && let Some(p) = cat.get("planner")
+        && !p.model.is_empty()
+    {
+        cmd.arg("--model").arg(&p.model);
+    }
     let output = cmd
         .output()
         .with_context(|| "planner headless authoring run")?;

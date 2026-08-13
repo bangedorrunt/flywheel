@@ -279,7 +279,8 @@ pub fn planner_authoring_prompt(
          \n\
          Reply with ONE YAML document only (a ```yaml fenced block is fine):\n\
          - top-level keys: name, description, crew: auto, inputs, steps\n\
-         - reference the target via {{{{inputs.objective}}}} and declare it in `inputs:`\n\
+         - inputs MUST be a list of objects, never a map: `inputs: [{{ name: objective }}]`\n\
+         - reference the target via {{{{inputs.objective}}}}\n\
          - only use profiles/stages/workflows listed above — anything else fails lint\n"
     )
 }
@@ -294,6 +295,7 @@ pub fn parse_planner_workflow(response: &str, name: &str) -> Result<Workflow, St
         return Err("planner returned an empty response".into());
     }
     let yaml = extract_fenced_yaml(response).unwrap_or_else(|| response.to_string());
+    let yaml = normalize_planner_inputs_map(&yaml)?;
     let mut wf = toron_workflow::schema::parse_workflow(&yaml)
         .map_err(|e| format!("planner-authored YAML does not parse as a workflow: {e}"))?;
     // The run's composed name is decided by the caller (composed-<ts>); the
@@ -301,6 +303,41 @@ pub fn parse_planner_workflow(response: &str, name: &str) -> Result<Workflow, St
     // key on one identity.
     wf.name = name.to_string();
     Ok(wf)
+}
+
+/// Planners often emit `inputs: { objective: "..." }` (a map). The schema
+/// wants `inputs: [{ name: objective }]`. Normalize so a live --agent run
+/// does not die on that one shape error.
+fn normalize_planner_inputs_map(yaml: &str) -> Result<String, String> {
+    let mut v: serde_yaml::Value = serde_yaml::from_str(yaml)
+        .map_err(|e| format!("planner-authored YAML does not parse as a workflow: {e}"))?;
+    let Some(map) = v.as_mapping_mut() else {
+        return Ok(yaml.to_string());
+    };
+    let key = serde_yaml::Value::from("inputs");
+    let Some(inputs) = map.get_mut(&key) else {
+        return Ok(yaml.to_string());
+    };
+    if inputs.as_sequence().is_some() {
+        return Ok(yaml.to_string());
+    }
+    let Some(obj) = inputs.as_mapping() else {
+        return Ok(yaml.to_string());
+    };
+    let seq: Vec<serde_yaml::Value> = obj
+        .keys()
+        .filter_map(|k| k.as_str())
+        .map(|name| {
+            let mut m = serde_yaml::Mapping::new();
+            m.insert(
+                serde_yaml::Value::from("name"),
+                serde_yaml::Value::from(name),
+            );
+            serde_yaml::Value::Mapping(m)
+        })
+        .collect();
+    *inputs = serde_yaml::Value::Sequence(seq);
+    serde_yaml::to_string(&v).map_err(|e| format!("normalize inputs: {e}"))
 }
 
 /// The first ```fenced block of a response, or `None` when unfenced.
@@ -1038,5 +1075,13 @@ steps:
         assert!(parse_planner_workflow("   \n\t\n", "composed-x").is_err());
         // Valid YAML that is NOT a workflow (no name) is rejected too.
         assert!(parse_planner_workflow("foo: bar\nbaz: 1\n", "composed-x").is_err());
+    }
+
+    #[test]
+    fn planner_map_inputs_normalized_to_list() {
+        let response = "name: draft\ncrew: auto\ninputs:\n  objective: do the thing\nsteps:\n  - name: s1\n    action: send_dm\n    to: operator\n    body: start\n";
+        let wf = parse_planner_workflow(response, "composed-x").expect("map inputs ok");
+        assert_eq!(wf.inputs.len(), 1);
+        assert_eq!(wf.inputs[0].name, "objective");
     }
 }
