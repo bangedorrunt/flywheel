@@ -3344,16 +3344,26 @@ fn spawn_items_from_plan(
 /// omp role flags (`--smol`/`--slow`/`--plan`, bd-gsvn.2). Order matters —
 /// flags precede any launch text (peer template) so a one-shot-capable
 /// harness (opencode) does not swallow the flags as a prompt.
-fn profile_launch_args(harness: &str, p: &profile::Profile) -> Vec<String> {
+pub(crate) fn profile_launch_args(harness: &str, p: &profile::Profile) -> Vec<String> {
+    let registry = models::ModelRegistry::load().unwrap_or_default();
+    let model = if p.model.is_empty() {
+        String::new()
+    } else {
+        registry.resolve(&p.model, harness)
+    };
     let mut args = headless::model_args(
         harness,
-        &p.model,
+        &model,
         (!p.effort.is_empty()).then_some(p.effort.as_str()),
     );
-    args.extend(headless::role_model_args(harness, &p.smol, &p.slow, &p.plan));
+    args.extend(headless::role_model_args(
+        harness,
+        &registry.resolve(&p.smol, harness),
+        &registry.resolve(&p.slow, harness),
+        &registry.resolve(&p.plan, harness),
+    ));
     args
 }
-
 /// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
 #[allow(clippy::too_many_arguments)]
 /// Render the peer-aware self-poll template (ADR-0001 §9.3) with all
@@ -3460,6 +3470,7 @@ pub(crate) fn project_workspaces(c: &mut Client, project: &str) -> Result<Worksp
 #[cfg(test)]
 mod spawn_profile_plan_tests {
     use super::*;
+    use crate::config::lock_env;
 
     fn profile(harness: &str, model: &str) -> profile::Profile {
         profile::Profile {
@@ -3509,8 +3520,34 @@ mod spawn_profile_plan_tests {
         assert_eq!(items[1].kind.as_deref(), Some("pi"));
     }
 
+    /// Registry provider must prefix the spawn flag (coder → opencode-go,
+    /// not a bare id that omp then binds to provider `deepseek`).
+    #[test]
+    fn launch_args_resolve_registry_provider() {
+        let _g = lock_env();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let cfg_home = dir.path().join("config");
+        std::fs::create_dir_all(cfg_home.join("flywheel")).expect("config dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
+        std::fs::write(
+            cfg_home.join("flywheel/models.toml"),
+            "[models.deepseek-v4-flash]\nprovider = \"opencode-go\"\n",
+        )
+        .expect("models.toml");
+        let p = profile("omp", "deepseek-v4-flash");
+        let args = profile_launch_args("omp", &p);
+        assert_eq!(
+            args,
+            vec!["--model=opencode-go/deepseek-v4-flash"],
+            "spawn must inject registry provider, not bare id: {args:?}"
+        );
+    }
+
     #[test]
     fn launch_args_follow_harness_forms() {
+        let _g = lock_env();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
         let p = profile("opencode", "deepseek-v4-flash");
         assert_eq!(profile_launch_args("opencode", &p), vec!["-m", "deepseek-v4-flash"]);
         let pi = profile("pi", "smol-model");
@@ -3529,6 +3566,9 @@ mod spawn_profile_plan_tests {
 
     #[test]
     fn launch_args_precede_peer_text() {
+        let _g = lock_env();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
         let p = profile("opencode", "deepseek-v4-flash");
         let mut args = profile_launch_args("opencode", &p);
         args.extend(vec!["peer template".to_string()]);
@@ -3612,7 +3652,6 @@ mod profile_run_spawn_tests {
         struct MockMux {
             ws: Vec<WorkspaceInfo>,
             panes: Vec<PaneInfo>,
-            created: Vec<String>,
         }
         impl MultiplexerBackend for MockMux {
             fn name(&self) -> &'static str {
@@ -3693,7 +3732,6 @@ mod profile_run_spawn_tests {
                 cwd: None,
             }],
             panes: vec![pane("wA", 1)],
-            created: Vec::new(),
         };
         let got = resolved_spec_workspace(&cfg, &mux, "omp").expect("resolves");
         assert_eq!(got, "wA:p1", "must return a pane id, not workspace id");
@@ -3702,7 +3740,6 @@ mod profile_run_spawn_tests {
         let mux2 = MockMux {
             ws: vec![],
             panes: vec![pane("ws-1", 1)],
-            created: vec!["ws-1".into()],
         };
         let got2 = resolved_spec_workspace(&cfg, &mux2, "omp").expect("resolves");
         assert_eq!(got2, "ws-1:p1", "created workspace's root pane");
@@ -9964,7 +10001,7 @@ fn kind_notes(kind: &str) -> Option<&'static str> {
             "- Config + sessions: ~/.grok (active sessions in ~/.grok/active_sessions.json).\n- Landing latency can be higher: the orchestrator's confirm wait covers it — you\n  only need to reach working/blocked, not finish, for the send to count as landed.",
         ),
         "omp" => Some(
-            "- Config + sessions: ~/.omp (agent sessions under ~/.omp/agent/sessions/).\n- Prompts live in ~/.omp/agent/prompts/beads-*.md (generated — re-run `flywheel\n  integration omp` after a rebuild to refresh; never hand-edit the generated files).",
+            "- Config + sessions: ~/.omp (agent sessions under ~/.omp/agent/sessions/).\n- Prompts live in ~/.omp/agent/prompts/beads-*.md (generated — re-run `flywheel\n  integration omp` after a rebuild to refresh; never hand-edit the generated files).\n- omp CLI works standalone. In herdr, omp exits on PTY stdin EOF (bd-ude8 / eign.7):\n  a context-respawn that tears the PTY down kills the agent. Flywheel layers already\n  inject model/effort args and pass a pane id (not a workspace id). Do not flip omp\n  defaults; remaining layer is herdr PTY lifetime.",
         ),
         _ => None,
     }
@@ -11151,9 +11188,9 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 // pane mode, --reuse the agent's workspace (same panes, the
                 // crew lands beside the profile agent; never reaped).
                 let invoke = profile_workflow_invoke(
-                    &wf,
+                    wf.as_str(),
                     inputs.as_deref(),
-                    &workspace,
+                    workspace.as_str(),
                     host_project,
                 );
                 cmd_workflow(cfg, &invoke)?;
@@ -12595,6 +12632,12 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let runner: toron_workflow::ActionRunner = if *execute {
                 match mode.as_str() {
                     "headless" => {
+                        // bd-omwg: fail closed — a spawn step cannot run
+                        // headless (no pane to launch; faking kind-43001/43004
+                        // is forbidden, ADR-0010 Spec E). Gate BEFORE invoke:
+                        // the engine's run_spawn would return ok:true with no
+                        // pane — the exact lie this fixes.
+                        headless_spawn_gate(&wf)?;
                         let catalog = profile::ProfileCatalog::load()?;
                         let wf_name = name.clone();
                         let inputs_c = inputs_value.clone();
@@ -12650,18 +12693,57 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // call_workflow returns "unknown workflow" and the steer chain
             // silently no-ops the ideate/plan steps). The same resolver
             // already fed crew inference above.
-            let profile_resolver: toron_workflow::ProfileResolver =
-                Arc::new(|_p: &str| None);
-            let output = rt.block_on(async {
-                let engine = toron_workflow::WorkflowEngine::local_with_resolvers(
-                    runner,
-                    profile_resolver,
-                    workflow_resolver,
-                )?;
-                engine
-                    .invoke(&run_id, invoke_wf, inputs_value.clone())
-                    .await
-            })?;
+            let profile_resolver = profile::ProfileCatalog::catalog_profile_resolver();
+            // bd-omwg: the SpawnSink drainer. Pane mode keeps the engine alive
+            // across invoke — a drainer thread consumes every promise_id the
+            // engine pushed (an `await: true` run parks on its job promise
+            // until the drainer settles it) and launches a REAL pane per job
+            // (profile_launch_args + the pane runner), resolving each promise
+            // when the job finishes. The crew workspace stays open until the
+            // drainer joins (closing it would kill in-flight spawn panes).
+            let mut spawn_receipts: Vec<Value> = vec![];
+            let output = match pane_ctx.as_ref() {
+                Some(pane_ctx) => {
+                    let engine = std::sync::Arc::new(
+                        toron_workflow::WorkflowEngine::local_with_resolvers(
+                            runner,
+                            profile_resolver,
+                            workflow_resolver,
+                        )?,
+                    );
+                    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let drainer = pane::start_spawn_drainer(
+                        cfg.clone(),
+                        project.as_deref().unwrap_or("flywheel").to_string(),
+                        name.clone(),
+                        pane_ctx.workspace_id.clone(),
+                        engine.clone(),
+                        stop.clone(),
+                    )?;
+                    let out = rt.block_on(async {
+                        engine
+                            .invoke(&run_id, invoke_wf, inputs_value.clone())
+                            .await
+                    });
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    spawn_receipts = drainer
+                        .join()
+                        .map_err(|_| anyhow!("spawn drainer thread panicked"))??;
+                    out
+                }
+                None => {
+                    rt.block_on(async {
+                        let engine = toron_workflow::WorkflowEngine::local_with_resolvers(
+                            runner,
+                            profile_resolver,
+                            workflow_resolver,
+                        )?;
+                        engine
+                            .invoke(&run_id, invoke_wf, inputs_value.clone())
+                            .await
+                    })
+                }
+            }?;
             // P10.3 lifecycle: ephemeral default — reap the crew workspace
             // (close it + its panes) at run end unless --retain (keep) or
             // --reuse (the workspace is the caller's).
@@ -12698,6 +12780,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     "crew": crew_plan.members,
                     "mode": mode,
                     "output": output,
+                    "spawn": spawn_receipts,
                 });
                 if let Some(ctx) = &pane_ctx {
                     out["panes"] = json!(ctx.entries);
@@ -12722,6 +12805,17 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                             e.name,
                             e.pane_id,
                             e.profile.as_deref().unwrap_or("-")
+                        );
+                    }
+                }
+                if !spawn_receipts.is_empty() {
+                    println!("  spawn: {} job(s) launched", spawn_receipts.len());
+                    for r in &spawn_receipts {
+                        println!(
+                            "    {} ({} @{})",
+                            r["agent"].as_str().unwrap_or("?"),
+                            r["harness"].as_str().unwrap_or("?"),
+                            r["profile"].as_str().unwrap_or("?")
                         );
                     }
                 }
@@ -12901,18 +12995,34 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                             builtin_workflows::builtin_workflows().get(sub).cloned()
                         })
                 });
-            let profile_resolver: toron_workflow::ProfileResolver =
-                Arc::new(|_p: &str| None);
+            let profile_resolver = profile::ProfileCatalog::catalog_profile_resolver();
+            // bd-omwg: the SpawnSink drainer — pane mode keeps the engine
+            // alive across invoke so the drainer thread can launch a real
+            // pane per spawned job and settle await:true promises.
+            let mut spawn_receipts: Vec<Value> = vec![];
+            let engine = std::sync::Arc::new(toron_workflow::WorkflowEngine::local_with_resolvers(
+                runner,
+                profile_resolver,
+                workflow_resolver,
+            )?);
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let drainer = pane::start_spawn_drainer(
+                cfg.clone(),
+                project_name.to_string(),
+                wf_name.clone(),
+                ctx.workspace_id.clone(),
+                engine.clone(),
+                stop.clone(),
+            )?;
             let output = rt.block_on(async {
-                let engine = toron_workflow::WorkflowEngine::local_with_resolvers(
-                    runner,
-                    profile_resolver,
-                    workflow_resolver,
-                )?;
                 engine
                     .invoke(&run_id, invoke_wf, inputs_c.clone())
                     .await
             })?;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            spawn_receipts = drainer
+                .join()
+                .map_err(|_| anyhow!("spawn drainer thread panicked"))??;
             let mut reaped = false;
             if !ctx.retained {
                 let mut c = Client::connect(Some(&cfg.socket_path()))?;
@@ -12944,6 +13054,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     "crew": crew_plan.members,
                     "mode": "pane",
                     "output": output,
+                    "spawn": spawn_receipts,
                     "workspace_id": ctx.workspace_id,
                     "reaped": reaped,
                 }));
@@ -12952,6 +13063,9 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     "composed workflow {wf_name} ran (run_id {run_id}, crew {} member(s), mode pane)",
                     crew_plan.members.len()
                 );
+                if !spawn_receipts.is_empty() {
+                    println!("  spawn: {} job(s) launched", spawn_receipts.len());
+                }
                 print_json(&output);
             }
             Ok(())
@@ -13246,8 +13360,7 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
                     .cloned()
                     .or_else(|| builtin_workflows::builtin_workflows().get(name).cloned())
             });
-            let profile_resolver: toron_workflow::ProfileResolver =
-                Arc::new(|_name: &str| None);
+            let profile_resolver = profile::ProfileCatalog::catalog_profile_resolver();
             // bd-8wvz: even a dry-run must never hang — a body with
             // `delay`/`request_approval`/`spawn` steps parks on a promise the
             // recording runner cannot resolve. 25s cap → explicit timeout
@@ -15093,7 +15206,10 @@ fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
 }
 
 /// internal leaf: close the agent's pane, split a fresh pane, restart the agent
-/// under the same name (fresh session context).
+/// under the same name (fresh session context). bd-ude8: omp-in-herdr
+/// EXITS on PTY stdin EOF, and `pane.close` on its pane delivers exactly
+/// that — so omp restarts IN PLACE (same pane, no split, no close); other
+/// kinds keep the split+close cycle.
 fn cmd_internal_respawn(
     cfg: &Config,
     project: &str,
@@ -15500,6 +15616,11 @@ pub(crate) fn headless_dispatch(
     action: &toron_workflow::schema::Action,
 ) -> Result<Value> {
     let toron_workflow::schema::Action::DispatchJob { spec, .. } = action else {
+        // bd-omwg: a Spawn reaching the runner is an engine-routing bug —
+        // fail closed, never record it as done (ADR-0010 Spec E).
+        if matches!(action, toron_workflow::schema::Action::Spawn { .. }) {
+            bail!("headless runner: Action::Spawn must be handled by the engine (run_spawn) — routing bug");
+        }
         // Recorded, not dispatched — the P10.1 backward-compat surface for
         // non-headless actions (byte-identical to the no-op runner).
         return Ok(json!({ "action": action.type_name() }));
@@ -15570,6 +15691,125 @@ pub(crate) fn headless_dispatch(
     }
     let err = String::from_utf8_lossy(&output.stderr).to_string();
     Ok(json!({ "ok": false, "error": if err.trim().is_empty() { raw } else { err } }))
+}
+
+/// bd-omwg: headless fail-closed gate (ADR-0010 Spec E). A workflow carrying
+/// a `spawn` step cannot run headless: there is no pane to launch and no
+/// honest kind-43001/43004 — faking them is forbidden. Refuse BEFORE the
+/// engine invoke (the engine's `run_spawn` would otherwise return
+/// `ok:true` with no pane — the exact lie this bead kills). Walks nested
+/// steps (retry/branch/foreach/parallel), because a nested spawn is the
+/// same lie. Returns the offending step names.
+fn workflow_spawn_steps(wf: &toron_workflow::Workflow) -> Vec<String> {
+    fn walk(action: &toron_workflow::schema::Action, name: Option<&str>, out: &mut Vec<String>) {
+        match action {
+            toron_workflow::schema::Action::Spawn { .. } => {
+                let n = name.unwrap_or("<unnamed>").to_string();
+                if !out.contains(&n) {
+                    out.push(n);
+                }
+            }
+            toron_workflow::schema::Action::Retry { step, .. } => walk(&step.action, name, out),
+            toron_workflow::schema::Action::Branch { then, else_steps, .. } => {
+                for s in then.iter().chain(else_steps.iter()) {
+                    walk(&s.action, s.name.as_deref(), out);
+                }
+            }
+            toron_workflow::schema::Action::Foreach { each, .. } => walk(&each.action, name, out),
+            toron_workflow::schema::Action::Parallel { each, .. } => walk(&each.action, name, out),
+            _ => {}
+        }
+    }
+    let mut out = vec![];
+    for step in &wf.steps {
+        walk(&step.action, step.name.as_deref(), &mut out);
+    }
+    out
+}
+
+/// bd-omwg: the gate itself — error names every spawn step and points at
+/// pane mode.
+pub(crate) fn headless_spawn_gate(wf: &toron_workflow::Workflow) -> Result<()> {
+    let steps = workflow_spawn_steps(wf);
+    if steps.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "headless cannot run spawn step(s) {:?}: a spawn launches a real pane — use --mode pane; faking kind-43001/43004 is forbidden (ADR-0010 Spec E)",
+        steps
+    );
+}
+
+#[cfg(test)]
+mod spawn_drain_gate_tests {
+    use super::*;
+
+    fn parse(yaml: &str) -> toron_workflow::Workflow {
+        toron_workflow::parse_workflow(yaml).expect("parse workflow")
+    }
+
+    /// bd-omwg: a flat spawn step is a headless violation — the gate must
+    /// refuse it (ADR-0010 Spec E fail-closed, never fake kind-43001/43004).
+    #[test]
+    fn headless_spawn_gate_rejects_flat_spawn_step() {
+        let wf = parse(
+            r##"
+name: gate-flat
+trigger:
+  type: webhook
+steps:
+  - name: job
+    action: spawn
+    profile: "@housekeeper"
+    await: false
+"##,
+        );
+        let err = headless_spawn_gate(&wf).unwrap_err();
+        assert!(err.to_string().contains("job"), "{err}");
+        assert!(err.to_string().contains("pane"), "points at pane mode: {err}");
+    }
+
+    /// bd-omwg: a spawn nested inside retry/branch/foreach/parallel is the
+    /// same lie — the gate walks nested steps, not just the top level.
+    #[test]
+    fn headless_spawn_gate_walks_nested_steps() {
+        let wf = parse(
+            r##"
+name: gate-nested
+trigger:
+  type: webhook
+steps:
+  - name: outer
+    action: branch
+    if: "{{inputs.x}}"
+    then:
+      - name: inner-job
+        action: spawn
+        profile: "@coder"
+        await: true
+"##,
+        );
+        let err = headless_spawn_gate(&wf).unwrap_err();
+        assert!(err.to_string().contains("inner-job"), "{err}");
+    }
+
+    /// bd-omwg: a spawn-free workflow passes the gate untouched.
+    #[test]
+    fn headless_spawn_gate_passes_spawn_free_workflow() {
+        let wf = parse(
+            r##"
+name: gate-clean
+trigger:
+  type: webhook
+steps:
+  - name: hello
+    action: send_dm
+    to: operator
+    body: "hi"
+"##,
+        );
+        headless_spawn_gate(&wf).expect("no spawn -> pass");
+    }
 }
 
 /// internal leaf: scan orchestrator inbox for `[xproj]` swarm requests.

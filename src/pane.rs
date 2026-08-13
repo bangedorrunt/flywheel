@@ -21,6 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -405,6 +406,11 @@ pub fn pane_dispatch(
     action: &Action,
 ) -> Result<Value> {
     let Action::DispatchJob { spec, .. } = action else {
+        // bd-omwg: a Spawn reaching the runner is an engine-routing bug —
+        // fail closed, never record it as done (ADR-0010 Spec E).
+        if matches!(action, Action::Spawn { .. }) {
+            bail!("pane runner: Action::Spawn must be handled by the engine (run_spawn) — routing bug");
+        }
         // Recorded, not dispatched — the P10.3 backward-compat surface for
         // non-dispatch actions (byte-identical to the no-op runner).
         return Ok(json!({ "action": action.type_name() }));
@@ -518,6 +524,326 @@ pub fn pane_dispatch(
             "agent": entry.name,
         }));
     }
+}
+
+/// One drained spawn side-channel entry (bd-omwg): the launch recipe for a
+/// job the engine created but cannot run itself — the profile + harness +
+/// launch args + the await decision. Built from the promise's `spec`
+/// (ADR-0005 Spec 4a: profile/workflow/resolved) by [`spawn_launch_plan`].
+#[derive(Debug, Clone)]
+pub struct SpawnJobLaunch {
+    /// the durable promise id the job binds to (kind-43001 would carry it)
+    pub promise_id: String,
+    /// stripped profile name (`@housekeeper` → `housekeeper`)
+    pub profile: String,
+    /// the sub-workflow the spawned agent runs, when the step names one
+    pub workflow: Option<String>,
+    /// harness from the RESOLVED spec (the embedding's view — the catalog
+    /// may have changed between resolve and drain)
+    pub harness: String,
+    /// per-harness model/effort args (profile_launch_args — bd-eign.9);
+    /// empty = bare launch (honest, never a silent skip)
+    pub args: Vec<String>,
+    /// `await: true` → the run parks: resolve the promise when the job
+    /// finishes. `false` → fire-and-forget: launch, never resolve.
+    pub await_job: bool,
+}
+
+/// bd-omwg: read one spawn side-channel promise spec into a launch plan.
+/// The profile name strips the `@`; the harness comes from the RESOLVED
+/// spec; the args come from `profile_launch_args` for that harness (the
+/// catalog profile may be gone — bare launch then, never an error).
+/// Pure + unit-tested.
+pub fn spawn_launch_plan(
+    promise_id: &str,
+    spec: &Value,
+    catalog: &ProfileCatalog,
+) -> Result<SpawnJobLaunch> {
+    let profile = spec["profile"]
+        .as_str()
+        .map(headless::strip_profile_ref)
+        .unwrap_or_default()
+        .to_string();
+    let workflow = spec["workflow"].as_str().map(str::to_string);
+    let harness = spec["resolved"]["spec"]["harness"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let args = catalog
+        .get(&profile)
+        .map(|p| crate::profile_launch_args(&harness, p))
+        .unwrap_or_default();
+    Ok(SpawnJobLaunch {
+        promise_id: promise_id.to_string(),
+        profile,
+        workflow,
+        harness,
+        args,
+        await_job: spec["await"].as_bool().unwrap_or(false),
+    })
+}
+
+/// bd-omwg contract: after `WorkflowEngine::invoke`, SpawnSink must NOT be
+/// silent. Drains every promise_id the engine pushed and hands each to the
+/// launcher (which owns the real pane launch + job completion wait).
+///
+/// Every created job promise must be SETTLED for the run to complete: the
+/// 0.6 runtime suspends a run that leaves an unresolved created promise
+/// (empirically proven — an await:false invoke parks until settle). The
+/// `await` flag decides the settlement moment, never whether to settle:
+///
+/// - `await: true` → the launcher waits for the JOB (agent back to Idle) and
+///   only then resolves — the parked run resumes with the real receipt
+///   (never a fake kind-43004).
+/// - `await: false` → fire-and-forget: the launch receipt settles the
+///   promise immediately — the run proceeds while the job keeps running in
+///   the pane. The workflow never waits for the job outcome.
+///
+/// `seen` dedups promise ids across calls: on resume the runtime REPLAYS the
+/// run, which re-executes `run_spawn` and re-pushes the same promise id to
+/// the sink — the idempotence guard that prevents a second launch.
+/// Errors are per-promise: one bad spec must not strand the rest.
+pub async fn drain_spawn_sink(
+    engine: &toron_workflow::WorkflowEngine,
+    catalog: &ProfileCatalog,
+    seen: &mut std::collections::HashSet<String>,
+    mut launch: impl FnMut(SpawnJobLaunch) -> Result<Value>,
+) -> Result<Vec<Value>> {
+    let mut receipts = vec![];
+    loop {
+        let ids: Vec<String> = engine.spawn_sink().lock().await.drain(..).collect();
+        if ids.is_empty() {
+            break;
+        }
+        for id in ids {
+            if !seen.insert(id.clone()) {
+                // Replay re-push (the resume re-executes run_spawn) — this
+                // promise was already settled; never launch twice.
+                continue;
+            }
+            let record = match engine.resonate().promises.get(&id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("flywheel: spawn drain: promise {id} unreadable ({e}) — skipping");
+                    continue;
+                }
+            };
+            let plan = spawn_launch_plan(&id, record.param.data_as_ref(), catalog);
+            let plan = match plan {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("flywheel: spawn drain: bad promise spec for {id}: {e}");
+                    continue;
+                }
+            };
+            match launch(plan.clone()) {
+                Ok(receipt) => {
+                    eprintln!(
+                        "flywheel: spawn drain: launched job {} (profile {}, harness {}){}",
+                        plan.promise_id,
+                        plan.profile,
+                        plan.harness,
+                        if plan.await_job {
+                            " — awaiting job completion"
+                        } else {
+                            " (fire-and-forget)"
+                        }
+                    );
+                    if let Err(e) = engine.resolve_spawn(&id, receipt.clone()).await {
+                        eprintln!("flywheel: spawn drain: resolve {id} failed: {e}");
+                    }
+                    receipts.push(receipt);
+                }
+                Err(e) => {
+                    eprintln!("flywheel: spawn drain: launch {id} failed: {e:#}");
+                    // The run parks on this promise — without a settle it
+                    // hangs forever. Reject it: the job never started is
+                    // a FAILURE, not a fake success (Spec 0 propagation).
+                    if let Err(re) = engine.reject_spawn(&id, &e.to_string()).await {
+                        eprintln!("flywheel: spawn drain: reject {id} failed: {re}");
+                    }
+                }
+            }
+        }
+    }
+    Ok(receipts)
+}
+
+/// The real pane launcher for a drained spawn job: split a pane in the crew
+/// workspace, `agent_start` with the plan's profile_launch_args (bd-eign.9 —
+/// never an empty arg list for a known profile), register the identity +
+/// spawn-registry entry, dispatch the job's workflow mission through the
+/// `__send` leaf, and — for `await: true` — wait for the agent to return to
+/// Idle (the job finished) before returning the receipt.
+pub fn launch_spawn_job(
+    cfg: &Config,
+    project: &str,
+    wf_name: &str,
+    ws_id: &str,
+    plan: &SpawnJobLaunch,
+) -> Result<Value> {
+    let mut c = Client::connect(Some(&cfg.socket_path()))?;
+    // Reuse a live registry entry of the same name (re-run idempotency,
+    // mirroring spawn_crew_into); else split a fresh pane + start.
+    let name = crew_agent_name(wf_name, &format!("spawn-{}", plan.profile), 1);
+    let registry = state::load_spawn_registry(project);
+    let live_panes = c.agent_list()?;
+    let existing = registry
+        .iter()
+        .find(|e| e.name == name)
+        .filter(|e| {
+            live_panes
+                .iter()
+                .any(|a| a.pane_id == e.pane_id && a.workspace_id == ws_id)
+        })
+        .cloned();
+    let (pane_id, name) = if let Some(e) = existing {
+        (e.pane_id.clone(), name)
+    } else {
+        let dir = crate::project_dir(cfg, project);
+        let panes = c.pane_list(Some(ws_id))?;
+        let prev = panes
+            .last()
+            .map(|p| p.pane_id.clone())
+            .ok_or_else(|| anyhow!("spawn drain: no panes in workspace {ws_id}"))?;
+        let split = crate::herdr_shim::pane_split(
+            &mut c,
+            &prev,
+            "down",
+            Some(&crate::utf8_path(&dir, "workspace dir")?),
+        )?;
+        let agent = crate::start_agent_with_retry(
+            &mut c,
+            &name,
+            &plan.harness,
+            &split.pane_id,
+            &plan.args,
+        )?;
+        (agent.pane_id.clone(), name)
+    };
+    let harness = plan.harness.clone();
+    let mail_identity = crate::register_spawned_agent(cfg, project, &name, &harness, &pane_id);
+    crate::record_spawn_entry(
+        cfg,
+        project,
+        state::SpawnEntry::profiled(&pane_id, &name, &plan.profile, &harness, mail_identity),
+    );
+    // Readiness (mirrors spawn_crew_into): the first __send must not hit a
+    // booting agent. Best-effort — a wait failure degrades to the __send
+    // landing semantics, never a panic.
+    if let Err(e) = c.agent_wait(&name, &[AgentStatus::Idle], Some(90_000)) {
+        eprintln!(
+            "flywheel: spawn drain {name} readiness wait failed (dispatching anyway): {e}"
+        );
+    }
+    let mut mission_err: Option<String> = None;
+    if let Some(w) = &plan.workflow {
+        let prompt = headless::base_prompt_for(w, &json!({}));
+        let mut cmd = Command::new(std::env::current_exe()?);
+        cmd.arg("__send")
+            .arg(project)
+            .arg(&name)
+            .arg(&prompt)
+            .arg("--confirm")
+            .arg("--profile")
+            .arg(&plan.profile);
+        let output = cmd.output().with_context(|| {
+            format!("__send spawn mission for {name} (workflow {w})")
+        })?;
+        let raw = String::from_utf8_lossy(&output.stdout).to_string();
+        let trimmed = raw.trim();
+        if let Ok(v) = serde_json::from_str::<Value>(trimmed)
+            && v.get("ok").and_then(Value::as_bool) == Some(false)
+        {
+            mission_err = Some(
+                v["error"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| raw.clone()),
+            );
+        } else if trimmed.is_empty() {
+            mission_err = Some(String::from_utf8_lossy(&output.stderr).to_string());
+        }
+    }
+    // await: true — the job finishes when the agent returns to Idle after
+    // its mission. Bound by the configured wait timeout (default 30 min).
+    if plan.await_job {
+        let timeout_ms = cfg.default_timeout_ms.unwrap_or(1_800_000);
+        c.agent_wait(&name, &[AgentStatus::Idle], Some(timeout_ms))?;
+    }
+    Ok(json!({
+        "ok": true,
+        "spawned": true,
+        "promise_id": plan.promise_id,
+        "profile": plan.profile,
+        "harness": plan.harness,
+        "workflow": plan.workflow,
+        "pane_id": pane_id,
+        "agent": name,
+        "await": plan.await_job,
+        "error": mission_err,
+    }))
+}
+
+/// bd-omwg: the pane-mode spawn drainer thread. Polls the engine's SpawnSink
+/// while `invoke` runs (an `await: true` run parks on its job promise until
+/// the drainer settles it), launches each job through [`launch_spawn_job`],
+/// and keeps draining until `stop` is set (the caller does this after invoke
+/// returns, then joins). Loads the profile catalog fresh — the thread is
+/// 'static and must not borrow the caller's.
+pub fn start_spawn_drainer(
+    cfg: Config,
+    project: String,
+    wf_name: String,
+    ws_id: String,
+    engine: std::sync::Arc<toron_workflow::WorkflowEngine>,
+    stop: std::sync::Arc<AtomicBool>,
+) -> Result<std::thread::JoinHandle<Result<Vec<Value>>>> {
+    let handle = std::thread::Builder::new()
+        .name("spawn-drainer".into())
+        .spawn(move || {
+            let catalog = crate::profile::ProfileCatalog::load().unwrap_or_default();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| anyhow!("spawn drainer runtime: {e}"))?;
+            rt.block_on(async {
+                loop {
+                    if !engine.spawn_sink().lock().await.is_empty() {
+                        let receipts = drain_spawn_sink(&engine, &catalog, &mut seen, |plan| {
+                            launch_spawn_job(&cfg, &project, &wf_name, &ws_id, &plan)
+                        })
+                        .await?;
+                        if !receipts.is_empty() {
+                            eprintln!(
+                                "flywheel: spawn drainer: {} job(s) launched",
+                                receipts.len()
+                            );
+                        }
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        // Final drain (an await:true resolve may have landed
+                        // between the last poll and stop) — then exit.
+                        let receipts = drain_spawn_sink(&engine, &catalog, &mut seen, |plan| {
+                            launch_spawn_job(&cfg, &project, &wf_name, &ws_id, &plan)
+                        })
+                        .await?;
+                        if !receipts.is_empty() {
+                            eprintln!(
+                                "flywheel: spawn drainer: {} job(s) launched (final)",
+                                receipts.len()
+                            );
+                        }
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+                Ok(vec![])
+            })
+        })
+        .map_err(|e| anyhow!("spawn drainer thread: {e}"))?;
+    Ok(handle)
 }
 
 #[cfg(test)]
@@ -654,5 +980,252 @@ mod tests {
         let mut plan = CrewPlan::default();
         plan.members.insert("planner".to_string(), 1);
         ensure_crew(&plan, "plan").expect("non-empty plan passes");
+    }
+
+    fn test_catalog() -> crate::profile::ProfileCatalog {
+        crate::profile::ProfileCatalog {
+            profiles: BTreeMap::from([(
+                "housekeeper".into(),
+                crate::profile::Profile {
+                    harness: "pi".into(),
+                    model: "glm-5.2".into(),
+                    effort: "max".into(),
+                    ..Default::default()
+                },
+            )]),
+            harnesses: BTreeMap::new(),
+        }
+    }
+
+    fn housekeeper_resolver() -> toron_workflow::ProfileResolver {
+        std::sync::Arc::new(|name: &str| {
+            if name == "@housekeeper" {
+                Some(json!({
+                    "npub": "",
+                    "spec": { "harness": "pi", "model": "glm-5.2", "backend": "herdr", "role": "housekeeper" },
+                }))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// bd-omwg: the engine's spawn side-channel promise spec yields a
+    /// concrete launch plan — stripped profile, harness from the RESOLVED
+    /// spec (the embedding's view), profile_launch_args for that harness
+    /// (model/effort must reach agent_start, never an empty arg list), and
+    /// the await flag that decides resolve-vs-fire-and-forget.
+    #[test]
+    fn spawn_launch_plan_reads_promise_spec() {
+        let spec = json!({
+            "profile": "@housekeeper",
+            "workflow": "weekly-upgrade",
+            "resolved": { "npub": "", "spec": { "harness": "pi", "model": "glm-5.2", "backend": "herdr", "role": "housekeeper" } },
+            "await": true,
+        });
+        let plan = spawn_launch_plan("prom-1", &spec, &test_catalog()).expect("plan");
+        assert_eq!(plan.promise_id, "prom-1");
+        assert_eq!(plan.profile, "housekeeper", "@ stripped");
+        assert_eq!(plan.workflow.as_deref(), Some("weekly-upgrade"));
+        assert_eq!(plan.harness, "pi");
+        assert!(plan.await_job, "await:true must resolve when the job finishes");
+        assert!(!plan.args.is_empty(), "model/effort args must reach agent_start");
+        assert!(
+            plan.args.iter().any(|a| a.contains("glm-5.2")),
+            "model flag present: {:?}",
+            plan.args
+        );
+    }
+
+    /// bd-omwg: an absent await flag (pre-flag specs) is fire-and-forget —
+    /// never a resolve. An unknown profile still yields a launch plan with
+    /// honest (empty) args — the pane launches, bare.
+    #[test]
+    fn spawn_launch_plan_defaults_await_false_and_bare_args() {
+        let spec = json!({
+            "profile": "@coder",
+            "resolved": { "spec": { "harness": "omp" } },
+        });
+        let plan = spawn_launch_plan("prom-2", &spec, &crate::profile::ProfileCatalog::default())
+            .expect("plan");
+        assert!(!plan.await_job, "absent await = fire-and-forget");
+        assert_eq!(plan.harness, "omp");
+        assert!(plan.args.is_empty(), "unknown profile -> bare launch");
+    }
+
+    fn spawn_workflow(await_job: bool) -> toron_workflow::Workflow {
+        toron_workflow::parse_workflow(&format!(
+            r##"
+name: spawn-drain-test
+trigger:
+  type: webhook
+steps:
+  - name: job
+    action: spawn
+    profile: "@housekeeper"
+    workflow: weekly-upgrade
+    await: {await_job}
+"##
+        ))
+        .expect("parse spawn workflow")
+    }
+
+    /// bd-omwg contract: after WorkflowEngine::invoke, SpawnSink must NOT be
+    /// silent. Every promise_id the engine pushed gets exactly one launch
+    /// (the fake launcher records the plan), the sink drains to empty, and
+    /// the engine's ok:true no longer lies about a pane.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drain_spawn_sink_launches_every_promise_after_invoke() {
+        let runner = std::sync::Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let engine = std::sync::Arc::new(
+            toron_workflow::WorkflowEngine::local_with(runner, housekeeper_resolver())
+                .expect("engine"),
+        );
+        let invoke = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .invoke(
+                        "fw-test-spawn-drain-1",
+                        spawn_workflow(false),
+                        json!({}),
+                    )
+                    .await
+            }
+        });
+        // Wait for the park (the created job promise is a remote todo the
+        // 0.6 runtime suspends on), then drain — exactly what the production
+        // drainer does.
+        let mut receipts = None;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            if !engine.spawn_sink().lock().await.is_empty() {
+                receipts = Some(
+                    drain_spawn_sink(&engine, &test_catalog(), &mut seen, |plan| {
+                        Ok(json!({
+                            "pane": "w1:p9",
+                            "agent": "crew-spawn-drain-test-spawn-housekeeper",
+                            "profile": plan.profile,
+                            "harness": plan.harness,
+                            "args": plan.args,
+                        }))
+                    })
+                    .await
+                    .expect("drain"),
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let output: Value = match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            invoke,
+        )
+        .await
+        {
+            Ok(Ok(Ok(v))) => v,
+            Ok(Ok(Err(e))) => panic!("invoke failed: {e}"),
+            Ok(Err(je)) => panic!("invoke task join: {je}"),
+            Err(_) => panic!("invoke timed out — drainer never settled the job promise"),
+        };
+        let receipts = receipts.expect("drainer must have run");
+        assert_eq!(receipts.len(), 1, "one promise -> one launch");
+        assert_eq!(receipts[0]["profile"], "housekeeper", "receipt: {receipts:?}");
+        assert_eq!(receipts[0]["harness"], "pi");
+        assert!(
+            receipts[0]["args"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|s| s.as_str().is_some_and(|x| x.contains("glm-5.2")))),
+            "launch args carried: {:?}",
+            receipts[0]["args"]
+        );
+        // The resume REPLAYS the run, re-executing run_spawn → the same
+        // promise id lands in the sink again. The drainer's idempotent
+        // re-drain (seen-dedup) consumes it — the sink is never left with
+        // an unread spawn.
+        for _ in 0..100 {
+            if engine.spawn_sink().lock().await.is_empty() {
+                break;
+            }
+            let re = drain_spawn_sink(&engine, &test_catalog(), &mut seen, |plan| {
+                Ok(json!({
+                    "pane": "w1:p9",
+                    "agent": "crew-spawn-drain-test-spawn-housekeeper",
+                    "profile": plan.profile,
+                    "harness": plan.harness,
+                    "args": plan.args,
+                }))
+            })
+            .await
+            .expect("re-drain");
+            assert!(re.is_empty(), "replayed id must be deduped: {re:?}");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            engine.spawn_sink().lock().await.len(),
+            0,
+            "sink drained, never silent"
+        );
+        assert_eq!(output["job"]["spawned"], true, "engine spawns: {output}");
+    }
+
+    /// bd-omwg: an `await: true` spawn parks the run; the drainer's resolve
+    /// — fired only AFTER the launcher reports the job finished — resumes it,
+    /// and the step carries the job receipt (a real completion, never a fake
+    /// kind-43004).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_await_true_resumes_on_drainer_resolve() {
+        let runner = std::sync::Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let engine = std::sync::Arc::new(
+            toron_workflow::WorkflowEngine::local_with(runner, housekeeper_resolver())
+                .expect("engine"),
+        );
+        let invoke = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .invoke("fw-test-spawn-drain-2", spawn_workflow(true), json!({}))
+                    .await
+            }
+        });
+        // The drainer: poll the sink while the run parks, then launch +
+        // resolve (the fake launcher "completes the job" by sleeping).
+        let catalog = test_catalog();
+        let drainer = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                for _ in 0..500 {
+                    if !engine.spawn_sink().lock().await.is_empty() {
+                        let mut seen = std::collections::HashSet::new();
+                        let receipts = drain_spawn_sink(&engine, &catalog, &mut seen, |_plan| {
+                            Ok(json!({ "pane": "w1:p9", "agent": "spawn-agent" }))
+                        })
+                        .await
+                        .expect("drain");
+                        assert_eq!(receipts.len(), 1, "one launch receipt");
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("spawn never parked on a job promise");
+            }
+        });
+        let output: Value = match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            invoke,
+        )
+        .await
+        {
+            Ok(Ok(Ok(v))) => v,
+            Ok(Ok(Err(e))) => panic!("invoke failed: {e}"),
+            Ok(Err(je)) => panic!("invoke task join: {je}"),
+            Err(_) => panic!("invoke timed out — the drainer never settled the job promise"),
+        };
+        drainer.await.expect("drainer ok");
+        assert_eq!(output["job"]["ok"], true, "step succeeded: {output}");
+        assert_eq!(
+            output["job"]["result"]["pane"], "w1:p9",
+            "job receipt captured, not a fake: {output}"
+        );
     }
 }
