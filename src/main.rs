@@ -2512,6 +2512,14 @@ fn to_want_token(project: &str, token: &str) -> WantToken {
             name: t.to_string(),
             broaden: false,
         }
+    } else if let Some((kind, ordinal)) = split_short_ordinal(t) {
+        // bd-eign.14: a numbered short resolves to THAT ordinal's agent —
+        // `oc1` → the first oc (`flywheel-<base>-oc`, which is NOT
+        // digit-suffixed), `oc2` → `-oc2`. Exact match, no broadening.
+        WantToken {
+            name: agent_name_n(project, kind, ordinal),
+            broaden: false,
+        }
     } else {
         let broaden = matches!(t, "oc" | "pi" | "gk") && t.chars().all(|c| c.is_ascii_lowercase());
         WantToken {
@@ -2519,6 +2527,19 @@ fn to_want_token(project: &str, token: &str) -> WantToken {
             broaden,
         }
     }
+}
+
+/// Split a numbered short (`oc1`, `pi2`, `gk3`) into kind + ordinal. The
+/// spawn naming scheme (`agent_name_n`) keeps the FIRST agent of a kind bare
+/// (`flywheel-<base>-oc`) and digit-suffixes later ones (`-oc2`), so the
+/// ordinal must be applied to the kind, not appended to it (bd-eign.14).
+fn split_short_ordinal(t: &str) -> Option<(&str, u32)> {
+    let first_digit = t.find(|c: char| c.is_ascii_digit())?;
+    let (kind, digits) = t.split_at(first_digit);
+    if kind.is_empty() || digits.is_empty() || !kind.chars().all(|c| c.is_ascii_lowercase()) {
+        return None;
+    }
+    digits.parse().ok().map(|n| (kind, n))
 }
 
 /// Exact match, or — for BARE kind shorts only — a digit-suffixed ordinal of
@@ -4986,6 +5007,37 @@ mod agent_mail_name_tests {
             to_want_token("toron", "oc2"),
             WantToken {
                 name: "flywheel-toron-oc2".into(),
+                broaden: false
+            }
+        );
+        // bd-eign.14: oc1 (the first oc agent) resolves — the first agent
+        // of a kind is NOT digit-suffixed, so the ordinal applies to the kind
+        assert_eq!(
+            to_want_token("toron", "oc1"),
+            WantToken {
+                name: "flywheel-toron-oc".into(),
+                broaden: false
+            }
+        );
+        assert_eq!(
+            to_want_token("toron", "pi2"),
+            WantToken {
+                name: "flywheel-toron-pi2".into(),
+                broaden: false
+            }
+        );
+        assert_eq!(
+            to_want_token("toron", "gk1"),
+            WantToken {
+                name: "flywheel-toron-gk".into(),
+                broaden: false
+            }
+        );
+        // a bare digit is not a numbered short (no kind prefix)
+        assert_eq!(
+            to_want_token("toron", "2"),
+            WantToken {
+                name: "flywheel-toron-2".into(),
                 broaden: false
             }
         );
