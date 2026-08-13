@@ -332,6 +332,32 @@ impl ProfileCatalog {
             }),
         }
     }
+
+    /// Engine `ProfileResolver` payload (ADR-0005 Spec 4a).
+    ///
+    /// Strips a leading `@`. Known catalog name → `{npub, spec:{harness,model,backend,role}}`.
+    /// Unknown → `None` (engine fail-closes the spawn step). `npub` is empty
+    /// here — host-scope identity is filled by the pane/dispatch path; the
+    /// engine treats this Value as opaque `spec.resolved`.
+    /// Flywheel `ProfileResolver` inject: catalog lookup, unknown → `None`.
+    pub fn catalog_profile_resolver() -> toron_workflow::ProfileResolver {
+        let cat = Self::load().unwrap_or_default();
+        std::sync::Arc::new(move |p: &str| cat.resolve_for_engine(p))
+    }
+
+    pub fn resolve_for_engine(&self, name: &str) -> Option<serde_json::Value> {
+        let key = name.strip_prefix('@').unwrap_or(name);
+        let profile = self.get(key)?;
+        Some(serde_json::json!({
+            "npub": "",
+            "spec": {
+                "harness": profile.harness,
+                "model": profile.model,
+                "backend": self.backend(key),
+                "role": profile.role,
+            }
+        }))
+    }
 }
 
 /// Field-level layering helper: a non-empty user value wins, else inherit the
@@ -678,6 +704,28 @@ spawn_cmd = "hermes --project {project} --role {role}"
             .resolve("@ghost", None, "npub-operator", &no_project)
             .unwrap_err();
         assert!(err.to_string().contains("unknown profile"), "{err}");
+    }
+
+    /// Engine DI seam (ADR-0005 Spec 4a): `@planner` resolves, `@ghost` is None.
+    #[test]
+    fn resolve_for_engine_known_at_prefix_and_unknown_none() {
+        let cat = catalog();
+        let got = cat
+            .resolve_for_engine("@planner")
+            .expect("@planner must resolve");
+        assert_eq!(got["spec"]["harness"], "omp");
+        assert_eq!(got["spec"]["model"], "deepseek-v4-flash");
+        assert_eq!(got["spec"]["backend"], "herdr");
+        assert_eq!(got["spec"]["role"], "planner");
+        assert_eq!(
+            cat.resolve_for_engine("planner").as_ref(),
+            Some(&got),
+            "bare name equals @-prefixed"
+        );
+        assert!(
+            cat.resolve_for_engine("@ghost").is_none(),
+            "unknown profile stays None"
+        );
     }
 
     #[test]

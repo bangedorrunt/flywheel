@@ -31,7 +31,7 @@ Run `flywheel decide "<target>" --json` (pure classifier in `src/decide.rs`). Ru
 
 ## Execution modes (ADR-0010)
 
-- **pane**: pre-spawn crew, `__send --confirm`, bus-auditable. `dispatch_job` live. `action: spawn` resolves profiles (`ProfileCatalog::resolve_for_engine`) but does **not** drain `SpawnSink` into a pane.
+- **pane**: pre-spawn crew, `__send --confirm`, bus-auditable. `dispatch_job` live. `action: spawn` drains `SpawnSink` into `agent_start`.
 - **headless**: `__run-headless` one-shot, logs `runs/<id>.jsonl`. Spawn must not fake 43001/43004.
 
 ## Profiles
