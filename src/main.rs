@@ -11,6 +11,7 @@ mod coalition;
 mod config;
 mod crew;
 mod cron;
+mod decide;
 mod durable;
 mod fs_util;
 mod headless;
