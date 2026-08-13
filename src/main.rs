@@ -144,21 +144,6 @@ enum Commands {
         /// peer-aware max peer-prompts per task (default 3)
         #[arg(long, default_value_t = 3)]
         peer_max_prompts: u32,
-        /// post-spawn settle: seconds to sleep after the readiness gate so a
-        /// booted-but-not-input-ready TUI (MCP init, model connect) catches
-        /// prompts (bd-eign.6). Default 30 — observed boot is 20-30s.
-        #[arg(long, default_value_t = 30)]
-        settle_secs: u64,
-        /// spawn agents from a profile (ADR-0005, bd-eign.13): the profile's
-        /// harness determines the kind, its model/effort ride the launch args
-        /// (bd-eign.9), and its behavior/skills condition dispatches via the
-        /// spawn registry. Combinable with --oc/--pi/--gk/--kind for mixed
-        /// crews.
-        #[arg(long)]
-        profile: Option<String>,
-        /// how many profile agents to spawn (with --profile; default 1)
-        #[arg(long, default_value_t = 1)]
-        count: u32,
     },
     /// Extend a running swarm with more agent panes
     Add {
@@ -2604,9 +2589,6 @@ fn main() {
             peer_poll_interval_minutes,
             peer_poll_budget_minutes,
             peer_max_prompts,
-            settle_secs,
-            profile,
-            count,
         }) => cmd_spawn(
             &cfg,
             project,
@@ -2621,9 +2603,6 @@ fn main() {
             *peer_poll_interval_minutes,
             *peer_poll_budget_minutes,
             *peer_max_prompts,
-            *settle_secs,
-            profile.as_deref(),
-            *count,
         ),
         Some(Commands::Add {
             project,
@@ -3169,63 +3148,6 @@ fn recipe_counts(
     Ok(out)
 }
 
-/// One spawn unit in [`cmd_spawn`]: a kind short (`oc`/`pi`/`gk`/kind name) or
-/// a profile name, with its count. Profile items carry the resolved harness
-/// (`profile.harness`) and the profile name; plain items resolve the kind via
-/// `Config::resolve_kind` at spawn time (bd-eign.9/13).
-struct SpawnItem {
-    /// name base: the kind short for plain items, the profile name for
-    /// profiled items (`flywheel-<base>-<short>-<n>`).
-    short: String,
-    count: u32,
-    /// resolved harness for profiled items; `None` → resolve_kind(short).
-    kind: Option<String>,
-    /// the profile name when this item is profile-driven.
-    profile: Option<String>,
-}
-
-/// Merge the recipe/count/kind plan with an optional profile-driven plan
-/// (bd-eign.13: `flywheel spawn <proj> --profile coder --count 2`). Pure —
-/// the catalog lookup happens at the call site, tests inject a profile here.
-fn spawn_items_from_plan(
-    plan: Vec<(String, u32)>,
-    profile: Option<(&str, &profile::Profile, u32)>,
-) -> Vec<SpawnItem> {
-    let mut items: Vec<SpawnItem> = plan
-        .into_iter()
-        .map(|(short, count)| SpawnItem {
-            short,
-            count,
-            kind: None,
-            profile: None,
-        })
-        .collect();
-    if let Some((name, p, count)) = profile {
-        items.push(SpawnItem {
-            short: name.to_string(),
-            count: count.max(1),
-            kind: Some(p.harness.clone()),
-            profile: Some(name.to_string()),
-        });
-    }
-    items
-}
-
-/// Model + role-model launch args for a profiled spawn (bd-eign.9): the
-/// per-harness `-m <model>` / `--model=<model>` flag (headless.rs) plus the
-/// omp role flags (`--smol`/`--slow`/`--plan`, bd-gsvn.2). Order matters —
-/// flags precede any launch text (peer template) so a one-shot-capable
-/// harness (opencode) does not swallow the flags as a prompt.
-fn profile_launch_args(harness: &str, p: &profile::Profile) -> Vec<String> {
-    let mut args = headless::model_args(
-        harness,
-        &p.model,
-        (!p.effort.is_empty()).then_some(p.effort.as_str()),
-    );
-    args.extend(headless::role_model_args(harness, &p.smol, &p.slow, &p.plan));
-    args
-}
-
 /// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
 #[allow(clippy::too_many_arguments)]
 /// Render the peer-aware self-poll template (ADR-0001 §9.3) with all
@@ -3327,85 +3249,6 @@ pub(crate) fn project_workspaces(c: &mut Client, project: &str) -> Result<Worksp
         &agents,
         state::load_spawn_meta(project).as_deref(),
     ))
-}
-
-#[cfg(test)]
-mod spawn_profile_plan_tests {
-    use super::*;
-
-    fn profile(harness: &str, model: &str) -> profile::Profile {
-        profile::Profile {
-            harness: harness.into(),
-            model: model.into(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn plain_plan_passes_through() {
-        let plan = vec![("oc".to_string(), 2), ("pi".to_string(), 1)];
-        let items = spawn_items_from_plan(plan, None);
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].short, "oc");
-        assert_eq!(items[0].count, 2);
-        assert!(items[0].kind.is_none());
-        assert!(items[0].profile.is_none());
-        assert!(items[1].profile.is_none());
-    }
-
-    #[test]
-    fn profile_item_carries_harness_and_name_base() {
-        let items = spawn_items_from_plan(vec![], Some(("coder", &profile("opencode", "deepseek-v4-flash"), 2)));
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].short, "coder");
-        assert_eq!(items[0].count, 2);
-        assert_eq!(items[0].kind.as_deref(), Some("opencode"));
-        assert_eq!(items[0].profile.as_deref(), Some("coder"));
-    }
-
-    #[test]
-    fn profile_count_floor_is_one() {
-        let items = spawn_items_from_plan(vec![], Some(("coder", &profile("opencode", "m"), 0)));
-        assert_eq!(items[0].count, 1);
-    }
-
-    #[test]
-    fn profile_merges_with_plain_for_mixed_crews() {
-        let items = spawn_items_from_plan(
-            vec![("oc".to_string(), 1)],
-            Some(("reviewer", &profile("pi", "smol"), 1)),
-        );
-        assert_eq!(items.len(), 2);
-        assert!(items[0].profile.is_none());
-        assert_eq!(items[1].profile.as_deref(), Some("reviewer"));
-        assert_eq!(items[1].kind.as_deref(), Some("pi"));
-    }
-
-    #[test]
-    fn launch_args_follow_harness_forms() {
-        let p = profile("opencode", "deepseek-v4-flash");
-        assert_eq!(profile_launch_args("opencode", &p), vec!["-m", "deepseek-v4-flash"]);
-        let pi = profile("pi", "smol-model");
-        assert_eq!(profile_launch_args("pi", &pi), vec!["--model", "smol-model"]);
-        let mut omp = profile("omp", "glm-5.2");
-        omp.effort = "max".into();
-        omp.smol = "glm-4.5-air".into();
-        assert_eq!(
-            profile_launch_args("omp", &omp),
-            vec!["--model=glm-5.2", "--thinking=max", "--smol=glm-4.5-air"]
-        );
-        let mut unknown = profile("hermes", "x");
-        unknown.effort = "max".into();
-        assert!(profile_launch_args("hermes", &unknown).is_empty());
-    }
-
-    #[test]
-    fn launch_args_precede_peer_text() {
-        let p = profile("opencode", "deepseek-v4-flash");
-        let mut args = profile_launch_args("opencode", &p);
-        args.extend(vec!["peer template".to_string()]);
-        assert_eq!(args, vec!["-m", "deepseek-v4-flash", "peer template"]);
-    }
 }
 
 #[cfg(test)]
@@ -3553,9 +3396,6 @@ fn cmd_spawn(
     peer_poll_interval_minutes: u32,
     peer_poll_budget_minutes: u32,
     peer_max_prompts: u32,
-    settle_secs: u64,
-    profile_name: Option<&str>,
-    profile_count: u32,
 ) -> Result<()> {
     let dir = project_dir(cfg, project);
     if !dir.exists() {
@@ -3591,19 +3431,6 @@ projects available: {}",
         bail!("{msg}");
     }
     let plan = recipe_counts(recipe, counts, kinds)?;
-    // bd-eign.13: merge an optional profile-driven plan (harness kind +
-    // count) with the recipe/count/kind plan for mixed crews.
-    let catalog = profile::ProfileCatalog::load()?;
-    let profile_plan = match profile_name {
-        Some(p) => {
-            let profile = catalog.get(p).ok_or_else(|| {
-                anyhow!("unknown profile '@{p}' (flywheel profile list)")
-            })?;
-            Some((p, profile, profile_count))
-        }
-        None => None,
-    };
-    let items = spawn_items_from_plan(plan, profile_plan);
     let label = label_override
         .map(String::from)
         .unwrap_or_else(|| swarm_label(project));
@@ -3721,12 +3548,12 @@ projects available: {}",
     } else {
         None
     };
-    for item in &items {
-        let kind = item.kind.clone().unwrap_or_else(|| cfg.resolve_kind(&item.short));
-        for _ in 0..item.count {
-            let ordinal = ordinals.entry(item.short.clone()).or_insert(0);
+    for (short, n) in &plan {
+        let kind = cfg.resolve_kind(short);
+        for _ in 0..*n {
+            let ordinal = ordinals.entry(short.clone()).or_insert(0);
             *ordinal += 1;
-            let name = agent_name_n(project, &item.short, *ordinal);
+            let name = agent_name_n(project, short, *ordinal);
             let peer_args: Vec<String> = peer_template
                 .as_ref()
                 .map(|t| {
@@ -3739,20 +3566,6 @@ projects available: {}",
                     )]
                 })
                 .unwrap_or_default();
-            // bd-eign.9: a profiled spawn launches with the profile's model —
-            // per-harness model args (headless::model_args) + omp role flags,
-            // then any launch text (peer template) LAST so a one-shot-capable
-            // harness does not swallow the flags as a prompt.
-            let mut agent_args: Vec<String> = match &item.profile {
-                Some(pname) => {
-                    let p = catalog
-                        .get(pname)
-                        .expect("profile resolved at plan build (bd-eign.13)");
-                    profile_launch_args(&kind, p)
-                }
-                None => vec![],
-            };
-            agent_args.extend(peer_args);
             let pane_id = if first {
                 first = false;
                 prev.clone()
@@ -3766,13 +3579,7 @@ projects available: {}",
                 prev = p.pane_id.clone();
                 prev.clone()
             };
-            let agent = start_agent_with_retry(&mut c, &name, &kind, &pane_id, &agent_args)?;
-            // bd-eign.6 L2: settle — a TUI can own the foreground while MCP
-            // servers still initialize; hold dispatch-side sleeps before the
-            // spawn command returns (default 30s, observed boot 20-30s).
-            if settle_secs > 0 {
-                std::thread::sleep(Duration::from_secs(settle_secs));
-            }
+            let agent = start_agent_with_retry(&mut c, &name, &kind, &pane_id, &peer_args)?;
             // governed-by: ADR-0001 (mail-register-on-spawn) — register the
             // spawned agent as an agent-mail identity so it's addressable by
             // name in mail. Best-effort: mail-not-configured is NOT a spawn
@@ -3780,23 +3587,13 @@ projects available: {}",
             // bd-627z.4: the returned identity is PINNED in the spawn
             // registry (pane → identity) so assign resolves deterministically.
             let mail_identity = register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
-            // bd-eign.13: profile-driven spawns pin profile+harness in the
-            // registry so __send auto-applies the behavior preamble and the
-            // skill-injection prefix (bd-eign.10).
-            let entry = match (&item.profile, &mail_identity) {
-                (Some(p), mid) => state::SpawnEntry::profiled(
-                    agent.pane_id.clone(),
-                    name.clone(),
-                    p.clone(),
-                    kind.clone(),
-                    mid.clone(),
-                ),
-                (None, Some(mid)) => state::SpawnEntry::with_mail_identity(
+            let entry = match &mail_identity {
+                Some(mid) => state::SpawnEntry::with_mail_identity(
                     agent.pane_id.clone(),
                     name.clone(),
                     mid.clone(),
                 ),
-                (None, None) => state::SpawnEntry::legacy(agent.pane_id.clone(), name.clone()),
+                None => state::SpawnEntry::legacy(agent.pane_id.clone(), name.clone()),
             };
             registry.push(entry);
             println!(
@@ -7042,9 +6839,6 @@ fn cmd_resume(cfg: &Config, project: &str, recipe: Option<&str>) -> Result<()> {
                 5,
                 30,
                 3,
-                30,
-                None,
-                1,
             )?;
         } else {
             bail!(
@@ -7116,9 +6910,6 @@ fn cmd_asset(cfg: &Config, kind: &str, cmd: &AssetCmd) -> Result<()> {
                 5,
                 30,
                 3,
-                30,
-                None,
-                1,
             ),
             "workflows" => run_workflow(cfg, project, name),
             "pipeline" => run_pipeline(cfg, project, name),
@@ -7241,9 +7032,6 @@ fn cmd_ensemble(cfg: &Config, project: &str, recipe: &str, workflow: &str) -> Re
         5,
         30,
         3,
-        30,
-        None,
-        1,
     )?;
     run_workflow(cfg, project, workflow)
 }
@@ -14021,9 +13809,6 @@ fn cmd_internal_xproj_spawn(
             5,
             30,
             3,
-            30,
-            None,
-            1,
         )
     };
     let spawned_ok = outcome.is_ok();

@@ -256,25 +256,6 @@ impl SpawnEntry {
             mail_identity: Some(mail_identity.into()),
         }
     }
-
-    /// Profile-driven entry (bd-eign.9/13): the pane serves `profile` under
-    /// harness `harness`; `cmd_send`/`__send` condition prompts with the
-    /// profile's behavior preamble + skill injection from these columns.
-    pub fn profiled(
-        pane_id: impl Into<String>,
-        name: impl Into<String>,
-        profile: impl Into<String>,
-        harness: impl Into<String>,
-        mail_identity: Option<String>,
-    ) -> Self {
-        Self {
-            pane_id: pane_id.into(),
-            name: name.into(),
-            profile: Some(profile.into()),
-            harness: Some(harness.into()),
-            mail_identity,
-        }
-    }
 }
 
 /// Tolerant read of the spawn registry (bd-ghcj.1): pre-P10.3 files hold
