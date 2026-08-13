@@ -45,11 +45,9 @@ use serde_json::{Value, json};
 use config::{Config, Recipe, WorkflowStep};
 use herdr_shim::{
     AgentInfo, AgentStatus, Client, SendVerdict, Subscription, WaitOptions, classify_send_result,
-    sanitize_pane_text,
 };
 use output::{die, dim, error, kind_paint, ok as paint_ok, print_json, status_paint};
 use state::{EventKind, log_event};
-use toron_core::backend::error::BackendErrorCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -194,11 +192,6 @@ enum Commands {
         /// bypass the policy deny-pattern guard
         #[arg(long)]
         force: bool,
-        /// bd-rdy: on agent_prompt_stalled (after one automatic retry),
-        /// respawn the agent under the same name and re-send instead of
-        /// failing with recovery guidance
-        #[arg(long)]
-        respawn_on_stall: bool,
     },
     /// Interrupt an agent (sends Escape by default — cancels the current
     /// tool call and returns to the prompt). Kill-style keys (ctrl+c) are
@@ -2628,7 +2621,6 @@ fn main() {
             wait,
             timeout_ms,
             force,
-            respawn_on_stall,
         }) => cmd_send(
             &cfg,
             project,
@@ -2638,7 +2630,6 @@ fn main() {
             *wait,
             *timeout_ms,
             *force,
-            *respawn_on_stall,
         ),
         Some(Commands::Interrupt {
             project,
@@ -2836,12 +2827,10 @@ fn main() {
             project,
             name,
             text,
-            SendOptions {
-                confirm_ms: *confirm,
-                invocation: invocation.as_deref(),
-                iteration: *iteration,
-                profile: profile.as_deref(),
-            },
+            *confirm,
+            invocation.as_deref(),
+            *iteration,
+            profile.as_deref(),
         ),
         Some(Commands::__MailBlocked {
             project,
@@ -4934,57 +4923,10 @@ fn spawn_kinds_from_log(project: &str) -> std::collections::HashMap<String, Stri
     kinds
 }
 
-/// bd-a8i: window for the responsiveness probe — long enough for a live
-/// agent's `state_change_seq` to advance on idle churn, short enough that
-/// `cmd_recover` stays snappy across many agents.
-const RESPONSIVENESS_WINDOW: Duration = Duration::from_secs(3);
-
-/// bd-1np: probe one registered agent's process liveness via herdr
-/// `pane.process_info` — pane existence is NOT liveness (a dead agent's pane
-/// still lists in herdr with the binding intact). `Some(true)` = process
-/// alive, `Some(false)` = provably dead, `None` = probe unavailable or
-/// inconclusive (the caller falls back to legacy pane-existence
-/// classification — never a confident "healthy").
-fn probe_agent_liveness(
-    probe: &mut Option<herdr_shim::Client>,
-    pane_id: &str,
-    kind: &str,
-    name: &str,
-) -> Option<bool> {
-    let c = probe.as_mut()?;
-    match herdr_shim::pane_process_info(c, pane_id) {
-        Ok(pi) => herdr_shim::pane_agent_alive(&pi, kind),
-        Err(e) => {
-            eprintln!("flywheel: recover liveness probe for {name} failed: {e:#}");
-            None
-        }
-    }
-}
-
-/// One agent's recovery decision in `cmd_recover` (bd-1np): healthy, rebind
-/// (pane survived, binding lost), or respawn (pane/process gone) with the
-/// reason recorded in the report.
-enum RecoverDecision<'a> {
-    Healthy,
-    Rebind { was: String },
-    Respawn { reason: &'a str },
-}
-
 /// bd-fw-interrupt-kills-agent-or3 (c): CLI supervision counterpart to the
 /// durable loop's self-heal — for every registered agent, restore the name
 /// binding if the pane survived, or respawn the agent (with its spawn-time
 /// kind) if it died. Reports what was done per agent.
-///
-/// bd-1np: an intact pane + binding is healthy ONLY if the process inside is
-/// alive. Each seemingly-healthy agent is liveness-probed via herdr
-/// `pane.process_info` (agent binary in the foreground process group); a pane
-/// whose process died (shell owns the foreground) is respawned in place, not
-/// classified healthy.
-///
-/// bd-a8i: process liveness is not responsiveness — a frozen opencode passes
-/// the foreground-group check. Alive agents are additionally probed for
-/// responsiveness (state_change_seq advancing across a window); a frozen +
-/// idle agent is respawned, not classified healthy.
 fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
     let backend = backend::multiplexer_backend(cfg)?;
     let ws_id = find_workspace_dyn(&*backend, project)?;
@@ -4998,85 +4940,31 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
     }
     let kinds = spawn_kinds_from_log(project);
     let agents = backend.agent_list()?;
-    // bd-1np: concrete herdr client for the process-liveness probe — the
-    // backend trait has no `pane.process_info`. Only the herdr backend can
-    // probe; other backends fall back to pane-existence classification.
-    let mut probe = (backend.name() == "herdr")
-        .then(|| Client::connect(Some(&cfg.socket_path())).ok())
-        .flatten();
     let mut recovered: Vec<Value> = Vec::new();
     let mut healthy = 0usize;
     for entry in &entries {
         let (pane_id, name) = (&entry.pane_id, &entry.name);
-        let kind = kinds.get(name).map(String::as_str).unwrap_or("opencode");
         let live = agents
             .iter()
             .find(|a| a.pane_id == *pane_id && a.workspace_id == ws_id);
-        let decision = match live {
+        match live {
             Some(a) if a.name.as_deref() == Some(name) => {
-                // pane + binding intact — liveness-probe the process inside.
-                match probe_agent_liveness(&mut probe, pane_id, kind, name) {
-                    // provably dead: respawn in the same pane (its shell is
-                    // back at the prompt). Some(false) is the bd-1np signal.
-                    Some(false) => RecoverDecision::Respawn {
-                        reason: "process-dead",
-                    },
-                    // process alive — probe responsiveness (bd-a8i): a
-                    // frozen agent passes pane_agent_alive but does not
-                    // advance state_change_seq while idle.
-                    Some(true) => {
-                        let verdict = probe.as_mut().map(|c| {
-                            herdr_shim::probe_agent_responsiveness(
-                                c, pane_id, RESPONSIVENESS_WINDOW,
-                            )
-                        });
-                        match verdict {
-                            // alive as a PID, dead to input → respawn,
-                            // not healthy (the bd-a8i shape).
-                            Some(herdr_shim::Responsiveness::Unresponsive) => {
-                                RecoverDecision::Respawn {
-                                    reason: "unresponsive",
-                                }
-                            }
-                            // responsive or inconclusive → healthy (a failed
-                            // probe never respawns an agent — bd-1np
-                            // principle).
-                            _ => RecoverDecision::Healthy,
-                        }
-                    }
-                    // probe unavailable/inconclusive → legacy healthy
-                    // classification (probe error ≠ dead — never respawn an
-                    // agent on a failed probe).
-                    None => RecoverDecision::Healthy,
-                }
+                healthy += 1; // pane + binding intact
             }
             Some(a) => {
                 // pane survived, binding lost → restore it (7rc path)
-                RecoverDecision::Rebind {
-                    was: a.name.clone().unwrap_or_else(|| "<null>".to_string()),
-                }
-            }
-            None => RecoverDecision::Respawn {
-                reason: "agent-gone",
-            },
-        };
-        match decision {
-            RecoverDecision::Healthy => {
-                healthy += 1; // pane + binding + live process
-            }
-            RecoverDecision::Rebind { was } => {
+                let was = a.name.clone().unwrap_or_else(|| "<null>".to_string());
                 backend.agent_rename(pane_id, Some(name))?;
                 recovered.push(json!({
                     "name": name, "pane_id": pane_id, "action": "rebound", "was": was
                 }));
             }
-            RecoverDecision::Respawn { reason } => {
-                // agent died (or its process died — bd-1np) → respawn with
-                // spawn-time kind, reusing the surviving pane.
+            None => {
+                // agent died (or pane is gone) → respawn with spawn-time kind
+                let kind = kinds.get(name).map(String::as_str).unwrap_or("opencode");
                 match start_agent_with_retry_dyn(&*backend, name, kind, pane_id, &[]) {
                     Ok(a) => recovered.push(json!({
-                        "name": name, "pane_id": a.pane_id, "action": "respawned",
-                        "kind": kind, "reason": reason
+                        "name": name, "pane_id": a.pane_id, "action": "respawned", "kind": kind
                     })),
                     Err(e) => eprintln!("flywheel: recover {name} failed: {e:#}"),
                 }
@@ -5163,7 +5051,6 @@ fn cmd_send(
     wait: bool,
     timeout_ms: Option<u64>,
     force: bool,
-    respawn_on_stall: bool,
 ) -> Result<()> {
     let text = match (stage, msg) {
         (Some(s), _) => stage_prompt(s)?,
@@ -5223,41 +5110,7 @@ fn cmd_send(
             timeout_ms: timeout,
             until: vec![AgentStatus::Idle, AgentStatus::Done, AgentStatus::Blocked],
         });
-        // bd-rdy: stall auto-recovery on the interactive send --wait path. The
-        // durable loop escalates stalls (respawn → requeue, bd-send-stall-
-        // escalation); the CLI counterpart is one retry after a short delay,
-        // then either a same-name respawn (--respawn-on-stall) or an
-        // actionable error naming the recovery commands.
-        let target = agent_target(a).to_string();
-        let name = a.name.clone().unwrap_or_else(|| target.clone());
-        let mut stalls_seen = 0usize;
-        let agent = loop {
-            match c.agent_prompt(&target, &text, wait_opts.clone()) {
-                Ok(agent) => break agent,
-                Err(e) => match stall_step(&e.code, stalls_seen, respawn_on_stall) {
-                    None => return Err(e.into()),
-                    Some(StallStep::Retry) => {
-                        eprintln!(
-                            "flywheel: {target} agent_prompt_stalled — retrying once in {STALL_RETRY_DELAY_SECS}s"
-                        );
-                        std::thread::sleep(Duration::from_secs(STALL_RETRY_DELAY_SECS));
-                        stalls_seen += 1;
-                    }
-                    Some(StallStep::Respawn) => {
-                        let kinds = spawn_kinds_from_log(project);
-                        let kind = kinds.get(&name).map(String::as_str).unwrap_or("opencode");
-                        eprintln!(
-                            "flywheel: {target} stalled again — respawning ({kind}) and re-sending (--respawn-on-stall)"
-                        );
-                        cmd_internal_respawn(cfg, project, &name, kind, true)?;
-                        stalls_seen += 1;
-                    }
-                    Some(StallStep::GiveUp) => {
-                        return Err(stall_giveup_error(&target, project));
-                    }
-                },
-            }
-        };
+        let agent = c.agent_prompt(agent_target(a), &text, wait_opts)?;
         let status = agent.agent_status.as_str();
         if std::io::stdout().is_terminal() {
             println!(
@@ -5284,116 +5137,6 @@ fn cmd_send(
         print_json(&json!({ "results": results }));
     }
     Ok(())
-}
-
-// ---- send --wait stall recovery (bd-rdy) ----
-
-/// Delay before the single automatic retry after `agent_prompt_stalled`.
-const STALL_RETRY_DELAY_SECS: u64 = 10;
-
-/// One step of the send --wait stall-recovery ladder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StallStep {
-    /// First stall: wait, then re-send once.
-    Retry,
-    /// Second stall with --respawn-on-stall: respawn under the same name,
-    /// then re-send.
-    Respawn,
-    /// Exhausted: fail with actionable recovery guidance.
-    GiveUp,
-}
-
-/// bd-rdy: pure stall-classification for the interactive send --wait path.
-/// `stalls_seen` = stalls already consumed (0 = first stall). Returns None
-/// for non-stall codes so the caller propagates the backend error unchanged.
-fn stall_step(
-    code: &BackendErrorCode,
-    stalls_seen: usize,
-    respawn_on_stall: bool,
-) -> Option<StallStep> {
-    if *code != BackendErrorCode::AgentPromptStalled {
-        return None;
-    }
-    match stalls_seen {
-        0 => Some(StallStep::Retry),
-        1 if respawn_on_stall => Some(StallStep::Respawn),
-        _ => Some(StallStep::GiveUp),
-    }
-}
-
-/// bd-rdy: the give-up error for a twice-stalled send — names the recovery
-/// commands instead of silently dropping the prompt.
-fn stall_giveup_error(target: &str, project: &str) -> anyhow::Error {
-    anyhow!(
-        "agent {target} produced no observed state change twice (agent_prompt_stalled) — the agent is not responding. {}\nAlternatively re-run with --respawn-on-stall to respawn {target} under the same name and re-send automatically.",
-        stall_recovery_hint(project),
-    )
-}
-
-/// bd-rdy: actionable recovery options for a stalled swarm.
-fn stall_recovery_hint(project: &str) -> String {
-    format!(
-        "Recovery options:\n  flywheel recover {project}   respawn dead agents from the spawn registry\n  flywheel kill {project} --force   hard-reset the swarm"
-    )
-}
-
-#[cfg(test)]
-mod send_stall_recovery_tests {
-    use super::*;
-
-    #[test]
-    fn first_stall_always_retries() {
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 0, false),
-            Some(StallStep::Retry)
-        );
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 0, true),
-            Some(StallStep::Retry)
-        );
-    }
-
-    #[test]
-    fn second_stall_respawns_only_with_flag() {
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 1, true),
-            Some(StallStep::Respawn)
-        );
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 1, false),
-            Some(StallStep::GiveUp)
-        );
-    }
-
-    #[test]
-    fn exhausted_stall_always_gives_up() {
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 2, true),
-            Some(StallStep::GiveUp)
-        );
-        assert_eq!(
-            stall_step(&BackendErrorCode::AgentPromptStalled, 2, false),
-            Some(StallStep::GiveUp)
-        );
-    }
-
-    #[test]
-    fn non_stall_errors_propagate() {
-        assert_eq!(stall_step(&BackendErrorCode::Timeout, 0, false), None);
-        assert_eq!(
-            stall_step(&BackendErrorCode::Other("agent_not_found".into()), 1, true),
-            None
-        );
-    }
-
-    #[test]
-    fn giveup_error_names_recovery_commands() {
-        let msg = stall_giveup_error("flywheel-demo-oc", "demo").to_string();
-        assert!(msg.contains("agent_prompt_stalled"), "{msg}");
-        assert!(msg.contains("flywheel recover demo"), "{msg}");
-        assert!(msg.contains("flywheel kill demo --force"), "{msg}");
-        assert!(msg.contains("--respawn-on-stall"), "{msg}");
-    }
 }
 
 // ---- interrupt / view / watch / zoom / attach / kill ----
@@ -5451,29 +5194,24 @@ fn cmd_interrupt(
 /// `agent_not_idle`). Fall back to the `visible` buffer with a note instead
 /// of failing the whole view. Never falls back when the caller explicitly
 /// asked for `visible`.
-///
-/// bd-3hd: every read (whatever source — recent, visible, recent-unwrapped)
-/// is passed through `sanitize_pane_text` so alternate-screen TUI chrome
-/// (ANSI/OSC sequences + box-drawing borders) never reaches the terminal.
 fn client_read_with_fallback(
     c: &mut Client,
     target: &str,
     source: &str,
     lines: Option<u32>,
 ) -> Result<String> {
-    let raw = match c.agent_read(target, source, lines) {
-        Ok(t) => t,
+    match c.agent_read(target, source, lines) {
+        Ok(t) => Ok(t),
         Err(e) if source != "visible" && e.to_string().contains("agent_not_idle") => {
             eprintln!(
                 "flywheel: {target} is working — {source} history unavailable (alternate screen); showing the visible buffer instead (attach for full history)"
             );
             c.agent_read(target, "visible", lines).map_err(|e2| {
                 anyhow!("{target}: agent_not_idle fallback to visible failed: {e2} ({e})")
-            })?
+            })
         }
-        Err(e) => return Err(e.into()),
-    };
-    Ok(sanitize_pane_text(&raw))
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn cmd_view(cfg: &Config, project: &str, to: &str, lines: Option<u32>, source: &str) -> Result<()> {
@@ -6356,7 +6094,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let v = mail.force_release_file_reservation(
                 &key,
                 &name,
-                path,
+                &path,
                 holder.as_deref(),
                 note.as_deref(),
                 false,
@@ -12912,17 +12650,6 @@ fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
     Ok(())
 }
 
-/// Dispatch options for the `__send` internal leaf (`cmd_internal_send`):
-/// confirm-wait, resume-dedup invocation/iteration, and profile conditioning.
-/// Bundled to keep the leaf's signature under clippy's argument cap; the
-/// core `cfg`/`project`/`name`/`text` params stay positional.
-struct SendOptions<'a> {
-    confirm_ms: Option<u64>,
-    invocation: Option<&'a str>,
-    iteration: Option<u64>,
-    profile: Option<&'a str>,
-}
-
 /// internal leaf: send one prompt to a named agent.
 ///
 /// **ADR-0002 note:** this leaf is NOT yet migrated to the trait factory. The
@@ -12944,14 +12671,11 @@ fn cmd_internal_send(
     project: &str,
     name: &str,
     text: &str,
-    opts: SendOptions<'_>,
+    confirm_ms: Option<u64>,
+    invocation: Option<&str>,
+    iteration: Option<u64>,
+    profile: Option<&str>,
 ) -> Result<()> {
-    let SendOptions {
-        confirm_ms,
-        invocation,
-        iteration,
-        profile,
-    } = opts;
     // bd-gsvn.1: Spec C role conditioning lands in __send — the ONE dispatch
     // leaf shared by the pane runner and both loop paths. When a profile is
     // given, the behavior preamble is prepended (conditioned_prompt) and the
