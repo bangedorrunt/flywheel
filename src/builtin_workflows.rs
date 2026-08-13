@@ -807,10 +807,8 @@ mod tests {
         let wfs = builtin_workflows();
         fn scan_action(action: &Action, wf: &str, dead: &mut Vec<String>) {
             match action {
-                Action::DispatchJob { spec, .. } => {
-                    if spec.get("prompt").is_some() {
-                        dead.push(wf.to_string());
-                    }
+                Action::DispatchJob { spec, .. } if spec.get("prompt").is_some() => {
+                    dead.push(wf.to_string());
                 }
                 Action::Parallel { each, .. } => scan_action(&each.action, wf, dead),
                 Action::Retry { step, .. } => scan_action(&step.action, wf, dead),

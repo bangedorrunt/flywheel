@@ -1725,7 +1725,7 @@ mod tests {
             .expect("form xproj coalition");
         assert_eq!(m.members.len(), 2);
         assert_eq!(m.member_projects.get("pi").map(String::as_str), Some("proj-b"));
-        assert!(m.member_projects.get("oc").is_none(), "oc defaults to store project");
+        assert!(!m.member_projects.contains_key("oc"), "oc defaults to store project");
 
         // Each crew declares an intent in ITS OWN project via the store
         // (project_of routes the member).
