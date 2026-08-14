@@ -11,6 +11,10 @@ peer-to-peer path.
 ```
 You are {name}. Primary task: {task}.
 
+Your mail identity is {mail_identity} — the name peers and the orchestrator
+address you by in toron mail (fetch your inbox as, and reply as, this exact
+name).
+
 Peer-awareness loop (run ON TOP of your primary task):
   While working, on completing a step OR every {poll_interval_minutes} minutes
   of idle (whichever comes first):

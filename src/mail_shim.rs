@@ -2019,6 +2019,41 @@ mod tests {
         assert_eq!(none["count"].as_u64().unwrap_or(0), 0, "unknown holder → empty board");
     }
 
+    /// S8.4: the swarm-start register_agent upsert clears stale profile task
+    /// fields from a prior session. A 2026-08-14 identity still advertised
+    /// `bd-qk9q`; re-registering the canonical name with the spawn profile
+    /// must overwrite the task — never preserve the stale bead id.
+    #[test]
+    fn register_upsert_clears_stale_task_on_reuse() {
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let project = "upsert-stale-task";
+        mail.ensure_project(project).expect("ensure");
+        // Prior session: the agent self-registered with a stale bead task.
+        mail.register_agent(
+            project,
+            "flywheel-proj-oc",
+            "opencode",
+            "deepseek-v4-flash",
+            "bd-qk9q implementer: stranded-bead reclaim fix",
+        )
+        .expect("prior session registration");
+        // Swarm start: the spawn profile upserts the canonical name with a
+        // fresh task stamp (S8.3/S8.4 — the same call register_spawned_agent
+        // makes).
+        let profile = crate::spawn_agent_profile("flywheel-proj-oc", "opencode", project);
+        block_on(mailbox().register_agent(project, &profile)).expect("upsert");
+        let who = mail.whois(project, "flywheel-proj-oc").expect("whois");
+        let task = who["task_description"].as_str().unwrap_or("");
+        assert!(
+            task.contains("flywheel agent for upsert-stale-task"),
+            "fresh task stamp wins: {task}"
+        );
+        assert!(
+            !task.contains("bd-qk9q"),
+            "stale bead task cleared: {task}"
+        );
+    }
+
     /// bd-pncn: `--to all` broadcasts to every registered agent's inbox
     /// (roster expansion), not a literal "all" recipient.
     #[test]

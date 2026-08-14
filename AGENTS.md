@@ -26,6 +26,7 @@ Live ignored tests need herdr + mail. `cargo test --exclude-ignored` is invalid.
 - **`cron run`** is a 25s dry-run. Live ticks are `cron start`.
 - **compose --agent** is wired (planner YAML → lint).
 - **Spawn:** `--profile`, never `add --oc` when a profiled pane exists. Model via `ModelRegistry` (`opencode-go/deepseek-v4-flash` for coder).
+- **Peer-aware spawns:** `spawn --peer-aware` injects the peer-poll template (`integrations/peer-aware.md.tpl`) with the agent's registered mail identity — the canonical `flywheel-<project>-<role><N>` name (S8.3), never a random pair. Wake/digest resolves + registers the identity before instructing fetch (S8.1); assigns wake only when unread, unexecuted, and deduped (S8.2).
 - **Send:** `--to <full-name|coder1|omp1|pane_id>`. Never bare `--to oc`. `launch_pending` is not idle. `agent_not_ready` → retry pane id. Do not flip omp defaults.
 - TDD. No script-based code edits. No file deletion without permission.
 - **Preflight:** `steer`/`loop run`/`workflow run --execute` auto-run prerequisite checks (herdr, resonate, br, beads, operator key, mail). `--skip-preflight` bypasses. Standalone: `flywheel preflight --mode {steer|loop|workflow|cron}`.

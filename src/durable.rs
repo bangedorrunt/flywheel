@@ -470,7 +470,15 @@ fn default_xproj_limit() -> u32 {
 /// message attributes. `urgent` is the wake trigger.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MailDigest {
+    /// the herdr agent name — the loop's digest-map key (plan_actions looks
+    /// digests up by the agent state name)
     pub agent: String,
+    /// S8.1: the REGISTERED mail identity this agent fetches as (the
+    /// spawn-registry / agent-names pin, else the canonical name). The wake
+    /// prompt's "fetch as X" / "reply --as X" use THIS name — never a
+    /// not-yet-registered alias (debrief D1/D2).
+    #[serde(default)]
+    pub mail_identity: Option<String>,
     #[serde(default)]
     pub recent: usize,
     #[serde(default)]
@@ -1738,15 +1746,18 @@ fn digest_prefix(d: &MailDigest) -> Option<String> {
 /// (toron MCP `reply_message` or `flywheel mail reply --message-id`) — a
 /// vague "check your inbox" prompt gets acknowledged in-chat and never
 /// produces the actual mail reply (e2e-verified).
+///
+/// S8.1: the fetch/reply identity is `mail_identity` (the identity the
+/// digest registered) — the wake must not instruct "fetch as" a name that
+/// is not registered (debrief D1/D2).
 fn urgent_wake_prompt(d: &MailDigest) -> String {
+    let identity = d.mail_identity.as_deref().unwrap_or(d.agent.as_str());
     let mut line = format!(
         "MAIL WAKE: {} urgent message(s) in your inbox — a peer needs you. \
-         Fetch with `flywheel mail inbox <project> --as {} --urgent`, then \
-         REPLY to the most recent urgent one with `flywheel mail reply <project> --message-id <id> --body '<answer>' --as {}` \
+         Fetch with `flywheel mail inbox <project> --as {identity} --urgent`, then \
+         REPLY to the most recent urgent one with `flywheel mail reply <project> --message-id <id> --body '<answer>' --as {identity}` \
          (or toron `reply_message` with the same thread_id). Your reply IS the work — do not just acknowledge in chat.",
         d.urgent,
-        d.agent,
-        d.agent
     );
     if let Some(t) = &d.thread_id {
         line.push_str(&format!(" Latest urgent thread: {t}"));
@@ -6247,6 +6258,7 @@ mod tests {
     fn digest(recent: usize, urgent: usize, from: &str, subj: &str) -> MailDigest {
         MailDigest {
             agent: "flywheel-proj-oc".into(),
+            mail_identity: None,
             recent,
             urgent,
             last_id: (urgent > 0).then(|| format!("urgent-{from}")),
@@ -6308,6 +6320,30 @@ mod tests {
             }
             other => panic!("expected wake Send, got {other:?}"),
         }
+    }
+
+    /// S8.1: the wake prompt instructs fetch/reply as the REGISTERED mail
+    /// identity (mail_identity), never the herdr name when they differ.
+    #[test]
+    fn urgent_wake_prompt_fetches_as_registered_identity() {
+        let mut d = digest(1, 1, "CoralFinch", "[assign] x");
+        d.mail_identity = Some("YellowCastle".into());
+        let text = urgent_wake_prompt(&d);
+        assert!(
+            text.contains("--as YellowCastle --urgent"),
+            "fetch as the registered identity: {text}"
+        );
+        assert!(
+            text.contains("--as YellowCastle`"),
+            "reply as the registered identity: {text}"
+        );
+        assert!(
+            !text.contains("--as flywheel-proj-oc"),
+            "never fetch as the unregistered herdr name: {text}"
+        );
+        // fallback: no mail_identity → the agent name
+        let plain = urgent_wake_prompt(&digest(1, 1, "CoralFinch", "[assign] x"));
+        assert!(plain.contains("--as flywheel-proj-oc --urgent"), "{plain}");
     }
 
     #[test]

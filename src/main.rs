@@ -3453,14 +3453,20 @@ pub(crate) fn profile_launch_args(harness: &str, p: &profile::Profile) -> Vec<St
 /// Render the peer-aware self-poll template (ADR-0001 §9.3) with all
 /// placeholders substituted. Pure + deterministic so the injected prompt is
 /// free of literal `{placeholder}` text (bd-pattern-peer-triggered).
+///
+/// S8.3: `mail_identity` (the registered canonical name, resolved BEFORE
+/// the agent starts) is injected as "your mail identity is X" so the agent
+/// boots knowing the exact name its peers/assigns address it by.
 fn peer_prompt_template(
     tpl: &str,
     name: &str,
+    mail_identity: &str,
     poll_interval_minutes: u32,
     poll_budget_minutes: u32,
     max_peer_prompts: u32,
 ) -> String {
     tpl.replace("{name}", name)
+        .replace("{mail_identity}", mail_identity)
         .replace("{task}", "await the swarm loop's queue or help peers")
         .replace(
             "{poll_interval_minutes}",
@@ -4650,12 +4656,32 @@ projects available: {}",
             let ordinal = ordinals.entry(item.short.clone()).or_insert(0);
             *ordinal += 1;
             let name = agent_name_n(project, &item.short, *ordinal);
+            let pane_id = if first {
+                first = false;
+                prev.clone()
+            } else {
+                let p = herdr_shim::pane_split(
+                    &mut c,
+                    &prev,
+                    "down",
+                    Some(&utf8_path(&dir, "workspace dir")?),
+                )?;
+                prev = p.pane_id.clone();
+                prev.clone()
+            };
+            // S8.3: register the canonical mail identity BEFORE the launch
+            // prompt is rendered — the template injects "your mail identity
+            // is X" so the agent boots knowing the name it is addressed by.
+            // Best-effort (register failures never fail the spawn).
+            let mail_identity = register_spawned_agent(cfg, project, &name, &kind, &pane_id);
+            let identity = mail_identity.as_deref().unwrap_or(&name);
             let peer_args: Vec<String> = peer_template
                 .as_ref()
                 .map(|t| {
                     vec![peer_prompt_template(
                         t,
                         &name,
+                        identity,
                         peer_poll_interval_minutes,
                         peer_poll_budget_minutes,
                         peer_max_prompts,
@@ -4676,19 +4702,6 @@ projects available: {}",
                 None => vec![],
             };
             agent_args.extend(peer_args);
-            let pane_id = if first {
-                first = false;
-                prev.clone()
-            } else {
-                let p = herdr_shim::pane_split(
-                    &mut c,
-                    &prev,
-                    "down",
-                    Some(&utf8_path(&dir, "workspace dir")?),
-                )?;
-                prev = p.pane_id.clone();
-                prev.clone()
-            };
             let agent = start_agent_with_retry(&mut c, &name, &kind, &pane_id, &agent_args)?;
             // bd-eign.6 L1: readiness gate — agent.start returns when the
             // launch command is dispatched, not when the TUI is input-ready;
@@ -4712,16 +4725,12 @@ projects available: {}",
             if settle_secs > 0 {
                 std::thread::sleep(Duration::from_secs(settle_secs));
             }
-            // governed-by: ADR-0001 (mail-register-on-spawn) — register the
-            // spawned agent as an agent-mail identity so it's addressable by
-            // name in mail. Best-effort: mail-not-configured is NOT a spawn
-            // failure (silent skip); a registration error is a warning.
-            // bd-627z.4: the returned identity is PINNED in the spawn
-            // registry (pane → identity) so assign resolves deterministically.
-            let mail_identity = register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
-            // bd-eign.13: profile-driven spawns pin profile+harness in the
-            // registry so __send auto-applies the behavior preamble and the
-            // skill-injection prefix (bd-eign.10).
+            // governed-by: ADR-0001 (mail-register-on-spawn) — the spawned
+            // agent was already registered (S8.3, above, before the launch
+            // prompt); pin the returned identity in the spawn registry
+            // (pane → identity) so assign resolves deterministically.
+            // bd-627z.4: the pinned identity never shifts across calls,
+            // restarts, and daemon restarts.
             let entry = match (&item.profile, &mail_identity) {
                 (Some(p), mid) => state::SpawnEntry::profiled(
                     agent.pane_id.clone(),
@@ -4926,9 +4935,20 @@ fn start_agent_with_retry_dyn(
 /// recovers, with the remediation (start the daemon; the loop/assign
 /// auto-registers on first contact once it is back).
 ///
-/// bd-627z.4: returns the DETERMINISTIC mail identity (adjective+noun) so
-/// the spawn caller can pin it in the spawn registry (pane → identity) —
-/// assign then resolves through that map and the identity never shifts.
+/// bd-627z.4: returns the DETERMINISTIC mail identity so the spawn caller
+/// can pin it in the spawn registry (pane → identity) — assign then
+/// resolves through that map and the identity never shifts.
+///
+/// S8.3: the identity is the CANONICAL herdr name (`flywheel-<project>-
+/// <role><N>`) itself, not the legacy adjective+noun mapping — toron
+/// accepts any name (the agent-mail whitelist constraint never applied to
+/// the toron backend), so the name the wake/assign surfaces IS the
+/// registered identity. The random npub stays underneath (registration
+/// creates or upserts the key for the name).
+///
+/// S8.4: the upsert carries a FRESH task stamp (spawn_agent_profile) — the
+/// toron register_agent upsert overwrites stale profile task fields from a
+/// prior session (a 2026-08-14 identity still advertised `bd-qk9q`).
 ///
 /// governed-by: ADR-0001 (bd-mail-register-on-spawn, bd-mail-pane-identity-bridge), ADR-0002 (factory)
 pub(crate) fn register_spawned_agent(
@@ -4970,19 +4990,11 @@ pub(crate) fn register_spawned_agent(
         warn_no_identities(&e);
         return None;
     }
-    // bd-odc fix: agent-mail's register_agent REJECTS non-adjective+noun
-    // names, and flywheel spawns `flywheel-<base>-<kind>` names. Map to a
-    // stable adjective+noun (agent_mail_name), keep the herdr name in
-    // task_description so list_agents is the reverse lookup.
-    let mail_name = agent_mail_name(name);
-    let task = format!("{name} (flywheel agent for {project})");
-    let profile = backend::AgentProfile {
-        name: mail_name.clone(),
-        program: Some(kind.to_string()),
-        model: Some(kind.to_string()),
-        persona: None,
-        task_description: Some(task),
-    };
+    // S8.3: the canonical herdr name IS the mail identity. The legacy
+    // agent-mail adjective+noun whitelist (bd-odc) does not apply to the
+    // toron backend — any name registers; the random npub stays underneath.
+    let mail_name = name.to_string();
+    let profile = spawn_agent_profile(name, kind, project);
     if let Err(e) = backend::run_mail(mail.register_agent(&key, &profile)) {
         // Best-effort: a registration failure must never fail the spawn. The
         // pane-identity bridge below still works (the identity file is the
@@ -4993,9 +5005,8 @@ pub(crate) fn register_spawned_agent(
         return None;
     }
     // bridge the identity to the herdr pane (best-effort, like register).
-    // The file holds the REGISTERED identity (the mapped adjective+noun) so
-    // resolve_pane_identity returns a name that exists in the registry — the
-    // herdr name is not registrable and would resolve to a dead end.
+    // The file holds the REGISTERED identity (the canonical name) so
+    // resolve_pane_identity returns a name that exists in the registry.
     if let Err(e) = backend::run_mail(mail.write_pane_identity(&key, pane_id, &mail_name)) {
         eprintln!("flywheel: mail write_pane_identity failed for {name} on {pane_id}: {e}");
     }
@@ -8159,40 +8170,29 @@ fn cmd_toron(cfg: &Config, cmd: &ToronCmd) -> Result<()> {
 /// is a documented no-op (messages are "fresh on first read" per pipeline
 /// dedup). The digest therefore reports the RECENT inbox (limit 10) with an
 /// honest label: `recent` = messages in the projection window, `urgent` =
-/// high|urgent importance among them. The wake trigger uses `urgent > 0`,
-/// which IS meaningful (importance is a real message attribute).
+/// the [`wake_urgent`]-filtered high|urgent count among them (S8.2: read or
+/// already-executed assigns do not wake). The wake trigger uses
+/// `urgent > 0`, which IS meaningful (importance is a real message
+/// attribute).
 fn digest_for(mail: &mail_shim::Mail, key: &str, name: &str) -> Result<Value> {
     let v = mail.inbox_filtered(
         key,
         name,
         &mail_shim::MailInboxFilter {
             unread_only: false,
-            include_bodies: false,
+            include_bodies: true,
             limit: 10,
             ..Default::default()
         },
     )?;
     let arr = v.as_array().cloned().unwrap_or_default();
     let recent = arr.len();
-    let urgent = arr
-        .iter()
-        .filter(|m| {
-            m.get("importance")
-                .and_then(|i| i.as_str())
-                .map(|i| i == "high" || i == "urgent")
-                .unwrap_or(false)
-        })
-        .count();
+    let urgent_rows = wake_urgent(&arr);
+    let urgent = urgent_rows.len();
     let last = arr.first();
-    let last_urgent = arr
-        .iter()
-        .find(|m| {
-            m.get("importance")
-                .and_then(|i| i.as_str())
-                .map(|i| i == "high" || i == "urgent")
-                .unwrap_or(false)
-        })
-        .or(last);
+    // wake key: the most recent URGENT message that survives the wake
+    // filter (the loop wakes once per id)
+    let last_urgent = urgent_rows.first().copied().or(last);
     let last_from = last.and_then(|m| {
         m.get("sender")
             .or_else(|| m.get("from"))
@@ -8200,6 +8200,8 @@ fn digest_for(mail: &mail_shim::Mail, key: &str, name: &str) -> Result<Value> {
     });
     Ok(json!({
         "agent": name,
+        // the caller's mail is bound to this identity — wake fetches as it
+        "mail_identity": name,
         "recent": recent,
         "urgent": urgent,
         "last_id": last_urgent.and_then(|m| {
@@ -8209,6 +8211,303 @@ fn digest_for(mail: &mail_shim::Mail, key: &str, name: &str) -> Result<Value> {
         "last_subject": last.and_then(|m| m.get("subject").and_then(|s| s.as_str())),
         "thread_id": last.and_then(|m| m.get("thread_id").and_then(|t| t.as_str())),
     }))
+}
+
+/// S8.1: the wake identity for a herdr agent name. The spawn-registry /
+/// agent-names pin (pane → name → mail identity) wins; otherwise the
+/// canonical name itself — the identity flywheel registers at spawn and the
+/// wake backstop registers idempotently BEFORE instructing fetch. Never the
+/// legacy adjective+noun hash: a wake must name an identity that exists (or
+/// is about to be registered), or the "fetch as X" instruction 404s
+/// (debrief D1/D2 — "fetch as flywheel-toron-oc4" for a never-registered
+/// name).
+pub(crate) fn wake_identity_pin(
+    reg: &[state::SpawnEntry],
+    names: &[state::SpawnEntry],
+    name: &str,
+) -> String {
+    for e in reg.iter().chain(names.iter()) {
+        if e.name == name {
+            if let Some(mid) = e.mail_identity.as_deref().filter(|m| !m.is_empty()) {
+                return mid.to_string();
+            }
+            break;
+        }
+    }
+    name.to_string()
+}
+
+/// S8.2: which urgent inbox rows legitimately wake an agent.
+///
+/// Assign messages (`[assign]` subjects) wake only when UNREAD
+/// (`read_ts_us` absent — the agent has not fetched them) AND not-yet-
+/// executed (no in-thread reply newer than the assign). Identical
+/// (sender, subject, body) assigns within the window collapse to the first
+/// — the duplicate-assign double-wake (debrief D1: two identical assigns
+/// both woke the agent). All other urgent rows pass through unchanged.
+///
+/// Pure + deterministic; the digest paths (loop wake + operator `mail
+/// digest`) share this one filter.
+pub(crate) fn wake_urgent(rows: &[Value]) -> Vec<&Value> {
+    let urgent = |m: &Value| {
+        m.get("importance")
+            .and_then(|i| i.as_str())
+            .map(|i| i == "high" || i == "urgent")
+            .unwrap_or(false)
+    };
+    let is_assign = |m: &Value| {
+        m.get("subject")
+            .and_then(|s| s.as_str())
+            .map(|s| s.starts_with("[assign]"))
+            .unwrap_or(false)
+    };
+    let key_of = |m: &Value| {
+        (
+            m.get("sender")
+                .or_else(|| m.get("from"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            m.get("subject")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            m.get("body_md")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        )
+    };
+    // Pass 1: urgent rows, with identical (sender, subject, body) assigns
+    // collapsed to the first (the duplicate-assign double-wake, debrief D1).
+    // Duplicate copies are remembered so they never count as thread replies
+    // in pass 2.
+    let mut seen: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
+    let mut duplicate_ids: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
+    let mut deduped: Vec<&Value> = Vec::new();
+    for m in rows {
+        if !urgent(m) {
+            continue;
+        }
+        if is_assign(m) && !seen.insert(key_of(m)) {
+            if let Some(id) = m.get("id").and_then(|i| i.as_str()) {
+                duplicate_ids.insert(id);
+            }
+            continue; // duplicate assign — same sender+subject+body
+        }
+        deduped.push(m);
+    }
+    // Pass 2: assigns wake only when UNREAD (`read_ts_us` absent) AND
+    // not-yet-executed (no in-thread reply newer than the assign, judged
+    // against ALL rows minus the deduplicated copies — a duplicate copy
+    // never counts as a reply, a real reply (urgent or not) always does).
+    let mut out = Vec::new();
+    for m in &deduped {
+        if !is_assign(m) {
+            out.push(*m);
+            continue;
+        }
+        if m.get("read_ts_us")
+            .map(|v| !v.is_null())
+            .unwrap_or(false)
+        {
+            continue; // already read — the agent saw it
+        }
+        if thread_has_reply(rows, &duplicate_ids, m) {
+            continue; // executed — the thread already moved
+        }
+        out.push(*m);
+    }
+    out
+}
+
+/// A later, non-duplicate message exists on the same thread as `m` (the
+/// thread moved). `duplicate_ids` are the collapsed assign copies — they do
+/// not count as replies.
+fn thread_has_reply(
+    rows: &[Value],
+    duplicate_ids: &std::collections::HashSet<&str>,
+    m: &Value,
+) -> bool {
+    let Some(tid) = m.get("thread_id").and_then(|t| t.as_str()) else {
+        return false;
+    };
+    let Some(ts) = m.get("created_ts_us").and_then(|t| t.as_i64()) else {
+        return false;
+    };
+    rows.iter().any(|r| {
+        !std::ptr::eq(r, m)
+            && !r
+                .get("id")
+                .and_then(|i| i.as_str())
+                .map(|i| duplicate_ids.contains(i))
+                .unwrap_or(false)
+            && r.get("thread_id").and_then(|t| t.as_str()) == Some(tid)
+            && r
+                .get("created_ts_us")
+                .and_then(|t| t.as_i64())
+                .map(|t| t > ts)
+                .unwrap_or(false)
+    })
+}
+
+/// S8.3/S8.4: the mail profile a spawn registers — the CANONICAL herdr name
+/// as the identity (the random npub stays underneath; toron accepts any
+/// name, the legacy agent-mail adjective+noun whitelist does not apply),
+/// with a fresh task stamp whose idempotent upsert overwrites stale task
+/// fields from a prior session (debrief A2: a 2026-08-14 identity still
+/// advertised `bd-qk9q`).
+pub(crate) fn spawn_agent_profile(
+    name: &str,
+    kind: &str,
+    project: &str,
+) -> backend::AgentProfile {
+    backend::AgentProfile {
+        name: name.to_string(),
+        program: Some(kind.to_string()),
+        model: Some(kind.to_string()),
+        persona: None,
+        task_description: Some(format!("{name} (flywheel agent for {project})")),
+    }
+}
+
+#[cfg(test)]
+mod wake_identity_tests {
+    use super::*;
+    use crate::state::SpawnEntry;
+
+    fn entry(name: &str, mid: Option<&str>) -> SpawnEntry {
+        match mid {
+            Some(m) => SpawnEntry::with_mail_identity("p1", name, m),
+            None => SpawnEntry::legacy("p1", name),
+        }
+    }
+
+    fn assign_row(
+        id: &str,
+        body: &str,
+        thread: &str,
+        created_us: i64,
+        read: bool,
+    ) -> Value {
+        json!({
+            "id": id,
+            "sender": "CoralFinch",
+            "subject": "[assign] toron → bd-x.1",
+            "body_md": body,
+            "importance": "high",
+            "thread_id": thread,
+            "created_ts_us": created_us,
+            "read_ts_us": read.then(|| created_us + 1),
+        })
+    }
+
+    /// S8.1: the wake identity is the registry pin, else the canonical name
+    /// itself — never a not-yet-registered alias.
+    #[test]
+    fn wake_identity_prefers_pin_else_canonical_name() {
+        let reg = vec![entry("flywheel-toron-oc", Some("DustySparrow"))];
+        let names = vec![entry("flywheel-toron-oc", Some("DustySparrow"))];
+        assert_eq!(
+            wake_identity_pin(&reg, &names, "flywheel-toron-oc"),
+            "DustySparrow",
+            "legacy registry pin still wins"
+        );
+        assert_eq!(
+            wake_identity_pin(&[], &names, "flywheel-toron-oc"),
+            "DustySparrow",
+            "agent-names mirror pin wins when the registry is empty"
+        );
+        assert_eq!(
+            wake_identity_pin(&[], &[], "flywheel-toron-oc4"),
+            "flywheel-toron-oc4",
+            "unregistered name resolves to itself — the wake registers it"
+        );
+        let unpinned = vec![entry("flywheel-toron-oc", None)];
+        assert_eq!(
+            wake_identity_pin(&unpinned, &[], "flywheel-toron-oc"),
+            "flywheel-toron-oc",
+            "legacy entry without a pin falls back to the canonical name"
+        );
+    }
+
+    /// S8.2: a plain urgent message always wakes.
+    #[test]
+    fn wake_urgent_keeps_normal_urgent() {
+        let rows = vec![json!({
+            "id": "m1", "sender": "PinkGorge", "subject": "[bd-1] help",
+            "body_md": "x", "importance": "urgent", "thread_id": "t1",
+            "created_ts_us": 1000,
+        })];
+        assert_eq!(wake_urgent(&rows).len(), 1);
+    }
+
+    /// S8.2: two identical assigns (same sender+subject+body) collapse to one.
+    #[test]
+    fn wake_urgent_collapses_duplicate_assigns() {
+        let rows = vec![
+            assign_row("18072be9", "Assigned beads: bd-gsvn.2", "t-a", 1000, false),
+            assign_row("4436c7eb", "Assigned beads: bd-gsvn.2", "t-a", 1001, false),
+        ];
+        let out = wake_urgent(&rows);
+        assert_eq!(out.len(), 1, "identical assigns wake once");
+        assert_eq!(out[0]["id"], "18072be9", "the first assign wins");
+    }
+
+    /// S8.2: an assign the agent already read does not wake.
+    #[test]
+    fn wake_urgent_skips_read_assign() {
+        let rows = vec![assign_row("m1", "Assigned beads: bd-x.1", "t-1", 1000, true)];
+        assert_eq!(wake_urgent(&rows).len(), 0, "read assign must not wake");
+    }
+
+    /// S8.2: an assign whose thread already has a reply is executed — no wake.
+    #[test]
+    fn wake_urgent_skips_executed_assign() {
+        let rows = vec![
+            assign_row("18072be9", "Assigned beads: bd-gsvn.2", "t-a", 1000, false),
+            json!({
+                "id": "reply-1", "sender": "YellowCastle",
+                "subject": "Re: [assign] toron → bd-gsvn.2",
+                "body_md": "all closed", "importance": "normal",
+                "thread_id": "t-a", "created_ts_us": 2000,
+            }),
+        ];
+        assert_eq!(
+            wake_urgent(&rows).len(),
+            0,
+            "executed assign (thread moved) must not wake"
+        );
+    }
+
+    /// S8.2: an unread, unexecuted assign DOES wake.
+    #[test]
+    fn wake_urgent_keeps_fresh_assign() {
+        let rows = vec![assign_row("m1", "Assigned beads: bd-x.1", "t-1", 1000, false)];
+        assert_eq!(wake_urgent(&rows).len(), 1);
+    }
+
+    /// S8.3/S8.4: the spawn profile registers the canonical name with a
+    /// fresh task stamp (the upsert clears stale prior-session tasks).
+    #[test]
+    fn spawn_profile_uses_canonical_name_and_fresh_task() {
+        let p = spawn_agent_profile("flywheel-toron-oc4", "opencode", "toron");
+        assert_eq!(p.name, "flywheel-toron-oc4", "canonical name, not a hash pair");
+        let task = p.task_description.unwrap();
+        assert!(task.contains("flywheel agent for toron"), "{task}");
+        assert!(!task.contains("bd-"), "no stale bead id in the fresh stamp: {task}");
+    }
+
+    /// S8.3: the peer-aware spawn template injects the mail identity.
+    #[test]
+    fn peer_prompt_injects_mail_identity() {
+        let tpl = "You are {name}. Your mail identity is {mail_identity}. Budget {poll_interval_minutes}/{poll_budget_minutes}/{max_peer_prompts}";
+        let out = peer_prompt_template(tpl, "flywheel-toron-oc4", "flywheel-toron-oc4", 10, 60, 5);
+        assert!(out.contains("Your mail identity is flywheel-toron-oc4"), "{out}");
+        assert!(!out.contains('{'), "no literal placeholders: {out}");
+    }
 }
 
 /// Block until a thread gains a message newer than the current latest
@@ -15982,17 +16281,35 @@ steps:
 /// asked it — without carrying a standing peer-poll template in its context
 /// (token-efficient: no per-agent self-poll loop; the orchestrator polls).
 ///
-/// Output: `{ "agent": <mail name>, "unread": N, "urgent": N,
-/// "last_from": "...", "last_subject": "...", "thread_id": "..." }`.
+/// S8.1: the digest RESOLVES the wake identity (spawn-registry /
+/// agent-names pin, else the canonical name) and registers it idempotently
+/// BEFORE the fetch — the wake prompt's "fetch as X" then names an identity
+/// that exists. `mail_identity` rides alongside `agent` (the herdr-name map
+/// key the loop uses).
+///
+/// S8.2: `urgent` counts only wake-filtered rows (read or already-executed
+/// assigns are excluded; duplicate assigns collapse).
+///
+/// Output: `{ "agent": <herdr name>, "mail_identity": <registered identity>,
+/// "recent": N, "urgent": N, "last_from": "...", "last_subject": "...",
+/// "thread_id": "..." }`.
 /// Soft-fail: mail down / unknown agent → zeroed digest, never an error.
 fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<()> {
-    // `agent` is the caller's key (herdr name from the poll snapshot, or a
-    // mail name) — echo it verbatim so the loop can key its digest map by
-    // the same name it will look up in plan_actions. The inbox query below
-    // resolves to the registered mail identity.
+    // `agent` is the caller's key (herdr name from the poll snapshot) —
+    // echo it verbatim so the loop can key its digest map by the same name
+    // it will look up in plan_actions.
     let key_name = agent.trim().to_string();
+    // S8.1: resolve the identity BEFORE the fetch. The registry pin (spawn
+    // pinned the identity at spawn) or the project-local agent-names mirror
+    // wins; otherwise the canonical name itself — which is what flywheel
+    // registers at spawn and what this backstop registers below.
+    let identity = {
+        let reg = state::load_spawn_registry(project);
+        let names = state::load_agent_names(&project_dir(cfg, project));
+        wake_identity_pin(&reg, &names, &key_name)
+    };
     let zero = json!({
-        "agent": key_name, "unread": 0, "urgent": 0,
+        "agent": key_name, "mail_identity": identity, "unread": 0, "urgent": 0,
         "last_from": null, "last_subject": null, "thread_id": null,
     });
     let mail = match backend::mail_backend(cfg) {
@@ -16007,33 +16324,35 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
         print_json(&zero);
         return Ok(());
     }
-    let name = resolve_mail_target(&key_name);
-    // bd-627z.2: first-contact auto-register backstop for the loop's dispatch
-    // path. A spawn that ran while the daemon was down left the agent without
-    // an identity; the first digest poll (the loop's first contact with the
-    // agent's mailbox) registers the expected identity so inbox/send never
-    // 404 "Agent not found". Idempotent upsert; best-effort — a failure just
-    // zeroes the digest and the loop retries next poll.
+    // S8.1 + bd-627z.2: first-contact auto-register backstop for the loop's
+    // dispatch path. A spawn that ran while the daemon was down left the
+    // agent without an identity; the first digest poll (the loop's first
+    // contact with the agent's mailbox) registers the RESOLVED identity so
+    // inbox/send never 404 "Agent not found". Idempotent upsert;
+    // best-effort — a failure just zeroes the digest and the loop retries
+    // next poll.
     let auto_profile = backend::AgentProfile {
-        name: name.clone(),
+        name: identity.clone(),
         program: Some("opencode".into()),
         model: Some("opencode".into()),
         persona: None,
         task_description: Some("flywheel mail CLI actor".into()),
     };
     if let Err(e) = backend::run_mail(mail.register_agent(&key, &auto_profile)) {
-        eprintln!("flywheel: mail digest auto-register of {name} failed (zeroing digest): {e}");
+        eprintln!(
+            "flywheel: mail digest auto-register of {identity} failed (zeroing digest): {e}"
+        );
     }
     // toron's projection has NO read-state: `unread_only` is a documented
-    // no-op ("fresh on first read"). Fetch the RECENT inbox (limit 10) and
-    // report `recent` + `urgent` (importance high|urgent) — both honest;
-    // `urgent` is the wake trigger and IS meaningful.
+    // no-op ("fresh on first read"). Fetch the RECENT inbox (limit 10) with
+    // bodies (the S8.2 dedup keys on body) and report `recent` + the
+    // wake-filtered `urgent` (importance high|urgent, assigns filtered).
     let v = match backend::run_mail(mail.inbox(&backend::InboxQuery {
         project: key,
-        agent: name.clone(),
+        agent: identity.clone(),
         unread_only: false,
         urgent_only: false,
-        include_bodies: false,
+        include_bodies: true,
         limit: Some(10),
         since_ts: None,
     })) {
@@ -16046,26 +16365,12 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
     let v_json = serde_json::to_value(&v).unwrap_or_default();
     let arr = v_json.as_array().cloned().unwrap_or_default();
     let recent = arr.len();
-    let urgent = arr
-        .iter()
-        .filter(|m| {
-            m.get("importance")
-                .and_then(|i| i.as_str())
-                .map(|i| i == "high" || i == "urgent")
-                .unwrap_or(false)
-        })
-        .count();
+    let urgent_rows = wake_urgent(&arr);
+    let urgent = urgent_rows.len();
     let last = arr.first();
-    // wake key: the most recent URGENT message (the loop wakes once per id)
-    let last_urgent = arr
-        .iter()
-        .find(|m| {
-            m.get("importance")
-                .and_then(|i| i.as_str())
-                .map(|i| i == "high" || i == "urgent")
-                .unwrap_or(false)
-        })
-        .or(last);
+    // wake key: the most recent URGENT message that survives the wake
+    // filter (the loop wakes once per id)
+    let last_urgent = urgent_rows.first().copied().or(last);
     // the wire row names the sender `sender` (toron MCP) or `from`
     // (agent-mail MCP) — read both (MailItem aliases them, but the raw
     // serde_json::Value here is the untyped projection).
@@ -16076,6 +16381,7 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
     });
     print_json(&json!({
         "agent": key_name,
+        "mail_identity": identity,
         "recent": recent,
         "urgent": urgent,
         "last_id": last_urgent.and_then(|m| {
