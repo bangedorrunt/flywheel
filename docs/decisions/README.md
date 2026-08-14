@@ -15,4 +15,4 @@ flywheel is tightly coupled to toron (toron carries; flywheel drives). Key cross
 
 - **toron ADR-0003** — the Nostr mailbox fabric flywheel consumes
 - **toron ADR-0007 se2.3** — the unified `MailSurface` trait both backends implement (supersedes flywheel ADR-0003's `MailBackend`)
-- **toron ADR-0013** — toron.dev website architecture; flywheel is a section (D5)
+- **toron ADR-0013** — toron.dev website architecture; flywheel is a section (D5). *Moved 2026-08-14 to the [toron.dev repo](https://github.com/bangedorrunt/toron.dev), renumbered ADR-0001*
