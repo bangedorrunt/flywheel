@@ -10,6 +10,12 @@
 | **Companion** | toron ADR-0013 D5 (flywheel scope = section of toron.dev) |
 | **Verification** | See §8 |
 
+> **Relocation note (2026-08-14):** every "toron ADR-0013" reference below now
+> lives in the **toron.dev repo** as
+> [ADR-0001](https://github.com/bangedorrunt/toron.dev/blob/main/docs/decisions/0001-website-architecture-and-feature-presentation.md)
+> (moved + renumbered). References are left in pre-move numbering as
+> historical context.
+
 ---
 
 ## 1. TL;DR
