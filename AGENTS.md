@@ -28,6 +28,18 @@ Live ignored tests need herdr + mail. `cargo test --exclude-ignored` is invalid.
 - **Spawn:** `--profile`, never `add --oc` when a profiled pane exists. Model via `ModelRegistry` (`opencode-go/deepseek-v4-flash` for coder).
 - **Send:** `--to <full-name|coder1|omp1|pane_id>`. Never bare `--to oc`. `launch_pending` is not idle. `agent_not_ready` → retry pane id. Do not flip omp defaults.
 - TDD. No script-based code edits. No file deletion without permission.
+- **Preflight:** `steer`/`loop run`/`workflow run --execute` auto-run prerequisite checks (herdr, resonate, br, beads, operator key, mail). `--skip-preflight` bypasses. Standalone: `flywheel preflight --mode {steer|loop|workflow|cron}`.
+
+## Skill Sync Contract
+
+When you add/remove/rename a CLI command, update ALL of:
+1. The `Commands` enum (`src/main.rs`) — ground truth (compiles).
+2. The `robot_capabilities` JSON (`src/main.rs`, `--robot-capabilities`) — agent self-discovery.
+3. This AGENTS.md (the Critical overrides + Details sections).
+4. The skill: `~/.agents/skills/flywheel/SKILL.md` §5 Commands.
+
+The skill files are the canonical agent-facing reference. A command not in the
+skill is invisible to any agent that triggers the skill.
 
 ## Details
 

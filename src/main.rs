@@ -22,6 +22,7 @@ mod mcp_http;
 mod models;
 mod output;
 mod pane;
+mod preflight;
 mod profile;
 mod run_log;
 mod smart_cron;
@@ -95,6 +96,10 @@ struct Cli {
     /// List flywheel's machine-readable capabilities as JSON
     #[arg(long, global = true)]
     robot_capabilities: bool,
+
+    /// Skip preflight checks (steer/loop/workflow auto-verify before dispatch)
+    #[arg(long, global = true)]
+    skip_preflight: bool,
 
     /// Compact JSON status of all flywheel swarms
     #[arg(long, global = true)]
@@ -596,6 +601,24 @@ enum Commands {
     Toron {
         #[command(subcommand)]
         cmd: ToronCmd,
+    },
+    /// Preflight: verify all prerequisites for a fleet operation before
+    /// dispatching. Catches environment/dependency failures in <1s instead
+    /// of 30s+ into a Resonate cycle. Auto-runs before steer/loop/workflow
+    /// unless --skip-preflight is passed.
+    Preflight {
+        /// operation mode to check: steer|loop|workflow|cron (default loop)
+        #[arg(long, default_value = "loop")]
+        mode: String,
+        /// project path
+        #[arg(long)]
+        project: Option<String>,
+        /// loop --work mode (adds beads check)
+        #[arg(long)]
+        work: bool,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
     },
     /// internal: poll swarm state as JSON (durable workflow leaf)
     #[command(name = "__poll", hide = true)]
@@ -2680,9 +2703,13 @@ fn main() {
             "version": VERSION,
             "backend": format!("herdr (socket protocol v{})", herdr_shim::HDR_PROTOCOL),
             "commands": [
-                "init spawn add list status send interrupt view watch zoom attach kill",
-                "work assign mail worktree checkpoint timeline audit history changes resume analytics",
-                "recipes workflows pipeline template ensemble safety guards policy deps config upgrade tutorial serve"
+                "init spawn add list status decide rebind recover",
+                "send interrupt view output watch zoom attach kill",
+                "loop work assign collab xproj mail toron steer",
+                "coalition debate plan-review profile squad model runs",
+                "workflow cron recipes workflows pipeline template stage ensemble",
+                "checkpoint timeline audit history changes resume analytics",
+                "backend safety guards policy deps integration config upgrade tutorial serve preflight"
             ],
             "tracker": "br/bv (CLI, no MCP)",
             "coordination": "toron mail",
@@ -2845,25 +2872,29 @@ fn main() {
                 confirm_timeout_ms,
                 engine,
                 force,
-            } => cmd_loop(
-                &cfg,
-                project,
-                *interval,
-                *interval_active,
-                queue.as_deref(),
-                workflow.as_deref(),
-                nudge.as_deref(),
-                *timeout_ms,
-                *once,
-                *local,
-                *work,
-                on_blocked,
-                to,
-                *no_confirm,
-                *confirm_timeout_ms,
-                *engine,
-                *force,
-            ),
+            } => {
+                let pf_mode = if *work { preflight::Mode::loop_work() } else { preflight::Mode::loop_queue() };
+                preflight_gate(&cfg, cli.skip_preflight, pf_mode, Some(project.as_str()))
+                    .and_then(|_| cmd_loop(
+                        &cfg,
+                        project,
+                        *interval,
+                        *interval_active,
+                        queue.as_deref(),
+                        workflow.as_deref(),
+                        nudge.as_deref(),
+                        *timeout_ms,
+                        *once,
+                        *local,
+                        *work,
+                        on_blocked,
+                        to,
+                        *no_confirm,
+                        *confirm_timeout_ms,
+                        *engine,
+                        *force,
+                    ))
+            },
             LoopCmd::Status { project } => cmd_loop_status(&cfg, project),
             LoopCmd::List => cmd_loop_list(),
             LoopCmd::Prune => cmd_loop_prune(),
@@ -2941,18 +2972,32 @@ fn main() {
             retain,
             retire_orphans,
             json,
-        }) => cmd_steer(
-            &cfg,
-            objective,
-            *direct,
-            crew.as_deref(),
-            project.as_deref(),
-            reuse.as_deref(),
-            *retain,
-            *retire_orphans,
-            *json,
-        ),
-        Some(Commands::Workflow { cmd }) => cmd_workflow(&cfg, cmd),
+        }) => preflight_gate(&cfg, cli.skip_preflight, preflight::Mode::steer(), project.as_deref())
+            .and_then(|_| cmd_steer(
+                &cfg,
+                objective,
+                *direct,
+                crew.as_deref(),
+                project.as_deref(),
+                reuse.as_deref(),
+                *retain,
+                *retire_orphans,
+                *json,
+            )),
+        Some(Commands::Workflow { cmd }) => {
+            let needs_pf = !cli.skip_preflight
+                && matches!(cmd, WorkflowCmd::Run { execute: true, .. });
+            let pf = if needs_pf {
+                let project = match &cmd {
+                    WorkflowCmd::Run { project, .. } => project.as_deref(),
+                    _ => None,
+                };
+                preflight_gate(&cfg, false, preflight::Mode::workflow(), project)
+            } else {
+                Ok(())
+            };
+            pf.and_then(|_| cmd_workflow(&cfg, cmd))
+        },
         Some(Commands::Model { cmd }) => cmd_models(cmd),
         Some(Commands::Cron { cmd }) => cmd_cron(&cfg, cmd),
         Some(Commands::Debate {
@@ -2991,6 +3036,9 @@ fn main() {
         Some(Commands::Tutorial) => cmd_tutorial(),
         Some(Commands::Serve { port }) => cmd_serve(&cfg, *port),
         Some(Commands::Toron { cmd }) => cmd_toron(&cfg, cmd),
+        Some(Commands::Preflight { mode, project, work, json }) => {
+            cmd_preflight(&cfg, mode, project.as_deref(), *work, *json)
+        }
         Some(Commands::__Poll { project, to }) => cmd_internal_poll(&cfg, project, to),
         Some(Commands::__PollEvents {
             project,
@@ -10030,8 +10078,7 @@ fn save_policy(path: &std::path::Path, policy: &config::Policy) -> Result<()> {
 }
 
 // ---- deps / config / upgrade / tutorial ----
-
-fn resonate_health(cfg: &Config) -> Result<()> {
+pub(crate) fn resonate_health(cfg: &Config) -> Result<()> {
     let url = cfg
         .resonate_url()
         .unwrap_or_else(|| "http://localhost:8001".to_string());
@@ -10044,12 +10091,60 @@ fn resonate_health(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn command_exists(name: &str) -> bool {
+pub(crate) fn command_exists(name: &str) -> bool {
     Command::new("sh")
         .args(["-c", &format!("command -v {name} >/dev/null 2>&1")])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+// ─── preflight ──────────────────────────────────────────────────────────────
+
+/// Run preflight checks and bail if any fail. No-op when `skip` is true.
+fn preflight_gate(
+    cfg: &Config,
+    skip: bool,
+    mode: preflight::Mode,
+    project: Option<&str>,
+) -> Result<()> {
+    if skip {
+        return Ok(());
+    }
+    let checks = preflight::run(cfg, mode, project);
+    if preflight::all_pass(&checks) {
+        return Ok(());
+    }
+    eprint!("{}", preflight::render(&checks));
+    bail!("preflight failed — fix the above or pass --skip-preflight");
+}
+
+/// `flywheel preflight --mode <m> [--project <p>] [--work] [--json]`
+fn cmd_preflight(
+    cfg: &Config,
+    mode: &str,
+    project: Option<&str>,
+    work: bool,
+    json: bool,
+) -> Result<()> {
+    let pf_mode = match mode {
+        "steer" => preflight::Mode::steer(),
+        "loop" if work => preflight::Mode::loop_work(),
+        "loop" => preflight::Mode::loop_queue(),
+        "workflow" => preflight::Mode::workflow(),
+        "cron" => preflight::Mode::cron(),
+        other => bail!("unknown preflight mode: {other} (steer|loop|workflow|cron)"),
+    };
+    let checks = preflight::run(cfg, pf_mode, project);
+    if json {
+        print_json(&preflight::to_json(&checks));
+    } else {
+        print!("{}", preflight::render(&checks));
+    }
+    if !preflight::all_pass(&checks) {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// Per-kind notes for the beads-agent integration template. Keep terse —
