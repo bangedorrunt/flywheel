@@ -521,6 +521,96 @@ steps:
     on_error: fail_run
 "##,
     ),
+    // ---- ADR-0019 Spec 7.2 measured-improvement playbooks (bd-w2-perf-to27) ----
+    (
+        "perf",
+        r##"
+name: perf
+description: "Measured-improvement playbook (ADR-0019 Spec 7.2): baseline → ONE change → same-command measure → KEEP (commit) or DISCARD (a revert, never a leftover) via an explicit control-flow branch."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: metric
+  - name: baseline_cmd
+  - name: budget
+principles:
+  - prove-it-works
+  - sequence-verifiable-units
+  - laziness-protocol
+steps:
+  - name: baseline
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@scout"
+      task: "Run the baseline for {{inputs.metric}}: `{{inputs.baseline_cmd}}`. Record the NUMBER (the baseline). The budget is {{inputs.budget}}."
+    on_error: fail_run
+  - name: change
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@coder"
+      task: "Make ONE change aimed at improving {{inputs.metric}} (baseline: {{steps.baseline}}). No scope creep — one change only."
+    on_error: fail_run
+  - name: measure
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@scout"
+      task: "Measure {{inputs.metric}} with the SAME command `{{inputs.baseline_cmd}}` against the change. Return JSON: {\"improved\": <bool>, \"number\": <N>} — improved iff the metric is better AND the budget {{inputs.budget}} is held."
+    on_error: fail_run
+  - name: keep-or-discard
+    action: branch
+    if: "{{steps.measure.improved}} == true"
+    then:
+      - name: keep
+        action: dispatch_job
+        assignee: x
+        spec:
+          profile: "@scout"
+          task: "KEEP the change: {{inputs.metric}} improved to {{steps.measure.number}} within budget. Commit the win — the improved state becomes the new baseline."
+        on_error: fail_run
+    else:
+      - name: discard
+        action: dispatch_job
+        assignee: x
+        spec:
+          profile: "@scout"
+          task: "DISCARD the change: {{inputs.metric}} did not improve (or the budget was missed). DISCARD IS A REVERT — restore the baseline exactly, no leftover."
+        on_error: fail_run
+"##,
+    ),
+    (
+        "hillclimb",
+        r##"
+name: hillclimb
+description: "Sustained measured-improvement loop (ADR-0019 Spec 7.2): capped retry — each attempt hypothesizes -> applies the smallest change -> measures -> KEEPS (ledger row + ONE commit per accepted win) or DISCARDS (a revert) and retries with a new hypothesis. The retry max_attempts is the iteration cap (max_iters)."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: metric
+  - name: target
+  - name: max_iters
+    default: 10
+principles:
+  - prove-it-works
+  - sequence-verifiable-units
+  - build-the-lever
+steps:
+  - name: climb
+    action: retry
+    max_attempts: 10
+    step:
+      name: iteration
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@coder"
+        task: "HILLCLIMB ITERATION (budget {{inputs.max_iters}} attempts; target {{inputs.target}} for {{inputs.metric}}): hypothesize -> apply the SMALLEST change -> measure with the same command. If improved: KEEP — record the ledger row (flywheel ledger / br gate, sha of this iteration's commit) + ONE commit per accepted win, return ok. If NOT improved: DISCARD — discard IS a revert, restore the baseline exactly, then return an ERROR so the loop retries with a new hypothesis. No unrelated work."
+"##,
+    ),
     (
         "prototype",
         r##"
@@ -1705,6 +1795,109 @@ mod tests {
                     "{name} must not contain {needle:?} (Spec 0 vocabulary)"
                 );
             }
+        }
+    }
+
+    // ---- ADR-0019 Spec 7.2 measured-improvement playbooks (bd-w2-perf-to27) ----
+
+    /// perf + hillclimb are compiled-in, crew:auto, with the exact input
+    /// contracts (metric/baseline_cmd/budget and metric/target/max_iters).
+    #[test]
+    fn measured_improvement_playbooks_are_compiled_in() {
+        let wfs = builtin_workflows();
+        let perf = &wfs["perf"];
+        assert_eq!(perf.crew, Some(CrewSpec::Auto), "perf is crew: auto");
+        assert_eq!(
+            perf.inputs.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            vec!["metric", "baseline_cmd", "budget"],
+            "perf inputs"
+        );
+        let hc = &wfs["hillclimb"];
+        assert_eq!(hc.crew, Some(CrewSpec::Auto), "hillclimb is crew: auto");
+        let hc_inputs: Vec<&str> = hc.inputs.iter().map(|i| i.name.as_str()).collect();
+        for required in ["metric", "target", "max_iters"] {
+            assert!(hc_inputs.contains(&required), "hillclimb input {required}: {hc_inputs:?}");
+        }
+        assert!(
+            hc.inputs.iter().any(|i| i.name == "max_iters" && i.default.is_some()),
+            "max_iters carries a default cap"
+        );
+    }
+
+    /// perf's keep/discard is an EXPLICIT control-flow branch on the measure
+    /// result — the dry-run shows it (acceptance: keep/discard branch).
+    #[test]
+    fn perf_has_explicit_keep_discard_branch() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let perf = &wfs["perf"];
+        let branch = perf
+            .steps
+            .iter()
+            .find(|s| s.name.as_deref() == Some("keep-or-discard"))
+            .expect("perf has the keep-or-discard branch step");
+        let Action::Branch { if_guard, then, else_steps } = &branch.action else {
+            panic!("keep-or-discard is a branch");
+        };
+        assert!(
+            if_guard.contains("steps.measure.improved"),
+            "branch guards on the measure result: {if_guard}"
+        );
+        assert_eq!(then.len(), 1, "keep arm");
+        assert_eq!(else_steps.len(), 1, "discard arm");
+        assert_eq!(then[0].name.as_deref(), Some("keep"), "keep = commit the win");
+        assert_eq!(else_steps[0].name.as_deref(), Some("discard"), "discard arm");
+    }
+
+    /// hillclimb's loop is a CAPPED retry — max_attempts is the iteration
+    /// cap (dry-run shows it); each attempt keeps (ledger row + commit) or
+    /// discards (revert) via the retry's success/failure split.
+    #[test]
+    fn hillclimb_loop_is_capped_retry() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let hc = &wfs["hillclimb"];
+        let climb = hc
+            .steps
+            .iter()
+            .find(|s| s.name.as_deref() == Some("climb"))
+            .expect("hillclimb has the climb step");
+        let Action::Retry {
+            max_attempts,
+            step,
+            ..
+        } = &climb.action
+        else {
+            panic!("climb is a capped retry");
+        };
+        assert!(
+            *max_attempts >= 1,
+            "retry carries the iteration cap: {max_attempts}"
+        );
+        let Action::DispatchJob { spec, .. } = &step.action else {
+            panic!("each attempt is a dispatch_job");
+        };
+        let task = spec.get("task").and_then(Value::as_str).unwrap_or("");
+        assert!(task.contains("DISCARD"), "attempt carries the discard rule: {task}");
+        assert!(task.contains("KEEP"), "attempt carries the keep rule");
+        assert!(task.contains("max_iters"), "budget binds to the max_iters input");
+    }
+
+    /// The principle tags ride in the raw YAML with canonical names.
+    #[test]
+    fn measured_playbooks_carry_canonical_principle_tags() {
+        let yaml_for = |name: &str| -> &str {
+            BUILTIN_WORKFLOWS_YAML
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, y)| *y)
+                .expect(name)
+        };
+        for tag in ["prove-it-works", "sequence-verifiable-units", "laziness-protocol"] {
+            assert!(yaml_for("perf").contains(tag), "perf carries {tag}");
+        }
+        for tag in ["prove-it-works", "sequence-verifiable-units", "build-the-lever"] {
+            assert!(yaml_for("hillclimb").contains(tag), "hillclimb carries {tag}");
         }
     }
 }
