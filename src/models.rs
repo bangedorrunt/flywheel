@@ -19,11 +19,34 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::verdict::{AcShape, BeadUnit, Blast};
+
 /// Blocked reason for the single-family degrade (ADR-0019 Spec 4): the
 /// registry cannot supply a second model family, so the bead cannot be
 /// independently verified. The loop marks it `blocked` with this reason,
 /// mails the captain exactly once, and does not respawn the verifier.
 pub const VERIFIER_FAMILY_MISSING: &str = "verifier-family-missing";
+
+/// The loop's verifier decision (ADR-0019 Spec 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifierPlan {
+    /// No independent verifier needed: the loop runs VERIFY itself (cheap
+    /// band) or a WorkerReceipt is legal (non-runnable band).
+    NoneRequired,
+    /// Dispatch an independent verifier on this model (different family, or
+    /// the captain's explicit `verifier_family_override`).
+    Dispatch(String),
+    /// Single-family degrade: block the bead `verifier-family-missing`,
+    /// mail the captain exactly once, no respawn.
+    Degrade,
+}
+
+/// Does this bead require an INDEPENDENT verifier (ADR-0019 Spec 4)? True
+/// for judgment AC, priority <= 1, or blast High — the cells where neither a
+/// loop-run CommandVerified nor a WorkerReceipt can legally close.
+pub fn verifier_required(bead: &BeadUnit, ac: AcShape) -> bool {
+    ac == AcShape::Judgment || bead.priority <= 1 || bead.blast == Blast::High
+}
 
 /// One registry entry (`[models.ID]`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -196,6 +219,27 @@ impl ModelRegistry {
             return Some((*c).to_string());
         }
         None
+    }
+
+    /// The full verifier decision for one bead (ADR-0019 Spec 4): when
+    /// `verifier_required`, resolve a different-family model; the degrade
+    /// signal (`Degrade`) is what the loop turns into `blocked` +
+    /// `verifier-family-missing` + exactly one captain mail + no respawn.
+    pub fn verifier_plan(
+        &self,
+        bead: &BeadUnit,
+        ac: AcShape,
+        worker_model: &str,
+        candidates: &[&str],
+        family_override: Option<&str>,
+    ) -> VerifierPlan {
+        if !verifier_required(bead, ac) {
+            return VerifierPlan::NoneRequired;
+        }
+        match self.verifier_for(worker_model, candidates, family_override) {
+            Some(model) => VerifierPlan::Dispatch(model),
+            None => VerifierPlan::Degrade,
+        }
     }
 
     /// Save to an explicit path (test seam).
@@ -513,5 +557,120 @@ provider = "local"
     #[test]
     fn verifier_family_missing_reason_constant() {
         assert_eq!(VERIFIER_FAMILY_MISSING, "verifier-family-missing");
+    }
+
+    fn bead(priority: u8, blast: Blast, runnable: bool) -> BeadUnit {
+        BeadUnit {
+            id: "bd-v-1".into(),
+            title: "verifier fixture".into(),
+            priority,
+            verify: if runnable {
+                "cargo test -p flywheel verifier".into()
+            } else {
+                "cargo test -p flywheel verifier && sleep 3600".into()
+            },
+            blast,
+            owner: None,
+            head_sha: None,
+        }
+    }
+
+    /// Cheap band (p>=2, Normal, loop-runnable): the loop verifies itself —
+    /// no independent verifier, even in a single-family swarm.
+    #[test]
+    fn verifier_plan_none_required_on_cheap_band() {
+        let reg = reg_with(&[("deepseek-v4", "deepseek")]);
+        let b = bead(3, Blast::Normal, true);
+        let plan = reg.verifier_plan(
+            &b,
+            AcShape::Checkable,
+            "deepseek-v4",
+            &["deepseek-v4"],
+            None,
+        );
+        assert_eq!(plan, VerifierPlan::NoneRequired);
+        // Non-runnable band (WorkerReceipt legal) also needs no verifier.
+        let b = bead(3, Blast::Normal, false);
+        let plan = reg.verifier_plan(
+            &b,
+            AcShape::Checkable,
+            "deepseek-v4",
+            &["deepseek-v4"],
+            None,
+        );
+        assert_eq!(plan, VerifierPlan::NoneRequired);
+    }
+
+    /// P0 (priority <= 1) with a second family: dispatch the different-family
+    /// verifier.
+    #[test]
+    fn verifier_plan_dispatches_different_family_for_p0() {
+        let reg = reg_with(&[("deepseek-v4", "deepseek"), ("opus-5", "anthropic")]);
+        let b = bead(0, Blast::Normal, true);
+        let plan = reg.verifier_plan(
+            &b,
+            AcShape::Checkable,
+            "deepseek-v4",
+            &["deepseek-v4", "opus-5"],
+            None,
+        );
+        assert_eq!(plan, VerifierPlan::Dispatch("opus-5".into()));
+    }
+
+    /// Single-family swarm + P0: Degrade (blocked verifier-family-missing,
+    /// one captain mail, no respawn loop).
+    #[test]
+    fn verifier_plan_degrades_single_family_for_p0() {
+        let reg = reg_with(&[("deepseek-v4", "deepseek"), ("deepseek-v3", "deepseek")]);
+        let b = bead(0, Blast::Normal, true);
+        let plan = reg.verifier_plan(
+            &b,
+            AcShape::Checkable,
+            "deepseek-v4",
+            &["deepseek-v4", "deepseek-v3"],
+            None,
+        );
+        assert_eq!(plan, VerifierPlan::Degrade);
+    }
+
+    /// Judgment AC always needs a verifier (ReviewerSigned); single-family +
+    /// override makes it dispatchable.
+    #[test]
+    fn verifier_plan_judgment_ac_requires_reviewer() {
+        let reg = reg_with(&[("deepseek-v4", "deepseek"), ("deepseek-v3", "deepseek")]);
+        let b = bead(2, Blast::Normal, true);
+        // Judgment + no override: degrade (no second family).
+        let plan = reg.verifier_plan(
+            &b,
+            AcShape::Judgment,
+            "deepseek-v4",
+            &["deepseek-v4", "deepseek-v3"],
+            None,
+        );
+        assert_eq!(plan, VerifierPlan::Degrade);
+        // Override: dispatch the same-family reviewer.
+        let plan = reg.verifier_plan(
+            &b,
+            AcShape::Judgment,
+            "deepseek-v4",
+            &["deepseek-v4", "deepseek-v3"],
+            Some("deepseek"),
+        );
+        assert_eq!(plan, VerifierPlan::Dispatch("deepseek-v3".into()));
+    }
+
+    /// High blast (overlap) needs an independent verifier too.
+    #[test]
+    fn verifier_plan_required_for_high_blast() {
+        let reg = reg_with(&[("deepseek-v4", "deepseek"), ("opus-5", "anthropic")]);
+        let b = bead(3, Blast::High, true);
+        let plan = reg.verifier_plan(
+            &b,
+            AcShape::Checkable,
+            "deepseek-v4",
+            &["deepseek-v4", "opus-5"],
+            None,
+        );
+        assert_eq!(plan, VerifierPlan::Dispatch("opus-5".into()));
     }
 }
