@@ -102,7 +102,9 @@ pub fn decide(target: &str, snap: &Snapshot) -> Decision {
         || (implement
             && has(
                 &t,
-                &["bug", "crash", "panic", "leak", "broken", "failing", "error"],
+                &[
+                    "bug", "crash", "panic", "leak", "broken", "failing", "error",
+                ],
             ))
     {
         return dec(
@@ -259,7 +261,10 @@ pub fn decide(target: &str, snap: &Snapshot) -> Decision {
     }
     // 12. interrogate / tear this apart / adversarial review -> interrogate
     //     (N reviewers, different families, same rubric, read-only).
-    if has(&t, &["interrogate", "tear this apart", "adversarial review"]) {
+    if has(
+        &t,
+        &["interrogate", "tear this apart", "adversarial review"],
+    ) {
         return dec(
             "interrogate",
             "interrogate — N-model adversarial review (read-only)",
@@ -622,8 +627,16 @@ mod tests {
         ] {
             let d = decide(t, &snap());
             assert_eq!(d.primitive, "bug-fix", "target: {t}");
-            assert!(d.argv.contains(&"bug-fix".to_string()), "argv: {:?}", d.argv);
-            assert!(d.argv.contains(&"pane".to_string()), "pane mode: {:?}", d.argv);
+            assert!(
+                d.argv.contains(&"bug-fix".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
+            assert!(
+                d.argv.contains(&"pane".to_string()),
+                "pane mode: {:?}",
+                d.argv
+            );
         }
     }
 
@@ -651,7 +664,11 @@ mod tests {
         ] {
             let d = decide(t, &snap());
             assert_eq!(d.primitive, "prototype", "target: {t}");
-            assert!(d.argv.contains(&"prototype".to_string()), "argv: {:?}", d.argv);
+            assert!(
+                d.argv.contains(&"prototype".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
         }
     }
 
@@ -666,7 +683,11 @@ mod tests {
     // Row 6 — perf/p95/slow (not fix/implement) -> perf.
     #[test]
     fn row6_perf_goes_to_perf() {
-        for t in ["profile the p95 latency", "dispatch is slow", "perf the ingest path"] {
+        for t in [
+            "profile the p95 latency",
+            "dispatch is slow",
+            "perf the ingest path",
+        ] {
             let d = decide(t, &snap());
             assert_eq!(d.primitive, "perf", "target: {t}");
             assert!(d.argv.contains(&"perf".to_string()), "argv: {:?}", d.argv);
@@ -678,7 +699,11 @@ mod tests {
     fn row6_implement_slow_is_not_perf() {
         let d = decide("fix the slow dispatch", &snap());
         assert_ne!(d.primitive, "perf");
-        assert_eq!(d.primitive, "steer", "implement falls through to steer: {:?}", d);
+        assert_eq!(
+            d.primitive, "steer",
+            "implement falls through to steer: {:?}",
+            d
+        );
     }
 
     // Row 7 — hillclimb -> hillclimb.
@@ -686,7 +711,11 @@ mod tests {
     fn row7_hillclimb_goes_to_hillclimb() {
         let d = decide("hillclimb the sharpe ratio", &snap());
         assert_eq!(d.primitive, "hillclimb");
-        assert!(d.argv.contains(&"hillclimb".to_string()), "argv: {:?}", d.argv);
+        assert!(
+            d.argv.contains(&"hillclimb".to_string()),
+            "argv: {:?}",
+            d.argv
+        );
     }
 
     // Row 8 — forensic/leak/idle cpu/spindump (not fix/implement) -> forensics.
@@ -700,7 +729,11 @@ mod tests {
         ] {
             let d = decide(t, &snap());
             assert_eq!(d.primitive, "forensics", "target: {t}");
-            assert!(d.argv.contains(&"forensics".to_string()), "argv: {:?}", d.argv);
+            assert!(
+                d.argv.contains(&"forensics".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
             assert!(
                 d.argv.contains(&"headless".to_string()),
                 "forensics is headless: {:?}",
@@ -737,7 +770,10 @@ mod tests {
     // Row 10 — pickup / resume session -> pickup.
     #[test]
     fn row10_pickup_goes_to_pickup() {
-        for t in ["pickup the stranded session", "resume session after the reboot"] {
+        for t in [
+            "pickup the stranded session",
+            "resume session after the reboot",
+        ] {
             let d = decide(t, &snap());
             assert_eq!(d.primitive, "pickup", "target: {t}");
             assert!(d.argv.contains(&"pickup".to_string()), "argv: {:?}", d.argv);
@@ -788,8 +824,16 @@ mod tests {
         for t in ["figure it out", "there's no playbook for this"] {
             let d = decide(t, &snap());
             assert_eq!(d.primitive, "figure-it-out", "target: {t}");
-            assert!(d.argv.contains(&"compose".to_string()), "compose: {:?}", d.argv);
-            assert!(d.argv.contains(&"--agent".to_string()), "planner arm: {:?}", d.argv);
+            assert!(
+                d.argv.contains(&"compose".to_string()),
+                "compose: {:?}",
+                d.argv
+            );
+            assert!(
+                d.argv.contains(&"--agent".to_string()),
+                "planner arm: {:?}",
+                d.argv
+            );
         }
     }
 
@@ -799,7 +843,11 @@ mod tests {
         for t in ["ship beads now", "land the beads"] {
             let d = decide(t, &snap());
             assert_eq!(d.primitive, "ship-beads", "target: {t}");
-            assert!(d.argv.contains(&"ship-beads".to_string()), "argv: {:?}", d.argv);
+            assert!(
+                d.argv.contains(&"ship-beads".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
         }
     }
 

@@ -62,10 +62,9 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
         "herdr" => {
             // ADR-0005 P1: the unified HerdrBackend (toron-core) connects the
             // client itself and implements the unified Backend trait.
-            let backend = toron_core::backend::herdr::HerdrBackend::connect(Some(
-                &cfg.socket_path(),
-            ))
-            .map_err(|e| BackendError::Other(anyhow::anyhow!("{e}")))?;
+            let backend =
+                toron_core::backend::herdr::HerdrBackend::connect(Some(&cfg.socket_path()))
+                    .map_err(|e| BackendError::Other(anyhow::anyhow!("{e}")))?;
             Ok(Box::new(backend))
         }
         // superlogical/tmux: stub backends (bd-toron-superlogical-stubs). With
@@ -329,8 +328,14 @@ mod tests {
         assert_eq!(b.name(), "superlogical");
         let m: Box<dyn MultiplexerBackend> = Box::new(b);
         match m.workspace_list() {
-            Err(toron_core::backend::BackendError { code: toron_core::backend::BackendErrorCode::Unsupported, message }) => {
-                assert!(message.contains("superlogical"), "names the backend: {message}")
+            Err(toron_core::backend::BackendError {
+                code: toron_core::backend::BackendErrorCode::Unsupported,
+                message,
+            }) => {
+                assert!(
+                    message.contains("superlogical"),
+                    "names the backend: {message}"
+                )
             }
             Ok(_) => panic!("stub must not Ok"),
             Err(e) => panic!("expected Unsupported, got {e:?}"),

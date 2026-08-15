@@ -64,11 +64,7 @@ pub fn crew_agent_name(wf_name: &str, role: &str, ordinal: u32) -> String {
             }
         })
         .collect();
-    let slug = slug
-        .trim_matches('-')
-        .chars()
-        .take(16)
-        .collect::<String>();
+    let slug = slug.trim_matches('-').chars().take(16).collect::<String>();
     let role_slug: String = role
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
@@ -84,10 +80,7 @@ pub fn crew_agent_name(wf_name: &str, role: &str, ordinal: u32) -> String {
 /// Resolve which registry entry serves a dispatch target: first the entry
 /// whose PROFILE matches `@role`, else an entry whose NAME matches. Pure —
 /// the runner's `@role -> running pane` mapping (ADR-0010 Spec A pane row).
-pub fn resolve_pane_entry<'a>(
-    entries: &'a [SpawnEntry],
-    profile: &str,
-) -> Option<&'a SpawnEntry> {
+pub fn resolve_pane_entry<'a>(entries: &'a [SpawnEntry], profile: &str) -> Option<&'a SpawnEntry> {
     entries
         .iter()
         .find(|e| e.profile.as_deref() == Some(profile))
@@ -177,9 +170,7 @@ pub fn pre_spawn_crew(
         {
             bail!("--reuse workspace {ws_id} not found for {project}");
         }
-        let entries = spawn_crew_into(
-            cfg, project, wf_name, plan, catalog, &mut c, ws_id, &label,
-        )?;
+        let entries = spawn_crew_into(cfg, project, wf_name, plan, catalog, &mut c, ws_id, &label)?;
         return Ok(PaneRunCtx {
             workspace_id: ws_id.to_string(),
             entries,
@@ -213,7 +204,12 @@ pub fn pre_spawn_crew(
     if !orphans.is_empty() {
         let detail: Vec<String> = orphans
             .iter()
-            .map(|ws| format!("{} (label {:?}, {} panes)", ws.workspace_id, ws.label, ws.pane_count))
+            .map(|ws| {
+                format!(
+                    "{} (label {:?}, {} panes)",
+                    ws.workspace_id, ws.label, ws.pane_count
+                )
+            })
             .collect();
         if retire_orphans {
             eprintln!(
@@ -234,8 +230,22 @@ pub fn pre_spawn_crew(
             );
         }
     }
-    let (ws, _root) = c.workspace_create(Some(&crate::utf8_path(&dir, "workspace dir")?), Some(&label), false, None)?;
-    let entries = spawn_crew_into(cfg, project, wf_name, plan, catalog, &mut c, &ws.workspace_id, &label)?;
+    let (ws, _root) = c.workspace_create(
+        Some(&crate::utf8_path(&dir, "workspace dir")?),
+        Some(&label),
+        false,
+        None,
+    )?;
+    let entries = spawn_crew_into(
+        cfg,
+        project,
+        wf_name,
+        plan,
+        catalog,
+        &mut c,
+        &ws.workspace_id,
+        &label,
+    )?;
     Ok(PaneRunCtx {
         workspace_id: ws.workspace_id,
         entries,
@@ -265,9 +275,9 @@ fn spawn_crew_into(
     let mut prev: Option<String> = None;
     let dir = crate::project_dir(cfg, project);
     for (role, count) in &plan.members {
-        let profile = catalog.get(role).ok_or_else(|| {
-            anyhow!("pane crew: unknown profile @{role} (flywheel profile list)")
-        })?;
+        let profile = catalog
+            .get(role)
+            .ok_or_else(|| anyhow!("pane crew: unknown profile @{role} (flywheel profile list)"))?;
         let harness = &profile.harness;
         if harness.is_empty() {
             bail!("pane crew: profile @{role} has no harness (set --harness)");
@@ -295,19 +305,19 @@ fn spawn_crew_into(
                 })
                 .cloned();
             let (agent_pane_id, name) = if let Some(e) = existing {
-                eprintln!("  crew {}: reusing {} ({}) @{}", label, name, e.pane_id, role);
+                eprintln!(
+                    "  crew {}: reusing {} ({}) @{}",
+                    label, name, e.pane_id, role
+                );
                 (e.pane_id.clone(), name.clone())
             } else {
                 let pane_id = match &prev {
                     None => {
                         // root pane of the workspace — list it by workspace id
                         let panes = c.pane_list(Some(ws_id))?;
-                        panes
-                            .first()
-                            .map(|p| p.pane_id.clone())
-                            .ok_or_else(|| {
-                                anyhow!("pane crew: no root pane in workspace {ws_id}")
-                            })?
+                        panes.first().map(|p| p.pane_id.clone()).ok_or_else(|| {
+                            anyhow!("pane crew: no root pane in workspace {ws_id}")
+                        })?
                     }
                     Some(p) => {
                         let split = crate::herdr_shim::pane_split(
@@ -357,7 +367,8 @@ fn spawn_crew_into(
             registry.retain(|e| e.name != name);
             // bd-627z.4: pin the registered mail identity at spawn so assign
             // resolves this pane's agent deterministically.
-            let mail_identity = crate::register_spawned_agent(cfg, project, &name, harness, &agent_pane_id);
+            let mail_identity =
+                crate::register_spawned_agent(cfg, project, &name, harness, &agent_pane_id);
             registry.push(SpawnEntry {
                 pane_id: agent_pane_id.clone(),
                 name: name.clone(),
@@ -366,10 +377,7 @@ fn spawn_crew_into(
                 mail_identity,
                 skills_injected: false,
             });
-            eprintln!(
-                "  crew {}: {} ({}) @{}",
-                label, name, agent_pane_id, role
-            );
+            eprintln!("  crew {}: {} ({}) @{}", label, name, agent_pane_id, role);
         }
     }
     // Persist the crew registry (pane_id, name, profile) — `__send`'s auto-
@@ -410,7 +418,9 @@ pub fn pane_dispatch(
         // bd-omwg: a Spawn reaching the runner is an engine-routing bug —
         // fail closed, never record it as done (ADR-0010 Spec E).
         if matches!(action, Action::Spawn { .. }) {
-            bail!("pane runner: Action::Spawn must be handled by the engine (run_spawn) — routing bug");
+            bail!(
+                "pane runner: Action::Spawn must be handled by the engine (run_spawn) — routing bug"
+            );
         }
         // Recorded, not dispatched — the P10.3 backward-compat surface for
         // non-dispatch actions (byte-identical to the no-op runner).
@@ -734,9 +744,7 @@ pub fn launch_spawn_job(
     // booting agent. Best-effort — a wait failure degrades to the __send
     // landing semantics, never a panic.
     if let Err(e) = c.agent_wait(&name, &[AgentStatus::Idle], Some(90_000)) {
-        eprintln!(
-            "flywheel: spawn drain {name} readiness wait failed (dispatching anyway): {e}"
-        );
+        eprintln!("flywheel: spawn drain {name} readiness wait failed (dispatching anyway): {e}");
     }
     let mut mission_err: Option<String> = None;
     if let Some(w) = &plan.workflow {
@@ -749,9 +757,9 @@ pub fn launch_spawn_job(
             .arg("--confirm")
             .arg("--profile")
             .arg(&plan.profile);
-        let output = cmd.output().with_context(|| {
-            format!("__send spawn mission for {name} (workflow {w})")
-        })?;
+        let output = cmd
+            .output()
+            .with_context(|| format!("__send spawn mission for {name} (workflow {w})"))?;
         let raw = String::from_utf8_lossy(&output.stdout).to_string();
         let trimmed = raw.trim();
         if let Ok(v) = serde_json::from_str::<Value>(trimmed)
@@ -962,7 +970,10 @@ mod tests {
         assert_eq!(crew_agent_name("plan", "planner", 1), "crew-plan-planner");
         assert_eq!(crew_agent_name("plan", "coder", 2), "crew-plan-coder2");
         // Uppercase + spaces slug down (CREW-WF -> crew-wf)
-        assert_eq!(crew_agent_name("CREW-WF", "planner", 1), "crew-crew-wf-planner");
+        assert_eq!(
+            crew_agent_name("CREW-WF", "planner", 1),
+            "crew-crew-wf-planner"
+        );
         assert_eq!(crew_agent_name("My Plan", "coder", 1), "crew-my-plan-coder");
         // long names truncate to stay within herdr's 32-char budget
         let long = crew_agent_name("a-very-long-workflow-name-that-goes-on", "reviewer", 1);
@@ -1043,8 +1054,14 @@ mod tests {
         assert_eq!(plan.profile, "housekeeper", "@ stripped");
         assert_eq!(plan.workflow.as_deref(), Some("weekly-upgrade"));
         assert_eq!(plan.harness, "pi");
-        assert!(plan.await_job, "await:true must resolve when the job finishes");
-        assert!(!plan.args.is_empty(), "model/effort args must reach agent_start");
+        assert!(
+            plan.await_job,
+            "await:true must resolve when the job finishes"
+        );
+        assert!(
+            !plan.args.is_empty(),
+            "model/effort args must reach agent_start"
+        );
         assert!(
             plan.args.iter().any(|a| a.contains("glm-5.2")),
             "model flag present: {:?}",
@@ -1100,11 +1117,7 @@ steps:
             let engine = engine.clone();
             async move {
                 engine
-                    .invoke(
-                        "fw-test-spawn-drain-1",
-                        spawn_workflow(false),
-                        json!({}),
-                    )
+                    .invoke("fw-test-spawn-drain-1", spawn_workflow(false), json!({}))
                     .await
             }
         });
@@ -1132,25 +1145,24 @@ steps:
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let output: Value = match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            invoke,
-        )
-        .await
-        {
-            Ok(Ok(Ok(v))) => v,
-            Ok(Ok(Err(e))) => panic!("invoke failed: {e}"),
-            Ok(Err(je)) => panic!("invoke task join: {je}"),
-            Err(_) => panic!("invoke timed out — drainer never settled the job promise"),
-        };
+        let output: Value =
+            match tokio::time::timeout(std::time::Duration::from_secs(15), invoke).await {
+                Ok(Ok(Ok(v))) => v,
+                Ok(Ok(Err(e))) => panic!("invoke failed: {e}"),
+                Ok(Err(je)) => panic!("invoke task join: {je}"),
+                Err(_) => panic!("invoke timed out — drainer never settled the job promise"),
+            };
         let receipts = receipts.expect("drainer must have run");
         assert_eq!(receipts.len(), 1, "one promise -> one launch");
-        assert_eq!(receipts[0]["profile"], "housekeeper", "receipt: {receipts:?}");
+        assert_eq!(
+            receipts[0]["profile"], "housekeeper",
+            "receipt: {receipts:?}"
+        );
         assert_eq!(receipts[0]["harness"], "pi");
         assert!(
-            receipts[0]["args"]
-                .as_array()
-                .is_some_and(|a| a.iter().any(|s| s.as_str().is_some_and(|x| x.contains("glm-5.2")))),
+            receipts[0]["args"].as_array().is_some_and(|a| a
+                .iter()
+                .any(|s| s.as_str().is_some_and(|x| x.contains("glm-5.2")))),
             "launch args carried: {:?}",
             receipts[0]["args"]
         );
@@ -1225,17 +1237,13 @@ steps:
                 panic!("spawn never parked on a job promise");
             }
         });
-        let output: Value = match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            invoke,
-        )
-        .await
-        {
-            Ok(Ok(Ok(v))) => v,
-            Ok(Ok(Err(e))) => panic!("invoke failed: {e}"),
-            Ok(Err(je)) => panic!("invoke task join: {je}"),
-            Err(_) => panic!("invoke timed out — the drainer never settled the job promise"),
-        };
+        let output: Value =
+            match tokio::time::timeout(std::time::Duration::from_secs(15), invoke).await {
+                Ok(Ok(Ok(v))) => v,
+                Ok(Ok(Err(e))) => panic!("invoke failed: {e}"),
+                Ok(Err(je)) => panic!("invoke task join: {je}"),
+                Err(_) => panic!("invoke timed out — the drainer never settled the job promise"),
+            };
         drainer.await.expect("drainer ok");
         assert_eq!(output["job"]["ok"], true, "step succeeded: {output}");
         assert_eq!(

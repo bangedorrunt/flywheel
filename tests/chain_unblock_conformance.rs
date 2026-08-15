@@ -46,7 +46,8 @@ fn br_stdout(dir: &std::path::Path, args: &[&str]) -> serde_json::Value {
         String::from_utf8_lossy(&out.stderr)
     );
     let raw = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(raw.trim()).unwrap_or_else(|_| serde_json::Value::String(raw.trim().to_string()))
+    serde_json::from_str(raw.trim())
+        .unwrap_or_else(|_| serde_json::Value::String(raw.trim().to_string()))
 }
 
 fn ready_ids(v: &serde_json::Value) -> Vec<String> {

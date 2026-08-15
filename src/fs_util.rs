@@ -20,8 +20,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("atomic_write: {} has no parent dir", path.display()))?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("create dir {}", parent.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("atomic_write: {} has no file name", path.display()))?;
@@ -35,7 +34,8 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             .with_context(|| format!("create temp {}", tmp.display()))?;
         f.write_all(bytes)
             .with_context(|| format!("write temp {}", tmp.display()))?;
-        f.sync_all().with_context(|| format!("sync temp {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("sync temp {}", tmp.display()))?;
         std::fs::rename(&tmp, path)
             .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
         Ok(())
@@ -53,8 +53,8 @@ mod tests {
 
     #[test]
     fn atomic_write_roundtrips_and_overwrites() {
-        let path = std::env::temp_dir()
-            .join(format!("flywheel-atomic-write-{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("flywheel-atomic-write-{}", std::process::id()));
         atomic_write(&path, b"first").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
         atomic_write(&path, b"second").unwrap();
@@ -64,8 +64,8 @@ mod tests {
 
     #[test]
     fn atomic_write_creates_parent_dirs() {
-        let dir = std::env::temp_dir()
-            .join(format!("flywheel-atomic-dir-{}/nested", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("flywheel-atomic-dir-{}/nested", std::process::id()));
         let path = dir.join("data.toml");
         atomic_write(&path, b"x").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "x");
@@ -87,9 +87,7 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(std::env::temp_dir())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name().to_string_lossy().contains(".x.toml.tmp-")
-            })
+            .filter(|e| e.file_name().to_string_lossy().contains(".x.toml.tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "temp cleaned up on failure");
         let _ = std::fs::remove_file(&dir);

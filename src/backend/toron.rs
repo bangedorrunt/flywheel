@@ -140,7 +140,11 @@ fn renew_result_from(v: Value) -> Result<RenewResult, MailError> {
                         .unwrap_or("")
                         .to_string(),
                     exclusive: true,
-                    reason: r.get("reason").and_then(Value::as_str).unwrap_or("").to_string(),
+                    reason: r
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                     expires_ts_us: r
                         .get("new_expires_ts")
                         .and_then(Value::as_str)

@@ -35,7 +35,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::state_dir;
@@ -364,9 +364,7 @@ pub fn load_spawn_meta(project: &str) -> Option<String> {
     let path = spawn_meta_file(project);
     let raw = std::fs::read_to_string(&path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    v.get("label")
-        .and_then(|l| l.as_str())
-        .map(String::from)
+    v.get("label").and_then(|l| l.as_str()).map(String::from)
 }
 
 /// bd-a7j: an outstanding expected reply — written by `flywheel collab`
@@ -968,10 +966,7 @@ pub fn ensure_loop_owner(project: &str) -> Result<()> {
 /// process must never be unregistered by an older one exiting late.
 pub fn unregister_loop(project: &str, pid: u32) {
     let mut pids = load_loop_pids();
-    let remove = pids
-        .get(project)
-        .map(|e| e.pid == pid)
-        .unwrap_or(false);
+    let remove = pids.get(project).map(|e| e.pid == pid).unwrap_or(false);
     if remove {
         pids.remove(project);
         let _ = save_loop_pids(&pids);
@@ -1222,7 +1217,14 @@ pub(crate) fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     use chrono::{Datelike, Timelike};
     let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
         .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
-    (dt.year() as i64, dt.month(), dt.day(), dt.hour(), dt.minute(), dt.second())
+    (
+        dt.year() as i64,
+        dt.month(),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+    )
 }
 
 fn slugify(s: &str) -> String {
@@ -1559,7 +1561,10 @@ mod tests {
         let mut msgs: Vec<&str> = list.iter().map(|c| c.message.as_str()).collect();
         msgs.sort_unstable();
         assert_eq!(msgs, vec!["first snapshot", "second snapshot"]);
-        let second = list.iter().find(|c| c.message == "second snapshot").unwrap();
+        let second = list
+            .iter()
+            .find(|c| c.message == "second snapshot")
+            .unwrap();
         assert!(second.agents.is_empty());
         let first = list.iter().find(|c| c.message == "first snapshot").unwrap();
         assert_eq!(first.workspace_id.as_deref(), Some("ws-1"));
@@ -1649,7 +1654,10 @@ mod last_sent_tests {
 
     #[test]
     fn find_last_sent_matches_name_and_hash() {
-        let v = vec![rec("a", 11, "inv1", true, false), rec("b", 22, "inv1", true, false)];
+        let v = vec![
+            rec("a", 11, "inv1", true, false),
+            rec("b", 22, "inv1", true, false),
+        ];
         assert!(find_last_sent(&v, "a", 11).is_some());
         assert!(find_last_sent(&v, "a", 22).is_none());
         assert!(find_last_sent(&v, "b", 22).is_some());
@@ -1689,7 +1697,12 @@ mod last_sent_tests {
         ];
         let runs: Vec<&LogEntry> = entries
             .iter()
-            .filter(|e| matches!(e.kind, EventKind::Workflow | EventKind::Pipeline | EventKind::Loop))
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::Workflow | EventKind::Pipeline | EventKind::Loop
+                )
+            })
             .collect();
         assert_eq!(runs.len(), 3, "Send is not a run");
 
@@ -1799,12 +1812,24 @@ mod loops_sidecar_tests {
         // migrate via read
         let (_schema, loaded) = load_loops_registry().unwrap();
         assert_eq!(
-            loaded.get(&p1).unwrap().escalation.get("agent-x").unwrap().ping_count,
+            loaded
+                .get(&p1)
+                .unwrap()
+                .escalation
+                .get("agent-x")
+                .unwrap()
+                .ping_count,
             1,
             "p1 survives migration"
         );
         assert_eq!(
-            loaded.get(&p2).unwrap().escalation.get("agent-x").unwrap().ping_count,
+            loaded
+                .get(&p2)
+                .unwrap()
+                .escalation
+                .get("agent-x")
+                .unwrap()
+                .ping_count,
             2,
             "p2 survives migration"
         );
@@ -1905,7 +1930,11 @@ mod loops_sidecar_tests {
         assert_eq!(loaded.len(), 1, "content migrated");
         // exactly ONE marker remains (the newest = the one just created)
         let markers = loops_dir_markers();
-        assert_eq!(markers.len(), pre_markers.len() + 1, "litter swept: {markers:?}");
+        assert_eq!(
+            markers.len(),
+            pre_markers.len() + 1,
+            "litter swept: {markers:?}"
+        );
         let new_markers: Vec<String> = markers
             .iter()
             .filter(|n| !pre_markers.contains(n))
@@ -2041,7 +2070,8 @@ mod loops_sidecar_tests {
         assert!(agent_names_file(&dir).starts_with(&dir));
         assert_eq!(load_agent_names(&dir), entries);
         // missing → empty
-        let empty_dir = std::env::temp_dir().join(format!("fw-agent-names-none-{}", std::process::id()));
+        let empty_dir =
+            std::env::temp_dir().join(format!("fw-agent-names-none-{}", std::process::id()));
         assert!(load_agent_names(&empty_dir).is_empty());
         // cleanup
         let _ = std::fs::remove_file(agent_names_file(&dir));
@@ -2164,7 +2194,11 @@ mod loops_sidecar_tests {
         assert_eq!(loaded.get(&p), Some(&e));
         // unregister removes only matching pid
         unregister_loop(&p, 9999);
-        assert_eq!(load_loop_pids().get(&p), Some(&e), "other pid must not unregister");
+        assert_eq!(
+            load_loop_pids().get(&p),
+            Some(&e),
+            "other pid must not unregister"
+        );
         unregister_loop(&p, 4242);
         assert!(!load_loop_pids().contains_key(&p));
     }
@@ -2180,7 +2214,9 @@ mod loops_sidecar_tests {
         let registered = load_loop_pids().get(&p).unwrap().clone();
         assert_eq!(registered.pid, std::process::id());
         // the registry's own pid is alive → a second registration refuses
-        let prev = register_loop(&p, "inv-2", false).unwrap().expect("live owner");
+        let prev = register_loop(&p, "inv-2", false)
+            .unwrap()
+            .expect("live owner");
         assert_eq!(prev.pid, std::process::id());
         // cleanup the self entry before the takeover case
         unregister_loop(&p, std::process::id());
@@ -2205,7 +2241,10 @@ mod loops_sidecar_tests {
         save_loop_pids(&pids).unwrap();
         assert!(pid_alive(child_pid), "child is the live loop");
         assert!(register_loop(&p, "inv-3", true).unwrap().is_none());
-        assert!(!pid_alive(child_pid), "--force terminates the old loop process");
+        assert!(
+            !pid_alive(child_pid),
+            "--force terminates the old loop process"
+        );
         assert_eq!(load_loop_pids().get(&p).unwrap().invocation, "inv-3");
         // cleanup
         let _ = child.wait();
@@ -2259,8 +2298,9 @@ mod loops_sidecar_tests {
         let _g = loops_test_guard();
         let n = 8usize;
         let per = 50usize;
-        let projects: Vec<String> =
-            (0..n).map(|i| test_project(&format!("stress-{i}"))).collect();
+        let projects: Vec<String> = (0..n)
+            .map(|i| test_project(&format!("stress-{i}")))
+            .collect();
         let mut handles = Vec::new();
         for (i, p) in projects.iter().enumerate() {
             let p = p.clone();
@@ -2334,8 +2374,14 @@ mod loops_sidecar_tests {
 
         xproj_seen_unmark(&project, "msg-b").unwrap();
         assert!(!xproj_seen_contains(&project, "msg-b").unwrap(), "unmarked");
-        assert!(xproj_seen_contains(&project, "msg-a").unwrap(), "siblings kept");
-        assert!(xproj_seen_contains(&project, "msg-c").unwrap(), "siblings kept");
+        assert!(
+            xproj_seen_contains(&project, "msg-a").unwrap(),
+            "siblings kept"
+        );
+        assert!(
+            xproj_seen_contains(&project, "msg-c").unwrap(),
+            "siblings kept"
+        );
 
         // no-op paths: unmarked id, and a missing file.
         xproj_seen_unmark(&project, "msg-b").unwrap();
@@ -2360,7 +2406,13 @@ mod loops_sidecar_tests {
         // a directory at the legacy path is unreadable as a file
         std::fs::create_dir_all(&legacy).unwrap();
         let err = save_active_loop(&p, &make_loop(&p, 3)).unwrap_err();
-        assert!(err.to_string().contains("Is a directory") || err.to_string().contains("EISDIR") || err.to_string().contains("not a regular file") || !err.to_string().is_empty(), "save aborts: {err:#}");
+        assert!(
+            err.to_string().contains("Is a directory")
+                || err.to_string().contains("EISDIR")
+                || err.to_string().contains("not a regular file")
+                || !err.to_string().is_empty(),
+            "save aborts: {err:#}"
+        );
         assert!(legacy.is_dir(), "unreadable path left untouched");
         // restore
         std::fs::remove_dir_all(&legacy).unwrap();
@@ -2381,7 +2433,16 @@ mod loops_sidecar_tests {
         let _ = std::fs::remove_file(&legacy);
         // fresh registry: save must succeed
         save_active_loop(&p, &make_loop(&p, 5)).unwrap();
-        assert_eq!(load_active_loop(&p).unwrap().unwrap().escalation.get("agent-x").unwrap().ping_count, 5);
+        assert_eq!(
+            load_active_loop(&p)
+                .unwrap()
+                .unwrap()
+                .escalation
+                .get("agent-x")
+                .unwrap()
+                .ping_count,
+            5
+        );
         if let Some(bytes) = pre_legacy {
             // restore the real legacy (it will re-split on next access)
             let _ = std::fs::remove_file(&legacy);
@@ -2414,7 +2475,9 @@ mod loops_sidecar_tests {
         let (_schema, loaded) = load_loops_registry().unwrap();
         assert_eq!(loaded.get(&p).unwrap().id, format!("swarm-loop:{p}:1"));
         assert!(sidecar_file(&p).exists());
-        let new_marker = loops_dir_markers().into_iter().any(|n| !pre_markers.contains(&n));
+        let new_marker = loops_dir_markers()
+            .into_iter()
+            .any(|n| !pre_markers.contains(&n));
         assert!(new_marker, "legacy renamed after v1 migration");
         // restore
         let _ = std::fs::remove_file(sidecar_file(&p));

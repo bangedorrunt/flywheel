@@ -90,8 +90,7 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
 
     // Capture the dispatch payloads so we assert the legacy Send semantics
     // (to/stage/msg) survive absorption, not just that the engine runs.
-    let dispatches: Arc<Mutex<Vec<(String, serde_json::Value)>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let dispatches: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
     let captured = dispatches.clone();
     let runner: ActionRunner = Arc::new(move |a: &Action| {
         if let Action::DispatchJob { assignee, spec, .. } = a {
@@ -112,11 +111,13 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
         trigger: None,
         guard: None,
         policy: None,
+        principles: vec![],
         steps: vec![
             Step {
                 name: Some("send-0".into()),
                 guard: None,
                 on_error: Default::default(),
+                build_slot: false,
                 action: Action::DispatchJob {
                     assignee: "pi".into(),
                     spec: serde_json::json!({
@@ -131,6 +132,7 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
                 name: Some("wait-0".into()),
                 guard: None,
                 on_error: Default::default(),
+                build_slot: false,
                 action: Action::Delay { secs: 0 },
             },
         ],
@@ -146,8 +148,14 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
         .expect("invoke absorbed legacy workflow");
 
     // send-0 produced a step output (engine advanced past both steps).
-    assert!(output.get("send-0").is_some(), "send-0 step output: {output}");
-    assert!(output.get("wait-0").is_some(), "wait-0 step output: {output}");
+    assert!(
+        output.get("send-0").is_some(),
+        "send-0 step output: {output}"
+    );
+    assert!(
+        output.get("wait-0").is_some(),
+        "wait-0 step output: {output}"
+    );
 
     // The legacy Send semantics survived absorption: one DispatchJob to pi
     // carrying the p6 stage.

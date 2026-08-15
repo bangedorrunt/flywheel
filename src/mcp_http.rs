@@ -26,8 +26,8 @@
 
 use std::sync::OnceLock;
 
-use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 
 /// Protocol version spoken by the client (toron's rmcp server prefers it).
 const PROTOCOL_VERSION: &str = "2026-07-28";
@@ -381,8 +381,8 @@ mod tests {
         // Full happy path: initialize 200 → tools/call 200 with a text
         // ContentBlock carrying the structured JSON. The initialized
         // OnceLock must make the handshake run exactly once.
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let inits = Arc::new(AtomicUsize::new(0));
         let inits_closure = Arc::clone(&inits);
         let base = serve_raw(move |req| {

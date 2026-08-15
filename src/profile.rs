@@ -188,10 +188,7 @@ impl Squad {
 
     /// All (profile, count) pairs, ordered by profile name.
     pub fn members(&self) -> Vec<(&str, u32)> {
-        self.counts
-            .iter()
-            .map(|(k, v)| (k.as_str(), *v))
-            .collect()
+        self.counts.iter().map(|(k, v)| (k.as_str(), *v)).collect()
     }
 }
 
@@ -215,8 +212,8 @@ impl ProfileCatalog {
         {
             let raw = std::fs::read_to_string(path)
                 .with_context(|| format!("read {}", path.display()))?;
-            let toml: ProfilesToml = toml::from_str(&raw)
-                .with_context(|| format!("parse {}", path.display()))?;
+            let toml: ProfilesToml =
+                toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
             // Layered: user profiles OVERRIDE built-ins field-by-field
             // (empty user fields inherit the compiled-in value), so a
             // partial `[profiles.scout] {model=...}` keeps the built-in
@@ -314,8 +311,9 @@ impl ProfileCatalog {
         };
         match project_scope {
             Some(slug) => {
-                let npub = project_resolver(slug, name)
-                    .ok_or_else(|| anyhow::anyhow!("profile '@{name}' not registered in project '{slug}'"))?;
+                let npub = project_resolver(slug, name).ok_or_else(|| {
+                    anyhow::anyhow!("profile '@{name}' not registered in project '{slug}'")
+                })?;
                 Ok(ResolvedProfile {
                     npub: npub.clone(),
                     spec,
@@ -546,8 +544,8 @@ pub fn compiled_in_harnesses() -> BTreeMap<String, HarnessConfig> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     // Temp-dir creation without a tempfile dep. Atomic counter keeps parallel
     // tests from colliding on the same path.
@@ -701,15 +699,41 @@ spawn_cmd = "hermes --project {project} --role {role}"
         // built-in must carry both; a stub (empty behavior) fails here.
         let cat = catalog();
         let expect: &[(&str, &str, &[&str])] = &[
-            ("oracle", "You are an ORACLE.", &["accretive", "glaze", "latent-diver"]),
-            ("planner", "You are a PLANNER.", &["writing-plans", "planning-workflow"]),
-            ("reviewer", "You are a REVIEWER.", &["adversarial-reviewer", "code-review"]),
-            ("coder", "You are a CODER.", &["test-driven-development", "code-edit"]),
-            ("scout", "You are a SCOUT.", &["scout", "codebase-archaeologist"]),
-            ("housekeeper", "You are a HOUSEKEEPER.", &["docker-auto-upgrade", "cron-management"]),
+            (
+                "oracle",
+                "You are an ORACLE.",
+                &["accretive", "glaze", "latent-diver"],
+            ),
+            (
+                "planner",
+                "You are a PLANNER.",
+                &["writing-plans", "planning-workflow"],
+            ),
+            (
+                "reviewer",
+                "You are a REVIEWER.",
+                &["adversarial-reviewer", "code-review"],
+            ),
+            (
+                "coder",
+                "You are a CODER.",
+                &["test-driven-development", "code-edit"],
+            ),
+            (
+                "scout",
+                "You are a SCOUT.",
+                &["scout", "codebase-archaeologist"],
+            ),
+            (
+                "housekeeper",
+                "You are a HOUSEKEEPER.",
+                &["docker-auto-upgrade", "cron-management"],
+            ),
         ];
         for (name, preamble, skills) in expect {
-            let p = cat.get(name).unwrap_or_else(|| panic!("{name} built-in missing"));
+            let p = cat
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} built-in missing"));
             assert!(
                 p.behavior.starts_with(preamble),
                 "{name} preamble missing verbatim start: {}...",
@@ -731,7 +755,12 @@ spawn_cmd = "hermes --project {project} --role {role}"
             Some("npub-project-agent".to_string())
         };
         let r = cat
-            .resolve("housekeeper", Some("demo"), "npub-operator", &project_resolver)
+            .resolve(
+                "housekeeper",
+                Some("demo"),
+                "npub-operator",
+                &project_resolver,
+            )
             .expect("resolve");
         assert_eq!(r.npub, "npub-project-agent");
         assert_eq!(r.spec.harness, "omp");

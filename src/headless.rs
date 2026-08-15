@@ -121,8 +121,13 @@ pub fn build_argv_roles(
             // the other harnesses).
             let single = format!("--single={prompt}");
             argv.extend(
-                ["grok", &single, "--output-format", "streaming-messages-json"]
-                    .map(String::from),
+                [
+                    "grok",
+                    &single,
+                    "--output-format",
+                    "streaming-messages-json",
+                ]
+                .map(String::from),
             );
             if let Some(m) = model {
                 argv.extend(model_args("grok", m, None));
@@ -316,7 +321,16 @@ mod tests {
     #[test]
     fn pi_argv_with_model() {
         assert_eq!(
-            build_argv_roles("pi", Some("google/gemini-2.5-flash"), None, "", "", "", "hello").unwrap(),
+            build_argv_roles(
+                "pi",
+                Some("google/gemini-2.5-flash"),
+                None,
+                "",
+                "",
+                "",
+                "hello"
+            )
+            .unwrap(),
             vec![
                 "pi".to_string(),
                 "-p".into(),
@@ -360,7 +374,16 @@ mod tests {
     #[test]
     fn opencode_argv_uses_run_with_json_format() {
         assert_eq!(
-            build_argv_roles("opencode", Some("anthropic/claude-sonnet-4"), None, "", "", "", "hi").unwrap(),
+            build_argv_roles(
+                "opencode",
+                Some("anthropic/claude-sonnet-4"),
+                None,
+                "",
+                "",
+                "",
+                "hi"
+            )
+            .unwrap(),
             vec![
                 "opencode".to_string(),
                 "run".into(),
@@ -399,7 +422,10 @@ mod tests {
     /// `--model`). bd-42fs: omp carries `--thinking=<effort>` when given.
     #[test]
     fn model_args_follow_harness_forms() {
-        assert_eq!(model_args("opencode", "claude-sonnet-4", None), vec!["-m", "claude-sonnet-4"]);
+        assert_eq!(
+            model_args("opencode", "claude-sonnet-4", None),
+            vec!["-m", "claude-sonnet-4"]
+        );
         assert_eq!(model_args("grok", "grok-4", None), vec!["-m", "grok-4"]);
         assert_eq!(model_args("omp", "gpt-5.2", None), vec!["--model=gpt-5.2"]);
         assert_eq!(
@@ -410,7 +436,10 @@ mod tests {
             model_args("omp", "deepseek-v4-flash", Some("high")),
             vec!["--model=deepseek-v4-flash", "--thinking=high"]
         );
-        assert_eq!(model_args("pi", "glm-5.2", None), vec!["--model", "glm-5.2"]);
+        assert_eq!(
+            model_args("pi", "glm-5.2", None),
+            vec!["--model", "glm-5.2"]
+        );
         // H1 (bd-harness-prime-agent-818f): prime-agent takes `--model` +
         // `--thinking` (omitted when no effort is set).
         assert_eq!(
@@ -426,7 +455,10 @@ mod tests {
                 "medium"
             ]
         );
-        assert!(model_args("hermes", "x", None).is_empty(), "unknown harness: no model args");
+        assert!(
+            model_args("hermes", "x", None).is_empty(),
+            "unknown harness: no model args"
+        );
     }
 
     /// bd-gsvn.2: omp role models inject as `--smol/--slow/--plan`; every
@@ -440,10 +472,17 @@ mod tests {
         );
         // absent roles emit nothing.
         assert_eq!(role_model_args("omp", "", "", ""), Vec::<String>::new());
-        assert_eq!(role_model_args("omp", "smol-1", "", "plan-1"), vec!["--smol=smol-1", "--plan=plan-1"]);
+        assert_eq!(
+            role_model_args("omp", "smol-1", "", "plan-1"),
+            vec!["--smol=smol-1", "--plan=plan-1"]
+        );
         // non-omp harnesses: never.
         for h in ["opencode", "grok", "pi", "hermes"] {
-            assert_eq!(role_model_args(h, "s", "l", "p"), Vec::<String>::new(), "{h}");
+            assert_eq!(
+                role_model_args(h, "s", "l", "p"),
+                Vec::<String>::new(),
+                "{h}"
+            );
         }
     }
 
@@ -476,7 +515,16 @@ mod tests {
         );
         // opencode ignores roles (uses -m for everything).
         assert_eq!(
-            build_argv_roles("opencode", Some("claude-sonnet-4"), None, "s", "l", "p", "hi").unwrap(),
+            build_argv_roles(
+                "opencode",
+                Some("claude-sonnet-4"),
+                None,
+                "s",
+                "l",
+                "p",
+                "hi"
+            )
+            .unwrap(),
             vec![
                 "opencode".to_string(),
                 "run".into(),
@@ -620,6 +668,9 @@ mod tests {
     #[test]
     fn spec_extra_none_when_absent_or_empty() {
         assert_eq!(spec_extra(&json!({}), "plan", &json!({})), None);
-        assert_eq!(spec_extra(&json!({ "plan": "  " }), "plan", &json!({})), None);
+        assert_eq!(
+            spec_extra(&json!({ "plan": "  " }), "plan", &json!({})),
+            None
+        );
     }
 }

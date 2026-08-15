@@ -148,8 +148,8 @@ impl WorkflowCatalog {
         if wf_path.exists() {
             let raw = std::fs::read_to_string(&wf_path)
                 .with_context(|| format!("read {}", wf_path.display()))?;
-            let legacy: LegacyWorkflows = toml::from_str(&raw)
-                .with_context(|| format!("parse {}", wf_path.display()))?;
+            let legacy: LegacyWorkflows =
+                toml::from_str(&raw).with_context(|| format!("parse {}", wf_path.display()))?;
             for (name, steps) in legacy.workflows {
                 if self.workflows.contains_key(&name) {
                     self.notes.push(MappingNote {
@@ -170,8 +170,8 @@ impl WorkflowCatalog {
         if pipe_path.exists() {
             let raw = std::fs::read_to_string(&pipe_path)
                 .with_context(|| format!("read {}", pipe_path.display()))?;
-            let legacy: LegacyPipelines = toml::from_str(&raw)
-                .with_context(|| format!("parse {}", pipe_path.display()))?;
+            let legacy: LegacyPipelines =
+                toml::from_str(&raw).with_context(|| format!("parse {}", pipe_path.display()))?;
             for (name, chain) in legacy.pipelines {
                 if self.workflows.contains_key(&name) {
                     self.notes.push(MappingNote {
@@ -214,6 +214,7 @@ fn absorb_workflow_steps(name: &str, steps: &[LegacyStep]) -> (Workflow, Vec<Map
                     name: Some(format!("send-{i}")),
                     guard: None,
                     on_error: Default::default(),
+                    build_slot: false,
                     action: Action::DispatchJob {
                         assignee: to.clone(),
                         spec,
@@ -228,12 +229,14 @@ fn absorb_workflow_steps(name: &str, steps: &[LegacyStep]) -> (Workflow, Vec<Map
                 notes.push(MappingNote {
                     source: source.clone(),
                     legacy: format!("wait {until}"),
-                    reason: "Wait maps to the P4 spawn{await} binding; delay shell used until then".into(),
+                    reason: "Wait maps to the P4 spawn{await} binding; delay shell used until then"
+                        .into(),
                 });
                 unified.push(Step {
                     name: Some(format!("wait-{i}")),
                     guard: None,
                     on_error: Default::default(),
+                    build_slot: false,
                     action: Action::Delay {
                         // Round UP (is1.5): integer division truncates a
                         // sub-second wait to 0s — a silent no-op. 500ms → 1s
@@ -254,7 +257,11 @@ fn absorb_workflow_steps(name: &str, steps: &[LegacyStep]) -> (Workflow, Vec<Map
         graph: None,
         crew: None,
         policy: None,
-        inputs: vec![InputDecl { name: "goal".into() }],
+        inputs: vec![InputDecl {
+            name: "goal".into(),
+            default: None,
+        }],
+        principles: vec![],
     };
     (wf, notes)
 }
@@ -269,6 +276,7 @@ fn absorb_pipeline(name: &str, chain: &[String]) -> (Workflow, Option<MappingNot
             name: Some(format!("call-{i}")),
             guard: None,
             on_error: Default::default(),
+            build_slot: false,
             // call_workflow is a P5 action; the engine currently rejects it.
             // The flag below is the honesty contract — the chain is listed but
             // not runnable until P5 lands.
@@ -288,7 +296,11 @@ fn absorb_pipeline(name: &str, chain: &[String]) -> (Workflow, Option<MappingNot
         graph: None,
         crew: None,
         policy: None,
-        inputs: vec![InputDecl { name: "goal".into() }],
+        inputs: vec![InputDecl {
+            name: "goal".into(),
+            default: None,
+        }],
+        principles: vec![],
     };
     let note = MappingNote {
         source: format!("pipelines.toml:{name}"),
@@ -390,7 +402,10 @@ timeout_ms = 500
         assert!(matches!(wf.steps[0].action, Action::DispatchJob { .. }));
         assert!(matches!(wf.steps[1].action, Action::Delay { .. }));
         assert!(
-            catalog.notes.iter().any(|n| n.source.contains("daily") && n.legacy.contains("wait")),
+            catalog
+                .notes
+                .iter()
+                .any(|n| n.source.contains("daily") && n.legacy.contains("wait")),
             "Wait non-1:1 mapping is FLAGGED, never dropped: {:?}",
             catalog.notes
         );
@@ -405,15 +420,15 @@ timeout_ms = 500
             &dir.join("workflows.toml"),
             "[[a]]\ntype = \"send\"\nto = \"oc\"\nmsg = \"hello\"\n",
         );
-        write(
-            &dir.join("pipelines.toml"),
-            "chain = [\"a\"]\n",
-        );
+        write(&dir.join("pipelines.toml"), "chain = [\"a\"]\n");
         let catalog = WorkflowCatalog::load_from(dir.clone()).unwrap();
         let wf = catalog.workflows.get("chain").expect("pipeline absorbed");
         assert_eq!(wf.steps.len(), 1);
         assert!(
-            catalog.notes.iter().any(|n| n.source.starts_with("pipelines.toml:chain")),
+            catalog
+                .notes
+                .iter()
+                .any(|n| n.source.starts_with("pipelines.toml:chain")),
             "pipeline call_workflow flag present: {:?}",
             catalog.notes
         );
@@ -490,7 +505,10 @@ msg = "legacy triage"
             "canonical YAML wins the collision"
         );
         assert!(
-            catalog.notes.iter().any(|n| n.reason.contains("shadowed by canonical")),
+            catalog
+                .notes
+                .iter()
+                .any(|n| n.reason.contains("shadowed by canonical")),
             "collision recorded: {:?}",
             catalog.notes
         );

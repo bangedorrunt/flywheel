@@ -16,9 +16,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use toron_workflow::schema::{CronScope, CronSpec, Workflow};
 
 /// One registered cron: a schedule bound to a workflow template.
@@ -92,8 +92,8 @@ impl Crons {
         if !path.exists() {
             return Ok(Crons::default());
         }
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))
     }
 
@@ -264,15 +264,18 @@ pub fn builtin_crons() -> BTreeMap<String, CronSpec> {
                 scope: *scope,
                 mode: toron_workflow::schema::CronMode::Headless,
                 enabled: true,
-                policy: wf.policy.as_ref().map(|p| toron_workflow::schema::CronSpecPolicy {
-                    on_failure: p.on_failure,
-                    on_repeat_failure: p.on_repeat_failure,
-                    repeat_threshold: p.repeat_threshold,
-                    on_success: p.on_success,
-                    max_retries: p.max_retries,
-                    no_claim_timeout: p.no_claim_timeout,
-                    catchup: toron_workflow::schema::CronCatchup::Latest,
-                }),
+                policy: wf
+                    .policy
+                    .as_ref()
+                    .map(|p| toron_workflow::schema::CronSpecPolicy {
+                        on_failure: p.on_failure,
+                        on_repeat_failure: p.on_repeat_failure,
+                        repeat_threshold: p.repeat_threshold,
+                        on_success: p.on_success,
+                        max_retries: p.max_retries,
+                        no_claim_timeout: p.no_claim_timeout,
+                        catchup: toron_workflow::schema::CronCatchup::Latest,
+                    }),
                 steps: wf.steps.clone(),
                 graph: wf.graph.clone(),
             },
@@ -348,18 +351,11 @@ fn scan_tier(out: &mut BTreeMap<String, CronRow>, dir: &Path, source: CronSource
         if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
             continue;
         }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let spec = toron_workflow::schema::parse_cron(&raw)
             .map_err(|e| anyhow!("parse {}: {e}", path.display()))?;
-        out.insert(
-            spec.name.clone(),
-            CronRow {
-                spec,
-                source,
-                path,
-            },
-        );
+        out.insert(spec.name.clone(), CronRow { spec, source, path });
     }
     Ok(())
 }
@@ -398,11 +394,7 @@ pub fn set_cron_enabled(
 /// Remove a cron definition (user tiers only; built-ins are read-only).
 /// Removing a project-tier cron reveals the global/built-in definition it
 /// shadowed.
-pub fn remove_cron(
-    cfg: &crate::config::Config,
-    project: Option<&str>,
-    name: &str,
-) -> Result<()> {
+pub fn remove_cron(cfg: &crate::config::Config, project: Option<&str>, name: &str) -> Result<()> {
     let rows = load_crons(cfg, project)?;
     let row = rows
         .iter()
@@ -835,7 +827,17 @@ pub fn spawn_failure_bead(bundle: &toron_workflow::FailureBundle) -> Result<Stri
     use std::process::Command;
     let (title, description) = failure_bead_fields(bundle);
     let out = Command::new("br")
-        .args(["create", &title, "--type", "bug", "--priority", "1", "--description", &description, "--json"])
+        .args([
+            "create",
+            &title,
+            "--type",
+            "bug",
+            "--priority",
+            "1",
+            "--description",
+            &description,
+            "--json",
+        ])
         .output()
         .map_err(|e| anyhow!("br create failed: {e}"))?;
     if !out.status.success() {
@@ -917,7 +919,12 @@ pub fn review_idea_from_output(output: &serde_json::Value) -> Option<ReviewIdea>
     if idea.is_null() {
         return None;
     }
-    let s = |k: &str| idea.get(k).and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+    let s = |k: &str| {
+        idea.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
     let title = s("title");
     if title.trim().is_empty() {
         return None;
@@ -944,11 +951,7 @@ pub fn review_bead_fields(idea: &ReviewIdea, date: &str) -> (String, String) {
          \n## Blast radius\n{}\n\
          \n## Acceptance\n{}\n\
          \nCaptain triages: implement or close. Tagged `weekly-review`.",
-        idea.what,
-        idea.why,
-        idea.ev,
-        idea.blast_radius,
-        idea.acceptance,
+        idea.what, idea.why, idea.ev, idea.blast_radius, idea.acceptance,
     );
     (title, description)
 }
@@ -1097,9 +1100,7 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
         let cron_mgr = CronManager::new(engine.clone(), {
             let regs = registrations.clone();
             let name = reg.name.clone();
-            std::sync::Arc::new(move || {
-                regs.iter().filter(|&r| r.name == name).cloned().collect()
-            })
+            std::sync::Arc::new(move || regs.iter().filter(|&r| r.name == name).cloned().collect())
         })?;
         let sink = engine.policy_sink().clone();
         drain_tasks.push(tokio::spawn(async move {
@@ -1181,17 +1182,17 @@ impl CronManager for RegistryCronManager {
     }
 
     fn show(&self, name: &str) -> Result<Option<MergedCron>> {
-        Ok(self
-            .merged()?
-            .into_iter()
-            .find(|m| m.entry.name == name))
+        Ok(self.merged()?.into_iter().find(|m| m.entry.name == name))
     }
 
     fn add(&mut self, entry: CronEntry) -> Result<()> {
         // fail-stop validation, mirroring lint_flywheel_tier: template must
         // resolve, owner profile must exist, cron must parse (upsert checks).
         if !self.workflows.contains_key(&entry.template) {
-            bail!("template {:?} does not resolve (flywheel workflow list)", entry.template);
+            bail!(
+                "template {:?} does not resolve (flywheel workflow list)",
+                entry.template
+            );
         }
         let profiles = crate::profile::ProfileCatalog::load().unwrap_or_default();
         if !profiles.get(&entry.owner).is_some() {
@@ -1265,9 +1266,7 @@ pub fn last_run_state(name: &str) -> (Option<String>, bool) {
                 continue;
             }
             match e.data.get("status").and_then(Value::as_str) {
-                Some(s) if s == "failed" || s == "succeeded" => {
-                    last_status = Some(s.to_string())
-                }
+                Some(s) if s == "failed" || s == "succeeded" => last_status = Some(s.to_string()),
                 Some("running") => in_flight = true,
                 _ => {}
             }
@@ -1314,7 +1313,11 @@ pub fn cron_history(name: &str) -> Vec<CronRun> {
                     .and_then(Value::as_str)
                     .unwrap_or("done")
                     .to_string(),
-                bead: e.data.get("bead").and_then(Value::as_str).map(str::to_string),
+                bead: e
+                    .data
+                    .get("bead")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             });
         }
     }
@@ -1394,7 +1397,11 @@ owner = "housekeeper"
         std::fs::write(&path, raw).unwrap();
         let loaded = Crons::load_from(&path).unwrap();
         let got = loaded.get("legacy-cron").unwrap();
-        assert_eq!(got.mode, CronMode::Headless, "missing mode = headless default");
+        assert_eq!(
+            got.mode,
+            CronMode::Headless,
+            "missing mode = headless default"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1497,16 +1504,14 @@ owner = "housekeeper"
                 inputs: serde_json::Value::Null,
             },
         ] {
-            let out = runner(&a).unwrap_or_else(|e| {
-                serde_json::json!({ "ok": false, "error": e.to_string() })
-            });
+            let out = runner(&a)
+                .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e.to_string() }));
             assert!(
                 out.get("ok").is_some(),
                 "every step returns a JSON value (no hang): {out}"
             );
         }
     }
-
 
     /// l4s.3: save_to writes ATOMICALLY — the destination is either the old
     /// or the new content, never torn; a stale temp file from a "crash"
@@ -1540,8 +1545,14 @@ owner = "housekeeper"
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n == &pid_tmp)
             .collect();
-        assert!(leftovers.is_empty(), "no temps from this save: {leftovers:?}");
-        assert!(stale.exists(), "pre-existing stale temp left inert, not clobbered");
+        assert!(
+            leftovers.is_empty(),
+            "no temps from this save: {leftovers:?}"
+        );
+        assert!(
+            stale.exists(),
+            "pre-existing stale temp left inert, not clobbered"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1563,7 +1574,11 @@ owner = "housekeeper"
         crons.set_enabled("weekly-docker-upgrade", true).unwrap();
         let resumed = crons.get("weekly-docker-upgrade").unwrap();
         assert!(resumed.enabled, "resume flips enabled back");
-        assert_eq!(resumed, &sample("weekly-docker-upgrade"), "full state intact");
+        assert_eq!(
+            resumed,
+            &sample("weekly-docker-upgrade"),
+            "full state intact"
+        );
     }
 
     /// set_enabled on an unknown name fails (fail-stop, no silent no-op).
@@ -1637,10 +1652,12 @@ owner = "housekeeper"
                     }),
                     policy: None,
                     guard: None,
+                    principles: vec![],
                     steps: vec![Step {
                         name: None,
                         guard: None,
                         on_error: toron_workflow::schema::StepOnError::Continue,
+                        build_slot: false,
                         action: toron_workflow::schema::Action::Delay { secs: 0 },
                     }],
                     graph: None,
@@ -1663,6 +1680,7 @@ owner = "housekeeper"
                     }),
                     policy: None,
                     guard: None,
+                    principles: vec![],
                     steps: vec![],
                     graph: None,
                     inputs: vec![],
@@ -1680,6 +1698,7 @@ owner = "housekeeper"
                     trigger: None,
                     policy: None,
                     guard: None,
+                    principles: vec![],
                     steps: vec![],
                     graph: None,
                     inputs: vec![],
@@ -1705,7 +1724,10 @@ owner = "housekeeper"
         assert_eq!(reg.entry.cron, "30 3 * * 0");
 
         // derived: built-in schedule workflow surfaces with source=builtin
-        let derived = merged.iter().find(|m| m.entry.name == "weekly-backup").unwrap();
+        let derived = merged
+            .iter()
+            .find(|m| m.entry.name == "weekly-backup")
+            .unwrap();
         assert_eq!(derived.source, "builtin");
         assert_eq!(derived.entry.owner, "housekeeper");
     }
@@ -1809,7 +1831,10 @@ owner = "housekeeper"
         // show + status (due before any runs)
         let shown = mgr.show("weekly-docker-upgrade").unwrap().expect("show");
         assert_eq!(shown.entry.template, "weekly-docker-upgrade-wf");
-        let st = mgr.status("weekly-docker-upgrade").unwrap().expect("status");
+        let st = mgr
+            .status("weekly-docker-upgrade")
+            .unwrap()
+            .expect("status");
         assert_eq!(st.status, "due");
         assert!(st.next_due.is_some(), "next_due computed");
 
@@ -1818,7 +1843,11 @@ owner = "housekeeper"
         let paused = mgr.status("weekly-docker-upgrade").unwrap().unwrap();
         assert_eq!(paused.status, "paused");
         assert_eq!(
-            mgr.show("weekly-docker-upgrade").unwrap().unwrap().entry.cron,
+            mgr.show("weekly-docker-upgrade")
+                .unwrap()
+                .unwrap()
+                .entry
+                .cron,
             entry.cron,
             "pause preserves cron expr"
         );
@@ -1867,10 +1896,12 @@ owner = "housekeeper"
                     }),
                     policy: None,
                     guard: None,
+                    principles: vec![],
                     steps: vec![Step {
                         name: None,
                         guard: None,
                         on_error: toron_workflow::schema::StepOnError::Continue,
+                        build_slot: false,
                         action: toron_workflow::schema::Action::Delay { secs: 0 },
                     }],
                     graph: None,
@@ -2004,9 +2035,9 @@ owner = "housekeeper"
         // (bounded 5s), THEN build the workflow.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let ready = ports.iter().all(|p| {
-                std::net::TcpStream::connect(("127.0.0.1", *p)).is_ok()
-            });
+            let ready = ports
+                .iter()
+                .all(|p| std::net::TcpStream::connect(("127.0.0.1", *p)).is_ok());
             if ready {
                 break;
             }
@@ -2022,6 +2053,7 @@ owner = "housekeeper"
             name: Some(name.into()),
             guard: None,
             on_error: StepOnError::FailRun,
+            build_slot: false,
             action: Action::CallWebhook {
                 url: format!("http://127.0.0.1:{port}/health"),
                 method: Some("GET".into()),
@@ -2034,6 +2066,7 @@ owner = "housekeeper"
             trigger: None,
             policy: None,
             guard: None,
+            principles: vec![],
             steps: services
                 .iter()
                 .enumerate()
@@ -2046,16 +2079,14 @@ owner = "housekeeper"
 
         // All five up → pass. The probe surface is the recording runner
         // (dry-run); pane mode dispatches (bd-5qls).
-        let engine =
-            toron_workflow::WorkflowEngine::local(recording_runner()).unwrap();
+        let engine = toron_workflow::WorkflowEngine::local(recording_runner()).unwrap();
         let all_up: Vec<u16> = ports.to_vec();
         let out = engine
             .invoke("gate-all-up", gate_wf(&all_up), json!({}))
             .await
             .expect("gate runs");
         assert!(
-            !out
-                .as_object()
+            !out.as_object()
                 .and_then(|o| o.get("status"))
                 .and_then(Value::as_str)
                 .is_some_and(|s| s == "failed"),
@@ -2071,8 +2102,7 @@ owner = "housekeeper"
             .await
             .expect("gate runs");
         assert!(
-            out2
-                .as_object()
+            out2.as_object()
                 .and_then(|o| o.get("status"))
                 .and_then(Value::as_str)
                 .is_some_and(|s| s == "failed"),
@@ -2097,9 +2127,15 @@ owner = "housekeeper"
         let (title, description) = failure_bead_fields(&bundle);
 
         assert!(title.contains("docker-upgrade"), "title names the workflow");
-        assert!(title.contains("cron:docker-upgrade:1786246200"), "title carries run_id");
+        assert!(
+            title.contains("cron:docker-upgrade:1786246200"),
+            "title carries run_id"
+        );
         assert!(title.contains("#2"), "title carries streak");
-        assert!(description.contains("cron:docker-upgrade:1786246200"), "desc run_id");
+        assert!(
+            description.contains("cron:docker-upgrade:1786246200"),
+            "desc run_id"
+        );
         assert!(description.contains("docker-upgrade"), "desc workflow");
         assert!(description.contains("@housekeeper"), "desc owner");
         assert!(
@@ -2135,7 +2171,10 @@ owner = "housekeeper"
         let output = serde_json::json!({
             "oracle": { "response": r#"{"idea": null}"# }
         });
-        assert!(review_idea_from_output(&output).is_none(), "null idea -> None");
+        assert!(
+            review_idea_from_output(&output).is_none(),
+            "null idea -> None"
+        );
     }
 
     /// Missing oracle node / missing response / malformed JSON / empty title
@@ -2177,7 +2216,10 @@ owner = "housekeeper"
         assert!(description.contains("Wire the LLM planner"), "what body");
         assert!(description.contains("## Why"), "why section");
         assert!(description.contains("## EV"), "ev section");
-        assert!(description.contains("## Blast radius"), "blast radius section");
+        assert!(
+            description.contains("## Blast radius"),
+            "blast radius section"
+        );
         assert!(description.contains("## Acceptance"), "acceptance section");
         assert!(description.contains("weekly-review"), "tag hint");
     }

@@ -15,7 +15,9 @@
 /// The three design workflows, name → YAML.
 #[cfg(test)]
 pub const DESIGN_WORKFLOWS: &[(&str, &str)] = &[
-    ("docker-upgrade", r##"
+    (
+        "docker-upgrade",
+        r##"
 name: docker-upgrade
 description: "Weekly health-gated Docker image upgrade with auto-rollback (saga replacement, ADR-0005 Spec 3)."
 trigger:
@@ -64,8 +66,11 @@ steps:
         action: send_dm
         to: housekeeper
         body: "docker-upgrade FAILED — rolled back to snapshot"
-"##),
-    ("agent-reach-upgrade", r##"
+"##,
+    ),
+    (
+        "agent-reach-upgrade",
+        r##"
 name: agent-reach-upgrade
 description: "Weekly agent-reach CLI upgrade + verify (saga replacement, ADR-0005 Spec 3)."
 trigger:
@@ -105,8 +110,11 @@ steps:
         action: call_webhook
         url: "http://127.0.0.1:9/none"
         on_error: fail_run
-"##),
-    ("housekeeper-diagnose", r##"
+"##,
+    ),
+    (
+        "housekeeper-diagnose",
+        r##"
 name: housekeeper-diagnose
 description: "Defined fixer (ADR-0005 Spec 3): reads a failure bead bundle and proposes a patch."
 trigger:
@@ -134,7 +142,8 @@ steps:
         action: send_dm
         to: housekeeper
         body: "housekeeper-diagnose could not propose a patch for {{inputs.bundle.workflow}} — human-in-the-loop"
-"##),
+"##,
+    ),
 ];
 
 #[cfg(test)]
@@ -163,7 +172,9 @@ mod tests {
                 Action::Retry { step, .. } => walk_step(step, cb),
                 Action::Foreach { each, .. } => walk_step(each, cb),
                 Action::Parallel { each, .. } => walk_step(each, cb),
-                Action::Branch { then, else_steps, .. } => {
+                Action::Branch {
+                    then, else_steps, ..
+                } => {
                     for s in then.iter().chain(else_steps.iter()) {
                         walk_step(s, cb);
                     }
@@ -326,7 +337,10 @@ mod tests {
                     "gate {} must fail the run on a dead service",
                     step.name.as_deref().unwrap_or("probe")
                 );
-                assert!(url.starts_with("http://127.0.0.1:"), "probe targets a host port: {url}");
+                assert!(
+                    url.starts_with("http://127.0.0.1:"),
+                    "probe targets a host port: {url}"
+                );
                 probe_count += 1;
             }
         }

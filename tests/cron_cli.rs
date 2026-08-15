@@ -23,7 +23,10 @@ fn flywheel() -> &'static str {
 }
 
 struct Hermetic {
-    #[expect(dead_code, reason = "keeps the temp dir alive for the hermetic env's lifetime")]
+    #[expect(
+        dead_code,
+        reason = "keeps the temp dir alive for the hermetic env's lifetime"
+    )]
     dir: tempfile::TempDir,
     config_home: PathBuf,
     state_home: PathBuf,
@@ -62,15 +65,21 @@ fn project_dir(h: &Hermetic) -> PathBuf {
 fn write_global(h: &Hermetic, name: &str, owner: &str, schedule: &str) {
     let dir = global_dir(h);
     fs::create_dir_all(&dir).expect("global crons dir");
-    fs::write(dir.join(format!("{name}.yaml")), cron_yaml(name, owner, schedule))
-        .expect("global cron yaml");
+    fs::write(
+        dir.join(format!("{name}.yaml")),
+        cron_yaml(name, owner, schedule),
+    )
+    .expect("global cron yaml");
 }
 
 fn write_project(h: &Hermetic, name: &str, owner: &str, schedule: &str) {
     let dir = project_dir(h);
     fs::create_dir_all(&dir).expect("project crons dir");
-    fs::write(dir.join(format!("{name}.yaml")), cron_yaml(name, owner, schedule))
-        .expect("project cron yaml");
+    fs::write(
+        dir.join(format!("{name}.yaml")),
+        cron_yaml(name, owner, schedule),
+    )
+    .expect("project cron yaml");
 }
 
 fn run(h: &Hermetic, args: &[&str]) -> Output {
@@ -87,7 +96,11 @@ fn project_flag(h: &Hermetic) -> String {
 }
 
 fn json(out: &Output) -> serde_json::Value {
-    assert!(out.status.success(), "stdout: {}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        out.status.success(),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     serde_json::from_slice(&out.stdout).expect("valid json on stdout")
 }
 
@@ -104,7 +117,10 @@ fn list_precedence_project_shadows_global_shadows_builtin() {
 
     // no project tier: global wins over built-in; built-in shows only when
     // no user tier defines it
-    let v = json(&run(&h, &["cron", "list", "--json", "--project", "/nonexistent-proj"]));
+    let v = json(&run(
+        &h,
+        &["cron", "list", "--json", "--project", "/nonexistent-proj"],
+    ));
     let by_name = |n: &str| {
         v["crons"]
             .as_array()
@@ -116,7 +132,11 @@ fn list_precedence_project_shadows_global_shadows_builtin() {
     };
     assert_eq!(by_name("alpha")["source"], "global");
     assert_eq!(by_name("alpha")["owner"], "housekeeper");
-    assert_eq!(by_name("weekly-review")["source"], "global", "global shadows builtin");
+    assert_eq!(
+        by_name("weekly-review")["source"],
+        "global",
+        "global shadows builtin"
+    );
     assert_eq!(by_name("weekly-review")["owner"], "housekeeper");
 
     // project tier shadows global + built-in
@@ -132,19 +152,32 @@ fn list_precedence_project_shadows_global_shadows_builtin() {
             .expect(n)
             .clone()
     };
-    assert_eq!(by_name("alpha")["source"], "project", "project shadows global");
+    assert_eq!(
+        by_name("alpha")["source"],
+        "project",
+        "project shadows global"
+    );
     assert_eq!(by_name("alpha")["owner"], "scout");
-    assert_eq!(by_name("weekly-review")["source"], "project", "project shadows global+builtin");
+    assert_eq!(
+        by_name("weekly-review")["source"],
+        "project",
+        "project shadows global+builtin"
+    );
     assert_eq!(by_name("weekly-review")["owner"], "scout");
 
     // bare built-in: no user tiers at all -> compiled-in weekly-review
-    let v = json(&run(&h, &["cron", "list", "--json",
-        "--project", "/nonexistent-proj2"]));
+    let v = json(&run(
+        &h,
+        &["cron", "list", "--json", "--project", "/nonexistent-proj2"],
+    ));
     // NOTE: global tier was written in this test — use a fresh hermetic env
     // for the pure-builtin case instead.
     let _ = v;
     let h2 = hermetic();
-    let v = json(&run(&h2, &["cron", "list", "--json", "--project", "/nonexistent-proj2"]));
+    let v = json(&run(
+        &h2,
+        &["cron", "list", "--json", "--project", "/nonexistent-proj2"],
+    ));
     let wr = v["crons"]
         .as_array()
         .unwrap()
@@ -153,7 +186,10 @@ fn list_precedence_project_shadows_global_shadows_builtin() {
         .expect("builtin weekly-review");
     assert_eq!(wr["source"], "builtin");
     assert_eq!(wr["owner"], "oracle");
-    assert_eq!(wr["scope"], "project", "builtin scope carried from the workflow");
+    assert_eq!(
+        wr["scope"], "project",
+        "builtin scope carried from the workflow"
+    );
 }
 
 /// Gate: `cron list` shows the resolved source + scope on every row.
@@ -161,7 +197,10 @@ fn list_precedence_project_shadows_global_shadows_builtin() {
 fn list_rows_carry_source_and_scope() {
     let h = hermetic();
     write_global(&h, "alpha", "housekeeper", "30 3 * * 0");
-    let v = json(&run(&h, &["cron", "list", "--json", "--project", "/nonexistent-proj"]));
+    let v = json(&run(
+        &h,
+        &["cron", "list", "--json", "--project", "/nonexistent-proj"],
+    ));
     let row = v["crons"]
         .as_array()
         .unwrap()
@@ -183,7 +222,17 @@ fn list_rows_carry_source_and_scope() {
 fn show_resolves_definition() {
     let h = hermetic();
     write_global(&h, "alpha", "housekeeper", "30 3 * * 0");
-    let v = json(&run(&h, &["cron", "show", "alpha", "--json", "--project", "/nonexistent-proj"]));
+    let v = json(&run(
+        &h,
+        &[
+            "cron",
+            "show",
+            "alpha",
+            "--json",
+            "--project",
+            "/nonexistent-proj",
+        ],
+    ));
     assert_eq!(v["name"], "alpha");
     assert_eq!(v["source"], "global");
     assert_eq!(v["scope"], "host");
@@ -191,7 +240,17 @@ fn show_resolves_definition() {
     assert_eq!(v["owner"], "housekeeper");
     assert_eq!(v["status"], "due");
 
-    let out = run(&h, &["cron", "show", "nope", "--json", "--project", "/nonexistent-proj"]);
+    let out = run(
+        &h,
+        &[
+            "cron",
+            "show",
+            "nope",
+            "--json",
+            "--project",
+            "/nonexistent-proj",
+        ],
+    );
     assert!(!out.status.success(), "unknown cron fails");
 }
 
@@ -203,25 +262,57 @@ fn pause_resume_persists_in_yaml_and_preserves_state() {
     write_global(&h, "alpha", "housekeeper", "30 3 * * 0");
     let path = global_dir(&h).join("alpha.yaml");
 
-    let pause = run(&h, &["cron", "pause", "alpha", "--project", "/nonexistent-proj"]);
-    assert!(pause.status.success(), "pause: {}", String::from_utf8_lossy(&pause.stdout));
+    let pause = run(
+        &h,
+        &["cron", "pause", "alpha", "--project", "/nonexistent-proj"],
+    );
+    assert!(
+        pause.status.success(),
+        "pause: {}",
+        String::from_utf8_lossy(&pause.stdout)
+    );
     let raw = fs::read_to_string(&path).expect("alpha.yaml");
     assert!(raw.contains("enabled: false"), "pause persisted: {raw}");
 
-    let v = json(&run(&h, &["cron", "status", "--json", "--project", "/nonexistent-proj"]));
-    let row = v["crons"].as_array().unwrap().iter().find(|c| c["name"] == "alpha").unwrap();
+    let v = json(&run(
+        &h,
+        &["cron", "status", "--json", "--project", "/nonexistent-proj"],
+    ));
+    let row = v["crons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "alpha")
+        .unwrap();
     assert_eq!(row["status"], "paused");
     assert!(!row["enabled"].as_bool().unwrap());
 
-    let resume = run(&h, &["cron", "resume", "alpha", "--project", "/nonexistent-proj"]);
+    let resume = run(
+        &h,
+        &["cron", "resume", "alpha", "--project", "/nonexistent-proj"],
+    );
     assert!(resume.status.success());
     let raw = fs::read_to_string(&path).expect("alpha.yaml");
-    assert!(!raw.contains("enabled: false"), "resume clears the marker: {raw}");
-    assert!(raw.contains("schedule: 30 3 * * 0"), "definition preserved: {raw}");
+    assert!(
+        !raw.contains("enabled: false"),
+        "resume clears the marker: {raw}"
+    );
+    assert!(
+        raw.contains("schedule: 30 3 * * 0"),
+        "definition preserved: {raw}"
+    );
     assert!(raw.contains("owner: housekeeper"), "owner preserved: {raw}");
 
-    let v = json(&run(&h, &["cron", "status", "--json", "--project", "/nonexistent-proj"]));
-    let row = v["crons"].as_array().unwrap().iter().find(|c| c["name"] == "alpha").unwrap();
+    let v = json(&run(
+        &h,
+        &["cron", "status", "--json", "--project", "/nonexistent-proj"],
+    ));
+    let row = v["crons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "alpha")
+        .unwrap();
     assert_eq!(row["status"], "due");
 }
 
@@ -229,7 +320,16 @@ fn pause_resume_persists_in_yaml_and_preserves_state() {
 #[test]
 fn pause_builtin_fails() {
     let h = hermetic();
-    let out = run(&h, &["cron", "pause", "weekly-review", "--project", "/nonexistent-proj"]);
+    let out = run(
+        &h,
+        &[
+            "cron",
+            "pause",
+            "weekly-review",
+            "--project",
+            "/nonexistent-proj",
+        ],
+    );
     assert!(!out.status.success(), "built-in is read-only");
 }
 
@@ -242,25 +342,56 @@ fn remove_reveals_lower_tier() {
     write_project(&h, "alpha", "scout", "0 2 * * 0");
 
     let rm = run(&h, &["cron", "remove", "alpha", &project_flag(&h)]);
-    assert!(rm.status.success(), "remove: {}", String::from_utf8_lossy(&rm.stdout));
-    assert!(!project_dir(&h).join("alpha.yaml").exists(), "project yaml deleted");
+    assert!(
+        rm.status.success(),
+        "remove: {}",
+        String::from_utf8_lossy(&rm.stdout)
+    );
+    assert!(
+        !project_dir(&h).join("alpha.yaml").exists(),
+        "project yaml deleted"
+    );
 
     let v = json(&run(&h, &["cron", "list", "--json", &project_flag(&h)]));
-    let row = v["crons"].as_array().unwrap().iter().find(|c| c["name"] == "alpha").unwrap();
+    let row = v["crons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "alpha")
+        .unwrap();
     assert_eq!(row["source"], "global", "project removal reveals global");
     assert_eq!(row["owner"], "housekeeper");
 
     // remove the global too -> gone entirely
-    let rm = run(&h, &["cron", "remove", "alpha", "--project", "/nonexistent-proj"]);
+    let rm = run(
+        &h,
+        &["cron", "remove", "alpha", "--project", "/nonexistent-proj"],
+    );
     assert!(rm.status.success());
-    let v = json(&run(&h, &["cron", "list", "--json", "--project", "/nonexistent-proj"]));
+    let v = json(&run(
+        &h,
+        &["cron", "list", "--json", "--project", "/nonexistent-proj"],
+    ));
     assert!(
-        v["crons"].as_array().unwrap().iter().all(|c| c["name"] != "alpha"),
+        v["crons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["name"] != "alpha"),
         "alpha removed"
     );
 
     // removing a built-in fails
-    let out = run(&h, &["cron", "remove", "weekly-review", "--project", "/nonexistent-proj"]);
+    let out = run(
+        &h,
+        &[
+            "cron",
+            "remove",
+            "weekly-review",
+            "--project",
+            "/nonexistent-proj",
+        ],
+    );
     assert!(!out.status.success(), "built-in is read-only");
 }
 
@@ -269,8 +400,21 @@ fn remove_reveals_lower_tier() {
 fn lint_rejects_invalid_schedule() {
     let h = hermetic();
     write_global(&h, "bad-schedule", "housekeeper", "not a cron");
-    let out = run(&h, &["cron", "lint", "bad-schedule", "--project", "/nonexistent-proj"]);
-    assert_eq!(out.status.code(), Some(1), "invalid schedule must fail lint");
+    let out = run(
+        &h,
+        &[
+            "cron",
+            "lint",
+            "bad-schedule",
+            "--project",
+            "/nonexistent-proj",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "invalid schedule must fail lint"
+    );
 }
 
 /// Gate: `cron lint` rejects an unknown owner profile (flywheel tier).
@@ -278,10 +422,22 @@ fn lint_rejects_invalid_schedule() {
 fn lint_rejects_unknown_owner() {
     let h = hermetic();
     write_global(&h, "bad-owner", "no-such-profile", "30 3 * * 0");
-    let out = run(&h, &["cron", "lint", "bad-owner", "--project", "/nonexistent-proj"]);
+    let out = run(
+        &h,
+        &[
+            "cron",
+            "lint",
+            "bad-owner",
+            "--project",
+            "/nonexistent-proj",
+        ],
+    );
     assert_eq!(out.status.code(), Some(1), "unknown owner must fail lint");
     let msg = String::from_utf8_lossy(&out.stderr);
-    assert!(msg.contains("does not resolve"), "owner resolution error named: {msg}");
+    assert!(
+        msg.contains("does not resolve"),
+        "owner resolution error named: {msg}"
+    );
 }
 
 /// Gate: a valid cron lints clean (engine tier + owner resolution).
@@ -289,8 +445,15 @@ fn lint_rejects_unknown_owner() {
 fn lint_accepts_valid_cron() {
     let h = hermetic();
     write_global(&h, "alpha", "housekeeper", "30 3 * * 0");
-    let out = run(&h, &["cron", "lint", "alpha", "--project", "/nonexistent-proj"]);
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let out = run(
+        &h,
+        &["cron", "lint", "alpha", "--project", "/nonexistent-proj"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("lints clean"),
         "stdout: {}",
@@ -310,8 +473,22 @@ fn run_executes_spec_body() {
     raw = raw.replace("scope: host\n", "scope: host\nmode: pane\n");
     fs::write(&path, raw).unwrap();
 
-    let out = run(&h, &["cron", "run", "alpha", "--json", "--project", "/nonexistent-proj"]);
-    assert!(out.status.success(), "run: {}", String::from_utf8_lossy(&out.stdout));
+    let out = run(
+        &h,
+        &[
+            "cron",
+            "run",
+            "alpha",
+            "--json",
+            "--project",
+            "/nonexistent-proj",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "run: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["cron"], "alpha");
     assert!(v["run_id"].as_str().is_some());
@@ -333,7 +510,10 @@ fn history_empty_runs_json() {
 fn status_lists_all_with_derived_status() {
     let h = hermetic();
     write_global(&h, "alpha", "housekeeper", "30 3 * * 0");
-    let v = json(&run(&h, &["cron", "status", "--json", "--project", "/nonexistent-proj"]));
+    let v = json(&run(
+        &h,
+        &["cron", "status", "--json", "--project", "/nonexistent-proj"],
+    ));
     let rows = v["crons"].as_array().unwrap();
     assert!(!rows.is_empty());
     let row = rows.iter().find(|c| c["name"] == "alpha").unwrap();
@@ -346,7 +526,17 @@ fn status_lists_all_with_derived_status() {
 fn show_accepts_vixie_sunday_zero() {
     let h = hermetic();
     write_global(&h, "sunday-cron", "housekeeper", "0 2 * * 0");
-    let v = json(&run(&h, &["cron", "show", "sunday-cron", "--json", "--project", "/nonexistent-proj"]));
+    let v = json(&run(
+        &h,
+        &[
+            "cron",
+            "show",
+            "sunday-cron",
+            "--json",
+            "--project",
+            "/nonexistent-proj",
+        ],
+    ));
     assert_eq!(v["schedule"], "0 2 * * 0");
     assert_eq!(v["status"], "due");
 }
@@ -355,7 +545,10 @@ fn show_accepts_vixie_sunday_zero() {
 #[test]
 fn empty_tiers_list_empty() {
     let h = hermetic();
-    let v = json(&run(&h, &["cron", "list", "--json", "--project", "/nonexistent-proj"]));
+    let v = json(&run(
+        &h,
+        &["cron", "list", "--json", "--project", "/nonexistent-proj"],
+    ));
     let names: Vec<&str> = v["crons"]
         .as_array()
         .unwrap()

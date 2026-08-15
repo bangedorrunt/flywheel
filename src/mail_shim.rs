@@ -345,17 +345,12 @@ impl Mail {
     /// `list_agents` (project's registered identities). `active_within_days`
     /// filters to agents active within that window (surface parity — the
     /// daemon supports it on the wire; in-process passes it to the mailbox).
-    pub fn list_agents(
-        &self,
-        project_key: &str,
-        active_within_days: Option<u64>,
-    ) -> Result<Value> {
+    pub fn list_agents(&self, project_key: &str, active_within_days: Option<u64>) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
-                let agents = block_on(mailbox().list_agents(
-                    project_key,
-                    ListAgentsOptions { active_within_days },
-                ))?;
+                let agents = block_on(
+                    mailbox().list_agents(project_key, ListAgentsOptions { active_within_days }),
+                )?;
                 Ok(Value::Array(agents.iter().map(ToJson::to_json).collect()))
             }
             BackendKind::Remote(_) => self.call_remote(
@@ -834,7 +829,11 @@ impl Mail {
             }
             BackendKind::Remote(_) => self.call_remote(
                 "summarize_thread",
-                crate::backend::wire::summarize_thread_args(project_key, thread_id, include_examples),
+                crate::backend::wire::summarize_thread_args(
+                    project_key,
+                    thread_id,
+                    include_examples,
+                ),
             ),
         }
     }
@@ -984,9 +983,8 @@ impl Mail {
     ) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
-                let r = block_on(
-                    mailbox().release_file_reservations(project_key, agent_name, paths),
-                )?;
+                let r =
+                    block_on(mailbox().release_file_reservations(project_key, agent_name, paths))?;
                 Ok(r.to_json())
             }
             BackendKind::Remote(_) => self.call_remote(
@@ -1930,7 +1928,10 @@ mod tests {
         unsafe { std::env::remove_var("XDG_DATA_HOME") };
         unsafe { std::env::set_var("HOME", "/tmp/flywheel-se2.1-home") };
         let (data_dir, _) = mailbox_roots();
-        assert_eq!(data_dir, PathBuf::from("/tmp/flywheel-se2.1-home/.local/share/toron"));
+        assert_eq!(
+            data_dir,
+            PathBuf::from("/tmp/flywheel-se2.1-home/.local/share/toron")
+        );
         unsafe { std::env::remove_var("HOME") };
         let (data_dir, db) = mailbox_roots();
         assert_eq!(
@@ -1992,10 +1993,24 @@ mod tests {
             mail.register_agent(project, name, "test", "test", "bd-dsu1 test")
                 .expect("register");
         }
-        mail.reserve(project, "BlueLake", &["src/**".into()], 3600, true, "bd-dsu1")
-            .expect("BlueLake hold");
-        mail.reserve(project, "RoseDune", &["docs/**".into()], 3600, true, "bd-dsu1")
-            .expect("RoseDune hold");
+        mail.reserve(
+            project,
+            "BlueLake",
+            &["src/**".into()],
+            3600,
+            true,
+            "bd-dsu1",
+        )
+        .expect("BlueLake hold");
+        mail.reserve(
+            project,
+            "RoseDune",
+            &["docs/**".into()],
+            3600,
+            true,
+            "bd-dsu1",
+        )
+        .expect("RoseDune hold");
 
         let board = mail.list_active(project, None, None).expect("board");
         assert_eq!(
@@ -2008,21 +2023,51 @@ mod tests {
                 !row["id"].as_str().unwrap_or("").is_empty(),
                 "row carries the reservation id: {row}"
             );
-            assert!(!row["holder"].as_str().unwrap_or("").is_empty(), "row names its holder: {row}");
-            assert!(row["exclusive"].as_bool().unwrap_or(false), "exclusive flag present: {row}");
+            assert!(
+                !row["holder"].as_str().unwrap_or("").is_empty(),
+                "row names its holder: {row}"
+            );
+            assert!(
+                row["exclusive"].as_bool().unwrap_or(false),
+                "exclusive flag present: {row}"
+            );
             assert_eq!(row["reason"].as_str().unwrap_or(""), "bd-dsu1");
         }
 
-        let blue = mail.list_active(project, Some("BlueLake"), None).expect("holder filter");
-        assert_eq!(blue["count"].as_u64().unwrap_or(0), 1, "holder filter narrows: {blue}");
-        assert_eq!(blue["reservations"][0]["path"].as_str().unwrap_or(""), "src/**");
+        let blue = mail
+            .list_active(project, Some("BlueLake"), None)
+            .expect("holder filter");
+        assert_eq!(
+            blue["count"].as_u64().unwrap_or(0),
+            1,
+            "holder filter narrows: {blue}"
+        );
+        assert_eq!(
+            blue["reservations"][0]["path"].as_str().unwrap_or(""),
+            "src/**"
+        );
 
-        let src = mail.list_active(project, None, Some("src/lib.rs")).expect("path filter");
-        assert_eq!(src["count"].as_u64().unwrap_or(0), 1, "glob overlap narrows: {src}");
-        assert_eq!(src["reservations"][0]["holder"].as_str().unwrap_or(""), "BlueLake");
+        let src = mail
+            .list_active(project, None, Some("src/lib.rs"))
+            .expect("path filter");
+        assert_eq!(
+            src["count"].as_u64().unwrap_or(0),
+            1,
+            "glob overlap narrows: {src}"
+        );
+        assert_eq!(
+            src["reservations"][0]["holder"].as_str().unwrap_or(""),
+            "BlueLake"
+        );
 
-        let none = mail.list_active(project, Some("Nobody"), None).expect("no match");
-        assert_eq!(none["count"].as_u64().unwrap_or(0), 0, "unknown holder → empty board");
+        let none = mail
+            .list_active(project, Some("Nobody"), None)
+            .expect("no match");
+        assert_eq!(
+            none["count"].as_u64().unwrap_or(0),
+            0,
+            "unknown holder → empty board"
+        );
     }
 
     /// S8.4: the swarm-start register_agent upsert clears stale profile task
@@ -2054,10 +2099,7 @@ mod tests {
             task.contains("flywheel agent for upsert-stale-task"),
             "fresh task stamp wins: {task}"
         );
-        assert!(
-            !task.contains("bd-qk9q"),
-            "stale bead task cleared: {task}"
-        );
+        assert!(!task.contains("bd-qk9q"), "stale bead task cleared: {task}");
     }
 
     /// bd-pncn: `--to all` broadcasts to every registered agent's inbox
