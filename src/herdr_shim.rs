@@ -33,6 +33,7 @@ pub use toron_core::backend::herdr::{
     WorkspaceInfo, HDR_PROTOCOL,
 };
 pub use toron_core::backend::types::AgentStatus;
+pub use toron_core::backend::error::{BackendError, BackendErrorCode};
 
 /// bd-bug-omp-herdr-wedge: the HERDR_* integration env a herdr-launched
 /// harness needs to activate its herdr extension (omp's
@@ -1544,6 +1545,390 @@ pub fn read_session_log(
         }
     }
     Ok(out)
+}
+
+/// H4 (bd-harness-alt-screen-reads): alt-screen transcript read primitives.
+/// Two adapters implement this — `ClientAltScreenRead` (cmd_view) and
+/// `BackendAltScreenRead` (loop diagnostics) — so the shared ladder drives
+/// both surfaces with one tested code path.
+pub trait AltScreenReadOps {
+    /// Read `source` (recent-unwrapped / visible / ...). May return
+    /// `BackendErrorCode::AgentNotIdle` while the agent is working.
+    fn read(&mut self, source: &str) -> Result<String, BackendError>;
+    /// Bounded wait for the agent to become idle. `Ok(true)` = became idle
+    /// within the bound; `Ok(false)` = timed out; `Err` = wait failed.
+    fn wait_idle(&mut self) -> Result<bool, BackendError>;
+    /// Last resort: prompt the agent to write its recent output to a temp
+    /// file, then read the file back (herdr docs' file-path contract).
+    fn file_fallback(&mut self) -> Result<String, BackendError>;
+}
+
+/// Bounded wait budget for `wait_idle` (herdr `agent.wait` timeout).
+pub const ALT_SCREEN_IDLE_WAIT_MS: u64 = 5_000;
+
+/// herdr wire `agent.read` source for unwrapped transcript history (the
+/// docs call it `recent-unwrapped`; the protocol enum is
+/// `recent_unwrapped` — verified live against herdr
+/// 0.8.0-preview.2026-08-04-d78e3d3b5126, 2026-08-15).
+pub const RECENT_UNWRAPPED_SOURCE: &str = "recent_unwrapped";
+
+/// H4 (bd-harness-alt-screen-reads): the alt-screen transcript read ladder.
+///
+/// 1. `recent-unwrapped` (the transcript source — wire name
+///    `recent_unwrapped`; herdr auto-scrolls the mouse-scroll interface when
+///    the agent is idle).
+/// 2. `agent_not_idle` → bounded wait for idle + ONE retry.
+/// 3. Still unavailable → `visible` buffer.
+/// 4. `visible` unavailable → file fallback (docs' last-resort contract).
+///
+/// An explicit `visible` request reads the visible buffer directly — never
+/// ladders (caller asked for the screen, not history).
+pub fn alt_screen_read_ladder(
+    ops: &mut dyn AltScreenReadOps,
+    source: &str,
+) -> Result<String, BackendError> {
+    if source == "visible" {
+        return ops.read("visible");
+    }
+    match ops.read(RECENT_UNWRAPPED_SOURCE) {
+        Ok(t) => return Ok(t),
+        Err(e) if e.code() == &BackendErrorCode::AgentNotIdle => {}
+        Err(e) => return Err(e),
+    }
+    // agent_not_idle: bounded wait + single retry
+    match ops.wait_idle() {
+        Ok(true) => {
+            if let Ok(t) = ops.read(RECENT_UNWRAPPED_SOURCE) {
+                return Ok(t);
+            }
+        }
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("flywheel: alt-screen wait-for-idle failed: {e:#}");
+        }
+    }
+    // still unavailable → visible buffer
+    if let Ok(t) = ops.read("visible") {
+        return Ok(t);
+    }
+    // last resort: ask the agent to write its output to a temp file
+    ops.file_fallback()
+}
+
+/// H4 (bd-harness-alt-screen-reads): the docs' file-path last resort. Prompt
+/// the agent to write its recent output to a temp file and reply with the
+/// path; then read the file. `prompt` must block until the agent processes
+/// the request (agent.prompt with a wait-until-idle window).
+pub fn alt_screen_file_fallback(
+    target: &str,
+    lines: Option<u32>,
+    mut prompt: impl FnMut(&str) -> Result<(), BackendError>,
+) -> Result<String, BackendError> {
+    let path = std::env::temp_dir().join(format!(
+        "flywheel-alt-{}-{}.md",
+        target.replace(['/', ':'], "_"),
+        std::process::id()
+    ));
+    let text = format!(
+        "Your terminal transcript is on the alternate screen and cannot be read remotely. \
+         Write the last {} lines of your current session output to {} as plain text, \
+         then reply with the path.",
+        lines.unwrap_or(40),
+        path.display()
+    );
+    prompt(&text).map_err(|e| {
+        BackendError::new(
+            BackendErrorCode::Io,
+            format!("alt-screen file fallback prompt to {target} failed: {e}"),
+        )
+    })?;
+    std::fs::read_to_string(&path).map_err(|e| {
+        BackendError::new(
+            BackendErrorCode::Io,
+            format!("alt-screen file fallback: {target} did not write {}: {e}", path.display()),
+        )
+    })
+}
+
+/// H4 (bd-harness-alt-screen-reads): adapter over the toron-core herdr
+/// `Client` (cmd_view path).
+pub struct ClientAltScreenRead<'a> {
+    c: &'a mut Client,
+    target: &'a str,
+    lines: Option<u32>,
+}
+
+impl<'a> ClientAltScreenRead<'a> {
+    pub fn new(c: &'a mut Client, target: &'a str, lines: Option<u32>) -> Self {
+        Self { c, target, lines }
+    }
+}
+
+impl AltScreenReadOps for ClientAltScreenRead<'_> {
+    fn read(&mut self, source: &str) -> Result<String, BackendError> {
+        self.c.agent_read(self.target, source, self.lines)
+    }
+    fn wait_idle(&mut self) -> Result<bool, BackendError> {
+        match self
+            .c
+            .agent_wait(self.target, &[AgentStatus::Idle], Some(ALT_SCREEN_IDLE_WAIT_MS))
+        {
+            Ok(_) => Ok(true),
+            Err(e) if e.code() == &BackendErrorCode::Timeout => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+    fn file_fallback(&mut self) -> Result<String, BackendError> {
+        let target = self.target;
+        let lines = self.lines;
+        let c = &mut *self.c;
+        let mut prompt = |text: &str| {
+            c.agent_prompt_coded(
+                target,
+                text,
+                Some(WaitOptions {
+                    timeout_ms: Some(ALT_SCREEN_IDLE_WAIT_MS),
+                    until: vec![AgentStatus::Idle],
+                }),
+            )
+            .map(|_| ())
+        };
+        alt_screen_file_fallback(target, lines, &mut prompt)
+    }
+}
+
+/// H4 (bd-harness-alt-screen-reads): adapter over the unified backend trait
+/// (`Box<dyn Backend>`, loop diagnostics path). Reads are `{text}` shaped.
+pub struct BackendAltScreenRead<'a> {
+    b: &'a dyn crate::backend::MultiplexerBackend,
+    target: &'a str,
+    lines: u32,
+}
+
+impl<'a> BackendAltScreenRead<'a> {
+    pub fn new(
+        b: &'a dyn crate::backend::MultiplexerBackend,
+        target: &'a str,
+        lines: u32,
+    ) -> Self {
+        Self { b, target, lines }
+    }
+}
+
+impl AltScreenReadOps for BackendAltScreenRead<'_> {
+    fn read(&mut self, source: &str) -> Result<String, BackendError> {
+        let v = self.b.agent_read(self.target, source, self.lines)?;
+        v.get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                BackendError::new(
+                    BackendErrorCode::Malformed,
+                    format!("agent.read missing text for {}: {v}", self.target),
+                )
+            })
+    }
+    fn wait_idle(&mut self) -> Result<bool, BackendError> {
+        match self.b.agent_wait(
+            self.target,
+            &[AgentStatus::Idle],
+            Some(ALT_SCREEN_IDLE_WAIT_MS),
+        ) {
+            Ok(_) => Ok(true),
+            Err(e) if e.code() == &BackendErrorCode::Timeout => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+    fn file_fallback(&mut self) -> Result<String, BackendError> {
+        let target = self.target;
+        let lines = self.lines;
+        let b = self.b;
+        let mut prompt = |text: &str| {
+            b.prompt_coded(
+                target,
+                text,
+                Some(&WaitOptions {
+                    timeout_ms: Some(ALT_SCREEN_IDLE_WAIT_MS),
+                    until: vec![AgentStatus::Idle],
+                }),
+            )
+            .map(|_| ())
+        };
+        alt_screen_file_fallback(target, Some(lines), &mut prompt)
+    }
+}
+
+#[cfg(test)]
+mod alt_screen_read_ladder_tests {
+    use super::*;
+    use toron_core::backend::error::{BackendError, BackendErrorCode};
+
+    struct MockOps {
+        reads: Vec<(String, Result<String, BackendError>)>,
+        waits: Vec<Result<bool, BackendError>>,
+        fallbacks: Vec<Result<String, BackendError>>,
+        log: Vec<String>,
+    }
+
+    impl AltScreenReadOps for MockOps {
+        fn read(&mut self, source: &str) -> Result<String, BackendError> {
+            self.log.push(format!("read:{source}"));
+            let (_, res) = self.reads.remove(0);
+            res
+        }
+        fn wait_idle(&mut self) -> Result<bool, BackendError> {
+            self.log.push("wait_idle".into());
+            let res = self.waits.remove(0);
+            res
+        }
+        fn file_fallback(&mut self) -> Result<String, BackendError> {
+            self.log.push("file_fallback".into());
+            let res = self.fallbacks.remove(0);
+            res
+        }
+    }
+
+    fn not_idle(msg: &str) -> BackendError {
+        BackendError::new(BackendErrorCode::AgentNotIdle, msg)
+    }
+
+    fn ok(text: &str) -> Result<String, BackendError> {
+        Ok(text.to_string())
+    }
+
+    /// H4: an idle agent's recent-unwrapped read succeeds on the FIRST
+    /// attempt — no wait, no fallback.
+    #[test]
+    fn alt_screen_read_ladder_reads_recent_unwrapped_when_idle() {
+        let mut m = MockOps {
+            reads: vec![("recent_unwrapped".into(), ok("transcript"))],
+            waits: vec![],
+            fallbacks: vec![],
+            log: vec![],
+        };
+        let out = alt_screen_read_ladder(&mut m, "recent").expect("read");
+        assert_eq!(out, "transcript");
+        assert_eq!(m.log, vec!["read:recent_unwrapped"]);
+    }
+
+    /// H4: agent_not_idle on the first read → bounded wait for idle →
+    /// retry recent-unwrapped → success. File fallback never invoked.
+    #[test]
+    fn alt_screen_read_ladder_waits_and_retries_after_agent_not_idle() {
+        let mut m = MockOps {
+            reads: vec![
+                ("recent_unwrapped".into(), Err(not_idle("working"))),
+                ("recent_unwrapped".into(), ok("transcript")),
+            ],
+            waits: vec![Ok(true)],
+            fallbacks: vec![],
+            log: vec![],
+        };
+        let out = alt_screen_read_ladder(&mut m, "recent").expect("read");
+        assert_eq!(out, "transcript");
+        assert_eq!(
+            m.log,
+            vec!["read:recent_unwrapped", "wait_idle", "read:recent_unwrapped"]
+        );
+    }
+
+    /// H4: wait times out (never became idle) → fall to the visible buffer.
+    #[test]
+    fn alt_screen_read_ladder_visible_fallback_after_wait_timeout() {
+        let mut m = MockOps {
+            reads: vec![
+                ("recent_unwrapped".into(), Err(not_idle("working"))),
+                ("visible".into(), ok("visible buffer")),
+            ],
+            waits: vec![Ok(false)],
+            fallbacks: vec![],
+            log: vec![],
+        };
+        let out = alt_screen_read_ladder(&mut m, "recent").expect("read");
+        assert_eq!(out, "visible buffer");
+        assert_eq!(
+            m.log,
+            vec!["read:recent_unwrapped", "wait_idle", "read:visible"]
+        );
+    }
+
+    /// H4: wait succeeds, retry still agent_not_idle → visible → visible
+    /// also not idle → file fallback (the docs' last-resort contract).
+    #[test]
+    fn alt_screen_read_ladder_file_fallback_when_visible_not_idle() {
+        let mut m = MockOps {
+            reads: vec![
+                ("recent_unwrapped".into(), Err(not_idle("working"))),
+                ("recent_unwrapped".into(), Err(not_idle("still working"))),
+                ("visible".into(), Err(not_idle("alt screen"))),
+            ],
+            waits: vec![Ok(true)],
+            fallbacks: vec![ok("file transcript")],
+            log: vec![],
+        };
+        let out = alt_screen_read_ladder(&mut m, "recent").expect("read");
+        assert_eq!(out, "file transcript");
+        assert_eq!(
+            m.log,
+            vec![
+                "read:recent_unwrapped",
+                "wait_idle",
+                "read:recent_unwrapped",
+                "read:visible",
+                "file_fallback",
+            ]
+        );
+    }
+
+    /// H4: a non-idle error on the first read propagates — no wait, no
+    /// fallback (never mask real backend failures).
+    #[test]
+    fn alt_screen_read_ladder_propagates_hard_read_errors() {
+        let hard = BackendError::new(BackendErrorCode::Connect, "socket gone");
+        let mut m = MockOps {
+            reads: vec![("recent_unwrapped".into(), Err(hard.clone()))],
+            waits: vec![],
+            fallbacks: vec![],
+            log: vec![],
+        };
+        let err = alt_screen_read_ladder(&mut m, "recent").expect_err("connect error");
+        assert_eq!(err.code(), &BackendErrorCode::Connect);
+        assert_eq!(m.log, vec!["read:recent_unwrapped"]);
+    }
+
+    /// H4: an explicit `visible` request reads the visible buffer directly —
+    /// never ladders, never waits.
+    #[test]
+    fn alt_screen_read_ladder_visible_source_never_ladders() {
+        let mut m = MockOps {
+            reads: vec![("visible".into(), ok("direct visible"))],
+            waits: vec![],
+            fallbacks: vec![],
+            log: vec![],
+        };
+        let out = alt_screen_read_ladder(&mut m, "visible").expect("read");
+        assert_eq!(out, "direct visible");
+        assert_eq!(m.log, vec!["read:visible"]);
+    }
+
+    /// H4: when the file fallback itself fails, the error surfaces (with
+    /// the agent_not_idle context preserved by the caller's map_err).
+    #[test]
+    fn alt_screen_read_ladder_file_fallback_error_propagates() {
+        let fb_err = BackendError::new(BackendErrorCode::Io, "temp file missing");
+        let mut m = MockOps {
+            reads: vec![
+                ("recent_unwrapped".into(), Err(not_idle("working"))),
+                ("recent_unwrapped".into(), Err(not_idle("still working"))),
+                ("visible".into(), Err(not_idle("alt screen"))),
+            ],
+            waits: vec![Ok(false)],
+            fallbacks: vec![Err(fb_err.clone())],
+            log: vec![],
+        };
+        let err = alt_screen_read_ladder(&mut m, "recent").expect_err("file fallback fails");
+        assert_eq!(err.code(), &BackendErrorCode::Io);
+    }
 }
 
 #[cfg(test)]
