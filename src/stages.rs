@@ -212,10 +212,17 @@ mod tests {
     fn p2_p6_cite_verification_principles_and_ledger() {
         let lib = StageLibrary::compiled_in();
         let p6 = lib.resolve("p6").expect("p6 resolves");
-        for name in ["prove-it-works", "fix-root-causes", "sequence-verifiable-units"] {
+        for name in [
+            "prove-it-works",
+            "fix-root-causes",
+            "sequence-verifiable-units",
+        ] {
             assert!(p6.contains(name), "p6 must name {name}");
         }
-        assert!(p6.contains("flywheel ledger check"), "p6 cites the ledger CLI");
+        assert!(
+            p6.contains("flywheel ledger check"),
+            "p6 cites the ledger CLI"
+        );
         let p2 = lib.resolve("p2").expect("p2 resolves");
         for name in ["prove-it-works", "fix-root-causes", "minimize-reader-load"] {
             assert!(p2.contains(name), "p2 must name {name}");
