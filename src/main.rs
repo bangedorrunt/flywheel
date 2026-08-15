@@ -713,11 +713,17 @@ enum Commands {
         bead_id: String,
         title: String,
     },
-    /// internal: close-detect SHA check (ADR-0019, bd-w1-sha-xyhd) — derive
-    /// the sha of the commit whose message carries the bead id; no commit ->
-    /// close ILLEGAL + mail names the missing commit
-    #[command(name = "__verify-close-sha", hide = true)]
-    __VerifyCloseSha { project: String, bead_id: String },
+    /// internal: close-detect check (ADR-0019, bd-w1-reopen-f6tw) — SHA
+    /// rule + ledger; legal/missing/no-commit verdict for the loop
+    #[command(name = "__close-check", hide = true)]
+    __CloseCheck { project: String, bead_id: String },
+    /// internal: reopen an unverified close + one mail per (bead, sha)
+    #[command(name = "__reopen-bead", hide = true)]
+    __ReopenBead {
+        project: String,
+        bead_id: String,
+        sha: String,
+    },
     /// internal: verifier-dispatch leaf (ADR-0019 Spec 4,
     /// bd-w1-verifier-degrade-a6fk) — decide the independent-verifier plan
     /// for a bead that needs one; on single-family degrade, block the bead
@@ -3293,9 +3299,14 @@ fn main() {
             bead_id,
             title,
         }) => cmd_internal_mail_not_ready(&cfg, project, bead_id, title),
-        Some(Commands::__VerifyCloseSha { project, bead_id }) => {
-            cmd_internal_verify_close_sha(&cfg, project, bead_id)
+        Some(Commands::__CloseCheck { project, bead_id }) => {
+            cmd_internal_close_check(&cfg, project, bead_id)
         }
+        Some(Commands::__ReopenBead {
+            project,
+            bead_id,
+            sha,
+        }) => cmd_internal_reopen_bead(&cfg, project, bead_id, sha),
         Some(Commands::__VerifyDispatch {
             project,
             bead_id,
@@ -11586,9 +11597,9 @@ mod loop_tests {
         );
     }
 
-    /// ADR-0019 SHA rule (bd-w1-sha-xyhd): a close with no commit carrying
-    /// the bead id is ILLEGAL — the planner is mailed on the bead's thread,
-    /// and the mail NAMES the missing commit.
+    /// ADR-0019 (bd-w1-reopen-f6tw): the unverified-close mail rides the
+    /// bead's thread, subject `[<id>] unverified close reopened`, and NAMES
+    /// what is missing (here: the commit).
     #[test]
     fn sha_rule_missing_commit_mail_names_the_missing_commit() {
         use crate::backend::MailSurface as _;
@@ -11604,8 +11615,8 @@ mod loop_tests {
             .expect("register sender");
         let profile = spawn_agent_profile("PlannerOne", "opencode", project);
         backend::run_mail(backend.register_agent(project, &profile)).expect("register");
-        send_missing_commit_mail(&backend, project, "bd-sha-missing", "PlannerOne")
-            .expect("missing-commit mail sends");
+        send_unverified_close_mail(&backend, project, "bd-sha-missing", "", "PlannerOne")
+            .expect("unverified-close mail sends");
         let items = backend::run_mail(backend.inbox(&backend::InboxQuery {
             project: project.into(),
             agent: "PlannerOne".into(),
@@ -11618,8 +11629,8 @@ mod loop_tests {
         .expect("inbox");
         let m = items
             .iter()
-            .find(|m| m.subject.contains("no commit"))
-            .expect("planner received the missing-commit mail");
+            .find(|m| m.subject.contains("unverified close reopened"))
+            .expect("planner received the unverified-close mail");
         assert_eq!(
             m.thread_id.as_ref().map(|t| t.as_str()),
             Some("bd-sha-missing"),
@@ -11629,6 +11640,169 @@ mod loop_tests {
             m.body_md.contains("bd-sha-missing"),
             "mail names the bead whose commit is missing"
         );
+    }
+
+    // ---- bd-w1-reopen-f6tw: the red-then-green of the program ----
+
+    /// Scratch workspace (git + br + one bead with a VERIFY fence + a commit
+    /// whose message carries the bead id + gate policy).
+    fn scratch_workspace(tag: &str) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .output()
+            .expect("git init");
+        assert!(init.status.success(), "git init");
+        let bi = std::process::Command::new("br")
+            .arg("init")
+            .current_dir(&dir)
+            .output()
+            .expect("br init");
+        assert!(bi.status.success(), "br init");
+        std::fs::write(
+            dir.join(".beads/policy.yaml"),
+            "workflow:\n  transitions:\n    open:\n      - closed\n  gates:\n    open -> closed:\n      require_all:\n        - command-verified\n",
+        )
+        .unwrap();
+        let created = std::process::Command::new("br")
+            .args([
+                "create",
+                "--title",
+                "reopen fixture",
+                "--slug",
+                "reopen-fix-1",
+                "-p",
+                "3",
+                "-d",
+                "work\n\n## VERIFY\n```\ncargo test -p flywheel reopen::\n```",
+            ])
+            .current_dir(&dir)
+            .output()
+            .expect("br create");
+        assert!(created.status.success(), "br create");
+        let list = std::process::Command::new("br")
+            .args(["list", "--json"])
+            .current_dir(&dir)
+            .output()
+            .expect("br list");
+        let v: serde_json::Value = serde_json::from_slice(&list.stdout).expect("br list json");
+        let bead_id = v["issues"][0]["id"].as_str().expect("bead id").to_string();
+        std::fs::write(dir.join("work.txt"), "work\n").unwrap();
+        let add = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .expect("git add");
+        assert!(add.status.success());
+        let cm = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test",
+                "-c",
+                "user.name=test",
+                "commit",
+                "-q",
+                "-m",
+                &format!("feat: reopen fixture ({bead_id})"),
+            ])
+            .current_dir(&dir)
+            .output()
+            .expect("git commit");
+        assert!(cm.status.success(), "git commit");
+        (dir, bead_id)
+    }
+
+    /// THE RED-THEN-GREEN OF THE PROGRAM: a worker closes with no gate row
+    /// -> close-check says MISSING -> `reopen_unverified_close` reopens ->
+    /// the bead is back in `br ready`. Repeated ticks (same bead, same sha)
+    /// mail exactly ONCE (marker dedup) — the reopen storm guard.
+    #[test]
+    fn reopen_flow_reopens_unverified_close_and_mails_once() {
+        use crate::backend::MailSurface as _;
+        let (dir, bead_id) = scratch_workspace("reopen-flow");
+        let dir_str = dir.to_string_lossy().to_string();
+        // worker closes with NO gate row
+        let close = std::process::Command::new("br")
+            .args(["close", &bead_id, "--reason", "worker says done"])
+            .current_dir(&dir)
+            .output()
+            .expect("br close");
+        assert!(close.status.success(), "br close: {close:?}");
+        // close-detect: sha derived (commit carries the id), ledger missing
+        match verdict::close_check(&dir, &bead_id).unwrap() {
+            verdict::CloseCheck::Missing {
+                sha,
+                receipt_eligible,
+            } => {
+                assert!(!receipt_eligible, "loop-runnable -> no receipt grace");
+                let mail = crate::mail_shim::Mail::from_config(None)
+                    .expect("mail ok")
+                    .expect("mail Some");
+                let backend = crate::backend::toron::ToronMailBackend::new(mail);
+                // the reopen leaf ensures the PROJECT DIR path as its key —
+                // the test must register identities under the SAME key.
+                let project = dir_str.clone();
+                backend::run_mail(backend.ensure_project(&project)).expect("ensure");
+                let sender = backend.agent_name().to_string();
+                let sender_profile = spawn_agent_profile(&sender, "opencode", &project);
+                backend::run_mail(backend.register_agent(&project, &sender_profile))
+                    .expect("register sender");
+                // the planner = the bead's creator (registered identity)
+                let planner = resolve_planner_for_bead(&dir_str, &bead_id, "FallbackIdentity");
+                let planner_profile = spawn_agent_profile(&planner, "opencode", &project);
+                backend::run_mail(backend.register_agent(&project, &planner_profile))
+                    .expect("register planner");
+                // tick 1: reopen + mail
+                let v = reopen_unverified_close(&dir_str, &bead_id, &sha, &backend, &planner)
+                    .expect("reopen tick 1");
+                assert_eq!(v["reopened"].as_bool(), Some(true), "reopened: {v}");
+                // the bead is back in br ready — RED-THEN-GREEN
+                let ready = std::process::Command::new("br")
+                    .args(["ready", "--json"])
+                    .current_dir(&dir)
+                    .output()
+                    .expect("br ready");
+                let rv: serde_json::Value =
+                    serde_json::from_slice(&ready.stdout).expect("ready json");
+                assert!(
+                    rv.as_array().unwrap().iter().any(|b| b["id"] == bead_id),
+                    "reopened bead is back in br ready: {rv}"
+                );
+                // tick 2 (repeated): no second mail — exactly one per (bead, sha)
+                let v2 = reopen_unverified_close(&dir_str, &bead_id, &sha, &backend, &planner)
+                    .expect("reopen tick 2");
+                assert_eq!(v2["already_processed"].as_bool(), Some(true), "dedup: {v2}");
+                let items = backend::run_mail(backend.inbox(&backend::InboxQuery {
+                    project: project.clone(),
+                    agent: planner.clone(),
+                    unread_only: false,
+                    limit: Some(10),
+                    include_bodies: false,
+                    urgent_only: false,
+                    since_ts: None,
+                }))
+                .expect("inbox");
+                let mails: Vec<_> = items
+                    .iter()
+                    .filter(|m| m.subject.contains("unverified close reopened"))
+                    .collect();
+                assert_eq!(
+                    mails.len(),
+                    1,
+                    "exactly one mail per (bead, sha): {items:?}"
+                );
+                assert_eq!(
+                    mails[0].thread_id.as_ref().map(|t| t.as_str()),
+                    Some(bead_id.as_str()),
+                    "on the bead's thread"
+                );
+            }
+            other => panic!("expected Missing, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The planner to notify is the bead's creator (`br show --json` →
@@ -18744,7 +18918,9 @@ fn cmd_internal_verify_dispatch(
             eprintln!(
                 "flywheel: verifier-dispatch for {bead_id} bead lookup failed (continuing): {e}"
             );
-            print_json(&json!({ "plan": "none-required", "bead_id": bead_id, "error": format!("{e}") }));
+            print_json(
+                &json!({ "plan": "none-required", "bead_id": bead_id, "error": format!("{e}") }),
+            );
             return Ok(());
         }
     };
@@ -18764,7 +18940,9 @@ fn cmd_internal_verify_dispatch(
             eprintln!(
                 "flywheel: verifier-dispatch for {bead_id} registry load failed (continuing): {e}"
             );
-            print_json(&json!({ "plan": "none-required", "bead_id": bead_id, "error": format!("{e}") }));
+            print_json(
+                &json!({ "plan": "none-required", "bead_id": bead_id, "error": format!("{e}") }),
+            );
             return Ok(());
         }
     };
@@ -18811,7 +18989,9 @@ fn cmd_internal_verify_dispatch(
             // One captain mail, deduped by marker file (durable across loop
             // invocations; the caller's dedup set covers one-per-invocation).
             let mut mailed = false;
-            let marker = key.join(".flywheel").join(format!("verifier-family-missing-{bead_id}.mailed"));
+            let marker = key
+                .join(".flywheel")
+                .join(format!("verifier-family-missing-{bead_id}.mailed"));
             if !marker.exists() {
                 let key_str = key.to_string_lossy().into_owned();
                 let captain = cfg
@@ -18821,7 +19001,8 @@ fn cmd_internal_verify_dispatch(
                     .unwrap_or_else(|| "Flywheel".to_string());
                 if let Ok(mail) = backend::mail_backend(cfg) {
                     let out = (|| -> Result<backend::SendReceipt> {
-                        backend::run_mail(mail.ensure_project(&key_str)).map_err(|e| anyhow!("{e}"))?;
+                        backend::run_mail(mail.ensure_project(&key_str))
+                            .map_err(|e| anyhow!("{e}"))?;
                         send_verifier_family_missing_mail(&*mail, &key_str, bead_id, &captain)
                     })();
                     mailed = out.is_ok();
@@ -18831,9 +19012,7 @@ fn cmd_internal_verify_dispatch(
                         );
                     }
                 }
-                if mailed
-                    && let Some(parent) = marker.parent()
-                {
+                if mailed && let Some(parent) = marker.parent() {
                     let _ = std::fs::create_dir_all(parent);
                     let _ = std::fs::write(&marker, "1");
                 }
@@ -18882,62 +19061,186 @@ fn send_verifier_family_missing_mail(
     )
 }
 
-fn cmd_internal_verify_close_sha(cfg: &Config, project: &str, bead_id: &str) -> Result<()> {
+/// internal leaf: close-detect check (ADR-0019, bd-w1-reopen-f6tw) — wrap
+/// `verdict::close_check` (SHA rule + ledger): `{status: legal, sha}` |
+/// `{status: missing, sha, receipt_eligible}` | `{status: no-commit}`. The
+/// loop turns a non-legal status into `__reopen-bead`. Always exit 0.
+fn cmd_internal_close_check(cfg: &Config, project: &str, bead_id: &str) -> Result<()> {
     let key = project_dir_str(cfg, project)?;
-    match verdict::derive_head_sha(std::path::Path::new(&key), bead_id) {
-        Ok(sha) => {
-            print_json(&json!({ "illegal": false, "bead_id": bead_id, "sha": sha }));
+    match verdict::close_check(std::path::Path::new(&key), bead_id) {
+        Ok(verdict::CloseCheck::Legal { sha }) => {
+            print_json(&json!({ "status": "legal", "bead_id": bead_id, "sha": sha }));
+            Ok(())
+        }
+        Ok(verdict::CloseCheck::Missing {
+            sha,
+            receipt_eligible,
+        }) => {
+            print_json(&json!({
+                "status": "missing",
+                "bead_id": bead_id,
+                "sha": sha,
+                "receipt_eligible": receipt_eligible,
+            }));
+            Ok(())
+        }
+        Ok(verdict::CloseCheck::NoCommit) => {
+            print_json(&json!({ "status": "no-commit", "bead_id": bead_id }));
             Ok(())
         }
         Err(e) => {
-            eprintln!(
-                "flywheel: bead {bead_id} closed WITHOUT a commit carrying its id — close ILLEGAL: {e}"
+            eprintln!("flywheel: close-check for {bead_id} failed: {e:#}");
+            print_json(
+                &json!({ "status": "error", "bead_id": bead_id, "error": format!("{e:#}") }),
             );
-            let mut mailed = false;
-            if let Ok(mail) = backend::mail_backend(cfg) {
-                let fallback = cfg
-                    .agent_mail
-                    .as_ref()
-                    .and_then(|m| m.name.clone())
-                    .unwrap_or_else(|| "Flywheel".to_string());
-                let planner = resolve_planner_for_bead(&key, bead_id, &fallback);
-                let out = (|| -> Result<backend::SendReceipt> {
-                    backend::run_mail(mail.ensure_project(&key)).map_err(|e| anyhow!("{e}"))?;
-                    send_missing_commit_mail(&*mail, &key, bead_id, &planner)
-                })();
-                mailed = out.is_ok();
-                if let Err(me) = out {
-                    eprintln!("flywheel: missing-commit mail for {bead_id} failed: {me:#}");
-                }
-            }
+            Ok(())
+        }
+    }
+}
+
+/// internal leaf: reopen an unverified close (ADR-0019, bd-w1-reopen-f6tw) —
+/// `br reopen <id>` (idempotent: already-open -> no-op) + ONE mail per
+/// (bead, sha) on `thread_id=<id>`, subject `[<id>] unverified close
+/// reopened`. Durable dedup: a `.flywheel/reopened/<bead>-<sha>.reopened`
+/// marker written after the mail (removed on mail failure) makes the storm
+/// guard hold across ticks AND invocations. Always exit 0.
+fn cmd_internal_reopen_bead(cfg: &Config, project: &str, bead_id: &str, sha: &str) -> Result<()> {
+    let key = project_dir_str(cfg, project)?;
+    let fallback = cfg
+        .agent_mail
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| "Flywheel".to_string());
+    let planner = resolve_planner_for_bead(&key, bead_id, &fallback);
+    let mail = match backend::mail_backend(cfg) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("flywheel: mail backend unavailable for reopen alert {bead_id}: {e:#}");
             print_json(&json!({
-                "illegal": true,
+                "ok": false,
                 "bead_id": bead_id,
-                "error": format!("{e}"),
-                "mailed": mailed,
+                "sha": sha,
+                "error": format!("mail backend: {e:#}"),
+            }));
+            return Ok(());
+        }
+    };
+    match reopen_unverified_close(&key, bead_id, sha, &*mail, &planner) {
+        Ok(v) => {
+            print_json(&v);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("flywheel: reopen of {bead_id} failed: {e:#}");
+            print_json(&json!({
+                "ok": false,
+                "bead_id": bead_id,
+                "sha": sha,
+                "error": format!("{e:#}"),
             }));
             Ok(())
         }
     }
 }
 
-/// The missing-commit mail itself: thread = the bead id, so the planner's
-/// reply stays on the bead's thread (ADR-0019 Spec 0). Separated for tests.
-fn send_missing_commit_mail(
+/// The reopen side of the close-detect flow (ADR-0019, bd-w1-reopen-f6tw):
+/// `br reopen <id>` (idempotent — already open is a no-op) + ONE mail per
+/// (bead, sha) on the bead's thread. Durable dedup via a
+/// `.flywheel/reopened/<bead>-<sha>.reopened` marker written AFTER a
+/// successful mail (removed on failure so a retry re-mails) — the storm
+/// guard holds across repeated ticks and loop invocations. Returns the
+/// outcome JSON for the leaf / tests.
+fn reopen_unverified_close(
+    key: &str,
+    bead_id: &str,
+    sha: &str,
+    mail: &dyn backend::MailSurface,
+    planner: &str,
+) -> Result<serde_json::Value> {
+    let dir = std::path::Path::new(key);
+    let marker_dir = dir.join(".flywheel").join("reopened");
+    let marker = marker_dir.join(format!(
+        "{bead_id}-{}.reopened",
+        if sha.is_empty() { "nocommit" } else { sha }
+    ));
+    if marker.exists() {
+        return Ok(json!({
+            "ok": true,
+            "bead_id": bead_id,
+            "sha": sha,
+            "reopened": false,
+            "already_processed": true,
+        }));
+    }
+    // idempotent reopen: already-open + missing row -> no-op (br exit 0).
+    let out = std::process::Command::new("br")
+        .args([
+            "reopen",
+            bead_id,
+            "--reason",
+            "unverified close (ADR-0019: no legal verdict for the derived sha)",
+            "--actor",
+            "flywheel-loop",
+        ])
+        .current_dir(dir)
+        .output()
+        .map_err(|e| anyhow!("br reopen not found: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "br reopen {bead_id} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    // one mail per (bead, sha): write the marker FIRST, remove on failure
+    std::fs::create_dir_all(&marker_dir)?;
+    std::fs::write(&marker, "mailed\n")?;
+    let send = (|| -> Result<backend::SendReceipt> {
+        backend::run_mail(mail.ensure_project(key)).map_err(|e| anyhow!("{e}"))?;
+        send_unverified_close_mail(mail, key, bead_id, sha, planner)
+    })();
+    match send {
+        Ok(_) => Ok(json!({
+            "ok": true,
+            "bead_id": bead_id,
+            "sha": sha,
+            "reopened": true,
+            "notified": planner,
+        })),
+        Err(e) => {
+            let _ = std::fs::remove_file(&marker);
+            Err(e)
+        }
+    }
+}
+
+/// The unverified-close mail: thread = the bead id, subject `[<id>]
+/// unverified close reopened` (ADR-0019 Spec 0). Body names what is
+/// missing (a verdict row for the derived sha, or the commit itself).
+fn send_unverified_close_mail(
     mail: &dyn backend::MailSurface,
     key: &str,
     bead_id: &str,
+    sha: &str,
     planner: &str,
 ) -> Result<backend::SendReceipt> {
-    let subject = format!("[{bead_id}] unverified close REJECTED: no commit carries the bead id");
-    let body = format!(
-        "Bead **{bead_id}** was closed but **no commit carries its id** — the close is \
-         ILLEGAL under the ADR-0019 SHA rule (`git log --all --grep={bead_id}` finds nothing).\n\n\
-         In a shared tree bare HEAD may not contain this bead's work at all, so a verdict \
-         cannot bind to it. Commit the bead's work BEFORE closing with the bead id IN the \
-         commit message; then the close becomes legal.\n\n\
-         Missing: the commit whose message contains `{bead_id}`."
-    );
+    let subject = format!("[{bead_id}] unverified close reopened");
+    let body = if sha.is_empty() {
+        format!(
+            "Bead **{bead_id}** was closed but **no commit carries its id** — the close is \
+             ILLEGAL under the ADR-0019 SHA rule (`git log --all --grep={bead_id}` finds \
+             nothing). In a shared tree bare HEAD may not contain this bead's work at all, \
+             so a verdict cannot bind to it. The loop reopened the bead.\n\n\
+             Missing: the commit whose message contains `{bead_id}`."
+        )
+    } else {
+        format!(
+            "Bead **{bead_id}** was closed without a legal verdict for sha `{sha}` — the \
+             close is unverified under ADR-0019 and the loop reopened the bead.\n\n\
+             Commit the work (message must carry `{bead_id}`), run the bead's ## VERIFY, \
+             record the verdict (`flywheel ledger` / `br gate report` with sha={sha}), \
+             then close."
+        )
+    };
     mail_send(
         mail,
         key,

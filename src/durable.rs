@@ -317,29 +317,57 @@ async fn reservation_board(args: ReservationBoardArgs) -> Result<Vec<(String, St
         .unwrap_or_default())
 }
 
-/// Args for the `__verify-close-sha` leaf (ADR-0019 SHA rule, bd-w1-sha-xyhd).
+/// Args for the `__close-check` leaf (ADR-0019, bd-w1-reopen-f6tw).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VerifyCloseShaArgs {
+pub struct CloseCheckArgs {
     pub project: String,
     pub bead_id: String,
 }
 
-/// Checkpointed leaf — close-detect SHA check: derive the sha of the commit
-/// whose message carries the bead id (`git log --all -1 --grep=<id>`, no
-/// bare-HEAD fallback). Success -> `{illegal: false, sha}`. No commit
-/// carries the id -> the close is ILLEGAL regardless of verdicts: the leaf
-/// mails the planner naming the missing commit and returns `{illegal: true}`
-/// (the reopen call lands in bd-w1-reopen-f6tw). Always exits 0 — a git or
-/// mail hiccup must never kill the loop.
+/// Checkpointed leaf — close-detect check: SHA rule + ledger
+/// (`verdict::close_check`). Returns `{status: legal, sha}` |
+/// `{status: missing, sha, receipt_eligible}` | `{status: no-commit}`. The
+/// loop reopens (and mails once per (bead, sha)) on anything non-legal.
+/// Always exits 0 — a git/br hiccup must never kill the loop.
 #[function]
-async fn verify_close_sha(args: VerifyCloseShaArgs) -> Result<Value> {
+async fn close_check(args: CloseCheckArgs) -> Result<Value> {
     let exe = self_exe().map_err(map_err)?;
     let mut cmd = Command::new(&exe);
-    cmd.args(["__verify-close-sha", &args.project, &args.bead_id]);
-    let out = run_leaf_cmd(cmd, "__verify-close-sha").await?;
+    cmd.args(["__close-check", &args.project, &args.bead_id]);
+    let out = run_leaf_cmd(cmd, "__close-check").await?;
     if !out.status.success() {
         return Err(map_err(anyhow::anyhow!(
-            "__verify-close-sha failed: {}",
+            "__close-check failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    Ok(serde_json::from_str(raw.trim())
+        .unwrap_or_else(|_| serde_json::json!({ "raw": raw.trim() })))
+}
+
+/// Args for the `__reopen-bead` leaf (ADR-0019, bd-w1-reopen-f6tw).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReopenBeadArgs {
+    pub project: String,
+    pub bead_id: String,
+    /// The derived close sha (empty for the no-commit case — marker keyed
+    /// "nocommit" so the one-mail-per-(bead, sha) guard still holds).
+    pub sha: String,
+}
+
+/// Checkpointed leaf — reopen an unverified close: `br reopen` (idempotent)
+/// + ONE mail per (bead, sha) on `thread_id=<bead_id>` (marker-deduped,
+/// durable across ticks and invocations). Always exits 0.
+#[function]
+async fn reopen_bead(args: ReopenBeadArgs) -> Result<Value> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__reopen-bead", &args.project, &args.bead_id, &args.sha]);
+    let out = run_leaf_cmd(cmd, "__reopen-bead").await?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__reopen-bead failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
@@ -3114,13 +3142,17 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // checkpointed `__mail-not-ready` leaf results, so a crash never
     // re-mails a bead the checkpoint already mailed.
     let mut not_ready_mailed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // ADR-0019 (bd-w1-sha-xyhd): closed beads whose close-detect SHA check
-    // already ran this invocation (same replay-rebuilt dedup contract).
-    let mut close_sha_checked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // ADR-0019 (bd-w1-reopen-f6tw): consecutive-missing-tick counter per
+    // closed bead — the WorkerReceipt two-tick receipt grace. Per-invocation
+    // state; on replay it is rebuilt from the checkpointed `__close-check`
+    // leaf results, so a crash converges next tick.
+    let mut close_grace_ticks: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
     // ADR-0019 Spec 4 (bd-w1-verifier-degrade-a6fk): closed beads whose
     // verifier-dispatch decision already ran this invocation. Degrade mails
     // the captain once per bead — the marker file is the durable dedup.
-    let mut verifier_dispatched: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut verifier_dispatched: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     // bd-efk1: claim-watch nudge sends collected during work-mode sourcing,
     // merged into the action list AFTER plan_actions (they target specific
     // agents — including WORKING ones — and must not be double-filtered by
@@ -3586,30 +3618,99 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         queue_brief(&mut queue, &bead_id, &title, &params.project, true, true);
                     }
                     ClaimWatchAction::ReleaseReservations { bead_id } => {
-                        // ADR-0019 SHA rule (bd-w1-sha-xyhd): a closed bead
-                        // MUST have a commit whose message carries its id —
-                        // derive it at close-detect. No commit -> the close
-                        // is ILLEGAL regardless of verdicts (the leaf mails
-                        // the planner naming the missing commit; the br
-                        // reopen call lands in bd-w1-reopen-f6tw). Once per
-                        // bead per invocation.
-                        if close_sha_checked.insert(bead_id.clone()) {
-                            let sha_args = VerifyCloseShaArgs {
-                                project: params.project.clone(),
-                                bead_id: bead_id.clone(),
-                            };
-                            match ctx.run(verify_close_sha, sha_args).await {
-                                Ok(v) => {
-                                    if v.get("illegal").and_then(Value::as_bool).unwrap_or(false) {
+                        // ADR-0019 (bd-w1-reopen-f6tw): close-detect
+                        // enforcement — SHA rule + ledger. A closed bead must
+                        // have a legal verdict bound to the commit whose
+                        // message carries its id. Non-legal -> reopen + one
+                        // mail per (bead, sha). WorkerReceipt-eligible beads
+                        // get TWO consecutive missing ticks of grace (the
+                        // receipt can race the close write): the bead is
+                        // re-watched so the next tick re-checks.
+                        let args = CloseCheckArgs {
+                            project: params.project.clone(),
+                            bead_id: bead_id.clone(),
+                        };
+                        match ctx.run(close_check, args).await {
+                            Ok(v) => {
+                                let status = v.get("status").and_then(Value::as_str).unwrap_or("?");
+                                match status {
+                                    "legal" => {
+                                        close_grace_ticks.remove(&bead_id);
                                         eprintln!(
-                                            "flywheel: bead {bead_id} closed WITHOUT a commit carrying its id — close ILLEGAL (planner mailed)"
+                                            "flywheel: close of {bead_id} verified (legal verdict bound to sha)"
                                         );
                                     }
+                                    "no-commit" => {
+                                        close_grace_ticks.remove(&bead_id);
+                                        let rb = ReopenBeadArgs {
+                                            project: params.project.clone(),
+                                            bead_id: bead_id.clone(),
+                                            sha: String::new(),
+                                        };
+                                        match ctx.run(reopen_bead, rb).await {
+                                            Ok(r) => eprintln!(
+                                                "flywheel: {bead_id} closed without a commit — reopened: {r}"
+                                            ),
+                                            Err(e) => eprintln!(
+                                                "flywheel: reopen of {bead_id} failed (continuing): {e}"
+                                            ),
+                                        }
+                                    }
+                                    "missing" => {
+                                        let eligible = v
+                                            .get("receipt_eligible")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false);
+                                        let sha = v
+                                            .get("sha")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let ticks =
+                                            close_grace_ticks.entry(bead_id.clone()).or_insert(0);
+                                        *ticks += 1;
+                                        if eligible && *ticks < 2 {
+                                            // receipt may race the close:
+                                            // re-watch so the next tick
+                                            // re-checks before reopening.
+                                            eprintln!(
+                                                "flywheel: {bead_id} missing verdict (WorkerReceipt grace {ticks}/2)"
+                                            );
+                                            claim_watch.insert(
+                                                bead_id.clone(),
+                                                ClaimWatch {
+                                                    agent: String::new(),
+                                                    unclaimed_polls: 0,
+                                                    close_nudged: false,
+                                                    close_polls: 0,
+                                                    wait_reason: None,
+                                                },
+                                            );
+                                        } else {
+                                            close_grace_ticks.remove(&bead_id);
+                                            let rb = ReopenBeadArgs {
+                                                project: params.project.clone(),
+                                                bead_id: bead_id.clone(),
+                                                sha,
+                                            };
+                                            match ctx.run(reopen_bead, rb).await {
+                                                Ok(r) => eprintln!(
+                                                    "flywheel: {bead_id} unverified close — reopened: {r}"
+                                                ),
+                                                Err(e) => eprintln!(
+                                                    "flywheel: reopen of {bead_id} failed (continuing): {e}"
+                                                ),
+                                            }
+                                        }
+                                    }
+                                    other => eprintln!(
+                                        "flywheel: close-check for {bead_id} unknown status {other}"
+                                    ),
                                 }
-                                Err(e) => eprintln!(
-                                    "flywheel: verify-close-sha for {bead_id} failed (continuing): {e}"
-                                ),
                             }
+                            Err(e) => eprintln!(
+                                "flywheel: close-check for {bead_id} failed (continuing): {e}"
+                            ),
                         }
                         // ADR-0019 Spec 4 (bd-w1-verifier-degrade-a6fk): a
                         // closed bead that needs independent verification
@@ -3629,19 +3730,14 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             };
                             match ctx.run(verify_dispatch, v_args).await {
                                 Ok(v) => {
-                                    let plan = v
-                                        .get("plan")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("?");
+                                    let plan = v.get("plan").and_then(Value::as_str).unwrap_or("?");
                                     if plan == "degrade" {
                                         eprintln!(
                                             "flywheel: bead {bead_id} blocked verifier-family-missing (single-family swarm; captain mailed once)"
                                         );
                                     } else if plan == "dispatch" {
-                                        let model = v
-                                            .get("model")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("?");
+                                        let model =
+                                            v.get("model").and_then(Value::as_str).unwrap_or("?");
                                         eprintln!(
                                             "flywheel: bead {bead_id} needs an independent verifier on {model} (reviewer pane dispatch, ADR-0019 Spec 4)"
                                         );
@@ -4451,8 +4547,11 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
         .register(mail_not_ready)
         .map_err(|e| anyhow::anyhow!("register mail_not_ready: {e}"))?;
     resonate
-        .register(verify_close_sha)
-        .map_err(|e| anyhow::anyhow!("register verify_close_sha: {e}"))?;
+        .register(close_check)
+        .map_err(|e| anyhow::anyhow!("register close_check: {e}"))?;
+    resonate
+        .register(reopen_bead)
+        .map_err(|e| anyhow::anyhow!("register reopen_bead: {e}"))?;
     resonate
         .register(verify_dispatch)
         .map_err(|e| anyhow::anyhow!("register verify_dispatch: {e}"))?;
@@ -4804,12 +4903,16 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // already fired this invocation (dedup, rebuilt on replay from the
     // checkpointed `__mail-not-ready` leaf results).
     let mut not_ready_mailed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // ADR-0019 (bd-w1-sha-xyhd): closed beads whose close-detect SHA check
-    // already ran this invocation (same replay-rebuilt dedup contract).
-    let mut close_sha_checked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // ADR-0019 (bd-w1-reopen-f6tw): consecutive-missing-tick counter per
+    // closed bead — the WorkerReceipt two-tick receipt grace. Per-invocation
+    // state; on replay it is rebuilt from the checkpointed `__close-check`
+    // leaf results, so a crash converges next tick.
+    let mut close_grace_ticks: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
     // ADR-0019 Spec 4 (bd-w1-verifier-degrade-a6fk): closed beads whose
     // verifier-dispatch decision already ran this invocation.
-    let mut verifier_dispatched: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut verifier_dispatched: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut watch_sends: Vec<LoopAction> = Vec::new();
 
     loop {
@@ -5118,27 +5221,93 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         queue_brief(&mut queue, &bead_id, &title, &params.project, true, true);
                     }
                     ClaimWatchAction::ReleaseReservations { bead_id } => {
-                        // ADR-0019 SHA rule (bd-w1-sha-xyhd): same close-detect
-                        // sha check as swarm_loop — no commit carrying the id
-                        // -> close ILLEGAL (planner mailed; reopen in
-                        // bd-w1-reopen-f6tw). Once per bead per invocation.
-                        if close_sha_checked.insert(bead_id.clone()) {
-                            let sha_args = VerifyCloseShaArgs {
-                                project: params.project.clone(),
-                                bead_id: bead_id.clone(),
-                            };
-                            match ctx.run(verify_close_sha, sha_args).await {
-                                Ok(v) => {
-                                    if v.get("illegal").and_then(Value::as_bool).unwrap_or(false) {
+                        // ADR-0019 (bd-w1-reopen-f6tw): same close-detect
+                        // enforcement as swarm_loop — SHA rule + ledger;
+                        // non-legal close -> reopen + one mail per (bead,
+                        // sha); WorkerReceipt-eligible beads get TWO
+                        // consecutive missing ticks of grace (re-watch).
+                        let args = CloseCheckArgs {
+                            project: params.project.clone(),
+                            bead_id: bead_id.clone(),
+                        };
+                        match ctx.run(close_check, args).await {
+                            Ok(v) => {
+                                let status = v.get("status").and_then(Value::as_str).unwrap_or("?");
+                                match status {
+                                    "legal" => {
+                                        close_grace_ticks.remove(&bead_id);
                                         eprintln!(
-                                            "flywheel: bead {bead_id} closed WITHOUT a commit carrying its id — close ILLEGAL (planner mailed)"
+                                            "flywheel: close of {bead_id} verified (legal verdict bound to sha)"
                                         );
                                     }
+                                    "no-commit" => {
+                                        close_grace_ticks.remove(&bead_id);
+                                        let rb = ReopenBeadArgs {
+                                            project: params.project.clone(),
+                                            bead_id: bead_id.clone(),
+                                            sha: String::new(),
+                                        };
+                                        match ctx.run(reopen_bead, rb).await {
+                                            Ok(r) => eprintln!(
+                                                "flywheel: {bead_id} closed without a commit — reopened: {r}"
+                                            ),
+                                            Err(e) => eprintln!(
+                                                "flywheel: reopen of {bead_id} failed (continuing): {e}"
+                                            ),
+                                        }
+                                    }
+                                    "missing" => {
+                                        let eligible = v
+                                            .get("receipt_eligible")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false);
+                                        let sha = v
+                                            .get("sha")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let ticks =
+                                            close_grace_ticks.entry(bead_id.clone()).or_insert(0);
+                                        *ticks += 1;
+                                        if eligible && *ticks < 2 {
+                                            eprintln!(
+                                                "flywheel: {bead_id} missing verdict (WorkerReceipt grace {ticks}/2)"
+                                            );
+                                            claim_watch.insert(
+                                                bead_id.clone(),
+                                                ClaimWatch {
+                                                    agent: String::new(),
+                                                    unclaimed_polls: 0,
+                                                    close_nudged: false,
+                                                    close_polls: 0,
+                                                    wait_reason: None,
+                                                },
+                                            );
+                                        } else {
+                                            close_grace_ticks.remove(&bead_id);
+                                            let rb = ReopenBeadArgs {
+                                                project: params.project.clone(),
+                                                bead_id: bead_id.clone(),
+                                                sha,
+                                            };
+                                            match ctx.run(reopen_bead, rb).await {
+                                                Ok(r) => eprintln!(
+                                                    "flywheel: {bead_id} unverified close — reopened: {r}"
+                                                ),
+                                                Err(e) => eprintln!(
+                                                    "flywheel: reopen of {bead_id} failed (continuing): {e}"
+                                                ),
+                                            }
+                                        }
+                                    }
+                                    other => eprintln!(
+                                        "flywheel: close-check for {bead_id} unknown status {other}"
+                                    ),
                                 }
-                                Err(e) => eprintln!(
-                                    "flywheel: verify-close-sha for {bead_id} failed (continuing): {e}"
-                                ),
                             }
+                            Err(e) => eprintln!(
+                                "flywheel: close-check for {bead_id} failed (continuing): {e}"
+                            ),
                         }
                         // bd-h3oj: the bead closed — release its file
                         // reservations (reason == bead id). Checkpointed
@@ -5539,8 +5708,11 @@ pub async fn run_engine_loop(cfg: &Config, mut params: LoopParams) -> anyhow::Re
         .register(mail_not_ready)
         .map_err(|e| anyhow::anyhow!("register mail_not_ready: {e}"))?;
     resonate
-        .register(verify_close_sha)
-        .map_err(|e| anyhow::anyhow!("register verify_close_sha: {e}"))?;
+        .register(close_check)
+        .map_err(|e| anyhow::anyhow!("register close_check: {e}"))?;
+    resonate
+        .register(reopen_bead)
+        .map_err(|e| anyhow::anyhow!("register reopen_bead: {e}"))?;
     resonate
         .register(verify_dispatch)
         .map_err(|e| anyhow::anyhow!("register verify_dispatch: {e}"))?;
