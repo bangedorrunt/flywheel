@@ -19,6 +19,12 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// Blocked reason for the single-family degrade (ADR-0019 Spec 4): the
+/// registry cannot supply a second model family, so the bead cannot be
+/// independently verified. The loop marks it `blocked` with this reason,
+/// mails the captain exactly once, and does not respawn the verifier.
+pub const VERIFIER_FAMILY_MISSING: &str = "verifier-family-missing";
+
 /// One registry entry (`[models.ID]`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelEntry {
@@ -132,6 +138,64 @@ impl ModelRegistry {
     pub fn save(&self) -> Result<()> {
         let path = crate::config::config_dir().join("models.toml");
         self.save_to(&path)
+    }
+
+    /// The model family of an id (ADR-0019 Spec 4: "worker grok -> reviewer
+    /// not grok"): the registry `provider` prefix. Unknown id -> the id
+    /// itself (a one-model registry is one family; never guess a family).
+    pub fn family_of(&self, id: &str) -> String {
+        self.models
+            .get(id)
+            .and_then(|e| (!e.provider.is_empty()).then(|| e.provider.clone()))
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    /// Verifier model resolution (ADR-0019 Spec 4): pick the first
+    /// `candidates` model whose family differs from the worker's. Returns
+    /// `None` when the registry cannot supply a second family (single-family
+    /// swarm) and no captain override applies — the caller marks the bead
+    /// `blocked` with `VERIFIER_FAMILY_MISSING`, mails the captain exactly
+    /// once, and does not respawn (no infinite loop).
+    ///
+    /// `family_override` = config `verifier_family_override`: an explicit
+    /// captain allowance for one family (the single-family degrade path).
+    ///
+    /// Scale-to-unit (ADR-0019 Spec 4): a verifier whose entire product is
+    /// rerunning one cheap loop-runnable command is ceremony — on the
+    /// loop-runnable band the loop already ran it (w1-loop-run-verify). The
+    /// loop only dispatches an independent verifier when the legal-close
+    /// table requires it (priority <= 1, blast High, or judgment AC).
+    ///
+    /// Pane budget: verifier dispatches share the spawn budget with workers;
+    /// one reusable verifier pane per project, headless preferred (pane only
+    /// when VERIFY needs a live TUI/UI).
+    pub fn verifier_for(
+        &self,
+        worker_model: &str,
+        candidates: &[&str],
+        family_override: Option<&str>,
+    ) -> Option<String> {
+        let worker_family = self.family_of(worker_model);
+        // The worker's own model can never be the verifier (identity rule
+        // survives even the family override).
+        let others: Vec<&str> = candidates
+            .iter()
+            .copied()
+            .filter(|c| *c != worker_model)
+            .collect();
+        // 1. Strict rule first: any candidate from a DIFFERENT family.
+        if let Some(c) = others.iter().find(|c| self.family_of(c) != worker_family) {
+            return Some((*c).to_string());
+        }
+        // 2. Single-family swarm: an explicit captain override (config
+        //    verifier_family_override) may allow that family. Absent or no
+        //    matching candidate -> None = the degrade signal.
+        if let Some(fam) = family_override
+            && let Some(c) = others.iter().find(|c| self.family_of(c) == fam)
+        {
+            return Some((*c).to_string());
+        }
+        None
     }
 
     /// Save to an explicit path (test seam).
@@ -352,5 +416,102 @@ provider = "local"
         assert_eq!(e.cost_out_per_mtok, 0.0);
         assert!(e.caps.is_empty());
         assert!(e.fallback.is_none());
+    }
+
+    // ---- ADR-0019 Spec 4: verifier family resolution + single-family degrade
+
+    fn reg_with(entries: &[(&str, &str)]) -> ModelRegistry {
+        ModelRegistry {
+            models: entries
+                .iter()
+                .map(|(id, provider)| {
+                    (
+                        (*id).to_string(),
+                        ModelEntry {
+                            provider: (*provider).to_string(),
+                            cost_in_per_mtok: 0.0,
+                            cost_out_per_mtok: 0.0,
+                            caps: vec![],
+                            fallback: None,
+                            effort: None,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Family = registry provider prefix; unknown ids are their own family.
+    #[test]
+    fn verifier_family_of_uses_registry_provider() {
+        let reg = reg_with(&[("deepseek-v4", "deepseek"), ("opus-5", "anthropic")]);
+        assert_eq!(reg.family_of("deepseek-v4"), "deepseek");
+        assert_eq!(reg.family_of("opus-5"), "anthropic");
+        // Unknown id: the id itself is the family (never guess).
+        assert_eq!(reg.family_of("unregistered-model"), "unregistered-model");
+    }
+
+    /// A different-family candidate wins (worker deepseek -> anthropic).
+    #[test]
+    fn verifier_resolution_prefers_different_family() {
+        let reg = reg_with(&[
+            ("deepseek-v4", "deepseek"),
+            ("opus-5", "anthropic"),
+            ("flash-x", "google"),
+        ]);
+        let v = reg
+            .verifier_for("deepseek-v4", &["deepseek-v4", "opus-5", "flash-x"], None)
+            .expect("different family exists");
+        assert_eq!(v, "opus-5");
+        // Candidate order matters: first different-family entry wins.
+        let v = reg
+            .verifier_for("deepseek-v4", &["deepseek-v4", "flash-x"], None)
+            .expect("different family exists");
+        assert_eq!(v, "flash-x");
+    }
+
+    /// Single-family swarm: no second family -> None (the degrade signal).
+    #[test]
+    fn verifier_resolution_degrades_single_family() {
+        let reg = reg_with(&[("deepseek-v4", "deepseek"), ("deepseek-v3", "deepseek")]);
+        assert_eq!(
+            reg.verifier_for("deepseek-v4", &["deepseek-v4", "deepseek-v3"], None),
+            None
+        );
+        // Empty candidate list degrades too.
+        let reg = reg_with(&[("deepseek-v4", "deepseek")]);
+        assert_eq!(reg.verifier_for("deepseek-v4", &[], None), None);
+    }
+
+    /// An explicit captain override (config verifier_family_override) allows
+    /// the same family when no second family exists.
+    #[test]
+    fn verifier_resolution_honors_family_override() {
+        let reg = reg_with(&[("deepseek-v4", "deepseek"), ("deepseek-v3", "deepseek")]);
+        let v = reg
+            .verifier_for(
+                "deepseek-v4",
+                &["deepseek-v4", "deepseek-v3"],
+                Some("deepseek"),
+            )
+            .expect("override allows the family");
+        assert_eq!(v, "deepseek-v3");
+        // Override for a family with no candidate still degrades.
+        assert_eq!(
+            reg.verifier_for("deepseek-v4", &["deepseek-v4"], Some("anthropic")),
+            None
+        );
+        // Override never kicks in when a different family already exists.
+        let reg = reg_with(&[("deepseek-v4", "deepseek"), ("opus-5", "anthropic")]);
+        let v = reg
+            .verifier_for("deepseek-v4", &["deepseek-v4", "opus-5"], Some("deepseek"))
+            .expect("different family wins before override");
+        assert_eq!(v, "opus-5");
+    }
+
+    /// The degrade constant is the documented blocked reason.
+    #[test]
+    fn verifier_family_missing_reason_constant() {
+        assert_eq!(VERIFIER_FAMILY_MISSING, "verifier-family-missing");
     }
 }
