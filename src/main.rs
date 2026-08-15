@@ -28,6 +28,7 @@ mod profile;
 mod run_log;
 mod smart_cron;
 mod stages;
+mod standing_orders;
 mod state;
 mod toron_embed;
 mod verdict;
