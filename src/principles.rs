@@ -181,6 +181,66 @@ pub fn suggest(name: &str) -> Option<&'static str> {
     })
 }
 
+/// Result of checking a report's PRINCIPLES field (ADR-0019 Spec 6
+/// delivery 3 + the risks-table rule: a citation with no decision is a
+/// skip).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrinciplesCheck {
+    /// Required for priority <= 2 and every line is `name — decision it
+    /// changed` with a known name.
+    Complete,
+    /// Missing or insufficient citations.
+    Incomplete { reason: String },
+}
+
+/// Check a report's PRINCIPLES section (bd-w3-brief-principles-yy39):
+/// - priority <= 2: the field is REQUIRED (empty -> incomplete).
+/// - every line must be `name — decision it changed`; a name-only line has
+///   no decision clause and is a cargo-cult citation (incomplete).
+/// - names must be from the canonical 21-name registry (unknown -> fail,
+///   regardless of priority).
+/// The builder emits the field; this checker enforces it (the stage p2
+/// reviewer BLOCKER language is the human-side of the same rule).
+pub fn check_principles(priority: u8, principles: &str) -> PrinciplesCheck {
+    let lines: Vec<&str> = principles
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if priority <= 2 && lines.is_empty() {
+        return PrinciplesCheck::Incomplete {
+            reason: format!(
+                "PRINCIPLES is required for priority <= 2 beads (P{priority} report has none)"
+            ),
+        };
+    }
+    for line in &lines {
+        // The brief shapes citations as `<name> — <the decision it
+        // changed>` (em-dash). Anything without the separator is a
+        // name-only cargo-cult citation.
+        let Some((name, decision)) = line.split_once('—') else {
+            return PrinciplesCheck::Incomplete {
+                reason: format!("citation has no decision clause (name-only is a skip): {line:?}"),
+            };
+        };
+        let name = name.trim();
+        let decision = decision.trim();
+        if decision.is_empty() {
+            return PrinciplesCheck::Incomplete {
+                reason: format!("citation has no decision clause: {line:?}"),
+            };
+        }
+        if !is_known_name(name) {
+            return PrinciplesCheck::Incomplete {
+                reason: format!(
+                    "unknown principle name {name:?} in citation (canonical 21, see `flywheel principles list`): {line:?}"
+                ),
+            };
+        }
+    }
+    PrinciplesCheck::Complete
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +314,82 @@ mod tests {
         assert_eq!(suggest("laziness-protoco"), Some("laziness-protocol"));
         assert_eq!(suggest(""), None);
         assert_eq!(suggest("zzz-nothing"), None);
+    }
+
+    // ---- bd-w3-brief-principles-yy39: report PRINCIPLES checker ----
+
+    /// Empty PRINCIPLES on a P0-P2 report -> incomplete; on P3/P4 the field
+    /// is optional.
+    #[test]
+    fn principles_brief_checker_requires_field_on_p0_p2() {
+        assert!(matches!(
+            check_principles(2, ""),
+            PrinciplesCheck::Incomplete { .. }
+        ));
+        assert!(matches!(
+            check_principles(0, "  \n "),
+            PrinciplesCheck::Incomplete { .. }
+        ));
+        assert!(matches!(
+            check_principles(1, ""),
+            PrinciplesCheck::Incomplete { .. }
+        ));
+        assert_eq!(check_principles(3, ""), PrinciplesCheck::Complete);
+        assert_eq!(check_principles(4, ""), PrinciplesCheck::Complete);
+    }
+
+    /// A name-only line (no decision clause) is a cargo-cult citation.
+    #[test]
+    fn principles_brief_checker_rejects_name_only_line() {
+        assert!(matches!(
+            check_principles(2, "prove-it-works"),
+            PrinciplesCheck::Incomplete { .. }
+        ));
+        assert!(matches!(
+            check_principles(2, "prove-it-works —"),
+            PrinciplesCheck::Incomplete { .. }
+        ));
+        assert!(matches!(
+            check_principles(2, "fix-root-causes\nprove-it-works"),
+            PrinciplesCheck::Incomplete { .. }
+        ));
+    }
+
+    /// `name — decision it changed` passes, single and multi-line.
+    #[test]
+    fn principles_brief_checker_accepts_name_decision() {
+        assert_eq!(
+            check_principles(0, "prove-it-works — checked the ledger row before closing"),
+            PrinciplesCheck::Complete
+        );
+        assert_eq!(
+            check_principles(
+                2,
+                "fix-root-causes — reproduced the failure first\nsequence-verifiable-units — one check per bead before the next"
+            ),
+            PrinciplesCheck::Complete
+        );
+        assert_eq!(
+            check_principles(4, "laziness-protocol — deleted a dead wrapper"),
+            PrinciplesCheck::Complete
+        );
+    }
+
+    /// An unknown name fails regardless of priority.
+    #[test]
+    fn principles_brief_checker_rejects_unknown_name() {
+        assert!(matches!(
+            check_principles(2, "prove-it-work — did something"),
+            PrinciplesCheck::Incomplete { .. }
+        ));
+        assert!(matches!(
+            check_principles(4, "laziness — deleted a wrapper"),
+            PrinciplesCheck::Incomplete { .. }
+        ));
+        // A known name in a garbled line still fails on the name parse.
+        assert!(matches!(
+            check_principles(2, "prove-it-works - checked the ledger"),
+            PrinciplesCheck::Incomplete { .. }
+        ));
     }
 }

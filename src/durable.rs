@@ -1239,7 +1239,7 @@ VERIFY run the bead's ## VERIFY command from its description; include its stdout
 TIMEBOX about 90 minutes; on expiry return partial findings + deviations — never silently extend.
 FORBIDDEN DO NOT create new beads — report scope gaps in the thread, not as new beads. Never force-unlock a peer's reservation. No worktree. Stay inside SCOPE.
 REPORT status; commit sha (commit BEFORE close; the bead id {id} IN the commit message); verdict kind; what you actually ran; deviations; PRINCIPLES cited.
-PRINCIPLES each line `<principle-name> — <the decision it changed>`; names only, no leaf text.
+PRINCIPLES each line `<principle-name> — <the decision it changed>`; names only, no leaf text. REQUIRED for priority <= 2 beads — a name with no decision clause is a skip (cargo-cult citation; the reviewer marks the report incomplete).
 STANDING {project}/.flywheel/standing-orders.md layered on ~/.config/flywheel/standing-orders.md — the lifecycle (claim → reserve → announce → execute → verify → close → sync → commit) lives there; referenced BY PATH ONLY, never pasted here.
 CONTRACTS renew your own file reservations while working (toron `renew_file_reservations` — extend the TTL before it lapses; the orchestrator cannot renew on your behalf). When a message has ack_required=true, call `acknowledge_message` after acting on it — the orchestrator cannot ack on your behalf. If your session context usage exceeds about 80%: write {"context_pct": <pct>, "ts": "<now RFC3339>"} to .flywheel/agent-state/{AGENT_NAME}.json (best-effort, never block on it), then finish + sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you."#;
 
