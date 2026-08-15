@@ -10829,15 +10829,14 @@ fn cmd_loop(
                     let to_assign: Vec<String> = work_prompts(&[], &ok, &mut assigned, project);
                     queue_items.extend(to_assign);
                     for bead in &not_ready {
-                        if not_ready_mailed.insert(bead.id.clone()) {
-                            if let Err(e) =
+                        if not_ready_mailed.insert(bead.id.clone())
+                            && let Err(e) =
                                 cmd_internal_mail_not_ready(cfg, project, &bead.id, &bead.title)
-                            {
-                                eprintln!(
-                                    "flywheel: mail-not-ready for {} failed (continuing): {e:#}",
-                                    bead.id
-                                );
-                            }
+                        {
+                            eprintln!(
+                                "flywheel: mail-not-ready for {} failed (continuing): {e:#}",
+                                bead.id
+                            );
                         }
                     }
                 }
