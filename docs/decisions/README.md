@@ -18,3 +18,4 @@ flywheel is tightly coupled to toron (toron carries; flywheel drives). Key cross
 - **toron ADR-0013** — toron.dev website architecture; flywheel is a section (D5). *Moved 2026-08-14 to the [toron.dev repo](https://github.com/bangedorrunt/toron.dev), renumbered ADR-0001*
 - **toron ADR-0015** — flywheel ↔ toron integration contract (one mail surface, one-way dep)
 - **toron [ADR-0019](../../toron/docs/decisions/0019-bead-verified-execution-and-principle-playbooks.md)** — bead-verified execution, baked poteto principles, playbook workflows (proposed 2026-08-15). Wave 1 lives in flywheel (`ledger.rs`, loop reopen, briefs). Wave 4 is this repo's ADR-0001 A2 leftover.
+- **toron [ADR-0020](../../toron/docs/decisions/0020-nostr-two-plane-cli-and-crew-steering.md)** — CLI-first Nostr rooms/jobs/presence/watch so crews steer without flywheel `send`. No new flywheel subcommands in wave 1.
