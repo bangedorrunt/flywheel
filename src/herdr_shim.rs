@@ -34,6 +34,21 @@ pub use toron_core::backend::herdr::{
 };
 pub use toron_core::backend::types::AgentStatus;
 
+/// bd-bug-omp-herdr-wedge: the HERDR_* integration env a herdr-launched
+/// harness needs to activate its herdr extension (omp's
+/// herdr-omp-agent-state.ts gates on HERDR_ENV=1 + socket + pane id).
+/// herdr's agent.start has NO env param and does not inherit pane env
+/// (direct exec), so the caller must inject at pane creation:
+/// workspace.create / pane.split both accept env. herdr fills the per-pane
+/// ids (HERDR_PANE_ID/TAB/WORKSPACE_ID) itself at agent.start; we supply
+/// the two workspace-level vars.
+pub(crate) fn herdr_integration_env(cfg: &crate::config::Config) -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([
+        ("HERDR_ENV".to_string(), "1".to_string()),
+        ("HERDR_SOCKET_PATH".to_string(), cfg.socket_path()),
+    ])
+}
+
 /// Parse `AgentStatus` from its wire string (the old inherent `parse` —
 /// toron-core exposes `FromStr` instead, so this is a thin free wrapper).
 pub fn parse_agent_status(s: &str) -> Result<AgentStatus> {
@@ -728,11 +743,16 @@ pub fn pane_split(
     pane_id: &str,
     direction: &str,
     cwd: Option<&str>,
+    env: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<PaneInfo> {
-    let res = c.call(
-        "pane.split",
-        json!({ "target_pane_id": pane_id, "direction": direction, "cwd": cwd }),
-    )?;
+    let mut params = serde_json::Map::new();
+    params.insert("target_pane_id".into(), serde_json::json!(pane_id));
+    params.insert("direction".into(), serde_json::json!(direction));
+    params.insert("cwd".into(), serde_json::json!(cwd));
+    if let Some(env) = env {
+        params.insert("env".into(), serde_json::json!(env));
+    }
+    let res = c.call("pane.split", serde_json::Value::Object(params))?;
     serde_json::from_value(res.get("pane").cloned().unwrap_or(res))
         .context("parse pane.split result")
 }
