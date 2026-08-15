@@ -25,9 +25,9 @@ use crate::backend::wire;
 use crate::backend::{
     AcquireBuildSlotResult, AcquireResult, BuildSlot, ConflictReport, ContactLink, ContactPolicy,
     ContactRequest, ContactResponse, DeliveryLine, InboxQuery, MailError, MailItem, MailSurface,
-    MessageId, ProductHit, ProductInfo, ReceiptOp, ReceiptOutcome, RegisteredAgent, ReleasedLease,
-    ReleaseResult,
-    RenewResult, ReplyMail, SearchQuery, SendMail, SendReceipt, ThreadSummary, WhoIs,
+    MessageId, ProductHit, ProductInfo, ReceiptOp, ReceiptOutcome, RegisteredAgent, ReleaseResult,
+    ReleasedLease, RenewResult, ReplyMail, SearchQuery, SendMail, SendReceipt, ThreadSummary,
+    WhoIs,
 };
 use crate::mcp_http::{McpClient, McpError, ServerKind};
 use serde_json::{Value, json};
@@ -113,7 +113,12 @@ fn opt_string_field(v: &Value, keys: &[&str]) -> Option<String> {
 fn string_array_field(v: &Value, keys: &[&str]) -> Vec<String> {
     keys.iter()
         .find_map(|k| v.get(k).and_then(Value::as_array))
-        .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -321,7 +326,10 @@ impl MailSurface for AgentMailBackend {
         project: &str,
         _active_within_days: Option<u64>,
     ) -> Result<Vec<WhoIs>, MailError> {
-        let v = self.call("list_agents", wire::list_agents_args(project, _active_within_days))?;
+        let v = self.call(
+            "list_agents",
+            wire::list_agents_args(project, _active_within_days),
+        )?;
         row_array(&v)
             .iter()
             .map(|a| {
@@ -563,20 +571,12 @@ impl MailSurface for AgentMailBackend {
         let conflicts = v
             .get("conflicts")
             .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .map(path_conflict)
-                    .collect()
-            })
+            .map(|arr| arr.iter().map(path_conflict).collect())
             .unwrap_or_default();
         let soft_conflicts: Vec<toron_core::mailbox::reservations::PathConflict> = v
             .get("soft_conflicts")
             .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .map(path_conflict)
-                    .collect()
-            })
+            .map(|arr| arr.iter().map(path_conflict).collect())
             .unwrap_or_default();
         Ok(AcquireResult {
             granted,
@@ -599,11 +599,7 @@ impl MailSurface for AgentMailBackend {
         let conflicts: Vec<toron_core::mailbox::reservations::PathConflict> = v
             .get("conflicts")
             .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .map(path_conflict)
-                    .collect()
-            })
+            .map(|arr| arr.iter().map(path_conflict).collect())
             .unwrap_or_default();
         let clear_paths = v
             .get("clear_paths")
@@ -618,11 +614,7 @@ impl MailSurface for AgentMailBackend {
         let soft_conflicts: Vec<toron_core::mailbox::reservations::PathConflict> = v
             .get("soft_conflicts")
             .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .map(path_conflict)
-                    .collect()
-            })
+            .map(|arr| arr.iter().map(path_conflict).collect())
             .unwrap_or_default();
         Ok(ConflictReport {
             conflict_free: v

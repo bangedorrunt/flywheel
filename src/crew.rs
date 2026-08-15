@@ -151,7 +151,9 @@ pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
             if name.is_empty() {
                 return Err(format!("compose part {token:?}: empty workflow name"));
             }
-            Ok(ComposePart::CallWorkflow { name: name.to_string() })
+            Ok(ComposePart::CallWorkflow {
+                name: name.to_string(),
+            })
         }
         role => {
             let role = role.trim();
@@ -195,6 +197,7 @@ pub fn compose_workflow(
                     name: Some(slug),
                     guard: None,
                     on_error: StepOnError::Continue,
+                    build_slot: false,
                     action: Action::DispatchJob {
                         assignee: "x".to_string(),
                         spec: serde_json::json!({
@@ -210,17 +213,16 @@ pub fn compose_workflow(
                 steps.push(s);
                 continue;
             }
-            ComposePart::CallWorkflow { name: sub } => {
-                Action::CallWorkflow {
-                    workflow: sub.clone(),
-                    inputs: serde_json::json!({ "goal": objective }),
-                }
-            }
+            ComposePart::CallWorkflow { name: sub } => Action::CallWorkflow {
+                workflow: sub.clone(),
+                inputs: serde_json::json!({ "goal": objective }),
+            },
         };
         steps.push(Step {
             name: Some(format!("part-{ordinal}")),
             guard: None,
             on_error: StepOnError::Continue,
+            build_slot: false,
             action: step_name,
         });
     }
@@ -236,8 +238,10 @@ pub fn compose_workflow(
         graph: None,
         inputs: vec![InputDecl {
             name: "objective".to_string(),
+            default: None,
         }],
         crew: Some(CrewSpec::Auto),
+        principles: vec![],
     }
 }
 
@@ -367,10 +371,7 @@ fn extract_fenced_yaml(response: &str) -> Option<String> {
 /// sub-workflow (its roles are unknowable — skip, today's behavior).
 /// Cycle-guarded: a visited set prevents infinite recursion on workflow
 /// cycles (goal → plan → ... → goal).
-pub fn plan_crew_with(
-    workflow: &Workflow,
-    resolve: &dyn Fn(&str) -> Option<Workflow>,
-) -> CrewPlan {
+pub fn plan_crew_with(workflow: &Workflow, resolve: &dyn Fn(&str) -> Option<Workflow>) -> CrewPlan {
     match &workflow.crew {
         Some(CrewSpec::Explicit(map)) => CrewPlan {
             members: map.clone(),
@@ -438,7 +439,9 @@ fn infer_auto(
                 scan_action(&each.action, counts, resolve, visited);
             }
             Action::Retry { step, .. } => scan_action(&step.action, counts, resolve, visited),
-            Action::Branch { then, else_steps, .. } => {
+            Action::Branch {
+                then, else_steps, ..
+            } => {
                 for s in then.iter().chain(else_steps.iter()) {
                     scan_action(&s.action, counts, resolve, visited);
                 }
@@ -545,8 +548,18 @@ steps:
         };
         let plan = plan_crew_with(&wf, &resolve);
         assert_eq!(plan.members.get("coder"), Some(&1), "{:?}", plan.members);
-        assert_eq!(plan.members.get("oracle"), Some(&1), "sub-workflow oracle: {:?}", plan.members);
-        assert_eq!(plan.members.get("planner"), Some(&1), "sub-workflow planner: {:?}", plan.members);
+        assert_eq!(
+            plan.members.get("oracle"),
+            Some(&1),
+            "sub-workflow oracle: {:?}",
+            plan.members
+        );
+        assert_eq!(
+            plan.members.get("planner"),
+            Some(&1),
+            "sub-workflow planner: {:?}",
+            plan.members
+        );
     }
 
     /// bd-t86p cycle guard: a workflow that composes itself (or a cycle
@@ -613,7 +626,10 @@ steps:
         );
         assert!(parse_compose_part("nonsense").is_err(), "no colon errors");
         assert!(parse_compose_part(":stage").is_err(), "empty role errors");
-        assert!(parse_compose_part("workflow:").is_err(), "empty name errors");
+        assert!(
+            parse_compose_part("workflow:").is_err(),
+            "empty name errors"
+        );
     }
 
     /// The deterministic arm assembles a NEW workflow from parts: dispatch
@@ -731,7 +747,11 @@ steps:
         )
         .expect("parse");
         let plan = plan_crew(&wf);
-        assert_eq!(plan.fanout_count("@crew.coder"), 2, "@crew.coder -> 2 coders");
+        assert_eq!(
+            plan.fanout_count("@crew.coder"),
+            2,
+            "@crew.coder -> 2 coders"
+        );
         // Elastic N stays N.
         assert_eq!(plan.fanout_count("4"), 4);
         // Unknown crew role → 1 (safe default).
@@ -794,7 +814,9 @@ steps:
                     parallel_overs(each, out);
                 }
                 Action::Retry { step, .. } => parallel_overs(step, out),
-                Action::Branch { then, else_steps, .. } => {
+                Action::Branch {
+                    then, else_steps, ..
+                } => {
                     for s in then.iter().chain(else_steps.iter()) {
                         parallel_overs(s, out);
                     }
@@ -810,11 +832,11 @@ steps:
         assert_eq!(
             overs,
             vec![
-                "2".to_string(),          // @crew.coder -> 2
-                "4".to_string(),          // elastic N untouched
-                "1".to_string(),          // @crew.reviewer -> 1 (nested retry)
-                "2".to_string(),          // @crew.coder (branch then)
-                "1".to_string(),          // @crew.ghost -> 1 (safe default)
+                "2".to_string(), // @crew.coder -> 2
+                "4".to_string(), // elastic N untouched
+                "1".to_string(), // @crew.reviewer -> 1 (nested retry)
+                "2".to_string(), // @crew.coder (branch then)
+                "1".to_string(), // @crew.ghost -> 1 (safe default)
             ],
             "all @crew refs substituted, elastic N preserved: {overs:?}"
         );
@@ -941,6 +963,7 @@ steps:
             name: None,
             guard: None,
             on_error: StepOnError::Continue,
+            build_slot: false,
             action: Action::DispatchJob {
                 assignee: "x".into(),
                 spec: serde_json::json!({ "profile": profile }),
@@ -957,6 +980,7 @@ steps:
             policy: None,
             guard: None,
             crew: Some(CrewSpec::Auto),
+            principles: vec![],
             steps,
             graph: None,
             inputs: vec![],
@@ -967,6 +991,7 @@ steps:
                 name: Some("outer-branch".into()),
                 guard: None,
                 on_error: StepOnError::Continue,
+                build_slot: false,
                 action: Action::Branch {
                     if_guard: "true".into(),
                     then: vec![dj("@reviewer")],
@@ -982,6 +1007,7 @@ steps:
                     name: Some("loop".into()),
                     guard: None,
                     on_error: StepOnError::Continue,
+                    build_slot: false,
                     action: Action::Foreach {
                         over: "items".into(),
                         each: Box::new(dj("@coder")),
@@ -991,6 +1017,7 @@ steps:
                     name: Some("retry".into()),
                     guard: None,
                     on_error: StepOnError::Continue,
+                    build_slot: false,
                     action: Action::Retry {
                         max_attempts: 3,
                         backoff_secs: 1,
@@ -1026,7 +1053,10 @@ steps:
             ],
         );
         assert!(prompt.contains("harden the loop"), "{prompt}");
-        assert!(prompt.contains("weekly-review: periodic review"), "{prompt}");
+        assert!(
+            prompt.contains("weekly-review: periodic review"),
+            "{prompt}"
+        );
         assert!(prompt.contains("@planner"), "{prompt}");
         assert!(prompt.contains("fresh-eyes-explore"), "{prompt}");
         assert!(prompt.contains("call_workflow"), "{prompt}");

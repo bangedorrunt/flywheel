@@ -17,8 +17,7 @@ pub struct TmuxBackend;
 
 impl TmuxBackend {
     /// Why operations fail today (toron ADR-0003 holds the tmux backend).
-    pub const REASON: &'static str =
-        "tmux backend is on hold per toron ADR-0003 (un-held is a future toron-core impl); set FLYWHEEL_BACKEND=herdr";
+    pub const REASON: &'static str = "tmux backend is on hold per toron ADR-0003 (un-held is a future toron-core impl); set FLYWHEEL_BACKEND=herdr";
 }
 
 impl MultiplexerBackend for TmuxBackend {

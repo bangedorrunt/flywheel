@@ -219,7 +219,10 @@ pub fn propose_split(a: &IntentView, b: &IntentView) -> SplitProposal {
         assignment.insert(agents[1].clone(), b.path.clone());
         let rationale = format!(
             "overlap under shared dir `{parent}` — split at the directory boundary: {} holds {}, {} holds {}",
-            agents[0].clone(), a.path, agents[1].clone(), b.path
+            agents[0].clone(),
+            a.path,
+            agents[1].clone(),
+            b.path
         );
         return SplitProposal {
             tier: "rule".into(),
@@ -385,7 +388,10 @@ mod tests {
         let proposal = propose_split(&iv("oc", "src/foo.rs"), &iv("pi", "src/foo.rs"));
         assert_eq!(proposal.kind, ProposalKind::Merge);
         assert_eq!(proposal.tier, "rule");
-        assert_eq!(proposal.assignment.get("oc").map(String::as_str), Some("src/foo.rs"));
+        assert_eq!(
+            proposal.assignment.get("oc").map(String::as_str),
+            Some("src/foo.rs")
+        );
         assert!(!proposal.assignment.contains_key("pi"), "pi stands down");
     }
 
@@ -394,8 +400,14 @@ mod tests {
     fn containment_sequences() {
         let proposal = propose_split(&iv("oc", "src/**"), &iv("pi", "src/foo.rs"));
         assert_eq!(proposal.kind, ProposalKind::SequenceByDependency);
-        assert_eq!(proposal.assignment.get("oc").map(String::as_str), Some("src/**"));
-        assert_eq!(proposal.assignment.get("pi").map(String::as_str), Some("src/foo.rs"));
+        assert_eq!(
+            proposal.assignment.get("oc").map(String::as_str),
+            Some("src/**")
+        );
+        assert_eq!(
+            proposal.assignment.get("pi").map(String::as_str),
+            Some("src/foo.rs")
+        );
         assert!(proposal.rationale.contains("oc"), "{proposal:?}");
     }
 
@@ -422,20 +434,36 @@ mod tests {
     fn auto_coalesce_gate() {
         let board = vec![iv("oc", "src/**"), iv("pi", "src/foo.rs")];
         let report = run_detector(&board, &|_| false);
-        assert_eq!(report.auto_coalesce.len(), 1, "unaffiliated non-trivial pair");
+        assert_eq!(
+            report.auto_coalesce.len(),
+            1,
+            "unaffiliated non-trivial pair"
+        );
         // One crew already affiliated → no auto-coalesce.
         let report2 = run_detector(&board, &|a| a == "oc");
-        assert!(report2.auto_coalesce.is_empty(), "oc is in a coalition already");
+        assert!(
+            report2.auto_coalesce.is_empty(),
+            "oc is in a coalition already"
+        );
     }
 
     /// Common parent: `src/**` and `src/foo.rs` share `src`; unrelated
     /// trees share nothing.
     #[test]
     fn common_parent_finds_boundary() {
-        assert_eq!(common_parent("src/**", "src/foo.rs").as_deref(), Some("src"));
-        assert_eq!(common_parent("crates/a/**", "crates/b/**").as_deref(), Some("crates"));
+        assert_eq!(
+            common_parent("src/**", "src/foo.rs").as_deref(),
+            Some("src")
+        );
+        assert_eq!(
+            common_parent("crates/a/**", "crates/b/**").as_deref(),
+            Some("crates")
+        );
         assert_eq!(common_parent("crates/a/**", "docs/guide.md"), None);
-        assert_eq!(common_parent("src/foo.rs", "src/foo.rs").as_deref(), Some("src/foo.rs"));
+        assert_eq!(
+            common_parent("src/foo.rs", "src/foo.rs").as_deref(),
+            Some("src/foo.rs")
+        );
     }
 
     /// Glob coverage: `src/**` covers `src/foo.rs`; `crates/a/**` does not
@@ -458,7 +486,11 @@ mod tests {
             iv("gk", "src/README.md"),
         ];
         let report = run_detector(&board, &|_| false);
-        assert_eq!(report.overlaps.len(), 2, "oc-pi source overlap + oc-gk trivial overlap");
+        assert_eq!(
+            report.overlaps.len(),
+            2,
+            "oc-pi source overlap + oc-gk trivial overlap"
+        );
         assert!(
             report
                 .proposals

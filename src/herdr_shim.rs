@@ -24,16 +24,16 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+pub use toron_core::backend::error::{BackendError, BackendErrorCode};
 pub use toron_core::backend::herdr::{
-    classify_send_result, AgentInfo, Client, PaneInfo, SendVerdict, Subscription, WaitOptions,
-    WorkspaceInfo, HDR_PROTOCOL,
+    AgentInfo, Client, HDR_PROTOCOL, PaneInfo, SendVerdict, Subscription, WaitOptions,
+    WorkspaceInfo, classify_send_result,
 };
 pub use toron_core::backend::types::AgentStatus;
-pub use toron_core::backend::error::{BackendError, BackendErrorCode};
 
 /// bd-bug-omp-herdr-wedge: the HERDR_* integration env a herdr-launched
 /// harness needs to activate its herdr extension (omp's
@@ -43,7 +43,9 @@ pub use toron_core::backend::error::{BackendError, BackendErrorCode};
 /// workspace.create / pane.split both accept env. herdr fills the per-pane
 /// ids (HERDR_PANE_ID/TAB/WORKSPACE_ID) itself at agent.start; we supply
 /// the two workspace-level vars.
-pub(crate) fn herdr_integration_env(cfg: &crate::config::Config) -> std::collections::BTreeMap<String, String> {
+pub(crate) fn herdr_integration_env(
+    cfg: &crate::config::Config,
+) -> std::collections::BTreeMap<String, String> {
     std::collections::BTreeMap::from([
         ("HERDR_ENV".to_string(), "1".to_string()),
         ("HERDR_SOCKET_PATH".to_string(), cfg.socket_path()),
@@ -104,9 +106,22 @@ impl IntegrationStatus {
 /// integration are NOT in this list — preflight skips them (nothing to
 /// install, nothing to report).
 pub const INTEGRATION_KINDS: &[&str] = &[
-    "pi", "omp", "claude", "codex", "copilot", "devin", "droid", "kimi",
-    "opencode", "kilo", "hermes", "qodercli", "cursor", "mastracode",
-    "antigravity-cli", "grok",
+    "pi",
+    "omp",
+    "claude",
+    "codex",
+    "copilot",
+    "devin",
+    "droid",
+    "kimi",
+    "opencode",
+    "kilo",
+    "hermes",
+    "qodercli",
+    "cursor",
+    "mastracode",
+    "antigravity-cli",
+    "grok",
 ];
 
 /// Map a flywheel kind to the socket `integration.install` target (the
@@ -199,7 +214,9 @@ pub fn integration_status_all() -> Result<Vec<(String, IntegrationStatus)>> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(parse_integration_status_output(&String::from_utf8_lossy(&out.stdout)))
+    Ok(parse_integration_status_output(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
 }
 
 /// Install a kind's herdr integration through the socket `integration.install`
@@ -740,8 +757,8 @@ pub enum HerdrEventData {
 impl HerdrEventData {
     /// Deserialize the payload `data` for the given `kind`.
     pub fn from_kind(kind: HerdrEventKind, data: Value) -> Result<Self> {
-        use serde_json::from_value;
         use HerdrEventKind::*;
+        use serde_json::from_value;
         Ok(match kind {
             WorkspaceCreated => HerdrEventData::WorkspaceCreated(from_value(data)?),
             WorkspaceUpdated => HerdrEventData::WorkspaceUpdated(from_value(data)?),
@@ -835,7 +852,7 @@ pub fn wait_for_output_params(
                 message: format!(
                     "unknown pane wait-output mode: {other} (expected \"match\" or \"regex\")"
                 ),
-            })
+            });
         }
     };
     Ok(json!({
@@ -945,7 +962,11 @@ pub fn pane_wait_output(
 /// no raw `pane.run` method in herdr protocol 19; the CLI implements it the
 /// same way). The caller typically follows with [`pane_wait_output`] to await
 /// a regex/substring match.
-pub fn pane_run(c: &mut Client, pane_id: &str, command: &str) -> std::result::Result<(), HerdrError> {
+pub fn pane_run(
+    c: &mut Client,
+    pane_id: &str,
+    command: &str,
+) -> std::result::Result<(), HerdrError> {
     c.pane_run(pane_id, command).map_err(to_herdr_error)?;
     Ok(())
 }
@@ -1389,10 +1410,7 @@ mod sanitize_pane_text_tests {
 
     #[test]
     fn strips_csi_cursor_and_erase_sequences() {
-        assert_eq!(
-            sanitize_pane_text("a\u{1b}[2Kb\u{1b}[1;1Hc"),
-            "abc"
-        );
+        assert_eq!(sanitize_pane_text("a\u{1b}[2Kb\u{1b}[1;1Hc"), "abc");
     }
 
     #[test]
@@ -1815,7 +1833,10 @@ pub fn alt_screen_file_fallback(
     std::fs::read_to_string(&path).map_err(|e| {
         BackendError::new(
             BackendErrorCode::Io,
-            format!("alt-screen file fallback: {target} did not write {}: {e}", path.display()),
+            format!(
+                "alt-screen file fallback: {target} did not write {}: {e}",
+                path.display()
+            ),
         )
     })
 }
@@ -1839,10 +1860,11 @@ impl AltScreenReadOps for ClientAltScreenRead<'_> {
         self.c.agent_read(self.target, source, self.lines)
     }
     fn wait_idle(&mut self) -> Result<bool, BackendError> {
-        match self
-            .c
-            .agent_wait(self.target, &[AgentStatus::Idle], Some(ALT_SCREEN_IDLE_WAIT_MS))
-        {
+        match self.c.agent_wait(
+            self.target,
+            &[AgentStatus::Idle],
+            Some(ALT_SCREEN_IDLE_WAIT_MS),
+        ) {
             Ok(_) => Ok(true),
             Err(e) if e.code() == &BackendErrorCode::Timeout => Ok(false),
             Err(e) => Err(e),
@@ -1876,11 +1898,7 @@ pub struct BackendAltScreenRead<'a> {
 }
 
 impl<'a> BackendAltScreenRead<'a> {
-    pub fn new(
-        b: &'a dyn crate::backend::MultiplexerBackend,
-        target: &'a str,
-        lines: u32,
-    ) -> Self {
+    pub fn new(b: &'a dyn crate::backend::MultiplexerBackend, target: &'a str, lines: u32) -> Self {
         Self { b, target, lines }
     }
 }
@@ -1998,7 +2016,11 @@ mod alt_screen_read_ladder_tests {
         assert_eq!(out, "transcript");
         assert_eq!(
             m.log,
-            vec!["read:recent_unwrapped", "wait_idle", "read:recent_unwrapped"]
+            vec![
+                "read:recent_unwrapped",
+                "wait_idle",
+                "read:recent_unwrapped"
+            ]
         );
     }
 
@@ -2117,7 +2139,10 @@ mod session_log_tests {
         let long = "r".repeat(5000);
         let v = summarize_part(&format!(r#"{{"type":"reasoning","text":"{long}"}}"#)).unwrap();
         assert_eq!(v["kind"], "reasoning");
-        assert_eq!(v["text"].as_str().unwrap().len(), 2000 + "\n…(truncated)".len());
+        assert_eq!(
+            v["text"].as_str().unwrap().len(),
+            2000 + "\n…(truncated)".len()
+        );
     }
 
     #[test]
@@ -2172,8 +2197,8 @@ mod session_log_tests {
 #[cfg(test)]
 mod integration_status_tests {
     use super::{
-        IntegrationStatus, INTEGRATION_KINDS, integration_target,
-        parse_integration_status_line, parse_integration_status_output,
+        INTEGRATION_KINDS, IntegrationStatus, integration_target, parse_integration_status_line,
+        parse_integration_status_output,
     };
 
     /// `current (vN) (/path)` → installed + current, version captured.
@@ -2290,7 +2315,10 @@ hermes: outdated (v3 < v4) (/Users/bangedorrunt/.hermes/plugins/herdr-agent-stat
         for k in INTEGRATION_KINDS {
             assert!(integration_target(k).is_some(), "{k} must map to a target");
         }
-        assert_eq!(integration_target("antigravity-cli"), Some("antigravity_cli"));
+        assert_eq!(
+            integration_target("antigravity-cli"),
+            Some("antigravity_cli")
+        );
         assert_eq!(integration_target("my-custom-kind"), None);
     }
 

@@ -114,11 +114,7 @@ pub fn parse_ts(ts: &str) -> Option<u64> {
     }
     let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
     let unix = dt.timestamp();
-    if unix < 0 {
-        None
-    } else {
-        Some(unix as u64)
-    }
+    if unix < 0 { None } else { Some(unix as u64) }
 }
 
 /// Is the state file fresh relative to `now_unix` (seconds)? A file exactly

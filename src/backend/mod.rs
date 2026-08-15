@@ -31,7 +31,6 @@
 pub mod agentmail;
 pub mod factory;
 pub mod herdr;
-pub mod wire;
 #[cfg(test)]
 mod parity;
 #[cfg(feature = "backend-superlogical")]
@@ -40,6 +39,7 @@ pub mod superlogical;
 pub mod tmux;
 #[cfg(feature = "mail-toron")]
 pub mod toron;
+pub mod wire;
 
 /// The unified multiplexer backend trait (ADR-0005 P1): sync, `&self`,
 /// object-safe, Unsupported-open. The ONE trait source lives in toron-core;
@@ -53,27 +53,27 @@ pub use toron_core::backend::PromptLanding;
 // toron-core, never redefined here. The local `MailBackend` trait was
 // deleted with se2.3; flywheel consumes `MailSurface` and its typed DTOs.
 // ===========================================================================
-pub use toron_core::mailbox::surface::{
-    ContactRequest, ContactResponse, DeliveryLine, InboxQuery, MailItem, MailSurface,
-    ProductHit, ReceiptOp, ReceiptOutcome, ReplyMail, SearchQuery, SendMail, SendReceipt,
-};
+#[allow(unused_imports)]
+pub use toron_core::index::slots::{BuildSlot, GrantedSlot, SlotConflict};
+pub use toron_core::mailbox::build_slots::AcquireBuildSlotResult;
+pub use toron_core::mailbox::contacts::ContactLink;
 pub use toron_core::mailbox::error::MailError;
 pub use toron_core::mailbox::ids::MessageId;
-pub use toron_core::mailbox::{AgentProfile, RegisteredAgent, WhoIs};
 #[allow(unused_imports)]
 pub use toron_core::mailbox::infra::{HealthReport, ProjectState};
-pub use toron_core::mailbox::contacts::ContactLink;
-pub use toron_core::mailbox::search::ThreadSummary;
 pub use toron_core::mailbox::product::ProductInfo;
 #[allow(unused_imports)]
 pub use toron_core::mailbox::reservations::{
-    AcquireResult, ConflictReport, GrantedReservation, PathConflict, ReleasedLease, ReleaseResult,
+    AcquireResult, ConflictReport, GrantedReservation, PathConflict, ReleaseResult, ReleasedLease,
     RenewResult,
 };
-pub use toron_core::mailbox::build_slots::AcquireBuildSlotResult;
+pub use toron_core::mailbox::search::ThreadSummary;
+pub use toron_core::mailbox::surface::{
+    ContactRequest, ContactResponse, DeliveryLine, InboxQuery, MailItem, MailSurface, ProductHit,
+    ReceiptOp, ReceiptOutcome, ReplyMail, SearchQuery, SendMail, SendReceipt,
+};
 pub use toron_core::mailbox::unwrap::ContactPolicy;
-#[allow(unused_imports)]
-pub use toron_core::index::slots::{BuildSlot, GrantedSlot, SlotConflict};
+pub use toron_core::mailbox::{AgentProfile, RegisteredAgent, WhoIs};
 
 // Factory entry points — consumers (the durable-loop leaf handlers in main.rs)
 // call `backend::multiplexer_backend(&cfg)` / `backend::mail_backend(&cfg)`;

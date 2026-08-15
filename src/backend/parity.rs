@@ -417,7 +417,12 @@ mod tests {
             };
             let r = run_mail(b.register_agent(project, &profile))
                 .unwrap_or_else(|e| panic!("{} register_agent: {e}", kind.name()));
-            assert_eq!(r.name, agent, "{} register_agent identity: {r:?}", kind.name());
+            assert_eq!(
+                r.name,
+                agent,
+                "{} register_agent identity: {r:?}",
+                kind.name()
+            );
         }
 
         // list_agents: both array of agent objects with same semantic keys.
@@ -467,7 +472,11 @@ mod tests {
             .map(|(kind, v)| {
                 let items: Vec<crate::backend::MailItem> =
                     serde_json::from_value(v.clone()).expect("inbox rows are MailItems");
-                assert!(!items.is_empty(), "{} inbox has a row to reply to", kind.name());
+                assert!(
+                    !items.is_empty(),
+                    "{} inbox has a row to reply to",
+                    kind.name()
+                );
                 (*kind, items)
             })
             .collect();
@@ -522,8 +531,7 @@ mod tests {
             }))
             .expect("search");
             if *kind == ParityKind::Toron {
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 while std::time::Instant::now() < deadline && last.is_empty() {
                     std::thread::sleep(std::time::Duration::from_millis(500));
                     last = run_mail(b.search(&crate::backend::SearchQuery {

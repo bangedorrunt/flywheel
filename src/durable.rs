@@ -467,9 +467,8 @@ async fn loop_run_verify(args: LoopRunVerifyArgs) -> Result<Value> {
         )));
     }
     let raw = String::from_utf8_lossy(&out.stdout);
-    let v: Value = serde_json::from_str(raw.trim()).unwrap_or_else(|_| {
-        serde_json::json!({ "band": "non-runnable", "raw": raw.trim() })
-    });
+    let v: Value = serde_json::from_str(raw.trim())
+        .unwrap_or_else(|_| serde_json::json!({ "band": "non-runnable", "raw": raw.trim() }));
     if v.get("band").and_then(Value::as_str) != Some("loop-runnable") {
         return Ok(v);
     }
@@ -483,7 +482,11 @@ async fn loop_run_verify(args: LoopRunVerifyArgs) -> Result<Value> {
         // Armed in-process writes: only the loop records the proof. The
         // worker cannot forge what it does not write (anti-forgery).
         let output = v.get("output_tail").and_then(Value::as_str).unwrap_or("");
-        let verify_cmd = v.get("verify").and_then(Value::as_str).unwrap_or("").to_string();
+        let verify_cmd = v
+            .get("verify")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let receipt =
             crate::verdict::write_command_verified_receipt(cwd, &args.bead_id, &sha, output);
         match receipt {
@@ -521,12 +524,7 @@ async fn loop_run_verify(args: LoopRunVerifyArgs) -> Result<Value> {
         // unit — it re-dispatches with the failure in its thread). Never a
         // re-verify of the same broken head.
         let mut cmd = Command::new(&exe);
-        cmd.args([
-            "__reopen-bead",
-            &args.project,
-            &args.bead_id,
-            &sha,
-        ]);
+        cmd.args(["__reopen-bead", &args.project, &args.bead_id, &sha]);
         let out = run_leaf_cmd(cmd, "__reopen-bead").await?;
         if !out.status.success() {
             return Err(map_err(anyhow::anyhow!(
@@ -4934,6 +4932,7 @@ pub fn build_loop_dispatch_workflow(name: &str, text: &str, profile: &str) -> Wo
             name: Some("dispatch".to_string()),
             guard: None,
             on_error: StepOnError::FailRun,
+            build_slot: false,
             action: Action::DispatchJob {
                 assignee: name.to_string(),
                 spec: json!({
@@ -4946,8 +4945,10 @@ pub fn build_loop_dispatch_workflow(name: &str, text: &str, profile: &str) -> Wo
         graph: None,
         inputs: vec![InputDecl {
             name: "target".to_string(),
+            default: None,
         }],
         crew: None,
+        principles: vec![],
     }
 }
 

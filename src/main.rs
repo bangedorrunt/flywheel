@@ -3353,14 +3353,9 @@ fn main() {
             sha,
             timeout_secs,
             dir,
-        }) => cmd_internal_loop_run_verify(
-            &cfg,
-            project,
-            bead_id,
-            sha,
-            *timeout_secs,
-            dir.as_deref(),
-        ),
+        }) => {
+            cmd_internal_loop_run_verify(&cfg, project, bead_id, sha, *timeout_secs, dir.as_deref())
+        }
         Some(Commands::__ReservationBoard { project }) => {
             cmd_internal_reservation_board(&cfg, project)
         }
@@ -11457,15 +11452,7 @@ mod loop_run_verify_tests {
         let desc = format!("work\n\n## VERIFY\n```\n{verify}\n```");
         let created = std::process::Command::new("br")
             .args([
-                "create",
-                "--title",
-                "lrv",
-                "--slug",
-                slug,
-                "-p",
-                "3",
-                "-d",
-                &desc,
+                "create", "--title", "lrv", "--slug", slug, "-p", "3", "-d", &desc,
             ])
             .current_dir(dir)
             .output()
@@ -11508,7 +11495,13 @@ mod loop_run_verify_tests {
             .unwrap();
         assert!(cm.status.success());
         let log = std::process::Command::new("git")
-            .args(["log", "--all", "-1", &format!("--grep={bead_id}"), "--format=%H"])
+            .args([
+                "log",
+                "--all",
+                "-1",
+                &format!("--grep={bead_id}"),
+                "--format=%H",
+            ])
             .current_dir(dir)
             .output()
             .unwrap();
@@ -11559,24 +11552,22 @@ mod loop_run_verify_tests {
             .unwrap();
         assert!(close.status.success());
         // The loop executes VERIFY itself.
-        let o = loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir))
-            .unwrap();
+        let o =
+            loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir)).unwrap();
         assert_eq!(o.band, "loop-runnable");
         assert_eq!(o.exit, 0, "verify output: {}", o.output_tail);
         assert!(!o.skipped);
         // The armed loop writes the machine receipt + records the gate row
         // (this is exactly what the durable leaf does in-process).
         crate::verdict::arm_loop_reporter();
-        let receipt = crate::verdict::write_command_verified_receipt(
-            &o.dir,
-            &bead_id,
-            &sha,
-            &o.output_tail,
-        )
-        .unwrap();
+        let receipt =
+            crate::verdict::write_command_verified_receipt(&o.dir, &bead_id, &sha, &o.output_tail)
+                .unwrap();
         assert_eq!(
             receipt,
-            dir.join(format!(".flywheel/receipts/{bead_id}-{sha}.command-verified.txt"))
+            dir.join(format!(
+                ".flywheel/receipts/{bead_id}-{sha}.command-verified.txt"
+            ))
         );
         let v = crate::verdict::Verdict {
             kind: crate::verdict::VerdictKind::CommandVerified,
@@ -11606,16 +11597,14 @@ mod loop_run_verify_tests {
         let dir = std::env::temp_dir().join(format!("lrv-fail-{}", std::process::id()));
         let bead_id = scratch_lrv(&dir, "lrv-fail", "test -f does-not-exist.txt");
         let sha = commit_and_sha(&dir, &bead_id);
-        let o1 = loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir))
-            .unwrap();
+        let o1 =
+            loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir)).unwrap();
         assert_eq!(o1.band, "loop-runnable");
         assert_ne!(o1.exit, 0, "the fixture VERIFY must fail");
-        let marker = dir.join(format!(
-            ".flywheel/loop-run-verify-failed/{bead_id}-{sha}"
-        ));
+        let marker = dir.join(format!(".flywheel/loop-run-verify-failed/{bead_id}-{sha}"));
         assert!(marker.exists(), "failed-head marker must be written");
-        let o2 = loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir))
-            .unwrap();
+        let o2 =
+            loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir)).unwrap();
         assert!(
             o2.skipped,
             "never re-verify the same broken head — second run must skip"
@@ -11630,8 +11619,8 @@ mod loop_run_verify_tests {
         let dir = std::env::temp_dir().join(format!("lrv-heavy-{}", std::process::id()));
         let bead_id = scratch_lrv(&dir, "lrv-heavy", "cargo test --workspace");
         let sha = commit_and_sha(&dir, &bead_id);
-        let o = loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir))
-            .unwrap();
+        let o =
+            loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir)).unwrap();
         assert_eq!(o.band, "non-runnable");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -19493,10 +19482,10 @@ fn cmd_internal_loop_run_verify(
     let o = match loop_run_verify_exec(cfg, project, bead_id, sha, timeout_secs, dir) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!(
-                "flywheel: loop-run-verify for {bead_id} failed (continuing): {e}"
+            eprintln!("flywheel: loop-run-verify for {bead_id} failed (continuing): {e}");
+            print_json(
+                &json!({ "band": "non-runnable", "bead_id": bead_id, "error": format!("{e}") }),
             );
-            print_json(&json!({ "band": "non-runnable", "bead_id": bead_id, "error": format!("{e}") }));
             return Ok(());
         }
     };

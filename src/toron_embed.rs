@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde_json::json;
 
 use toron_core::mailbox::{FetchInbox, SendMessage};
@@ -54,7 +54,7 @@ pub async fn dispatch(_cfg: &Config, cmd: &ToronCmd) -> Result<()> {
         ToronCmd::SetupMcp { .. } => {
             return Err(anyhow::anyhow!(
                 "toron setup-mcp must run outside the in-process embed dispatch"
-            ))
+            ));
         }
     }
     Ok(())

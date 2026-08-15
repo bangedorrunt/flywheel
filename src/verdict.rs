@@ -887,12 +887,20 @@ mod tests {
     #[test]
     fn loop_run_verify_classifier_accepts_targeted_checks() {
         assert!(verify_is_loop_runnable("cargo test -p flywheel verdict::"));
-        assert!(verify_is_loop_runnable("cargo test -p flywheel loop_run_verify"));
-        assert!(verify_is_loop_runnable("cargo test --package flywheel verifier"));
+        assert!(verify_is_loop_runnable(
+            "cargo test -p flywheel loop_run_verify"
+        ));
+        assert!(verify_is_loop_runnable(
+            "cargo test --package flywheel verifier"
+        ));
         assert!(verify_is_loop_runnable("pytest tests/test_gate.py"));
         assert!(verify_is_loop_runnable("python -m pytest tests/test_x.py"));
-        assert!(verify_is_loop_runnable("timeout 300 cargo test -p flywheel verifier"));
-        assert!(verify_is_loop_runnable("sh -c \"timeout 60 cargo test -p flywheel verifier\""));
+        assert!(verify_is_loop_runnable(
+            "timeout 300 cargo test -p flywheel verifier"
+        ));
+        assert!(verify_is_loop_runnable(
+            "sh -c \"timeout 60 cargo test -p flywheel verifier\""
+        ));
         assert!(verify_is_loop_runnable("test -f Cargo.toml"));
     }
 
@@ -918,7 +926,9 @@ mod tests {
     fn loop_run_verify_classifier_rejects_composition() {
         assert!(!verify_is_loop_runnable(""));
         assert!(!verify_is_loop_runnable("   "));
-        assert!(!verify_is_loop_runnable("cargo test -p flywheel verifier && echo done"));
+        assert!(!verify_is_loop_runnable(
+            "cargo test -p flywheel verifier && echo done"
+        ));
         assert!(!verify_is_loop_runnable("cargo test | tee out.txt"));
         assert!(!verify_is_loop_runnable("cargo test; echo done"));
         assert!(!verify_is_loop_runnable("cargo test\ncargo build"));
@@ -944,8 +954,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lr-receipt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let err = write_receipt(&dir, "bd-x", "abc", VerdictKind::CommandVerified, "out")
-            .unwrap_err();
+        let err =
+            write_receipt(&dir, "bd-x", "abc", VerdictKind::CommandVerified, "out").unwrap_err();
         assert!(
             err.to_string().contains("LOOP only"),
             "worker must not write command-verified: {err}"
@@ -1127,7 +1137,9 @@ mod tests {
             write_command_verified_receipt(&dir, &bead_id, &sha, "cargo test ... ok\n").unwrap();
         assert_eq!(
             path,
-            dir.join(format!(".flywheel/receipts/{bead_id}-{sha}.command-verified.txt"))
+            dir.join(format!(
+                ".flywheel/receipts/{bead_id}-{sha}.command-verified.txt"
+            ))
         );
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
