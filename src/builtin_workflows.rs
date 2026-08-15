@@ -30,7 +30,7 @@
 
 use std::collections::BTreeMap;
 
-use toron_workflow::schema::{parse_workflow, Workflow};
+use toron_workflow::schema::{Workflow, parse_workflow};
 
 /// The compiled-in built-in workflows, name → YAML text.
 pub const BUILTIN_WORKFLOWS_YAML: &[(&str, &str)] = &[
@@ -382,6 +382,145 @@ graph:
       needs: [scout-fanout]
 "##,
     ),
+    // ---- ADR-0019 Spec 7.2 fix-path playbooks (bd-w2-fix-path-7gd5) ----
+    (
+        "bug-fix",
+        r##"
+name: bug-fix
+description: "Fix-path playbook (ADR-0019 Spec 7.2): repro → failing test → minimal fix → independent proof. No fix node without a repro predecessor (lint)."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: symptom
+  - name: repro
+principles:
+  - fix-root-causes
+  - prove-it-works
+  - sequence-verifiable-units
+graph:
+  nodes:
+    repro:
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@scout"
+        task: "Run or write the repro for: {{inputs.symptom}}\n\nRepro: {{inputs.repro}}\nACCEPTANCE: the command exits non-zero (or visibly shows the bug). Record the exact failing output as the baseline."
+      on_error: fail_run
+    tdd:
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@coder"
+        task: "Write the FAILING test first (RED) for: {{inputs.symptom}}\n\nRepro: {{inputs.repro}}\nVERIFY: the new test FAILS. Do not fix anything yet."
+      needs: [repro]
+      on_error: fail_run
+    fix:
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@coder"
+        task: "Apply the MINIMAL fix for {{inputs.symptom}} against the failing test from step tdd.\nVERIFY: the test PASSES AND the original repro ({{inputs.repro}}) no longer reproduces."
+      needs: [tdd]
+      on_error: fail_run
+    prove:
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@reviewer"
+        harness: "opencode"
+        task: "Independently prove the fix for {{inputs.symptom}} (different model family, ADR-0019 Spec 4). VERIFY from the bead: test green + repro gone. Record unit-test-verified. Do not re-fix."
+      needs: [fix]
+      on_error: fail_run
+"##,
+    ),
+    (
+        "feature",
+        r##"
+name: feature
+description: "Feature playbook (ADR-0019 Spec 7.2): shape the domain type/state machine → TDD build → independent proof. data_shape is REQUIRED."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: objective
+  - name: data_shape
+principles:
+  - foundational-thinking
+  - model-the-domain
+  - prove-it-works
+steps:
+  - name: shape
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@planner"
+      task: "Name the type / state machine for: {{inputs.objective}}\n\ndata_shape: {{inputs.data_shape}}\nREFUSE (return an error) when data_shape is empty — the feature cannot be shaped without naming its data."
+    on_error: fail_run
+  - name: build
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@coder"
+      task: "Implement {{inputs.objective}} against the shape from step shape: {{steps.shape}}\nTDD: failing test first, then minimal code to pass."
+    on_error: fail_run
+  - name: prove
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@reviewer"
+      harness: "opencode"
+      task: "Prove {{inputs.objective}} independently (different model family, ADR-0019 Spec 4). VERIFY from the bead. Record unit-test-verified. Do not re-implement."
+    on_error: fail_run
+"##,
+    ),
+    (
+        "refactoring",
+        r##"
+name: refactoring
+description: "Refactoring playbook (ADR-0019 Spec 7.2): baseline invariant → delete first → behavior-preserving reshape → invariant still green, no *V2* files."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: target
+  - name: invariant_cmd
+principles:
+  - laziness-protocol
+  - subtract-before-you-add
+  - prove-it-works
+steps:
+  - name: baseline
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@scout"
+      task: "Run the behavior invariant for the refactoring of {{inputs.target}}: `{{inputs.invariant_cmd}}`. Store the stdout receipt — this is the baseline that must stay green."
+    on_error: fail_run
+  - name: subtract
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@coder"
+      task: "Deletion inventory for {{inputs.target}}: list every line/module that can be removed, then APPLY the deletions. Do not add code yet (laziness protocol: subtract before you add)."
+    on_error: fail_run
+  - name: reshape
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@coder"
+      task: "Behavior-preserving reshape of {{inputs.target}}: no behavior change, no *V2*/*_improved*/*_enhanced* files. Invariant must stay green: `{{inputs.invariant_cmd}}`."
+    on_error: fail_run
+  - name: prove
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@reviewer"
+      harness: "opencode"
+      task: "Prove the refactoring of {{inputs.target}}: invariant `{{inputs.invariant_cmd}}` still green AND no *V2*/*_improved*/*_enhanced* files added. Record unit-test-verified."
+    on_error: fail_run
+"##,
+    ),
 ];
 
 /// Load the compiled-in built-in workflows as parsed `Workflow`s.
@@ -475,11 +614,15 @@ mod tests {
             .iter()
             .filter_map(|s| s.name.as_deref())
             .collect();
-        assert_eq!(step_names, vec!["ideate", "plan", "build", "review", "ship"]);
+        assert_eq!(
+            step_names,
+            vec!["ideate", "plan", "build", "review", "ship"]
+        );
         for s in &direct.steps {
             if let Action::CallWorkflow { workflow, .. } = &s.action {
                 assert_ne!(
-                    workflow.as_str(), "beads",
+                    workflow.as_str(),
+                    "beads",
                     "goal-direct must not call the beads workflow"
                 );
             }
@@ -562,7 +705,10 @@ mod tests {
             }
         }
         // The direct arm's plan companion is gate-free AND resolves.
-        assert!(wfs.contains_key("plan-direct"), "plan-direct built-in present");
+        assert!(
+            wfs.contains_key("plan-direct"),
+            "plan-direct built-in present"
+        );
     }
 
     /// STEER-COMPOSE crew strategy (bd-2pcq #7): the composed goal/direct
@@ -638,7 +784,9 @@ mod tests {
                 Action::DispatchJob { .. } => {}
                 Action::Parallel { each, .. } => scan_action(&each.action, name, found),
                 Action::Retry { step, .. } => scan_action(&step.action, name, found),
-                Action::Branch { then, else_steps, .. } => {
+                Action::Branch {
+                    then, else_steps, ..
+                } => {
                     for s in then.iter().chain(else_steps.iter()) {
                         scan_action(&s.action, name, found);
                     }
@@ -855,7 +1003,9 @@ mod tests {
                 }
                 Action::Parallel { each, .. } => scan_action(&each.action, wf, dead),
                 Action::Retry { step, .. } => scan_action(&step.action, wf, dead),
-                Action::Branch { then, else_steps, .. } => {
+                Action::Branch {
+                    then, else_steps, ..
+                } => {
                     for s in then.iter().chain(else_steps.iter()) {
                         scan_action(&s.action, wf, dead);
                     }
@@ -875,7 +1025,10 @@ mod tests {
                 }
             }
         }
-        assert!(dead.is_empty(), "dispatch specs with dead prompt key: {dead:?}");
+        assert!(
+            dead.is_empty(),
+            "dispatch specs with dead prompt key: {dead:?}"
+        );
     }
 
     /// bd-h4fc: the goal meta-chain carries context forward — build gets the
@@ -957,7 +1110,9 @@ mod tests {
             let mut out = Vec::new();
             for s in &wf.steps {
                 out.push((
-                    s.name.clone().unwrap_or_else(|| s.action.type_name().into()),
+                    s.name
+                        .clone()
+                        .unwrap_or_else(|| s.action.type_name().into()),
                     s.on_error == StepOnError::FailRun,
                 ));
             }
@@ -1072,10 +1227,7 @@ mod tests {
         let Action::DispatchJob { spec, .. } = &synthesize.action else {
             panic!("synthesize is a dispatch_job");
         };
-        assert_eq!(
-            spec.get("profile").and_then(Value::as_str),
-            Some("@oracle")
-        );
+        assert_eq!(spec.get("profile").and_then(Value::as_str), Some("@oracle"));
         assert!(synthesize.needs.contains(&"gather".to_string()));
         assert_eq!(synthesize.on_error, StepOnError::FailRun);
         let challenge = &g.nodes["challenge"];
@@ -1126,6 +1278,123 @@ mod tests {
                 "captain-audit fleet includes {role}: {:?}",
                 plan.members
             );
+        }
+    }
+
+    // ---- ADR-0019 Spec 7.2 fix-path playbooks (bd-w2-fix-path-7gd5) ----
+
+    /// The three fix-path playbooks are compiled-in, crew:auto, and declare
+    /// their inputs.
+    #[test]
+    fn fix_path_playbooks_are_compiled_in() {
+        let wfs = builtin_workflows();
+        for name in ["bug-fix", "feature", "refactoring"] {
+            let wf = &wfs[name];
+            assert_eq!(wf.crew, Some(CrewSpec::Auto), "{name} is crew: auto");
+            let input_names: Vec<&str> = wf.inputs.iter().map(|i| i.name.as_str()).collect();
+            assert!(!input_names.is_empty(), "{name} declares inputs: {input_names:?}");
+        }
+        // the exact input contracts
+        let bug = &wfs["bug-fix"];
+        assert_eq!(
+            bug.inputs.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            vec!["symptom", "repro"],
+            "bug-fix inputs"
+        );
+        let feat = &wfs["feature"];
+        assert_eq!(
+            feat.inputs.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            vec!["objective", "data_shape"],
+            "feature inputs — data_shape REQUIRED (lint)"
+        );
+        let refac = &wfs["refactoring"];
+        assert_eq!(
+            refac.inputs.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            vec!["target", "invariant_cmd"],
+            "refactoring inputs"
+        );
+    }
+
+    /// bug-fix is a DAG with the TDD chain explicit: prove needs fix, fix
+    /// needs tdd, tdd needs repro — a fix node without a repro predecessor
+    /// cannot exist (the wave-2 structural lint reads exactly this shape).
+    #[test]
+    fn bug_fix_graph_orders_repro_before_fix() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let bug = &wfs["bug-fix"];
+        let graph = bug.graph.as_ref().expect("bug-fix is a graph");
+        assert_eq!(
+            graph.nodes["tdd"].needs,
+            vec!["repro".to_string()],
+            "tdd runs after the repro"
+        );
+        assert_eq!(
+            graph.nodes["fix"].needs,
+            vec!["tdd".to_string()],
+            "fix runs after the failing test"
+        );
+        assert_eq!(
+            graph.nodes["prove"].needs,
+            vec!["fix".to_string()],
+            "prove runs after the fix"
+        );
+        // the reviewer prove node carries the opencode harness override
+        let Action::DispatchJob { spec, .. } = &graph.nodes["prove"].action else {
+            panic!("prove is a dispatch_job");
+        };
+        assert_eq!(spec.get("profile").and_then(Value::as_str), Some("@reviewer"));
+        assert_eq!(spec.get("harness").and_then(Value::as_str), Some("opencode"));
+    }
+
+    /// The principle tags ride in the raw YAML with their CANONICAL names
+    /// (ADR-0019 Spec 6 registry names — fixed by the ADR, validated by the
+    /// wave-2 principles lint once the registry merge lands).
+    #[test]
+    fn fix_path_playbooks_carry_canonical_principle_tags() {
+        let yaml_for = |name: &str| -> &str {
+            BUILTIN_WORKFLOWS_YAML
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, y)| *y)
+                .expect(name)
+        };
+        let cases = [
+            ("bug-fix", ["fix-root-causes", "prove-it-works", "sequence-verifiable-units"]),
+            ("feature", ["foundational-thinking", "model-the-domain", "prove-it-works"]),
+            ("refactoring", ["laziness-protocol", "subtract-before-you-add", "prove-it-works"]),
+        ];
+        for (name, tags) in cases {
+            let yaml = yaml_for(name);
+            for tag in tags {
+                assert!(yaml.contains(tag), "{name} carries principle {tag}");
+            }
+        }
+    }
+
+    /// ADR-0019 Spec 0: NO pull-request / Graphite / gh-pr vocabulary in the
+    /// playbooks (needles assembled so this test never trips itself).
+    #[test]
+    fn fix_path_playbooks_avoid_pr_vocabulary() {
+        let forbidden = [
+            format!("pull {}", "request"),
+            "Graphite".to_string(),
+            format!("gh {}", "pr"),
+            format!("merge-{}", "when-ready"),
+            format!("land the {}", "stack"),
+        ];
+        for name in ["bug-fix", "feature", "refactoring"] {
+            let yaml = BUILTIN_WORKFLOWS_YAML
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, y)| *y)
+                .unwrap();
+            for needle in &forbidden {
+                assert!(
+                    !yaml.contains(needle.as_str()),
+                    "{name} must not contain {needle:?} (Spec 0 vocabulary)"
+                );
+            }
         }
     }
 }
