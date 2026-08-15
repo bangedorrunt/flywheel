@@ -430,6 +430,120 @@ async fn verify_dispatch(args: VerifyDispatchArgs) -> Result<Value> {
         .unwrap_or_else(|_| serde_json::json!({ "raw": raw.trim() })))
 }
 
+/// Args for the `__loop-run-verify` leaf (ADR-0019 cheap band,
+/// bd-w1-loop-run-verify-mbbe).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopRunVerifyArgs {
+    pub project: String,
+    pub bead_id: String,
+    #[serde(default)]
+    pub sha: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Checkpointed leaf — close-detect loop-run VERIFY (cheap band): the LOOP
+/// is the verifier. Executes the bead's VERIFY (TIMEBOX timeout, cargo under
+/// the build slot), then IN-PROCESS (armed) writes the machine receipt and
+/// records `command-verified`. Non-zero exit / timeout -> failed-head marker
+/// (NEVER re-verify the same broken head) + reopen. Returns
+/// `{band: loop-runnable|non-runnable, recorded?|reopened?}`.
+#[function]
+async fn loop_run_verify(args: LoopRunVerifyArgs) -> Result<Value> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__loop-run-verify", &args.project, &args.bead_id]);
+    if let Some(sha) = &args.sha {
+        cmd.args(["--sha", sha]);
+    }
+    if let Some(t) = args.timeout_secs {
+        cmd.args(["--timeout-secs", &t.to_string()]);
+    }
+    let out = run_leaf_cmd(cmd, "__loop-run-verify").await?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__loop-run-verify failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v: Value = serde_json::from_str(raw.trim()).unwrap_or_else(|_| {
+        serde_json::json!({ "band": "non-runnable", "raw": raw.trim() })
+    });
+    if v.get("band").and_then(Value::as_str) != Some("loop-runnable") {
+        return Ok(v);
+    }
+    let dir = v.get("dir").and_then(Value::as_str).unwrap_or(".");
+    let cwd = std::path::Path::new(dir);
+    let sha = args.sha.clone().unwrap_or_default();
+    let skipped = v.get("skipped").and_then(Value::as_str).is_some();
+    let timed_out = v.get("timed_out").and_then(Value::as_bool).unwrap_or(false);
+    let exit = v.get("exit").and_then(Value::as_i64).unwrap_or(-1);
+    if !skipped && exit == 0 {
+        // Armed in-process writes: only the loop records the proof. The
+        // worker cannot forge what it does not write (anti-forgery).
+        let output = v.get("output_tail").and_then(Value::as_str).unwrap_or("");
+        let verify_cmd = v.get("verify").and_then(Value::as_str).unwrap_or("").to_string();
+        let receipt =
+            crate::verdict::write_command_verified_receipt(cwd, &args.bead_id, &sha, output);
+        match receipt {
+            Ok(receipt_path) => {
+                let verdict = crate::verdict::Verdict {
+                    kind: crate::verdict::VerdictKind::CommandVerified,
+                    bead_id: args.bead_id.clone(),
+                    sha: sha.clone(),
+                    at: chrono::Utc::now(),
+                    actor: crate::verdict::AgentName::new("flywheel-toron-loop1"),
+                    receipt_path,
+                    verify_cmd,
+                };
+                match crate::verdict::report_pass(cwd, &verdict) {
+                    Ok(()) => Ok(serde_json::json!({
+                        "band": "loop-runnable",
+                        "recorded": true,
+                        "bead_id": args.bead_id,
+                        "sha": sha,
+                    })),
+                    Err(e) => Err(map_err(anyhow::anyhow!(
+                        "loop-run-verify record failed for {}: {e}",
+                        args.bead_id
+                    ))),
+                }
+            }
+            Err(e) => Err(map_err(anyhow::anyhow!(
+                "loop-run-verify receipt write failed for {}: {e}",
+                args.bead_id
+            ))),
+        }
+    } else {
+        // Failed or skipped-head: reopen via the `__reopen-bead` leaf command
+        // (idempotent, one mail per (bead, sha); the reopened bead IS the fix
+        // unit — it re-dispatches with the failure in its thread). Never a
+        // re-verify of the same broken head.
+        let mut cmd = Command::new(&exe);
+        cmd.args([
+            "__reopen-bead",
+            &args.project,
+            &args.bead_id,
+            &sha,
+        ]);
+        let out = run_leaf_cmd(cmd, "__reopen-bead").await?;
+        if !out.status.success() {
+            return Err(map_err(anyhow::anyhow!(
+                "__reopen-bead failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(serde_json::json!({
+            "band": "loop-runnable",
+            "reopened": true,
+            "bead_id": args.bead_id,
+            "timed_out": timed_out,
+            "exit": exit,
+        }))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadyArgs {
     pub project: String,
@@ -3666,41 +3780,78 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                             .and_then(Value::as_str)
                                             .unwrap_or("")
                                             .to_string();
-                                        let ticks =
-                                            close_grace_ticks.entry(bead_id.clone()).or_insert(0);
-                                        *ticks += 1;
-                                        if eligible && *ticks < 2 {
-                                            // receipt may race the close:
-                                            // re-watch so the next tick
-                                            // re-checks before reopening.
-                                            eprintln!(
-                                                "flywheel: {bead_id} missing verdict (WorkerReceipt grace {ticks}/2)"
-                                            );
-                                            claim_watch.insert(
-                                                bead_id.clone(),
-                                                ClaimWatch {
-                                                    agent: String::new(),
-                                                    unclaimed_polls: 0,
-                                                    close_nudged: false,
-                                                    close_polls: 0,
-                                                    wait_reason: None,
-                                                },
-                                            );
-                                        } else {
-                                            close_grace_ticks.remove(&bead_id);
-                                            let rb = ReopenBeadArgs {
-                                                project: params.project.clone(),
-                                                bead_id: bead_id.clone(),
-                                                sha,
-                                            };
-                                            match ctx.run(reopen_bead, rb).await {
-                                                Ok(r) => eprintln!(
-                                                    "flywheel: {bead_id} unverified close — reopened: {r}"
-                                                ),
-                                                Err(e) => eprintln!(
-                                                    "flywheel: reopen of {bead_id} failed (continuing): {e}"
-                                                ),
+                                        // bd-w1-loop-run-verify-mbbe: cheap
+                                        // band — the LOOP is the verifier.
+                                        // Run VERIFY before any reopen;
+                                        // success records command-verified
+                                        // and the bead stays closed; failure
+                                        // reopens (never re-verify the same
+                                        // broken head — failed-head marker).
+                                        let mut lr_band = String::new();
+                                        let lr_args = LoopRunVerifyArgs {
+                                            project: params.project.clone(),
+                                            bead_id: bead_id.clone(),
+                                            sha: Some(sha.clone()),
+                                            timeout_secs: None,
+                                        };
+                                        match ctx.run(loop_run_verify, lr_args).await {
+                                            Ok(v) => {
+                                                lr_band = v
+                                                    .get("band")
+                                                    .and_then(Value::as_str)
+                                                    .unwrap_or("")
+                                                    .to_string();
                                             }
+                                            Err(e) => eprintln!(
+                                                "flywheel: loop-run-verify for {bead_id} failed (continuing): {e}"
+                                            ),
+                                        }
+                                        if lr_band != "loop-runnable" {
+                                            // Non-runnable band (or a leaf
+                                            // error): the existing grace /
+                                            // reopen flow applies.
+                                            let ticks = close_grace_ticks
+                                                .entry(bead_id.clone())
+                                                .or_insert(0);
+                                            *ticks += 1;
+                                            if eligible && *ticks < 2 {
+                                                // receipt may race the close:
+                                                // re-watch so the next tick
+                                                // re-checks before reopening.
+                                                eprintln!(
+                                                    "flywheel: {bead_id} missing verdict (WorkerReceipt grace {ticks}/2)"
+                                                );
+                                                claim_watch.insert(
+                                                    bead_id.clone(),
+                                                    ClaimWatch {
+                                                        agent: String::new(),
+                                                        unclaimed_polls: 0,
+                                                        close_nudged: false,
+                                                        close_polls: 0,
+                                                        wait_reason: None,
+                                                    },
+                                                );
+                                            } else {
+                                                close_grace_ticks.remove(&bead_id);
+                                                let rb = ReopenBeadArgs {
+                                                    project: params.project.clone(),
+                                                    bead_id: bead_id.clone(),
+                                                    sha,
+                                                };
+                                                match ctx.run(reopen_bead, rb).await {
+                                                    Ok(r) => eprintln!(
+                                                        "flywheel: {bead_id} unverified close — reopened: {r}"
+                                                    ),
+                                                    Err(e) => eprintln!(
+                                                        "flywheel: reopen of {bead_id} failed (continuing): {e}"
+                                                    ),
+                                                }
+                                            }
+                                        } else {
+                                            // The leaf recorded command-verified
+                                            // (legal, stays closed) or reopened
+                                            // the bead — not in verdict limbo.
+                                            close_grace_ticks.remove(&bead_id);
                                         }
                                     }
                                     other => eprintln!(
@@ -4555,6 +4706,9 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     resonate
         .register(verify_dispatch)
         .map_err(|e| anyhow::anyhow!("register verify_dispatch: {e}"))?;
+    resonate
+        .register(loop_run_verify)
+        .map_err(|e| anyhow::anyhow!("register loop_run_verify: {e}"))?;
     resonate
         .register(reservation_board)
         .map_err(|e| anyhow::anyhow!("register reservation_board: {e}"))?;
@@ -5716,6 +5870,9 @@ pub async fn run_engine_loop(cfg: &Config, mut params: LoopParams) -> anyhow::Re
     resonate
         .register(verify_dispatch)
         .map_err(|e| anyhow::anyhow!("register verify_dispatch: {e}"))?;
+    resonate
+        .register(loop_run_verify)
+        .map_err(|e| anyhow::anyhow!("register loop_run_verify: {e}"))?;
     resonate
         .register(reservation_board)
         .map_err(|e| anyhow::anyhow!("register reservation_board: {e}"))?;
