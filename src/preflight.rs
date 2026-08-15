@@ -477,8 +477,11 @@ pub fn scan_new_forbidden_files(dir: &Path) -> Vec<String> {
 /// with the regen command in the message.
 pub fn check_standing_orders(cfg: &Config, project: Option<&str>) -> Check {
     let global = crate::config::config_dir().join("standing-orders.md");
-    let fence = project
-        .map(|p| crate::project_dir(cfg, p).join(".flywheel").join("standing-orders.md"));
+    let fence = project.map(|p| {
+        crate::project_dir(cfg, p)
+            .join(".flywheel")
+            .join("standing-orders.md")
+    });
     check_standing_orders_at(&global, fence.as_deref())
 }
 
@@ -716,9 +719,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let global = dir.join("config").join("standing-orders.md");
         let check = check_standing_orders_at(&global, None);
-        assert!(matches!(check.status, Status::Pass), "generated on first run: {check:?}");
+        assert!(
+            matches!(check.status, Status::Pass),
+            "generated on first run: {check:?}"
+        );
         assert!(global.exists(), "global written");
-        assert!(std::fs::read_to_string(&global).unwrap().contains("claim before work"));
+        assert!(
+            std::fs::read_to_string(&global)
+                .unwrap()
+                .contains("claim before work")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -737,7 +747,10 @@ mod tests {
         match check.status {
             Status::Fail(msg) => {
                 assert!(msg.contains("standing-orders regen"), "actionable: {msg}");
-                assert!(msg.contains("standing orders missing"), "names the gap: {msg}");
+                assert!(
+                    msg.contains("standing orders missing"),
+                    "names the gap: {msg}"
+                );
             }
             other => panic!("expected Fail, got {other:?}"),
         }
@@ -755,8 +768,14 @@ mod tests {
         std::fs::write(&fence, "# authored fence\n").unwrap();
         let global = dir.join("config").join("standing-orders.md");
         let check = check_standing_orders_at(&global, Some(&fence));
-        assert!(matches!(check.status, Status::Pass), "fence satisfies: {check:?}");
-        assert!(!global.exists(), "global not generated when the fence suffices");
+        assert!(
+            matches!(check.status, Status::Pass),
+            "fence satisfies: {check:?}"
+        );
+        assert!(
+            !global.exists(),
+            "global not generated when the fence suffices"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
