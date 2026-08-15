@@ -49,6 +49,9 @@ fn dec(primitive: &'static str, reason: &str, argv: &[&str]) -> Decision {
 ///   7 contention|coalition|shared-file (target or snap) → coalition-form
 ///   8 one pane|watch me|single agent → spawn-send
 ///   9 cron|schedule|nightly → cron-start
+///  10 crew-steer|mention peer|peer mention → steer (plane S: the steer
+///     target runs `toron channel post --mention` / `toron job claim`; no new
+///     primitive — first-match keeps row 3/fallback)
 /// Unmatched targets fall back to steer (the catalog loudly rejects unknown
 /// shapes — never a silent no-op).
 pub fn decide(target: &str, snap: &Snapshot) -> Decision {
@@ -325,6 +328,27 @@ mod tests {
             let d = decide(t, &snap());
             assert_eq!(d.primitive, "cron-start", "target: {t}");
             assert_eq!(d.argv, vec!["flywheel", "cron", "start"]);
+        }
+    }
+
+    // Row 10 — crew-steer|mention peer|peer mention → steer (plane S verbs
+    // run inside the steer target; no new primitive — first-match preserved).
+    #[test]
+    fn row10_crew_steer_is_steer_not_new_primitive() {
+        for t in [
+            "crew-steer this to the peer",
+            "mention peer on the channel",
+            "peer mention for the handoff",
+        ] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "steer", "target: {t}");
+            // No flywheel channel subcommand (ADR-0020 wave 1) — the steer
+            // target drives `toron channel post --mention` / `toron job claim`.
+            assert!(
+                !d.argv.iter().any(|a| a == "channel"),
+                "no flywheel channel subcommand: {:?}",
+                d.argv
+            );
         }
     }
 

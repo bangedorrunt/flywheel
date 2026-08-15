@@ -317,6 +317,7 @@ Headless run logs (`runs/*.jsonl`) feed this view; pane runs feed from the proje
 | fan out N agents on one step | `parallel over: "@crew.<role>"` in a workflow |
 | add a new role/persona | `flywheel profile create <name> ...` |
 | pick a model per role | set `model` on the profile (+ `flywheel model add` to the registry) |
+| steer a peer crew (two live panes) | **plane S, NOT a workflow**: `toron channel join steer-<bead> --project <slug> --as "$AGENT_NAME"` → `toron channel post --mention` / `toron job claim`. No `flywheel channel` subcommand exists (ADR-0020 wave 1) and `workflow lint` does not resolve the toron CLI, so crew-to-crew steering is documented as a shell recipe, never a compiled-in workflow. Shared work on the room; secrets on plane P (`toron mail`). |
 
 > **Status note (ADR-0010):** the `--execute` real runner, `--mode headless`, model injection,
 > and the `remove`/`model` commands land in the P10.1–P10.5 beads. Until P10.3 lands,
