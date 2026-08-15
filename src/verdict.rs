@@ -155,20 +155,89 @@ pub struct Verdict {
     pub verify_cmd: String,
 }
 
-/// Cheap-band predicate (ADR-0019 Spec 1): VERIFY is loop-runnable when it is
-/// a single cheap command the loop can execute headless under the build slot —
-/// one command line, no shell composition. Long-running / live-UI / agent-env
-/// VERIFY (or anything composed) is NOT loop-runnable.
+/// Cheap-band classifier (ADR-0019 Spec 1): VERIFY is loop-runnable when it
+/// is a single command line with an allowlisted executable (cargo/test/
+/// pytest/python/bounded shell) estimated cheap — the loop can execute it
+/// headless under the build slot within the bead's TIMEBOX. Everything else
+/// is the non-runnable band (worker receipt + two-tick grace, or independent
+/// verification).
 pub fn verify_is_loop_runnable(verify: &str) -> bool {
+    let Some((exec, args)) = parse_verify_command(verify) else {
+        return false;
+    };
+    allowlisted_exec(&exec) && estimated_cheap(&exec, &args)
+}
+
+/// Parse a VERIFY line into `(executable, args)`. `None` when empty,
+/// multi-line, or shell composition (`&&`, `||`, `|`, `;`, backticks,
+/// `$( )`) — composition is never loop-runnable.
+fn parse_verify_command(verify: &str) -> Option<(String, Vec<String>)> {
     let t = verify.trim();
-    !t.is_empty()
-        && !t.contains('\n')
-        && !t.contains("&&")
-        && !t.contains("||")
-        && !t.contains('|')
-        && !t.contains(';')
-        && !t.contains('`')
-        && !t.contains("$(")
+    if t.is_empty()
+        || t.contains('\n')
+        || t.contains("&&")
+        || t.contains("||")
+        || t.contains('|')
+        || t.contains(';')
+        || t.contains('`')
+        || t.contains("$(")
+    {
+        return None;
+    }
+    let mut parts = t.split_whitespace();
+    let exec = parts.next()?.to_string();
+    let args = parts.map(String::from).collect();
+    Some((exec, args))
+}
+
+/// Executables the loop may run headless on the cheap band. A "bounded
+/// shell" (sh/bash) is allowed only when the invocation carries an explicit
+/// `timeout` bound — an unbounded shell is a time bomb.
+fn allowlisted_exec(exec: &str) -> bool {
+    matches!(
+        exec,
+        "cargo" | "test" | "pytest" | "python" | "python3" | "timeout" | "sh" | "bash"
+    )
+}
+
+/// Known-heavy markers: whole-workspace matrices, long waits, live servers.
+fn is_heavy_marker(arg: &str) -> bool {
+    arg == "--workspace"
+        || arg == "--all-features"
+        || arg == "--all-targets"
+        || arg == "--ignored"
+        || arg.contains("verify-gates")
+        || arg.starts_with("sleep")
+        || arg.starts_with("serve")
+}
+
+/// Estimated-cheap heuristic: a targeted, bounded check. Whole-workspace
+/// matrices and unbounded shells are time bombs — non-runnable band.
+fn estimated_cheap(exec: &str, args: &[String]) -> bool {
+    match exec {
+        // cargo: a TARGETED test run (`-p <pkg>` and/or a test filter after
+        // `test`); never the whole workspace matrix or a bare `cargo test`.
+        "cargo" => {
+            let Some(test_pos) = args.iter().position(|a| a == "test") else {
+                return false; // cargo without `test` is not a verification
+            };
+            !args.iter().any(|a| is_heavy_marker(a))
+                && (args[test_pos + 1..]
+                    .iter()
+                    .any(|a| a == "-p" || a.starts_with("-p") || a.starts_with("--package"))
+                    || args[test_pos + 1..].iter().any(|a| !a.starts_with('-')))
+        }
+        // pytest / test runners / python: targeted by default — reject the
+        // known-heavy markers.
+        "pytest" | "test" | "python" | "python3" => !args.iter().any(|a| is_heavy_marker(a)),
+        // Bounded shell: must carry an explicit `timeout` bound (quoted
+        // args split on whitespace, so match the token as a substring).
+        "sh" | "bash" => args.iter().any(|a| a.contains("timeout")),
+        // An explicit `timeout` wrapper is loop-runnable by definition (the
+        // bound is the caller's call).
+        "timeout" => true,
+        _ => false,
+    }
 }
 
 /// Legal-close table (ADR-0019 Spec 1, amended 2026-08-15):
@@ -489,11 +558,109 @@ pub fn write_receipt(
     if content.trim().is_empty() {
         anyhow::bail!("receipt refuses empty content");
     }
+    // Anti-forgery (ADR-0019 Spec 1): command-verified receipts are written
+    // by the LOOP only — a lying worker cannot forge what it does not write.
+    // The worker helper refuses this kind outright.
+    if matches!(kind, VerdictKind::CommandVerified) {
+        anyhow::bail!(
+            "command-verified receipts are written by the LOOP only (anti-forgery, ADR-0019 Spec 1): workers never write this kind"
+        );
+    }
     let dir = cwd.join(".flywheel").join("receipts");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{bead_id}-{sha}.{}.txt", kind.gate_name()));
     std::fs::write(&path, content)?;
     Ok(path)
+}
+
+/// Machine receipt writer — LOOP ONLY (armed-gated like `report_pass`):
+/// `.flywheel/receipts/<bead-id>-<sha>.command-verified.txt`. The loop
+/// executes VERIFY itself and writes this file; workers never write this
+/// kind (anti-forgery by construction, ADR-0019 Spec 1).
+pub fn write_command_verified_receipt(
+    cwd: &Path,
+    bead_id: &str,
+    sha: &str,
+    content: &str,
+) -> anyhow::Result<PathBuf> {
+    if !loop_armed() {
+        anyhow::bail!(
+            "command-verified receipts are written by the LOOP only (anti-forgery, ADR-0019 Spec 1)"
+        );
+    }
+    if content.trim().is_empty() {
+        anyhow::bail!("receipt refuses empty content");
+    }
+    let dir = cwd.join(".flywheel").join("receipts");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{bead_id}-{sha}.command-verified.txt"));
+    std::fs::write(&path, content)?;
+    Ok(path)
+}
+
+/// Close-detect decision (ADR-0019, bd-w1-reopen-f6tw): what the loop must
+/// do when a dispatched bead left the tracker as closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CloseCheck {
+    /// A legal verdict row binds the derived sha — leave the bead closed.
+    Legal { sha: String },
+    /// No legal verdict row for the derived sha. `receipt_eligible` = the
+    /// bead MAY close via WorkerReceipt (the receipt races the close write)
+    /// — the loop grants TWO consecutive missing ticks before reopening.
+    /// Non-eligible -> reopen now.
+    Missing { sha: String, receipt_eligible: bool },
+    /// No commit carries the bead id — the close is illegal regardless of
+    /// verdicts; reopen now.
+    NoCommit,
+}
+
+/// The close-detect check: SHA rule first (`derive_head_sha`), then the
+/// ledger (`ledger_check`). Pure decision over br/git — the loop's reopen
+/// leaf turns a non-`Legal` verdict into `br reopen` + one mail per
+/// (bead, sha).
+pub fn close_check(cwd: &Path, bead_id: &str) -> anyhow::Result<CloseCheck> {
+    let sha = match derive_head_sha(cwd, bead_id) {
+        Ok(s) => s,
+        // "SHA rule: no commit carries the bead id" — the close is illegal.
+        // Anything else (git missing, git log failure) is an environment
+        // error and must propagate, never masquerade as a verdict.
+        Err(e) => {
+            if format!("{e:#}").contains("SHA rule") {
+                return Ok(CloseCheck::NoCommit);
+            }
+            return Err(e);
+        }
+    };
+    // A closed bead without a legal VERIFY fence has no receipt path either —
+    // fail closed: reopen it (the fence is required before dispatch).
+    let bead = match bead_from_br_show(cwd, bead_id) {
+        Ok(b) => b,
+        Err(_) => {
+            return Ok(CloseCheck::Missing {
+                sha,
+                receipt_eligible: false,
+            });
+        }
+    };
+    if ledger_check(cwd, &bead, AcShape::Checkable, &sha)? {
+        return Ok(CloseCheck::Legal { sha });
+    }
+    // Is WorkerReceipt a legal close for this bead? (priority >= 2, Normal
+    // blast, VERIFY not loop-runnable — row 2 of the legal-close table).
+    let receipt = Verdict {
+        kind: VerdictKind::WorkerReceipt,
+        bead_id: bead_id.to_string(),
+        sha: sha.clone(),
+        at: Utc::now(),
+        actor: AgentName::new("flywheel-toron-loop1"),
+        receipt_path: PathBuf::new(),
+        verify_cmd: bead.verify.clone(),
+    };
+    let receipt_eligible = legal_close(&receipt, &bead, AcShape::Checkable);
+    Ok(CloseCheck::Missing {
+        sha,
+        receipt_eligible,
+    })
 }
 
 #[cfg(test)]
@@ -652,7 +819,6 @@ mod tests {
     #[test]
     fn verify_is_loop_runnable_predicate() {
         assert!(verify_is_loop_runnable("cargo test -p flywheel verdict::"));
-        assert!(verify_is_loop_runnable("cargo test --lib"));
         assert!(!verify_is_loop_runnable(""));
         assert!(!verify_is_loop_runnable("   "));
         assert!(!verify_is_loop_runnable("cargo test && sleep 3600"));
@@ -662,6 +828,67 @@ mod tests {
         assert!(!verify_is_loop_runnable("cargo test\ncargo build"));
         assert!(!verify_is_loop_runnable("cargo test `echo x`"));
         assert!(!verify_is_loop_runnable("cargo test $(echo x)"));
+    }
+
+    // ---- bd-w1-loop-run-verify-mbbe: loop-runnable classifier ----
+
+    /// Targeted, allowlisted checks are loop-runnable.
+    #[test]
+    fn loop_run_verify_classifier_accepts_targeted_checks() {
+        assert!(verify_is_loop_runnable("cargo test -p flywheel verdict::"));
+        assert!(verify_is_loop_runnable("cargo test -p flywheel loop_run_verify"));
+        assert!(verify_is_loop_runnable("cargo test --package flywheel verifier"));
+        assert!(verify_is_loop_runnable("pytest tests/test_gate.py"));
+        assert!(verify_is_loop_runnable("python -m pytest tests/test_x.py"));
+        assert!(verify_is_loop_runnable("timeout 300 cargo test -p flywheel verifier"));
+        assert!(verify_is_loop_runnable("sh -c \"timeout 60 cargo test -p flywheel verifier\""));
+        assert!(verify_is_loop_runnable("test -f Cargo.toml"));
+    }
+
+    /// Whole-workspace matrices, unbounded shells, and non-verification
+    /// commands are NOT loop-runnable.
+    #[test]
+    fn loop_run_verify_classifier_rejects_heavy_and_unbounded() {
+        assert!(!verify_is_loop_runnable("cargo test --workspace"));
+        assert!(!verify_is_loop_runnable("cargo test --all-features"));
+        assert!(!verify_is_loop_runnable("cargo test --all-targets"));
+        assert!(!verify_is_loop_runnable("cargo test"));
+        assert!(!verify_is_loop_runnable("cargo test --lib"));
+        assert!(!verify_is_loop_runnable("cargo build"));
+        assert!(!verify_is_loop_runnable("bash scripts/verify-gates.sh"));
+        assert!(!verify_is_loop_runnable("sh -c 'cargo test --workspace'"));
+        assert!(!verify_is_loop_runnable("sleep 3600"));
+        assert!(!verify_is_loop_runnable("git push"));
+        assert!(!verify_is_loop_runnable("npm run e2e"));
+    }
+
+    /// Shell composition and empty VERIFY are never loop-runnable.
+    #[test]
+    fn loop_run_verify_classifier_rejects_composition() {
+        assert!(!verify_is_loop_runnable(""));
+        assert!(!verify_is_loop_runnable("   "));
+        assert!(!verify_is_loop_runnable("cargo test -p flywheel verifier && echo done"));
+        assert!(!verify_is_loop_runnable("cargo test | tee out.txt"));
+        assert!(!verify_is_loop_runnable("cargo test; echo done"));
+        assert!(!verify_is_loop_runnable("cargo test\ncargo build"));
+        assert!(!verify_is_loop_runnable("cargo test `echo x`"));
+        assert!(!verify_is_loop_runnable("cargo test $(echo x)"));
+    }
+
+    /// Anti-forgery: the WORKER receipt helper refuses CommandVerified
+    /// outright (no arm dependency — always refused).
+    #[test]
+    fn worker_ledger_receipt_refuses_command_verified_kind() {
+        let dir = std::env::temp_dir().join(format!("lr-receipt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = write_receipt(&dir, "bd-x", "abc", VerdictKind::CommandVerified, "out")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("LOOP only"),
+            "worker must not write command-verified: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -801,6 +1028,14 @@ mod tests {
         // worker path: the loop reporter is unarmed -> rejected.
         let err = report_pass(&dir, &v).unwrap_err();
         assert!(err.to_string().contains("loop-only"), "{err}");
+        // Anti-forgery (bd-w1-loop-run-verify-mbbe): the machine receipt for
+        // the loop-run band is written by the LOOP only — refused while
+        // unarmed (a worker cannot forge what it does not write).
+        let err = write_command_verified_receipt(&dir, &bead_id, &sha, "ok\n").unwrap_err();
+        assert!(
+            err.to_string().contains("LOOP only"),
+            "unarmed loop writer must refuse: {err}"
+        );
         // loop path: armed -> recorded as a PASS gate row.
         arm_loop_reporter();
         report_pass(&dir, &v).unwrap();
@@ -820,6 +1055,15 @@ mod tests {
             )
             .unwrap()
         );
+        // Anti-forgery (armed path): the loop's machine receipt writes the
+        // exact filename once armed.
+        let path =
+            write_command_verified_receipt(&dir, &bead_id, &sha, "cargo test ... ok\n").unwrap();
+        assert_eq!(
+            path,
+            dir.join(format!(".flywheel/receipts/{bead_id}-{sha}.command-verified.txt"))
+        );
+        assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -840,13 +1084,13 @@ mod tests {
             &dir,
             "bd-x-1",
             "abc123",
-            VerdictKind::CommandVerified,
+            VerdictKind::WorkerReceipt,
             "all tests passed\n",
         )
         .unwrap();
         assert_eq!(
             path,
-            dir.join(".flywheel/receipts/bd-x-1-abc123.command-verified.txt")
+            dir.join(".flywheel/receipts/bd-x-1-abc123.worker-receipt.txt")
         );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -856,7 +1100,7 @@ mod tests {
             &dir,
             "bd-x-1",
             "abc123",
-            VerdictKind::CommandVerified,
+            VerdictKind::WorkerReceipt,
             "   \n",
         )
         .unwrap_err();
@@ -952,5 +1196,184 @@ mod tests {
                 "{f} must not use the bare-HEAD fallback (ADR-0019)"
             );
         }
+    }
+
+    // ---- bd-w1-reopen-f6tw: close-detect reopen decision ----
+
+    /// THE RED-THEN-GREEN FIXTURE: a worker closes with no gate row -> the
+    /// close-detect check says MISSING -> the loop reopens -> the bead is
+    /// back in `br ready`. (The reopen + mail side lives in the loop's
+    /// reopen leaf; the DECISION is this function.)
+    #[test]
+    fn close_check_reopens_when_worker_closes_without_gate_row() {
+        let (dir, bead_id) = scratch_workspace("reopen-red-green");
+        let cm = StdCommand::new("br")
+            .args(["close", &bead_id, "--reason", "worker says done"])
+            .current_dir(&dir)
+            .output()
+            .expect("br close");
+        assert!(cm.status.success(), "br close: {cm:?}");
+        match close_check(&dir, &bead_id).unwrap() {
+            CloseCheck::Missing {
+                sha,
+                receipt_eligible,
+            } => {
+                assert!(
+                    !receipt_eligible,
+                    "loop-runnable VERIFY is NOT WorkerReceipt-eligible"
+                );
+                assert!(!sha.is_empty(), "sha derived from the bead's commit");
+            }
+            other => panic!("expected Missing, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A legal verdict row bound to the derived sha -> leave closed.
+    /// NOTE: the gate row is recorded via direct `br gate report` (not
+    /// `report_pass`) — the loop-only guard is a process-global flag and
+    /// arming it here would race lane A's roundtrip test in parallel runs.
+    #[test]
+    fn close_check_legal_when_gate_row_binds_sha() {
+        let (dir, bead_id) = scratch_workspace("reopen-legal");
+        let sha = derive_head_sha(&dir, &bead_id).unwrap();
+        let gate = StdCommand::new("br")
+            .args([
+                "gate",
+                "report",
+                &bead_id,
+                "--gate",
+                "command-verified",
+                "--provider",
+                "flywheel-toron-loop1",
+                "--status",
+                "pass",
+                "--note",
+                &format!("sha={sha} receipt={}/x.txt", dir.display()),
+            ])
+            .current_dir(&dir)
+            .output()
+            .expect("br gate report");
+        assert!(gate.status.success(), "br gate report: {gate:?}");
+        let cm = StdCommand::new("br")
+            .args(["close", &bead_id, "--reason", "verified"])
+            .current_dir(&dir)
+            .output()
+            .expect("br close");
+        assert!(cm.status.success(), "br close: {cm:?}");
+        assert_eq!(
+            close_check(&dir, &bead_id).unwrap(),
+            CloseCheck::Legal { sha },
+            "gate row binds the sha -> legal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No commit carries the bead id -> the close is illegal regardless of
+    /// verdicts.
+    #[test]
+    fn close_check_no_commit_is_no_commit() {
+        let (dir, bead_id) = scratch_workspace("reopen-nocommit");
+        let cm = StdCommand::new("br")
+            .args(["close", &bead_id, "--reason", "no commit behind this"])
+            .current_dir(&dir)
+            .output()
+            .expect("br close");
+        assert!(cm.status.success(), "br close: {cm:?}");
+        // strip the only ref: git log --all now finds no commit
+        let strip = StdCommand::new("git")
+            .args(["update-ref", "-d", "HEAD"])
+            .current_dir(&dir)
+            .output()
+            .expect("git update-ref");
+        assert!(strip.status.success(), "git update-ref: {strip:?}");
+        assert_eq!(
+            close_check(&dir, &bead_id).unwrap(),
+            CloseCheck::NoCommit,
+            "no commit -> NoCommit (illegal close)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WorkerReceipt-eligible bead (VERIFY not loop-runnable): the check
+    /// grants the two-tick receipt grace instead of an instant reopen.
+    #[test]
+    fn close_check_grants_receipt_grace_when_worker_receipt_is_legal() {
+        let (dir, _bead1) = scratch_workspace("reopen-grace");
+        // a second bead whose VERIFY is NOT loop-runnable (shell composition)
+        let created = StdCommand::new("br")
+            .args([
+                "create",
+                "--title",
+                "receipt bead",
+                "--slug",
+                "receipt-b-1",
+                "-p",
+                "3",
+                "-d",
+                "work\n\n## VERIFY\n```\ncd x && cargo test -p y z\n```",
+            ])
+            .current_dir(&dir)
+            .output()
+            .expect("br create");
+        assert!(created.status.success(), "br create: {created:?}");
+        let list = StdCommand::new("br")
+            .args(["list", "--json"])
+            .current_dir(&dir)
+            .output()
+            .expect("br list");
+        let v: serde_json::Value = serde_json::from_slice(&list.stdout).expect("list json");
+        let bead_id = v["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["title"] == "receipt bead")
+            .expect("receipt bead")
+            .get("id")
+            .and_then(|s| s.as_str())
+            .expect("id")
+            .to_string();
+        std::fs::write(dir.join("receipt-work.txt"), "work\n").unwrap();
+        let add = StdCommand::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .expect("git add");
+        assert!(add.status.success());
+        let cm = StdCommand::new("git")
+            .args([
+                "-c",
+                "user.email=test@test",
+                "-c",
+                "user.name=test",
+                "commit",
+                "-q",
+                "-m",
+                &format!("feat: receipt bead ({bead_id})"),
+            ])
+            .current_dir(&dir)
+            .output()
+            .expect("git commit");
+        assert!(cm.status.success(), "git commit: {cm:?}");
+        let close = StdCommand::new("br")
+            .args(["close", &bead_id, "--reason", "receipt on the way"])
+            .current_dir(&dir)
+            .output()
+            .expect("br close");
+        assert!(close.status.success(), "br close: {close:?}");
+        match close_check(&dir, &bead_id).unwrap() {
+            CloseCheck::Missing {
+                sha,
+                receipt_eligible,
+            } => {
+                assert!(
+                    receipt_eligible,
+                    "non-runnable VERIFY bead MAY close via WorkerReceipt"
+                );
+                assert!(!sha.is_empty());
+            }
+            other => panic!("expected Missing(receipt-eligible), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
