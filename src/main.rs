@@ -23,6 +23,7 @@ mod models;
 mod output;
 mod pane;
 mod preflight;
+mod principles;
 mod profile;
 mod run_log;
 mod smart_cron;
