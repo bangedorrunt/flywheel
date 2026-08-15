@@ -2407,13 +2407,15 @@ fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
 /// kinds that merely share a prefix (`ocr`).
 fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Result<Vec<AgentInfo>> {
     let agents = c.agent_list()?;
-    let in_ws: Vec<AgentInfo> = agents
+    let mut in_ws: Vec<AgentInfo> = agents
         .into_iter()
         .filter(|a| a.workspace_id == ws_id)
         .collect();
     if in_ws.is_empty() {
         bail!("no agents in workspace {ws_id} — is the swarm spawned?");
     }
+    // bd-a2bw: nameless omp panes still resolve via the spawn registry.
+    overlay_registry_names(&mut in_ws, &state::load_spawn_registry(project));
     let avail: Vec<String> = in_ws
         .iter()
         .map(|a| a.name.clone().unwrap_or_default())
@@ -2487,13 +2489,15 @@ fn resolve_agents_dyn(
     to: &str,
 ) -> Result<Vec<AgentInfo>> {
     let agents = backend.agent_list()?;
-    let in_ws: Vec<AgentInfo> = agents
+    let mut in_ws: Vec<AgentInfo> = agents
         .into_iter()
         .filter(|a| a.workspace_id == ws_id)
         .collect();
     if in_ws.is_empty() {
         bail!("no agents in workspace {ws_id} — is the swarm spawned?");
     }
+    // bd-a2bw: nameless omp panes still resolve via the spawn registry.
+    overlay_registry_names(&mut in_ws, &state::load_spawn_registry(project));
     let avail: Vec<String> = in_ws
         .iter()
         .map(|a| a.name.clone().unwrap_or_default())
@@ -2628,9 +2632,10 @@ fn kind_nth_index(agents: &[AgentInfo], kind: &str, ordinal: u32) -> Option<usiz
 
 /// Indices of agents matched by the `--to` wants (bd-4pxy): name-based
 /// resolution is canonical (exact, numbered, or broadened); when a short's
-/// name target matches NOTHING, fall back to the ordinal-th agent OF THAT
-/// KIND. Order preserved, deduped. Pure — shared by the CLI and the
-/// backend-factory resolution paths.
+/// name target matches NOTHING, fall back to a pane-id exact match
+/// (bd-a2bw — `--to w70:p3` must hit a nameless omp pane), then the
+/// ordinal-th agent OF THAT KIND. Order preserved, deduped. Pure — shared
+/// by the CLI and the backend-factory resolution paths.
 fn match_indices(agents: &[AgentInfo], wants: &[WantToken]) -> Vec<usize> {
     let mut out = vec![false; agents.len()];
     for want in wants {
@@ -2649,6 +2654,10 @@ fn match_indices(agents: &[AgentInfo], wants: &[WantToken]) -> Vec<usize> {
             for i in name_hits {
                 out[i] = true;
             }
+        } else if let Some(i) = agents.iter().position(|a| a.pane_id == want.name) {
+            // bd-a2bw: pane-id tokens never sit in `a.name`. Match the pane
+            // even when herdr reports name=null (omp profile splits).
+            out[i] = true;
         } else if let Some(short) = &want.short
             && let Some(i) = kind_nth_index(agents, short, want.ordinal)
         {
@@ -2664,6 +2673,62 @@ fn match_indices(agents: &[AgentInfo], wants: &[WantToken]) -> Vec<usize> {
 
 fn agent_target(a: &AgentInfo) -> &str {
     a.name.as_deref().unwrap_or(a.pane_id.as_str())
+}
+
+/// bd-a2bw / ADR-0018: herdr omp panes drop names (bd-w17). Fill null
+/// names from the spawn registry so `--to coder3` matches after overlay
+/// even though herdr kind stays `omp`.
+fn overlay_registry_names(agents: &mut [AgentInfo], entries: &[state::SpawnEntry]) {
+    for a in agents.iter_mut() {
+        if a.name.is_some() {
+            continue;
+        }
+        if let Some(e) = entries.iter().find(|e| e.pane_id == a.pane_id) {
+            a.name = Some(e.name.clone());
+        }
+    }
+}
+
+/// bd-a2bw: resolve a send/rebind token to a spawn-registry row. Accepts
+/// the herdr name, a pane id, or a numbered short (`coder3` →
+/// `flywheel-<base>-coder3`).
+fn registry_entry_for_token<'a>(
+    entries: &'a [state::SpawnEntry],
+    project: &str,
+    token: &str,
+) -> Option<&'a state::SpawnEntry> {
+    let t = token.trim();
+    if t.is_empty() {
+        return None;
+    }
+    entries
+        .iter()
+        .find(|e| e.name == t || e.pane_id == t)
+        .or_else(|| {
+            let want = to_want_token(project, t);
+            entries.iter().find(|e| e.name == want.name)
+        })
+}
+
+/// bd-a2bw: herdr `launch_pending` is stale when the pane is already
+/// input-ready (omp at `π >` with a session, status idle/working/blocked/
+/// done). Spawn/send must not treat that as still-booting.
+fn is_still_booting(a: &AgentInfo) -> bool {
+    if !a.launch_pending {
+        return false;
+    }
+    if a.interactive_ready
+        && matches!(
+            a.agent_status,
+            AgentStatus::Idle
+                | AgentStatus::Working
+                | AgentStatus::Blocked
+                | AgentStatus::Done
+        )
+    {
+        return false;
+    }
+    true
 }
 
 /// Log an event with a compact payload.
@@ -4813,7 +4878,7 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
             let agents = c.agent_list()?;
             let pending: Vec<AgentInfo> = agents
                 .iter()
-                .filter(|a| a.workspace_id == ws.workspace_id && a.launch_pending)
+                .filter(|a| a.workspace_id == ws.workspace_id && is_still_booting(a))
                 .cloned()
                 .collect();
             if pending.is_empty() {
@@ -6281,6 +6346,22 @@ fn spawn_kinds_from_log(project: &str) -> std::collections::HashMap<String, Stri
     kinds
 }
 
+/// bd-a2bw: recover must probe/respawn with the registry harness first.
+/// Profile coder panes run `omp`; the event-log fallback is `opencode`,
+/// so a live omp looks process-dead and recover tries to start a second
+/// harness in the same pane.
+fn recover_probe_kind<'a>(
+    entry: &'a state::SpawnEntry,
+    log_kinds: &'a std::collections::HashMap<String, String>,
+) -> &'a str {
+    entry
+        .harness
+        .as_deref()
+        .filter(|h| !h.is_empty())
+        .or_else(|| log_kinds.get(&entry.name).map(String::as_str))
+        .unwrap_or("opencode")
+}
+
 /// bd-a8i: window for the responsiveness probe — long enough for a live
 /// agent's `state_change_seq` to advance on idle churn, short enough that
 /// `cmd_recover` stays snappy across many agents.
@@ -6360,7 +6441,7 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
     let mut healthy = 0usize;
     for entry in &entries {
         let (pane_id, name) = (&entry.pane_id, &entry.name);
-        let kind = kinds.get(name).map(String::as_str).unwrap_or("opencode");
+        let kind = recover_probe_kind(entry, &kinds);
         let live = agents
             .iter()
             .find(|a| a.pane_id == *pane_id && a.workspace_id == ws_id);
@@ -6455,7 +6536,7 @@ fn rebind_from_registry(
     ws_id: &str,
 ) -> Result<bool> {
     let entries = state::load_spawn_registry(project);
-    let Some(entry) = entries.iter().find(|e| e.name == name) else {
+    let Some(entry) = registry_entry_for_token(&entries, project, name) else {
         return Ok(false);
     };
     let pane_id = &entry.pane_id;
@@ -6540,9 +6621,23 @@ fn cmd_send(
         // bd-fw-name-binding-loss-7rc auto-heal: an agent that restarted in
         // its pane lost its name binding — restore from the spawn registry
         // (best-effort) and re-resolve before reporting the miss.
+        let backend = backend::multiplexer_backend(cfg)?;
         for tok in to.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            let _ =
-                rebind_from_registry(&*backend::multiplexer_backend(cfg)?, project, tok, &ws_id);
+            let _ = rebind_from_registry(&*backend, project, tok, &ws_id);
+        }
+        // bd-a2bw: also rebind every nameless pane in the workspace — a
+        // `--to coder3` miss must not depend on the token already being
+        // the full herdr name.
+        if let Ok(live) = c.agent_list() {
+            let entries = state::load_spawn_registry(project);
+            for a in live
+                .iter()
+                .filter(|a| a.workspace_id == ws_id && a.name.is_none())
+            {
+                if let Some(e) = entries.iter().find(|e| e.pane_id == a.pane_id) {
+                    let _ = c.agent_rename(&a.pane_id, &e.name);
+                }
+            }
         }
         targets = resolve_agents(&mut c, &ws_id, project, to);
     }
@@ -6738,10 +6833,7 @@ fn status_label(launch_pending: bool, status: &str) -> String {
 /// bd-4pxy: the spawn-readiness failure — names the `launch_pending` field
 /// and every agent still pending. `None` when all agents are launch-ready.
 fn launch_pending_error(agents: &[AgentInfo]) -> Option<String> {
-    let pending: Vec<&AgentInfo> = agents
-        .iter()
-        .filter(|a| a.launch_pending)
-        .collect();
+    let pending: Vec<&AgentInfo> = agents.iter().filter(|a| is_still_booting(a)).collect();
     if pending.is_empty() {
         return None;
     }
@@ -6826,7 +6918,11 @@ mod bd_4pxy_tests {
 
     #[test]
     fn launch_pending_error_names_field_and_agent() {
-        let pending = agent(Some("omp"), Some("flywheel-flywheel-coder"), "w1", true, AgentStatus::Idle);
+        // bd-a2bw: a truly-booting agent is launch_pending AND not yet
+        // interactive_ready. Idle + ready with launch_pending set is stale
+        // (covered by is_still_booting_ignores_stale_launch_pending).
+        let mut pending = agent(Some("omp"), Some("flywheel-flywheel-coder"), "w1", true, AgentStatus::Unknown);
+        pending.interactive_ready = false;
         let ready = agent(Some("oc"), Some("flywheel-flywheel-oc"), "w1", false, AgentStatus::Idle);
         let msg = launch_pending_error(&[pending, ready]).expect("pending agent names the error");
         assert!(msg.contains("launch_pending"), "{msg}");
@@ -6882,6 +6978,170 @@ mod bd_4pxy_tests {
         let oc2 = agent(Some("oc"), Some("flywheel-flywheel-oc2"), "w1", false, AgentStatus::Idle);
         let agents = vec![oc, oc2];
         assert_eq!(match_indices(&agents, &[to_want_token("flywheel", "oc")]), vec![0, 1]);
+    }
+
+    fn agent_on_pane(
+        kind: Option<&str>,
+        name: Option<&str>,
+        pane_id: &str,
+        pending: bool,
+        status: AgentStatus,
+        ready: bool,
+    ) -> AgentInfo {
+        let mut a = agent(kind, name, "w70", pending, status);
+        a.pane_id = pane_id.to_string();
+        a.interactive_ready = ready;
+        a
+    }
+
+    /// bd-a2bw: `--to w70:p3` must hit the pane even when herdr name is null
+    /// (omp profile split; ADR-0018 seq-1 suffix-less names never land as
+    /// the herdr name on later splits).
+    #[test]
+    fn match_indices_resolves_pane_id_when_name_null() {
+        let p1 = agent_on_pane(
+            Some("omp"),
+            Some("flywheel-toron-coder"),
+            "w70:p1",
+            false,
+            AgentStatus::Idle,
+            true,
+        );
+        let p3 = agent_on_pane(Some("omp"), None, "w70:p3", false, AgentStatus::Working, true);
+        let agents = vec![p1, p3];
+        assert_eq!(
+            match_indices(&agents, &[to_want_token("toron", "w70:p3")]),
+            vec![1],
+            "--to pane id must match AgentInfo.pane_id when name is null"
+        );
+        assert_eq!(
+            match_indices(&agents, &[to_want_token("toron", "w70:p1")]),
+            vec![0]
+        );
+    }
+
+    /// bd-a2bw: `--to coder1` is suffix-less (ADR-0018); `--to coder3`
+    /// resolves after overlaying the spawn-registry name onto a nameless
+    /// omp pane (herdr kind stays `omp`, so kind fallback cannot save us).
+    #[test]
+    fn overlay_registry_names_lets_coder_short_hit_nameless_omp() {
+        assert_eq!(
+            to_want_token("toron", "coder1").name,
+            "flywheel-toron-coder"
+        );
+        assert_eq!(
+            to_want_token("toron", "coder3").name,
+            "flywheel-toron-coder3"
+        );
+        let mut agents = vec![
+            agent_on_pane(
+                Some("omp"),
+                Some("flywheel-toron-coder"),
+                "w70:p1",
+                false,
+                AgentStatus::Idle,
+                true,
+            ),
+            agent_on_pane(Some("omp"), None, "w70:p3", false, AgentStatus::Idle, true),
+        ];
+        let entries = vec![
+            state::SpawnEntry::profiled(
+                "w70:p1",
+                "flywheel-toron-coder",
+                "coder",
+                "omp",
+                Some("flywheel-toron-coder".into()),
+            ),
+            state::SpawnEntry::profiled(
+                "w70:p3",
+                "flywheel-toron-coder3",
+                "coder",
+                "omp",
+                Some("flywheel-toron-coder3".into()),
+            ),
+        ];
+        overlay_registry_names(&mut agents, &entries);
+        assert_eq!(agents[1].name.as_deref(), Some("flywheel-toron-coder3"));
+        assert_eq!(
+            match_indices(&agents, &[to_want_token("toron", "coder3")]),
+            vec![1]
+        );
+        assert_eq!(
+            match_indices(&agents, &[to_want_token("toron", "coder1")]),
+            vec![0]
+        );
+        assert_eq!(
+            registry_entry_for_token(&entries, "toron", "w70:p3")
+                .map(|e| e.name.as_str()),
+            Some("flywheel-toron-coder3")
+        );
+        assert_eq!(
+            registry_entry_for_token(&entries, "toron", "coder3")
+                .map(|e| e.name.as_str()),
+            Some("flywheel-toron-coder3")
+        );
+    }
+
+    /// bd-a2bw: omp at `π >` with a session is idle + interactive_ready;
+    /// herdr may still report launch_pending. That bit is stale — send
+    /// must proceed.
+    #[test]
+    fn is_still_booting_ignores_stale_launch_pending() {
+        let stale = agent_on_pane(
+            Some("omp"),
+            None,
+            "w70:p2",
+            true,
+            AgentStatus::Idle,
+            true,
+        );
+        assert!(
+            !is_still_booting(&stale),
+            "idle + interactive_ready is not booting even if launch_pending"
+        );
+        let booting = agent_on_pane(
+            Some("omp"),
+            None,
+            "w70:p2",
+            true,
+            AgentStatus::Unknown,
+            false,
+        );
+        assert!(is_still_booting(&booting));
+        assert!(!is_still_booting(&agent_on_pane(
+            Some("omp"),
+            Some("flywheel-toron-coder"),
+            "w70:p1",
+            false,
+            AgentStatus::Idle,
+            true,
+        )));
+        assert!(launch_pending_error(&[stale]).is_none());
+        assert!(launch_pending_error(&[booting]).is_some());
+    }
+
+    #[test]
+    fn recover_probe_kind_prefers_registry_harness() {
+        let entry = state::SpawnEntry::profiled(
+            "w70:p1",
+            "flywheel-toron-coder",
+            "coder",
+            "omp",
+            Some("flywheel-toron-coder".into()),
+        );
+        let empty = std::collections::HashMap::new();
+        assert_eq!(recover_probe_kind(&entry, &empty), "omp");
+        let mut log = std::collections::HashMap::new();
+        log.insert("flywheel-toron-coder".into(), "opencode".into());
+        assert_eq!(
+            recover_probe_kind(&entry, &log),
+            "omp",
+            "registry harness beats a stale spawn-log kind"
+        );
+        let legacy = state::SpawnEntry::legacy("w70:p1", "flywheel-toron-oc");
+        assert_eq!(recover_probe_kind(&legacy, &empty), "opencode");
+        log.insert("flywheel-toron-oc".into(), "pi".into());
+        assert_eq!(recover_probe_kind(&legacy, &log), "pi");
     }
 }
 
