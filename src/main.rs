@@ -718,6 +718,34 @@ enum Commands {
     /// close ILLEGAL + mail names the missing commit
     #[command(name = "__verify-close-sha", hide = true)]
     __VerifyCloseSha { project: String, bead_id: String },
+    /// internal: verifier-dispatch leaf (ADR-0019 Spec 4,
+    /// bd-w1-verifier-degrade-a6fk) — decide the independent-verifier plan
+    /// for a bead that needs one; on single-family degrade, block the bead
+    /// `verifier-family-missing` + mail the captain exactly once (marker-
+    /// deduped) + never respawn. Prints
+    /// `{"plan":"none-required"|"degrade"|"dispatch","model":M}`.
+    #[command(name = "__verify-dispatch", hide = true)]
+    __VerifyDispatch {
+        project: String,
+        bead_id: String,
+        /// worker model id (absent -> unknown family: every candidate is a
+        /// different family)
+        #[arg(long)]
+        worker_model: Option<String>,
+        /// candidate verifier model ids, comma-separated (default: every
+        /// registered model in the registry)
+        #[arg(long)]
+        candidates: Option<String>,
+        /// blast radius: normal|high (default normal)
+        #[arg(long, value_parser = ["normal", "high"], default_value = "normal")]
+        blast: String,
+        /// AC shape: checkable|judgment (default checkable)
+        #[arg(long, value_parser = ["checkable", "judgment"], default_value = "checkable")]
+        ac: String,
+        /// repo dir (default: the project dir from config)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
     /// internal: the project's active reservation board (ADR-0019 Spec
     /// 3.4/3.5, bd-w1-reserve-serialize-2mam) — serialize-on-overlap data
     #[command(name = "__reservation-board", hide = true)]
@@ -3268,6 +3296,24 @@ fn main() {
         Some(Commands::__VerifyCloseSha { project, bead_id }) => {
             cmd_internal_verify_close_sha(&cfg, project, bead_id)
         }
+        Some(Commands::__VerifyDispatch {
+            project,
+            bead_id,
+            worker_model,
+            candidates,
+            blast,
+            ac,
+            dir,
+        }) => cmd_internal_verify_dispatch(
+            &cfg,
+            project,
+            bead_id,
+            worker_model.as_deref(),
+            candidates.as_deref(),
+            blast,
+            ac,
+            dir.as_deref(),
+        ),
         Some(Commands::__ReservationBoard { project }) => {
             cmd_internal_reservation_board(&cfg, project)
         }
@@ -11161,6 +11207,179 @@ fn cmd_loop(
 }
 
 #[cfg(test)]
+mod verifier_dispatch_tests {
+    use super::*;
+
+    /// Scratch workspace: git + br + one bead with a `## VERIFY` fence.
+    fn scratch_vd(dir: &Path, slug: &str, priority: &str) -> String {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .output()
+            .expect("git init");
+        assert!(init.status.success());
+        let bi = std::process::Command::new("br")
+            .arg("init")
+            .current_dir(dir)
+            .output()
+            .expect("br init");
+        assert!(bi.status.success());
+        let created = std::process::Command::new("br")
+            .args([
+                "create",
+                "--title",
+                "vd",
+                "--slug",
+                slug,
+                "-p",
+                priority,
+                "-d",
+                "work\n\n## VERIFY\n```\ncargo test -p flywheel verifier\n```",
+            ])
+            .current_dir(dir)
+            .output()
+            .expect("br create");
+        assert!(
+            created.status.success(),
+            "br create: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let list = std::process::Command::new("br")
+            .args(["list", "--json"])
+            .current_dir(dir)
+            .output()
+            .expect("br list");
+        let v: Value = serde_json::from_slice(&list.stdout).expect("br list json");
+        v["issues"][0]["id"].as_str().expect("id").to_string()
+    }
+
+    fn status_of(dir: &Path, bead_id: &str) -> String {
+        let out = std::process::Command::new("br")
+            .args(["show", bead_id, "--json"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        v[0]["status"].as_str().unwrap_or("").to_string()
+    }
+
+    /// A config whose mail backend fails FAST (daemon at port 1) so the
+    /// degrade test never stalls on a real relay round-trip.
+    fn no_mail_cfg() -> Config {
+        Config {
+            mail: Some(crate::config::MailSections {
+                toron: Some(crate::config::MailServerConfig {
+                    url: Some("http://127.0.0.1:1".to_string()),
+                    token: None,
+                }),
+                agentmail: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn write_registry(toml: &str) {
+        let cfg_dir = crate::config::config_dir();
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(cfg_dir.join("models.toml"), toml).unwrap();
+    }
+
+    /// Fixture 3 (ADR-0019 Spec 4): single-family swarm + P0 bead ->
+    /// blocked `verifier-family-missing`; idempotent on re-invocation;
+    /// never reopened/respawned.
+    #[test]
+    fn single_family_p0_is_blocked_not_reopened() {
+        let _g = crate::config::lock_env();
+        let cfg = no_mail_cfg();
+        let dir = std::env::temp_dir().join(format!("vd-degrade-{}", std::process::id()));
+        let bead_id = scratch_vd(&dir, "vd-deg", "0");
+        write_registry(
+            "[models.deepseek-v4]\nprovider = \"deepseek\"\n[models.deepseek-v3]\nprovider = \"deepseek\"\n",
+        );
+        let out = cmd_internal_verify_dispatch(
+            &cfg,
+            "vd-test",
+            &bead_id,
+            Some("deepseek-v4"),
+            Some("deepseek-v4,deepseek-v3"),
+            "normal",
+            "checkable",
+            Some(&dir),
+        );
+        assert!(out.is_ok(), "{out:?}");
+        assert_eq!(status_of(&dir, &bead_id), "blocked");
+        // Re-invocation is idempotent (still ok, still blocked, no reopen).
+        let out2 = cmd_internal_verify_dispatch(
+            &cfg,
+            "vd-test",
+            &bead_id,
+            Some("deepseek-v4"),
+            Some("deepseek-v4,deepseek-v3"),
+            "normal",
+            "checkable",
+            Some(&dir),
+        );
+        assert!(out2.is_ok(), "{out2:?}");
+        assert_eq!(status_of(&dir, &bead_id), "blocked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fixture 1 (decision half): P0 with a second family -> dispatch the
+    /// different-family model; the bead is NOT blocked.
+    #[test]
+    fn p0_with_second_family_dispatches_and_is_not_blocked() {
+        let _g = crate::config::lock_env();
+        let cfg = no_mail_cfg();
+        let dir = std::env::temp_dir().join(format!("vd-dispatch-{}", std::process::id()));
+        let bead_id = scratch_vd(&dir, "vd-disp", "0");
+        write_registry(
+            "[models.deepseek-v4]\nprovider = \"deepseek\"\n[models.opus-5]\nprovider = \"anthropic\"\n",
+        );
+        let out = cmd_internal_verify_dispatch(
+            &cfg,
+            "vd-test",
+            &bead_id,
+            Some("deepseek-v4"),
+            Some("deepseek-v4,opus-5"),
+            "normal",
+            "checkable",
+            Some(&dir),
+        );
+        assert!(out.is_ok(), "{out:?}");
+        assert_ne!(status_of(&dir, &bead_id), "blocked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cheap band (P3, normal, loop-runnable): none-required — no side
+    /// effect even in a single-family swarm (the loop verifies itself).
+    #[test]
+    fn cheap_band_is_none_required() {
+        let _g = crate::config::lock_env();
+        let cfg = no_mail_cfg();
+        let dir = std::env::temp_dir().join(format!("vd-cheap-{}", std::process::id()));
+        let bead_id = scratch_vd(&dir, "vd-cheap", "3");
+        write_registry(
+            "[models.deepseek-v4]\nprovider = \"deepseek\"\n[models.deepseek-v3]\nprovider = \"deepseek\"\n",
+        );
+        let out = cmd_internal_verify_dispatch(
+            &cfg,
+            "vd-test",
+            &bead_id,
+            Some("deepseek-v4"),
+            Some("deepseek-v4,deepseek-v3"),
+            "normal",
+            "checkable",
+            Some(&dir),
+        );
+        assert!(out.is_ok(), "{out:?}");
+        assert_ne!(status_of(&dir, &bead_id), "blocked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod loop_tests {
     use super::*;
 
@@ -18490,6 +18709,177 @@ fn cmd_internal_reservation_board(cfg: &Config, project: &str) -> Result<()> {
     };
     print_json(&v);
     Ok(())
+}
+
+/// internal leaf: verifier-dispatch (ADR-0019 Spec 4,
+/// bd-w1-verifier-degrade-a6fk). Computes the independent-verifier plan for
+/// `bead_id`:
+/// - `none-required`: the loop-run / worker-receipt band already covers it.
+/// - `dispatch`: return the resolved model (different family, or the
+///   captain's `verifier_family_override`); the loop spawns the reviewer
+///   pane on it (one reusable verifier pane per project, headless preferred).
+/// - `degrade`: block the bead `verifier-family-missing` (idempotent) + mail
+///   the captain exactly once (`.flywheel/verifier-family-missing-<id>.mailed`
+///   marker dedup) + NEVER respawn — the single-family swarm path.
+/// Always exits 0 — a block/mail hiccup must not kill the loop.
+fn cmd_internal_verify_dispatch(
+    cfg: &Config,
+    project: &str,
+    bead_id: &str,
+    worker_model: Option<&str>,
+    candidates: Option<&str>,
+    blast: &str,
+    ac: &str,
+    dir: Option<&Path>,
+) -> Result<()> {
+    let key = match dir {
+        Some(p) => p.to_path_buf(),
+        None => PathBuf::from(project_dir_str(cfg, project)?),
+    };
+    let mut bead = match verdict::bead_from_br_show(&key, bead_id) {
+        Ok(b) => b,
+        Err(e) => {
+            // Unreadable bead (wrong dir / missing fence): report and let the
+            // loop continue; never kill the loop on a lookup hiccup.
+            eprintln!(
+                "flywheel: verifier-dispatch for {bead_id} bead lookup failed (continuing): {e}"
+            );
+            print_json(&json!({ "plan": "none-required", "bead_id": bead_id, "error": format!("{e}") }));
+            return Ok(());
+        }
+    };
+    bead.blast = if blast == "high" {
+        verdict::Blast::High
+    } else {
+        verdict::Blast::Normal
+    };
+    let ac = if ac == "judgment" {
+        verdict::AcShape::Judgment
+    } else {
+        verdict::AcShape::Checkable
+    };
+    let reg = match crate::models::ModelRegistry::load() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "flywheel: verifier-dispatch for {bead_id} registry load failed (continuing): {e}"
+            );
+            print_json(&json!({ "plan": "none-required", "bead_id": bead_id, "error": format!("{e}") }));
+            return Ok(());
+        }
+    };
+    let cands: Vec<&str> = match candidates {
+        Some(c) => c.split(',').filter(|s| !s.is_empty()).collect(),
+        None => reg.models.keys().map(String::as_str).collect(),
+    };
+    let plan = reg.verifier_plan(
+        &bead,
+        ac,
+        worker_model.unwrap_or("unknown"),
+        &cands,
+        cfg.verifier_family_override(),
+    );
+    match plan {
+        crate::models::VerifierPlan::NoneRequired => {
+            print_json(&json!({ "plan": "none-required", "bead_id": bead_id }));
+            Ok(())
+        }
+        crate::models::VerifierPlan::Dispatch(model) => {
+            print_json(&json!({ "plan": "dispatch", "bead_id": bead_id, "model": model }));
+            Ok(())
+        }
+        crate::models::VerifierPlan::Degrade => {
+            // Block (idempotent — an already-blocked bead stays blocked).
+            let block = std::process::Command::new("br")
+                .args([
+                    "update",
+                    bead_id,
+                    "--status=blocked",
+                    "--transition-comment",
+                    &format!(
+                        "verifier-family-missing (ADR-0019 Spec 4): no second model family in the \
+                         registry and no verifier_family_override — bead blocked, captain mailed \
+                         once, no respawn"
+                    ),
+                ])
+                .current_dir(&key)
+                .output();
+            let blocked = match block {
+                Ok(o) => o.status.success(),
+                Err(_) => false,
+            };
+            // One captain mail, deduped by marker file (durable across loop
+            // invocations; the caller's dedup set covers one-per-invocation).
+            let mut mailed = false;
+            let marker = key.join(".flywheel").join(format!("verifier-family-missing-{bead_id}.mailed"));
+            if !marker.exists() {
+                let key_str = key.to_string_lossy().into_owned();
+                let captain = cfg
+                    .agent_mail
+                    .as_ref()
+                    .and_then(|m| m.name.clone())
+                    .unwrap_or_else(|| "Flywheel".to_string());
+                if let Ok(mail) = backend::mail_backend(cfg) {
+                    let out = (|| -> Result<backend::SendReceipt> {
+                        backend::run_mail(mail.ensure_project(&key_str)).map_err(|e| anyhow!("{e}"))?;
+                        send_verifier_family_missing_mail(&*mail, &key_str, bead_id, &captain)
+                    })();
+                    mailed = out.is_ok();
+                    if let Err(me) = out {
+                        eprintln!(
+                            "flywheel: verifier-family-missing mail for {bead_id} failed (continuing): {me:#}"
+                        );
+                    }
+                }
+                if mailed
+                    && let Some(parent) = marker.parent()
+                {
+                    let _ = std::fs::create_dir_all(parent);
+                    let _ = std::fs::write(&marker, "1");
+                }
+            }
+            print_json(&json!({
+                "plan": "degrade",
+                "bead_id": bead_id,
+                "blocked": blocked,
+                "mailed": mailed,
+                "reason": crate::models::VERIFIER_FAMILY_MISSING,
+            }));
+            Ok(())
+        }
+    }
+}
+
+/// The verifier-family-missing mail: thread = the bead id (ADR-0019 Spec 0),
+/// recipient = the configured orchestrator/captain identity. Exactly once per
+/// bead via the marker dedup in the caller.
+fn send_verifier_family_missing_mail(
+    mail: &dyn backend::MailSurface,
+    key: &str,
+    bead_id: &str,
+    captain: &str,
+) -> Result<backend::SendReceipt> {
+    let captain = captain.to_string();
+    let subject = format!("[{bead_id}] verifier family missing — bead blocked");
+    let body = format!(
+        "Bead **{bead_id}** needs an independent verifier (priority <= 1, high blast, or \
+         judgment AC) but the model registry cannot supply a second model family and no \
+         `verifier_family_override` is set. Blocked `verifier-family-missing` \
+         (ADR-0019 Spec 4).\n\n\
+         Fixes: register a model from another provider in `models.toml`, or set \
+         `[loop] verifier_family_override` in the flywheel config to allow the same family. \
+         The bead was NOT reopened — no respawn loop."
+    );
+    mail_send(
+        mail,
+        key,
+        std::slice::from_ref(&captain),
+        &subject,
+        &body,
+        "high",
+        true,
+        Some(bead_id),
+    )
 }
 
 fn cmd_internal_verify_close_sha(cfg: &Config, project: &str, bead_id: &str) -> Result<()> {

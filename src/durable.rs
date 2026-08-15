@@ -348,6 +348,60 @@ async fn verify_close_sha(args: VerifyCloseShaArgs) -> Result<Value> {
         .unwrap_or_else(|_| serde_json::json!({ "raw": raw.trim() })))
 }
 
+/// Args for the `__verify-dispatch` leaf (ADR-0019 Spec 4,
+/// bd-w1-verifier-degrade-a6fk).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyDispatchArgs {
+    pub project: String,
+    pub bead_id: String,
+    /// Worker model id; absent -> unknown family (every candidate is a
+    /// different family).
+    #[serde(default)]
+    pub worker_model: Option<String>,
+    /// Candidate verifier model ids; absent -> every registered model.
+    #[serde(default)]
+    pub candidates: Option<Vec<String>>,
+    #[serde(default)]
+    pub blast: Option<String>,
+    #[serde(default)]
+    pub ac: Option<String>,
+}
+
+/// Checkpointed leaf — close-detect verifier dispatch: decide the
+/// independent-verifier plan for a closed bead that needs one. Degrade
+/// (single-family swarm) blocks the bead `verifier-family-missing` + mails
+/// the captain exactly once (marker-deduped) + never respawns. Returns
+/// `{plan: none-required|degrade|dispatch, model?}`. Always exits 0 — a
+/// block/mail hiccup must never kill the loop.
+#[function]
+async fn verify_dispatch(args: VerifyDispatchArgs) -> Result<Value> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__verify-dispatch", &args.project, &args.bead_id]);
+    if let Some(w) = &args.worker_model {
+        cmd.args(["--worker-model", w]);
+    }
+    if let Some(c) = &args.candidates {
+        cmd.args(["--candidates", &c.join(",")]);
+    }
+    if let Some(b) = &args.blast {
+        cmd.args(["--blast", b]);
+    }
+    if let Some(a) = &args.ac {
+        cmd.args(["--ac", a]);
+    }
+    let out = run_leaf_cmd(cmd, "__verify-dispatch").await?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__verify-dispatch failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    Ok(serde_json::from_str(raw.trim())
+        .unwrap_or_else(|_| serde_json::json!({ "raw": raw.trim() })))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadyArgs {
     pub project: String,
@@ -3063,6 +3117,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // ADR-0019 (bd-w1-sha-xyhd): closed beads whose close-detect SHA check
     // already ran this invocation (same replay-rebuilt dedup contract).
     let mut close_sha_checked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // ADR-0019 Spec 4 (bd-w1-verifier-degrade-a6fk): closed beads whose
+    // verifier-dispatch decision already ran this invocation. Degrade mails
+    // the captain once per bead — the marker file is the durable dedup.
+    let mut verifier_dispatched: std::collections::HashSet<String> = std::collections::HashSet::new();
     // bd-efk1: claim-watch nudge sends collected during work-mode sourcing,
     // merged into the action list AFTER plan_actions (they target specific
     // agents — including WORKING ones — and must not be double-filtered by
@@ -3550,6 +3608,47 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 }
                                 Err(e) => eprintln!(
                                     "flywheel: verify-close-sha for {bead_id} failed (continuing): {e}"
+                                ),
+                            }
+                        }
+                        // ADR-0019 Spec 4 (bd-w1-verifier-degrade-a6fk): a
+                        // closed bead that needs independent verification
+                        // (priority <= 1, high blast, judgment AC) gets its
+                        // verifier plan decided once per invocation. Degrade
+                        // blocks the bead verifier-family-missing + mails the
+                        // captain once (marker-deduped) + never respawns;
+                        // dispatch returns the reviewer model for the pane.
+                        if verifier_dispatched.insert(bead_id.clone()) {
+                            let v_args = VerifyDispatchArgs {
+                                project: params.project.clone(),
+                                bead_id: bead_id.clone(),
+                                worker_model: None,
+                                candidates: None,
+                                blast: None,
+                                ac: None,
+                            };
+                            match ctx.run(verify_dispatch, v_args).await {
+                                Ok(v) => {
+                                    let plan = v
+                                        .get("plan")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("?");
+                                    if plan == "degrade" {
+                                        eprintln!(
+                                            "flywheel: bead {bead_id} blocked verifier-family-missing (single-family swarm; captain mailed once)"
+                                        );
+                                    } else if plan == "dispatch" {
+                                        let model = v
+                                            .get("model")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("?");
+                                        eprintln!(
+                                            "flywheel: bead {bead_id} needs an independent verifier on {model} (reviewer pane dispatch, ADR-0019 Spec 4)"
+                                        );
+                                    }
+                                }
+                                Err(e) => eprintln!(
+                                    "flywheel: verifier-dispatch for {bead_id} failed (continuing): {e}"
                                 ),
                             }
                         }
@@ -4355,6 +4454,9 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
         .register(verify_close_sha)
         .map_err(|e| anyhow::anyhow!("register verify_close_sha: {e}"))?;
     resonate
+        .register(verify_dispatch)
+        .map_err(|e| anyhow::anyhow!("register verify_dispatch: {e}"))?;
+    resonate
         .register(reservation_board)
         .map_err(|e| anyhow::anyhow!("register reservation_board: {e}"))?;
     resonate
@@ -4705,6 +4807,9 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // ADR-0019 (bd-w1-sha-xyhd): closed beads whose close-detect SHA check
     // already ran this invocation (same replay-rebuilt dedup contract).
     let mut close_sha_checked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // ADR-0019 Spec 4 (bd-w1-verifier-degrade-a6fk): closed beads whose
+    // verifier-dispatch decision already ran this invocation.
+    let mut verifier_dispatched: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut watch_sends: Vec<LoopAction> = Vec::new();
 
     loop {
@@ -5436,6 +5541,9 @@ pub async fn run_engine_loop(cfg: &Config, mut params: LoopParams) -> anyhow::Re
     resonate
         .register(verify_close_sha)
         .map_err(|e| anyhow::anyhow!("register verify_close_sha: {e}"))?;
+    resonate
+        .register(verify_dispatch)
+        .map_err(|e| anyhow::anyhow!("register verify_dispatch: {e}"))?;
     resonate
         .register(reservation_board)
         .map_err(|e| anyhow::anyhow!("register reservation_board: {e}"))?;
