@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Coalition CLI (ADR-0011, `bd-foh8.3a`, 2026-08-10)** — `flywheel coalition
   {register,form,status,list,intent,reserve,detect,auto-coalesce,negotiate-*,disband}` over the
   intent/soft-conflict substrate.
+- **prime-agent (pa) as a spawnable harness (H1, `bd-harness-prime-agent-818f`, 2026-08-15)** —
+  compiled-in `pa` profile + `[harness.pa]` spawn recipe (`prime-agent --offline`); when herdr
+  rejects an unknown kind (`unsupported_agent_kind`), `start_agent_with_retry[(_dyn)]` falls back
+  to `pane.run` the recipe with shell-quoted launch args and waits/renames. prime-agent's built-in
+  herdr socket extension self-reports lifecycle (hook-authority Accept route; verified smoke: spawn
+  → agent listed as `prime-agent`, boot prime answered READY). `agent.prompt` remains blocked
+  upstream (herdr closed Agent enum; kind request: herdrdev/herdr#2840).
 - **Crew/agent model rework (`bd-42fs`, 2026-08-10)** — all profiles default harness `omp`;
   per-role models (oracle=glm-5.2/max/fb grok-4.5, planner/coder/reviewer/housekeeper=
   deepseek-v4-flash, scout=big-pickle), effort-tuned, retry-on-429 fallback wired. Per-step

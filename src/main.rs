@@ -46,10 +46,11 @@ use serde_json::{Value, json};
 
 use config::{Config, Recipe, WorkflowStep};
 use herdr_shim::{
-    AgentInfo, AgentStatus, Client, SendVerdict, Subscription, WaitOptions, classify_send_result,
-    sanitize_pane_text,
+    AgentInfo, AgentStatus, Client, SendVerdict, Subscription, WaitOptions, alt_screen_read_ladder,
+    classify_send_result, sanitize_pane_text,
 };
 use output::{die, dim, error, kind_paint, ok as paint_ok, print_json, status_paint};
+use profile::ProfileCatalog;
 use state::{EventKind, log_event};
 use toron_core::backend::error::BackendErrorCode;
 
@@ -4964,6 +4965,108 @@ fn project_base(project: &str) -> String {
     project.rsplit('/').next().unwrap_or(project).to_string()
 }
 
+/// H1 (bd-harness-prime-agent-818f): herdr has NO kind for some harnesses —
+/// its `Agent` enum is a closed 22-kind set (`agent.start --kind pa` →
+/// `unsupported_agent_kind`), and `server.agent_manifests` registers
+/// screen-detection rules only, NOT kinds. A harness WITH a spawn recipe
+/// (`[harness.<name>]`, compiled-in or profiles.toml) is launched via the
+/// recipe instead: `pane.run` the command. herdr's standard pane launch env
+/// already carries HERDR_ENV / HERDR_SOCKET_PATH / HERDR_PANE_ID, so
+/// prime-agent's built-in herdr extension activates and self-reports
+/// lifecycle (working/blocked/idle) through the socket — which herdr accepts
+/// as hook authority even for unknown kinds (empirically verified: the pane
+/// shows up in `agent list` as `agent=prime-agent`). The normal wait/rename
+/// loop then binds the name. Returns `Ok(true)` when the recipe path was
+/// taken, `Ok(false)` when this kind has no recipe, `Err` on launch failure.
+fn try_recipe_launch(c: &mut Client, kind: &str, pane_id: &str, args: &[String]) -> Result<bool> {
+    // Best-effort catalog: a malformed user profiles.toml must not convert a
+    // spawn into a hard error — the recipe is a fallback, not a gate.
+    let Some(recipe) = ProfileCatalog::load()
+        .ok()
+        .and_then(|cat| cat.harness(kind).and_then(|h| h.spawn_cmd.clone()))
+    else {
+        return Ok(false);
+    };
+    let cmd = recipe_launch_command(&recipe, args);
+    eprintln!("agent.start: herdr has no kind '{kind}'; launching via harness recipe: {cmd}");
+    c.pane_run(pane_id, &cmd)?;
+    Ok(true)
+}
+
+/// Trait-object variant of [`try_recipe_launch`] (same contract as
+/// [`start_agent_with_retry_dyn`]): routes the recipe launch through
+/// `MultiplexerBackend::pane_run`.
+fn try_recipe_launch_dyn(
+    backend: &dyn backend::MultiplexerBackend,
+    kind: &str,
+    pane_id: &str,
+    args: &[String],
+) -> Result<bool> {
+    let Some(recipe) = ProfileCatalog::load()
+        .ok()
+        .and_then(|cat| cat.harness(kind).and_then(|h| h.spawn_cmd.clone()))
+    else {
+        return Ok(false);
+    };
+    let cmd = recipe_launch_command(&recipe, args);
+    eprintln!("agent.start: herdr has no kind '{kind}'; launching via harness recipe: {cmd}");
+    backend.pane_run(pane_id, &cmd)?;
+    Ok(true)
+}
+
+/// Shell-quote one arg for the `pane.run` command line (single quotes,
+/// escaping embedded quotes the POSIX way).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Render a `[harness.<name>] spawn_cmd` recipe + launch args into a single
+/// shell command. Args are shell-quoted so model ids / boot primes with
+/// spaces survive the pane's shell.
+fn recipe_launch_command(recipe: &str, args: &[String]) -> String {
+    let mut cmd = recipe.to_string();
+    for a in args {
+        cmd.push(' ');
+        cmd.push_str(&shell_quote(a));
+    }
+    cmd
+}
+
+#[cfg(test)]
+mod recipe_launch_tests {
+    use super::{recipe_launch_command, shell_quote};
+
+    #[test]
+    fn shell_quote_wraps_plain_and_escapes_embedded_quotes() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("a b c"), "'a b c'");
+        // POSIX single-quote escape: '\'' ends the quote, emits a literal
+        // quote, reopens.
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn recipe_command_appends_quoted_args() {
+        let args: Vec<String> = vec![
+            "--model".into(),
+            "opencode-go/deepseek-v4-flash".into(),
+            "Boot ready check: reply exactly READY.".into(),
+        ];
+        assert_eq!(
+            recipe_launch_command("prime-agent --offline", &args),
+            "prime-agent --offline '--model' 'opencode-go/deepseek-v4-flash' 'Boot ready check: reply exactly READY.'"
+        );
+    }
+
+    #[test]
+    fn recipe_command_with_no_args_is_the_recipe() {
+        assert_eq!(
+            recipe_launch_command("prime-agent --offline", &[]),
+            "prime-agent --offline"
+        );
+    }
+}
+
 pub(crate) fn start_agent_with_retry(
     c: &mut Client,
     name: &str,
@@ -4971,11 +5074,28 @@ pub(crate) fn start_agent_with_retry(
     pane_id: &str,
     args: &[String],
 ) -> Result<AgentInfo> {
+    let mut recipe_launched = false;
     for attempt in 0..30 {
-        if let Err(e) = c.agent_start(name, kind, pane_id, 45_000, args)
-            && attempt == 0
-        {
-            eprintln!("agent.start error: {e:#}");
+        if !recipe_launched {
+            match c.agent_start(name, kind, pane_id, 45_000, args) {
+                Ok(_) => {}
+                Err(e) => {
+                    if attempt == 0 {
+                        eprintln!("agent.start error: {e:#}");
+                        // Deterministic herdr rejection for a kind it does not
+                        // know: fall back to the harness spawn recipe once.
+                        // No recipe -> fail fast instead of burning 30 retries.
+                        if matches!(&e.code, BackendErrorCode::Other(c) if c == "unsupported_agent_kind")
+                        {
+                            if try_recipe_launch(c, kind, pane_id, args)? {
+                                recipe_launched = true;
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
+            }
         }
         // a timeout can leave the agent already booted; check the registry.
         // match name AND pane — a same-named agent on another pane is not ours.
@@ -5019,11 +5139,28 @@ fn start_agent_with_retry_dyn(
     pane_id: &str,
     args: &[String],
 ) -> Result<AgentInfo> {
+    let mut recipe_launched = false;
     for attempt in 0..30 {
-        if let Err(e) = backend.agent_start(name, kind, pane_id, args)
-            && attempt == 0
-        {
-            eprintln!("agent.start error: {e:#}");
+        if !recipe_launched {
+            match backend.agent_start(name, kind, pane_id, args) {
+                Ok(_) => {}
+                Err(e) => {
+                    if attempt == 0 {
+                        eprintln!("agent.start error: {e:#}");
+                        // H1 (bd-harness-prime-agent-818f): same recipe
+                        // fallback as the concrete-client variant — herdr
+                        // rejects unknown kinds deterministically.
+                        if matches!(&e.code, BackendErrorCode::Other(c) if c == "unsupported_agent_kind")
+                        {
+                            if try_recipe_launch_dyn(backend, kind, pane_id, args)? {
+                                recipe_launched = true;
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
+            }
         }
         if let Ok(agents) = backend.agent_list() {
             if let Some(a) = agents
@@ -18479,9 +18616,9 @@ mod profile_cli_tests {
     }
 
     #[test]
-    fn profile_catalog_lists_six_builtins() {
+    fn profile_catalog_lists_seven_builtins() {
         let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
-        assert_eq!(cat.names().len(), 6);
+        assert_eq!(cat.names().len(), 7);
         for name in [
             "oracle",
             "planner",
@@ -18540,7 +18677,7 @@ mod profile_cli_tests {
                 "no user recipe named {name} in a fresh install"
             );
         }
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 7);
     }
 
     #[test]

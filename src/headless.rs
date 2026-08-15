@@ -46,6 +46,19 @@ pub fn model_args(harness: &str, model: &str, effort: Option<&str>) -> Vec<Strin
             args
         }
         "pi" => vec!["--model".to_string(), model.to_string()],
+        // H1 (bd-harness-prime-agent-818f): prime-agent takes `--model` +
+        // `--thinking` (levels: off/minimal/low/medium/high/xhigh/max).
+        // `--offline` lives in the spawn recipe, not here — launch args may
+        // target either the recipe path (herdr-unknown kind) or a future
+        // `agent.start --kind pa`.
+        "pa" => {
+            let mut args = vec!["--model".to_string(), model.to_string()];
+            if let Some(e) = effort.filter(|e| !e.is_empty()) {
+                args.push("--thinking".to_string());
+                args.push(e.to_string());
+            }
+            args
+        }
         _ => vec![],
     }
 }
@@ -398,6 +411,21 @@ mod tests {
             vec!["--model=deepseek-v4-flash", "--thinking=high"]
         );
         assert_eq!(model_args("pi", "glm-5.2", None), vec!["--model", "glm-5.2"]);
+        // H1 (bd-harness-prime-agent-818f): prime-agent takes `--model` +
+        // `--thinking` (omitted when no effort is set).
+        assert_eq!(
+            model_args("pa", "opencode-go/deepseek-v4-flash", None),
+            vec!["--model", "opencode-go/deepseek-v4-flash"]
+        );
+        assert_eq!(
+            model_args("pa", "opencode-go/deepseek-v4-flash", Some("medium")),
+            vec![
+                "--model",
+                "opencode-go/deepseek-v4-flash",
+                "--thinking",
+                "medium"
+            ]
+        );
         assert!(model_args("hermes", "x", None).is_empty(), "unknown harness: no model args");
     }
 

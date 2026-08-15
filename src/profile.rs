@@ -491,6 +491,25 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
                 ..Profile::default()
             },
         ),
+        (
+            "pa",
+            Profile {
+                harness: "pa".into(),
+                model: "opencode-go/deepseek-v4-flash".into(),
+                effort: "medium".into(),
+                role: "coder".into(),
+                task_hint: "RLM coding agent with built-in herdr lifecycle reporting".into(),
+                behavior: "You are a PRIME-AGENT WORKER in a flywheel swarm pane (harness pa). Unverified code is a lie.\n\nRULES:\n- RED-GREEN-REFACTOR. Write the failing test first. Watch it fail. Write minimal code to pass. Refactor green.\n- Revise IN PLACE. Never create V2 files. New files are for genuinely new functionality.\n- Verify before you claim. 'Done' = tests pass + build clean + edge cases checked. Report the command you ran.\n- Label every claim VERIFIED (ran/read) · INFERRED (follows from X) · SPECULATION.\n- Reply READY to boot checks and await instructions.\n- This pane reports your lifecycle to herdr automatically; it is not a decision input.".into(),
+                skills: vec![
+                    "test-driven-development".into(),
+                    "code-edit".into(),
+                    "accretive-implementer".into(),
+                    "systematic-debugging".into(),
+                    "code-quality".into(),
+                ],
+                ..Profile::default()
+            },
+        ),
     ] {
         m.insert(name.to_string(), profile);
     }
@@ -500,7 +519,27 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
 /// Compiled-in harness recipes (empty today — the default backends spawn
 /// known harnesses directly). Seam for `[harness.<name>]` additions.
 pub fn compiled_in_harnesses() -> BTreeMap<String, HarnessConfig> {
-    BTreeMap::new()
+    let mut m = BTreeMap::new();
+    // H1 (bd-harness-prime-agent-818f): prime-agent ships a BUILT-IN herdr
+    // socket integration (`packages/coding-agent/src/core/extensions/builtin/
+    // herdr-agent-state.ts`) that activates on HERDR_ENV=1 + HERDR_SOCKET_PATH
+    // + HERDR_PANE_ID — all injected by herdr's standard pane launch env —
+    // and reports pane.report_agent (source "herdr:pi", agent "prime-agent",
+    // working/blocked/idle + session refs), which herdr accepts as hook
+    // authority even for unknown kinds. BUT herdr has NO `pa` kind: its
+    // Agent enum is a closed 22-kind set (`agent.start --kind pa` →
+    // `unsupported_agent_kind`), and `server.agent_manifests` registers
+    // screen-detection rules only, not kinds. The spawn path therefore falls
+    // back to this recipe via `pane.run` when herdr rejects the kind (upstream
+    // kind request filed: herdrdev/herdr). `--offline` skips startup network
+    // checks so the TUI comes up fast in a bare pane.
+    m.insert(
+        "pa".to_string(),
+        HarnessConfig {
+            spawn_cmd: Some("prime-agent --offline".to_string()),
+        },
+    );
+    m
 }
 
 #[cfg(test)]
@@ -550,10 +589,32 @@ behavior = "be terse"
     fn compiled_in_defaults_appear_without_profiles_toml() {
         // No file -> defaults only (zero-config baseline).
         let cat = ProfileCatalog::load_from(None).expect("load defaults");
-        for name in ["oracle", "planner", "reviewer", "coder", "scout", "housekeeper"] {
+        for name in [
+            "oracle",
+            "planner",
+            "reviewer",
+            "coder",
+            "scout",
+            "housekeeper",
+            "pa",
+        ] {
             assert!(cat.get(name).is_some(), "{name} built-in missing");
         }
-        assert_eq!(cat.names().len(), 6, "exactly the 6 canonical built-ins");
+        assert_eq!(
+            cat.names().len(),
+            7,
+            "7 canonical built-ins (6 Spec 1b + pa)"
+        );
+        // H1 (bd-harness-prime-agent-818f): pa resolves to the prime-agent
+        // harness and carries the compiled-in spawn recipe.
+        let pa = cat.get("pa").expect("pa present");
+        assert_eq!(pa.harness, "pa", "pa profile uses the pa harness");
+        let h = cat.harness("pa").expect("pa harness recipe");
+        assert_eq!(
+            h.spawn_cmd.as_deref(),
+            Some("prime-agent --offline"),
+            "pa spawn recipe launches the prime-agent TUI"
+        );
     }
 
     #[test]
