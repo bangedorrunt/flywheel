@@ -2253,6 +2253,11 @@ pub(crate) fn project_dir(cfg: &Config, project: &str) -> PathBuf {
     } else {
         cfg.workspace_root().join(project)
     }
+    // NOTE (2026-08-15, bd-test-tmp-hygiene-pq5b): a RELATIVE project key
+    // resolves to a data dir under the workspace root — gate/test invocations
+    // must pass ABSOLUTE scratch paths (mktemp -d / temp_dir), or the test
+    // matrix leaks mailbox-archive dirs into the workspace. verify-workspace-
+    // clean.sh enforces this.
 }
 
 /// Fallible UTF-8 conversion of a filesystem path (193.1). Paths used as
