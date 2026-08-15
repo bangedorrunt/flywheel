@@ -4474,6 +4474,22 @@ mod workspace_origin_tests {
 }
 
 #[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
+/// bd-bug-omp-herdr-wedge: harnesses whose herdr integration holds FULL
+/// lifecycle-hook authority (herdr skips screen/process detection for them)
+/// only open the agent.prompt gate after their integration reports a
+/// processed prompt. Prime that gate at boot with a neutral message.
+/// Empirically verified on herdr 0.8.0-preview (2026-08-15): omp, pi AND
+/// grok all show `screen_detection_skip_reason: full_lifecycle_hook_authority`
+/// (or the bundled-manifest twin) and gate agent.prompt on "active named
+/// agent" until their herdr integration reports a processed prompt. opencode
+/// is the exception (no herdr extension on this host; fallback detection —
+/// delivered without a prime). If a future preview changes any kind's
+/// manifest, adjust THIS list; the env injection is already universal.
+const HERDR_HOOK_AUTHORITY_KINDS: &[&str] = &["omp", "pi", "grok"];
+fn needs_boot_prime(kind: &str) -> bool {
+    HERDR_HOOK_AUTHORITY_KINDS.contains(&kind)
+}
+
 fn cmd_spawn(
     cfg: &Config,
     project: &str,
@@ -4613,6 +4629,19 @@ projects available: {}",
             live_owned.push(ws.clone());
             continue;
         }
+        // bd-bug-liveness-false-death: a workspace whose agents report
+        // working/blocked is LIVE, period — the foreground-process liveness
+        // probe is known to false-negative on harnesses that resolve through
+        // wrappers (omp via mise) or whose integration processes own the
+        // foreground. Probe failures never prove death (bd-1np); a
+        // confident wrong probe is worse — never auto-close a working swarm.
+        if ws_agents
+            .iter()
+            .any(|a| matches!(a.agent_status.as_str(), "working" | "blocked"))
+        {
+            live_owned.push(ws.clone());
+            continue;
+        }
         let mut all_dead = true;
         for a in &ws_agents {
             let kind = a.agent.as_deref().unwrap_or("opencode");
@@ -4680,10 +4709,20 @@ projects available: {}",
             );
         }
     }
+    // bd-bug-omp-herdr-wedge: herdr's agent.start launches the harness
+    // WITHOUT the HERDR_* env its own omp integration contract requires
+    // (agent.start has no env param). omp's herdr extension stays disabled,
+    // herdr skips screen detection for omp (full lifecycle hook authority),
+    // and every agent.prompt gates on agent_not_ready. Inject the env at
+    // workspace creation (the one surface herdr's API accepts it); the
+    // extension then activates ("Herdr active") and reports on the first
+    // processed prompt (see BOOT_PRIME in the spawn loop below).
+    let herdr_env = herdr_shim::herdr_integration_env(cfg);
     let (ws, root) = c.workspace_create(
         Some(&utf8_path(&dir, "workspace dir")?),
         Some(&label),
         !no_focus,
+        Some(&herdr_env),
     )?;
     println!(
         "{}",
@@ -4735,6 +4774,7 @@ projects available: {}",
                     &prev,
                     "down",
                     Some(&utf8_path(&dir, "workspace dir")?),
+                    Some(&herdr_env),
                 )?;
                 prev = p.pane_id.clone();
                 prev.clone()
@@ -4772,7 +4812,24 @@ projects available: {}",
                 }
                 None => vec![],
             };
+
+            let has_peer_prime = !peer_args.is_empty();
             agent_args.extend(peer_args);
+            // bd-bug-omp-herdr-wedge: with the HERDR_* env injected at
+            // workspace_create, omp's integration activates but only reports
+            // agent_start once omp PROCESSES a prompt — and agent.prompt is
+            // gated on that report (deadlock). Prime the gate at boot with a
+            // neutral message as a positional MESSAGES arg AFTER the model
+            // flags (omp processes it on startup and stays in REPL). Kinds
+            // with herdr fallback detection (opencode) need no prime. If a
+            // peer template was already supplied it IS the prime — do not
+            // stack.
+            if needs_boot_prime(&kind) && !has_peer_prime {
+                agent_args.push(
+                    "Boot ready check: reply exactly READY and await captain instructions."
+                        .to_string(),
+                );
+            }
             let agent = start_agent_with_retry(&mut c, &name, &kind, &pane_id, &agent_args)?;
             // bd-eign.6 L1: readiness gate — agent.start returns when the
             // launch command is dispatched, not when the TUI is input-ready;
@@ -5074,7 +5131,7 @@ pub(crate) fn register_spawned_agent(
         .iter()
         .find(|e| e.name == name)
         .and_then(|e| e.mail_identity.clone())
-        .filter(|m| !m.is_empty())
+        .filter(|m| !m.is_empty() && m != name) // bd-bug-omp-herdr-wedge: a retained SLUG (pre-ADR-0018 D1a registry entry) is not a pin — redraw
         .unwrap_or_else(|| {
             let mut taken: std::collections::HashSet<String> = registry
                 .iter()
@@ -6089,6 +6146,10 @@ fn cmd_add(
     }
     let mut prev = root.pane_id.clone();
     let mut spawned: Vec<Value> = Vec::new();
+    // bd-bug-omp-herdr-wedge: split panes do NOT inherit the workspace env —
+    // pass the herdr integration env at split time too (same as the spawn
+    // path's workspace.create injection).
+    let herdr_env = herdr_shim::herdr_integration_env(cfg);
     for (short, n) in &plan {
         let kind = cfg.resolve_kind(short);
         for _ in 0..*n {
@@ -6100,9 +6161,21 @@ fn cmd_add(
                 &prev,
                 "down",
                 Some(&utf8_path(&dir, "workspace dir")?),
+                Some(&herdr_env),
             )?;
             prev = p.pane_id.clone();
-            let agent = start_agent_with_retry(&mut c, &name, &kind, &prev, &[])?;
+            let mut add_args: Vec<String> = Vec::new();
+            // bd-bug-omp-herdr-wedge: same boot-prime contract as spawn —
+            // omp's herdr integration must process ONE prompt before herdr
+            // opens the agent.prompt gate; add-created panes need the prime
+            // too (empty args leave the gate closed forever).
+            if needs_boot_prime(&kind) {
+                add_args.push(
+                    "Boot ready check: reply exactly READY and await captain instructions."
+                        .to_string(),
+                );
+            }
+            let agent = start_agent_with_retry(&mut c, &name, &kind, &prev, &add_args)?;
             // bd-627z.4: register + pin the mail identity (the add path's
             // registry persists on the next spawn/rebind save).
             let _ = register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
@@ -6630,13 +6703,23 @@ fn cmd_send(
         // the full herdr name.
         if let Ok(live) = c.agent_list() {
             let entries = state::load_spawn_registry(project);
+            let mut rebound = false;
             for a in live
                 .iter()
                 .filter(|a| a.workspace_id == ws_id && a.name.is_none())
             {
                 if let Some(e) = entries.iter().find(|e| e.pane_id == a.pane_id) {
-                    let _ = c.agent_rename(&a.pane_id, &e.name);
+                    if c.agent_rename(&a.pane_id, &e.name).is_ok() {
+                        rebound = true;
+                    }
                 }
+            }
+            // bd-bug-omp-herdr-wedge: the omp herdr integration re-reports the
+            // agent as UNNAMED on every processed prompt, so a name-addressed
+            // prompt racing the report misses herdr's name index. Settle a
+            // beat after the rename before re-resolving.
+            if rebound {
+                std::thread::sleep(Duration::from_millis(400));
             }
         }
         targets = resolve_agents(&mut c, &ws_id, project, to);
@@ -6693,6 +6776,33 @@ fn cmd_send(
                                 "flywheel: {target} agent_not_ready — retrying via pane id {pane}"
                             );
                             target = pane;
+                        }
+                        None => return Err(e.into()),
+                    }
+                }
+                // bd-bug-omp-herdr-wedge: omp's herdr integration re-reports
+                // the agent UNNAMED on each processed prompt, so a
+                // name-addressed prompt can miss herdr's name index even
+                // after the send-path heal. Rebind from the spawn registry
+                // and retry once via the pane.
+                Err(e)
+                    if matches!(&e.code, BackendErrorCode::Other(c) if c == "agent_not_found")
+                        && !pane_retried
+                        && !target.contains(':') => {
+                    let entry = state::load_spawn_registry(project)
+                        .iter()
+                        .find(|en| en.name == name)
+                        .cloned();
+                    match entry {
+                        Some(en) => {
+                            let _ = c.agent_rename(&en.pane_id, &name);
+                            std::thread::sleep(Duration::from_millis(400));
+                            pane_retried = true;
+                            eprintln!(
+                                "flywheel: {target} agent_not_found — rebound from registry, retrying via {}",
+                                en.pane_id
+                            );
+                            target = en.pane_id;
                         }
                         None => return Err(e.into()),
                     }

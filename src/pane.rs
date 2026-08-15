@@ -234,7 +234,7 @@ pub fn pre_spawn_crew(
             );
         }
     }
-    let (ws, _root) = c.workspace_create(Some(&crate::utf8_path(&dir, "workspace dir")?), Some(&label), false)?;
+    let (ws, _root) = c.workspace_create(Some(&crate::utf8_path(&dir, "workspace dir")?), Some(&label), false, None)?;
     let entries = spawn_crew_into(cfg, project, wf_name, plan, catalog, &mut c, &ws.workspace_id, &label)?;
     Ok(PaneRunCtx {
         workspace_id: ws.workspace_id,
@@ -315,6 +315,7 @@ fn spawn_crew_into(
                             p,
                             "down",
                             Some(&crate::utf8_path(&dir, "workspace dir")?),
+                            Some(&crate::herdr_shim::herdr_integration_env(cfg)),
                         )?;
                         split.pane_id
                     }
@@ -711,6 +712,7 @@ pub fn launch_spawn_job(
             &prev,
             "down",
             Some(&crate::utf8_path(&dir, "workspace dir")?),
+            Some(&crate::herdr_shim::herdr_integration_env(cfg)),
         )?;
         let agent = crate::start_agent_with_retry(
             &mut c,
