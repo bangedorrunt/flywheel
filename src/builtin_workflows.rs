@@ -25,6 +25,16 @@
 //! - `captain-audit` — read-only analysis (bd-wsui): scout → oracle →
 //!   reviewer graph, no beads, no repo edits, report written to
 //!   `{{inputs.report_path}}`.
+//! - `interrogate` — adversarial N-model review (bd-w2-review-s6ij): N
+//!   reviewers (default 2) on DIFFERENT model families, same rubric,
+//!   READONLY; the oracle parent synthesizes Act-on / Consider / Noted /
+//!   Dismissed. Extends, does not delete, `debate`.
+//! - `forensics` — diagnosis-only (bd-w2-review-s6ij): diagnose @scout —
+//!   instrument or read the artifact; the deliverable is the DIAGNOSIS. NO
+//!   fix step (lint-enforced); a fix is a separate bug-fix.
+//! - `figure-it-out` — no bundled playbook (bd-w2-review-s6ij): the planner
+//!   authors workflow YAML (lint is the gate); the captain executes via
+//!   `workflow compose --agent` then `--execute`.
 //!
 //! governed-by: ADR-0005 Spec 2b, P3.5
 
@@ -712,6 +722,91 @@ graph:
       on_error: fail_run
 "##,
     ),
+    (
+        "interrogate",
+        r##"
+name: interrogate
+description: "Adversarial N-model review (extends debate — 2-brief synthesis vs N-model rubric; both live): N reviewers on DIFFERENT model families, same rubric, READONLY; the parent synthesizes Act-on / Consider / Noted / Dismissed. Does not apply fixes — a follow-up bug-fix or refactoring consumes Act-on."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: target
+  - name: reviewers
+    default: "2"
+principles:
+  - prove-it-works
+  - fix-root-causes
+  - guard-the-context-window
+graph:
+  nodes:
+    briefs:
+      action: parallel
+      over: "{{inputs.reviewers}}"
+      each:
+        action: dispatch_job
+        assignee: x
+        spec:
+          profile: "@reviewer"
+          harness: "opencode"
+          task: "READONLY adversarial review — no edits, no repo writes, no beads. Same rubric for every reviewer (DIFFERENT model families per reviewer). Target: {{inputs.target}}. Review the target against the rubric; per finding give ONE classification: Act-on | Consider | Noted | Dismissed, with evidence. Rubric: prove-it-works (check the real artifact, not a proxy), fix-root-causes (name the root cause), guard-the-context-window (compressed evidence, no dumps)."
+    synthesize:
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@oracle"
+        task: "Synthesize the N reviewer briefs for: {{inputs.target}}. Group every finding into Act-on / Consider / Noted / Dismissed with the supporting evidence. Do not apply changes — the parent routes Act-on into a follow-up playbook. Reviewer briefs: {{steps.briefs}}"
+      needs: [briefs]
+      on_error: fail_run
+"##,
+    ),
+    (
+        "forensics",
+        r##"
+name: forensics
+description: "Diagnosis-only playbook (merged from runtime-forensics + trace-forensics): instrument the live surface or read the artifact; the deliverable is the DIAGNOSIS. Follow-up work is a separate playbook after the captain accepts the diagnosis."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: symptom
+  - name: artifact
+principles:
+  - fix-root-causes
+  - prove-it-works
+graph:
+  nodes:
+    diagnose:
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@scout"
+        task: "Diagnose the symptom — instrument the live surface or read the artifact; the deliverable is the DIAGNOSIS with the reproducing evidence, root cause, and confidence. Read-only: no mutations to the repo or the target. Symptom: {{inputs.symptom}}. Artifact: {{inputs.artifact}}"
+"##,
+    ),
+    (
+        "figure-it-out",
+        r##"
+name: figure-it-out
+description: "No bundled playbook matches — the planner authors workflow YAML (lint is the gate); the captain executes it via workflow compose --agent then --execute."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: objective
+principles:
+  - foundational-thinking
+  - encode-lessons-in-structure
+steps:
+  - name: author
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@planner"
+      task: "Author a workflow YAML for this objective — name the data shapes, sequence verifiable units, declare principles; lint is the gate. Return the YAML document. Objective: {{inputs.objective}}"
+    on_error: fail_run
+"##,
+    ),
 ];
 
 /// Load the compiled-in built-in workflows as parsed `Workflow`s.
@@ -760,9 +855,62 @@ mod tests {
             "onboard",
             "triage-deep",
             "captain-audit",
+            "interrogate",
+            "forensics",
+            "figure-it-out",
         ] {
             assert!(wfs.contains_key(name), "built-in {name} present");
         }
+    }
+
+    /// bd-w2-review-s6ij: interrogate defaults N=2 with a @reviewer briefs
+    /// fanout (readonly lives in the task text; lint-asserted clean);
+    /// forensics has a @scout diagnose node and NO fix-named node
+    /// (lint-asserted — a fix is a separate bug-fix); figure-it-out authors
+    /// via @planner.
+    #[test]
+    fn review_trio_shapes() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        // interrogate: reviewers default "2".
+        let inter = &wfs["interrogate"];
+        let default = inter
+            .inputs
+            .iter()
+            .find(|i| i.name == "reviewers")
+            .and_then(|i| i.default.as_ref())
+            .and_then(|d| d.as_str());
+        assert_eq!(default, Some("2"), "interrogate defaults N=2");
+        let briefs = inter
+            .graph
+            .as_ref()
+            .expect("interrogate graph")
+            .nodes
+            .get("briefs")
+            .expect("briefs node");
+        assert!(
+            matches!(briefs.action, Action::Parallel { .. }),
+            "briefs is a parallel fanout"
+        );
+        // forensics: a @scout diagnose node.
+        let fore = &wfs["forensics"];
+        let diagnose = fore
+            .graph
+            .as_ref()
+            .expect("forensics graph")
+            .nodes
+            .get("diagnose")
+            .expect("diagnose node");
+        assert!(
+            matches!(diagnose.action, Action::DispatchJob { .. }),
+            "diagnose is a dispatch"
+        );
+        // figure-it-out: @planner author step.
+        let fio = &wfs["figure-it-out"];
+        assert!(
+            fio.steps.iter().any(|s| s.name.as_deref() == Some("author")),
+            "figure-it-out has an author step"
+        );
     }
 
     /// bd-t86p: the goal DIRECT arm is a built-in (`goal-direct` + its
