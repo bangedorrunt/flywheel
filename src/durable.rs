@@ -36,12 +36,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use resonate_sdk::function;
 use resonate_sdk::prelude::*;
-use toron_workflow::schema::{Action, Workflow};
 use toron_workflow::engine::{ActionRunner, WorkflowEngine};
+use toron_workflow::schema::{Action, Workflow};
 
 use crate::config::Config;
 
@@ -171,6 +171,108 @@ pub struct ReadyBead {
     /// completion decision reads it.
     #[serde(default)]
     pub assignee: Option<String>,
+    /// ADR-0019: the single-line command parsed from the bead's `## VERIFY`
+    /// fence (a `## VERIFY` heading + ONE fenced one-line command).
+    /// `Some(cmd)` = the bead is dispatchable. `None` = the fence is
+    /// missing/multi-line/empty — the bead is NOT ready: refuse-to-dispatch
+    /// + mail the planner on thread_id=<bead-id> (bd-w1-verify-fence).
+    #[serde(default)]
+    pub verify: Option<String>,
+}
+
+/// Parse the exact `## VERIFY` fence from a bead description (ADR-0019
+/// Spec 1). Required block, exact shape:
+///
+/// ```text
+/// ## VERIFY
+/// ```
+/// <one command, one line>
+/// ```
+/// ```
+///
+/// `Some(cmd)` only when the heading exists, is followed by ONE fenced
+/// block, and the fence holds exactly ONE non-empty line (whitespace
+/// trimmed; a ` ```lang ` opener is tolerated). Anything else — missing
+/// heading, missing/truncated fence, multi-line or empty command — is
+/// `None`: the bead is NOT ready.
+pub fn parse_verify_fence(description: &str) -> Option<String> {
+    let lines: Vec<&str> = description.lines().collect();
+    // The heading must be present and exact (`## VERIFY`, trimmed).
+    let heading = lines.iter().position(|l| l.trim() == "## VERIFY")?;
+    let rest = &lines[heading + 1..];
+    // First fenced block after the heading (blank lines allowed between).
+    let open = rest.iter().position(|l| is_fence_line(l))?;
+    let mut content: Vec<&str> = Vec::new();
+    for line in &rest[open + 1..] {
+        if is_fence_line(line) {
+            // closing fence found
+            if content.len() != 1 {
+                return None;
+            }
+            let cmd = content[0].trim();
+            if cmd.is_empty() {
+                return None;
+            }
+            return Some(cmd.to_string());
+        }
+        content.push(line);
+    }
+    // no closing fence
+    None
+}
+
+/// A fence line: a line whose trimmed form starts with ` ``` `, with at
+/// most one trailing language token (` ``` `, ` ```bash `). The closing
+/// fence is the bare ` ``` `.
+fn is_fence_line(line: &str) -> bool {
+    match line.trim().strip_prefix("```") {
+        Some(rest) => rest.is_empty() || !rest.contains(' '),
+        None => false,
+    }
+}
+
+/// Split ready beads into dispatchable (valid `## VERIFY` fence) and
+/// not-ready (missing/malformed fence — refuse-to-dispatch + mail the
+/// planner, ADR-0019). Pure — the single decision every dispatch path
+/// (swarm_loop, engine_loop, sync loop) shares.
+pub fn partition_ready(ready: &[ReadyBead]) -> (Vec<&ReadyBead>, Vec<&ReadyBead>) {
+    ready.iter().partition(|b| b.verify.is_some())
+}
+
+/// Args for the `__mail-not-ready` leaf (ADR-0019): tell the planner a
+/// ready bead is NOT dispatchable because its `## VERIFY` fence is
+/// missing/malformed. The loop mails at most once per bead per invocation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotReadyMailArgs {
+    pub project: String,
+    pub bead_id: String,
+    pub title: String,
+}
+
+/// Checkpointed leaf — mail the planner that bead `bead_id` is NOT ready
+/// (missing/malformed `## VERIFY` fence, ADR-0019). The underlying
+/// `__mail-not-ready` command always exits 0 with `{ok, notified, error}` —
+/// a mail hiccup must never kill the loop.
+#[function]
+async fn mail_not_ready(args: NotReadyMailArgs) -> Result<Value> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args([
+        "__mail-not-ready",
+        &args.project,
+        &args.bead_id,
+        &args.title,
+    ]);
+    let out = run_leaf_cmd(cmd, "__mail-not-ready").await?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__mail-not-ready failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    Ok(serde_json::from_str(raw.trim())
+        .unwrap_or_else(|_| serde_json::json!({ "raw": raw.trim() })))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -768,6 +870,11 @@ fn parse_bead_list(v: &serde_json::Value, what: &str) -> anyhow::Result<Vec<Read
                 .and_then(serde_json::Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
+            verify: b
+                .get("verify")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         })
         .collect())
 }
@@ -784,32 +891,123 @@ fn parse_expected_reply_entries(v: &serde_json::Value) -> Vec<crate::state::Expe
 /// `__check-reply`. Pure — bd-87hq regression pin.
 fn parse_reply_check(v: &serde_json::Value) -> (Option<String>, Option<String>) {
     (
-        v.get("newest_id").and_then(serde_json::Value::as_str).map(String::from),
-        v.get("author").and_then(serde_json::Value::as_str).map(String::from),
+        v.get("newest_id")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+        v.get("author")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
     )
 }
 
-/// The prompt given to an agent for a ready bead: self-contained + lifecycle.
-/// The state-file contract (bd-prompt-state-file) tells the agent to write
-/// `.flywheel/agent-state/{AGENT_NAME}.json` when context is high; the
-/// `{AGENT_NAME}` placeholder is substituted with the receiving agent's herdr
-/// name at dispatch time (plan_actions) so the agent never guesses the
-/// filename. `context_pct` < 80 is ignored by the READER (bd-read-state-
-/// fallback) — the threshold lives there, not here.
-pub fn bead_prompt(id: &str, title: &str) -> String {
-    // Mail backend is toron by default (`flywheel mail` → [backend] mail=toron).
-    // ALWAYS pass --as <mail identity> so peer collab is not CoralFinch-collapsed.
-    // Prefer mail name from spawn (adjective+noun); herdr name also maps via --as.
-    let template = r#"Execute bead {id}: {title}. Mail: toron via `flywheel mail`. Lifecycle: claim (`br update {id} --claim --actor "$AGENT_NAME" --json`) → reserve `flywheel mail locks reserve <project> --as YOUR_MAIL_NAME --paths <files> --exclusive --reason {id} --ttl-seconds 7200` → announce `flywheel mail send <project> --as YOUR_MAIL_NAME --to all --thread-id {id} --subject '[{id}] starting' --body '<plan>'` → execute one narrow slice → verify AC → close with honest reason → `br sync --flush-only` + commit `.beads/` → `flywheel mail unlock <project> --as YOUR_MAIL_NAME` → `flywheel mail send ... --thread-id {id} --subject '[{id}] done'`. YOUR_MAIL_NAME = registered adjective+noun (DustySparrow/…) or set FLYWHEEL_MAIL_AS. Renew your own file reservations while working (toron `renew_file_reservations` or `flywheel mail renew` — extend the TTL before it lapses — the orchestrator cannot renew on your behalf), so long edits never lose their lease. When a message has ack_required=true, call `acknowledge_message` (toron) after acting on it — the orchestrator cannot ack on your behalf. Peer blocks: reply on same --thread-id, never steal reserved files. DO NOT create new beads — work the assigned bead only; report scope gaps in the thread, not as new beads. If your session context usage exceeds about 80%: write `{"context_pct": <pct>, "ts": "<now RFC3339>"}` to `.flywheel/agent-state/{AGENT_NAME}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you. If {id} already claimed, next from `br ready --json`."#;
-    template.replace("{id}", id).replace("{title}", title)
+/// The dispatched bead prompt is a filled brief (ADR-0019 Spec 2), not the
+/// old lifecycle prose. The state-file contract (bd-prompt-state-file) tells
+/// the agent to write `.flywheel/agent-state/{AGENT_NAME}.json` when context
+/// is high; the `{AGENT_NAME}` placeholder is substituted with the receiving
+/// agent's herdr name at dispatch time (plan_actions) so the agent never
+/// guesses the filename. `context_pct` < 80 is ignored by the READER
+/// (bd-read-state-fallback) — the threshold lives there, not here.
+/// Hard cap on the dispatched prompt (behavior + skills prefix + brief).
+/// Over the cap is a LOOP BUG — the send fails loud, never silent truncation
+/// (ADR-0019 Spec 2, `minimize-reader-load`).
+pub const DISPATCH_PROMPT_CAP: usize = 4 * 1024;
+
+/// Why a filled brief could not be dispatched. Only the cap exists today —
+/// a brief that cannot fit must never be truncated or silently shortened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BriefError {
+    /// Size of the filled brief that exceeded the cap (bytes).
+    pub bytes: usize,
 }
 
-/// Prompt to resume an in-progress bead after an interruption. Carries the
-/// same state-file contract (placeholder substituted at dispatch).
-pub fn resume_prompt(id: &str, title: &str) -> String {
-    format!(
-        "Resume bead {id}: {title}. Still in_progress — finish, verify AC, close honestly, `br sync --flush-only` + commit `.beads/`. Mail: toron via `flywheel mail`: renew your own file reservations with `--as YOUR_MAIL_NAME` (toron `renew_file_reservations` — extend the TTL before it lapses — the orchestrator cannot renew on your behalf), keep using `--thread-id {id}` for peer updates. Never release another agent's exclusive lock. When a message has ack_required=true, call `acknowledge_message` (toron) after acting on it — the orchestrator cannot ack on your behalf. If your session context usage exceeds about 80%: write `{{\"context_pct\": <pct>, \"ts\": \"<now RFC3339>\"}}` to `.flywheel/agent-state/{{AGENT_NAME}}.json` in the project root (best-effort, never block on it), then finish and sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you."
-    )
+impl std::fmt::Display for BriefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "filled brief is {} bytes — over the {} byte dispatch cap (ADR-0019 Spec 2; loop bug, never truncated)",
+            self.bytes, DISPATCH_PROMPT_CAP
+        )
+    }
+}
+
+impl std::error::Error for BriefError {}
+
+/// The dispatched bead prompt: a filled brief (ADR-0019 Spec 2). The old
+/// claim→reserve→announce→close lifecycle novel (`bead_prompt`) is GONE —
+/// the lifecycle lives in the standing-orders file, referenced BY PATH ONLY
+/// in the STANDING field. GOAL carries the bead id (`Execute <id>:` /
+/// `Resume <id>:` per Spec 2) so the claim-watch watchdog can extract it
+/// ([`bead_id_from_prompt`]) without parsing prose. The state-file /
+/// ack / lease-renewal contracts carry over from the old prompts
+/// (bd-prompt-state-file, bd-fug, bd-mail-lease-renewal-durable).
+pub fn build_brief(
+    id: &str,
+    title: &str,
+    project: &str,
+    resume: bool,
+) -> std::result::Result<String, BriefError> {
+    let goal = if resume {
+        format!("Resume {id}: {title}")
+    } else {
+        format!("Execute {id}: {title}")
+    };
+    let brief = BRIEF_TEMPLATE
+        .replace("{goal}", &goal)
+        .replace("{id}", id)
+        .replace("{project}", project);
+    if brief.len() > DISPATCH_PROMPT_CAP {
+        return Err(BriefError { bytes: brief.len() });
+    }
+    Ok(brief)
+}
+
+/// The brief template (ADR-0019 Spec 2 fields). `{id}` / `{goal}` /
+/// `{project}` are filled by [`build_brief`]; `{AGENT_NAME}` is substituted
+/// at dispatch time (plan_actions) so the state-file path is concrete.
+const BRIEF_TEMPLATE: &str = r#"GOAL {goal}.
+SCOPE may-write: only paths you hold an exclusive reservation on (reason={id}); may-not-write: everything else — no scope leak.
+CONTEXT pointers only (never paste file contents): bead {id} description (acceptance criteria + ## VERIFY fence); thread-id {id} for peer mail; .flywheel/agent-state/{AGENT_NAME}.json (state file); .flywheel/receipts/ (verification receipts).
+ACCEPTANCE close only when every acceptance criterion in the bead description holds — one checkable criterion per line in the close reason.
+VERIFY run the bead's ## VERIFY command from its description; include its stdout in the REPORT. No ## VERIFY fence → say so explicitly; never substitute a whole-workspace matrix script.
+TIMEBOX about 90 minutes; on expiry return partial findings + deviations — never silently extend.
+FORBIDDEN DO NOT create new beads — report scope gaps in the thread, not as new beads. Never force-unlock a peer's reservation. No worktree. Stay inside SCOPE.
+REPORT status; commit sha (commit BEFORE close; the bead id {id} IN the commit message); verdict kind; what you actually ran; deviations; PRINCIPLES cited.
+PRINCIPLES each line `<principle-name> — <the decision it changed>`; names only, no leaf text.
+STANDING {project}/.flywheel/standing-orders.md layered on ~/.config/flywheel/standing-orders.md — the lifecycle (claim → reserve → announce → execute → verify → close → sync → commit) lives there; referenced BY PATH ONLY, never pasted here.
+CONTRACTS renew your own file reservations while working (toron `renew_file_reservations` — extend the TTL before it lapses; the orchestrator cannot renew on your behalf). When a message has ack_required=true, call `acknowledge_message` after acting on it — the orchestrator cannot ack on your behalf. If your session context usage exceeds about 80%: write {"context_pct": <pct>, "ts": "<now RFC3339>"} to .flywheel/agent-state/{AGENT_NAME}.json (best-effort, never block on it), then finish + sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you."#;
+
+/// Convenience wrapper for call sites that must produce a brief as a plain
+/// String (sync-loop queue refresh). Over-cap is a LOOP BUG — panic loudly,
+/// never truncate (ADR-0019 Spec 2).
+pub fn brief(id: &str, title: &str, project: &str, resume: bool) -> String {
+    build_brief(id, title, project, resume)
+        .expect("bead brief over dispatch cap (ADR-0019 Spec 2 loop bug)")
+}
+
+/// Queue a filled brief for a dispatched bead, or surface the loop bug
+/// loudly if the brief cannot fit the dispatch cap (ADR-0019 Spec 2: over
+/// cap fails loud, never silent truncation). `front` = re-queue at the head
+/// (claim-watch re-dispatches must stay ahead of fresh beads).
+fn queue_brief(
+    queue: &mut Vec<String>,
+    id: &str,
+    title: &str,
+    project: &str,
+    resume: bool,
+    front: bool,
+) {
+    match build_brief(id, title, project, resume) {
+        Ok(b) => {
+            if front {
+                queue.insert(0, b);
+            } else {
+                queue.push(b);
+            }
+        }
+        Err(e) => eprintln!(
+            "flywheel: CRITICAL: {e} — bead {id} NOT dispatched (loop bug; no truncation)"
+        ),
+    }
 }
 
 /// Bead-creation flood verdict (bd-eign.2): more than 3 previously-unassigned
@@ -1044,7 +1242,12 @@ pub struct ReclaimResult {
 async fn reclaim_stranded(args: ReclaimArgs) -> Result<ReclaimResult> {
     let exe = self_exe().map_err(map_err)?;
     let mut cmd = Command::new(&exe);
-    cmd.args(["__reclaim-stranded", &args.project, "--live", &args.live.join(",")]);
+    cmd.args([
+        "__reclaim-stranded",
+        &args.project,
+        "--live",
+        &args.live.join(","),
+    ]);
     let out = run_leaf_cmd(cmd, "__reclaim-stranded").await?;
     if !out.status.success() {
         return Err(map_err(anyhow::anyhow!(
@@ -1300,17 +1503,18 @@ fn escalate_and_persist(
     params: serde_json::Value,
 ) -> anyhow::Result<(u32, u32, bool)> {
     let now_us = now_us_micros();
-    let mut al = crate::state::load_active_loop(project)?
-        .unwrap_or_else(|| crate::state::ActiveLoop::new("swarm-loop", params, crate::state::now_iso()));
-    let st = al
-        .escalation
-        .entry(name.to_string())
-        .or_insert_with(|| crate::state::EscalationState {
-            first_blocked_ts: first_blocked_seed.unwrap_or(now_us),
-            ping_count: 0,
-            last_ping_tier: None,
-            last_tail: String::new(),
-        });
+    let mut al = crate::state::load_active_loop(project)?.unwrap_or_else(|| {
+        crate::state::ActiveLoop::new("swarm-loop", params, crate::state::now_iso())
+    });
+    let st =
+        al.escalation
+            .entry(name.to_string())
+            .or_insert_with(|| crate::state::EscalationState {
+                first_blocked_ts: first_blocked_seed.unwrap_or(now_us),
+                ping_count: 0,
+                last_ping_tier: None,
+                last_tail: String::new(),
+            });
     let (tier, ping_count, should_mail) = escalation_step(st, now_us, interval_secs);
     crate::state::save_active_loop(project, &al)?;
     Ok((tier, ping_count, should_mail))
@@ -1497,11 +1701,10 @@ async fn poll_mail_digests(args: MailDigestArgs) -> Result<Vec<MailDigest>> {
             }
         };
         let raw = String::from_utf8_lossy(&out.stdout);
-        let mut d: MailDigest =
-            serde_json::from_str(raw.trim()).unwrap_or_else(|_| MailDigest {
-                agent: agent.clone(),
-                ..Default::default()
-            });
+        let mut d: MailDigest = serde_json::from_str(raw.trim()).unwrap_or_else(|_| MailDigest {
+            agent: agent.clone(),
+            ..Default::default()
+        });
         if d.agent.is_empty() {
             d.agent = agent.clone();
         }
@@ -1658,8 +1861,11 @@ async fn release_bead_locks(args: ReleaseBeadLocksArgs) -> Result<Value> {
         )));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(&stdout)
-        .map_err(|e| map_err(anyhow::anyhow!("__release-bead-locks bad JSON: {e}: {stdout}")))
+    serde_json::from_str(&stdout).map_err(|e| {
+        map_err(anyhow::anyhow!(
+            "__release-bead-locks bad JSON: {e}: {stdout}"
+        ))
+    })
 }
 
 /// Lease TTL policy for loop-made reservations: an initial TTL of
@@ -1819,7 +2025,11 @@ pub enum ClaimWatchAction {
     RedispatchBead { bead_id: String, title: String },
     /// the bead was claimed but its assignee is idle/done without closing —
     /// send a close-focused nudge to the assignee.
-    NudgeClose { agent: String, bead_id: String, title: String },
+    NudgeClose {
+        agent: String,
+        bead_id: String,
+        title: String,
+    },
     /// claimed-but-unclosed after the close nudge — re-queue a RESUME prompt
     /// so a fresh agent finishes + closes it.
     RedispatchResume { bead_id: String, title: String },
@@ -1829,20 +2039,17 @@ pub enum ClaimWatchAction {
     ReleaseReservations { bead_id: String },
 }
 
-/// Extract the bead id from a dispatched bead/resume prompt, if any.
-/// `bead_prompt` starts with "Execute bead bd-XXX: ..."; `resume_prompt`
-/// with "Resume bead bd-XXX: ...". Plain prompts (nudges, mail wakes) yield
-/// `None` — the watchdog only tracks bead dispatches.
+/// Extract the bead id from a dispatched brief, if any. The brief's first
+/// line carries it: `GOAL Execute bd-XXX: ...` (fresh) / `GOAL Resume bd-XXX:
+/// ...` (resume). Plain prompts (nudges, mail wakes, stages) yield `None` —
+/// the watchdog only tracks bead dispatches.
 pub fn bead_id_from_prompt(text: &str) -> Option<&str> {
-    let rest = text
-        .strip_prefix("Execute bead ")
-        .or_else(|| text.strip_prefix("Resume bead "))?;
+    let goal = text.lines().next()?.strip_prefix("GOAL ")?.trim();
+    let rest = goal
+        .strip_prefix("Execute ")
+        .or_else(|| goal.strip_prefix("Resume "))?;
     let id = rest.split(':').next().unwrap_or(rest).trim();
-    if id.is_empty() {
-        None
-    } else {
-        Some(id)
-    }
+    if id.is_empty() { None } else { Some(id) }
 }
 
 /// The claim-focused nudge prompt (bd-efk1 option A): one explicit command,
@@ -1980,9 +2187,9 @@ pub fn plan_actions(
                 // idle / done → feed work or nudge
                 if !queue.is_empty() {
                     let text = queue.remove(0); // FIFO: stages in declared order
-                                                // bead/resume prompts carry a {AGENT_NAME} placeholder —
-                                                // substitute the receiving agent's herdr name so the
-                                                // state-file path is concrete (no-op for plain prompts)
+                    // bead/resume prompts carry a {AGENT_NAME} placeholder —
+                    // substitute the receiving agent's herdr name so the
+                    // state-file path is concrete (no-op for plain prompts)
                     let base = text.replace("{AGENT_NAME}", &s.name);
                     let text = match digests.get(&s.name) {
                         Some(d) => match digest_prefix(d) {
@@ -2160,7 +2367,10 @@ pub fn all_settled(states: &[AgentState]) -> bool {
 /// present in the polled swarm is live regardless of status (unknown included
 /// — bd-bvwf.5: reclaim targets GONE/absent agents, never unknown-but-present
 /// ones). Pure — the unit surface for the reclaim decision.
-pub fn stranded_beads<'a>(inprogress: &'a [ReadyBead], live_names: &[String]) -> Vec<&'a ReadyBead> {
+pub fn stranded_beads<'a>(
+    inprogress: &'a [ReadyBead],
+    live_names: &[String],
+) -> Vec<&'a ReadyBead> {
     inprogress
         .iter()
         .filter(|b| match &b.assignee {
@@ -2176,7 +2386,10 @@ pub fn stranded_beads<'a>(inprogress: &'a [ReadyBead], live_names: &[String]) ->
 /// (re-opened to ready + re-dispatched), so they must not keep the loop from
 /// resolving once everything else is done. Pure — the unit surface for the
 /// completion re-check.
-pub fn blocking_inprogress<'a>(inprogress: &'a [ReadyBead], live_names: &[String]) -> Vec<&'a ReadyBead> {
+pub fn blocking_inprogress<'a>(
+    inprogress: &'a [ReadyBead],
+    live_names: &[String],
+) -> Vec<&'a ReadyBead> {
     inprogress
         .iter()
         .filter(|b| match &b.assignee {
@@ -2262,9 +2475,7 @@ pub enum Escalation {
 /// respawns an agent after the first three non-landing sends and stops on
 /// the FOURTH. Single source of truth for both halt sites + tests.
 pub fn failstop_message(name: &str, reason: Option<&str>) -> String {
-    format!(
-        "agent {name} failed to accept 4 prompts in a row (last reason: {reason:?})"
-    )
+    format!("agent {name} failed to accept 4 prompts in a row (last reason: {reason:?})")
 }
 
 /// Pure verdict for one confirmed send outcome.
@@ -2558,7 +2769,7 @@ pub fn self_heal_step(
 /// failure the failure is logged and the queue is left unchanged (the next
 /// poll re-derives the agent's state; the send-dedup prevents duplicates).
 #[allow(clippy::too_many_arguments)] // the single respawn point: ctx, params, queue,
-                                     // kinds, name, text, reason, attempts — every parameter is load-bearing.
+// kinds, name, text, reason, attempts — every parameter is load-bearing.
 async fn respawn_and_requeue(
     ctx: &Context,
     params: &LoopParams,
@@ -2683,6 +2894,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // watch catches unclaimed/ unclosed beads and nudges or re-dispatches.
     let mut claim_watch: std::collections::HashMap<String, ClaimWatch> =
         std::collections::HashMap::new();
+    // ADR-0019 (bd-w1-verify-fence): not-ready beads (missing/malformed
+    // `## VERIFY` fence) whose planner-mail already fired this invocation.
+    // Dedup is per-invocation state; on replay it is rebuilt from the
+    // checkpointed `__mail-not-ready` leaf results, so a crash never
+    // re-mails a bead the checkpoint already mailed.
+    let mut not_ready_mailed: std::collections::HashSet<String> = std::collections::HashSet::new();
     // bd-efk1: claim-watch nudge sends collected during work-mode sourcing,
     // merged into the action list AFTER plan_actions (they target specific
     // agents — including WORKING ones — and must not be double-filtered by
@@ -2984,7 +3201,14 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 .filter(|b| !assigned.contains(&b.id) && !stranded.contains(&b.id))
                 .collect();
             for bead in to_resume {
-                queue.push(resume_prompt(&bead.id, &bead.title));
+                queue_brief(
+                    &mut queue,
+                    &bead.id,
+                    &bead.title,
+                    &params.project,
+                    true,
+                    false,
+                );
                 assigned.push(bead.id.clone());
             }
 
@@ -3006,8 +3230,16 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     vec![]
                 }
             };
-            let to_assign: Vec<&ReadyBead> =
-                ready.iter().filter(|b| !assigned.contains(&b.id)).collect();
+            // ADR-0019 (bd-w1-verify-fence): only beads whose `## VERIFY`
+            // fence parsed to a single-line command are dispatchable. Beads
+            // with a missing/multi-line/empty fence are NOT dispatched —
+            // the planner is mailed once per bead per invocation.
+            let (dispatchable, not_ready) = partition_ready(&ready);
+            let to_assign: Vec<&ReadyBead> = dispatchable
+                .iter()
+                .filter(|b| !assigned.contains(&b.id))
+                .copied()
+                .collect();
             // bd-eign.2: bead-creation flood guard — >3 new ready beads in
             // ONE poll is the runaway-create signature (40 junk beads in
             // ~4 min, RC2). CRITICAL warn + PAUSE dispatch this poll: feeding
@@ -3021,8 +3253,36 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 );
             } else {
                 for bead in to_assign {
-                    queue.push(bead_prompt(&bead.id, &bead.title));
+                    queue_brief(
+                        &mut queue,
+                        &bead.id,
+                        &bead.title,
+                        &params.project,
+                        false,
+                        false,
+                    );
                     assigned.push(bead.id.clone());
+                }
+            }
+            // ADR-0019: refuse-to-dispatch — never queue a bead without a
+            // legal VERIFY fence; tell the planner why, on the bead's thread.
+            for bead in &not_ready {
+                if not_ready_mailed.insert(bead.id.clone()) {
+                    let args = NotReadyMailArgs {
+                        project: params.project.clone(),
+                        bead_id: bead.id.clone(),
+                        title: bead.title.clone(),
+                    };
+                    match ctx.run(mail_not_ready, args).await {
+                        Ok(v) => eprintln!(
+                            "flywheel: bead {} NOT ready (no legal VERIFY fence) — planner mailed: {v}",
+                            bead.id
+                        ),
+                        Err(e) => eprintln!(
+                            "flywheel: mail-not-ready for {} failed (continuing): {e}",
+                            bead.id
+                        ),
+                    }
                 }
             }
 
@@ -3050,16 +3310,20 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         });
                     }
                     ClaimWatchAction::RedispatchBead { bead_id, title } => {
-                        queue.insert(0, bead_prompt(&bead_id, &title));
+                        queue_brief(&mut queue, &bead_id, &title, &params.project, false, true);
                     }
-                    ClaimWatchAction::NudgeClose { agent, bead_id, title } => {
+                    ClaimWatchAction::NudgeClose {
+                        agent,
+                        bead_id,
+                        title,
+                    } => {
                         watch_sends.push(LoopAction::Send {
                             name: agent,
                             text: close_nudge_prompt(&bead_id, &title),
                         });
                     }
                     ClaimWatchAction::RedispatchResume { bead_id, title } => {
-                        queue.insert(0, resume_prompt(&bead_id, &title));
+                        queue_brief(&mut queue, &bead_id, &title, &params.project, true, true);
                     }
                     ClaimWatchAction::ReleaseReservations { bead_id } => {
                         // bd-h3oj: the bead closed — release its file
@@ -3223,11 +3487,14 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         let mut next_expected: std::collections::HashMap<String, ExpectedReplyRun> =
             std::collections::HashMap::new();
         for e in expected_entries {
-            let run = expected_replies.get(&e.agent).cloned().unwrap_or(ExpectedReplyRun {
-                thread: e.thread.clone(),
-                head: e.head.clone(),
-                reminder_count: 0,
-            });
+            let run = expected_replies
+                .get(&e.agent)
+                .cloned()
+                .unwrap_or(ExpectedReplyRun {
+                    thread: e.thread.clone(),
+                    head: e.head.clone(),
+                    reminder_count: 0,
+                });
             let run = if run.thread == e.thread {
                 run
             } else {
@@ -3249,9 +3516,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // settle check, the thread check, and the reminder target agree.
             let herdr_name = states
                 .iter()
-                .find(|s| {
-                    s.name == *agent || crate::resolve_mail_target(&s.name) == *agent
-                })
+                .find(|s| s.name == *agent || crate::resolve_mail_target(&s.name) == *agent)
                 .map(|s| s.name.clone());
             let Some(herdr_name) = herdr_name else {
                 continue; // agent not in this swarm (or expectation stale)
@@ -3259,9 +3524,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             if dispatch_pending.contains(&herdr_name) {
                 continue; // just dispatched this iteration — give it time
             }
-            let settled = states.iter().any(|s| {
-                s.name == herdr_name && matches!(s.status.as_str(), "idle" | "done")
-            });
+            let settled = states
+                .iter()
+                .any(|s| s.name == herdr_name && matches!(s.status.as_str(), "idle" | "done"));
             if !settled {
                 continue; // working/blocked/unknown — not settled yet
             }
@@ -3674,8 +3939,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 .await
             {
                 Ok(bs) => {
-                    let live_names: Vec<String> =
-                        states.iter().map(|s| s.name.clone()).collect();
+                    let live_names: Vec<String> = states.iter().map(|s| s.name.clone()).collect();
                     !blocking_inprogress(&bs, &live_names).is_empty()
                 }
                 Err(e) => {
@@ -3723,8 +3987,11 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // loop would exit "complete" having dispatched nothing (the
             // reported symptom). Count consecutive blind iterations; abort
             // loudly after the threshold with --force advice.
-            blind_complete_failures =
-                blind_completion_count(complete_now, critical_leaf_failed_this_iter, blind_complete_failures);
+            blind_complete_failures = blind_completion_count(
+                complete_now,
+                critical_leaf_failed_this_iter,
+                blind_complete_failures,
+            );
             if critical_leaf_failed_this_iter {
                 complete_holds = 0;
                 if blind_complete_failures >= DEFAULT_LEAF_FAILURE_ABORT_POLLS {
@@ -3854,6 +4121,9 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
         .register(poll_ready)
         .map_err(|e| anyhow::anyhow!("register poll_ready: {e}"))?;
     resonate
+        .register(mail_not_ready)
+        .map_err(|e| anyhow::anyhow!("register mail_not_ready: {e}"))?;
+    resonate
         .register(poll_inprogress)
         .map_err(|e| anyhow::anyhow!("register poll_inprogress: {e}"))?;
     resonate
@@ -3912,9 +4182,17 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
             }))
             .unwrap_or_default();
             let _ = resonate.promises.reject(&al.id, v).await;
-            fresh_loop_id(&params.project, &serde_json::to_value(&params)?, "swarm-loop")?
+            fresh_loop_id(
+                &params.project,
+                &serde_json::to_value(&params)?,
+                "swarm-loop",
+            )?
         }
-        _ => fresh_loop_id(&params.project, &serde_json::to_value(&params)?, "swarm-loop")?,
+        _ => fresh_loop_id(
+            &params.project,
+            &serde_json::to_value(&params)?,
+            "swarm-loop",
+        )?,
     };
 
     // bd-87hq: clear the project's OTHER stale pending loop invocations on the
@@ -3968,11 +4246,7 @@ fn fresh_loop_id(
     );
     crate::state::save_active_loop(
         project,
-        &crate::state::ActiveLoop::new(
-            fresh.clone(),
-            params.clone(),
-            crate::state::now_iso(),
-        ),
+        &crate::state::ActiveLoop::new(fresh.clone(), params.clone(), crate::state::now_iso()),
     )?;
     Ok(fresh)
 }
@@ -4027,11 +4301,7 @@ async fn clear_stale_loop_invocations(resonate: &Resonate, base: &str, except: O
                 return;
             }
         };
-        let ids: Vec<&str> = result
-            .promises
-            .iter()
-            .map(|p| p.id.as_str())
-            .collect();
+        let ids: Vec<&str> = result.promises.iter().map(|p| p.id.as_str()).collect();
         let value = resonate_sdk::types::Value::from_serializable(serde_json::json!({
             "rejected": "stale-loop-takeover"
         }))
@@ -4066,8 +4336,7 @@ pub fn build_loop_dispatch_workflow(name: &str, text: &str, profile: &str) -> Wo
     Workflow {
         name: "loop-dispatch".to_string(),
         description: Some(
-            "Loop dispatch tick — one agent prompt through the engine (bd-e0xk)."
-                .to_string(),
+            "Loop dispatch tick — one agent prompt through the engine (bd-e0xk).".to_string(),
         ),
         trigger: None,
         policy: None,
@@ -4126,7 +4395,7 @@ pub fn loop_dispatch_runner(project: String, confirm_sends: bool) -> ActionRunne
                 return Ok(json!({
                     "ok": false,
                     "error": format!("__send for {assignee} failed: {e:#}"),
-                }))
+                }));
             }
         };
         let raw = String::from_utf8_lossy(&out.stdout).to_string();
@@ -4195,6 +4464,10 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // claim-watch (dispatched bead → agent) + nudge sends as swarm_loop.
     let mut claim_watch: std::collections::HashMap<String, ClaimWatch> =
         std::collections::HashMap::new();
+    // ADR-0019 (bd-w1-verify-fence): not-ready beads whose planner-mail
+    // already fired this invocation (dedup, rebuilt on replay from the
+    // checkpointed `__mail-not-ready` leaf results).
+    let mut not_ready_mailed: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut watch_sends: Vec<LoopAction> = Vec::new();
 
     loop {
@@ -4264,8 +4537,7 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
 
         // self-heal (bd-event-self-heal): diagnose → respawn (budgeted) →
         // blocked. Same phase as the imperative loop.
-        let mut exited_names: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut exited_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for ev in &event_batch.events {
             if ev.event_type == "pane.exited" {
                 if let Some(n) = name_for_pane(&states, &ev.pane_id) {
@@ -4372,7 +4644,14 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 .filter(|b| !assigned.contains(&b.id) && !stranded.contains(&b.id))
                 .collect();
             for bead in to_resume {
-                queue.push(resume_prompt(&bead.id, &bead.title));
+                queue_brief(
+                    &mut queue,
+                    &bead.id,
+                    &bead.title,
+                    &params.project,
+                    true,
+                    false,
+                );
                 assigned.push(bead.id.clone());
             }
 
@@ -4391,11 +4670,47 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     vec![]
                 }
             };
-            let to_assign: Vec<&ReadyBead> =
-                ready.iter().filter(|b| !assigned.contains(&b.id)).collect();
+            // ADR-0019 (bd-w1-verify-fence): only beads whose `## VERIFY`
+            // fence parsed to a single-line command are dispatchable. Beads
+            // with a missing/multi-line/empty fence are NOT dispatched —
+            // the planner is mailed once per bead per invocation.
+            let (dispatchable, not_ready) = partition_ready(&ready);
+            let to_assign: Vec<&ReadyBead> = dispatchable
+                .iter()
+                .filter(|b| !assigned.contains(&b.id))
+                .copied()
+                .collect();
             for bead in to_assign {
-                queue.push(bead_prompt(&bead.id, &bead.title));
+                queue_brief(
+                    &mut queue,
+                    &bead.id,
+                    &bead.title,
+                    &params.project,
+                    false,
+                    false,
+                );
                 assigned.push(bead.id.clone());
+            }
+            // ADR-0019: refuse-to-dispatch — never queue a bead without a
+            // legal VERIFY fence; tell the planner why, on the bead's thread.
+            for bead in &not_ready {
+                if not_ready_mailed.insert(bead.id.clone()) {
+                    let args = NotReadyMailArgs {
+                        project: params.project.clone(),
+                        bead_id: bead.id.clone(),
+                        title: bead.title.clone(),
+                    };
+                    match ctx.run(mail_not_ready, args).await {
+                        Ok(v) => eprintln!(
+                            "flywheel: bead {} NOT ready (no legal VERIFY fence) — planner mailed: {v}",
+                            bead.id
+                        ),
+                        Err(e) => eprintln!(
+                            "flywheel: mail-not-ready for {} failed (continuing): {e}",
+                            bead.id
+                        ),
+                    }
+                }
             }
 
             // bd-efk1 parity: same crew-execution watchdog as swarm_loop —
@@ -4416,16 +4731,20 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         });
                     }
                     ClaimWatchAction::RedispatchBead { bead_id, title } => {
-                        queue.insert(0, bead_prompt(&bead_id, &title));
+                        queue_brief(&mut queue, &bead_id, &title, &params.project, false, true);
                     }
-                    ClaimWatchAction::NudgeClose { agent, bead_id, title } => {
+                    ClaimWatchAction::NudgeClose {
+                        agent,
+                        bead_id,
+                        title,
+                    } => {
                         watch_sends.push(LoopAction::Send {
                             name: agent,
                             text: close_nudge_prompt(&bead_id, &title),
                         });
                     }
                     ClaimWatchAction::RedispatchResume { bead_id, title } => {
-                        queue.insert(0, resume_prompt(&bead_id, &title));
+                        queue_brief(&mut queue, &bead_id, &title, &params.project, true, true);
                     }
                     ClaimWatchAction::ReleaseReservations { bead_id } => {
                         // bd-h3oj: the bead closed — release its file
@@ -4468,8 +4787,7 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         let mut any_blocked = false;
         for action in &actions {
             match action {
-                LoopAction::Send { name, text }
-                | LoopAction::DispatchImmediate { name, text } => {
+                LoopAction::Send { name, text } | LoopAction::DispatchImmediate { name, text } => {
                     // context guard: if the idle agent is context-exhausted,
                     // respawn a fresh instance instead of delegating to it
                     let verdict = match ctx
@@ -4512,15 +4830,15 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     let wf = build_loop_dispatch_workflow(name, text, &profile);
                     // deterministic run id per (invocation, agent, tick) —
                     // replay reuses it, never double-sends.
-                    let run_id = format!(
-                        "loop-dispatch:{}:{}:{}",
-                        params.invocation, iteration, name
-                    );
+                    let run_id =
+                        format!("loop-dispatch:{}:{}:{}", params.invocation, iteration, name);
                     let out = engine.invoke(&run_id, wf, json!({ "target": name })).await;
                     let value = match out {
                         Ok(v) => v,
                         Err(e) => {
-                            eprintln!("flywheel: loop-dispatch engine run for {name} failed: {e:#}");
+                            eprintln!(
+                                "flywheel: loop-dispatch engine run for {name} failed: {e:#}"
+                            );
                             json!({ "ok": false, "error": format!("{e:#}") })
                         }
                     };
@@ -4608,16 +4926,20 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         .find(|e| e.name == *name)
                         .and_then(|e| e.profile)
                         .unwrap_or_default();
-                    let wf = build_loop_dispatch_workflow(name, &params.nudge.clone().unwrap_or_default(), &profile);
-                    let run_id = format!(
-                        "loop-dispatch:{}:{}:{}",
-                        params.invocation, iteration, name
+                    let wf = build_loop_dispatch_workflow(
+                        name,
+                        &params.nudge.clone().unwrap_or_default(),
+                        &profile,
                     );
+                    let run_id =
+                        format!("loop-dispatch:{}:{}:{}", params.invocation, iteration, name);
                     let value = engine
                         .invoke(&run_id, wf, json!({ "target": name }))
                         .await
                         .unwrap_or_else(|e| {
-                            eprintln!("flywheel: loop-dispatch engine run for {name} failed: {e:#}");
+                            eprintln!(
+                                "flywheel: loop-dispatch engine run for {name} failed: {e:#}"
+                            );
                             json!({ "ok": false, "error": format!("{e:#}") })
                         });
                     let outcome = engine_dispatch_outcome(name, &value);
@@ -4709,8 +5031,7 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 .await
             {
                 Ok(bs) => {
-                    let live_names: Vec<String> =
-                        states.iter().map(|s| s.name.clone()).collect();
+                    let live_names: Vec<String> = states.iter().map(|s| s.name.clone()).collect();
                     !blocking_inprogress(&bs, &live_names).is_empty()
                 }
                 Err(e) => {
@@ -4821,6 +5142,9 @@ pub async fn run_engine_loop(cfg: &Config, mut params: LoopParams) -> anyhow::Re
         .register(poll_ready)
         .map_err(|e| anyhow::anyhow!("register poll_ready: {e}"))?;
     resonate
+        .register(mail_not_ready)
+        .map_err(|e| anyhow::anyhow!("register mail_not_ready: {e}"))?;
+    resonate
         .register(poll_inprogress)
         .map_err(|e| anyhow::anyhow!("register poll_inprogress: {e}"))?;
     resonate
@@ -4865,9 +5189,17 @@ pub async fn run_engine_loop(cfg: &Config, mut params: LoopParams) -> anyhow::Re
             }))
             .unwrap_or_default();
             let _ = resonate.promises.reject(&al.id, v).await;
-            fresh_loop_id(&params.project, &serde_json::to_value(&params)?, "engine-loop")?
+            fresh_loop_id(
+                &params.project,
+                &serde_json::to_value(&params)?,
+                "engine-loop",
+            )?
         }
-        _ => fresh_loop_id(&params.project, &serde_json::to_value(&params)?, "engine-loop")?,
+        _ => fresh_loop_id(
+            &params.project,
+            &serde_json::to_value(&params)?,
+            "engine-loop",
+        )?,
     };
     params.invocation = id.clone();
     params.resonate_url = url;
@@ -4988,7 +5320,11 @@ pub async fn loop_doctor(cfg: &Config, fix: bool) -> anyhow::Result<serde_json::
     });
 
     // (1) connectivity — the search is the ping.
-    let connectivity = match resonate.promises.search(Some("pending"), None, Some(1), None).await {
+    let connectivity = match resonate
+        .promises
+        .search(Some("pending"), None, Some(1), None)
+        .await
+    {
         Ok(_) => json!({"ok": true, "url": url, "error": null}),
         Err(e) => json!({"ok": false, "url": url, "error": e.to_string()}),
     };
@@ -5225,8 +5561,16 @@ mod reply_verify_tests {
         assert_eq!(
             argv,
             vec![
-                "__remind-reply", "proj", "oc", "t1", "--reminder-count", "0",
-                "--invocation", "inv", "--iteration", "7"
+                "__remind-reply",
+                "proj",
+                "oc",
+                "t1",
+                "--reminder-count",
+                "0",
+                "--invocation",
+                "inv",
+                "--iteration",
+                "7"
             ]
         );
         let ca = CheckReplyArgs {
@@ -5241,13 +5585,19 @@ mod reply_verify_tests {
         let ea = ExpectedArgs {
             project: "proj".into(),
         };
-        assert_eq!(load_expected_replies_argv(&ea), vec!["__expected-replies", "proj"]);
+        assert_eq!(
+            load_expected_replies_argv(&ea),
+            vec!["__expected-replies", "proj"]
+        );
         let sa = ReplySettledArgs {
             project: "proj".into(),
             name: "oc".into(),
             thread: "t1".into(),
         };
-        assert_eq!(reply_settled_argv(&sa), vec!["__reply-settled", "proj", "oc", "t1"]);
+        assert_eq!(
+            reply_settled_argv(&sa),
+            vec!["__reply-settled", "proj", "oc", "t1"]
+        );
     }
 }
 
@@ -5330,7 +5680,11 @@ mod tests {
             "engine-loop:flywheel:1786557202790124002",
         ];
         // the invocation this run owns/resumes is preserved
-        let rejected = stale_loop_reject_ids(&ids, "flywheel", Some("swarm-loop:flywheel:1786557202790124000"));
+        let rejected = stale_loop_reject_ids(
+            &ids,
+            "flywheel",
+            Some("swarm-loop:flywheel:1786557202790124000"),
+        );
         assert_eq!(
             rejected,
             vec![
@@ -5384,8 +5738,14 @@ mod tests {
 
     #[test]
     fn loop_verdict_settled_states_ignore_liveness() {
-        assert_eq!(loop_verdict(Some(&PromiseState::Resolved), true), "complete");
-        assert_eq!(loop_verdict(Some(&PromiseState::Resolved), false), "complete");
+        assert_eq!(
+            loop_verdict(Some(&PromiseState::Resolved), true),
+            "complete"
+        );
+        assert_eq!(
+            loop_verdict(Some(&PromiseState::Resolved), false),
+            "complete"
+        );
         assert_eq!(loop_verdict(Some(&PromiseState::Rejected), true), "failed");
         assert_eq!(
             loop_verdict(Some(&PromiseState::RejectedCanceled), false),
@@ -5411,7 +5771,13 @@ mod tests {
     fn idle_agent_pops_queue() {
         let states = vec![st("a", "idle")];
         let mut q = vec!["p1".to_string(), "p6".to_string()];
-        let actions = plan_actions(&states, &mut q, None, &HashMap::new(), &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut q,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(q.len(), 1);
         assert!(
             matches!(&actions[0], LoopAction::Send { name, text } if name == "a" && text == "p1")
@@ -5422,7 +5788,13 @@ mod tests {
     fn queue_drains_across_idle_agents_in_order() {
         let states = vec![st("a", "idle"), st("b", "done")];
         let mut q = vec!["p1".to_string(), "p6".to_string()];
-        let actions = plan_actions(&states, &mut q, None, &HashMap::new(), &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut q,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert!(q.is_empty());
         match (&actions[0], &actions[1]) {
             (LoopAction::Send { name: n1, text: t1 }, LoopAction::Send { name: n2, text: t2 }) => {
@@ -5439,7 +5811,13 @@ mod tests {
     fn working_agent_gets_nothing() {
         let states = vec![st("a", "working")];
         let mut q = vec!["p1".to_string()];
-        let actions = plan_actions(&states, &mut q, None, &HashMap::new(), &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut q,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(q.len(), 1);
         assert!(matches!(actions[0], LoopAction::Wait));
     }
@@ -5448,7 +5826,13 @@ mod tests {
     fn blocked_agent_reports_and_keeps_queue() {
         let states = vec![st("a", "blocked")];
         let mut q = vec!["p1".to_string()];
-        let actions = plan_actions(&states, &mut q, None, &HashMap::new(), &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut q,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert!(matches!(&actions[0], LoopAction::Blocked { name } if name == "a"));
         assert_eq!(q.len(), 1);
     }
@@ -5457,7 +5841,13 @@ mod tests {
     fn empty_queue_with_nudge_nudges() {
         let states = vec![st("a", "idle")];
         let mut q: Vec<String> = vec![];
-        let actions = plan_actions(&states, &mut q, Some("proceed"), &HashMap::new(), &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut q,
+            Some("proceed"),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert!(matches!(&actions[0], LoopAction::Nudge { name } if name == "a"));
     }
 
@@ -5465,7 +5855,13 @@ mod tests {
     fn empty_queue_no_nudge_waits() {
         let states = vec![st("a", "done")];
         let mut q: Vec<String> = vec![];
-        let actions = plan_actions(&states, &mut q, None, &HashMap::new(), &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut q,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert!(matches!(actions[0], LoopAction::Wait));
     }
 
@@ -5475,7 +5871,13 @@ mod tests {
     fn unknown_agent_keeps_queue() {
         let states = vec![st("a", "unknown")];
         let mut q = vec!["p1".to_string()];
-        let actions = plan_actions(&states, &mut q, None, &HashMap::new(), &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut q,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(q.len(), 1); // queue intact — unknown must never consume items
         assert!(matches!(actions[0], LoopAction::Wait));
     }
@@ -5484,7 +5886,13 @@ mod tests {
     fn unknown_with_nudge_no_send() {
         let states = vec![st("a", "unknown")];
         let mut q: Vec<String> = vec![];
-        let actions = plan_actions(&states, &mut q, Some("proceed"), &HashMap::new(), &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut q,
+            Some("proceed"),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert!(matches!(actions[0], LoopAction::Wait)); // no Nudge, no Send
     }
 
@@ -5514,6 +5922,7 @@ mod tests {
             id: id.into(),
             title: String::new(),
             assignee: assignee.map(str::to_string),
+            verify: None,
         }
     }
 
@@ -5523,7 +5932,7 @@ mod tests {
     fn stranded_beads_flag_non_live_assignees() {
         let live = vec!["oc".to_string(), "pi".to_string()];
         let inprog = vec![
-            rb("bd-1", Some("oc")),   // live — not stranded
+            rb("bd-1", Some("oc")),      // live — not stranded
             rb("bd-2", Some("captain")), // non-live — stranded
             rb("bd-3", Some("ghost")),   // dead agent — stranded
             rb("bd-4", None),            // unowned — stranded (bd-qk9q: nobody holds it)
@@ -5559,7 +5968,11 @@ mod tests {
         let inprog = vec![rb("bd-1", Some("oc"))];
         assert!(stranded_beads(&inprog, &live).is_empty());
         let absent = vec![rb("bd-2", Some("ghost"))];
-        assert_eq!(stranded_beads(&absent, &live).len(), 1, "absent agent IS stranded");
+        assert_eq!(
+            stranded_beads(&absent, &live).len(),
+            1,
+            "absent agent IS stranded"
+        );
     }
 
     /// Stranded beads do NOT block completion; live-held and unowned
@@ -5568,7 +5981,7 @@ mod tests {
     fn blocking_inprogress_counts_live_and_unowned_only() {
         let live = vec!["oc".to_string()];
         let inprog = vec![
-            rb("bd-1", Some("oc")),     // live — blocks
+            rb("bd-1", Some("oc")),      // live — blocks
             rb("bd-2", Some("captain")), // stranded — does NOT block
             rb("bd-3", None),            // unowned — blocks (tracker resolves)
         ];
@@ -5582,12 +5995,12 @@ mod tests {
     #[test]
     fn blocking_inprogress_empty_when_all_stranded() {
         let live = vec!["oc".to_string()];
-        let inprog = vec![
-            rb("bd-1", Some("captain")),
-            rb("bd-2", Some("ghost")),
-        ];
+        let inprog = vec![rb("bd-1", Some("captain")), rb("bd-2", Some("ghost"))];
         assert!(blocking_inprogress(&inprog, &live).is_empty());
-        assert!(!stranded_beads(&inprog, &live).is_empty(), "they ARE stranded");
+        assert!(
+            !stranded_beads(&inprog, &live).is_empty(),
+            "they ARE stranded"
+        );
     }
 
     // ---- adaptive poll interval (bd-adaptive-interval) ----
@@ -5842,17 +6255,30 @@ mod tests {
         assert_eq!(f.get("unk"), Some(&1));
     }
 
+    /// ADR-0019 Spec 2 test helpers: filled briefs (fresh + resume) that fit
+    /// the dispatch cap.
+    fn brief(id: &str, title: &str) -> String {
+        build_brief(id, title, "flywheel", false).expect("brief fits the dispatch cap")
+    }
+
+    fn resume_brief(id: &str, title: &str) -> String {
+        build_brief(id, title, "flywheel", true).expect("brief fits the dispatch cap")
+    }
+
+    /// ADR-0019 Spec 2: a resume brief is the same filled template with the
+    /// GOAL prefixed `Resume <id>:` — the old prose `resume_prompt` is gone.
     #[test]
-    fn resume_prompt_mentions_continuation() {
-        let p = resume_prompt("bd-7", "finish the parser");
+    fn resume_brief_mentions_continuation() {
+        let p = resume_brief("bd-7", "finish the parser");
         assert!(p.contains("bd-7"));
         assert!(p.contains("Resume"));
         assert!(p.contains("CONTEXT_LIMIT"));
+        assert!(p.starts_with("GOAL Resume bd-7: finish the parser."));
     }
 
     #[test]
-    fn resume_prompt_carries_state_file_contract() {
-        let p = resume_prompt("bd-7", "finish the parser");
+    fn resume_brief_carries_state_file_contract() {
+        let p = resume_brief("bd-7", "finish the parser");
         // the literal path pattern + the field; the name placeholder is
         // substituted at dispatch (plan_actions) — the template must not
         // hardcode any agent
@@ -5994,35 +6420,98 @@ mod tests {
         assert_eq!(ro.terminal, "y");
     }
 
+    /// ADR-0019 Spec 2: the brief replaces the lifecycle novel — it is
+    /// self-contained (id + GOAL + standing-orders path), not a prose
+    /// claim→close recipe.
     #[test]
-    fn bead_prompt_is_self_contained() {
-        let p = bead_prompt("bd-12", "fix auth flow");
+    fn brief_is_self_contained() {
+        let p = brief("bd-12", "fix auth flow");
         assert!(p.contains("bd-12"));
-        assert!(p.contains("--claim"));
-        assert!(p.contains("br sync --flush-only"));
+        assert!(p.contains("GOAL Execute bd-12: fix auth flow."));
+        assert!(p.contains(".flywheel/standing-orders.md"));
     }
 
     #[test]
-    fn bead_prompt_carries_state_file_contract() {
-        let p = bead_prompt("bd-12", "fix auth flow");
+    fn brief_carries_state_file_contract() {
+        let p = brief("bd-12", "fix auth flow");
         assert!(p.contains(".flywheel/agent-state/"));
         assert!(p.contains("context_pct"));
         assert!(p.contains(".flywheel/agent-state/{AGENT_NAME}.json"));
         assert!(p.contains("CONTEXT_LIMIT"));
     }
 
-    // ---- lease renewal (bd-mail-lease-renewal-durable) ----
-
-    /// Both spawn prompts carry the self-renew clause: agents renew their own
-    /// reservations (the orchestrator cannot renew on their behalf).
+    /// The brief fills ALL ten Spec 2 fields.
     #[test]
-    fn spawn_prompts_carry_lease_renew_clause() {
-        for p in [
-            bead_prompt("bd-12", "fix auth flow"),
-            resume_prompt("bd-7", "finish the parser"),
+    fn brief_fills_all_ten_fields() {
+        let p = brief("bd-12", "fix auth flow");
+        for field in [
+            "GOAL",
+            "SCOPE",
+            "CONTEXT",
+            "ACCEPTANCE",
+            "VERIFY",
+            "TIMEBOX",
+            "FORBIDDEN",
+            "REPORT",
+            "PRINCIPLES",
+            "STANDING",
+        ] {
+            assert!(p.contains(field), "brief carries the {field} field: {p}");
+        }
+    }
+
+    /// ADR-0019 Spec 2: the lifecycle (claim → reserve → announce → execute →
+    /// verify → close → sync → commit) lives in the standing-orders file,
+    /// referenced BY PATH ONLY. The brief must not restate the commands.
+    #[test]
+    fn brief_standing_is_path_only_and_no_lifecycle_commands() {
+        let p = brief("bd-12", "fix auth flow");
+        assert!(p.contains("flywheel/.flywheel/standing-orders.md"));
+        assert!(p.contains("~/.config/flywheel/standing-orders.md"));
+        for cmd in [
+            "br update",
+            "br sync",
+            "br close",
+            "locks reserve",
+            "--claim",
         ] {
             assert!(
-                p.to_lowercase().contains("renew your own file reservations"),
+                !p.contains(cmd),
+                "lifecycle command {cmd} must live in standing orders, not the brief: {p}"
+            );
+        }
+    }
+
+    /// The old novel header is gone from every brief variant — no dispatched
+    /// prompt may carry it (rg acceptance: the two-word sequence must not
+    /// appear anywhere in flywheel/src, including inside this guard).
+    #[test]
+    fn brief_never_says_execute_bead() {
+        let old_header = ["Execute", "bead"].join(" ");
+        for p in [
+            brief("bd-12", "fix auth flow"),
+            resume_brief("bd-7", "finish the parser"),
+        ] {
+            assert!(
+                !p.contains(&old_header),
+                "old novel header must be gone: {p}"
+            );
+        }
+    }
+
+    // ---- lease renewal (bd-mail-lease-renewal-durable) ----
+
+    /// Both brief variants carry the self-renew clause: agents renew their
+    /// own reservations (the orchestrator cannot renew on their behalf).
+    #[test]
+    fn briefs_carry_lease_renew_clause() {
+        for p in [
+            brief("bd-12", "fix auth flow"),
+            resume_brief("bd-7", "finish the parser"),
+        ] {
+            assert!(
+                p.to_lowercase()
+                    .contains("renew your own file reservations"),
                 "prompt must instruct agents to renew their own leases: {p}"
             );
             assert!(
@@ -6032,12 +6521,13 @@ mod tests {
         }
     }
 
-    /// bd-fug: ack contract in bead_prompt + resume_prompt (grep-verifiable).
+    /// bd-fug: the ack contract carries into both brief variants
+    /// (grep-verifiable).
     #[test]
-    fn spawn_prompts_carry_ack_contract_clause() {
+    fn briefs_carry_ack_contract_clause() {
         for p in [
-            bead_prompt("bd-12", "fix auth flow"),
-            resume_prompt("bd-7", "finish the parser"),
+            brief("bd-12", "fix auth flow"),
+            resume_brief("bd-7", "finish the parser"),
         ] {
             assert!(
                 p.contains("ack_required=true"),
@@ -6052,6 +6542,42 @@ mod tests {
                 "prompt must state orchestrator cannot ack: {p}"
             );
         }
+    }
+
+    /// ADR-0019 Spec 2: the dispatched prompt (behavior + brief) has a hard
+    /// cap; over it is a LOOP BUG — fail loud, never silent truncation.
+    #[test]
+    fn brief_cap_enforced_fails_loud() {
+        let huge = "x".repeat(8192);
+        let err = build_brief("bd-1", &huge, "flywheel", false).unwrap_err();
+        assert!(
+            err.bytes > DISPATCH_PROMPT_CAP,
+            "over-cap brief reports its size"
+        );
+    }
+
+    /// The cap boundary: a brief landing exactly ON the cap is legal; one
+    /// byte more is a loud error.
+    #[test]
+    fn brief_cap_boundary() {
+        let base = build_brief("bd-1", "", "flywheel", false).unwrap();
+        let room = DISPATCH_PROMPT_CAP.saturating_sub(base.len());
+        let fits = build_brief("bd-1", &"x".repeat(room), "flywheel", false).unwrap();
+        assert!(fits.len() <= DISPATCH_PROMPT_CAP);
+        assert!(
+            build_brief("bd-1", &"x".repeat(room + 1), "flywheel", false).is_err(),
+            "one byte over the cap fails loud"
+        );
+    }
+
+    /// The {AGENT_NAME} placeholder survives the fill — plan_actions
+    /// substitutes the receiving agent's name at dispatch (never the
+    /// template).
+    #[test]
+    fn brief_agent_name_placeholder_survives_fill() {
+        let p = brief("bd-12", "fix auth flow");
+        assert!(p.contains("{AGENT_NAME}"));
+        assert!(p.contains(".flywheel/agent-state/{AGENT_NAME}.json"));
     }
 
     /// Renewal extension per tick: `4 × heartbeat`, floored at agent-mail's
@@ -6084,11 +6610,17 @@ mod tests {
 
     #[test]
     fn plan_actions_substitutes_agent_name_at_dispatch() {
-        // a queued bead prompt carries {AGENT_NAME}; the idle agent's name
+        // a queued brief carries {AGENT_NAME}; the idle agent's name
         // replaces it when the Send action is built
-        let mut queue = vec![bead_prompt("bd-12", "fix auth flow")];
+        let mut queue = vec![brief("bd-12", "fix auth flow")];
         let states = vec![st("flywheel-proj-oc", "idle")];
-        let actions = plan_actions(&states, &mut queue, None, &HashMap::new(), &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut queue,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         match &actions[0] {
             LoopAction::Send { name, text } => {
                 assert_eq!(name, "flywheel-proj-oc");
@@ -6104,7 +6636,13 @@ mod tests {
     fn plan_actions_leaves_plain_prompts_untouched() {
         let mut queue = vec!["t1".to_string()];
         let states = vec![st("flywheel-proj-oc", "idle")];
-        let actions = plan_actions(&states, &mut queue, None, &HashMap::new(), &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut queue,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         match &actions[0] {
             LoopAction::Send { text, .. } => assert_eq!(text, "t1"),
             other => panic!("expected Send, got {other:?}"),
@@ -6121,12 +6659,15 @@ mod tests {
         assert!(bead_flood_verdict(40));
     }
 
-    /// bd-eign.2: the dispatch prompt forbids creating new beads — the agent
-    /// must report scope gaps in the thread, not spawn tracker work.
+    /// bd-eign.2: the brief forbids creating new beads — the agent must
+    /// report scope gaps in the thread, not spawn tracker work.
     #[test]
-    fn bead_prompt_forbids_creating_new_beads() {
-        let p = bead_prompt("bd-12", "fix auth flow");
-        assert!(p.contains("DO NOT create new beads"), "prompt must forbid bead creation: {p}");
+    fn brief_forbids_creating_new_beads() {
+        let p = brief("bd-12", "fix auth flow");
+        assert!(
+            p.contains("DO NOT create new beads"),
+            "prompt must forbid bead creation: {p}"
+        );
         assert!(
             p.contains("report scope gaps in the thread"),
             "prompt must redirect scope gaps to the thread: {p}"
@@ -6150,7 +6691,10 @@ mod tests {
             panic!("loop-dispatch step is a dispatch_job");
         };
         assert_eq!(assignee, "oc-1");
-        assert_eq!(spec.get("task").and_then(Value::as_str), Some("work the beads"));
+        assert_eq!(
+            spec.get("task").and_then(Value::as_str),
+            Some("work the beads")
+        );
         assert_eq!(spec.get("profile").and_then(Value::as_str), Some("@coder"));
         // the workflow itself is lint-clean (declarative quality gate)
         let report = toron_workflow::lint_workflow(&wf);
@@ -6171,7 +6715,10 @@ mod tests {
                 return Ok(json!({ "ok": false }));
             };
             let task = spec.get("task").and_then(Value::as_str).unwrap_or_default();
-            seen2.lock().unwrap().push((assignee.clone(), task.to_string()));
+            seen2
+                .lock()
+                .unwrap()
+                .push((assignee.clone(), task.to_string()));
             Ok(json!({ "ok": true, "name": assignee }))
         });
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -6179,11 +6726,7 @@ mod tests {
             let engine = WorkflowEngine::local(runner).unwrap();
             let wf = build_loop_dispatch_workflow("oc-1", "work the beads", "@coder");
             engine
-                .invoke(
-                    "test-loop-dispatch-1",
-                    wf,
-                    json!({ "target": "oc-1" }),
-                )
+                .invoke("test-loop-dispatch-1", wf, json!({ "target": "oc-1" }))
                 .await
         });
         let out = result.expect("engine run completes");
@@ -6201,9 +6744,15 @@ mod tests {
     /// same prompt.
     #[test]
     fn plan_actions_to_engine_dispatch_parity() {
-        let mut queue = vec![bead_prompt("bd-12", "fix auth flow")];
+        let mut queue = vec![brief("bd-12", "fix auth flow")];
         let states = vec![st("flywheel-proj-oc", "idle")];
-        let actions = plan_actions(&states, &mut queue, None, &HashMap::new(), &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut queue,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         let LoopAction::Send { name, text } = &actions[0] else {
             panic!("expected Send");
         };
@@ -6229,7 +6778,10 @@ mod tests {
             iteration: 1,
             profile: String::new(),
         });
-        assert!(argv.iter().any(|a| a == text), "legacy argv carries the same text: {argv:?}");
+        assert!(
+            argv.iter().any(|a| a == text),
+            "legacy argv carries the same text: {argv:?}"
+        );
     }
 
     /// The runner maps a dispatch_job to the exact `__send` argv the loop
@@ -6279,7 +6831,13 @@ mod tests {
         let mut queue = vec!["do the work".to_string()];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(2, 1, "PinkGorge", "[bd-1] need input"));
-        let actions = plan_actions(&states, &mut queue, None, &d, &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut queue,
+            None,
+            &d,
+            &std::collections::HashSet::new(),
+        );
         match &actions[0] {
             LoopAction::Send { text, .. } => {
                 assert!(
@@ -6296,7 +6854,13 @@ mod tests {
         let mut queue = vec!["do the work".to_string()];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(0, 0, "", ""));
-        let actions = plan_actions(&states, &mut queue, None, &d, &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut queue,
+            None,
+            &d,
+            &std::collections::HashSet::new(),
+        );
         match &actions[0] {
             LoopAction::Send { text, .. } => assert_eq!(text, "do the work"),
             other => panic!("expected Send, got {other:?}"),
@@ -6309,7 +6873,13 @@ mod tests {
         let mut queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] help needed"));
-        let actions = plan_actions(&states, &mut queue, None, &d, &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut queue,
+            None,
+            &d,
+            &std::collections::HashSet::new(),
+        );
         match &actions[0] {
             LoopAction::Send { text, .. } => {
                 assert!(
@@ -6351,7 +6921,13 @@ mod tests {
         let mut queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(0, 0, "", ""));
-        let actions = plan_actions(&states, &mut queue, None, &d, &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut queue,
+            None,
+            &d,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(actions[0], LoopAction::Wait);
     }
 
@@ -6362,7 +6938,13 @@ mod tests {
         let mut queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(3, 2, "PinkGorge", "[bd-1] urgent"));
-        let actions = plan_actions(&states, &mut queue, Some("proceed"), &d, &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut queue,
+            Some("proceed"),
+            &d,
+            &std::collections::HashSet::new(),
+        );
         match &actions[0] {
             LoopAction::Nudge { .. } => {}
             other => panic!("expected Nudge (orchestrator direction wins), got {other:?}"),
@@ -6380,7 +6962,11 @@ mod tests {
         let mut suppressed = std::collections::HashSet::new();
         suppressed.insert("flywheel-proj-oc".to_string());
         let actions = plan_actions(&states, &mut queue, None, &d, &suppressed);
-        assert_eq!(actions[0], LoopAction::Wait, "already-woken agent must wait");
+        assert_eq!(
+            actions[0],
+            LoopAction::Wait,
+            "already-woken agent must wait"
+        );
         assert!(queue.is_empty());
     }
 
@@ -6390,7 +6976,13 @@ mod tests {
         let mut queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] new help"));
-        let actions = plan_actions(&states, &mut queue, None, &d, &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut queue,
+            None,
+            &d,
+            &std::collections::HashSet::new(),
+        );
         match &actions[0] {
             LoopAction::Send { text, .. } => assert!(text.starts_with("MAIL WAKE:")),
             other => panic!("expected wake Send, got {other:?}"),
@@ -6403,9 +6995,19 @@ mod tests {
         let mut queue = vec!["do the work".to_string()];
         let states = vec![st("flywheel-proj-oc", "working")];
         let d = digest_map(digest(5, 1, "PinkGorge", "[bd-1] input"));
-        let actions = plan_actions(&states, &mut queue, None, &d, &std::collections::HashSet::new());
+        let actions = plan_actions(
+            &states,
+            &mut queue,
+            None,
+            &d,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(actions[0], LoopAction::Wait);
-        assert_eq!(queue.len(), 1, "queue must not be consumed by a working agent");
+        assert_eq!(
+            queue.len(),
+            1,
+            "queue must not be consumed by a working agent"
+        );
     }
 
     // ---- bd-efk1: crew-execution claim watchdog (pure surface) ----
@@ -6415,6 +7017,7 @@ mod tests {
             id: id.to_string(),
             title: title.to_string(),
             assignee: None,
+            verify: None,
         }
     }
 
@@ -6423,6 +7026,7 @@ mod tests {
             id: id.to_string(),
             title: title.to_string(),
             assignee: Some(assignee.to_string()),
+            verify: None,
         }
     }
 
@@ -6436,24 +7040,33 @@ mod tests {
     }
 
     #[test]
-    fn bead_id_from_prompt_extracts_execute_and_resume() {
+    fn bead_id_from_prompt_extracts_goal_execute_and_resume() {
         assert_eq!(
-            bead_id_from_prompt("Execute bead bd-12: fix auth flow"),
+            bead_id_from_prompt("GOAL Execute bd-12: fix auth flow."),
             Some("bd-12")
         );
         assert_eq!(
-            bead_id_from_prompt("Resume bead bd-bvwf.1: loop reliability"),
+            bead_id_from_prompt("GOAL Resume bd-bvwf.1: loop reliability."),
             Some("bd-bvwf.1")
         );
-        assert_eq!(bead_id_from_prompt("p1"), None, "plain stage prompts are not tracked");
+        assert_eq!(
+            bead_id_from_prompt("p1"),
+            None,
+            "plain stage prompts are not tracked"
+        );
         assert_eq!(
             bead_id_from_prompt("MAIL WAKE: 1 urgent message..."),
             None,
             "mail wakes are not tracked"
         );
+        assert_eq!(
+            bead_id_from_prompt("CLAIM REQUIRED: bead bd-9 is still unclaimed"),
+            None,
+            "nudges are not tracked"
+        );
         // an edge id with a colon in the title must stop at the first colon
         assert_eq!(
-            bead_id_from_prompt("Execute bead bd-x: title: with colon"),
+            bead_id_from_prompt("GOAL Execute bd-x: title: with colon."),
             Some("bd-x")
         );
     }
@@ -6461,7 +7074,10 @@ mod tests {
     #[test]
     fn claim_nudge_prompt_is_claim_focused() {
         let p = claim_nudge_prompt("bd-12");
-        assert!(p.contains("br update bd-12 --claim"), "explicit claim command: {p}");
+        assert!(
+            p.contains("br update bd-12 --claim"),
+            "explicit claim command: {p}"
+        );
         assert!(p.contains("bd-12"), "names the bead");
     }
 
@@ -6524,7 +7140,10 @@ mod tests {
             "{:?}",
             actions[0]
         );
-        assert!(watch.is_empty(), "settled-without-claim drops the watch entry");
+        assert!(
+            watch.is_empty(),
+            "settled-without-claim drops the watch entry"
+        );
     }
 
     /// A claimed bead (in `br inprogress`) whose assignee is idle/done
@@ -6543,7 +7162,11 @@ mod tests {
         let actions = claim_watch_step(&mut watch, &ready, &inprogress, &states, 2);
         assert_eq!(actions.len(), 1, "{actions:?}");
         match &actions[0] {
-            ClaimWatchAction::NudgeClose { agent, bead_id, title } => {
+            ClaimWatchAction::NudgeClose {
+                agent,
+                bead_id,
+                title,
+            } => {
                 assert_eq!(agent, "oc-1");
                 assert_eq!(bead_id, "bd-12");
                 assert_eq!(title, "fix auth");
@@ -6579,7 +7202,10 @@ mod tests {
         let inprogress = vec![rb_assignee("bd-12", "fix auth", "oc-1")];
         let states = vec![st("oc-1", "working")];
         let actions = claim_watch_step(&mut watch, &ready, &inprogress, &states, 2);
-        assert!(actions.is_empty(), "no nudge while claimed work is in flight: {actions:?}");
+        assert!(
+            actions.is_empty(),
+            "no nudge while claimed work is in flight: {actions:?}"
+        );
         assert!(watch.contains_key("bd-12"), "keep watching");
     }
 
@@ -7094,7 +7720,12 @@ mod tests {
         assert_eq!(blind_completion_count(false, true, 2), 0);
         // Abort threshold: DEFAULT_LEAF_FAILURE_ABORT_POLLS consecutive
         // blind iterations trip the abort (the loop body returns Err).
-        const { assert!(DEFAULT_LEAF_FAILURE_ABORT_POLLS >= 3, "abort is not instant") };
+        const {
+            assert!(
+                DEFAULT_LEAF_FAILURE_ABORT_POLLS >= 3,
+                "abort is not instant"
+            )
+        };
     }
 
     // ---- bd-event-dispatch-zero-latency: route_event ----
@@ -7138,7 +7769,7 @@ mod tests {
         );
         assert!(a2.is_none());
         assert_eq!(queue, vec!["p2".to_string()]); // only one pop
-                                                   // working clears pending
+        // working clears pending
         let a3 = route_event(
             &states,
             &pev("pane.agent_status_changed", "%1", "working", 3),
@@ -7304,7 +7935,10 @@ mod tests {
         assert_eq!(hs.diagnose_count, 0);
         assert_eq!(hs.respawn_count, 0);
         // once classification lands, the episode resets (still no heal)
-        assert_eq!(self_heal_step(&mut hs, "working", false, 6, 3, 2), HealAction::None);
+        assert_eq!(
+            self_heal_step(&mut hs, "working", false, 6, 3, 2),
+            HealAction::None
+        );
         assert_eq!(hs.unknown_count, 0);
         // grace=0 preserves the old immediate ladder
         let mut old = HealState::default();
@@ -7320,11 +7954,20 @@ mod tests {
     fn self_heal_after_grace_diagnose_then_respawn() {
         let mut hs = HealState::default();
         for _ in 0..6 {
-            assert_eq!(self_heal_step(&mut hs, "unknown", false, 6, 3, 2), HealAction::None);
+            assert_eq!(
+                self_heal_step(&mut hs, "unknown", false, 6, 3, 2),
+                HealAction::None
+            );
         }
-        assert_eq!(self_heal_step(&mut hs, "unknown", false, 6, 3, 2), HealAction::Diagnose);
+        assert_eq!(
+            self_heal_step(&mut hs, "unknown", false, 6, 3, 2),
+            HealAction::Diagnose
+        );
         assert!(hs.awaiting_clear);
-        assert_eq!(self_heal_step(&mut hs, "unknown", false, 6, 3, 2), HealAction::Respawn);
+        assert_eq!(
+            self_heal_step(&mut hs, "unknown", false, 6, 3, 2),
+            HealAction::Respawn
+        );
         assert_eq!(hs.respawn_count, 1);
     }
 
@@ -7404,10 +8047,16 @@ mod tests {
     }
 
     fn poll_dispatch(states: &[AgentState], queue: &mut Vec<String>) -> Vec<DispatchRec> {
-        plan_actions(states, queue, None, &HashMap::new(), &std::collections::HashSet::new())
-            .iter()
-            .filter_map(rec_from_action)
-            .collect()
+        plan_actions(
+            states,
+            queue,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .iter()
+        .filter_map(rec_from_action)
+        .collect()
     }
 
     fn event_dispatch(
@@ -7585,46 +8234,101 @@ mod resume_dedup_tests {
         // no record -> never sent -> resend
         assert!(should_resend(None, "inv-1"));
         // landed, same invocation -> delivered; skip
-        assert!(!should_resend(Some(&rec("a", 1, "inv-1", true, false)), "inv-1"));
+        assert!(!should_resend(
+            Some(&rec("a", 1, "inv-1", true, false)),
+            "inv-1"
+        ));
         // unlanded, same invocation -> crashed mid-flight; resend
-        assert!(should_resend(Some(&rec("a", 1, "inv-1", false, false)), "inv-1"));
+        assert!(should_resend(
+            Some(&rec("a", 1, "inv-1", false, false)),
+            "inv-1"
+        ));
         // cg6.5: ambiguous (timeout-confirm), same invocation -> may be
         // mid-flight; NEVER re-delegate
-        assert!(!should_resend(Some(&rec("a", 1, "inv-1", false, true)), "inv-1"));
+        assert!(!should_resend(
+            Some(&rec("a", 1, "inv-1", false, true)),
+            "inv-1"
+        ));
         // any record from ANOTHER invocation -> fresh run re-delegates
-        assert!(should_resend(Some(&rec("a", 1, "inv-0", true, false)), "inv-1"));
-        assert!(should_resend(Some(&rec("a", 1, "inv-0", false, false)), "inv-1"));
-        assert!(should_resend(Some(&rec("a", 1, "inv-0", false, true)), "inv-1"));
+        assert!(should_resend(
+            Some(&rec("a", 1, "inv-0", true, false)),
+            "inv-1"
+        ));
+        assert!(should_resend(
+            Some(&rec("a", 1, "inv-0", false, false)),
+            "inv-1"
+        ));
+        assert!(should_resend(
+            Some(&rec("a", 1, "inv-0", false, true)),
+            "inv-1"
+        ));
     }
 
     fn st(name: &str, status: &str) -> AgentState {
-        AgentState { name: name.to_string(), status: status.to_string(), kind: String::new(), pane_id: String::new() }
+        AgentState {
+            name: name.to_string(),
+            status: status.to_string(),
+            kind: String::new(),
+            pane_id: String::new(),
+        }
     }
 
     #[test]
     fn keep_landed_record_clears_stale_for_idle_or_done() {
         // THE FIX (bd-dedup-stale): landed + same invocation + IDLE/DONE agent
         // => the prior dispatch stalled => clear (re-dispatchable).
-        assert!(!keep_landed_record(&rec("a", 1, "inv-1", true, false), "inv-1", &[st("a", "idle")]));
-        assert!(!keep_landed_record(&rec("a", 1, "inv-1", true, false), "inv-1", &[st("a", "done")]));
+        assert!(!keep_landed_record(
+            &rec("a", 1, "inv-1", true, false),
+            "inv-1",
+            &[st("a", "idle")]
+        ));
+        assert!(!keep_landed_record(
+            &rec("a", 1, "inv-1", true, false),
+            "inv-1",
+            &[st("a", "done")]
+        ));
     }
 
     #[test]
     fn keep_landed_record_preserves_in_flight() {
         // landed + WORKING/BLOCKED/UNKNOWN => in flight => keep (crash-resume dedup intact)
-        assert!(keep_landed_record(&rec("a", 1, "inv-1", true, false), "inv-1", &[st("a", "working")]));
-        assert!(keep_landed_record(&rec("a", 1, "inv-1", true, false), "inv-1", &[st("a", "blocked")]));
-        assert!(keep_landed_record(&rec("a", 1, "inv-1", true, false), "inv-1", &[st("a", "unknown")]));
+        assert!(keep_landed_record(
+            &rec("a", 1, "inv-1", true, false),
+            "inv-1",
+            &[st("a", "working")]
+        ));
+        assert!(keep_landed_record(
+            &rec("a", 1, "inv-1", true, false),
+            "inv-1",
+            &[st("a", "blocked")]
+        ));
+        assert!(keep_landed_record(
+            &rec("a", 1, "inv-1", true, false),
+            "inv-1",
+            &[st("a", "unknown")]
+        ));
     }
 
     #[test]
     fn keep_landed_record_keeps_non_stale_cases() {
         // landed + DIFFERENT invocation => keep (fresh run re-delegates)
-        assert!(keep_landed_record(&rec("a", 1, "inv-0", true, false), "inv-1", &[st("a", "idle")]));
+        assert!(keep_landed_record(
+            &rec("a", 1, "inv-0", true, false),
+            "inv-1",
+            &[st("a", "idle")]
+        ));
         // unlanded => keep (mid-flight resend path)
-        assert!(keep_landed_record(&rec("a", 1, "inv-1", false, false), "inv-1", &[st("a", "idle")]));
+        assert!(keep_landed_record(
+            &rec("a", 1, "inv-1", false, false),
+            "inv-1",
+            &[st("a", "idle")]
+        ));
         // landed + agent absent from the poll => conservative keep
-        assert!(keep_landed_record(&rec("a", 1, "inv-1", true, false), "inv-1", &[st("other", "idle")]));
+        assert!(keep_landed_record(
+            &rec("a", 1, "inv-1", true, false),
+            "inv-1",
+            &[st("other", "idle")]
+        ));
     }
 
     #[test]
@@ -7632,7 +8336,10 @@ mod resume_dedup_tests {
         // pre-confirm loops recorded nothing (or unlanded): resend = today
         // (the fn docstring promises the guard degrades to re-sending)
         assert!(should_resend(None, "inv-1"));
-        assert!(should_resend(Some(&rec("a", 1, "inv-1", false, false)), "inv-1"));
+        assert!(should_resend(
+            Some(&rec("a", 1, "inv-1", false, false)),
+            "inv-1"
+        ));
     }
 
     // ---- escalation tiers (bd-blocked-escalation-protocol) ----
@@ -7762,7 +8469,11 @@ mod resume_dedup_tests {
         let project = cg61_test_project("fresh");
         let (tier, count, mails) =
             escalate_and_persist(&project, "agent-a", None, 30, json!({})).unwrap();
-        assert_eq!((tier, count, mails), (0, 1, true), "first escalation is T0 + ping 1 + mail");
+        assert_eq!(
+            (tier, count, mails),
+            (0, 1, true),
+            "first escalation is T0 + ping 1 + mail"
+        );
         // the entry was persisted with the seeded timestamp
         let al = crate::state::load_active_loop(&project).unwrap().unwrap();
         let st = al.escalation.get("agent-a").expect("entry persisted");
@@ -7791,7 +8502,11 @@ mod resume_dedup_tests {
         crate::state::save_active_loop(&project, &al).unwrap();
         let (tier, count, mails) =
             escalate_and_persist(&project, "agent-b", None, 30, json!({})).unwrap();
-        assert_eq!((tier, count, mails), (3, 1, true), "stale first_blocked_ts → T3 + mail");
+        assert_eq!(
+            (tier, count, mails),
+            (3, 1, true),
+            "stale first_blocked_ts → T3 + mail"
+        );
         cg61_cleanup(&project);
     }
 
@@ -7821,7 +8536,10 @@ mod resume_dedup_tests {
         // the persisted first_blocked_ts is the ORIGINAL seed, not a re-stamp
         let al = crate::state::load_active_loop(&project).unwrap().unwrap();
         let st = al.escalation.get("agent-c").unwrap();
-        assert_eq!(st.first_blocked_ts, seed, "first_blocked_ts never re-seeded");
+        assert_eq!(
+            st.first_blocked_ts, seed,
+            "first_blocked_ts never re-seeded"
+        );
         assert_eq!(st.ping_count, 1);
         assert_eq!(st.last_ping_tier, Some(0), "T0 ping marked");
         cg61_cleanup(&project);
@@ -7881,5 +8599,148 @@ mod resume_dedup_tests {
             format!("{spawn_err}").contains("__test-leaf"),
             "labels the leaf: {spawn_err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod verify_fence_tests {
+    use super::*;
+
+    // ---- ADR-0019: ## VERIFY fence parsing --------------------------------
+
+    /// The exact fence (a `## VERIFY` heading + ONE fenced single-line
+    /// command) parses to the command line — the bead is dispatchable.
+    #[test]
+    fn parse_verify_fence_valid_single_line() {
+        let desc = "\
+Part of ADR-0019.
+
+## Background
+Some body text.
+
+## VERIFY
+```
+cd ~/workspace/flywheel && cargo test -p flywheel verify_fence
+```
+
+Dependencies:
+  -> bd-w1-epic-119n (parent-child)
+";
+        assert_eq!(
+            parse_verify_fence(desc).as_deref(),
+            Some("cd ~/workspace/flywheel && cargo test -p flywheel verify_fence")
+        );
+    }
+
+    /// Missing `## VERIFY` heading -> the bead is NOT ready (fixture A).
+    #[test]
+    fn parse_verify_fence_missing_heading_is_not_ready() {
+        assert_eq!(parse_verify_fence("## Background\nbody\n"), None);
+        assert_eq!(parse_verify_fence(""), None);
+        // a different heading level is not the exact shape
+        assert_eq!(parse_verify_fence("### VERIFY\n```\necho hi\n```\n"), None);
+        // heading with extra text is not the exact shape
+        assert_eq!(
+            parse_verify_fence("## VERIFY: run tests\n```\necho hi\n```\n"),
+            None
+        );
+    }
+
+    /// Multi-line command inside the fence -> NOT ready (fixture B).
+    #[test]
+    fn parse_verify_fence_multi_line_is_not_ready() {
+        let desc = "## VERIFY\n```\nline one\nline two\n```\n";
+        assert_eq!(parse_verify_fence(desc), None);
+    }
+
+    /// Empty fence -> NOT ready (fixture B).
+    #[test]
+    fn parse_verify_fence_empty_is_not_ready() {
+        assert_eq!(parse_verify_fence("## VERIFY\n```\n```\n"), None);
+        assert_eq!(parse_verify_fence("## VERIFY\n```\n   \n```\n"), None);
+    }
+
+    /// Heading with no fence at all -> NOT ready.
+    #[test]
+    fn parse_verify_fence_missing_fence_is_not_ready() {
+        assert_eq!(parse_verify_fence("## VERIFY\nno fence here\n"), None);
+    }
+
+    /// Truncated fence (no closing ```) -> NOT ready.
+    #[test]
+    fn parse_verify_fence_truncated_fence_is_not_ready() {
+        assert_eq!(parse_verify_fence("## VERIFY\n```\necho hi\n"), None);
+    }
+
+    /// A language tag on the opener (```bash) still yields the command.
+    #[test]
+    fn parse_verify_fence_language_tag_accepted() {
+        assert_eq!(
+            parse_verify_fence("## VERIFY\n```bash\necho hi\n```\n").as_deref(),
+            Some("echo hi")
+        );
+    }
+
+    /// Blank lines between heading and fence are tolerated; the command is
+    /// whitespace-trimmed.
+    #[test]
+    fn parse_verify_fence_blank_lines_and_trim() {
+        assert_eq!(
+            parse_verify_fence("## VERIFY\n\n\n```\n  echo hi  \n```\n").as_deref(),
+            Some("echo hi")
+        );
+    }
+
+    // ---- ADR-0019: refuse-to-dispatch partition ---------------------------
+
+    /// Dispatchable beads (valid fence) and not-ready beads (missing/
+    /// malformed fence) split cleanly — the not-ready half is NEVER
+    /// dispatched; it feeds the planner mail instead.
+    #[test]
+    fn verify_fence_partition_ready_splits_dispatchable() {
+        let ready = vec![
+            ReadyBead {
+                id: "bd-ok-1".into(),
+                title: "has fence".into(),
+                assignee: None,
+                verify: Some("cargo test ok".into()),
+            },
+            ReadyBead {
+                id: "bd-no-fence".into(),
+                title: "no fence".into(),
+                assignee: None,
+                verify: None,
+            },
+            ReadyBead {
+                id: "bd-multi".into(),
+                title: "multi-line fence".into(),
+                assignee: None,
+                verify: None,
+            },
+        ];
+        let (dispatchable, not_ready) = partition_ready(&ready);
+        let dispatched: Vec<&str> = dispatchable.iter().map(|b| b.id.as_str()).collect();
+        let blocked: Vec<&str> = not_ready.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(dispatched, vec!["bd-ok-1"]);
+        assert_eq!(blocked, vec!["bd-no-fence", "bd-multi"]);
+    }
+
+    /// ADR-0019: the dispatch path must NEVER fall back to the whole-
+    /// workspace matrix verify script (a time and token bomb that lies about
+    /// a docs bead). Source-level pin on the dispatch files: the literal
+    /// token is assembled (not spelled) so this test never trips itself.
+    #[test]
+    fn verify_fence_dispatch_path_never_references_verify_gates() {
+        let needle = format!("verify-{}", "gates");
+        for f in ["src/main.rs", "src/durable.rs", "src/work.rs"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(f);
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            assert!(
+                !src.contains(&needle),
+                "{f} must not reference the {} fallback (ADR-0019)",
+                needle
+            );
+        }
     }
 }
