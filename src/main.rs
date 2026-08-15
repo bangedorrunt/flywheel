@@ -933,6 +933,12 @@ enum LoopCmd {
         /// take over the project from a live loop process instead of refusing
         #[arg(long)]
         force: bool,
+        /// ADR-0019 Spec 3.3 (operator-only, logged): allow `loop run` in a
+        /// workspace that carries an extra linked worktree (deliberate human
+        /// experiment). Requires the operator key; the loop still never
+        /// dispatches `--work` INTO the linked tree.
+        #[arg(long)]
+        allow_worktree: bool,
     },
     /// Query the state of a durable loop invocation on the Resonate server
     Status { project: String },
@@ -2092,6 +2098,11 @@ enum WorkflowCmd {
         /// JSON output for agent drivers
         #[arg(long)]
         json: bool,
+        /// ADR-0019 Spec 3.3 (operator-only, logged): allow `workflow run
+        /// --execute` in a workspace that carries an extra linked worktree.
+        /// Requires the operator key.
+        #[arg(long)]
+        allow_worktree: bool,
     },
     /// Scaffold a new workflow YAML in the config dir
     New {
@@ -3002,12 +3013,22 @@ fn main() {
                 confirm_timeout_ms,
                 engine,
                 force,
+                allow_worktree,
             } => {
-                let pf_mode = if *work {
+                let mut pf_mode = if *work {
                     preflight::Mode::loop_work()
                 } else {
                     preflight::Mode::loop_queue()
                 };
+                if *allow_worktree {
+                    pf_mode.allow_worktree = true;
+                    // ADR-0019 Spec 3.3: the operator opt-out is LOGGED —
+                    // the run record must show the worktree ban was lifted
+                    // deliberately, never silently.
+                    eprintln!(
+                        "flywheel: operator opt-out --allow-worktree — linked-worktree preflight check skipped (ADR-0019 Spec 3.3; operator-only, logged)"
+                    );
+                }
                 preflight_gate(&cfg, cli.skip_preflight, pf_mode, Some(project.as_str())).and_then(
                     |_| {
                         cmd_loop(
@@ -3133,11 +3154,23 @@ fn main() {
             let needs_pf =
                 !cli.skip_preflight && matches!(cmd, WorkflowCmd::Run { execute: true, .. });
             let pf = if needs_pf {
-                let project = match &cmd {
-                    WorkflowCmd::Run { project, .. } => project.as_deref(),
-                    _ => None,
+                let (project, allow_wt) = match &cmd {
+                    WorkflowCmd::Run {
+                        project,
+                        allow_worktree,
+                        ..
+                    } => (project.as_deref(), *allow_worktree),
+                    _ => (None, false),
                 };
-                preflight_gate(&cfg, false, preflight::Mode::workflow(), project)
+                let mut m = preflight::Mode::workflow();
+                m.allow_worktree = allow_wt;
+                if allow_wt {
+                    // ADR-0019 Spec 3.3: operator opt-out, logged.
+                    eprintln!(
+                        "flywheel: operator opt-out --allow-worktree — linked-worktree preflight check skipped (ADR-0019 Spec 3.3; operator-only, logged)"
+                    );
+                }
+                preflight_gate(&cfg, false, m, project)
             } else {
                 Ok(())
             };
@@ -14313,6 +14346,7 @@ fn cmd_steer(
         retain,
         retire_orphans,
         json,
+        allow_worktree: false,
     };
     cmd_workflow(cfg, &run)
 }
@@ -14338,6 +14372,7 @@ fn profile_workflow_invoke(
         retain: false,
         retire_orphans: false,
         json: false,
+        allow_worktree: false,
     }
 }
 
@@ -14532,6 +14567,9 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             retain,
             retire_orphans,
             json,
+            // the preflight gate consumed --allow-worktree (operator-only);
+            // cmd_workflow itself needs no opt-out state
+            allow_worktree: _,
         } => {
             let all = all_workflows()?;
             let wf = resolve_workflow(name, &all)?.clone();
