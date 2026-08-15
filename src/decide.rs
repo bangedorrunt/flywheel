@@ -41,17 +41,35 @@ fn dec(primitive: &'static str, reason: &str, argv: &[&str]) -> Decision {
 /// Classify `target` + `snap` into one primitive. No harness special case.
 /// Table order (first match wins):
 ///   1 audit|read-only|analyze (not implement/fix) → captain-audit
-///   2 ready beads + empty|work|loop|beads (not implement/fix) → loop-work
-///   3 implement/fix + beads|tracker|gate (not "no tracker") → steer
-///   4 implement/fix + no tracker|direct → steer-direct
-///   5 compose|catalog miss|parts: → compose-parts
-///   6 shape unknown|improvise|author workflow → compose-agent
-///   7 contention|coalition|shared-file (target or snap) → coalition-form
-///   8 one pane|watch me|single agent → spawn-send
-///   9 cron|schedule|nightly → cron-start
-///  10 crew-steer|mention peer|peer mention → steer (plane S: the steer
+///   2 repro|regression|bug-fix, or implement/fix with a bug-shaped needle
+///     (bug/crash/panic/leak/broken/failing/error) → bug-fix
+///   3 refactor → refactoring
+///   4 prototype|sketch|mock → prototype
+///   5 arena → arena
+///   6 perf|p95|slow (not implement/fix) → perf
+///   7 hillclimb → hillclimb
+///   8 forensic|leak|idle cpu|spindump (not implement/fix) → forensics
+///   9 babysit + bead-ish → babysit-bead
+///  10 pickup|resume session → pickup
+///  11 pause|going offline → pause
+///  12 interrogate|tear this apart|adversarial review → interrogate
+///  13 figure it out|no playbook → figure-it-out
+///  14 ship beads|land the beads → ship-beads
+///  15 ready beads + empty|work|loop|beads (not implement/fix) → loop-work
+///  16 implement/fix + beads|tracker|gate (not "no tracker") → steer
+///  17 implement/fix + no tracker|direct → steer-direct
+///  18 compose|catalog miss|parts: → compose-parts
+///  19 shape unknown|improvise|author workflow → compose-agent
+///  20 contention|coalition|shared-file (target or snap) → coalition-form
+///  21 one pane|watch me|single agent → spawn-send
+///  22 cron|schedule|nightly → cron-start
+///  23 crew-steer|mention peer|peer mention → steer (plane S: the steer
 ///     target runs `toron channel post --mention` / `toron job claim`; no new
-///     primitive — first-match keeps row 3/fallback)
+///     primitive — first-match keeps row 16/fallback)
+/// Implement-bearing targets never fall to a diagnosis-only workflow
+/// (Spec 8): `fix the memory leak` → bug-fix, not forensics; `perf`/`slow`
+/// and `forensic`/`leak`/`idle cpu`/`spindump` rows carry the !implement
+/// guard.
 /// Unmatched targets fall back to steer (the catalog loudly rejects unknown
 /// shapes — never a silent no-op).
 pub fn decide(target: &str, snap: &Snapshot) -> Decision {
@@ -74,7 +92,215 @@ pub fn decide(target: &str, snap: &Snapshot) -> Decision {
             ],
         );
     }
-    // 2. Ready beads + work-ish intent → run the loop, not hand-rolled sends.
+    // 2. repro/regression/bug-fix — plus any implement/fix target carrying a
+    //    bug-shaped needle -> bug-fix. The repro step IS the forensics;
+    //    implement-bearing targets never fall to forensics/perf (Spec 8
+    //    pre-acceptance guard: `fix the memory leak` contains no bug/repro
+    //    token, yet must reach bug-fix, not forensics). Placed before
+    //    loop-work so a repro never hides behind ready-bead dispatch.
+    if has(&t, &["repro", "regression", "bug-fix"])
+        || (implement
+            && has(
+                &t,
+                &["bug", "crash", "panic", "leak", "broken", "failing", "error"],
+            ))
+    {
+        return dec(
+            "bug-fix",
+            "repro/regression/bug-shaped fix — bug-fix workflow (repro first)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "bug-fix",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 3. refactor -> refactoring (baseline -> subtract -> reshape -> prove).
+    if has(&t, &["refactor"]) {
+        return dec(
+            "refactoring",
+            "refactor — refactoring workflow (invariant stays green)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "refactoring",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 4. prototype/sketch/mock it up -> prototype (n >= 2 arms).
+    if has(&t, &["prototype", "sketch", "mock"]) {
+        return dec(
+            "prototype",
+            "prototype/sketch — prototype workflow (2-3 arms, oracle picks)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "prototype",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 5. arena -> arena (same brief on different models).
+    if has(&t, &["arena"]) {
+        return dec(
+            "arena",
+            "arena — model race on one brief (declared selection rule)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "arena",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 6. perf/p95/slow, NOT implement/fix -> perf.
+    if !implement && has(&t, &["perf", "p95", "slow"]) {
+        return dec(
+            "perf",
+            "perf/p95/slow — perf workflow (metric + budget)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "perf",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 7. hillclimb -> hillclimb (hypothesize -> smallest change -> measure).
+    if has(&t, &["hillclimb"]) {
+        return dec(
+            "hillclimb",
+            "hillclimb — hillclimb workflow (one commit per accepted win)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "hillclimb",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 8. forensic/leak/idle cpu/spindump, NOT implement/fix -> forensics
+    //    (diagnosis is the artifact; NO fix step — a fix is a separate
+    //    bug-fix after the captain accepts the diagnosis).
+    if !implement && has(&t, &["forensic", "leak", "idle cpu", "spindump"]) {
+        return dec(
+            "forensics",
+            "forensics — diagnosis only, no fix step (bug-fix consumes Act-on)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "forensics",
+                "--execute",
+                "--mode",
+                "headless",
+            ],
+        );
+    }
+    // 9. babysit + bead-ish -> babysit-bead (no new beads).
+    if has(&t, &["babysit"]) && has(&t, &["bead", "tracker", "issue"]) {
+        return dec(
+            "babysit-bead",
+            "babysit a bead — babysit-bead workflow (no new beads)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "babysit-bead",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 10. pickup / resume session -> pickup.
+    if has(&t, &["pickup", "resume session"]) {
+        return dec(
+            "pickup",
+            "pickup / resume session — pickup workflow",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "pickup",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 11. pause / going offline -> pause (checkpoint + handoff; no --mode).
+    if has(&t, &["pause", "going offline"]) {
+        return dec(
+            "pause",
+            "pause / going offline — checkpoint + standing handoff",
+            &["flywheel", "workflow", "run", "pause", "--execute"],
+        );
+    }
+    // 12. interrogate / tear this apart / adversarial review -> interrogate
+    //     (N reviewers, different families, same rubric, read-only).
+    if has(&t, &["interrogate", "tear this apart", "adversarial review"]) {
+        return dec(
+            "interrogate",
+            "interrogate — N-model adversarial review (read-only)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "interrogate",
+                "--execute",
+                "--mode",
+                "headless",
+            ],
+        );
+    }
+    // 13. figure it out / no playbook -> figure-it-out (planner authors
+    //     YAML, lint is the gate).
+    if has(&t, &["figure it out", "no playbook"]) {
+        return dec(
+            "figure-it-out",
+            "no matching playbook — planner compose, lint is the gate",
+            &["flywheel", "workflow", "compose", target, "--agent"],
+        );
+    }
+    // 14. ship beads / land the beads -> ship-beads (ledger-green then
+    //     housekeeper commit).
+    if has(&t, &["ship beads", "land the beads"]) {
+        return dec(
+            "ship-beads",
+            "ship beads — ledger-green then housekeeper commit",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "ship-beads",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 15. Ready beads + work-ish intent → run the loop, not hand-rolled sends.
     if snap.ready_bead_count > 0
         && !implement
         && (t.trim().is_empty() || has(&t, &["work", "loop", "beads"]))
@@ -236,7 +462,10 @@ mod tests {
         let d = decide("implement the parser with a plan gate", &with_beads(3));
         assert_eq!(d.primitive, "steer");
         assert!(d.argv.contains(&"steer".to_string()));
-        assert!(d.argv.contains(&"implement the parser with a plan gate".to_string()));
+        assert!(
+            d.argv
+                .contains(&"implement the parser with a plan gate".to_string())
+        );
     }
 
     // Row 4 — implement/fix + no tracker|direct → steer-direct.
@@ -245,7 +474,11 @@ mod tests {
         for t in ["implement this direct", "fix the widget no tracker"] {
             let d = decide(t, &snap());
             assert_eq!(d.primitive, "steer-direct", "target: {t}");
-            assert!(d.argv.contains(&"--direct".to_string()), "argv: {:?}", d.argv);
+            assert!(
+                d.argv.contains(&"--direct".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
         }
     }
 
@@ -259,17 +492,29 @@ mod tests {
         ] {
             let d = decide(t, &snap());
             assert_eq!(d.primitive, "compose-parts", "target: {t}");
-            assert!(d.argv.contains(&"--parts".to_string()), "argv: {:?}", d.argv);
+            assert!(
+                d.argv.contains(&"--parts".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
         }
     }
 
     // Row 6 — shape unknown|improvise|author workflow → compose-agent.
     #[test]
     fn row6_shape_unknown_is_compose_agent() {
-        for t in ["shape unknown here", "improvise it", "author workflow for ingest"] {
+        for t in [
+            "shape unknown here",
+            "improvise it",
+            "author workflow for ingest",
+        ] {
             let d = decide(t, &snap());
             assert_eq!(d.primitive, "compose-agent", "target: {t}");
-            assert!(d.argv.contains(&"--agent".to_string()), "argv: {:?}", d.argv);
+            assert!(
+                d.argv.contains(&"--agent".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
         }
     }
 
@@ -324,7 +569,11 @@ mod tests {
     // Row 9 — cron|schedule|nightly → cron-start.
     #[test]
     fn row9_scheduled_is_cron_start() {
-        for t in ["cron the weekly report", "schedule the nightly sync", "nightly housekeeping"] {
+        for t in [
+            "cron the weekly report",
+            "schedule the nightly sync",
+            "nightly housekeeping",
+        ] {
             let d = decide(t, &snap());
             assert_eq!(d.primitive, "cron-start", "target: {t}");
             assert_eq!(d.argv, vec!["flywheel", "cron", "start"]);
@@ -358,5 +607,213 @@ mod tests {
         let d = decide("zzz something odd", &snap());
         assert_eq!(d.primitive, "steer");
         assert!(d.argv.contains(&"zzz something odd".to_string()));
+    }
+
+    // ===== ADR-0019 Spec 8 rows (bd-w2-decide-drgi) =====
+
+    // Row 2 — repro/regression/bug-fix, and bug-shaped implement targets.
+    #[test]
+    fn row2_repro_and_bug_shaped_fix_go_to_bug_fix() {
+        for t in [
+            "repro the scroll drift",
+            "fix the repro",
+            "regression in dispatch",
+            "fix the memory leak",
+        ] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "bug-fix", "target: {t}");
+            assert!(d.argv.contains(&"bug-fix".to_string()), "argv: {:?}", d.argv);
+            assert!(d.argv.contains(&"pane".to_string()), "pane mode: {:?}", d.argv);
+        }
+    }
+
+    // Row 3 — refactor -> refactoring.
+    #[test]
+    fn row3_refactor_goes_to_refactoring() {
+        for t in ["refactor the auth layer", "refactoring the loop dispatch"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "refactoring", "target: {t}");
+            assert!(
+                d.argv.contains(&"refactoring".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
+        }
+    }
+
+    // Row 4 — prototype/sketch/mock -> prototype.
+    #[test]
+    fn row4_prototype_goes_to_prototype() {
+        for t in [
+            "prototype the data shape",
+            "sketch the state machine",
+            "mock it up before we build",
+        ] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "prototype", "target: {t}");
+            assert!(d.argv.contains(&"prototype".to_string()), "argv: {:?}", d.argv);
+        }
+    }
+
+    // Row 5 — arena -> arena.
+    #[test]
+    fn row5_arena_goes_to_arena() {
+        let d = decide("arena two models on this brief", &snap());
+        assert_eq!(d.primitive, "arena");
+        assert!(d.argv.contains(&"arena".to_string()), "argv: {:?}", d.argv);
+    }
+
+    // Row 6 — perf/p95/slow (not fix/implement) -> perf.
+    #[test]
+    fn row6_perf_goes_to_perf() {
+        for t in ["profile the p95 latency", "dispatch is slow", "perf the ingest path"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "perf", "target: {t}");
+            assert!(d.argv.contains(&"perf".to_string()), "argv: {:?}", d.argv);
+        }
+    }
+
+    // Row 6 guard — implement + slow is NOT perf (falls through to steer).
+    #[test]
+    fn row6_implement_slow_is_not_perf() {
+        let d = decide("fix the slow dispatch", &snap());
+        assert_ne!(d.primitive, "perf");
+        assert_eq!(d.primitive, "steer", "implement falls through to steer: {:?}", d);
+    }
+
+    // Row 7 — hillclimb -> hillclimb.
+    #[test]
+    fn row7_hillclimb_goes_to_hillclimb() {
+        let d = decide("hillclimb the sharpe ratio", &snap());
+        assert_eq!(d.primitive, "hillclimb");
+        assert!(d.argv.contains(&"hillclimb".to_string()), "argv: {:?}", d.argv);
+    }
+
+    // Row 8 — forensic/leak/idle cpu/spindump (not fix/implement) -> forensics.
+    #[test]
+    fn row8_forensics_goes_to_forensics() {
+        for t in [
+            "profile the idle cpu spin",
+            "forensic trace of the crash",
+            "investigate the memory leak",
+            "spindump the hung pane",
+        ] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "forensics", "target: {t}");
+            assert!(d.argv.contains(&"forensics".to_string()), "argv: {:?}", d.argv);
+            assert!(
+                d.argv.contains(&"headless".to_string()),
+                "forensics is headless: {:?}",
+                d.argv
+            );
+        }
+    }
+
+    // Row 8 guard — implement + leak -> bug-fix, NOT forensics (the
+    // pre-acceptance fix: `fix the memory leak` contains no bug/repro token,
+    // yet the captain said FIX).
+    #[test]
+    fn row8_fix_memory_leak_is_bug_fix_not_forensics() {
+        let d = decide("fix the memory leak", &snap());
+        assert_ne!(d.primitive, "forensics");
+        assert_eq!(d.primitive, "bug-fix", "the repro step IS the forensics");
+    }
+
+    // Row 9 — babysit + bead-ish -> babysit-bead.
+    #[test]
+    fn row9_babysit_bead_goes_to_babysit_bead() {
+        let d = decide("babysit the bd-w2-ops-szky bead", &snap());
+        assert_eq!(d.primitive, "babysit-bead");
+        assert!(
+            d.argv.contains(&"babysit-bead".to_string()),
+            "argv: {:?}",
+            d.argv
+        );
+        // not bead-ish -> no match.
+        let d2 = decide("babysit the server", &snap());
+        assert_ne!(d2.primitive, "babysit-bead");
+    }
+
+    // Row 10 — pickup / resume session -> pickup.
+    #[test]
+    fn row10_pickup_goes_to_pickup() {
+        for t in ["pickup the stranded session", "resume session after the reboot"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "pickup", "target: {t}");
+            assert!(d.argv.contains(&"pickup".to_string()), "argv: {:?}", d.argv);
+        }
+    }
+
+    // Row 11 — pause / going offline -> pause (argv has NO --mode).
+    #[test]
+    fn row11_pause_goes_to_pause() {
+        for t in ["pause the swarm", "going offline for the night"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "pause", "target: {t}");
+            assert!(d.argv.contains(&"pause".to_string()), "argv: {:?}", d.argv);
+            assert!(
+                !d.argv.contains(&"--mode".to_string()),
+                "pause takes no --mode: {:?}",
+                d.argv
+            );
+        }
+    }
+
+    // Row 12 — interrogate / tear this apart / adversarial review -> interrogate.
+    #[test]
+    fn row12_interrogate_goes_to_interrogate() {
+        for t in [
+            "interrogate this diff",
+            "tear this apart",
+            "adversarial review of the patch",
+        ] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "interrogate", "target: {t}");
+            assert!(
+                d.argv.contains(&"interrogate".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
+            assert!(
+                d.argv.contains(&"headless".to_string()),
+                "headless: {:?}",
+                d.argv
+            );
+        }
+    }
+
+    // Row 13 — figure it out / no playbook -> figure-it-out (planner arm).
+    #[test]
+    fn row13_figure_it_out_goes_to_figure_it_out() {
+        for t in ["figure it out", "there's no playbook for this"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "figure-it-out", "target: {t}");
+            assert!(d.argv.contains(&"compose".to_string()), "compose: {:?}", d.argv);
+            assert!(d.argv.contains(&"--agent".to_string()), "planner arm: {:?}", d.argv);
+        }
+    }
+
+    // Row 14 — ship beads / land the beads -> ship-beads.
+    #[test]
+    fn row14_ship_beads_goes_to_ship_beads() {
+        for t in ["ship beads now", "land the beads"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "ship-beads", "target: {t}");
+            assert!(d.argv.contains(&"ship-beads".to_string()), "argv: {:?}", d.argv);
+        }
+    }
+
+    // Existing rows still win where they should (regression anchors).
+    #[test]
+    fn rows_keep_audit_loop_work_and_steer_anchors() {
+        // audit + implement still steers (no bug-shaped needle).
+        let d = decide("audit then fix the tracker", &snap());
+        assert_eq!(d.primitive, "steer");
+        // plain implement without a playbook needle still steers.
+        let d2 = decide("fix the tracker", &snap());
+        assert_eq!(d2.primitive, "steer");
+        // ready beads + work intent still loop-work (no new-row needle hits).
+        let d3 = decide("work the ready beads", &with_beads(3));
+        assert_eq!(d3.primitive, "loop-work");
     }
 }
