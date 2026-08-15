@@ -348,6 +348,13 @@ enum Commands {
         #[command(subcommand)]
         cmd: LedgerCmd,
     },
+    /// engineering principle registry (ADR-0019 Spec 5/6): list the 21
+    /// canonical names, or show a leaf's full when+rule (unknown name ->
+    /// non-zero + suggestion)
+    Principles {
+        #[command(subcommand)]
+        cmd: PrinciplesCmd,
+    },
     /// Work-graph surfaces (bv/br pass-through)
     Work {
         #[command(subcommand)]
@@ -1073,6 +1080,15 @@ enum LedgerCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum PrinciplesCmd {
+    /// print the 21 canonical principle names (one per line)
+    List,
+    /// print a principle's full when+rule (unknown name -> non-zero exit +
+    /// a suggestion)
+    Show { name: String },
 }
 
 #[derive(Subcommand)]
@@ -2910,7 +2926,7 @@ fn main() {
             "commands": [
                 "init spawn add list status decide rebind recover",
                 "send interrupt view output watch zoom attach kill",
-                "loop work assign collab xproj mail toron steer ledger",
+                "loop work assign collab xproj mail toron steer ledger principles",
                 "coalition debate plan-review profile squad model runs",
                 "workflow cron recipes workflows pipeline template stage ensemble",
                 "checkpoint timeline audit history changes resume analytics",
@@ -3132,6 +3148,7 @@ fn main() {
             force_working,
         }) => cmd_kill(&cfg, project, *force, *force_working),
         Some(Commands::Ledger { cmd }) => cmd_ledger(&cfg, cmd),
+        Some(Commands::Principles { cmd }) => cmd_principles(cmd),
         Some(Commands::Work { cmd }) => cmd_work(&cfg, cmd),
         Some(Commands::Assign {
             project,
@@ -8451,6 +8468,36 @@ fn cmd_kill(cfg: &Config, project: &str, force: bool, force_working: bool) -> Re
 }
 
 // ---- work / assign ----
+
+/// ADR-0019 Spec 5/6 `flywheel principles`: the compiled-in 21 leaves.
+/// `list` prints exactly the 21 canonical names; `show <name>` prints the
+/// full when+rule (unknown name -> non-zero exit + a suggestion).
+fn cmd_principles(cmd: &PrinciplesCmd) -> Result<()> {
+    match cmd {
+        PrinciplesCmd::List => {
+            for p in crate::principles::PRINCIPLES {
+                println!("{}", p.name);
+            }
+            Ok(())
+        }
+        PrinciplesCmd::Show { name } => match crate::principles::show(name) {
+            Some(p) => {
+                println!("{}", p.name);
+                println!("WHEN {}", p.when);
+                println!("RULE {}", p.rule);
+                Ok(())
+            }
+            None => {
+                let suggestion = crate::principles::suggest(name)
+                    .map(|s| format!(" — did you mean `{s}`?"))
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "unknown principle `{name}`{suggestion} (see `flywheel principles list`)"
+                );
+            }
+        },
+    }
+}
 
 /// ADR-0019 `flywheel ledger`: br gate verdict store + receipt helper.
 /// `check` exits 0 only on a legal verdict for the current SHA (SHA rule,
