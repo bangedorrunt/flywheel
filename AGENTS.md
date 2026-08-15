@@ -26,6 +26,7 @@ Live ignored tests need herdr + mail. `cargo test --exclude-ignored` is invalid.
 - **`cron run`** is a 25s dry-run. Live ticks are `cron start`.
 - **compose --agent** is wired (planner YAML → lint).
 - **Spawn:** `--profile`, never `add --oc` when a profiled pane exists. Model via `ModelRegistry` (`opencode-go/deepseek-v4-flash` for coder).
+- **Harness recipes (H1, bd-harness-prime-agent-818f):** a profile whose harness is NOT in herdr's closed kind set (e.g. `pa` = prime-agent) spawns via the compiled-in `[harness.<name>]` recipe: on `unsupported_agent_kind` from `agent.start`, `start_agent_with_retry[(_dyn)]` falls back to `pane.run` the recipe (+ shell-quoted model/effort args) and waits/renames. prime-agent's built-in herdr socket extension self-reports lifecycle; `agent.prompt` stays blocked upstream until herdr ships the kind (discussion herdrdev/herdr#2840).
 - **Peer-aware spawns:** `spawn --peer-aware` injects the peer-poll template (`integrations/peer-aware.md.tpl`) with the agent's registered mail identity — the canonical `flywheel-<project>-<role><N>` name (S8.3), never a random pair. Wake/digest resolves + registers the identity before instructing fetch (S8.1); assigns wake only when unread, unexecuted, and deduped (S8.2).
 - **Send:** `--to <full-name|coder1|omp1|pane_id>`. Never bare `--to oc`. `launch_pending` is not idle. `agent_not_ready` → retry pane id. Do not flip omp defaults.
 - TDD. No script-based code edits. No file deletion without permission.
