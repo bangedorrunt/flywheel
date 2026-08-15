@@ -3634,6 +3634,49 @@ pub(crate) fn project_workspaces(c: &mut Client, project: &str) -> Result<Worksp
     ))
 }
 
+/// bd-bug-add-foreign-workspace-m7dg: the add path's target workspace. Same
+/// partition as spawn: owned swarm workspace required, foreign (captain/omp
+/// session sharing the base label) never targeted — the old find_workspace
+/// matched the base label and added panes into the captain's own workspace
+/// (w37, label toron) instead of the flywheel-owned swarm (label
+/// flywheel-toron). Refuses when no owned workspace exists (spawn first).
+fn add_target_from_split(
+    split: &WorkspaceSplit,
+    agents: &[herdr_shim::AgentInfo],
+    project: &str,
+) -> Result<String> {
+    if split.owned.is_empty() {
+        bail!("no flywheel-owned swarm for {project} (run: flywheel spawn {project})")
+    }
+    // prefer the owned workspace hosting managed agents; first owned otherwise
+    // (resolve_workspace_id picks the agent-hosting workspace among many).
+    let prefix = format!("flywheel-{}-", project_base(project));
+    Ok(herdr_shim::resolve_workspace_id(&split.owned, agents, &prefix))
+}
+
+fn add_target_workspace(c: &mut Client, project: &str) -> Result<String> {
+    let split = project_workspaces(c, project)?;
+    if !split.foreign.is_empty() {
+        let detail: Vec<String> = split
+            .foreign
+            .iter()
+            .map(|ws| {
+                format!(
+                    "{} (label {:?}, {} panes)",
+                    ws.workspace_id, ws.label, ws.pane_count
+                )
+            })
+            .collect();
+        eprintln!(
+            "flywheel: warn: {} foreign workspace(s) share the {project} label but are not flywheel-owned — leaving them alone: {}",
+            split.foreign.len(),
+            detail.join(", ")
+        );
+    }
+    let agents = c.agent_list()?;
+    add_target_from_split(&split, &agents, project)
+}
+
 #[cfg(test)]
 mod spawn_profile_plan_tests {
     use super::*;
@@ -4477,6 +4520,40 @@ mod workspace_origin_tests {
         assert_eq!(split.owned[0].workspace_id, "wA");
         assert_eq!(split.foreign.len(), 1);
         assert_eq!(split.foreign[0].workspace_id, "wB");
+    }
+
+    // bd-bug-add-foreign-workspace-m7dg gate: `add` targets the flywheel-OWNED
+    // swarm workspace only — a foreign captain workspace that merely shares the
+    // project base label (w37, label toron) is never selected. This is the
+    // regression fixture: the old find_workspace lookup matched the base label
+    // and spawned added panes inside the captain's own workspace.
+    #[test]
+    fn add_targets_owned_workspace() {
+        let ws_list = vec![
+            ws("w37", "toron", 6),
+            ws("w83", "flywheel-toron", 3),
+            ws("wX", "scratchpad", 1),
+        ];
+        let split = partition_workspaces("toron", ws_list, &[], None);
+        assert_eq!(split.foreign.len(), 1);
+        assert_eq!(split.foreign[0].workspace_id, "w37");
+        assert_eq!(split.owned.len(), 1);
+        assert_eq!(split.owned[0].workspace_id, "w83");
+        let target = add_target_from_split(&split, &[], "toron").unwrap();
+        assert_eq!(target, "w83", "add must target the owned swarm workspace");
+    }
+
+    // bd-bug-add-foreign-workspace-m7dg: no owned workspace -> add REFUSES
+    // (spawn first); a foreign base-labeled workspace alone never suffices.
+    #[test]
+    fn add_refuses_when_only_foreign_workspace_exists() {
+        let ws_list = vec![ws("w37", "toron", 6)];
+        let split = partition_workspaces("toron", ws_list, &[], None);
+        let err = add_target_from_split(&split, &[], "toron").unwrap_err();
+        assert!(
+            err.to_string().contains("no flywheel-owned swarm"),
+            "expected refuse, got: {err}"
+        );
     }
 }
 
@@ -6287,7 +6364,11 @@ fn cmd_add(
     let plan = recipe_counts(None, counts, kinds)?;
     let dir = project_dir(cfg, project);
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    let ws_id = find_workspace(&mut c, project)?;
+    // bd-bug-add-foreign-workspace-m7dg: add targets the flywheel-OWNED swarm
+    // workspace only (same partition as spawn). find_workspace matched the
+    // project base label and spawned panes into a foreign captain workspace
+    // (w37, label toron); that path is now refused/never targeted.
+    let ws_id = add_target_workspace(&mut c, project)?;
     let existing: Vec<AgentInfo> = c
         .agent_list()?
         .into_iter()
