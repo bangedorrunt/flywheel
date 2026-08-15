@@ -67,7 +67,8 @@ pub use toron_core::mailbox::search::ThreadSummary;
 pub use toron_core::mailbox::product::ProductInfo;
 #[allow(unused_imports)]
 pub use toron_core::mailbox::reservations::{
-    AcquireResult, ConflictReport, GrantedReservation, PathConflict, ReleaseResult, RenewResult,
+    AcquireResult, ConflictReport, GrantedReservation, PathConflict, ReleasedLease, ReleaseResult,
+    RenewResult,
 };
 pub use toron_core::mailbox::build_slots::AcquireBuildSlotResult;
 pub use toron_core::mailbox::unwrap::ContactPolicy;

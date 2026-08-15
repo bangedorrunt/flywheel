@@ -25,7 +25,8 @@ use crate::backend::wire;
 use crate::backend::{
     AcquireBuildSlotResult, AcquireResult, BuildSlot, ConflictReport, ContactLink, ContactPolicy,
     ContactRequest, ContactResponse, DeliveryLine, InboxQuery, MailError, MailItem, MailSurface,
-    MessageId, ProductHit, ProductInfo, ReceiptOp, ReceiptOutcome, RegisteredAgent, ReleaseResult,
+    MessageId, ProductHit, ProductInfo, ReceiptOp, ReceiptOutcome, RegisteredAgent, ReleasedLease,
+    ReleaseResult,
     RenewResult, ReplyMail, SearchQuery, SendMail, SendReceipt, ThreadSummary, WhoIs,
 };
 use crate::mcp_http::{McpClient, McpError, ServerKind};
@@ -188,6 +189,7 @@ fn mail_item_from(v: &Value, op: &str) -> Result<MailItem, MailError> {
             })
             .unwrap_or(false),
         thread_id: opt_string_field(v, &["thread_id"]).map(MessageId::from),
+        duplicate_of: opt_string_field(v, &["duplicate_of"]).map(MessageId::from),
         created_ts_us: ts_us(v, &["created_ts_us", "created_ts"]),
     })
 }
@@ -707,6 +709,21 @@ impl MailSurface for AgentMailBackend {
                 .and_then(Value::as_u64)
                 .map(|n| n as usize)
                 .unwrap_or(0),
+            leases: v
+                .get("leases")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|l| {
+                            Some(ReleasedLease {
+                                path: l.get("path")?.as_str()?.to_string(),
+                                mode: l.get("mode")?.as_str()?.to_string(),
+                                holder: l.get("holder")?.as_str()?.to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 
