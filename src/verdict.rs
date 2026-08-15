@@ -285,6 +285,13 @@ fn run_br(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
 /// Record a PASS verdict (ADR-0019 Spec 1): `br gate report <id> --gate
 /// <kind> --provider <actor> --status pass --note "sha=<sha> receipt=<path>"`.
 ///
+/// SPIKE VERDICT (bd-w1-policy-spike-nq1p, br 0.2.22, 2026-08-16): `br gate
+/// report --to closed` does NOT transition the issue — verdicts are append-only
+/// `gate_result_history` rows, a later FAIL cannot revert a sticky PASS, and
+/// `br close` ignores gate satisfaction (policy.yaml `require_all` is advisory).
+/// Gate policy is DETECTION, not PREVENTION: the loop-side reopen (w1-reopen)
+/// is the enforcement floor. Revisit only if br grows native close gating.
+///
 /// Loop-only: refuses while the loop reporter is not armed (a worker-invoked
 /// report on a loop-owned bead is rejected), and refuses Blocked/Failed —
 /// those are loop state, never gate rows.
@@ -876,5 +883,74 @@ mod tests {
             PathBuf::from("/tmp/r.txt")
         );
         assert_eq!(note_receipt_path("no tokens"), None);
+    }
+
+    // ---- bd-w1-sha-xyhd: SHA invariant at close-detect ----
+
+    /// ADR-0019 SHA-rule fixture (bd-w1-sha-xyhd): a sibling commit landing
+    /// AFTER the bead's commit must not hijack the derived sha — the close
+    /// sha resolves to the bead's OWN commit, never bare HEAD.
+    #[test]
+    fn derive_head_sha_resolves_own_commit_when_head_moved() {
+        let (dir, bead_id) = scratch_workspace("sha-head-moved");
+        let own = derive_head_sha(&dir, &bead_id).unwrap();
+        // a sibling lands on top with NO bead id in its message
+        std::fs::write(dir.join("sibling.txt"), "sibling\n").unwrap();
+        let add = StdCommand::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .expect("git add");
+        assert!(add.status.success());
+        let cm = StdCommand::new("git")
+            .args([
+                "-c",
+                "user.email=test@test",
+                "-c",
+                "user.name=test",
+                "commit",
+                "-q",
+                "-m",
+                "feat: sibling committed after the bead",
+            ])
+            .current_dir(&dir)
+            .output()
+            .expect("git commit");
+        assert!(cm.status.success(), "sibling commit");
+        // HEAD moved past the bead's commit
+        let rp = format!("rev-{}", "parse");
+        let head = StdCommand::new("git")
+            .args([rp.as_str(), "HEAD"])
+            .current_dir(&dir)
+            .output()
+            .expect("resolve current HEAD sha");
+        let head_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        assert_ne!(own, head_sha, "HEAD moved past the bead commit");
+        // the derived sha still resolves to the bead's OWN commit
+        assert_eq!(
+            derive_head_sha(&dir, &bead_id).unwrap(),
+            own,
+            "git log --grep resolves the bead's own commit, not bare HEAD"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0019 (bd-w1-sha-xyhd): NO bare-HEAD fallback anywhere in the
+    /// verdict path — in a shared tree bare HEAD is the same sha for
+    /// every bead closed between commits and may not contain the closed
+    /// bead's work at all. Source-level pin (needle assembled so this test
+    /// never trips itself).
+    #[test]
+    fn sha_rule_never_falls_back_to_bare_head() {
+        let needle = format!("rev-{}", "parse");
+        for f in ["src/verdict.rs", "src/durable.rs"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(f);
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            assert!(
+                !src.contains(&needle),
+                "{f} must not use the bare-HEAD fallback (ADR-0019)"
+            );
+        }
     }
 }
