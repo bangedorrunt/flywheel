@@ -32,7 +32,7 @@ mod toron_embed;
 mod work;
 mod workflow_catalog;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -4596,6 +4596,126 @@ fn prime_via_send_text(c: &mut Client, pane_id: &str) {
     }
 }
 
+/// H3 (bd-harness-integration-preflight): lifecycle-hook-authority harness
+/// kinds — the same list the boot-prime machinery documents (see
+/// [`boot_prime_line`]): their herdr integration authors idle/working/blocked
+/// from hook events, so a missing integration degrades lifecycle-state
+/// reporting. Warn-only by H3 decision; the env + prime machinery works
+/// regardless.
+const LIFECYCLE_AUTHORITY_KINDS: &[&str] =
+    &["pi", "omp", "kimi", "opencode", "kilo", "mastracode", "grok"];
+
+/// H3 (bd-harness-integration-preflight): before a kind's first agent
+/// launches, make sure its herdr integration exists and is current.
+/// Best-effort by contract — a missing/broken integration NEVER fails the
+/// spawn: install failures get the bd-627z.2 loud-warning treatment, and
+/// lifecycle-hook-authority kinds additionally warn that lifecycle-state
+/// reporting is degraded (the env + boot-prime machinery works regardless —
+/// H3 decided warn-only, do NOT block).
+fn preflight_kind_integration(
+    c: &mut Client,
+    kind: &str,
+    statuses: &HashMap<String, herdr_shim::IntegrationStatus>,
+) {
+    if herdr_shim::integration_target(kind).is_none() {
+        return; // custom kind with no herdr integration — nothing to preflight
+    }
+    let st = statuses
+        .get(kind)
+        .cloned()
+        .unwrap_or_else(herdr_shim::IntegrationStatus::not_installed);
+    if st.installed && st.current {
+        return; // already good
+    }
+    if st.installed {
+        // outdated (vN < vM) — refresh to current
+        let detail = match (&st.version, &st.expected_version) {
+            (Some(v), Some(e)) => format!("outdated ({v} < {e})"),
+            _ => "outdated".to_string(),
+        };
+        eprintln!("flywheel: warn: {kind} herdr integration {detail} — refreshing");
+    }
+    match herdr_shim::integration_install_socket(c, kind) {
+        Ok(messages) => {
+            eprintln!(
+                "flywheel: herdr integration {kind} installed via socket{}",
+                if messages.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", messages.join("; "))
+                }
+            );
+        }
+        Err(e) => warn_integration_install_failed(
+            kind,
+            LIFECYCLE_AUTHORITY_KINDS.contains(&kind),
+            &e,
+        ),
+    }
+}
+
+/// H3: the bd-627z.2 loud-warning pattern for a missing/outdated integration
+/// whose auto-install failed. Hook-authority kinds additionally warn that
+/// lifecycle-state reporting is degraded — warn-only, never block.
+fn warn_integration_install_failed(kind: &str, hook_authority: bool, e: &anyhow::Error) {
+    eprintln!(
+        "\n!!! WARNING: the herdr integration for {kind} is missing or outdated and the \
+         auto-install failed.\n\
+         Fix: run `herdr integration install {kind}` manually \
+         (herdr.dev/docs/preview/integrations/).\n\
+         {kind} detection falls back to process-based heuristics until the integration reports.\n\
+         (integration.install via socket failed: {e:#})\n"
+    );
+    if hook_authority {
+        eprintln!(
+            "    {kind} is a lifecycle-hook-authority harness: without a reporting integration,\n\
+             herdr cannot author idle/working/blocked from hook events, so lifecycle-state\n\
+             reporting is DEGRADED. The env + boot-prime machinery works regardless — the\n\
+             spawn proceeds (H3 warn-only, do not block).\n"
+        );
+    }
+}
+
+/// One `herdr integration status` read per spawn/add — the preflight map all
+/// kinds share. A failed read degrades to an empty map (every kind looks
+/// not-installed → best-effort install attempt, the self-healing path).
+fn read_integration_statuses() -> HashMap<String, herdr_shim::IntegrationStatus> {
+    match herdr_shim::integration_status_all() {
+        Ok(v) => v.into_iter().collect(),
+        Err(e) => {
+            eprintln!(
+                "flywheel: WARNING cannot read `herdr integration status` — spawn integration \
+                 preflight degraded: {e:#}"
+            );
+            HashMap::new()
+        }
+    }
+}
+
+/// H3: one `kind: <state>` line for the status/deps surfaces
+/// (kind -> installed/current/version), painted by state.
+fn integration_status_line(kind: &str, st: &herdr_shim::IntegrationStatus) -> String {
+    let label = if st.installed && st.current {
+        format!("current ({})", st.version.as_deref().unwrap_or("?"))
+    } else if st.installed {
+        format!(
+            "outdated ({} < {})",
+            st.version.as_deref().unwrap_or("?"),
+            st.expected_version.as_deref().unwrap_or("?")
+        )
+    } else {
+        "not installed".to_string()
+    };
+    let painted = if st.installed && st.current {
+        paint_ok(&label)
+    } else if st.installed {
+        crate::output::warn(&label)
+    } else {
+        error(&label)
+    };
+    format!("{} integration: {}", kind_paint(kind), painted)
+}
+
 fn cmd_spawn(
     cfg: &Config,
     project: &str,
@@ -4865,8 +4985,16 @@ projects available: {}",
     } else {
         None
     };
+    // H3 (bd-harness-integration-preflight): one status read per spawn;
+    // preflight each kind before its first agent launches (deduped — a
+    // recipe + explicit flags may repeat a kind).
+    let integration_statuses = read_integration_statuses();
+    let mut preflighted_kinds: HashSet<String> = HashSet::new();
     for item in &items {
         let kind = item.kind.clone().unwrap_or_else(|| cfg.resolve_kind(&item.short));
+        if preflighted_kinds.insert(kind.clone()) {
+            preflight_kind_integration(&mut c, &kind, &integration_statuses);
+        }
         for _ in 0..item.count {
             let ordinal = ordinals.entry(item.short.clone()).or_insert(0);
             *ordinal += 1;
@@ -6399,8 +6527,16 @@ fn cmd_add(
     // pass the herdr integration env at split time too (same as the spawn
     // path's workspace.create injection).
     let herdr_env = herdr_shim::herdr_integration_env(cfg);
+    // H3 (bd-harness-integration-preflight): same preflight as spawn — add
+    // launches kinds into an existing workspace, so their integrations must
+    // be present too. One status read per add, deduped per kind.
+    let integration_statuses = read_integration_statuses();
+    let mut preflighted_kinds: HashSet<String> = HashSet::new();
     for (short, n) in &plan {
         let kind = cfg.resolve_kind(short);
+        if preflighted_kinds.insert(kind.clone()) {
+            preflight_kind_integration(&mut c, &kind, &integration_statuses);
+        }
         for _ in 0..*n {
             let ordinal = ordinals.entry(short.clone()).or_insert(0);
             *ordinal += 1;
@@ -6567,6 +6703,23 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             })
         })
         .collect();
+    // H3 (bd-harness-integration-preflight): surface each distinct kind's
+    // herdr integration state (kind -> installed/current/version).
+    let integration_statuses = read_integration_statuses();
+    let integrations: BTreeMap<String, herdr_shim::IntegrationStatus> = agents
+        .iter()
+        .filter_map(|a| a.agent.as_deref())
+        .filter(|k| herdr_shim::integration_target(k).is_some())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|k| {
+            let st = integration_statuses
+                .get(k)
+                .cloned()
+                .unwrap_or_else(herdr_shim::IntegrationStatus::not_installed);
+            (k.to_string(), st)
+        })
+        .collect();
     if std::io::stdout().is_terminal() {
         for r in &rows {
             let st = r["status"].as_str().unwrap_or("unknown");
@@ -6581,8 +6734,13 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
                 dim(r["pane_id"].as_str().unwrap_or(""))
             );
         }
+        for (k, st) in &integrations {
+            println!("  {}", integration_status_line(k, st));
+        }
     } else {
-        print_json(&json!({ "workspace_id": ws_id, "agents": rows }));
+        print_json(&json!({
+            "workspace_id": ws_id, "agents": rows, "integrations": integrations
+        }));
     }
     Ok(())
 }
@@ -12037,6 +12195,25 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
             eprintln!(
                 "flywheel: WARNING cannot read herdr protocol (herdr api schema --json failed)"
             );
+        }
+    }
+
+    // H3 (bd-harness-integration-preflight): per-kind integration state
+    // (kind -> installed/current/version). Informational — a failed status
+    // read warns but does not fail the deps check (the socket surface works
+    // regardless of the CLI status read).
+    match herdr_shim::integration_status_all() {
+        Ok(list) => {
+            println!("herdr integrations:");
+            for (kind, st) in list {
+                println!("  {}", integration_status_line(&kind, &st));
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "flywheel: WARNING cannot read `herdr integration status` — integration surface degraded: {e:#}"
+            );
+            println!("herdr integrations: {}", crate::output::warn("unknown"));
         }
     }
 
