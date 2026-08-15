@@ -45,8 +45,8 @@ pub fn register_agent_args(
 }
 
 /// `list_agents`.
-pub fn list_agents_args(project_key: &str) -> Value {
-    json!({ "project_key": project_key })
+pub fn list_agents_args(project_key: &str, active_within_days: Option<u64>) -> Value {
+    json!({ "project_key": project_key, "active_within_days": active_within_days })
 }
 
 /// `whois`.
