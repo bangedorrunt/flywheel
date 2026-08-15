@@ -4669,10 +4669,11 @@ projects available: {}",
                 prev = p.pane_id.clone();
                 prev.clone()
             };
-            // S8.3: register the canonical mail identity BEFORE the launch
-            // prompt is rendered — the template injects "your mail identity
-            // is X" so the agent boots knowing the name it is addressed by.
-            // Best-effort (register failures never fail the spawn).
+            // S9 (ADR-0018 D1a): register the adj+noun PIN mail identity
+            // BEFORE the launch prompt is rendered — the template injects
+            // "your mail identity is X" so the agent boots knowing the name
+            // it is addressed by. Best-effort (register failures never fail
+            // the spawn).
             let mail_identity = register_spawned_agent(cfg, project, &name, &kind, &pane_id);
             let identity = mail_identity.as_deref().unwrap_or(&name);
             let peer_args: Vec<String> = peer_template
@@ -4939,18 +4940,20 @@ fn start_agent_with_retry_dyn(
 /// can pin it in the spawn registry (pane → identity) — assign then
 /// resolves through that map and the identity never shifts.
 ///
-/// S8.3: the identity is the CANONICAL herdr name (`flywheel-<project>-
-/// <role><N>`) itself, not the legacy adjective+noun mapping — toron
-/// accepts any name (the agent-mail whitelist constraint never applied to
-/// the toron backend), so the name the wake/assign surfaces IS the
-/// registered identity. The random npub stays underneath (registration
-/// creates or upserts the key for the name).
+/// S9 (ADR-0018 D1a): the identity is a UNIQUE adjective+noun PIN (the
+/// legacy whitelist generator, collision-checked against the spawn
+/// registry pins AND the registered agents; retry on collision), not the
+/// canonical herdr name. The slug name stays the technical pane handle and
+/// resolves as an alias through the registry pin (wake + debate read it).
+/// A re-spawn of the same herdr name KEEPS its pinned identity — idempotent,
+/// never a fresh draw. The random npub stays underneath (registration
+/// creates or upserts the key for the pin).
 ///
 /// S8.4: the upsert carries a FRESH task stamp (spawn_agent_profile) — the
 /// toron register_agent upsert overwrites stale profile task fields from a
 /// prior session (a 2026-08-14 identity still advertised `bd-qk9q`).
 ///
-/// governed-by: ADR-0001 (bd-mail-register-on-spawn, bd-mail-pane-identity-bridge), ADR-0002 (factory)
+/// governed-by: ADR-0001 (bd-mail-register-on-spawn, bd-mail-pane-identity-bridge), ADR-0002 (factory), ADR-0018 D1a (bd-spawn-adjnoun-pin-7psn)
 pub(crate) fn register_spawned_agent(
     cfg: &Config,
     project: &str,
@@ -4990,11 +4993,34 @@ pub(crate) fn register_spawned_agent(
         warn_no_identities(&e);
         return None;
     }
-    // S8.3: the canonical herdr name IS the mail identity. The legacy
-    // agent-mail adjective+noun whitelist (bd-odc) does not apply to the
-    // toron backend — any name registers; the random npub stays underneath.
-    let mail_name = name.to_string();
-    let profile = spawn_agent_profile(name, kind, project);
+    // S9 (ADR-0018 D1a): the mail identity is a UNIQUE adjective+noun pin.
+    // The canonical slug stays the herdr handle and resolves as an alias
+    // through the registry pin (wake + debate read it). A re-spawn of the
+    // same name KEEPS its pinned identity (idempotent); a fresh name draws
+    // a pin collision-checked against the spawn-registry pins AND the
+    // registered agents table, retrying on collision.
+    let registry = state::load_spawn_registry(project);
+    let mail_name = registry
+        .iter()
+        .find(|e| e.name == name)
+        .and_then(|e| e.mail_identity.clone())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| {
+            let mut taken: std::collections::HashSet<String> = registry
+                .iter()
+                .filter_map(|e| e.mail_identity.clone())
+                .collect();
+            match backend::run_mail(mail.list_agents(&key, None)) {
+                Ok(agents) => {
+                    taken.extend(agents.into_iter().map(|a| a.name));
+                }
+                Err(e) => eprintln!(
+                    "flywheel: mail list_agents failed during pin draw for {name}: {e}"
+                ),
+            }
+            unique_adjnoun_pin(&taken, state::fnv1a64(name))
+        });
+    let profile = spawn_agent_profile(&mail_name, kind, project);
     if let Err(e) = backend::run_mail(mail.register_agent(&key, &profile)) {
         // Best-effort: a registration failure must never fail the spawn. The
         // pane-identity bridge below still works (the identity file is the
@@ -5005,10 +5031,26 @@ pub(crate) fn register_spawned_agent(
         return None;
     }
     // bridge the identity to the herdr pane (best-effort, like register).
-    // The file holds the REGISTERED identity (the canonical name) so
+    // The file holds the REGISTERED identity (the pin) so
     // resolve_pane_identity returns a name that exists in the registry.
     if let Err(e) = backend::run_mail(mail.write_pane_identity(&key, pane_id, &mail_name)) {
         eprintln!("flywheel: mail write_pane_identity failed for {name} on {pane_id}: {e}");
+    }
+    // persist the pin binding so a re-spawn of the same herdr name KEEPS the
+    // identity (idempotent — never a fresh draw) and wake/debate resolve
+    // the slug through it. The spawn command saves the full registry too,
+    // but the add path relies on this write.
+    let mut entries = state::load_spawn_registry(project);
+    match entries.iter_mut().find(|e| e.name == name) {
+        Some(e) => e.mail_identity = Some(mail_name.clone()),
+        None => entries.push(state::SpawnEntry::with_mail_identity(
+            pane_id.to_string(),
+            name.to_string(),
+            mail_name.clone(),
+        )),
+    }
+    if let Err(e) = state::save_spawn_registry(project, &entries) {
+        eprintln!("flywheel: cannot save spawn registry for {name}: {e:#}");
     }
     Some(mail_name)
 }
@@ -5061,7 +5103,53 @@ fn agent_mail_name(herdr_name: &str) -> String {
         return pair;
     }
     // Keep in lockstep with mcp_agent_mail_core::models::VALID_ADJECTIVES.
-    const ADJECTIVES: [&str; 75] = [
+    // Module-scope: the S9 pin draw (unique_adjnoun_pin) shares the whitelist.
+    let h = state::fnv1a64(herdr_name);
+    adjnoun_from_fnv(h)
+}
+
+/// The legacy whitelist pair for a hash: ADJECTIVES[h % 75] +
+/// NOUNS[(h >> 32) % 132], PascalCase. This is the pair shape agent-mail
+/// validates (bd-odc) — the "legacy generator" the captain's adj+noun pins
+/// are drawn from (ADR-0018 D1a).
+///
+/// governed-by: ADR-0018 D1a (bd-spawn-adjnoun-pin-7psn)
+pub(crate) fn adjnoun_from_fnv(h: u64) -> String {
+    let adj = ADJECTIVES[(h % ADJECTIVES.len() as u64) as usize];
+    let noun = NOUNS[((h >> 32) % NOUNS.len() as u64) as usize];
+    let mut adj = adj.to_owned();
+    let mut noun = noun.to_owned();
+    if let Some(c) = adj.get_mut(0..1) {
+        c.make_ascii_uppercase();
+    }
+    if let Some(c) = noun.get_mut(0..1) {
+        c.make_ascii_uppercase();
+    }
+    format!("{adj}{noun}")
+}
+
+/// S9 (ADR-0018 D1a): draw a UNIQUE adjective+noun pin, deterministic under
+/// `seed` (the caller seeds per herdr name, so the FIRST candidate matches
+/// the legacy hash mapping when free). A candidate already in `taken`
+/// (spawn-registry pins + registered agents) redraws to the next candidate
+/// — the 9900-pair space makes the loop effectively single-pass and the
+/// seed increment guarantees termination.
+///
+/// governed-by: ADR-0018 D1a (bd-spawn-adjnoun-pin-7psn)
+pub(crate) fn unique_adjnoun_pin(taken: &std::collections::HashSet<String>, seed: u64) -> String {
+    let mut h = seed;
+    loop {
+        let pin = adjnoun_from_fnv(h);
+        if !taken.contains(&pin) {
+            return pin;
+        }
+        h = h.wrapping_add(1);
+    }
+}
+
+/// Keep in lockstep with mcp_agent_mail_core::models::VALID_ADJECTIVES.
+/// (75 adjectives — the S9 pin-draw candidate space.)
+const ADJECTIVES: [&str; 75] = [
         "red",
         "orange",
         "yellow",
@@ -5138,8 +5226,9 @@ fn agent_mail_name(herdr_name: &str) -> String {
         "noble",
         "proud",
     ];
-    // Keep in lockstep with mcp_agent_mail_core::models::VALID_NOUNS.
-    const NOUNS: [&str; 132] = [
+/// Keep in lockstep with mcp_agent_mail_core::models::VALID_NOUNS.
+/// (132 nouns — the S9 pin-draw candidate space.)
+const NOUNS: [&str; 132] = [
         "stone",
         "lake",
         "creek",
@@ -5273,22 +5362,6 @@ fn agent_mail_name(herdr_name: &str) -> String {
         "citadel",
         "fortress",
     ];
-    let h = state::fnv1a64(herdr_name);
-    let adj = ADJECTIVES[(h % ADJECTIVES.len() as u64) as usize];
-    let noun = NOUNS[((h >> 32) % NOUNS.len() as u64) as usize];
-    // PascalCase: adjective + noun, each capitalized (server normalizes to
-    // PascalCase before storing, so any case is accepted; produce the canonical
-    // form).
-    let mut adj = adj.to_owned();
-    let mut noun = noun.to_owned();
-    if let Some(c) = adj.get_mut(0..1) {
-        c.make_ascii_uppercase();
-    }
-    if let Some(c) = noun.get_mut(0..1) {
-        c.make_ascii_uppercase();
-    }
-    format!("{adj}{noun}")
-}
 
 /// Resolve a mail-recipient specifier to a registered agent-mail identity
 /// name. A herdr agent name (`flywheel-<base>-<kind>[N]`) maps
@@ -8489,23 +8562,113 @@ mod wake_identity_tests {
         assert_eq!(wake_urgent(&rows).len(), 1);
     }
 
-    /// S8.3/S8.4: the spawn profile registers the canonical name with a
-    /// fresh task stamp (the upsert clears stale prior-session tasks).
+    /// S9 (ADR-0018 D1a): the spawn profile registers the adj+noun PIN as
+    /// the mail identity with a fresh task stamp (the upsert clears stale
+    /// prior-session tasks).
     #[test]
-    fn spawn_profile_uses_canonical_name_and_fresh_task() {
-        let p = spawn_agent_profile("flywheel-toron-oc4", "opencode", "toron");
-        assert_eq!(p.name, "flywheel-toron-oc4", "canonical name, not a hash pair");
+    fn spawn_profile_uses_adjnoun_pin_and_fresh_task() {
+        let p = spawn_agent_profile("DustySparrow", "opencode", "toron");
+        assert_eq!(p.name, "DustySparrow", "the adj+noun pin is the identity");
         let task = p.task_description.unwrap();
         assert!(task.contains("flywheel agent for toron"), "{task}");
         assert!(!task.contains("bd-"), "no stale bead id in the fresh stamp: {task}");
     }
 
-    /// S8.3: the peer-aware spawn template injects the mail identity.
+    /// S9 (ADR-0018 D1a): a pin draw whose first candidate is taken (spawn
+    /// registry pin or registered agent) redraws to a DIFFERENT valid
+    /// adj+noun pair; a fully-blocked prefix still terminates.
+    #[test]
+    fn pin_collision_redraws() {
+        let seed = state::fnv1a64("flywheel-toron-oc");
+        let first = adjnoun_from_fnv(seed);
+        assert!(valid_pair(&first, &ADJECTIVES, &NOUNS).is_some(), "{first}");
+        let taken: std::collections::HashSet<String> =
+            std::collections::HashSet::from([first.clone()]);
+        let redrawn = unique_adjnoun_pin(&taken, seed);
+        assert_ne!(redrawn, first, "collision must redraw");
+        assert!(valid_pair(&redrawn, &ADJECTIVES, &NOUNS).is_some());
+        let blocked: std::collections::HashSet<String> =
+            (0..10).map(|i| adjnoun_from_fnv(seed + i)).collect();
+        let out = unique_adjnoun_pin(&blocked, seed);
+        assert!(!blocked.contains(&out), "redraw escapes the blocked prefix");
+    }
+
+    /// S9 (ADR-0018 D1a): the pin lands in the spawn registry AND the
+    /// project-local agent-names.json mirror; wake + debate/send resolve the
+    /// slug THROUGH the pin (the slug stays the technical pane handle).
+    #[test]
+    fn spawn_pin_flows_into_agent_names_and_resolves() {
+        let _g = crate::config::lock_env();
+        let dir = std::env::temp_dir().join(format!("fw-s9-names-{}", uuid::Uuid::new_v4()));
+        unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
+        let project = "/tmp/fw-s9-proj";
+        let entries = vec![state::SpawnEntry::with_mail_identity(
+            "w7:p1",
+            "flywheel-toron-oc",
+            "DustySparrow",
+        )];
+        state::save_spawn_registry(project, &entries).expect("save registry");
+        state::save_agent_names(std::path::Path::new(project), &entries).expect("save names");
+        let names = state::load_agent_names(std::path::Path::new(project));
+        assert_eq!(names[0].mail_identity.as_deref(), Some("DustySparrow"));
+        assert_eq!(
+            wake_identity_pin(
+                &state::load_spawn_registry(project),
+                &names,
+                "flywheel-toron-oc"
+            ),
+            "DustySparrow",
+            "wake reads the pin through the binding"
+        );
+        assert_eq!(
+            resolve_mail_target_registry(project, "flywheel-toron-oc"),
+            "DustySparrow",
+            "debate/send read the pin through the binding"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S9 (ADR-0018 D1a) integration (embedded mailbox): spawn registers a
+    /// UNIQUE adj+noun pin — never the slug — keeps it on re-spawn
+    /// (idempotent), and redraws when the agents table already holds the
+    /// seed-draw candidate.
+    #[test]
+    fn register_spawned_agent_pins_unique_adjnoun_identity() {
+        let _g = crate::config::lock_env();
+        let data = std::env::temp_dir().join(format!("fw-s9-mail-{}", uuid::Uuid::new_v4()));
+        unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
+        let cfg = Config::default();
+        let project = "/tmp/fw-s9-mail-proj";
+        let slug = "flywheel-toron-oc";
+        let pin = register_spawned_agent(&cfg, project, slug, "opencode", "w7:p1")
+            .expect("first spawn pins an identity");
+        assert!(valid_pair(&pin, &ADJECTIVES, &NOUNS).is_some(), "adj+noun pin: {pin}");
+        assert_ne!(pin, slug, "the slug is the pane handle, not the identity");
+        let again = register_spawned_agent(&cfg, project, slug, "opencode", "w7:p1")
+            .expect("re-spawn keeps the pin");
+        assert_eq!(again, pin, "re-spawn must not draw a fresh pin");
+        // agents-table collision: find a name whose seed-draw equals the
+        // pinned identity, spawn it — its draw must redraw around the taken
+        // pin (the 9900-pair space guarantees a colliding candidate).
+        let target = pin.clone();
+        let collider = (0..200_000u64)
+            .map(|i| format!("s9spawn-{i}"))
+            .find(|n| adjnoun_from_fnv(state::fnv1a64(n)) == target)
+            .expect("a colliding name exists in the 9900-pair space");
+        let pin2 = register_spawned_agent(&cfg, project, &collider, "opencode", "w7:p2")
+            .expect("colliding spawn draws a fresh pin");
+        assert_ne!(pin2, pin, "collision with the agents table redraws");
+        assert!(valid_pair(&pin2, &ADJECTIVES, &NOUNS).is_some(), "{pin2}");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// S9 (ADR-0018 D1a): the peer-aware spawn template injects the mail
+    /// identity — now the adj+noun PIN, not the slug.
     #[test]
     fn peer_prompt_injects_mail_identity() {
         let tpl = "You are {name}. Your mail identity is {mail_identity}. Budget {poll_interval_minutes}/{poll_budget_minutes}/{max_peer_prompts}";
-        let out = peer_prompt_template(tpl, "flywheel-toron-oc4", "flywheel-toron-oc4", 10, 60, 5);
-        assert!(out.contains("Your mail identity is flywheel-toron-oc4"), "{out}");
+        let out = peer_prompt_template(tpl, "flywheel-toron-oc4", "DustySparrow", 10, 60, 5);
+        assert!(out.contains("Your mail identity is DustySparrow"), "{out}");
         assert!(!out.contains('{'), "no literal placeholders: {out}");
     }
 }
