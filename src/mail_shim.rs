@@ -427,6 +427,8 @@ impl Mail {
                     unread_only: false,
                     limit: Some(limit as usize),
                     include_bodies: true,
+                    urgent_only: false,
+                    since_ts: None,
                 }))?;
                 Ok(Value::Array(msgs.iter().map(ToJson::to_json).collect()))
             }
@@ -478,6 +480,8 @@ impl Mail {
                     unread_only: filter.unread_only,
                     limit: Some(filter.limit as usize),
                     include_bodies: filter.include_bodies,
+                    urgent_only: filter.urgent_only,
+                    since_ts: filter.since_ts.clone(),
                 }))?;
                 let rows = msgs
                     .iter()
@@ -598,6 +602,8 @@ impl Mail {
                     unread_only: false,
                     limit: None,
                     include_bodies: false,
+                    urgent_only: false,
+                    since_ts: None,
                 }))?;
                 Ok(Value::Array(msgs.iter().map(ToJson::to_json).collect()))
             }

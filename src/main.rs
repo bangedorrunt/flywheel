@@ -14226,7 +14226,8 @@ fn cmd_debate(
     let mux = backend::multiplexer_backend(cfg)?;
     backend::run_mail(mail.ensure_project(&key))?;
 
-    let mail_target = |agent: &str| resolve_mail_target(agent).to_string();
+    let mail_target =
+        |agent: &str| resolve_mail_target_registry(&project, agent).to_string();
 
     // opening: A argues FOR
     let opening = format!(
@@ -14567,7 +14568,7 @@ fn cmd_plan_review(
     let key = project_dir_str(cfg, project)?;
     backend::run_mail(mail.ensure_project(&key))?;
 
-    let mail_target = |agent: &str| resolve_mail_target(agent);
+    let mail_target = |agent: &str| resolve_mail_target_registry(project, agent);
     let subject = format!("[plan-review] {project}");
 
     eprintln!(
