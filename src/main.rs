@@ -29,6 +29,7 @@ mod smart_cron;
 mod stages;
 mod state;
 mod toron_embed;
+mod verdict;
 mod work;
 mod workflow_catalog;
 
@@ -697,6 +698,14 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         tier: u32,
     },
+    /// internal: mail the planner that a ready bead is NOT dispatchable
+    /// (missing/malformed `## VERIFY` fence — ADR-0019, bd-w1-verify-fence)
+    #[command(name = "__mail-not-ready", hide = true)]
+    __MailNotReady {
+        project: String,
+        bead_id: String,
+        title: String,
+    },
     /// internal: diagnose unresponsive agent (tail + health mail)
     #[command(name = "__diagnose", hide = true)]
     __Diagnose {
@@ -771,10 +780,7 @@ enum Commands {
     /// bead id (bd-h3oj release-on-bead-close; durable workflow leaf —
     /// idempotent, `released == 0` is a clean no-op)
     #[command(name = "__release-bead-locks", hide = true)]
-    __ReleaseBeadLocks {
-        project: String,
-        bead_id: String,
-    },
+    __ReleaseBeadLocks { project: String, bead_id: String },
     /// internal: list ready beads as JSON (durable workflow leaf)
     #[command(name = "__ready", hide = true)]
     __Ready { project: String },
@@ -2733,10 +2739,7 @@ fn is_still_booting(a: &AgentInfo) -> bool {
     if a.interactive_ready
         && matches!(
             a.agent_status,
-            AgentStatus::Idle
-                | AgentStatus::Working
-                | AgentStatus::Blocked
-                | AgentStatus::Done
+            AgentStatus::Idle | AgentStatus::Working | AgentStatus::Blocked | AgentStatus::Done
         )
     {
         return false;
@@ -2958,28 +2961,35 @@ fn main() {
                 engine,
                 force,
             } => {
-                let pf_mode = if *work { preflight::Mode::loop_work() } else { preflight::Mode::loop_queue() };
-                preflight_gate(&cfg, cli.skip_preflight, pf_mode, Some(project.as_str()))
-                    .and_then(|_| cmd_loop(
-                        &cfg,
-                        project,
-                        *interval,
-                        *interval_active,
-                        queue.as_deref(),
-                        workflow.as_deref(),
-                        nudge.as_deref(),
-                        *timeout_ms,
-                        *once,
-                        *local,
-                        *work,
-                        on_blocked,
-                        to,
-                        *no_confirm,
-                        *confirm_timeout_ms,
-                        *engine,
-                        *force,
-                    ))
-            },
+                let pf_mode = if *work {
+                    preflight::Mode::loop_work()
+                } else {
+                    preflight::Mode::loop_queue()
+                };
+                preflight_gate(&cfg, cli.skip_preflight, pf_mode, Some(project.as_str())).and_then(
+                    |_| {
+                        cmd_loop(
+                            &cfg,
+                            project,
+                            *interval,
+                            *interval_active,
+                            queue.as_deref(),
+                            workflow.as_deref(),
+                            nudge.as_deref(),
+                            *timeout_ms,
+                            *once,
+                            *local,
+                            *work,
+                            on_blocked,
+                            to,
+                            *no_confirm,
+                            *confirm_timeout_ms,
+                            *engine,
+                            *force,
+                        )
+                    },
+                )
+            }
             LoopCmd::Status { project } => cmd_loop_status(&cfg, project),
             LoopCmd::List => cmd_loop_list(),
             LoopCmd::Prune => cmd_loop_prune(),
@@ -3057,8 +3067,14 @@ fn main() {
             retain,
             retire_orphans,
             json,
-        }) => preflight_gate(&cfg, cli.skip_preflight, preflight::Mode::steer(), project.as_deref())
-            .and_then(|_| cmd_steer(
+        }) => preflight_gate(
+            &cfg,
+            cli.skip_preflight,
+            preflight::Mode::steer(),
+            project.as_deref(),
+        )
+        .and_then(|_| {
+            cmd_steer(
                 &cfg,
                 objective,
                 *direct,
@@ -3068,10 +3084,11 @@ fn main() {
                 *retain,
                 *retire_orphans,
                 *json,
-            )),
+            )
+        }),
         Some(Commands::Workflow { cmd }) => {
-            let needs_pf = !cli.skip_preflight
-                && matches!(cmd, WorkflowCmd::Run { execute: true, .. });
+            let needs_pf =
+                !cli.skip_preflight && matches!(cmd, WorkflowCmd::Run { execute: true, .. });
             let pf = if needs_pf {
                 let project = match &cmd {
                     WorkflowCmd::Run { project, .. } => project.as_deref(),
@@ -3082,7 +3099,7 @@ fn main() {
                 Ok(())
             };
             pf.and_then(|_| cmd_workflow(&cfg, cmd))
-        },
+        }
         Some(Commands::Model { cmd }) => cmd_models(cmd),
         Some(Commands::Cron { cmd }) => cmd_cron(&cfg, cmd),
         Some(Commands::Debate {
@@ -3121,9 +3138,12 @@ fn main() {
         Some(Commands::Tutorial) => cmd_tutorial(),
         Some(Commands::Serve { port }) => cmd_serve(&cfg, *port),
         Some(Commands::Toron { cmd }) => cmd_toron(&cfg, cmd),
-        Some(Commands::Preflight { mode, project, work, json }) => {
-            cmd_preflight(&cfg, mode, project.as_deref(), *work, *json)
-        }
+        Some(Commands::Preflight {
+            mode,
+            project,
+            work,
+            json,
+        }) => cmd_preflight(&cfg, mode, project.as_deref(), *work, *json),
         Some(Commands::__Poll { project, to }) => cmd_internal_poll(&cfg, project, to),
         Some(Commands::__PollEvents {
             project,
@@ -3155,6 +3175,11 @@ fn main() {
             name,
             tier,
         }) => cmd_internal_mail_blocked(&cfg, project, name, *tier),
+        Some(Commands::__MailNotReady {
+            project,
+            bead_id,
+            title,
+        }) => cmd_internal_mail_not_ready(&cfg, project, bead_id, title),
         Some(Commands::__Diagnose {
             project,
             name,
@@ -3601,10 +3626,7 @@ fn classify_workspace_origin(
                 .map(|n| n.starts_with(&prefix))
                 .unwrap_or(false)
     });
-    if ws.label == label
-        || hosts_agents
-        || spawn_label == Some(ws.label.as_str())
-    {
+    if ws.label == label || hosts_agents || spawn_label == Some(ws.label.as_str()) {
         Some(WorkspaceOrigin::Owned)
     } else if ws.label == base {
         Some(WorkspaceOrigin::Foreign)
@@ -3659,7 +3681,11 @@ fn add_target_from_split(
     // prefer the owned workspace hosting managed agents; first owned otherwise
     // (resolve_workspace_id picks the agent-hosting workspace among many).
     let prefix = format!("flywheel-{}-", project_base(project));
-    Ok(herdr_shim::resolve_workspace_id(&split.owned, agents, &prefix))
+    Ok(herdr_shim::resolve_workspace_id(
+        &split.owned,
+        agents,
+        &prefix,
+    ))
 }
 
 fn add_target_workspace(c: &mut Client, project: &str) -> Result<String> {
@@ -3712,7 +3738,10 @@ mod spawn_profile_plan_tests {
 
     #[test]
     fn profile_item_carries_harness_and_name_base() {
-        let items = spawn_items_from_plan(vec![], Some(("coder", &profile("opencode", "deepseek-v4-flash"), 2)));
+        let items = spawn_items_from_plan(
+            vec![],
+            Some(("coder", &profile("opencode", "deepseek-v4-flash"), 2)),
+        );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].short, "coder");
         assert_eq!(items[0].count, 2);
@@ -3767,9 +3796,15 @@ mod spawn_profile_plan_tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
         let p = profile("opencode", "deepseek-v4-flash");
-        assert_eq!(profile_launch_args("opencode", &p), vec!["-m", "deepseek-v4-flash"]);
+        assert_eq!(
+            profile_launch_args("opencode", &p),
+            vec!["-m", "deepseek-v4-flash"]
+        );
         let pi = profile("pi", "smol-model");
-        assert_eq!(profile_launch_args("pi", &pi), vec!["--model", "smol-model"]);
+        assert_eq!(
+            profile_launch_args("pi", &pi),
+            vec!["--model", "smol-model"]
+        );
         let mut omp = profile("omp", "glm-5.2");
         omp.effort = "max".into();
         omp.smol = "glm-4.5-air".into();
@@ -3795,10 +3830,20 @@ mod spawn_profile_plan_tests {
 
     #[test]
     fn skill_prefix_built_once_for_fresh_profiled_agent() {
-        let entry = state::SpawnEntry::profiled("w1:p1", "flywheel-flywheel-coder", "coder", "opencode", None);
+        let entry = state::SpawnEntry::profiled(
+            "w1:p1",
+            "flywheel-flywheel-coder",
+            "coder",
+            "opencode",
+            None,
+        );
         let skills = vec!["code-quality".to_string(), "tdd".to_string()];
-        let p = skill_injection_prefix(&entry, &skills).expect("fresh profiled agent gets the prefix");
-        assert_eq!(p, "Read skill://code-quality skill://tdd before starting.\n\n");
+        let p =
+            skill_injection_prefix(&entry, &skills).expect("fresh profiled agent gets the prefix");
+        assert_eq!(
+            p,
+            "Read skill://code-quality skill://tdd before starting.\n\n"
+        );
         let mut injected = entry;
         injected.skills_injected = true;
         assert!(skill_injection_prefix(&injected, &skills).is_none());
@@ -3808,7 +3853,13 @@ mod spawn_profile_plan_tests {
     fn skill_prefix_skips_legacy_and_skillless() {
         let legacy = state::SpawnEntry::legacy("w1:p1", "flywheel-flywheel-oc");
         assert!(skill_injection_prefix(&legacy, &["x".to_string()]).is_none());
-        let profiled = state::SpawnEntry::profiled("w1:p1", "flywheel-flywheel-coder", "coder", "opencode", None);
+        let profiled = state::SpawnEntry::profiled(
+            "w1:p1",
+            "flywheel-flywheel-coder",
+            "coder",
+            "opencode",
+            None,
+        );
         assert!(skill_injection_prefix(&profiled, &[]).is_none());
     }
 }
@@ -3847,7 +3898,10 @@ mod profile_run_spawn_tests {
         let mut coder = profile("omp", "glm-5.2");
         coder.effort = "max".into();
         let args = profile_launch_args("omp", &coder);
-        assert!(!args.is_empty(), "known profile must inject model/effort args");
+        assert!(
+            !args.is_empty(),
+            "known profile must inject model/effort args"
+        );
         assert!(
             args.iter().any(|a| a.contains("glm-5.2")),
             "model flag present: {args:?}"
@@ -4014,7 +4068,10 @@ mod profile_run_spawn_tests {
             .iter()
             .find(|e| e.name == "profile-coder")
             .expect("coder row present");
-        assert_eq!(coder.pane_id, "w1:p9", "re-spawn replaces the same-name row");
+        assert_eq!(
+            coder.pane_id, "w1:p9",
+            "re-spawn replaces the same-name row"
+        );
         assert_eq!(coder.profile.as_deref(), Some("coder"));
         assert!(
             registry.iter().any(|e| e.name == "profile-planner"),
@@ -4144,9 +4201,7 @@ mod internal_respawn_tests {
         fn name(&self) -> &'static str {
             "mock-mux"
         }
-        fn workspace_list(
-            &self,
-        ) -> Result<Vec<WorkspaceInfo>, toron_core::backend::BackendError> {
+        fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, toron_core::backend::BackendError> {
             Ok(vec![workspace(&self.ws_label)])
         }
         fn pane_list(
@@ -4184,10 +4239,12 @@ mod internal_respawn_tests {
             pane_id: &str,
             args: &[String],
         ) -> Result<AgentInfo, toron_core::backend::BackendError> {
-            self.started
-                .lock()
-                .expect("mock started lock")
-                .push((name.into(), kind.into(), pane_id.into(), args.to_vec()));
+            self.started.lock().expect("mock started lock").push((
+                name.into(),
+                kind.into(),
+                pane_id.into(),
+                args.to_vec(),
+            ));
             let mut agents = self.agents.lock().expect("mock agents lock");
             agents.push(agent(name, pane_id, "wA", AgentStatus::Idle));
             Ok(agents.last().expect("just pushed").clone())
@@ -4222,8 +4279,16 @@ mod internal_respawn_tests {
 
         respawn_with_backend(&mux, &cfg, "demo", "profile-coder", "omp", true).expect("respawn ok");
 
-        assert_eq!(mux.splits.load(Ordering::SeqCst), 0, "omp respawn must NOT split a new pane");
-        assert_eq!(mux.closes.load(Ordering::SeqCst), 0, "omp respawn must NOT pane.close (PTY stdin EOF kills omp)");
+        assert_eq!(
+            mux.splits.load(Ordering::SeqCst),
+            0,
+            "omp respawn must NOT split a new pane"
+        );
+        assert_eq!(
+            mux.closes.load(Ordering::SeqCst),
+            0,
+            "omp respawn must NOT pane.close (PTY stdin EOF kills omp)"
+        );
         let started = mux.started.lock().expect("mock started lock");
         assert_eq!(started.len(), 1);
         let (name, kind, pane_id, args) = &started[0];
@@ -4250,11 +4315,22 @@ mod internal_respawn_tests {
         respawn_with_backend(&mux, &cfg, "demo", "flywheel-demo-oc", "opencode", true)
             .expect("respawn ok");
 
-        assert_eq!(mux.splits.load(Ordering::SeqCst), 1, "non-omp respawn splits a fresh pane");
-        assert_eq!(mux.closes.load(Ordering::SeqCst), 1, "non-omp respawn closes the old pane");
+        assert_eq!(
+            mux.splits.load(Ordering::SeqCst),
+            1,
+            "non-omp respawn splits a fresh pane"
+        );
+        assert_eq!(
+            mux.closes.load(Ordering::SeqCst),
+            1,
+            "non-omp respawn closes the old pane"
+        );
         let started = mux.started.lock().expect("mock started lock");
         assert_eq!(started.len(), 1);
-        assert_eq!(started[0].2, "wA:p2", "agent starts on the fresh split pane");
+        assert_eq!(
+            started[0].2, "wA:p2",
+            "agent starts on the fresh split pane"
+        );
         assert!(
             started[0].3.is_empty(),
             "unprofiled agent has no registry profile → unchanged empty argv"
@@ -4280,7 +4356,10 @@ mod internal_respawn_tests {
 
         let omp = respawn_launch_args(&cfg, "demo", "profile-coder", "omp");
         assert!(!omp.is_empty(), "profiled agent re-injects its launch args");
-        assert!(omp.iter().any(|a| a.contains("glm-5.2")), "model flag: {omp:?}");
+        assert!(
+            omp.iter().any(|a| a.contains("glm-5.2")),
+            "model flag: {omp:?}"
+        );
 
         let legacy = respawn_launch_args(&cfg, "demo", "flywheel-demo-oc", "opencode");
         assert!(legacy.is_empty(), "legacy entry (no profile) → empty argv");
@@ -4300,12 +4379,8 @@ mod profile_workflow_invoke_tests {
     /// message.
     #[test]
     fn invoke_attempts_pane_run_in_spawned_workspace() {
-        let cmd = profile_workflow_invoke(
-            "weekly-review",
-            Some("{\"goal\":\"x\"}"),
-            "ws-1",
-            "toron",
-        );
+        let cmd =
+            profile_workflow_invoke("weekly-review", Some("{\"goal\":\"x\"}"), "ws-1", "toron");
         let WorkflowCmd::Run {
             name,
             inputs,
@@ -4353,8 +4428,9 @@ mod steer_safety_tests {
             "raw token must resolve: {aliases:?}"
         );
         assert!(
-            aliases.iter().any(|a| a == "flywheel-flywheel-omp-repro"
-                || a.starts_with("flywheel-")),
+            aliases
+                .iter()
+                .any(|a| a == "flywheel-flywheel-omp-repro" || a.starts_with("flywheel-")),
             "default swarm label present: {aliases:?}"
         );
     }
@@ -4598,9 +4674,7 @@ fn prime_via_send_text(c: &mut Client, pane_id: &str) {
         .pane_send_text(pane_id, boot_prime_line())
         .and_then(|_| c.pane_send_input(pane_id, &["Enter"]));
     if let Err(e) = res {
-        eprintln!(
-            "flywheel: warn: boot-prime via pane.send_text failed for {pane_id}: {e:#}"
-        );
+        eprintln!("flywheel: warn: boot-prime via pane.send_text failed for {pane_id}: {e:#}");
     }
 }
 
@@ -4610,8 +4684,15 @@ fn prime_via_send_text(c: &mut Client, pane_id: &str) {
 /// from hook events, so a missing integration degrades lifecycle-state
 /// reporting. Warn-only by H3 decision; the env + prime machinery works
 /// regardless.
-const LIFECYCLE_AUTHORITY_KINDS: &[&str] =
-    &["pi", "omp", "kimi", "opencode", "kilo", "mastracode", "grok"];
+const LIFECYCLE_AUTHORITY_KINDS: &[&str] = &[
+    "pi",
+    "omp",
+    "kimi",
+    "opencode",
+    "kilo",
+    "mastracode",
+    "grok",
+];
 
 /// H3 (bd-harness-integration-preflight): before a kind's first agent
 /// launches, make sure its herdr integration exists and is current.
@@ -4654,11 +4735,9 @@ fn preflight_kind_integration(
                 }
             );
         }
-        Err(e) => warn_integration_install_failed(
-            kind,
-            LIFECYCLE_AUTHORITY_KINDS.contains(&kind),
-            &e,
-        ),
+        Err(e) => {
+            warn_integration_install_failed(kind, LIFECYCLE_AUTHORITY_KINDS.contains(&kind), &e)
+        }
     }
 }
 
@@ -4788,9 +4867,9 @@ projects available: {}",
     let catalog = profile::ProfileCatalog::load()?;
     let profile_plan = match profile_name {
         Some(p) => {
-            let profile = catalog.get(p).ok_or_else(|| {
-                anyhow!("unknown profile '@{p}' (flywheel profile list)")
-            })?;
+            let profile = catalog
+                .get(p)
+                .ok_or_else(|| anyhow!("unknown profile '@{p}' (flywheel profile list)"))?;
             Some((p, profile, profile_count))
         }
         None => None,
@@ -5003,7 +5082,10 @@ projects available: {}",
     let integration_statuses = read_integration_statuses();
     let mut preflighted_kinds: HashSet<String> = HashSet::new();
     for item in &items {
-        let kind = item.kind.clone().unwrap_or_else(|| cfg.resolve_kind(&item.short));
+        let kind = item
+            .kind
+            .clone()
+            .unwrap_or_else(|| cfg.resolve_kind(&item.short));
         if preflighted_kinds.insert(kind.clone()) {
             preflight_kind_integration(&mut c, &kind, &integration_statuses);
         }
@@ -5526,9 +5608,9 @@ pub(crate) fn register_spawned_agent(
                 Ok(agents) => {
                     taken.extend(agents.into_iter().map(|a| a.name));
                 }
-                Err(e) => eprintln!(
-                    "flywheel: mail list_agents failed during pin draw for {name}: {e}"
-                ),
+                Err(e) => {
+                    eprintln!("flywheel: mail list_agents failed during pin draw for {name}: {e}")
+                }
             }
             unique_adjnoun_pin(&taken, state::fnv1a64(name))
         });
@@ -5662,218 +5744,218 @@ pub(crate) fn unique_adjnoun_pin(taken: &std::collections::HashSet<String>, seed
 /// Keep in lockstep with mcp_agent_mail_core::models::VALID_ADJECTIVES.
 /// (75 adjectives — the S9 pin-draw candidate space.)
 const ADJECTIVES: [&str; 75] = [
-        "red",
-        "orange",
-        "yellow",
-        "pink",
-        "black",
-        "purple",
-        "blue",
-        "brown",
-        "white",
-        "green",
-        "chartreuse",
-        "lilac",
-        "fuchsia",
-        "azure",
-        "amber",
-        "coral",
-        "crimson",
-        "cyan",
-        "gold",
-        "golden",
-        "gray",
-        "indigo",
-        "ivory",
-        "jade",
-        "lavender",
-        "magenta",
-        "maroon",
-        "navy",
-        "olive",
-        "pearl",
-        "rose",
-        "ruby",
-        "sage",
-        "scarlet",
-        "silver",
-        "teal",
-        "topaz",
-        "violet",
-        "cobalt",
-        "copper",
-        "bronze",
-        "emerald",
-        "sapphire",
-        "turquoise",
-        "beige",
-        "tan",
-        "cream",
-        "peach",
-        "plum",
-        "sunny",
-        "misty",
-        "foggy",
-        "stormy",
-        "windy",
-        "frosty",
-        "dusty",
-        "hazy",
-        "cloudy",
-        "rainy",
-        "snowy",
-        "icy",
-        "mossy",
-        "sandy",
-        "swift",
-        "quiet",
-        "bold",
-        "calm",
-        "bright",
-        "dark",
-        "wild",
-        "silent",
-        "gentle",
-        "rustic",
-        "noble",
-        "proud",
-    ];
+    "red",
+    "orange",
+    "yellow",
+    "pink",
+    "black",
+    "purple",
+    "blue",
+    "brown",
+    "white",
+    "green",
+    "chartreuse",
+    "lilac",
+    "fuchsia",
+    "azure",
+    "amber",
+    "coral",
+    "crimson",
+    "cyan",
+    "gold",
+    "golden",
+    "gray",
+    "indigo",
+    "ivory",
+    "jade",
+    "lavender",
+    "magenta",
+    "maroon",
+    "navy",
+    "olive",
+    "pearl",
+    "rose",
+    "ruby",
+    "sage",
+    "scarlet",
+    "silver",
+    "teal",
+    "topaz",
+    "violet",
+    "cobalt",
+    "copper",
+    "bronze",
+    "emerald",
+    "sapphire",
+    "turquoise",
+    "beige",
+    "tan",
+    "cream",
+    "peach",
+    "plum",
+    "sunny",
+    "misty",
+    "foggy",
+    "stormy",
+    "windy",
+    "frosty",
+    "dusty",
+    "hazy",
+    "cloudy",
+    "rainy",
+    "snowy",
+    "icy",
+    "mossy",
+    "sandy",
+    "swift",
+    "quiet",
+    "bold",
+    "calm",
+    "bright",
+    "dark",
+    "wild",
+    "silent",
+    "gentle",
+    "rustic",
+    "noble",
+    "proud",
+];
 /// Keep in lockstep with mcp_agent_mail_core::models::VALID_NOUNS.
 /// (132 nouns — the S9 pin-draw candidate space.)
 const NOUNS: [&str; 132] = [
-        "stone",
-        "lake",
-        "creek",
-        "pond",
-        "mountain",
-        "hill",
-        "snow",
-        "castle",
-        "river",
-        "forest",
-        "valley",
-        "canyon",
-        "meadow",
-        "prairie",
-        "desert",
-        "island",
-        "cliff",
-        "cave",
-        "glacier",
-        "waterfall",
-        "spring",
-        "stream",
-        "reef",
-        "dune",
-        "ridge",
-        "peak",
-        "gorge",
-        "marsh",
-        "brook",
-        "glen",
-        "grove",
-        "fern",
-        "hollow",
-        "basin",
-        "cove",
-        "bay",
-        "harbor",
-        "coast",
-        "shore",
-        "bluff",
-        "knoll",
-        "summit",
-        "plateau",
-        "dog",
-        "cat",
-        "bear",
-        "fox",
-        "wolf",
-        "deer",
-        "elk",
-        "moose",
-        "otter",
-        "beaver",
-        "badger",
-        "lynx",
-        "puma",
-        "squirrel",
-        "rabbit",
-        "hare",
-        "mouse",
-        "mink",
-        "seal",
-        "horse",
-        "lion",
-        "tiger",
-        "panther",
-        "leopard",
-        "jaguar",
-        "coyote",
-        "bison",
-        "ox",
-        "hawk",
-        "eagle",
-        "owl",
-        "falcon",
-        "raven",
-        "heron",
-        "crane",
-        "finch",
-        "robin",
-        "sparrow",
-        "duck",
-        "goose",
-        "swan",
-        "dove",
-        "wren",
-        "jay",
-        "lark",
-        "kite",
-        "condor",
-        "osprey",
-        "pelican",
-        "gull",
-        "tern",
-        "stork",
-        "ibis",
-        "cardinal",
-        "oriole",
-        "thrush",
-        "trout",
-        "salmon",
-        "bass",
-        "pike",
-        "carp",
-        "turtle",
-        "frog",
-        "pine",
-        "oak",
-        "maple",
-        "birch",
-        "cedar",
-        "willow",
-        "aspen",
-        "elm",
-        "orchid",
-        "lotus",
-        "ivy",
-        "tower",
-        "bridge",
-        "forge",
-        "mill",
-        "barn",
-        "gate",
-        "anchor",
-        "lantern",
-        "beacon",
-        "compass",
-        "horizon",
-        "spire",
-        "chapel",
-        "citadel",
-        "fortress",
-    ];
+    "stone",
+    "lake",
+    "creek",
+    "pond",
+    "mountain",
+    "hill",
+    "snow",
+    "castle",
+    "river",
+    "forest",
+    "valley",
+    "canyon",
+    "meadow",
+    "prairie",
+    "desert",
+    "island",
+    "cliff",
+    "cave",
+    "glacier",
+    "waterfall",
+    "spring",
+    "stream",
+    "reef",
+    "dune",
+    "ridge",
+    "peak",
+    "gorge",
+    "marsh",
+    "brook",
+    "glen",
+    "grove",
+    "fern",
+    "hollow",
+    "basin",
+    "cove",
+    "bay",
+    "harbor",
+    "coast",
+    "shore",
+    "bluff",
+    "knoll",
+    "summit",
+    "plateau",
+    "dog",
+    "cat",
+    "bear",
+    "fox",
+    "wolf",
+    "deer",
+    "elk",
+    "moose",
+    "otter",
+    "beaver",
+    "badger",
+    "lynx",
+    "puma",
+    "squirrel",
+    "rabbit",
+    "hare",
+    "mouse",
+    "mink",
+    "seal",
+    "horse",
+    "lion",
+    "tiger",
+    "panther",
+    "leopard",
+    "jaguar",
+    "coyote",
+    "bison",
+    "ox",
+    "hawk",
+    "eagle",
+    "owl",
+    "falcon",
+    "raven",
+    "heron",
+    "crane",
+    "finch",
+    "robin",
+    "sparrow",
+    "duck",
+    "goose",
+    "swan",
+    "dove",
+    "wren",
+    "jay",
+    "lark",
+    "kite",
+    "condor",
+    "osprey",
+    "pelican",
+    "gull",
+    "tern",
+    "stork",
+    "ibis",
+    "cardinal",
+    "oriole",
+    "thrush",
+    "trout",
+    "salmon",
+    "bass",
+    "pike",
+    "carp",
+    "turtle",
+    "frog",
+    "pine",
+    "oak",
+    "maple",
+    "birch",
+    "cedar",
+    "willow",
+    "aspen",
+    "elm",
+    "orchid",
+    "lotus",
+    "ivy",
+    "tower",
+    "bridge",
+    "forge",
+    "mill",
+    "barn",
+    "gate",
+    "anchor",
+    "lantern",
+    "beacon",
+    "compass",
+    "horizon",
+    "spire",
+    "chapel",
+    "citadel",
+    "fortress",
+];
 
 /// Resolve a mail-recipient specifier to a registered agent-mail identity
 /// name. A herdr agent name (`flywheel-<base>-<kind>[N]`) maps
@@ -6303,11 +6385,7 @@ mod agent_mail_name_tests {
                 "flywheel-fw-regpin-oc2",
                 "DustySparrow",
             ),
-            state::SpawnEntry::with_mail_identity(
-                "w3:p2",
-                "flywheel-fw-regpin-oc3",
-                "RoseDune",
-            ),
+            state::SpawnEntry::with_mail_identity("w3:p2", "flywheel-fw-regpin-oc3", "RoseDune"),
         ];
         state::save_spawn_registry(project, &entries).expect("save");
 
@@ -6962,7 +7040,9 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
                     Some(true) => {
                         let verdict = probe.as_mut().map(|c| {
                             herdr_shim::probe_agent_responsiveness(
-                                c, pane_id, RESPONSIVENESS_WINDOW,
+                                c,
+                                pane_id,
+                                RESPONSIVENESS_WINDOW,
                             )
                         });
                         match verdict {
@@ -7217,7 +7297,8 @@ fn cmd_send(
                 Err(e)
                     if matches!(&e.code, BackendErrorCode::Other(c) if c == "agent_not_found")
                         && !pane_retried
-                        && !target.contains(':') => {
+                        && !target.contains(':') =>
+                {
                     let entry = state::load_spawn_registry(project)
                         .iter()
                         .find(|en| en.name == name)
@@ -7344,7 +7425,11 @@ fn stall_recovery_hint(project: &str) -> String {
 /// booting agent answers its pane even before the name binding settles —
 /// so the send path retries once via the pane id. `None` when the pane-id
 /// retry already happened (bounded — never an infinite retry loop).
-fn not_ready_retry_target(name_used: &str, agent: &AgentInfo, pane_retried: bool) -> Option<String> {
+fn not_ready_retry_target(
+    name_used: &str,
+    agent: &AgentInfo,
+    pane_retried: bool,
+) -> Option<String> {
     if pane_retried || name_used == agent.pane_id {
         None
     } else {
@@ -7427,15 +7512,25 @@ mod bd_4pxy_tests {
 
     #[test]
     fn is_agent_not_ready_matches_protocol_code() {
-        assert!(is_agent_not_ready(&BackendErrorCode::Other("agent_not_ready".into())));
+        assert!(is_agent_not_ready(&BackendErrorCode::Other(
+            "agent_not_ready".into()
+        )));
         assert!(!is_agent_not_ready(&BackendErrorCode::AgentPromptStalled));
-        assert!(!is_agent_not_ready(&BackendErrorCode::Other("agent_prompt_stalled".into())));
+        assert!(!is_agent_not_ready(&BackendErrorCode::Other(
+            "agent_prompt_stalled".into()
+        )));
         assert!(!is_agent_not_ready(&BackendErrorCode::Timeout));
     }
 
     #[test]
     fn not_ready_retry_target_pane_once() {
-        let a = agent(Some("omp"), Some("flywheel-flywheel-coder"), "w1", false, AgentStatus::Idle);
+        let a = agent(
+            Some("omp"),
+            Some("flywheel-flywheel-coder"),
+            "w1",
+            false,
+            AgentStatus::Idle,
+        );
         // first not-ready on the NAME → retry via the pane id
         assert_eq!(
             not_ready_retry_target("flywheel-flywheel-coder", &a, false),
@@ -7452,7 +7547,10 @@ mod bd_4pxy_tests {
     fn status_label_launch_pending_is_not_idle() {
         assert_eq!(status_label(true, AgentStatus::Idle.as_str()), "launching");
         assert_eq!(status_label(false, AgentStatus::Idle.as_str()), "idle");
-        assert_eq!(status_label(false, AgentStatus::Working.as_str()), "working");
+        assert_eq!(
+            status_label(false, AgentStatus::Working.as_str()),
+            "working"
+        );
     }
 
     #[test]
@@ -7460,14 +7558,32 @@ mod bd_4pxy_tests {
         // bd-a2bw: a truly-booting agent is launch_pending AND not yet
         // interactive_ready. Idle + ready with launch_pending set is stale
         // (covered by is_still_booting_ignores_stale_launch_pending).
-        let mut pending = agent(Some("omp"), Some("flywheel-flywheel-coder"), "w1", true, AgentStatus::Unknown);
+        let mut pending = agent(
+            Some("omp"),
+            Some("flywheel-flywheel-coder"),
+            "w1",
+            true,
+            AgentStatus::Unknown,
+        );
         pending.interactive_ready = false;
-        let ready = agent(Some("oc"), Some("flywheel-flywheel-oc"), "w1", false, AgentStatus::Idle);
+        let ready = agent(
+            Some("oc"),
+            Some("flywheel-flywheel-oc"),
+            "w1",
+            false,
+            AgentStatus::Idle,
+        );
         let msg = launch_pending_error(&[pending, ready]).expect("pending agent names the error");
         assert!(msg.contains("launch_pending"), "{msg}");
         assert!(msg.contains("flywheel-flywheel-coder"), "{msg}");
         assert!(msg.contains("w1:p1"), "{msg}");
-        let all_ready = agent(Some("oc"), Some("flywheel-flywheel-oc"), "w1", false, AgentStatus::Idle);
+        let all_ready = agent(
+            Some("oc"),
+            Some("flywheel-flywheel-oc"),
+            "w1",
+            false,
+            AgentStatus::Idle,
+        );
         assert!(launch_pending_error(&[all_ready]).is_none());
     }
 
@@ -7489,34 +7605,91 @@ mod bd_4pxy_tests {
     #[test]
     fn match_indices_kind_fallback_resolves_omp1() {
         // the bd-4pxy witness shape: an omp agent NAMED flywheel-<base>-coder
-        let omp1 = agent(Some("omp"), Some("flywheel-flywheel-coder"), "w1", false, AgentStatus::Idle);
-        let omp2 = agent(Some("omp"), Some("flywheel-flywheel-doer"), "w1", false, AgentStatus::Idle);
-        let oc = agent(Some("oc"), Some("flywheel-flywheel-oc"), "w1", false, AgentStatus::Idle);
+        let omp1 = agent(
+            Some("omp"),
+            Some("flywheel-flywheel-coder"),
+            "w1",
+            false,
+            AgentStatus::Idle,
+        );
+        let omp2 = agent(
+            Some("omp"),
+            Some("flywheel-flywheel-doer"),
+            "w1",
+            false,
+            AgentStatus::Idle,
+        );
+        let oc = agent(
+            Some("oc"),
+            Some("flywheel-flywheel-oc"),
+            "w1",
+            false,
+            AgentStatus::Idle,
+        );
         let agents = vec![omp1, omp2, oc];
         // --to omp1: name flywheel-flywheel-omp does not exist → first kind=omp
-        assert_eq!(match_indices(&agents, &[to_want_token("flywheel", "omp1")]), vec![0]);
+        assert_eq!(
+            match_indices(&agents, &[to_want_token("flywheel", "omp1")]),
+            vec![0]
+        );
         // --to omp2 → second kind=omp
-        assert_eq!(match_indices(&agents, &[to_want_token("flywheel", "omp2")]), vec![1]);
+        assert_eq!(
+            match_indices(&agents, &[to_want_token("flywheel", "omp2")]),
+            vec![1]
+        );
         // bare --to omp → first kind=omp (no flywheel-flywheel-omp name)
-        assert_eq!(match_indices(&agents, &[to_want_token("flywheel", "omp")]), vec![0]);
+        assert_eq!(
+            match_indices(&agents, &[to_want_token("flywheel", "omp")]),
+            vec![0]
+        );
     }
 
     #[test]
     fn match_indices_name_match_beats_kind_fallback() {
-        let oc = agent(Some("oc"), Some("flywheel-flywheel-oc"), "w1", false, AgentStatus::Idle);
-        let omp = agent(Some("omp"), Some("flywheel-flywheel-coder"), "w1", false, AgentStatus::Idle);
+        let oc = agent(
+            Some("oc"),
+            Some("flywheel-flywheel-oc"),
+            "w1",
+            false,
+            AgentStatus::Idle,
+        );
+        let omp = agent(
+            Some("omp"),
+            Some("flywheel-flywheel-coder"),
+            "w1",
+            false,
+            AgentStatus::Idle,
+        );
         let agents = vec![oc, omp];
         // --to oc1 resolves by NAME (exists) — kind fallback must not add a
         // second, differently-named kind=oc agent
-        assert_eq!(match_indices(&agents, &[to_want_token("flywheel", "oc1")]), vec![0]);
+        assert_eq!(
+            match_indices(&agents, &[to_want_token("flywheel", "oc1")]),
+            vec![0]
+        );
     }
 
     #[test]
     fn match_indices_broaden_keeps_whole_crew() {
-        let oc = agent(Some("oc"), Some("flywheel-flywheel-oc"), "w1", false, AgentStatus::Idle);
-        let oc2 = agent(Some("oc"), Some("flywheel-flywheel-oc2"), "w1", false, AgentStatus::Idle);
+        let oc = agent(
+            Some("oc"),
+            Some("flywheel-flywheel-oc"),
+            "w1",
+            false,
+            AgentStatus::Idle,
+        );
+        let oc2 = agent(
+            Some("oc"),
+            Some("flywheel-flywheel-oc2"),
+            "w1",
+            false,
+            AgentStatus::Idle,
+        );
         let agents = vec![oc, oc2];
-        assert_eq!(match_indices(&agents, &[to_want_token("flywheel", "oc")]), vec![0, 1]);
+        assert_eq!(
+            match_indices(&agents, &[to_want_token("flywheel", "oc")]),
+            vec![0, 1]
+        );
     }
 
     fn agent_on_pane(
@@ -7546,7 +7719,14 @@ mod bd_4pxy_tests {
             AgentStatus::Idle,
             true,
         );
-        let p3 = agent_on_pane(Some("omp"), None, "w70:p3", false, AgentStatus::Working, true);
+        let p3 = agent_on_pane(
+            Some("omp"),
+            None,
+            "w70:p3",
+            false,
+            AgentStatus::Working,
+            true,
+        );
         let agents = vec![p1, p3];
         assert_eq!(
             match_indices(&agents, &[to_want_token("toron", "w70:p3")]),
@@ -7610,13 +7790,11 @@ mod bd_4pxy_tests {
             vec![0]
         );
         assert_eq!(
-            registry_entry_for_token(&entries, "toron", "w70:p3")
-                .map(|e| e.name.as_str()),
+            registry_entry_for_token(&entries, "toron", "w70:p3").map(|e| e.name.as_str()),
             Some("flywheel-toron-coder3")
         );
         assert_eq!(
-            registry_entry_for_token(&entries, "toron", "coder3")
-                .map(|e| e.name.as_str()),
+            registry_entry_for_token(&entries, "toron", "coder3").map(|e| e.name.as_str()),
             Some("flywheel-toron-coder3")
         );
     }
@@ -7626,14 +7804,7 @@ mod bd_4pxy_tests {
     /// must proceed.
     #[test]
     fn is_still_booting_ignores_stale_launch_pending() {
-        let stale = agent_on_pane(
-            Some("omp"),
-            None,
-            "w70:p2",
-            true,
-            AgentStatus::Idle,
-            true,
-        );
+        let stale = agent_on_pane(Some("omp"), None, "w70:p2", true, AgentStatus::Idle, true);
         assert!(
             !is_still_booting(&stale),
             "idle + interactive_ready is not booting even if launch_pending"
@@ -8037,11 +8208,7 @@ fn working_agent_names(agents: &[AgentInfo]) -> Vec<String> {
     agents
         .iter()
         .filter(|a| a.agent_status == herdr_shim::AgentStatus::Working)
-        .map(|a| {
-            a.name
-                .clone()
-                .unwrap_or_else(|| a.pane_id.clone())
-        })
+        .map(|a| a.name.clone().unwrap_or_else(|| a.pane_id.clone()))
         .collect()
 }
 
@@ -8193,7 +8360,8 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
     // never needs manual iterative registration. Best-effort: a registration
     // failure (daemon still down) keeps the send attempt + actionable error.
     for t in &targets {
-        if let Err(e) = mail.register_agent(&key, t, "opencode", "opencode", "flywheel mail CLI actor")
+        if let Err(e) =
+            mail.register_agent(&key, t, "opencode", "opencode", "flywheel mail CLI actor")
         {
             eprintln!("flywheel: assign auto-register of {t} failed (continuing): {e:#}");
         }
@@ -9165,8 +9333,7 @@ pub(crate) fn wake_urgent(rows: &[Value]) -> Vec<&Value> {
     // in pass 2.
     let mut seen: std::collections::HashSet<(String, String, String)> =
         std::collections::HashSet::new();
-    let mut duplicate_ids: std::collections::HashSet<&str> =
-        std::collections::HashSet::new();
+    let mut duplicate_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut deduped: Vec<&Value> = Vec::new();
     for m in rows {
         if !urgent(m) {
@@ -9190,10 +9357,7 @@ pub(crate) fn wake_urgent(rows: &[Value]) -> Vec<&Value> {
             out.push(*m);
             continue;
         }
-        if m.get("read_ts_us")
-            .map(|v| !v.is_null())
-            .unwrap_or(false)
-        {
+        if m.get("read_ts_us").map(|v| !v.is_null()).unwrap_or(false) {
             continue; // already read — the agent saw it
         }
         if thread_has_reply(rows, &duplicate_ids, m) {
@@ -9226,8 +9390,7 @@ fn thread_has_reply(
                 .map(|i| duplicate_ids.contains(i))
                 .unwrap_or(false)
             && r.get("thread_id").and_then(|t| t.as_str()) == Some(tid)
-            && r
-                .get("created_ts_us")
+            && r.get("created_ts_us")
                 .and_then(|t| t.as_i64())
                 .map(|t| t > ts)
                 .unwrap_or(false)
@@ -9240,11 +9403,7 @@ fn thread_has_reply(
 /// with a fresh task stamp whose idempotent upsert overwrites stale task
 /// fields from a prior session (debrief A2: a 2026-08-14 identity still
 /// advertised `bd-qk9q`).
-pub(crate) fn spawn_agent_profile(
-    name: &str,
-    kind: &str,
-    project: &str,
-) -> backend::AgentProfile {
+pub(crate) fn spawn_agent_profile(name: &str, kind: &str, project: &str) -> backend::AgentProfile {
     backend::AgentProfile {
         name: name.to_string(),
         program: Some(kind.to_string()),
@@ -9266,13 +9425,7 @@ mod wake_identity_tests {
         }
     }
 
-    fn assign_row(
-        id: &str,
-        body: &str,
-        thread: &str,
-        created_us: i64,
-        read: bool,
-    ) -> Value {
+    fn assign_row(id: &str, body: &str, thread: &str, created_us: i64, read: bool) -> Value {
         json!({
             "id": id,
             "sender": "CoralFinch",
@@ -9340,7 +9493,13 @@ mod wake_identity_tests {
     /// S8.2: an assign the agent already read does not wake.
     #[test]
     fn wake_urgent_skips_read_assign() {
-        let rows = vec![assign_row("m1", "Assigned beads: bd-x.1", "t-1", 1000, true)];
+        let rows = vec![assign_row(
+            "m1",
+            "Assigned beads: bd-x.1",
+            "t-1",
+            1000,
+            true,
+        )];
         assert_eq!(wake_urgent(&rows).len(), 0, "read assign must not wake");
     }
 
@@ -9366,7 +9525,13 @@ mod wake_identity_tests {
     /// S8.2: an unread, unexecuted assign DOES wake.
     #[test]
     fn wake_urgent_keeps_fresh_assign() {
-        let rows = vec![assign_row("m1", "Assigned beads: bd-x.1", "t-1", 1000, false)];
+        let rows = vec![assign_row(
+            "m1",
+            "Assigned beads: bd-x.1",
+            "t-1",
+            1000,
+            false,
+        )];
         assert_eq!(wake_urgent(&rows).len(), 1);
     }
 
@@ -9379,7 +9544,10 @@ mod wake_identity_tests {
         assert_eq!(p.name, "DustySparrow", "the adj+noun pin is the identity");
         let task = p.task_description.unwrap();
         assert!(task.contains("flywheel agent for toron"), "{task}");
-        assert!(!task.contains("bd-"), "no stale bead id in the fresh stamp: {task}");
+        assert!(
+            !task.contains("bd-"),
+            "no stale bead id in the fresh stamp: {task}"
+        );
     }
 
     /// S9 (ADR-0018 D1a): a pin draw whose first candidate is taken (spawn
@@ -9450,7 +9618,10 @@ mod wake_identity_tests {
         let slug = "flywheel-toron-oc";
         let pin = register_spawned_agent(&cfg, project, slug, "opencode", "w7:p1")
             .expect("first spawn pins an identity");
-        assert!(valid_pair(&pin, &ADJECTIVES, &NOUNS).is_some(), "adj+noun pin: {pin}");
+        assert!(
+            valid_pair(&pin, &ADJECTIVES, &NOUNS).is_some(),
+            "adj+noun pin: {pin}"
+        );
         assert_ne!(pin, slug, "the slug is the pane handle, not the identity");
         let again = register_spawned_agent(&cfg, project, slug, "opencode", "w7:p1")
             .expect("re-spawn keeps the pin");
@@ -10200,6 +10371,12 @@ fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
+            // ADR-0019 (bd-w1-verify-fence): the single-line command from the
+            // bead's `## VERIFY` fence; None = missing/malformed -> NOT ready.
+            verify: b
+                .get("description")
+                .and_then(Value::as_str)
+                .and_then(durable::parse_verify_fence),
         })
         .collect())
 }
@@ -10232,6 +10409,12 @@ fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
+            // ADR-0019 (bd-w1-verify-fence): same fence parse as the ready
+            // path — close-detect / claim-watch consumers read it later.
+            verify: b
+                .get("description")
+                .and_then(Value::as_str)
+                .and_then(durable::parse_verify_fence),
         })
         .collect())
 }
@@ -10279,18 +10462,19 @@ fn work_prompts(
     inprog: &[durable::ReadyBead],
     ready: &[durable::ReadyBead],
     assigned: &mut Vec<String>,
+    project: &str,
 ) -> Vec<String> {
     let mut prompts = Vec::new();
     let mut fresh: Vec<&durable::ReadyBead> = Vec::new();
     for bead in inprog {
         if !assigned.contains(&bead.id) {
-            prompts.push(durable::resume_prompt(&bead.id, &bead.title));
+            prompts.push(durable::brief(&bead.id, &bead.title, project, true));
             fresh.push(bead);
         }
     }
     for bead in ready {
         if !assigned.contains(&bead.id) {
-            prompts.push(durable::bead_prompt(&bead.id, &bead.title));
+            prompts.push(durable::brief(&bead.id, &bead.title, project, false));
             fresh.push(bead);
         }
     }
@@ -10578,6 +10762,9 @@ fn cmd_loop(
     // the empty-queue warning only applies when NOT in work mode. Each bead is
     // assigned at most once per loop run (bd-fw-loop-sync-work-zero-way).
     let mut assigned: Vec<String> = Vec::new();
+    // ADR-0019 (bd-w1-verify-fence): not-ready beads (missing/malformed
+    // `## VERIFY` fence) whose planner-mail already fired this run.
+    let mut not_ready_mailed: std::collections::HashSet<String> = std::collections::HashSet::new();
     if queue_items.is_empty() && nudge.is_none() && !work {
         eprintln!("flywheel: no instructions queued and no --nudge — loop will only monitor");
     }
@@ -10627,15 +10814,32 @@ fn cmd_loop(
         if work {
             match load_inprogress_beads(cfg, project) {
                 Ok(inprog) => {
-                    let to_resume: Vec<String> = work_prompts(&inprog, &[], &mut assigned);
+                    let to_resume: Vec<String> = work_prompts(&inprog, &[], &mut assigned, project);
                     queue_items.extend(to_resume);
                 }
                 Err(e) => eprintln!("flywheel: br inprogress failed (continuing): {e:#}"),
             }
             match load_ready_beads(cfg, project) {
                 Ok(ready) => {
-                    let to_assign: Vec<String> = work_prompts(&[], &ready, &mut assigned);
+                    // ADR-0019 (bd-w1-verify-fence): only beads with a legal
+                    // `## VERIFY` fence are dispatched; not-ready beads are
+                    // mailed to the planner once per loop run.
+                    let (dispatchable, not_ready) = durable::partition_ready(&ready);
+                    let ok: Vec<durable::ReadyBead> = dispatchable.into_iter().cloned().collect();
+                    let to_assign: Vec<String> = work_prompts(&[], &ok, &mut assigned, project);
                     queue_items.extend(to_assign);
+                    for bead in &not_ready {
+                        if not_ready_mailed.insert(bead.id.clone()) {
+                            if let Err(e) =
+                                cmd_internal_mail_not_ready(cfg, project, &bead.id, &bead.title)
+                            {
+                                eprintln!(
+                                    "flywheel: mail-not-ready for {} failed (continuing): {e:#}",
+                                    bead.id
+                                );
+                            }
+                        }
+                    }
                 }
                 Err(e) => eprintln!("flywheel: br ready failed (continuing): {e:#}"),
             }
@@ -10830,28 +11034,31 @@ mod loop_tests {
                 id: "bd-r1".into(),
                 title: "resume me".into(),
                 assignee: None,
+                verify: None,
             },
             durable::ReadyBead {
                 id: "bd-r2".into(),
                 title: "resume me too".into(),
                 assignee: None,
+                verify: None,
             },
         ];
         let ready = vec![durable::ReadyBead {
             id: "bd-f1".into(),
             title: "fresh".into(),
             assignee: None,
+            verify: None,
         }];
         let mut assigned = Vec::new();
-        let prompts = work_prompts(&inprog, &ready, &mut assigned);
+        let prompts = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
         // resume first, then fresh
         assert_eq!(prompts.len(), 3);
-        assert!(prompts[0].contains("Resume bead bd-r1"));
-        assert!(prompts[1].contains("Resume bead bd-r2"));
-        assert!(prompts[2].contains("Execute bead bd-f1"));
+        assert!(prompts[0].contains("GOAL Resume bd-r1"));
+        assert!(prompts[1].contains("GOAL Resume bd-r2"));
+        assert!(prompts[2].contains("GOAL Execute bd-f1"));
         assert_eq!(assigned, vec!["bd-r1", "bd-r2", "bd-f1"]);
         // second call assigns nothing new (dedup)
-        let again = work_prompts(&inprog, &ready, &mut assigned);
+        let again = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
         assert!(again.is_empty());
     }
 
@@ -10861,14 +11068,16 @@ mod loop_tests {
             id: "bd-r1".into(),
             title: "x".into(),
             assignee: None,
+            verify: None,
         }];
         let ready = vec![durable::ReadyBead {
             id: "bd-r1".into(),
             title: "x".into(),
             assignee: None,
+            verify: None,
         }];
         let mut assigned = vec!["bd-r1".to_string()];
-        let prompts = work_prompts(&inprog, &ready, &mut assigned);
+        let prompts = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
         assert!(prompts.is_empty());
     }
 
@@ -10878,15 +11087,18 @@ mod loop_tests {
             id: "bd-42".into(),
             title: "fix auth".into(),
             assignee: None,
+            verify: None,
         }];
         let mut assigned = Vec::new();
-        let prompts = work_prompts(&[], &ready, &mut assigned);
+        let prompts = work_prompts(&[], &ready, &mut assigned, "flywheel");
         assert_eq!(prompts.len(), 1);
         let p = &prompts[0];
         assert!(p.contains("bd-42"));
-        assert!(p.contains("fix auth"));
-        // lifecycle contract present (grep-verifiable per beads workflow)
-        assert!(p.contains("br update bd-42 --claim"));
+        assert!(p.contains("GOAL Execute bd-42: fix auth."));
+        // the brief carries the standing-orders path, not the lifecycle novel
+        // (grep-verifiable per beads workflow)
+        assert!(p.contains("flywheel/.flywheel/standing-orders.md"));
+        assert!(!p.contains("br update"));
     }
 
     #[test]
@@ -10924,6 +11136,126 @@ mod loop_tests {
         assert_eq!(beads[1].assignee.as_deref(), Some("captain"));
         assert_eq!(beads[2].assignee, None, "absent assignee -> None");
         assert_eq!(beads[3].assignee, None, "empty assignee -> None");
+    }
+
+    // ---- ADR-0019: VERIFY fence -> ReadyBead.verify -----------------------
+
+    /// `br ready --json` rows carry the description; the fence parses into
+    /// `ReadyBead.verify`. Missing/malformed fence -> verify = None (the
+    /// bead is NOT ready — refuse-to-dispatch).
+    #[test]
+    fn verify_fence_parse_ready_beads_json_populates_verify() {
+        // built via json! so the `## VERIFY` + fence bytes escape cleanly
+        let raw = serde_json::to_string(&serde_json::json!([
+            {"id":"bd-a","title":"one","description":"## VERIFY\n```\ncargo test -p flywheel verify_fence\n```\n"},
+            {"id":"bd-b","title":"two","description":"no fence here"}
+        ]))
+        .unwrap();
+        let beads = parse_ready_beads_json(&raw).unwrap();
+        assert_eq!(beads.len(), 2);
+        assert_eq!(
+            beads[0].verify.as_deref(),
+            Some("cargo test -p flywheel verify_fence"),
+            "valid fence -> verify command"
+        );
+        assert_eq!(beads[1].verify, None, "no fence -> not ready");
+        // multi-line fence -> not ready
+        let raw_multi = serde_json::to_string(&serde_json::json!([
+            {"id":"bd-c","title":"three","description":"## VERIFY\n```\na\nb\n```\n"}
+        ]))
+        .unwrap();
+        let beads = parse_ready_beads_json(&raw_multi).unwrap();
+        assert_eq!(beads[0].verify, None, "multi-line fence -> not ready");
+    }
+
+    /// ADR-0019 acceptance: a bead without a fence must be refused at
+    /// dispatch AND the planner must be mailed on the bead's thread. The
+    /// not-ready mail lands in the planner's inbox with thread = bead id.
+    #[test]
+    fn verify_fence_not_ready_bead_mails_planner_on_bead_thread() {
+        use crate::backend::MailSurface as _;
+        let mail = crate::mail_shim::Mail::from_config(None)
+            .expect("mail ok")
+            .expect("mail Some");
+        let backend = crate::backend::toron::ToronMailBackend::new(mail);
+        let project = "verify-fence-mail";
+        backend::run_mail(backend.ensure_project(project)).expect("ensure");
+        // the surface sends AS its own identity — it needs a key in-project
+        let sender = backend.agent_name().to_string();
+        let sender_profile = spawn_agent_profile(&sender, "opencode", project);
+        backend::run_mail(backend.register_agent(project, &sender_profile))
+            .expect("register sender");
+        let profile = spawn_agent_profile("PlannerOne", "opencode", project);
+        backend::run_mail(backend.register_agent(project, &profile)).expect("register");
+        let receipt = send_not_ready_mail(
+            &backend,
+            project,
+            "bd-fence-missing",
+            "some bead",
+            "PlannerOne",
+        )
+        .expect("not-ready mail sends");
+        assert!(receipt.count >= 1, "delivered: {receipt:?}");
+        let items = backend::run_mail(backend.inbox(&backend::InboxQuery {
+            project: project.into(),
+            agent: "PlannerOne".into(),
+            unread_only: false,
+            limit: Some(10),
+            include_bodies: false,
+            urgent_only: false,
+            since_ts: None,
+        }))
+        .expect("inbox");
+        let m = items
+            .iter()
+            .find(|m| m.subject.contains("NOT ready"))
+            .expect("planner received the not-ready mail");
+        assert_eq!(
+            m.thread_id.as_ref().map(|t| t.as_str()),
+            Some("bd-fence-missing"),
+            "mail rides the bead's thread (ADR-0019 Spec 0)"
+        );
+    }
+
+    /// The planner to notify is the bead's creator (`br show --json` →
+    /// `created_by`), falling back to the configured identity when the
+    /// creator cannot be resolved.
+    #[test]
+    fn verify_fence_resolve_planner_uses_bead_creator() {
+        let dir = std::env::temp_dir().join(format!("verify-fence-planner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = std::process::Command::new("br")
+            .arg("init")
+            .current_dir(&dir)
+            .output()
+            .expect("br init");
+        assert!(init.status.success(), "br init: {init:?}");
+        let created = std::process::Command::new("br")
+            .args(["create", "--title", "fixture", "--description", "body"])
+            .current_dir(&dir)
+            .output()
+            .expect("br create");
+        assert!(created.status.success(), "br create: {created:?}");
+        let list = std::process::Command::new("br")
+            .args(["list", "--json"])
+            .current_dir(&dir)
+            .output()
+            .expect("br list");
+        let v: Value = serde_json::from_slice(&list.stdout).expect("br list json");
+        let id = v["issues"][0]["id"].as_str().expect("bead id").to_string();
+        let dir_str = dir.to_string_lossy().to_string();
+        let planner = resolve_planner_for_bead(&dir_str, &id, "FallbackIdentity");
+        assert!(
+            !planner.is_empty() && planner != "FallbackIdentity",
+            "creator resolved, got: {planner}"
+        );
+        // unresolvable bead -> fallback
+        assert_eq!(
+            resolve_planner_for_bead(&dir_str, "bd-does-not-exist", "FallbackIdentity"),
+            "FallbackIdentity"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -11477,10 +11809,18 @@ const PROMPT_PHASES: &[(&str, &str)] = &[
 /// Per-tool prompt frontmatter (tool-specific format) + {{PHASE_DESCRIPTION}}.
 fn prompt_frontmatter(kind: &str) -> Option<&'static str> {
     match kind {
-        "opencode" => Some(include_str!("../integrations/prompts/frontmatter-opencode.md.tpl")),
-        "pi" => Some(include_str!("../integrations/prompts/frontmatter-pi.md.tpl")),
-        "grok" => Some(include_str!("../integrations/prompts/frontmatter-grok.md.tpl")),
-        "omp" => Some(include_str!("../integrations/prompts/frontmatter-omp.md.tpl")),
+        "opencode" => Some(include_str!(
+            "../integrations/prompts/frontmatter-opencode.md.tpl"
+        )),
+        "pi" => Some(include_str!(
+            "../integrations/prompts/frontmatter-pi.md.tpl"
+        )),
+        "grok" => Some(include_str!(
+            "../integrations/prompts/frontmatter-grok.md.tpl"
+        )),
+        "omp" => Some(include_str!(
+            "../integrations/prompts/frontmatter-omp.md.tpl"
+        )),
         _ => None,
     }
 }
@@ -11546,15 +11886,25 @@ const PROMPT_WORKFLOWS: &[(&str, &str, &str)] = &[
 /// lifecycle commands).
 fn prompt_workflow_template(name: &str) -> Option<&'static str> {
     match name {
-        "debate" => Some(include_str!("../integrations/prompts/workflow-debate.md.tpl")),
+        "debate" => Some(include_str!(
+            "../integrations/prompts/workflow-debate.md.tpl"
+        )),
         "plan" => Some(include_str!("../integrations/prompts/workflow-plan.md.tpl")),
-        "plan-review" => Some(include_str!("../integrations/prompts/workflow-plan-review.md.tpl")),
-        "brainstorm" => Some(include_str!("../integrations/prompts/workflow-brainstorm.md.tpl")),
-        "onboard" => Some(include_str!("../integrations/prompts/workflow-onboard.md.tpl")),
-        "triage" => Some(include_str!("../integrations/prompts/workflow-triage.md.tpl")),
-        "captain-audit" => {
-            Some(include_str!("../integrations/prompts/workflow-captain-audit.md.tpl"))
-        }
+        "plan-review" => Some(include_str!(
+            "../integrations/prompts/workflow-plan-review.md.tpl"
+        )),
+        "brainstorm" => Some(include_str!(
+            "../integrations/prompts/workflow-brainstorm.md.tpl"
+        )),
+        "onboard" => Some(include_str!(
+            "../integrations/prompts/workflow-onboard.md.tpl"
+        )),
+        "triage" => Some(include_str!(
+            "../integrations/prompts/workflow-triage.md.tpl"
+        )),
+        "captain-audit" => Some(include_str!(
+            "../integrations/prompts/workflow-captain-audit.md.tpl"
+        )),
         _ => None,
     }
 }
@@ -11578,8 +11928,9 @@ pub fn prompts_dir(kind: &str) -> Option<std::path::PathBuf> {
 fn render_prompt(kind: &str, phase: &str, version: &str, generated: &str) -> Result<String> {
     let frontmatter = prompt_frontmatter(kind)
         .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp)"))?;
-    let phase_tpl = prompt_phase_template(phase)
-        .ok_or_else(|| anyhow!("unknown phase: {phase} (known: triage, execute, review, commit, create)"))?;
+    let phase_tpl = prompt_phase_template(phase).ok_or_else(|| {
+        anyhow!("unknown phase: {phase} (known: triage, execute, review, commit, create)")
+    })?;
     let (_, description) = PROMPT_PHASES
         .iter()
         .find(|(p, _)| *p == phase)
@@ -11590,7 +11941,10 @@ fn render_prompt(kind: &str, phase: &str, version: &str, generated: &str) -> Res
         .replace("{{VERSION}}", version)
         .replace("{{GENERATED}}", generated);
     Ok(phase_tpl
-        .replace("{{TOOL_FRONTMATTER}}", &frontmatter.replace("{{PHASE_DESCRIPTION}}", description))
+        .replace(
+            "{{TOOL_FRONTMATTER}}",
+            &frontmatter.replace("{{PHASE_DESCRIPTION}}", description),
+        )
         .replace("{{BODY}}", &body)
         .replace("{{VERSION}}", version)
         .replace("{{GENERATED}}", generated))
@@ -11599,7 +11953,12 @@ fn render_prompt(kind: &str, phase: &str, version: &str, generated: &str) -> Res
 /// Render one workflow command for one agent kind. Pure (deterministic
 /// tests): frontmatter (with the workflow's description) + the workflow
 /// focus template + version/generated stamps.
-fn render_workflow_prompt(kind: &str, name: &str, version: &str, generated: &str) -> Result<String> {
+fn render_workflow_prompt(
+    kind: &str,
+    name: &str,
+    version: &str,
+    generated: &str,
+) -> Result<String> {
     let frontmatter = prompt_frontmatter(kind)
         .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp)"))?;
     let tpl = prompt_workflow_template(name)
@@ -11609,7 +11968,10 @@ fn render_workflow_prompt(kind: &str, name: &str, version: &str, generated: &str
         .find(|(n, _, _)| *n == name)
         .expect("workflow command in table");
     Ok(tpl
-        .replace("{{TOOL_FRONTMATTER}}", &frontmatter.replace("{{PHASE_DESCRIPTION}}", description))
+        .replace(
+            "{{TOOL_FRONTMATTER}}",
+            &frontmatter.replace("{{PHASE_DESCRIPTION}}", description),
+        )
         .replace("{{VERSION}}", version)
         .replace("{{GENERATED}}", generated))
 }
@@ -11630,7 +11992,11 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
         println!(
             "  + {} workflow slash commands per kind: workflow-{{{}}}.md",
             PROMPT_WORKFLOWS.len(),
-            PROMPT_WORKFLOWS.iter().map(|(n, _, _)| *n).collect::<Vec<_>>().join(",")
+            PROMPT_WORKFLOWS
+                .iter()
+                .map(|(n, _, _)| *n)
+                .collect::<Vec<_>>()
+                .join(",")
         );
         for (k, _) in [("opencode", ""), ("pi", ""), ("grok", ""), ("omp", "")] {
             let dir = prompts_dir(k)
@@ -11651,8 +12017,9 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
     };
     let dir = match out {
         Some(p) => p.to_path_buf(),
-        None => prompts_dir(kind)
-            .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp)"))?,
+        None => prompts_dir(kind).ok_or_else(|| {
+            anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp)")
+        })?,
     };
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create prompts dir {}", dir.display()))?;
@@ -11661,8 +12028,7 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
     for (phase, _) in PROMPT_PHASES {
         let rendered = render_prompt(kind, phase, VERSION, &generated)?;
         let path = dir.join(format!("beads-{phase}.md"));
-        std::fs::write(&path, &rendered)
-            .with_context(|| format!("write {}", path.display()))?;
+        std::fs::write(&path, &rendered).with_context(|| format!("write {}", path.display()))?;
         println!(
             "wrote {} ({} bytes)",
             dim(&path.display().to_string()),
@@ -11675,8 +12041,7 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
     for (name, _, _) in PROMPT_WORKFLOWS {
         let rendered = render_workflow_prompt(kind, name, VERSION, &generated)?;
         let path = dir.join(format!("workflow-{name}.md"));
-        std::fs::write(&path, &rendered)
-            .with_context(|| format!("write {}", path.display()))?;
+        std::fs::write(&path, &rendered).with_context(|| format!("write {}", path.display()))?;
         println!(
             "wrote {} ({} bytes)",
             dim(&path.display().to_string()),
@@ -12103,18 +12468,38 @@ mod renew_sweep_tests {
     #[test]
     fn bead_id_from_reason_parses_bd_ids() {
         assert_eq!(bead_id_from_reason("bd-oj9o"), Some("bd-oj9o"));
-        assert_eq!(bead_id_from_reason("bd-oj9o "), Some("bd-oj9o"), "trailing space trimmed");
-        assert_eq!(bead_id_from_reason("  bd-12  "), Some("bd-12"), "leading space trimmed");
-        assert_eq!(bead_id_from_reason("bd-12: fix auth"), Some("bd-12"), "first token wins");
+        assert_eq!(
+            bead_id_from_reason("bd-oj9o "),
+            Some("bd-oj9o"),
+            "trailing space trimmed"
+        );
+        assert_eq!(
+            bead_id_from_reason("  bd-12  "),
+            Some("bd-12"),
+            "leading space trimmed"
+        );
+        assert_eq!(
+            bead_id_from_reason("bd-12: fix auth"),
+            Some("bd-12"),
+            "first token wins"
+        );
     }
 
     #[test]
     fn bead_id_from_reason_rejects_non_beads() {
         assert_eq!(bead_id_from_reason(""), None);
-        assert_eq!(bead_id_from_reason("src/foo.rs"), None, "paths are not beads");
+        assert_eq!(
+            bead_id_from_reason("src/foo.rs"),
+            None,
+            "paths are not beads"
+        );
         assert_eq!(bead_id_from_reason("orchestrator-lock"), None);
         assert_eq!(bead_id_from_reason("bd-"), None, "bare prefix is not an id");
-        assert_eq!(bead_id_from_reason("my-bd-12"), None, "prefix must start the token");
+        assert_eq!(
+            bead_id_from_reason("my-bd-12"),
+            None,
+            "prefix must start the token"
+        );
     }
 
     /// The sweep predicate: a reservation is stale when its reason parses to
@@ -12754,7 +13139,11 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
     }
 
     match cmd {
-        CoalitionCmd::Register { name, project, json } => {
+        CoalitionCmd::Register {
+            name,
+            project,
+            json,
+        } => {
             let store = CoalitionStore::open(project, coalitions_root())?;
             store.register_agent(name)?;
             if *json {
@@ -12778,9 +13167,9 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
             let member_projects: BTreeMap<String, String> = member_project
                 .iter()
                 .map(|kv| {
-                    let (member, proj) = kv
-                        .split_once('=')
-                        .ok_or_else(|| anyhow!("--member-project expects <member>=<project>, got {kv:?}"))?;
+                    let (member, proj) = kv.split_once('=').ok_or_else(|| {
+                        anyhow!("--member-project expects <member>=<project>, got {kv:?}")
+                    })?;
                     if member.is_empty() || proj.is_empty() {
                         return Err(anyhow!(
                             "--member-project expects <member>=<project>, got {kv:?}"
@@ -12832,7 +13221,12 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
             }
             Ok(())
         }
-        CoalitionCmd::Status { id, project, json, digest } => {
+        CoalitionCmd::Status {
+            id,
+            project,
+            json,
+            digest,
+        } => {
             let store = CoalitionStore::open(project, coalitions_root())?;
             let st = store.status(id)?;
             if *json {
@@ -12841,7 +13235,10 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                 // bd-hkw5.1 digest mode: one line per member + the board
                 // heat (intents / frozen / negotiations) — the captain's
                 // quick scan.
-                println!("coalition {} [{}] goal {} captain {}", st.id, st.status, st.goal, st.captain);
+                println!(
+                    "coalition {} [{}] goal {} captain {}",
+                    st.id, st.status, st.goal, st.captain
+                );
                 let mut by_member: std::collections::BTreeMap<String, (usize, usize, usize)> =
                     std::collections::BTreeMap::new();
                 for i in &st.intents {
@@ -12854,8 +13251,7 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                     by_member.entry(f.agent.clone()).or_default().2 += 1;
                 }
                 for m in &st.members {
-                    let (intents, held, frozen) =
-                        by_member.get(m).copied().unwrap_or((0, 0, 0));
+                    let (intents, held, frozen) = by_member.get(m).copied().unwrap_or((0, 0, 0));
                     println!(
                         "  {} [{}] intents {} held {} frozen {}",
                         m,
@@ -12869,10 +13265,16 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                     "  negotiations: {} | channel events: {} | run: {}",
                     st.negotiations.len(),
                     st.channel.events.len(),
-                    st.run.as_ref().map(|r| r.status.as_str()).unwrap_or("unknown")
+                    st.run
+                        .as_ref()
+                        .map(|r| r.status.as_str())
+                        .unwrap_or("unknown")
                 );
                 for n in &st.negotiations {
-                    println!("    {} -> {}: {} ({})", n.requester, n.holder, n.path, n.status);
+                    println!(
+                        "    {} -> {}: {} ({})",
+                        n.requester, n.holder, n.path, n.status
+                    );
                 }
             } else {
                 println!(
@@ -12882,7 +13284,10 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                 println!(
                     "  run: {} ({})",
                     st.run_id,
-                    st.run.as_ref().map(|r| r.status.as_str()).unwrap_or("unknown")
+                    st.run
+                        .as_ref()
+                        .map(|r| r.status.as_str())
+                        .unwrap_or("unknown")
                 );
                 for (member, proj) in &st.member_projects {
                     println!("  {member} -> project {proj}");
@@ -12955,7 +13360,10 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
             if *json {
                 print_json(&serde_json::to_value(&res)?);
             } else {
-                println!("intent declared: {} path(s) by {as_agent}", res.declared.len());
+                println!(
+                    "intent declared: {} path(s) by {as_agent}",
+                    res.declared.len()
+                );
             }
             Ok(())
         }
@@ -13038,7 +13446,10 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                     "count": res.count,
                 }));
             } else {
-                println!("response delivered to {} recipient(s)", res.deliveries.len());
+                println!(
+                    "response delivered to {} recipient(s)",
+                    res.deliveries.len()
+                );
             }
             Ok(())
         }
@@ -13122,7 +13533,10 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                     );
                 }
                 for c in &report.auto_coalesce {
-                    println!("auto-coalesce candidate: {} <-> {} (non-trivial source)", c.a, c.b);
+                    println!(
+                        "auto-coalesce candidate: {} <-> {} (non-trivial source)",
+                        c.a, c.b
+                    );
                 }
             }
             Ok(())
@@ -13184,13 +13598,7 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
             json,
         } => {
             let store = CoalitionStore::open(project, coalitions_root())?;
-            let leaf = store.dispatch_leaf(
-                id,
-                as_agent,
-                profile,
-                scope,
-                harness.as_deref(),
-            )?;
+            let leaf = store.dispatch_leaf(id, as_agent, profile, scope, harness.as_deref())?;
             if *json {
                 print_json(&serde_json::to_value(&leaf)?);
             } else {
@@ -13321,7 +13729,8 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
                     let agent_name = format!("squad-{name}-{profile_name}-{}", i + 1);
                     let workspace = resolved_spec_workspace(cfg, backend.as_ref(), &spec.harness)?;
                     let args = profile_launch_args(&spec.harness, profile);
-                    let info = backend.agent_start(&agent_name, &spec.harness, &workspace, &args)?;
+                    let info =
+                        backend.agent_start(&agent_name, &spec.harness, &workspace, &args)?;
                     // bd-l2ky: record the profiled entry so __send --profile
                     // and loop conditioning resolve this member.
                     let mail_identity = register_spawned_agent(
@@ -14039,20 +14448,15 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // call_workflow sub-workflows — bd-t86p: the composed fleet);
             // <squad> → explicit role:count. Used for the preview + the
             // engine invoke.
-            let workflow_resolver: toron_workflow::WorkflowResolver =
-                Arc::new(|sub: &str| {
-                    let cat = workflow_catalog::WorkflowCatalog::load().ok()?;
-                    cat.workflows
-                        .get(sub)
-                        .cloned()
-                        .or_else(|| {
-                            builtin_workflows::builtin_workflows().get(sub).cloned()
-                        })
-                });
+            let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(|sub: &str| {
+                let cat = workflow_catalog::WorkflowCatalog::load().ok()?;
+                cat.workflows
+                    .get(sub)
+                    .cloned()
+                    .or_else(|| builtin_workflows::builtin_workflows().get(sub).cloned())
+            });
             let crew_plan = match crew.as_deref() {
-                None | Some("auto") => {
-                    crew::plan_crew_with(&wf, &|sub| workflow_resolver(sub))
-                }
+                None | Some("auto") => crew::plan_crew_with(&wf, &|sub| workflow_resolver(sub)),
                 Some(squad) => {
                     let cat = profile::ProfileCatalog::load()?;
                     let recipes = config::Recipes::load()?.recipes;
@@ -14118,12 +14522,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         pane_ctx = Some(ctx);
                         Arc::new(move |a: &Action| {
                             pane::pane_dispatch(
-                                &catalog,
-                                &project_c,
-                                &wf_name,
-                                &inputs_c,
-                                &entries,
-                                a,
+                                &catalog, &project_c, &wf_name, &inputs_c, &entries, a,
                             )
                         })
                     }
@@ -14183,18 +14582,16 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         .map_err(|_| anyhow!("spawn drainer thread panicked"))??;
                     out
                 }
-                None => {
-                    rt.block_on(async {
-                        let engine = toron_workflow::WorkflowEngine::local_with_resolvers(
-                            runner,
-                            profile_resolver,
-                            workflow_resolver,
-                        )?;
-                        engine
-                            .invoke(&run_id, invoke_wf, inputs_value.clone())
-                            .await
-                    })
-                }
+                None => rt.block_on(async {
+                    let engine = toron_workflow::WorkflowEngine::local_with_resolvers(
+                        runner,
+                        profile_resolver,
+                        workflow_resolver,
+                    )?;
+                    engine
+                        .invoke(&run_id, invoke_wf, inputs_value.clone())
+                        .await
+                }),
             }?;
             // P10.3 lifecycle: ephemeral default — reap the crew workspace
             // (close it + its panes) at run end unless --retain (keep) or
@@ -14333,12 +14730,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 let profile_refs: Vec<&str> = profile_names.iter().map(String::as_str).collect();
                 let stage_lib = stages::StageLibrary::load()?;
                 let stage_rows = stage_lib.list();
-                let prompt = crew::planner_authoring_prompt(
-                    target,
-                    &wf_rows,
-                    &profile_refs,
-                    &stage_rows,
-                );
+                let prompt =
+                    crew::planner_authoring_prompt(target, &wf_rows, &profile_refs, &stage_rows);
                 let response = planner_author_response(&wf_name, &prompt)?;
                 crew::parse_planner_workflow(&response, &wf_name)
                     .map_err(|e| anyhow!("planner-authored workflow invalid: {e}"))?
@@ -14424,29 +14817,19 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 let entries = entries.clone();
                 let inputs_c = inputs_c.clone();
                 Arc::new(move |a: &Action| {
-                    pane::pane_dispatch(
-                        &catalog,
-                        &project_c,
-                        &wf_name_c,
-                        &inputs_c,
-                        &entries,
-                        a,
-                    )
+                    pane::pane_dispatch(&catalog, &project_c, &wf_name_c, &inputs_c, &entries, a)
                 })
             };
             let rt = tokio::runtime::Runtime::new()?;
             let run_id = format!("fw-composed-{}", state::now_iso());
             let invoke_wf = crew::resolve_crew_fanouts(&composed, &crew_plan);
-            let workflow_resolver: toron_workflow::WorkflowResolver =
-                Arc::new(|sub: &str| {
-                    let cat = workflow_catalog::WorkflowCatalog::load().ok()?;
-                    cat.workflows
-                        .get(sub)
-                        .cloned()
-                        .or_else(|| {
-                            builtin_workflows::builtin_workflows().get(sub).cloned()
-                        })
-                });
+            let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(|sub: &str| {
+                let cat = workflow_catalog::WorkflowCatalog::load().ok()?;
+                cat.workflows
+                    .get(sub)
+                    .cloned()
+                    .or_else(|| builtin_workflows::builtin_workflows().get(sub).cloned())
+            });
             let profile_resolver = profile::ProfileCatalog::catalog_profile_resolver();
             // bd-omwg: the SpawnSink drainer — pane mode keeps the engine
             // alive across invoke so the drainer thread can launch a real
@@ -14467,11 +14850,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 engine.clone(),
                 stop.clone(),
             )?;
-            let output = rt.block_on(async {
-                engine
-                    .invoke(&run_id, invoke_wf, inputs_c.clone())
-                    .await
-            })?;
+            let output =
+                rt.block_on(async { engine.invoke(&run_id, invoke_wf, inputs_c.clone()).await })?;
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             spawn_receipts = drainer
                 .join()
@@ -14572,9 +14952,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
         WorkflowCmd::Crew { name } => {
             let all = all_workflows()?;
             let wf = resolve_workflow(name, &all)?;
-            let resolve = |sub: &str| {
-                all.get(sub).map(|(w, _)| w.clone())
-            };
+            let resolve = |sub: &str| all.get(sub).map(|(w, _)| w.clone());
             let plan = crew::plan_crew_with(wf, &resolve);
             let members: Vec<Value> = plan
                 .members
@@ -14614,7 +14992,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
 /// built-in) with a shared CronSpec body on the toron-workflow engine.
 /// Status is derived from the state log + run log.
 fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
-    use toron_workflow::lint::{lint_cron, Level};
+    use toron_workflow::lint::{Level, lint_cron};
 
     /// Lint one cron: engine tier (schedule parse, policy sanity, step/graph
     /// checks — P1) + flywheel tier (owner-profile resolution against the
@@ -14671,20 +15049,12 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
                 .iter()
                 .map(|row| {
                     let (last, in_flight) = cron::last_run_state(row.name());
-                    let status = cron::derive_status(
-                        row.enabled(),
-                        in_flight,
-                        last.as_deref(),
-                    );
+                    let status = cron::derive_status(row.enabled(), in_flight, last.as_deref());
                     let next_due = cron::next_due(row.cron(), cron::now_ts());
                     cron::cron_row_json(row, status, next_due)
                 })
                 .collect();
-            rows.sort_by(|a, b| {
-                a["name"]
-                    .as_str()
-                    .cmp(&b["name"].as_str())
-            });
+            rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
             if *json {
                 print_json(&json!({ "crons": rows }));
             } else {
@@ -14712,7 +15082,11 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
             }
             Ok(())
         }
-        CronCmd::Show { name, json, project } => {
+        CronCmd::Show {
+            name,
+            json,
+            project,
+        } => {
             let rows = cron::load_crons(cfg, project.as_deref())?;
             let row = resolve(&rows, name)?;
             let (last, in_flight) = cron::last_run_state(name);
@@ -14781,7 +15155,11 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
                 }
             }
         }
-        CronCmd::Run { name, project, json } => {
+        CronCmd::Run {
+            name,
+            project,
+            json,
+        } => {
             let rows = cron::load_crons(cfg, project.as_deref())?;
             let row = resolve(&rows, name)?.clone();
             let source = row.source_label().to_string();
@@ -14881,11 +15259,7 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
                 .iter()
                 .map(|row| {
                     let (last, in_flight) = cron::last_run_state(row.name());
-                    let status = cron::derive_status(
-                        row.enabled(),
-                        in_flight,
-                        last.as_deref(),
-                    );
+                    let status = cron::derive_status(row.enabled(), in_flight, last.as_deref());
                     let next_due = cron::next_due(row.cron(), cron::now_ts());
                     json!({
                         "name": row.name(),
@@ -14900,7 +15274,10 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
             if *json {
                 print_json(&json!({ "crons": rows }));
             } else {
-                println!("{:<28} {:<9} {:<8} {:<12} {:<8}", "NAME", "STATUS", "STATE", "NEXT_DUE", "SOURCE");
+                println!(
+                    "{:<28} {:<9} {:<8} {:<12} {:<8}",
+                    "NAME", "STATUS", "STATE", "NEXT_DUE", "SOURCE"
+                );
                 for row in &rows {
                     println!(
                         "{:<28} {:<9} {:<8} {} {:<8}",
@@ -15219,8 +15596,7 @@ fn cmd_debate(
     let mux = backend::multiplexer_backend(cfg)?;
     backend::run_mail(mail.ensure_project(&key))?;
 
-    let mail_target =
-        |agent: &str| resolve_mail_target_registry(&project, agent).to_string();
+    let mail_target = |agent: &str| resolve_mail_target_registry(&project, agent).to_string();
 
     // opening: A argues FOR
     let opening = format!(
@@ -16254,7 +16630,9 @@ fn cmd_internal_send(
                     pr.skills.clone(),
                 )),
                 None => {
-                    eprintln!("flywheel: __send --profile {p} unknown (flywheel profile list) — sending raw");
+                    eprintln!(
+                        "flywheel: __send --profile {p} unknown (flywheel profile list) — sending raw"
+                    );
                     None
                 }
             }
@@ -16308,9 +16686,7 @@ fn cmd_internal_send(
                 }
             })
             .unwrap_or(false);
-        if injected
-            && let Err(e) = state::save_spawn_registry(project, &entries)
-        {
+        if injected && let Err(e) = state::save_spawn_registry(project, &entries) {
             eprintln!("flywheel: cannot persist skills_injected for {name}: {e:#}");
         }
     }
@@ -16318,6 +16694,19 @@ fn cmd_internal_send(
         Some((_, _, _, behavior, _)) => headless::conditioned_prompt(behavior, &send_base),
         None => send_base,
     };
+
+    // ADR-0019 Spec 2: a dispatched bead brief (behavior + skills prefix +
+    // brief) over the 4 KiB cap is a LOOP BUG — fail loud, never silent
+    // truncation. Only briefs are capped (first line `GOAL ...`); captain
+    // steers, nudges, and mail wakes are raw text and exempt.
+    if text.starts_with("GOAL ") && send_text.len() > durable::DISPATCH_PROMPT_CAP {
+        bail!(
+            "flywheel: dispatched prompt for bead {} is {} bytes — over the {} byte cap (loop bug; NOT sent, never truncated)",
+            durable::bead_id_from_prompt(text).unwrap_or("<unknown>"),
+            send_text.len(),
+            durable::DISPATCH_PROMPT_CAP,
+        );
+    }
 
     // review-fix F6: __send routes through the backend factory (ADR-0002).
     // The trait now exposes agent_prompt_coded with landing data, so the
@@ -16461,7 +16850,11 @@ fn log_engine_dispatch(
         mode: "pane".into(),
         prompt_hash,
         response: String::new(),
-        status: if landed { "success".into() } else { "fail".into() },
+        status: if landed {
+            "success".into()
+        } else {
+            "fail".into()
+        },
         tokens_in: 0,
         tokens_out: 0,
         duration_ms: started.elapsed().as_millis() as u64,
@@ -16561,7 +16954,9 @@ fn cmd_internal_ready(cfg: &Config, project: &str) -> Result<()> {
     let beads = load_ready_beads(cfg, project)?;
     let beads: Vec<Value> = beads
         .iter()
-        .map(|b| json!({ "id": b.id, "title": b.title }))
+        // ADR-0019 (bd-w1-verify-fence): emit the parsed VERIFY command so
+        // the durable `parse_bead_list` consumer carries it too.
+        .map(|b| json!({ "id": b.id, "title": b.title, "verify": b.verify }))
         .collect();
     print_json(&json!({ "beads": beads }));
     Ok(())
@@ -16574,9 +16969,9 @@ fn cmd_internal_inprogress(cfg: &Config, project: &str) -> Result<()> {
     let beads = load_inprogress_beads(cfg, project)?;
     let beads: Vec<Value> = beads
         .iter()
-        .map(|b| {
-            json!({ "id": b.id, "title": b.title, "assignee": b.assignee })
-        })
+        .map(
+            |b| json!({ "id": b.id, "title": b.title, "assignee": b.assignee, "verify": b.verify }),
+        )
         .collect();
     print_json(&json!({ "beads": beads }));
     Ok(())
@@ -16620,7 +17015,10 @@ fn cmd_internal_reclaim_stranded(cfg: &Config, project: &str, live: &str) -> Res
             .output();
         match out {
             Ok(o) if o.status.success() => {
-                eprintln!("flywheel: reclaimed stranded bead {} (assignee {:?})", b.id, b.assignee);
+                eprintln!(
+                    "flywheel: reclaimed stranded bead {} (assignee {:?})",
+                    b.id, b.assignee
+                );
                 reclaimed.push(b.id.clone());
             }
             Ok(o) => failed.push(json!({
@@ -16781,8 +17179,7 @@ fn respawn_with_backend(
             })
             .or_else(|| panes.first().map(|p| p.pane_id.clone()))
             .ok_or_else(|| anyhow!("no pane in {project} to split for respawn"))?;
-        let pane =
-            backend.pane_split(&anchor, "down", Some(&utf8_path(&dir, "workspace dir")?))?;
+        let pane = backend.pane_split(&anchor, "down", Some(&utf8_path(&dir, "workspace dir")?))?;
         // best-effort close of the dead pane via the backend trait (herdr
         // implements it with the same `pane.close` RPC).
         if let Some(old) = &old_pane {
@@ -16932,7 +17329,9 @@ fn cmd_internal_run_headless(
             return String::new();
         }
         if registry.get(id).is_none() {
-            eprintln!("flywheel: role model {id:?} not in registry (flywheel model add) — passing through");
+            eprintln!(
+                "flywheel: role model {id:?} not in registry (flywheel model add) — passing through"
+            );
         }
         registry.resolve(id, harness)
     };
@@ -16945,46 +17344,47 @@ fn cmd_internal_run_headless(
     // `fallback` (oracle glm-5.2 -> grok, on the grok harness). Thin
     // dynamic-routing slice; the transition is logged via the run entry's
     // `model` (the actual used id).
-    let run_once = |harness: &str, model_id: &str, model: &str, effort: &str| -> Result<RunAttempt> {
-        let argv = headless::build_argv_roles(
-            harness,
-            (!model.is_empty()).then_some(model),
-            (!effort.is_empty()).then_some(effort),
-            &role_smol,
-            &role_slow,
-            &role_plan,
-            prompt,
-        )
-        .map_err(|e| anyhow!("headless run for @{profile_name}: {e}"))?;
-        let started = std::time::Instant::now();
-        let output = Command::new(&argv[0])
-            .args(&argv[1..])
-            .output()
-            .with_context(|| format!("spawn {} for headless run", argv[0]))?;
-        let duration_ms = started.elapsed().as_millis() as u64;
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let run_once =
+        |harness: &str, model_id: &str, model: &str, effort: &str| -> Result<RunAttempt> {
+            let argv = headless::build_argv_roles(
+                harness,
+                (!model.is_empty()).then_some(model),
+                (!effort.is_empty()).then_some(effort),
+                &role_smol,
+                &role_slow,
+                &role_plan,
+                prompt,
+            )
+            .map_err(|e| anyhow!("headless run for @{profile_name}: {e}"))?;
+            let started = std::time::Instant::now();
+            let output = Command::new(&argv[0])
+                .args(&argv[1..])
+                .output()
+                .with_context(|| format!("spawn {} for headless run", argv[0]))?;
+            let duration_ms = started.elapsed().as_millis() as u64;
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-        let mut outcome = headless::parse_stream(&stdout, harness);
-        outcome.exit_code = output.status.code().unwrap_or(-1);
-        outcome.duration_ms = duration_ms;
-        if outcome.response.is_empty() && !stderr.trim().is_empty() {
-            outcome.error = Some(stderr.trim().to_string());
-        }
-        if output.status.code() != Some(0) && outcome.error.is_none() {
-            outcome.error = Some(format!("harness exited {}", output.status));
-        }
-        if outcome.error.is_some() {
-            outcome.status = "fail".into();
-        }
-        let rate_limited = is_rate_limited(&outcome);
-        Ok(RunAttempt {
-            model_id: model_id.to_string(),
-            model: model.to_string(),
-            outcome,
-            rate_limited,
-        })
-    };
+            let mut outcome = headless::parse_stream(&stdout, harness);
+            outcome.exit_code = output.status.code().unwrap_or(-1);
+            outcome.duration_ms = duration_ms;
+            if outcome.response.is_empty() && !stderr.trim().is_empty() {
+                outcome.error = Some(stderr.trim().to_string());
+            }
+            if output.status.code() != Some(0) && outcome.error.is_none() {
+                outcome.error = Some(format!("harness exited {}", output.status));
+            }
+            if outcome.error.is_some() {
+                outcome.status = "fail".into();
+            }
+            let rate_limited = is_rate_limited(&outcome);
+            Ok(RunAttempt {
+                model_id: model_id.to_string(),
+                model: model.to_string(),
+                outcome,
+                rate_limited,
+            })
+        };
 
     let mut attempt = run_once(harness, &model_id, &model, &profile.effort)?;
     let mut retried_fallback = false;
@@ -17114,7 +17514,9 @@ pub(crate) fn headless_dispatch(
         // bd-omwg: a Spawn reaching the runner is an engine-routing bug —
         // fail closed, never record it as done (ADR-0010 Spec E).
         if matches!(action, toron_workflow::schema::Action::Spawn { .. }) {
-            bail!("headless runner: Action::Spawn must be handled by the engine (run_spawn) — routing bug");
+            bail!(
+                "headless runner: Action::Spawn must be handled by the engine (run_spawn) — routing bug"
+            );
         }
         // Recorded, not dispatched — the P10.1 backward-compat surface for
         // non-headless actions (byte-identical to the no-op runner).
@@ -17205,7 +17607,9 @@ fn workflow_spawn_steps(wf: &toron_workflow::Workflow) -> Vec<String> {
                 }
             }
             toron_workflow::schema::Action::Retry { step, .. } => walk(&step.action, name, out),
-            toron_workflow::schema::Action::Branch { then, else_steps, .. } => {
+            toron_workflow::schema::Action::Branch {
+                then, else_steps, ..
+            } => {
                 for s in then.iter().chain(else_steps.iter()) {
                     walk(&s.action, s.name.as_deref(), out);
                 }
@@ -17261,7 +17665,10 @@ steps:
         );
         let err = headless_spawn_gate(&wf).unwrap_err();
         assert!(err.to_string().contains("job"), "{err}");
-        assert!(err.to_string().contains("pane"), "points at pane mode: {err}");
+        assert!(
+            err.to_string().contains("pane"),
+            "points at pane mode: {err}"
+        );
     }
 
     /// bd-omwg: a spawn nested inside retry/branch/foreach/parallel is the
@@ -17374,9 +17781,7 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
         task_description: Some("flywheel mail CLI actor".into()),
     };
     if let Err(e) = backend::run_mail(mail.register_agent(&key, &auto_profile)) {
-        eprintln!(
-            "flywheel: mail digest auto-register of {identity} failed (zeroing digest): {e}"
-        );
+        eprintln!("flywheel: mail digest auto-register of {identity} failed (zeroing digest): {e}");
     }
     // toron's projection has NO read-state: `unread_only` is a documented
     // no-op ("fresh on first read"). Fetch the RECENT inbox (limit 10) with
@@ -17754,6 +18159,115 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str, tier: u32)
     }
 }
 
+/// internal leaf: mail the planner that a ready bead is NOT dispatchable
+/// because its `## VERIFY` fence is missing/multi-line/empty (ADR-0019,
+/// bd-w1-verify-fence). Refuse-to-dispatch is the hard guarantee (the loops
+/// never queue such a bead); this mail is the advisory. Always soft-fail:
+/// exit 0 with `{ok, ...}` so overnight loops never die.
+fn cmd_internal_mail_not_ready(
+    cfg: &Config,
+    project: &str,
+    bead_id: &str,
+    title: &str,
+) -> Result<()> {
+    let mail = match backend::mail_backend(cfg) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("flywheel: mail backend unavailable for not-ready alert {bead_id}: {e:#}");
+            print_json(&json!({ "ok": false, "bead_id": bead_id, "error": format!("{e:#}") }));
+            return Ok(());
+        }
+    };
+    let key = project_dir_str(cfg, project)?;
+    let fallback = cfg
+        .agent_mail
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| "Flywheel".to_string());
+    let planner = resolve_planner_for_bead(&key, bead_id, &fallback);
+    let out = (|| -> Result<backend::SendReceipt> {
+        backend::run_mail(mail.ensure_project(&key)).map_err(|e| anyhow!("{e}"))?;
+        send_not_ready_mail(&*mail, &key, bead_id, title, &planner)
+    })();
+    match out {
+        Ok(_) => {
+            print_json(&json!({ "ok": true, "bead_id": bead_id, "notified": planner }));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("flywheel: not-ready alert for {bead_id} failed: {e:#}");
+            print_json(&json!({
+                "ok": false,
+                "bead_id": bead_id,
+                "notified": planner,
+                "error": format!("{e:#}")
+            }));
+            Ok(())
+        }
+    }
+}
+
+/// Resolve the planner to notify for a not-ready bead: the bead's creator
+/// (`br show --json` → `created_by`), falling back to the configured
+/// orchestrator identity when the creator cannot be resolved.
+fn resolve_planner_for_bead(project_dir: &str, bead_id: &str, fallback: &str) -> String {
+    let out = std::process::Command::new("br")
+        .args(["show", bead_id, "--json"])
+        .current_dir(project_dir)
+        .output();
+    if let Ok(out) = out
+        && out.status.success()
+    {
+        if let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) {
+            if let Some(created_by) = v
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|b| b.get("created_by"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                return created_by.to_string();
+            }
+        }
+    }
+    fallback.to_string()
+}
+
+/// The not-ready mail itself: thread = the bead id, so the planner's reply
+/// stays on the bead's thread (ADR-0019 Spec 0). Separated from the leaf
+/// command so the "planner mailed" acceptance is testable with a real
+/// in-process toron facade.
+fn send_not_ready_mail(
+    mail: &dyn backend::MailSurface,
+    key: &str,
+    bead_id: &str,
+    title: &str,
+    planner: &str,
+) -> Result<backend::SendReceipt> {
+    let subject =
+        format!("[{bead_id}] NOT ready: missing/invalid VERIFY fence — fix before dispatch");
+    let body = format!(
+        "Bead **{bead_id}** (`{title}`) sits in the ready set but was **NOT dispatched**: \
+         its `## VERIFY` fence is missing, empty, or multi-line (ADR-0019).\n\n\
+         Required block in the bead description, exact shape:\n\n\
+         ```text\n## VERIFY\n```\n\
+         <one command, one line>\n```\n```\n\n\
+         Name one cheap command the loop can run (e.g. `cargo test -p X name`). \
+         Until then the bead stays ready-but-undispatchable — the loop has \
+         no fallback verifier for the whole workspace matrix."
+    );
+    mail_send(
+        mail,
+        key,
+        std::slice::from_ref(&planner.to_string()),
+        &subject,
+        &body,
+        "high",
+        true,
+        Some(bead_id),
+    )
+}
+
 /// internal leaf: diagnose an unresponsive agent (bd-event-self-heal).
 ///
 /// 1. Capture recent output via the read path (best-effort).
@@ -17885,7 +18399,11 @@ fn cmd_internal_renew_leases(cfg: &Config, project: &str, extend_seconds: u64) -
             .map(|r| r.path_pattern.clone())
             .collect();
         for path in &stale {
-            match backend::run_mail(mail.release_reservations(&key, &agent, std::slice::from_ref(path))) {
+            match backend::run_mail(mail.release_reservations(
+                &key,
+                &agent,
+                std::slice::from_ref(path),
+            )) {
                 Ok(rel) if rel.released > 0 => {
                     eprintln!("flywheel: released stale reservation {path} (owning bead closed)");
                     released_closed.push(path.clone());
@@ -17893,7 +18411,9 @@ fn cmd_internal_renew_leases(cfg: &Config, project: &str, extend_seconds: u64) -
                 Ok(_) => {
                     eprintln!("flywheel: release of stale reservation {path} reported 0 released");
                 }
-                Err(e) => eprintln!("flywheel: release of stale reservation {path} failed (continuing): {e}"),
+                Err(e) => eprintln!(
+                    "flywheel: release of stale reservation {path} failed (continuing): {e}"
+                ),
             }
         }
     }
@@ -17931,7 +18451,10 @@ fn cmd_internal_release_bead_locks(cfg: &Config, project: &str, bead_id: &str) -
     let v = backend::run_mail(mail.release_by_reason(&key, &requestor, bead_id, true))
         .map_err(|e| anyhow!("mail backend: {e}"))?;
     if v.released > 0 {
-        eprintln!("flywheel: released {} reservation(s) for closed bead {bead_id}", v.released);
+        eprintln!(
+            "flywheel: released {} reservation(s) for closed bead {bead_id}",
+            v.released
+        );
     }
     print_json(&json!({
         "bead_id": bead_id,
@@ -18314,10 +18837,13 @@ mod integration_tests {
     /// workflow description) + the focus section + stamps; no beads body.
     #[test]
     fn render_workflow_prompt_has_frontmatter_and_focus() {
-        let out = render_workflow_prompt("opencode", "debate", "9.9.9", "2026-08-10T00:00:00Z")
-            .unwrap();
+        let out =
+            render_workflow_prompt("opencode", "debate", "9.9.9", "2026-08-10T00:00:00Z").unwrap();
         assert!(out.starts_with("---\n"), "frontmatter");
-        assert!(out.contains("Run the debate workflow"), "description in frontmatter");
+        assert!(
+            out.contains("Run the debate workflow"),
+            "description in frontmatter"
+        );
         assert!(out.contains("# Workflow: debate"));
         assert!(out.contains("## This command's focus"));
         assert!(
@@ -18327,7 +18853,10 @@ mod integration_tests {
         assert!(out.contains("flywheel 9.9.9"));
         assert!(out.contains("2026-08-10T00:00:00Z"));
         assert!(!out.contains("{{TOOL_FRONTMATTER}}"));
-        assert!(!out.contains("{{BODY}}"), "workflow commands are standalone — no beads body");
+        assert!(
+            !out.contains("{{BODY}}"),
+            "workflow commands are standalone — no beads body"
+        );
     }
 
     /// bd-oj9o #3: every kind renders every workflow command.
@@ -18399,7 +18928,11 @@ mod headless_retry_tests {
             response: String::new(),
             tokens_in: 0,
             tokens_out: 0,
-            status: if err.is_some() { "fail".into() } else { "success".into() },
+            status: if err.is_some() {
+                "fail".into()
+            } else {
+                "success".into()
+            },
             model: String::new(),
             duration_ms: 0,
             exit_code: if err.is_some() { 1 } else { 0 },
@@ -18411,12 +18944,22 @@ mod headless_retry_tests {
     /// retry-on-429 trigger; other errors are not.
     #[test]
     fn rate_limit_predicate_classifies_429() {
-        assert!(is_rate_limited(&outcome_with_error(Some("Error: 429 Too Many Requests"))));
-        assert!(is_rate_limited(&outcome_with_error(Some("rate limit exceeded"))));
+        assert!(is_rate_limited(&outcome_with_error(Some(
+            "Error: 429 Too Many Requests"
+        ))));
+        assert!(is_rate_limited(&outcome_with_error(Some(
+            "rate limit exceeded"
+        ))));
         assert!(is_rate_limited(&outcome_with_error(Some("RATE LIMIT"))));
-        assert!(is_rate_limited(&outcome_with_error(Some("{\"error\":{\"code\":429}}"))));
-        assert!(!is_rate_limited(&outcome_with_error(Some("model not found"))));
-        assert!(!is_rate_limited(&outcome_with_error(Some("401 unauthorized"))));
+        assert!(is_rate_limited(&outcome_with_error(Some(
+            "{\"error\":{\"code\":429}}"
+        ))));
+        assert!(!is_rate_limited(&outcome_with_error(Some(
+            "model not found"
+        ))));
+        assert!(!is_rate_limited(&outcome_with_error(Some(
+            "401 unauthorized"
+        ))));
         assert!(!is_rate_limited(&outcome_with_error(None)));
     }
 
@@ -19150,7 +19693,6 @@ steps:
             );
         }
     }
-
 }
 
 /// bd-bvwf.1 regression: --retire-orphans must catch orphan workspaces from
@@ -19160,7 +19702,7 @@ steps:
 /// enter the dispatch decision.
 #[cfg(test)]
 mod bd_bvwf1_orphan_workspaces {
-    use super::{classify_workspace_origin, partition_workspaces, WorkspaceOrigin};
+    use super::{WorkspaceOrigin, classify_workspace_origin, partition_workspaces};
     use crate::herdr_shim::{AgentInfo, WorkspaceInfo};
 
     fn ws(id: &str, label: &str) -> WorkspaceInfo {
@@ -19238,11 +19780,26 @@ mod bd_bvwf1_orphan_workspaces {
         ];
         let agents = vec![agent("w-orphan", Some("flywheel-toron-oc2"))];
         let split = partition_workspaces(project, ws_list, &agents, None);
-        let owned_ids: Vec<&str> = split.owned.iter().map(|w| w.workspace_id.as_str()).collect();
-        let foreign_ids: Vec<&str> =
-            split.foreign.iter().map(|w| w.workspace_id.as_str()).collect();
-        assert_eq!(owned_ids, vec!["w-default", "w-orphan"], "default + orphan owned");
-        assert_eq!(foreign_ids, vec!["w-captain"], "base-label session is foreign");
+        let owned_ids: Vec<&str> = split
+            .owned
+            .iter()
+            .map(|w| w.workspace_id.as_str())
+            .collect();
+        let foreign_ids: Vec<&str> = split
+            .foreign
+            .iter()
+            .map(|w| w.workspace_id.as_str())
+            .collect();
+        assert_eq!(
+            owned_ids,
+            vec!["w-default", "w-orphan"],
+            "default + orphan owned"
+        );
+        assert_eq!(
+            foreign_ids,
+            vec!["w-captain"],
+            "base-label session is foreign"
+        );
         // unrelated workspace is neither (None) — never blocks or closes.
     }
 }
