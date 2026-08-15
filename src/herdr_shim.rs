@@ -25,7 +25,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub use toron_core::backend::herdr::{
@@ -63,6 +63,176 @@ pub fn parse_protocol(raw: &str) -> Option<u64> {
     serde_json::from_str::<Value>(raw)
         .ok()
         .and_then(|v| v.get("protocol").and_then(Value::as_u64))
+}
+
+/// A herdr agent integration's install state, parsed from a
+/// `herdr integration status` line (`<kind>: <state> (<path>)`).
+///
+/// H3 (bd-harness-integration-preflight): spawn preflights each launched
+/// kind's integration and installs it when missing/outdated; `flywheel
+/// status` / `flywheel deps` surface this state per kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IntegrationStatus {
+    /// integration file exists at the documented path
+    pub installed: bool,
+    /// installed version equals the version herdr ships (vN == expected)
+    pub current: bool,
+    /// installed version (`vN`) when known; `None` when not installed
+    pub version: Option<String>,
+    /// expected version (`vM`) for `outdated` lines; `None` otherwise
+    pub expected_version: Option<String>,
+    /// install path (the trailing `(...)` group); `None` when unparseable
+    pub path: Option<String>,
+}
+
+impl IntegrationStatus {
+    /// The herdr default for any kind with no installed integration.
+    pub fn not_installed() -> Self {
+        Self {
+            installed: false,
+            current: false,
+            version: None,
+            expected_version: None,
+            path: None,
+        }
+    }
+}
+
+/// Canonical herdr integration kinds (`herdr integration status` /
+/// `herdr integration install` surface, herdr.dev/docs/preview/integrations/
+/// build 2026-08-04-d78e3d3b5126). Flywheel custom kinds without a herdr
+/// integration are NOT in this list — preflight skips them (nothing to
+/// install, nothing to report).
+pub const INTEGRATION_KINDS: &[&str] = &[
+    "pi", "omp", "claude", "codex", "copilot", "devin", "droid", "kimi",
+    "opencode", "kilo", "hermes", "qodercli", "cursor", "mastracode",
+    "antigravity-cli", "grok",
+];
+
+/// Map a flywheel kind to the socket `integration.install` target (the
+/// `IntegrationTarget` enum). `None` when the kind has no herdr integration.
+/// The only spelling difference: `antigravity-cli` (CLI display) vs
+/// `antigravity_cli` (socket enum).
+pub fn integration_target(kind: &str) -> Option<&'static str> {
+    if kind == "antigravity-cli" {
+        return Some("antigravity_cli");
+    }
+    INTEGRATION_KINDS.iter().copied().find(|k| *k == kind)
+}
+
+/// Parse one line of `herdr integration status` output into `(kind, status)`.
+/// `None` for a line that does not match the `<kind>: <state> (<path>)`
+/// grammar herdr 0.8.0-preview emits. States:
+/// - `current (v9) (/path)`        → installed + current
+/// - `outdated (v3 < v4) (/path)`  → installed, not current
+/// - `not installed (/path)`       → not installed
+pub fn parse_integration_status_line(line: &str) -> Option<(&str, IntegrationStatus)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (kind, rest) = line.split_once(": ")?;
+    let kind = kind.trim();
+    // The path is the LAST ` (...) ` group; state text precedes it.
+    let (state_part, path) = match rest.rfind(" (") {
+        Some(idx) if rest[idx..].ends_with(')') => (
+            &rest[..idx],
+            Some(rest[idx + 2..rest.len() - 1].to_string()),
+        ),
+        _ => (rest, None),
+    };
+    let (installed, current, version, expected_version) = if let Some(inner) = state_part
+        .strip_prefix("current (")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        (true, true, Some(inner.to_string()), None)
+    } else if let Some(inner) = state_part
+        .strip_prefix("outdated (")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let (v, exp) = inner.split_once(" < ").unwrap_or((inner, ""));
+        (
+            true,
+            false,
+            Some(v.to_string()),
+            (!exp.is_empty()).then(|| exp.to_string()),
+        )
+    } else if state_part.trim() == "not installed" {
+        (false, false, None, None)
+    } else {
+        // Unknown state text — shape drift: treat as not installed and
+        // drop the path claim rather than inventing a state.
+        (false, false, None, None)
+    };
+    Some((
+        kind,
+        IntegrationStatus {
+            installed,
+            current,
+            version,
+            expected_version,
+            path,
+        },
+    ))
+}
+
+/// Parse full `herdr integration status` output into per-kind statuses
+/// (one call, N kinds — spawn/deps reuse the map). Kinds absent from the
+/// output are omitted; callers fall back to [`IntegrationStatus::not_installed`].
+pub fn parse_integration_status_output(raw: &str) -> Vec<(String, IntegrationStatus)> {
+    raw.lines()
+        .filter_map(parse_integration_status_line)
+        .map(|(k, s)| (k.to_string(), s))
+        .collect()
+}
+
+/// Run `herdr integration status` once and return every kind's state.
+pub fn integration_status_all() -> Result<Vec<(String, IntegrationStatus)>> {
+    let out = std::process::Command::new("herdr")
+        .args(["integration", "status"])
+        .output()
+        .map_err(|e| anyhow!("cannot run `herdr integration status`: {e}"))?;
+    if !out.status.success() {
+        bail!(
+            "`herdr integration status` failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(parse_integration_status_output(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Query one kind's integration state. A kind missing from the CLI output
+/// resolves to not-installed (herdr lists every known kind, so absence is
+/// shape drift — never invent a state).
+pub fn integration_status(kind: &str) -> Result<IntegrationStatus> {
+    Ok(integration_status_all()?
+        .into_iter()
+        .find(|(k, _)| k == kind)
+        .map(|(_, s)| s)
+        .unwrap_or_else(IntegrationStatus::not_installed))
+}
+
+/// Install a kind's herdr integration through the socket `integration.install`
+/// method (herdr 0.8.0-preview raw method; the socket is the in-process
+/// surface — `herdr integration install <TARGET>` is the CLI twin). Returns
+/// the server's install messages. The CALLER decides how to surface
+/// failures — H3 preflight warns loudly and never fails the spawn.
+pub fn integration_install_socket(c: &mut Client, kind: &str) -> Result<Vec<String>> {
+    let target = integration_target(kind)
+        .ok_or_else(|| anyhow!("kind {kind} has no herdr integration target"))?;
+    let resp = c.call("integration.install", json!({ "target": target }))?;
+    let messages = resp
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(messages)
 }
 
 /// Strip terminal control sequences and TUI box-drawing chrome from a pane
@@ -778,6 +948,17 @@ pub fn pane_wait_output(
         .call_coded("pane.wait_for_output", params)
         .map_err(to_herdr_error)?;
     parse_wait_for_output_result(&res)
+}
+
+/// Pane-scoped command execution without an agent lifecycle (ADR-0019
+/// CommandVerified, H2 bd-harness-pane-send-text-7fe8): run `command` in the
+/// pane's shell via the `pane.run` composite (send_text + Enter — there is
+/// no raw `pane.run` method in herdr protocol 19; the CLI implements it the
+/// same way). The caller typically follows with [`pane_wait_output`] to await
+/// a regex/substring match.
+pub fn pane_run(c: &mut Client, pane_id: &str, command: &str) -> std::result::Result<(), HerdrError> {
+    c.pane_run(pane_id, command).map_err(to_herdr_error)?;
+    Ok(())
 }
 
 /// `worktree.list` — delegation over `Client::call`, returning the
@@ -1993,5 +2174,144 @@ mod session_log_tests {
     fn tool_without_state_renders_question_mark() {
         let v = summarize_part(r#"{"type":"tool","tool":"edit"}"#).unwrap();
         assert_eq!(v["state"]["status"], "?");
+    }
+}
+
+/// H3 (bd-harness-integration-preflight): `herdr integration status` CLI
+/// output parser + install-target mapping. The gate is
+/// `cargo test -p flywheel integration_status`.
+#[cfg(test)]
+mod integration_status_tests {
+    use super::{
+        IntegrationStatus, INTEGRATION_KINDS, integration_target,
+        parse_integration_status_line, parse_integration_status_output,
+    };
+
+    /// `current (vN) (/path)` → installed + current, version captured.
+    #[test]
+    fn integration_status_parser_current() {
+        let (kind, st) = parse_integration_status_line(
+            "opencode: current (v9) (/Users/bangedorrunt/.config/opencode/plugins/herdr-agent-state.js)",
+        )
+        .expect("current line parses");
+        assert_eq!(kind, "opencode");
+        assert!(st.installed);
+        assert!(st.current);
+        assert_eq!(st.version.as_deref(), Some("v9"));
+        assert_eq!(st.expected_version, None);
+        assert_eq!(
+            st.path.as_deref(),
+            Some("/Users/bangedorrunt/.config/opencode/plugins/herdr-agent-state.js")
+        );
+    }
+
+    /// `outdated (vN < vM) (/path)` → installed, not current, both versions.
+    #[test]
+    fn integration_status_parser_outdated() {
+        let (kind, st) = parse_integration_status_line(
+            "hermes: outdated (v3 < v4) (/Users/bangedorrunt/.hermes/plugins/herdr-agent-state/__init__.py)",
+        )
+        .expect("outdated line parses");
+        assert_eq!(kind, "hermes");
+        assert!(st.installed);
+        assert!(!st.current);
+        assert_eq!(st.version.as_deref(), Some("v3"));
+        assert_eq!(st.expected_version.as_deref(), Some("v4"));
+        assert_eq!(
+            st.path.as_deref(),
+            Some("/Users/bangedorrunt/.hermes/plugins/herdr-agent-state/__init__.py")
+        );
+    }
+
+    /// `not installed (/path)` → installed=false, no versions.
+    #[test]
+    fn integration_status_parser_not_installed() {
+        let (kind, st) = parse_integration_status_line(
+            "claude: not installed (/Users/bangedorrunt/.claude/hooks/herdr-agent-state.sh)",
+        )
+        .expect("not-installed line parses");
+        assert_eq!(kind, "claude");
+        assert!(!st.installed);
+        assert!(!st.current);
+        assert_eq!(st.version, None);
+        assert_eq!(st.expected_version, None);
+        assert_eq!(
+            st.path.as_deref(),
+            Some("/Users/bangedorrunt/.claude/hooks/herdr-agent-state.sh")
+        );
+    }
+
+    /// A path containing spaces (herdr prints the literal path) must not
+    /// break the state extraction — the LAST ` (...) ` group is the path.
+    #[test]
+    fn integration_status_parser_path_with_spaces() {
+        let (_, st) = parse_integration_status_line(
+            "kimi: current (v2) (/Users/bangedorrunt/Library/Application Support/kimi/hooks/herdr-agent-state.sh)",
+        )
+        .expect("spacey path line parses");
+        assert!(st.installed && st.current);
+        assert_eq!(
+            st.path.as_deref(),
+            Some("/Users/bangedorrunt/Library/Application Support/kimi/hooks/herdr-agent-state.sh")
+        );
+    }
+
+    /// Unknown state text = shape drift: never invent a state, treat as
+    /// not installed (the path group is still data — keep it).
+    #[test]
+    fn integration_status_parser_unknown_state_defaults_not_installed() {
+        let (kind, st) = parse_integration_status_line("foo: mysterious (v1) (/tmp/x)")
+            .expect("unknown-state line still parses kind");
+        assert_eq!(kind, "foo");
+        assert!(!st.installed);
+        assert_eq!(st.path.as_deref(), Some("/tmp/x"));
+    }
+
+    /// Empty / malformed lines are skipped (multi-line output parses as a
+    /// map; a shape-drifted line must not poison the rest).
+    #[test]
+    fn integration_status_parser_skips_garbage_lines() {
+        assert!(parse_integration_status_line("").is_none());
+        assert!(parse_integration_status_line("   ").is_none());
+        assert!(parse_integration_status_line("no-colon-line").is_none());
+    }
+
+    /// Full-output parse: the real 0.8.0-preview shape, all states present.
+    #[test]
+    fn integration_status_output_parses_all_kinds() {
+        let raw = "\
+pi: current (v8) (/Users/bangedorrunt/.pi/agent/extensions/herdr-agent-state.ts)
+omp: current (v8) (/Users/bangedorrunt/.omp/agent/extensions/herdr-omp-agent-state.ts)
+claude: not installed (/Users/bangedorrunt/.claude/hooks/herdr-agent-state.sh)
+hermes: outdated (v3 < v4) (/Users/bangedorrunt/.hermes/plugins/herdr-agent-state/__init__.py)
+";
+        let map: std::collections::HashMap<_, _> =
+            parse_integration_status_output(raw).into_iter().collect();
+        assert_eq!(map.len(), 4);
+        assert!(map["pi"].installed && map["pi"].current);
+        assert!(map["omp"].installed && map["omp"].current);
+        assert!(!map["claude"].installed);
+        assert!(map["hermes"].installed && !map["hermes"].current);
+    }
+
+    /// Every canonical kind maps to a socket target; the underscore twin
+    /// resolves too; custom flywheel kinds resolve to None (preflight skips).
+    #[test]
+    fn integration_status_target_mapping() {
+        for k in INTEGRATION_KINDS {
+            assert!(integration_target(k).is_some(), "{k} must map to a target");
+        }
+        assert_eq!(integration_target("antigravity-cli"), Some("antigravity_cli"));
+        assert_eq!(integration_target("my-custom-kind"), None);
+    }
+
+    /// not_installed() is the fallback the callers use on absent kinds.
+    #[test]
+    fn integration_status_not_installed_fallback() {
+        let st = IntegrationStatus::not_installed();
+        assert!(!st.installed && !st.current);
+        assert_eq!(st.version, None);
+        assert_eq!(st.expected_version, None);
+        assert_eq!(st.path, None);
     }
 }
