@@ -752,6 +752,27 @@ enum Commands {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+    /// internal: loop-run VERIFY executor (ADR-0019 cheap band,
+    /// bd-w1-loop-run-verify-mbbe). Classifies the bead's VERIFY
+    /// (loop-runnable or not) and, on the cheap band, RUNS it with the
+    /// TIMEBOX timeout (cargo under the build slot). Never re-verifies a
+    /// broken head (marker). The machine receipt + command-verified gate row
+    /// are written IN-PROCESS by the armed loop — this command only returns
+    /// the outcome. Prints `{"band","dir","exit","timed_out","skipped"}`.
+    #[command(name = "__loop-run-verify", hide = true)]
+    __LoopRunVerify {
+        project: String,
+        bead_id: String,
+        /// derived sha (SHA rule)
+        #[arg(long)]
+        sha: String,
+        /// timeout seconds (default: the bead's TIMEBOX, else 600)
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+        /// repo dir (default: the project dir from config)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
     /// internal: the project's active reservation board (ADR-0019 Spec
     /// 3.4/3.5, bd-w1-reserve-serialize-2mam) — serialize-on-overlap data
     #[command(name = "__reservation-board", hide = true)]
@@ -3323,6 +3344,20 @@ fn main() {
             candidates.as_deref(),
             blast,
             ac,
+            dir.as_deref(),
+        ),
+        Some(Commands::__LoopRunVerify {
+            project,
+            bead_id,
+            sha,
+            timeout_secs,
+            dir,
+        }) => cmd_internal_loop_run_verify(
+            &cfg,
+            project,
+            bead_id,
+            sha,
+            *timeout_secs,
             dir.as_deref(),
         ),
         Some(Commands::__ReservationBoard { project }) => {
@@ -11391,6 +11426,217 @@ mod verifier_dispatch_tests {
 }
 
 #[cfg(test)]
+mod loop_run_verify_tests {
+    use super::*;
+
+    fn scratch_lrv(dir: &Path, slug: &str, verify: &str) -> String {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .output()
+            .expect("git init");
+        assert!(init.status.success());
+        let bi = std::process::Command::new("br")
+            .arg("init")
+            .current_dir(dir)
+            .output()
+            .expect("br init");
+        assert!(bi.status.success());
+        // The loop records command-verified AFTER the worker closes (close-
+        // detect) — br 0.2.22 validates the report against the CURRENT
+        // status, so the policy must declare the `closed -> closed` gated
+        // self-transition (probed 2026-08-16).
+        std::fs::write(
+            dir.join(".beads/policy.yaml"),
+            "workflow:\n  transitions:\n    open:\n      - closed\n    closed:\n      - closed\n  gates:\n    open -> closed:\n      require_all:\n        - command-verified\n    closed -> closed:\n      require_all:\n        - command-verified\n",
+        )
+        .unwrap();
+        let desc = format!("work\n\n## VERIFY\n```\n{verify}\n```");
+        let created = std::process::Command::new("br")
+            .args([
+                "create",
+                "--title",
+                "lrv",
+                "--slug",
+                slug,
+                "-p",
+                "3",
+                "-d",
+                &desc,
+            ])
+            .current_dir(dir)
+            .output()
+            .expect("br create");
+        assert!(
+            created.status.success(),
+            "br create: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let list = std::process::Command::new("br")
+            .args(["list", "--json"])
+            .current_dir(dir)
+            .output()
+            .expect("br list");
+        let v: Value = serde_json::from_slice(&list.stdout).expect("br list json");
+        v["issues"][0]["id"].as_str().expect("id").to_string()
+    }
+
+    fn commit_and_sha(dir: &Path, bead_id: &str) -> String {
+        std::fs::write(dir.join("work.txt"), "work\n").unwrap();
+        let add = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(add.status.success());
+        let cm = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                &format!("feat: lrv ({bead_id})"),
+            ])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(cm.status.success());
+        let log = std::process::Command::new("git")
+            .args(["log", "--all", "-1", &format!("--grep={bead_id}"), "--format=%H"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&log.stdout).trim().to_string()
+    }
+
+    fn status_of(dir: &Path, bead_id: &str) -> String {
+        let out = std::process::Command::new("br")
+            .args(["show", bead_id, "--json"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        v[0]["status"].as_str().unwrap_or("").to_string()
+    }
+
+    fn no_mail_cfg() -> Config {
+        Config {
+            mail: Some(crate::config::MailSections {
+                toron: Some(crate::config::MailServerConfig {
+                    url: Some("http://127.0.0.1:1".to_string()),
+                    token: None,
+                }),
+                agentmail: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Fixture: cheap P3 loop-runnable VERIFY -> the loop executes it,
+    /// records command-verified (machine receipt + gate row), the ledger is
+    /// legal and the bead STAYS closed (never reopened).
+    #[test]
+    fn cheap_p3_loop_runnable_records_and_stays_closed() {
+        // Arming is process-global — serialize with other arming tests and
+        // reset the flag (it persists once armed).
+        let _lock = crate::verdict::LOOP_REPORTER_LOCK.lock().unwrap();
+        crate::verdict::test_reset_loop_reporter();
+        let cfg = no_mail_cfg();
+        let dir = std::env::temp_dir().join(format!("lrv-ok-{}", std::process::id()));
+        let bead_id = scratch_lrv(&dir, "lrv-ok", "test -f work.txt");
+        let sha = commit_and_sha(&dir, &bead_id);
+        // Worker closes (the loop's close-detect would see `closed`).
+        let close = std::process::Command::new("br")
+            .args(["close", &bead_id, "--reason", "worker done"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(close.status.success());
+        // The loop executes VERIFY itself.
+        let o = loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir))
+            .unwrap();
+        assert_eq!(o.band, "loop-runnable");
+        assert_eq!(o.exit, 0, "verify output: {}", o.output_tail);
+        assert!(!o.skipped);
+        // The armed loop writes the machine receipt + records the gate row
+        // (this is exactly what the durable leaf does in-process).
+        crate::verdict::arm_loop_reporter();
+        let receipt = crate::verdict::write_command_verified_receipt(
+            &o.dir,
+            &bead_id,
+            &sha,
+            &o.output_tail,
+        )
+        .unwrap();
+        assert_eq!(
+            receipt,
+            dir.join(format!(".flywheel/receipts/{bead_id}-{sha}.command-verified.txt"))
+        );
+        let v = crate::verdict::Verdict {
+            kind: crate::verdict::VerdictKind::CommandVerified,
+            bead_id: bead_id.clone(),
+            sha: sha.clone(),
+            at: chrono::Utc::now(),
+            actor: crate::verdict::AgentName::new("flywheel-toron-loop1"),
+            receipt_path: receipt,
+            verify_cmd: o.verify,
+        };
+        crate::verdict::report_pass(&o.dir, &v).unwrap();
+        // Ledger legal -> the bead stays closed (the loop never reopened it).
+        let bead = crate::verdict::bead_from_br_show(&dir, &bead_id).unwrap();
+        assert!(
+            crate::verdict::ledger_check(&o.dir, &bead, crate::verdict::AcShape::Checkable, &sha)
+                .unwrap()
+        );
+        assert_eq!(status_of(&dir, &bead_id), "closed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// VERIFY failing -> failed-head marker written; the same head is NEVER
+    /// re-verified (second invocation skips).
+    #[test]
+    fn failing_verify_marks_head_and_never_rereuns_same_head() {
+        let cfg = no_mail_cfg();
+        let dir = std::env::temp_dir().join(format!("lrv-fail-{}", std::process::id()));
+        let bead_id = scratch_lrv(&dir, "lrv-fail", "test -f does-not-exist.txt");
+        let sha = commit_and_sha(&dir, &bead_id);
+        let o1 = loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir))
+            .unwrap();
+        assert_eq!(o1.band, "loop-runnable");
+        assert_ne!(o1.exit, 0, "the fixture VERIFY must fail");
+        let marker = dir.join(format!(
+            ".flywheel/loop-run-verify-failed/{bead_id}-{sha}"
+        ));
+        assert!(marker.exists(), "failed-head marker must be written");
+        let o2 = loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir))
+            .unwrap();
+        assert!(
+            o2.skipped,
+            "never re-verify the same broken head — second run must skip"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whole-workspace / heavy VERIFY is NOT the loop-runnable band.
+    #[test]
+    fn heavy_verify_is_non_runnable_band() {
+        let cfg = no_mail_cfg();
+        let dir = std::env::temp_dir().join(format!("lrv-heavy-{}", std::process::id()));
+        let bead_id = scratch_lrv(&dir, "lrv-heavy", "cargo test --workspace");
+        let sha = commit_and_sha(&dir, &bead_id);
+        let o = loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir))
+            .unwrap();
+        assert_eq!(o.band, "non-runnable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod loop_tests {
     use super::*;
 
@@ -19211,6 +19457,303 @@ fn reopen_unverified_close(
             Err(e)
         }
     }
+}
+
+/// internal leaf: loop-run VERIFY executor (ADR-0019 cheap band,
+/// bd-w1-loop-run-verify-mbbe). Classify the bead's VERIFY; on the
+/// loop-runnable band RUN it under `sh -c` with the TIMEBOX timeout (cargo
+/// under the build slot), writing a failed-head marker on non-zero exit or
+/// timeout (the loop NEVER re-verifies the same broken head). The machine
+/// receipt + the command-verified gate row are written IN-PROCESS by the
+/// armed loop — this command only executes and reports. Always exits 0 —
+/// a run hiccup must never kill the loop.
+/// The executor's outcome — what the leaf turns into the machine receipt +
+/// gate row (recorded) or the failed-head marker + reopen.
+#[derive(Debug, Clone)]
+struct LoopRunOutcome {
+    band: String,
+    dir: PathBuf,
+    sha: String,
+    exit: i32,
+    timed_out: bool,
+    skipped: bool,
+    verify: String,
+    output_tail: String,
+}
+
+fn cmd_internal_loop_run_verify(
+    cfg: &Config,
+    project: &str,
+    bead_id: &str,
+    sha: &str,
+    timeout_secs: Option<u64>,
+    dir: Option<&Path>,
+) -> Result<()> {
+    let o = match loop_run_verify_exec(cfg, project, bead_id, sha, timeout_secs, dir) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!(
+                "flywheel: loop-run-verify for {bead_id} failed (continuing): {e}"
+            );
+            print_json(&json!({ "band": "non-runnable", "bead_id": bead_id, "error": format!("{e}") }));
+            return Ok(());
+        }
+    };
+    if o.band != "loop-runnable" {
+        print_json(&json!({
+            "band": o.band,
+            "bead_id": bead_id,
+            "dir": o.dir.to_string_lossy(),
+            "verify": o.verify,
+        }));
+        return Ok(());
+    }
+    let mut v = json!({
+        "band": "loop-runnable",
+        "bead_id": bead_id,
+        "sha": sha,
+        "dir": o.dir.to_string_lossy(),
+        "verify": o.verify,
+    });
+    if o.skipped {
+        v["skipped"] = json!("failed-head");
+    } else if o.timed_out {
+        v["timed_out"] = json!(true);
+        v["output_tail"] = json!(o.output_tail);
+    } else {
+        v["exit"] = json!(o.exit);
+        v["output_tail"] = json!(o.output_tail);
+    }
+    print_json(&v);
+    Ok(())
+}
+
+/// The loop-run VERIFY executor core: classify the bead's VERIFY; on the
+/// loop-runnable band run it under `sh -c` with the TIMEBOX timeout (cargo
+/// under the build slot), writing a failed-head marker on non-zero exit or
+/// timeout (the loop NEVER re-verifies the same broken head). Pure-ish: the
+/// only side effects are the failed-head marker + the build-slot hold.
+fn loop_run_verify_exec(
+    cfg: &Config,
+    project: &str,
+    bead_id: &str,
+    sha: &str,
+    timeout_secs: Option<u64>,
+    dir: Option<&Path>,
+) -> Result<LoopRunOutcome> {
+    let key = match dir {
+        Some(p) => p.to_path_buf(),
+        None => PathBuf::from(project_dir_str(cfg, project)?),
+    };
+    let bead = match verdict::bead_from_br_show(&key, bead_id) {
+        Ok(b) => b,
+        Err(e) => {
+            // Unreadable bead (no fence / wrong dir): NOT loop-runnable —
+            // the non-runnable band's machinery handles it.
+            return Ok(LoopRunOutcome {
+                band: "non-runnable".into(),
+                dir: key,
+                sha: sha.to_string(),
+                exit: -1,
+                timed_out: false,
+                skipped: false,
+                verify: String::new(),
+                output_tail: format!("bead lookup failed: {e}"),
+            });
+        }
+    };
+    if !verdict::verify_is_loop_runnable(&bead.verify) {
+        return Ok(LoopRunOutcome {
+            band: "non-runnable".into(),
+            dir: key,
+            sha: sha.to_string(),
+            exit: -1,
+            timed_out: false,
+            skipped: false,
+            verify: bead.verify,
+            output_tail: String::new(),
+        });
+    }
+    // Never re-verify the same broken head (marker survives restarts).
+    let marker_dir = key.join(".flywheel").join("loop-run-verify-failed");
+    let marker = marker_dir.join(format!("{bead_id}-{sha}"));
+    if marker.exists() {
+        return Ok(LoopRunOutcome {
+            band: "loop-runnable".into(),
+            dir: key,
+            sha: sha.to_string(),
+            exit: -1,
+            timed_out: false,
+            skipped: true,
+            verify: bead.verify,
+            output_tail: String::new(),
+        });
+    }
+    let timeout = timeout_secs.unwrap_or_else(|| verdict::bead_timebox_secs(&key, bead_id, 600));
+    let is_cargo = bead.verify.split_whitespace().next() == Some("cargo");
+    if is_cargo {
+        acquire_cargo_slot(cfg, project);
+    }
+    let outcome = run_verify_with_timeout(&bead.verify, timeout, &key);
+    if is_cargo {
+        release_cargo_slot(cfg, project);
+    }
+    match outcome {
+        Ok((exit, tail)) => {
+            if exit != 0 {
+                let _ = std::fs::create_dir_all(&marker_dir);
+                let _ = std::fs::write(&marker, "1");
+            }
+            Ok(LoopRunOutcome {
+                band: "loop-runnable".into(),
+                dir: key,
+                sha: sha.to_string(),
+                exit,
+                timed_out: false,
+                skipped: false,
+                verify: bead.verify,
+                output_tail: tail,
+            })
+        }
+        Err(tail) => {
+            let _ = std::fs::create_dir_all(&marker_dir);
+            let _ = std::fs::write(&marker, "1");
+            Ok(LoopRunOutcome {
+                band: "loop-runnable".into(),
+                dir: key,
+                sha: sha.to_string(),
+                exit: -1,
+                timed_out: true,
+                skipped: false,
+                verify: bead.verify,
+                output_tail: tail,
+            })
+        }
+    }
+}
+
+/// Run `<verify>` under `sh -c` with a hard timeout in the bead's repo dir;
+/// the pipes are drained concurrently so a verbose test never deadlocks on
+/// the pipe buffer. Returns `Ok((exit_code, tail))` or `Err(tail)` when the
+/// deadline hit (the child was killed).
+fn run_verify_with_timeout(
+    verify: &str,
+    timeout_secs: u64,
+    cwd: &Path,
+) -> std::result::Result<(i32, String), String> {
+    use std::io::Read;
+    let mut child = match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(verify)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return Ok((-1, format!("spawn failed: {e}"))),
+    };
+    let mut out = child.stdout.take();
+    let mut err = child.stderr.take();
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut o) = out {
+            let _ = o.read_to_string(&mut buf);
+        }
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut e2) = err {
+            let _ = e2.read_to_string(&mut buf);
+        }
+        buf
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let exit_code = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st.code().unwrap_or(-1),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let tail = tail_of(&format!(
+                        "{}\n{}",
+                        out_handle.join().unwrap_or_default(),
+                        err_handle.join().unwrap_or_default()
+                    ));
+                    return Err(tail);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Ok((-1, format!("wait failed: {e}")));
+            }
+        }
+    };
+    let stdout = out_handle.join().unwrap_or_default();
+    let stderr = err_handle.join().unwrap_or_default();
+    Ok((exit_code, tail_of(&format!("{stdout}\n{stderr}"))))
+}
+
+/// Last ~4 KiB of captured output (receipts stay small).
+fn tail_of(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let start = chars.len().saturating_sub(4096);
+    chars[start..].iter().collect()
+}
+
+/// Best-effort build-slot hold for cargo VERIFY (ADR-0019: "cargo commands
+/// under the build slot"). Advisory — a slot failure must never block the
+/// loop (the always-serialize gate already serializes cargo dispatch).
+fn acquire_cargo_slot(cfg: &Config, project: &str) {
+    let agent = cfg
+        .agent_mail
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| "flywheel-toron-loop1".to_string());
+    if let Ok(out) = std::process::Command::new("toron")
+        .args([
+            "slot",
+            "acquire",
+            "--project",
+            project,
+            "--agent",
+            &agent,
+            "--slot",
+            "cargo",
+            "--exclusive",
+            "--json",
+        ])
+        .output()
+        && !out.status.success()
+    {
+        eprintln!(
+            "flywheel: loop-run-verify cargo slot acquire failed (continuing): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+}
+
+fn release_cargo_slot(cfg: &Config, project: &str) {
+    let agent = cfg
+        .agent_mail
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| "flywheel-toron-loop1".to_string());
+    let _ = std::process::Command::new("toron")
+        .args([
+            "slot",
+            "release",
+            "--project",
+            project,
+            "--agent",
+            &agent,
+            "--slot",
+            "cargo",
+        ])
+        .output();
 }
 
 /// The unverified-close mail: thread = the bead id, subject `[<id>]

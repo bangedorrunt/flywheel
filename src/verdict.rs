@@ -155,6 +155,44 @@ pub struct Verdict {
     pub verify_cmd: String,
 }
 
+/// Parse the bead's TIMEBOX from its description (brief template:
+/// `TIMEBOX 90min/bead` or `TIMEBOX: 30`). Returns SECONDS. Absent or
+/// malformed -> `None` (the caller applies its default).
+pub fn parse_timebox(description: &str) -> Option<u64> {
+    for line in description.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("TIMEBOX") else {
+            continue;
+        };
+        let rest = rest.trim_start_matches(':').trim();
+        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(mins) = num.parse::<u64>()
+            && mins > 0
+        {
+            return Some(mins * 60);
+        }
+    }
+    None
+}
+
+/// TIMEBOX (seconds) for a bead, from `br show`'s description; `default`
+/// when absent, malformed, or the lookup fails (best-effort — the loop must
+/// never die on a missing TIMEBOX).
+pub fn bead_timebox_secs(cwd: &Path, bead_id: &str, default: u64) -> u64 {
+    let Ok(stdout) = run_br(cwd, &["show", bead_id, "--json"]) else {
+        return default;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+        return default;
+    };
+    let desc = v
+        .get(0)
+        .and_then(|b| b.get("description"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    parse_timebox(desc).unwrap_or(default)
+}
+
 /// Cheap-band classifier (ADR-0019 Spec 1): VERIFY is loop-runnable when it
 /// is a single command line with an allowlisted executable (cargo/test/
 /// pytest/python/bounded shell) estimated cheap — the loop can execute it
@@ -296,6 +334,20 @@ use std::process::Command as StdCommand;
 /// worker-invoked `br gate report` for a loop-owned bead is rejected while
 /// unarmed — workers never write verdicts (ADR-0019 Spec 1).
 static LOOP_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Serializes tests that arm the loop reporter: arming is process-global, so
+/// a parallel armed test would race another test's unarmed-refusal
+/// assertions. Tests take this lock for the whole arming sequence.
+#[doc(hidden)]
+pub static LOOP_REPORTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test seam: reset the process-global arm flag (call under
+/// `LOOP_REPORTER_LOCK` at the start of an arming test — the flag persists
+/// across tests once armed).
+#[doc(hidden)]
+pub fn test_reset_loop_reporter() {
+    LOOP_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
 
 /// Arm the loop reporter. Called once by the durable loop at startup
 /// (durable.rs, bd-w1-reopen-f6tw wiring). Idempotent.
@@ -576,7 +628,9 @@ pub fn write_receipt(
 /// Machine receipt writer — LOOP ONLY (armed-gated like `report_pass`):
 /// `.flywheel/receipts/<bead-id>-<sha>.command-verified.txt`. The loop
 /// executes VERIFY itself and writes this file; workers never write this
-/// kind (anti-forgery by construction, ADR-0019 Spec 1).
+/// kind (anti-forgery by construction, ADR-0019 Spec 1). Unlike a worker
+/// receipt, content may be empty — a silent pass is still evidence of the
+/// loop's own execution; the armed gate is the proof, not the bytes.
 pub fn write_command_verified_receipt(
     cwd: &Path,
     bead_id: &str,
@@ -587,9 +641,6 @@ pub fn write_command_verified_receipt(
         anyhow::bail!(
             "command-verified receipts are written by the LOOP only (anti-forgery, ADR-0019 Spec 1)"
         );
-    }
-    if content.trim().is_empty() {
-        anyhow::bail!("receipt refuses empty content");
     }
     let dir = cwd.join(".flywheel").join("receipts");
     std::fs::create_dir_all(&dir)?;
@@ -875,6 +926,17 @@ mod tests {
         assert!(!verify_is_loop_runnable("cargo test $(echo x)"));
     }
 
+    /// TIMEBOX parse: minutes -> seconds; absent/malformed -> None.
+    #[test]
+    fn loop_run_verify_parses_timebox_to_seconds() {
+        assert_eq!(parse_timebox("TIMEBOX 90min/bead"), Some(5400));
+        assert_eq!(parse_timebox("TIMEBOX: 30"), Some(1800));
+        assert_eq!(parse_timebox("TIMEBOX 45 minutes"), Some(2700));
+        assert_eq!(parse_timebox("no timebox here"), None);
+        assert_eq!(parse_timebox("TIMEBOX"), None);
+        assert_eq!(parse_timebox("TIMEBOX 0"), None);
+    }
+
     /// Anti-forgery: the WORKER receipt helper refuses CommandVerified
     /// outright (no arm dependency — always refused).
     #[test]
@@ -1011,6 +1073,10 @@ mod tests {
     /// (worker-invoked report blocked, loop path accepted).
     #[test]
     fn loop_only_reporter_guard_blocks_workers_then_loop_roundtrips() {
+        // Arming is process-global — serialize with other arming tests and
+        // reset the flag (it persists once armed).
+        let _lock = crate::verdict::LOOP_REPORTER_LOCK.lock().unwrap();
+        crate::verdict::test_reset_loop_reporter();
         let (dir, bead_id) = scratch_workspace("gate-roundtrip");
         let sha = derive_head_sha(&dir, &bead_id).unwrap();
         let bead = bead_from_br_show(&dir, &bead_id).unwrap();
