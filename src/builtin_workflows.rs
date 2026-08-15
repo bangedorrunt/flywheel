@@ -35,6 +35,15 @@
 //! - `figure-it-out` — no bundled playbook (bd-w2-review-s6ij): the planner
 //!   authors workflow YAML (lint is the gate); the captain executes via
 //!   `workflow compose --agent` then `--execute`.
+//! - `babysit-bead` / `ship-beads` / `autonomous-work` / `pickup` / `pause`
+//!   — the operations playbooks (ADR-0019 Spec 7.2, bd-w2-ops-szky):
+//!   babysit drives ONE bead to a legal ledger row; ship-beads gates on the
+//!   ship predicate (no ready beads, claim-watch empty, closed beads
+//!   ledger-legal) then commits+pushes (p8); autonomous-work runs the REAL
+//!   loop (`loop run --work --on-blocked mail`) then ship-beads; pickup
+//!   resumes stranded/exhausted work + ledger gaps; pause checkpoints +
+//!   writes a standing handoff (kills nothing working without
+//!   --force-working).
 //!
 //! governed-by: ADR-0005 Spec 2b, P3.5
 
@@ -807,6 +816,144 @@ steps:
     on_error: fail_run
 "##,
     ),
+    (
+        "babysit-bead",
+        r##"
+name: babysit-bead
+description: "Drive ONE bead to a legal ledger row (ADR-0019 Spec 7.2, pstack babysit without PRs): claim-watch nudge, reservation renew, T0-T3 mail, verifier spawn when required. NEVER starts new beads. Principles: never-block-on-the-human, prove-it-works."
+trigger:
+  type: webhook
+crew: auto
+principles:
+  - never-block-on-the-human
+  - prove-it-works
+inputs:
+  - name: bead_id
+steps:
+  - name: drive
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@housekeeper"
+      harness: "opencode"
+      task: "BABYSIT ONE BEAD {{inputs.bead_id}} to a legal ledger row (ADR-0019): (1) `br show {{inputs.bead_id}} --json` — status in_progress / blocked / unverified-closed; (2) claim-watch: if the dispatched agent never claimed, nudge it (loop claim-watch); if it is unclaimed and free, claim it; (3) RENEW its file reservations (reason={{inputs.bead_id}}, toron renew_file_reservations) before the TTL lapses; (4) if blocked: drive the T0-T3 escalation mail through the loop machinery — never fabricate a verdict; (5) if closed but unverified: `flywheel ledger check {{inputs.bead_id}}` — missing/illegal verdict → the LOOP reopens it (never force-unlock a peer); if a verifier is required (P0/P1/judgment AC), spawn the reviewer dispatch on a different model family. NEVER start new beads; NEVER write a verdict yourself — only the loop records gate rows. Report: status before/after, what you drove, the legal ledger row."
+    on_error: fail_run
+"##,
+    ),
+    (
+        "ship-beads",
+        r##"
+name: ship-beads
+description: "Ship beads (ADR-0019 Spec 7.2, pstack shipping without merge-when-ready): predicate = no ready beads AND claim-watch empty AND every newly closed bead legal on the ledger -> @housekeeper commit-and-push (stage p8). Principles: prove-it-works, sequence-verifiable-units."
+trigger:
+  type: webhook
+crew: auto
+principles:
+  - prove-it-works
+  - sequence-verifiable-units
+inputs:
+  - name: project
+steps:
+  - name: verify-predicate
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@housekeeper"
+      harness: "opencode"
+      task: "SHIP-BEADS PREDICATE for {{inputs.project}} (ADR-0019) — verify ALL THREE before any commit: (1) `br list --status ready --json` in the project repo is EMPTY (no ready beads); (2) claim-watch is EMPTY — no dispatched-but-unclosed beads (`flywheel loop status --project {{inputs.project}}`); (3) every newly closed bead is LEGAL on the ledger — `flywheel ledger check <bead-id>` exits 0 for each close since the last ship (commit BEFORE close; bead id IN the commit message). If ANY predicate fails, STOP and report exactly what blocks — do NOT commit. If all three hold, report PREDICATE-PASS."
+    on_error: fail_run
+  - name: ship
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@housekeeper"
+      harness: "opencode"
+      stage: "commit-and-push"
+      task: "Predicate verified ({{steps.verify-predicate}}). Commit all changed files in logically connected groups with detailed messages (bead ids IN the messages), then push. Do not edit code; do not commit obviously ephemeral files. This is pstack shipping without merge-when-ready — the ledger is the proof."
+    on_error: fail_run
+"##,
+    ),
+    (
+        "autonomous-work",
+        r##"
+name: autonomous-work
+description: "Autonomous overnight work (ADR-0019 Spec 7.2): runs `flywheel loop run --work --on-blocked mail` — the REAL loop, this workflow does NOT reimplement it — then a terminal ship-beads check (predicate default = ship-beads). Documented so decide can point at it. Principles: never-block-on-the-human, make-operations-idempotent."
+trigger:
+  type: webhook
+crew: auto
+principles:
+  - never-block-on-the-human
+  - make-operations-idempotent
+inputs:
+  - name: project
+  - name: predicate
+    default: ship-beads
+steps:
+  - name: run-loop
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@housekeeper"
+      harness: "opencode"
+      task: "AUTONOMOUS WORK for {{inputs.project}} (ADR-0019): run the REAL loop — `flywheel loop run --work --on-blocked mail --project {{inputs.project}}` — do NOT reimplement the loop (no hand-rolled polling, no bespoke dispatch, no new beads). Idempotent: the loop resumes its persisted invocation; taking over a live loop requires --force. When the loop settles (predicate reached or stall), run the terminal ship-beads check (predicate: {{inputs.predicate}}, default ship-beads): no ready beads, claim-watch empty, every newly closed bead legal on the ledger (`flywheel ledger check` per close since the last ship). Report: loop outcome, beads processed, ledger state."
+    on_error: fail_run
+  - name: ship
+    action: call_workflow
+    workflow: ship-beads
+    inputs: { project: "{{inputs.project}}" }
+"##,
+    ),
+    (
+        "pickup",
+        r##"
+name: pickup
+description: "Session pickup (ADR-0019 Spec 7.2): read .flywheel/agent-state/, br list --status in_progress, ledger gaps, and the last-sent registry; respawn context-exhausted panes; resume briefs for stranded in_progress beads. Principles: make-operations-idempotent, guard-the-context-window."
+trigger:
+  type: webhook
+crew: auto
+principles:
+  - make-operations-idempotent
+  - guard-the-context-window
+inputs:
+  - name: project
+steps:
+  - name: pickup
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@housekeeper"
+      harness: "opencode"
+      task: "PICKUP for {{inputs.project}} (ADR-0019): (1) read .flywheel/agent-state/*.json — context_pct >= 80 = EXHAUSTED → respawn those panes; (2) `br list --status in_progress --json` — stranded beads (assignee dead/gone) get a RESUME brief re-dispatched; (3) ledger gaps — beads closed without a legal verdict (`flywheel ledger check <bead-id>` exits non-zero) → flag for the loop reopen path, NEVER force-unlock; (4) last-sent registry — prompts recorded but unconfirmed get re-sent per resume-dedup. Idempotent: re-running is safe — a done pickup finds nothing to do. Keep SUMMARIES in your report, not raw dumps (guard-the-context-window)."
+    on_error: fail_run
+"##,
+    ),
+    (
+        "pause",
+        r##"
+name: pause
+description: "Pause safely (ADR-0019 Spec 7.2): `flywheel checkpoint save` + standing handoff (what is in flight, ledger gaps, the EXACT resume command). Kills nothing that is working unless --force-working is explicit. Principles: make-operations-idempotent, never-block-on-the-human."
+trigger:
+  type: webhook
+crew: auto
+principles:
+  - make-operations-idempotent
+  - never-block-on-the-human
+inputs:
+  - name: project
+  - name: msg
+  - name: force_working
+    default: false
+steps:
+  - name: pause
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@housekeeper"
+      harness: "opencode"
+      task: "PAUSE {{inputs.project}} (ADR-0019): (1) `flywheel checkpoint save --project {{inputs.project}}` — durable state snapshot; (2) write the STANDING HANDOFF: what is in flight (in_progress beads + held reservations), ledger gaps (closed-but-unverified beads), and the EXACT resume command (e.g. `flywheel loop run --work --on-blocked mail --project {{inputs.project}}` or the pickup workflow); (3) kill NOTHING that is working unless force_working={{inputs.force_working}} was explicit — a working agent keeps running through the pause. Operator message: {{inputs.msg}}. Report: checkpoint id, handoff path, what stayed alive."
+    on_error: fail_run
+"##,
+    ),
 ];
 
 /// Load the compiled-in built-in workflows as parsed `Workflow`s.
@@ -908,7 +1055,9 @@ mod tests {
         // figure-it-out: @planner author step.
         let fio = &wfs["figure-it-out"];
         assert!(
-            fio.steps.iter().any(|s| s.name.as_deref() == Some("author")),
+            fio.steps
+                .iter()
+                .any(|s| s.name.as_deref() == Some("author")),
             "figure-it-out has an author step"
         );
     }
@@ -934,6 +1083,155 @@ mod tests {
                 report.issues
             );
         }
+    }
+
+    // ---- ADR-0019 Spec 7.2: operations playbooks (bd-w2-ops-szky) ----
+
+    /// The five operations playbooks are builtins; each cites its principles
+    /// and is crew: auto; autonomous-work documents the decide target.
+    #[test]
+    fn ops_playbooks_present_with_principles() {
+        let wfs = builtin_workflows();
+        for name in [
+            "babysit-bead",
+            "ship-beads",
+            "autonomous-work",
+            "pickup",
+            "pause",
+        ] {
+            assert!(wfs.contains_key(name), "built-in {name} present");
+            let wf = &wfs[name];
+            assert!(!wf.principles.is_empty(), "{name} cites principles");
+            assert_eq!(wf.crew, Some(CrewSpec::Auto), "{name} is crew: auto");
+        }
+        // autonomous-work documents the decide target in the description.
+        assert!(
+            wfs["autonomous-work"]
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .contains("decide"),
+            "decide can point at autonomous-work"
+        );
+    }
+
+    /// ship-beads = predicate gate (no ready beads + claim-watch empty +
+    /// every newly closed bead ledger-legal) THEN the p8 commit-and-push.
+    #[test]
+    fn ship_beads_predicates_then_ships() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let ship = &wfs["ship-beads"];
+        assert_eq!(ship.steps.len(), 2, "predicate then ship");
+        let Action::DispatchJob { spec, .. } = &ship.steps[0].action else {
+            panic!("verify-predicate is a dispatch");
+        };
+        let task = spec
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(task.contains("br list --status ready"), "no ready beads");
+        assert!(task.contains("claim-watch"), "claim-watch empty");
+        assert!(task.contains("ledger check"), "ledger legal");
+        let Action::DispatchJob { spec, .. } = &ship.steps[1].action else {
+            panic!("ship is a dispatch");
+        };
+        assert_eq!(
+            spec.get("stage").and_then(serde_json::Value::as_str),
+            Some("commit-and-push"),
+            "ship = p8 commit-and-push"
+        );
+    }
+
+    /// autonomous-work uses the REAL loop (never reimplements it) and ends
+    /// in a ship-beads call; the predicate input defaults to ship-beads.
+    #[test]
+    fn autonomous_work_uses_real_loop_then_ships() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let aw = &wfs["autonomous-work"];
+        let Action::DispatchJob { spec, .. } = &aw.steps[0].action else {
+            panic!("run-loop is a dispatch");
+        };
+        let task = spec
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(
+            task.contains("flywheel loop run --work --on-blocked mail"),
+            "the REAL loop"
+        );
+        assert!(
+            task.contains("do NOT reimplement the loop"),
+            "no reimplementation"
+        );
+        let Action::CallWorkflow { workflow, .. } = &aw.steps[1].action else {
+            panic!("terminal check calls ship-beads");
+        };
+        assert_eq!(workflow, "ship-beads");
+        let pred = aw.inputs.iter().find(|i| i.name == "predicate").unwrap();
+        assert_eq!(
+            pred.default.as_ref(),
+            Some(&serde_json::json!("ship-beads"))
+        );
+    }
+
+    /// pause kills nothing working unless force_working is explicit (the
+    /// input defaults false and the task gates on it).
+    #[test]
+    fn pause_never_kills_working_without_force() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let pause = &wfs["pause"];
+        let fw = pause
+            .inputs
+            .iter()
+            .find(|i| i.name == "force_working")
+            .unwrap();
+        assert_eq!(fw.default.as_ref(), Some(&serde_json::json!(false)));
+        let Action::DispatchJob { spec, .. } = &pause.steps[0].action else {
+            panic!("pause is a dispatch");
+        };
+        let task = spec
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(task.contains("checkpoint save"), "durable state snapshot");
+        assert!(task.contains("EXACT resume command"), "standing handoff");
+        assert!(
+            task.contains("kill NOTHING that is working"),
+            "never kill working"
+        );
+        assert!(task.contains("force_working"), "unless explicit");
+    }
+
+    /// babysit-bead drives ONE bead only — the task never starts new beads
+    /// and never writes a verdict (loop-only gate rows).
+    #[test]
+    fn babysit_bead_drives_one_bead_never_starts_new() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let bb = &wfs["babysit-bead"];
+        let Action::DispatchJob { spec, .. } = &bb.steps[0].action else {
+            panic!("babysit is a dispatch");
+        };
+        let task = spec
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(task.contains("ONE BEAD"), "one bead");
+        assert!(
+            task.contains("NEVER start new beads"),
+            "never starts new beads"
+        );
+        assert!(
+            task.contains("only the loop records gate rows"),
+            "never writes a verdict"
+        );
+        assert!(
+            task.contains("ledger check"),
+            "drives to a legal ledger row"
+        );
     }
 
     /// bd-t86p: goal-direct is goal MINUS the tracker + the plan gate — the
@@ -1956,7 +2254,10 @@ mod tests {
         let perf = &wfs["perf"];
         assert_eq!(perf.crew, Some(CrewSpec::Auto), "perf is crew: auto");
         assert_eq!(
-            perf.inputs.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            perf.inputs
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["metric", "baseline_cmd", "budget"],
             "perf inputs"
         );
@@ -1964,10 +2265,15 @@ mod tests {
         assert_eq!(hc.crew, Some(CrewSpec::Auto), "hillclimb is crew: auto");
         let hc_inputs: Vec<&str> = hc.inputs.iter().map(|i| i.name.as_str()).collect();
         for required in ["metric", "target", "max_iters"] {
-            assert!(hc_inputs.contains(&required), "hillclimb input {required}: {hc_inputs:?}");
+            assert!(
+                hc_inputs.contains(&required),
+                "hillclimb input {required}: {hc_inputs:?}"
+            );
         }
         assert!(
-            hc.inputs.iter().any(|i| i.name == "max_iters" && i.default.is_some()),
+            hc.inputs
+                .iter()
+                .any(|i| i.name == "max_iters" && i.default.is_some()),
             "max_iters carries a default cap"
         );
     }
@@ -1984,7 +2290,12 @@ mod tests {
             .iter()
             .find(|s| s.name.as_deref() == Some("keep-or-discard"))
             .expect("perf has the keep-or-discard branch step");
-        let Action::Branch { if_guard, then, else_steps } = &branch.action else {
+        let Action::Branch {
+            if_guard,
+            then,
+            else_steps,
+        } = &branch.action
+        else {
             panic!("keep-or-discard is a branch");
         };
         assert!(
@@ -1993,8 +2304,16 @@ mod tests {
         );
         assert_eq!(then.len(), 1, "keep arm");
         assert_eq!(else_steps.len(), 1, "discard arm");
-        assert_eq!(then[0].name.as_deref(), Some("keep"), "keep = commit the win");
-        assert_eq!(else_steps[0].name.as_deref(), Some("discard"), "discard arm");
+        assert_eq!(
+            then[0].name.as_deref(),
+            Some("keep"),
+            "keep = commit the win"
+        );
+        assert_eq!(
+            else_steps[0].name.as_deref(),
+            Some("discard"),
+            "discard arm"
+        );
     }
 
     /// hillclimb's loop is a CAPPED retry — max_attempts is the iteration
@@ -2011,9 +2330,7 @@ mod tests {
             .find(|s| s.name.as_deref() == Some("climb"))
             .expect("hillclimb has the climb step");
         let Action::Retry {
-            max_attempts,
-            step,
-            ..
+            max_attempts, step, ..
         } = &climb.action
         else {
             panic!("climb is a capped retry");
@@ -2026,9 +2343,15 @@ mod tests {
             panic!("each attempt is a dispatch_job");
         };
         let task = spec.get("task").and_then(Value::as_str).unwrap_or("");
-        assert!(task.contains("DISCARD"), "attempt carries the discard rule: {task}");
+        assert!(
+            task.contains("DISCARD"),
+            "attempt carries the discard rule: {task}"
+        );
         assert!(task.contains("KEEP"), "attempt carries the keep rule");
-        assert!(task.contains("max_iters"), "budget binds to the max_iters input");
+        assert!(
+            task.contains("max_iters"),
+            "budget binds to the max_iters input"
+        );
     }
 
     /// The principle tags ride in the raw YAML with canonical names.
@@ -2041,11 +2364,22 @@ mod tests {
                 .map(|(_, y)| *y)
                 .expect(name)
         };
-        for tag in ["prove-it-works", "sequence-verifiable-units", "laziness-protocol"] {
+        for tag in [
+            "prove-it-works",
+            "sequence-verifiable-units",
+            "laziness-protocol",
+        ] {
             assert!(yaml_for("perf").contains(tag), "perf carries {tag}");
         }
-        for tag in ["prove-it-works", "sequence-verifiable-units", "build-the-lever"] {
-            assert!(yaml_for("hillclimb").contains(tag), "hillclimb carries {tag}");
+        for tag in [
+            "prove-it-works",
+            "sequence-verifiable-units",
+            "build-the-lever",
+        ] {
+            assert!(
+                yaml_for("hillclimb").contains(tag),
+                "hillclimb carries {tag}"
+            );
         }
     }
 }
