@@ -398,6 +398,14 @@ graph:
       spec:
         profile: "@oracle"
         task: "Synthesize the scout findings: {{steps.scout-fanout}}. Rank by EV + project-fit. Pick the SINGLE best improvement idea (feature / design pattern / bug fix). Output JSON: {\"idea\": {\"title\": ..., \"what\": ..., \"why\": ..., \"ev\": ..., \"blast_radius\": ..., \"acceptance\": ...}} — or {\"idea\": null} if nothing worth proposing (honest, not forced)."
+    # reflect edge (wave 6, OFF by default — bd-w6-reflect-8gp5): uncomment
+    # to append the reflect playbook to the weekly review so repeated
+    # corrections become structure (a hook bead, never an AGENTS.md paragraph).
+    #   reflect:
+    #     action: call_workflow
+    #     workflow: reflect
+    #     inputs: { project: "{{trigger.project}}", run_id: "{{trigger.id}}" }
+    #     needs: [oracle]
       needs: [scout-fanout]
 "##,
     ),
@@ -951,6 +959,45 @@ steps:
       profile: "@housekeeper"
       harness: "opencode"
       task: "PAUSE {{inputs.project}} (ADR-0019): (1) `flywheel checkpoint save --project {{inputs.project}}` — durable state snapshot; (2) write the STANDING HANDOFF: what is in flight (in_progress beads + held reservations), ledger gaps (closed-but-unverified beads), and the EXACT resume command (e.g. `flywheel loop run --work --on-blocked mail --project {{inputs.project}}` or the pickup workflow); (3) kill NOTHING that is working unless force_working={{inputs.force_working}} was explicit — a working agent keeps running through the pause. Operator message: {{inputs.msg}}. Report: checkpoint id, handoff path, what stayed alive."
+    on_error: fail_run
+"##,
+    ),
+    // ---- ADR-0019 Spec 7.2 reflect (wave 6, bd-w6-reflect-8gp5) ----
+    (
+        "reflect",
+        r##"
+name: reflect
+description: "Corrections become structure (ADR-0019 Spec 7.2 reflect, wave 6): scan standing orders + ledger + mail threads; the SAME instruction twice -> emit ONE hook-adding bead (a lint, a preflight, or a principle-registry line) + delete the superseded lines from the PROJECT standing orders (the global regenerates from the registry). The output is a hook bead, NEVER an AGENTS.md paragraph. Principles: encode-lessons-in-structure."
+trigger:
+  type: webhook
+crew: auto
+principles:
+  - encode-lessons-in-structure
+inputs:
+  - name: project
+  - name: run_id
+    default: ""
+steps:
+  - name: scan
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@scout"
+      task: "REFLECT SCAN for {{inputs.project}} (run {{inputs.run_id}}): read the standing orders (project layer {{inputs.project}}/.flywheel/standing-orders.md + global ~/.config/flywheel/standing-orders.md), the ledger (br gate rows), and human corrections in mail threads. Find any instruction stated TWICE — the same correction repeated in different places. Output JSON: [{\"instruction\": ..., \"locations\": [...]}] — an empty list when nothing repeats."
+    on_error: fail_run
+  - name: emit
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@planner"
+      task: "For EACH duplicated instruction from {{steps.scan}}: emit ONE bead (br create) whose description adds a STRUCTURAL hook — a lint rule, a preflight check, or a principle-registry line — AND deletes that instruction from the project standing orders. The output is a hook-adding bead, NEVER an AGENTS.md paragraph. Two restatements of the same instruction = ONE hook bead, never two."
+    on_error: fail_run
+  - name: prune
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@coder"
+      task: "Delete the superseded standing-order lines from {{steps.scan}} in the PROJECT layer ONLY ({{inputs.project}}/.flywheel/standing-orders.md). NEVER edit the global (~/.config/flywheel/standing-orders.md) — it regenerates from the principle registry."
     on_error: fail_run
 "##,
     ),
@@ -2381,5 +2428,79 @@ mod tests {
                 "hillclimb carries {tag}"
             );
         }
+    }
+
+    // ---- ADR-0019 Spec 7.2 reflect (wave 6, bd-w6-reflect-8gp5) ----
+
+    /// reflect is compiled-in, crew:auto, with the scan → emit → prune
+    /// chain and the encode-lessons-in-structure principle tag.
+    #[test]
+    fn reflect_builtin_is_compiled_in_with_scan_emit_prune() {
+        let wfs = builtin_workflows();
+        let refl = &wfs["reflect"];
+        assert_eq!(refl.crew, Some(CrewSpec::Auto), "reflect is crew: auto");
+        let inputs: Vec<&str> = refl.inputs.iter().map(|i| i.name.as_str()).collect();
+        assert!(inputs.contains(&"project"), "reflect inputs: {inputs:?}");
+        assert!(inputs.contains(&"run_id"), "run_id or project (run_id optional)");
+        let step_names: Vec<&str> = refl
+            .steps
+            .iter()
+            .filter_map(|s| s.name.as_deref())
+            .collect();
+        assert_eq!(step_names, vec!["scan", "emit", "prune"], "the reflect chain");
+        let yaml = BUILTIN_WORKFLOWS_YAML
+            .iter()
+            .find(|(n, _)| *n == "reflect")
+            .map(|(_, y)| *y)
+            .unwrap();
+        assert!(yaml.contains("encode-lessons-in-structure"), "principle tag");
+    }
+
+    /// THE FIXTURE: two identical standing-order restatements -> ONE hook
+    /// bead (never two, never an AGENTS.md paragraph), and the superseded
+    /// lines get deleted from the PROJECT layer only.
+    #[test]
+    fn reflect_emit_one_hook_bead_per_duplicate_and_prunes_project_only() {
+        let yaml = BUILTIN_WORKFLOWS_YAML
+            .iter()
+            .find(|(n, _)| *n == "reflect")
+            .map(|(_, y)| *y)
+            .unwrap();
+        // the emit step: for EACH duplicate -> ONE bead
+        assert!(yaml.contains("For EACH duplicated instruction"), "scans every duplicate");
+        assert!(yaml.contains("ONE bead"), "one hook bead per duplicate");
+        assert!(
+            yaml.contains("Two restatements of the same instruction = ONE hook bead"),
+            "two restatements -> ONE bead (never two)"
+        );
+        // the hook is a STRUCTURAL line, never an AGENTS.md paragraph
+        assert!(yaml.contains("a lint rule, a preflight check, or a principle-registry line"));
+        assert!(yaml.contains("NEVER an AGENTS.md paragraph"), "nothing appended to AGENTS.md");
+        // both reminders deleted — from the PROJECT layer only
+        assert!(
+            yaml.contains("Delete the superseded standing-order lines"),
+            "prune deletes the superseded reminders"
+        );
+        assert!(
+            yaml.contains("NEVER edit the global"),
+            "the global regenerates — never hand-edited"
+        );
+        assert!(
+            yaml.contains("{{inputs.project}}/.flywheel/standing-orders.md"),
+            "prune targets the project layer"
+        );
+    }
+
+    /// The weekly-review reflect edge is documented but OFF by default
+    /// (commented out — enabling it is a deliberate one-line uncomment).
+    #[test]
+    fn weekly_review_reflect_edge_is_off_by_default() {
+        let yaml = BUILTIN_WORKFLOWS_YAML
+            .iter()
+            .find(|(n, _)| *n == "weekly-review")
+            .map(|(_, y)| *y)
+            .unwrap();
+        assert!(yaml.contains("reflect edge (wave 6, OFF by default"));
+        assert!(yaml.contains("#     action: call_workflow"), "edge is commented out");
     }
 }
