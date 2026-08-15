@@ -3403,6 +3403,29 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 .filter(|b| !assigned.contains(&b.id))
                 .copied()
                 .collect();
+            // ADR-0019 Spec 3.4/3.5: the reservation board drives BOTH the
+            // always-serialize dispatch gate (Spec 3.5: while an
+            // always-serialize path — .beads/**, .flywheel/**, Cargo.lock,
+            // root Cargo.toml, docs/catalog/**, target/** — is held by an
+            // in-flight bead, NO new ready bead is dispatched; the second
+            // stays ready until the holder releases, never parallel) and the
+            // claim-watch overlap wait set (Spec 3.4: overlap waits are NOT
+            // stuck owners). Best-effort: a fetch failure degrades to an
+            // empty board (no gate, existing behavior), never a loop crash.
+            let board: Vec<(String, String)> = ctx
+                .run(
+                    reservation_board,
+                    ReservationBoardArgs {
+                        project: params.project.clone(),
+                    },
+                )
+                .await
+                .unwrap_or_default();
+            let overlap: std::collections::HashSet<String> = {
+                let in_flight: Vec<String> = inprog.iter().map(|b| b.id.clone()).collect();
+                bead_overlap_waits(&board, &in_flight)
+            };
+            let serialize_all = always_serialize_held(&board);
             // bd-eign.2: bead-creation flood guard — >3 new ready beads in
             // ONE poll is the runaway-create signature (40 junk beads in
             // ~4 min, RC2). CRITICAL warn + PAUSE dispatch this poll: feeding
@@ -3413,6 +3436,16 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 eprintln!(
                     "flywheel: CRITICAL: {} new ready beads this poll — runaway bead creation suspected (bd-eign.2). Pausing dispatch this poll; queue not fed.",
                     to_assign.len()
+                );
+            } else if serialize_all {
+                eprintln!(
+                    "flywheel: always-serialize path held ({}) — no new ready-bead dispatch this poll (ADR-0019 Spec 3.5; serialized until the holder releases)",
+                    board
+                        .iter()
+                        .filter(|(p, _)| ALWAYS_SERIALIZE_PATHS.iter().any(|a| overlaps(p, a)))
+                        .map(|(p, r)| format!("{p} (reason={r})"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             } else {
                 for bead in to_assign {
@@ -3460,21 +3493,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // ADR-0019 Spec 3.4: overlap waits are NOT stuck owners. Beads
             // whose write paths another in-flight bead holds get no
             // claim/close nudge and no resume redispatch — the loop waits
-            // for the holder to release. Best-effort: a board fetch failure
-            // degrades to an empty overlap set (existing watchdog behavior).
-            let overlap: std::collections::HashSet<String> = {
-                let board: Vec<(String, String)> = ctx
-                    .run(
-                        reservation_board,
-                        ReservationBoardArgs {
-                            project: params.project.clone(),
-                        },
-                    )
-                    .await
-                    .unwrap_or_default();
-                let in_flight: Vec<String> = inprog.iter().map(|b| b.id.clone()).collect();
-                bead_overlap_waits(&board, &in_flight)
-            };
+            // for the holder to release (`overlap` comes from the board
+            // fetched at dispatch planning above).
             let watch_actions = claim_watch_step(
                 &mut claim_watch,
                 &ready,
@@ -4897,16 +4917,39 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 .filter(|b| !assigned.contains(&b.id))
                 .copied()
                 .collect();
-            for bead in to_assign {
-                queue_brief(
-                    &mut queue,
-                    &bead.id,
-                    &bead.title,
-                    &params.project,
-                    false,
-                    false,
+            // ADR-0019 Spec 3.4/3.5 (parity with swarm_loop): the reservation
+            // board drives the always-serialize dispatch gate + the
+            // claim-watch overlap wait set. Best-effort fetch — a failure
+            // degrades to an empty board (no gate), never a loop crash.
+            let board: Vec<(String, String)> = ctx
+                .run(
+                    reservation_board,
+                    ReservationBoardArgs {
+                        project: params.project.clone(),
+                    },
+                )
+                .await
+                .unwrap_or_default();
+            let overlap: std::collections::HashSet<String> = {
+                let in_flight: Vec<String> = inprog.iter().map(|b| b.id.clone()).collect();
+                bead_overlap_waits(&board, &in_flight)
+            };
+            if always_serialize_held(&board) {
+                eprintln!(
+                    "flywheel: always-serialize path held — no new ready-bead dispatch this poll (ADR-0019 Spec 3.5; serialized until the holder releases)"
                 );
-                assigned.push(bead.id.clone());
+            } else {
+                for bead in to_assign {
+                    queue_brief(
+                        &mut queue,
+                        &bead.id,
+                        &bead.title,
+                        &params.project,
+                        false,
+                        false,
+                    );
+                    assigned.push(bead.id.clone());
+                }
             }
             // ADR-0019: refuse-to-dispatch — never queue a bead without a
             // legal VERIFY fence; tell the planner why, on the bead's thread.
@@ -4935,21 +4978,8 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // ADR-0019 Spec 3.4: overlap waits are NOT stuck owners. Beads
             // whose write paths another in-flight bead holds get no
             // claim/close nudge and no resume redispatch — the loop waits
-            // for the holder to release. Best-effort: a board fetch failure
-            // degrades to an empty overlap set (existing watchdog behavior).
-            let overlap: std::collections::HashSet<String> = {
-                let board: Vec<(String, String)> = ctx
-                    .run(
-                        reservation_board,
-                        ReservationBoardArgs {
-                            project: params.project.clone(),
-                        },
-                    )
-                    .await
-                    .unwrap_or_default();
-                let in_flight: Vec<String> = inprog.iter().map(|b| b.id.clone()).collect();
-                bead_overlap_waits(&board, &in_flight)
-            };
+            // for the holder to release (`overlap` comes from the board
+            // fetched at dispatch planning above).
             let watch_actions = claim_watch_step(
                 &mut claim_watch,
                 &ready,
@@ -7696,6 +7726,28 @@ mod tests {
             actions[0]
         );
         assert_eq!(watch["bd-a"].wait_reason, None);
+    }
+
+    /// The loop NEVER calls `worktree create` (ADR-0019 Spec 3.2): the
+    /// brief's FORBIDDEN field bans it, the preflight gate blocks extra
+    /// linked worktrees, and the dispatch planner has no worktree surface
+    /// (the action enum has no worktree variant — compile-enforced). This
+    /// guard pins the dispatch-side guarantee.
+    #[test]
+    fn serialize_overlap_loop_never_calls_worktree_create() {
+        let b = build_brief("bd-1", "t", "flywheel", false).unwrap();
+        assert!(
+            b.contains("No worktree"),
+            "brief FORBIDDEN bans worktrees: {b}"
+        );
+        assert!(
+            !b.contains("worktree.create"),
+            "no worktree-create call in the dispatch surface: {b}"
+        );
+        // the preflight gate is the structural ban (operator opt-out exists,
+        // but never the default)
+        assert!(crate::preflight::worktree_optout_legal(false, false));
+        assert!(!crate::preflight::Mode::loop_work().allow_worktree);
     }
 
     #[test]
