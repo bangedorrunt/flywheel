@@ -173,6 +173,12 @@ pub struct LoopConfig {
     /// sends a claim-focused nudge. Default 2 (~60s at the 30s active
     /// cadence). 0/absent → the default.
     pub claim_nudge_after_polls: Option<u32>,
+    /// verifier-family override (ADR-0019 Spec 4 single-family degrade):
+    /// when the model registry cannot supply a second model family for the
+    /// independent verifier, this family is explicitly allowed. Absent =
+    /// strict different-family rule (bead blocked `verifier-family-missing`,
+    /// one captain mail, no respawn).
+    pub verifier_family_override: Option<String>,
 }
 
 impl Config {
@@ -217,6 +223,14 @@ impl Config {
             .unwrap_or(crate::durable::DEFAULT_CLAIM_NUDGE_AFTER_POLLS)
     }
 
+    /// Verifier-family override (ADR-0019 Spec 4): absent = strict
+    /// different-family rule for the independent verifier.
+    pub fn verifier_family_override(&self) -> Option<&str> {
+        self.r#loop
+            .as_ref()
+            .and_then(|l| l.verifier_family_override.as_deref())
+    }
+
     pub fn load() -> Result<Self> {
         // Load .env first (non-fatal if absent). dotenvy does NOT override
         // already-set env vars, so a real env var wins over .env (ADR-0002 §3.3
@@ -252,10 +266,9 @@ impl Config {
         if let Ok(v) = std::env::var("FLYWHEEL_TIMEOUT") {
             // Fail loudly on bad input (is1.6): a typo'd value must abort
             // startup, never silently fall back to the default.
-            cfg.default_timeout_ms = Some(
-                v.parse()
-                    .map_err(|e| anyhow::anyhow!("FLYWHEEL_TIMEOUT={v:?} is not a number of ms: {e}"))?,
-            );
+            cfg.default_timeout_ms = Some(v.parse().map_err(|e| {
+                anyhow::anyhow!("FLYWHEEL_TIMEOUT={v:?} is not a number of ms: {e}")
+            })?);
         }
         if let Ok(v) = std::env::var("RESONATE_URL") {
             cfg.resonate_url = Some(v);
@@ -638,6 +651,22 @@ mod tests {
         assert_eq!(c.resolve_kind("oc"), "opencode");
     }
 
+    /// ADR-0019 Spec 4: `[loop] verifier_family_override` parses and is
+    /// honored by the accessor; absent = strict different-family rule.
+    #[test]
+    fn verifier_family_override_parses_from_loop_section() {
+        let c: Config = toml::from_str(
+            r#"
+[loop]
+verifier_family_override = "deepseek"
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.verifier_family_override(), Some("deepseek"));
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.verifier_family_override(), None);
+    }
+
     #[test]
     fn policy_violation_matches() {
         let p = Policy {
@@ -906,7 +935,10 @@ daily = [
         let tmp = std::env::temp_dir().join(format!("flywheel-sock-xdg-{}", std::process::id()));
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
         let cfg = Config::default();
-        assert_eq!(cfg.socket_path(), tmp.join("herdr/herdr.sock").to_string_lossy());
+        assert_eq!(
+            cfg.socket_path(),
+            tmp.join("herdr/herdr.sock").to_string_lossy()
+        );
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 
