@@ -355,6 +355,15 @@ enum Commands {
         #[command(subcommand)]
         cmd: PrinciplesCmd,
     },
+    /// standing orders (ADR-0019 Spec 2): regen the GENERATED global file
+    /// (~/.config/flywheel/standing-orders.md) from the registry + wave-1
+    /// criticals; project fences (<project>/.flywheel/standing-orders.md)
+    /// are authored and preserved byte-identical
+    #[command(name = "standing-orders")]
+    StandingOrders {
+        #[command(subcommand)]
+        cmd: StandingOrdersCmd,
+    },
     /// Work-graph surfaces (bv/br pass-through)
     Work {
         #[command(subcommand)]
@@ -1089,6 +1098,14 @@ enum PrinciplesCmd {
     /// print a principle's full when+rule (unknown name -> non-zero exit +
     /// a suggestion)
     Show { name: String },
+}
+
+#[derive(Subcommand)]
+enum StandingOrdersCmd {
+    /// regenerate the global standing orders from the registry + wave-1
+    /// criticals. Writes ONLY ~/.config/flywheel/standing-orders.md —
+    /// project fences are authored and never touched (layering guarantee).
+    Regen,
 }
 
 #[derive(Subcommand)]
@@ -3149,6 +3166,7 @@ fn main() {
         }) => cmd_kill(&cfg, project, *force, *force_working),
         Some(Commands::Ledger { cmd }) => cmd_ledger(&cfg, cmd),
         Some(Commands::Principles { cmd }) => cmd_principles(cmd),
+        Some(Commands::StandingOrders { cmd }) => cmd_standing_orders(cmd),
         Some(Commands::Work { cmd }) => cmd_work(&cfg, cmd),
         Some(Commands::Assign {
             project,
@@ -8496,6 +8514,30 @@ fn cmd_principles(cmd: &PrinciplesCmd) -> Result<()> {
                 );
             }
         },
+    }
+}
+
+/// ADR-0019 Spec 2 `flywheel standing-orders regen`: regenerate the GLOBAL
+/// standing orders (~/.config/flywheel/standing-orders.md) from the
+/// principle registry + the wave-1 criticals (numbered lines, one constraint
+/// each). Writes ONLY the global path — project fences
+/// (<project>/.flywheel/standing-orders.md) are authored and preserved
+/// byte-identical (the layering guarantee, tested in standing_orders.rs).
+fn cmd_standing_orders(cmd: &StandingOrdersCmd) -> Result<()> {
+    match cmd {
+        StandingOrdersCmd::Regen => {
+            let global = crate::config::config_dir().join("standing-orders.md");
+            standing_orders::regen_global(&global)?;
+            let lines = standing_orders::global_standing_orders()
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .count();
+            println!(
+                "regenerated {} ({lines} numbered constraints; project fences untouched)",
+                global.display()
+            );
+            Ok(())
+        }
     }
 }
 
