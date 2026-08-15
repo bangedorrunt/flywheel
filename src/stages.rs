@@ -69,7 +69,7 @@ impl StageLibrary {
             (
                 "code-review",
                 "p2",
-                "Ok can you now turn your attention to reviewing the code written by your fellow agents and checking for any issues, bugs, errors, problems, inefficiencies, security problems, reliability issues, etc. and carefully diagnose their underlying root causes using first-principle analysis and then fix or revise them if necessary? Don't restrict yourself to the latest commits, cast a wider net and go super deep! Use ultrathink.",
+                "Review the code written by your fellow agents — issues, bugs, errors, problems, inefficiencies, security problems, reliability issues, etc. — and carefully diagnose their underlying root causes using first-principle analysis. Don't restrict yourself to the latest commits; cast a wider net and go super deep. Use ultrathink. Principles in force: prove-it-works (check the real artifact — run the change's VERIFY or the ledger proof, never a self-report), fix-root-causes (reproduce first; name the root, not the symptom), minimize-reader-load (count layers and hidden state; collapse one-caller wrappers). BLOCKER: a REPORT line that cites a PRINCIPLES name without its decision (`<name> — <the decision it changed>`) is a cargo-cult citation — reject it and require the decision the principle changed; on a non-trivial bead (priority <= 2) an empty PRINCIPLES field is an incomplete report.",
             ),
             (
                 "decompose-beads",
@@ -84,7 +84,7 @@ impl StageLibrary {
             (
                 "systematic-execute",
                 "p6",
-                "Execute the beads via the brief contract. Every dispatched bead carries a filled brief (GOAL / SCOPE / CONTEXT / ACCEPTANCE / VERIFY / TIMEBOX / FORBIDDEN / REPORT / PRINCIPLES / STANDING) — the brief IS the work contract, and the lifecycle lives in the standing-orders file named in its STANDING field (read it once before starting; never re-derive it from memory). For each bead: run the VERIFY command from the brief, write the receipt to `.flywheel/receipts/<bead-id>-<sha>.<kind>.txt`, then close only with a REPORT that states status, commit sha (commit BEFORE close; bead id IN the commit message), verdict kind, what you actually ran, deviations, and the PRINCIPLES cited (`<name> — <the decision it changed>`). Prefer delegating to the `beads` subagent when available. If another agent (peer) is working in this project, join its shared room and steer on plane S (ADR-0020): `toron channel join steer-<bead-id> --project <slug> --as \"$AGENT_NAME\"` then accept/claim jobs posted there via `toron job list --state open --project <slug> --as \"$AGENT_NAME\"` + `toron job claim <job-id> --project <slug> --as \"$AGENT_NAME\"` (first claimer wins; a second claimer exits 1). Keep shared work on the room; keep secrets on plane P (`toron mail`). No worktree.",
+                "Execute the beads via the brief contract. Every dispatched bead carries a filled brief (GOAL / SCOPE / CONTEXT / ACCEPTANCE / VERIFY / TIMEBOX / FORBIDDEN / REPORT / PRINCIPLES / STANDING) — the brief IS the work contract, and the lifecycle lives in the standing-orders file named in its STANDING field (read it once before starting; never re-derive it from memory). For each bead: run the VERIFY command from the brief, write the receipt to `.flywheel/receipts/<bead-id>-<sha>.<kind>.txt`, then close only with a REPORT that states status, commit sha (commit BEFORE close; bead id IN the commit message), verdict kind, what you actually ran, deviations, and the PRINCIPLES cited (`<name> — <the decision it changed>`). Principles in force: prove-it-works (the close is not done without a legal ledger row — verify with `flywheel ledger check <bead-id>`; the receipt is evidence, the verdict is the proof), fix-root-causes (reproduce before diagnosing; no silencers), sequence-verifiable-units (each bead ends in a check before the next starts). Prefer delegating to the `beads` subagent when available. If another agent (peer) is working in this project, join its shared room and steer on plane S (ADR-0020): `toron channel join steer-<bead-id> --project <slug> --as \"$AGENT_NAME\"` then accept/claim jobs posted there via `toron job list --state open --project <slug> --as \"$AGENT_NAME\"` + `toron job claim <job-id> --project <slug> --as \"$AGENT_NAME\"` (first claimer wins; a second claimer exits 1). Keep shared work on the room; keep secrets on plane P (`toron mail`). No worktree.",
             ),
             (
                 "commit-and-push",
@@ -202,6 +202,31 @@ mod tests {
             .resolve("systematic-execute")
             .expect("semantic resolves");
         assert_eq!(by_alias, by_semantic, "p6 == systematic-execute");
+    }
+
+    /// W3 (bd-w3-stages-o8lg): p2/p6 resolved prompts name the three
+    /// verification principles; p6 cites the `flywheel ledger` CLI; p2
+    /// carries the cargo-cult BLOCKER language. The stage_alias contract
+    /// survives the prompt edits.
+    #[test]
+    fn p2_p6_cite_verification_principles_and_ledger() {
+        let lib = StageLibrary::compiled_in();
+        let p6 = lib.resolve("p6").expect("p6 resolves");
+        for name in ["prove-it-works", "fix-root-causes", "sequence-verifiable-units"] {
+            assert!(p6.contains(name), "p6 must name {name}");
+        }
+        assert!(p6.contains("flywheel ledger check"), "p6 cites the ledger CLI");
+        let p2 = lib.resolve("p2").expect("p2 resolves");
+        for name in ["prove-it-works", "fix-root-causes", "minimize-reader-load"] {
+            assert!(p2.contains(name), "p2 must name {name}");
+        }
+        assert!(p2.contains("BLOCKER"), "p2 carries BLOCKER language");
+        assert!(p2.contains("cargo-cult"), "p2 rejects cargo-cult citations");
+        assert_eq!(
+            lib.resolve("p6"),
+            lib.resolve("systematic-execute"),
+            "p6 == systematic-execute after the edits"
+        );
     }
 
     /// The compiled-in library exposes the p-codes (backward compat: existing
