@@ -1161,8 +1161,14 @@ enum MailCmd {
         #[arg(long = "as")]
         as_agent: Option<String>,
     },
-    /// list registered agents in the project
-    Agents { project: String },
+    /// list registered agents in the project (active within 24h by default;
+    /// --all shows the full history incl. stale registrations)
+    Agents {
+        project: String,
+        /// include ALL registered identities (history), not just active ones
+        #[arg(long)]
+        all: bool,
+    },
     /// cross-project contact (request_contact / respond / list)
     Contact {
         #[command(subcommand)]
@@ -8664,11 +8670,15 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let v = mail.conflicts_for(&key, &agent, paths)?;
             print_json(&v);
         }
-        MailCmd::Agents { project } => {
+        MailCmd::Agents { project, all } => {
             let key = project_dir_str(cfg, project)?;
             let mail = mail_or_die(cfg)?;
             mail.ensure_project(&key)?;
-            let v = mail.list_agents(&key, None)?;
+            // Roster = CURRENT agents by default (active <24h); --all shows
+            // the full registration history (ADR-0018 keeps legacy
+            // identities registered for attribution).
+            let active_within = if *all { None } else { Some(1) };
+            let v = mail.list_agents(&key, active_within)?;
             print_json(&v);
         }
         MailCmd::Contact { cmd } => match cmd {

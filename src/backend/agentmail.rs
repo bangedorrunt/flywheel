@@ -321,7 +321,7 @@ impl MailSurface for AgentMailBackend {
         project: &str,
         _active_within_days: Option<u64>,
     ) -> Result<Vec<WhoIs>, MailError> {
-        let v = self.call("list_agents", wire::list_agents_args(project))?;
+        let v = self.call("list_agents", wire::list_agents_args(project, _active_within_days))?;
         row_array(&v)
             .iter()
             .map(|a| {

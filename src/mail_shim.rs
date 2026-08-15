@@ -360,7 +360,7 @@ impl Mail {
             }
             BackendKind::Remote(_) => self.call_remote(
                 "list_agents",
-                crate::backend::wire::list_agents_args(project_key),
+                crate::backend::wire::list_agents_args(project_key, active_within_days),
             ),
         }
     }
