@@ -14268,8 +14268,15 @@ fn cmd_debate(
         // settle: wait for the speaker to reach done/idle (the ack-gate proxy;
         // full ack-checking is the loop's ack_overdue path)
         settle_agent(&*mux, speaker)?;
-        // harvest the speaker's latest message in the thread
-        last_reply = harvest_latest(mail.as_ref(), &key, &thread, &resolve_mail_target(speaker))?;
+        // harvest the speaker's latest message in the thread — bails loudly
+        // when no reply actually landed, so "replied" prints only after the
+        // thread moved (bd-debate-reply-routing-99ad)
+        last_reply = Some(harvest_latest(
+            mail.as_ref(),
+            &key,
+            &thread,
+            &resolve_mail_target(speaker),
+        )?);
         println!("debate {thread}: {} replied (round {})", speaker, round);
     }
 
@@ -14289,10 +14296,7 @@ fn cmd_debate(
     )?;
     settle_agent(&*mux, &j)?;
     let verdict = harvest_latest(mail.as_ref(), &key, &thread, &resolve_mail_target(&j))?;
-    println!(
-        "debate {thread} verdict: {}",
-        verdict.unwrap_or_else(|| "(no verdict harvested)".into())
-    );
+    println!("debate {thread} verdict: {verdict}");
     Ok(())
 }
 
@@ -14593,8 +14597,7 @@ fn cmd_plan_review(
     )?;
     settle_agent(&*mux, &planner)?;
     let planner_mail = mail_target(&planner);
-    let plan_reply =
-        harvest_latest(mail.as_ref(), &key, &thread, &planner_mail)?.unwrap_or_default();
+    let plan_reply = harvest_latest(mail.as_ref(), &key, &thread, &planner_mail)?;
     current_path = extract_plan_path(&plan_reply, &current_path);
     let (_next_phase, action) = pri_after_plan(&current_path);
     let mut phase = PriPhase::AwaitingPlanReview;
@@ -14629,8 +14632,7 @@ fn cmd_plan_review(
                     Some(&thread),
                 )?;
                 settle_agent(&*mux, &planner)?;
-                let pr = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&planner))?
-                    .unwrap_or_default();
+                let pr = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&planner))?;
                 current_path = extract_plan_path(&pr, &current_path);
                 let (p2, a2) = pri_after_plan(&current_path);
                 phase = p2; // AwaitingPlanReview
@@ -14655,8 +14657,7 @@ fn cmd_plan_review(
                     Some(&thread),
                 )?;
                 settle_agent(&*mux, &reviewer)?;
-                let body = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&reviewer))?
-                    .unwrap_or_default();
+                let body = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&reviewer))?;
                 let token = parse_review_token(&body).ok_or_else(|| {
                     anyhow!(
                         "reviewer reply missing APPROVE|CHANGES:|VERIFIED|REJECT: token: {body}"
@@ -14708,8 +14709,7 @@ fn cmd_plan_review(
                     Some(&thread),
                 )?;
                 settle_agent(&*mux, &reviewer)?;
-                let rev2 = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&reviewer))?
-                    .unwrap_or_default();
+                let rev2 = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&reviewer))?;
                 let token2 = parse_review_token(&rev2).ok_or_else(|| {
                     anyhow!("verify reply missing VERIFIED|REJECT: token: {rev2}")
                 })?;
@@ -14823,37 +14823,84 @@ fn mail_send(
     }))?)
 }
 
-/// Harvest the latest message in a thread from a sender (recency-ranked).
+/// Pure selection of the newest in-thread row from `sender` over
+/// inbox-projection rows (the FTS-free path shared by harvest + reply
+/// verification). Matches the sender NAME (toron resolves registered npubs;
+/// agent-mail returns `from` directly) or the raw npub hex (toron's
+/// fallback when the sender never registered). Newest wins.
+///
+/// governed-by: ADR-0001 §9.1 (bd-debate-harvest-dsww / bd-debate-reply-routing-99ad)
+fn newest_in_thread<'a>(
+    items: &'a [backend::MailItem],
+    thread: &str,
+    sender: &str,
+    sender_npub: &str,
+) -> Option<&'a backend::MailItem> {
+    items
+        .iter()
+        .filter(|m| m.thread_id.as_ref().map(|t| t.as_str()) == Some(thread))
+        .filter(|m| m.sender == sender || (!sender_npub.is_empty() && m.sender == sender_npub))
+        .max_by_key(|m| m.created_ts_us)
+}
+
+/// Harvest the newest in-thread reply from `sender` via the INBOX
+/// PROJECTION (fetch_inbox), not FTS search — hyphenated thread ids like
+/// `debate-20260806T130548` are not reliably phrase-searchable in FTS5
+/// (index-coverage gap, cf bd-debate-harvest-dsww), so a fresh thread can
+/// be invisible to `search_messages` while the reply sits in the inbox.
+/// The orchestrator's own inbox carries every in-thread message with its
+/// exact `thread_id` — match client-side, newest wins.
+///
+/// Inbox rows carry the sender NAME (toron resolves registered npubs;
+/// agent-mail returns `from` directly) or the raw npub hex — whois
+/// resolves the name so both match. Fails loudly (bail) when the thread
+/// has no readable reply from `sender`: never ships an empty counter or
+/// verdict prompt.
+///
+/// review-fix F1: the debate/plan-review patterns need the reply BODY
+/// (the argument / the APPROVE|CHANGES: token), not the subject line.
+///
+/// governed-by: ADR-0001 §9.1/§9.2 (bd-debate-harvest-dsww)
 fn harvest_latest(
     mail: &dyn backend::MailSurface,
     key: &str,
     thread: &str,
     sender: &str,
-) -> Result<Option<String>> {
-    let items = backend::run_mail(mail.search(&backend::SearchQuery {
+) -> Result<String> {
+    let sender_npub = backend::run_mail(mail.whois(key, sender))
+        .map(|w| w.npub)
+        .unwrap_or_default();
+    // limit: None — the inbox projects oldest-first (G7 rumor time), so a
+    // bounded `take` would keep the OLDEST rows and could drop a fresh
+    // debate thread entirely. Full projection, client-side filter.
+    let items = backend::run_mail(mail.inbox(&backend::InboxQuery {
         project: key.to_string(),
-        query: String::new(),
-        limit: Some(1),
-        sender: Some(sender.to_string()),
-        thread_id: Some(thread.to_string()),
-        ranking: Some("recency".to_string()),
-        // review-fix F1: search_messages returns subject-only unless
-        // include_body_md is set — the debate/plan-review patterns need
-        // the reply BODY (the argument / the APPROVE|CHANGES: token),
-        // not the subject line.
-        include_body_md: true,
-        ..Default::default()
+        agent: mail.agent_name().to_string(),
+        unread_only: false,
+        include_bodies: true,
+        limit: None,
+        urgent_only: false,
+        since_ts: None,
     }))?;
-    // body_md first, then body, then subject — mirrors the precedence in
-    // extract_xproj_from_inbox so a body-bearing envelope wins over the
-    // subject even if a server version omits one of the body keys.
-    Ok(items.first().map(|m| {
-        if !m.body_md.is_empty() {
-            m.body_md.trim().to_string()
-        } else {
-            m.subject.trim().to_string()
-        }
-    }))
+    let body = newest_in_thread(&items, thread, sender, &sender_npub)
+        .map(|m| {
+            // body_md first, then subject — mirrors the precedence in
+            // extract_xproj_from_inbox so a body-bearing envelope wins.
+            if m.body_md.is_empty() {
+                m.subject.trim().to_string()
+            } else {
+                m.body_md.trim().to_string()
+            }
+        })
+        .filter(|s| !s.is_empty());
+    match body {
+        Some(b) => Ok(b),
+        None => bail!(
+            "harvest_latest: no in-thread reply from {sender} in thread {thread} \
+             (inbox projection has no matching row) — the reply never landed, \
+             do not ship an empty prompt"
+        ),
+    }
 }
 
 fn cmd_upgrade() -> Result<()> {
@@ -16398,28 +16445,36 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
 /// bd-a7j: newest (message id, sender) in a thread from a sender —
 /// recency-ranked, so `verify` = "did the thread move after dispatch?".
 ///
-/// NOTE: the toron-core search sender filter currently binds a NAME against
-/// the `sender_pubkey` column (returns nothing), so the thread is fetched
-/// without the sender filter and filtered by sender client-side. The thread
-/// is small (a collab question + replies); recency rank keeps the newest.
+/// Read via the INBOX PROJECTION (fetch_inbox), not FTS search: hyphenated
+/// thread ids are not reliably phrase-searchable in FTS5 (index-coverage
+/// gap, cf bd-debate-reply-routing-99ad), so a reply can sit in the
+/// orchestrator inbox while `search_messages(thread_id=...)` returns
+/// nothing — the check falsely reports "no reply". Inbox rows carry the
+/// sender NAME (toron resolves registered npubs) or the raw npub hex —
+/// whois resolves the name so both match.
+///
+/// governed-by: ADR-0001 §9.1 (bd-debate-reply-routing-99ad)
 fn thread_head(
     mail: &dyn backend::MailSurface,
     key: &str,
     thread: &str,
     sender: &str,
 ) -> Result<Option<(String, String)>> {
-    let items = backend::run_mail(mail.search(&backend::SearchQuery {
+    let sender_npub = backend::run_mail(mail.whois(key, sender))
+        .map(|w| w.npub)
+        .unwrap_or_default();
+    // limit: None — the inbox projects oldest-first (G7 rumor time), so a
+    // bounded `take` would keep the OLDEST rows and could drop the reply.
+    let items = backend::run_mail(mail.inbox(&backend::InboxQuery {
         project: key.to_string(),
-        query: String::new(),
-        limit: Some(20),
-        thread_id: Some(thread.to_string()),
-        ranking: Some("recency".to_string()),
-        include_body_md: true,
-        ..Default::default()
+        agent: mail.agent_name().to_string(),
+        unread_only: false,
+        include_bodies: false,
+        limit: None,
+        urgent_only: false,
+        since_ts: None,
     }))?;
-    Ok(items
-        .iter()
-        .find(|m| m.sender == sender)
+    Ok(newest_in_thread(&items, thread, sender, &sender_npub)
         .map(|m| (m.id.to_string(), m.sender.clone())))
 }
 
@@ -17614,6 +17669,77 @@ mod plan_review_tests {
             "result": [{"id": 3, "subject": "   ", "body_md": ""}]
         });
         assert_eq!(extract_latest_body(&v), None);
+    }
+
+    /// bd-debate-harvest-dsww: inbox-projection selection replaces FTS
+    /// search — a hyphenated thread id (`debate-20260806T130548`) must
+    /// match EXACTLY on the row's thread_id (no FTS tokenization), the
+    /// newest in-thread row from the sender wins, and rows outside the
+    /// thread or from other senders never leak in.
+    #[test]
+    fn newest_in_thread_matches_exact_thread_and_newest() {
+        let mk =
+            |id: &str, sender: &str, thread: Option<&str>, ts: i64, body: &str| backend::MailItem {
+                id: backend::MessageId::from(id),
+                sender: sender.to_string(),
+                subject: format!("Re: [debate] prop {id}"),
+                body_md: body.to_string(),
+                importance: "high".to_string(),
+                ack_required: true,
+                thread_id: thread.map(backend::MessageId::from),
+                created_ts_us: ts,
+                duplicate_of: None,
+            };
+        let thread = "debate-20260806T130548";
+        let rows = vec![
+            mk("o1", "CoralFinch", Some(thread), 1_000, "opening prompt"),
+            mk("r1", "TopazOx", Some(thread), 2_000, "counter one"),
+            mk("r2", "TopazOx", Some(thread), 3_000, "counter two"),
+            mk("x1", "TopazOx", Some("debate-other"), 9_000, "other thread"),
+            mk(
+                "x2",
+                "CoralFinch",
+                Some(thread),
+                9_500,
+                "orchestrator prompt",
+            ),
+        ];
+        // newest TopazOx row in THIS thread wins, other thread/sender excluded
+        let hit = newest_in_thread(&rows, thread, "TopazOx", "").expect("reply must be found");
+        assert_eq!(hit.id.to_string(), "r2");
+        assert_eq!(hit.body_md, "counter two");
+        // no reply yet → None (harvest then bails loudly, never ships empty)
+        assert!(newest_in_thread(&rows, thread, "NeverReplied", "").is_none());
+    }
+
+    /// bd-debate-harvest-dsww / bd-debate-reply-routing-99ad: the sender
+    /// matches by NAME (toron resolves registered npubs, agent-mail returns
+    /// `from`) AND by raw npub hex (toron's fallback when the sender never
+    /// registered) — both inbox projections land in the same match.
+    #[test]
+    fn newest_in_thread_matches_name_or_npub() {
+        let mk = |id: &str, sender: &str, ts: i64| backend::MailItem {
+            id: backend::MessageId::from(id),
+            sender: sender.to_string(),
+            subject: "Re: [debate] prop".to_string(),
+            body_md: "arg".to_string(),
+            importance: "high".to_string(),
+            ack_required: true,
+            thread_id: Some(backend::MessageId::from("debate-20260806T130548")),
+            created_ts_us: ts,
+            duplicate_of: None,
+        };
+        let npub = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        // name-only rows: the NAME matches
+        let rows = vec![mk("n1", "TopazOx", 1_000), mk("n3", "someone-else", 3_000)];
+        let by_name = newest_in_thread(&rows, "debate-20260806T130548", "TopazOx", npub).unwrap();
+        assert_eq!(by_name.id.to_string(), "n1");
+        // raw-hex rows only (unregistered sender): the NPUB matches
+        let rows = vec![mk("n2", npub, 2_000), mk("n3", "someone-else", 3_000)];
+        let by_npub = newest_in_thread(&rows, "debate-20260806T130548", "TopazOx", npub).unwrap();
+        assert_eq!(by_npub.id.to_string(), "n2");
+        // npub unknown AND name absent → no match against the hex row
+        assert!(newest_in_thread(&rows, "debate-20260806T130548", "TopazOx", "").is_none());
     }
 
     /// review-fix F2: the gate is a real state machine, not a single pass.
