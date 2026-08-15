@@ -521,6 +521,107 @@ steps:
     on_error: fail_run
 "##,
     ),
+    (
+        "prototype",
+        r##"
+name: prototype
+description: "Exhaust-the-design-space (ADR-0019 Spec 7.2, as amended 2026-08-15 — no /tmp crate-copy): n arms (2-3) prototype the question, an @oracle judge picks ONE. Sketch mode (default): arms run PARALLEL and write NON-COMPILING design sketches — API shapes, state machines, tradeoff table — TEXT ONLY to /tmp/flywheel-proto-<run>-<arm>/; no crate copy, no br, no .beads/ writes. Compile mode: arms run SEQUENTIALLY (one at a time) in the primary tree on a scratch git ref under the build slot; arm N+1 starts only after arm N is measured and reset. Judge compares on named criteria, picks one, discards the rest; no merge of a bit-of-each unless the oracle writes a graft bead. Principles: exhaust-the-design-space, separate-before-serializing-shared-state."
+trigger:
+  type: webhook
+crew: auto
+principles:
+  - exhaust-the-design-space
+  - separate-before-serializing-shared-state
+inputs:
+  - name: question
+  - name: n
+    default: 2
+  - name: mode
+    default: sketch
+  - name: run
+  - name: arms
+graph:
+  nodes:
+    arms:
+      action: branch
+      if: "str_contains(trigger_inputs, \"compile\")"
+      then:
+        - name: arm
+          action: foreach
+          build_slot: true
+          over: "{{inputs.arms}}"
+          each:
+            action: dispatch_job
+            assignee: x
+            build_slot: true
+            spec: { profile: "@coder", harness: "opencode", task: "PROTOTYPE COMPILE ARM {{item}} (of {{inputs.arms}}): implement your arm of the question in the PRIMARY TREE on a SCRATCH git ref (branch off current HEAD, never a herdr worktree). Question: {{inputs.question}}. One arm at a time: after implementing, MEASURE (build + test under the build slot — toron slot acquire before any cargo) and RESET the tree (git checkout the base + clean) so arm {{item}} leaves NO residue — the next arm starts only after your reset. No br, no .beads/ writes. Report: what you built, the measurement result, the reset proof." }
+      else:
+        - name: arm
+          action: parallel
+          over: "{{inputs.n}}"
+          each:
+            action: dispatch_job
+            assignee: x
+            spec: { profile: "@coder", harness: "opencode", task: "PROTOTYPE SKETCH ARM (you are ONE of {{inputs.n}} arms): NON-COMPILING design sketch for the question — API shapes, state machines, a tradeoff table, and the blast radius of each choice. Write TEXT ONLY to /tmp/flywheel-proto-{{inputs.run}}-<YOUR-AGENT-NAME>/ (no crate copy, no compile, no br, no .beads/ writes, no worktree). Question: {{inputs.question}}." }
+    judge:
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@oracle", harness: "opencode", task: "Judge the prototype arms for: {{inputs.question}}. Compare on the named criteria (fit to the question, design quality, feasibility, blast radius). Arms (branch envelope — the collected arm reports live under outputs.arm): {{steps.arms}}. Pick ONE; the others are DISCARDED. No merge of a bit-of-each unless you write a graft bead for the merged design. Report: chosen arm + the comparison table." }
+      needs: [arms]
+      on_error: fail_run
+"##,
+    ),
+    (
+        "arena",
+        r##"
+name: arena
+description: "Model race (ADR-0019 Spec 7.2 arena): same shape as prototype but the arms may run the SAME brief on DIFFERENT models — the race is in the models, not the tree. Selection rule declared UP FRONT via the `selection` input: first-pass (pick the first arm that clears the bar) | rank-all (rank every arm) | best-of (pick the best). Sketch arms: parallel, text-only under /tmp/flywheel-proto-<run>-<arm>/; compile arms: SEQUENTIAL on the build slot, one arm at a time on a scratch ref, measure + reset between arms. The @oracle judge keeps the comparison TABLE, not raw dumps (guard-the-context-window). Principles: exhaust-the-design-space, guard-the-context-window."
+trigger:
+  type: webhook
+crew: auto
+principles:
+  - exhaust-the-design-space
+  - guard-the-context-window
+inputs:
+  - name: question
+  - name: n
+    default: 2
+  - name: mode
+    default: sketch
+  - name: selection
+  - name: run
+  - name: arms
+graph:
+  nodes:
+    arms:
+      action: branch
+      if: "str_contains(trigger_inputs, \"compile\")"
+      then:
+        - name: arm
+          action: foreach
+          build_slot: true
+          over: "{{inputs.arms}}"
+          each:
+            action: dispatch_job
+            assignee: x
+            build_slot: true
+            spec: { profile: "@coder", harness: "opencode", task: "ARENA COMPILE ARM {{item}} (of {{inputs.arms}}): run the SAME brief on YOUR assigned model on the SCRATCH git ref in the PRIMARY TREE (no herdr worktree). Brief: {{inputs.question}}. One arm at a time under the build slot (toron slot acquire before any cargo): after implementing, MEASURE (build + test) and RESET the tree (git checkout base + clean) — arm {{item}} must leave no residue; the next arm starts only after your reset. No br, no .beads/ writes. Report: model used, what you built, measurement, reset proof." }
+      else:
+        - name: arm
+          action: parallel
+          over: "{{inputs.n}}"
+          each:
+            action: dispatch_job
+            assignee: x
+            spec: { profile: "@coder", harness: "opencode", task: "ARENA SKETCH ARM (you are ONE of {{inputs.n}} arms): NON-COMPILING design sketch for the SAME brief on your assigned model — API shapes, state machines, tradeoff table. Write TEXT ONLY to /tmp/flywheel-proto-{{inputs.run}}-<YOUR-AGENT-NAME>/ (no crate copy, no br, no .beads/ writes, no worktree). Brief: {{inputs.question}}." }
+    judge:
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@oracle", harness: "opencode", task: "Judge the arena arms for: {{inputs.question}}. SELECTION RULE (declared up front): {{inputs.selection}} — first-pass: pick the first arm that clears the bar; rank-all: rank every arm; best-of: pick the best. Arms (branch envelope — collected arm reports under outputs.arm): {{steps.arms}}. Output the comparison TABLE (model per arm, verdict per criterion) — the table, not raw dumps. Pick ONE winner; others discarded. No merge of a bit-of-each unless you write a graft bead." }
+      needs: [arms]
+      on_error: fail_run
+"##,
+    ),
 ];
 
 /// Load the compiled-in built-in workflows as parsed `Workflow`s.
@@ -888,6 +989,175 @@ mod tests {
         let wfs = builtin_workflows();
         for name in ["onboard", "triage-deep", "plan-review"] {
             assert!(wfs.contains_key(name), "built-in {name} present (bd-oj9o)");
+        }
+    }
+
+    /// ADR-0019 Spec 7.2 (amended): prototype + arena are builtins; the
+    /// inputs carry the structural contracts (n default 2 = the min, mode
+    /// default sketch, selection required on arena).
+    #[test]
+    fn prototype_and_arena_present_with_structural_defaults() {
+        use toron_workflow::schema::{InputDecl, Workflow};
+        let wfs = builtin_workflows();
+        for name in ["prototype", "arena"] {
+            assert!(wfs.contains_key(name), "built-in {name} present");
+            let wf: &Workflow = &wfs[name];
+            let input = |n: &str| {
+                wf.inputs
+                    .iter()
+                    .find(|i: &&InputDecl| i.name == n)
+                    .unwrap_or_else(|| panic!("{name} input {n}"))
+            };
+            // n: default 2 (min 2 — n=1 fails lint, lands with w2-lints).
+            assert_eq!(input("n").default.as_ref(), Some(&serde_json::json!(2)));
+            // mode: default sketch.
+            assert_eq!(
+                input("mode").default.as_ref(),
+                Some(&serde_json::json!("sketch"))
+            );
+            // arena declares the selection rule UP FRONT (first-pass | rank-all | best-of).
+            if name == "arena" {
+                assert!(
+                    input("selection").default.is_none(),
+                    "selection is caller-declared"
+                );
+            }
+        }
+    }
+
+    /// ADR-0019 Spec 7.2: prototype arms branch on mode — compile = SEQUENTIAL
+    /// foreach (build_slot: true, scratch ref, measure+reset) and sketch =
+    /// PARALLEL fan-out; the @oracle judge needs the arms node.
+    #[test]
+    fn prototype_branches_on_mode_and_oracle_judges() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let proto = &wfs["prototype"];
+        let g = proto.graph.as_ref().expect("graph present");
+        // arms node is a branch (mode switch)
+        let arms = &g.nodes["arms"];
+        let Action::Branch {
+            if_guard,
+            then,
+            else_steps,
+        } = &arms.action
+        else {
+            panic!("arms must branch on mode, got {:?}", arms.action);
+        };
+        assert!(
+            if_guard.contains("compile"),
+            "compile branch guard: {if_guard}"
+        );
+        // compile arm: foreach over {{inputs.arms}}, build_slot declared
+        assert_eq!(then.len(), 1, "one compile arm step");
+        assert!(
+            matches!(then[0].action, Action::Foreach { .. }),
+            "compile arms are sequential foreach"
+        );
+        assert!(
+            then[0].build_slot,
+            "compile arm serializes on the build slot"
+        );
+        // sketch arm: parallel over {{inputs.n}}, no build slot
+        assert_eq!(else_steps.len(), 1, "one sketch arm step");
+        assert!(
+            matches!(&else_steps[0].action, Action::Parallel { over, .. } if over == "{{inputs.n}}"),
+            "sketch arms fan out in parallel"
+        );
+        assert!(
+            !else_steps[0].build_slot,
+            "sketch arms write text only, no slot"
+        );
+        // judge: @oracle needs arms
+        let judge = &g.nodes["judge"];
+        assert!(judge.needs.contains(&"arms".to_string()));
+        let Action::DispatchJob { spec, .. } = &judge.action else {
+            panic!("judge is a dispatch");
+        };
+        let task = spec
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .expect("judge task");
+        assert!(task.contains("@oracle") || spec.get("profile").is_some());
+        assert!(task.contains("{{steps.arms}}"), "judge consumes the arms");
+    }
+
+    /// ADR-0019 Spec 7.2: arena carries the same shape PLUS the declared-up-front
+    /// selection rule (first-pass | rank-all | best-of) in the judge task.
+    #[test]
+    fn arena_declares_selection_rule_up_front() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let arena = &wfs["arena"];
+        let g = arena.graph.as_ref().expect("graph present");
+        let judge = &g.nodes["judge"];
+        let Action::DispatchJob { spec, .. } = &judge.action else {
+            panic!("judge is a dispatch");
+        };
+        let task = spec
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .expect("judge task");
+        assert!(
+            task.contains("{{inputs.selection}}"),
+            "selection rule declared up front"
+        );
+        assert!(task.contains("first-pass"), "first-pass documented");
+        assert!(task.contains("rank-all"), "rank-all documented");
+        assert!(task.contains("best-of"), "best-of documented");
+        assert!(
+            task.contains("comparison TABLE"),
+            "parent keeps the table, not raw dumps"
+        );
+    }
+
+    /// ADR-0019 Spec 7.2: neither prototype nor arena carries any
+    /// worktree/br/.beads surface — the dispatch text bans them per arm and
+    /// the workflows declare no worktree action (compile-enforced).
+    #[test]
+    fn prototype_arena_arms_ban_worktree_br_beads() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        for name in ["prototype", "arena"] {
+            let wf = &wfs[name];
+            let g = wf.graph.as_ref().expect("graph");
+            let Action::Branch {
+                then, else_steps, ..
+            } = &g.nodes["arms"].action
+            else {
+                panic!("{name}: arms is a branch");
+            };
+            for step in then.iter().chain(else_steps.iter()) {
+                let action = &step.action;
+                let (Action::Foreach { each, .. } | Action::Parallel { each, .. }) = action else {
+                    continue;
+                };
+                let Action::DispatchJob { spec, .. } = &each.action else {
+                    panic!("{name}: arm each is a dispatch_job");
+                };
+                let task = spec
+                    .get("task")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("{name} arm dispatch task");
+                // the ban is EXPLICIT (no worktree) and no creation
+                // instruction exists (no `git worktree` command text)
+                assert!(
+                    task.contains("worktree"),
+                    "{name} arm bans worktrees explicitly: {task}"
+                );
+                assert!(
+                    !task.contains("git worktree") && !task.contains("worktree create"),
+                    "{name} arm must never instruct a worktree create: {task}"
+                );
+                assert!(
+                    task.to_lowercase().contains("no br"),
+                    "{name} arm bans br: {task}"
+                );
+                assert!(
+                    task.contains(".beads/"),
+                    "{name} arm bans .beads/ writes: {task}"
+                );
+            }
         }
     }
 
@@ -1292,24 +1562,37 @@ mod tests {
             let wf = &wfs[name];
             assert_eq!(wf.crew, Some(CrewSpec::Auto), "{name} is crew: auto");
             let input_names: Vec<&str> = wf.inputs.iter().map(|i| i.name.as_str()).collect();
-            assert!(!input_names.is_empty(), "{name} declares inputs: {input_names:?}");
+            assert!(
+                !input_names.is_empty(),
+                "{name} declares inputs: {input_names:?}"
+            );
         }
         // the exact input contracts
         let bug = &wfs["bug-fix"];
         assert_eq!(
-            bug.inputs.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            bug.inputs
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["symptom", "repro"],
             "bug-fix inputs"
         );
         let feat = &wfs["feature"];
         assert_eq!(
-            feat.inputs.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            feat.inputs
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["objective", "data_shape"],
             "feature inputs — data_shape REQUIRED (lint)"
         );
         let refac = &wfs["refactoring"];
         assert_eq!(
-            refac.inputs.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            refac
+                .inputs
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["target", "invariant_cmd"],
             "refactoring inputs"
         );
@@ -1343,8 +1626,14 @@ mod tests {
         let Action::DispatchJob { spec, .. } = &graph.nodes["prove"].action else {
             panic!("prove is a dispatch_job");
         };
-        assert_eq!(spec.get("profile").and_then(Value::as_str), Some("@reviewer"));
-        assert_eq!(spec.get("harness").and_then(Value::as_str), Some("opencode"));
+        assert_eq!(
+            spec.get("profile").and_then(Value::as_str),
+            Some("@reviewer")
+        );
+        assert_eq!(
+            spec.get("harness").and_then(Value::as_str),
+            Some("opencode")
+        );
     }
 
     /// The principle tags ride in the raw YAML with their CANONICAL names
@@ -1360,9 +1649,30 @@ mod tests {
                 .expect(name)
         };
         let cases = [
-            ("bug-fix", ["fix-root-causes", "prove-it-works", "sequence-verifiable-units"]),
-            ("feature", ["foundational-thinking", "model-the-domain", "prove-it-works"]),
-            ("refactoring", ["laziness-protocol", "subtract-before-you-add", "prove-it-works"]),
+            (
+                "bug-fix",
+                [
+                    "fix-root-causes",
+                    "prove-it-works",
+                    "sequence-verifiable-units",
+                ],
+            ),
+            (
+                "feature",
+                [
+                    "foundational-thinking",
+                    "model-the-domain",
+                    "prove-it-works",
+                ],
+            ),
+            (
+                "refactoring",
+                [
+                    "laziness-protocol",
+                    "subtract-before-you-add",
+                    "prove-it-works",
+                ],
+            ),
         ];
         for (name, tags) in cases {
             let yaml = yaml_for(name);
