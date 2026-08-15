@@ -265,7 +265,7 @@ enum Commands {
         to: String,
         #[arg(long)]
         lines: Option<u32>,
-        #[arg(long, default_value = "recent")]
+        #[arg(long, default_value = "recent_unwrapped")]
         source: String,
     },
     /// Read an agent's output from the opencode structured session store
@@ -4477,18 +4477,40 @@ mod workspace_origin_tests {
 #[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
 /// bd-bug-omp-herdr-wedge: harnesses whose herdr integration holds FULL
 /// lifecycle-hook authority (herdr skips screen/process detection for them)
-/// only open the agent.prompt gate after their integration reports a
-/// processed prompt. Prime that gate at boot with a neutral message.
-/// Empirically verified on herdr 0.8.0-preview (2026-08-15): omp, pi AND
-/// grok all show `screen_detection_skip_reason: full_lifecycle_hook_authority`
-/// (or the bundled-manifest twin) and gate agent.prompt on "active named
-/// agent" until their herdr integration reports a processed prompt. opencode
-/// is the exception (no herdr extension on this host; fallback detection —
-/// delivered without a prime). If a future preview changes any kind's
-/// manifest, adjust THIS list; the env injection is already universal.
-const HERDR_HOOK_AUTHORITY_KINDS: &[&str] = &["omp", "pi", "grok"];
-fn needs_boot_prime(kind: &str) -> bool {
-    HERDR_HOOK_AUTHORITY_KINDS.contains(&kind)
+/// The neutral boot prompt that opens the agent.prompt gate. H2
+/// (bd-harness-pane-send-text-7fe8): delivered via `pane.send_text` after the
+/// TUI owns the foreground (works for any kind, non-agent panes too), not as
+/// a positional MESSAGES launch arg.
+///
+/// Lifecycle-authority kinds — pi/omp/kimi/opencode/kilo/mastracode (+grok) —
+/// gate agent.prompt on a processed prompt when their herdr integration is
+/// reporting; the prime is harmless for all kinds and removes the
+/// detection-class race entirely (bd-bug-omp-herdr-wedge, H5
+/// bd-harness-prime-kind-list-eivx).
+fn boot_prime_line() -> &'static str {
+    "Boot ready check: reply exactly READY and await captain instructions."
+}
+
+/// Kinds that require the prime as a positional launch arg (secondary path —
+/// kept for kinds that cannot take typed TUI input). Primary is
+/// [`prime_via_send_text`]; currently no kind needs the in-arg form.
+fn needs_in_arg_prime(_kind: &str) -> bool {
+    false
+}
+
+/// Prime the agent.prompt gate via `pane.send_text` + Enter (H2): replaces
+/// the char-by-char send-keys hack (send-keys rejects multi-char text:
+/// `invalid_key`) and the MESSAGES-arg boot prime. Best-effort — a failed
+/// prime warns but never fails the spawn.
+fn prime_via_send_text(c: &mut Client, pane_id: &str) {
+    let res = c
+        .pane_send_text(pane_id, boot_prime_line())
+        .and_then(|_| c.pane_send_input(pane_id, &["Enter"]));
+    if let Err(e) = res {
+        eprintln!(
+            "flywheel: warn: boot-prime via pane.send_text failed for {pane_id}: {e:#}"
+        );
+    }
 }
 
 fn cmd_spawn(
@@ -4816,20 +4838,15 @@ projects available: {}",
 
             let has_peer_prime = !peer_args.is_empty();
             agent_args.extend(peer_args);
-            // bd-bug-omp-herdr-wedge: with the HERDR_* env injected at
-            // workspace_create, omp's integration activates but only reports
-            // agent_start once omp PROCESSES a prompt — and agent.prompt is
-            // gated on that report (deadlock). Prime the gate at boot with a
-            // neutral message as a positional MESSAGES arg AFTER the model
-            // flags (omp processes it on startup and stays in REPL). Kinds
-            // with herdr fallback detection (opencode) need no prime. If a
-            // peer template was already supplied it IS the prime — do not
-            // stack.
-            if needs_boot_prime(&kind) && !has_peer_prime {
-                agent_args.push(
-                    "Boot ready check: reply exactly READY and await captain instructions."
-                        .to_string(),
-                );
+            // H2 (bd-harness-pane-send-text-7fe8): the boot prime is typed
+            // into the pane via pane.send_text AFTER the TUI owns the
+            // foreground + settle (see below) — works for any kind and for
+            // non-agent panes, replacing the old positional MESSAGES-arg
+            // prime (bd-bug-omp-herdr-wedge). Secondary in-arg path kept for
+            // kinds that need it (needs_in_arg_prime; currently none). A
+            // supplied peer template IS the prime — never stack.
+            if needs_in_arg_prime(&kind) && !has_peer_prime {
+                agent_args.push(boot_prime_line().to_string());
             }
             let agent = start_agent_with_retry(&mut c, &name, &kind, &pane_id, &agent_args)?;
             // bd-eign.6 L1: readiness gate — agent.start returns when the
@@ -4853,6 +4870,14 @@ projects available: {}",
             // spawn command returns (default 30s, observed boot 20-30s).
             if settle_secs > 0 {
                 std::thread::sleep(Duration::from_secs(settle_secs));
+            }
+            // H2 (bd-harness-pane-send-text-7fe8): prime the agent.prompt
+            // gate via pane.send_text once the TUI is input-ready (a prompt
+            // in the boot window is lost to the shell, bd-eign.6). Universal
+            // — any kind, non-agent panes too. Peer templates are their own
+            // prime; never stack.
+            if !has_peer_prime {
+                prime_via_send_text(&mut c, &pane_id);
             }
             // governed-by: ADR-0001 (mail-register-on-spawn) — the spawned
             // agent was already registered (S8.3, above, before the launch
@@ -6302,17 +6327,27 @@ fn cmd_add(
             )?;
             prev = p.pane_id.clone();
             let mut add_args: Vec<String> = Vec::new();
-            // bd-bug-omp-herdr-wedge: same boot-prime contract as spawn —
-            // omp's herdr integration must process ONE prompt before herdr
-            // opens the agent.prompt gate; add-created panes need the prime
-            // too (empty args leave the gate closed forever).
-            if needs_boot_prime(&kind) {
-                add_args.push(
-                    "Boot ready check: reply exactly READY and await captain instructions."
-                        .to_string(),
-                );
+            // H2 (bd-harness-pane-send-text-7fe8): same boot-prime contract
+            // as spawn — the prime is typed via pane.send_text after the TUI
+            // owns the foreground (below), not pushed as a positional
+            // MESSAGES arg. In-arg secondary kept for kinds that need it.
+            if needs_in_arg_prime(&kind) {
+                add_args.push(boot_prime_line().to_string());
             }
             let agent = start_agent_with_retry(&mut c, &name, &kind, &prev, &add_args)?;
+            // H2: the add path has no settle — wait for the TUI to own the
+            // foreground (bd-eign.6, same 15s contract as spawn) before the
+            // send_text prime, so it is not lost to the shell.
+            let _ = herdr_shim::wait_agent_foreground(
+                &mut c,
+                &prev,
+                &kind,
+                &name,
+                Duration::from_secs(15),
+            );
+            if !needs_in_arg_prime(&kind) {
+                prime_via_send_text(&mut c, &prev);
+            }
             // bd-627z.4: register + pin the mail identity (the add path's
             // registry persists on the next spawn/rebind save).
             let _ = register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
@@ -7516,18 +7551,9 @@ fn client_read_with_fallback(
     source: &str,
     lines: Option<u32>,
 ) -> Result<String> {
-    let raw = match c.agent_read(target, source, lines) {
-        Ok(t) => t,
-        Err(e) if source != "visible" && e.to_string().contains("agent_not_idle") => {
-            eprintln!(
-                "flywheel: {target} is working — {source} history unavailable (alternate screen); showing the visible buffer instead (attach for full history)"
-            );
-            c.agent_read(target, "visible", lines).map_err(|e2| {
-                anyhow!("{target}: agent_not_idle fallback to visible failed: {e2} ({e})")
-            })?
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let mut ops = herdr_shim::ClientAltScreenRead::new(c, target, lines);
+    let raw = alt_screen_read_ladder(&mut ops, source)
+        .map_err(|e| anyhow!("{target}: alt-screen read failed: {e:#}"))?;
     Ok(sanitize_pane_text(&raw))
 }
 
@@ -8302,6 +8328,15 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
             let name = mail.name.clone();
+            // 2026-08-15: an UNREGISTERED --as identity previously made the
+            // inbox projection scan without an agent scope (multi-second
+            // hang). Fail fast with the registration command instead.
+            if mail.whois(&key, &name).is_err() {
+                anyhow::bail!(
+                    "mail identity {name} is not registered for {project} — register it \
+                     first: flywheel mail register {project} --name <adjnoun-pin>"
+                );
+            }
             // --unread needs the filtered surface; --urgent and the plain
             // path share the legacy inbox() call (toron's in-process fetch
             // ignores urgent_only, the filter applies it in inbox_filtered).
@@ -16360,22 +16395,16 @@ fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
         .ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
     let target = agent_target(&agent).to_string();
-    // bd-fw-view-alt-screen-blocked-ct9: a working agent's `recent` read is
-    // rejected (alternate screen) — fall back to the visible buffer so the
-    // loop's context guard still sees CONTEXT_LIMIT markers mid-task.
-    let text = match backend.agent_read(&target, "recent", 60) {
-        Ok(v) => v,
-        Err(e) if e.to_string().contains("agent_not_idle") => {
-            backend.agent_read(&target, "visible", 60).map_err(|e2| {
-                anyhow!("{target}: agent_not_idle fallback to visible failed: {e2} ({e})")
-            })?
-        }
-        Err(e) => return Err(e.into()),
-    }
-    .get("text")
-    .and_then(serde_json::Value::as_str)
-    .unwrap_or_default()
-    .to_string();
+    // bd-harness-alt-screen-reads (H4): route through the alt-screen ladder —
+    // recent-unwrapped first (wire source `recent_unwrapped`), bounded wait
+    // for idle + retry on agent_not_idle, visible fallback, then the docs'
+    // file-path fallback — so the loop's context guard still sees
+    // CONTEXT_LIMIT markers mid-task.
+    let mut ops = herdr_shim::BackendAltScreenRead::new(&*backend, &target, 60);
+    let text = match alt_screen_read_ladder(&mut ops, herdr_shim::RECENT_UNWRAPPED_SOURCE) {
+        Ok(t) => t,
+        Err(e) => return Err(anyhow!("{target}: alt-screen read failed: {e:#}")),
+    };
     // state-file fallback channel: parse the agent's state file when present.
     // Malformed/absent files yield null — never an error (the loop treats
     // null as "terminal channel only", identical to pre-zwa behavior).
@@ -17463,15 +17492,13 @@ fn cmd_internal_diagnose(cfg: &Config, project: &str, name: &str, reason: &str) 
             return Ok(());
         }
     };
-    // Prefer agent_read (recent, 80 lines); soft on failure.
-    match backend.agent_read(name, "recent", 80) {
+    // bd-harness-alt-screen-reads (H4): route through the alt-screen ladder
+    // (recent-unwrapped → wait+retry on agent_not_idle → visible → file
+    // fallback); still soft on failure — the health mail goes out regardless.
+    let mut ops = herdr_shim::BackendAltScreenRead::new(&*backend, name, 80);
+    match alt_screen_read_ladder(&mut ops, herdr_shim::RECENT_UNWRAPPED_SOURCE) {
         Ok(v) => {
-            // herdr returns a string or {text}/array — normalize
-            tail = v
-                .as_str()
-                .map(str::to_string)
-                .or_else(|| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
-                .unwrap_or_else(|| v.to_string());
+            tail = v;
             if tail.len() > 4000 {
                 let start = tail.len().saturating_sub(4000);
                 tail = tail[start..].to_string();
