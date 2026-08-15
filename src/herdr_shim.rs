@@ -202,17 +202,6 @@ pub fn integration_status_all() -> Result<Vec<(String, IntegrationStatus)>> {
     Ok(parse_integration_status_output(&String::from_utf8_lossy(&out.stdout)))
 }
 
-/// Query one kind's integration state. A kind missing from the CLI output
-/// resolves to not-installed (herdr lists every known kind, so absence is
-/// shape drift — never invent a state).
-pub fn integration_status(kind: &str) -> Result<IntegrationStatus> {
-    Ok(integration_status_all()?
-        .into_iter()
-        .find(|(k, _)| k == kind)
-        .map(|(_, s)| s)
-        .unwrap_or_else(IntegrationStatus::not_installed))
-}
-
 /// Install a kind's herdr integration through the socket `integration.install`
 /// method (herdr 0.8.0-preview raw method; the socket is the in-process
 /// surface — `herdr integration install <TARGET>` is the CLI twin). Returns
