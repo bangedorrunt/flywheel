@@ -325,7 +325,9 @@ pub fn operator_key_configured() -> bool {
         return true;
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    Path::new(&home).join(".config/toron/operator_nsec").exists()
+    Path::new(&home)
+        .join(".config/toron/operator_nsec")
+        .exists()
 }
 
 /// Pure: is the `--allow-worktree` opt-out legal? It is operator-only —
@@ -493,7 +495,10 @@ mod tests {
             worktree_optout_legal(true, true),
             "operator key configured -> opt-out legal"
         );
-        assert!(worktree_optout_legal(false, false), "no opt-out, no key -> fine");
+        assert!(
+            worktree_optout_legal(false, false),
+            "no opt-out, no key -> fine"
+        );
         assert!(worktree_optout_legal(false, true));
     }
 
