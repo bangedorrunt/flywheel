@@ -339,6 +339,13 @@ enum Commands {
         #[arg(long)]
         force_working: bool,
     },
+    /// bead-verdict ledger (ADR-0019): br gate wrappers + receipt helper.
+    /// `check` exits 0 only on a legal verdict for the current SHA; `receipt`
+    /// writes only the receipt file (workers never write verdicts).
+    Ledger {
+        #[command(subcommand)]
+        cmd: LedgerCmd,
+    },
     /// Work-graph surfaces (bv/br pass-through)
     Work {
         #[command(subcommand)]
@@ -959,6 +966,41 @@ enum WorkCmd {
     Plan,
     /// br ready --json: ready beads
     Ready,
+}
+
+#[derive(Subcommand)]
+enum LedgerCmd {
+    /// wrap `br gate list <id> --json` + legal_close; exit 0 only on a legal
+    /// verdict bound to the current SHA (ADR-0019 Spec 1, SHA rule — no bare
+    /// HEAD fallback)
+    Check {
+        bead_id: String,
+        /// blast radius (ADR-0019): normal|high (default normal)
+        #[arg(long, value_parser = ["normal", "high"], default_value = "normal")]
+        blast: String,
+        /// AC shape: checkable|judgment (default checkable)
+        #[arg(long, value_parser = ["checkable", "judgment"], default_value = "checkable")]
+        ac: String,
+        /// repo dir for SHA derivation + br (default: current directory)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// worker helper: write ONLY the receipt file
+    /// `.flywheel/receipts/<bead-id>-<sha>.<kind>.txt` (refuses empty stdin).
+    /// Workers never write verdicts — this writes evidence, not proof.
+    Receipt {
+        bead_id: String,
+        /// verdict kind (kebab): command-verified | unit-test-verified |
+        /// live-verified | reviewer-signed | worker-receipt
+        #[arg(long)]
+        kind: String,
+        /// commit SHA (default: derived via git log --grep=<bead-id>)
+        #[arg(long)]
+        sha: Option<String>,
+        /// repo dir (default: current directory)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2791,7 +2833,7 @@ fn main() {
             "commands": [
                 "init spawn add list status decide rebind recover",
                 "send interrupt view output watch zoom attach kill",
-                "loop work assign collab xproj mail toron steer",
+                "loop work assign collab xproj mail toron steer ledger",
                 "coalition debate plan-review profile squad model runs",
                 "workflow cron recipes workflows pipeline template stage ensemble",
                 "checkpoint timeline audit history changes resume analytics",
@@ -3002,6 +3044,7 @@ fn main() {
             force,
             force_working,
         }) => cmd_kill(&cfg, project, *force, *force_working),
+        Some(Commands::Ledger { cmd }) => cmd_ledger(&cfg, cmd),
         Some(Commands::Work { cmd }) => cmd_work(&cfg, cmd),
         Some(Commands::Assign {
             project,
@@ -8271,6 +8314,66 @@ fn cmd_kill(cfg: &Config, project: &str, force: bool, force_working: bool) -> Re
 }
 
 // ---- work / assign ----
+
+/// ADR-0019 `flywheel ledger`: br gate verdict store + receipt helper.
+/// `check` exits 0 only on a legal verdict for the current SHA (SHA rule,
+/// no bare-HEAD fallback). `receipt` writes only the receipt file.
+fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
+    match cmd {
+        LedgerCmd::Check {
+            bead_id,
+            blast,
+            ac,
+            dir,
+        } => {
+            let cwd = dir
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+            // SHA rule first: no commit carries the bead id -> illegal
+            // regardless of verdicts.
+            let sha = verdict::derive_head_sha(&cwd, bead_id)?;
+            let mut bead = verdict::bead_from_br_show(&cwd, bead_id)?;
+            bead.blast = match blast.as_str() {
+                "high" => verdict::Blast::High,
+                _ => verdict::Blast::Normal,
+            };
+            let ac = match ac.as_str() {
+                "judgment" => verdict::AcShape::Judgment,
+                _ => verdict::AcShape::Checkable,
+            };
+            if verdict::ledger_check(&cwd, &bead, ac, &sha)? {
+                println!("ledger check {bead_id}: LEGAL (sha {sha})");
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "ledger check {bead_id}: no legal verdict bound to sha {sha} \
+                     (legal-close table, ADR-0019 Spec 1)"
+                );
+            }
+        }
+        LedgerCmd::Receipt {
+            bead_id,
+            kind,
+            sha,
+            dir,
+        } => {
+            let cwd = dir
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+            let kind = verdict::VerdictKind::from_gate_name(kind)
+                .ok_or_else(|| anyhow::anyhow!("unknown verdict kind: {kind}"))?;
+            let sha = match sha {
+                Some(s) => s.clone(),
+                None => verdict::derive_head_sha(&cwd, bead_id)?,
+            };
+            let mut content = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut content)?;
+            let path = verdict::write_receipt(&cwd, bead_id, &sha, kind, &content)?;
+            println!("receipt {}", path.display());
+            Ok(())
+        }
+    }
+}
 
 fn cmd_work(cfg: &Config, cmd: &WorkCmd) -> Result<()> {
     let cwd = std::env::current_dir()?;

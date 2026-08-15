@@ -124,6 +124,21 @@ impl VerdictKind {
             VerdictKind::VerifierFailed => "verifier-failed",
         }
     }
+
+    /// Inverse of `gate_name` — parse a br gate row's gate name back into a
+    /// kind. Unknown names -> `None` (not a verdict row).
+    pub fn from_gate_name(name: &str) -> Option<VerdictKind> {
+        Some(match name {
+            "command-verified" => VerdictKind::CommandVerified,
+            "unit-test-verified" => VerdictKind::UnitTestVerified,
+            "live-verified" => VerdictKind::LiveVerified,
+            "reviewer-signed" => VerdictKind::ReviewerSigned,
+            "worker-receipt" => VerdictKind::WorkerReceipt,
+            "verifier-blocked" => VerdictKind::VerifierBlocked,
+            "verifier-failed" => VerdictKind::VerifierFailed,
+            _ => return None,
+        })
+    }
 }
 
 /// A recorded proof (ADR-0019 Spec 1). Non-Option by construction: a close
@@ -198,6 +213,280 @@ pub fn legal_close(verdict: &Verdict, bead: &BeadUnit, ac: AcShape) -> bool {
         // Row 5 — never a pass.
         VerdictKind::VerifierBlocked | VerdictKind::VerifierFailed => false,
     }
+}
+
+// ============================================================================
+// br-gate verdict store + receipts (ADR-0019 Spec 1; bd-w1-gate-store-h2ur)
+// The types and the matrix above stay pure; IO lives in this section.
+// ============================================================================
+
+use std::path::Path;
+use std::process::Command as StdCommand;
+
+/// Loop-reporter arm flag. Only the durable loop arms it (durable.rs). A
+/// worker-invoked `br gate report` for a loop-owned bead is rejected while
+/// unarmed — workers never write verdicts (ADR-0019 Spec 1).
+static LOOP_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Arm the loop reporter. Called once by the durable loop at startup
+/// (durable.rs, bd-w1-reopen-f6tw wiring). Idempotent.
+pub fn arm_loop_reporter() {
+    LOOP_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn loop_armed() -> bool {
+    LOOP_ARMED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// One gate row from `br gate list <id> --json` history.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GateRow {
+    pub id: i64,
+    pub issue_id: String,
+    pub from_status: String,
+    pub to_status: String,
+    pub status_revision: i64,
+    pub gate: String,
+    pub provider: String,
+    pub passed: bool,
+    pub note: String,
+    pub recorded_by: String,
+    pub recorded_at: String,
+}
+
+/// `br gate list <id> --json` (unknown fields — legacy_results,
+/// gated_transitions, … — are ignored by serde).
+#[derive(Clone, Debug, Deserialize)]
+pub struct GateList {
+    pub issue_id: String,
+    pub current_status: String,
+    pub history: Vec<GateRow>,
+}
+
+/// Run `br` with `args` in `cwd`; stdout on success, stderr in the error.
+/// Same subprocess style as the existing br calls in the loop (no nested
+/// block_on).
+fn run_br(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let out = StdCommand::new("br")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| anyhow::anyhow!("br not found: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "br {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Record a PASS verdict (ADR-0019 Spec 1): `br gate report <id> --gate
+/// <kind> --provider <actor> --status pass --note "sha=<sha> receipt=<path>"`.
+///
+/// Loop-only: refuses while the loop reporter is not armed (a worker-invoked
+/// report on a loop-owned bead is rejected), and refuses Blocked/Failed —
+/// those are loop state, never gate rows.
+pub fn report_pass(cwd: &Path, verdict: &Verdict) -> anyhow::Result<()> {
+    if !loop_armed() {
+        anyhow::bail!(
+            "verdict reporting is loop-only: a worker-invoked br gate report for a loop-owned bead is rejected"
+        );
+    }
+    if matches!(
+        verdict.kind,
+        VerdictKind::VerifierBlocked | VerdictKind::VerifierFailed
+    ) {
+        anyhow::bail!(
+            "only PASS verdicts are recorded; {:?} is loop state, never a gate row",
+            verdict.kind
+        );
+    }
+    let gate = verdict.kind.gate_name();
+    let note = format!(
+        "sha={} receipt={}",
+        verdict.sha,
+        verdict.receipt_path.display()
+    );
+    let stdout = run_br(
+        cwd,
+        &[
+            "gate",
+            "report",
+            &verdict.bead_id,
+            "--gate",
+            gate,
+            "--provider",
+            verdict.actor.as_str(),
+            "--status",
+            "pass",
+            "--note",
+            &note,
+        ],
+    )?;
+    let _ = stdout;
+    Ok(())
+}
+
+/// Wrap `br gate list <id> --json`.
+pub fn list_gates(cwd: &Path, bead_id: &str) -> anyhow::Result<GateList> {
+    let stdout = run_br(cwd, &["gate", "list", bead_id, "--json"])?;
+    Ok(serde_json::from_str(stdout.trim())?)
+}
+
+/// SHA rule (ADR-0019 Spec 1): the verdict must bind to the commit whose
+/// message carries the bead id. `git log --all -1 --grep=<id> --format=%H`,
+/// no bare-HEAD fallback: no commit carries the id -> the close is illegal
+/// regardless of verdicts.
+pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
+    let out = StdCommand::new("git")
+        .args([
+            "log",
+            "--all",
+            "-1",
+            &format!("--grep={bead_id}"),
+            "--format=%H",
+        ])
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| anyhow::anyhow!("git not found: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git log --grep failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() {
+        anyhow::bail!(
+            "SHA rule: no commit carries the bead id {bead_id} (git log --all --grep) — \
+             close is illegal regardless of verdicts"
+        );
+    }
+    Ok(sha)
+}
+
+/// Rebuild a `BeadUnit` from `br show <id> --json`: priority, title, and the
+/// `## VERIFY` fence parsed from the description (shared parser in durable.rs,
+/// bd-w1-verify-fence). Blast/AC-shape are not in br; the caller supplies them
+/// (the loop derives blast from reservation overlap + AC shape at ready-parse).
+pub fn bead_from_br_show(cwd: &Path, bead_id: &str) -> anyhow::Result<BeadUnit> {
+    #[derive(Deserialize)]
+    struct BrShow {
+        id: String,
+        title: String,
+        priority: u8,
+        description: String,
+    }
+    let stdout = run_br(cwd, &["show", bead_id, "--json"])?;
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())?;
+    let row: BrShow = serde_json::from_value(v[0].clone())?;
+    let verify = crate::durable::parse_verify_fence(&row.description).ok_or_else(|| {
+        anyhow::anyhow!("bead {bead_id}: missing/malformed ## VERIFY fence — refuse to dispatch")
+    })?;
+    Ok(BeadUnit {
+        id: row.id,
+        title: row.title,
+        priority: row.priority,
+        verify,
+        blast: Blast::Normal,
+        owner: None,
+        head_sha: None,
+    })
+}
+
+/// `note` key=value token helpers (ADR-0019 Spec 1: sha + receipt ride in the
+/// report `--note`).
+fn note_token<'a>(note: &'a str, key: &str) -> Option<&'a str> {
+    note.split_whitespace()
+        .find_map(|tok| tok.strip_prefix(key)?.strip_prefix('='))
+}
+
+fn note_has_sha(note: &str, sha: &str) -> bool {
+    note_token(note, "sha").is_some_and(|v| v == sha)
+}
+
+fn note_receipt_path(note: &str) -> Option<PathBuf> {
+    note_token(note, "receipt").map(PathBuf::from)
+}
+
+/// Parse a gate row's `recorded_at` (RFC3339 or the br human format
+/// `%Y-%m-%d %H:%M:%S`).
+fn parse_recorded_at(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|d| d.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|n| n.and_utc())
+        })
+}
+
+/// `flywheel ledger check` core: wrap `br gate list <id> --json`, apply
+/// `legal_close`, and report whether any history row is a legal verdict bound
+/// to `sha`. Exits 0 only on a legal verdict for the current SHA (the CLI
+/// layer maps `Ok(false)` to a non-zero exit).
+pub fn ledger_check(cwd: &Path, bead: &BeadUnit, ac: AcShape, sha: &str) -> anyhow::Result<bool> {
+    let list = list_gates(cwd, &bead.id)?;
+    for row in &list.history {
+        if !row.passed {
+            continue;
+        }
+        let Some(kind) = VerdictKind::from_gate_name(&row.gate) else {
+            continue;
+        };
+        // Blocked/Failed are loop state, never gate rows; if a row somehow
+        // carries them it is not a pass verdict.
+        if matches!(
+            kind,
+            VerdictKind::VerifierBlocked | VerdictKind::VerifierFailed
+        ) {
+            continue;
+        }
+        // The verdict must bind to this SHA (SHA rule): the note carries
+        // `sha=<sha>`.
+        if !note_has_sha(&row.note, sha) {
+            continue;
+        }
+        let Some(at) = parse_recorded_at(&row.recorded_at) else {
+            continue;
+        };
+        let verdict = Verdict {
+            kind,
+            bead_id: bead.id.clone(),
+            sha: sha.to_string(),
+            at,
+            actor: AgentName::new(row.provider.clone()),
+            receipt_path: note_receipt_path(&row.note).unwrap_or_default(),
+            verify_cmd: bead.verify.clone(),
+        };
+        if legal_close(&verdict, bead, ac) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Worker helper: write ONLY the receipt file
+/// `.flywheel/receipts/<bead-id>-<sha>.<kind>.txt`. Refuses empty content.
+/// Workers never write verdicts — this helper writes evidence, not proof.
+pub fn write_receipt(
+    cwd: &Path,
+    bead_id: &str,
+    sha: &str,
+    kind: VerdictKind,
+    content: &str,
+) -> anyhow::Result<PathBuf> {
+    if content.trim().is_empty() {
+        anyhow::bail!("receipt refuses empty content");
+    }
+    let dir = cwd.join(".flywheel").join("receipts");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{bead_id}-{sha}.{}.txt", kind.gate_name()));
+    std::fs::write(&path, content)?;
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -394,5 +683,198 @@ mod tests {
         assert_eq!(n.as_str(), "flywheel-toron-coder1");
         assert_eq!(n.to_string(), "flywheel-toron-coder1");
         assert_ne!(n, AgentName::new("flywheel-toron-coder2"));
+    }
+
+    // ---- bd-w1-gate-store-h2ur: br gate store + receipts + loop guard ----
+
+    /// Scratch workspace: git repo + br tracker + gate policy (spike shape,
+    /// GreenStork 2026-08-16) + one P3 issue with a `## VERIFY` fence + a
+    /// commit whose message carries the bead id (SHA rule). Returns
+    /// `(dir, bead_id)`.
+    fn scratch_workspace(tag: &str) -> (PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = StdCommand::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .output()
+            .expect("git init");
+        assert!(init.status.success(), "git init");
+        let bi = StdCommand::new("br")
+            .arg("init")
+            .current_dir(&dir)
+            .output()
+            .expect("br init");
+        assert!(
+            bi.status.success(),
+            "br init: {}",
+            String::from_utf8_lossy(&bi.stderr)
+        );
+        std::fs::write(
+            dir.join(".beads/policy.yaml"),
+            "workflow:\n  transitions:\n    open:\n      - closed\n  gates:\n    open -> closed:\n      require_all:\n        - command-verified\n",
+        )
+        .unwrap();
+        let created = StdCommand::new("br")
+            .args([
+                "create",
+                "--title",
+                "gate roundtrip",
+                "--slug",
+                "gate-rt-1",
+                "-p",
+                "3",
+                "-d",
+                "work\n\n## VERIFY\n```\ncargo test -p flywheel verdict::\n```",
+            ])
+            .current_dir(&dir)
+            .output()
+            .expect("br create");
+        assert!(
+            created.status.success(),
+            "br create: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let list = StdCommand::new("br")
+            .args(["list", "--json"])
+            .current_dir(&dir)
+            .output()
+            .expect("br list");
+        let v: serde_json::Value = serde_json::from_slice(&list.stdout).expect("br list json");
+        let bead_id = v["issues"][0]["id"].as_str().expect("bead id").to_string();
+        std::fs::write(dir.join("work.txt"), "work\n").unwrap();
+        let add = StdCommand::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .expect("git add");
+        assert!(add.status.success());
+        let cm = StdCommand::new("git")
+            .args([
+                "-c",
+                "user.email=test@test",
+                "-c",
+                "user.name=test",
+                "commit",
+                "-q",
+                "-m",
+                &format!("feat: gate roundtrip ({bead_id})"),
+            ])
+            .current_dir(&dir)
+            .output()
+            .expect("git commit");
+        assert!(
+            cm.status.success(),
+            "git commit: {}",
+            String::from_utf8_lossy(&cm.stderr)
+        );
+        (dir, bead_id)
+    }
+
+    /// Acceptance round-trip: `br gate report` then ledger check legal on the
+    /// same bead — plus the loop-only reporter guard on both paths
+    /// (worker-invoked report blocked, loop path accepted).
+    #[test]
+    fn loop_only_reporter_guard_blocks_workers_then_loop_roundtrips() {
+        let (dir, bead_id) = scratch_workspace("gate-roundtrip");
+        let sha = derive_head_sha(&dir, &bead_id).unwrap();
+        let bead = bead_from_br_show(&dir, &bead_id).unwrap();
+        assert_eq!(bead.priority, 3);
+        assert_eq!(bead.verify, "cargo test -p flywheel verdict::");
+        let v = Verdict {
+            kind: VerdictKind::CommandVerified,
+            bead_id: bead_id.clone(),
+            sha: sha.clone(),
+            at: Utc::now(),
+            actor: AgentName::new("flywheel-toron-loop1"),
+            receipt_path: dir.join(".flywheel/receipts/x.txt"),
+            verify_cmd: bead.verify.clone(),
+        };
+        // worker path: the loop reporter is unarmed -> rejected.
+        let err = report_pass(&dir, &v).unwrap_err();
+        assert!(err.to_string().contains("loop-only"), "{err}");
+        // loop path: armed -> recorded as a PASS gate row.
+        arm_loop_reporter();
+        report_pass(&dir, &v).unwrap();
+        let list = list_gates(&dir, &bead_id).unwrap();
+        assert_eq!(list.history.len(), 1);
+        assert!(list.history[0].passed);
+        assert_eq!(list.history[0].gate, "command-verified");
+        assert!(note_has_sha(&list.history[0].note, &sha));
+        // ledger check: legal for the current SHA, not for a wrong SHA.
+        assert!(ledger_check(&dir, &bead, AcShape::Checkable, &sha).unwrap());
+        assert!(
+            !ledger_check(
+                &dir,
+                &bead,
+                AcShape::Checkable,
+                "0000000000000000000000000000000000000000"
+            )
+            .unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn derive_head_sha_refuses_when_no_commit_carries_the_id() {
+        let (dir, _id) = scratch_workspace("sha-rule");
+        let err = derive_head_sha(&dir, "bd-never-committed").unwrap_err();
+        assert!(err.to_string().contains("SHA rule"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn receipt_helper_writes_exact_filename_and_refuses_empty() {
+        let dir = std::env::temp_dir().join(format!("gate-receipt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_receipt(
+            &dir,
+            "bd-x-1",
+            "abc123",
+            VerdictKind::CommandVerified,
+            "all tests passed\n",
+        )
+        .unwrap();
+        assert_eq!(
+            path,
+            dir.join(".flywheel/receipts/bd-x-1-abc123.command-verified.txt")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "all tests passed\n"
+        );
+        let err = write_receipt(
+            &dir,
+            "bd-x-1",
+            "abc123",
+            VerdictKind::CommandVerified,
+            "   \n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gate_names_roundtrip_through_from_gate_name() {
+        for kind in VerdictKind::ALL {
+            assert_eq!(VerdictKind::from_gate_name(kind.gate_name()), Some(kind));
+        }
+        assert_eq!(VerdictKind::from_gate_name("not-a-gate"), None);
+        assert_eq!(VerdictKind::from_gate_name(""), None);
+    }
+
+    #[test]
+    fn note_key_value_tokens_parse_sha_and_receipt() {
+        let note = "sha=deadbeef receipt=/tmp/r.txt";
+        assert!(note_has_sha(note, "deadbeef"));
+        assert!(!note_has_sha(note, "beef"));
+        assert_eq!(
+            note_receipt_path(note).unwrap(),
+            PathBuf::from("/tmp/r.txt")
+        );
+        assert_eq!(note_receipt_path("no tokens"), None);
     }
 }
