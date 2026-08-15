@@ -146,7 +146,7 @@ fn default_active_interval() -> u64 {
 }
 
 /// One polled agent state: (name, status string).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentState {
     pub name: String,
     pub status: String,
@@ -2593,6 +2593,57 @@ pub fn name_for_pane(states: &[AgentState], pane_id: &str) -> Option<String> {
         .map(|s| s.name.clone())
 }
 
+/// Heartbeat snapshot cadence (bd-w4-events-primary-gt0e): the authoritative
+/// `agent.list` snapshot runs every this-many iterations when the event
+/// stream is healthy. Between snapshots the event stream asserts status
+/// changes ([`apply_events_to_states`]); the snapshot confirms. The FIRST
+/// iteration after crash-resume always snapshots (herdr has no since/seq
+/// replay) — the correctness floor is never skipped.
+pub const HEARTBEAT_POLL_EVERY: u64 = 5;
+
+/// Snapshot-due policy (bd-w4-events-primary-gt0e): the authoritative
+/// `agent.list` snapshot runs when the loop has no state (crash-resume /
+/// first iteration — herdr has no since/seq replay, so the floor always
+/// runs first), when the event stream errored (fallback), or at the
+/// heartbeat cadence (poll confirms what events asserted).
+pub fn snapshot_due(states_empty: bool, stream_error: bool, since_snapshot: u64) -> bool {
+    states_empty || stream_error || since_snapshot >= HEARTBEAT_POLL_EVERY
+}
+
+/// Events assert, the poll confirms (bd-w4-events-primary-gt0e): apply a
+/// status-change batch to the last-known `states` so `all_settled` and
+/// `plan_actions` react to event-asserted statuses without waiting for the
+/// heartbeat snapshot. `pane.agent_status_changed` / `pane.agent_detected`
+/// update the status of the pane's agent; `pane.exited` marks the agent
+/// `exited`. Unknown panes (not yet in the snapshot — e.g. freshly spawned)
+/// are left to the next snapshot. Pure + unit-tested.
+pub fn apply_events_to_states(states: &mut Vec<AgentState>, events: &[PollEvent]) {
+    for ev in events {
+        let status = ev.status.as_deref().unwrap_or("");
+        match ev.event_type.as_str() {
+            "pane.agent_status_changed" | "pane.agent_detected" => {
+                let Some(name) = name_for_pane(states, &ev.pane_id) else {
+                    continue;
+                };
+                if let Some(s) = states.iter_mut().find(|s| s.name == name) {
+                    if !status.is_empty() {
+                        s.status = status.to_string();
+                    }
+                }
+            }
+            "pane.exited" => {
+                let Some(name) = name_for_pane(states, &ev.pane_id) else {
+                    continue;
+                };
+                if let Some(s) = states.iter_mut().find(|s| s.name == name) {
+                    s.status = "exited".to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Event-shaped decision path (bd-event-dispatch-zero-latency).
 ///
 /// Pure: updates `dispatch_pending` and may pop the queue front (FIFO, same
@@ -3282,6 +3333,15 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // thread, and the NEXT urgent message id wakes again). Deterministic on
     // replay: rebuilt from the checkpointed digest leaf results.
     let mut woken_for: HashMap<String, String> = HashMap::new();
+    // bd-w4-events-primary-gt0e: the agent.list snapshot is DEMOTED to the
+    // heartbeat cadence. `states` persists across iterations; between
+    // snapshots the event stream asserts status changes
+    // (apply_events_to_states) and the snapshot confirms
+    // (snapshot_due: no state / stream error / cadence boundary). The first
+    // iteration after crash-resume ALWAYS snapshots — herdr has no since/seq
+    // replay, so the correctness floor is never skipped.
+    let mut states: Vec<AgentState> = Vec::new();
+    let mut since_snapshot: u64 = 0;
 
     loop {
         iteration += 1;
@@ -3344,29 +3404,46 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // checkpointed; a body-side log would duplicate on replay.)
 
         // ---- correctness floor: authoritative agent.list snapshot ----
-        // Always runs. Catches any state change missed during a crash gap
-        // (events are not replayed). Full routing of event_batch is owned by
-        // bd-event-dispatch-zero-latency; here events only wake the loop early.
-        let states: Vec<AgentState> = match ctx
-            .run(
-                poll_swarm,
-                PollArgs {
-                    project: params.project.clone(),
-                    to: params.to.clone(),
-                },
-            )
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                // cg6.2: the correctness floor must not be a crash point —
-                // a transient herdr failure yields an empty snapshot; the
-                // next tick re-polls. bd-87hq: flag for the completion gate.
-                critical_leaf_failed_this_iter = true;
-                eprintln!("flywheel: poll_swarm leaf failed (continuing with empty snapshot): {e}");
-                vec![]
-            }
-        };
+        // DEMOTED to the heartbeat cadence (bd-w4-events-primary-gt0e):
+        // events assert status changes between snapshots
+        // (apply_events_to_states below); the snapshot CONFIRMS at the
+        // heartbeat cadence, after crash-resume (no state yet — herdr has no
+        // since/seq replay, so the first iteration always snapshots), and as
+        // the fallback when the event stream errored. The floor is never
+        // skipped; it just stops running every iteration.
+        if snapshot_due(
+            states.is_empty(),
+            event_batch.stream_error.is_some(),
+            since_snapshot,
+        ) {
+            since_snapshot = 0;
+            states = match ctx
+                .run(
+                    poll_swarm,
+                    PollArgs {
+                        project: params.project.clone(),
+                        to: params.to.clone(),
+                    },
+                )
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    // cg6.2: the correctness floor must not be a crash point —
+                    // a transient herdr failure yields an empty snapshot; the
+                    // next tick re-polls. bd-87hq: flag for the completion gate.
+                    critical_leaf_failed_this_iter = true;
+                    eprintln!("flywheel: poll_swarm leaf failed (continuing with empty snapshot): {e}");
+                    vec![]
+                }
+            };
+        } else {
+            since_snapshot += 1;
+        }
+        // Events assert: apply the batch's status changes so all_settled and
+        // plan_actions react to event-asserted statuses immediately instead
+        // of waiting for the next snapshot (poll confirms at cadence).
+        apply_events_to_states(&mut states, &event_batch.events);
 
         // proof of life: a working/blocked agent is receiving prompts — its
         // failure history is stale (landed sends reset at the send site too)
@@ -9133,6 +9210,141 @@ mod tests {
         assert!(poll.is_empty());
         assert_eq!(q, vec!["p1".to_string()]);
     }
+
+    // ---- bd-w4-events-primary-gt0e: events primary, poll = heartbeat ----
+
+    /// The reaction-without-waiting timed test (unit form): a `done` event
+    /// flips all_settled on the merged states — no snapshot needed. Before
+    /// the merge the loop would have waited for the next poll to see it.
+    #[test]
+    fn events_primary_done_event_flips_settled_without_poll() {
+        let mut states = vec![st_pane("a", "working", "%1")];
+        assert!(!all_settled(&states));
+        apply_events_to_states(
+            &mut states,
+            &[pev("pane.agent_status_changed", "%1", "done", 1)],
+        );
+        assert!(all_settled(&states), "event-asserted done must settle immediately");
+        // The poll-confirms half: a fresh snapshot of the same world agrees.
+        let confirmed = vec![st_pane("a", "done", "%1")];
+        assert!(all_settled(&confirmed));
+        assert_eq!(states, confirmed, "merged view == poll-confirmed view");
+    }
+
+    /// pane.exited marks the agent exited (diagnose-able, not idle).
+    #[test]
+    fn events_primary_exit_marks_exited() {
+        let mut states = vec![st_pane("a", "working", "%1")];
+        apply_events_to_states(&mut states, &[pev("pane.exited", "%1", "exited", 1)]);
+        assert_eq!(states[0].status, "exited");
+        assert!(!all_settled(&states), "exited is not settled");
+    }
+
+    /// agent_detected updates the status of a known pane.
+    #[test]
+    fn events_primary_detected_updates_status() {
+        let mut states = vec![st_pane("a", "unknown", "%1")];
+        apply_events_to_states(&mut states, &[pev("pane.agent_detected", "%1", "idle", 1)]);
+        assert_eq!(states[0].status, "idle");
+    }
+
+    /// Unknown panes (not yet in the snapshot) are left to the next poll —
+    /// the merge never fabricates state.
+    #[test]
+    fn events_primary_unknown_pane_is_noop() {
+        let mut states = vec![st_pane("a", "working", "%1")];
+        apply_events_to_states(
+            &mut states,
+            &[pev("pane.agent_status_changed", "%99", "done", 1)],
+        );
+        assert_eq!(states[0].status, "working");
+        // empty pane id is never matched
+        let mut states2 = vec![st_pane("a", "working", "%1")];
+        apply_events_to_states(
+            &mut states2,
+            &[pev("pane.agent_status_changed", "", "done", 2)],
+        );
+        assert_eq!(states2[0].status, "working");
+    }
+
+    /// The snapshot cadence policy: after crash-resume / no state, on stream
+    /// error (fallback), and at the heartbeat boundary.
+    #[test]
+    fn events_primary_snapshot_due_policy() {
+        // crash-resume / first iteration: no state yet -> always snapshot.
+        assert!(snapshot_due(true, false, 0));
+        // mid-cadence with a healthy stream -> no snapshot (events assert).
+        assert!(!snapshot_due(false, false, 3));
+        // heartbeat boundary -> snapshot confirms.
+        assert!(snapshot_due(false, false, HEARTBEAT_POLL_EVERY));
+        // stream error -> snapshot fallback immediately.
+        assert!(snapshot_due(false, true, 1));
+    }
+
+    /// Grep acceptance: the loop path (durable.rs + the __poll_events
+    /// collector) contains no direct herdr_shim event construction — the
+    /// event stream comes via the backend trait. The scan covers the
+    /// non-test source (the loop path), not this test's own strings.
+    #[test]
+    fn events_primary_grep_no_herdr_shim_in_loop_path() {
+        let durable = include_str!("durable.rs");
+        let loop_path = durable
+            .split("#[cfg(test)]")
+            .next()
+            .expect("non-test source");
+        assert!(
+            !loop_path.contains("herdr_shim"),
+            "durable.rs (the loop core) must not touch herdr_shim directly"
+        );
+        let main_src = include_str!("main.rs");
+        let collect = main_src
+            .split("fn collect_poll_events")
+            .nth(1)
+            .expect("collect_poll_events exists");
+        let collect = collect.split("\nfn ").next().expect("collect fn body");
+        assert!(
+            collect.contains("backend::multiplexer_backend(cfg)"),
+            "collect_poll_events must obtain the stream via the backend trait"
+        );
+        assert!(
+            !collect.contains("herdr_shim"),
+            "collect_poll_events must not construct herdr_shim events"
+        );
+    }
+
+    /// Differential parity (extended): on a scripted done-scenario the
+    /// event-derived dispatch decision (pre-change states + the done event)
+    /// equals the poll-derived one (the post-change confirmed snapshot),
+    /// and the event-merged completion view equals the poll-confirmed one.
+    #[test]
+    fn events_primary_parity_dispatch_and_settled_agree() {
+        use std::collections::HashSet;
+        let pre_change = vec![st_pane("a", "working", "%1")];
+        let confirmed = vec![st_pane("a", "done", "%1")];
+        // poll path sees the confirmed snapshot; the event path sees the
+        // pre-change world plus the done event — the decisions must agree.
+        let mut q_poll = vec!["p1".into()];
+        let poll = poll_dispatch(&confirmed, &mut q_poll);
+        let mut q_ev = vec!["p1".into()];
+        let mut pending = HashSet::new();
+        let event = event_dispatch(
+            &pre_change,
+            &[pev("pane.agent_status_changed", "%1", "done", 1)],
+            &mut q_ev,
+            &mut pending,
+        );
+        assert_eq!(poll, event, "{}", parity_report(&poll, &event));
+        assert!(!poll.is_empty(), "both paths must dispatch the queued prompt");
+        // completion parity: the merged states settle exactly like a fresh
+        // poll of the same world.
+        let mut merged = pre_change.clone();
+        apply_events_to_states(
+            &mut merged,
+            &[pev("pane.agent_status_changed", "%1", "done", 1)],
+        );
+        assert_eq!(merged, confirmed, "merged view == poll-confirmed view");
+        assert!(all_settled(&merged));
+    }
 }
 
 #[cfg(test)]
@@ -9665,4 +9877,5 @@ Dependencies:
             );
         }
     }
+
 }
