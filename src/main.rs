@@ -142,8 +142,14 @@ enum Commands {
         #[arg(long)]
         retire_orphans: bool,
         /// spawn agents with the peer-aware self-poll template (ADR-0001 §9.3)
-        #[arg(long)]
+        /// — DEFAULT ON (2026-08-15, captain: collab is not optional; manual
+        /// steering is not a swarm). --no-peer-aware opts out for single-shot
+        /// panes.
+        #[arg(long, action = clap::ArgAction::SetTrue, default_value_t = true)]
         peer_aware: bool,
+        /// opt OUT of the peer-aware self-poll template (single-shot panes)
+        #[arg(long)]
+        no_peer_aware: bool,
         /// peer-aware poll cadence (minutes idle between inbox polls; default 5)
         #[arg(long, default_value_t = 5)]
         peer_poll_interval_minutes: u32,
@@ -2839,6 +2845,7 @@ fn main() {
             no_verify,
             retire_orphans,
             peer_aware,
+            no_peer_aware,
             peer_poll_interval_minutes,
             peer_poll_budget_minutes,
             peer_max_prompts,
@@ -2856,6 +2863,7 @@ fn main() {
             *no_verify,
             *retire_orphans,
             *peer_aware,
+            *no_peer_aware,
             *peer_poll_interval_minutes,
             *peer_poll_budget_minutes,
             *peer_max_prompts,
@@ -4727,6 +4735,7 @@ fn cmd_spawn(
     no_verify: bool,
     retire_orphans: bool,
     peer_aware: bool,
+    no_peer_aware: bool,
     peer_poll_interval_minutes: u32,
     peer_poll_budget_minutes: u32,
     peer_max_prompts: u32,
@@ -4970,6 +4979,9 @@ projects available: {}",
     // When --peer-aware, each spawned agent receives the self-poll template as
     // its initial instruction. The template is read once; per-agent
     // placeholders are substituted at the call site below.
+    // 2026-08-15 (captain): collab is the default — crews self-poll the
+    // mailbox unless explicitly opted out. Manual steering is not a swarm.
+    let peer_aware = peer_aware && !no_peer_aware;
     let peer_template: Option<String> = if peer_aware {
         let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("integrations/peer-aware.md.tpl");
         match std::fs::read_to_string(&p) {
@@ -9853,6 +9865,7 @@ fn cmd_resume(cfg: &Config, project: &str, recipe: Option<&str>) -> Result<()> {
                 false,
                 false,
                 false,
+                false,
                 5,
                 30,
                 3,
@@ -9923,6 +9936,7 @@ fn cmd_asset(cfg: &Config, kind: &str, cmd: &AssetCmd) -> Result<()> {
                 Some(name),
                 &[],
                 None,
+                false,
                 false,
                 false,
                 false,
@@ -10048,6 +10062,7 @@ fn cmd_ensemble(cfg: &Config, project: &str, recipe: &str, workflow: &str) -> Re
         Some(recipe),
         &[],
         None,
+        false,
         false,
         false,
         false,
@@ -17602,6 +17617,7 @@ fn cmd_internal_xproj_spawn(
             false, // skip post-spawn visibility verify (background xproj spawn)
             false, // retire orphan workspaces (xproj spawns are additive)
             false, // not peer-aware by default
+            false, // no_peer_aware (xproj spawns stay non-collab)
             5,
             30,
             3,
