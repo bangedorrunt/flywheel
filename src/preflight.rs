@@ -8,10 +8,10 @@
 
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::herdr_shim::Client;
+use crate::herdr_shim::{Client, WorktreeInfo};
 use crate::mail_shim::Mail;
 use crate::{command_exists, resonate_health};
 
@@ -37,14 +37,23 @@ pub enum Status {
 
 impl Check {
     fn pass(name: &'static str) -> Self {
-        Self { name, status: Status::Pass }
+        Self {
+            name,
+            status: Status::Pass,
+        }
     }
     fn fail(name: &'static str, msg: impl Into<String>) -> Self {
-        Self { name, status: Status::Fail(msg.into()) }
+        Self {
+            name,
+            status: Status::Fail(msg.into()),
+        }
     }
     #[allow(dead_code)]
     fn skip(name: &'static str, reason: &'static str) -> Self {
-        Self { name, status: Status::Skip(reason) }
+        Self {
+            name,
+            status: Status::Skip(reason),
+        }
     }
 }
 
@@ -54,28 +63,65 @@ pub struct Mode {
     pub needs_beads: bool,
     pub needs_project: bool,
     pub needs_mail: bool,
+    /// ADR-0019 Spec 3.3: `loop run` / `workflow run --execute` fail when
+    /// the project workspace carries an extra linked worktree — the loop
+    /// never adopts a second tree.
+    pub needs_worktree: bool,
+    /// Operator opt-out (`--allow-worktree`, operator-only + logged): skip
+    /// the linked-worktree check for a deliberate human experiment.
+    pub allow_worktree: bool,
 }
 
 impl Mode {
     /// Steer: needs herdr, resonate, mail, project dir.
     pub fn steer() -> Self {
-        Self { needs_beads: false, needs_project: true, needs_mail: true }
+        Self {
+            needs_beads: false,
+            needs_project: true,
+            needs_mail: true,
+            needs_worktree: false,
+            allow_worktree: false,
+        }
     }
     /// Loop `--work`: needs herdr, resonate, br, beads, mail, project dir.
     pub fn loop_work() -> Self {
-        Self { needs_beads: true, needs_project: true, needs_mail: true }
+        Self {
+            needs_beads: true,
+            needs_project: true,
+            needs_mail: true,
+            needs_worktree: true,
+            allow_worktree: false,
+        }
     }
     /// Loop `--queue` (static stages): needs herdr, resonate, mail, project dir.
     pub fn loop_queue() -> Self {
-        Self { needs_beads: false, needs_project: true, needs_mail: true }
+        Self {
+            needs_beads: false,
+            needs_project: true,
+            needs_mail: true,
+            needs_worktree: true,
+            allow_worktree: false,
+        }
     }
     /// Workflow `--execute`: needs herdr, resonate, mail, project dir.
     pub fn workflow() -> Self {
-        Self { needs_beads: false, needs_project: true, needs_mail: true }
+        Self {
+            needs_beads: false,
+            needs_project: true,
+            needs_mail: true,
+            needs_worktree: true,
+            allow_worktree: false,
+        }
     }
     /// Cron (headless): needs resonate only.
     pub fn cron() -> Self {
-        Self { needs_beads: false, needs_project: false, needs_mail: false }
+        Self {
+            needs_beads: false,
+            needs_project: false,
+            needs_mail: false,
+            needs_worktree: false,
+            allow_worktree: false,
+        }
     }
 }
 
@@ -124,14 +170,39 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
         checks.push(check_mail(cfg));
     }
 
+    // 8. ADR-0019 Spec 3.3: no extra linked worktree in the project
+    //    workspace (loop run / workflow run --execute). `--allow-worktree`
+    //    is the operator-only opt-out (refused without an operator key,
+    //    logged at the call site).
+    if mode.needs_worktree {
+        if mode.allow_worktree {
+            if worktree_optout_legal(mode.allow_worktree, operator_key_configured()) {
+                checks.push(Check::skip(
+                    "worktree",
+                    "--allow-worktree operator opt-out (ADR-0019 Spec 3.3, logged)",
+                ));
+            } else {
+                checks.push(Check::fail(
+                    "worktree",
+                    "--allow-worktree is operator-only (ADR-0019 Spec 3.3): no operator key configured",
+                ));
+            }
+        } else if let Some(p) = project {
+            checks.push(check_worktree(cfg, p));
+        } else {
+            checks.push(Check::fail(
+                "worktree",
+                "no project specified (required for the worktree check)",
+            ));
+        }
+    }
+
     checks
 }
 
 /// True if no check failed (Skips are advisory — the operation can proceed).
 pub fn all_pass(checks: &[Check]) -> bool {
-    checks
-        .iter()
-        .all(|c| !matches!(c.status, Status::Fail(_)))
+    checks.iter().all(|c| !matches!(c.status, Status::Fail(_)))
 }
 
 /// Human-readable summary (stderr-friendly).
@@ -229,20 +300,13 @@ fn check_beads(project: &str) -> Check {
     } else {
         Check::fail(
             "beads-db",
-            format!(
-                "no .beads/ in {project} — run `br init` or use --queue instead of --work"
-            ),
+            format!("no .beads/ in {project} — run `br init` or use --queue instead of --work"),
         )
     }
 }
 
 fn check_operator_key() -> Check {
-    if std::env::var("TORON_OPERATOR_KEY").is_ok() {
-        return Check::pass("operator-key");
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let default = Path::new(&home).join(".config/toron/operator_nsec");
-    if default.exists() {
+    if operator_key_configured() {
         Check::pass("operator-key")
     } else {
         Check::skip(
@@ -250,6 +314,63 @@ fn check_operator_key() -> Check {
             "not configured (needed for ensure_project, force-release)",
         )
     }
+}
+
+/// Operator key configured? The gate for operator-only opt-outs
+/// (`--allow-worktree`, ADR-0019 Spec 3.3). Same sources as
+/// [`check_operator_key`]: `TORON_OPERATOR_KEY` or
+/// `~/.config/toron/operator_nsec`.
+pub fn operator_key_configured() -> bool {
+    if std::env::var("TORON_OPERATOR_KEY").is_ok() {
+        return true;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    Path::new(&home).join(".config/toron/operator_nsec").exists()
+}
+
+/// Pure: is the `--allow-worktree` opt-out legal? It is operator-only —
+/// refused when no operator key is configured (ADR-0019 Spec 3.3).
+pub fn worktree_optout_legal(allow_worktree: bool, operator_key: bool) -> bool {
+    !allow_worktree || operator_key
+}
+
+/// Pure: the linked-worktree subset of a `worktree.list` — the workspace's
+/// own (primary) tree is expected and fine; only LINKED trees are the extra
+/// checkouts the loop must never adopt.
+pub fn linked_worktrees(v: &[WorktreeInfo]) -> Vec<&WorktreeInfo> {
+    v.iter().filter(|w| w.is_linked_worktree).collect()
+}
+
+/// ADR-0019 Spec 3.3: fail the run when the project workspace carries an
+/// extra linked worktree — the loop will not dispatch `--work` into it and
+/// will not ledger-check a SHA from it. Removing it (or the operator's
+/// `--allow-worktree`) unblocks the run.
+fn check_worktree(cfg: &Config, project: &str) -> Check {
+    let mut c = match Client::connect(Some(&cfg.socket_path())) {
+        Ok(c) => c,
+        Err(e) => return Check::fail("worktree", format!("herdr connect failed: {e}")),
+    };
+    let ws_id = match crate::find_workspace(&mut c, project) {
+        Ok(id) => id,
+        Err(e) => return Check::fail("worktree", format!("workspace lookup failed: {e}")),
+    };
+    let all = match crate::herdr_shim::worktree_list(&mut c, Some(&ws_id)) {
+        Ok(v) => v,
+        Err(e) => return Check::fail("worktree", format!("worktree.list failed: {e}")),
+    };
+    let linked = linked_worktrees(&all);
+    if linked.is_empty() {
+        return Check::pass("worktree");
+    }
+    let paths: Vec<String> = linked.iter().map(|w| w.path.clone()).collect();
+    Check::fail(
+        "worktree",
+        format!(
+            "{} linked worktree(s): {} — worktrees are forbidden in the loop (ADR-0019 Spec 3); remove them or pass --allow-worktree (operator-only, logged)",
+            linked.len(),
+            paths.join(", ")
+        ),
+    )
 }
 
 fn check_mail(cfg: &Config) -> Check {
@@ -271,11 +392,7 @@ mod tests {
 
     #[test]
     fn all_pass_with_passes_and_skips() {
-        let checks = vec![
-            Check::pass("a"),
-            Check::skip("b", "n/a"),
-            Check::pass("c"),
-        ];
+        let checks = vec![Check::pass("a"), Check::skip("b", "n/a"), Check::pass("c")];
         assert!(all_pass(&checks));
     }
 
@@ -317,6 +434,67 @@ mod tests {
         assert!(m.needs_beads);
         assert!(m.needs_project);
         assert!(m.needs_mail);
+    }
+
+    /// ADR-0019 Spec 3.3: `loop run` and `workflow run --execute` preflight
+    /// the workspace for extra linked worktrees (forbidden in the loop);
+    /// steer and cron do not. `--allow-worktree` is the operator opt-out.
+    #[test]
+    fn mode_dispatch_modes_check_worktree_steer_cron_do_not() {
+        for m in [Mode::loop_work(), Mode::loop_queue(), Mode::workflow()] {
+            assert!(m.needs_worktree, "dispatch mode checks worktrees");
+            assert!(!m.allow_worktree, "opt-out is never the default");
+        }
+        for m in [Mode::steer(), Mode::cron()] {
+            assert!(!m.needs_worktree, "steer/cron do not check worktrees");
+        }
+    }
+
+    /// ADR-0019 Spec 3.3: only LINKED worktrees are extra — the workspace's
+    /// own (primary) tree is expected.
+    #[test]
+    fn linked_worktrees_filters_primary_tree() {
+        let primary = WorktreeInfo {
+            path: "/w/main".into(),
+            branch: Some("main".into()),
+            is_bare: false,
+            is_detached: false,
+            is_prunable: false,
+            is_linked_worktree: false,
+            open_workspace_id: Some("ws-main".into()),
+            label: String::new(),
+        };
+        let linked = WorktreeInfo {
+            path: "/w/exp".into(),
+            branch: Some("exp".into()),
+            is_bare: false,
+            is_detached: true,
+            is_prunable: true,
+            is_linked_worktree: true,
+            open_workspace_id: None,
+            label: "exp".into(),
+        };
+        let v = vec![primary, linked];
+        let linked_only = linked_worktrees(&v);
+        assert_eq!(linked_only.len(), 1);
+        assert_eq!(linked_only[0].path, "/w/exp");
+        assert!(linked_worktrees(&[]).is_empty());
+    }
+
+    /// ADR-0019 Spec 3.3: `--allow-worktree` is operator-only — the opt-out
+    /// is refused when no operator key is configured.
+    #[test]
+    fn allow_worktree_requires_operator_key() {
+        assert!(
+            !worktree_optout_legal(true, false),
+            "no operator key -> --allow-worktree refused"
+        );
+        assert!(
+            worktree_optout_legal(true, true),
+            "operator key configured -> opt-out legal"
+        );
+        assert!(worktree_optout_legal(false, false), "no opt-out, no key -> fine");
+        assert!(worktree_optout_legal(false, true));
     }
 
     #[test]
