@@ -40,6 +40,7 @@ use serde_json::{Value, json};
 
 use resonate_sdk::function;
 use resonate_sdk::prelude::*;
+use toron_core::mailbox::overlaps;
 use toron_workflow::engine::{ActionRunner, WorkflowEngine};
 use toron_workflow::schema::{Action, Workflow};
 
@@ -267,6 +268,78 @@ async fn mail_not_ready(args: NotReadyMailArgs) -> Result<Value> {
     if !out.status.success() {
         return Err(map_err(anyhow::anyhow!(
             "__mail-not-ready failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    Ok(serde_json::from_str(raw.trim())
+        .unwrap_or_else(|_| serde_json::json!({ "raw": raw.trim() })))
+}
+
+/// Args for the `__reservation-board` leaf (ADR-0019 Spec 3.4/3.5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReservationBoardArgs {
+    pub project: String,
+}
+
+/// Checkpointed leaf — the project's active reservation board as
+/// `(path_pattern, reason)` rows (reason = the holding bead's id, from
+/// `active_reservations`, bd-dsu1). Feeds serialize-on-overlap: the
+/// claim-watch overlap wait set (Spec 3.4) and the always-serialize
+/// dispatch gate (Spec 3.5). Always exits 0 — a mail hiccup degrades to an
+/// empty board (no suppression, existing behavior), never a loop crash.
+#[function]
+async fn reservation_board(args: ReservationBoardArgs) -> Result<Vec<(String, String)>> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__reservation-board", &args.project]);
+    let out = run_leaf_cmd(cmd, "__reservation-board").await?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__reservation-board failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_default();
+    Ok(v.get("reservations")
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| {
+                    Some((
+                        r.get("path")?.as_str()?.to_string(),
+                        r.get("reason")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Args for the `__verify-close-sha` leaf (ADR-0019 SHA rule, bd-w1-sha-xyhd).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyCloseShaArgs {
+    pub project: String,
+    pub bead_id: String,
+}
+
+/// Checkpointed leaf — close-detect SHA check: derive the sha of the commit
+/// whose message carries the bead id (`git log --all -1 --grep=<id>`, no
+/// bare-HEAD fallback). Success -> `{illegal: false, sha}`. No commit
+/// carries the id -> the close is ILLEGAL regardless of verdicts: the leaf
+/// mails the planner naming the missing commit and returns `{illegal: true}`
+/// (the reopen call lands in bd-w1-reopen-f6tw). Always exits 0 — a git or
+/// mail hiccup must never kill the loop.
+#[function]
+async fn verify_close_sha(args: VerifyCloseShaArgs) -> Result<Value> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__verify-close-sha", &args.project, &args.bead_id]);
+    let out = run_leaf_cmd(cmd, "__verify-close-sha").await?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__verify-close-sha failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
@@ -2000,6 +2073,18 @@ fn urgent_wake_prompt(d: &MailDigest) -> String {
 // Pure + deterministic (unit-tested below); the loops only wire the
 // decisions into their action/queue plumbing.
 
+/// Why a watched bead is waiting (ADR-0019 Spec 3.4). An overlap wait is
+/// NOT a stuck owner: the bead's write paths are held by another in-flight
+/// bead — no nudge, no T0-T3 escalation, the loop waits for release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitReason {
+    /// the dispatched agent reported blocked (the T0-T3 escalation path
+    /// owns this reason)
+    Blocked,
+    /// the bead serialized behind another in-flight bead's reservation
+    Overlap,
+}
+
 /// One dispatched bead's claim-watch entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimWatch {
@@ -2013,6 +2098,60 @@ pub struct ClaimWatch {
     pub close_nudged: bool,
     /// polls since the close-nudge while the bead stayed unclosed
     pub close_polls: u32,
+    /// why the bead is waiting (None = normal in-flight work)
+    pub wait_reason: Option<WaitReason>,
+}
+
+/// ADR-0019 Spec 3.5: paths whose overlap is NEVER split into parallel —
+/// two beads needing any of these run one after the other (serialize).
+pub const ALWAYS_SERIALIZE_PATHS: &[&str] = &[
+    ".beads/**",
+    ".flywheel/**",
+    "Cargo.lock",
+    "Cargo.toml",
+    "docs/catalog/**",
+    "target/**",
+];
+
+/// Pure: does ANY held reservation (path, reason=bead-id) overlap an
+/// always-serialize path? If yes, all NEW ready-bead dispatch serializes —
+/// never parallel (ADR-0019 Spec 3.5, acceptance: two beads touching
+/// `.beads/` or `Cargo.lock` run one after the other).
+pub fn always_serialize_held(held: &[(String, String)]) -> bool {
+    held.iter()
+        .any(|(path, _)| ALWAYS_SERIALIZE_PATHS.iter().any(|a| overlaps(path, a)))
+}
+
+/// Pure: in-flight bead ids whose held path globs conflict with ANOTHER
+/// in-flight bead's held globs — both are overlap-waiting (ADR-0019 Spec
+/// 3.4). `held` = reservation rows `(path_pattern, reason)` where reason is
+/// the holding bead's id; `in_flight` = currently dispatched bead ids. The
+/// claim-watch must not treat these waits as stuck owners.
+pub fn bead_overlap_waits(
+    held: &[(String, String)],
+    in_flight: &[String],
+) -> std::collections::HashSet<String> {
+    let mut waits = std::collections::HashSet::new();
+    let mut by_reason: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for (path, reason) in held {
+        by_reason.entry(reason).or_default().push(path);
+    }
+    let reasons: Vec<&String> = in_flight
+        .iter()
+        .filter(|r| by_reason.contains_key(r.as_str()))
+        .collect();
+    for i in 0..reasons.len() {
+        for j in (i + 1)..reasons.len() {
+            let a = &by_reason[reasons[i].as_str()];
+            let b = &by_reason[reasons[j].as_str()];
+            if a.iter().any(|pa| b.iter().any(|pb| overlaps(pa, pb))) {
+                waits.insert(reasons[i].clone());
+                waits.insert(reasons[j].clone());
+            }
+        }
+    }
+    waits
 }
 
 /// One watchdog decision for a watched bead.
@@ -2077,22 +2216,35 @@ pub fn close_nudge_prompt(bead_id: &str, title: &str) -> String {
 /// `watch` and returns the actions the loop must take this poll.
 ///
 /// `nudge_after_polls`: consecutive unclaimed polls before a claim nudge.
+/// `overlap`: bead ids currently waiting on another in-flight bead's
+/// reservation (ADR-0019 Spec 3.4). An overlap wait is NOT a stuck owner —
+/// no claim nudge, no close nudge, no resume re-dispatch; the wait reason is
+/// recorded and the loop waits for the holder to release.
 pub fn claim_watch_step(
     watch: &mut std::collections::HashMap<String, ClaimWatch>,
     ready: &[ReadyBead],
     inprogress: &[ReadyBead],
     states: &[AgentState],
     nudge_after_polls: u32,
+    overlap: &std::collections::HashSet<String>,
 ) -> Vec<ClaimWatchAction> {
     let mut actions = Vec::new();
     let mut drop = Vec::new();
     let nudge_after = nudge_after_polls.max(1);
     for (bead_id, cw) in watch.iter_mut() {
+        let waiting_on_overlap = overlap.contains(bead_id);
         let in_ready = ready.iter().find(|b| b.id == *bead_id);
         let claimed = inprogress.iter().find(|b| b.id == *bead_id);
         match (in_ready, claimed) {
             // still unclaimed
             (Some(rb), None) => {
+                if waiting_on_overlap {
+                    // serialized behind another in-flight bead's reservation —
+                    // not a stuck owner: no claim nudge, keep waiting.
+                    cw.wait_reason = Some(WaitReason::Overlap);
+                    continue;
+                }
+                cw.wait_reason = None;
                 let st = states
                     .iter()
                     .find(|s| s.name == cw.agent)
@@ -2129,6 +2281,14 @@ pub fn claim_watch_step(
                     .map(|s| matches!(s.status.as_str(), "idle" | "done"))
                     .unwrap_or(false);
                 if live && settled {
+                    if waiting_on_overlap {
+                        // the assignee settled but another bead holds this
+                        // bead's paths — waiting on release, not stuck: no
+                        // close nudge, no resume re-dispatch.
+                        cw.wait_reason = Some(WaitReason::Overlap);
+                        continue;
+                    }
+                    cw.wait_reason = None;
                     if !cw.close_nudged {
                         cw.close_nudged = true;
                         cw.close_polls = 0;
@@ -2900,6 +3060,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // checkpointed `__mail-not-ready` leaf results, so a crash never
     // re-mails a bead the checkpoint already mailed.
     let mut not_ready_mailed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // ADR-0019 (bd-w1-sha-xyhd): closed beads whose close-detect SHA check
+    // already ran this invocation (same replay-rebuilt dedup contract).
+    let mut close_sha_checked: std::collections::HashSet<String> = std::collections::HashSet::new();
     // bd-efk1: claim-watch nudge sends collected during work-mode sourcing,
     // merged into the action list AFTER plan_actions (they target specific
     // agents — including WORKING ones — and must not be double-filtered by
@@ -3294,12 +3457,31 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // agents (bypass plan_actions — they fire even for WORKING
             // agents); re-dispatches re-enter the queue at the FRONT so the
             // next idle agent takes them.
+            // ADR-0019 Spec 3.4: overlap waits are NOT stuck owners. Beads
+            // whose write paths another in-flight bead holds get no
+            // claim/close nudge and no resume redispatch — the loop waits
+            // for the holder to release. Best-effort: a board fetch failure
+            // degrades to an empty overlap set (existing watchdog behavior).
+            let overlap: std::collections::HashSet<String> = {
+                let board: Vec<(String, String)> = ctx
+                    .run(
+                        reservation_board,
+                        ReservationBoardArgs {
+                            project: params.project.clone(),
+                        },
+                    )
+                    .await
+                    .unwrap_or_default();
+                let in_flight: Vec<String> = inprog.iter().map(|b| b.id.clone()).collect();
+                bead_overlap_waits(&board, &in_flight)
+            };
             let watch_actions = claim_watch_step(
                 &mut claim_watch,
                 &ready,
                 &inprog,
                 &states,
                 params.claim_nudge_after_polls,
+                &overlap,
             );
             for a in watch_actions {
                 match a {
@@ -3326,6 +3508,31 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         queue_brief(&mut queue, &bead_id, &title, &params.project, true, true);
                     }
                     ClaimWatchAction::ReleaseReservations { bead_id } => {
+                        // ADR-0019 SHA rule (bd-w1-sha-xyhd): a closed bead
+                        // MUST have a commit whose message carries its id —
+                        // derive it at close-detect. No commit -> the close
+                        // is ILLEGAL regardless of verdicts (the leaf mails
+                        // the planner naming the missing commit; the br
+                        // reopen call lands in bd-w1-reopen-f6tw). Once per
+                        // bead per invocation.
+                        if close_sha_checked.insert(bead_id.clone()) {
+                            let sha_args = VerifyCloseShaArgs {
+                                project: params.project.clone(),
+                                bead_id: bead_id.clone(),
+                            };
+                            match ctx.run(verify_close_sha, sha_args).await {
+                                Ok(v) => {
+                                    if v.get("illegal").and_then(Value::as_bool).unwrap_or(false) {
+                                        eprintln!(
+                                            "flywheel: bead {bead_id} closed WITHOUT a commit carrying its id — close ILLEGAL (planner mailed)"
+                                        );
+                                    }
+                                }
+                                Err(e) => eprintln!(
+                                    "flywheel: verify-close-sha for {bead_id} failed (continuing): {e}"
+                                ),
+                            }
+                        }
                         // bd-h3oj: the bead closed — release its file
                         // reservations (reason == bead id) so they never
                         // linger to TTL. Checkpointed leaf; best-effort:
@@ -3716,6 +3923,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                         unclaimed_polls: 0,
                                         close_nudged: false,
                                         close_polls: 0,
+                                        wait_reason: None,
                                     });
                             }
                         }
@@ -4124,6 +4332,12 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
         .register(mail_not_ready)
         .map_err(|e| anyhow::anyhow!("register mail_not_ready: {e}"))?;
     resonate
+        .register(verify_close_sha)
+        .map_err(|e| anyhow::anyhow!("register verify_close_sha: {e}"))?;
+    resonate
+        .register(reservation_board)
+        .map_err(|e| anyhow::anyhow!("register reservation_board: {e}"))?;
+    resonate
         .register(poll_inprogress)
         .map_err(|e| anyhow::anyhow!("register poll_inprogress: {e}"))?;
     resonate
@@ -4468,6 +4682,9 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // already fired this invocation (dedup, rebuilt on replay from the
     // checkpointed `__mail-not-ready` leaf results).
     let mut not_ready_mailed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // ADR-0019 (bd-w1-sha-xyhd): closed beads whose close-detect SHA check
+    // already ran this invocation (same replay-rebuilt dedup contract).
+    let mut close_sha_checked: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut watch_sends: Vec<LoopAction> = Vec::new();
 
     loop {
@@ -4715,12 +4932,31 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
 
             // bd-efk1 parity: same crew-execution watchdog as swarm_loop —
             // reconcile the dispatched-bead watch against fresh snapshots.
+            // ADR-0019 Spec 3.4: overlap waits are NOT stuck owners. Beads
+            // whose write paths another in-flight bead holds get no
+            // claim/close nudge and no resume redispatch — the loop waits
+            // for the holder to release. Best-effort: a board fetch failure
+            // degrades to an empty overlap set (existing watchdog behavior).
+            let overlap: std::collections::HashSet<String> = {
+                let board: Vec<(String, String)> = ctx
+                    .run(
+                        reservation_board,
+                        ReservationBoardArgs {
+                            project: params.project.clone(),
+                        },
+                    )
+                    .await
+                    .unwrap_or_default();
+                let in_flight: Vec<String> = inprog.iter().map(|b| b.id.clone()).collect();
+                bead_overlap_waits(&board, &in_flight)
+            };
             let watch_actions = claim_watch_step(
                 &mut claim_watch,
                 &ready,
                 &inprog,
                 &states,
                 params.claim_nudge_after_polls,
+                &overlap,
             );
             for a in watch_actions {
                 match a {
@@ -4747,6 +4983,28 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         queue_brief(&mut queue, &bead_id, &title, &params.project, true, true);
                     }
                     ClaimWatchAction::ReleaseReservations { bead_id } => {
+                        // ADR-0019 SHA rule (bd-w1-sha-xyhd): same close-detect
+                        // sha check as swarm_loop — no commit carrying the id
+                        // -> close ILLEGAL (planner mailed; reopen in
+                        // bd-w1-reopen-f6tw). Once per bead per invocation.
+                        if close_sha_checked.insert(bead_id.clone()) {
+                            let sha_args = VerifyCloseShaArgs {
+                                project: params.project.clone(),
+                                bead_id: bead_id.clone(),
+                            };
+                            match ctx.run(verify_close_sha, sha_args).await {
+                                Ok(v) => {
+                                    if v.get("illegal").and_then(Value::as_bool).unwrap_or(false) {
+                                        eprintln!(
+                                            "flywheel: bead {bead_id} closed WITHOUT a commit carrying its id — close ILLEGAL (planner mailed)"
+                                        );
+                                    }
+                                }
+                                Err(e) => eprintln!(
+                                    "flywheel: verify-close-sha for {bead_id} failed (continuing): {e}"
+                                ),
+                            }
+                        }
                         // bd-h3oj: the bead closed — release its file
                         // reservations (reason == bead id). Checkpointed
                         // leaf; best-effort, never kill the loop.
@@ -4858,6 +5116,7 @@ async fn engine_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                         unclaimed_polls: 0,
                                         close_nudged: false,
                                         close_polls: 0,
+                                        wait_reason: None,
                                     });
                             }
                         }
@@ -5144,6 +5403,12 @@ pub async fn run_engine_loop(cfg: &Config, mut params: LoopParams) -> anyhow::Re
     resonate
         .register(mail_not_ready)
         .map_err(|e| anyhow::anyhow!("register mail_not_ready: {e}"))?;
+    resonate
+        .register(verify_close_sha)
+        .map_err(|e| anyhow::anyhow!("register verify_close_sha: {e}"))?;
+    resonate
+        .register(reservation_board)
+        .map_err(|e| anyhow::anyhow!("register reservation_board: {e}"))?;
     resonate
         .register(poll_inprogress)
         .map_err(|e| anyhow::anyhow!("register poll_inprogress: {e}"))?;
@@ -7036,7 +7301,13 @@ mod tests {
             unclaimed_polls: 0,
             close_nudged: false,
             close_polls: 0,
+            wait_reason: None,
         }
+    }
+
+    /// An empty overlap board — the default for legacy claim-watch tests.
+    fn empty_overlap() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
     }
 
     #[test]
@@ -7102,12 +7373,26 @@ mod tests {
         let states = vec![st("oc-1", "working")];
 
         // below threshold: keep watching, no action
-        let actions = claim_watch_step(&mut watch, &ready, &inprogress, &states, 2);
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &inprogress,
+            &states,
+            2,
+            &empty_overlap(),
+        );
         assert!(actions.is_empty(), "no nudge before threshold: {actions:?}");
         assert_eq!(watch.get("bd-12").unwrap().unclaimed_polls, 1);
 
         // at threshold: claim nudge to the dispatched agent
-        let actions = claim_watch_step(&mut watch, &ready, &inprogress, &states, 2);
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &inprogress,
+            &states,
+            2,
+            &empty_overlap(),
+        );
         assert_eq!(actions.len(), 1, "{actions:?}");
         match &actions[0] {
             ClaimWatchAction::NudgeClaim { agent, bead_id } => {
@@ -7132,7 +7417,14 @@ mod tests {
         let inprogress = vec![];
         let states = vec![st("oc-1", "idle")]; // settled, never claimed
 
-        let actions = claim_watch_step(&mut watch, &ready, &inprogress, &states, 2);
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &inprogress,
+            &states,
+            2,
+            &empty_overlap(),
+        );
         assert_eq!(actions.len(), 1, "{actions:?}");
         assert!(
             matches!(&actions[0], ClaimWatchAction::RedispatchBead { bead_id, title }
@@ -7159,7 +7451,14 @@ mod tests {
         let states = vec![st("oc-1", "done")]; // claimed but never closed
 
         // first poll: close nudge once
-        let actions = claim_watch_step(&mut watch, &ready, &inprogress, &states, 2);
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &inprogress,
+            &states,
+            2,
+            &empty_overlap(),
+        );
         assert_eq!(actions.len(), 1, "{actions:?}");
         match &actions[0] {
             ClaimWatchAction::NudgeClose {
@@ -7176,11 +7475,25 @@ mod tests {
         assert!(watch.get("bd-12").unwrap().close_nudged);
 
         // still unclosed: polls accumulate (no repeated nudge)
-        let actions = claim_watch_step(&mut watch, &ready, &inprogress, &states, 2);
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &inprogress,
+            &states,
+            2,
+            &empty_overlap(),
+        );
         assert!(actions.is_empty(), "no repeat close nudge: {actions:?}");
 
         // past the threshold (nudge_after more polls): resume re-dispatch
-        let actions = claim_watch_step(&mut watch, &ready, &inprogress, &states, 2);
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &inprogress,
+            &states,
+            2,
+            &empty_overlap(),
+        );
         assert_eq!(actions.len(), 1, "{actions:?}");
         assert!(
             matches!(&actions[0], ClaimWatchAction::RedispatchResume { bead_id, title }
@@ -7201,7 +7514,14 @@ mod tests {
         let ready = vec![];
         let inprogress = vec![rb_assignee("bd-12", "fix auth", "oc-1")];
         let states = vec![st("oc-1", "working")];
-        let actions = claim_watch_step(&mut watch, &ready, &inprogress, &states, 2);
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &inprogress,
+            &states,
+            2,
+            &empty_overlap(),
+        );
         assert!(
             actions.is_empty(),
             "no nudge while claimed work is in flight: {actions:?}"
@@ -7216,7 +7536,7 @@ mod tests {
         let mut watch: std::collections::HashMap<String, ClaimWatch> =
             std::collections::HashMap::new();
         watch.insert("bd-12".into(), cw("oc-1"));
-        let actions = claim_watch_step(&mut watch, &[], &[], &[], 2);
+        let actions = claim_watch_step(&mut watch, &[], &[], &[], 2, &empty_overlap());
         assert!(watch.is_empty(), "closed bead drops from the watch");
         assert!(
             matches!(&actions[0], ClaimWatchAction::ReleaseReservations { bead_id }
@@ -7234,7 +7554,7 @@ mod tests {
         let mut watch: std::collections::HashMap<String, ClaimWatch> =
             std::collections::HashMap::new();
         watch.insert("bd-77".into(), cw("oc-1"));
-        let actions = claim_watch_step(&mut watch, &[], &[], &[], 2);
+        let actions = claim_watch_step(&mut watch, &[], &[], &[], 2, &empty_overlap());
         assert_eq!(actions.len(), 1, "one release action: {actions:?}");
         assert!(
             matches!(&actions[0], ClaimWatchAction::ReleaseReservations { bead_id }
@@ -7243,7 +7563,7 @@ mod tests {
             actions[0]
         );
         // Second poll: the entry is gone — no re-fire.
-        let actions = claim_watch_step(&mut watch, &[], &[], &[], 2);
+        let actions = claim_watch_step(&mut watch, &[], &[], &[], 2, &empty_overlap());
         assert!(actions.is_empty(), "no repeat release: {actions:?}");
         assert!(watch.is_empty());
     }
@@ -7256,7 +7576,7 @@ mod tests {
             std::collections::HashMap::new();
         watch.insert("bd-12".into(), cw("oc-1"));
         let ready = vec![rb2("bd-12", "fix auth")];
-        let actions = claim_watch_step(&mut watch, &ready, &[], &[], 2);
+        let actions = claim_watch_step(&mut watch, &ready, &[], &[], 2, &empty_overlap());
         assert!(
             matches!(&actions[0], ClaimWatchAction::RedispatchBead { bead_id, .. }
                 if bead_id == "bd-12"),
@@ -7264,6 +7584,118 @@ mod tests {
             actions[0]
         );
         assert!(watch.is_empty());
+    }
+
+    // ---- ADR-0019 Spec 3: serialize-on-overlap + overlap wait reason ----
+
+    /// Always-serialize paths: a held reservation on .beads/**, .flywheel/**,
+    /// Cargo.lock, root Cargo.toml, docs/catalog/** or target/** gates ALL
+    /// new ready-bead dispatch (never parallel). Normal source paths do not.
+    #[test]
+    fn serialize_overlap_always_serialize_paths_gate() {
+        let held = vec![("Cargo.lock".to_string(), "bd-a".to_string())];
+        assert!(always_serialize_held(&held), "Cargo.lock serializes");
+        let held = vec![(".flywheel/receipts/x.txt".to_string(), "bd-a".to_string())];
+        assert!(always_serialize_held(&held), ".flywheel/** serializes");
+        let held = vec![(".beads/issues.jsonl".to_string(), "bd-a".to_string())];
+        assert!(always_serialize_held(&held), ".beads/** serializes");
+        let held = vec![(
+            "docs/catalog/toron-mcp.json".to_string(),
+            "bd-a".to_string(),
+        )];
+        assert!(always_serialize_held(&held), "docs/catalog/** serializes");
+        let held = vec![("src/durable.rs".to_string(), "bd-a".to_string())];
+        assert!(
+            !always_serialize_held(&held),
+            "normal source paths do not serialize everything"
+        );
+        assert!(!always_serialize_held(&[]), "empty board never serializes");
+    }
+
+    /// Two in-flight beads holding overlapping path globs are BOTH
+    /// overlap-waiting; disjoint paths are not.
+    #[test]
+    fn serialize_overlap_bead_overlap_waits_marks_conflicting_in_flight() {
+        let held = vec![
+            ("src/**".to_string(), "bd-a".to_string()),
+            ("src/durable.rs".to_string(), "bd-b".to_string()),
+            ("docs/**".to_string(), "bd-c".to_string()),
+        ];
+        let in_flight = vec!["bd-a".to_string(), "bd-b".to_string(), "bd-c".to_string()];
+        let waits = bead_overlap_waits(&held, &in_flight);
+        assert!(waits.contains("bd-a"), "src/** waits: {waits:?}");
+        assert!(waits.contains("bd-b"), "src/durable.rs waits: {waits:?}");
+        assert!(
+            !waits.contains("bd-c"),
+            "disjoint docs/** does not wait: {waits:?}"
+        );
+        // a reason with no held rows never waits
+        let waits = bead_overlap_waits(&held, &["bd-z".to_string()]);
+        assert!(waits.is_empty());
+    }
+
+    /// An unclaimed bead waiting on overlap is NOT a stuck owner: no claim
+    /// nudge, wait reason recorded as Overlap.
+    #[test]
+    fn serialize_overlap_claim_watch_unclaimed_overlap_no_nudge() {
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-b".into(), cw("oc-1"));
+        let ready = vec![rb2("bd-b", "blocked bead")];
+        let states = vec![st("oc-1", "working")];
+        let overlap: std::collections::HashSet<String> =
+            std::collections::HashSet::from(["bd-b".to_string()]);
+        // at/over the nudge threshold — still suppressed
+        let actions = claim_watch_step(&mut watch, &ready, &[], &states, 2, &overlap);
+        assert!(
+            actions.is_empty(),
+            "no claim nudge for an overlap wait: {actions:?}"
+        );
+        assert_eq!(
+            watch["bd-b"].wait_reason,
+            Some(WaitReason::Overlap),
+            "wait reason recorded"
+        );
+    }
+
+    /// A claimed-but-settled bead whose paths are contested is waiting on
+    /// the other bead's release — no close nudge, no resume re-dispatch.
+    #[test]
+    fn serialize_overlap_claim_watch_claimed_settled_overlap_no_close_nudge() {
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-b".into(), cw("oc-1"));
+        let inprogress = vec![rb_assignee("bd-b", "blocked bead", "oc-1")];
+        let states = vec![st("oc-1", "idle")];
+        let overlap: std::collections::HashSet<String> =
+            std::collections::HashSet::from(["bd-b".to_string()]);
+        let actions = claim_watch_step(&mut watch, &[], &inprogress, &states, 2, &overlap);
+        assert!(
+            actions.is_empty(),
+            "no close nudge / redispatch for an overlap wait: {actions:?}"
+        );
+        assert_eq!(watch["bd-b"].wait_reason, Some(WaitReason::Overlap));
+    }
+
+    /// Non-overlap beads keep the exact pre-existing watchdog behavior and
+    /// their wait reason stays None (a released overlap clears the marker).
+    #[test]
+    fn serialize_overlap_claim_watch_non_overlap_unchanged() {
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-a".into(), cw("oc-1"));
+        let ready = vec![rb2("bd-a", "normal bead")];
+        let states = vec![st("oc-1", "working")];
+        let overlap: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // nudge_after=1 → immediate claim nudge for the non-overlap bead
+        let actions = claim_watch_step(&mut watch, &ready, &[], &states, 1, &overlap);
+        assert!(
+            matches!(&actions[0], ClaimWatchAction::NudgeClaim { bead_id, .. }
+                if bead_id == "bd-a"),
+            "{:?}",
+            actions[0]
+        );
+        assert_eq!(watch["bd-a"].wait_reason, None);
     }
 
     #[test]

@@ -713,6 +713,15 @@ enum Commands {
         bead_id: String,
         title: String,
     },
+    /// internal: close-detect SHA check (ADR-0019, bd-w1-sha-xyhd) — derive
+    /// the sha of the commit whose message carries the bead id; no commit ->
+    /// close ILLEGAL + mail names the missing commit
+    #[command(name = "__verify-close-sha", hide = true)]
+    __VerifyCloseSha { project: String, bead_id: String },
+    /// internal: the project's active reservation board (ADR-0019 Spec
+    /// 3.4/3.5, bd-w1-reserve-serialize-2mam) — serialize-on-overlap data
+    #[command(name = "__reservation-board", hide = true)]
+    __ReservationBoard { project: String },
     /// internal: diagnose unresponsive agent (tail + health mail)
     #[command(name = "__diagnose", hide = true)]
     __Diagnose {
@@ -3256,6 +3265,12 @@ fn main() {
             bead_id,
             title,
         }) => cmd_internal_mail_not_ready(&cfg, project, bead_id, title),
+        Some(Commands::__VerifyCloseSha { project, bead_id }) => {
+            cmd_internal_verify_close_sha(&cfg, project, bead_id)
+        }
+        Some(Commands::__ReservationBoard { project }) => {
+            cmd_internal_reservation_board(&cfg, project)
+        }
         Some(Commands::__Diagnose {
             project,
             name,
@@ -11352,6 +11367,51 @@ mod loop_tests {
         );
     }
 
+    /// ADR-0019 SHA rule (bd-w1-sha-xyhd): a close with no commit carrying
+    /// the bead id is ILLEGAL — the planner is mailed on the bead's thread,
+    /// and the mail NAMES the missing commit.
+    #[test]
+    fn sha_rule_missing_commit_mail_names_the_missing_commit() {
+        use crate::backend::MailSurface as _;
+        let mail = crate::mail_shim::Mail::from_config(None)
+            .expect("mail ok")
+            .expect("mail Some");
+        let backend = crate::backend::toron::ToronMailBackend::new(mail);
+        let project = "sha-rule-mail";
+        backend::run_mail(backend.ensure_project(project)).expect("ensure");
+        let sender = backend.agent_name().to_string();
+        let sender_profile = spawn_agent_profile(&sender, "opencode", project);
+        backend::run_mail(backend.register_agent(project, &sender_profile))
+            .expect("register sender");
+        let profile = spawn_agent_profile("PlannerOne", "opencode", project);
+        backend::run_mail(backend.register_agent(project, &profile)).expect("register");
+        send_missing_commit_mail(&backend, project, "bd-sha-missing", "PlannerOne")
+            .expect("missing-commit mail sends");
+        let items = backend::run_mail(backend.inbox(&backend::InboxQuery {
+            project: project.into(),
+            agent: "PlannerOne".into(),
+            unread_only: false,
+            limit: Some(10),
+            include_bodies: false,
+            urgent_only: false,
+            since_ts: None,
+        }))
+        .expect("inbox");
+        let m = items
+            .iter()
+            .find(|m| m.subject.contains("no commit"))
+            .expect("planner received the missing-commit mail");
+        assert_eq!(
+            m.thread_id.as_ref().map(|t| t.as_str()),
+            Some("bd-sha-missing"),
+            "mail rides the bead's thread (ADR-0019 Spec 0)"
+        );
+        assert!(
+            m.body_md.contains("bd-sha-missing"),
+            "mail names the bead whose commit is missing"
+        );
+    }
+
     /// The planner to notify is the bead's creator (`br show --json` →
     /// `created_by`), falling back to the configured identity when the
     /// creator cannot be resolved.
@@ -18351,24 +18411,20 @@ fn cmd_internal_mail_not_ready(
 /// (`br show --json` → `created_by`), falling back to the configured
 /// orchestrator identity when the creator cannot be resolved.
 fn resolve_planner_for_bead(project_dir: &str, bead_id: &str, fallback: &str) -> String {
-    let out = std::process::Command::new("br")
+    if let Ok(out) = std::process::Command::new("br")
         .args(["show", bead_id, "--json"])
         .current_dir(project_dir)
-        .output();
-    if let Ok(out) = out
+        .output()
         && out.status.success()
+        && let Ok(v) = serde_json::from_slice::<Value>(&out.stdout)
+        && let Some(created_by) = v
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|b| b.get("created_by"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
     {
-        if let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) {
-            if let Some(created_by) = v
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(|b| b.get("created_by"))
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                return created_by.to_string();
-            }
-        }
+        return created_by.to_string();
     }
     fallback.to_string()
 }
@@ -18403,6 +18459,102 @@ fn send_not_ready_mail(
         &subject,
         &body,
         "high",
+        true,
+        Some(bead_id),
+    )
+}
+
+/// internal leaf: close-detect SHA check (ADR-0019 SHA rule, bd-w1-sha-xyhd).
+/// Derives `sha = git log --all -1 --grep=<bead-id> --format=%H` in the
+/// primary tree — no `git rev-parse HEAD` fallback (shared-tree bare HEAD may
+/// not contain the closed bead's work). No commit carries the id -> the close
+/// is ILLEGAL regardless of verdicts: mail the planner naming the missing
+/// commit (the reopen call lands in bd-w1-reopen-f6tw). Always soft-fail:
+/// exit 0 with `{illegal, ...}` so overnight loops never die.
+/// internal leaf: the project's active reservation board (ADR-0019 Spec
+/// 3.4/3.5, bd-w1-reserve-serialize-2mam) — `{reservations: [{path, reason,
+/// holder, ...}]}` from `active_reservations` (bd-dsu1). Feeds the loop's
+/// serialize-on-overlap decision. Always exits 0 — a mail hiccup degrades
+/// to an empty board, never a loop crash.
+fn cmd_internal_reservation_board(cfg: &Config, project: &str) -> Result<()> {
+    let key = project_dir_str(cfg, project)?;
+    let v = match mail_or_die(cfg) {
+        Ok(mail) => mail.list_active(&key, None, None).unwrap_or_else(|e| {
+            eprintln!("flywheel: reservation board failed (continuing): {e:#}");
+            json!({ "project": key, "count": 0, "reservations": [] })
+        }),
+        Err(e) => {
+            eprintln!("flywheel: reservation board mail unavailable (continuing): {e:#}");
+            json!({ "project": key, "count": 0, "reservations": [] })
+        }
+    };
+    print_json(&v);
+    Ok(())
+}
+
+fn cmd_internal_verify_close_sha(cfg: &Config, project: &str, bead_id: &str) -> Result<()> {
+    let key = project_dir_str(cfg, project)?;
+    match verdict::derive_head_sha(std::path::Path::new(&key), bead_id) {
+        Ok(sha) => {
+            print_json(&json!({ "illegal": false, "bead_id": bead_id, "sha": sha }));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "flywheel: bead {bead_id} closed WITHOUT a commit carrying its id — close ILLEGAL: {e}"
+            );
+            let mut mailed = false;
+            if let Ok(mail) = backend::mail_backend(cfg) {
+                let fallback = cfg
+                    .agent_mail
+                    .as_ref()
+                    .and_then(|m| m.name.clone())
+                    .unwrap_or_else(|| "Flywheel".to_string());
+                let planner = resolve_planner_for_bead(&key, bead_id, &fallback);
+                let out = (|| -> Result<backend::SendReceipt> {
+                    backend::run_mail(mail.ensure_project(&key)).map_err(|e| anyhow!("{e}"))?;
+                    send_missing_commit_mail(&*mail, &key, bead_id, &planner)
+                })();
+                mailed = out.is_ok();
+                if let Err(me) = out {
+                    eprintln!("flywheel: missing-commit mail for {bead_id} failed: {me:#}");
+                }
+            }
+            print_json(&json!({
+                "illegal": true,
+                "bead_id": bead_id,
+                "error": format!("{e}"),
+                "mailed": mailed,
+            }));
+            Ok(())
+        }
+    }
+}
+
+/// The missing-commit mail itself: thread = the bead id, so the planner's
+/// reply stays on the bead's thread (ADR-0019 Spec 0). Separated for tests.
+fn send_missing_commit_mail(
+    mail: &dyn backend::MailSurface,
+    key: &str,
+    bead_id: &str,
+    planner: &str,
+) -> Result<backend::SendReceipt> {
+    let subject = format!("[{bead_id}] unverified close REJECTED: no commit carries the bead id");
+    let body = format!(
+        "Bead **{bead_id}** was closed but **no commit carries its id** — the close is \
+         ILLEGAL under the ADR-0019 SHA rule (`git log --all --grep={bead_id}` finds nothing).\n\n\
+         In a shared tree bare HEAD may not contain this bead's work at all, so a verdict \
+         cannot bind to it. Commit the bead's work BEFORE closing with the bead id IN the \
+         commit message; then the close becomes legal.\n\n\
+         Missing: the commit whose message contains `{bead_id}`."
+    );
+    mail_send(
+        mail,
+        key,
+        std::slice::from_ref(&planner.to_string()),
+        &subject,
+        &body,
+        "urgent",
         true,
         Some(bead_id),
     )
