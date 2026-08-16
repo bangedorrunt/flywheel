@@ -497,7 +497,8 @@ steps:
     spec:
       profile: "@reviewer"
       harness: "opencode"
-      task: "Prove {{inputs.objective}} independently (different model family, ADR-0019 Spec 4). VERIFY from the bead. Record unit-test-verified. Do not re-implement."
+      stage: "prove-verify"
+      plan: "Objective: {{inputs.objective}}"
     on_error: fail_run
 "##,
     ),
@@ -522,7 +523,8 @@ steps:
     assignee: x
     spec:
       profile: "@scout"
-      task: "Run the behavior invariant for the refactoring of {{inputs.target}}: `{{inputs.invariant_cmd}}`. Store the stdout receipt — this is the baseline that must stay green."
+      stage: "baseline-measure"
+      plan: "Refactoring of {{inputs.target}}: `{{inputs.invariant_cmd}}` — store the stdout receipt."
     on_error: fail_run
   - name: subtract
     action: dispatch_job
@@ -544,7 +546,8 @@ steps:
     spec:
       profile: "@reviewer"
       harness: "opencode"
-      task: "Prove the refactoring of {{inputs.target}}: invariant `{{inputs.invariant_cmd}}` still green AND no *V2*/*_improved*/*_enhanced* files added. Record unit-test-verified."
+      stage: "prove-verify"
+      plan: "Refactoring of {{inputs.target}}: invariant `{{inputs.invariant_cmd}}` still green AND no *V2*/*_improved*/*_enhanced* files added."
     on_error: fail_run
 "##,
     ),
@@ -571,7 +574,8 @@ steps:
     assignee: x
     spec:
       profile: "@scout"
-      task: "Run the baseline for {{inputs.metric}}: `{{inputs.baseline_cmd}}`. Record the NUMBER (the baseline). The budget is {{inputs.budget}}."
+      stage: "baseline-measure"
+      plan: "Perf baseline for {{inputs.metric}}: `{{inputs.baseline_cmd}}` — record the NUMBER. Budget: {{inputs.budget}}."
     on_error: fail_run
   - name: change
     action: dispatch_job
@@ -585,7 +589,8 @@ steps:
     assignee: x
     spec:
       profile: "@scout"
-      task: "Measure {{inputs.metric}} with the SAME command `{{inputs.baseline_cmd}}` against the change. Return JSON: {\"improved\": <bool>, \"number\": <N>} — improved iff the metric is better AND the budget {{inputs.budget}} is held."
+      stage: "measure-keep-or-discard"
+      plan: "Measure {{inputs.metric}} with the SAME command `{{inputs.baseline_cmd}}` against the change. Return JSON: {\"improved\": <bool>, \"number\": <N>} — improved iff the metric is better AND the budget {{inputs.budget}} is held."
     on_error: fail_run
   - name: keep-or-discard
     action: branch
@@ -635,7 +640,8 @@ steps:
       assignee: x
       spec:
         profile: "@coder"
-        task: "HILLCLIMB ITERATION (budget {{inputs.max_iters}} attempts; target {{inputs.target}} for {{inputs.metric}}): hypothesize -> apply the SMALLEST change -> measure with the same command. If improved: KEEP — record the ledger row (flywheel ledger / br gate, sha of this iteration's commit) + ONE commit per accepted win, return ok. If NOT improved: DISCARD — discard IS a revert, restore the baseline exactly, then return an ERROR so the loop retries with a new hypothesis. No unrelated work."
+        stage: "measure-keep-or-discard"
+        plan: "HILLCLIMB ITERATION (budget {{inputs.max_iters}} attempts; target {{inputs.target}} for {{inputs.metric}}): hypothesize -> apply the SMALLEST change -> measure with the same command. If improved: KEEP — record the ledger row (flywheel ledger / br gate, sha of this iteration's commit) + ONE commit per accepted win, return ok. If NOT improved: DISCARD — discard IS a revert, restore the baseline exactly, then return an ERROR so the loop retries with a new hypothesis. No unrelated work."
 "##,
     ),
     (
@@ -683,7 +689,7 @@ graph:
     judge:
       action: dispatch_job
       assignee: x
-      spec: { profile: "@oracle", harness: "opencode", task: "Judge the prototype arms for: {{inputs.question}}. Compare on the named criteria (fit to the question, design quality, feasibility, blast radius). Arms (branch envelope — the collected arm reports live under outputs.arm): {{steps.arms}}. Pick ONE; the others are DISCARDED. No merge of a bit-of-each unless you write a graft bead for the merged design. Report: chosen arm + the comparison table." }
+      spec: { profile: "@oracle", harness: "opencode", stage: "judge-arms", plan: "Prototype arms for: {{inputs.question}}" }
       needs: [arms]
       on_error: fail_run
 "##,
@@ -734,7 +740,7 @@ graph:
     judge:
       action: dispatch_job
       assignee: x
-      spec: { profile: "@oracle", harness: "opencode", task: "Judge the arena arms for: {{inputs.question}}. SELECTION RULE (declared up front): {{inputs.selection}} — first-pass: pick the first arm that clears the bar; rank-all: rank every arm; best-of: pick the best. Arms (branch envelope — collected arm reports under outputs.arm): {{steps.arms}}. Output the comparison TABLE (model per arm, verdict per criterion) — the table, not raw dumps. Pick ONE winner; others discarded. No merge of a bit-of-each unless you write a graft bead." }
+      spec: { profile: "@oracle", harness: "opencode", stage: "judge-arms", plan: "Arena arms for: {{inputs.question}}. SELECTION RULE (declared up front): {{inputs.selection}} — first-pass: pick the first arm that clears the bar; rank-all: rank every arm; best-of: pick the best. Output the comparison TABLE (model per arm, verdict per criterion) — the table, not raw dumps." }
       needs: [arms]
       on_error: fail_run
 "##,
@@ -798,7 +804,8 @@ graph:
       assignee: x
       spec:
         profile: "@scout"
-        task: "Diagnose the symptom — instrument the live surface or read the artifact; the deliverable is the DIAGNOSIS with the reproducing evidence, root cause, and confidence. Read-only: no mutations to the repo or the target. Symptom: {{inputs.symptom}}. Artifact: {{inputs.artifact}}"
+        stage: "diagnose-only"
+        plan: "Symptom: {{inputs.symptom}}. Artifact: {{inputs.artifact}}"
 "##,
     ),
     (
@@ -931,7 +938,8 @@ steps:
     spec:
       profile: "@housekeeper"
       harness: "opencode"
-      task: "PICKUP for {{inputs.project}} (ADR-0019): (1) read .flywheel/agent-state/*.json — context_pct >= 80 = EXHAUSTED → respawn those panes; (2) `br list --status in_progress --json` — stranded beads (assignee dead/gone) get a RESUME brief re-dispatched; (3) ledger gaps — beads closed without a legal verdict (`flywheel ledger check <bead-id>` exits non-zero) → flag for the loop reopen path, NEVER force-unlock; (4) last-sent registry — prompts recorded but unconfirmed get re-sent per resume-dedup. Idempotent: re-running is safe — a done pickup finds nothing to do. Keep SUMMARIES in your report, not raw dumps (guard-the-context-window)."
+      stage: "resume-pickup"
+      plan: "Project: {{inputs.project}}"
     on_error: fail_run
 "##,
     ),
@@ -1513,6 +1521,88 @@ mod tests {
         );
     }
 
+    /// bd-h9xn (extraction proof): the ADR-0019 playbooks compose from
+    /// stages — every dispatch spec that carries a `stage:` ref must NOT
+    /// also carry an inline `task:` (the stage IS the discipline; `plan:`
+    /// carries per-run interpolation). bug-fix is the documented EXCEPTION:
+    /// its four nodes keep `task:` because the sc_bugfix_playbook ORDER test
+    /// reads raw `spec.task` from the bare engine (no stage resolution
+    /// exists in toron-workflow) — pinned by the test contract. Scope: the
+    /// nine rewired playbooks (the stage list in the bead); ship-beads is
+    /// NOT in scope — it pre-existed with a `stage` + `task` pair where the
+    /// inline task wins by design (bd-m7ac).
+    #[test]
+    fn playbook_stage_refs_carry_no_inline_task() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let rewired = [
+            "feature",
+            "refactoring",
+            "perf",
+            "hillclimb",
+            "prototype",
+            "arena",
+            "forensics",
+            "pickup",
+        ];
+        let mut checked = 0u32;
+        fn scan_action(action: &Action, name: &str, checked: &mut u32) {
+            if let Action::DispatchJob { spec, .. } = action
+                && spec.get("stage").and_then(Value::as_str).is_some()
+            {
+                assert!(
+                    spec.get("task").is_none(),
+                    "{name}: a stage-ref dispatch must not carry inline task: {spec}"
+                );
+                *checked += 1;
+            }
+            match action {
+                Action::Parallel { each, .. } => scan_action(&each.action, name, checked),
+                Action::Retry { step, .. } => scan_action(&step.action, name, checked),
+                Action::Branch {
+                    then, else_steps, ..
+                } => {
+                    for s in then.iter().chain(else_steps.iter()) {
+                        scan_action(&s.action, name, checked);
+                    }
+                }
+                Action::Foreach { each, .. } => scan_action(&each.action, name, checked),
+                _ => {}
+            }
+        }
+        for name in rewired {
+            let wf = &wfs[name];
+            for step in &wf.steps {
+                scan_action(&step.action, name, &mut checked);
+            }
+            if let Some(g) = &wf.graph {
+                for node in g.nodes.values() {
+                    scan_action(&node.action, name, &mut checked);
+                }
+            }
+        }
+        assert!(
+            checked >= 10,
+            "expected >=10 stage-ref dispatches, saw {checked}"
+        );
+        // The documented exception stays inline (ORDER-test contract).
+        let bug_fix = &wfs["bug-fix"];
+        let mut bug_fix_tasks = 0u32;
+        if let Some(g) = &bug_fix.graph {
+            for node in g.nodes.values() {
+                if let Action::DispatchJob { spec, .. } = &node.action
+                    && spec.get("task").and_then(Value::as_str).is_some()
+                {
+                    bug_fix_tasks += 1;
+                }
+            }
+        }
+        assert_eq!(
+            bug_fix_tasks, 4,
+            "bug-fix keeps its four inline task: nodes"
+        );
+    }
+
     /// Every built-in lints clean (the lint gate over all compiled-in
     /// workflows — ADR-0005 Lint-time checks).
     #[test]
@@ -1651,22 +1741,39 @@ mod tests {
             !else_steps[0].build_slot,
             "sketch arms write text only, no slot"
         );
-        // judge: @oracle needs arms
+        // judge: @oracle needs arms — the judge discipline is the judge-arms
+        // stage (bd-h9xn extraction); the plan carries the per-run question.
         let judge = &g.nodes["judge"];
         assert!(judge.needs.contains(&"arms".to_string()));
         let Action::DispatchJob { spec, .. } = &judge.action else {
             panic!("judge is a dispatch");
         };
-        let task = spec
-            .get("task")
+        assert_eq!(
+            spec.get("stage").and_then(serde_json::Value::as_str),
+            Some("judge-arms"),
+            "judge composes from the judge-arms stage"
+        );
+        let plan = spec
+            .get("plan")
             .and_then(serde_json::Value::as_str)
-            .expect("judge task");
-        assert!(task.contains("@oracle") || spec.get("profile").is_some());
-        assert!(task.contains("{{steps.arms}}"), "judge consumes the arms");
+            .expect("judge plan");
+        assert!(
+            plan.contains("Prototype arms"),
+            "plan names the arms: {plan}"
+        );
+        // The arms consumer lives in the stage discipline (extraction proof:
+        // the stage prompt still reaches the arms envelope).
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let stage_prompt = lib.resolve("judge-arms").expect("judge-arms resolves");
+        assert!(
+            stage_prompt.contains("{{steps.arms}}"),
+            "judge consumes the arms"
+        );
     }
 
     /// ADR-0019 Spec 7.2: arena carries the same shape PLUS the declared-up-front
-    /// selection rule (first-pass | rank-all | best-of) in the judge task.
+    /// selection rule (first-pass | rank-all | best-of) in the judge PLAN
+    /// (the judge discipline is the shared judge-arms stage — bd-h9xn).
     #[test]
     fn arena_declares_selection_rule_up_front() {
         use toron_workflow::schema::Action;
@@ -1677,19 +1784,24 @@ mod tests {
         let Action::DispatchJob { spec, .. } = &judge.action else {
             panic!("judge is a dispatch");
         };
-        let task = spec
-            .get("task")
+        assert_eq!(
+            spec.get("stage").and_then(serde_json::Value::as_str),
+            Some("judge-arms"),
+            "arena judge composes from judge-arms"
+        );
+        let plan = spec
+            .get("plan")
             .and_then(serde_json::Value::as_str)
-            .expect("judge task");
+            .expect("judge plan");
         assert!(
-            task.contains("{{inputs.selection}}"),
+            plan.contains("{{inputs.selection}}"),
             "selection rule declared up front"
         );
-        assert!(task.contains("first-pass"), "first-pass documented");
-        assert!(task.contains("rank-all"), "rank-all documented");
-        assert!(task.contains("best-of"), "best-of documented");
+        assert!(plan.contains("first-pass"), "first-pass documented");
+        assert!(plan.contains("rank-all"), "rank-all documented");
+        assert!(plan.contains("best-of"), "best-of documented");
         assert!(
-            task.contains("comparison TABLE"),
+            plan.contains("comparison TABLE"),
             "parent keeps the table, not raw dumps"
         );
     }
@@ -2389,14 +2501,21 @@ mod tests {
         let Action::DispatchJob { spec, .. } = &step.action else {
             panic!("each attempt is a dispatch_job");
         };
-        let task = spec.get("task").and_then(Value::as_str).unwrap_or("");
-        assert!(
-            task.contains("DISCARD"),
-            "attempt carries the discard rule: {task}"
+        // The keep/discard discipline is the measure-keep-or-discard stage
+        // (bd-h9xn extraction); the plan carries the iteration specifics.
+        assert_eq!(
+            spec.get("stage").and_then(Value::as_str),
+            Some("measure-keep-or-discard"),
+            "hillclimb attempts compose from measure-keep-or-discard"
         );
-        assert!(task.contains("KEEP"), "attempt carries the keep rule");
+        let plan = spec.get("plan").and_then(Value::as_str).unwrap_or("");
         assert!(
-            task.contains("max_iters"),
+            plan.contains("DISCARD"),
+            "attempt carries the discard rule: {plan}"
+        );
+        assert!(plan.contains("KEEP"), "attempt carries the keep rule");
+        assert!(
+            plan.contains("max_iters"),
             "budget binds to the max_iters input"
         );
     }
