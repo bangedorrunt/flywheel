@@ -5790,8 +5790,8 @@ mod peer_encoding_tests {
 
     /// Read the real template from disk (the file the spawn path loads).
     fn real_template() -> String {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("integrations/peer-aware.md.tpl");
+        let p =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("integrations/peer-aware.md.tpl");
         std::fs::read_to_string(&p).expect("peer-aware template readable")
     }
 
@@ -5810,14 +5810,7 @@ mod peer_encoding_tests {
             ("flywheel-toron-omp", "GrayCarp", 60, 240, 0),
         ];
         for (name, identity, interval, budget, prompts) in inputs {
-            let rendered = peer_prompt_template(
-                &tpl,
-                name,
-                identity,
-                *interval,
-                *budget,
-                *prompts,
-            );
+            let rendered = peer_prompt_template(&tpl, name, identity, *interval, *budget, *prompts);
             assert!(
                 rendered.is_ascii(),
                 "rendered template must be ASCII for name={name} identity={identity}"
@@ -13136,8 +13129,9 @@ pub fn prompts_dir(kind: &str) -> Option<std::path::PathBuf> {
 /// Render one phase prompt for one agent kind. Pure: `version` and
 /// `generated` are injected by the caller (deterministic tests).
 fn render_prompt(kind: &str, phase: &str, version: &str, generated: &str) -> Result<String> {
-    let frontmatter = prompt_frontmatter(kind)
-        .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp, pa)"))?;
+    let frontmatter = prompt_frontmatter(kind).ok_or_else(|| {
+        anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp, pa)")
+    })?;
     let phase_tpl = prompt_phase_template(phase).ok_or_else(|| {
         anyhow!("unknown phase: {phase} (known: triage, execute, review, commit, create)")
     })?;
@@ -13169,8 +13163,9 @@ fn render_workflow_prompt(
     version: &str,
     generated: &str,
 ) -> Result<String> {
-    let frontmatter = prompt_frontmatter(kind)
-        .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp, pa)"))?;
+    let frontmatter = prompt_frontmatter(kind).ok_or_else(|| {
+        anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp, pa)")
+    })?;
     let tpl = prompt_workflow_template(name)
         .ok_or_else(|| anyhow!("unknown workflow command: {name} (flywheel integration list)"))?;
     let (_, _, description) = PROMPT_WORKFLOWS
@@ -13195,8 +13190,9 @@ fn render_orchestration_prompt(
     version: &str,
     generated: &str,
 ) -> Result<String> {
-    let frontmatter = prompt_frontmatter(kind)
-        .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp, pa)"))?;
+    let frontmatter = prompt_frontmatter(kind).ok_or_else(|| {
+        anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp, pa)")
+    })?;
     let tpl = prompt_orchestration_template(name).ok_or_else(|| {
         anyhow!("unknown orchestration command: {name} (flywheel integration list)")
     })?;
@@ -20870,9 +20866,8 @@ mod integration_tests {
     /// description) + the playbook template + stamps; no beads body.
     #[test]
     fn render_orchestration_prompt_has_frontmatter_and_focus() {
-        let out =
-            render_orchestration_prompt("opencode", "swarm", "9.9.9", "2026-08-10T00:00:00Z")
-                .unwrap();
+        let out = render_orchestration_prompt("opencode", "swarm", "9.9.9", "2026-08-10T00:00:00Z")
+            .unwrap();
         assert!(out.starts_with("---\n"), "frontmatter");
         assert!(
             out.contains("wave-gated bead-graph swarm playbook"),
@@ -20985,9 +20980,8 @@ mod integration_tests {
     /// plus the frontmatter description and stamps.
     #[test]
     fn render_loop_prompt_has_frontmatter_and_steps() {
-        let out =
-            render_orchestration_prompt("opencode", "loop", "9.9.9", "2026-08-10T00:00:00Z")
-                .unwrap();
+        let out = render_orchestration_prompt("opencode", "loop", "9.9.9", "2026-08-10T00:00:00Z")
+            .unwrap();
         assert!(out.starts_with("---\n"), "frontmatter");
         assert!(
             out.contains("single-agent autonomy"),
