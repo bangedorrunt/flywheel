@@ -13095,17 +13095,25 @@ fn prompt_workflow_template(name: &str) -> Option<&'static str> {
 /// commands) and the beads lifecycle commands. The template files live in
 /// integrations/prompts/ and are rendered per agent kind like the workflow
 /// commands.
-const ORCHESTRATION_COMMANDS: &[(&str, &str, &str)] = &[(
-    "swarm",
-    "Run the /swarm command — the wave-gated bead-graph swarm playbook: classify, gate-prep, lanes, spawn, brief, conflict ladder, wave gate, teardown.",
-    "swarm.md.tpl",
-)];
+const ORCHESTRATION_COMMANDS: &[(&str, &str, &str)] = &[
+    (
+        "swarm",
+        "Run the /swarm command — the wave-gated bead-graph swarm playbook: classify, gate-prep, lanes, spawn, brief, conflict ladder, wave gate, teardown.",
+        "swarm.md.tpl",
+    ),
+    (
+        "loop",
+        "Run the /loop command — single-agent autonomy: one objective, TDD per unit, in-flight peer checkpoints (summoned reviewer instead of blocking on the captain), VERIFY receipt, commit-before-close.",
+        "loop.md.tpl",
+    ),
+];
 
 /// Per-orchestration-command template: `{{TOOL_FRONTMATTER}}` + the
 /// playbook body. Standalone — no beads body.
 fn prompt_orchestration_template(name: &str) -> Option<&'static str> {
     match name {
         "swarm" => Some(include_str!("../integrations/prompts/swarm.md.tpl")),
+        "loop" => Some(include_str!("../integrations/prompts/loop.md.tpl")),
         _ => None,
     }
 }
@@ -20845,12 +20853,16 @@ mod integration_tests {
         );
         assert_eq!(
             ORCHESTRATION_COMMANDS.len(),
-            1,
-            "exactly one orchestration command (bd-ug9z /loop extends this set)"
+            2,
+            "exactly two orchestration commands (swarm + loop)"
         );
         let (name, description, template) = ORCHESTRATION_COMMANDS[0];
         assert_eq!(name, "swarm");
         assert!(!description.is_empty(), "/swarm has a description");
+        assert!(template.ends_with(".tpl"), "template file referenced");
+        let (name, description, template) = ORCHESTRATION_COMMANDS[1];
+        assert_eq!(name, "loop", "bd-ug9z adds /loop");
+        assert!(!description.is_empty(), "/loop has a description");
         assert!(template.ends_with(".tpl"), "template file referenced");
     }
 
@@ -20936,6 +20948,70 @@ mod integration_tests {
         ] {
             assert!(tpl.contains(p), "cites principle {p}");
         }
+    }
+
+    /// bd-ug9z: the loop template is ASCII-only (the bd-zq8u peer-aware
+    /// "cannot be encoded safely" failure mode) and under 4 KiB.
+    #[test]
+    fn loop_template_is_ascii_only_and_bounded() {
+        let tpl: &str = prompt_orchestration_template("loop").expect("loop template");
+        assert!(tpl.is_ascii(), "loop.md.tpl must be ASCII-only");
+        assert!(
+            tpl.len() < 4 * 1024,
+            "loop.md.tpl must stay under 4 KiB ({} bytes)",
+            tpl.len()
+        );
+    }
+
+    /// bd-ug9z: the loop playbook cites the governing principles by name
+    /// (ADR-0019 Spec 5 steering vocabulary) — prove-it-works,
+    /// fix-root-causes, never-block-on-the-human,
+    /// sequence-verifiable-units.
+    #[test]
+    fn loop_template_cites_principles() {
+        let tpl: &str = prompt_orchestration_template("loop").expect("loop template");
+        for p in [
+            "prove-it-works",
+            "fix-root-causes",
+            "never-block-on-the-human",
+            "sequence-verifiable-units",
+        ] {
+            assert!(tpl.contains(p), "cites principle {p}");
+        }
+    }
+
+    /// bd-ug9z: the rendered /loop command carries the full playbook —
+    /// setup, execute, in-flight peer checkpoints, verify, close, promote —
+    /// plus the frontmatter description and stamps.
+    #[test]
+    fn render_loop_prompt_has_frontmatter_and_steps() {
+        let out =
+            render_orchestration_prompt("opencode", "loop", "9.9.9", "2026-08-10T00:00:00Z")
+                .unwrap();
+        assert!(out.starts_with("---\n"), "frontmatter");
+        assert!(
+            out.contains("single-agent autonomy"),
+            "description in frontmatter"
+        );
+        assert!(out.contains("# Orchestration: loop"));
+        for step in [
+            "SETUP",
+            "EXECUTE",
+            "IN-FLIGHT PEER CHECKPOINTS",
+            "VERIFY",
+            "CLOSE",
+            "PROMOTE",
+        ] {
+            assert!(out.contains(step), "playbook step {step} present");
+        }
+        assert!(out.contains("flywheel collab <proj> --to <reviewer-pin>"));
+        assert!(out.contains("flywheel 9.9.9"));
+        assert!(out.contains("2026-08-10T00:00:00Z"));
+        assert!(!out.contains("{{TOOL_FRONTMATTER}}"));
+        assert!(
+            !out.contains("{{BODY}}"),
+            "orchestration commands are standalone — no beads body"
+        );
     }
 
     #[test]
