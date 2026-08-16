@@ -68,6 +68,10 @@ pub struct LoopParams {
     pub max_iterations: Option<u64>,
     /// bead-driven mode: source work from `br ready` instead of a static queue
     pub work: bool,
+    /// bd-gnej kill-switch: disable the wave-gate (wave-N label ordering)
+    /// for graphs that do not use wave labels. Default false = gating ON.
+    #[serde(default)]
+    pub no_wave_gates: bool,
     /// send every prompt via `__send --confirm` (landing confirmation).
     /// Default true — reliability is the default, --no-confirm is the escape
     /// hatch. `#[serde(default)]` keeps pre-confirm saved params loadable.
@@ -179,6 +183,10 @@ pub struct ReadyBead {
     /// + mail the planner on thread_id=<bead-id> (bd-w1-verify-fence).
     #[serde(default)]
     pub verify: Option<String>,
+    /// The bead's labels (bd-gnej wave-gate: `wave-N` labels gate dispatch
+    /// by wave order). `br ready --json` / `br list --json` emit them.
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 /// Parse the exact `## VERIFY` fence from a bead description (ADR-0019
@@ -238,6 +246,36 @@ fn is_fence_line(line: &str) -> bool {
 /// (the single survivor loop body) shares.
 pub fn partition_ready(ready: &[ReadyBead]) -> (Vec<&ReadyBead>, Vec<&ReadyBead>) {
     ready.iter().partition(|b| b.verify.is_some())
+}
+
+/// Parse a bead's `wave-N` label into its wave number (bd-gnej). A bead
+/// carrying `wave-3` → `Some(3)`. No wave label → `None` (no gating).
+pub fn bead_wave(b: &ReadyBead) -> Option<u32> {
+    b.labels
+        .iter()
+        .find_map(|l| l.strip_prefix("wave-").and_then(|n| n.parse::<u32>().ok()))
+}
+
+/// bd-gnej wave-gate: a bead labeled `wave-N` is HELD while ANY bead with a
+/// `wave-M` label (M<N) is open or in_progress — earlier waves run first.
+/// No wave labels anywhere → no gating (identity). Pure — the single
+/// decision both dispatch paths (sync loop + durable loop) share.
+pub fn wave_gate_held(ready: &[ReadyBead], inprogress: &[ReadyBead]) -> Vec<String> {
+    // Lowest wave among ALL open/in-progress beads. A ready bead is held iff
+    // its wave is strictly higher than that floor.
+    let min_open_wave = ready
+        .iter()
+        .chain(inprogress.iter())
+        .filter_map(bead_wave)
+        .min();
+    let Some(floor) = min_open_wave else {
+        return Vec::new(); // no wave labels → no gating
+    };
+    ready
+        .iter()
+        .filter(|b| bead_wave(b).is_some_and(|w| w > floor))
+        .map(|b| b.id.clone())
+        .collect()
 }
 
 /// Args for the `__mail-not-ready` leaf (ADR-0019): tell the planner a
@@ -1142,6 +1180,16 @@ fn parse_bead_list(v: &serde_json::Value, what: &str) -> anyhow::Result<Vec<Read
                 .and_then(serde_json::Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
+            labels: b
+                .get("labels")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
         .collect())
 }
@@ -2277,6 +2325,10 @@ pub enum WaitReason {
     Blocked,
     /// the bead serialized behind another in-flight bead's reservation
     Overlap,
+    /// the bead is a wave-N labeled bead held while an earlier wave-M (M<N)
+    /// is still open/in_progress (bd-gnej) — not a stuck owner, the loop
+    /// waits for the earlier wave to close
+    WaveGate,
 }
 
 /// One dispatched bead's claim-watch entry.
@@ -2425,10 +2477,16 @@ pub fn claim_watch_step(
     let mut actions = Vec::new();
     let mut drop = Vec::new();
     let nudge_after = nudge_after_polls.max(1);
+    // bd-gnej: ready beads currently held by the wave-gate (an earlier wave
+    // is open). Computed once — a dispatched bead that is now wave-held
+    // waits like an overlap, NOT a stuck owner.
+    let wave_held: std::collections::HashSet<String> =
+        wave_gate_held(ready, inprogress).into_iter().collect();
     for (bead_id, cw) in watch.iter_mut() {
         let waiting_on_overlap = overlap.contains(bead_id);
         let in_ready = ready.iter().find(|b| b.id == *bead_id);
         let claimed = inprogress.iter().find(|b| b.id == *bead_id);
+        let waiting_on_wave = wave_held.contains(bead_id);
         match (in_ready, claimed) {
             // still unclaimed
             (Some(rb), None) => {
@@ -2436,6 +2494,12 @@ pub fn claim_watch_step(
                     // serialized behind another in-flight bead's reservation —
                     // not a stuck owner: no claim nudge, keep waiting.
                     cw.wait_reason = Some(WaitReason::Overlap);
+                    continue;
+                }
+                if waiting_on_wave {
+                    // an earlier wave-M (M<N) is open — the bead waits for
+                    // the wave gate, not for its owner: no claim nudge.
+                    cw.wait_reason = Some(WaitReason::WaveGate);
                     continue;
                 }
                 cw.wait_reason = None;
@@ -3585,6 +3649,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // bead-driven mode: refresh the instruction queue from the tracker each
         // poll; the assigned-set is deterministic across replays (derives from
         // checkpointed poll results)
+        // bd-gnej wave-gate: ready beads held this poll (earlier wave open).
+        // Hoisted so the completion gate below can require them empty.
+        let mut wave_held: Vec<String> = Vec::new();
         if params.work {
             // interrupted work first: an in-progress bead's agent went idle —
             // resume it before handing out fresh beads. bd-627z.1: live names
@@ -3679,11 +3746,25 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // with a missing/multi-line/empty fence are NOT dispatched —
             // the planner is mailed once per bead per invocation.
             let (dispatchable, not_ready) = partition_ready(&ready);
+            // bd-gnej wave-gate: hold a wave-N labeled bead while any
+            // earlier wave-M (M<N) is open/in_progress — earlier waves run
+            // first. No wave labels → no gating. --no-wave-gates kills it.
+            wave_held = if params.no_wave_gates {
+                Vec::new()
+            } else {
+                wave_gate_held(&ready, &inprog)
+            };
             let to_assign: Vec<&ReadyBead> = dispatchable
                 .iter()
-                .filter(|b| !assigned.contains(&b.id))
+                .filter(|b| !assigned.contains(&b.id) && !wave_held.contains(&b.id))
                 .copied()
                 .collect();
+            if !wave_held.is_empty() {
+                eprintln!(
+                    "flywheel: wave-gate: holding {} (earlier wave open; not stuck-owner)",
+                    wave_held.join(", ")
+                );
+            }
             // ADR-0019 Spec 3.4/3.5: the reservation board drives BOTH the
             // always-serialize dispatch gate (Spec 3.5: while an
             // always-serialize path — .beads/**, .flywheel/**, Cargo.lock,
@@ -4630,7 +4711,11 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // the claim-watch must be EMPTY (every dispatched bead claimed
             // AND closed, or re-dispatched) before the loop may exit. Only
             // in work mode — non-work queues may hold arbitrary prompts.
-            && (!params.work || claim_watch.is_empty());
+            // bd-gnej: wave-gated beads are OPEN WORK too — an earlier wave
+            // is still running; the loop must NOT declare complete while
+            // any wave-N bead is held (the wave-gate resolves on a later
+            // poll once the earlier wave closes).
+            && (!params.work || (claim_watch.is_empty() && wave_held.is_empty()));
         if complete_now {
             // bd-87hq: never certify completion on a poll that could not
             // see the swarm/queue. The stale-checkpoint signature is EXACTLY
@@ -5703,7 +5788,87 @@ mod tests {
             title: String::new(),
             assignee: assignee.map(str::to_string),
             verify: None,
+            labels: Vec::new(),
         }
+    }
+
+    /// bd-gnej: rb + a wave label (`wave-N`).
+    fn rb_wave(id: &str, wave: u32) -> ReadyBead {
+        ReadyBead {
+            id: id.into(),
+            title: String::new(),
+            assignee: None,
+            verify: Some("true".into()),
+            labels: vec![format!("wave-{wave}")],
+        }
+    }
+
+    // ---- bd-gnej: wave-gate (wave-N label ordering) -----------------------
+
+    /// A wave-2 bead is HELD while a wave-1 bead is open/in_progress —
+    /// earlier waves run first; the loop waits (wave-gate, NOT a stuck
+    /// owner).
+    #[test]
+    fn wave_gate_holds_wave2_while_wave1_open() {
+        let ready = vec![rb_wave("bd-w1", 1), rb_wave("bd-w2", 2)];
+        let inprog: Vec<ReadyBead> = Vec::new();
+        let held = wave_gate_held(&ready, &inprog);
+        assert_eq!(held, vec!["bd-w2"], "{held:?}");
+    }
+
+    /// The wave-2 bead is RELEASED once the wave-1 bead closes (drops out of
+    /// ready AND in_progress).
+    #[test]
+    fn wave_gate_releases_when_earlier_wave_closes() {
+        let ready = vec![rb_wave("bd-w2", 2)];
+        let inprog: Vec<ReadyBead> = Vec::new();
+        let held = wave_gate_held(&ready, &inprog);
+        assert!(held.is_empty(), "wave-1 closed -> wave-2 dispatches");
+    }
+
+    /// No wave labels anywhere → no gating (identity).
+    #[test]
+    fn wave_gate_no_labels_no_gating() {
+        let ready = vec![
+            rb("bd-a", None),
+            rb("bd-b", None),
+            rb_wave("bd-c", 3), // labeled bead, but no earlier wave open
+        ];
+        let inprog: Vec<ReadyBead> = Vec::new();
+        let held = wave_gate_held(&ready, &inprog);
+        assert!(held.is_empty(), "{held:?}");
+    }
+
+    /// An in_progress wave-1 bead also holds a ready wave-2 bead.
+    #[test]
+    fn wave_gate_inprogress_earlier_wave_holds() {
+        let ready = vec![rb_wave("bd-w2", 2)];
+        let inprog = vec![rb_wave("bd-w1", 1)];
+        let held = wave_gate_held(&ready, &inprog);
+        assert_eq!(held, vec!["bd-w2"], "{held:?}");
+    }
+
+    /// A same-wave bead never holds itself or its siblings.
+    #[test]
+    fn wave_gate_same_wave_does_not_hold() {
+        let ready = vec![rb_wave("bd-w2a", 2), rb_wave("bd-w2b", 2)];
+        let inprog: Vec<ReadyBead> = Vec::new();
+        let held = wave_gate_held(&ready, &inprog);
+        assert!(held.is_empty(), "same wave runs together: {held:?}");
+    }
+
+    /// Multiple open waves: only beads above the LOWEST open wave are held —
+    /// wave-2 AND wave-3 hold while wave-1 is open.
+    #[test]
+    fn wave_gate_holds_all_above_min_open_wave() {
+        let ready = vec![
+            rb_wave("bd-w1", 1),
+            rb_wave("bd-w2", 2),
+            rb_wave("bd-w3", 3),
+        ];
+        let inprog: Vec<ReadyBead> = Vec::new();
+        let held = wave_gate_held(&ready, &inprog);
+        assert_eq!(held, vec!["bd-w2", "bd-w3"], "{held:?}");
     }
 
     /// A bead held by a NON-live assignee (captain, dead agent, unknown
@@ -6704,6 +6869,7 @@ mod tests {
             title: title.to_string(),
             assignee: None,
             verify: None,
+            labels: Vec::new(),
         }
     }
 
@@ -6713,6 +6879,7 @@ mod tests {
             title: title.to_string(),
             assignee: Some(assignee.to_string()),
             verify: None,
+            labels: Vec::new(),
         }
     }
 
@@ -7098,6 +7265,31 @@ mod tests {
         assert_eq!(watch["bd-b"].wait_reason, Some(WaitReason::Overlap));
     }
 
+    /// A dispatched bead that became wave-held (an earlier wave opened after
+    /// dispatch) waits like an overlap — NOT a stuck owner: no claim nudge,
+    /// wait reason recorded as WaveGate.
+    #[test]
+    fn serialize_overlap_claim_watch_unclaimed_wave_held_no_nudge() {
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-w2".into(), cw("oc-1"));
+        // the dispatched wave-2 bead is still unclaimed AND a wave-1 bead is
+        // open — the wave-gate holds it
+        let ready = vec![rb_wave("bd-w1", 1), rb_wave("bd-w2", 2)];
+        let states = vec![st("oc-1", "working")];
+        let overlap: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let actions = claim_watch_step(&mut watch, &ready, &[], &states, 1, &overlap);
+        assert!(
+            actions.is_empty(),
+            "no claim nudge for a wave-gated wait: {actions:?}"
+        );
+        assert_eq!(
+            watch["bd-w2"].wait_reason,
+            Some(WaitReason::WaveGate),
+            "wait reason recorded as wave-gate, not stuck-owner"
+        );
+    }
+
     /// Non-overlap beads keep the exact pre-existing watchdog behavior and
     /// their wait reason stays None (a released overlap clears the marker).
     #[test]
@@ -7153,6 +7345,7 @@ mod tests {
             on_blocked: "continue".into(),
             max_iterations: Some(10),
             work: false,
+            no_wave_gates: false,
             confirm_sends: true,
             confirm_timeout_ms: Some(45_000),
             invocation: "inv-1".into(),
@@ -8720,18 +8913,21 @@ Dependencies:
                 title: "has fence".into(),
                 assignee: None,
                 verify: Some("cargo test ok".into()),
+                labels: Vec::new(),
             },
             ReadyBead {
                 id: "bd-no-fence".into(),
                 title: "no fence".into(),
                 assignee: None,
                 verify: None,
+                labels: Vec::new(),
             },
             ReadyBead {
                 id: "bd-multi".into(),
                 title: "multi-line fence".into(),
                 assignee: None,
                 verify: None,
+                labels: Vec::new(),
             },
         ];
         let (dispatchable, not_ready) = partition_ready(&ready);
