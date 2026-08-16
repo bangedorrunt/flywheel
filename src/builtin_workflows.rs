@@ -2441,19 +2441,29 @@ mod tests {
         assert_eq!(refl.crew, Some(CrewSpec::Auto), "reflect is crew: auto");
         let inputs: Vec<&str> = refl.inputs.iter().map(|i| i.name.as_str()).collect();
         assert!(inputs.contains(&"project"), "reflect inputs: {inputs:?}");
-        assert!(inputs.contains(&"run_id"), "run_id or project (run_id optional)");
+        assert!(
+            inputs.contains(&"run_id"),
+            "run_id or project (run_id optional)"
+        );
         let step_names: Vec<&str> = refl
             .steps
             .iter()
             .filter_map(|s| s.name.as_deref())
             .collect();
-        assert_eq!(step_names, vec!["scan", "emit", "prune"], "the reflect chain");
+        assert_eq!(
+            step_names,
+            vec!["scan", "emit", "prune"],
+            "the reflect chain"
+        );
         let yaml = BUILTIN_WORKFLOWS_YAML
             .iter()
             .find(|(n, _)| *n == "reflect")
             .map(|(_, y)| *y)
             .unwrap();
-        assert!(yaml.contains("encode-lessons-in-structure"), "principle tag");
+        assert!(
+            yaml.contains("encode-lessons-in-structure"),
+            "principle tag"
+        );
     }
 
     /// THE FIXTURE: two identical standing-order restatements -> ONE hook
@@ -2467,7 +2477,10 @@ mod tests {
             .map(|(_, y)| *y)
             .unwrap();
         // the emit step: for EACH duplicate -> ONE bead
-        assert!(yaml.contains("For EACH duplicated instruction"), "scans every duplicate");
+        assert!(
+            yaml.contains("For EACH duplicated instruction"),
+            "scans every duplicate"
+        );
         assert!(yaml.contains("ONE bead"), "one hook bead per duplicate");
         assert!(
             yaml.contains("Two restatements of the same instruction = ONE hook bead"),
@@ -2475,7 +2488,10 @@ mod tests {
         );
         // the hook is a STRUCTURAL line, never an AGENTS.md paragraph
         assert!(yaml.contains("a lint rule, a preflight check, or a principle-registry line"));
-        assert!(yaml.contains("NEVER an AGENTS.md paragraph"), "nothing appended to AGENTS.md");
+        assert!(
+            yaml.contains("NEVER an AGENTS.md paragraph"),
+            "nothing appended to AGENTS.md"
+        );
         // both reminders deleted — from the PROJECT layer only
         assert!(
             yaml.contains("Delete the superseded standing-order lines"),
@@ -2501,6 +2517,9 @@ mod tests {
             .map(|(_, y)| *y)
             .unwrap();
         assert!(yaml.contains("reflect edge (wave 6, OFF by default"));
-        assert!(yaml.contains("#     action: call_workflow"), "edge is commented out");
+        assert!(
+            yaml.contains("#     action: call_workflow"),
+            "edge is commented out"
+        );
     }
 }

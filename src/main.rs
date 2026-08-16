@@ -12275,7 +12275,10 @@ mod loop_tests {
     fn idle_agent_pops_queue() {
         let states = vec![st("a", AgentStatus::Idle)];
         let mut q = vec!["p1".into(), "p6".into()];
-        let actions = durable::plan_actions(&states, &mut q, None,
+        let actions = durable::plan_actions(
+            &states,
+            &mut q,
+            None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
@@ -12295,7 +12298,10 @@ mod loop_tests {
         // next bead — dispatch must include `done`, not only `idle`.
         let states = vec![st("a", AgentStatus::Done)];
         let mut q = vec!["p1".into(), "p6".into()];
-        let actions = durable::plan_actions(&states, &mut q, None,
+        let actions = durable::plan_actions(
+            &states,
+            &mut q,
+            None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
@@ -12310,9 +12316,13 @@ mod loop_tests {
         // and it takes a nudge when the queue is empty
         let states = vec![st("a", AgentStatus::Done)];
         let mut q2: Vec<String> = vec![];
-        let actions = durable::plan_actions(&states, &mut q2, Some("continue"),
+        let actions = durable::plan_actions(
+            &states,
+            &mut q2,
+            Some("continue"),
             &HashMap::new(),
-            &std::collections::HashSet::new(),);
+            &std::collections::HashSet::new(),
+        );
         assert!(
             matches!(actions[0], durable::LoopAction::Nudge { .. }),
             "{actions:?}"
@@ -12325,7 +12335,10 @@ mod loop_tests {
         // the {AGENT_NAME} placeholder must resolve to the receiving agent
         let states = vec![st("flywheel-proj-oc", AgentStatus::Idle)];
         let mut q = vec!["write to .flywheel/agent-state/{AGENT_NAME}.json".into()];
-        let actions = durable::plan_actions(&states, &mut q, None,
+        let actions = durable::plan_actions(
+            &states,
+            &mut q,
+            None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
@@ -12339,7 +12352,10 @@ mod loop_tests {
         // plain prompts stay untouched
         let states = vec![st("a", AgentStatus::Idle)];
         let mut q = vec!["t1".into()];
-        let actions = durable::plan_actions(&states, &mut q, None,
+        let actions = durable::plan_actions(
+            &states,
+            &mut q,
+            None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
@@ -12353,13 +12369,19 @@ mod loop_tests {
     fn queue_drains_across_idle_agents_in_order() {
         let states = vec![st("a", AgentStatus::Idle), st("b", AgentStatus::Idle)];
         let mut q = vec!["p1".into(), "p6".into()];
-        let actions = durable::plan_actions(&states, &mut q, None,
+        let actions = durable::plan_actions(
+            &states,
+            &mut q,
+            None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
         assert!(q.is_empty());
         match (&actions[0], &actions[1]) {
-            (durable::LoopAction::Send { name: n1, text: t1 }, durable::LoopAction::Send { name: n2, text: t2 }) => {
+            (
+                durable::LoopAction::Send { name: n1, text: t1 },
+                durable::LoopAction::Send { name: n2, text: t2 },
+            ) => {
                 assert_eq!((n1, t1), (&"a".to_string(), &"p1".to_string()));
                 assert_eq!((n2, t2), (&"b".to_string(), &"p6".to_string()));
             }
@@ -12371,7 +12393,10 @@ mod loop_tests {
     fn working_agent_gets_nothing() {
         let states = vec![st("a", AgentStatus::Working)];
         let mut q = vec!["p1".into()];
-        let actions = durable::plan_actions(&states, &mut q, None,
+        let actions = durable::plan_actions(
+            &states,
+            &mut q,
+            None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
@@ -12383,7 +12408,10 @@ mod loop_tests {
     fn blocked_agent_reports() {
         let states = vec![st("a", AgentStatus::Blocked)];
         let mut q = vec!["p1".into()];
-        let actions = durable::plan_actions(&states, &mut q, None,
+        let actions = durable::plan_actions(
+            &states,
+            &mut q,
+            None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
@@ -12399,16 +12427,23 @@ mod loop_tests {
         // nudge; the queue stays intact.
         let states = vec![st("a", AgentStatus::Unknown)];
         let mut q = vec!["p1".into()];
-        let actions = durable::plan_actions(&states, &mut q, None,
+        let actions = durable::plan_actions(
+            &states,
+            &mut q,
+            None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
         assert_eq!(q.len(), 1);
         assert!(matches!(actions[0], durable::LoopAction::Wait));
         let mut q2: Vec<String> = vec![];
-        let actions = durable::plan_actions(&states, &mut q2, Some("proceed"),
+        let actions = durable::plan_actions(
+            &states,
+            &mut q2,
+            Some("proceed"),
             &HashMap::new(),
-            &std::collections::HashSet::new(),);
+            &std::collections::HashSet::new(),
+        );
         assert!(
             matches!(actions[0], durable::LoopAction::Wait),
             "no nudge to unknown"
@@ -12419,9 +12454,13 @@ mod loop_tests {
     fn empty_queue_with_nudge_nudges() {
         let states = vec![st("a", AgentStatus::Idle)];
         let mut q: Vec<String> = vec![];
-        let actions = durable::plan_actions(&states, &mut q, Some("proceed"),
+        let actions = durable::plan_actions(
+            &states,
+            &mut q,
+            Some("proceed"),
             &HashMap::new(),
-            &std::collections::HashSet::new(),);
+            &std::collections::HashSet::new(),
+        );
         assert!(matches!(&actions[0], durable::LoopAction::Nudge { name } if name == "a"));
     }
 
@@ -12429,7 +12468,10 @@ mod loop_tests {
     fn empty_queue_no_nudge_waits() {
         let states = vec![st("a", AgentStatus::Done)];
         let mut q: Vec<String> = vec![];
-        let actions = durable::plan_actions(&states, &mut q, None,
+        let actions = durable::plan_actions(
+            &states,
+            &mut q,
+            None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
@@ -12440,7 +12482,10 @@ mod loop_tests {
     fn done_treated_like_idle() {
         let states = vec![st("a", AgentStatus::Done)];
         let mut q = vec!["p8".into()];
-        let actions = durable::plan_actions(&states, &mut q, None,
+        let actions = durable::plan_actions(
+            &states,
+            &mut q,
+            None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
