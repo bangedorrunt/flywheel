@@ -11062,10 +11062,10 @@ fn cmd_loop(
         let rt = tokio::runtime::Runtime::new()?;
         if engine {
             // bd-e0xk: the loop as a WorkflowEngine durable function — the
-            // coexistence path. Dispatches run as `loop-dispatch` engine
-            // workflows (unified vocabulary); poll + plan phases unchanged.
+            // bd-w4-delete-dup-sbh8: the engine-backed loop body is deleted —
+            // --engine routes to the durable keeper (thin wrapper).
             println!(
-                "loop: engine-backed swarm monitor for {} (bd-e0xk coexistence path; resume: flywheel loop run {project} --engine)",
+                "loop: swarm monitor for {} (--engine routed to the durable keeper; resume: flywheel loop run {project})",
                 dim(project)
             );
             let result = rt.block_on(durable::run_engine_loop(cfg, params))?;
