@@ -87,3 +87,21 @@ If the loop's `--on-blocked mail` is active, a blocked agent gets tiered pings (
 - **MUST verify the acceptance gate BEFORE closing**: run the gate, and the close reason MUST cite the command + result that proves it (e.g. "gate: cargo test -p flywheel -> 487 passed"). A close without gate-evidence in the reason is FLAGGED — the loop enforces this (close-evidence rule).
 - **NEVER leave a bead in_progress without a resume path.** A strand (in_progress + no live agent on it) stalls the whole batch — the loop auto-reclaims stranded beads to ready (stranded-reclaim rule), but do not create the strand in the first place: finish, close, or reopen the bead before ending work on it.
 - **If you cannot finish a bead** (blocker, context exhaustion): do NOT leave it in_progress silently — reopen it (`br update <id> --status open`) or set blocked with a comment, so the loop re-dispatches it.
+
+# ADR-0019 crew contract (2026-08-16 -- the loop enforces these)
+
+- **VERIFY fence (Spec 1/4):** every bead carries a `## VERIFY` command. Run it yourself before closing and record the output tail in the close reason. On the cheap band (P>=2, blast Normal, command-runnable) the loop re-runs VERIFY and records `command-verified` -- a close whose VERIFY would fail is reopened, never patched silently.
+- **Reserve before edit, renew before expiry:** exclusive toron reservation on every path you will write, `reason=<bead-id>`, TTL renewed by you. Acquire-vs-held = HARD (freeze). Acquire-vs-intent = SOFT (negotiate a split). Never edit a path you do not hold.
+- **Build slot before cargo:** acquire the `cargo` build slot (`flywheel mail slot acquire <project> --slot cargo --exclusive --as YOU`) before `cargo build`/`cargo test`; release immediately after. Conflicts mean a sibling builds -- wait + retry with backoff, never build without the slot.
+- **Stage ONLY your reserved paths.** `git add` the exact files your reservation covers, never `git add -A`. A cross-sweep (staging a sibling's uncommitted work) is a coordination breach -- flag it on the steer channel, do not absorb it.
+- **Commit BEFORE close, bead id in the message.** The commit message MUST carry the bead id (`bd-<id>`); the close reason cites the commit sha. Close without a commit = unverifiable close.
+- **Close reason carries the VERIFY tail:** last lines of the VERIFY command's stdout, plus the gate result. Evidence, not intent.
+- **PRINCIPLES citation (Spec 5):** brief PRINCIPLES lines are `<principle-name> -- <the decision it changed>` (em-dash, names only, from `flywheel principles list`). A PRINCIPLES line without a decision is cargo-cult -- reviewers reject it.
+- **NO worktree ever (Spec 3):** worktrees are forbidden in loop-owned bead work -- a worktree is a second full context that duplicates the single-writer objects (`.beads/`, receipts, `Cargo.lock`, catalog). Contention **serializes or splits**; it never spawns a worktree. The loop refuses to ledger-check a SHA from an unexpected linked worktree.
+- **Conflict ladder (Spec 3, stop at the first that applies):**
+  1. **Hard overlap** (same reserved path, both held): serialize -- the second bead stays ready until the holder releases; post on the steer channel.
+  2. **Soft conflict** (acquire hits a peer's intent/held): freeze on the contested path, negotiate a split (request-release protocol).
+  3. **Design fork** (two defensible architectures): collab/interrogate the fork in the bead thread -- do not implement both.
+  4. **Blocked > 10 min** (external blocker, no path forward): mail the captain on the captain thread, post blocked on the steer channel, set the bead `blocked` with the reason.
+- **AGENT_NAME for repo hooks:** the flywheel repo's pre-commit hook reads `AGENT_NAME` to attribute commits. Run with `AGENT_NAME=<your-pin>` env for every commit in a hooked repo.
+
