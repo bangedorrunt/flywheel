@@ -3433,7 +3433,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     // a transient herdr failure yields an empty snapshot; the
                     // next tick re-polls. bd-87hq: flag for the completion gate.
                     critical_leaf_failed_this_iter = true;
-                    eprintln!("flywheel: poll_swarm leaf failed (continuing with empty snapshot): {e}");
+                    eprintln!(
+                        "flywheel: poll_swarm leaf failed (continuing with empty snapshot): {e}"
+                    );
                     vec![]
                 }
             };
@@ -8098,7 +8100,10 @@ mod tests {
             &mut states,
             &[pev("pane.agent_status_changed", "%1", "done", 1)],
         );
-        assert!(all_settled(&states), "event-asserted done must settle immediately");
+        assert!(
+            all_settled(&states),
+            "event-asserted done must settle immediately"
+        );
         // The poll-confirms half: a fresh snapshot of the same world agrees.
         let confirmed = vec![st_pane("a", "done", "%1")];
         assert!(all_settled(&confirmed));
@@ -8208,7 +8213,10 @@ mod tests {
             &mut pending,
         );
         assert_eq!(poll, event, "{}", parity_report(&poll, &event));
-        assert!(!poll.is_empty(), "both paths must dispatch the queued prompt");
+        assert!(
+            !poll.is_empty(),
+            "both paths must dispatch the queued prompt"
+        );
         // completion parity: the merged states settle exactly like a fresh
         // poll of the same world.
         let mut merged = pre_change.clone();
@@ -8751,5 +8759,4 @@ Dependencies:
             );
         }
     }
-
 }
