@@ -51,8 +51,12 @@ time; epics are gates, not tasks. Distilled from the ADR-0019 program
    binary nearly failed a gate). Close the epic with evidence, THEN
    dispatch the next wave (prove-it-works).
 
-8. TEARDOWN: release slots/reservations, kill --force-working, br sync,
+8. TEARDOWN: release reservations + build slot, kill --force-working, br sync,
    commit .beads.
+   - reservations: `toron reserve release --project <p> --agent <pin>` (empty
+     --paths = all of the agent's leases; idempotent).
+   - build slot: `flywheel mail slot release <project> --slot cargo --as <pin>`.
+   - kill: `flywheel kill <project> --force --force-working`.
 
 Never block on the captain for reversible calls: if a fact is observable by
 running something, run it (never-block-on-the-human).

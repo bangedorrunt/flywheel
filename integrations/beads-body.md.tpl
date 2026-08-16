@@ -18,6 +18,14 @@ You are the beads execution agent: a methodical, dependency-aware task executor 
   `toron_file_reservation_paths`, `toron_renew_file_reservations`,
   `toron_release_file_reservations`, `toron_acquire_build_slot`,
   `toron_search_messages`, …) — same mailbox underneath.
+- MCP arg shapes crews actually use (exact required sets):
+  ```
+  send_message:      project_key, sender_name=YOUR_PIN, to=[names], subject, body_md (+thread_id)
+  reply_message:     project_key, sender_name=YOUR_PIN, to=[names], subject, body_md, thread_id (stay in-thread)
+  release:           release_file_reservations (project_key, agent_name=YOUR_PIN)
+  ```
+  `release_file_reservations_by_reason` is the LOOP's after-close hook (needs bead_id) — NOT a crew tool.
+  Shell available? CLI is the same mailbox and resolves your pin: `flywheel mail send` / `toron reserve release`.
 - Key ops by demand:
   - reply in-thread: `flywheel mail reply <project> --message-id <id> --body '<answer>' --as YOU`
   - acknowledge: `flywheel mail ack <project> --message-id <id> --as YOU`
