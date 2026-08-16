@@ -1017,6 +1017,10 @@ enum LoopCmd {
         /// a static queue — feeds the swarm until the plan/beads are done
         #[arg(long)]
         work: bool,
+        /// bd-gnej: disable the wave-gate (wave-N label ordering) — for
+        /// graphs that do not use wave labels. Default: gating ON.
+        #[arg(long)]
+        no_wave_gates: bool,
         /// send prompts without landing confirmation (escape hatch; confirm
         /// is the default). Only affects the durable workflow.
         #[arg(long)]
@@ -3128,6 +3132,7 @@ fn main() {
                 to,
                 local,
                 work,
+                no_wave_gates,
                 no_confirm,
                 confirm_timeout_ms,
                 engine,
@@ -3162,6 +3167,7 @@ fn main() {
                             *once,
                             *local,
                             *work,
+                            *no_wave_gates,
                             on_blocked,
                             to,
                             *no_confirm,
@@ -4900,9 +4906,7 @@ mod workspace_origin_tests {
     #[test]
     fn add_prime_wired_into_add_path() {
         let src = include_str!("main.rs");
-        let add = src
-            .find("fn cmd_add(")
-            .expect("cmd_add present in main.rs");
+        let add = src.find("fn cmd_add(").expect("cmd_add present in main.rs");
         let add_body = &src[add..];
         let prime_fn = src
             .find("fn prime_via_send_text(")
@@ -11026,6 +11030,17 @@ fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                 .get("description")
                 .and_then(Value::as_str)
                 .and_then(durable::parse_verify_fence),
+            // bd-gnej: wave labels (`wave-N`) for the loop wave-gate.
+            labels: b
+                .get("labels")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
         .collect())
 }
@@ -11064,6 +11079,17 @@ fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                 .get("description")
                 .and_then(Value::as_str)
                 .and_then(durable::parse_verify_fence),
+            // bd-gnej: wave labels (`wave-N`) for the loop wave-gate.
+            labels: b
+                .get("labels")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
         .collect())
 }
@@ -11312,6 +11338,7 @@ fn cmd_loop(
     once: bool,
     local: bool,
     work: bool,
+    no_wave_gates: bool,
     on_blocked: &str,
     to: &str,
     no_confirm: bool,
@@ -11368,6 +11395,7 @@ fn cmd_loop(
             on_blocked: on_blocked.to_string(),
             max_iterations,
             work,
+            no_wave_gates,
             confirm_sends: !no_confirm,
             confirm_timeout_ms,
             invocation: String::new(),
@@ -11461,10 +11489,14 @@ fn cmd_loop(
         // ready beads. Soft-fail: a tracker hiccup yields no new work this
         // tick, never a loop crash.
         if work {
+            // bd-gnej: in-progress beads feed the wave-gate (an earlier
+            // wave's in_progress bead holds later waves).
+            let mut inprog_now: Vec<durable::ReadyBead> = Vec::new();
             match load_inprogress_beads(cfg, project) {
                 Ok(inprog) => {
                     let to_resume: Vec<String> = work_prompts(&inprog, &[], &mut assigned, project);
                     queue_items.extend(to_resume);
+                    inprog_now = inprog;
                 }
                 Err(e) => eprintln!("flywheel: br inprogress failed (continuing): {e:#}"),
             }
@@ -11475,7 +11507,28 @@ fn cmd_loop(
                     // mailed to the planner once per loop run.
                     let (dispatchable, not_ready) = durable::partition_ready(&ready);
                     let ok: Vec<durable::ReadyBead> = dispatchable.into_iter().cloned().collect();
-                    let to_assign: Vec<String> = work_prompts(&[], &ok, &mut assigned, project);
+                    // bd-gnej wave-gate: hold a wave-N labeled bead while any
+                    // earlier wave-M (M<N) is open/in_progress — earlier
+                    // waves run first. No wave labels → no gating.
+                    // --no-wave-gates kills it. The FULL ready list is the
+                    // open context (a not-ready wave-1 bead still gates).
+                    let wave_held: Vec<String> = if no_wave_gates {
+                        Vec::new()
+                    } else {
+                        durable::wave_gate_held(&ready, &inprog_now)
+                    };
+                    if !wave_held.is_empty() {
+                        eprintln!(
+                            "flywheel: wave-gate: holding {} (earlier wave open; not stuck-owner)",
+                            wave_held.join(", ")
+                        );
+                    }
+                    let to_assign: Vec<durable::ReadyBead> = ok
+                        .into_iter()
+                        .filter(|b| !wave_held.contains(&b.id))
+                        .collect();
+                    let to_assign: Vec<String> =
+                        work_prompts(&[], &to_assign, &mut assigned, project);
                     queue_items.extend(to_assign);
                     for bead in &not_ready {
                         if not_ready_mailed.insert(bead.id.clone())
@@ -12092,12 +12145,14 @@ mod loop_tests {
                 title: "resume me".into(),
                 assignee: None,
                 verify: None,
+                labels: Vec::new(),
             },
             durable::ReadyBead {
                 id: "bd-r2".into(),
                 title: "resume me too".into(),
                 assignee: None,
                 verify: None,
+                labels: Vec::new(),
             },
         ];
         let ready = vec![durable::ReadyBead {
@@ -12105,6 +12160,7 @@ mod loop_tests {
             title: "fresh".into(),
             assignee: None,
             verify: None,
+            labels: Vec::new(),
         }];
         let mut assigned = Vec::new();
         let prompts = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
@@ -12126,12 +12182,14 @@ mod loop_tests {
             title: "x".into(),
             assignee: None,
             verify: None,
+            labels: Vec::new(),
         }];
         let ready = vec![durable::ReadyBead {
             id: "bd-r1".into(),
             title: "x".into(),
             assignee: None,
             verify: None,
+            labels: Vec::new(),
         }];
         let mut assigned = vec!["bd-r1".to_string()];
         let prompts = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
@@ -12145,6 +12203,7 @@ mod loop_tests {
             title: "fix auth".into(),
             assignee: None,
             verify: None,
+            labels: Vec::new(),
         }];
         let mut assigned = Vec::new();
         let prompts = work_prompts(&[], &ready, &mut assigned, "flywheel");
@@ -12165,6 +12224,16 @@ mod loop_tests {
         assert_eq!(beads.len(), 2);
         assert_eq!(beads[0].id, "bd-a");
         assert_eq!(beads[1].title, "two");
+    }
+
+    /// bd-gnej: the ready parser carries the bead's labels — the wave-gate
+    /// reads `wave-N` off them. Absent labels → empty vec.
+    #[test]
+    fn parse_ready_beads_json_carries_labels() {
+        let raw = r#"[{"id":"bd-a","title":"one","labels":["wave-1","docs"]},{"id":"bd-b","title":"two"}]"#;
+        let beads = parse_ready_beads_json(raw).unwrap();
+        assert_eq!(beads[0].labels, vec!["wave-1", "docs"]);
+        assert!(beads[1].labels.is_empty(), "absent labels -> empty");
     }
 
     #[test]
@@ -15062,6 +15131,27 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
     }
 }
 
+/// bd-brie: resolve a squad member profile for spawn with the
+/// project-scope → host-scope fallback. Project-scope resolution that fails
+/// with "not registered in project" falls back to host-scope (operator
+/// npub) — profiles are host-scoped in practice; `spawn --profile` resolves
+/// the same way. Returns `(resolved, fell_back)`.
+fn resolve_squad_member(
+    cat: &ProfileCatalog,
+    name: &str,
+    project: Option<&str>,
+    operator_npub: &str,
+) -> Result<(profile::ResolvedProfile, bool)> {
+    match cat.resolve(name, project, operator_npub, &|_, _| None) {
+        Ok(r) => Ok((r, false)),
+        Err(e) if project.is_some() && e.to_string().contains("not registered in project") => {
+            let r = cat.resolve(name, None, operator_npub, &|_, _| None)?;
+            Ok((r, true))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// `flywheel squad` — named groups of profiles (ADR-0005 P6). Legacy recipes
 /// map onto squads via [`profile::Squad::from_recipe`]; `recipes list` stays
 /// an alias (the `recipes`/`template` asset commands).
@@ -15154,10 +15244,21 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
             // the orchestrator's host project (host-scope, debate convention).
             let project_key = project.as_deref().unwrap_or("flywheel");
             for (profile_name, n) in squad.members() {
-                let resolved =
-                    cat.resolve(profile_name, project.as_deref(), &operator_npub, &|_, _| {
-                        None
-                    })?;
+                // bd-brie: project-scope resolve falls back to HOST-scope
+                // (operator npub) with a one-line notice when the profile is
+                // not registered in the project. Profiles are host-scoped in
+                // practice (the captain's recipes.toml crew); `spawn --profile`
+                // resolves the same way. Registration stays the strict path
+                // for workflow runs that sign as project agents — the
+                // fallback is squad-spawn-only, never engine resolution.
+                let (resolved, fell_back) =
+                    resolve_squad_member(&cat, profile_name, project.as_deref(), &operator_npub)?;
+                if fell_back {
+                    eprintln!(
+                        "flywheel: notice: profile '@{profile_name}' not registered in project '{}' — falling back to host-scope resolve (operator {operator_npub})",
+                        project.as_deref().unwrap_or("?")
+                    );
+                }
                 let spec = &resolved.spec;
                 // bd-l2ky: launch with the member profile's model/effort args
                 // — the same profile_launch_args as `spawn --profile`
@@ -18400,8 +18501,9 @@ fn cmd_internal_ready(cfg: &Config, project: &str) -> Result<()> {
     let beads: Vec<Value> = beads
         .iter()
         // ADR-0019 (bd-w1-verify-fence): emit the parsed VERIFY command so
-        // the durable `parse_bead_list` consumer carries it too.
-        .map(|b| json!({ "id": b.id, "title": b.title, "verify": b.verify }))
+        // the durable `parse_bead_list` consumer carries it too. bd-gnej:
+        // labels ride along for the wave-gate.
+        .map(|b| json!({ "id": b.id, "title": b.title, "verify": b.verify, "labels": b.labels }))
         .collect();
     print_json(&json!({ "beads": beads }));
     Ok(())
@@ -18415,7 +18517,7 @@ fn cmd_internal_inprogress(cfg: &Config, project: &str) -> Result<()> {
     let beads: Vec<Value> = beads
         .iter()
         .map(
-            |b| json!({ "id": b.id, "title": b.title, "assignee": b.assignee, "verify": b.verify }),
+            |b| json!({ "id": b.id, "title": b.title, "assignee": b.assignee, "verify": b.verify, "labels": b.labels }),
         )
         .collect();
     print_json(&json!({ "beads": beads }));
@@ -21791,6 +21893,44 @@ mod profile_cli_tests {
         }
     }
 
+    // ---- bd-brie: squad spawn project-scope → host-scope fallback ----
+
+    /// Project-scope resolution of an UNREGISTERED profile falls back to
+    /// host-scope (operator npub) — the same effective behavior as
+    /// `spawn --profile`. Registration stays the strict path for workflow
+    /// runs that sign as project agents (engine resolution, untouched).
+    #[test]
+    fn squad_resolve_unregistered_profile_falls_back_host_scope() {
+        let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
+        let (r, fell_back) = resolve_squad_member(&cat, "coder", Some("demo"), "npub-operator")
+            .expect("fallback resolves host-scope");
+        assert!(fell_back, "unregistered profile must fall back");
+        assert_eq!(r.npub, "npub-operator");
+        assert!(matches!(r.signing, profile::SigningContext::Operator(_)));
+    }
+
+    /// No project flag → host-scope resolve directly, no fallback signal.
+    #[test]
+    fn squad_resolve_host_scope_without_project_no_fallback() {
+        let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
+        let (r, fell_back) =
+            resolve_squad_member(&cat, "coder", None, "npub-operator").expect("host-scope resolve");
+        assert!(!fell_back, "no project -> no fallback path");
+        assert_eq!(r.npub, "npub-operator");
+        assert!(matches!(r.signing, profile::SigningContext::Operator(_)));
+    }
+
+    /// Unknown profile still fails fast in both scopes (never a silent
+    /// fallback for a typo).
+    #[test]
+    fn squad_resolve_unknown_profile_fails_fast() {
+        let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
+        let err = resolve_squad_member(&cat, "ghost", Some("demo"), "npub-operator").unwrap_err();
+        assert!(err.to_string().contains("unknown profile"), "{err}");
+        let err = resolve_squad_member(&cat, "ghost", None, "npub-operator").unwrap_err();
+        assert!(err.to_string().contains("unknown profile"), "{err}");
+    }
+
     #[test]
     fn profile_run_resolves_host_scope_and_spec() {
         let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
@@ -22135,16 +22275,27 @@ mod send_conditioning_tests {
 
     #[test]
     fn profiled_target_gets_behavior_preamble() {
-        let catalog = catalog_with("You are a SCOUT. VERIFIED/INFERRED labeling mandatory.", vec![]);
-        let mut entry = state::SpawnEntry::profiled("w:p1", "crew-scout", "scout", "opencode", None);
+        let catalog = catalog_with(
+            "You are a SCOUT. VERIFIED/INFERRED labeling mandatory.",
+            vec![],
+        );
+        let mut entry =
+            state::SpawnEntry::profiled("w:p1", "crew-scout", "scout", "opencode", None);
         let (text, profile, injected) =
             condition_send_target(Some(&mut entry), &catalog, "echo who you are", false);
         assert!(
             text.starts_with("You are a SCOUT."),
             "behavior preamble must lead: {text:?}"
         );
-        assert!(text.contains("echo who you are"), "mission preserved: {text:?}");
-        assert_eq!(profile.as_deref(), Some("scout"), "conditioned profile reported");
+        assert!(
+            text.contains("echo who you are"),
+            "mission preserved: {text:?}"
+        );
+        assert_eq!(
+            profile.as_deref(),
+            Some("scout"),
+            "conditioned profile reported"
+        );
         assert!(!injected, "no skills on this profile");
     }
 
@@ -22165,7 +22316,8 @@ mod send_conditioning_tests {
     #[test]
     fn raw_flag_bypasses_conditioning() {
         let catalog = catalog_with("You are a SCOUT.", vec![]);
-        let mut entry = state::SpawnEntry::profiled("w:p3", "crew-scout", "scout", "opencode", None);
+        let mut entry =
+            state::SpawnEntry::profiled("w:p3", "crew-scout", "scout", "opencode", None);
         let (text, profile, _) =
             condition_send_target(Some(&mut entry), &catalog, "echo who you are", true);
         assert_eq!(text, "echo who you are", "--raw sends verbatim");
@@ -22186,7 +22338,8 @@ mod send_conditioning_tests {
     #[test]
     fn skill_prefix_injected_once_then_not_repeated() {
         let catalog = catalog_with("You are a SCOUT.", vec!["accretive"]);
-        let mut entry = state::SpawnEntry::profiled("w:p5", "crew-skilled", "scout", "opencode", None);
+        let mut entry =
+            state::SpawnEntry::profiled("w:p5", "crew-skilled", "scout", "opencode", None);
         let (text, profile, injected) =
             condition_send_target(Some(&mut entry), &catalog, "survey the repo", false);
         assert!(injected, "first dispatch carries the skill prefix");
@@ -22200,14 +22353,23 @@ mod send_conditioning_tests {
             text.contains("Read skill://accretive before starting."),
             "skill prefix present: {text:?}"
         );
-        assert!(text.contains("survey the repo"), "mission preserved: {text:?}");
+        assert!(
+            text.contains("survey the repo"),
+            "mission preserved: {text:?}"
+        );
         assert_eq!(profile.as_deref(), Some("scout"));
-        assert!(entry.skills_injected, "flag persisted on the registry entry");
+        assert!(
+            entry.skills_injected,
+            "flag persisted on the registry entry"
+        );
         // second dispatch: prefix NOT repeated (registry-tracked)
         let (text2, _, injected2) =
             condition_send_target(Some(&mut entry), &catalog, "survey the repo", false);
         assert!(!injected2, "prefix delivered once (bd-eign.10 advisory)");
-        assert!(!text2.contains("Read skill://"), "no repeat prefix: {text2:?}");
+        assert!(
+            !text2.contains("Read skill://"),
+            "no repeat prefix: {text2:?}"
+        );
         assert!(text2.contains("You are a SCOUT."));
     }
 }
