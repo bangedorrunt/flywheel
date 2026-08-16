@@ -10579,55 +10579,9 @@ fn cmd_ensemble(cfg: &Config, project: &str, recipe: &str, workflow: &str) -> Re
 
 // ---- loop (monitoring orchestrator) ----
 
-/// What the loop should do for one agent on one poll.
-#[derive(Debug, Clone, PartialEq)]
-enum LoopAction {
-    /// send queued instruction (popped from the queue)
-    Send { name: String, text: String },
-    /// send the nudge text (queue empty)
-    Nudge { name: String },
-    /// agent is blocked
-    Blocked { name: String },
-    /// nothing to do
-    Wait,
-}
-
-/// Pure planning: given current agent states, decide actions.
-/// Queue is drained in order across idle/done agents.
-fn plan_actions(
-    states: &[(String, AgentStatus)],
-    queue: &mut Vec<String>,
-    nudge: Option<&str>,
-) -> Vec<LoopAction> {
-    let mut actions = Vec::new();
-    for (name, status) in states {
-        match status {
-            AgentStatus::Working => actions.push(LoopAction::Wait),
-            AgentStatus::Blocked => actions.push(LoopAction::Blocked { name: name.clone() }),
-            // parity with the durable loop (bd-unknown-skip-dispatch): never
-            // dispatch to an unclassified agent — a prompt could land in a
-            // half-dead session and be silently lost
-            AgentStatus::Unknown => actions.push(LoopAction::Wait),
-            AgentStatus::Idle | AgentStatus::Done => {
-                if !queue.is_empty() {
-                    let text = queue.remove(0); // FIFO: stages in declared order
-                    // bead/resume prompts carry a {AGENT_NAME} placeholder —
-                    // substitute the receiving agent's herdr name (same
-                    // contract as the durable loop's plan_actions)
-                    actions.push(LoopAction::Send {
-                        name: name.clone(),
-                        text: text.replace("{AGENT_NAME}", name),
-                    });
-                } else if nudge.is_some() {
-                    actions.push(LoopAction::Nudge { name: name.clone() });
-                } else {
-                    actions.push(LoopAction::Wait);
-                }
-            }
-        }
-    }
-    actions
-}
+/// What the loop should do for one agent on one poll — the SINGLE
+/// definition lives in durable.rs (bd-w4-delete-dup-sbh8); the sync
+/// (`--local`/`--once`) path delegates to `durable::plan_actions`.
 
 /// Build the instruction queue from --queue / --workflow.
 /// Clamp the active cadence to the 5s floor (consistent with the workflow's
@@ -11191,7 +11145,26 @@ fn cmd_loop(
                 .collect()
         };
 
-        let actions = plan_actions(&managed, &mut queue_items, nudge);
+        // bd-w4-delete-dup-sbh8: the sync path DELEGATES to the single
+        // durable planner (one plan_actions — the duplicate was deleted).
+        // States convert to the durable shape; digests/wake are
+        // durable-loop-only (empty here — mail wake stays poll-based).
+        let d_states: Vec<durable::AgentState> = managed
+            .iter()
+            .map(|(name, status)| durable::AgentState {
+                name: name.clone(),
+                status: format!("{status:?}").to_ascii_lowercase(),
+                kind: String::new(),
+                pane_id: String::new(),
+            })
+            .collect();
+        let actions = durable::plan_actions(
+            &d_states,
+            &mut queue_items,
+            nudge,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         // with on_blocked=stop, no work may be dispatched this iteration once a
         // blocker is known — otherwise sends before the blocked agent in the
         // action list already fired (order-dependent behavior)
@@ -11199,7 +11172,7 @@ fn cmd_loop(
             let blocked: Vec<&str> = actions
                 .iter()
                 .filter_map(|a| match a {
-                    LoopAction::Blocked { name } => Some(name.as_str()),
+                    durable::LoopAction::Blocked { name } => Some(name.as_str()),
                     _ => None,
                 })
                 .collect();
@@ -11211,7 +11184,8 @@ fn cmd_loop(
         let mut any_work = false;
         for action in &actions {
             match action {
-                LoopAction::Send { name, text } => {
+                durable::LoopAction::Send { name, text }
+                | durable::LoopAction::DispatchImmediate { name, text } => {
                     // bd-gsvn.1: the sync loop routes through the same
                     // dispatch leaf as the durable loop + pane runner —
                     // __send --profile conditions the prompt with the
@@ -11257,7 +11231,7 @@ fn cmd_loop(
                     );
                     any_work = true;
                 }
-                LoopAction::Nudge { name } => {
+                durable::LoopAction::Nudge { name } => {
                     let n = nudge.unwrap_or("proceed");
                     if let Err(e) = c.agent_prompt(name, n, None) {
                         eprintln!("flywheel: nudge to {name} failed: {e:#}");
@@ -11271,7 +11245,7 @@ fn cmd_loop(
                         any_work = true;
                     }
                 }
-                LoopAction::Blocked { name } => {
+                durable::LoopAction::Blocked { name } => {
                     any_blocked = true;
                     match on_blocked {
                         "mail" => {
@@ -11301,7 +11275,11 @@ fn cmd_loop(
                         }
                     }
                 }
-                LoopAction::Wait => {}
+                durable::LoopAction::Wait => {}
+                // Self-heal actions never come out of plan_actions (the
+                // durable loop's heal step is a separate phase); if one ever
+                // appears here the sync path has no heal machine — skip.
+                durable::LoopAction::Diagnose { .. } | durable::LoopAction::Respawn { .. } => {}
             }
         }
 
@@ -11720,8 +11698,15 @@ mod loop_run_verify_tests {
 mod loop_tests {
     use super::*;
 
-    fn st(name: &str, s: AgentStatus) -> (String, AgentStatus) {
-        (name.to_string(), s)
+    fn st(name: &str, s: AgentStatus) -> durable::AgentState {
+        // the sync planner tests delegate to the SINGLE durable::plan_actions
+        // (bd-w4-delete-dup-sbh8) — states use the durable shape.
+        durable::AgentState {
+            name: name.to_string(),
+            status: format!("{s:?}").to_ascii_lowercase(),
+            kind: String::new(),
+            pane_id: String::new(),
+        }
     }
 
     #[test]
@@ -12290,10 +12275,13 @@ mod loop_tests {
     fn idle_agent_pops_queue() {
         let states = vec![st("a", AgentStatus::Idle)];
         let mut q = vec!["p1".into(), "p6".into()];
-        let actions = plan_actions(&states, &mut q, None);
+        let actions = durable::plan_actions(&states, &mut q, None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(q.len(), 1);
         match &actions[0] {
-            LoopAction::Send { name, text } => {
+            durable::LoopAction::Send { name, text } => {
                 assert_eq!(name, "a");
                 assert_eq!(text, "p1");
             }
@@ -12307,10 +12295,13 @@ mod loop_tests {
         // next bead — dispatch must include `done`, not only `idle`.
         let states = vec![st("a", AgentStatus::Done)];
         let mut q = vec!["p1".into(), "p6".into()];
-        let actions = plan_actions(&states, &mut q, None);
+        let actions = durable::plan_actions(&states, &mut q, None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(q.len(), 1);
         match &actions[0] {
-            LoopAction::Send { name, text } => {
+            durable::LoopAction::Send { name, text } => {
                 assert_eq!(name, "a");
                 assert_eq!(text, "p1");
             }
@@ -12319,9 +12310,11 @@ mod loop_tests {
         // and it takes a nudge when the queue is empty
         let states = vec![st("a", AgentStatus::Done)];
         let mut q2: Vec<String> = vec![];
-        let actions = plan_actions(&states, &mut q2, Some("continue"));
+        let actions = durable::plan_actions(&states, &mut q2, Some("continue"),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),);
         assert!(
-            matches!(actions[0], LoopAction::Nudge { .. }),
+            matches!(actions[0], durable::LoopAction::Nudge { .. }),
             "{actions:?}"
         );
     }
@@ -12332,9 +12325,12 @@ mod loop_tests {
         // the {AGENT_NAME} placeholder must resolve to the receiving agent
         let states = vec![st("flywheel-proj-oc", AgentStatus::Idle)];
         let mut q = vec!["write to .flywheel/agent-state/{AGENT_NAME}.json".into()];
-        let actions = plan_actions(&states, &mut q, None);
+        let actions = durable::plan_actions(&states, &mut q, None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         match &actions[0] {
-            LoopAction::Send { text, .. } => {
+            durable::LoopAction::Send { text, .. } => {
                 assert!(text.contains(".flywheel/agent-state/flywheel-proj-oc.json"));
                 assert!(!text.contains("{AGENT_NAME}"));
             }
@@ -12343,9 +12339,12 @@ mod loop_tests {
         // plain prompts stay untouched
         let states = vec![st("a", AgentStatus::Idle)];
         let mut q = vec!["t1".into()];
-        let actions = plan_actions(&states, &mut q, None);
+        let actions = durable::plan_actions(&states, &mut q, None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         match &actions[0] {
-            LoopAction::Send { text, .. } => assert_eq!(text, "t1"),
+            durable::LoopAction::Send { text, .. } => assert_eq!(text, "t1"),
             other => panic!("expected Send, got {other:?}"),
         }
     }
@@ -12354,10 +12353,13 @@ mod loop_tests {
     fn queue_drains_across_idle_agents_in_order() {
         let states = vec![st("a", AgentStatus::Idle), st("b", AgentStatus::Idle)];
         let mut q = vec!["p1".into(), "p6".into()];
-        let actions = plan_actions(&states, &mut q, None);
+        let actions = durable::plan_actions(&states, &mut q, None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert!(q.is_empty());
         match (&actions[0], &actions[1]) {
-            (LoopAction::Send { name: n1, text: t1 }, LoopAction::Send { name: n2, text: t2 }) => {
+            (durable::LoopAction::Send { name: n1, text: t1 }, durable::LoopAction::Send { name: n2, text: t2 }) => {
                 assert_eq!((n1, t1), (&"a".to_string(), &"p1".to_string()));
                 assert_eq!((n2, t2), (&"b".to_string(), &"p6".to_string()));
             }
@@ -12369,17 +12371,23 @@ mod loop_tests {
     fn working_agent_gets_nothing() {
         let states = vec![st("a", AgentStatus::Working)];
         let mut q = vec!["p1".into()];
-        let actions = plan_actions(&states, &mut q, None);
+        let actions = durable::plan_actions(&states, &mut q, None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(q.len(), 1); // queue untouched
-        assert!(matches!(actions[0], LoopAction::Wait));
+        assert!(matches!(actions[0], durable::LoopAction::Wait));
     }
 
     #[test]
     fn blocked_agent_reports() {
         let states = vec![st("a", AgentStatus::Blocked)];
         let mut q = vec!["p1".into()];
-        let actions = plan_actions(&states, &mut q, None);
-        assert!(matches!(&actions[0], LoopAction::Blocked { name } if name == "a"));
+        let actions = durable::plan_actions(&states, &mut q, None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        assert!(matches!(&actions[0], durable::LoopAction::Blocked { name } if name == "a"));
         assert_eq!(q.len(), 1); // blocked agent doesn't consume the queue
     }
 
@@ -12391,13 +12399,18 @@ mod loop_tests {
         // nudge; the queue stays intact.
         let states = vec![st("a", AgentStatus::Unknown)];
         let mut q = vec!["p1".into()];
-        let actions = plan_actions(&states, &mut q, None);
+        let actions = durable::plan_actions(&states, &mut q, None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(q.len(), 1);
-        assert!(matches!(actions[0], LoopAction::Wait));
+        assert!(matches!(actions[0], durable::LoopAction::Wait));
         let mut q2: Vec<String> = vec![];
-        let actions = plan_actions(&states, &mut q2, Some("proceed"));
+        let actions = durable::plan_actions(&states, &mut q2, Some("proceed"),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),);
         assert!(
-            matches!(actions[0], LoopAction::Wait),
+            matches!(actions[0], durable::LoopAction::Wait),
             "no nudge to unknown"
         );
     }
@@ -12406,25 +12419,33 @@ mod loop_tests {
     fn empty_queue_with_nudge_nudges() {
         let states = vec![st("a", AgentStatus::Idle)];
         let mut q: Vec<String> = vec![];
-        let actions = plan_actions(&states, &mut q, Some("proceed"));
-        assert!(matches!(&actions[0], LoopAction::Nudge { name } if name == "a"));
+        let actions = durable::plan_actions(&states, &mut q, Some("proceed"),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),);
+        assert!(matches!(&actions[0], durable::LoopAction::Nudge { name } if name == "a"));
     }
 
     #[test]
     fn empty_queue_no_nudge_waits() {
         let states = vec![st("a", AgentStatus::Done)];
         let mut q: Vec<String> = vec![];
-        let actions = plan_actions(&states, &mut q, None);
-        assert!(matches!(actions[0], LoopAction::Wait));
+        let actions = durable::plan_actions(&states, &mut q, None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        assert!(matches!(actions[0], durable::LoopAction::Wait));
     }
 
     #[test]
     fn done_treated_like_idle() {
         let states = vec![st("a", AgentStatus::Done)];
         let mut q = vec!["p8".into()];
-        let actions = plan_actions(&states, &mut q, None);
+        let actions = durable::plan_actions(&states, &mut q, None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert!(q.is_empty());
-        assert!(matches!(&actions[0], LoopAction::Send { text, .. } if text == "p8"));
+        assert!(matches!(&actions[0], durable::LoopAction::Send { text, .. } if text == "p8"));
     }
 
     #[test]
