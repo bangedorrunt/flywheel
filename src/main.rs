@@ -21025,6 +21025,63 @@ mod integration_tests {
         assert!(render_prompt("opencode", "bogus", "0.1.0", "ts").is_err());
     }
 
+    /// bd-vwsz: the crew templates carry the EXACT MCP arg shapes crews use —
+    /// agents were guessing arg names and failing tool validation (live bug
+    /// 2026-08-16). Each tool name must appear with its REQUIRED set in the
+    /// rendered beads body, and the release note must point crews at
+    /// release_file_reservations (NOT the loop's by_reason hook).
+    #[test]
+    fn rendered_body_carries_exact_mcp_arg_shapes() {
+        let out = render_prompt("omp", "execute", "0.1.0", "ts").unwrap();
+        // send_message: the required set is project_key, sender_name, to,
+        // subject, body_md (+ optional thread_id)
+        let send = out.find("send_message:").expect("send_message shape present");
+        let send_span = &out[send..send + 200];
+        for needle in [
+            "project_key",
+            "sender_name=YOUR_PIN",
+            "to=[names]",
+            "subject",
+            "body_md",
+            "thread_id",
+        ] {
+            assert!(send_span.contains(needle), "send_message missing {needle}");
+        }
+        // reply_message: same required set + thread_id to stay in-thread
+        let reply = out
+            .find("reply_message:")
+            .expect("reply_message shape present");
+        let reply_span = &out[reply..reply + 200];
+        for needle in [
+            "project_key",
+            "sender_name=YOUR_PIN",
+            "to=[names]",
+            "subject",
+            "body_md",
+            "thread_id",
+        ] {
+            assert!(
+                reply_span.contains(needle),
+                "reply_message missing {needle}"
+            );
+        }
+        // release: crews use release_file_reservations, NOT the by_reason
+        // loop hook (which needs bead_id)
+        assert!(
+            out.contains("release_file_reservations"),
+            "crew release tool named"
+        );
+        assert!(
+            out.contains("release_file_reservations_by_reason"),
+            "loop hook named so crews know the difference"
+        );
+        // the shell fallback line
+        assert!(
+            out.contains("`flywheel mail send` / `toron reserve release`"),
+            "shell fallback one-liner present"
+        );
+    }
+
     /// bd-oj9o #3 + bd-ucd4: the workflow command set is EXACTLY the popular
     /// user-facing workflows (debate, plan, plan-review, brainstorm, onboard,
     /// triage) — the same rule as the builtin set. Behind-the-scenes
