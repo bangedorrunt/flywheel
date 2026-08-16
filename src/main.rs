@@ -960,7 +960,7 @@ fn cmd_internal_last_sent(_cfg: &Config, project: &str, name: &str, hash: u64) -
     Ok(())
 }
 
-#[derive(Args, Default, Clone)]
+#[derive(Args, Default, Clone, Debug)]
 struct AgentCounts {
     #[arg(long)]
     oc: Option<u32>,
@@ -3031,21 +3031,23 @@ fn main() {
         }) => cmd_spawn(
             &cfg,
             project,
-            counts,
-            recipe.as_deref(),
-            kinds,
-            label.as_deref(),
-            *no_focus,
-            *no_verify,
-            *retire_orphans,
-            *peer_aware,
-            *no_peer_aware,
-            *peer_poll_interval_minutes,
-            *peer_poll_budget_minutes,
-            *peer_max_prompts,
-            *settle_secs,
-            profile.as_deref(),
-            *count,
+            SpawnOpts {
+                counts: counts.clone(),
+                recipe: recipe.clone(),
+                kinds: kinds.clone(),
+                label_override: label.clone(),
+                no_focus: *no_focus,
+                no_verify: *no_verify,
+                retire_orphans: *retire_orphans,
+                peer_aware: *peer_aware,
+                no_peer_aware: *no_peer_aware,
+                peer_poll_interval_minutes: *peer_poll_interval_minutes,
+                peer_poll_budget_minutes: *peer_poll_budget_minutes,
+                peer_max_prompts: *peer_max_prompts,
+                settle_secs: *settle_secs,
+                profile_name: profile.clone(),
+                profile_count: *count,
+            },
         ),
         Some(Commands::Add {
             project,
@@ -3403,11 +3405,13 @@ fn main() {
             &cfg,
             project,
             bead_id,
-            worker_model.as_deref(),
-            candidates.as_deref(),
-            blast,
-            ac,
-            dir.as_deref(),
+            VerifyDispatchOpts {
+                worker_model: worker_model.clone(),
+                candidates: candidates.clone(),
+                blast: blast.clone(),
+                ac: ac.clone(),
+                dir: dir.clone(),
+            },
         ),
         Some(Commands::__LoopRunVerify {
             project,
@@ -5122,13 +5126,16 @@ fn integration_status_line(kind: &str, st: &herdr_shim::IntegrationStatus) -> St
     format!("{} integration: {}", kind_paint(kind), painted)
 }
 
-fn cmd_spawn(
-    cfg: &Config,
-    project: &str,
-    counts: &AgentCounts,
-    recipe: Option<&str>,
-    kinds: &[(String, u32)],
-    label_override: Option<&str>,
+/// Spawn configuration knobs (bd-llbe: cmd_spawn had 17 positional args —
+/// a real readability bug). Grouped into one struct; `Default` matches the
+/// internal spawn patterns (respawn/asset/ensemble), the CLI spawn arm and
+/// the xproj spawn override what they need explicitly.
+#[derive(Debug, Clone)]
+struct SpawnOpts {
+    counts: AgentCounts,
+    recipe: Option<String>,
+    kinds: Vec<(String, u32)>,
+    label_override: Option<String>,
     no_focus: bool,
     no_verify: bool,
     retire_orphans: bool,
@@ -5138,9 +5145,33 @@ fn cmd_spawn(
     peer_poll_budget_minutes: u32,
     peer_max_prompts: u32,
     settle_secs: u64,
-    profile_name: Option<&str>,
+    profile_name: Option<String>,
     profile_count: u32,
-) -> Result<()> {
+}
+
+impl Default for SpawnOpts {
+    fn default() -> Self {
+        Self {
+            counts: AgentCounts::default(),
+            recipe: None,
+            kinds: Vec::new(),
+            label_override: None,
+            no_focus: false,
+            no_verify: false,
+            retire_orphans: false,
+            peer_aware: false,
+            no_peer_aware: false,
+            peer_poll_interval_minutes: 5,
+            peer_poll_budget_minutes: 30,
+            peer_max_prompts: 3,
+            settle_secs: 30,
+            profile_name: None,
+            profile_count: 1,
+        }
+    }
+}
+
+fn cmd_spawn(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
     let dir = project_dir(cfg, project);
     if !dir.exists() {
         // bd-vik B: fail BEFORE any herdr side effect, and name the valid
@@ -5176,20 +5207,20 @@ projects available: {}",
     }
     // bd-eign.13 fix: a PROFILE-ONLY spawn must not die in recipe_counts'
     // "nothing to spawn" guard — the profile plan is the spawn plan.
-    let plan = match recipe_counts(recipe, counts, kinds) {
+    let plan = match recipe_counts(opts.recipe.as_deref(), &opts.counts, &opts.kinds) {
         Ok(p) => p,
-        Err(_e) if profile_name.is_some() => Vec::new(),
+        Err(_e) if opts.profile_name.is_some() => Vec::new(),
         Err(e) => return Err(e),
     };
     // bd-eign.13: merge an optional profile-driven plan (harness kind +
     // count) with the recipe/count/kind plan for mixed crews.
     let catalog = profile::ProfileCatalog::load()?;
-    let profile_plan = match profile_name {
+    let profile_plan = match opts.profile_name.as_deref() {
         Some(p) => {
             let profile = catalog
                 .get(p)
                 .ok_or_else(|| anyhow!("unknown profile '@{p}' (flywheel profile list)"))?;
-            Some((p, profile, profile_count))
+            Some((p, profile, opts.profile_count))
         }
         None => None,
     };
@@ -5197,15 +5228,18 @@ projects available: {}",
     if items.is_empty() {
         bail!("nothing to spawn: pass --oc/--pi/--gk counts, --recipe NAME, or --profile NAME");
     }
-    let label = label_override
+    let label = opts
+        .label_override
+        .as_deref()
         .map(String::from)
         .unwrap_or_else(|| swarm_label(project));
     // bd-vik C: labels are workspace metadata — normalize to a slug
     // (lowercase alphanumerics + hyphens) and warn when changed.
     let (label, changed) = slugify_label(&label);
-    if changed && label_override.is_some() {
+    if changed && opts.label_override.is_some() {
         eprintln!(
-            "flywheel: label {label_override:?} normalized to {label:?} (slugs: lowercase + hyphens)"
+            "flywheel: label {:?} normalized to {label:?} (slugs: lowercase + hyphens)",
+            opts.label_override.as_deref()
         );
     }
     if label.is_empty() {
@@ -5213,7 +5247,7 @@ projects available: {}",
     }
     // bd-vik: record the custom label so project-based discovery still works
     // after a custom-label spawn (find_workspace falls back to this).
-    if label_override.is_some()
+    if opts.label_override.is_some()
         && let Err(e) = state::save_spawn_meta(project, &label)
     {
         eprintln!("flywheel: cannot save spawn label metadata: {e:#}");
@@ -5323,7 +5357,7 @@ projects available: {}",
                 )
             })
             .collect();
-        if retire_orphans {
+        if opts.retire_orphans {
             eprintln!(
                 "flywheel: closing {} pre-existing workspace(s) for {project}: {}",
                 orphans.len(),
@@ -5354,12 +5388,12 @@ projects available: {}",
     let (ws, root) = c.workspace_create(
         Some(&utf8_path(&dir, "workspace dir")?),
         Some(&label),
-        !no_focus,
+        !opts.no_focus,
         Some(&herdr_env),
     )?;
     println!(
         "{}",
-        if no_focus {
+        if opts.no_focus {
             format!("workspace {} created (background)", ws.workspace_id)
         } else {
             format!("workspace {} created", ws.workspace_id)
@@ -5379,7 +5413,7 @@ projects available: {}",
     // placeholders are substituted at the call site below.
     // 2026-08-15 (captain): collab is the default — crews self-poll the
     // mailbox unless explicitly opted out. Manual steering is not a swarm.
-    let peer_aware = peer_aware && !no_peer_aware;
+    let peer_aware = opts.peer_aware && !opts.no_peer_aware;
     let peer_template: Option<String> = if peer_aware {
         let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("integrations/peer-aware.md.tpl");
         match std::fs::read_to_string(&p) {
@@ -5440,9 +5474,9 @@ projects available: {}",
                         t,
                         &name,
                         identity,
-                        peer_poll_interval_minutes,
-                        peer_poll_budget_minutes,
-                        peer_max_prompts,
+                        opts.peer_poll_interval_minutes,
+                        opts.peer_poll_budget_minutes,
+                        opts.peer_max_prompts,
                     )]
                 })
                 .unwrap_or_default();
@@ -5492,8 +5526,8 @@ projects available: {}",
             // bd-eign.6 L2: settle — a TUI can own the foreground while MCP
             // servers still initialize; hold dispatch-side sleeps before the
             // spawn command returns (default 30s, observed boot 20-30s).
-            if settle_secs > 0 {
-                std::thread::sleep(Duration::from_secs(settle_secs));
+            if opts.settle_secs > 0 {
+                std::thread::sleep(Duration::from_secs(opts.settle_secs));
             }
             // H2 (bd-harness-pane-send-text-7fe8): prime the agent.prompt
             // gate via pane.send_text once the TUI is input-ready (a prompt
@@ -5562,7 +5596,7 @@ projects available: {}",
     // invisible to list/send/status. Verify the exact workspace_id we just
     // created is visible from the same view list/send use; fail loudly with
     // recovery steps instead of silent success.
-    if !no_verify {
+    if !opts.no_verify {
         let listed = c.workspace_list()?;
         let created_id = ws.workspace_id.clone();
         if !listed.iter().any(|lws| lws.workspace_id == created_id) {
@@ -5579,7 +5613,7 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
     // finished; a harness that cannot start stays pending). Wait briefly,
     // then FAIL naming the field + the pending agents (a silent ready is
     // the bug that produced dead sends).
-    if !no_verify {
+    if !opts.no_verify {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             let agents = c.agent_list()?;
@@ -7761,10 +7795,10 @@ fn cmd_send(
                 .iter()
                 .filter(|a| a.workspace_id == ws_id && a.name.is_none())
             {
-                if let Some(e) = entries.iter().find(|e| e.pane_id == a.pane_id) {
-                    if c.agent_rename(&a.pane_id, &e.name).is_ok() {
-                        rebound = true;
-                    }
+                if let Some(e) = entries.iter().find(|e| e.pane_id == a.pane_id)
+                    && c.agent_rename(&a.pane_id, &e.name).is_ok()
+                {
+                    rebound = true;
                 }
             }
             // bd-bug-omp-herdr-wedge: the omp herdr integration re-reports the
@@ -10727,21 +10761,10 @@ fn cmd_resume(cfg: &Config, project: &str, recipe: Option<&str>) -> Result<()> {
             cmd_spawn(
                 cfg,
                 project,
-                &AgentCounts::default(),
-                Some(r),
-                &[],
-                None,
-                false,
-                false,
-                false,
-                false,
-                false,
-                5,
-                30,
-                3,
-                30,
-                None,
-                1,
+                SpawnOpts {
+                    recipe: Some(r.to_string()),
+                    ..Default::default()
+                },
             )?;
         } else {
             bail!(
@@ -10802,21 +10825,10 @@ fn cmd_asset(cfg: &Config, kind: &str, cmd: &AssetCmd) -> Result<()> {
             "recipes" | "template" => cmd_spawn(
                 cfg,
                 project,
-                &AgentCounts::default(),
-                Some(name),
-                &[],
-                None,
-                false,
-                false,
-                false,
-                false,
-                false,
-                5,
-                30,
-                3,
-                30,
-                None,
-                1,
+                SpawnOpts {
+                    recipe: Some(name.clone()),
+                    ..Default::default()
+                },
             ),
             "workflows" => run_workflow(cfg, project, name),
             "pipeline" => run_pipeline(cfg, project, name),
@@ -10928,21 +10940,10 @@ fn cmd_ensemble(cfg: &Config, project: &str, recipe: &str, workflow: &str) -> Re
     cmd_spawn(
         cfg,
         project,
-        &AgentCounts::default(),
-        Some(recipe),
-        &[],
-        None,
-        false,
-        false,
-        false,
-        false,
-        false,
-        5,
-        30,
-        3,
-        30,
-        None,
-        1,
+        SpawnOpts {
+            recipe: Some(recipe.to_string()),
+            ..Default::default()
+        },
     )?;
     run_workflow(cfg, project, workflow)
 }
@@ -10952,7 +10953,6 @@ fn cmd_ensemble(cfg: &Config, project: &str, recipe: &str, workflow: &str) -> Re
 /// What the loop should do for one agent on one poll — the SINGLE
 /// definition lives in durable.rs (bd-w4-delete-dup-sbh8); the sync
 /// (`--local`/`--once`) path delegates to `durable::plan_actions`.
-
 /// Build the instruction queue from --queue / --workflow.
 /// Clamp the active cadence to the 5s floor (consistent with the workflow's
 /// `INTERVAL_MIN` in `next_interval_secs`). Pure — the warning is emitted by
@@ -11867,11 +11867,13 @@ mod verifier_dispatch_tests {
             &cfg,
             "vd-test",
             &bead_id,
-            Some("deepseek-v4"),
-            Some("deepseek-v4,deepseek-v3"),
-            "normal",
-            "checkable",
-            Some(&dir),
+            VerifyDispatchOpts {
+                worker_model: Some("deepseek-v4".to_string()),
+                candidates: Some("deepseek-v4,deepseek-v3".to_string()),
+                blast: "normal".to_string(),
+                ac: "checkable".to_string(),
+                dir: Some(dir.clone()),
+            },
         );
         assert!(out.is_ok(), "{out:?}");
         assert_eq!(status_of(&dir, &bead_id), "blocked");
@@ -11880,11 +11882,13 @@ mod verifier_dispatch_tests {
             &cfg,
             "vd-test",
             &bead_id,
-            Some("deepseek-v4"),
-            Some("deepseek-v4,deepseek-v3"),
-            "normal",
-            "checkable",
-            Some(&dir),
+            VerifyDispatchOpts {
+                worker_model: Some("deepseek-v4".to_string()),
+                candidates: Some("deepseek-v4,deepseek-v3".to_string()),
+                blast: "normal".to_string(),
+                ac: "checkable".to_string(),
+                dir: Some(dir.clone()),
+            },
         );
         assert!(out2.is_ok(), "{out2:?}");
         assert_eq!(status_of(&dir, &bead_id), "blocked");
@@ -11906,11 +11910,13 @@ mod verifier_dispatch_tests {
             &cfg,
             "vd-test",
             &bead_id,
-            Some("deepseek-v4"),
-            Some("deepseek-v4,opus-5"),
-            "normal",
-            "checkable",
-            Some(&dir),
+            VerifyDispatchOpts {
+                worker_model: Some("deepseek-v4".to_string()),
+                candidates: Some("deepseek-v4,opus-5".to_string()),
+                blast: "normal".to_string(),
+                ac: "checkable".to_string(),
+                dir: Some(dir.clone()),
+            },
         );
         assert!(out.is_ok(), "{out:?}");
         assert_ne!(status_of(&dir, &bead_id), "blocked");
@@ -11932,11 +11938,13 @@ mod verifier_dispatch_tests {
             &cfg,
             "vd-test",
             &bead_id,
-            Some("deepseek-v4"),
-            Some("deepseek-v4,deepseek-v3"),
-            "normal",
-            "checkable",
-            Some(&dir),
+            VerifyDispatchOpts {
+                worker_model: Some("deepseek-v4".to_string()),
+                candidates: Some("deepseek-v4,deepseek-v3".to_string()),
+                blast: "normal".to_string(),
+                ac: "checkable".to_string(),
+                dir: Some(dir.clone()),
+            },
         );
         assert!(out.is_ok(), "{out:?}");
         assert_ne!(status_of(&dir, &bead_id), "blocked");
@@ -19609,25 +19617,16 @@ fn cmd_internal_xproj_spawn(
         cmd_spawn(
             cfg,
             project,
-            &AgentCounts {
-                oc: Some(workers.max(1)),
-                pi: None,
-                gk: None,
+            SpawnOpts {
+                counts: AgentCounts {
+                    oc: Some(workers.max(1)),
+                    pi: None,
+                    gk: None,
+                },
+                recipe: Some(recipe.to_string()),
+                no_focus: true, // background workspace — must not steal terminal focus
+                ..Default::default()
             },
-            Some(recipe),
-            &[],
-            None,
-            true,  // background workspace (no_focus — must not steal terminal focus)
-            false, // skip post-spawn visibility verify (background xproj spawn)
-            false, // retire orphan workspaces (xproj spawns are additive)
-            false, // not peer-aware by default
-            false, // no_peer_aware (xproj spawns stay non-collab)
-            5,
-            30,
-            3,
-            30,
-            None,
-            1,
         )
     };
     let spawned_ok = outcome.is_ok();
@@ -19910,6 +19909,18 @@ fn cmd_internal_reservation_board(cfg: &Config, project: &str) -> Result<()> {
     Ok(())
 }
 
+/// Verifier-dispatch options (bd-llbe: cmd_internal_verify_dispatch had 8
+/// positional args — the trailing five are one option group). `dir` lets
+/// tests point at a scratch project dir; production callers pass None.
+#[derive(Debug, Clone, Default)]
+struct VerifyDispatchOpts {
+    worker_model: Option<String>,
+    candidates: Option<String>,
+    blast: String,
+    ac: String,
+    dir: Option<PathBuf>,
+}
+
 /// internal leaf: verifier-dispatch (ADR-0019 Spec 4,
 /// bd-w1-verifier-degrade-a6fk). Computes the independent-verifier plan for
 /// `bead_id`:
@@ -19920,19 +19931,16 @@ fn cmd_internal_reservation_board(cfg: &Config, project: &str) -> Result<()> {
 /// - `degrade`: block the bead `verifier-family-missing` (idempotent) + mail
 ///   the captain exactly once (`.flywheel/verifier-family-missing-<id>.mailed`
 ///   marker dedup) + NEVER respawn — the single-family swarm path.
+///
 /// Always exits 0 — a block/mail hiccup must not kill the loop.
 fn cmd_internal_verify_dispatch(
     cfg: &Config,
     project: &str,
     bead_id: &str,
-    worker_model: Option<&str>,
-    candidates: Option<&str>,
-    blast: &str,
-    ac: &str,
-    dir: Option<&Path>,
+    opts: VerifyDispatchOpts,
 ) -> Result<()> {
-    let key = match dir {
-        Some(p) => p.to_path_buf(),
+    let key = match opts.dir {
+        Some(ref p) => p.to_path_buf(),
         None => PathBuf::from(project_dir_str(cfg, project)?),
     };
     let mut bead = match verdict::bead_from_br_show(&key, bead_id) {
@@ -19949,12 +19957,12 @@ fn cmd_internal_verify_dispatch(
             return Ok(());
         }
     };
-    bead.blast = if blast == "high" {
+    bead.blast = if opts.blast == "high" {
         verdict::Blast::High
     } else {
         verdict::Blast::Normal
     };
-    let ac = if ac == "judgment" {
+    let ac = if opts.ac == "judgment" {
         verdict::AcShape::Judgment
     } else {
         verdict::AcShape::Checkable
@@ -19971,14 +19979,14 @@ fn cmd_internal_verify_dispatch(
             return Ok(());
         }
     };
-    let cands: Vec<&str> = match candidates {
-        Some(c) => c.split(',').filter(|s| !s.is_empty()).collect(),
+    let cands: Vec<&str> = match opts.candidates {
+        Some(ref c) => c.split(',').filter(|s| !s.is_empty()).collect(),
         None => reg.models.keys().map(String::as_str).collect(),
     };
     let plan = reg.verifier_plan(
         &bead,
         ac,
-        worker_model.unwrap_or("unknown"),
+        opts.worker_model.as_deref().unwrap_or("unknown"),
         &cands,
         cfg.verifier_family_override(),
     );
@@ -19999,11 +20007,9 @@ fn cmd_internal_verify_dispatch(
                     bead_id,
                     "--status=blocked",
                     "--transition-comment",
-                    &format!(
-                        "verifier-family-missing (ADR-0019 Spec 4): no second model family in the \
-                         registry and no verifier_family_override — bead blocked, captain mailed \
-                         once, no respawn"
-                    ),
+                    "verifier-family-missing (ADR-0019 Spec 4): no second model family in the \
+                     registry and no verifier_family_override — bead blocked, captain mailed \
+                     once, no respawn",
                 ])
                 .current_dir(&key)
                 .output();
@@ -21106,7 +21112,9 @@ mod integration_tests {
         let out = render_prompt("omp", "execute", "0.1.0", "ts").unwrap();
         // send_message: the required set is project_key, sender_name, to,
         // subject, body_md (+ optional thread_id)
-        let send = out.find("send_message:").expect("send_message shape present");
+        let send = out
+            .find("send_message:")
+            .expect("send_message shape present");
         let send_span = &out[send..send + 200];
         for needle in [
             "project_key",

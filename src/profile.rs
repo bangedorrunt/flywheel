@@ -788,6 +788,13 @@ spawn_cmd = "hermes --project {project} --role {role}"
         ] {
             for (name, preamble, _skills, _principles) in expect {
                 let p = cat.get(name).unwrap();
+                // The preamble is the behavior's opening line — never a stub
+                // and never the leaf text itself (bd-llbe: use the column,
+                // don't underscore it).
+                assert!(
+                    !preamble.trim().is_empty() && p.behavior.starts_with(preamble),
+                    "{name} preamble must be a non-empty verbatim behavior start"
+                );
                 assert!(
                     !p.behavior.contains(leaf_phrase),
                     "{name} behavior must NOT paste the leaf text: {leaf_phrase:?}"
