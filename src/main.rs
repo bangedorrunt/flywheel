@@ -486,9 +486,12 @@ enum Commands {
     /// Environment + toolchain health check
     Deps,
     /// Generate the beads-agent integration prompts for an agent kind.
-    /// Writes 5 files (beads-{triage,execute,review,commit,create}.md) into
-    /// the tool's prompts dir. Omit KIND to list the available kinds.
-    /// Re-run after a flywheel rebuild to refresh the generated prompts.
+    /// Writes the beads files (beads-{triage,execute,review,commit,create}.md),
+    /// the workflow slash commands (workflow-{...}.md), and the orchestration
+    /// slash commands (swarm.md, loop.md) into the tool's prompts dir.
+    /// Kinds: opencode|pi|grok|omp|pa (shorts oc|pi|gk accepted); omit to
+    /// list kinds. Re-run after a flywheel rebuild to refresh the generated
+    /// prompts.
     Integration {
         /// agent kind: opencode|pi|grok|omp (shorts oc|pi|gk accepted);
         /// omit to list kinds
@@ -12801,6 +12804,9 @@ fn prompt_frontmatter(kind: &str) -> Option<&'static str> {
         "omp" => Some(include_str!(
             "../integrations/prompts/frontmatter-omp.md.tpl"
         )),
+        "pa" => Some(include_str!(
+            "../integrations/prompts/frontmatter-pa.md.tpl"
+        )),
         _ => None,
     }
 }
@@ -12889,6 +12895,28 @@ fn prompt_workflow_template(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The orchestration slash-command set (bd-glup /swarm; bd-ug9z /loop):
+/// command name → (description, template file). These are the
+/// captain/steering commands — wave-gated bead-graph swarms and
+/// single-agent autonomous loops — distinct from PROMPT_WORKFLOWS (workflow
+/// commands) and the beads lifecycle commands. The template files live in
+/// integrations/prompts/ and are rendered per agent kind like the workflow
+/// commands.
+const ORCHESTRATION_COMMANDS: &[(&str, &str, &str)] = &[(
+    "swarm",
+    "Run the /swarm command — the wave-gated bead-graph swarm playbook: classify, gate-prep, lanes, spawn, brief, conflict ladder, wave gate, teardown.",
+    "swarm.md.tpl",
+)];
+
+/// Per-orchestration-command template: `{{TOOL_FRONTMATTER}}` + the
+/// playbook body. Standalone — no beads body.
+fn prompt_orchestration_template(name: &str) -> Option<&'static str> {
+    match name {
+        "swarm" => Some(include_str!("../integrations/prompts/swarm.md.tpl")),
+        _ => None,
+    }
+}
+
 /// The prompts directory for one agent kind (the dir the 5 command files
 /// are written into). Purely conventional per tool.
 pub fn prompts_dir(kind: &str) -> Option<std::path::PathBuf> {
@@ -12899,6 +12927,7 @@ pub fn prompts_dir(kind: &str) -> Option<std::path::PathBuf> {
         "pi" => home.join(".pi/agent/prompts"),
         "grok" => home.join(".grok/prompts"),
         "omp" => home.join(".omp/agent/prompts"),
+        "pa" => home.join(".prime/agent/commands"),
         _ => return None,
     })
 }
@@ -12907,7 +12936,7 @@ pub fn prompts_dir(kind: &str) -> Option<std::path::PathBuf> {
 /// `generated` are injected by the caller (deterministic tests).
 fn render_prompt(kind: &str, phase: &str, version: &str, generated: &str) -> Result<String> {
     let frontmatter = prompt_frontmatter(kind)
-        .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp)"))?;
+        .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp, pa)"))?;
     let phase_tpl = prompt_phase_template(phase).ok_or_else(|| {
         anyhow!("unknown phase: {phase} (known: triage, execute, review, commit, create)")
     })?;
@@ -12940,7 +12969,7 @@ fn render_workflow_prompt(
     generated: &str,
 ) -> Result<String> {
     let frontmatter = prompt_frontmatter(kind)
-        .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp)"))?;
+        .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp, pa)"))?;
     let tpl = prompt_workflow_template(name)
         .ok_or_else(|| anyhow!("unknown workflow command: {name} (flywheel integration list)"))?;
     let (_, _, description) = PROMPT_WORKFLOWS
@@ -12956,10 +12985,39 @@ fn render_workflow_prompt(
         .replace("{{GENERATED}}", generated))
 }
 
+/// Render one orchestration command (/swarm, /loop) for one agent kind.
+/// Pure (deterministic tests): frontmatter (with the command's description)
+/// + the playbook template + version/generated stamps.
+fn render_orchestration_prompt(
+    kind: &str,
+    name: &str,
+    version: &str,
+    generated: &str,
+) -> Result<String> {
+    let frontmatter = prompt_frontmatter(kind)
+        .ok_or_else(|| anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp, pa)"))?;
+    let tpl = prompt_orchestration_template(name).ok_or_else(|| {
+        anyhow!("unknown orchestration command: {name} (flywheel integration list)")
+    })?;
+    let (_, description, _) = ORCHESTRATION_COMMANDS
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .expect("orchestration command in table");
+    Ok(tpl
+        .replace(
+            "{{TOOL_FRONTMATTER}}",
+            &frontmatter.replace("{{PHASE_DESCRIPTION}}", description),
+        )
+        .replace("{{VERSION}}", version)
+        .replace("{{GENERATED}}", generated))
+}
+
 /// `flywheel integration [KIND] [--out PATH]` — generate the 5 beads prompt
 /// files (beads-{triage,execute,review,commit,create}.md) for one agent kind
-/// (opencode/pi/grok/omp), each from the shared beads-body. With no KIND,
-/// list the available kinds. With `--out <dir>`, write the 5 files into that
+/// (opencode/pi/grok/omp/pa), each from the shared beads-body, plus the
+/// workflow slash commands (workflow-{...}.md) and the orchestration slash
+/// commands (bd-glup /swarm, bd-ug9z /loop: {name}.md). With no KIND, list
+/// the available kinds. With `--out <dir>`, write the files into that
 /// directory instead of the tool's conventional prompts dir.
 ///
 /// The beads SUBAGENT (agents/beads.md) is retired (bd-ra0g.1): the loop
@@ -12978,7 +13036,22 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        for (k, _) in [("opencode", ""), ("pi", ""), ("grok", ""), ("omp", "")] {
+        println!(
+            "  + {} orchestration slash commands per kind: {{{}}}.md",
+            ORCHESTRATION_COMMANDS.len(),
+            ORCHESTRATION_COMMANDS
+                .iter()
+                .map(|(n, _, _)| *n)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for (k, _) in [
+            ("opencode", ""),
+            ("pi", ""),
+            ("grok", ""),
+            ("omp", ""),
+            ("pa", ""),
+        ] {
             let dir = prompts_dir(k)
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "<HOME>/.config/...".to_string());
@@ -12998,7 +13071,7 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
     let dir = match out {
         Some(p) => p.to_path_buf(),
         None => prompts_dir(kind).ok_or_else(|| {
-            anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp)")
+            anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp, pa)")
         })?,
     };
     std::fs::create_dir_all(&dir)
@@ -13021,6 +13094,19 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
     for (name, _, _) in PROMPT_WORKFLOWS {
         let rendered = render_workflow_prompt(kind, name, VERSION, &generated)?;
         let path = dir.join(format!("workflow-{name}.md"));
+        std::fs::write(&path, &rendered).with_context(|| format!("write {}", path.display()))?;
+        println!(
+            "wrote {} ({} bytes)",
+            dim(&path.display().to_string()),
+            rendered.len()
+        );
+        written += 1;
+    }
+    // The orchestration slash commands (bd-glup /swarm; bd-ug9z /loop):
+    // captain/steering playbooks, rendered as {name}.md.
+    for (name, _, _) in ORCHESTRATION_COMMANDS {
+        let rendered = render_orchestration_prompt(kind, name, VERSION, &generated)?;
+        let path = dir.join(format!("{name}.md"));
         std::fs::write(&path, &rendered).with_context(|| format!("write {}", path.display()))?;
         println!(
             "wrote {} ({} bytes)",
@@ -20431,7 +20517,7 @@ mod integration_tests {
 
     #[test]
     fn render_all_five_phases_exist_per_kind() {
-        for kind in ["opencode", "pi", "grok", "omp"] {
+        for kind in ["opencode", "pi", "grok", "omp", "pa"] {
             for phase in ["triage", "execute", "review", "commit", "create"] {
                 let out = render_prompt(kind, phase, "0.1.0", "ts").unwrap();
                 assert!(
@@ -20536,7 +20622,7 @@ mod integration_tests {
     /// bd-oj9o #3: every kind renders every workflow command.
     #[test]
     fn render_all_workflow_commands_per_kind() {
-        for kind in ["opencode", "pi", "grok", "omp"] {
+        for kind in ["opencode", "pi", "grok", "omp", "pa"] {
             for (name, _, _) in PROMPT_WORKFLOWS {
                 let out = render_workflow_prompt(kind, name, "0.1.0", "ts").unwrap();
                 assert!(out.starts_with("---"), "{kind}/{name} frontmatter");
@@ -20553,6 +20639,110 @@ mod integration_tests {
     fn render_workflow_rejects_unknown() {
         assert!(render_workflow_prompt("claude", "debate", "0.1.0", "ts").is_err());
         assert!(render_workflow_prompt("opencode", "beads", "0.1.0", "ts").is_err());
+    }
+
+    /// bd-glup: the ORCHESTRATION_COMMANDS set holds the swarm/loop slash
+    /// commands — distinct from the workflow command set; PROMPT_WORKFLOWS
+    /// stays workflow-only. bd-ug9z (/loop) extends this set.
+    #[test]
+    fn orchestration_command_set_has_swarm() {
+        assert!(
+            !PROMPT_WORKFLOWS.iter().any(|(n, _, _)| *n == "swarm"),
+            "swarm must not be a workflow command"
+        );
+        assert_eq!(
+            ORCHESTRATION_COMMANDS.len(),
+            1,
+            "exactly one orchestration command (bd-ug9z /loop extends this set)"
+        );
+        let (name, description, template) = ORCHESTRATION_COMMANDS[0];
+        assert_eq!(name, "swarm");
+        assert!(!description.is_empty(), "/swarm has a description");
+        assert!(template.ends_with(".tpl"), "template file referenced");
+    }
+
+    /// bd-glup: a rendered orchestration command = frontmatter (with the
+    /// description) + the playbook template + stamps; no beads body.
+    #[test]
+    fn render_orchestration_prompt_has_frontmatter_and_focus() {
+        let out =
+            render_orchestration_prompt("opencode", "swarm", "9.9.9", "2026-08-10T00:00:00Z")
+                .unwrap();
+        assert!(out.starts_with("---\n"), "frontmatter");
+        assert!(
+            out.contains("wave-gated bead-graph swarm playbook"),
+            "description in frontmatter"
+        );
+        assert!(out.contains("# Orchestration: swarm"));
+        for step in [
+            "CLASSIFY",
+            "GATE PREP",
+            "LANES",
+            "SPAWN",
+            "BRIEF",
+            "CONFLICT",
+            "WAVE GATE",
+            "TEARDOWN",
+        ] {
+            assert!(out.contains(step), "playbook step {step} present");
+        }
+        assert!(out.contains("flywheel 9.9.9"));
+        assert!(out.contains("2026-08-10T00:00:00Z"));
+        assert!(!out.contains("{{TOOL_FRONTMATTER}}"));
+        assert!(
+            !out.contains("{{BODY}}"),
+            "orchestration commands are standalone — no beads body"
+        );
+    }
+
+    /// bd-glup: every kind (incl pa) renders every orchestration command.
+    #[test]
+    fn render_all_orchestration_commands_per_kind() {
+        for kind in ["opencode", "pi", "grok", "omp", "pa"] {
+            for (name, _, _) in ORCHESTRATION_COMMANDS {
+                let out = render_orchestration_prompt(kind, name, "0.1.0", "ts").unwrap();
+                assert!(out.starts_with("---"), "{kind}/{name} frontmatter");
+                assert!(
+                    out.contains(&format!("# Orchestration: {name}")),
+                    "{kind}/{name} heading"
+                );
+            }
+        }
+    }
+
+    /// bd-glup: unknown kind or command is an actionable error.
+    #[test]
+    fn render_orchestration_rejects_unknown() {
+        assert!(render_orchestration_prompt("claude", "swarm", "0.1.0", "ts").is_err());
+        assert!(render_orchestration_prompt("opencode", "bogus-cmd", "0.1.0", "ts").is_err());
+    }
+
+    /// bd-glup: the swarm template is ASCII-only (the bd-zq8u peer-aware
+    /// "cannot be encoded safely" failure mode) and under 4 KiB.
+    #[test]
+    fn swarm_template_is_ascii_only_and_bounded() {
+        let tpl: &str = prompt_orchestration_template("swarm").expect("swarm template");
+        assert!(tpl.is_ascii(), "swarm.md.tpl must be ASCII-only");
+        assert!(
+            tpl.len() < 4 * 1024,
+            "swarm.md.tpl must stay under 4 KiB ({} bytes)",
+            tpl.len()
+        );
+    }
+
+    /// bd-glup: the swarm playbook cites the governing principles by name
+    /// (ADR-0019 Spec 5 steering vocabulary).
+    #[test]
+    fn swarm_template_cites_principles() {
+        let tpl: &str = prompt_orchestration_template("swarm").expect("swarm template");
+        for p in [
+            "prove-it-works",
+            "sequence-verifiable-units",
+            "guard-the-context-window",
+            "never-block-on-the-human",
+        ] {
+            assert!(tpl.contains(p), "cites principle {p}");
+        }
     }
 
     #[test]
