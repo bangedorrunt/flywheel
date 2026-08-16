@@ -956,21 +956,6 @@ pub fn pane_wait_output(
     parse_wait_for_output_result(&res)
 }
 
-/// Pane-scoped command execution without an agent lifecycle (ADR-0019
-/// CommandVerified, H2 bd-harness-pane-send-text-7fe8): run `command` in the
-/// pane's shell via the `pane.run` composite (send_text + Enter — there is
-/// no raw `pane.run` method in herdr protocol 19; the CLI implements it the
-/// same way). The caller typically follows with [`pane_wait_output`] to await
-/// a regex/substring match.
-pub fn pane_run(
-    c: &mut Client,
-    pane_id: &str,
-    command: &str,
-) -> std::result::Result<(), HerdrError> {
-    c.pane_run(pane_id, command).map_err(to_herdr_error)?;
-    Ok(())
-}
-
 /// `worktree.list` — delegation over `Client::call`, returning the
 /// flywheel-shaped [`WorktreeInfo`].
 pub fn worktree_list(c: &mut Client, workspace_id: Option<&str>) -> Result<Vec<WorktreeInfo>> {
@@ -1966,13 +1951,11 @@ mod alt_screen_read_ladder_tests {
         }
         fn wait_idle(&mut self) -> Result<bool, BackendError> {
             self.log.push("wait_idle".into());
-            let res = self.waits.remove(0);
-            res
+            self.waits.remove(0)
         }
         fn file_fallback(&mut self) -> Result<String, BackendError> {
             self.log.push("file_fallback".into());
-            let res = self.fallbacks.remove(0);
-            res
+            self.fallbacks.remove(0)
         }
     }
 

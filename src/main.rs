@@ -3382,7 +3382,7 @@ fn main() {
             project,
             bead_id,
             title,
-        }) => cmd_internal_mail_not_ready(&cfg, project, bead_id, title),
+        }) => cmd_internal_mail_not_ready(&cfg, project, bead_id, title, None),
         Some(Commands::__CloseCheck { project, bead_id }) => {
             cmd_internal_close_check(&cfg, project, bead_id)
         }
@@ -5906,7 +5906,7 @@ mod peer_encoding_tests {
                 "rendered template must be control-char-free (herdr rejects \
                  is_control args) for name={name} identity={identity}"
             );
-            ensure_ascii_launch_args(&[rendered.clone()])
+            ensure_ascii_launch_args(std::slice::from_ref(&rendered))
                 .unwrap_or_else(|e| panic!("ASCII render must pass the launch guard: {e}"));
         }
     }
@@ -11041,6 +11041,18 @@ fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // bd-4spn: priority + `## PRINCIPLES` section feed the dispatch
+            // gate (PRINCIPLES required for P<=2).
+            priority: b
+                .get("priority")
+                .and_then(Value::as_u64)
+                .map(|p| p.min(u8::MAX as u64) as u8)
+                .unwrap_or(3),
+            principles: b
+                .get("description")
+                .and_then(Value::as_str)
+                .map(durable::parse_principles_field)
+                .unwrap_or_default(),
         })
         .collect())
 }
@@ -11089,6 +11101,18 @@ fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                         .map(str::to_string)
                         .collect()
                 })
+                .unwrap_or_default(),
+            // bd-4spn: priority + `## PRINCIPLES` section (the resume path
+            // reads the same gate fields as the ready path).
+            priority: b
+                .get("priority")
+                .and_then(Value::as_u64)
+                .map(|p| p.min(u8::MAX as u64) as u8)
+                .unwrap_or(3),
+            principles: b
+                .get("description")
+                .and_then(Value::as_str)
+                .map(durable::parse_principles_field)
                 .unwrap_or_default(),
         })
         .collect())
@@ -11532,8 +11556,20 @@ fn cmd_loop(
                     queue_items.extend(to_assign);
                     for bead in &not_ready {
                         if not_ready_mailed.insert(bead.id.clone())
-                            && let Err(e) =
-                                cmd_internal_mail_not_ready(cfg, project, &bead.id, &bead.title)
+                            && let Err(e) = cmd_internal_mail_not_ready(
+                                cfg,
+                                project,
+                                &bead.id,
+                                &bead.title,
+                                // bd-4spn: name the blocker — a missing
+                                // VERIFY fence OR the PRINCIPLES requirement
+                                // (priority<=2); the planner fixes in one pass.
+                                Some(&if bead.verify.is_none() {
+                                    "## VERIFY fence missing, empty, or multi-line".to_string()
+                                } else {
+                                    durable::principles_block_reason(bead).unwrap_or_default()
+                                }),
+                            )
                         {
                             eprintln!(
                                 "flywheel: mail-not-ready for {} failed (continuing): {e:#}",
@@ -12146,6 +12182,8 @@ mod loop_tests {
                 assignee: None,
                 verify: None,
                 labels: Vec::new(),
+                priority: 3,
+                principles: String::new(),
             },
             durable::ReadyBead {
                 id: "bd-r2".into(),
@@ -12153,6 +12191,8 @@ mod loop_tests {
                 assignee: None,
                 verify: None,
                 labels: Vec::new(),
+                priority: 3,
+                principles: String::new(),
             },
         ];
         let ready = vec![durable::ReadyBead {
@@ -12161,6 +12201,8 @@ mod loop_tests {
             assignee: None,
             verify: None,
             labels: Vec::new(),
+            priority: 3,
+            principles: String::new(),
         }];
         let mut assigned = Vec::new();
         let prompts = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
@@ -12183,6 +12225,8 @@ mod loop_tests {
             assignee: None,
             verify: None,
             labels: Vec::new(),
+            priority: 3,
+            principles: String::new(),
         }];
         let ready = vec![durable::ReadyBead {
             id: "bd-r1".into(),
@@ -12190,6 +12234,8 @@ mod loop_tests {
             assignee: None,
             verify: None,
             labels: Vec::new(),
+            priority: 3,
+            principles: String::new(),
         }];
         let mut assigned = vec!["bd-r1".to_string()];
         let prompts = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
@@ -12204,6 +12250,8 @@ mod loop_tests {
             assignee: None,
             verify: None,
             labels: Vec::new(),
+            priority: 3,
+            principles: String::new(),
         }];
         let mut assigned = Vec::new();
         let prompts = work_prompts(&[], &ready, &mut assigned, "flywheel");
@@ -12319,6 +12367,7 @@ mod loop_tests {
             "bd-fence-missing",
             "some bead",
             "PlannerOne",
+            None,
         )
         .expect("not-ready mail sends");
         assert!(receipt.count >= 1, "delivered: {receipt:?}");
@@ -15823,7 +15872,7 @@ fn planner_author_response(wf_name: &str, prompt: &str) -> Result<String> {
 
 fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
     use toron_workflow::schema::{Action, CrewSpec, Workflow};
-    use toron_workflow::{Level, lint_workflow};
+    use toron_workflow::{Level, lint_workflow_with_principles};
 
     /// The full workflow set: built-ins (compiled-in) + catalog (canonical
     /// YAML + absorbed legacy), name → (workflow, source).
@@ -15845,7 +15894,10 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
     fn lint_one(name: &str, wf: &Workflow) -> usize {
         // Engine tier (toron-workflow lint): schema, guards (evalexpr +
         // timeout), template refs, graph acyclicity — inherited, fail-stop.
-        let report = lint_workflow(wf);
+        // bd-4spn GAP 2: lint with the FLYWHEEL principle registry (names())
+        // — the toron in-crate fallback would silently drift from the
+        // check_principles registry.
+        let report = lint_workflow_with_principles(wf, crate::principles::names());
         let mut blocking = report
             .issues
             .iter()
@@ -19716,6 +19768,7 @@ fn cmd_internal_mail_not_ready(
     project: &str,
     bead_id: &str,
     title: &str,
+    reason: Option<&str>,
 ) -> Result<()> {
     let mail = match backend::mail_backend(cfg) {
         Ok(m) => m,
@@ -19734,7 +19787,7 @@ fn cmd_internal_mail_not_ready(
     let planner = resolve_planner_for_bead(&key, bead_id, &fallback);
     let out = (|| -> Result<backend::SendReceipt> {
         backend::run_mail(mail.ensure_project(&key)).map_err(|e| anyhow!("{e}"))?;
-        send_not_ready_mail(&*mail, &key, bead_id, title, &planner)
+        send_not_ready_mail(&*mail, &key, bead_id, title, &planner, reason)
     })();
     match out {
         Ok(_) => {
@@ -19786,19 +19839,37 @@ fn send_not_ready_mail(
     bead_id: &str,
     title: &str,
     planner: &str,
+    reason: Option<&str>,
 ) -> Result<backend::SendReceipt> {
-    let subject =
-        format!("[{bead_id}] NOT ready: missing/invalid VERIFY fence — fix before dispatch");
-    let body = format!(
-        "Bead **{bead_id}** (`{title}`) sits in the ready set but was **NOT dispatched**: \
-         its `## VERIFY` fence is missing, empty, or multi-line (ADR-0019).\n\n\
-         Required block in the bead description, exact shape:\n\n\
-         ```text\n## VERIFY\n```\n\
-         <one command, one line>\n```\n```\n\n\
-         Name one cheap command the loop can run (e.g. `cargo test -p X name`). \
-         Until then the bead stays ready-but-undispatchable — the loop has \
-         no fallback verifier for the whole workspace matrix."
-    );
+    let subject = match reason {
+        Some(r) => format!("[{bead_id}] NOT ready: {r} — fix before dispatch"),
+        None => {
+            format!("[{bead_id}] NOT ready: missing/invalid VERIFY fence — fix before dispatch")
+        }
+    };
+    // bd-4spn: a PRINCIPLES-blocked bead (priority<=2, incomplete section)
+    // carries the check's exact reason; the legacy VERIFY body is unchanged
+    // when no reason is supplied (byte-identical path).
+    let body = match reason {
+        Some(r) => format!(
+            "Bead **{bead_id}** (`{title}`) sits in the ready set but was **NOT dispatched**: {r}.\n\n\
+             ADR-0019 Spec 6 requires priority <= 2 beads to carry a `## PRINCIPLES` section in \
+             the description — every line `<principle-name> — <the decision it changed>`, names \
+             from the canonical 21 (see `flywheel principles list`). A missing section, a \
+             name-only citation, or an unknown name keeps the bead ready-but-undispatchable \
+             until the planner fixes the description."
+        ),
+        None => format!(
+            "Bead **{bead_id}** (`{title}`) sits in the ready set but was **NOT dispatched**: \
+             its `## VERIFY` fence is missing, empty, or multi-line (ADR-0019).\n\n\
+             Required block in the bead description, exact shape:\n\n\
+             ```text\n## VERIFY\n```\n\
+             <one command, one line>\n```\n```\n\n\
+             Name one cheap command the loop can run (e.g. `cargo test -p X name`). \
+             Until then the bead stays ready-but-undispatchable — the loop has \
+             no fallback verifier for the whole workspace matrix."
+        ),
+    };
     mail_send(
         mail,
         key,
@@ -20219,7 +20290,7 @@ fn cmd_internal_loop_run_verify(
     let mut v = json!({
         "band": "loop-runnable",
         "bead_id": bead_id,
-        "sha": sha,
+        "sha": o.sha,
         "dir": o.dir.to_string_lossy(),
         "verify": o.verify,
     });
@@ -20361,8 +20432,8 @@ fn run_verify_with_timeout(
         Ok(c) => c,
         Err(e) => return Ok((-1, format!("spawn failed: {e}"))),
     };
-    let mut out = child.stdout.take();
-    let mut err = child.stderr.take();
+    let out = child.stdout.take();
+    let err = child.stderr.take();
     let out_handle = std::thread::spawn(move || {
         let mut buf = String::new();
         if let Some(mut o) = out {
@@ -22310,6 +22381,7 @@ mod bd_bvwf1_orphan_workspaces {
 /// loop's `__profile` leaf), sends raw to unprofiled ones, and `--raw`
 /// bypasses conditioning. The VERIFY gate for the bead:
 /// `cargo test -p flywheel send_conditioning`.
+#[cfg(test)]
 mod send_conditioning_tests {
     use super::*;
 

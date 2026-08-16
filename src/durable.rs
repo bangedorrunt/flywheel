@@ -32,8 +32,6 @@
 
 use std::collections::HashMap;
 use std::process::Command;
-use std::sync::Arc;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -41,8 +39,6 @@ use serde_json::{Value, json};
 use resonate_sdk::function;
 use resonate_sdk::prelude::*;
 use toron_core::mailbox::overlaps;
-use toron_workflow::engine::{ActionRunner, WorkflowEngine};
-use toron_workflow::schema::{Action, Workflow};
 
 use crate::config::Config;
 
@@ -187,6 +183,19 @@ pub struct ReadyBead {
     /// by wave order). `br ready --json` / `br list --json` emit them.
     #[serde(default)]
     pub labels: Vec<String>,
+    /// bd-4spn: the bead's priority (0=P0 … 3=P3). Default 3 (exempt) so a
+    /// missing field in a foreign br JSON never gates a bead.
+    #[serde(default = "default_priority")]
+    pub priority: u8,
+    /// bd-4spn: the bead description's `## PRINCIPLES` section (ADR-0019
+    /// Spec 6 — REQUIRED for priority <= 2, every line `name — decision`).
+    /// Empty = the section is absent (dispatch gate refuses P<=2).
+    #[serde(default)]
+    pub principles: String,
+}
+
+fn default_priority() -> u8 {
+    3
 }
 
 /// Parse the exact `## VERIFY` fence from a bead description (ADR-0019
@@ -244,8 +253,53 @@ fn is_fence_line(line: &str) -> bool {
 /// not-ready (missing/malformed fence — refuse-to-dispatch + mail the
 /// planner, ADR-0019). Pure — the single decision every dispatch path
 /// (the single survivor loop body) shares.
+/// Partition ready beads into dispatchable vs not-ready (ADR-0019).
+///
+/// A bead is dispatchable iff BOTH gates pass:
+/// - the `## VERIFY` fence is present and single-line (bd-w1-verify-fence);
+/// - the PRINCIPLES section is complete for priority <= 2 beads
+///   (bd-4spn GAP 1 — `check_principles`: required, `name — decision`
+///   lines, canonical names; P3+ is exempt).
+///
+/// The not-ready half feeds the planner mail; it is NEVER dispatched.
 pub fn partition_ready(ready: &[ReadyBead]) -> (Vec<&ReadyBead>, Vec<&ReadyBead>) {
-    ready.iter().partition(|b| b.verify.is_some())
+    ready
+        .iter()
+        .partition(|b| b.verify.is_some() && principles_block_reason(b).is_none())
+}
+
+/// Why a bead's PRINCIPLES section blocks dispatch (bd-4spn). `None` =
+/// the section passes (or the bead is priority 3+ and exempt). The reason
+/// names the exact failure for the planner mail.
+pub fn principles_block_reason(b: &ReadyBead) -> Option<String> {
+    match crate::principles::check_principles(b.priority, &b.principles) {
+        crate::principles::PrinciplesCheck::Complete => None,
+        crate::principles::PrinciplesCheck::Incomplete { reason } => Some(reason),
+    }
+}
+
+/// Extract the `## PRINCIPLES` section from a bead description (bd-4spn):
+/// everything after the exact `## PRINCIPLES` heading until the next `## `
+/// heading or EOF, trimmed. Absent -> empty string.
+pub fn parse_principles_field(description: &str) -> String {
+    let lines: Vec<&str> = description.lines().collect();
+    let Some(heading) = lines.iter().position(|l| l.trim() == "## PRINCIPLES") else {
+        return String::new();
+    };
+    let mut out: Vec<&str> = Vec::new();
+    for line in &lines[heading + 1..] {
+        if line.trim_start().starts_with("## ") {
+            break;
+        }
+        if line.trim().is_empty() && out.is_empty() {
+            continue;
+        }
+        out.push(line);
+    }
+    while out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+    out.join("\n").trim().to_string()
 }
 
 /// Parse a bead's `wave-N` label into its wave number (bd-gnej). A bead
@@ -1188,6 +1242,25 @@ fn parse_bead_list(v: &serde_json::Value, what: &str) -> anyhow::Result<Vec<Read
                         .filter_map(serde_json::Value::as_str)
                         .map(str::to_string)
                         .collect()
+                })
+                .unwrap_or_default(),
+            // bd-4spn: priority for the PRINCIPLES dispatch gate; the
+            // `## PRINCIPLES` section from the description (fall back to a
+            // direct `principles` field if the br shape carries one).
+            priority: b
+                .get("priority")
+                .and_then(serde_json::Value::as_u64)
+                .map(|p| p.min(u8::MAX as u64) as u8)
+                .unwrap_or(3),
+            principles: b
+                .get("principles")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    b.get("description")
+                        .and_then(serde_json::Value::as_str)
+                        .map(parse_principles_field)
                 })
                 .unwrap_or_default(),
         })
@@ -2508,8 +2581,23 @@ pub fn claim_watch_step(
                     .find(|s| s.name == cw.agent)
                     .map(|s| s.status.as_str());
                 match st {
+                    // bd-4spn: the dispatched agent REPORTED blocked while the
+                    // bead stays unclaimed — record the reason (the T0-T3
+                    // escalation path owns the blocked ACTION; the reason
+                    // taxonomy is complete: blocked vs overlap vs wave-gate).
+                    Some("blocked") => {
+                        cw.wait_reason = Some(WaitReason::Blocked);
+                        cw.unclaimed_polls += 1;
+                        if cw.unclaimed_polls >= nudge_after {
+                            cw.unclaimed_polls = 0;
+                            actions.push(ClaimWatchAction::NudgeClaim {
+                                agent: cw.agent.clone(),
+                                bead_id: bead_id.clone(),
+                            });
+                        }
+                    }
                     // engaged but never claimed → nudge after N polls
-                    Some("working") | Some("blocked") | Some("unknown") => {
+                    Some("working") | Some("unknown") => {
                         cw.unclaimed_polls += 1;
                         if cw.unclaimed_polls >= nudge_after {
                             cw.unclaimed_polls = 0;
@@ -2681,7 +2769,7 @@ pub fn snapshot_due(states_empty: bool, stream_error: bool, since_snapshot: u64)
 /// update the status of the pane's agent; `pane.exited` marks the agent
 /// `exited`. Unknown panes (not yet in the snapshot — e.g. freshly spawned)
 /// are left to the next snapshot. Pure + unit-tested.
-pub fn apply_events_to_states(states: &mut Vec<AgentState>, events: &[PollEvent]) {
+pub fn apply_events_to_states(states: &mut [AgentState], events: &[PollEvent]) {
     for ev in events {
         let status = ev.status.as_deref().unwrap_or("");
         match ev.event_type.as_str() {
@@ -2689,10 +2777,10 @@ pub fn apply_events_to_states(states: &mut Vec<AgentState>, events: &[PollEvent]
                 let Some(name) = name_for_pane(states, &ev.pane_id) else {
                     continue;
                 };
-                if let Some(s) = states.iter_mut().find(|s| s.name == name) {
-                    if !status.is_empty() {
-                        s.status = status.to_string();
-                    }
+                if let Some(s) = states.iter_mut().find(|s| s.name == name)
+                    && !status.is_empty()
+                {
+                    s.status = status.to_string();
                 }
             }
             "pane.exited" => {
@@ -5789,6 +5877,8 @@ mod tests {
             assignee: assignee.map(str::to_string),
             verify: None,
             labels: Vec::new(),
+            priority: 3,
+            principles: String::new(),
         }
     }
 
@@ -5800,6 +5890,8 @@ mod tests {
             assignee: None,
             verify: Some("true".into()),
             labels: vec![format!("wave-{wave}")],
+            priority: 3,
+            principles: String::new(),
         }
     }
 
@@ -6870,6 +6962,8 @@ mod tests {
             assignee: None,
             verify: None,
             labels: Vec::new(),
+            priority: 3,
+            principles: String::new(),
         }
     }
 
@@ -6880,6 +6974,8 @@ mod tests {
             assignee: Some(assignee.to_string()),
             verify: None,
             labels: Vec::new(),
+            priority: 3,
+            principles: String::new(),
         }
     }
 
@@ -8914,6 +9010,8 @@ Dependencies:
                 assignee: None,
                 verify: Some("cargo test ok".into()),
                 labels: Vec::new(),
+                priority: 3,
+                principles: String::new(),
             },
             ReadyBead {
                 id: "bd-no-fence".into(),
@@ -8921,6 +9019,8 @@ Dependencies:
                 assignee: None,
                 verify: None,
                 labels: Vec::new(),
+                priority: 3,
+                principles: String::new(),
             },
             ReadyBead {
                 id: "bd-multi".into(),
@@ -8928,6 +9028,8 @@ Dependencies:
                 assignee: None,
                 verify: None,
                 labels: Vec::new(),
+                priority: 3,
+                principles: String::new(),
             },
         ];
         let (dispatchable, not_ready) = partition_ready(&ready);
@@ -8935,6 +9037,104 @@ Dependencies:
         let blocked: Vec<&str> = not_ready.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(dispatched, vec!["bd-ok-1"]);
         assert_eq!(blocked, vec!["bd-no-fence", "bd-multi"]);
+    }
+
+    /// bd-4spn GAP 1: the dispatch gate must machine-enforce the ADR-0019
+    /// PRINCIPLES requirement — a priority<=2 bead with an incomplete
+    /// PRINCIPLES section is NOT dispatchable (mirrors the ## VERIFY fence
+    /// gate); P3+ is exempt.
+    #[test]
+    fn partition_ready_enforces_principles_for_priority_le_2() {
+        let rb = |id: &str, priority: u8, principles: &str, verify: Option<&str>| ReadyBead {
+            id: id.into(),
+            title: String::new(),
+            assignee: None,
+            priority,
+            principles: principles.into(),
+            verify: verify.map(str::to_string),
+            labels: Vec::new(),
+        };
+        let ready = vec![
+            // P2 with an empty PRINCIPLES section -> refuse
+            rb("bd-p2-empty", 2, "", Some("true")),
+            // P2 with a name-only citation (no decision clause) -> refuse
+            rb("bd-p2-nameonly", 2, "prove-it-works", Some("true")),
+            // P2 with `name — decision` -> dispatch
+            rb(
+                "bd-p2-ok",
+                2,
+                "prove-it-works — wired the gate",
+                Some("true"),
+            ),
+            // P3 empty -> dispatch (exempt)
+            rb("bd-p3-empty", 3, "", Some("true")),
+        ];
+        let (dispatchable, not_ready) = partition_ready(&ready);
+        let dispatched: Vec<&str> = dispatchable.iter().map(|b| b.id.as_str()).collect();
+        let blocked: Vec<&str> = not_ready.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(
+            dispatched,
+            vec!["bd-p2-ok", "bd-p3-empty"],
+            "gate lets compliant beads through"
+        );
+        assert_eq!(
+            blocked,
+            vec!["bd-p2-empty", "bd-p2-nameonly"],
+            "gate refuses incomplete PRINCIPLES"
+        );
+    }
+
+    /// The not-ready mail needs the WHY — the principles block reason names
+    /// the exact failure (required-field vs no-decision-clause vs unknown
+    /// name) so the planner can fix the description in one pass.
+    #[test]
+    fn principles_block_reason_names_the_problem() {
+        let rb = |id: &str, priority: u8, principles: &str| ReadyBead {
+            id: id.into(),
+            title: String::new(),
+            assignee: None,
+            priority,
+            principles: principles.into(),
+            verify: Some("true".into()),
+            labels: Vec::new(),
+        };
+        let empty = rb("bd-x", 2, "");
+        let r = principles_block_reason(&empty).expect("P2 empty blocks");
+        assert!(r.contains("PRINCIPLES is required"), "reason: {r}");
+
+        let nameonly = rb("bd-y", 2, "prove-it-works");
+        let r2 = principles_block_reason(&nameonly).expect("name-only blocks");
+        assert!(r2.contains("no decision clause"), "reason: {r2}");
+
+        let unknown = rb("bd-w", 2, "not-a-principle — changed something");
+        let r3 = principles_block_reason(&unknown).expect("unknown name blocks");
+        assert!(r3.contains("unknown principle name"), "reason: {r3}");
+
+        assert!(
+            principles_block_reason(&rb("bd-z", 3, "")).is_none(),
+            "P3 empty is exempt"
+        );
+        assert!(
+            principles_block_reason(&rb("bd-v", 2, "prove-it-works — wired the gate")).is_none(),
+            "complete citation passes"
+        );
+    }
+
+    /// The `## PRINCIPLES` section extractor: everything after the exact
+    /// heading until the next `## ` heading or EOF; absent -> empty.
+    #[test]
+    fn parse_principles_field_extracts_section() {
+        let desc = "goal line\n\n## PRINCIPLES\nprove-it-works — the change;\nfix-root-causes — the why.\n\n## VERIFY\n```\ncargo test x\n```";
+        assert_eq!(
+            parse_principles_field(desc),
+            "prove-it-works — the change;\nfix-root-causes — the why."
+        );
+        // section terminated by the next ## heading
+        let d2 = "## PRINCIPLES\nprove-it-works — x.\n## VERIFY\n```\ny\n```";
+        assert_eq!(parse_principles_field(d2), "prove-it-works — x.");
+        // absent -> empty
+        assert_eq!(parse_principles_field("goal\n## VERIFY\n```\nx\n```"), "");
+        assert_eq!(parse_principles_field(""), "");
     }
 
     /// ADR-0019: the dispatch path must NEVER fall back to the whole-
