@@ -126,7 +126,7 @@ enum Commands {
         #[arg(long)]
         recipe: Option<String>,
         /// extra herdr agent kind counts: --kind claude=1 (repeatable)
-        #[arg(long = "kind", value_parser = parse_kind_count)]
+        #[arg(long = "kind", value_name = "KIND=COUNT", value_parser = parse_kind_count)]
         kinds: Vec<(String, u32)>,
         #[arg(long)]
         label: Option<String>,
@@ -183,7 +183,7 @@ enum Commands {
         project: String,
         #[command(flatten)]
         counts: AgentCounts,
-        #[arg(long = "kind", value_parser = parse_kind_count)]
+        #[arg(long = "kind", value_name = "KIND=COUNT", value_parser = parse_kind_count)]
         kinds: Vec<(String, u32)>,
         /// post-split settle: seconds to sleep after the readiness gate so a
         /// booted-but-not-input-ready TUI (MCP init, model connect) catches
