@@ -185,6 +185,14 @@ enum Commands {
         counts: AgentCounts,
         #[arg(long = "kind", value_parser = parse_kind_count)]
         kinds: Vec<(String, u32)>,
+        /// post-split settle: seconds to sleep after the readiness gate so a
+        /// booted-but-not-input-ready TUI (MCP init, model connect) catches
+        /// prompts (bd-eign.6, same contract as spawn). Default 30 —
+        /// observed boot is 20-30s. bd-umb3: the add path previously had no
+        /// settle, so the boot prime raced the shell and added panes stayed
+        /// `agent_not_ready` until a manual prime.
+        #[arg(long, default_value_t = 30)]
+        settle_secs: u64,
     },
     /// List flywheel swarms and their agents
     List {
@@ -3039,7 +3047,8 @@ fn main() {
             project,
             counts,
             kinds,
-        }) => cmd_add(&cfg, project, counts, kinds),
+            settle_secs,
+        }) => cmd_add(&cfg, project, counts, kinds, *settle_secs),
         Some(Commands::List { all }) => cmd_list(&cfg, *all),
         Some(Commands::Status { project }) => cmd_status(&cfg, project.as_deref()),
         Some(Commands::Decide {
@@ -4880,6 +4889,47 @@ mod workspace_origin_tests {
             "expected refuse, got: {err}"
         );
     }
+
+    // bd-umb3: the `add` path must boot-prime each new pane (settle before
+    // the send_text prime, retried, manual-socket fallback) — an unprimed
+    // pane reports idle in herdr but rejects `flywheel send` with
+    // `agent_not_ready` until a manual prime. Code-pointer gate: `cmd_add`
+    // must (a) sleep the settle before priming, (b) call the retried
+    // `prime_via_send_text` for non-in-arg kinds, (c) the prime helper
+    // itself must warn with the manual socket one-liner on final failure.
+    #[test]
+    fn add_prime_wired_into_add_path() {
+        let src = include_str!("main.rs");
+        let add = src
+            .find("fn cmd_add(")
+            .expect("cmd_add present in main.rs");
+        let add_body = &src[add..];
+        let prime_fn = src
+            .find("fn prime_via_send_text(")
+            .expect("prime_via_send_text present in main.rs");
+        let prime_body = &src[prime_fn..];
+        // (a) settle before the prime (bd-eign.6 L2, same contract as spawn)
+        assert!(
+            add_body.contains("if settle_secs > 0 {\n                std::thread::sleep")
+                && add_body
+                    .find("if settle_secs > 0")
+                    .expect("settle sleep in cmd_add")
+                    < add_body
+                        .find("prime_via_send_text(&mut c, &prev)")
+                        .expect("prime call in cmd_add"),
+            "cmd_add must sleep the settle BEFORE priming (bd-umb3)"
+        );
+        // (b) the add path primes via the shared helper (not skipped)
+        assert!(
+            add_body.contains("prime_via_send_text(&mut c, &prev);"),
+            "cmd_add must invoke the retried boot prime for each new pane (bd-umb3)"
+        );
+        // (c) helper warns with the manual socket one-liner on final failure
+        assert!(
+            prime_body.contains("manual socket prime: herdr pane send-text"),
+            "prime_via_send_text must warn with the manual socket one-liner (bd-umb3)"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
@@ -4910,12 +4960,36 @@ fn needs_in_arg_prime(_kind: &str) -> bool {
 /// the char-by-char send-keys hack (send-keys rejects multi-char text:
 /// `invalid_key`) and the MESSAGES-arg boot prime. Best-effort — a failed
 /// prime warns but never fails the spawn.
+///
+/// bd-umb3: retried — a transiently-busy pane (mid-boot, integration not yet
+/// reporting) must not silently stay unpromptable. Up to 3 attempts with a
+/// short settle between; on final failure the warning carries the manual
+/// socket one-liner so an operator can prime the pane by hand instead of
+/// discovering `agent_not_ready` on the first send.
 fn prime_via_send_text(c: &mut Client, pane_id: &str) {
-    let res = c
-        .pane_send_text(pane_id, boot_prime_line())
-        .and_then(|_| c.pane_send_input(pane_id, &["Enter"]));
-    if let Err(e) = res {
-        eprintln!("flywheel: warn: boot-prime via pane.send_text failed for {pane_id}: {e:#}");
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let res = c
+            .pane_send_text(pane_id, boot_prime_line())
+            .and_then(|_| c.pane_send_input(pane_id, &["Enter"]));
+        match res {
+            Ok(_) => return,
+            Err(e) if attempt < MAX_ATTEMPTS => {
+                eprintln!(
+                    "flywheel: warn: boot-prime attempt {attempt}/{MAX_ATTEMPTS} failed for {pane_id}: {e:#} — retrying"
+                );
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            Err(e) => {
+                eprintln!(
+                    "flywheel: warn: boot-prime via pane.send_text failed for {pane_id} after {MAX_ATTEMPTS} attempts: {e:#}"
+                );
+                eprintln!(
+                    "flywheel:   manual socket prime: herdr pane send-text {pane_id} '{}' then send Enter (or herdr agent prompt {pane_id})",
+                    boot_prime_line()
+                );
+            }
+        }
     }
 }
 
@@ -6990,6 +7064,7 @@ fn cmd_add(
     project: &str,
     counts: &AgentCounts,
     kinds: &[(String, u32)],
+    settle_secs: u64,
 ) -> Result<()> {
     let plan = recipe_counts(None, counts, kinds)?;
     let dir = project_dir(cfg, project);
@@ -7060,9 +7135,9 @@ fn cmd_add(
                 add_args.push(boot_prime_line().to_string());
             }
             let agent = start_agent_with_retry(&mut c, &name, &kind, &prev, &add_args)?;
-            // H2: the add path has no settle — wait for the TUI to own the
-            // foreground (bd-eign.6, same 15s contract as spawn) before the
-            // send_text prime, so it is not lost to the shell.
+            // H2: the add path previously had no settle — wait for the TUI to
+            // own the foreground (bd-eign.6, same 15s contract as spawn)
+            // before the send_text prime, so it is not lost to the shell.
             let _ = herdr_shim::wait_agent_foreground(
                 &mut c,
                 &prev,
@@ -7070,7 +7145,18 @@ fn cmd_add(
                 &name,
                 Duration::from_secs(15),
             );
+            // bd-umb3 (bd-eign.6 L2): settle — same as spawn. A TUI can own
+            // the foreground while MCP servers still initialize; the prime
+            // typed into a half-booted shell is lost, leaving the pane
+            // `agent_not_ready` until a manual prime. Hold the dispatch-side
+            // sleep (default 30s, observed boot 20-30s) before priming.
+            if settle_secs > 0 {
+                std::thread::sleep(Duration::from_secs(settle_secs));
+            }
             if !needs_in_arg_prime(&kind) {
+                // bd-umb3: retried prime — a transiently-busy pane must not
+                // silently stay unpromptable; on final failure the helper
+                // warns with the manual socket one-liner.
                 prime_via_send_text(&mut c, &prev);
             }
             // bd-627z.4: register + pin the mail identity (the add path's
