@@ -5615,6 +5615,33 @@ mod recipe_launch_tests {
     }
 }
 
+/// bd-zq8u: herdr's `agent.start` rejects launch args it cannot encode
+/// safely for the target shell — `arg.chars().any(char::is_control)`
+/// (herdr src/app/agents.rs, added 2026-07-17): any control character
+/// (tab, newline, CR, NUL, ESC) fails with `invalid_agent_argument`.
+/// Pre-validate BEFORE the retry loop: a poisoned launch arg must fail
+/// LOUD on the first call with an actionable error, never burn the retry
+/// budget. The check is strict ASCII-printable (0x20..=0x7E): non-ASCII
+/// and control bytes both fail.
+fn ensure_ascii_launch_args(args: &[String]) -> Result<()> {
+    for (idx, arg) in args.iter().enumerate() {
+        if let Some((byte_idx, c)) = arg
+            .char_indices()
+            .find(|(_, c)| !c.is_ascii() || c.is_control())
+        {
+            bail!(
+                "agent launch argument {idx} contains non-ASCII or control character {c:?} \
+                 (U+{:04X}) at byte {byte_idx}: herdr cannot encode it safely for the \
+                 target shell. ASCII-fy the launch text (e.g. \
+                 integrations/peer-aware.md.tpl, which must also be free of \
+                 newlines/tabs) or pass --no-peer-aware",
+                c as u32
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn start_agent_with_retry(
     c: &mut Client,
     name: &str,
@@ -5622,6 +5649,8 @@ pub(crate) fn start_agent_with_retry(
     pane_id: &str,
     args: &[String],
 ) -> Result<AgentInfo> {
+    // bd-zq8u: fail fast on un-encodable launch text before any retry burn.
+    ensure_ascii_launch_args(args)?;
     let mut recipe_launched = false;
     for attempt in 0..30 {
         if !recipe_launched {
@@ -5687,6 +5716,8 @@ fn start_agent_with_retry_dyn(
     pane_id: &str,
     args: &[String],
 ) -> Result<AgentInfo> {
+    // bd-zq8u: fail fast on un-encodable launch text before any retry burn.
+    ensure_ascii_launch_args(args)?;
     let mut recipe_launched = false;
     for attempt in 0..30 {
         if !recipe_launched {
@@ -5731,6 +5762,153 @@ fn start_agent_with_retry_dyn(
         std::thread::sleep(Duration::from_secs(3));
     }
     bail!("agent start failed for {name} on {pane_id} after 30 attempts")
+}
+
+/// bd-zq8u: the peer-aware template is injected into agent.start launch
+/// args; herdr rejects non-ASCII bytes ("cannot be encoded safely for the
+/// target shell"). These tests pin the ASCII contract on the rendered
+/// template AND the fail-fast guard (never a 30-attempt retry burn).
+#[cfg(test)]
+mod peer_encoding_tests {
+    use super::{ensure_ascii_launch_args, peer_prompt_template, start_agent_with_retry_dyn};
+    use crate::backend::MultiplexerBackend;
+
+    /// Read the real template from disk (the file the spawn path loads).
+    fn real_template() -> String {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("integrations/peer-aware.md.tpl");
+        std::fs::read_to_string(&p).expect("peer-aware template readable")
+    }
+
+    /// S9/bd-zq8u: the rendered peer template is ASCII-only AND free of
+    /// control characters for ALL substitution inputs — name,
+    /// mail_identity, and the three budget numbers. herdr rejects any arg
+    /// with a control char (`arg.chars().any(char::is_control)`), so the
+    /// rendered launch text must pass the strict launch guard.
+    #[test]
+    fn peer_template_renders_ascii_for_all_inputs() {
+        let tpl = real_template();
+        let inputs: &[(&str, &str, u32, u32, u32)] = &[
+            ("flywheel-toron-coder1", "DustySparrow", 5, 30, 3),
+            ("flywheel-hachiko-oc4", "BlueRidge", 10, 60, 5),
+            ("flywheel-xproj-gk2", "CoralFinch", 1, 1, 1),
+            ("flywheel-toron-omp", "GrayCarp", 60, 240, 0),
+        ];
+        for (name, identity, interval, budget, prompts) in inputs {
+            let rendered = peer_prompt_template(
+                &tpl,
+                name,
+                identity,
+                *interval,
+                *budget,
+                *prompts,
+            );
+            assert!(
+                rendered.is_ascii(),
+                "rendered template must be ASCII for name={name} identity={identity}"
+            );
+            assert!(
+                !rendered.chars().any(char::is_control),
+                "rendered template must be control-char-free (herdr rejects \
+                 is_control args) for name={name} identity={identity}"
+            );
+            ensure_ascii_launch_args(&[rendered.clone()])
+                .unwrap_or_else(|e| panic!("ASCII render must pass the launch guard: {e}"));
+        }
+    }
+
+    /// bd-zq8u: a poisoned (non-ASCII) launch arg fails LOUD with an
+    /// actionable error naming the character and the fix.
+    #[test]
+    fn launch_arg_guard_rejects_non_ascii_with_actionable_error() {
+        let err = ensure_ascii_launch_args(&["You are §9.3 -- ok -> done".to_string()])
+            .expect_err("non-ASCII arg must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-ASCII or control"),
+            "error must name the defect class: {msg}"
+        );
+        assert!(
+            msg.contains("U+00A7"),
+            "error must name the character code: {msg}"
+        );
+        assert!(
+            msg.contains("--no-peer-aware"),
+            "error must offer the opt-out: {msg}"
+        );
+    }
+
+    /// bd-zq8u: a control-char arg (tab/newline — herdr's ACTUAL rejection
+    /// criterion, `char::is_control`) fails fast too. This is the real
+    /// regression that burned 30 retries on 2026-08-15: the multi-line
+    /// template's newlines, not the non-ASCII glyphs.
+    #[test]
+    fn launch_arg_guard_rejects_control_chars() {
+        let err = ensure_ascii_launch_args(&["line one\nline two".to_string()])
+            .expect_err("control-char arg must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-ASCII or control"),
+            "error must name the defect class: {msg}"
+        );
+        assert!(
+            msg.contains("U+000A"),
+            "error must name the character code: {msg}"
+        );
+        assert!(
+            msg.contains("integrations/peer-aware.md.tpl"),
+            "error must point at the template: {msg}"
+        );
+    }
+
+    /// bd-zq8u: the guard fires BEFORE agent.start — a poisoned arg must
+    /// fail on the first call, never enter the 30-attempt retry loop. A
+    /// backend whose agent_start panics proves the guard returns first.
+    struct PanicOnStartMux;
+    impl MultiplexerBackend for PanicOnStartMux {
+        fn name(&self) -> &'static str {
+            "panic-on-start"
+        }
+        /// If the guard ever regresses and this is reached, the test fails
+        /// immediately instead of burning the 30-attempt retry loop.
+        fn agent_start(
+            &self,
+            _name: &str,
+            _kind: &str,
+            _pane_id: &str,
+            _args: &[String],
+        ) -> Result<crate::herdr_shim::AgentInfo, crate::herdr_shim::BackendError> {
+            panic!("agent.start must never be reached with a poisoned arg")
+        }
+    }
+
+    #[test]
+    fn start_agent_retry_fails_fast_on_poisoned_arg() {
+        let backend = &PanicOnStartMux as &dyn MultiplexerBackend;
+        let err = start_agent_with_retry_dyn(
+            backend,
+            "flywheel-toron-coder1",
+            "opencode",
+            "w9:p1",
+            &["peer template with § section sign".to_string()],
+        )
+        .expect_err("poisoned arg must fail fast");
+        assert!(
+            err.to_string().contains("non-ASCII or control"),
+            "fast-fail error must be the guard's: {err}"
+        );
+    }
+
+    /// bd-zq8u: empty args (non-peer-aware single-shot panes) always pass.
+    #[test]
+    fn launch_arg_guard_accepts_empty_and_ascii_args() {
+        ensure_ascii_launch_args(&[]).expect("no args is fine");
+        ensure_ascii_launch_args(&[
+            "Boot ready check: reply exactly READY.".to_string(),
+            "--model opencode-go/deepseek-v4-flash".to_string(),
+        ])
+        .expect("ASCII args pass");
+    }
 }
 
 /// Register a spawned agent as an agent-mail identity (ADR-0001
