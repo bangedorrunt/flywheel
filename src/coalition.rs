@@ -319,11 +319,15 @@ impl CoalitionStore {
         // Goal must be a known workflow + pass the engine-tier lint gate
         // (mirrors `workflow run`'s fail-stop).
         let wf = resolve_goal_workflow(goal)?;
-        let blocking = toron_workflow::lint_workflow(&wf)
-            .issues
-            .iter()
-            .filter(|i| i.level == toron_workflow::Level::Error)
-            .count();
+        // bd-4spn GAP 2: lint with the flywheel principle registry (names())
+        // — same bridge as the workflow-lint CLI; the fallback list would
+        // silently drift.
+        let blocking =
+            toron_workflow::lint_workflow_with_principles(&wf, crate::principles::names())
+                .issues
+                .iter()
+                .filter(|i| i.level == toron_workflow::Level::Error)
+                .count();
         if blocking > 0 {
             bail!(
                 "goal workflow {goal:?} has {blocking} blocking lint issue(s) — refusing to form"

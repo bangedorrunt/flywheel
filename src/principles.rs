@@ -43,6 +43,14 @@ pub fn is_known_name(name: &str) -> bool {
     PRINCIPLE_NAMES.contains(&name)
 }
 
+/// The canonical 21-name registry as a slice — the ADR-0019 wave-2 bridge
+/// (bd-4spn): flywheel's workflow-lint call sites pass THIS into
+/// `toron_workflow::lint_workflow_with_principles`, keeping the lint
+/// registry identical to the check_principles registry (no silent drift).
+pub fn names() -> &'static [&'static str] {
+    &PRINCIPLE_NAMES
+}
+
 /// One compiled-in principle leaf (ADR-0019 Spec 5, wave 3): the canonical
 /// name, the `when` trigger, and the full `rule` — verbatim from the Spec 5
 /// tables. `flywheel principles show <name>` resolves these.
@@ -194,11 +202,12 @@ pub enum PrinciplesCheck {
 }
 
 /// Check a report's PRINCIPLES section (bd-w3-brief-principles-yy39):
-/// - priority <= 2: the field is REQUIRED (empty -> incomplete).
+/// - priority <= 2: the field is REQUIRED (empty -> incomplete);
 /// - every line must be `name — decision it changed`; a name-only line has
-///   no decision clause and is a cargo-cult citation (incomplete).
+///   no decision clause and is a cargo-cult citation (incomplete);
 /// - names must be from the canonical 21-name registry (unknown -> fail,
 ///   regardless of priority).
+///
 /// The builder emits the field; this checker enforces it (the stage p2
 /// reviewer BLOCKER language is the human-side of the same rule).
 pub fn check_principles(priority: u8, principles: &str) -> PrinciplesCheck {
@@ -264,6 +273,7 @@ mod tests {
         assert!(!is_known_name("prove-it-work"));
         assert!(!is_known_name(""));
         assert!(!is_known_name("prove-it-works "));
+
         assert!(!is_known_name("PROVE-IT-WORKS"));
         assert!(!is_known_name("laziness"));
     }
@@ -391,5 +401,54 @@ mod tests {
             check_principles(2, "prove-it-works - checked the ledger"),
             PrinciplesCheck::Incomplete { .. }
         ));
+    }
+
+    /// bd-4spn GAP 2 cross-repo bridge: tamper one name in the flywheel
+    /// registry -> toron-workflow lint rejects the citation with
+    /// unknown-principle. Proves the flywheel list (not the toron in-crate
+    /// fallback, which still has the original name) drives the lint.
+    #[test]
+    fn principle_registry_drives_workflow_lint_bridge() {
+        use toron_workflow::schema::Workflow;
+        let wf = Workflow {
+            name: "bridge-fixture".into(),
+            description: None,
+            trigger: None,
+            policy: None,
+            guard: None,
+            principles: vec!["laziness-protocol".into()],
+            steps: vec![],
+            graph: None,
+            inputs: vec![],
+            crew: None,
+        };
+        let unknown = |r: &toron_workflow::LintReport| {
+            r.issues
+                .iter()
+                .any(|i| i.message.contains("unknown principle name"))
+        };
+        // The real flywheel registry resolves the citation.
+        let real = toron_workflow::lint_workflow_with_principles(&wf, names());
+        assert!(
+            !unknown(&real),
+            "canonical registry accepts: {:?}",
+            real.issues
+        );
+        // Tamper: drop laziness-protocol from the passed list.
+        let tampered: Vec<&str> = names()
+            .iter()
+            .copied()
+            .filter(|n| *n != "laziness-protocol")
+            .collect();
+        let report = toron_workflow::lint_workflow_with_principles(&wf, &tampered);
+        assert!(
+            unknown(&report),
+            "tampered registry must reject the citation: {:?}",
+            report.issues
+        );
+        // The in-crate fallback still knows the name — the tampered list,
+        // not the fallback, was live.
+        let fallback = toron_workflow::lint_workflow(&wf);
+        assert!(!unknown(&fallback), "fallback still resolves the name");
     }
 }
