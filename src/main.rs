@@ -3778,13 +3778,20 @@ pub(crate) fn profile_launch_args(harness: &str, p: &profile::Profile) -> Vec<St
 }
 /// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
 #[allow(clippy::too_many_arguments)]
-/// Render the peer-aware self-poll template (ADR-0001 §9.3) with all
+/// Render the peer-aware self-poll template (ADR-0001 S.9.3) with all
 /// placeholders substituted. Pure + deterministic so the injected prompt is
 /// free of literal `{placeholder}` text (bd-pattern-peer-triggered).
 ///
 /// S8.3: `mail_identity` (the registered canonical name, resolved BEFORE
 /// the agent starts) is injected as "your mail identity is X" so the agent
 /// boots knowing the exact name its peers/assigns address it by.
+///
+/// bd-zq8u: the rendered output is the launch ARG — herdr rejects any arg
+/// containing control characters (`arg.chars().any(char::is_control)`,
+/// herdr src/app/agents.rs). The template file keeps markdown newlines for
+/// readability; the rendered string collapses them to spaces so the launch
+/// text is control-char-free. `ensure_ascii_launch_args` guards the same
+/// boundary defensively.
 fn peer_prompt_template(
     tpl: &str,
     name: &str,
@@ -3793,7 +3800,8 @@ fn peer_prompt_template(
     poll_budget_minutes: u32,
     max_peer_prompts: u32,
 ) -> String {
-    tpl.replace("{name}", name)
+    let rendered = tpl
+        .replace("{name}", name)
         .replace("{mail_identity}", mail_identity)
         .replace("{task}", "await the swarm loop's queue or help peers")
         .replace(
@@ -3801,7 +3809,14 @@ fn peer_prompt_template(
             &poll_interval_minutes.to_string(),
         )
         .replace("{poll_budget_minutes}", &poll_budget_minutes.to_string())
-        .replace("{max_peer_prompts}", &max_peer_prompts.to_string())
+        .replace("{max_peer_prompts}", &max_peer_prompts.to_string());
+    // bd-zq8u: herdr's `is_control` check rejects \t \n \r \0 \x1b etc. —
+    // collapse every control char to a space (semantics preserved: the
+    // prompt text survives, just de-blanked).
+    rendered
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
