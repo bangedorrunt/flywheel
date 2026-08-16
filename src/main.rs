@@ -250,6 +250,12 @@ enum Commands {
         /// failing with recovery guidance
         #[arg(long)]
         respawn_on_stall: bool,
+        /// bd-98gd: bypass profile conditioning — send the text verbatim.
+        /// Default resolves each target's spawn-registry profile and
+        /// prepends its behavior preamble (Spec C everywhere); use --raw
+        /// for nudges and mail wakes that must not carry role behavior.
+        #[arg(long)]
+        raw: bool,
     },
     /// Interrupt an agent (sends Escape by default — cancels the current
     /// tool call and returns to the prompt). Kill-style keys (ctrl+c) are
@@ -3062,6 +3068,7 @@ fn main() {
             timeout_ms,
             force,
             respawn_on_stall,
+            raw,
         }) => cmd_send(
             &cfg,
             project,
@@ -3072,6 +3079,7 @@ fn main() {
             *timeout_ms,
             *force,
             *respawn_on_stall,
+            *raw,
         ),
         Some(Commands::Interrupt {
             project,
@@ -7572,6 +7580,47 @@ fn bare_short_group_matches(project: &str, to: &str, names: &[String]) -> Option
     }
 }
 
+/// bd-98gd: Spec C everywhere — condition ONE captain `flywheel send`
+/// target. The target's spawn-registry entry carries its profile; the
+/// profile's behavior preamble is prepended via conditioned_prompt (the
+/// SAME conditioning the `__send` leaf applies), with the skill-load
+/// prefix on first dispatch (registry-tracked `skills_injected`). Returns
+/// `(send_text, Some(profile) when conditioned, skills_injected_now)`.
+/// Raw text when the target has no profiled entry, its profile is unknown
+/// to the catalog, or `--raw` was passed — byte-identical legacy behavior.
+fn condition_send_target(
+    entry: Option<&mut state::SpawnEntry>,
+    catalog: &profile::ProfileCatalog,
+    text: &str,
+    raw: bool,
+) -> (String, Option<String>, bool) {
+    let Some(entry) = entry else {
+        return (text.to_string(), None, false);
+    };
+    let Some(profile_name) = entry.profile.as_deref() else {
+        return (text.to_string(), None, false);
+    };
+    if raw {
+        return (text.to_string(), None, false);
+    }
+    let Some(profile_obj) = catalog.get(profile_name) else {
+        eprintln!(
+            "flywheel: send --to {} profile @{profile_name} unknown (flywheel profile list) — sending raw",
+            entry.name
+        );
+        return (text.to_string(), None, false);
+    };
+    let mut send_base = text.to_string();
+    let mut skills_injected = false;
+    if let Some(prefix) = skill_injection_prefix(entry, &profile_obj.skills) {
+        send_base = format!("{prefix}{send_base}");
+        entry.skills_injected = true;
+        skills_injected = true;
+    }
+    let send_text = headless::conditioned_prompt(&profile_obj.behavior, &send_base);
+    (send_text, Some(profile_name.to_string()), skills_injected)
+}
+
 #[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
 fn cmd_send(
     cfg: &Config,
@@ -7583,6 +7632,7 @@ fn cmd_send(
     timeout_ms: Option<u64>,
     force: bool,
     respawn_on_stall: bool,
+    raw: bool,
 ) -> Result<()> {
     let text = match (stage, msg) {
         (Some(s), _) => stage_prompt(s)?,
@@ -7658,6 +7708,14 @@ fn cmd_send(
     }
 
     let timeout = timeout_ms.or_else(|| wait.then(|| cfg.timeout_ms()));
+    // bd-98gd: Spec C everywhere — the captain-facing send resolves each
+    // target's profile from the spawn registry (same lookup the loop's
+    // __profile leaf uses) and conditions its prompt. Loaded once; the
+    // catalog load is deferred to first profiled target via Result (a
+    // broken catalog degrades to raw sends, never a hard failure).
+    let mut registry = state::load_spawn_registry(project);
+    let catalog = profile::ProfileCatalog::load();
+    let mut registry_dirty = false;
     let mut results: Vec<Value> = Vec::new();
     for a in &targets {
         // --wait means "settle": idle, done, or blocked. An empty `until` array
@@ -7673,13 +7731,38 @@ fn cmd_send(
         // actionable error naming the recovery commands.
         let mut target = agent_target(a).to_string();
         let name = a.name.clone().unwrap_or_else(|| target.clone());
+        // bd-98gd: condition THIS target with its profile's behavior preamble
+        // (+ skill-load prefix on first dispatch). Raw only when the target
+        // has no profiled entry, its profile is unknown, or --raw was passed
+        // — byte-identical legacy behavior.
+        let entry = registry.iter_mut().find(|e| e.name == name);
+        let (send_text, cond_profile, skills_injected) = match &catalog {
+            Ok(c) => condition_send_target(entry, c, &text, raw),
+            Err(e) => {
+                eprintln!("flywheel: profile catalog unavailable ({e:#}) — sending raw");
+                (text.to_string(), None, false)
+            }
+        };
+        if skills_injected {
+            registry_dirty = true;
+        }
+        // Fail-loud cap for conditioned bead briefs — the same invariant as
+        // the __send leaf: never silently truncate a dispatched brief.
+        if text.starts_with("GOAL ") && send_text.len() > durable::DISPATCH_PROMPT_CAP {
+            bail!(
+                "flywheel: dispatched prompt for {} is {} bytes — over the {} byte cap (send conditioning; NOT sent)",
+                durable::bead_id_from_prompt(&text).unwrap_or("<unknown>"),
+                send_text.len(),
+                durable::DISPATCH_PROMPT_CAP,
+            );
+        }
         let mut stalls_seen = 0usize;
         // bd-4pxy: a still-booting agent rejects name-addressed prompts with
         // `agent_not_ready`; herdr accepts pane ids, so retry once via the
         // pane before giving up (bounded — never an infinite loop).
         let mut pane_retried = false;
         let agent = loop {
-            match c.agent_prompt(&target, &text, wait_opts.clone()) {
+            match c.agent_prompt(&target, &send_text, wait_opts.clone()) {
                 Ok(agent) => break agent,
                 Err(e) if is_agent_not_ready(&e.code) => {
                     match not_ready_retry_target(&target, a, pane_retried) {
@@ -7756,15 +7839,23 @@ fn cmd_send(
             );
         }
         results.push(json!({
-            "target": agent_target(a), "status": status, "pane_id": a.pane_id
+            "target": agent_target(a), "status": status, "pane_id": a.pane_id,
+            "profile": cond_profile,
         }));
+    }
+
+    // bd-98gd: persist skills_injected flags set by conditioning (single
+    // write after the loop — the registry is ours for this send).
+    if registry_dirty && let Err(e) = state::save_spawn_registry(project, &registry) {
+        eprintln!("flywheel: cannot persist skills_injected for send targets: {e:#}");
     }
 
     log(
         project,
         EventKind::Send,
         json!({
-            "to": to, "stage": stage, "text_len": text.len(), "wait": wait, "results": results
+            "to": to, "stage": stage, "text_len": text.len(), "wait": wait,
+            "raw": raw, "results": results
         }),
     );
     if !std::io::stdout().is_terminal() {
@@ -21928,5 +22019,109 @@ mod bd_bvwf1_orphan_workspaces {
             "base-label session is foreign"
         );
         // unrelated workspace is neither (None) — never blocks or closes.
+    }
+}
+
+/// bd-98gd acceptance: `flywheel send` conditions profiled targets (Spec C
+/// everywhere — the captain-facing CLI resolves the spawn registry like the
+/// loop's `__profile` leaf), sends raw to unprofiled ones, and `--raw`
+/// bypasses conditioning. The VERIFY gate for the bead:
+/// `cargo test -p flywheel send_conditioning`.
+mod send_conditioning_tests {
+    use super::*;
+
+    fn catalog_with(behavior: &str, skills: Vec<&str>) -> profile::ProfileCatalog {
+        let mut profiles = std::collections::BTreeMap::new();
+        profiles.insert(
+            "scout".to_string(),
+            profile::Profile {
+                harness: "opencode".into(),
+                behavior: behavior.into(),
+                skills: skills.into_iter().map(str::to_string).collect(),
+                ..Default::default()
+            },
+        );
+        profile::ProfileCatalog {
+            profiles,
+            harnesses: Default::default(),
+        }
+    }
+
+    #[test]
+    fn profiled_target_gets_behavior_preamble() {
+        let catalog = catalog_with("You are a SCOUT. VERIFIED/INFERRED labeling mandatory.", vec![]);
+        let mut entry = state::SpawnEntry::profiled("w:p1", "crew-scout", "scout", "opencode", None);
+        let (text, profile, injected) =
+            condition_send_target(Some(&mut entry), &catalog, "echo who you are", false);
+        assert!(
+            text.starts_with("You are a SCOUT."),
+            "behavior preamble must lead: {text:?}"
+        );
+        assert!(text.contains("echo who you are"), "mission preserved: {text:?}");
+        assert_eq!(profile.as_deref(), Some("scout"), "conditioned profile reported");
+        assert!(!injected, "no skills on this profile");
+    }
+
+    #[test]
+    fn unprofiled_target_stays_raw() {
+        let catalog = catalog_with("You are a SCOUT.", vec![]);
+        let mut entry = state::SpawnEntry::legacy("w:p2", "plain-oc");
+        let (text, profile, _) =
+            condition_send_target(Some(&mut entry), &catalog, "echo who you are", false);
+        assert_eq!(text, "echo who you are", "byte-identical legacy send");
+        assert_eq!(profile, None);
+        // no registry entry at all → raw
+        let (text, profile, _) = condition_send_target(None, &catalog, "echo who you are", false);
+        assert_eq!(text, "echo who you are");
+        assert_eq!(profile, None);
+    }
+
+    #[test]
+    fn raw_flag_bypasses_conditioning() {
+        let catalog = catalog_with("You are a SCOUT.", vec![]);
+        let mut entry = state::SpawnEntry::profiled("w:p3", "crew-scout", "scout", "opencode", None);
+        let (text, profile, _) =
+            condition_send_target(Some(&mut entry), &catalog, "echo who you are", true);
+        assert_eq!(text, "echo who you are", "--raw sends verbatim");
+        assert_eq!(profile, None);
+    }
+
+    #[test]
+    fn unknown_profile_falls_back_raw() {
+        let catalog = catalog_with("You are a SCOUT.", vec![]);
+        let mut entry =
+            state::SpawnEntry::profiled("w:p4", "crew-ghost", "no-such-profile", "opencode", None);
+        let (text, profile, _) =
+            condition_send_target(Some(&mut entry), &catalog, "echo who you are", false);
+        assert_eq!(text, "echo who you are", "unknown profile never conditions");
+        assert_eq!(profile, None);
+    }
+
+    #[test]
+    fn skill_prefix_injected_once_then_not_repeated() {
+        let catalog = catalog_with("You are a SCOUT.", vec!["accretive"]);
+        let mut entry = state::SpawnEntry::profiled("w:p5", "crew-skilled", "scout", "opencode", None);
+        let (text, profile, injected) =
+            condition_send_target(Some(&mut entry), &catalog, "survey the repo", false);
+        assert!(injected, "first dispatch carries the skill prefix");
+        // Ordering mirrors cmd_internal_send (__send leaf): behavior
+        // preamble, then the skill-load prefix, then the mission.
+        assert!(
+            text.starts_with("You are a SCOUT."),
+            "behavior preamble leads: {text:?}"
+        );
+        assert!(
+            text.contains("Read skill://accretive before starting."),
+            "skill prefix present: {text:?}"
+        );
+        assert!(text.contains("survey the repo"), "mission preserved: {text:?}");
+        assert_eq!(profile.as_deref(), Some("scout"));
+        assert!(entry.skills_injected, "flag persisted on the registry entry");
+        // second dispatch: prefix NOT repeated (registry-tracked)
+        let (text2, _, injected2) =
+            condition_send_target(Some(&mut entry), &catalog, "survey the repo", false);
+        assert!(!injected2, "prefix delivered once (bd-eign.10 advisory)");
+        assert!(!text2.contains("Read skill://"), "no repeat prefix: {text2:?}");
+        assert!(text2.contains("You are a SCOUT."));
     }
 }
