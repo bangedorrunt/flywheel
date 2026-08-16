@@ -116,6 +116,56 @@ fn decide_implement_is_steer() {
     );
 }
 
+/// ADR-0019 Spec 8 !implement guard, CLI surface: `fix the memory leak` is a
+/// BUG-FIX (repro→red→fix→prove playbook), never forensics — implement-bearing
+/// targets must not fall to a diagnosis-only workflow even when they carry a
+/// forensics-shaped needle (`leak`).
+#[test]
+fn decide_fix_memory_leak_is_bug_fix_not_forensics() {
+    let h = hermetic();
+    let out = run(&h, &["decide", "fix the memory leak", "--json"]);
+    assert!(out.status.success());
+    let v = stdout_json(&out);
+    assert_eq!(v["primitive"], "bug-fix");
+    assert_eq!(
+        v["argv"],
+        serde_json::json!([
+            "flywheel",
+            "workflow",
+            "run",
+            "bug-fix",
+            "--execute",
+            "--mode",
+            "pane",
+        ])
+    );
+}
+
+/// ADR-0019 Spec 8 !implement guard, forensics side: `profile the idle cpu
+/// spin` is FORENSICS (diagnosis is the artifact, no fix step) — the
+/// forensics row is read-only and an implement-bearing target never reaches
+/// it.
+#[test]
+fn decide_profile_idle_cpu_spin_is_forensics() {
+    let h = hermetic();
+    let out = run(&h, &["decide", "profile the idle cpu spin", "--json"]);
+    assert!(out.status.success());
+    let v = stdout_json(&out);
+    assert_eq!(v["primitive"], "forensics");
+    assert_eq!(
+        v["argv"],
+        serde_json::json!([
+            "flywheel",
+            "workflow",
+            "run",
+            "forensics",
+            "--execute",
+            "--mode",
+            "headless",
+        ])
+    );
+}
+
 #[test]
 fn decide_contention_flag_is_coalition() {
     let h = hermetic();
