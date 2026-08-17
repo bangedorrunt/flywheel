@@ -25,8 +25,12 @@ grep -q 'include_body_md: bool' src/backend/wire.rs \
 grep -q 'body_md' src/main.rs \
   && ok "F1: harvest reads body_md (extract_latest_body)" \
   || bad "F1: harvest body extraction missing"
-grep -q 'include_body_md: true' src/main.rs \
-  && ok "F1: harvest_latest requests include_body_md" \
+# bd-debate-harvest-dsww rewrote harvest_latest onto the inbox projection
+# (search_messages no longer involved): the body request is now
+# include_bodies: true on the InboxQuery. Scope the grep to the function
+# so an unrelated include_bodies elsewhere cannot false-pass.
+awk '/^fn harvest_latest\(/,/^}/' src/main.rs | grep -q 'include_bodies: true' \
+  && ok "F1: harvest_latest requests bodies (inbox include_bodies)" \
   || bad "F1: harvest_latest no longer requests bodies"
 
 # F2: plan-review gate is a real state machine (no dead phase, no never_loop)
@@ -52,8 +56,10 @@ grep -q 'blocked_t3_halts_loop_mail_mode_only' src/durable.rs \
   && ok "F4: T3-halt test present" \
   || bad "F4: T3-halt test missing"
 
-# F5: xproj loop-triggered spawn is background (no focus steal)
-grep -q 'background workspace (no_focus' src/main.rs \
+# F5: xproj loop-triggered spawn is background (no focus steal). The spawn
+# lives in cmd_internal_xproj_spawn; scope the grep to that function so a
+# no_focus elsewhere cannot false-pass this gate.
+awk '/^fn cmd_internal_xproj_spawn\(/,/^}/' src/main.rs | grep -q 'no_focus: true' \
   && ok "F5: xproj spawn passes no_focus=true" \
   || bad "F5: xproj spawn focus regression"
 
