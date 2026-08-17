@@ -18558,14 +18558,11 @@ fn cmd_internal_wait_output(
 
 fn cmd_internal_ready(cfg: &Config, project: &str) -> Result<()> {
     let beads = load_ready_beads(cfg, project)?;
-    let beads: Vec<Value> = beads
-        .iter()
-        // ADR-0019 (bd-w1-verify-fence): emit the parsed VERIFY command so
-        // the durable `parse_bead_list` consumer carries it too. bd-gnej:
-        // labels ride along for the wave-gate.
-        .map(|b| json!({ "id": b.id, "title": b.title, "verify": b.verify, "labels": b.labels }))
-        .collect();
-    print_json(&json!({ "beads": beads }));
+    // bd-87hq never-drift pin: the envelope builder lives next to its
+    // consumer (durable::parse_bead_list); this leaf must never re-shape
+    // the JSON by hand (dropping priority/principles here once silently
+    // exempted every bead from the PRINCIPLES gate on the durable path).
+    print_json(&durable::ready_leaf_envelope(&beads));
     Ok(())
 }
 
@@ -18574,13 +18571,7 @@ fn cmd_internal_ready(cfg: &Config, project: &str) -> Result<()> {
 /// stranded-reclaim + scoped-completion decision).
 fn cmd_internal_inprogress(cfg: &Config, project: &str) -> Result<()> {
     let beads = load_inprogress_beads(cfg, project)?;
-    let beads: Vec<Value> = beads
-        .iter()
-        .map(
-            |b| json!({ "id": b.id, "title": b.title, "assignee": b.assignee, "verify": b.verify, "labels": b.labels }),
-        )
-        .collect();
-    print_json(&json!({ "beads": beads }));
+    print_json(&durable::inprogress_leaf_envelope(&beads));
     Ok(())
 }
 

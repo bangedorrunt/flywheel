@@ -1267,6 +1267,53 @@ fn parse_bead_list(v: &serde_json::Value, what: &str) -> anyhow::Result<Vec<Read
         .collect())
 }
 
+/// The `__ready` leaf envelope (bd-87hq never-drift pin): the EXACT shape
+/// `cmd_internal_ready` prints and `parse_bead_list` re-reads. Must carry
+/// `priority` + `principles` — the durable loop's PRINCIPLES dispatch gate
+/// (bd-4spn) reads them off the parsed rows; dropping them here silently
+/// defaults every bead to P3-exempt and neuters the gate on the durable
+/// path (the sync path parses `br` JSON directly and was unaffected).
+pub fn ready_leaf_envelope(beads: &[ReadyBead]) -> serde_json::Value {
+    serde_json::json!({
+        "beads": beads
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "id": b.id,
+                    "title": b.title,
+                    "verify": b.verify,
+                    "labels": b.labels,
+                    "priority": b.priority,
+                    "principles": b.principles,
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+}
+
+/// The `__inprogress` leaf envelope (same pin): id/title/assignee plus the
+/// gate fields for shape symmetry with `__ready` — `parse_bead_list` is the
+/// shared consumer and must never see a field one leaf carries and the
+/// other drops.
+pub fn inprogress_leaf_envelope(beads: &[ReadyBead]) -> serde_json::Value {
+    serde_json::json!({
+        "beads": beads
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "id": b.id,
+                    "title": b.title,
+                    "assignee": b.assignee,
+                    "verify": b.verify,
+                    "labels": b.labels,
+                    "priority": b.priority,
+                    "principles": b.principles,
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+}
+
 /// Parse the `{"entries": [...]}` leaf output of `__expected-replies`. Pure —
 /// bd-87hq regression pin (producer: cmd_internal_expected_replies).
 fn parse_expected_reply_entries(v: &serde_json::Value) -> Vec<crate::state::ExpectedReply> {
@@ -9082,6 +9129,46 @@ Dependencies:
             vec!["bd-p2-empty", "bd-p2-nameonly"],
             "gate refuses incomplete PRINCIPLES"
         );
+    }
+
+    /// bd-4spn round-trip (bd-87hq never-drift pin class): the `__ready`
+    /// leaf envelope and `parse_bead_list` are a producer/consumer pair —
+    /// priority + the `## PRINCIPLES` section must survive the boundary or
+    /// the durable-loop PRINCIPLES gate reads default-P3 rows and never
+    /// blocks (the emit once dropped both fields; the sync path was
+    /// unaffected because it parses `br` JSON directly).
+    #[test]
+    fn ready_leaf_round_trip_preserves_the_principles_gate() {
+        let p2_blocked = ReadyBead {
+            id: "bd-rt-blocked".into(),
+            title: "P2 without principles".into(),
+            assignee: None,
+            verify: Some("cargo test".into()),
+            labels: vec!["wave-1".into()],
+            priority: 2,
+            principles: String::new(),
+        };
+        let p2_ok = ReadyBead {
+            id: "bd-rt-ok".into(),
+            title: "P2 compliant".into(),
+            assignee: None,
+            verify: Some("cargo test".into()),
+            labels: Vec::new(),
+            priority: 2,
+            principles: "prove-it-works — ran the VERIFY fence".into(),
+        };
+        let env = ready_leaf_envelope(&[p2_blocked, p2_ok]);
+        let parsed = parse_bead_list(&env, "__ready").expect("leaf JSON parses");
+        assert_eq!(parsed[0].priority, 2, "priority survives the leaf boundary");
+        assert!(
+            parsed[1].principles.contains("prove-it-works"),
+            "PRINCIPLES section survives the leaf boundary"
+        );
+        let (dispatchable, not_ready) = partition_ready(&parsed);
+        let dispatched: Vec<&str> = dispatchable.iter().map(|b| b.id.as_str()).collect();
+        let blocked: Vec<&str> = not_ready.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(dispatched, vec!["bd-rt-ok"], "compliant P2 dispatches");
+        assert_eq!(blocked, vec!["bd-rt-blocked"], "gate blocks THROUGH the leaf");
     }
 
     /// The not-ready mail needs the WHY — the principles block reason names
