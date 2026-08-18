@@ -752,6 +752,11 @@ enum Commands {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// internal: programmatic done-mail (2026-08-18) — the loop mails the
+    /// captain the close-reason REPORT on thread_id=<bead_id> when a
+    /// watched bead closes with a legal verdict.
+    #[command(name = "__mail-done", hide = true)]
+    __MailDone { project: String, bead_id: String },
     /// internal: close-detect check (ADR-0019, bd-w1-reopen-f6tw) — SHA
     /// rule + ledger; legal/missing/no-commit verdict for the loop
     #[command(name = "__close-check", hide = true)]
@@ -3415,6 +3420,9 @@ fn main() {
             title,
             reason,
         }) => cmd_internal_mail_not_ready(&cfg, project, bead_id, title, reason.as_deref()),
+        Some(Commands::__MailDone { project, bead_id }) => {
+            cmd_internal_mail_done(&cfg, project, bead_id)
+        }
         Some(Commands::__CloseCheck { project, bead_id }) => {
             cmd_internal_close_check(&cfg, project, bead_id)
         }
@@ -12883,12 +12891,79 @@ mod loop_tests {
         );
     }
 
+    /// Programmatic done-mail (2026-08-18): the loop's close-report mail
+    /// rides the bead's thread, subject `[<id>] done`, body carries the
+    /// close-reason REPORT — the captain's copy that does not depend on the
+    /// agent remembering the courtesy.
+    #[test]
+    fn done_mail_carries_close_report_on_bead_thread() {
+        use crate::backend::MailSurface as _;
+        let mail = crate::mail_shim::Mail::from_config(None)
+            .expect("mail ok")
+            .expect("mail Some");
+        let backend = crate::backend::toron::ToronMailBackend::new(mail);
+        let project = "done-mail-test";
+        backend::run_mail(backend.ensure_project(project)).expect("ensure");
+        let sender = backend.agent_name().to_string();
+        backend::run_mail(backend.register_agent(
+            project,
+            &spawn_agent_profile(&sender, "opencode", project),
+        ))
+        .expect("register sender");
+        let captain = "CaptainPine";
+        backend::run_mail(backend.register_agent(
+            project,
+            &spawn_agent_profile(captain, "flywheel", project),
+        ))
+        .expect("register captain");
+        // the orchestrator resolution prefers the program=="flywheel" agent
+        assert_eq!(
+            registered_orchestrator(&backend, project).as_deref(),
+            Some(captain),
+            "orchestrator = the registered flywheel-program agent"
+        );
+        let receipt = send_done_mail(
+            &backend,
+            project,
+            "bd-done-probe",
+            "some bead",
+            "status: closed; sha: abc123; verdict: command-verified; verify: cargo test -p x",
+            captain,
+        )
+        .expect("done mail sends");
+        assert!(receipt.count >= 1, "delivered: {receipt:?}");
+        let items = backend::run_mail(backend.inbox(&backend::InboxQuery {
+            project: project.into(),
+            agent: captain.into(),
+            unread_only: false,
+            limit: Some(10),
+            include_bodies: true,
+            urgent_only: false,
+            since_ts: None,
+            thread_id: None,
+        }))
+        .expect("inbox");
+        let m = items
+            .iter()
+            .find(|m| m.subject == "[bd-done-probe] done")
+            .expect("captain received the done mail");
+        assert_eq!(
+            m.thread_id.as_ref().map(|t| t.as_str()),
+            Some("bd-done-probe"),
+            "done mail rides the bead's thread"
+        );
+        assert!(
+            m.body_md.contains("cargo test -p x"),
+            "body carries the close-reason REPORT: {}",
+            m.body_md
+        );
+    }
+
     /// ADR-0019 (bd-w1-reopen-f6tw): the unverified-close mail rides the
     /// bead's thread, subject `[<id>] unverified close reopened`, and NAMES
     /// what is missing (here: the commit).
     #[test]
-    fn sha_rule_missing_commit_mail_names_the_missing_commit() {
-        use crate::backend::MailSurface as _;
+    fn sha_rule_missing_commit_mail_names_the_missing_commit() {        use crate::backend::MailSurface as _;
         let mail = crate::mail_shim::Mail::from_config(None)
             .expect("mail ok")
             .expect("mail Some");
@@ -20397,6 +20472,139 @@ fn send_not_ready_mail(
         true,
         Some(bead_id),
     )
+}
+
+/// The programmatic done-mail leaf (2026-08-18): the LOOP mails the captain
+/// the close-reason REPORT on `thread_id=<bead_id>` when a watched bead
+/// closes with a legal verdict. Recipient: the bead's `created_by` when it
+/// resolves as a REGISTERED identity (routable), else the project's
+/// registered orchestrator agent (program == "flywheel"), else soft-fail
+/// `{ok:false}` — a mail hiccup never kills the loop.
+fn cmd_internal_mail_done(cfg: &Config, project: &str, bead_id: &str) -> Result<()> {
+    let mail = match backend::mail_backend(cfg) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("flywheel: mail backend unavailable for done-mail {bead_id}: {e:#}");
+            print_json(&json!({ "ok": false, "bead_id": bead_id, "error": format!("{e:#}") }));
+            return Ok(());
+        }
+    };
+    let key = project_dir_str(cfg, project)?;
+    let fallback = cfg
+        .agent_mail
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| "Flywheel".to_string());
+    let (title, report) = bead_title_and_close_report(&key, bead_id);
+    let created_by = resolve_planner_for_bead(&key, bead_id, &fallback);
+    // created_by is routable only when it is a registered identity in this
+    // project (the "bangedorrunt" class is a username, not a pin).
+    let captain = if mail_whois_ok(&*mail, &key, &created_by) {
+        created_by
+    } else {
+        match registered_orchestrator(&*mail, &key) {
+            Some(name) => name,
+            None => {
+                print_json(&json!({
+                    "ok": false,
+                    "bead_id": bead_id,
+                    "notified": created_by,
+                    "error": format!("no routable captain identity for {key} (created_by {created_by} unregistered)")
+                }));
+                return Ok(());
+            }
+        }
+    };
+    let out = (|| -> Result<backend::SendReceipt> {
+        backend::run_mail(mail.ensure_project(&key)).map_err(|e| anyhow!("{e}"))?;
+        send_done_mail(&*mail, &key, bead_id, &title, &report, &captain)
+    })();
+    match out {
+        Ok(_) => {
+            print_json(&json!({ "ok": true, "bead_id": bead_id, "notified": captain }));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("flywheel: done-mail for {bead_id} failed: {e:#}");
+            print_json(&json!({
+                "ok": false,
+                "bead_id": bead_id,
+                "notified": captain,
+                "error": format!("{e:#}")
+            }));
+            Ok(())
+        }
+    }
+}
+
+/// The bead's title + close-reason REPORT: the latest comment text (the
+/// close reason lands as a comment — evidence: closed beads carry it),
+/// falling back to "closed". Best-effort — empty report degrades to the
+/// title alone.
+fn bead_title_and_close_report(project_dir: &str, bead_id: &str) -> (String, String) {
+    let (mut title, mut report) = (String::new(), String::new());
+    if let Ok(out) = std::process::Command::new("br")
+        .args(["show", bead_id, "--json"])
+        .current_dir(project_dir)
+        .output()
+        && out.status.success()
+        && let Ok(v) = serde_json::from_slice::<Value>(&out.stdout)
+    {
+        let first = v.as_array().and_then(|a| a.first());
+        if let Some(t) = first
+            .and_then(|b| b.get("title"))
+            .and_then(Value::as_str)
+        {
+            title = t.to_string();
+        }
+        if let Some(c) = first
+            .and_then(|b| b.get("comments"))
+            .and_then(Value::as_array)
+            .and_then(|a| a.last())
+            .and_then(|c| c.get("text"))
+            .and_then(Value::as_str)
+        {
+            report = c.trim().to_string();
+        }
+    }
+    (title, report)
+}
+
+/// True when `name` resolves as a registered identity in the project
+/// (routable per ADR-0018 D1a/D3).
+fn mail_whois_ok(mail: &dyn backend::MailSurface, key: &str, name: &str) -> bool {
+    backend::run_mail(mail.whois(key, name)).is_ok()
+}
+
+/// The project's registered orchestrator agent (program == "flywheel") —
+/// the captain/operator identity (e.g. CoralFinch), when present.
+fn registered_orchestrator(mail: &dyn backend::MailSurface, key: &str) -> Option<String> {
+    let agents = backend::run_mail(mail.list_agents(key, None)).ok()?;
+    agents.iter().find_map(|a| {
+        let program = a.program.as_deref().unwrap_or("");
+        let model = a.model.as_deref().unwrap_or("");
+        (program == "flywheel" || model == "flywheel").then(|| a.name.clone())
+    })
+}
+
+/// The done-mail itself: thread = the bead id, body = the close-reason
+/// REPORT (status/sha/verdict/verify-tail live in it) — the captain's copy
+/// of the report the agent put in the close reason.
+fn send_done_mail(
+    mail: &dyn backend::MailSurface,
+    key: &str,
+    bead_id: &str,
+    title: &str,
+    report: &str,
+    captain: &str,
+) -> Result<backend::SendReceipt> {
+    let subject = format!("[{bead_id}] done");
+    let body = if report.is_empty() {
+        format!("Bead **{bead_id}** (`{title}`) closed with a legal verdict.")
+    } else {
+        format!("Bead **{bead_id}** (`{title}`) closed with a legal verdict.\n\nReport:\n```text\n{report}\n```")
+    };
+    mail_send(mail, key, std::slice::from_ref(&captain.to_string()), &subject, &body, "normal", true, Some(bead_id))
 }
 
 /// internal leaf: close-detect SHA check (ADR-0019 SHA rule, bd-w1-sha-xyhd).

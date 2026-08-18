@@ -439,6 +439,38 @@ async fn mail_not_ready(args: NotReadyMailArgs) -> Result<Value> {
         .unwrap_or_else(|_| serde_json::json!({ "raw": raw.trim() })))
 }
 
+/// Args for the `__mail-done` leaf (programmatic done-mail, 2026-08-18):
+/// the loop mails the captain the close-reason REPORT when a watched bead
+/// closes with a legal verdict. One mail per bead per loop invocation (the
+/// `done_mailed` set) — the courtesy does not depend on the agent
+/// remembering; the close reason is the durable copy, this mail is the
+/// captain's copy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailDoneArgs {
+    pub project: String,
+    pub bead_id: String,
+}
+
+/// Checkpointed leaf — mail the captain that bead `bead_id` closed with a
+/// legal verdict. Always exits 0 with `{ok, notified, error}` — a mail
+/// hiccup must never kill the loop.
+#[function]
+async fn mail_done(args: MailDoneArgs) -> Result<Value> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__mail-done", &args.project, &args.bead_id]);
+    let out = run_leaf_cmd(cmd, "__mail-done").await?;
+    if !out.status.success() {
+        return Err(map_err(anyhow::anyhow!(
+            "__mail-done failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    Ok(serde_json::from_str(raw.trim())
+        .unwrap_or_else(|_| serde_json::json!({ "raw": raw.trim() })))
+}
+
 /// Args for the `__reservation-board` leaf (ADR-0019 Spec 3.4/3.5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReservationBoardArgs {
@@ -3686,6 +3718,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // leaf results, so a crash converges next tick.
     let mut close_grace_ticks: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
+    // programmatic done-mail (2026-08-18): one captain done-mail per closed
+    // bead per invocation.
+    let mut done_mailed: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     // ADR-0019 Spec 4 (bd-w1-verifier-degrade-a6fk): closed beads whose
     // verifier-dispatch decision already ran this invocation. Degrade mails
     // the captain once per bead — the marker file is the durable dedup.
