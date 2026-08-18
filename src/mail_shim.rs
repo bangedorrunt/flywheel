@@ -345,6 +345,29 @@ impl Mail {
         }
     }
 
+    /// bd-pin-public-plane-s-easy.2: switch a project to `swarm` identity
+    /// mode so whois(slug) resolves through the slug → pin fold (ADR-0018
+    /// D3/D4; open mode passes names through and the slug alone is not a
+    /// registered identity). In-process writes the mode row; the remote
+    /// daemon carries it via `ensure_project`'s identity_mode arg.
+    pub fn set_identity_mode(&self, project_key: &str, mode: &str) -> Result<Value> {
+        match &self.backend {
+            BackendKind::InProcess => {
+                let canonical = block_on(mailbox().canonical_project(project_key));
+                block_on(mailbox().set_identity_mode(&canonical, mode));
+                Ok(json!({ "project": canonical, "identity_mode": mode }))
+            }
+            BackendKind::Remote(_) => {
+                let mut v = self.call_remote(
+                    "ensure_project",
+                    crate::backend::wire::ensure_project_with_mode_args(project_key, mode),
+                )?;
+                v["identity_mode"] = json!(mode);
+                Ok(v)
+            }
+        }
+    }
+
     /// `list_agents` (project's registered identities). `active_within_days`
     /// filters to agents active within that window (surface parity — the
     /// daemon supports it on the wire; in-process passes it to the mailbox).
@@ -374,6 +397,35 @@ impl Mail {
             BackendKind::Remote(_) => self.call_remote(
                 "whois",
                 crate::backend::wire::whois_args(project_key, agent_name),
+            ),
+        }
+    }
+
+    /// bd-pin-public-plane-s-easy.2: record a legacy-name fold (slug → pin)
+    /// so whois(slug) resolves to the pin's npub (ADR-0018 D4). The fold row
+    /// is written under the CANONICAL project (whois resolves via
+    /// canonical_project — a raw path key would miss). In-process writes the
+    /// index row directly; the remote daemon exposes no fold tool (frozen
+    /// MCP surface) — loud error, the caller decides how to surface.
+    pub fn fold_agent_name_alias(
+        &self,
+        project_key: &str,
+        alias: &str,
+        canonical: &str,
+    ) -> Result<()> {
+        match &self.backend {
+            BackendKind::InProcess => {
+                let canonical_project = block_on(mailbox().canonical_project(project_key));
+                block_on(mailbox().fold_agent_name_alias(
+                    &canonical_project,
+                    alias,
+                    canonical,
+                ));
+                Ok(())
+            }
+            BackendKind::Remote(_) => bail!(
+                "fold_agent_name_alias: the remote daemon exposes no fold tool \
+                 (frozen MCP surface) — slug {alias} -> {canonical} not folded"
             ),
         }
     }

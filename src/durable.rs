@@ -160,6 +160,12 @@ pub struct AgentState {
     /// (bd-event-dispatch-zero-latency). `#[serde(default)]` for old polls.
     #[serde(default)]
     pub pane_id: String,
+    /// the agent's mail PIN (adjective+noun) — populated by `__poll` from
+    /// the spawn registry so `{AGENT_NAME}` substitutes the pin, not the
+    /// herdr slug (bd-pin-public-plane-s-easy.2). `#[serde(default)]` for
+    /// checkpoints written before this field existed.
+    #[serde(default)]
+    pub mail_identity: Option<String>,
 }
 
 /// One ready bead from `br ready --json`.
@@ -2961,9 +2967,13 @@ pub fn plan_actions(
                 if !queue.is_empty() {
                     let text = queue.remove(0); // FIFO: stages in declared order
                     // bead/resume prompts carry a {AGENT_NAME} placeholder —
-                    // substitute the receiving agent's herdr name so the
-                    // state-file path is concrete (no-op for plain prompts)
-                    let base = text.replace("{AGENT_NAME}", &s.name);
+                    // substitute the receiving agent's mail PIN (the
+                    // identity it is addressed by; bd-pin-public-plane-s-easy.2),
+                    // falling back to the herdr name when no pin is known
+                    let base = text.replace(
+                        "{AGENT_NAME}",
+                        s.mail_identity.as_deref().unwrap_or(&s.name),
+                    );
                     let text = match digests.get(&s.name) {
                         Some(d) => match digest_prefix(d) {
                             Some(p) => format!("{p}\n{base}"),
@@ -3109,7 +3119,14 @@ pub fn route_event(
                         return None;
                     }
                     let text = queue.remove(0);
-                    let text = text.replace("{AGENT_NAME}", &name);
+                    // bd-pin-public-plane-s-easy.2: {AGENT_NAME} is the pin
+                    // when the state knows it, else the herdr name.
+                    let display = states
+                        .iter()
+                        .find(|s| s.name == name)
+                        .and_then(|s| s.mail_identity.clone())
+                        .unwrap_or_else(|| name.clone());
+                    let text = text.replace("{AGENT_NAME}", &display);
                     dispatch_pending.insert(name.clone());
                     Some(LoopAction::DispatchImmediate { name, text })
                 }
@@ -3127,7 +3144,12 @@ pub fn route_event(
                 return None;
             }
             let text = queue.remove(0);
-            let text = text.replace("{AGENT_NAME}", &name);
+            let display = states
+                .iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.mail_identity.clone())
+                .unwrap_or_else(|| name.clone());
+            let text = text.replace("{AGENT_NAME}", &display);
             dispatch_pending.insert(name.clone());
             Some(LoopAction::DispatchImmediate { name, text })
         }
@@ -3392,9 +3414,11 @@ pub fn respawn_kind(
     kinds.get(name).cloned()
 }
 
-/// Parse one `__poll` entry: `[name, status, kind, pane_id?]`.
+/// Parse one `__poll` entry: `[name, status, kind, pane_id?, mail_identity?]`.
 /// kind added for respawn; pane_id for event→name routing
-/// (bd-event-dispatch). Legacy 2/3-element entries yield empty kind/pane_id.
+/// (bd-event-dispatch); mail_identity (the pin) for `{AGENT_NAME}`
+/// substitution (bd-pin-public-plane-s-easy.2). Legacy 2/3/4-element
+/// entries yield empty kind/pane_id and None mail_identity.
 pub fn parse_poll_entry(v: &serde_json::Value) -> anyhow::Result<AgentState> {
     let arr = v
         .as_array()
@@ -3420,6 +3444,11 @@ pub fn parse_poll_entry(v: &serde_json::Value) -> anyhow::Result<AgentState> {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_string(),
+        mail_identity: arr
+            .get(4)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -5867,6 +5896,7 @@ mod tests {
             status: status.to_string(),
             kind: String::new(),
             pane_id: String::new(),
+            mail_identity: None,
         }
     }
 
@@ -5876,6 +5906,7 @@ mod tests {
             status: status.to_string(),
             kind: "opencode".to_string(),
             pane_id: pane.to_string(),
+            mail_identity: None,
         }
     }
 
@@ -6971,6 +7002,40 @@ mod tests {
         assert!(queue.is_empty());
     }
 
+    /// bd-pin-public-plane-s-easy.2: {AGENT_NAME} in the brief substitutes
+    /// the agent's mail PIN, never the herdr slug — the state-file path and
+    /// br claim actor must match the identity the agent is addressed by.
+    #[test]
+    fn plan_actions_substitutes_pin_not_slug() {
+        let mut queue = vec![brief("bd-12", "fix auth flow")];
+        let mut s = st("flywheel-proj-oc", "idle");
+        s.mail_identity = Some("DustySparrow".to_string());
+        let states = vec![s];
+        let actions = plan_actions(
+            &states,
+            &mut queue,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        match &actions[0] {
+            LoopAction::Send { name, text } => {
+                assert_eq!(name, "flywheel-proj-oc", "send target stays the herdr name");
+                assert!(
+                    text.contains(".flywheel/agent-state/DustySparrow.json"),
+                    "state-file path uses the pin: {text}"
+                );
+                assert!(
+                    !text.contains(".flywheel/agent-state/flywheel-proj-oc.json"),
+                    "never the slug: {text}"
+                );
+                assert!(!text.contains("{AGENT_NAME}"));
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+        assert!(queue.is_empty());
+    }
+
     #[test]
     fn plan_actions_leaves_plain_prompts_untouched() {
         let mut queue = vec!["t1".to_string()];
@@ -8048,12 +8113,14 @@ mod tests {
                 status: "idle".into(),
                 kind: "pi".into(),
                 pane_id: String::new(),
+                mail_identity: None,
             },
             AgentState {
                 name: "b".into(),
                 status: "working".into(),
                 kind: "opencode".into(),
                 pane_id: String::new(),
+                mail_identity: None,
             },
         ];
         learn_kinds(&mut kinds, &states);
@@ -8072,6 +8139,7 @@ mod tests {
             status: "idle".into(),
             kind: String::new(),
             pane_id: String::new(),
+            mail_identity: None,
         }];
         learn_kinds(&mut kinds, &states);
         assert_eq!(kinds.get("a").map(String::as_str), Some("opencode"));
@@ -8912,6 +8980,7 @@ mod resume_dedup_tests {
             status: status.to_string(),
             kind: String::new(),
             pane_id: String::new(),
+            mail_identity: None,
         }
     }
 
