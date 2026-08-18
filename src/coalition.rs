@@ -1180,6 +1180,7 @@ impl CoalitionStore {
                     include_bodies: false,
                     urgent_only: false,
                     since_ts: None,
+                    thread_id: None,
                 }))
                 .map_err(|e| anyhow!("negotiation probe inbox for {member}: {e}"))?;
             for m in inbox {

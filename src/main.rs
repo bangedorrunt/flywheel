@@ -3413,7 +3413,8 @@ fn main() {
             project,
             bead_id,
             title,
-        }) => cmd_internal_mail_not_ready(&cfg, project, bead_id, title, None),
+            reason,
+        }) => cmd_internal_mail_not_ready(&cfg, project, bead_id, title, reason.as_deref()),
         Some(Commands::__CloseCheck { project, bead_id }) => {
             cmd_internal_close_check(&cfg, project, bead_id)
         }
@@ -5758,6 +5759,23 @@ projects available: {}",
             if needs_in_arg_prime(&kind) && !has_peer_prime {
                 agent_args.push(boot_prime_line().to_string());
             }
+            // bd-pattern-peer-triggered: gate the launch on the shell being
+            // INTERACTIVE. herdr types the launch command (peer template ~2.6KB)
+            // immediately after pane.split; a booting shell (canonical mode,
+            // 1024-byte MAX_CANON line limit) splits the single-quoted arg
+            // mid-quote and zsh parks at `>....` — agent never starts
+            // (2026-08-18 coder2/coder3). Wait for the rendered prompt.
+            let shell_ready = herdr_shim::wait_shell_prompt(
+                &mut c,
+                &pane_id,
+                Duration::from_secs(15),
+            )?;
+            if !shell_ready {
+                eprintln!(
+                    "flywheel: warn: shell for {name} ({pane_id}) did not render a prompt \
+                     within 15s — the launch command may be mangled by the booting shell"
+                );
+            }
             let agent = start_agent_with_retry(&mut c, &name, &kind, &pane_id, &agent_args)?;
             // bd-eign.6 L1: readiness gate — agent.start returns when the
             // launch command is dispatched, not when the TUI is input-ready;
@@ -7467,6 +7485,19 @@ fn cmd_add(
             // MESSAGES arg. In-arg secondary kept for kinds that need it.
             if needs_in_arg_prime(&kind) {
                 add_args.push(boot_prime_line().to_string());
+            }
+            // bd-pattern-peer-triggered: same shell-readiness gate as spawn —
+            // typing into a booting shell mangles long single-quoted args.
+            let shell_ready = herdr_shim::wait_shell_prompt(
+                &mut c,
+                &prev,
+                Duration::from_secs(15),
+            )?;
+            if !shell_ready {
+                eprintln!(
+                    "flywheel: warn: shell for {name} ({prev}) did not render a prompt \
+                     within 15s — the launch command may be mangled by the booting shell"
+                );
             }
             let agent = start_agent_with_retry(&mut c, &name, &kind, &prev, &add_args)?;
             // H2: the add path previously had no settle — wait for the TUI to
@@ -12838,6 +12869,7 @@ mod loop_tests {
             include_bodies: false,
             urgent_only: false,
             since_ts: None,
+            thread_id: None,
         }))
         .expect("inbox");
         let m = items
@@ -12879,6 +12911,7 @@ mod loop_tests {
             include_bodies: false,
             urgent_only: false,
             since_ts: None,
+            thread_id: None,
         }))
         .expect("inbox");
         let m = items
@@ -13037,6 +13070,7 @@ mod loop_tests {
                     include_bodies: false,
                     urgent_only: false,
                     since_ts: None,
+                    thread_id: None,
                 }))
                 .expect("inbox");
                 let mails: Vec<_> = items
@@ -18296,9 +18330,12 @@ fn harvest_latest(
     let sender_npub = backend::run_mail(mail.whois(key, sender))
         .map(|w| w.npub)
         .unwrap_or_default();
-    // limit: None — the inbox projects oldest-first (G7 rumor time), so a
-    // bounded `take` would keep the OLDEST rows and could drop a fresh
-    // debate thread entirely. Full projection, client-side filter.
+    // bd-harvest-thread-filter-yp9r: the thread predicate is pushed into the
+    // inbox projection (toron's shared post-unwrap filter; `idx_messages_thread`
+    // serves the SQL side of the thread dimension) — the server returns ONLY
+    // the target thread's rows instead of a full-inbox drain. `newest_in_thread`
+    // below still selects newest-from-sender client-side; thread membership is
+    // already guaranteed by the projection.
     let items = backend::run_mail(mail.inbox(&backend::InboxQuery {
         project: key.to_string(),
         agent: mail.agent_name().to_string(),
@@ -18307,6 +18344,7 @@ fn harvest_latest(
         limit: None,
         urgent_only: false,
         since_ts: None,
+        thread_id: Some(thread.to_string()),
     }))?;
     let body = newest_in_thread(&items, thread, sender, &sender_npub)
         .map(|m| {
@@ -19877,6 +19915,7 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
         include_bodies: true,
         limit: Some(10),
         since_ts: None,
+        thread_id: None,
     })) {
         Ok(v) => v,
         Err(_) => {
@@ -19937,8 +19976,10 @@ fn thread_head(
     let sender_npub = backend::run_mail(mail.whois(key, sender))
         .map(|w| w.npub)
         .unwrap_or_default();
-    // limit: None — the inbox projects oldest-first (G7 rumor time), so a
-    // bounded `take` would keep the OLDEST rows and could drop the reply.
+    // bd-harvest-thread-filter-yp9r: push the thread predicate into the
+    // inbox projection — the server returns ONLY the target thread's rows
+    // instead of a full-inbox drain; `newest_in_thread` still picks
+    // newest-from-sender client-side.
     let items = backend::run_mail(mail.inbox(&backend::InboxQuery {
         project: key.to_string(),
         agent: mail.agent_name().to_string(),
@@ -19947,6 +19988,7 @@ fn thread_head(
         limit: None,
         urgent_only: false,
         since_ts: None,
+        thread_id: Some(thread.to_string()),
     }))?;
     Ok(newest_in_thread(&items, thread, sender, &sender_npub)
         .map(|m| (m.id.to_string(), m.sender.clone())))
@@ -20051,6 +20093,7 @@ fn cmd_internal_xproj_inbox(cfg: &Config, project: &str, limit: u32) -> Result<(
         include_bodies: true,
         limit: Some(limit as usize),
         since_ts: None,
+        thread_id: None,
     })) {
         Ok(v) => v,
         Err(e) => {

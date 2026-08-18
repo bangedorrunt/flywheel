@@ -181,6 +181,9 @@ pub struct MailInboxFilter {
     /// Keep only messages with `created_ts_us` strictly newer than this
     /// RFC3339 timestamp (c3b.3 — applied by the toron projection).
     pub since_ts: Option<String>,
+    /// Keep only messages in this thread (bd-harvest-thread-filter-yp9r).
+    /// Post-unwrap filter on the toron projection; `None` = no thread bound.
+    pub thread_id: Option<String>,
 }
 
 /// c3b.3: parse an RFC3339 `since_ts` filter into epoch micros (the unit
@@ -424,6 +427,7 @@ impl Mail {
                     include_bodies: true,
                     urgent_only: false,
                     since_ts: None,
+                    thread_id: None,
                 }))?;
                 Ok(Value::Array(msgs.iter().map(ToJson::to_json).collect()))
             }
@@ -437,6 +441,7 @@ impl Mail {
                     false,
                     true,
                     limit,
+                    None,
                     None,
                 ),
             ),
@@ -477,6 +482,7 @@ impl Mail {
                     include_bodies: filter.include_bodies,
                     urgent_only: filter.urgent_only,
                     since_ts: filter.since_ts.clone(),
+                    thread_id: filter.thread_id.clone(),
                 }))?;
                 let rows = msgs
                     .iter()
@@ -501,6 +507,7 @@ impl Mail {
                         filter.include_bodies,
                         filter.limit,
                         filter.since_ts.as_deref(),
+                        filter.thread_id.as_deref(),
                     ),
                 )?;
                 // Same policy on the wire rows (InboxMessageOut carries
@@ -524,6 +531,17 @@ impl Mail {
                             .and_then(Value::as_i64)
                             .map(|ts| ts > s)
                             .unwrap_or(true),
+                        None => true,
+                    })
+                    // bd-harvest-thread-filter-yp9r: belt-and-braces client
+                    // filter for remote backends whose projection cannot push
+                    // the thread predicate (AM parity rows carry thread_id).
+                    .filter(|row| match &filter.thread_id {
+                        Some(t) => row
+                            .get("thread_id")
+                            .and_then(Value::as_str)
+                            .map(|row_t| row_t == t)
+                            .unwrap_or(false),
                         None => true,
                     })
                     .collect();
@@ -599,6 +617,7 @@ impl Mail {
                     include_bodies: false,
                     urgent_only: false,
                     since_ts: None,
+                    thread_id: None,
                 }))?;
                 Ok(Value::Array(msgs.iter().map(ToJson::to_json).collect()))
             }
@@ -612,6 +631,7 @@ impl Mail {
                     false,
                     false,
                     0,
+                    None,
                     None,
                 ),
             ),
@@ -2366,6 +2386,107 @@ mod tests {
             0,
             "nothing is newer than a future bound"
         );
+    }
+
+    /// bd-harvest-thread-filter-yp9r: `thread_id` keeps ONLY the target
+    /// thread's rows on the toron projection; the filter is pushed into the
+    /// shared core inbox stage (post-unwrap — the thread tag lives inside the
+    /// encrypted gift wrap), so `inbox_filtered` with the filter set returns
+    /// the thread, not a full-inbox drain.
+    #[test]
+    fn inbox_filtered_applies_thread_filter_on_toron() {
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let project = format!("harvest-thread-{}", std::process::id());
+        mail.ensure_project(&project).expect("project");
+        mail.register_agent(&project, "ThreadSender", "opencode", "test", "seed")
+            .expect("sender registered");
+        mail.register_agent(&project, "ThreadRecv", "opencode", "test", "seed")
+            .expect("recipient registered");
+        mail.register_agent(&project, &mail.name, "opencode", "test", "seed")
+            .expect("facade identity registered");
+        let recv = vec!["ThreadRecv".to_string()];
+
+        for (subject, thread) in [
+            ("t1-a", "debate-1"),
+            ("t1-b", "debate-1"),
+            ("t2-a", "debate-2"),
+        ] {
+            mail.send(
+                &project,
+                &recv,
+                subject,
+                "threaded",
+                "normal",
+                false,
+                Some(thread),
+            )
+            .expect("send threaded");
+        }
+
+        let all = mail
+            .inbox_filtered(
+                &project,
+                "ThreadRecv",
+                &MailInboxFilter {
+                    include_bodies: false,
+                    limit: 100,
+                    ..Default::default()
+                },
+            )
+            .expect("unfiltered inbox");
+        assert_eq!(all.as_array().unwrap().len(), 3);
+
+        let t1 = mail
+            .inbox_filtered(
+                &project,
+                "ThreadRecv",
+                &MailInboxFilter {
+                    include_bodies: false,
+                    limit: 100,
+                    thread_id: Some("debate-1".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("thread-filtered inbox");
+        let t1_subjects: Vec<&str> = t1
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["subject"].as_str())
+            .collect();
+        assert_eq!(t1_subjects.len(), 2, "only debate-1 rows: {t1_subjects:?}");
+        assert!(
+            t1_subjects.iter().all(|s| *s == "t1-a" || *s == "t1-b"),
+            "all rows belong to debate-1: {t1_subjects:?}"
+        );
+
+        let t2 = mail
+            .inbox_filtered(
+                &project,
+                "ThreadRecv",
+                &MailInboxFilter {
+                    include_bodies: false,
+                    limit: 100,
+                    thread_id: Some("debate-2".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("thread-filtered inbox 2");
+        assert_eq!(t2.as_array().unwrap().len(), 1);
+
+        let missing = mail
+            .inbox_filtered(
+                &project,
+                "ThreadRecv",
+                &MailInboxFilter {
+                    include_bodies: false,
+                    limit: 100,
+                    thread_id: Some("no-such-thread".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("empty thread inbox");
+        assert!(missing.as_array().unwrap().is_empty());
     }
 
     /// c3b.3: `ack_overdue_only` has no toron projection (rows carry no

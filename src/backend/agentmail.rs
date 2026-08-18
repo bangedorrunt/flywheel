@@ -410,6 +410,7 @@ impl MailSurface for AgentMailBackend {
                 req.include_bodies,
                 req.limit.unwrap_or(100) as u32,
                 req.since_ts.as_deref(),
+                req.thread_id.as_deref(),
             ),
         )?;
         row_array(&v)
