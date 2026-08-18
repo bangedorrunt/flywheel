@@ -317,6 +317,20 @@ pub fn resolve_workspace_id(
     if matches.len() == 1 {
         return matches[0].workspace_id.clone();
     }
+    // bd-ws-resolution (2026-08-17): prefer the flywheel-OWNED workspace
+    // LABEL over a foreign workspace sharing the bare project label — herdr
+    // reports no names for omp panes, so the agent-name scan below found
+    // nothing and dispatch fell to list order, targeting a foreign
+    // workspace with zero flywheel agents ("no agents in workspace w37").
+    // spawn names its own workspaces `flywheel-<base>`; the exact label
+    // (or its hyphen-prefixed supersets) is the deterministic tie-breaker.
+    let owned = prefix.trim_end_matches('-');
+    let owned_prefix = format!("{owned}-");
+    for ws in matches {
+        if ws.label == owned || ws.label.starts_with(&owned_prefix) {
+            return ws.workspace_id.clone();
+        }
+    }
     for ws in matches {
         if agents.iter().any(|a| {
             a.workspace_id == ws.workspace_id
@@ -2313,5 +2327,91 @@ hermes: outdated (v3 < v4) (/Users/bangedorrunt/.hermes/plugins/herdr-agent-stat
         assert_eq!(st.version, None);
         assert_eq!(st.expected_version, None);
         assert_eq!(st.path, None);
+    }
+}
+
+/// bd-pattern-peer-triggered: the shell-readiness gate predicate. A fresh
+/// split pane is NOT ready until the shell prints its prompt (line editor
+/// up, raw mode); typing the ~2.6KB single-quoted peer template into a
+/// booting shell (canonical mode, 1024-byte MAX_CANON) splits it mid-quote
+/// and zsh parks at `>....`. The predicate recognizes rendered prompts so
+/// the spawn path can wait for readiness instead of racing the shell.
+#[cfg(test)]
+mod shell_prompt_tests {
+    use super::shell_prompt_rendered;
+
+    #[test]
+    fn empty_or_booting_shell_is_not_ready() {
+        assert!(!shell_prompt_rendered(""));
+        assert!(!shell_prompt_rendered("   \n  \n"));
+        // Startup noise without a rendered prompt.
+        assert!(!shell_prompt_rendered("Last login: Mon Aug 18 04:24:39 on ttys001\n"));
+        assert!(!shell_prompt_rendered("loading zsh config...\ngit: command not found"));
+    }
+
+    #[test]
+    fn rendered_prompt_sigils_are_ready() {
+        // zsh default + p10k-style, bash, root, fish.
+        for prompt in [
+            "❯",
+            "❯ ",
+            "bangedorrunt in 🌐 mikasa in toron main*\n ⇡≡\n❯",
+            "%",
+            "$",
+            "#",
+            ">",
+            "➜  ~",
+        ] {
+            assert!(
+                shell_prompt_rendered(prompt),
+                "rendered prompt {prompt:?} must be ready"
+            );
+        }
+    }
+
+    #[test]
+    fn user_host_path_prompts_are_ready() {
+        assert!(shell_prompt_rendered("user@host:~$"));
+        assert!(shell_prompt_rendered("bob@macbook:~/work/src"));
+    }
+
+    /// bd-ws-resolution (2026-08-17): with a foreign workspace sharing the
+    /// bare project label, the flywheel-OWNED label must win even when herdr
+    /// reports NO agent names (the omp case — the name scan finds nothing
+    /// and the old code fell back to list order, dispatching into a foreign
+    /// workspace: "no agents in workspace w37").
+    #[test]
+    fn resolve_workspace_id_prefers_owned_label_over_foreign() {
+        use crate::herdr_shim::{AgentInfo, WorkspaceInfo};
+        let mk = |id: &str, label: &str| WorkspaceInfo {
+            workspace_id: id.into(),
+            number: 0,
+            label: label.into(),
+            focused: false,
+            pane_count: 0,
+            tab_count: 0,
+            active_tab_id: String::new(),
+            agent_status: crate::herdr_shim::AgentStatus::Unknown,
+            cwd: None,
+        };
+        let foreign = mk("w37", "toron");
+        let owned = mk("w70", "flywheel-toron");
+        // No agent names at all (omp panes) — the label must break the tie.
+        let no_agents: Vec<AgentInfo> = Vec::new();
+        assert_eq!(
+            super::resolve_workspace_id(&[foreign.clone(), owned.clone()], &no_agents, "flywheel-toron-"),
+            "w70",
+            "owned label wins over list order"
+        );
+        // A foreign FIRST in list order still loses.
+        assert_eq!(
+            super::resolve_workspace_id(&[foreign.clone(), owned.clone()], &no_agents, "flywheel-toron-"),
+            "w70"
+        );
+        // Single match: unchanged behavior.
+        assert_eq!(
+            super::resolve_workspace_id(&[foreign.clone()], &no_agents, "flywheel-toron-"),
+            "w37"
+        );
     }
 }

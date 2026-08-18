@@ -2657,6 +2657,23 @@ fn find_workspace_dyn(backend: &dyn backend::MultiplexerBackend, project: &str) 
         bail!("no flywheel swarm for {project} (run: flywheel spawn {project})")
     }
     if matches.len() > 1 {
+        // bd-ws-resolution (2026-08-17): a FOREIGN workspace sharing the
+        // bare project label ("toron") outranked the flywheel-owned one
+        // ("flywheel-toron") whenever the agent-name disambiguation below
+        // found no NAMED agents — herdr's raw agent_list has no names for
+        // omp panes (the spawn registry overlay supplies them later), so
+        // every disambiguation fell through to list order and dispatch
+        // targeted the foreign (empty-of-flywheel-agents) workspace. The
+        // flywheel-owned label prefix is the deterministic tie-breaker:
+        // spawn names its own workspaces `flywheel-<project>`.
+        let owned_label = format!("flywheel-{}", project_base(project));
+        let owned_prefix = format!("{owned_label}-");
+        if let Some(ws) = matches
+            .iter()
+            .find(|ws| ws.label == owned_label || ws.label.starts_with(&owned_prefix))
+        {
+            return Ok(ws.workspace_id.clone());
+        }
         let prefix = format!("flywheel-{}-", project_base(project));
         let agents = backend.agent_list()?;
         for ws in &matches {
