@@ -8462,10 +8462,17 @@ fn cmd_send(
                 )
             );
         }
-        results.push(json!({
-            "target": agent_target(a), "status": status, "pane_id": a.pane_id,
-            "profile": cond_profile,
-        }));
+        // bd-pin-public-plane-s-easy.9: dispatched + prior_status — the
+        // herdr status at TARGET time (before the prompt), never a bare
+        // `status` a captain reads as a miss when the agent was idle at
+        // dispatch. landed + settled_status only after --wait observed it.
+        results.push(send_result_row(
+            agent_target(a),
+            a.agent_status.as_str(),
+            &a.pane_id,
+            cond_profile.as_deref(),
+            wait.then_some(status),
+        ));
     }
 
     // bd-98gd: persist skills_injected flags set by conditioning (single
@@ -8503,6 +8510,49 @@ enum StallStep {
     Respawn,
     /// Exhausted: fail with actionable recovery guidance.
     GiveUp,
+}
+
+// ---- send result JSON (bd-pin-public-plane-s-easy.9) ----
+
+/// One send-result row. `dispatched: true` is the fire-and-forget success
+/// signal; `prior_status` names the herdr status at target time (never a
+/// bare `status` a captain parses as a miss when the agent was idle at
+/// dispatch). `landed` + `settled_status` appear ONLY after --wait/--confirm
+/// observed the prompt land (agent reached a settled state).
+fn send_result_row(
+    target: &str,
+    prior_status: &str,
+    pane_id: &str,
+    profile: Option<&str>,
+    settled: Option<&str>,
+) -> Value {
+    let mut v = json!({
+        "target": target,
+        "dispatched": true,
+        "prior_status": prior_status,
+        "pane_id": pane_id,
+        "profile": profile,
+    });
+    if let Some(s) = settled {
+        v["landed"] = json!(true);
+        v["settled_status"] = json!(s);
+    }
+    v
+}
+
+/// bd-pin-public-plane-s-easy.9: interrupt of a WORKING agent needs --force
+/// — a captain must not nudge a working agent off its task because the send
+/// JSON showed prior idle (the false-fail root cause). Pure: `force=false`
+/// + working → Err naming --force; everything else passes.
+fn interrupt_guard_working(status: AgentStatus, force: bool) -> Result<()> {
+    if !force && status == AgentStatus::Working {
+        bail!(
+            "agent is working — interrupting would cancel its current task. \
+             Leave it; a working agent is not stuck (prior idle in a send JSON \
+             is not a miss). Pass --force to interrupt deliberately."
+        );
+    }
+    Ok(())
 }
 
 /// bd-rdy: pure stall-classification for the interactive send --wait path.
@@ -9097,6 +9147,14 @@ fn cmd_interrupt(
         bail!(
             "--keys {k} TERMINATES the agent process (pane drops to a shell and the session binding is lost). Prefer the default Escape, which cancels the current tool call and returns to the prompt. Pass --force to send {k} deliberately."
         );
+    }
+    // bd-pin-public-plane-s-easy.9: interrupting a WORKING agent needs
+    // --force — a captain must not nudge a working agent off its task
+    // because a send JSON showed prior idle (false-fail root cause).
+    for a in &targets {
+        let prior = herdr_shim::parse_agent_status(a.agent_status.as_str())
+            .unwrap_or(AgentStatus::Unknown);
+        interrupt_guard_working(prior, force)?;
     }
     let is_kill = kill_key(&keys).is_some();
     for a in &targets {
@@ -23502,5 +23560,92 @@ mod send_conditioning_tests {
             "no repeat prefix: {text2:?}"
         );
         assert!(text2.contains("You are a SCOUT."));
+    }
+}
+
+#[cfg(test)]
+mod send_result_row_tests {
+    use super::*;
+
+    /// bd-pin-public-plane-s-easy.9: fire-and-forget send JSON carries
+    /// `dispatched: true` + `prior_status` (the herdr status at target
+    /// time) — never a bare `status` a captain parses as a miss when the
+    /// agent was idle at dispatch. No `landed` without --wait/--confirm.
+    #[test]
+    fn fire_and_forget_row_is_dispatched_not_landed() {
+        let row = send_result_row(
+            "flywheel-toron-coder",
+            "idle",
+            "w1:p1",
+            Some("coder"),
+            None,
+        );
+        assert_eq!(row["target"], "flywheel-toron-coder");
+        assert_eq!(row["dispatched"], true, "dispatch is the success signal");
+        assert_eq!(row["prior_status"], "idle", "names the status as prior");
+        assert!(
+            row.get("status").is_none(),
+            "no bare status field to misread as a miss"
+        );
+        assert!(
+            row.get("landed").is_none(),
+            "landing only after --wait/--confirm"
+        );
+    }
+
+    /// bd-pin-public-plane-s-easy.9: --wait/--confirm adds `landed: true` +
+    /// the settled status — the prompt was observed to land (agent reached a
+    /// settled state), not just dispatched.
+    #[test]
+    fn wait_row_reports_landed_with_settled_status() {
+        let row = send_result_row(
+            "flywheel-toron-coder",
+            "idle",
+            "w1:p1",
+            None,
+            Some("done"),
+        );
+        assert_eq!(row["dispatched"], true);
+        assert_eq!(row["prior_status"], "idle");
+        assert_eq!(row["landed"], true, "--wait observed landing");
+        assert_eq!(row["settled_status"], "done");
+    }
+
+    /// bd-pin-public-plane-s-easy.9: a working agent at target time is a
+    /// valid dispatch target — prior_status working must not read as a
+    /// failure (the captain false-fail root cause).
+    #[test]
+    fn row_preserves_working_prior_status() {
+        let row = send_result_row(
+            "flywheel-toron-coder",
+            "working",
+            "w1:p1",
+            None,
+            None,
+        );
+        assert_eq!(row["dispatched"], true);
+        assert_eq!(row["prior_status"], "working");
+    }
+
+    /// bd-pin-public-plane-s-easy.9: interrupt of a working agent needs
+    /// --force — a captain must not nudge a working agent off its task
+    /// because the send JSON showed prior idle. Pure guard, unit-tested.
+    #[test]
+    fn interrupt_of_working_agent_needs_force() {
+        let err = interrupt_guard_working(
+            AgentStatus::Working,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--force"), "names the escape hatch: {err}");
+        assert!(
+            interrupt_guard_working(AgentStatus::Working, true).is_ok(),
+            "--force permits the interrupt"
+        );
+        assert!(
+            interrupt_guard_working(AgentStatus::Idle, false).is_ok(),
+            "idle needs no force"
+        );
     }
 }
