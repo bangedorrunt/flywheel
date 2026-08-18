@@ -111,5 +111,6 @@ If the loop's `--on-blocked mail` is active, a blocked agent gets tiered pings (
   2. **Soft conflict** (acquire hits a peer's intent/held): freeze on the contested path, negotiate a split (request-release protocol).
   3. **Design fork** (two defensible architectures): collab/interrogate the fork in the bead thread -- do not implement both.
   4. **Blocked > 10 min** (external blocker, no path forward): mail the captain on the captain thread, post blocked on the steer channel, set the bead `blocked` with the reason.
+- **Done-mail (2026-08-17, the captain has NO push — bead-closed + commit are the durable signal, this mail is the courtesy):** when you close a bead, mail the captain on `thread_id=<bead_id>` with subject `[<bead_id>] done` and a one-line summary (what you ran, commit sha, VERIFY tail). Same for `starting` when you claim. This is how the captain knows without polling every tracker.
 - **AGENT_NAME for repo hooks:** the flywheel repo's pre-commit hook reads `AGENT_NAME` to attribute commits. Run with `AGENT_NAME=<your-pin>` env for every commit in a hooked repo.
 
