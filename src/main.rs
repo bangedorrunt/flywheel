@@ -18595,15 +18595,48 @@ fn cmd_internal_reclaim_stranded(cfg: &Config, project: &str, live: &str) -> Res
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
+    // bd-bvwf.6 (2026-08-17): claims are written with the agent's MAIL
+    // IDENTITY pin (BlueRidge), but the loop passes herdr NAMES
+    // (flywheel-toron-coder) as --live — a live agent's claim looked
+    // stranded and got yanked every poll. A registry pin counts as live
+    // only when its pane is LIVE in herdr right now (a dead pane's pin
+    // must still strand — that is the reclaim's purpose).
+    let dir = project_dir(cfg, project);
+    let registry = state::load_spawn_registry(dir.to_str().unwrap_or(project));
+    let live_panes: std::collections::HashSet<String> = {
+        let mut panes = std::collections::HashSet::new();
+        if let Ok(mut b) = backend::multiplexer_backend(cfg) {
+            if let Ok(ws) = find_workspace_dyn(&mut *b, project) {
+                if let Ok(agents) = b.agent_list() {
+                    for a in agents {
+                        if a.workspace_id == ws {
+                            panes.insert(a.pane_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        panes
+    };
+    let live: Vec<String> = {
+        let mut s: std::collections::HashSet<String> = live_names.iter().cloned().collect();
+        for e in &registry {
+            if let Some(pin) = &e.mail_identity {
+                if live_panes.contains(&e.pane_id) {
+                    s.insert(pin.clone());
+                }
+            }
+        }
+        s.into_iter().collect()
+    };
     let beads = load_inprogress_beads(cfg, project)?;
     let stranded: Vec<durable::ReadyBead> = beads
         .into_iter()
         .filter(|b| match &b.assignee {
-            Some(a) => !live_names.iter().any(|l| l == a),
+            Some(a) => !live.iter().any(|l| l == a),
             None => true,
         })
         .collect();
-    let dir = project_dir(cfg, project);
     let mut reclaimed: Vec<String> = Vec::new();
     let mut failed: Vec<Value> = Vec::new();
     for b in &stranded {
