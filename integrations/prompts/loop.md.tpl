@@ -42,8 +42,10 @@ summoned reviewer substitutes for the captain (never-block-on-the-human).
    state + the exact resume point, then stop (outcome-oriented-execution).
 
 6. DONE-MAIL: after closing, mail the captain on `thread_id=<bead-id>`;
-   subject `[<bead-id>] done`, one line (commit sha, VERIFY tail). The
-   captain has no push; the mail is the courtesy on top of commit+close.
+   subject `[<bead-id>] done`, BODY with the report fields (status, commit
+   sha, verdict kind, the VERIFY command + result tail, deviations,
+   PRINCIPLES cited). One report, two channels: the close reason is the
+   durable copy, the mail is the captain's copy. The captain has no push.
 
 7. PROMOTE (optional): the loop MAY promote itself to /swarm -- spawn
    peers -- only when the bead graph shows parallelizable disjoint lanes.

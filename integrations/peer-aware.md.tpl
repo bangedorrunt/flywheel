@@ -31,8 +31,9 @@ Peer-awareness loop (run ON TOP of your primary task):
 
   ON COMPLETION (every crew, not just bead crews): mail the
   orchestrator/captain on the TASK thread (thread_id=<task-id>) with
-  subject '[<task-id>] done' and a one-line summary (commit sha, what you
-  ran). The captain has no push channel; bead-closed + commit are the
+  subject '[<task-id>] done' and a BODY carrying the report fields:
+  status, commit sha, verdict kind, what you ran + the result tail,
+  deviations, PRINCIPLES cited. The captain has no push channel; bead-closed + commit are the
   durable signal; this mail is the courtesy that tells them without
   polling. Same for 'starting' when you claim a task.
 

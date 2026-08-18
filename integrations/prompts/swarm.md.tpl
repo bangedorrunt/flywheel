@@ -60,7 +60,9 @@ time; epics are gates, not tasks. Distilled from the ADR-0019 program
 
 9. DONE-MAIL (every crew): when your wave/lane is done, mail the captain on
    the lane thread (`thread_id=<lane-bead-id>`) with subject
-   `[<lane-bead-id>] done` + one line (commit sha, what you ran). The
+   `[<lane-bead-id>] done` and a BODY with the report fields: status,
+   commit sha, verdict kind, what you ran + the result tail, deviations,
+   PRINCIPLES cited. The
    captain has no push; this mail is the courtesy signal on top of the
    durable commit+close.
 
