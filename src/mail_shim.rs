@@ -405,8 +405,8 @@ impl Mail {
     /// so whois(slug) resolves to the pin's npub (ADR-0018 D4). The fold row
     /// is written under the CANONICAL project (whois resolves via
     /// canonical_project — a raw path key would miss). In-process writes the
-    /// index row directly; the remote daemon exposes no fold tool (frozen
-    /// MCP surface) — loud error, the caller decides how to surface.
+    /// index row directly; remote composes `register_agent` with optional
+    /// `alias` (no new MCP tool).
     pub fn fold_agent_name_alias(
         &self,
         project_key: &str,
@@ -423,10 +423,17 @@ impl Mail {
                 ));
                 Ok(())
             }
-            BackendKind::Remote(_) => bail!(
-                "fold_agent_name_alias: the remote daemon exposes no fold tool \
-                 (frozen MCP surface) — slug {alias} -> {canonical} not folded"
-            ),
+            BackendKind::Remote(_) => {
+                self.call_remote(
+                    "register_agent",
+                    json!({
+                        "project_key": project_key,
+                        "name": canonical,
+                        "alias": alias,
+                    }),
+                )?;
+                Ok(())
+            }
         }
     }
 

@@ -2547,7 +2547,7 @@ mod shell_prompt_tests {
         );
         // Single match: unchanged behavior.
         assert_eq!(
-            super::resolve_workspace_id(&[foreign.clone()], &no_agents, "flywheel-toron-"),
+            super::resolve_workspace_id(std::slice::from_ref(&foreign), &no_agents, "flywheel-toron-"),
             "w37"
         );
     }

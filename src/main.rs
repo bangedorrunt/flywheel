@@ -19559,14 +19559,13 @@ fn cmd_internal_reclaim_stranded(cfg: &Config, project: &str, live: &str) -> Res
     let registry = state::load_spawn_registry(dir.to_str().unwrap_or(project));
     let live_panes: std::collections::HashSet<String> = {
         let mut panes = std::collections::HashSet::new();
-        if let Ok(mut b) = backend::multiplexer_backend(cfg) {
-            if let Ok(ws) = find_workspace_dyn(&mut *b, project) {
-                if let Ok(agents) = b.agent_list() {
-                    for a in agents {
-                        if a.workspace_id == ws {
-                            panes.insert(a.pane_id.clone());
-                        }
-                    }
+        if let Ok(b) = backend::multiplexer_backend(cfg)
+            && let Ok(ws) = find_workspace_dyn(&*b, project)
+            && let Ok(agents) = b.agent_list()
+        {
+            for a in agents {
+                if a.workspace_id == ws {
+                    panes.insert(a.pane_id.clone());
                 }
             }
         }
@@ -19575,10 +19574,10 @@ fn cmd_internal_reclaim_stranded(cfg: &Config, project: &str, live: &str) -> Res
     let live: Vec<String> = {
         let mut s: std::collections::HashSet<String> = live_names.iter().cloned().collect();
         for e in &registry {
-            if let Some(pin) = &e.mail_identity {
-                if live_panes.contains(&e.pane_id) {
-                    s.insert(pin.clone());
-                }
+            if let Some(pin) = &e.mail_identity
+                && live_panes.contains(&e.pane_id)
+            {
+                s.insert(pin.clone());
             }
         }
         s.into_iter().collect()
