@@ -38,11 +38,14 @@ summoned reviewer substitutes for the captain (never-block-on-the-human).
    artifact, not "it compiles" (prove-it-works).
 
 5. CLOSE: commit-before-close with the bead id in the message; close
-   reason MUST include the ## VERIFY output tail; cite PRINCIPLES by name
-   -- which decision each changed. On TIMEBOX expiry: report the partial
+   reason MUST include the ## VERIFY output tail; cite PRINCIPLES by name   -- which decision each changed. On TIMEBOX expiry: report the partial
    state + the exact resume point, then stop (outcome-oriented-execution).
 
-6. PROMOTE (optional): the loop MAY promote itself to /swarm -- spawn
+6. DONE-MAIL: after closing, mail the captain on `thread_id=<bead-id>`;
+   subject `[<bead-id>] done`, one line (commit sha, VERIFY tail). The
+   captain has no push; the mail is the courtesy on top of commit+close.
+
+7. PROMOTE (optional): the loop MAY promote itself to /swarm -- spawn
    peers -- only when the bead graph shows parallelizable disjoint lanes.
    Otherwise stay one agent + the summoned reviewer.
 

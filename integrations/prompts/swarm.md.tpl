@@ -58,6 +58,12 @@ time; epics are gates, not tasks. Distilled from the ADR-0019 program
    - build slot: `flywheel mail slot release <project> --slot cargo --as <pin>`.
    - kill: `flywheel kill <project> --force --force-working`.
 
+9. DONE-MAIL (every crew): when your wave/lane is done, mail the captain on
+   the lane thread (`thread_id=<lane-bead-id>`) with subject
+   `[<lane-bead-id>] done` + one line (commit sha, what you ran). The
+   captain has no push; this mail is the courtesy signal on top of the
+   durable commit+close.
+
 Never block on the captain for reversible calls: if a fact is observable by
 running something, run it (never-block-on-the-human).
 
