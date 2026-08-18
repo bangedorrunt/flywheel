@@ -622,7 +622,12 @@ async fn loop_run_verify(args: LoopRunVerifyArgs) -> Result<Value> {
     if let Some(t) = args.timeout_secs {
         cmd.args(["--timeout-secs", &t.to_string()]);
     }
-    let out = run_leaf_cmd(cmd, "__loop-run-verify").await?;
+    let out = run_leaf_cmd_bounded(
+        cmd,
+        "__loop-run-verify",
+        std::time::Duration::from_secs(args.timeout_secs.unwrap_or(600)) + LEAF_WATCHDOG_GRACE,
+    )
+    .await?;
     if !out.status.success() {
         return Err(map_err(anyhow::anyhow!(
             "__loop-run-verify failed: {}",
@@ -1073,14 +1078,92 @@ fn self_exe() -> anyhow::Result<std::path::PathBuf> {
 /// tokio's blocking pool; the child-process-per-leaf crash-isolation
 /// boundary is untouched (a leaf panic still cannot kill the loop's
 /// memory).
+///
+/// bd-loop-park-fresh-invocation-xl6r: leaf subprocess watchdog. A hung
+/// leaf child (e.g. the toron daemon reserve-write hang of 6ec181d, >300s
+/// while reads respond) must NEVER park the durable loop — a fresh
+/// invocation stalls on the first un-checkpointed write leaf and the loop
+/// dies in cvwait with nothing scheduled. The default bound covers every
+/// leaf whose subprocess runs seconds-to-a-minute; leaves with a legit
+/// longer internal deadline (poll_events, send --confirm, loop-run-verify
+/// TIMEBOX) pass their own bound + grace via `run_leaf_cmd_bounded`.
+const DEFAULT_LEAF_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Grace added on top of a leaf's own internal deadline when the call site
+/// knows it (poll_events `--timeout-ms`, confirm timeout, VERIFY TIMEBOX).
+const LEAF_WATCHDOG_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
 async fn run_leaf_cmd(
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     label: &'static str,
 ) -> Result<std::process::Output> {
-    tokio::task::spawn_blocking(move || cmd.output())
-        .await
-        .map_err(|e| map_err(anyhow::anyhow!("{label} leaf task join failed: {e}")))?
-        .map_err(|e| map_err(anyhow::anyhow!("{label} spawn failed: {e}")))
+    run_leaf_cmd_bounded(cmd, label, DEFAULT_LEAF_WATCHDOG).await
+}
+
+/// `run_leaf_cmd` with an explicit subprocess watchdog: kill the child and
+/// surface a bounded Err when it outlives `watchdog` (park guard). The
+/// child is drained concurrently so a chatty leaf cannot deadlock the wait.
+async fn run_leaf_cmd_bounded(
+    mut cmd: std::process::Command,
+    label: &'static str,
+    watchdog: std::time::Duration,
+) -> Result<std::process::Output> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut child = match cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return Err(e),
+        };
+        let mut out = child.stdout.take().expect("piped stdout");
+        let mut err = child.stderr.take().expect("piped stderr");
+        let out_handle = std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = out.read_to_string(&mut buf);
+            buf
+        });
+        let err_handle = std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = err.read_to_string(&mut buf);
+            buf
+        });
+        let deadline = std::time::Instant::now() + watchdog;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break st,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "{label} leaf exceeded {watchdog:?} — child killed (watchdog; a hung leaf must never park the loop)"
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    return Err(e);
+                }
+            }
+        };
+        let stdout = out_handle.join().unwrap_or_default().into_bytes();
+        let stderr = err_handle.join().unwrap_or_default().into_bytes();
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+    .await
+    .map_err(|e| map_err(anyhow::anyhow!("{label} leaf task join failed: {e}")))?
+    .map_err(|e| map_err(anyhow::anyhow!("{label} spawn failed: {e}")))
 }
 
 /// Poll the swarm via the flywheel binary itself. Checkpointed.
@@ -1149,7 +1232,12 @@ async fn poll_events(args: PollEventsArgs) -> Result<PollEventsBatch> {
     if args.after_seq > 0 {
         cmd.args(["--after-seq", &args.after_seq.to_string()]);
     }
-    let out = run_leaf_cmd(cmd, "__poll_events").await?;
+    let out = run_leaf_cmd_bounded(
+        cmd,
+        "__poll_events",
+        std::time::Duration::from_millis(args.timeout_ms) + LEAF_WATCHDOG_GRACE,
+    )
+    .await?;
     if !out.status.success() {
         // soft-fail: return empty batch with the error so the loop can fall
         // back to heartbeat __poll without killing the workflow
@@ -1933,7 +2021,9 @@ async fn send_prompt(args: SendArgs) -> Result<SendOutcome> {
     let exe = self_exe().map_err(map_err)?;
     let mut cmd = Command::new(&exe);
     cmd.args(send_prompt_argv(&args));
-    let out = run_leaf_cmd(cmd, "__send").await?;
+    let confirm_bound = std::time::Duration::from_millis(args.confirm_timeout_ms.unwrap_or(45_000))
+        + LEAF_WATCHDOG_GRACE;
+    let out = run_leaf_cmd_bounded(cmd, "__send", confirm_bound).await?;
     if !out.status.success() {
         return Err(map_err(anyhow::anyhow!(
             "__send failed: {}",
@@ -9103,6 +9193,68 @@ mod resume_dedup_tests {
             format!("{spawn_err}").contains("__test-leaf"),
             "labels the leaf: {spawn_err}"
         );
+    }
+
+    /// bd-loop-park-fresh-invocation-xl6r regression: a hung leaf child
+    /// (e.g. the toron daemon reserve-write hang of 6ec181d — >300s while
+    /// reads respond) must NEVER park the durable loop. The watchdog kills
+    /// the child and surfaces a bounded Err; the loop's next poll proceeds.
+    /// Named with `loop_` so the bead's VERIFY fence (`cargo test --bin
+    /// flywheel loop`) exercises the park guard.
+    #[tokio::test]
+    async fn loop_leaf_watchdog_kills_hung_leaf() {
+        let start = std::time::Instant::now();
+        let err = run_leaf_cmd_bounded(
+            {
+                let mut cmd = std::process::Command::new("/bin/sh");
+                cmd.args(["-c", "sleep 30"]);
+                cmd
+            },
+            "__test-leaf",
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .expect_err("hung leaf must not park the loop");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "watchdog fires in bounded time: {elapsed:?}"
+        );
+        let msg = format!("{err}");
+        assert!(msg.contains("__test-leaf"), "names the leaf: {msg}");
+        assert!(
+            msg.contains("watchdog"),
+            "explains the kill: {msg}"
+        );
+    }
+
+    /// bd-loop-park-fresh-invocation-xl6r: the loop-equivalent property —
+    /// a hung leaf mid-flight must not stop the NEXT poll. Five consecutive
+    /// leaf invocations (one hung) each complete within their own bound,
+    /// so a fresh loop never parks on a stuck subprocess.
+    #[tokio::test]
+    async fn loop_poll_cycle_continues_after_hung_leaf() {
+        for i in 0..5 {
+            let start = std::time::Instant::now();
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", if i == 2 { "sleep 30" } else { "printf 'ok'" }]);
+            let res = run_leaf_cmd_bounded(
+                cmd,
+                "__test-leaf",
+                std::time::Duration::from_millis(300),
+            )
+            .await;
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "poll cycle {i} completes within bound: {elapsed:?}"
+            );
+            if i == 2 {
+                assert!(res.is_err(), "hung leaf surfaces Err (cycle {i})");
+            } else {
+                assert!(res.is_ok(), "healthy leaf stays Ok (cycle {i})");
+            }
+        }
     }
 }
 
