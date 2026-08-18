@@ -29,6 +29,13 @@ Peer-awareness loop (run ON TOP of your primary task):
   Continue your primary task. Exit when the primary task is done OR your
   context budget is reached.
 
+  ON COMPLETION (every crew, not just bead crews): mail the
+  orchestrator/captain on the TASK thread (thread_id=<task-id>) with
+  subject '[<task-id>] done' and a one-line summary (commit sha, what you
+  ran). The captain has no push channel; bead-closed + commit are the
+  durable signal; this mail is the courtesy that tells them without
+  polling. Same for 'starting' when you claim a task.
+
 Bounded budget (non-optional): max {poll_budget_minutes} minutes alive AND
 max {max_peer_prompts} peer-prompts per task. On budget exhaustion, exit
 cleanly (never crash). Do NOT spawn or close panes -- only the orchestrator
