@@ -49,7 +49,7 @@ pub fn verifier_required(bead: &BeadUnit, ac: AcShape) -> bool {
 }
 
 /// One registry entry (`[models.ID]`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelEntry {
     /// Provider prefix for harnesses that want `provider/model` (opencode,
     /// pi, omp — omp routes `--model=provider/id` through its provider
@@ -132,6 +132,23 @@ impl ModelRegistry {
         Ok(Self { models })
     }
 
+    /// The ROUTING registry: compiled-in fleet defaults layered under the
+    /// user's `models.toml` (user entries win per id). This — not `load()` —
+    /// is what profile/spawn resolution consults: catalog model ids route
+    /// through the registry even on a zero-config install.
+    pub fn load_routing() -> Result<Self> {
+        let path = crate::config::config_dir().join("models.toml");
+        let mut models = compiled_in_models();
+        // A missing file is fine (zero-config); a PRESENT but unparseable
+        // file is a loud error — silently skipping it would quietly drop
+        // the user's routing entries (a bypass).
+        let user = Self::load_from(Some(&path))?;
+        if !user.models.is_empty() {
+            models.extend(user.models);
+        }
+        Ok(Self { models })
+    }
+
     /// Look up one id.
     pub fn get(&self, id: &str) -> Option<&ModelEntry> {
         self.models.get(id)
@@ -153,6 +170,40 @@ impl ModelRegistry {
                 }
             }
             None => id.to_string(),
+        }
+    }
+
+    /// Strict resolution for PROFILE-sourced model ids (ADR-0010 Spec D):
+    /// the id MUST be a registry entry — unknown ids and caps-excluded
+    /// harnesses without a fallback are errors naming the fix, never a
+    /// silent passthrough. Empty id resolves empty (the caller skips the
+    /// flag). Ad-hoc CLI `--model` strings keep the lenient `resolve()`.
+    pub fn resolve_strict(&self, id: &str, harness: &str) -> Result<String> {
+        if id.is_empty() {
+            return Ok(String::new());
+        }
+        match self.models.get(id) {
+            Some(entry) => {
+                if entry.caps.is_empty() || entry.caps.iter().any(|c| c == harness) {
+                    Ok(entry.flag_for(id, harness))
+                } else {
+                    match &entry.fallback {
+                        Some(fb) => self.resolve_strict(fb, harness).with_context(|| {
+                            format!("model '{id}' fallback '{fb}' failed to resolve")
+                        }),
+                        None => anyhow::bail!(
+                            "model '{id}' is not routable on harness '{harness}' (caps: {}) \
+                             and has no fallback",
+                            entry.caps.join(",")
+                        ),
+                    }
+                }
+            }
+            None => anyhow::bail!(
+                "model '{id}' is not in the registry — add it first: \
+                 `flywheel model add {id} --provider <provider>` \
+                 (profile models route ONLY through the registry)"
+            ),
         }
     }
 
@@ -254,6 +305,42 @@ impl ModelRegistry {
         std::fs::write(path, raw).with_context(|| format!("write {}", path.display()))?;
         Ok(())
     }
+}
+
+/// Compiled-in routing defaults: the fleet's canonical models, layered
+/// under user `models.toml` entries by [`ModelRegistry::load_routing`].
+/// Mirrors the compiled-in profile defaults (ADR-0005): catalog profiles
+/// reference these bare ids, so routing works zero-config and the registry
+/// stays the SINGLE place a provider prefix lives.
+///
+/// `big-pickle` is capped to the `opencode` harness — it is free ONLY
+/// there; strict resolution refuses it elsewhere (no fallback by design,
+/// the scout profile pins the opencode harness).
+pub fn compiled_in_models() -> BTreeMap<String, ModelEntry> {
+    let mut m = BTreeMap::new();
+    m.insert(
+        "deepseek-v4-flash".to_string(),
+        ModelEntry {
+            provider: "opencode-go".into(),
+            ..ModelEntry::default()
+        },
+    );
+    m.insert(
+        "big-pickle".to_string(),
+        ModelEntry {
+            provider: "opencode".into(),
+            caps: vec!["opencode".into()],
+            ..ModelEntry::default()
+        },
+    );
+    m.insert(
+        "glm-5.2".to_string(),
+        ModelEntry {
+            provider: "zai".into(),
+            ..ModelEntry::default()
+        },
+    );
+    m
 }
 
 #[cfg(test)]
@@ -671,6 +758,108 @@ provider = "local"
             &["deepseek-v4", "opus-5"],
             None,
         );
+
         assert_eq!(plan, VerifierPlan::Dispatch("opus-5".into()));
+    }
+    /// Routing registry layers compiled-in fleet defaults under user
+    /// entries (user wins per id); `load()` stays the USER FILE ONLY so
+    /// `save()` never bakes defaults into models.toml.
+    #[test]
+    fn load_routing_layers_compiled_in_under_user_entries() {
+        let _g = with_config_dir();
+        let path = crate::config::config_dir().join("models.toml");
+        let _ = fs::remove_file(&path);
+
+        let reg = ModelRegistry::load_routing().expect("routing registry");
+        assert_eq!(
+            reg.resolve("deepseek-v4-flash", "omp"),
+            "opencode-go/deepseek-v4-flash",
+            "compiled-in deepseek routes zero-config"
+        );
+        assert_eq!(reg.resolve("glm-5.2", "omp"), "zai/glm-5.2");
+        // big-pickle is free ONLY on the opencode harness (caps whitelist).
+        assert_eq!(reg.resolve("big-pickle", "opencode"), "opencode/big-pickle");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
+         // A user entry OVERRIDES the compiled-in default for the same id.
+        fs::write(&path, "[models.deepseek-v4-flash]\nprovider = \"my-gateway\"\n")
+            .expect("write user models.toml");
+        let reg = ModelRegistry::load_routing().expect("reload routing");
+        assert_eq!(
+            reg.resolve("deepseek-v4-flash", "omp"),
+            "my-gateway/deepseek-v4-flash",
+            "user entry wins over compiled-in"
+        );
+        assert_eq!(reg.resolve("glm-5.2", "omp"), "zai/glm-5.2", "other default intact");
+
+        // load() (the CLI write path) must NOT see compiled-ins.
+        let user = ModelRegistry::load().expect("user file");
+        assert!(
+            user.get("glm-5.2").is_none(),
+            "load() reads the user file only — save() must not persist defaults"
+        );
+    }
+
+    /// Strict resolution: profile-sourced models MUST be registry ids.
+    /// Unknown id, or a caps-excluded harness with no fallback, is an
+    /// error naming the fix — never a silent passthrough.
+    #[test]
+    fn resolve_strict_fails_unknown_and_caps_excluded() {
+        let _g = with_config_dir();
+        let path = crate::config::config_dir().join("models.toml");
+        let _ = fs::remove_file(&path);
+        let reg = ModelRegistry::load_routing().expect("reg");
+
+        assert_eq!(reg.resolve_strict("", "omp").expect("empty ok"), "");
+        assert_eq!(
+            reg.resolve_strict("deepseek-v4-flash", "omp").expect("known ok"),
+            "opencode-go/deepseek-v4-flash"
+        );
+        let err = reg
+            .resolve_strict("no-such-model", "omp")
+            .expect_err("unknown id must fail");
+        assert!(
+            err.to_string().contains("flywheel model add"),
+            "error names the fix: {err}"
+        );
+        // big-pickle caps = opencode-only: strict refuses omp outright.
+        let err = reg
+            .resolve_strict("big-pickle", "omp")
+            .expect_err("caps-excluded must fail");
+        assert!(
+            err.to_string().contains("not routable"),
+            "error says why: {err}"
+        );
+    }
+
+    /// Strict resolution honors the caps->fallback chain: a caps-excluded
+    /// harness with a fallback resolves the fallback (strictly).
+    #[test]
+    fn resolve_strict_routes_fallback_chain() {
+        let _g = with_config_dir();
+        let path = crate::config::config_dir().join("models.toml");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
+        fs::write(
+            &path,
+            "[models.flagship]\nprovider = \"p\"\ncaps = [\"omp\"]\nfallback = \"glm-5.2\"\n",
+        )
+        .expect("write");
+        let reg = ModelRegistry::load_routing().expect("reg");
+        assert_eq!(
+            reg.resolve_strict("flagship", "omp").expect("caps allow"),
+            "p/flagship"
+        );
+        assert_eq!(
+            reg.resolve_strict("flagship", "opencode").expect("fallback"),
+            "zai/glm-5.2",
+            "caps-excluded -> compiled-in fallback routes strictly"
+        );
+        // A fallback pointing at an unknown id stays an error (no bypass).
+        fs::write(
+            &path,
+            "[models.flagship]\nprovider = \"p\"\ncaps = [\"omp\"]\nfallback = \"ghost\"\n",
+        )
+        .expect("rewrite");
+        let reg = ModelRegistry::load_routing().expect("reg");
+        assert!(reg.resolve_strict("flagship", "opencode").is_err());
     }
 }

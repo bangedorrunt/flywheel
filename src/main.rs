@@ -3847,13 +3847,19 @@ fn spawn_items_from_plan(
 /// omp role flags (`--smol`/`--slow`/`--plan`, bd-gsvn.2). Order matters —
 /// flags precede any launch text (peer template) so a one-shot-capable
 /// harness (opencode) does not swallow the flags as a prompt.
-pub(crate) fn profile_launch_args(harness: &str, p: &profile::Profile) -> Vec<String> {
-    let registry = models::ModelRegistry::load().unwrap_or_default();
-    let model = if p.model.is_empty() {
-        String::new()
-    } else {
-        registry.resolve(&p.model, harness)
-    };
+///
+/// STRICT routing (nothing bypasses the registry): profile-sourced model
+/// ids MUST be registry entries — an unknown id, or a harness excluded by
+/// `caps` with no fallback, fails the spawn naming the fix (`flywheel model
+/// add`). The routing registry layers compiled-in defaults under the
+/// user's models.toml. Explicit ad-hoc `--model` strings on the headless
+/// path keep the lenient passthrough.
+pub(crate) fn profile_launch_args(
+    harness: &str,
+    p: &profile::Profile,
+) -> Result<Vec<String>> {
+    let registry = models::ModelRegistry::load_routing()?;
+    let model = registry.resolve_strict(&p.model, harness)?;
     let mut args = headless::model_args(
         harness,
         &model,
@@ -3861,11 +3867,11 @@ pub(crate) fn profile_launch_args(harness: &str, p: &profile::Profile) -> Vec<St
     );
     args.extend(headless::role_model_args(
         harness,
-        &registry.resolve(&p.smol, harness),
-        &registry.resolve(&p.slow, harness),
-        &registry.resolve(&p.plan, harness),
+        &registry.resolve_strict(&p.smol, harness)?,
+        &registry.resolve_strict(&p.slow, harness)?,
+        &registry.resolve_strict(&p.plan, harness)?,
     ));
-    args
+    Ok(args)
 }
 /// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
 #[allow(clippy::too_many_arguments)]
@@ -4106,7 +4112,7 @@ mod spawn_profile_plan_tests {
         )
         .expect("models.toml");
         let p = profile("omp", "deepseek-v4-flash");
-        let args = profile_launch_args("omp", &p);
+        let args = profile_launch_args("omp", &p).expect("launch args");
         assert_eq!(
             args,
             vec!["--model=opencode-go/deepseek-v4-flash"],
@@ -4119,26 +4125,67 @@ mod spawn_profile_plan_tests {
         let _g = lock_env();
         let dir = tempfile::TempDir::new().expect("temp dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+        // Compiled-in routing defaults apply zero-config (no models.toml).
         let p = profile("opencode", "deepseek-v4-flash");
         assert_eq!(
-            profile_launch_args("opencode", &p),
-            vec!["-m", "deepseek-v4-flash"]
+            profile_launch_args("opencode", &p).expect("opencode"),
+            vec!["-m", "opencode-go/deepseek-v4-flash"]
         );
-        let pi = profile("pi", "smol-model");
+        let pi = profile("pi", "glm-5.2");
         assert_eq!(
-            profile_launch_args("pi", &pi),
-            vec!["--model", "smol-model"]
+            profile_launch_args("pi", &pi).expect("pi"),
+            vec!["--model", "zai/glm-5.2"]
         );
         let mut omp = profile("omp", "glm-5.2");
         omp.effort = "max".into();
-        omp.smol = "glm-4.5-air".into();
+        omp.smol = "deepseek-v4-flash".into();
         assert_eq!(
-            profile_launch_args("omp", &omp),
-            vec!["--model=glm-5.2", "--thinking=max", "--smol=glm-4.5-air"]
+            profile_launch_args("omp", &omp).expect("omp"),
+            vec![
+                "--model=zai/glm-5.2",
+                "--thinking=max",
+                "--smol=opencode-go/deepseek-v4-flash"
+            ]
         );
-        let mut unknown = profile("hermes", "x");
+        // Unknown harness injects nothing — but the model must still ROUTE.
+        let mut unknown = profile("hermes", "glm-5.2");
         unknown.effort = "max".into();
-        assert!(profile_launch_args("hermes", &unknown).is_empty());
+        assert!(profile_launch_args("hermes", &unknown)
+            .expect("unknown harness, routable model")
+            .is_empty());
+    }
+
+    /// STRICT routing: a profile model that is NOT a registry id fails the
+    /// launch naming the fix — nothing bypasses the registry (the old
+    /// passthrough spawned broken bare ids).
+    #[test]
+    fn launch_args_fail_loud_on_unregistered_model() {
+        let _g = lock_env();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+        let p = profile("omp", "totally-unknown-model");
+        let err = profile_launch_args("omp", &p).expect_err("unknown id must fail");
+        assert!(
+            err.to_string().contains("flywheel model add"),
+            "error names the fix: {err}"
+        );
+        // big-pickle is opencode-only (free there alone): omp is refused.
+        let bp = profile("omp", "big-pickle");
+        let err = profile_launch_args("omp", &bp).expect_err("caps must refuse omp");
+        assert!(
+            err.to_string().contains("not routable"),
+            "caps exclusion is an error: {err}"
+        );
+        // ...and routes on its capped harness.
+        assert_eq!(
+            profile_launch_args("opencode", &profile("opencode", "big-pickle"))
+                .expect("capped harness ok"),
+            vec!["-m", "opencode/big-pickle"]
+        );
+        // A role model (smol) is held to the same standard.
+        let mut role = profile("omp", "deepseek-v4-flash");
+        role.smol = "ghost-role".into();
+        assert!(profile_launch_args("omp", &role).is_err());
     }
 
     #[test]
@@ -4147,9 +4194,12 @@ mod spawn_profile_plan_tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
         let p = profile("opencode", "deepseek-v4-flash");
-        let mut args = profile_launch_args("opencode", &p);
+        let mut args = profile_launch_args("opencode", &p).expect("launch args");
         args.extend(vec!["peer template".to_string()]);
-        assert_eq!(args, vec!["-m", "deepseek-v4-flash", "peer template"]);
+        assert_eq!(
+            args,
+            vec!["-m", "opencode-go/deepseek-v4-flash", "peer template"]
+        );
     }
 
     #[test]
@@ -4221,7 +4271,7 @@ mod profile_run_spawn_tests {
         // `spawn --profile coder` — model + effort, never an empty arg list.
         let mut coder = profile("omp", "glm-5.2");
         coder.effort = "max".into();
-        let args = profile_launch_args("omp", &coder);
+        let args = profile_launch_args("omp", &coder).expect("launch args");
         assert!(
             !args.is_empty(),
             "known profile must inject model/effort args"
@@ -4436,6 +4486,13 @@ mod internal_respawn_tests {
             "[profiles.omp-coder]\nharness = \"omp\"\nmodel = \"glm-5.2\"\neffort = \"max\"\nsmol = \"glm-4.5-air\"\n",
         )
         .expect("profiles.toml");
+        // The role model is a USER registry entry (layered over the
+        // compiled-in defaults) — respawn must route through both.
+        std::fs::write(
+            dir.path().join("config/flywheel/models.toml"),
+            "[models.\"glm-4.5-air\"]\nprovider = \"zai\"\n",
+        )
+        .expect("models.toml");
     }
 
     fn agent(name: &str, pane: &str, ws: &str, status: AgentStatus) -> AgentInfo {
@@ -5788,7 +5845,7 @@ projects available: {}",
                     let p = catalog
                         .get(pname)
                         .expect("profile resolved at plan build (bd-eign.13)");
-                    profile_launch_args(&kind, p)
+                    profile_launch_args(&kind, p)?
                 }
                 None => vec![],
             };
@@ -6433,6 +6490,46 @@ mod peer_encoding_tests {
             "--model opencode-go/deepseek-v4-flash".to_string(),
         ])
         .expect("ASCII args pass");
+    }
+
+    /// Toron projection has no read-state: `unread_only` is a documented
+    /// no-op. The launch template must poll by `since_ts` high-water and
+    /// must not teach unread as a working filter.
+    fn teaches_unread_filter(s: &str) -> bool {
+        s.contains("unread_only=true")
+            || s.contains("unread_only = true")
+            || s.contains("unread_only: true")
+            || s.contains("unread_only,")
+            || s.contains("(unread_only")
+    }
+
+    #[test]
+    fn peer_template_polls_since_ts_not_unread() {
+        let tpl = real_template();
+        assert!(
+            !teaches_unread_filter(&tpl),
+            "peer-aware template must not teach unread as a working filter"
+        );
+        assert!(
+            tpl.contains("since_ts"),
+            "peer-aware template must teach since_ts high-water"
+        );
+        let rendered = peer_prompt_template(
+            &tpl,
+            "flywheel-toron-coder1",
+            "DustySparrow",
+            5,
+            30,
+            3,
+        );
+        assert!(
+            !teaches_unread_filter(&rendered),
+            "rendered launch prompt must not teach unread as a working filter"
+        );
+        assert!(
+            rendered.contains("since_ts"),
+            "rendered launch prompt must mention since_ts"
+        );
     }
 }
 
@@ -15391,11 +15488,8 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             // Spawn via the configured multiplexer backend (default herdr).
             let backend = backend::multiplexer_backend(cfg)?;
             let agent_name = format!("profile-{name}");
-            // bd-l2ky: launch with the profile's model/effort args — the
-            // same profile_launch_args as `spawn --profile` (bd-eign.9),
-            // never an empty arg list.
             let profile = cat.get(name).expect("resolve validated the profile above");
-            let args = profile_launch_args(&spec.harness, profile);
+            let args = profile_launch_args(&spec.harness, profile)?;
             // Find a pane in the default project workspace, or create one.
             let workspace = resolved_spec_workspace(cfg, backend.as_ref(), &spec.harness)?;
             let info = backend.agent_start(&agent_name, &spec.harness, &workspace, &args)?;
@@ -16166,7 +16260,7 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
                 for i in 0..n {
                     let agent_name = format!("squad-{name}-{profile_name}-{}", i + 1);
                     let workspace = resolved_spec_workspace(cfg, backend.as_ref(), &spec.harness)?;
-                    let args = profile_launch_args(&spec.harness, profile);
+                    let args = profile_launch_args(&spec.harness, profile)?;
                     let info =
                         backend.agent_start(&agent_name, &spec.harness, &workspace, &args)?;
                     // bd-l2ky: record the profiled entry so __send --profile
@@ -16514,7 +16608,8 @@ fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
 fn cmd_models(cmd: &ModelCmd) -> Result<()> {
     match cmd {
         ModelCmd::List { json } => {
-            let reg = models::ModelRegistry::load()?;
+            let user = models::ModelRegistry::load()?;
+            let reg = models::ModelRegistry::load_routing()?;
             let rows: Vec<Value> = reg
                 .models
                 .iter()
@@ -16526,6 +16621,7 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                         "cost_out_per_mtok": e.cost_out_per_mtok,
                         "caps": e.caps,
                         "fallback": e.fallback,
+                        "builtin": !user.models.contains_key(id),
                     })
                 })
                 .collect();
@@ -16552,7 +16648,7 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
             Ok(())
         }
         ModelCmd::Show { id } => {
-            let reg = models::ModelRegistry::load()?;
+            let reg = models::ModelRegistry::load_routing()?;
             match reg.get(id) {
                 Some(e) => print_json(&json!({
                     "id": id,
@@ -19732,10 +19828,17 @@ fn respawn_launch_args(cfg: &Config, project: &str, name: &str, kind: &str) -> V
     let Ok(catalog) = profile::ProfileCatalog::load() else {
         return Vec::new();
     };
-    catalog
-        .get(&profile_name)
-        .map(|p| profile_launch_args(kind, p))
-        .unwrap_or_default()
+    match catalog.get(&profile_name).map(|p| profile_launch_args(kind, p)) {
+        Some(Ok(args)) => args,
+        Some(Err(e)) => {
+            eprintln!(
+                "flywheel: respawn of '{name}' profile '{profile_name}' failed model routing \
+                 (bare launch, harness default model): {e}"
+            );
+            Vec::new()
+        }
+        None => Vec::new(),
+    }
 }
 
 /// internal leaf (ADR-0010 Spec E, P10.1): run one prompt headlessly through
@@ -19792,41 +19895,35 @@ fn cmd_internal_run_headless(
         bail!("unsupported harness for headless run: {harness} (pi | omp | opencode | grok)");
     }
     // Model resolution (P10.2): the effective id (flag override or the
-    // profile's), then the registry's per-harness injection form. Unknown
-    // ids warn + pass through — a run never blocks on the registry.
+    // profile's), then the routing registry's per-harness injection form.
+    // STRICT split: a PROFILE-sourced id must be a registry entry (nothing
+    // bypasses the registry); an EXPLICIT --model override is an ad-hoc
+    // operator string and keeps the lenient warn + passthrough.
     let model_id = model_override
         .or_else(|| (!profile.model.is_empty()).then_some(profile.model.as_str()))
         .unwrap_or("")
         .to_string();
-    let registry = models::ModelRegistry::load()?;
+    let registry = models::ModelRegistry::load_routing()?;
     let model = if model_id.is_empty() {
         String::new()
-    } else {
+    } else if model_override.is_some() {
         if registry.get(&model_id).is_none() {
             eprintln!(
                 "flywheel: model {model_id:?} not in registry (flywheel model add) — passing through"
             );
         }
         registry.resolve(&model_id, harness)
+    } else {
+        registry.resolve_strict(&model_id, harness)?
     };
 
     // bd-gsvn.2: the omp role models (--smol/--slow/--plan) resolve through
-    // the registry the same way as `model` (provider/id form for omp); an
-    // unknown role id passes through verbatim, never blocking the run.
-    let resolve_role = |id: &str| -> String {
-        if id.is_empty() {
-            return String::new();
-        }
-        if registry.get(id).is_none() {
-            eprintln!(
-                "flywheel: role model {id:?} not in registry (flywheel model add) — passing through"
-            );
-        }
-        registry.resolve(id, harness)
-    };
-    let role_smol = resolve_role(&profile.smol);
-    let role_slow = resolve_role(&profile.slow);
-    let role_plan = resolve_role(&profile.plan);
+    // the registry the same way as `model` (provider/id form for omp) —
+    // profile-sourced, so STRICT: an unknown role id fails the run naming
+    // the fix (no silent verbatim passthrough).
+    let role_smol = registry.resolve_strict(&profile.smol, harness)?;
+    let role_slow = registry.resolve_strict(&profile.slow, harness)?;
+    let role_plan = registry.resolve_strict(&profile.plan, harness)?;
 
     // bd-42fs retry-on-429: a rate-limited run (HTTP 429 in the harness
     // error stream or stderr) retries ONCE with the model's registry
@@ -21019,7 +21116,7 @@ fn cmd_internal_verify_dispatch(
     } else {
         verdict::AcShape::Checkable
     };
-    let reg = match crate::models::ModelRegistry::load() {
+    let reg = match crate::models::ModelRegistry::load_routing() {
         Ok(r) => r,
         Err(e) => {
             eprintln!(

@@ -454,7 +454,7 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
         (
             "scout",
             Profile {
-                harness: "omp".into(),
+                harness: "opencode".into(),
                 model: "big-pickle".into(),
                 effort: "low".into(),
                 role: "scout".into(),
@@ -493,7 +493,7 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
             "pa",
             Profile {
                 harness: "pa".into(),
-                model: "opencode-go/deepseek-v4-flash".into(),
+                model: "deepseek-v4-flash".into(),
                 effort: "medium".into(),
                 role: "coder".into(),
                 task_hint: "RLM coding agent with built-in herdr lifecycle reporting".into(),
@@ -627,7 +627,7 @@ model = "deepseek-v3"
         // Layered: the built-in still exists, with the user's model override.
         let s = cat.get("scout").expect("scout present");
         assert_eq!(s.model, "deepseek-v3");
-        assert_eq!(s.harness, "omp", "built-in harness preserved");
+        assert_eq!(s.harness, "opencode", "built-in harness preserved");
     }
 
     /// bd-gsvn.2: the omp role-model fields (smol/slow/plan) layer over the

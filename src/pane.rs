@@ -591,10 +591,11 @@ pub fn spawn_launch_plan(
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let args = catalog
-        .get(&profile)
-        .map(|p| crate::profile_launch_args(&harness, p))
-        .unwrap_or_default();
+    let args = match catalog.get(&profile) {
+        Some(p) => crate::profile_launch_args(&harness, p)
+            .map_err(|e| anyhow::anyhow!("spawn plan '{profile}' model routing: {e}"))?,
+        None => Vec::new(),
+    };
     Ok(SpawnJobLaunch {
         promise_id: promise_id.to_string(),
         profile,
