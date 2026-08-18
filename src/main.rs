@@ -747,6 +747,10 @@ enum Commands {
         project: String,
         bead_id: String,
         title: String,
+        /// bd-bead-create-contract-lint-4tdd: exact block reason carried
+        /// in the mail body (principles_block_reason / the fence error).
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// internal: close-detect check (ADR-0019, bd-w1-reopen-f6tw) — SHA
     /// rule + ledger; legal/missing/no-commit verdict for the loop
@@ -1075,6 +1079,14 @@ enum WorkCmd {
     Plan,
     /// br ready --json: ready beads
     Ready,
+    /// bd-bead-create-contract-lint-4tdd: creation-time contract check —
+    /// runs the EXACT loop parsers (verify fence + PRINCIPLES for P<=2)
+    /// over the ready set and reports per-bead block reasons with the
+    /// corrected snippet. Exit non-zero when any bead is not dispatchable.
+    Check {
+        /// project dir to run `br ready` in (default: current directory)
+        project: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -9078,9 +9090,85 @@ fn cmd_work(cfg: &Config, cmd: &WorkCmd) -> Result<()> {
             let v = bv.br_json(&["ready"])?;
             print_json(&v);
         }
+        WorkCmd::Check { project } => cmd_work_check(cfg, project.as_deref())?,
     }
     let _ = cfg;
     Ok(())
+}
+
+fn cmd_work_check(cfg: &Config, project: Option<&str>) -> Result<()> {
+    // bd-bead-create-contract-lint-4tdd: creation-time contract check —
+    // the EXACT loop parsers over the ready set (parse_verify_fence +
+    // principles_block_reason via not_ready_reason), per-bead report with
+    // the corrected snippet. Non-zero exit when any bead is not
+    // dispatchable, so planner lanes can gate "beads created" on it.
+    let dir = match project {
+        Some(p) => project_dir(cfg, p),
+        None => std::env::current_dir()?,
+    };
+    let out = std::process::Command::new("br")
+        .args(["ready", "--json"])
+        .current_dir(&dir)
+        .output()
+        .map_err(|e| anyhow!("br ready: {e}"))?;
+    if !out.status.success() {
+        bail!(
+            "br ready failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| anyhow!("br ready --json parse: {e}"))?;
+    let ready = crate::durable::parse_bead_list(&v, "br ready")?;
+    // The check runs the EXACT loop parsers over each bead's raw
+    // description (parse_verify_fence + the PRINCIPLES section check) —
+    // fetch descriptions per bead; the ready set is small.
+    let mut issues: Vec<crate::durable::BeadContractIssue> = Vec::new();
+    for b in &ready {
+        let desc = bead_description(&dir, &b.id);
+        if let Some(issue) = crate::durable::contract_issue(b, &desc) {
+            issues.push(issue);
+        }
+    }
+    if issues.is_empty() {
+        println!("work check: {} ready beads, all dispatchable", ready.len());
+        return Ok(());
+    }
+    for i in &issues {
+        println!("BLOCK {} — {}", i.id, i.reason);
+        println!("      fix: {}", i.fix);
+    }
+    bail!(
+        "work check: {} of {} ready beads not dispatchable",
+        issues.len(),
+        ready.len()
+    );
+}
+
+/// The raw description of a bead via `br show <id> --json` (empty on any
+/// failure — a missing description only yields the fence/PRINCIPLES
+/// verdicts the ready JSON already expresses).
+fn bead_description(dir: &std::path::Path, id: &str) -> String {
+    let Ok(out) = std::process::Command::new("br")
+        .args(["show", id, "--json"])
+        .current_dir(dir)
+        .output()
+    else {
+        return String::new();
+    };
+    if !out.status.success() {
+        return String::new();
+    }
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .ok()
+        .and_then(|v| {
+            v.as_array()
+                .and_then(|a| a.first())
+                .and_then(|b| b.get("description"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
 }
 
 fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&str>) -> Result<()> {
@@ -10440,7 +10528,11 @@ mod wake_identity_tests {
         let dir = project_dir(&cfg, project);
 
         let mut pins: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let slugs = ["flywheel-toron-oc", "flywheel-toron-oc2", "flywheel-toron-oc3"];
+        let slugs = [
+            "flywheel-toron-oc",
+            "flywheel-toron-oc2",
+            "flywheel-toron-oc3",
+        ];
         for (i, slug) in slugs.iter().enumerate() {
             let pane = format!("w7:p{}", i + 1);
             let pin = register_spawned_agent(&cfg, project, slug, "opencode", &pane)

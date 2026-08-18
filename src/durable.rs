@@ -278,6 +278,67 @@ pub fn principles_block_reason(b: &ReadyBead) -> Option<String> {
     }
 }
 
+/// bd-bead-create-contract-lint-4tdd: the not-ready REASON for a bead —
+/// the loop's exact dispatch decision (partition_ready), named. `None` =
+/// dispatchable. Fence failures name the gate; PRINCIPLES failures carry
+/// the exact `check_principles` reason (the 2026-08-17 mislabel class).
+pub fn not_ready_reason(b: &ReadyBead) -> Option<String> {
+    if b.verify.is_none() {
+        return Some("missing/malformed ## VERIFY fence".to_string());
+    }
+    principles_block_reason(b)
+}
+
+/// bd-bead-create-contract-lint-4tdd: one bead's contract verdict for the
+/// creation-time check — the block reason + the corrected snippet. Takes
+/// the raw description (the loop's exact parsers run over it) so the
+/// report distinguishes a missing heading from a malformed/multi-line
+/// fence and a bare `PRINCIPLES` heading from a truly absent section.
+pub struct BeadContractIssue {
+    pub id: String,
+    pub reason: String,
+    pub fix: String,
+}
+
+/// The corrected snippet for a blocked bead: name the exact edit — the
+/// `## VERIFY` fence block, the bare-`PRINCIPLES` heading fix, or the
+/// canonical-name guidance for a citation failure.
+fn contract_fix(description: &str, reason: &str) -> String {
+    let lines: Vec<&str> = description.lines().map(str::trim).collect();
+    if !lines.contains(&"## VERIFY") {
+        return "add `## VERIFY` plus one fenced single-line command to the description"
+            .to_string();
+    }
+    if reason.starts_with("PRINCIPLES is required") && lines.contains(&"PRINCIPLES") {
+        return "bare `PRINCIPLES` heading — write `## PRINCIPLES`".to_string();
+    }
+    "see reason (canonical names via `flywheel principles list`)".to_string()
+}
+
+/// The contract verdict of one ready bead (with its raw description):
+/// `None` = dispatchable.
+pub fn contract_issue(b: &ReadyBead, description: &str) -> Option<BeadContractIssue> {
+    if b.verify.is_none() {
+        let has_heading = description.lines().any(|l| l.trim() == "## VERIFY");
+        let reason = if has_heading {
+            "## VERIFY fence is malformed (must be ONE fenced command on a single line)"
+        } else {
+            "missing ## VERIFY fence (a `## VERIFY` heading + one fenced single-line command)"
+        };
+        return Some(BeadContractIssue {
+            id: b.id.clone(),
+            reason: reason.to_string(),
+            fix: "add `## VERIFY` plus one fenced single-line command to the description"
+                .to_string(),
+        });
+    }
+    principles_block_reason(b).map(|reason| BeadContractIssue {
+        id: b.id.clone(),
+        fix: contract_fix(description, &reason),
+        reason,
+    })
+}
+
 /// Extract the `## PRINCIPLES` section from a bead description (bd-4spn):
 /// everything after the exact `## PRINCIPLES` heading until the next `## `
 /// heading or EOF, trimmed. Absent -> empty string.
@@ -334,12 +395,19 @@ pub fn wave_gate_held(ready: &[ReadyBead], inprogress: &[ReadyBead]) -> Vec<Stri
 
 /// Args for the `__mail-not-ready` leaf (ADR-0019): tell the planner a
 /// ready bead is NOT dispatchable because its `## VERIFY` fence is
-/// missing/malformed. The loop mails at most once per bead per invocation.
+/// missing/malformed (or its PRINCIPLES section is incomplete — bd-4spn).
+/// The loop mails at most once per bead per invocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotReadyMailArgs {
     pub project: String,
     pub bead_id: String,
     pub title: String,
+    /// bd-bead-create-contract-lint-4tdd: the exact block reason
+    /// (`principles_block_reason` / the fence error) — carried in the mail
+    /// body, not just stderr. The 2026-08-17 mislabeled-log class ended
+    /// with a generic body + a wrong parser hunt.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// Checkpointed leaf — mail the planner that bead `bead_id` is NOT ready
@@ -356,6 +424,9 @@ async fn mail_not_ready(args: NotReadyMailArgs) -> Result<Value> {
         &args.bead_id,
         &args.title,
     ]);
+    if let Some(reason) = &args.reason {
+        cmd.args(["--reason", reason]);
+    }
     let out = run_leaf_cmd(cmd, "__mail-not-ready").await?;
     if !out.status.success() {
         return Err(map_err(anyhow::anyhow!(
@@ -1206,7 +1277,7 @@ async fn poll_ready(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
 /// and `__inprogress` (id/title/assignee) into `ReadyBead` rows. Pure —
 /// bd-87hq regression pin: the producer emitters (cmd_internal_ready /
 /// cmd_internal_inprogress in main.rs) and this consumer must never drift.
-fn parse_bead_list(v: &serde_json::Value, what: &str) -> anyhow::Result<Vec<ReadyBead>> {
+pub(crate) fn parse_bead_list(v: &serde_json::Value, what: &str) -> anyhow::Result<Vec<ReadyBead>> {
     let beads = v
         .get("beads")
         .and_then(serde_json::Value::as_array)
@@ -3999,20 +4070,19 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // legal VERIFY fence; tell the planner why, on the bead's thread.
             for bead in &not_ready {
                 if not_ready_mailed.insert(bead.id.clone()) {
+                    // bd-bead-create-contract-lint-4tdd: the EXACT reason
+                    // (fence error / principles_block_reason) rides in the
+                    // mail body — the 2026-08-17 hardcoded "(no legal VERIFY
+                    // fence)" mislabeled PRINCIPLES-gated P<=2 beads and
+                    // sent the captain chasing the wrong parser.
+                    let reason = not_ready_reason(bead)
+                        .unwrap_or_else(|| "not dispatchable (see loop)".to_string());
                     let args = NotReadyMailArgs {
                         project: params.project.clone(),
                         bead_id: bead.id.clone(),
                         title: bead.title.clone(),
+                        reason: Some(reason.clone()),
                     };
-                    // The eprintln names the ACTUAL gate that blocked the
-                    // bead (2026-08-17: a hardcoded "(no legal VERIFY
-                    // fence)" mislabeled PRINCIPLES-gated P<=2 beads, which
-                    // wasted a captain session diagnosing the wrong parser).
-                    let reason = bead
-                        .verify
-                        .as_ref()
-                        .map(|_| "PRINCIPLES gate (P<=2 missing ## PRINCIPLES section)")
-                        .unwrap_or("missing/malformed ## VERIFY fence");
                     match ctx.run(mail_not_ready, args).await {
                         Ok(v) => eprintln!(
                             "flywheel: bead {} NOT ready ({reason}) — planner mailed: {v}",
@@ -9287,6 +9357,141 @@ Dependencies:
             principles_block_reason(&rb("bd-v", 2, "prove-it-works — wired the gate")).is_none(),
             "complete citation passes"
         );
+    }
+
+    /// bd-bead-create-contract-lint-4tdd: the creation-time contract check
+    /// reports the EXACT reason + corrected snippet for each block class:
+    /// bare `PRINCIPLES` heading (missing `##`), missing `## VERIFY` fence,
+    /// malformed/multi-line fence, unknown principle name — and passes a
+    /// fully-compliant set (P3 exempt).
+    #[test]
+    fn contract_check_reports_exact_reason_and_fix() {
+        let rb = |id: &str, priority: u8, verify: Option<&str>, desc: &str| ReadyBead {
+            id: id.into(),
+            title: String::new(),
+            assignee: None,
+            priority,
+            principles: parse_principles_field(desc),
+            verify: verify.map(str::to_string),
+            labels: Vec::new(),
+        };
+        // Bare `PRINCIPLES` (no `##`) on a P2 → the exact missing-heading fix.
+        let bare_desc =
+            "goal\n\nPRINCIPLES\nprove-it-works — x.\n\n## VERIFY\n```\ncargo test x\n```";
+        let bare = rb("bd-bare", 2, Some("true"), bare_desc);
+        let issue = contract_issue(&bare, bare_desc).expect("bare PRINCIPLES blocks");
+        assert!(
+            issue.reason.contains("PRINCIPLES is required"),
+            "reason: {}",
+            issue.reason
+        );
+        assert_eq!(
+            issue.fix,
+            "bare `PRINCIPLES` heading — write `## PRINCIPLES`"
+        );
+
+        // Missing ## VERIFY fence.
+        let nofence = rb(
+            "bd-nofence",
+            2,
+            None,
+            "goal\n\n## PRINCIPLES\nprove-it-works — x.",
+        );
+        let issue2 = contract_issue(&nofence, "goal\n\n## PRINCIPLES\nprove-it-works — x.")
+            .expect("missing fence blocks");
+        assert!(
+            issue2.reason.contains("missing ## VERIFY fence"),
+            "reason: {}",
+            issue2.reason
+        );
+        assert!(issue2.fix.contains("## VERIFY"), "fix: {}", issue2.fix);
+
+        // Malformed/multi-line fence: heading present, fence not single-line
+        // (br's parse yields `verify: None` for that shape).
+        let multi = rb(
+            "bd-multi",
+            2,
+            None,
+            "## VERIFY\n```\ncargo test a\ncargo test b\n```",
+        );
+        let issue3 = contract_issue(&multi, "## VERIFY\n```\ncargo test a\ncargo test b\n```")
+            .expect("multi-line fence blocks");
+        assert!(
+            issue3.reason.contains("malformed"),
+            "reason: {}",
+            issue3.reason
+        );
+
+        // Unknown principle name.
+        let unknown = rb(
+            "bd-unk",
+            2,
+            Some("true"),
+            "## PRINCIPLES\nnot-a-principle — changed x.",
+        );
+        let issue4 = contract_issue(&unknown, "## PRINCIPLES\nnot-a-principle — changed x.")
+            .expect("unknown name blocks");
+        assert!(
+            issue4.reason.contains("unknown principle name"),
+            "reason: {}",
+            issue4.reason
+        );
+
+        // Fully compliant P2 + P3-with-no-principles → dispatchable.
+        let ok_desc = "goal\n\n## PRINCIPLES\nprove-it-works — wired the gate.\n\n## VERIFY\n```\ncargo test x\n```";
+        assert!(
+            contract_issue(&rb("bd-ok", 2, Some("true"), ok_desc), ok_desc).is_none(),
+            "compliant P2 passes"
+        );
+        assert!(
+            contract_issue(&rb("bd-p3", 3, Some("true"), "goal"), "goal").is_none(),
+            "P3 empty PRINCIPLES is exempt"
+        );
+    }
+
+    /// bd-bead-create-contract-lint-4tdd: the planner-mail reason must be
+    /// the EXACT `principles_block_reason` / fence-error string, not a
+    /// generic label (the 2026-08-17 mislabel class).
+    #[test]
+    fn not_ready_reason_carries_exact_block_string() {
+        let rb = |id: &str, priority: u8, verify: Option<&str>, principles: &str| ReadyBead {
+            id: id.into(),
+            title: String::new(),
+            assignee: None,
+            priority,
+            principles: principles.into(),
+            verify: verify.map(str::to_string),
+            labels: Vec::new(),
+        };
+        let nameonly = rb("bd-n", 2, Some("true"), "prove-it-works");
+        assert_eq!(
+            not_ready_reason(&nameonly).as_deref(),
+            principles_block_reason(&nameonly).as_deref(),
+            "P<=2 reason must be the exact check_principles string"
+        );
+        let nofence = rb("bd-f", 2, None, "");
+        let r = not_ready_reason(&nofence).expect("fence blocks");
+        assert!(r.contains("## VERIFY"), "fence reason names the gate: {r}");
+    }
+
+    /// bd-bead-create-contract-lint-4tdd: the checkpointed mail args carry
+    /// the reason across the durable boundary (serde round-trip).
+    #[test]
+    fn not_ready_mail_args_carry_reason() {
+        let args = NotReadyMailArgs {
+            project: "p".into(),
+            bead_id: "bd-1".into(),
+            title: "t".into(),
+            reason: Some("PRINCIPLES is required for priority <= 2 beads".into()),
+        };
+        let json = serde_json::to_string(&args).expect("serialize");
+        let back: NotReadyMailArgs = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.reason.as_deref(), args.reason.as_deref());
+        // legacy args (no reason) still deserialize.
+        let legacy: NotReadyMailArgs =
+            serde_json::from_str(r#"{"project":"p","bead_id":"bd-1","title":"t"}"#)
+                .expect("legacy args deserialize");
+        assert!(legacy.reason.is_none());
     }
 
     /// The `## PRINCIPLES` section extractor: everything after the exact
