@@ -4990,6 +4990,96 @@ mod workspace_origin_tests {
     }
 }
 
+#[cfg(test)]
+mod spawn_boot_reliability_tests {
+    use super::*;
+
+    // bd-spawn-omp-boot-reliability-3h06: spawn must verify the LIVE agent
+    // process (pane_agent_alive), not the launch_pending flag, and recover a
+    // shell-fallback pane (re-launch + re-prime) or FAIL — never declare the
+    // swarm ready with a dead shell that looks like an agent. Code-pointer
+    // gate: cmd_spawn must (a) call verify_or_respawn_pane AFTER the prime,
+    // (b) bail when recovery is exhausted, (c) run the final dead_panes gate
+    // before "swarm ready"; the helper must probe pane_agent_alive and
+    // re-launch via agent_start (start_agent_with_retry would short-circuit
+    // on the registered-but-dead agent).
+    #[test]
+    fn spawn_verifies_live_process_and_recovers_or_fails() {
+        let src = include_str!("main.rs");
+        // rfind: the gate's own source contains the same string literals —
+        // the LAST occurrence is the real definition (the test module sits
+        // above the functions it gates).
+        let spawn = src.rfind("fn cmd_spawn(").expect("cmd_spawn present");
+        let spawn_body = &src[spawn..];
+        let helper = src
+            .rfind("fn verify_or_respawn_pane(")
+            .expect("helper present");
+        let helper_body = &src[helper..];
+
+        // (a) the post-boot verify runs after the prime, inside cmd_spawn
+        assert!(
+            spawn_body
+                .find("verify_or_respawn_pane(")
+                .expect("verify call in cmd_spawn")
+                > spawn_body
+                    .find("prime_via_send_text(&mut c, &pane_id)")
+                    .expect("prime call in cmd_spawn"),
+            "cmd_spawn must verify the live process AFTER priming (bd-spawn-omp-boot-reliability-3h06)"
+        );
+        // (b) exhaustion fails the spawn (never declare ready)
+        assert!(
+            spawn_body.contains("no live agent process after spawn + recovery"),
+            "cmd_spawn must bail when recovery is exhausted (bd-spawn-omp-boot-reliability-3h06)"
+        );
+        // (c) the final process gate runs before swarm ready
+        let swarm = spawn_body
+            .find("swarm ready: flywheel")
+            .expect("swarm-ready println in cmd_spawn");
+        let gate = spawn_body
+            .find("dead_panes(&booted")
+            .expect("final dead_panes gate in cmd_spawn");
+        assert!(
+            gate < swarm,
+            "the final process gate must run BEFORE 'swarm ready' (bd-spawn-omp-boot-reliability-3h06)"
+        );
+        // (d) the helper asserts pane_agent_alive, never launch_pending
+        assert!(
+            helper_body.contains("pane_agent_alive"),
+            "verify_or_respawn_pane must probe the LIVE process via pane_agent_alive"
+        );
+        assert!(
+            helper_body.contains("c.agent_start(name, kind, pane_id, 45_000, args)"),
+            "verify_or_respawn_pane must re-launch via agent.start (not the registry short-circuit)"
+        );
+        assert!(
+            helper_body.contains("pane_send_input(pane_id, &[\"CTRL_C\"])"),
+            "verify_or_respawn_pane must cancel a partial command before re-typing the launch"
+        );
+    }
+
+    // bd-spawn-omp-boot-reliability-3h06: the final gate's pure verdict —
+    // only panes with a confirmed live process pass; a dead process, an
+    // inconclusive probe, and a probe error all count as dead.
+    #[test]
+    fn dead_panes_flags_everything_but_confirmed_live() {
+        let booted: Vec<(String, String, String)> = vec![
+            ("w1:p1".into(), "a".into(), "omp".into()),
+            ("w1:p2".into(), "b".into(), "omp".into()),
+            ("w1:p3".into(), "c".into(), "omp".into()),
+            ("w1:p4".into(), "d".into(), "omp".into()),
+        ];
+        let probes = |pane: &str, _kind: &str| match pane {
+            "w1:p1" => Some(true),  // live
+            "w1:p2" => Some(false), // shell fallback
+            "w1:p3" => None,        // inconclusive
+            _ => None,              // probe error (e.g. pane gone)
+        };
+        let dead = dead_panes(&booted, probes);
+        let dead_ids: Vec<&str> = dead.iter().map(|(p, _, _)| p.as_str()).collect();
+        assert_eq!(dead_ids, vec!["w1:p2", "w1:p3", "w1:p4"]);
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
 /// bd-bug-omp-herdr-wedge: harnesses whose herdr integration holds FULL
 /// lifecycle-hook authority (herdr skips screen/process detection for them)
@@ -5219,6 +5309,115 @@ impl Default for SpawnOpts {
             profile_count: 1,
         }
     }
+}
+
+/// bd-spawn-omp-boot-reliability-3h06: post-boot dead-shell verification for
+/// one spawned pane — assert the LIVE agent process (`pane_agent_alive`),
+/// never the herdr `launch_pending` flag. A pane can leave the launch window
+/// with `launch_pending=false` and still be a plain shell: the launch
+/// command was mangled by the booting shell and the agent never started;
+/// herdr reports the pane idle and it LOOKS like an agent until a send
+/// fails (2026-08-17 w70: p4/p5 plain shells, only p1 TUI'd).
+///
+/// A shell-fallback pane is recovered within `budget`: cancel any partial
+/// command (the booting shell may be parked at the PS2 continuation prompt),
+/// re-launch into the SAME pane (`agent.start` re-types the launch command —
+/// `start_agent_with_retry` would short-circuit on the registered-but-dead
+/// agent), re-run the bd-eign.6 foreground gate, and re-prime. Returns
+/// `Ok(true)` once the process is live; `Ok(false)` when the budget is
+/// exhausted — the caller must NOT declare the swarm ready.
+fn verify_or_respawn_pane(
+    c: &mut Client,
+    pane_id: &str,
+    name: &str,
+    kind: &str,
+    args: &[String],
+    prime: bool,
+    budget: Duration,
+) -> Result<bool> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut attempts = 0;
+    loop {
+        // Phase 1: bounded grace for a late boot (the process may still be
+        // finishing past the settle window — never re-launch a healthy TUI).
+        let grace = std::time::Instant::now() + Duration::from_secs(20);
+        let mut live = false;
+        while std::time::Instant::now() < grace && std::time::Instant::now() < deadline {
+            let verdict = herdr_shim::pane_process_info(c, pane_id)
+                .map(|pi| herdr_shim::pane_agent_alive(&pi, kind))
+                .unwrap_or(None);
+            if verdict == Some(true) {
+                live = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2000));
+        }
+        if live {
+            if attempts > 0 {
+                eprintln!(
+                    "flywheel: {name} ({pane_id}) recovered after {} re-launch(es)",
+                    attempts
+                );
+            }
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "flywheel: {name} ({pane_id}) has no live agent process after spawn + {attempts} re-launch(es) within the {:.0}s budget — the pane is a dead shell",
+                budget.as_secs_f32()
+            );
+            return Ok(false);
+        }
+        attempts += 1;
+        eprintln!(
+            "flywheel: {name} ({pane_id}) is a shell-fallback pane (no live agent process, bd-spawn-omp-boot-reliability-3h06) — re-launching (attempt {attempts})"
+        );
+        // Cancel any partial command before re-typing the launch. Safe only
+        // when the SHELL owns the foreground (pane_agent_alive == Some(false)
+        // requires the shell to own the fg group): no agent is running, so
+        // Ctrl+C cannot interrupt a TUI.
+        if let Some(pi) = herdr_shim::pane_process_info(c, pane_id).ok()
+            && herdr_shim::pane_agent_alive(&pi, kind) == Some(false)
+        {
+            let _ = c.pane_send_input(pane_id, &["CTRL_C"]);
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        // Re-launch into the SAME pane. Direct agent.start (not
+        // start_agent_with_retry): herdr still lists the dead agent, so the
+        // registry short-circuit would no-op instead of re-typing the launch.
+        match c.agent_start(name, kind, pane_id, 45_000, args) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "flywheel: re-launch of {name} ({pane_id}) attempt {attempts} failed: {e:#}"
+                );
+            }
+        }
+        // bd-eign.6 L1: readiness gate again (the TUI owns the foreground
+        // exactly when it is input-ready).
+        let _ = herdr_shim::wait_agent_foreground(c, pane_id, kind, name, Duration::from_secs(15));
+        // H2 / bd-umb3: re-prime (peer templates are their own prime; never
+        // stack).
+        if prime {
+            prime_via_send_text(c, pane_id);
+        }
+    }
+}
+
+/// bd-spawn-omp-boot-reliability-3h06: which spawned panes lack a live agent
+/// process right now? Pure verdict from a probe map — the final pre-"swarm
+/// ready" gate (a pane whose process died after its per-pane verification —
+/// during later panes' spawn — must fail the spawn loudly, never masquerade
+/// as ready). A probe that errors or returns `None` counts as dead
+/// (never declare ready on inconclusive evidence).
+fn dead_panes(
+    booted: &[(String, String, String)],
+    mut probes: impl FnMut(&str, &str) -> Option<bool>,
+) -> Vec<&(String, String, String)> {
+    booted
+        .iter()
+        .filter(|(pane_id, _name, kind)| probes(pane_id, kind) != Some(true))
+        .collect()
 }
 
 fn cmd_spawn(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
@@ -5451,6 +5650,9 @@ projects available: {}",
     );
 
     let mut spawned: Vec<Value> = Vec::new();
+    // bd-spawn-omp-boot-reliability-3h06: (pane_id, name, kind) of every
+    // booted pane — the final pre-"swarm ready" process gate re-probes these.
+    let mut booted: Vec<(String, String, String)> = Vec::new();
     // bd-fw-name-binding-loss-7rc: pane→name pairs for the spawn registry.
     let mut registry: Vec<state::SpawnEntry> = Vec::new();
     let mut prev = root.pane_id.clone();
@@ -5587,6 +5789,29 @@ projects available: {}",
             if !has_peer_prime {
                 prime_via_send_text(&mut c, &pane_id);
             }
+            // bd-spawn-omp-boot-reliability-3h06: post-boot dead-shell gate —
+            // verify the pane holds a LIVE agent process (pane_agent_alive,
+            // never the launch_pending flag); a shell-fallback pane is
+            // recovered (cancel + re-launch + re-prime) within the 2-minute
+            // budget. Exhaustion FAILS the spawn — never declare ready with
+            // a dead shell that looks like an agent.
+            if !opts.no_verify {
+                let live = verify_or_respawn_pane(
+                    &mut c,
+                    &pane_id,
+                    &name,
+                    &kind,
+                    &agent_args,
+                    !has_peer_prime,
+                    Duration::from_secs(120),
+                )?;
+                if !live {
+                    bail!(
+                        "{name} ({pane_id}) has no live agent process after spawn + recovery — the pane is a dead shell. Inspect it (herdr pane read {pane_id}), then recover manually (flywheel recover {project} {name}) or kill + re-spawn."
+                    );
+                }
+            }
+            booted.push((pane_id.clone(), name.clone(), kind.clone()));
             // governed-by: ADR-0001 (mail-register-on-spawn) — the spawned
             // agent was already registered (S8.3, above, before the launch
             // prompt); pin the returned identity in the spawn registry
@@ -5682,6 +5907,27 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
                 );
             }
             std::thread::sleep(Duration::from_secs(2));
+        }
+        // bd-spawn-omp-boot-reliability-3h06 final gate: every requested
+        // pane must hold a live agent PROCESS (not just a cleared
+        // launch_pending flag) before "swarm ready" — a pane whose process
+        // died after its per-pane verification (during later panes' spawn) is
+        // a dead shell, never a ready agent.
+        let dead = dead_panes(&booted, |pane_id, kind| {
+            herdr_shim::pane_process_info(&mut c, pane_id)
+                .ok()
+                .and_then(|pi| herdr_shim::pane_agent_alive(&pi, kind))
+        });
+        if !dead.is_empty() {
+            let list = dead
+                .iter()
+                .map(|(_, n, p)| format!("{n} ({p})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "swarm not ready: {} — no live agent process (dead shell). Re-run spawn, or recover manually (flywheel recover {project} <name> / herdr pane read <id>)",
+                list
+            );
         }
     }
 
