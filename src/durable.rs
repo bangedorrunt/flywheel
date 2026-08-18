@@ -1454,6 +1454,21 @@ pub fn bead_flood_verdict(new_ready: usize) -> bool {
     new_ready > 3
 }
 
+/// bd-eign.2.1: count ready beads the flood guard has NOT yet seen this
+/// invocation. The guard's pause feeds `seen`; a legitimate pre-created
+/// batch (>3 beads opened at once) is counted once and then dispatches,
+/// while a runaway minting NEW ids keeps tripping the verdict. PURE +
+/// unit-tested.
+pub fn flood_new_count<'a>(
+    to_assign: impl IntoIterator<Item = &'a ReadyBead>,
+    seen: &std::collections::HashSet<String>,
+) -> usize {
+    to_assign
+        .into_iter()
+        .filter(|b| !seen.contains(&b.id))
+        .count()
+}
+
 /// Exhaustion verdict from the two context channels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContextVerdict {
@@ -3787,6 +3802,14 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // bd-gnej wave-gate: ready beads held this poll (earlier wave open).
         // Hoisted so the completion gate below can require them empty.
         let mut wave_held: Vec<String> = Vec::new();
+        // bd-eign.2.1 (2026-08-17): beads the flood guard PAUSED this
+        // invocation. A legit pre-created batch (>3 beads opened at once by
+        // reclaims/creation) must pause ONE poll and then dispatch — without
+        // this, the same beads count as "new" every poll (they never enter
+        // `assigned` while paused) and dispatch locks forever. The guard
+        // still fires for EVER-NEW bead ids (the runaway signature).
+        let mut flood_seen: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         if params.work {
             // interrupted work first: an in-progress bead's agent went idle —
             // resume it before handing out fresh beads. bd-627z.1: live names
@@ -3923,16 +3946,31 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 bead_overlap_waits(&board, &in_flight)
             };
             let serialize_all = always_serialize_held(&board);
-            // bd-eign.2: bead-creation flood guard — >3 new ready beads in
+            // bd-eign.2: bead-creation flood guard — >3 NEW ready beads in
             // ONE poll is the runaway-create signature (40 junk beads in
             // ~4 min, RC2). CRITICAL warn + PAUSE dispatch this poll: feeding
             // the flood (each dispatch prompts "claim a bead") doubles the
             // creates. Deterministic: to_assign derives from checkpointed
             // poll results, so replays reach the same verdict.
-            if bead_flood_verdict(to_assign.len()) {
+            // bd-eign.2.1: paused beads enter flood_seen — the NEXT poll
+            // counts them as known and dispatches (legit pre-created batch
+            // of 4+ unblocks after one pause); a runaway keeps minting NEW
+            // ids, which flood_seen cannot absorb, so the guard still fires.
+            let flood_new: Vec<String> = to_assign
+                .iter()
+                .filter(|b| !flood_seen.contains(&b.id))
+                .map(|b| b.id.clone())
+                .collect();
+            if bead_flood_verdict(flood_new_count(
+                to_assign.iter().copied(),
+                &flood_seen,
+            )) {
+                for id in &flood_new {
+                    flood_seen.insert(id.clone());
+                }
                 eprintln!(
                     "flywheel: CRITICAL: {} new ready beads this poll — runaway bead creation suspected (bd-eign.2). Pausing dispatch this poll; queue not fed.",
-                    to_assign.len()
+                    flood_new.len()
                 );
             } else if serialize_all {
                 eprintln!(
@@ -6750,6 +6788,41 @@ mod tests {
         assert!(!bead_flood_verdict(3));
         assert!(bead_flood_verdict(4));
         assert!(bead_flood_verdict(40));
+    }
+
+    /// bd-eign.2.1: the flood guard's paused beads enter the seen-set, so a
+    /// legitimate pre-created batch of 4+ is counted ONCE and then
+    /// dispatches; a runaway minting new ids keeps tripping.
+    #[test]
+    fn flood_new_count_absorbs_paused_batch_and_catches_runaway() {
+        let rb = |id: &str| ReadyBead {
+            id: id.into(),
+            title: String::new(),
+            assignee: None,
+            priority: 3,
+            principles: String::new(),
+            verify: Some("true".into()),
+            labels: Vec::new(),
+        };
+        let batch = [rb("bd-a"), rb("bd-b"), rb("bd-c"), rb("bd-d")];
+        let mut seen = std::collections::HashSet::new();
+        let first = flood_new_count(batch.iter(), &seen);
+        assert_eq!(first, 4, "fresh batch counts fully");
+        assert!(bead_flood_verdict(first), "batch trips the pause");
+        for b in &batch {
+            seen.insert(b.id.clone());
+        }
+        assert_eq!(
+            flood_new_count(batch.iter(), &seen),
+            0,
+            "paused batch dispatches on the next poll (no repeat pause)"
+        );
+        let runaway = rb("bd-e");
+        assert_eq!(
+            flood_new_count(std::iter::once(&runaway), &seen),
+            1,
+            "a NEW id still trips the verdict"
+        );
     }
 
     /// bd-eign.2: the brief forbids creating new beads — the agent must
