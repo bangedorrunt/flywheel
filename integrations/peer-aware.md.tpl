@@ -2,29 +2,42 @@
 
 The self-poll loop lives INSIDE the spawned agent (ADR-0001 S.9.3). This
 template is the agent-side instruction: while working its primary task, the
-agent periodically checks its own toron inbox and acts on urgent messages
-from peers -- waking them, replying, or escalating. No orchestrator in the
-peer-to-peer path.
+agent periodically checks for peer work and acts on it -- waking peers,
+replying, or escalating. No orchestrator in the peer-to-peer path.
 
 ## Template (injected into the agent's session on spawn by default; `--no-peer-aware` opts out)
 
 ```
 You are {name}. Primary task: {task}.
 
-Your mail identity is {mail_identity} -- the name peers and the orchestrator
-address you by in toron mail (fetch your inbox as, and reply as, this exact
-name).
+Your mail identity is {mail_identity} -- the pin peers and the orchestrator
+address you by (use it for `--as` / `--to` / reserve / guard / presence).
+Your herdr name is the internal pane handle; never type it as `--as` or
+`--to`.
+
+Two planes (ADR-0020):
+- Plane S (shared, kind 9 rooms + jobs + presence): crew-visible work and
+  peer wake. Room: `toron channel create|join|post|read`. Job:
+  `toron job list|claim|result`. Wake: `toron watch --once
+  --kinds 9,7,43001,20001`. Presence: `toron presence publish --as
+  {mail_identity} --state idle|working|blocked|done`.
+- Plane P (private, NIP-17 gift-wrap): secrets and 1:1 only. `toron mail
+  send|inbox|reply`. `unread_only` is a documented no-op -- poll by
+  `since_ts` high-water.
 
 Peer-awareness loop (run ON TOP of your primary task):
   While working, on completing a step OR every {poll_interval_minutes} minutes
   of idle (whichever comes first):
-    1. fetch_inbox(self, unread_only=true, since_ts=<last_poll>) -> new messages
+    1. `toron watch --once --kinds 9,7,43001,20001` for crew-visible work;
+       `toron mail inbox --since <last_poll>` for private 1:1 (plane P only).
     2. For each URGENT message from a peer:
          - reply(P, ack) acknowledging you received it
          - if P needs help you can give: herdr agent prompt P '<help>' --wait
          - else: escalate via toron mail to the orchestrator/human
     3. acknowledge_message on each ack_required message you have acted on
     4. update <last_poll> to the latest message timestamp you processed
+    5. publish presence for the state you are in (working/done), so peers
+       and the orchestrator see liveness without polling mail.
 
   Continue your primary task. Exit when the primary task is done OR your
   context budget is reached.
@@ -54,7 +67,10 @@ owns lifecycle. You may prompt existing peers, never create them.
 - **Safety**: a peer-aware agent may `herdr agent prompt` an existing peer but
   must NEVER `pane split`/`agent start`/`close` -- the orchestrator owns
   lifecycle. Enforced by the template text.
-- **`since_ts` incremental fetch** keeps the poll cheap (only new messages),
-  per bd-mail-ack-sla-tracking.
+- **`since_ts` incremental fetch** keeps the plane-P poll cheap (only new
+  messages). `unread_only` is a no-op and is never taught as a filter.
+- **Plane S is the room, plane P is the whisper** (boundary-discipline):
+  crew-visible work and peer wake go through channel/watch/job; gift-wrap
+  stays for secrets and 1:1.
 - This is the HIGHEST-VARIANCE pattern (agents deciding to involve peers can
   cascade) -- the bounded budget is the control.

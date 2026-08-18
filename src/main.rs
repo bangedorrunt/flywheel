@@ -6002,6 +6002,36 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
         }
     }
 
+    // bd-pin-public-plane-s-easy.5: publish spawn presence (plane N, kind
+    // 20001) for every freshly spawned agent — the orchestrator + peers see
+    // liveness on the presence surface, not by polling mail. Best-effort:
+    // the existing CLI (`toron presence publish --as <pin>`); no new MCP
+    // tool, a presence failure never fails the spawn.
+    for e in &registry {
+        if let Some(pin) = &e.mail_identity {
+            let status = Command::new("toron")
+                .args([
+                    "presence",
+                    "publish",
+                    "--as",
+                    pin,
+                    "--state",
+                    "working",
+                    "--project",
+                    project,
+                ])
+                .output();
+            match status {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => eprintln!(
+                    "flywheel: presence publish failed for {pin}: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => eprintln!("flywheel: presence publish failed for {pin}: {e}"),
+            }
+        }
+    }
+
     println!(
         "swarm ready: flywheel {} {} {}",
         kind_paint("send"),
@@ -20226,6 +20256,10 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
         "mail_identity": identity,
         "recent": recent,
         "urgent": urgent,
+        // bd-pin-public-plane-s-easy.5: plane-S wake count — open kind-43001
+        // jobs assigned to this agent, via the existing CLI (no new MCP
+        // tool). Best-effort: a job-list failure just zeroes the count.
+        "plane_s": plane_s_open_jobs_for(project, &identity),
         "last_id": last_urgent.and_then(|m| {
             m.get("id").or_else(|| m.get("message_id")).and_then(|i| i.as_str())
         }),
@@ -20234,6 +20268,34 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
         "thread_id": last.and_then(|m| m.get("thread_id").and_then(|t| t.as_str())),
     }));
     Ok(())
+}
+
+/// bd-pin-public-plane-s-easy.5: count OPEN kind-43001 jobs assigned to an
+/// agent (plane-S wake). Calls the existing `toron job list --state open
+/// --assignee <pin>` CLI; zero on any failure (best-effort — the loop
+/// retries next poll).
+fn plane_s_open_jobs_for(project: &str, identity: &str) -> usize {
+    let out = match std::process::Command::new("toron")
+        .args([
+            "job",
+            "list",
+            "--project",
+            project,
+            "--state",
+            "open",
+            "--assignee",
+            identity,
+            "--json",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return 0,
+    };
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .ok()
+        .and_then(|v| v.as_array().map(|a| a.len()))
+        .unwrap_or(0)
 }
 
 /// bd-a7j: newest (message id, sender) in a thread from a sender —

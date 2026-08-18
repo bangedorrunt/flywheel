@@ -1058,6 +1058,11 @@ pub struct MailDigest {
     pub recent: usize,
     #[serde(default)]
     pub urgent: usize,
+    /// bd-pin-public-plane-s-easy.5: plane-S wake signals — open kind-43001
+    /// jobs assigned to this agent (or channel mentions). Same wake path as
+    /// urgent mail: an idle agent with crew-visible work gets woken.
+    #[serde(default)]
+    pub plane_s: usize,
     /// id of the most recent urgent message (the wake dedup key: the loop
     /// wakes an agent ONCE per message id, so a still-unreplied urgent
     /// message does not re-prompt every iteration).
@@ -2635,6 +2640,23 @@ fn urgent_wake_prompt(d: &MailDigest) -> String {
     line
 }
 
+/// Wake prompt for an idle agent with plane-S work (open jobs / channel
+/// mentions) and an empty queue. Concrete + actionable: names the surfaces
+/// (toron `job list` / `channel read` / `watch`) — a vague "check your
+/// channels" prompt gets acknowledged in-chat and never produces the actual
+/// job claim (bd-pin-public-plane-s-easy.5).
+fn plane_s_wake_prompt(d: &MailDigest) -> String {
+    let identity = d.mail_identity.as_deref().unwrap_or(d.agent.as_str());
+    format!(
+        "PLANE-S WAKE: {} open job(s)/mention(s) on the crew room — a peer posted work for you. \
+         Claim with `toron job list --project <project> --state open --as {identity}` then \
+         `toron job claim <job-id> --project <project> --as {identity}`; read the room with \
+         `toron channel read <channel> --project <project> --as {identity}`. Watch for new work: \
+         `toron watch --once --kinds 9,7,43001,20001 --project <project> --as {identity}`.",
+        d.plane_s,
+    )
+}
+
 // ---- bd-efk1: crew-execution contract watchdog --------------------------
 // Dispatched agents ENGAGE (status = working) but do NOT reliably run the
 // bead lifecycle: br update --claim / br close rarely happen autonomously.
@@ -2992,15 +3014,22 @@ pub fn plan_actions(
                         name: s.name.clone(),
                     });
                 } else if let Some(d) = digests.get(&s.name)
-                    && d.urgent > 0
+                    && (d.urgent > 0 || d.plane_s > 0)
                     && !wake_suppressed.contains(&s.name)
                 {
-                    // urgent mail with nothing queued: wake the agent
-                    // to handle it — mail IS work (loop-side wake, no
-                    // per-agent polling template).
+                    // urgent mail OR plane-S work (open jobs / channel
+                    // mentions) with nothing queued: wake the agent — crew
+                    // work IS work (loop-side wake, no per-agent polling
+                    // template). Plane S first (a job is actionable), mail
+                    // second.
+                    let text = if d.plane_s > 0 {
+                        plane_s_wake_prompt(d)
+                    } else {
+                        urgent_wake_prompt(d)
+                    };
                     actions.push(LoopAction::Send {
                         name: s.name.clone(),
-                        text: urgent_wake_prompt(d),
+                        text,
                     });
                 } else {
                     actions.push(LoopAction::Wait);
@@ -7158,6 +7187,7 @@ mod tests {
             mail_identity: None,
             recent,
             urgent,
+            plane_s: 0,
             last_id: (urgent > 0).then(|| format!("urgent-{from}")),
             last_from: (!from.is_empty()).then(|| from.to_string()),
             last_subject: (!subj.is_empty()).then(|| subj.to_string()),
@@ -7234,6 +7264,37 @@ mod tests {
                 assert!(text.contains("PinkGorge re: [bd-1] help needed"));
             }
             other => panic!("expected wake Send, got {other:?}"),
+        }
+    }
+
+    /// bd-pin-public-plane-s-easy.5: an idle agent with OPEN plane-S work
+    /// (kind-43001 jobs) and an empty queue is woken with the plane-S prompt
+    /// — crew work is work, not only urgent private mail.
+    #[test]
+    fn plan_actions_wakes_idle_agent_on_open_plane_s_job() {
+        let mut queue: Vec<String> = Vec::new();
+        let states = vec![st("flywheel-proj-oc", "idle")];
+        let mut d = digest(0, 0, "", "");
+        d.plane_s = 2;
+        let actions = plan_actions(
+            &states,
+            &mut queue,
+            None,
+            &digest_map(d),
+            &std::collections::HashSet::new(),
+        );
+        match &actions[0] {
+            LoopAction::Send { text, .. } => {
+                assert!(
+                    text.contains("PLANE-S WAKE: 2 open job(s)"),
+                    "wake prompt must say plane-S: {text}"
+                );
+                assert!(
+                    text.contains("toron job claim"),
+                    "wake must name the claim command: {text}"
+                );
+            }
+            other => panic!("expected plane-S wake Send, got {other:?}"),
         }
     }
 
@@ -7436,6 +7497,13 @@ mod tests {
             "explicit claim command: {p}"
         );
         assert!(p.contains("bd-12"), "names the bead");
+        // bd-pin-public-plane-s-easy.5: claim --actor is the PIN — the pane
+        // env sets AGENT_NAME=<pin> at spawn, so $AGENT_NAME expands to the
+        // pin the agent claims as (never the herdr slug).
+        assert!(
+            p.contains("--actor \"$AGENT_NAME\""),
+            "claim as the pin via AGENT_NAME env: {p}"
+        );
     }
 
     #[test]
