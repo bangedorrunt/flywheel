@@ -4955,6 +4955,27 @@ mod workspace_origin_tests {
             "prime_via_send_text must warn with the manual socket one-liner (bd-umb3)"
         );
     }
+
+    // bd-add-missing-mail-identity-16le: the `add` path must register a mail
+    // identity per added pane (same mechanism as spawn) AND write the
+    // project-local agent-names.json mirror — otherwise added panes claim as
+    // the unroutable default ("bangedorrunt") and the strand check cannot
+    // see them. Code-pointer gate: `cmd_add` must call
+    // `register_spawned_agent` (per pane) and `save_agent_names` (mirror).
+    #[test]
+    fn add_mints_mail_identity_and_writes_agent_names() {
+        let src = include_str!("main.rs");
+        let add = src.find("fn cmd_add(").expect("cmd_add present in main.rs");
+        let add_body = &src[add..];
+        assert!(
+            add_body.contains("register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id)"),
+            "cmd_add must register a unique mail identity per added pane (bd-add-missing-mail-identity-16le)"
+        );
+        assert!(
+            add_body.contains("state::save_agent_names(&dir, &registry)"),
+            "cmd_add must write the project-local agent-names.json mirror (bd-add-missing-mail-identity-16le)"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
@@ -7214,13 +7235,24 @@ fn cmd_add(
                 // warns with the manual socket one-liner.
                 prime_via_send_text(&mut c, &prev);
             }
-            // bd-627z.4: register + pin the mail identity (the add path's
-            // registry persists on the next spawn/rebind save).
+            // bd-627z.4 / bd-add-missing-mail-identity-16le: register + pin
+            // the mail identity — the SAME mechanism as spawn (unique
+            // adjective+noun pin, collision-checked, idempotent on re-add of
+            // a dead pane's name). The project-local agent-names.json mirror
+            // is written after the loop so claims/strand checks/whois work
+            // immediately after add (bd-add-missing-mail-identity-16le).
             let _ = register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
             println!("  {} {}", kind_paint(&kind), agent.pane_id);
             spawned
                 .push(json!({ "name": agent.name, "kind": agent.agent, "pane_id": agent.pane_id }));
         }
+    }
+    // bd-add-missing-mail-identity-16le: mirror the spawn contract — pins
+    // land in `.flywheel/agent-names.json` too (the registry alone only
+    // persists on the next spawn/rebind save). Best-effort like spawn.
+    let registry = state::load_spawn_registry(project);
+    if let Err(e) = state::save_agent_names(&dir, &registry) {
+        eprintln!("flywheel: cannot save .flywheel/agent-names.json: {e:#}");
     }
     log(
         project,
@@ -10388,6 +10420,69 @@ mod wake_identity_tests {
             .expect("colliding spawn draws a fresh pin");
         assert_ne!(pin2, pin, "collision with the agents table redraws");
         assert!(valid_pair(&pin2, &ADJECTIVES, &NOUNS).is_some(), "{pin2}");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// bd-add-missing-mail-identity-16le: the ADD path's identity step mints
+    /// a DISTINCT registered pin per added pane (oc/oc2/oc3 — even when the
+    /// seq counter reuses after a dead pane, distinct herdr names draw
+    /// distinct pins), never the unroutable default ("bangedorrunt"), and
+    /// the project-local agent-names.json mirror (written by cmd_add) holds
+    /// every pin — so claims write the real identity, strand checks see
+    /// live pins, and `flywheel mail whois` resolves.
+    #[test]
+    fn add_panes_get_distinct_registered_pins_in_agent_names() {
+        let _g = crate::config::lock_env();
+        let data = std::env::temp_dir().join(format!("fw-s9-add-{}", uuid::Uuid::new_v4()));
+        unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
+        let cfg = Config::default();
+        let project = "/tmp/fw-s9-add-proj";
+        let dir = project_dir(&cfg, project);
+
+        let mut pins: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let slugs = ["flywheel-toron-oc", "flywheel-toron-oc2", "flywheel-toron-oc3"];
+        for (i, slug) in slugs.iter().enumerate() {
+            let pane = format!("w7:p{}", i + 1);
+            let pin = register_spawned_agent(&cfg, project, slug, "opencode", &pane)
+                .expect("add pane registers an identity");
+            assert_ne!(pin, "bangedorrunt", "never the unroutable default identity");
+            assert_ne!(pin, *slug, "the pin is not the herdr slug");
+            assert!(
+                valid_pair(&pin, &ADJECTIVES, &NOUNS).is_some(),
+                "adj+noun pin: {pin}"
+            );
+            assert!(
+                pins.insert(pin.clone()),
+                "distinct pin per pane: {pin} duplicated across added panes"
+            );
+        }
+
+        // The add path's mirror write (the same calls cmd_add makes after
+        // the pane loop).
+        let registry = state::load_spawn_registry(project);
+        state::save_agent_names(&dir, &registry).expect("save agent names");
+        let names = state::load_agent_names(&dir);
+        let mirrored: std::collections::HashSet<String> = names
+            .iter()
+            .filter_map(|e| e.mail_identity.clone())
+            .collect();
+        assert_eq!(mirrored.len(), 3, "agent-names.json holds all 3 pins");
+        assert!(
+            mirrored.iter().all(|p| pins.contains(p)),
+            "mirror pins match the registered pins"
+        );
+        assert!(!mirrored.contains("bangedorrunt"));
+
+        // whois resolution: every pin is registered in the agents table.
+        let key = dir.to_str().map(str::to_string).unwrap();
+        let mail = backend::mail_backend(&cfg).expect("mail backend");
+        let agents = backend::run_mail(mail.list_agents(&key, None)).expect("list agents");
+        for p in &pins {
+            assert!(
+                agents.iter().any(|a| a.name == *p),
+                "registered pin {p} resolves via the agents table (whois)"
+            );
+        }
         let _ = std::fs::remove_dir_all(&data);
     }
 
