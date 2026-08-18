@@ -3966,9 +3966,18 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         bead_id: bead.id.clone(),
                         title: bead.title.clone(),
                     };
+                    // The eprintln names the ACTUAL gate that blocked the
+                    // bead (2026-08-17: a hardcoded "(no legal VERIFY
+                    // fence)" mislabeled PRINCIPLES-gated P<=2 beads, which
+                    // wasted a captain session diagnosing the wrong parser).
+                    let reason = bead
+                        .verify
+                        .as_ref()
+                        .map(|_| "PRINCIPLES gate (P<=2 missing ## PRINCIPLES section)")
+                        .unwrap_or("missing/malformed ## VERIFY fence");
                     match ctx.run(mail_not_ready, args).await {
                         Ok(v) => eprintln!(
-                            "flywheel: bead {} NOT ready (no legal VERIFY fence) — planner mailed: {v}",
+                            "flywheel: bead {} NOT ready ({reason}) — planner mailed: {v}",
                             bead.id
                         ),
                         Err(e) => eprintln!(
