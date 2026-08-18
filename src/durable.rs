@@ -1620,7 +1620,7 @@ ACCEPTANCE close only when every acceptance criterion in the bead description ho
 VERIFY run the bead's ## VERIFY command from its description; include its stdout in the REPORT. No ## VERIFY fence → say so explicitly; never substitute a whole-workspace matrix script.
 TIMEBOX about 90 minutes; on expiry return partial findings + deviations — never silently extend.
 FORBIDDEN DO NOT create new beads — report scope gaps in the thread, not as new beads. Never force-unlock a peer's reservation. No worktree. Stay inside SCOPE.
-REPORT status; commit sha (commit BEFORE close; the bead id {id} IN the commit message); verdict kind; what you actually ran; deviations; PRINCIPLES cited. After closing, mail the captain on thread_id={id} with subject [{id}] done + one line (commit sha, VERIFY tail) — the captain has no push channel; the mail is the courtesy signal.
+REPORT status; commit sha (commit BEFORE close; the bead id {id} IN the commit message); verdict kind; what you actually ran; deviations; PRINCIPLES cited. After closing, mail the captain on thread_id={id} with subject [{id}] done and a BODY carrying the same REPORT fields (status, sha, verdict, the VERIFY command + result tail, deviations, PRINCIPLES) — one report, two channels: the close reason is the durable copy, the mail is the captain's copy. The captain has no push channel.
 PRINCIPLES each line `<principle-name> — <the decision it changed>`; names only, no leaf text. REQUIRED for priority <= 2 beads — a name with no decision clause is a skip (cargo-cult citation; the reviewer marks the report incomplete).
 STANDING {project}/.flywheel/standing-orders.md layered on ~/.config/flywheel/standing-orders.md — the lifecycle (claim → reserve → announce → execute → verify → close → sync → commit) lives there; referenced BY PATH ONLY, never pasted here.
 CONTRACTS renew your own file reservations while working (toron `renew_file_reservations` — extend the TTL before it lapses; the orchestrator cannot renew on your behalf). When a message has ack_required=true, call `acknowledge_message` after acting on it — the orchestrator cannot ack on your behalf. If your session context usage exceeds about 80%: write {"context_pct": <pct>, "ts": "<now RFC3339>"} to .flywheel/agent-state/{AGENT_NAME}.json (best-effort, never block on it), then finish + sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you."#;
@@ -2948,12 +2948,8 @@ pub fn claim_watch_step(
                             });
                         }
                     }
-                }
-                // assignee working/blocked → claimed work in flight, keep
-                // watching (the in-progress completion guard owns liveness)
             }
-            // closed (neither snapshot) → the lifecycle completed: release
-            // the bead's file reservations (bd-h3oj), then drop the watch.
+            }
             (None, None) => {
                 actions.push(ClaimWatchAction::ReleaseReservations {
                     bead_id: bead_id.clone(),
@@ -4359,6 +4355,25 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                         eprintln!(
                                             "flywheel: close of {bead_id} verified (legal verdict bound to sha)"
                                         );
+                                        // programmatic done-mail (2026-08-18):
+                                        // the loop is the reporter of record —
+                                        // mail the captain the close-reason
+                                        // REPORT on the bead thread. Best-effort
+                                        // + once per bead per invocation.
+                                        if done_mailed.insert(bead_id.clone()) {
+                                            let md = MailDoneArgs {
+                                                project: params.project.clone(),
+                                                bead_id: bead_id.clone(),
+                                            };
+                                            match ctx.run(mail_done, md).await {
+                                                Ok(r) => eprintln!(
+                                                    "flywheel: done-mail sent for {bead_id}: {r}"
+                                                ),
+                                                Err(e) => eprintln!(
+                                                    "flywheel: done-mail for {bead_id} failed (continuing): {e}"
+                                                ),
+                                            }
+                                        }
                                     }
                                     "no-commit" => {
                                         close_grace_ticks.remove(&bead_id);
