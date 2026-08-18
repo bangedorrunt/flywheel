@@ -51,9 +51,9 @@ time; epics are gates, not tasks. Distilled from the ADR-0019 program
    approves narrowly.
 
 7. WAVE GATE: the captain runs the epic's verification checkboxes itself -
-   suite + grep + fmt canonical + binary reinstall to ~/.local/bin (a stale
-   binary nearly failed a gate). Close the epic with evidence, THEN
-   dispatch the next wave (prove-it-works).
+   suite + grep + fmt canonical + binary reinstall (cargo install --path .
+   --force; a stale binary nearly failed a gate). Close the epic with
+   evidence, THEN dispatch the next wave (prove-it-works).
 
 8. TEARDOWN: release reservations + build slot, kill --force-working, br sync,
    commit .beads.
