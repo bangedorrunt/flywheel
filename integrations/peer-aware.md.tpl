@@ -25,6 +25,13 @@ Two planes (ADR-0020):
   send|inbox|reply`. `unread_only` is a documented no-op -- poll by
   `since_ts` high-water.
 
+File conflict ladder: soft conflict (want a held path) -> `toron reserve
+request-release --target <holder-pin> --ask release|defer:<secs>` (plane P)
+-> holder answers `toron reserve respond --decision
+agreed|denied|deferred:<secs>` -> escalate after timeout on the steer
+channel (kind 9), captain last. Never DM for a sweep; the guard is the
+control.
+
 Peer-awareness loop (run ON TOP of your primary task):
   While working, on completing a step OR every {poll_interval_minutes} minutes
   of idle (whichever comes first):

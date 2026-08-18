@@ -39,8 +39,12 @@ time; epics are gates, not tasks. Distilled from the ADR-0019 program
    captain, TIMEBOX 90min then partial report with exact resume point.
    AGENT_NAME=<pin> env for repo hooks (guard-the-context-window).
 
-6. CONFLICT / COLLAB LADDER: hard reservation conflict -> serialize + post
-   the channel. Shared design question -> collab the peer
+6. CONFLICT / COLLAB LADDER: soft conflict (TTL overlap / want a held
+   path) -> `toron reserve request-release --target <holder-pin> --ask
+   release|defer:<secs>` (plane P) -> holder answers `toron reserve respond
+   --decision agreed|denied|deferred:<secs>` -> escalate after timeout on
+   the steer channel (kind 9), captain LAST. Hard reservation conflict ->
+   serialize + post the channel. Shared design question -> collab the peer
    (`flywheel collab <proj> --to <peer-pin>`) or interrogate/debate for
    forks. Cross-sweep detected -> flag on the channel, victim re-commits.
    Grant request for out-of-reservation files -> flag FIRST, captain
