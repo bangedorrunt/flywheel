@@ -9117,9 +9117,10 @@ fn cmd_work_check(cfg: &Config, project: Option<&str>) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| anyhow!("br ready --json parse: {e}"))?;
-    let ready = crate::durable::parse_bead_list(&v, "br ready")?;
+    // The loop's exact ready parse (array shape, `parse_verify_fence` on
+    // the description — the flywheel parser, not br's own) — same source
+    // of truth as the __ready leaf the durable loop consumes.
+    let ready = parse_ready_beads_json(&String::from_utf8_lossy(&out.stdout))?;
     // The check runs the EXACT loop parsers over each bead's raw
     // description (parse_verify_fence + the PRINCIPLES section check) —
     // fetch descriptions per bead; the ready set is small.
