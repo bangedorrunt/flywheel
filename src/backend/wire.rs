@@ -121,6 +121,7 @@ pub fn inbox_args(
     include_bodies: bool,
     limit: u32,
     since_ts: Option<&str>,
+    thread_id: Option<&str>,
 ) -> Value {
     let mut args = Map::new();
     args.insert("project_key".into(), json!(project_key));
@@ -132,6 +133,9 @@ pub fn inbox_args(
     args.insert("limit".into(), json!(limit));
     if let Some(ts) = since_ts {
         args.insert("since_ts".into(), json!(ts));
+    }
+    if let Some(t) = thread_id {
+        args.insert("thread_id".into(), json!(t));
     }
     Value::Object(args)
 }
@@ -528,7 +532,8 @@ mod tests {
                 true,
                 true,
                 5,
-                Some("2026-01-01T00:00:00Z")
+                Some("2026-01-01T00:00:00Z"),
+                Some("debate-1")
             ),
             json!({
                 "project_key": "p",
@@ -539,11 +544,14 @@ mod tests {
                 "include_bodies": true,
                 "limit": 5,
                 "since_ts": "2026-01-01T00:00:00Z",
+                "thread_id": "debate-1",
             })
         );
-        // since_ts omitted when None.
-        let no_since = inbox_args("p", "a", false, false, false, false, 10, None);
+        // since_ts + thread_id omitted when None.
+        let no_since =
+            inbox_args("p", "a", false, false, false, false, 10, None, None);
         assert!(no_since.get("since_ts").is_none());
+        assert!(no_since.get("thread_id").is_none());
         assert_eq!(
             reserve_args("p", "a", &["src/x.rs".into()], 3600, true, "bd-x"),
             json!({

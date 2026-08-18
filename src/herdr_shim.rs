@@ -970,6 +970,90 @@ pub fn pane_wait_output(
     parse_wait_for_output_result(&res)
 }
 
+/// Spawn shell-readiness gate (bd-pattern-peer-triggered): poll a
+/// freshly-split pane until its shell has rendered a prompt, so the launch
+/// command lands in an INTERACTIVE shell — not a booting one.
+///
+/// Why this gate exists: herdr's `agent.start` types the launch command
+/// into the pane's PTY immediately after `pane.split` returns. A new
+/// pane's shell is still starting up (zsh running `.zshrc`, prompt not yet
+/// rendered) and the PTY is in CANONICAL mode with a 1024-byte line limit
+/// (`MAX_CANON`). The peer-aware template renders to a ~2.6KB single-quoted
+/// launch arg; typing it into a booting shell splits it mid-quote, and zsh
+/// parks at the PS2 continuation prompt (`>....`) with the agent never
+/// starting (2026-08-18 coder2/coder3 dead-on-spawn). The root pane
+/// survived only because its first `agent.start` errored (shell not yet an
+/// available shell) and the retry's 3s sleep let it finish booting.
+///
+/// Signal: `pane.read` recent output contains a rendered prompt — a shell
+/// prints its prompt exactly when the line editor is up (raw mode, no
+/// canonical line limit). Poll every 250ms until the prompt appears (→
+/// `Ok(true)`), the probe errors continuously, or `timeout` elapses (→
+/// `Ok(false)` — the caller warns; the old race is the fallback).
+pub fn wait_shell_prompt(c: &mut Client, pane_id: &str, timeout: Duration) -> Result<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_err: Option<String> = None;
+    while std::time::Instant::now() < deadline {
+        match pane_recent_text(c, pane_id) {
+            Ok(text) => {
+                if shell_prompt_rendered(&text) {
+                    return Ok(true);
+                }
+            }
+            Err(e) => last_err = Some(format!("{e:#}")),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    if let Some(e) = last_err {
+        eprintln!("flywheel: shell-readiness gate for {pane_id}: last probe error: {e}");
+    }
+    Ok(false)
+}
+
+/// Recent text of a pane (`pane.read`, source=recent, format=text).
+fn pane_recent_text(c: &mut Client, pane_id: &str) -> Result<String> {
+    let res = c.call(
+        "pane.read",
+        json!({
+            "pane_id": pane_id,
+            "source": "recent",
+            "lines": 30,
+            "format": "text",
+            "strip_ansi": true,
+        }),
+    )?;
+    let read = res.get("read").cloned().unwrap_or(res);
+    Ok(read
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string())
+}
+
+/// True when recent pane output contains a rendered shell prompt. A prompt
+/// is a non-empty last line; its exact text is user-custom (zsh
+/// `❯`/`%`, bash `$`, root `#`, oh-my-zsh themes), so match the last
+/// non-blank line ending in a common prompt sigil OR a `user@host path`
+/// shape — either means the shell reached its line editor.
+fn shell_prompt_rendered(text: &str) -> bool {
+    let last = text.lines().rev().find(|l| !l.trim().is_empty());
+    match last {
+        Some(line) => {
+            let t = line.trim();
+            // Common prompt sigils (zsh ❯ / % / $, bash $, root #, fish >,
+            // oh-my-zsh ➜) — leading (➜  ~) or trailing (❯).
+            if t.starts_with(['❯', '➜', '%', '$', '#', '>', '»', '›', 'λ'])
+                || t.ends_with(['❯', '➜', '%', '$', '#', '>', '»', '›', 'λ'])
+            {
+                return true;
+            }
+            // user@host:path / user@host dir style prompts.
+            t.contains('@') && (t.contains(':') || t.contains('~') || t.contains('/'))
+        }
+        None => false,
+    }
+}
+
 /// `worktree.list` — delegation over `Client::call`, returning the
 /// flywheel-shaped [`WorktreeInfo`].
 pub fn worktree_list(c: &mut Client, workspace_id: Option<&str>) -> Result<Vec<WorktreeInfo>> {

@@ -457,6 +457,7 @@ mod tests {
                 include_bodies: true,
                 urgent_only: false,
                 since_ts: None,
+                thread_id: None,
             }))
             .expect("inbox");
             inboxes.push((*kind, serde_json::to_value(&items).unwrap_or_default()));
@@ -507,6 +508,7 @@ mod tests {
                 include_bodies: true,
                 urgent_only: false,
                 since_ts: None,
+                thread_id: None,
             }))
             .expect("inbox after reply");
             let subjects: Vec<String> = items.iter().map(|m| m.subject.clone()).collect();
@@ -592,6 +594,7 @@ mod tests {
                 include_bodies: true,
                 urgent_only: false,
                 since_ts: None,
+                thread_id: None,
             }))
             .expect("inbox");
             if let Some(item) = inbox.first() {

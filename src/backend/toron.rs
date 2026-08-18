@@ -244,6 +244,7 @@ impl MailSurface for ToronMailBackend {
             include_bodies: req.include_bodies,
             limit: req.limit.unwrap_or(100) as u32,
             since_ts,
+            thread_id: req.thread_id.clone(),
         };
         let v = run_facade(mail, move |m| m.inbox_filtered(&project, &agent, &filter)).await?;
         into_typed(v, "inbox")
