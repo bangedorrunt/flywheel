@@ -1135,6 +1135,13 @@ async fn run_leaf_cmd(
 /// `run_leaf_cmd` with an explicit subprocess watchdog: kill the child and
 /// surface a bounded Err when it outlives `watchdog` (park guard). The
 /// child is drained concurrently so a chatty leaf cannot deadlock the wait.
+///
+/// bd-loop-park-fresh-invocation-xl6r (grandchild orphan, CoralFinch
+/// review): the leaf child runs in its OWN process group
+/// (`process_group(0)`, pgid == child pid), and the timeout path kills the
+/// WHOLE GROUP via `kill -- -<pgid>` — a leaf's own children (br/git/cargo
+/// it spawned) die with it instead of orphaning to PPID 1 (prior incident:
+/// orphaned cargo test pid 9791).
 async fn run_leaf_cmd_bounded(
     mut cmd: std::process::Command,
     label: &'static str,
@@ -1142,7 +1149,9 @@ async fn run_leaf_cmd_bounded(
 ) -> Result<std::process::Output> {
     tokio::task::spawn_blocking(move || {
         use std::io::Read;
+        use std::os::unix::process::CommandExt as _;
         let mut child = match cmd
+            .process_group(0)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -1168,12 +1177,15 @@ async fn run_leaf_cmd_bounded(
                 Ok(Some(st)) => break st,
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
-                        let _ = child.kill();
+                        let pgid = child.id() as i64;
+                        let _ = std::process::Command::new("kill")
+                            .args(["-9", &format!("-{pgid}")])
+                            .status();
                         let _ = child.wait();
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
                             format!(
-                                "{label} leaf exceeded {watchdog:?} — child killed (watchdog; a hung leaf must never park the loop)"
+                                "{label} leaf exceeded {watchdog:?} — process group {pgid} killed (watchdog; a hung leaf must never park the loop, and its children must not orphan)"
                             ),
                         ));
                     }
@@ -9258,10 +9270,7 @@ mod resume_dedup_tests {
         );
         let msg = format!("{err}");
         assert!(msg.contains("__test-leaf"), "names the leaf: {msg}");
-        assert!(
-            msg.contains("watchdog"),
-            "explains the kill: {msg}"
-        );
+        assert!(msg.contains("watchdog"), "explains the kill: {msg}");
     }
 
     /// bd-loop-park-fresh-invocation-xl6r: the loop-equivalent property —
@@ -9274,12 +9283,9 @@ mod resume_dedup_tests {
             let start = std::time::Instant::now();
             let mut cmd = std::process::Command::new("/bin/sh");
             cmd.args(["-c", if i == 2 { "sleep 30" } else { "printf 'ok'" }]);
-            let res = run_leaf_cmd_bounded(
-                cmd,
-                "__test-leaf",
-                std::time::Duration::from_millis(300),
-            )
-            .await;
+            let res =
+                run_leaf_cmd_bounded(cmd, "__test-leaf", std::time::Duration::from_millis(300))
+                    .await;
             let elapsed = start.elapsed();
             assert!(
                 elapsed < std::time::Duration::from_secs(5),
@@ -9291,6 +9297,60 @@ mod resume_dedup_tests {
                 assert!(res.is_ok(), "healthy leaf stays Ok (cycle {i})");
             }
         }
+    }
+
+    /// bd-loop-park-fresh-invocation-xl6r (CoralFinch review): the watchdog
+    /// must kill the leaf's WHOLE process group — a leaf's own children
+    /// (br/git/cargo it spawned) die with it instead of orphaning to PPID 1
+    /// (prior incident: orphaned cargo test pid 9791). The fixture leaf
+    /// backgrounds a grandchild and writes its pid to a file; after the
+    /// timeout the grandchild must be dead (kill 0 fails).
+    #[tokio::test]
+    async fn loop_leaf_watchdog_kills_grandchild_process_group() {
+        let pid_file =
+            std::env::temp_dir().join(format!("xl6r-leaf-grandchild-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pid_file);
+        let script = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
+        let err = run_leaf_cmd_bounded(
+            {
+                let mut cmd = std::process::Command::new("/bin/sh");
+                cmd.args(["-c", &script]);
+                cmd
+            },
+            "__test-leaf",
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .expect_err("hung leaf with grandchild must not park the loop");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("process group") && msg.contains("killed"),
+            "names the group kill: {msg}"
+        );
+        let gc_pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("grandchild wrote its pid")
+            .trim()
+            .parse()
+            .expect("pid parses");
+        let _ = std::fs::remove_file(&pid_file);
+        // `kill 0 <pid>` fails once the process is gone (up to 3s for the
+        // SIGKILL to land and the pid to be reaped).
+        let mut gone = false;
+        for _ in 0..30 {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &gc_pid.to_string()])
+                .status()
+                .expect("kill -0 runs");
+            if !alive.success() {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            gone,
+            "grandchild pid {gc_pid} must be dead after the watchdog group-kill"
+        );
     }
 }
 
