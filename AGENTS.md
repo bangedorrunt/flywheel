@@ -9,8 +9,8 @@ toron (`MailSurface`); never the reverse.
 cargo test
 bash scripts/verify-clippy.sh
 bash docs/decisions/_scripts/verify-review-fixes.sh
-cargo build --release && cp target/release/flywheel ~/.local/bin/flywheel
-# macOS: codesign --force --sign - ~/.local/bin/flywheel
+cargo install --path . --force
+# macOS (only if a stale-signature SIGKILL appears): codesign --force --sign - ~/.cargo/bin/flywheel
 ```
 
 Live ignored tests need herdr + mail. `cargo test --exclude-ignored` is invalid.
@@ -31,6 +31,7 @@ Live ignored tests need herdr + mail. `cargo test --exclude-ignored` is invalid.
 - **Peer-aware spawns BY DEFAULT (2026-08-15, captain: collab is not optional):** `spawn --profile` injects the peer-poll template (`integrations/peer-aware.md.tpl`) with the agent's registered mail identity — the canonical `flywheel-<project>-<role><N>` name (S8.3), never a random pair — unless `--no-peer-aware` (single-shot panes). Wake/digest resolves + registers the identity before instructing fetch (S8.1); assigns wake only when unread, unexecuted, and deduped (S8.2). Poll 5-min idle / 30-min budget / ≤3 prompts per task.
 - **Send:** `--to <full-name|coder1|omp1|pane_id>`. Never bare `--to oc`. `launch_pending` is not idle. `agent_not_ready` → retry pane id. Do not flip omp defaults.
 - TDD. No script-based code edits. No file deletion without permission.
+- **Model routing is STRICT (nothing bypasses the registry):** profile models are registry ids — `ModelRegistry::load_routing()` (compiled-in defaults + user `models.toml`) + `resolve_strict()` add the provider prefix and enforce `caps`. An unregistered id or caps-excluded harness fails the spawn naming the fix. big-pickle is opencode-only (scout). Explicit ad-hoc `--model` keeps lenient passthrough. Dot-bearing ids must be quoted in models.toml (`[models."glm-5.2"]`).
 - **Engineering principles (ADR-0019 Spec 5/6):** `flywheel principles list`. Cite the name that changed the decision. Full leaves: `flywheel principles show <name>`.
 - **Wave 1-2 landed surface (ADR-0019):** `ledger {check,receipt}` = br-gate verdict store + SHA-bound legal close (close without a legal verdict reopens); `workflow lint` enforces playbook structure (feature `data_shape`, bug-fix `repro` predecessor, prototype/arena `n>=2` + mode rules, forensics read-only — lints live in toron-workflow); playbook builtins landed (bug-fix, feature, refactoring, prototype, arena, perf, hillclimb, interrogate, forensics, figure-it-out, babysit-bead, ship-beads, autonomous-work, pickup, pause); decide rows gained the `!implement` guard (fix-the-leak → bug-fix, never forensics).
 - **Preflight:** `steer`/`loop run`/`workflow run --execute` auto-run prerequisite checks (herdr, resonate, br, beads, operator key, mail). `--skip-preflight` bypasses. Standalone: `flywheel preflight --mode {steer|loop|workflow|cron}`.
