@@ -2624,11 +2624,15 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
         bail!("no agents in workspace {ws_id} — is the swarm spawned?");
     }
     // bd-a2bw: nameless omp panes still resolve via the spawn registry.
-    overlay_registry_names(&mut in_ws, &state::load_spawn_registry(project));
+    let registry = state::load_spawn_registry(project);
+    overlay_registry_names(&mut in_ws, &registry);
     let avail: Vec<String> = in_ws
         .iter()
         .map(|a| a.name.clone().unwrap_or_default())
         .collect();
+    // bd-pin-public-plane-s-easy.2: `--to <pin>` is the model-typed name —
+    // remap each token through the registry (herdr name, pane id, numbered
+    // short, or mail pin → the entry's herdr name). `all` passes through.
     let want: Vec<WantToken> = if to == "all" {
         avail
             .iter()
@@ -2641,7 +2645,15 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
             })
             .collect()
     } else {
-        to.split(',').map(|s| to_want_token(project, s)).collect()
+        to.split(',')
+            .map(|s| {
+                let t = s.trim();
+                let name = registry_entry_for_token(&registry, project, t)
+                    .map(|e| e.name.clone())
+                    .unwrap_or_else(|| t.to_string());
+                to_want_token(project, &name)
+            })
+            .collect()
     };
     // bd-4pxy: name-based resolution is canonical; a short with no name hit
     // falls back to the ordinal-th agent of that kind.
@@ -2723,11 +2735,15 @@ fn resolve_agents_dyn(
         bail!("no agents in workspace {ws_id} — is the swarm spawned?");
     }
     // bd-a2bw: nameless omp panes still resolve via the spawn registry.
-    overlay_registry_names(&mut in_ws, &state::load_spawn_registry(project));
+    let registry = state::load_spawn_registry(project);
+    overlay_registry_names(&mut in_ws, &registry);
     let avail: Vec<String> = in_ws
         .iter()
         .map(|a| a.name.clone().unwrap_or_default())
         .collect();
+    // bd-pin-public-plane-s-easy.2: `--to <pin>` is the model-typed name —
+    // remap each token through the registry (herdr name, pane id, numbered
+    // short, or mail pin → the entry's herdr name). `all` passes through.
     let want: Vec<WantToken> = if to == "all" {
         avail
             .iter()
@@ -2740,7 +2756,15 @@ fn resolve_agents_dyn(
             })
             .collect()
     } else {
-        to.split(',').map(|s| to_want_token(project, s)).collect()
+        to.split(',')
+            .map(|s| {
+                let t = s.trim();
+                let name = registry_entry_for_token(&registry, project, t)
+                    .map(|e| e.name.clone())
+                    .unwrap_or_else(|| t.to_string());
+                to_want_token(project, &name)
+            })
+            .collect()
     };
     // bd-4pxy: name-based resolution is canonical; a short with no name hit
     // falls back to the ordinal-th agent of that kind.
@@ -2915,9 +2939,11 @@ fn overlay_registry_names(agents: &mut [AgentInfo], entries: &[state::SpawnEntry
     }
 }
 
-/// bd-a2bw: resolve a send/rebind token to a spawn-registry row. Accepts
-/// the herdr name, a pane id, or a numbered short (`coder3` →
-/// `flywheel-<base>-coder3`).
+/// bd-a2bw / bd-pin-public-plane-s-easy.2: resolve a send/rebind token to a
+/// spawn-registry row. Accepts the herdr name, a pane id, a numbered short
+/// (`coder3` → `flywheel-<base>-coder3`), OR the agent's mail PIN
+/// (adjective+noun — `--to DustySparrow` resolves to the herdr name the
+/// identity was pinned for).
 fn registry_entry_for_token<'a>(
     entries: &'a [state::SpawnEntry],
     project: &str,
@@ -2929,7 +2955,7 @@ fn registry_entry_for_token<'a>(
     }
     entries
         .iter()
-        .find(|e| e.name == t || e.pane_id == t)
+        .find(|e| e.name == t || e.pane_id == t || e.mail_identity.as_deref() == Some(t))
         .or_else(|| {
             let want = to_want_token(project, t);
             entries.iter().find(|e| e.name == want.name)
@@ -5642,7 +5668,19 @@ projects available: {}",
     // workspace creation (the one surface herdr's API accepts it); the
     // extension then activates ("Herdr active") and reports on the first
     // processed prompt (see BOOT_PRIME in the spawn loop below).
-    let herdr_env = herdr_shim::herdr_integration_env(cfg);
+    //
+    // bd-pin-public-plane-s-easy.2: the FIRST agent runs on the ROOT pane,
+    // whose env is set here at workspace.create — so its pin must be drawn
+    // BEFORE create to ride along as AGENT_NAME/FLYWHEEL_MAIL_AS. Every
+    // later agent draws its pin before its own pane.split (the loop below).
+    let first_pin = items.first().and_then(|item| {
+        let kind = item
+            .kind
+            .clone()
+            .unwrap_or_else(|| cfg.resolve_kind(&item.short));
+        pinned_mail_identity(cfg, project, &agent_name_n(project, &item.short, 1), &kind)
+    });
+    let herdr_env = herdr_shim::herdr_integration_env(cfg, first_pin.as_deref());
     let (ws, root) = c.workspace_create(
         Some(&utf8_path(&dir, "workspace dir")?),
         Some(&label),
@@ -5707,6 +5745,13 @@ projects available: {}",
             let ordinal = ordinals.entry(item.short.clone()).or_insert(0);
             *ordinal += 1;
             let name = agent_name_n(project, &item.short, *ordinal);
+            // S9 (ADR-0018 D1a) + bd-pin-public-plane-s-easy.2: draw the
+            // adj+noun PIN BEFORE the pane exists so the pane env carries
+            // AGENT_NAME/FLYWHEEL_MAIL_AS (herdr injects env only at
+            // split/create). Best-effort (failures never fail the spawn).
+            let mail_identity = pinned_mail_identity(cfg, project, &name, &kind);
+            let identity = mail_identity.as_deref().unwrap_or(&name);
+            let pane_env = herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
             let pane_id = if first {
                 first = false;
                 prev.clone()
@@ -5716,18 +5761,11 @@ projects available: {}",
                     &prev,
                     "down",
                     Some(&utf8_path(&dir, "workspace dir")?),
-                    Some(&herdr_env),
+                    Some(&pane_env),
                 )?;
                 prev = p.pane_id.clone();
                 prev.clone()
             };
-            // S9 (ADR-0018 D1a): register the adj+noun PIN mail identity
-            // BEFORE the launch prompt is rendered — the template injects
-            // "your mail identity is X" so the agent boots knowing the name
-            // it is addressed by. Best-effort (register failures never fail
-            // the spawn).
-            let mail_identity = register_spawned_agent(cfg, project, &name, &kind, &pane_id);
-            let identity = mail_identity.as_deref().unwrap_or(&name);
             let peer_args: Vec<String> = peer_template
                 .as_ref()
                 .map(|t| {
@@ -5838,12 +5876,19 @@ projects available: {}",
                 }
             }
             booted.push((pane_id.clone(), name.clone(), kind.clone()));
-            // governed-by: ADR-0001 (mail-register-on-spawn) — the spawned
-            // agent was already registered (S8.3, above, before the launch
-            // prompt); pin the returned identity in the spawn registry
-            // (pane → identity) so assign resolves deterministically.
-            // bd-627z.4: the pinned identity never shifts across calls,
-            // restarts, and daemon restarts.
+            // governed-by: ADR-0001 (mail-register-on-spawn) — the pin was
+            // drawn + registered BEFORE the split (S8.3, above); now that
+            // the pane exists, bind the pane identity (pane → pin bridge +
+            // registry pane_id) so resolve_pane_identity / assign resolve
+            // deterministically. bd-627z.4: the pinned identity never
+            // shifts across calls, restarts, and daemon restarts.
+            bind_pane_mail_identity(
+                cfg,
+                project,
+                &name,
+                &agent.pane_id,
+                mail_identity.as_deref(),
+            );
             let entry = match (&item.profile, &mail_identity) {
                 (Some(p), mid) => state::SpawnEntry::profiled(
                     agent.pane_id.clone(),
@@ -6401,6 +6446,26 @@ pub(crate) fn register_spawned_agent(
     kind: &str,
     pane_id: &str,
 ) -> Option<String> {
+    let pin = pinned_mail_identity(cfg, project, name, kind)?;
+    bind_pane_mail_identity(cfg, project, name, pane_id, Some(&pin));
+    Some(pin)
+}
+
+/// S9 (ADR-0018 D1a): draw + register the agent's mail PIN and write the
+/// slug → pin fold, WITHOUT binding a pane. Idempotent — a re-spawn of the
+/// same herdr name keeps its pin (registry-first), a fresh name draws a pin
+/// collision-checked against the registry pins AND the agents table.
+///
+/// bd-pin-public-plane-s-easy.2: the pin is drawn BEFORE the pane exists so
+/// the pane env can carry `AGENT_NAME` / `FLYWHEEL_MAIL_AS` (herdr injects
+/// env only at split/create; agent.start has no env param). The caller then
+/// binds the pane with [`bind_pane_mail_identity`] once the pane id exists.
+pub(crate) fn pinned_mail_identity(
+    cfg: &Config,
+    project: &str,
+    name: &str,
+    kind: &str,
+) -> Option<String> {
     let key = project_dir(cfg, project).to_str().map(str::to_string)?;
     let mail = match backend::mail_backend(cfg) {
         Ok(m) => m,
@@ -6470,11 +6535,15 @@ pub(crate) fn register_spawned_agent(
         warn_no_identities(&e);
         return None;
     }
-    // bridge the identity to the herdr pane (best-effort, like register).
-    // The file holds the REGISTERED identity (the pin) so
-    // resolve_pane_identity returns a name that exists in the registry.
-    if let Err(e) = backend::run_mail(mail.write_pane_identity(&key, pane_id, &mail_name)) {
-        eprintln!("flywheel: mail write_pane_identity failed for {name} on {pane_id}: {e}");
+    // bd-pin-public-plane-s-easy.2: fold slug → pin (ADR-0018 D4) so
+    // whois(slug) resolves to the pin's npub — the slug never becomes a
+    // second identity. The fold is a Mailbox-only op (not on the shared
+    // MailSurface trait), so the concrete facade writes it. Best-effort,
+    // loud on fail; never fails the spawn.
+    if let Ok(Some(facade)) = mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
+        && let Err(e) = facade.fold_agent_name_alias(&key, name, &mail_name)
+    {
+        eprintln!("flywheel: mail fold_agent_name_alias failed for {name} -> {mail_name}: {e:#}");
     }
     // persist the pin binding so a re-spawn of the same herdr name KEEPS the
     // identity (idempotent — never a fresh draw) and wake/debate resolve
@@ -6484,7 +6553,7 @@ pub(crate) fn register_spawned_agent(
     match entries.iter_mut().find(|e| e.name == name) {
         Some(e) => e.mail_identity = Some(mail_name.clone()),
         None => entries.push(state::SpawnEntry::with_mail_identity(
-            pane_id.to_string(),
+            String::new(), // pane bound later by bind_pane_mail_identity
             name.to_string(),
             mail_name.clone(),
         )),
@@ -6493,6 +6562,49 @@ pub(crate) fn register_spawned_agent(
         eprintln!("flywheel: cannot save spawn registry for {name}: {e:#}");
     }
     Some(mail_name)
+}
+
+/// bd-pin-public-plane-s-easy.2: bind a drawn pin to its herdr pane — write
+/// the pane identity bridge (pane → pin, so resolve_pane_identity names an
+/// identity that exists) and record the pane_id in the spawn registry. Runs
+/// AFTER the pane exists; the pin itself was drawn pre-split so the pane env
+/// could carry it.
+pub(crate) fn bind_pane_mail_identity(
+    cfg: &Config,
+    project: &str,
+    name: &str,
+    pane_id: &str,
+    pin: Option<&str>,
+) {
+    let Some(pin) = pin.filter(|p| !p.is_empty()) else {
+        return;
+    };
+    let Some(key) = project_dir(cfg, project).to_str().map(str::to_string) else {
+        return;
+    };
+    if let Ok(mail) = backend::mail_backend(cfg) {
+        // bridge the identity to the herdr pane (best-effort, like register).
+        // The file holds the REGISTERED identity (the pin) so
+        // resolve_pane_identity returns a name that exists in the registry.
+        if let Err(e) = backend::run_mail(mail.write_pane_identity(&key, pane_id, pin)) {
+            eprintln!("flywheel: mail write_pane_identity failed for {name} on {pane_id}: {e}");
+        }
+    }
+    let mut entries = state::load_spawn_registry(project);
+    match entries.iter_mut().find(|e| e.name == name) {
+        Some(e) => {
+            e.pane_id = pane_id.to_string();
+            e.mail_identity = Some(pin.to_string());
+        }
+        None => entries.push(state::SpawnEntry::with_mail_identity(
+            pane_id.to_string(),
+            name.to_string(),
+            pin.to_string(),
+        )),
+    }
+    if let Err(e) = state::save_spawn_registry(project, &entries) {
+        eprintln!("flywheel: cannot save spawn registry for {name}: {e:#}");
+    }
 }
 
 /// Deterministic herdr-agent-name → agent-mail adjective+noun mapping.
@@ -7462,8 +7574,8 @@ fn cmd_add(
     let mut spawned: Vec<Value> = Vec::new();
     // bd-bug-omp-herdr-wedge: split panes do NOT inherit the workspace env —
     // pass the herdr integration env at split time too (same as the spawn
-    // path's workspace.create injection).
-    let herdr_env = herdr_shim::herdr_integration_env(cfg);
+    // path's workspace.create injection). bd-pin-public-plane-s-easy.2: the
+    // pin rides along as AGENT_NAME/FLYWHEEL_MAIL_AS in the per-pane env.
     // H3 (bd-harness-integration-preflight): same preflight as spawn — add
     // launches kinds into an existing workspace, so their integrations must
     // be present too. One status read per add, deduped per kind.
@@ -7478,12 +7590,16 @@ fn cmd_add(
             let ordinal = ordinals.entry(short.clone()).or_insert(0);
             *ordinal += 1;
             let name = agent_name_n(project, short, *ordinal);
+            // bd-pin-public-plane-s-easy.2: draw the pin BEFORE the split so
+            // the pane env carries AGENT_NAME/FLYWHEEL_MAIL_AS.
+            let mail_identity = pinned_mail_identity(cfg, project, &name, &kind);
+            let pane_env = herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
             let p = herdr_shim::pane_split(
                 &mut c,
                 &prev,
                 "down",
                 Some(&utf8_path(&dir, "workspace dir")?),
-                Some(&herdr_env),
+                Some(&pane_env),
             )?;
             prev = p.pane_id.clone();
             let mut add_args: Vec<String> = Vec::new();
@@ -7532,13 +7648,21 @@ fn cmd_add(
                 // warns with the manual socket one-liner.
                 prime_via_send_text(&mut c, &prev);
             }
-            // bd-627z.4 / bd-add-missing-mail-identity-16le: register + pin
-            // the mail identity — the SAME mechanism as spawn (unique
-            // adjective+noun pin, collision-checked, idempotent on re-add of
-            // a dead pane's name). The project-local agent-names.json mirror
-            // is written after the loop so claims/strand checks/whois work
-            // immediately after add (bd-add-missing-mail-identity-16le).
-            let _ = register_spawned_agent(cfg, project, &name, &kind, &agent.pane_id);
+            // bd-627z.4 / bd-add-missing-mail-identity-16le: the pin was
+            // drawn + registered BEFORE the split; bind the pane identity
+            // now that the pane exists (same mechanism as spawn — unique
+            // adjective+noun pin, collision-checked, idempotent on re-add
+            // of a dead pane's name). The project-local agent-names.json
+            // mirror is written after the loop so claims/strand
+            // checks/whois work immediately after add
+            // (bd-add-missing-mail-identity-16le).
+            bind_pane_mail_identity(
+                cfg,
+                project,
+                &name,
+                &agent.pane_id,
+                mail_identity.as_deref(),
+            );
             println!("  {} {}", kind_paint(&kind), agent.pane_id);
             spawned
                 .push(json!({ "name": agent.name, "kind": agent.agent, "pane_id": agent.pane_id }));
@@ -8700,6 +8824,40 @@ mod bd_4pxy_tests {
         );
         assert_eq!(
             match_indices(&agents, &[to_want_token("toron", "w70:p1")]),
+            vec![0]
+        );
+    }
+
+    /// bd-pin-public-plane-s-easy.2: `--to <pin>` (the adjective+noun mail
+    /// identity) resolves through the spawn registry to the agent's herdr
+    /// name — the pin is what a model types, the slug is internal.
+    #[test]
+    fn match_indices_resolves_pin_via_registry_mail_identity() {
+        let oc = agent(
+            Some("oc"),
+            Some("flywheel-toron-coder"),
+            "w1",
+            false,
+            AgentStatus::Idle,
+        );
+        let agents = vec![oc];
+        // the spawn-registry entry binds the herdr name to its mail pin
+        let entries = vec![state::SpawnEntry::with_mail_identity(
+            "w70:p1",
+            "flywheel-toron-coder",
+            "DustySparrow",
+        )];
+        // a pin token must resolve to the agent (via the registry mapping),
+        // while the herdr name and pane id keep working unchanged.
+        let resolved = registry_entry_for_token(&entries, "toron", "DustySparrow")
+            .map(|e| e.name.as_str())
+            .expect("pin resolves to a registry entry");
+        assert_eq!(resolved, "flywheel-toron-coder");
+        // full resolution: --to DustySparrow hits the named agent
+        let mut names = agents.clone();
+        overlay_registry_names(&mut names, &entries);
+        assert_eq!(
+            match_indices(&names, &[to_want_token("toron", resolved)]),
             vec![0]
         );
     }
@@ -10864,6 +11022,38 @@ mod wake_identity_tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
+    /// bd-pin-public-plane-s-easy.2: register_spawned_agent writes the
+    /// fold_agent_name_alias(slug -> pin) row after register — whois(slug)
+    /// must resolve to the pin's npub (ADR-0018 D4), never the slug as a
+    /// second identity.
+    #[test]
+    fn register_spawned_agent_folds_slug_to_pin() {
+        let _g = crate::config::lock_env();
+        let data = std::env::temp_dir().join(format!("fw-fold-{}", uuid::Uuid::new_v4()));
+        unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
+        let cfg = Config::default();
+        let project = "/tmp/fw-fold-proj";
+        let slug = "flywheel-toron-oc";
+        let pin = register_spawned_agent(&cfg, project, slug, "opencode", "w7:p1")
+            .expect("spawn registers a pin");
+        let key = project_dir(&cfg, project).to_str().map(str::to_string).unwrap();
+        // whois(slug) after the fold resolves to the PIN's npub — the slug
+        // is not registered as a second identity. Requires swarm mode (open
+        // mode passes the name through and the slug alone is not registered).
+        let mail = backend::mail_backend(&cfg).expect("mail backend");
+        backend::run_mail(mail.ensure_project(&key)).expect("ensure project");
+        if let Ok(Some(facade)) = mail_shim::Mail::from_config(Some(&cfg.toron_mail_config())) {
+            facade.set_identity_mode(&key, "swarm").expect("swarm mode");
+        }
+        let who_slug = backend::run_mail(mail.whois(&key, slug)).expect("whois slug via fold");
+        let who_pin = backend::run_mail(mail.whois(&key, &pin)).expect("whois pin");
+        assert_eq!(
+            who_slug.npub, who_pin.npub,
+            "whois(slug) resolves to the pin's npub after the fold"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
     /// S9 (ADR-0018 D1a): the peer-aware spawn template injects the mail
     /// identity — now the adj+noun PIN, not the slug.
     #[test]
@@ -12101,6 +12291,7 @@ fn cmd_loop(
                 status: format!("{status:?}").to_ascii_lowercase(),
                 kind: String::new(),
                 pane_id: String::new(),
+                mail_identity: None,
             })
             .collect();
         let actions = durable::plan_actions(
@@ -12659,6 +12850,7 @@ mod loop_tests {
             status: format!("{s:?}").to_ascii_lowercase(),
             kind: String::new(),
             pane_id: String::new(),
+            mail_identity: None,
         }
     }
 
@@ -18694,17 +18886,29 @@ fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
         .into_iter()
         .filter(|a| a.workspace_id == ws_id)
         .collect::<Vec<_>>();
-    // [name, status, kind, pane_id] — pane_id enables event→name routing
-    // (bd-event-dispatch-zero-latency). Older parsers ignore the 4th element.
+    // [name, status, kind, pane_id, mail_identity] — pane_id enables
+    // event→name routing (bd-event-dispatch-zero-latency); mail_identity is
+    // the pinned adjective+noun name the loop substitutes for {AGENT_NAME}
+    // (bd-pin-public-plane-s-easy.2, never the herdr slug). Older parsers
+    // ignore the 4th/5th elements.
+    let registry = state::load_spawn_registry(project);
+    let pin_for = |name: &str| -> Option<&str> {
+        registry
+            .iter()
+            .find(|e| e.name == name)
+            .and_then(|e| e.mail_identity.as_deref())
+    };
     let managed: Vec<Value> = if to == "all" {
         agents
             .iter()
             .map(|a| {
+                let name = agent_target(a);
                 json!([
-                    agent_target(a),
+                    name,
                     a.agent_status.as_str(),
                     a.agent.clone().unwrap_or_default(),
                     a.pane_id,
+                    pin_for(name),
                 ])
             })
             .collect()
@@ -18713,11 +18917,13 @@ fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
         resolved
             .iter()
             .map(|a| {
+                let name = agent_target(a);
                 json!([
-                    agent_target(a),
+                    name,
                     a.agent_status.as_str(),
                     a.agent.clone().unwrap_or_default(),
                     a.pane_id,
+                    pin_for(name),
                 ])
             })
             .collect()

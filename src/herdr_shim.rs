@@ -43,13 +43,24 @@ pub use toron_core::backend::types::AgentStatus;
 /// workspace.create / pane.split both accept env. herdr fills the per-pane
 /// ids (HERDR_PANE_ID/TAB/WORKSPACE_ID) itself at agent.start; we supply
 /// the two workspace-level vars.
+///
+/// bd-pin-public-plane-s-easy.2: the pane env additionally carries the
+/// agent's mail PIN (`AGENT_NAME` + `FLYWHEEL_MAIL_AS`) so a spawned agent
+/// boots knowing the identity it is addressed by — same pin the peer
+/// template injects and the loop's `{AGENT_NAME}` substitutes.
 pub(crate) fn herdr_integration_env(
     cfg: &crate::config::Config,
+    pin: Option<&str>,
 ) -> std::collections::BTreeMap<String, String> {
-    std::collections::BTreeMap::from([
+    let mut env = std::collections::BTreeMap::from([
         ("HERDR_ENV".to_string(), "1".to_string()),
         ("HERDR_SOCKET_PATH".to_string(), cfg.socket_path()),
-    ])
+    ]);
+    if let Some(pin) = pin.filter(|p| !p.is_empty()) {
+        env.insert("AGENT_NAME".to_string(), pin.to_string());
+        env.insert("FLYWHEEL_MAIL_AS".to_string(), pin.to_string());
+    }
+    env
 }
 
 /// Parse `AgentStatus` from its wire string (the old inherent `parse` —
@@ -1476,6 +1487,48 @@ mod process_liveness_tests {
         assert!(kind_process_names("pi").contains(&"pi"));
         assert!(kind_process_names("grok").contains(&"grok"));
         assert!(kind_process_names("omp").contains(&"omp"));
+    }
+}
+
+#[cfg(test)]
+mod herdr_env_tests {
+    use super::herdr_integration_env;
+
+    fn cfg() -> crate::config::Config {
+        crate::config::Config::default()
+    }
+
+    /// bd-pin-public-plane-s-easy.2: the pane env carries the agent's mail
+    /// PIN as AGENT_NAME + FLYWHEEL_MAIL_AS — the identity the spawned agent
+    /// boots knowing it is addressed by (same pin the peer template injects
+    /// and the loop substitutes for {AGENT_NAME}).
+    #[test]
+    fn env_carries_pin_as_agent_name_and_mail_as() {
+        let env = herdr_integration_env(&cfg(), Some("DustySparrow"));
+        assert_eq!(env.get("HERDR_ENV").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.get("AGENT_NAME").map(String::as_str),
+            Some("DustySparrow")
+        );
+        assert_eq!(
+            env.get("FLYWHEEL_MAIL_AS").map(String::as_str),
+            Some("DustySparrow")
+        );
+    }
+
+    #[test]
+    fn env_without_pin_omits_identity_keys() {
+        let env = herdr_integration_env(&cfg(), None);
+        assert!(env.contains_key("HERDR_ENV"));
+        assert!(!env.contains_key("AGENT_NAME"));
+        assert!(!env.contains_key("FLYWHEEL_MAIL_AS"));
+    }
+
+    #[test]
+    fn env_ignores_empty_pin() {
+        let env = herdr_integration_env(&cfg(), Some(""));
+        assert!(!env.contains_key("AGENT_NAME"));
+        assert!(!env.contains_key("FLYWHEEL_MAIL_AS"));
     }
 }
 

@@ -304,6 +304,11 @@ fn spawn_crew_into(
                         .any(|a| a.pane_id == e.pane_id && a.workspace_id == ws_id)
                 })
                 .cloned();
+            // bd-pin-public-plane-s-easy.2: draw the mail PIN BEFORE the
+            // pane exists so the pane env carries AGENT_NAME/FLYWHEEL_MAIL_AS
+            // (herdr injects env only at split/create).
+            let mail_identity = crate::pinned_mail_identity(cfg, project, &name, harness);
+            let pane_env = crate::herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
             let (agent_pane_id, name) = if let Some(e) = existing {
                 eprintln!(
                     "  crew {}: reusing {} ({}) @{}",
@@ -325,7 +330,7 @@ fn spawn_crew_into(
                             p,
                             "down",
                             Some(&crate::utf8_path(&dir, "workspace dir")?),
-                            Some(&crate::herdr_shim::herdr_integration_env(cfg)),
+                            Some(&pane_env),
                         )?;
                         split.pane_id
                     }
@@ -349,7 +354,15 @@ fn spawn_crew_into(
                 ));
                 let agent =
                     crate::start_agent_with_retry(c, &name, harness, &pane_id, &agent_args)?;
-                let _ = crate::register_spawned_agent(cfg, project, &name, harness, &agent.pane_id);
+                // bd-pin-public-plane-s-easy.2: bind the pane identity now
+                // that the pane exists (pane → pin bridge + registry).
+                crate::bind_pane_mail_identity(
+                    cfg,
+                    project,
+                    &name,
+                    &agent.pane_id,
+                    mail_identity.as_deref(),
+                );
                 // The first dispatch fires as soon as the engine runs step 1 —
                 // a still-booting agent rejects prompts (`agent_not_ready`).
                 // Wait for the pane to settle idle before returning
@@ -365,10 +378,8 @@ fn spawn_crew_into(
             };
             prev = Some(agent_pane_id.clone());
             registry.retain(|e| e.name != name);
-            // bd-627z.4: pin the registered mail identity at spawn so assign
-            // resolves this pane's agent deterministically.
-            let mail_identity =
-                crate::register_spawned_agent(cfg, project, &name, harness, &agent_pane_id);
+            // bd-627z.4: the pin (drawn pre-split above) binds this pane's
+            // agent deterministically — assign resolves through it.
             registry.push(SpawnEntry {
                 pane_id: agent_pane_id.clone(),
                 name: name.clone(),
@@ -717,12 +728,18 @@ pub fn launch_spawn_job(
             .last()
             .map(|p| p.pane_id.clone())
             .ok_or_else(|| anyhow!("spawn drain: no panes in workspace {ws_id}"))?;
+        // bd-pin-public-plane-s-easy.2: draw the pin BEFORE the split so the
+        // pane env carries AGENT_NAME/FLYWHEEL_MAIL_AS.
+        let mail_identity =
+            crate::pinned_mail_identity(cfg, project, &name, &plan.harness);
+        let pane_env =
+            crate::herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
         let split = crate::herdr_shim::pane_split(
             &mut c,
             &prev,
             "down",
             Some(&crate::utf8_path(&dir, "workspace dir")?),
-            Some(&crate::herdr_shim::herdr_integration_env(cfg)),
+            Some(&pane_env),
         )?;
         let agent = crate::start_agent_with_retry(
             &mut c,
@@ -731,6 +748,15 @@ pub fn launch_spawn_job(
             &split.pane_id,
             &plan.args,
         )?;
+        // bd-pin-public-plane-s-easy.2: bind the pane identity now that the
+        // pane exists.
+        crate::bind_pane_mail_identity(
+            cfg,
+            project,
+            &name,
+            &agent.pane_id,
+            mail_identity.as_deref(),
+        );
         (agent.pane_id.clone(), name)
     };
     let harness = plan.harness.clone();

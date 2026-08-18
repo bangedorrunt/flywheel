@@ -27,6 +27,13 @@ pub fn ensure_project_args(project_key: &str) -> Value {
     json!({ "human_key": project_key })
 }
 
+/// `ensure_project` with the ADR-0018 identity-mode row (`open`|`swarm`)
+/// set at creation (bd-pin-public-plane-s-easy.2 — the daemon's
+/// ensure_project accepts identity_mode; the fold only resolves in swarm).
+pub fn ensure_project_with_mode_args(project_key: &str, mode: &str) -> Value {
+    json!({ "human_key": project_key, "identity_mode": mode })
+}
+
 /// `register_agent`.
 pub fn register_agent_args(
     project_key: &str,
