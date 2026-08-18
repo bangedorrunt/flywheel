@@ -9,7 +9,6 @@ monitor states, checkpoint progress. Tracker: **br/bv**.
 
 ```bash
 cargo install --path . --force
-# or: cp target/release/flywheel ~/.local/bin/flywheel
 ```
 
 Config: `~/.config/flywheel/config.toml` (see `config.example.toml`).

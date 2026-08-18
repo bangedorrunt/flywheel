@@ -4,7 +4,7 @@
 # Each scenario targets one epic guarantee and prints PASS/FAIL with evidence.
 # Run on a clean machine:  scripts/e2e-hardened-loop.sh
 #
-# Requirements: ~/.local/bin/flywheel (current build), herdr server up,
+# Requirements: flywheel on PATH (cargo install --path . --force), herdr server up,
 # br on PATH, Resonate server up (launchd com.flywheel.resonate).
 #
 # Known build constraints (documented precisely, bd-ojx class):
