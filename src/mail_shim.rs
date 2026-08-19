@@ -345,8 +345,12 @@ impl Mail {
         }
     }
 
+    // bd-7bvi: production callers land with the pin-public-plane wave
+    // (spawn/loop startup switches projects to swarm mode); today only
+    // tests exercise it — allow dead_code outside tests so the clippy
+    // gate stays green until the wave wires it.
+    #[cfg_attr(not(test), allow(dead_code))]
     /// bd-pin-public-plane-s-easy.2: switch a project to `swarm` identity
-    /// mode so whois(slug) resolves through the slug → pin fold (ADR-0018
     /// D3/D4; open mode passes names through and the slug alone is not a
     /// registered identity). In-process writes the mode row; the remote
     /// daemon carries it via `ensure_project`'s identity_mode arg.
