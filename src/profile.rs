@@ -356,6 +356,23 @@ impl ProfileCatalog {
             }
         }))
     }
+
+    /// The RAW user-file entries (no compiled-in layering) — the base for
+    /// the CLI write path (bd-2dao): create/edit/remove must persist the
+    /// user's file, never a rebuild from the merged catalog (that drops
+    /// user overrides of built-in profile names).
+    pub fn load_user_file(path: Option<&Path>) -> BTreeMap<String, Profile> {
+        let Some(path) = path else {
+            return BTreeMap::new();
+        };
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return BTreeMap::new();
+        };
+        let Ok(toml) = toml::from_str::<ProfilesToml>(&raw) else {
+            return BTreeMap::new();
+        };
+        toml.profiles
+    }
 }
 
 /// Field-level layering helper: a non-empty user value wins, else inherit the
@@ -560,6 +577,30 @@ mod tests {
         let path = dir.join("profiles.toml");
         fs::write(&path, contents).expect("write temp profiles.toml");
         path
+    }
+
+    /// bd-2dao: the raw user file is the persistence base — builtin-name
+    /// overrides survive create/remove roundtrips.
+    #[test]
+    fn load_user_file_returns_raw_entries_without_layering() {
+        let path = tmp_profiles_toml(
+            r#"
+[profiles.scout]
+model = "big-pickle"
+harness = "opencode"
+
+[profiles.mybot]
+harness = "opencode"
+model = "big-pickle"
+"#,
+        );
+        let raw = ProfileCatalog::load_user_file(Some(&path));
+        assert_eq!(raw.len(), 2, "exactly the user entries: {raw:?}");
+        assert!(raw.contains_key("scout"), "builtin-name override preserved");
+        assert!(raw.contains_key("mybot"));
+        // No layering: absent names stay absent.
+        let empty = ProfileCatalog::load_user_file(None);
+        assert!(empty.is_empty());
     }
 
     #[test]
