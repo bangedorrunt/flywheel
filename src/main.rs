@@ -18039,10 +18039,10 @@ fn now_minus(secs: u64) -> String {
 /// True when a profile is one of the 6 compiled-in built-ins (so `create`/
 /// `edit` doesn't duplicate it on disk verbatim).
 fn is_builtin_profile(name: &str) -> bool {
-    matches!(
-        name,
-        "oracle" | "planner" | "reviewer" | "coder" | "scout" | "housekeeper"
-    )
+    // bd-2nib: derive from the catalog source of truth — a hardcoded name
+    // list drifted and missed `pa`, so profile create/remove baked the pa
+    // compiled-in into the user's profiles.toml.
+    profile::compiled_in_defaults().contains_key(name)
 }
 
 /// Resolve a pane id in the default project workspace for `profile run` /
@@ -23157,6 +23157,24 @@ mod profile_cli_tests {
         }
         assert!(!is_builtin_profile("mybot"));
         assert!(!is_builtin_profile(""));
+    }
+
+    /// bd-2nib: the builtin set must track compiled_in_defaults exactly —
+    /// a hardcoded name list drifted and missed `pa`, so profile
+    /// create/remove baked the pa compiled-in into the user's
+    /// profiles.toml (the merged-catalog leak).
+    #[test]
+    fn is_builtin_profile_tracks_compiled_in_defaults() {
+        assert!(
+            is_builtin_profile("pa"),
+            "pa is a compiled-in profile — must classify as builtin"
+        );
+        for name in profile::compiled_in_defaults().keys() {
+            assert!(
+                is_builtin_profile(name),
+                "every compiled-in profile is builtin: {name}"
+            );
+        }
     }
 
     #[test]
