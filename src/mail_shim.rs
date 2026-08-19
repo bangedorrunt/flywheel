@@ -133,6 +133,38 @@ fn env_non_empty_os(name: &str) -> Option<PathBuf> {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
 }
+/// bd-zncc: test-process mail hermeticity. `Mail::from_config(None)` builds
+/// the in-process mailbox on the DURABLE shared root (~/.local/share/toron)
+/// — correct for production, wrong for tests: agent rows and key files
+/// accumulate across `cargo test` runs until npubs diverge and gift-wrap
+/// unwrap stops projecting (deliveries report count=N, inboxes stay empty).
+/// Pin a per-process temp root unless the test explicitly set one.
+#[cfg(test)]
+pub(crate) fn pin_test_mail_root_once() {
+    static PINNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if PINNED.get().is_some() {
+        return;
+    }
+    // Same-thread re-entry: tests routinely hold lock_env ACROSS
+    // from_config — a plain lock() here deadlocks the suite. try-lock and
+    // mutate under it when free; when the caller already holds it, the
+    // caller's guard IS the serialization — mutate directly (idempotent,
+    // same per-pid value).
+    let _guard = crate::config::ENV_LOCK.try_lock().ok();
+    pin_test_mail_root_set();
+    let _ = PINNED.set(());
+}
+
+#[cfg(test)]
+fn pin_test_mail_root_set() {
+    if std::env::var_os("TORON_MCP_DATA_DIR").is_none()
+        && std::env::var_os("TORON_DATA_DIR").is_none()
+    {
+        let dir = std::env::temp_dir().join(format!("fw-mail-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe { std::env::set_var("TORON_MCP_DATA_DIR", &dir) };
+    }
+}
 
 async fn build_mailbox() -> anyhow::Result<toron_core::mailbox::Mailbox> {
     let (data_dir, db) = mailbox_roots();
@@ -247,9 +279,8 @@ pub struct Mail {
     backend: BackendKind,
 }
 
-#[cfg_attr(not(feature = "mail-toron"), allow(dead_code))]
 impl Mail {
-    /// Rebind the facade's sender identity. Construction-time only: consumes
+    /// Set the agent identity this facade sends AS / reads the inbox for;
     /// self so `Mail` stays `&self`-callable afterwards (c3b.2 — no interior
     /// mutability needed; `name` is never written through `&self`).
     pub fn with_name(mut self, name: String) -> Self {
@@ -266,6 +297,10 @@ impl Mail {
         match cfg.and_then(|c| c.url.as_deref()) {
             Some(url) if !url.is_empty() => Self::remote(cfg),
             _ => {
+                // bd-zncc: every test-path construction pins a per-process
+                // mail root FIRST — see pin_test_mail_root_once.
+                #[cfg(test)]
+                pin_test_mail_root_once();
                 // Eager shared-runtime + mailbox build (se2.1 Phase A / c3b.1):
                 // failures propagate as errors here — no panic on runtime or
                 // mailbox construction failure, and every op reuses the one
@@ -302,6 +337,7 @@ impl Mail {
             backend: BackendKind::Remote(client),
         }))
     }
+
 
     /// Route a tool call through the remote daemon (in-process backend errors).
     fn call_remote(&self, tool: &str, args: Value) -> Result<Value> {
