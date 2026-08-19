@@ -8,6 +8,7 @@ This directory contains records of the major architectural decisions made for th
 | [0002](0002-pluggable-backend-abstraction.md) | Pluggable Backend Abstraction (MultiplexerBackend + MailBackend) | **Accepted** |
 | [0003](0003-reintroduce-agent-mail-backend.md) | Reintroduce a Real agent-mail Backend (per-backend config, XDG, parity) | **Partially superseded** by toron ADR-0007 se2.3 (MailSurface trait unification) — config split, parity harness, per-backend routing survive |
 | [0004](0004-flywheel-web-presence.md) | flywheel Web Presence — Orchestration-Layer Presentation | **Accepted** (2026-08-13; flywheel = section of toron.dev per toron ADR-0013 D5; layer-ownership table, Orchestration pillar, 3 diagrams E/W/CO, docs sections, spin-out path to flywheel.dev) |
+| [0005](0005-always-on-collab-baseline-and-command-surface.md) | Always-On Collaboration Baseline + Composable Markdown Command Surface | **Proposed** (2026-08-19; Layer 0 baseline + markdown-args commands + /peer-aware retro-prime, extensions deferred) |
 
 ## Related toron ADRs
 
