@@ -2,32 +2,46 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | Proposed (captain discussion, 2026-08-19) |
+| **Status** | Proposed (captain discussion, 2026-08-19; doorbell amendment same day) |
 | **Date** | 2026-08-19 |
 | **Decision Maker** | Captain (bangedorrunt) |
-| **Relates to** | ADR-0001 (S.9.3 peer-triggered pattern), ADR-0003 (mail backend), toron ADR-0018 (identity/naming, identity mode), toron ADR-0020 (two-plane CLI), bd-pattern-peer-triggered |
-| **Governs** | `integrations/peer-aware.md.tpl`, `integrations/prompts/*.tpl`, `flywheel integration` generator (`src/main.rs` `cmd_integration`/`prompts_dir`/`render_prompt`), spawn defaults (`cmd_spawn`), `flywheel cron` surface |
+| **Relates to** | ADR-0001 (S.9.3 peer-triggered), ADR-0003 (mail backend), toron ADR-0015 (flywheel drives, toron carries), toron ADR-0018 (identity), toron ADR-0020 (two-plane CLI; plane W = bus push), bd-pattern-peer-triggered |
+| **Governs** | `integrations/peer-aware.md.tpl`, `integrations/prompts/*.tpl`, `flywheel integration` generator (`src/main.rs` `cmd_integration`/`prompts_dir`/`render_prompt`), spawn defaults (`cmd_spawn`), one workspace doorbell dispatcher (flywheel-owned), `flywheel cron` surface |
 | **Verification** | per §7 checkboxes |
 
 ---
 
 ## 1. TL;DR
 
-The captain's doubt, verified: **slash commands are fire-and-forget prompt
-expansions on every harness we target, so composable concerns (awareness,
-identity, conflict protocol) must never live behind them.** Decision: split
-flywheel's collaboration surface into two layers — **Layer 0: an always-on
-baseline** (identity prime, mail poll, reservation watch, guard attribution
-on EVERY flywheel-spawned pane + a `flywheel cron`/`toron watch` captain
-digest; never command-triggered, opt-out only at spawn), and **Layer 1: a
-markdown × frontmatter command surface with arguments** generated per
-harness by the EXISTING `flywheel integration` generator (orchestration
-modes pick a shape; a new standalone `/peer-aware` retro-primes a running
-pane). Per-harness programmatic extensions are **deferred** — one template
-source with N thin frontmatter adapters beats N extension APIs to maintain.
-The command layer stays as the fallback for unforeseeable events — the
-baseline is infrastructure, and infrastructure fails (witnessed 2026-08-19:
-guard hatch broken, two working-tree clobbers by an unprimed pane).
+Slash commands are fire-and-forget prompt expansions. Composable
+concerns (awareness, identity, conflict protocol) must never live
+behind them. The first draft of this ADR put those concerns in the
+**spawn template as a 5-minute self-poll**. That is the same class of
+bug: mail is pull, there is no push into an LLM's context, and a
+blank pane that never runs the poll is deaf.
+
+**Decision (amended):** two layers.
+
+**Layer 0 — always-on baseline (infrastructure, never command-triggered).**
+Identity prime in the prompt (pin is otherwise invisible). One
+**workspace doorbell dispatcher** (flywheel-owned, not N per-pin
+processes) holds `toron watch` plus a pin-scoped inbox `--since`
+sweep and injects one `[doorbell]` line via `herdr agent.prompt`.
+The agent **pulls** the body. The template is the **handler**, not
+the timer. `--no-peer-aware` opts the pane out of the dispatcher +
+handler, never of the identity line. A per-project `awareness-digest`
+cron needs no `loop run`.
+
+**Layer 1 — markdown × frontmatter commands with arguments** via the
+existing `flywheel integration` generator. `/peer-aware` retro-primes
+a running pane (start sidecar + identity + handler). Per-harness
+programmatic extensions stay deferred.
+
+Labor: **mail = state and protocol; dispatcher = wake; template =
+behavior; loop/swarm = dispatch.** Peer-collab works with no loop
+because the dispatcher, not the captain loop, is on the peer path.
+
+---
 
 ## 2. Background & Motivation
 
@@ -62,45 +76,111 @@ collapsed into monolithic, non-parameterized playbooks.
 
 ### 2.3 What the baseline must cover (from the 2026-08-19 session)
 
-Two unprimed-pane clobbers (my in-flight edits reverted twice by a peer with
-no prime and no reservations) and a broken guard escape hatch are the
-existence proof that awareness cannot depend on the captain remembering a
-command. Required always-on: identity prime (pin + guard attribution), mail
-poll loop (plane S kinds + plane P since_ts), reservation-awareness at
-EDIT time (watch kind 30031, not just the commit-time guard), presence
-publish, and a captain digest that does not need `loop run` to be alive.
+Two unprimed-pane clobbers (in-flight edits reverted twice by a peer
+with no prime and no reservations) and a broken guard escape hatch
+prove awareness cannot depend on the captain remembering a command.
+
+A second proof, same day: **toron mail is pull.** Identity registered,
+transport wired, and guard installed are invisible to a freshly
+spawned pane. The template is the only client driver today: it
+boot-primes the pin, the two planes, the self-poll, the conflict
+ladder, presence, and the budget. Delete the template and
+mail-by-default is infrastructure nobody speaks. Plane W (`toron
+watch`) is already push on the **bus**. Bus-push is not LLM-push.
+`herdr agent.prompt` is the only injection into a model.
+
+Required always-on: identity prime (pin + guard attribution), a
+**process** that rings the pane, reservation awareness at EDIT time
+(kind 30031), presence publish, and a captain digest that does not
+need `loop run`.
+
+---
 
 ## 3. Decision
 
 ### D1 — Layer 0: always-on baseline (infrastructure, never command-triggered)
 
 Every flywheel-spawned pane gets, at spawn time (launch args, ADR-0001
-S.9.3 mechanism, unchanged):
+S.9.3 mechanism, plus one flywheel-owned dispatcher for the workspace):
 
 1. **Identity prime**: "You are <pin>; mail identity; guard will block
-   unattributed/unreserved commits." — ONE line minimum, present even with
-   `--no-peer-aware` (single-shot panes still need guard attribution).
-2. **Full peer prime** (default-on, `--no-peer-aware` opts out of the LOOP,
-   never of the identity line): poll cadence, plane S/P, conflict ladder,
-   presence, budgets — today's `peer-aware.md.tpl` body.
-3. **Reservation watch**: the template's watch line adds kind **30031**
-   (file reservations) to `toron watch --once --kinds 9,7,43001,20001,30031`
-   → edit-time awareness of who holds what.
-4. **Wait-vs-collab decision table** in the template (presence + lease
-   state → defer / request-release / take over / share) so every agent
-   decides identically without asking the captain.
+   unattributed/unreserved commits." — ONE line minimum, present even
+   with `--no-peer-aware` (single-shot panes still need guard
+   attribution). A process cannot invent a name the model has never
+   heard.
 
-Captain side: **`flywheel cron` awareness digest** (new builtin workflow,
-e.g. `awareness-digest`): periodic snapshot of presence + active
-reservations + expired request-release timers + guard denials → one kind-9
-channel post + captain DM on conflict only. `toron watch` feeds it; no
-`loop run` required. The loop remains WORK dispatch, not awareness.
+2. **Workspace doorbell dispatcher** (default-on; `--no-peer-aware`
+   unregisters that pane from the dispatcher, never drops the identity
+   line). One flywheel process per workspace, not N `toron watch`
+   children. Ground: `toron watch` opens `demo_mailbox()` (plane.rs);
+   N sidecars = N SQLite handles on the daemon root — the split-brain
+   class ADR-0015 / bd-pin-public-plane-s-easy.14 just closed. Swarm
+   cap is 5 crews (`swarm.md.tpl`). `InProcessBus` persist is sqlite,
+   so one watcher that `collect_trusted`s the same XDG root sees
+   daemon posts.
+
+   **Plane S:** one `toron watch` (no `--once`) on kinds
+   `9,7,43001,30031`. Flywheel reads NDJSON and fans out to the pin
+   that matches `p` / assignee / holder.
+
+   **Plane P:** the same dispatcher loop calls daemon `fetch_inbox`
+   `--since` per registered pin (existing MCP tool, one mailbox).
+   `trigger_tx` stays the workflow host's gift-wrap edge (in-process
+   in `toron serve`). This ADR does **not** add a daemon→herdr socket.
+   Sub-second plane-P wake is a later ADR if 1s inbox sweep is too
+   slow; it is not required for 5 crews.
+
+   On a ring it calls `herdr agent.prompt` with **one line**:
+   `[doorbell] kind 9 h=<channel> from <pin>. Pull: toron channel read …`
+   or `toron mail inbox --since <ts>`. The agent then pulls. Never
+   push a gift-wrap body into context.
+
+   **Ring:** `@pin` on kind 9; job 43001 for that pin; request-release
+   to that pin; `importance` high|urgent on plane P; kind 30031 that
+   conflicts with this pin's paths.
+
+   **Do not ring:** room chatter, presence 20001, routine acks.
+
+   **Working pane:** queue the doorbell (same rule as interrupt:
+   injecting into a working agent needs `--force`). Drain on idle.
+
+   **Budget:** the existing 5 / 30 / 3 knobs
+   (`peer_poll_interval_minutes`, `peer_poll_budget_minutes`,
+   `peer_max_prompts` in `SpawnOpts`) move onto the dispatcher, per
+   pin. A process can enforce them; a prompt cannot. Retro-prime
+   **inherits 5/30/3** (one set of knobs; a shorter recovery budget
+   would kill peer-wake while the pane is still working).
+
+   Spawn fails if the dispatcher is not up. A pane is registered with
+   it when its pin is bound.
+
+3. **Handler template** (not a timer): planes S/P, conflict ladder
+   (request-release → respond → escalate), wait-vs-collab table
+   (presence + lease → defer / request-release / take over / share),
+   "on `[doorbell]`, pull, then act." An optional 5-minute pull stays
+   as a **safety net**, not the path.
+
+4. Captain side: **`flywheel cron` awareness digest** (builtin
+   `awareness-digest`), **per-project** YAML at
+   `<project>/.flywheel/crons/` (ADR-0012 tier: per-project > global >
+   built-in; `CronScope::Project`). Reservations, pins, and steer
+   channels are project-scoped; a host-wide digest would mix graphs.
+   Snapshot: presence + active reservations + expired request-release
+   + guard denials → one kind-9 post + captain DM on conflict only.
+   No `loop run` required. The loop remains WORK dispatch, not awareness.
+
+**Labor split (binding):** mail = state and protocol; dispatcher = wake;
+template = behavior; loop/swarm = dispatch. The dispatcher is the
+peer-to-peer wake path. The captain loop is optional after spawn.
+
+The daemon does **not** call herdr (toron ADR-0015: toron carries,
+flywheel drives).
 
 ### D2 — Layer 1: markdown command surface with arguments (fallback + shape selection)
 
 The command layer survives deliberately — the baseline is NOT 100%
-trustworthy (2026-08-19 proves it), and unforeseeable events need a manual
-trigger. Changes to the generator, not to harnesses:
+trustworthy (2026-08-19 proves it), and unforeseeable events need a
+manual trigger. Changes to the generator, not to harnesses:
 
 1. **Orchestration commands become parameterized**: `swarm.md`/`loop.md`
    (and steer) gain `argument-hint` frontmatter + `$ARGUMENTS` passthrough
@@ -108,9 +188,11 @@ trigger. Changes to the generator, not to harnesses:
    Arguments map onto existing flywheel CLI flags — the command text
    resolves them to a `flywheel` invocation; no new semantics live in prose.
 2. **Standalone `/peer-aware` command**: retro-primes an ALREADY-RUNNING
-   pane — instructs the agent to adopt the identity line + poll loop +
-   reservation watch NOW (recovery path for unprimed panes and manual
-   spawns; the exact remedy for this session's clobber incident class).
+   pane — register it with the workspace dispatcher, inject the identity
+   line, load the handler. Accepts `--budget` overrides mapped to the
+   three dispatcher knobs (default inherit 5/30/3). Recovery path for
+   unprimed panes and manual spawns; the exact remedy for this session's
+   clobber incident class. It does **not** ask the model to start polling.
 3. **One source, N adapters**: all commands render from
    `integrations/prompts/*.tpl` through per-kind `frontmatter-<kind>.tpl`
    (exists) into the five `prompts_dir` targets. A new harness = one
@@ -135,44 +217,200 @@ remain the cross-harness floor.
 pin-public-plane wave's `set_identity_mode` wiring); this ADR depends on
 it, does not change it.
 
+---
+
 ## 4. Options Considered
 
 | Option | Verdict | Why |
 |---|---|---|
-| A. Baseline-only (drop command layer) | rejected | baseline fails too (guard hatch, unprimed panes); unforeseeable events need a manual fallback — captain's call |
-| B. Baseline + markdown args (A + parameterized commands + /peer-aware) | **chosen** | composes by argument on every harness; one source of truth; extends the existing generator |
-| C. Per-harness extension commands | deferred | max power, N APIs to maintain; pi/omp/pa only — opencode structurally can't; revisit on proven need |
-| D. Orchestrator-everything (awareness only via loop/swarm) | rejected | requires a running loop; 2026-08-19 incident happened precisely with no loop alive |
+| A. Baseline-only (drop command layer) | rejected | baseline fails too (guard hatch, unprimed panes); unforeseeable events need a manual fallback |
+| B. Baseline + markdown args (poll-in-template + `/peer-aware`) | **superseded by G** | first-draft chosen; still fire-and-forget — a model that skips the 5-min poll is deaf |
+| C. Per-harness extension commands | deferred | max power, N APIs; pi/omp/pa only; revisit on proven need |
+| D. Orchestrator-everything (awareness only via loop/swarm) | rejected | requires a running loop; 2026-08-19 incident had no loop |
+| E. Inbox-push (dump `fetch_inbox` into context) | rejected | burns the window; leaks plane P |
+| F. Daemon calls `herdr agent.prompt` | rejected | blurs toron ADR-0015; flywheel owns panes |
+| G. Identity line + one workspace doorbell dispatcher + handler template + D2 commands | **chosen** | process cannot forget; one sqlite handle; pull stays the body; no loop required; no new MCP tools |
+
+---
+
+## 4.5 Debate (2026-08-19) — first draft → G
+
+The first draft's Layer 0 was "always-on" only as **more prompt**. That
+repeats the slash-command failure: awareness lives in text the model
+may never execute. Plane W already pushes on the bus. The missing
+wire is watch → `herdr agent.prompt`. Keep D2. Change D1's driver
+from poll-in-template to sidecar-then-pull.
+
+```diff
+--- a/docs/decisions/0005-always-on-collab-baseline-and-command-surface.md
++++ b/docs/decisions/0005-always-on-collab-baseline-and-command-surface.md
+@@ TL;DR
+-Layer 0: an always-on baseline (identity prime, mail poll, reservation
+-watch, guard attribution on EVERY flywheel-spawned pane + a flywheel
+-cron / toron watch captain digest)
++Layer 0: identity prime in the prompt + a doorbell sidecar outside the
++LLM (toron watch → one-line herdr agent.prompt) + handler template.
++Agent pulls the body. Captain digest unchanged. Loop is dispatch.
+
+@@ D1 item 2 (was "full peer prime = today's poll loop")
+-2. Full peer prime (default-on, --no-peer-aware opts out of the LOOP,
+-   never of the identity line): poll cadence, plane S/P, conflict
+-   ladder, presence, budgets — today's peer-aware.md.tpl body.
+-3. Reservation watch: add kind 30031 to toron watch --once --kinds
+-   9,7,43001,20001,30031
++2. Doorbell sidecar (default-on; --no-peer-aware opts out of sidecar +
++   handler, never identity): process holds
++   toron watch --as <pin> --kinds 9,7,43001,30031 + plane-P edge.
++   Ring → herdr agent.prompt one [doorbell] line. Queue if working.
++   Budget 5/30/3 enforced by the sidecar. Kind 30031 is a ring rule,
++   not a prompt instruction.
++3. Handler template: planes, ladder, wait-vs-collab, "on [doorbell]
++   pull then act." 5-min pull is a safety net, not the path.
+
+@@ D2 item 2 (/peer-aware)
+-instructs the agent to adopt the identity line + poll loop +
+-reservation watch NOW
++start (or attach) the doorbell sidecar, inject the identity line,
++load the handler. Does not ask the model to start polling.
+
+@@ Implementation Step 1
+-factor peer-aware.md.tpl into IDENTITY_LINE + POLL_LOOP
++factor peer-aware.md.tpl into IDENTITY_LINE + HANDLER
++(doorbell, ladder, wait-vs-collab). POLL_LOOP becomes optional
++safety-net, not the injected driver.
++New Step 1b: cmd_spawn starts the per-pin sidecar; spawn fails if
++it is down. Test: kind-9 / request-release → agent.prompt without
++the agent having polled.
+
+@@ Non-goals
++No inbox-push. No new MCP tools. No daemon→herdr call.
+```
+
+Why G beats B: encode-lessons-in-structure. A dispatcher either runs or
+spawn fails. A template poll is a suggestion. Why G beats F: pane
+lifecycle stays flywheel. Why G beats E: gift-wrap stays pull.
+
+Same-day close of §8 flipped the first G sketch (per-pin sidecar) to
+**one workspace dispatcher**: N `toron watch` children would each call
+`demo_mailbox()` on the daemon root.
+
+---
+
+## 4.6 Debate round 2 (2026-08-19) — G stands; three addenda proposed (CoralFinch)
+
+Opening concession: the doorbell amendment wins round 1 outright — a
+prompt-poll is a suggestion, a dispatcher is a mechanism
+(encode-lessons-in-structure). Evidence re-verified:
+`plane.rs` `demo_mailbox()` per CLI invocation + 100ms
+`collect_trusted`; interrupt-working-needs-`--force` (5b08079); grok
+prompts do not interpolate. The three diffs below are addenda, not
+reversals — each names a gap G leaves unspecified where silent
+failure returns.
+
+```diff
+@@ D1 item 2 — after "Spawn fails if the dispatcher is not up."
++   **Supervision (lazy self-heal):** any spawn retro-launches the
++   dispatcher when the workspace lock (pid file) is stale — crash →
++   next spawn boundary relaunches + re-registers pins from the spawn
++   registry. The awareness-digest's FIRST line reports dispatcher
++   liveness (`dispatcher: up|down <since>`) — a down dispatcher means
++   deaf panes, which is a conflict-shaped event, the digest's exact
++   job. Rejected: launchd/systemd units (host-specific — against the
++   harness-agnostic stance) and a supervising loop (re-introduces
++   "awareness needs a loop"). Residual gap between crash and next
++   spawn is covered by the handler's safety-net poll.
+@@ D1 "Working pane" bullet
+-   **Working pane:** queue the doorbell (same rule as interrupt:
+-   injecting into a working agent needs `--force`). Drain on idle.
++   **Working pane:** queue the doorbell (same rule as interrupt:
++   injecting into a working agent needs `--force`). Drain signal =
++   `pane_agent_status_changed` working→idle on the ADR-0001 event
++   spine — the dispatcher SUBSCRIBES (it already reads the bus); it
++   never polls herdr for status. Coalesce while queued: one
++   `[doorbell]` line per event-class (channel / job / request-release
++   / reservation-conflict / plane-P urgent), never one per ring.
+@@ D1 Plane P — after "calls daemon `fetch_inbox` `--since` per pin"
++   Cadence: the same ~1s dispatcher loop, pins batched in one pass
++   (fine at 5 crews). The later sub-second plane-P ADR replaces the
++   sweep implementation, not this structure.
+@@ D2 item 2 (/peer-aware)
+    retro-primes an ALREADY-RUNNING pane — register it with the
+    workspace dispatcher, ...
++   Attach takes the same workspace lock as spawn: a second
++   retro-prime attaches to the live dispatcher, never forks a second
++   one (the .14 split-brain guard applies to recovery too).
+@@ §7 Verification
++- [ ] dispatcher killed mid-flight → next spawn relaunches it (stale-lock path), digest line flips to `down`, no second dispatcher appears
++- [ ] queued doorbell drains on `pane_agent_status_changed` working→idle, coalesced per event-class (unit test on the queue)
+```
+
+Why these close real holes: an unsupervised dispatcher re-creates the
+deaf-pane failure mode silently (G's own motivation); an unnamed idle
+signal means every implementer invents one (polling herdr — the thing
+the event spine exists to prevent); unspecified cadence + unguarded
+attach are where the N-process split-brain sneaks back in during
+recovery, the highest-risk path (/peer-aware exists precisely for
+broken states).
+
+---
 
 ## 5. Non-Goals
 
 - No new mail transport, plane, or protocol (toron ADR-0020 covers the CLI surface).
+- No new MCP tools (toron ADR-0007 C3 / ADR-0020).
+- No inbox-push (bodies stay pull; plane P stays sealed).
+- No daemon → herdr `agent.prompt` (toron ADR-0015).
 - No change to the loop/swarm playbook CONTENT (wave gating, bead discipline).
 - No interactive UI work (that is the extension revisit trigger, not this ADR).
 - No per-harness behavioral forks — commands differ by frontmatter/dir only.
 
+---
+
 ## 6. Implementation Plan
 
-- **Affected paths**: `integrations/peer-aware.md.tpl`, `integrations/prompts/{swarm,loop,steer,peer-aware}.md.tpl`, `src/main.rs` (`cmd_integration`, `render_prompt`, `PROMPT_WORKFLOWS`/`ORCHESTRATION_COMMANDS`, `peer_prompt_template`, `cmd_spawn` minimal-prime branch), `src/cron.rs` (digest workflow registration), `src/builtin_workflows.rs` (`awareness-digest`).
-- **Step 1 — template split**: factor `peer-aware.md.tpl` into `IDENTITY_LINE` (always injected, even `--no-peer-aware`) + `POLL_LOOP` (default-on block). Add kind 30031 to the watch line + the wait-vs-collab table.
-- **Step 2 — /peer-aware command**: new `peer-aware.md.tpl` rendering the retro-prime instruction ("adopt identity + poll loop + reservation watch now; publish presence") into all five kinds via `flywheel integration`.
-- **Step 3 — parameterized orchestration commands**: `argument-hint` + `$ARGUMENTS` (validated mapping to flywheel CLI flags) in swarm/loop/steer templates; generator tests assert args present per kind.
-- **Step 4 — awareness digest**: builtin workflow `awareness-digest` (presence + reservations + expired request-release + guard denials → kind-9 post + conditional captain DM); register a default `flywheel cron` entry.
-- **Step 5 — spawn minimal prime**: `cmd_spawn` injects IDENTITY_LINE for every pane; unit test: `--no-peer-aware` pane still carries the identity line.
-- **Patterns**: templates stay the single source; per-kind differences live ONLY in `frontmatter-<kind>.tpl`. governed-by comments on touched files.
+- **Affected paths**: `integrations/peer-aware.md.tpl`, `integrations/prompts/{swarm,loop,steer,peer-aware}.md.tpl`, `integrations/prompts/frontmatter-{opencode,pi,omp,grok,pa}.md.tpl`, `src/main.rs` (`cmd_integration`, `render_prompt`, `PROMPT_WORKFLOWS`/`ORCHESTRATION_COMMANDS`, `peer_prompt_template`, `cmd_spawn` dispatcher register), `src/pane.rs` (queue-if-working), a new doorbell dispatcher module (workspace-scoped), `src/cron.rs` + `<project>/.flywheel/crons/` (digest), `src/builtin_workflows.rs` (`awareness-digest`).
+- **Step 1 — template split**: factor `peer-aware.md.tpl` into `IDENTITY_LINE` (always injected, even `--no-peer-aware`) + `HANDLER` (doorbell contract, planes, ladder, wait-vs-collab). Keep a short optional pull as safety net. Kind 30031 is a dispatcher ring rule and a handler line, not a 5-min chore.
+- **Step 1b — doorbell dispatcher**: one flywheel-owned process per workspace. Plane S: one `toron watch` on `9,7,43001,30031`. Plane P: `fetch_inbox --since` per pin in the same loop (daemon MCP). Spawn fails if the dispatcher is down. `--no-peer-aware` does not register the pane. Working-pane doorbells queue. Rate-limit 5/30/3 per pin. Test: post kind 9 / request-release → `agent.prompt` fires without the agent having polled. Test: two pins, one watch child.
+- **Step 2 — /peer-aware command**: new `peer-aware.md.tpl` rendering the retro-prime ("register with dispatcher; you are {pin}; on [doorbell] pull") into all five kinds via `flywheel integration`. Args include `--budget` → the three knobs.
+- **Step 3 — parameterized orchestration commands**: per-kind adapters (closed in §8): opencode `$ARGUMENTS`; pi/omp `argument-hint` + `$1`/`$@`; grok `argument-hint` plus trailing-text convention (no interpolation in `~/.grok/prompts` today); pa same as pi when the dir exists. Generator tests assert the adapter for each kind, not a fake `$ARGUMENTS` on grok.
+- **Step 4 — awareness digest**: builtin workflow `awareness-digest`; default cron YAML is **per-project** (`<project>/.flywheel/crons/`, `CronScope::Project`).
+- **Step 5 — spawn minimal prime**: `cmd_spawn` injects IDENTITY_LINE for every pane; unit test: `--no-peer-aware` pane still carries the identity line and is **not** registered with the dispatcher.
+- **Patterns**: templates stay the single source for **behavior**; the dispatcher is the single source for **wake**. Per-kind command differences live ONLY in `frontmatter-<kind>.tpl`. `// governed-by: ADR-0005` on touched files.
+
+---
 
 ## 7. Verification (checkboxes)
 
 - [ ] `flywheel integration <kind>` for all 5 kinds emits `peer-aware.md` + argument-bearing `swarm.md`/`loop.md` into the kind's `prompts_dir` (generator test, no live harness needed)
-- [ ] `/peer-aware` retro-prime: a live unprimed pane, prompted with the command output, publishes presence + reserves before its next edit (manual live check, one pane)
-- [ ] `--no-peer-aware` spawn still injects the identity line (unit test on `cmd_spawn` arg construction)
-- [ ] peer template watch line includes kind 30031 (template invariant test)
-- [ ] `awareness-digest` cron posts a digest without `loop run` alive (cron run + channel read)
+- [ ] `/peer-aware` retro-prime: a live unprimed pane, after the command, is registered with the dispatcher and publishes presence + reserves before its next edit (manual live check, one pane)
+- [ ] `--no-peer-aware` spawn still injects the identity line and is **not** registered with the dispatcher (unit test on `cmd_spawn`)
+- [ ] One workspace = one `toron watch` child; two pins do not start two watch processes (unit test)
+- [ ] Dispatcher watch kinds include 30031 (unit test on watcher argv)
+- [ ] Post kind 9 `@pin` or `reserve request-release` → `herdr agent.prompt` contains `[doorbell]` while the agent has not polled (e2e or herdr-mock)
+- [ ] Working pane: doorbell is queued, not injected, until idle (unit test)
+- [ ] `awareness-digest` cron YAML lives under `<project>/.flywheel/crons/` and posts a digest without `loop run` alive (cron run + channel read)
 - [ ] `/swarm peer-aware=off` renders the playbook with the flag mapped to `--no-peer-aware` spawns (render test)
+- [ ] Handler template has no mandatory "every 5 minutes of idle, watch" as the driver (template invariant test)
+- [ ] grok `frontmatter-grok.md.tpl` does **not** claim `$ARGUMENTS` interpolation (adapter test)
 
-## 8. Open Questions (for the discussion)
+---
 
-1. Budget defaults for the retro-primed loop (inherit 5/30/3, or shorter for recovery contexts)?
-2. Should the digest run per-project or one cross-project digest (cron entry shape)?
-3. `pa`/`grok` argument adapters: confirm their markdown arg syntax (TBD in §2.2) before Step 3 lands for those kinds.
-4. Should `/peer-aware` also accept `--budget` overrides in args (maps to the template's three knobs)?
+## 8. Open questions — closed (researched 2026-08-19)
+
+Evidence: `toron-cli/src/plane.rs` `run_plane_command` → `demo_mailbox()`;
+watch loop is `collect_trusted` every 100ms; `SpawnOpts` defaults 5/30/3
+(`main.rs`); swarm cap 5 (`swarm.md.tpl`); cron tiers
+`per-project > global > built-in` (`cron.rs` ADR-0012);
+`trigger_tx` is in-process `UnwrappedMail` for `WorkflowHost` only
+(`server.rs`); grok `~/.grok/prompts` frontmatter has no arg
+interpolation (skills take trailing text; `frontmatter-grok.md.tpl`
+is `prompt_mode` only); pi/omp already have `argument-hint`.
+
+| # | Decision | Why |
+|---|---|---|
+| 1 | **One dispatcher per workspace**, not N per-pin sidecars | N `toron watch` = N `demo_mailbox()` on the daemon root (the .14 split-brain). One watch child + fan-out. Isolation is per-pin **queue/budget**, not per-pin process. |
+| 2 | Retro-prime **inherits 5/30/3** | `SpawnOpts` already owns the knobs. A shorter recovery budget would silence peer-wake mid-task. Override is Layer 1 (`--budget`), not a second default. |
+| 3 | Digest is **per-project** (`<project>/.flywheel/crons/`, `CronScope::Project`) | Pins, reservations, and steer channels are project-scoped. Host-wide mix is a lie. Matches ADR-0012 precedence. |
+| 4 | Adapters: **opencode `$ARGUMENTS`**; **pi/omp `argument-hint` + `$1`/`$@`**; **grok `argument-hint` + trailing-text convention, no fake `$ARGUMENTS`**; **pa = pi** when the dir exists | Grok prompts are not skills. Inventing interpolation would fail closed. Pi/omp already interpolate. |
+| 5 | **`/peer-aware` accepts `--budget`** | Maps to the three dispatcher knobs. Default inherit. Recovery that wants `max_peer_prompts=1` can say so. |
+| 6 | Plane P = **dispatcher `fetch_inbox --since` per pin** on the same loop. `trigger_tx` stays workflows. **No daemon→herdr socket in this ADR** | Existing MCP tool, one mailbox, ADR-0015 intact. Sub-second P-wake is a later ADR if 1s sweep is too slow (not needed at 5 crews). |
