@@ -15446,18 +15446,12 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             if merged.harness.is_empty() || merged.model.is_empty() {
                 bail!("profile {name} needs at least --harness and --model");
             }
-            // Rebuild the on-disk [profiles.<name>] shape: user entries only,
-            // merged over the catalog (which already layers built-ins).
-            let mut on_disk: BTreeMap<String, profile::Profile> = BTreeMap::new();
-            for n in cat.names() {
-                // carry local (non-builtin) entries verbatim; the edited one is
-                // rewritten from the merge so partial edits keep built-in fields
-                if (n == *name || !is_builtin_profile(&n))
-                    && let Some(p) = cat.get(&n)
-                {
-                    on_disk.insert(n, p.clone());
-                }
-            }
+            // bd-2dao: persist from the RAW user file — the merged catalog
+            // rebuild dropped user overrides of built-in profile names.
+            // The edited entry is written as the merged profile so partial
+            // edits keep built-in fields.
+            let mut on_disk: BTreeMap<String, profile::Profile> =
+                profile::ProfileCatalog::load_user_file(Some(&path));
             on_disk.insert(name.clone(), merged);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -15545,17 +15539,12 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             if cat.get(name).is_none() {
                 bail!("no profile named {name:?}");
             }
-            // Rebuild the on-disk local entries WITHOUT the named one (mirrors
-            // create/edit: only non-builtin entries are persisted).
-            let mut on_disk: BTreeMap<String, profile::Profile> = BTreeMap::new();
-            for n in cat.names() {
-                if n != *name
-                    && !is_builtin_profile(&n)
-                    && let Some(p) = cat.get(&n)
-                {
-                    on_disk.insert(n, p.clone());
-                }
-            }
+            // bd-2dao: persist from the RAW user file minus the named entry —
+            // the merged-catalog rebuild dropped user overrides of built-in
+            // profile names.
+            let mut on_disk: BTreeMap<String, profile::Profile> =
+                profile::ProfileCatalog::load_user_file(Some(&path));
+            on_disk.remove(name);
             if on_disk.is_empty() {
                 // Removing the last local entry → drop the file (clean state).
                 let _ = std::fs::remove_file(&path);
