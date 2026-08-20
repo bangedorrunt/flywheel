@@ -32,7 +32,7 @@ flywheel backend status
 flywheel backend default <multiplexer|mail> <name>
 ```
 
-herdr protocol v19. Socket: `HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`.
+herdr protocol v20. Socket: `HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`.
 
 ## Runtime
 
