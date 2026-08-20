@@ -205,7 +205,7 @@ with **`__poll` heartbeat** as the correctness floor (no event replay). See
 | Debate | `flywheel debate "<proposition>" --rounds 3` | A/B + judge, thread `debate-<ts>` |
 | Plan→review→implement | `flywheel plan-review <project> "<feature>"` | APPROVE/CHANGES/VERIFIED/REJECT; paper-first |
 | Cross-project | `flywheel xproj send …` | product + contact; subject `[xproj]`; `--to-project` is routing context (delivery is name-based after `xproj request --to-project` handshake) |
-| Peer-triggered | spawn with peer-aware prompt | peer mail wakes idle peer |
+| Peer-triggered (ADR-0005) | spawn (doorbell ON) | kind-9 `@pin` / job / request-release → `[doorbell]` prompt; agent pulls |
 | **Workflow run** (ADR-0010) | `flywheel workflow run <name> --execute --mode headless|pane` | declarative multi-step procedure; role-conditioned + model-injected dispatch; `runs/` logged when headless |
 | **Coalition** (ADR-0011) | `flywheel coalition form <goal> --crews <squad>` | steer+collab layers; intent-based coordination (declare → soft-conflict → propose → negotiate); captain-formed + auto-coalesce |
 | **Cron** (ADR-0012) | `flywheel cron start` (drives cron YAMLs) | standalone scheduled primitive distinct from workflow; body composes workflows; Resonate `ctx.sleep` durable-sleep |

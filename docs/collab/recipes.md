@@ -42,13 +42,14 @@ flywheel plan-review ~/workspace/flywheel "Add backend list --json stability doc
 
 ## 3. Peer-triggered handoffs (ADR-0001 §9.4)
 
-**Contract:** agent A finishes a slice and mails peer B to claim related work;
-loop does not poll-only for the handoff.
+**Contract:** agent A finishes a slice and posts kind 9 `@pin` (or a job /
+request-release). The workspace doorbell injects `[doorbell]`; B pulls.
+No `loop run` required for peer wake.
 
 ```bash
-# spawn with peer-aware prompts (see flywheel spawn --help / peer-aware template)
-flywheel spawn myproj --oc=2
-# agents use agent-mail send/reply in thread peer-<bead>; subject [peer] wake
+flywheel spawn myproj --profile coder --count 2
+# crew-to-crew: toron channel post --mention <pin>
+# captain steer still: flywheel send --to <pin>
 ```
 
 - Prefer structured subjects so inbox filters stay simple

@@ -65,7 +65,7 @@ If you find bugs, TODOs, or related work while executing: create a new bead with
 
 - **Debate** (`flywheel debate "<prop>" --rounds N`): a peer may ask you to argue FOR/COUNTER a proposition in thread `debate-<ts>`. Reply concisely (<=120 words), then `acknowledge_message` the orchestrator's prompt — turn advancement is ack-gated.
 - **Plan-review gate** (`flywheel plan-review`): if cast as reviewer, reply with a leading structured token (`APPROVE` / `CHANGES:<notes>` / `VERIFIED` / `REJECT:<reason>`) so routing is deterministic; implementers hold a build slot while running cargo.
-- **Peer-triggered** (`flywheel spawn --peer-aware`): if you were spawned peer-aware, periodically `fetch_inbox(self, since_ts=<last_poll RFC3339>)` (unread_only is a no-op), act on urgent peer messages (reply + ack; help via `herdr agent prompt <peer> --wait`; else escalate), bounded to the budget. Never spawn/close panes — only the orchestrator owns lifecycle.
+- **Peer-triggered** (ADR-0005): the dispatcher rings `[doorbell]`. FIRST show you heard (120s): presence `working` or one kind-9 line, or you become `doorbell: unanswered pin=…`. Then pull (`toron channel read` / `toron job list` / `toron mail inbox --since <ts>`) and act. Gift-wrap bodies stay pull. A 5-min inbox self-poll is safety-net only. Never spawn/close panes — only the orchestrator owns lifecycle.
 - **Cross-project** (`flywheel xproj` / contact links): an approved cross-project sender may trigger a swarm in your project via a `[xproj]` subject; parse the body (`recipe=`/`workers=`/`product=`), spawn, and reply results in-thread.
 
 # Blocked escalation awareness (ADR-0001 §9.6/A6)

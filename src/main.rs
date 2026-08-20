@@ -12,6 +12,7 @@ mod config;
 mod crew;
 mod cron;
 mod decide;
+mod doorbell;
 mod durable;
 mod fs_util;
 mod headless;
@@ -38,7 +39,7 @@ mod workflow_catalog;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -144,22 +145,22 @@ enum Commands {
         /// are never closed — they only warn.
         #[arg(long)]
         retire_orphans: bool,
-        /// spawn agents with the peer-aware self-poll template (ADR-0001 §9.3)
-        /// — DEFAULT ON (2026-08-15, captain: collab is not optional; manual
-        /// steering is not a swarm). --no-peer-aware opts out for single-shot
-        /// panes.
+        /// spawn agents with the peer-aware handler (ADR-0005). DEFAULT ON.
+        /// --no-peer-aware opts out of dispatcher + handler, never of the
+        /// identity line.
         #[arg(long, action = clap::ArgAction::SetTrue, default_value_t = true)]
         peer_aware: bool,
-        /// opt OUT of the peer-aware self-poll template (single-shot panes)
+        /// opt OUT of dispatcher + handler (single-shot panes). Identity
+        /// line still injects.
         #[arg(long)]
         no_peer_aware: bool,
-        /// peer-aware poll cadence (minutes idle between inbox polls; default 5)
+        /// safety-net idle pull (minutes). Dispatcher wake is the path.
         #[arg(long, default_value_t = 5)]
         peer_poll_interval_minutes: u32,
-        /// peer-aware liveness budget (minutes alive; default 30)
+        /// dispatcher liveness budget (minutes; default 30)
         #[arg(long, default_value_t = 30)]
         peer_poll_budget_minutes: u32,
-        /// peer-aware max peer-prompts per task (default 3)
+        /// dispatcher max peer-prompts per pin (default 3)
         #[arg(long, default_value_t = 3)]
         peer_max_prompts: u32,
         /// post-spawn settle: seconds to sleep after the readiness gate so a
@@ -673,6 +674,24 @@ enum Commands {
     /// internal: poll swarm state as JSON (durable workflow leaf)
     #[command(name = "__poll", hide = true)]
     __Poll { project: String, to: String },
+    /// internal: detached workspace doorbell (ADR-0005). Spawned by
+    /// `cmd_spawn`; stay alive until `flywheel kill` SIGTERMs us.
+    #[command(name = "__doorbell", hide = true)]
+    __Doorbell {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        workspace: String,
+        /// herdr-mock (SC-D1): stdin watch NDJSON → JSON injects, then exit.
+        #[arg(long, hide = true)]
+        once: bool,
+        /// Print `dispatcher: up|down …` and exit (awareness-digest).
+        #[arg(long, hide = true)]
+        report: bool,
+        /// `pin=status` pairs for `--once` (e.g. `BlueRidge=idle`).
+        #[arg(long, hide = true)]
+        status: Vec<String>,
+    },
     /// internal: block up to timeout collecting herdr push events (durable leaf)
     ///
     /// Forward-only `events.subscribe` — no replay. The loop's `__poll`
@@ -3410,6 +3429,13 @@ fn main() {
             json,
         }) => cmd_preflight(&cfg, mode, project.as_deref(), *work, *json),
         Some(Commands::__Poll { project, to }) => cmd_internal_poll(&cfg, project, to),
+        Some(Commands::__Doorbell {
+            project,
+            workspace,
+            once,
+            report,
+            status,
+        }) => cmd_internal_doorbell(&cfg, project, workspace, *once, *report, status),
         Some(Commands::__PollEvents {
             project,
             timeout_ms,
@@ -3854,10 +3880,7 @@ fn spawn_items_from_plan(
 /// add`). The routing registry layers compiled-in defaults under the
 /// user's models.toml. Explicit ad-hoc `--model` strings on the headless
 /// path keep the lenient passthrough.
-pub(crate) fn profile_launch_args(
-    harness: &str,
-    p: &profile::Profile,
-) -> Result<Vec<String>> {
+pub(crate) fn profile_launch_args(harness: &str, p: &profile::Profile) -> Result<Vec<String>> {
     let registry = models::ModelRegistry::load_routing()?;
     let model = registry.resolve_strict(&p.model, harness)?;
     let mut args = headless::model_args(
@@ -4150,9 +4173,11 @@ mod spawn_profile_plan_tests {
         // Unknown harness injects nothing — but the model must still ROUTE.
         let mut unknown = profile("hermes", "glm-5.2");
         unknown.effort = "max".into();
-        assert!(profile_launch_args("hermes", &unknown)
-            .expect("unknown harness, routable model")
-            .is_empty());
+        assert!(
+            profile_launch_args("hermes", &unknown)
+                .expect("unknown harness, routable model")
+                .is_empty()
+        );
     }
 
     /// STRICT routing: a profile model that is NOT a registry id fails the
@@ -5149,6 +5174,46 @@ mod spawn_boot_reliability_tests {
         );
     }
 
+    #[test]
+    fn spawn_starts_doorbell_dispatcher() {
+        let src = include_str!("main.rs");
+        let spawn = src.rfind("fn cmd_spawn(").expect("cmd_spawn");
+        let spawn_end = src[spawn + 1..]
+            .find("\nfn cmd_internal_doorbell")
+            .map(|i| spawn + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[spawn..spawn_end];
+        assert!(
+            body.contains("doorbell::ensure_running"),
+            "cmd_spawn must start/attach the ADR-0005 doorbell dispatcher"
+        );
+        let kill = src.rfind("fn cmd_kill(").expect("cmd_kill");
+        let kbody = &src[kill..];
+        assert!(
+            kbody.contains("doorbell::stop"),
+            "cmd_kill must stop the doorbell child"
+        );
+    }
+
+    #[test]
+    fn spawn_no_peer_aware_keeps_identity_skips_dispatcher() {
+        let src = include_str!("main.rs");
+        let spawn = src.rfind("fn cmd_spawn(").expect("cmd_spawn");
+        let spawn_end = src[spawn + 1..]
+            .find("\nfn cmd_internal_doorbell")
+            .map(|i| spawn + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[spawn..spawn_end];
+        assert!(
+            body.contains("doorbell::identity_prime"),
+            "--no-peer-aware must still inject the identity line"
+        );
+        assert!(
+            body.contains("if peer_aware") && body.contains("doorbell::ensure_running"),
+            "dispatcher starts only when peer-aware"
+        );
+    }
+
     // bd-spawn-omp-boot-reliability-3h06: the final gate's pure verdict —
     // only panes with a confirmed live process pass; a dead process, an
     // inconclusive probe, and a probe error all count as dead.
@@ -5763,12 +5828,8 @@ projects available: {}",
     let mut first = true;
     // ordinals per kind across the whole plan (recipe + flags may repeat a kind)
     let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
-    // peer-aware bootstrap prompt (bd-pattern-peer-triggered, ADR-0001 §9.3).
-    // When --peer-aware, each spawned agent receives the self-poll template as
-    // its initial instruction. The template is read once; per-agent
-    // placeholders are substituted at the call site below.
-    // 2026-08-15 (captain): collab is the default — crews self-poll the
-    // mailbox unless explicitly opted out. Manual steering is not a swarm.
+    // ADR-0005: handler template when peer-aware; identity line always.
+    // --no-peer-aware skips dispatcher + handler, never the identity line.
     let peer_aware = opts.peer_aware && !opts.no_peer_aware;
     let peer_template: Option<String> = if peer_aware {
         let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("integrations/peer-aware.md.tpl");
@@ -5835,7 +5896,7 @@ projects available: {}",
                         opts.peer_max_prompts,
                     )]
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|| vec![doorbell::identity_prime(&name, identity)]);
             // bd-eign.9: a profiled spawn launches with the profile's model —
             // per-harness model args (headless::model_args) + omp role flags,
             // then any launch text (peer template) LAST so a one-shot-capable
@@ -5868,11 +5929,8 @@ projects available: {}",
             // 1024-byte MAX_CANON line limit) splits the single-quoted arg
             // mid-quote and zsh parks at `>....` — agent never starts
             // (2026-08-18 coder2/coder3). Wait for the rendered prompt.
-            let shell_ready = herdr_shim::wait_shell_prompt(
-                &mut c,
-                &pane_id,
-                Duration::from_secs(15),
-            )?;
+            let shell_ready =
+                herdr_shim::wait_shell_prompt(&mut c, &pane_id, Duration::from_secs(15))?;
             if !shell_ready {
                 eprintln!(
                     "flywheel: warn: shell for {name} ({pane_id}) did not render a prompt \
@@ -6089,6 +6147,14 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
         }
     }
 
+    // ADR-0005 D1: detached doorbell dispatcher. Spawn fails if it cannot
+    // start or attach. --no-peer-aware skips registration (no child).
+    if peer_aware {
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
+        doorbell::ensure_running(&exe, &config::state_dir(), &label, project)
+            .context("doorbell dispatcher")?;
+    }
+
     println!(
         "swarm ready: flywheel {} {} {}",
         kind_paint("send"),
@@ -6096,6 +6162,432 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
         dim("--to all --stage p1")
     );
     Ok(())
+}
+
+fn cmd_internal_doorbell(
+    cfg: &Config,
+    project: &str,
+    workspace: &str,
+    once: bool,
+    report: bool,
+    status: &[String],
+) -> Result<()> {
+    if report {
+        print!("{}", doorbell::report_text(&config::state_dir(), workspace));
+        return Ok(());
+    }
+    if once {
+        // herdr-mock: no pid file (must not clobber a live dispatcher).
+        let mut map = BTreeMap::new();
+        for pair in status {
+            if let Some((pin, st)) = doorbell::parse_status_pair(pair) {
+                map.insert(pin, st);
+            }
+        }
+        let mut stdin = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin)
+            .context("read doorbell --once stdin")?;
+        print!("{}", doorbell::once_json(&stdin, &map));
+        return Ok(());
+    }
+
+    let path = doorbell::pid_file(&config::state_dir(), workspace);
+    doorbell::write_pid(&path, std::process::id())?;
+    let mut watch = match Command::new("toron")
+        .args([
+            "watch",
+            "--project",
+            project,
+            "--kinds",
+            "9,7,43001,30031,20001",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("flywheel doorbell: toron watch failed ({e}); idle until pid file drops");
+            loop {
+                std::thread::sleep(Duration::from_secs(30));
+                if !path.exists() {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+    };
+    let stdout = watch.stdout.take().context("doorbell watch stdout")?;
+
+    enum Bell {
+        Watch(String),
+        Status { pane_id: String, to: String },
+        Died,
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Bell>();
+    let tx_watch = tx.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            match line {
+                Ok(l) => {
+                    if tx_watch.send(Bell::Watch(l)).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = tx_watch.send(Bell::Died);
+    });
+
+    let mut herdr = Client::connect(Some(&cfg.socket_path())).ok();
+    let mut status_by_pin: BTreeMap<String, String> = BTreeMap::new();
+    let mut pane_to_pin: BTreeMap<String, String> = BTreeMap::new();
+    let mut queues: BTreeMap<String, doorbell::DoorbellQueue> = BTreeMap::new();
+    let mut budgets: BTreeMap<String, doorbell::PinBudget> = BTreeMap::new();
+    let mut since_by_pin: BTreeMap<String, String> = BTreeMap::new();
+    let mut hear = doorbell::HearTracker::default();
+    hear.seed_unanswered(doorbell::read_unanswered(&doorbell::unanswered_file(
+        &config::state_dir(),
+        workspace,
+    )));
+    let mut index = {
+        let pins: Vec<String> = state::load_spawn_registry(project)
+            .iter()
+            .filter_map(|e| e.mail_identity.clone())
+            .collect();
+        doorbell_self_index(cfg, project, &pins)
+    };
+
+    doorbell_refresh_status(
+        herdr.as_mut(),
+        project,
+        &mut status_by_pin,
+        &mut pane_to_pin,
+        &mut queues,
+        &mut hear,
+        &index,
+        workspace,
+    );
+
+    let mut subscribed = false;
+    if let Ok(mut sub_client) = Client::connect(Some(&cfg.socket_path())) {
+        let registry = state::load_spawn_registry(project);
+        let subs: Vec<Subscription> = registry
+            .iter()
+            .filter(|e| !e.pane_id.is_empty())
+            .map(|e| Subscription::agent_status_changed(e.pane_id.clone()))
+            .collect();
+        if !subs.is_empty()
+            && let Ok(mut stream) = herdr_shim::subscribe(&mut sub_client, &subs)
+        {
+            subscribed = true;
+            let tx_st = tx;
+            std::thread::spawn(move || {
+                while let Ok(Some(ev)) = stream.read_event() {
+                    if let herdr_shim::HerdrEventData::PaneAgentStatusChanged(change)
+                    | herdr_shim::HerdrEventData::PaneAgentStatusChangedSub(change) = ev.data
+                        && tx_st
+                            .send(Bell::Status {
+                                pane_id: change.pane_id,
+                                to: change.agent_status.as_str().to_string(),
+                            })
+                            .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    loop {
+        if !path.exists() {
+            break;
+        }
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(Bell::Watch(line)) => {
+                let registry = state::load_spawn_registry(project);
+                let pins: Vec<String> = registry
+                    .iter()
+                    .filter_map(|e| e.mail_identity.clone())
+                    .collect();
+                for pin in &pins {
+                    index.insert_pin(pin.clone(), None);
+                }
+                let injects =
+                    doorbell::apply_watch_line(&line, &index, &status_by_pin, &mut queues);
+                let injects = doorbell::take_allowed(injects, &mut budgets, doorbell_now_unix());
+                if let Some(pk) = doorbell::watch_pubkey(&line) {
+                    hear.note_heard_pubkey(&pk);
+                    if let Some(pin) = index.resolve(&pk) {
+                        hear.note_heard_pin(&pin);
+                    }
+                    doorbell_persist_hear(workspace, &hear);
+                }
+                doorbell_prompt_and_hear(
+                    herdr.as_mut(),
+                    &registry,
+                    &injects,
+                    &mut hear,
+                    &index,
+                    workspace,
+                );
+            }
+            Ok(Bell::Status { pane_id, to }) => {
+                let Some(pin) = pane_to_pin.get(&pane_id).cloned() else {
+                    continue;
+                };
+                let from = status_by_pin
+                    .get(&pin)
+                    .cloned()
+                    .unwrap_or_else(|| "working".into());
+                status_by_pin.insert(pin.clone(), to.clone());
+                let injects = doorbell::apply_status_change(&pin, &from, &to, &mut queues);
+                let injects = doorbell::take_allowed(injects, &mut budgets, doorbell_now_unix());
+                let registry = state::load_spawn_registry(project);
+                doorbell_prompt_and_hear(
+                    herdr.as_mut(),
+                    &registry,
+                    &injects,
+                    &mut hear,
+                    &index,
+                    workspace,
+                );
+            }
+            Ok(Bell::Died) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                doorbell_sweep_inbox(
+                    project,
+                    &status_by_pin,
+                    &mut queues,
+                    &mut since_by_pin,
+                    &mut budgets,
+                    herdr.as_mut(),
+                    &mut hear,
+                    &index,
+                    workspace,
+                );
+                // ADR-0005: subscribe is the drain signal. Poll herdr only
+                // when the event spine is down.
+                if !subscribed {
+                    doorbell_refresh_status(
+                        herdr.as_mut(),
+                        project,
+                        &mut status_by_pin,
+                        &mut pane_to_pin,
+                        &mut queues,
+                        &mut hear,
+                        &index,
+                        workspace,
+                    );
+                } else {
+                    doorbell_refresh_pins(project, &mut pane_to_pin);
+                }
+                let _ = hear.expire(doorbell_now_unix(), doorbell::UNANSWERED_SECS);
+                doorbell_persist_hear(workspace, &hear);
+                let pins: Vec<String> = state::load_spawn_registry(project)
+                    .iter()
+                    .filter_map(|e| e.mail_identity.clone())
+                    .collect();
+                index = doorbell_self_index(cfg, project, &pins);
+                for pin in &pins {
+                    hear.remember_npub(pin, index.npub(pin));
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let _ = watch.kill();
+    Ok(())
+}
+
+/// Pins plus npubs so live kind-9 `p` tags (hex) resolve to the pin.
+fn doorbell_self_index(cfg: &Config, project: &str, pins: &[String]) -> doorbell::SelfIndex {
+    let mut index = doorbell::SelfIndex::from_pins(pins.iter().cloned());
+    let Ok(key) = project_dir_str(cfg, project) else {
+        return index;
+    };
+    let Ok(mail) = backend::mail_backend(cfg) else {
+        return index;
+    };
+    for pin in pins {
+        if let Ok(w) = backend::run_mail(mail.whois(&key, pin))
+            && !w.npub.is_empty()
+        {
+            index.insert_pin(pin.clone(), Some(w.npub));
+        }
+    }
+    index
+}
+
+fn doorbell_now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn doorbell_persist_hear(workspace: &str, hear: &doorbell::HearTracker) {
+    let _ = doorbell::write_unanswered(
+        &doorbell::unanswered_file(&config::state_dir(), workspace),
+        &hear.unanswered_pins(),
+    );
+}
+
+fn doorbell_prompt(
+    herdr: Option<&mut Client>,
+    registry: &[state::SpawnEntry],
+    injects: &[(String, String)],
+) -> Vec<String> {
+    let Some(client) = herdr else {
+        return Vec::new();
+    };
+    let mut ok = Vec::new();
+    for (pin, msg) in injects {
+        let Some(entry) = registry
+            .iter()
+            .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()))
+        else {
+            continue;
+        };
+        match client.agent_prompt(&entry.name, msg, None) {
+            Ok(_) => ok.push(pin.clone()),
+            Err(e) => eprintln!("flywheel doorbell: prompt {} failed: {e:#}", entry.name),
+        }
+    }
+    ok
+}
+
+fn doorbell_prompt_and_hear(
+    herdr: Option<&mut Client>,
+    registry: &[state::SpawnEntry],
+    injects: &[(String, String)],
+    hear: &mut doorbell::HearTracker,
+    index: &doorbell::SelfIndex,
+    workspace: &str,
+) {
+    let now = doorbell_now_unix();
+    for pin in doorbell_prompt(herdr, registry, injects) {
+        hear.note_inject(&pin, index.npub(&pin), now);
+    }
+    doorbell_persist_hear(workspace, hear);
+}
+
+/// Seed / poll pane status. Drain queues on working → idle|done.
+#[allow(clippy::too_many_arguments)]
+fn doorbell_refresh_status(
+    herdr: Option<&mut Client>,
+    project: &str,
+    status_by_pin: &mut BTreeMap<String, String>,
+    pane_to_pin: &mut BTreeMap<String, String>,
+    queues: &mut BTreeMap<String, doorbell::DoorbellQueue>,
+    hear: &mut doorbell::HearTracker,
+    index: &doorbell::SelfIndex,
+    workspace: &str,
+) {
+    let registry = state::load_spawn_registry(project);
+    pane_to_pin.clear();
+    for e in &registry {
+        if let Some(pin) = &e.mail_identity
+            && !e.pane_id.is_empty()
+        {
+            pane_to_pin.insert(e.pane_id.clone(), pin.clone());
+        }
+    }
+    let Some(client) = herdr else {
+        return;
+    };
+    let Ok(agents) = client.agent_list() else {
+        return;
+    };
+    let mut injects = Vec::new();
+    for a in agents {
+        let pin = registry
+            .iter()
+            .find(|e| e.pane_id == a.pane_id || e.name == a.name.as_deref().unwrap_or(""))
+            .and_then(|e| e.mail_identity.clone());
+        let Some(pin) = pin else {
+            continue;
+        };
+        let to = a.agent_status.as_str().to_string();
+        let from = status_by_pin
+            .get(&pin)
+            .cloned()
+            .unwrap_or_else(|| to.clone());
+        status_by_pin.insert(pin.clone(), to.clone());
+        injects.extend(doorbell::apply_status_change(&pin, &from, &to, queues));
+    }
+    doorbell_prompt_and_hear(Some(client), &registry, &injects, hear, index, workspace);
+}
+
+fn doorbell_refresh_pins(project: &str, pane_to_pin: &mut BTreeMap<String, String>) {
+    let registry = state::load_spawn_registry(project);
+    pane_to_pin.clear();
+    for e in &registry {
+        if let Some(pin) = &e.mail_identity
+            && !e.pane_id.is_empty()
+        {
+            pane_to_pin.insert(e.pane_id.clone(), pin.clone());
+        }
+    }
+}
+
+/// Plane P: one `toron mail inbox --since` per pin, batched on the 1s tick.
+#[allow(clippy::too_many_arguments)]
+fn doorbell_sweep_inbox(
+    project: &str,
+    status_by_pin: &BTreeMap<String, String>,
+    queues: &mut BTreeMap<String, doorbell::DoorbellQueue>,
+    since_by_pin: &mut BTreeMap<String, String>,
+    budgets: &mut BTreeMap<String, doorbell::PinBudget>,
+    herdr: Option<&mut Client>,
+    hear: &mut doorbell::HearTracker,
+    index: &doorbell::SelfIndex,
+    workspace: &str,
+) {
+    let registry = state::load_spawn_registry(project);
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut injects = Vec::new();
+    for e in &registry {
+        let Some(pin) = e.mail_identity.as_deref() else {
+            continue;
+        };
+        let since = since_by_pin
+            .get(pin)
+            .cloned()
+            .unwrap_or_else(|| now.clone());
+        let output = Command::new("toron")
+            .args([
+                "mail",
+                "inbox",
+                "--agent",
+                pin,
+                "--project",
+                project,
+                "--since",
+                &since,
+                "--limit",
+                "20",
+            ])
+            .output();
+        let Ok(output) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let raw = String::from_utf8_lossy(&output.stdout);
+        injects.extend(doorbell::apply_inbox_json(&raw, pin, status_by_pin, queues));
+        if let Some(hw) = doorbell::inbox_high_water(&raw) {
+            since_by_pin.insert(pin.to_string(), hw);
+        } else {
+            since_by_pin.insert(pin.to_string(), now.clone());
+        }
+    }
+    let injects = doorbell::take_allowed(injects, budgets, doorbell_now_unix());
+    doorbell_prompt_and_hear(herdr, &registry, &injects, hear, index, workspace);
 }
 
 fn project_base(project: &str) -> String {
@@ -6514,14 +7006,16 @@ mod peer_encoding_tests {
             tpl.contains("since_ts"),
             "peer-aware template must teach since_ts high-water"
         );
-        let rendered = peer_prompt_template(
-            &tpl,
-            "flywheel-toron-coder1",
-            "DustySparrow",
-            5,
-            30,
-            3,
+        assert!(
+            tpl.contains("[doorbell]"),
+            "ADR-0005: handler wakes on [doorbell], not a poll timer"
         );
+        assert!(
+            !tpl.contains("every {poll_interval_minutes} minutes\n  of idle"),
+            "ADR-0005: 5-min idle watch must not be the driver"
+        );
+        let rendered =
+            peer_prompt_template(&tpl, "flywheel-toron-coder1", "DustySparrow", 5, 30, 3);
         assert!(
             !teaches_unread_filter(&rendered),
             "rendered launch prompt must not teach unread as a working filter"
@@ -7737,13 +8231,14 @@ fn cmd_add(
             if needs_in_arg_prime(&kind) {
                 add_args.push(boot_prime_line().to_string());
             }
+            add_args.push(doorbell::identity_prime(
+                &name,
+                mail_identity.as_deref().unwrap_or(&name),
+            ));
             // bd-pattern-peer-triggered: same shell-readiness gate as spawn —
             // typing into a booting shell mangles long single-quoted args.
-            let shell_ready = herdr_shim::wait_shell_prompt(
-                &mut c,
-                &prev,
-                Duration::from_secs(15),
-            )?;
+            let shell_ready =
+                herdr_shim::wait_shell_prompt(&mut c, &prev, Duration::from_secs(15))?;
             if !shell_ready {
                 eprintln!(
                     "flywheel: warn: shell for {name} ({prev}) did not render a prompt \
@@ -7943,6 +8438,11 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             (k.to_string(), st)
         })
         .collect();
+    let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+    let dispatcher = doorbell::dispatcher_status_line(&config::state_dir(), &ws_label);
+    let unanswered =
+        doorbell::read_unanswered(&doorbell::unanswered_file(&config::state_dir(), &ws_label));
+    let report = doorbell::report_text(&config::state_dir(), &ws_label);
     if std::io::stdout().is_terminal() {
         for r in &rows {
             let st = r["status"].as_str().unwrap_or("unknown");
@@ -7960,9 +8460,12 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
         for (k, st) in &integrations {
             println!("  {}", integration_status_line(k, st));
         }
+        println!("{report}");
     } else {
         print_json(&json!({
-            "workspace_id": ws_id, "agents": rows, "integrations": integrations
+            "workspace_id": ws_id, "agents": rows, "integrations": integrations,
+            "dispatcher": dispatcher,
+            "unanswered": unanswered
         }));
     }
     Ok(())
@@ -9249,8 +9752,8 @@ fn cmd_interrupt(
     // --force — a captain must not nudge a working agent off its task
     // because a send JSON showed prior idle (false-fail root cause).
     for a in &targets {
-        let prior = herdr_shim::parse_agent_status(a.agent_status.as_str())
-            .unwrap_or(AgentStatus::Unknown);
+        let prior =
+            herdr_shim::parse_agent_status(a.agent_status.as_str()).unwrap_or(AgentStatus::Unknown);
         interrupt_guard_working(prior, force)?;
     }
     let is_kill = kill_key(&keys).is_some();
@@ -9555,6 +10058,10 @@ fn cmd_kill(cfg: &Config, project: &str, force: bool, force_working: bool) -> Re
         );
     }
     c.workspace_close(&ws_id)?;
+    let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+    if let Err(e) = doorbell::stop(&config::state_dir(), &ws_label) {
+        eprintln!("flywheel: doorbell stop failed: {e:#}");
+    }
     // tidy-up: drop the project's agent state files (stale context signals
     // must not survive into the next spawn — freshness only protects so much)
     let _ = std::fs::remove_dir_all(agentstate::project_state_dir(&project_dir(cfg, project)));
@@ -11221,7 +11728,10 @@ mod wake_identity_tests {
         let slug = "flywheel-toron-oc";
         let pin = register_spawned_agent(&cfg, project, slug, "opencode", "w7:p1")
             .expect("spawn registers a pin");
-        let key = project_dir(&cfg, project).to_str().map(str::to_string).unwrap();
+        let key = project_dir(&cfg, project)
+            .to_str()
+            .map(str::to_string)
+            .unwrap();
         // whois(slug) after the fold resolves to the PIN's npub — the slug
         // is not registered as a second identity. Requires swarm mode (open
         // mode passes the name through and the slug alone is not registered).
@@ -13282,16 +13792,14 @@ mod loop_tests {
         let project = "done-mail-test";
         backend::run_mail(backend.ensure_project(project)).expect("ensure");
         let sender = backend.agent_name().to_string();
-        backend::run_mail(backend.register_agent(
-            project,
-            &spawn_agent_profile(&sender, "opencode", project),
-        ))
+        backend::run_mail(
+            backend.register_agent(project, &spawn_agent_profile(&sender, "opencode", project)),
+        )
         .expect("register sender");
         let captain = "CaptainPine";
-        backend::run_mail(backend.register_agent(
-            project,
-            &spawn_agent_profile(captain, "flywheel", project),
-        ))
+        backend::run_mail(
+            backend.register_agent(project, &spawn_agent_profile(captain, "flywheel", project)),
+        )
         .expect("register captain");
         // the orchestrator resolution prefers the program=="flywheel" agent
         assert_eq!(
@@ -13340,7 +13848,8 @@ mod loop_tests {
     /// bead's thread, subject `[<id>] unverified close reopened`, and NAMES
     /// what is missing (here: the commit).
     #[test]
-    fn sha_rule_missing_commit_mail_names_the_missing_commit() {        use crate::backend::MailSurface as _;
+    fn sha_rule_missing_commit_mail_names_the_missing_commit() {
+        use crate::backend::MailSurface as _;
         let mail = crate::mail_shim::Mail::from_config(None)
             .expect("mail ok")
             .expect("mail Some");
@@ -14339,6 +14848,11 @@ const ORCHESTRATION_COMMANDS: &[(&str, &str, &str)] = &[
         "Run the /loop command — single-agent autonomy: one objective, TDD per unit, in-flight peer checkpoints (summoned reviewer instead of blocking on the captain), VERIFY receipt, commit-before-close.",
         "loop.md.tpl",
     ),
+    (
+        "peer-aware",
+        "Retro-prime a running pane (ADR-0005): attach to the workspace doorbell dispatcher, inject the pin identity line, load the handler. --budget maps to the 5/30/3 knobs.",
+        "peer-aware.md.tpl",
+    ),
 ];
 
 /// Per-orchestration-command template: `{{TOOL_FRONTMATTER}}` + the
@@ -14347,6 +14861,7 @@ fn prompt_orchestration_template(name: &str) -> Option<&'static str> {
     match name {
         "swarm" => Some(include_str!("../integrations/prompts/swarm.md.tpl")),
         "loop" => Some(include_str!("../integrations/prompts/loop.md.tpl")),
+        "peer-aware" => Some(include_str!("../integrations/prompts/peer-aware.md.tpl")),
         _ => None,
     }
 }
@@ -14440,13 +14955,52 @@ fn render_orchestration_prompt(
         .iter()
         .find(|(n, _, _)| *n == name)
         .expect("orchestration command in table");
-    Ok(tpl
-        .replace(
-            "{{TOOL_FRONTMATTER}}",
-            &frontmatter.replace("{{PHASE_DESCRIPTION}}", description),
-        )
+    let (frontmatter, body) = apply_argument_adapter(
+        kind,
+        &frontmatter.replace("{{PHASE_DESCRIPTION}}", description),
+        tpl,
+    );
+    Ok(body
+        .replace("{{TOOL_FRONTMATTER}}", &frontmatter)
         .replace("{{VERSION}}", version)
-        .replace("{{GENERATED}}", generated))
+        .replace("{{GENERATED}}", generated)
+        .replace("{{ARGUMENTS_NOTE}}", argument_note(kind)))
+}
+
+/// ADR-0005 D2/§8: per-kind argument adapter. Grok must not fake `$ARGUMENTS`.
+fn argument_note(kind: &str) -> &'static str {
+    match kind {
+        "opencode" => "Arguments: `$ARGUMENTS` (maps to flywheel CLI flags).",
+        "pi" | "omp" | "pa" => "Arguments: `$1` / `$@` (maps to flywheel CLI flags).",
+        "grok" => {
+            "Arguments: the text after the command name. Grok prompts do not interpolate dollar-ARGUMENTS."
+        }
+        _ => "Arguments: trailing text after the command.",
+    }
+}
+
+fn apply_argument_adapter(kind: &str, frontmatter: &str, body: &str) -> (String, String) {
+    let hint = match kind {
+        "opencode" => "peer-aware=off crews=3  OR  --budget 5/30/3",
+        "pi" | "omp" | "pa" => "[peer-aware=off] [crews=N] [--budget 5/30/3]",
+        "grok" => "peer-aware=off crews=3 (trailing text, not interpolated)",
+        _ => "args",
+    };
+    let fm = if frontmatter.contains("argument-hint:") {
+        frontmatter.to_string()
+    } else {
+        frontmatter.replace(
+            "description: ",
+            &format!("argument-hint: {hint}\ndescription: "),
+        )
+    };
+    let note = argument_note(kind);
+    let body = if body.contains("{{ARGUMENTS_NOTE}}") {
+        body.to_string()
+    } else {
+        format!("{body}\n\n{note}\n")
+    };
+    (fm, body)
 }
 
 /// `flywheel integration [KIND] [--out PATH]` — generate the 5 beads prompt
@@ -19816,7 +20370,10 @@ fn respawn_launch_args(cfg: &Config, project: &str, name: &str, kind: &str) -> V
     let Ok(catalog) = profile::ProfileCatalog::load() else {
         return Vec::new();
     };
-    match catalog.get(&profile_name).map(|p| profile_launch_args(kind, p)) {
+    match catalog
+        .get(&profile_name)
+        .map(|p| profile_launch_args(kind, p))
+    {
         Some(Ok(args)) => args,
         Some(Err(e)) => {
             eprintln!(
@@ -20962,10 +21519,7 @@ fn bead_title_and_close_report(project_dir: &str, bead_id: &str) -> (String, Str
         && let Ok(v) = serde_json::from_slice::<Value>(&out.stdout)
     {
         let first = v.as_array().and_then(|a| a.first());
-        if let Some(t) = first
-            .and_then(|b| b.get("title"))
-            .and_then(Value::as_str)
-        {
+        if let Some(t) = first.and_then(|b| b.get("title")).and_then(Value::as_str) {
             title = t.to_string();
         }
         if let Some(c) = first
@@ -21013,9 +21567,20 @@ fn send_done_mail(
     let body = if report.is_empty() {
         format!("Bead **{bead_id}** (`{title}`) closed with a legal verdict.")
     } else {
-        format!("Bead **{bead_id}** (`{title}`) closed with a legal verdict.\n\nReport:\n```text\n{report}\n```")
+        format!(
+            "Bead **{bead_id}** (`{title}`) closed with a legal verdict.\n\nReport:\n```text\n{report}\n```"
+        )
     };
-    mail_send(mail, key, std::slice::from_ref(&captain.to_string()), &subject, &body, "normal", true, Some(bead_id))
+    mail_send(
+        mail,
+        key,
+        std::slice::from_ref(&captain.to_string()),
+        &subject,
+        &body,
+        "normal",
+        true,
+        Some(bead_id),
+    )
 }
 
 /// internal leaf: close-detect SHA check (ADR-0019 SHA rule, bd-w1-sha-xyhd).
@@ -22401,8 +22966,8 @@ mod integration_tests {
         );
         assert_eq!(
             ORCHESTRATION_COMMANDS.len(),
-            2,
-            "exactly two orchestration commands (swarm + loop)"
+            3,
+            "exactly three orchestration commands (swarm + loop + peer-aware)"
         );
         let (name, description, template) = ORCHESTRATION_COMMANDS[0];
         assert_eq!(name, "swarm");
@@ -22411,6 +22976,10 @@ mod integration_tests {
         let (name, description, template) = ORCHESTRATION_COMMANDS[1];
         assert_eq!(name, "loop", "bd-ug9z adds /loop");
         assert!(!description.is_empty(), "/loop has a description");
+        assert!(template.ends_with(".tpl"), "template file referenced");
+        let (name, description, template) = ORCHESTRATION_COMMANDS[2];
+        assert_eq!(name, "peer-aware", "ADR-0005 adds /peer-aware");
+        assert!(!description.is_empty(), "/peer-aware has a description");
         assert!(template.ends_with(".tpl"), "template file referenced");
     }
 
@@ -22463,6 +23032,54 @@ mod integration_tests {
     }
 
     /// bd-glup: unknown kind or command is an actionable error.
+    #[test]
+    fn peer_aware_command_renders_attach_and_budget() {
+        for kind in ["opencode", "pi", "grok", "omp", "pa"] {
+            let out = render_orchestration_prompt(kind, "peer-aware", "0.1.0", "ts").unwrap();
+            assert!(
+                out.contains("# Orchestration: peer-aware"),
+                "{kind} heading"
+            );
+            assert!(
+                out.contains("ATTACH") || out.contains("attach"),
+                "{kind} must attach, not fork"
+            );
+            assert!(
+                out.contains("5/30/3") || out.contains("--budget"),
+                "{kind} budget knobs"
+            );
+            assert!(out.contains("doorbell"), "{kind} names the doorbell");
+        }
+    }
+
+    #[test]
+    fn argument_adapter_opencode_uses_dollar_arguments() {
+        let out = render_orchestration_prompt("opencode", "swarm", "0.1.0", "ts").unwrap();
+        assert!(
+            out.contains("$ARGUMENTS"),
+            "opencode interpolates $ARGUMENTS"
+        );
+        assert!(out.contains("argument-hint:"));
+    }
+
+    #[test]
+    fn argument_adapter_pi_has_argument_hint() {
+        let out = render_orchestration_prompt("pi", "loop", "0.1.0", "ts").unwrap();
+        assert!(out.contains("argument-hint:"));
+        assert!(out.contains("$1") || out.contains("$@"));
+    }
+
+    #[test]
+    fn argument_adapter_grok_has_no_dollar_arguments() {
+        let out = render_orchestration_prompt("grok", "swarm", "0.1.0", "ts").unwrap();
+        assert!(
+            !out.contains("Arguments: `$ARGUMENTS`"),
+            "grok prompts must not fake $ARGUMENTS interpolation"
+        );
+        assert!(out.contains("argument-hint:"));
+        assert!(out.contains("trailing text") || out.contains("do not interpolate"));
+    }
+
     #[test]
     fn render_orchestration_rejects_unknown() {
         assert!(render_orchestration_prompt("claude", "swarm", "0.1.0", "ts").is_err());
@@ -23676,13 +24293,7 @@ mod send_result_row_tests {
     /// agent was idle at dispatch. No `landed` without --wait/--confirm.
     #[test]
     fn fire_and_forget_row_is_dispatched_not_landed() {
-        let row = send_result_row(
-            "flywheel-toron-coder",
-            "idle",
-            "w1:p1",
-            Some("coder"),
-            None,
-        );
+        let row = send_result_row("flywheel-toron-coder", "idle", "w1:p1", Some("coder"), None);
         assert_eq!(row["target"], "flywheel-toron-coder");
         assert_eq!(row["dispatched"], true, "dispatch is the success signal");
         assert_eq!(row["prior_status"], "idle", "names the status as prior");
@@ -23701,13 +24312,7 @@ mod send_result_row_tests {
     /// settled state), not just dispatched.
     #[test]
     fn wait_row_reports_landed_with_settled_status() {
-        let row = send_result_row(
-            "flywheel-toron-coder",
-            "idle",
-            "w1:p1",
-            None,
-            Some("done"),
-        );
+        let row = send_result_row("flywheel-toron-coder", "idle", "w1:p1", None, Some("done"));
         assert_eq!(row["dispatched"], true);
         assert_eq!(row["prior_status"], "idle");
         assert_eq!(row["landed"], true, "--wait observed landing");
@@ -23719,13 +24324,7 @@ mod send_result_row_tests {
     /// failure (the captain false-fail root cause).
     #[test]
     fn row_preserves_working_prior_status() {
-        let row = send_result_row(
-            "flywheel-toron-coder",
-            "working",
-            "w1:p1",
-            None,
-            None,
-        );
+        let row = send_result_row("flywheel-toron-coder", "working", "w1:p1", None, None);
         assert_eq!(row["dispatched"], true);
         assert_eq!(row["prior_status"], "working");
     }
@@ -23735,12 +24334,9 @@ mod send_result_row_tests {
     /// because the send JSON showed prior idle. Pure guard, unit-tested.
     #[test]
     fn interrupt_of_working_agent_needs_force() {
-        let err = interrupt_guard_working(
-            AgentStatus::Working,
-            false,
-        )
-        .unwrap_err()
-        .to_string();
+        let err = interrupt_guard_working(AgentStatus::Working, false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("--force"), "names the escape hatch: {err}");
         assert!(
             interrupt_guard_working(AgentStatus::Working, true).is_ok(),

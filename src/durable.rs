@@ -2948,7 +2948,7 @@ pub fn claim_watch_step(
                             });
                         }
                     }
-            }
+                }
             }
             (None, None) => {
                 actions.push(ClaimWatchAction::ReleaseReservations {
@@ -3786,8 +3786,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         std::collections::HashMap::new();
     // programmatic done-mail (2026-08-18): one captain done-mail per closed
     // bead per invocation.
-    let mut done_mailed: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut done_mailed: std::collections::HashSet<String> = std::collections::HashSet::new();
     // ADR-0019 Spec 4 (bd-w1-verifier-degrade-a6fk): closed beads whose
     // verifier-dispatch decision already ran this invocation. Degrade mails
     // the captain once per bead — the marker file is the durable dedup.
@@ -4071,8 +4070,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // this, the same beads count as "new" every poll (they never enter
         // `assigned` while paused) and dispatch locks forever. The guard
         // still fires for EVER-NEW bead ids (the runaway signature).
-        let mut flood_seen: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut flood_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         if params.work {
             // interrupted work first: an in-progress bead's agent went idle —
             // resume it before handing out fresh beads. bd-627z.1: live names
@@ -4224,10 +4222,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 .filter(|b| !flood_seen.contains(&b.id))
                 .map(|b| b.id.clone())
                 .collect();
-            if bead_flood_verdict(flood_new_count(
-                to_assign.iter().copied(),
-                &flood_seen,
-            )) {
+            if bead_flood_verdict(flood_new_count(to_assign.iter().copied(), &flood_seen)) {
                 for id in &flood_new {
                     flood_seen.insert(id.clone());
                 }
@@ -9720,7 +9715,11 @@ Dependencies:
         let dispatched: Vec<&str> = dispatchable.iter().map(|b| b.id.as_str()).collect();
         let blocked: Vec<&str> = not_ready.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(dispatched, vec!["bd-rt-ok"], "compliant P2 dispatches");
-        assert_eq!(blocked, vec!["bd-rt-blocked"], "gate blocks THROUGH the leaf");
+        assert_eq!(
+            blocked,
+            vec!["bd-rt-blocked"],
+            "gate blocks THROUGH the leaf"
+        );
     }
 
     /// The not-ready mail needs the WHY — the principles block reason names

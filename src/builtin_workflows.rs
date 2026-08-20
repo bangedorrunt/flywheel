@@ -1009,6 +1009,32 @@ steps:
     on_error: fail_run
 "##,
     ),
+    (
+        "awareness-digest",
+        r##"
+name: awareness-digest
+description: "ADR-0005 captain digest (no loop): presence + reservations + expired request-release + guard denials. First line MUST be dispatcher: up|down <since>. Post kind 9 on the steer channel; DM captain on conflict only."
+trigger:
+  type: schedule
+  cron: "*/15 * * * *"
+  owner: flywheel
+  scope: project
+principles:
+  - never-block-on-the-human
+  - prove-it-works
+inputs:
+  - name: project
+steps:
+  - name: digest
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@housekeeper"
+      harness: "opencode"
+      task: "AWARENESS DIGEST for {{inputs.project}} (ADR-0005 D1.4, no loop run). First lines MUST be `flywheel status {{inputs.project}}` JSON `dispatcher` + `unanswered` (or `flywheel __doorbell --project {{inputs.project}} --workspace <label> --report`): `dispatcher: up|down …` then `doorbell: ok` or `doorbell: unanswered pin=…`. Then snapshot: presence list, active reservations, expired request-release, guard denials. Post the digest as one kind-9 on the project steer channel. DM the captain on conflict: dispatcher down, unanswered doorbell (deaf pane), hard reservation overlap, unanswered request-release. No beads, no repo edits. Per-project cron YAML lives at {{inputs.project}}/.flywheel/crons/ (builtin is the default)."
+    on_error: fail_run
+"##,
+    ),
 ];
 
 /// Load the compiled-in built-in workflows as parsed `Workflow`s.
@@ -1615,6 +1641,39 @@ mod tests {
                 report.issues
             );
         }
+    }
+
+    #[test]
+    fn awareness_digest_is_project_schedule() {
+        use toron_workflow::schema::{CronScope, Trigger};
+        let wfs = builtin_workflows();
+        let d = wfs
+            .get("awareness-digest")
+            .expect("awareness-digest builtin");
+        match &d.trigger {
+            Some(Trigger::Schedule { cron, scope, .. }) => {
+                assert!(!cron.is_empty(), "schedule cron present");
+                assert_eq!(*scope, CronScope::Project, "per-project digest");
+            }
+            other => panic!("expected schedule trigger, got {other:?}"),
+        }
+        let yaml = BUILTIN_WORKFLOWS_YAML
+            .iter()
+            .find(|(n, _)| *n == "awareness-digest")
+            .map(|(_, y)| *y)
+            .unwrap();
+        assert!(
+            yaml.contains("dispatcher: up|down"),
+            "digest first line is dispatcher liveness"
+        );
+        assert!(
+            yaml.contains("no loop run"),
+            "digest must not require loop run"
+        );
+        assert!(
+            yaml.contains("unanswered"),
+            "digest must treat unanswered doorbell as conflict"
+        );
     }
 
     /// bd-m7ac: weekly-review is a schedule-triggered graph — parallel

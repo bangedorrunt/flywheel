@@ -2482,8 +2482,12 @@ mod shell_prompt_tests {
         assert!(!shell_prompt_rendered(""));
         assert!(!shell_prompt_rendered("   \n  \n"));
         // Startup noise without a rendered prompt.
-        assert!(!shell_prompt_rendered("Last login: Mon Aug 18 04:24:39 on ttys001\n"));
-        assert!(!shell_prompt_rendered("loading zsh config...\ngit: command not found"));
+        assert!(!shell_prompt_rendered(
+            "Last login: Mon Aug 18 04:24:39 on ttys001\n"
+        ));
+        assert!(!shell_prompt_rendered(
+            "loading zsh config...\ngit: command not found"
+        ));
     }
 
     #[test]
@@ -2536,18 +2540,30 @@ mod shell_prompt_tests {
         // No agent names at all (omp panes) — the label must break the tie.
         let no_agents: Vec<AgentInfo> = Vec::new();
         assert_eq!(
-            super::resolve_workspace_id(&[foreign.clone(), owned.clone()], &no_agents, "flywheel-toron-"),
+            super::resolve_workspace_id(
+                &[foreign.clone(), owned.clone()],
+                &no_agents,
+                "flywheel-toron-"
+            ),
             "w70",
             "owned label wins over list order"
         );
         // A foreign FIRST in list order still loses.
         assert_eq!(
-            super::resolve_workspace_id(&[foreign.clone(), owned.clone()], &no_agents, "flywheel-toron-"),
+            super::resolve_workspace_id(
+                &[foreign.clone(), owned.clone()],
+                &no_agents,
+                "flywheel-toron-"
+            ),
             "w70"
         );
         // Single match: unchanged behavior.
         assert_eq!(
-            super::resolve_workspace_id(std::slice::from_ref(&foreign), &no_agents, "flywheel-toron-"),
+            super::resolve_workspace_id(
+                std::slice::from_ref(&foreign),
+                &no_agents,
+                "flywheel-toron-"
+            ),
             "w37"
         );
     }

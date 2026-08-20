@@ -71,6 +71,8 @@ optional = true
 serde_json = "1"
 tempfile = "3.27.0"
 uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+toron-core = { path = "/Users/bangedorrunt/workspace/toron/crates/toron-core" }
 
 [profile.release]
 strip = true

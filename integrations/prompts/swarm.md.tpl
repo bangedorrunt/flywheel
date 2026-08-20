@@ -23,18 +23,21 @@ time; epics are gates, not tasks. Distilled from the ADR-0019 program
    bead's ## VERIFY at clean HEAD, posts VERIFIED/FAILED; br sync
    housekeeping).
 
-4. SPAWN: `flywheel spawn <proj> --profile <role> --count N` (peer-aware
-   self-poll ON; --no-peer-aware only for single-shot panes). Poll-channel:
-   `toron channel create <slug>-steer`; captain mail thread <slug>-captain.
-   Captain posts the lane map + contract. `flywheel loop run <proj>` from
-   PARENT cwd, project as slug.
+4. SPAWN: `flywheel spawn <proj> --profile <role> --count N` (doorbell
+   ON; `/swarm peer-aware=off` maps to `--no-peer-aware`). Steer
+   channel: `toron channel create <slug>-steer`; captain mail thread
+   <slug>-captain. Captain posts the lane map + contract. Peer wake is
+   Layer 0 (ADR-0005): no `loop run` required. Optional:
+   `flywheel loop run <proj>` from PARENT cwd when beads need
+   claim/wave-gate/VERIFY. Loop is bead dispatch, not wake.
 
 5. BRIEF each lane: bead ids in order, files owned, pin, claim
    (br update --status=in_progress), reserve before edit
    (toron reserve acquire, renew 4min), build slot before cargo, TDD
    (RED test first), commit-before-close with bead id in the message, close
    reason MUST include the ## VERIFY output tail, stage ONLY reserved paths
-   (never git add -A - cross-sweep race), poll inbox 5min, post
+   (never git add -A - cross-sweep race), on [doorbell] pull then act
+   (no 5-min inbox timer), post
    claim/close/blocked to the steer channel, blocked >10min -> mail the
    captain, TIMEBOX 90min then partial report with exact resume point.
    AGENT_NAME=<pin> env for repo hooks (guard-the-context-window).

@@ -13,8 +13,11 @@ summoned reviewer substitutes for the captain (never-block-on-the-human).
    in-place if already pane'd). Write the objective as a brief:
    GOAL / SCOPE / CONTEXT / ACCEPTANCE / VERIFY / TIMEBOX / FORBIDDEN /
    REPORT / PRINCIPLES / STANDING (ADR-0019 Spec 2). Reserve files before
-   edit (toron reserve acquire; renew 4min); build slot for cargo; poll the
-   captain thread + your own inbox every 5 min.
+   edit (toron reserve acquire; renew 4min); build slot for cargo. Wake is
+   the workspace doorbell (`[doorbell]` then show heard within 120s:
+   presence working or one kind-9 line; then pull `inbox --since` /
+   captain thread). Unanswered is a digest conflict. Do not start a
+   5-min inbox timer.
 
 2. EXECUTE: TDD red-green per unit (RED test first, GREEN minimal code,
    REFACTOR while green). Stage ONLY reserved paths (never git add -A --
