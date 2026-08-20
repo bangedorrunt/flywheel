@@ -62,7 +62,7 @@ harness's markdown-command mechanism.
 
 | Harness | Command mechanism | Args? | State/chain? | Fire-and-forget? |
 |---|---|---|---|---|
-| opencode | `~/.config/opencode/command/*.md`, frontmatter (`description`, `agent`, `model`, `template`, `subtask`) — one expanded user message per invocation | `$ARGUMENTS` (unused by flywheel's commands today) | none | **yes** |
+| opencode | `~/.config/opencode/commands/*.md` (plural — singular `command/` is dead), frontmatter (`description`, `agent`, `model`, `template`, `subtask`) — one expanded user message per invocation | `$ARGUMENTS` (unused by flywheel's commands today) | none | **yes** |
 | pi | prompt templates `~/.pi/agent/prompts/*.md` (`pi.dev/docs/latest/prompt-templates`): frontmatter (`description`, `argument-hint`) + `$1`/`$@`/`${1:-default}` positional args | **yes, rich** | none (pure expansion) | **yes** |
 | pi/omp (programmatic) | `pi.registerCommand(name, {handler(args, ctx)})` — full TS handler: args, UI, session, state | yes | **yes** | no — but per-harness API to maintain |
 | omp | pi fork: both mechanisms above (`~/.omp/agent/prompts`) | as pi | as pi | markdown: yes |

@@ -14872,7 +14872,11 @@ pub fn prompts_dir(kind: &str) -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
     let home = std::path::Path::new(&home);
     Some(match kind {
-        "opencode" => home.join(".config/opencode/command"),
+        // opencode reads custom commands from `commands/` (PLURAL) — the
+        // singular `command/` dir is dead (files there are never surfaced
+        // as slash commands; empirically confirmed against opencode 2026-08,
+        // cf. the working caveman-* commands in commands/).
+        "opencode" => home.join(".config/opencode/commands"),
         "pi" => home.join(".pi/agent/prompts"),
         "grok" => home.join(".grok/prompts"),
         "omp" => home.join(".omp/agent/prompts"),
@@ -23197,7 +23201,7 @@ mod integration_tests {
         let home = std::env::temp_dir().join(format!("fw-prompts-home-{}", std::process::id()));
         unsafe { std::env::set_var("HOME", &home) };
         for (kind, sub) in [
-            ("opencode", ".config/opencode/command"),
+            ("opencode", ".config/opencode/commands"),
             ("pi", ".pi/agent/prompts"),
             ("grok", ".grok/prompts"),
             ("omp", ".omp/agent/prompts"),
