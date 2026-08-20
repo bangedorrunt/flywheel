@@ -780,16 +780,23 @@ provider = "local"
         // big-pickle is free ONLY on the opencode harness (caps whitelist).
         assert_eq!(reg.resolve("big-pickle", "opencode"), "opencode/big-pickle");
         std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
-         // A user entry OVERRIDES the compiled-in default for the same id.
-        fs::write(&path, "[models.deepseek-v4-flash]\nprovider = \"my-gateway\"\n")
-            .expect("write user models.toml");
+        // A user entry OVERRIDES the compiled-in default for the same id.
+        fs::write(
+            &path,
+            "[models.deepseek-v4-flash]\nprovider = \"my-gateway\"\n",
+        )
+        .expect("write user models.toml");
         let reg = ModelRegistry::load_routing().expect("reload routing");
         assert_eq!(
             reg.resolve("deepseek-v4-flash", "omp"),
             "my-gateway/deepseek-v4-flash",
             "user entry wins over compiled-in"
         );
-        assert_eq!(reg.resolve("glm-5.2", "omp"), "zai/glm-5.2", "other default intact");
+        assert_eq!(
+            reg.resolve("glm-5.2", "omp"),
+            "zai/glm-5.2",
+            "other default intact"
+        );
 
         // load() (the CLI write path) must NOT see compiled-ins.
         let user = ModelRegistry::load().expect("user file");
@@ -811,7 +818,8 @@ provider = "local"
 
         assert_eq!(reg.resolve_strict("", "omp").expect("empty ok"), "");
         assert_eq!(
-            reg.resolve_strict("deepseek-v4-flash", "omp").expect("known ok"),
+            reg.resolve_strict("deepseek-v4-flash", "omp")
+                .expect("known ok"),
             "opencode-go/deepseek-v4-flash"
         );
         let err = reg
@@ -849,7 +857,8 @@ provider = "local"
             "p/flagship"
         );
         assert_eq!(
-            reg.resolve_strict("flagship", "opencode").expect("fallback"),
+            reg.resolve_strict("flagship", "opencode")
+                .expect("fallback"),
             "zai/glm-5.2",
             "caps-excluded -> compiled-in fallback routes strictly"
         );

@@ -1,0 +1,1132 @@
+// governed-by: ADR-0005
+//! Workspace doorbell (ADR-0005 D1): ring rules, queue coalesce, inject
+//! gate. The live dispatcher process is spawn-owned; this module is the
+//! functional core the e2e gate tests.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use anyhow::{Context, Result};
+
+/// One class of doorbell. Queued last-write-wins per class (ADR-0005 D1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EventClass {
+    Channel,
+    Job,
+    RequestRelease,
+    ReservationConflict,
+    PlanePUrgent,
+}
+
+/// A watch/inbox edge the dispatcher might ring on.
+#[derive(Debug, Clone)]
+pub struct RingInput {
+    pub kind: u16,
+    /// Kind-9 `p` / job assignee / request-release target is this pin.
+    pub addressed_to_self: bool,
+    pub toron_kind_request_release: bool,
+    pub importance_high_or_urgent: bool,
+    pub reservation_conflicts_self: bool,
+    /// Room chatter: kind 9 with no self address.
+    pub is_presence: bool,
+    pub is_ack_only: bool,
+}
+
+/// Classify a bus/inbox edge. `None` = do not ring.
+pub fn classify(ev: &RingInput) -> Option<EventClass> {
+    if ev.is_presence || ev.is_ack_only {
+        return None;
+    }
+    if ev.toron_kind_request_release && ev.addressed_to_self {
+        return Some(EventClass::RequestRelease);
+    }
+    if ev.reservation_conflicts_self && ev.kind == 30031 {
+        return Some(EventClass::ReservationConflict);
+    }
+    if ev.addressed_to_self && ev.kind == 43001 {
+        return Some(EventClass::Job);
+    }
+    if ev.addressed_to_self && ev.kind == 9 {
+        return Some(EventClass::Channel);
+    }
+    if ev.importance_high_or_urgent && ev.addressed_to_self {
+        return Some(EventClass::PlanePUrgent);
+    }
+    None
+}
+
+/// Inject only when the pane is idle or done (same rule as interrupt).
+pub fn should_inject(herdr_status: &str) -> bool {
+    matches!(herdr_status, "idle" | "done")
+}
+
+/// Drain on working → idle or working → done (`pane.agent_status_changed`).
+pub fn is_drain_transition(from: &str, to: &str) -> bool {
+    from == "working" && matches!(to, "idle" | "done")
+}
+
+/// Last-write-wins queue, one line per [`EventClass`].
+#[derive(Debug, Default)]
+pub struct DoorbellQueue {
+    pending: BTreeMap<EventClass, String>,
+}
+
+impl DoorbellQueue {
+    pub fn push(&mut self, class: EventClass, line: impl Into<String>) {
+        self.pending.insert(class, line.into());
+    }
+
+    #[allow(dead_code)] // asserted by queue coalesce tests
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Drain in class order. Empty after.
+    pub fn drain(&mut self) -> Vec<(EventClass, String)> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.pending).into_iter().collect()
+    }
+}
+
+/// Pid file: `~/.local/state/flywheel/doorbell/<workspace>.pid`.
+pub fn pid_file(state_dir: &Path, workspace: &str) -> PathBuf {
+    state_dir.join("doorbell").join(format!("{workspace}.pid"))
+}
+
+/// ADR-0005 D1.4 first line: `dispatcher: up|down …`
+pub fn dispatcher_status_line(state_dir: &Path, workspace: &str) -> String {
+    match inspect_lock(&pid_file(state_dir, workspace)) {
+        LockAction::Attach { pid } => format!("dispatcher: up pid={pid}"),
+        LockAction::Reloaded { stale } => format!("dispatcher: down stale={stale}"),
+        LockAction::Start => "dispatcher: down".into(),
+    }
+}
+
+/// One-line identity prime. Injected even with `--no-peer-aware` (D1 item 1).
+pub fn identity_prime(name: &str, mail_identity: &str) -> String {
+    format!(
+        "You are {name}. Your mail identity is {mail_identity}. Guard will block unattributed/unreserved commits."
+    )
+}
+
+/// Per-pin 5/30/3 budget the dispatcher enforces (D1 item 2).
+#[derive(Debug, Clone)]
+pub struct PinBudget {
+    pub budget_minutes: u32,
+    pub max_prompts: u32,
+    pub prompts: u32,
+    pub started_unix: u64,
+}
+
+impl PinBudget {
+    pub fn adr_default(started_unix: u64) -> Self {
+        Self::new(30, 3, started_unix)
+    }
+
+    pub fn new(budget_minutes: u32, max_prompts: u32, started_unix: u64) -> Self {
+        Self {
+            budget_minutes,
+            max_prompts,
+            prompts: 0,
+            started_unix,
+        }
+    }
+
+    pub fn allows(&self, now_unix: u64) -> bool {
+        let elapsed_min = now_unix.saturating_sub(self.started_unix) / 60;
+        self.prompts < self.max_prompts && elapsed_min < u64::from(self.budget_minutes)
+    }
+
+    pub fn record(&mut self) {
+        self.prompts = self.prompts.saturating_add(1);
+    }
+}
+
+/// Drop injects that exceed the pin's 5/30/3 budget.
+pub fn take_allowed(
+    injects: Vec<(String, String)>,
+    budgets: &mut BTreeMap<String, PinBudget>,
+    now_unix: u64,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (pin, msg) in injects {
+        let b = budgets
+            .entry(pin.clone())
+            .or_insert_with(|| PinBudget::adr_default(now_unix));
+        if b.allows(now_unix) {
+            b.record();
+            out.push((pin, msg));
+        }
+    }
+    out
+}
+
+pub fn read_pid(path: &Path) -> Option<u32> {
+    let raw = fs::read_to_string(path).ok()?;
+    raw.trim().parse().ok()
+}
+
+pub fn write_pid(path: &Path, pid: u32) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    fs::write(path, format!("{pid}\n")).with_context(|| format!("write {}", path.display()))
+}
+
+pub fn clear_pid(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
+pub fn pid_alive(pid: u32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// What spawn should do with the workspace lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockAction {
+    Start,
+    Attach { pid: u32 },
+    Reloaded { stale: u32 },
+}
+
+pub fn inspect_lock_with(path: &Path, alive: impl Fn(u32) -> bool) -> LockAction {
+    match read_pid(path) {
+        None => LockAction::Start,
+        Some(pid) if alive(pid) => LockAction::Attach { pid },
+        Some(pid) => LockAction::Reloaded { stale: pid },
+    }
+}
+
+pub fn inspect_lock(path: &Path) -> LockAction {
+    inspect_lock_with(path, pid_alive)
+}
+
+/// Kill the dispatcher and drop the pid file (ADR-0005 D1 lifetime).
+pub fn stop(state_dir: &Path, workspace: &str) -> Result<()> {
+    let path = pid_file(state_dir, workspace);
+    if let Some(pid) = read_pid(&path)
+        && pid > 1
+    {
+        let _ = Command::new("kill")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    clear_pid(&path);
+    let _ = fs::remove_file(unanswered_file(state_dir, workspace));
+    Ok(())
+}
+
+/// Start or attach the detached `__doorbell` child. Never forks a second
+/// live process for the same workspace lock.
+pub fn ensure_running(
+    exe: &Path,
+    state_dir: &Path,
+    workspace: &str,
+    project: &str,
+) -> Result<LockAction> {
+    let path = pid_file(state_dir, workspace);
+    let action = inspect_lock(&path);
+    match action {
+        LockAction::Attach { .. } => Ok(action),
+        LockAction::Start | LockAction::Reloaded { .. } => {
+            if matches!(action, LockAction::Reloaded { .. }) {
+                clear_pid(&path);
+            }
+            let mut cmd = Command::new(exe);
+            cmd.args(["__doorbell", "--project", project, "--workspace", workspace]);
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                cmd.process_group(0);
+            }
+            let child = cmd
+                .spawn()
+                .with_context(|| format!("spawn doorbell for {workspace}"))?;
+            write_pid(&path, child.id())?;
+            Ok(action)
+        }
+    }
+}
+
+/// Fan-out: given classified rings and pane status, produce (pin, line)
+/// pairs that should be prompted now. Working pins are skipped (queued
+/// by the caller).
+#[allow(dead_code)]
+pub fn fanout_now(
+    rings: &[(String, EventClass, String)],
+    status_by_pin: &BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (pin, class, hint) in rings {
+        let status = status_by_pin.get(pin).map(String::as_str).unwrap_or("idle");
+        if !should_inject(status) {
+            continue;
+        }
+        out.push((pin.clone(), doorbell_line(*class, hint)));
+    }
+    out
+}
+
+/// Pins this dispatcher owns. Live kind-9 `p` tags are **npub hex**, not
+/// the pin; jobs use `assignee=<pin>`. Resolve both to a pin.
+#[derive(Debug, Default, Clone)]
+pub struct SelfIndex {
+    pins: BTreeMap<String, String>,
+    npubs: BTreeMap<String, String>,
+}
+
+impl SelfIndex {
+    pub fn from_pins<I, S>(pins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut idx = Self::default();
+        for p in pins {
+            idx.insert_pin(p.into(), None);
+        }
+        idx
+    }
+
+    pub fn insert_pin(&mut self, pin: String, npub: Option<String>) {
+        if let Some(n) = npub.filter(|s| !s.is_empty()) {
+            let n = n.to_lowercase();
+            self.npubs.insert(n.clone(), pin.clone());
+            self.pins.insert(pin, n);
+        } else {
+            self.pins.entry(pin).or_default();
+        }
+    }
+
+    pub fn resolve(&self, token: &str) -> Option<String> {
+        if self.pins.contains_key(token) {
+            return Some(token.to_string());
+        }
+        self.npubs.get(&token.to_lowercase()).cloned()
+    }
+
+    pub fn pin_names(&self) -> impl Iterator<Item = &str> {
+        self.pins.keys().map(String::as_str)
+    }
+
+    pub fn npub(&self, pin: &str) -> Option<&str> {
+        let n = self.pins.get(pin)?;
+        if n.is_empty() { None } else { Some(n.as_str()) }
+    }
+}
+
+/// Seconds after inject with no agent-originated event before the pin is
+/// unanswered (presence / kind-9 / reaction from their npub).
+pub const UNANSWERED_SECS: u64 = 120;
+
+#[derive(Debug, Clone)]
+struct PendingRing {
+    npub: String,
+    injected_unix: u64,
+}
+
+/// Heard-or-deaf: a ring that is not heard is a conflict-shaped event.
+#[derive(Debug, Default, Clone)]
+pub struct HearTracker {
+    pending: BTreeMap<String, PendingRing>,
+    unanswered: BTreeSet<String>,
+    /// pin → npub, kept after expire so a late post still clears deaf.
+    npubs: BTreeMap<String, String>,
+}
+
+impl HearTracker {
+    pub fn note_inject(&mut self, pin: &str, npub: Option<&str>, now: u64) {
+        self.unanswered.remove(pin);
+        let npub = npub.unwrap_or("").to_lowercase();
+        if !npub.is_empty() {
+            self.npubs.insert(pin.to_string(), npub.clone());
+        }
+        self.pending.insert(
+            pin.to_string(),
+            PendingRing {
+                npub,
+                injected_unix: now,
+            },
+        );
+    }
+
+    /// Fill npubs learned later (whois on the 1s tick).
+    pub fn remember_npub(&mut self, pin: &str, npub: Option<&str>) {
+        let Some(n) = npub.filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let n = n.to_lowercase();
+        self.npubs.insert(pin.to_string(), n.clone());
+        if let Some(ring) = self.pending.get_mut(pin) {
+            ring.npub = n;
+        }
+    }
+
+    pub fn note_heard_pin(&mut self, pin: &str) {
+        self.pending.remove(pin);
+        self.unanswered.remove(pin);
+    }
+
+    pub fn note_heard_pubkey(&mut self, pubkey: &str) {
+        let key = pubkey.to_lowercase();
+        let mut pins: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, r)| !r.npub.is_empty() && r.npub == key)
+            .map(|(p, _)| p.clone())
+            .collect();
+        pins.extend(
+            self.npubs
+                .iter()
+                .filter(|(_, n)| *n == &key)
+                .map(|(p, _)| p.clone()),
+        );
+        pins.sort();
+        pins.dedup();
+        for pin in pins {
+            self.note_heard_pin(&pin);
+        }
+    }
+
+    /// Move timed-out pending pins to unanswered. Returns newly expired pins.
+    pub fn expire(&mut self, now: u64, timeout_secs: u64) -> Vec<String> {
+        let mut expired = Vec::new();
+        self.pending.retain(|pin, ring| {
+            if now.saturating_sub(ring.injected_unix) >= timeout_secs {
+                expired.push(pin.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for pin in &expired {
+            self.unanswered.insert(pin.clone());
+        }
+        expired
+    }
+
+    pub fn unanswered_pins(&self) -> Vec<String> {
+        self.unanswered.iter().cloned().collect()
+    }
+
+    pub fn seed_unanswered(&mut self, pins: impl IntoIterator<Item = String>) {
+        self.unanswered.extend(pins);
+    }
+}
+
+pub fn unanswered_file(state_dir: &Path, workspace: &str) -> PathBuf {
+    state_dir
+        .join("doorbell")
+        .join(format!("{workspace}.unanswered"))
+}
+
+pub fn write_unanswered(path: &Path, pins: &[String]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let body = if pins.is_empty() {
+        String::new()
+    } else {
+        let mut pins = pins.to_vec();
+        pins.sort();
+        format!("{}\n", pins.join("\n"))
+    };
+    fs::write(path, body).with_context(|| format!("write {}", path.display()))
+}
+
+pub fn read_unanswered(path: &Path) -> Vec<String> {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Poster pubkey on a `toron watch` NDJSON line.
+pub fn watch_pubkey(line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    v.get("pubkey")
+        .and_then(|p| p.as_str())
+        .map(|s| s.to_lowercase())
+}
+
+/// `dispatcher: up|down` plus unanswered pins (digest / `--report`).
+pub fn report_text(state_dir: &Path, workspace: &str) -> String {
+    let head = dispatcher_status_line(state_dir, workspace);
+    let pins = read_unanswered(&unanswered_file(state_dir, workspace));
+    if pins.is_empty() {
+        format!("{head}\ndoorbell: ok")
+    } else {
+        format!("{head}\ndoorbell: unanswered pin={}", pins.join(","))
+    }
+}
+
+/// Pins addressed by this watch line: `p`/`assignee` (pin or npub) plus
+/// kind-9 `@pin` in content (live posts do both; `p` is npub).
+pub fn watch_targets(line: &str, index: &SelfIndex) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Vec::new();
+    };
+    let mut out = BTreeSet::new();
+    if let Some(tags) = v.get("tags").and_then(|t| t.as_array()) {
+        for t in tags {
+            let Some(a) = t.as_array() else { continue };
+            let Some(key) = a.first().and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let Some(val) = a.get(1).and_then(|x| x.as_str()) else {
+                continue;
+            };
+            if matches!(key, "p" | "assignee")
+                && let Some(pin) = index.resolve(val)
+            {
+                out.insert(pin);
+            }
+        }
+    }
+    if v.get("kind").and_then(|k| k.as_u64()) == Some(9)
+        && let Some(content) = v.get("content").and_then(|c| c.as_str())
+    {
+        for pin in index.pin_names() {
+            if content.contains(&format!("@{pin}")) {
+                out.insert(pin.to_string());
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Parse one `toron watch` NDJSON line (`{kind,id,tags,content}`).
+pub fn parse_watch_ndjson(line: &str, index: &SelfIndex) -> Option<(EventClass, String)> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let kind = v.get("kind")?.as_u64()? as u16;
+    let tags = v.get("tags")?.as_array()?;
+    let addressed_to_self = !watch_targets(line, index).is_empty();
+    let toron_kind_request_release = tags.iter().any(|t| {
+        t.as_array()
+            .map(|a| {
+                a.first().and_then(|x| x.as_str()) == Some("toron-kind")
+                    && a.get(1).and_then(|x| x.as_str()) == Some("request-release")
+            })
+            .unwrap_or(false)
+    });
+    let class = classify(&RingInput {
+        kind,
+        addressed_to_self,
+        toron_kind_request_release,
+        importance_high_or_urgent: false,
+        reservation_conflicts_self: kind == 30031 && addressed_to_self,
+        is_presence: kind == 20001,
+        is_ack_only: false,
+    })?;
+    let h = tags.iter().find_map(|t| {
+        let a = t.as_array()?;
+        if a.first()?.as_str()? == "h" {
+            a.get(1)?.as_str()
+        } else {
+            None
+        }
+    });
+    let hint = pull_hint(class, h);
+    Some((class, hint))
+}
+
+fn pull_hint(class: EventClass, channel: Option<&str>) -> String {
+    match class {
+        EventClass::Channel => match channel {
+            Some(h) => format!("toron channel read h={h}"),
+            None => "toron channel read".into(),
+        },
+        EventClass::Job => "toron job list".into(),
+        EventClass::RequestRelease | EventClass::PlanePUrgent => "toron mail inbox --since".into(),
+        EventClass::ReservationConflict => "toron reserve list".into(),
+    }
+}
+
+/// Classify one `fetch_inbox` row (plane P). Inbox is already pin-scoped.
+pub fn parse_inbox_item(v: &serde_json::Value) -> Option<(EventClass, String)> {
+    if v.get("ack_only").and_then(|x| x.as_bool()).unwrap_or(false) {
+        return None;
+    }
+    let tags = v.get("tags").and_then(|t| t.as_array());
+    let request_release = tags
+        .map(|tags| {
+            tags.iter().any(|t| {
+                t.as_array()
+                    .map(|a| {
+                        a.first().and_then(|x| x.as_str()) == Some("toron-kind")
+                            && a.get(1).and_then(|x| x.as_str()) == Some("request-release")
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    let importance = v.get("importance").and_then(|x| x.as_str()).unwrap_or("");
+    let class = if request_release {
+        EventClass::RequestRelease
+    } else if matches!(importance, "high" | "urgent") {
+        EventClass::PlanePUrgent
+    } else {
+        return None;
+    };
+    Some((class, pull_hint(class, None)))
+}
+
+/// Walk a `toron mail inbox` JSON blob; return injects for this pin.
+pub fn apply_inbox_json(
+    raw: &str,
+    pin: &str,
+    status_by_pin: &BTreeMap<String, String>,
+    queues: &mut BTreeMap<String, DoorbellQueue>,
+) -> Vec<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
+    let items: Vec<&serde_json::Value> = if let Some(arr) = v.as_array() {
+        arr.iter().collect()
+    } else if let Some(arr) = v.get("messages").and_then(|m| m.as_array()) {
+        arr.iter().collect()
+    } else if v.is_object() {
+        vec![&v]
+    } else {
+        return Vec::new();
+    };
+    let mut inject = Vec::new();
+    let status = status_by_pin.get(pin).map(String::as_str).unwrap_or("idle");
+    for item in items {
+        let Some((class, hint)) = parse_inbox_item(item) else {
+            continue;
+        };
+        let msg = doorbell_line(class, &hint);
+        if should_inject(status) {
+            inject.push((pin.to_string(), msg));
+        } else {
+            queues.entry(pin.to_string()).or_default().push(class, msg);
+        }
+    }
+    inject
+}
+
+/// Newest `created_ts` in an inbox blob (RFC3339), for the high-water.
+pub fn inbox_high_water(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let items: Vec<&serde_json::Value> = if let Some(arr) = v.as_array() {
+        arr.iter().collect()
+    } else if let Some(arr) = v.get("messages").and_then(|m| m.as_array()) {
+        arr.iter().collect()
+    } else if v.is_object() {
+        vec![&v]
+    } else {
+        return None;
+    };
+    items
+        .into_iter()
+        .filter_map(|i| {
+            i.get("created_ts")
+                .and_then(|t| t.as_str())
+                .map(str::to_string)
+        })
+        .max()
+}
+
+/// One `[doorbell]` line. Body stays pull.
+pub fn doorbell_line(class: EventClass, hint: &str) -> String {
+    let kind = match class {
+        EventClass::Channel => "kind 9",
+        EventClass::Job => "kind 43001",
+        EventClass::RequestRelease => "request-release",
+        EventClass::ReservationConflict => "kind 30031",
+        EventClass::PlanePUrgent => "plane-P urgent",
+    };
+    format!("[doorbell] {kind}. Pull: {hint}")
+}
+
+/// Parse `--status pin=idle` pairs for the herdr-mock (`__doorbell --once`).
+pub fn parse_status_pair(s: &str) -> Option<(String, String)> {
+    let (pin, st) = s.split_once('=')?;
+    if pin.is_empty() || st.is_empty() {
+        return None;
+    }
+    Some((pin.to_string(), st.to_string()))
+}
+
+/// Classify one watch NDJSON line. Idle/done pins inject now; working pins
+/// queue (last-write-wins per class). Unmentioned pins stay quiet.
+pub fn apply_watch_line(
+    line: &str,
+    index: &SelfIndex,
+    status_by_pin: &BTreeMap<String, String>,
+    queues: &mut BTreeMap<String, DoorbellQueue>,
+) -> Vec<(String, String)> {
+    let Some((class, hint)) = parse_watch_ndjson(line, index) else {
+        return Vec::new();
+    };
+    let msg = doorbell_line(class, &hint);
+    let mut inject = Vec::new();
+    for pin in watch_targets(line, index) {
+        let status = status_by_pin
+            .get(&pin)
+            .map(String::as_str)
+            .unwrap_or("idle");
+        if should_inject(status) {
+            inject.push((pin, msg.clone()));
+        } else {
+            queues.entry(pin).or_default().push(class, msg.clone());
+        }
+    }
+    inject
+}
+
+/// Drain a pin's queue on working → idle|done. Empty if not a drain edge.
+pub fn apply_status_change(
+    pin: &str,
+    from: &str,
+    to: &str,
+    queues: &mut BTreeMap<String, DoorbellQueue>,
+) -> Vec<(String, String)> {
+    if !is_drain_transition(from, to) {
+        return Vec::new();
+    }
+    match queues.get_mut(pin) {
+        Some(q) => q
+            .drain()
+            .into_iter()
+            .map(|(_, line)| (pin.to_string(), line))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// herdr-mock: stdin watch lines + pin statuses → JSON injects. No loop.
+pub fn once_json(stdin: &str, status_by_pin: &BTreeMap<String, String>) -> String {
+    let index = SelfIndex::from_pins(status_by_pin.keys().cloned());
+    let mut queues = BTreeMap::new();
+    let mut rows = Vec::new();
+    for line in stdin.lines() {
+        for (pin, msg) in apply_watch_line(line, &index, status_by_pin, &mut queues) {
+            rows.push(serde_json::json!({"pin": pin, "line": msg}));
+        }
+    }
+    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn base() -> RingInput {
+        RingInput {
+            kind: 9,
+            addressed_to_self: false,
+            toron_kind_request_release: false,
+            importance_high_or_urgent: false,
+            reservation_conflicts_self: false,
+            is_presence: false,
+            is_ack_only: false,
+        }
+    }
+
+    #[test]
+    fn sc_d1_kind9_at_self_rings_channel() {
+        let mut ev = base();
+        ev.addressed_to_self = true;
+        assert_eq!(classify(&ev), Some(EventClass::Channel));
+    }
+
+    #[test]
+    fn room_chatter_without_mention_does_not_ring() {
+        assert_eq!(classify(&base()), None);
+    }
+
+    #[test]
+    fn presence_never_rings() {
+        let mut ev = base();
+        ev.kind = 20001;
+        ev.is_presence = true;
+        ev.addressed_to_self = true;
+        assert_eq!(classify(&ev), None);
+    }
+
+    #[test]
+    fn sc_d2_request_release_rings_holder() {
+        let mut ev = base();
+        ev.kind = 14;
+        ev.toron_kind_request_release = true;
+        ev.addressed_to_self = true;
+        assert_eq!(classify(&ev), Some(EventClass::RequestRelease));
+    }
+
+    #[test]
+    fn job_for_self_rings() {
+        let mut ev = base();
+        ev.kind = 43001;
+        ev.addressed_to_self = true;
+        assert_eq!(classify(&ev), Some(EventClass::Job));
+    }
+
+    #[test]
+    fn reservation_conflict_rings() {
+        let mut ev = base();
+        ev.kind = 30031;
+        ev.reservation_conflicts_self = true;
+        assert_eq!(classify(&ev), Some(EventClass::ReservationConflict));
+    }
+
+    #[test]
+    fn sc_d3_queue_coalesces_per_class() {
+        let mut q = DoorbellQueue::default();
+        q.push(EventClass::Channel, doorbell_line(EventClass::Channel, "a"));
+        q.push(EventClass::Channel, doorbell_line(EventClass::Channel, "b"));
+        q.push(EventClass::Job, doorbell_line(EventClass::Job, "j"));
+        assert_eq!(q.len(), 2);
+        let drained = q.drain();
+        assert_eq!(drained.len(), 2);
+        assert!(q.is_empty());
+        assert!(
+            drained[0].1.contains("[doorbell]"),
+            "line is a doorbell, got {}",
+            drained[0].1
+        );
+        assert!(
+            drained[0].1.contains("Pull: b"),
+            "last write wins: {}",
+            drained[0].1
+        );
+    }
+
+    #[test]
+    fn sc_d3_inject_only_when_idle_or_done() {
+        assert!(!should_inject("working"));
+        assert!(should_inject("idle"));
+        assert!(should_inject("done"));
+        assert!(is_drain_transition("working", "idle"));
+        assert!(is_drain_transition("working", "done"));
+        assert!(!is_drain_transition("idle", "working"));
+    }
+
+    #[test]
+    fn pid_stale_lock_reloads() {
+        let dir = std::env::temp_dir().join(format!("fw-doorbell-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = pid_file(&dir, "w81");
+        write_pid(&path, 999_999).expect("write");
+        assert_eq!(
+            inspect_lock_with(&path, |_| false),
+            LockAction::Reloaded { stale: 999_999 }
+        );
+        assert_eq!(
+            inspect_lock_with(&path, |_| true),
+            LockAction::Attach { pid: 999_999 }
+        );
+        clear_pid(&path);
+        assert_eq!(inspect_lock_with(&path, |_| true), LockAction::Start);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fanout_skips_working_pins() {
+        let rings = vec![
+            ("BlueRidge".into(), EventClass::Channel, "ch".into()),
+            ("LilacChapel".into(), EventClass::Job, "job".into()),
+        ];
+        let mut status = BTreeMap::new();
+        status.insert("BlueRidge".into(), "working".into());
+        status.insert("LilacChapel".into(), "idle".into());
+        let out = fanout_now(&rings, &status);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "LilacChapel");
+        assert!(out[0].1.contains("[doorbell]"));
+    }
+
+    #[test]
+    fn parse_watch_kind9_mention() {
+        let line =
+            r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","steer-x"]],"content":"hi"}"#;
+        let (class, _) =
+            parse_watch_ndjson(line, &SelfIndex::from_pins(["BlueRidge"])).expect("ring");
+        assert_eq!(class, EventClass::Channel);
+        assert!(parse_watch_ndjson(line, &SelfIndex::from_pins(["LilacChapel"])).is_none());
+    }
+
+    fn kind9_at_blueridge() -> &'static str {
+        r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","steer-x"]],"content":"@BlueRidge hi"}"#
+    }
+
+    #[test]
+    fn sc_d1_kind9_at_pin_injects_when_idle() {
+        let mut status = BTreeMap::new();
+        status.insert("BlueRidge".into(), "idle".into());
+        status.insert("LilacChapel".into(), "idle".into());
+        let mut queues = BTreeMap::new();
+        let out = apply_watch_line(
+            kind9_at_blueridge(),
+            &SelfIndex::from_pins(["BlueRidge", "LilacChapel"]),
+            &status,
+            &mut queues,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "BlueRidge");
+        assert!(
+            out[0].1.contains("[doorbell]"),
+            "inject is a doorbell, got {}",
+            out[0].1
+        );
+        assert!(queues.is_empty(), "idle pin must not queue");
+    }
+
+    #[test]
+    fn sc_d1_kind9_skips_unmentioned_pin() {
+        let mut status = BTreeMap::new();
+        status.insert("BlueRidge".into(), "idle".into());
+        status.insert("LilacChapel".into(), "idle".into());
+        let json = once_json(kind9_at_blueridge(), &status);
+        assert!(json.contains("BlueRidge"), "mentioned pin rings: {json}");
+        assert!(json.contains("[doorbell]"), "line is a doorbell: {json}");
+        assert!(
+            !json.contains("LilacChapel"),
+            "unmentioned pin stays quiet: {json}"
+        );
+    }
+
+    #[test]
+    fn sc_d3_working_queues_then_drains_on_idle() {
+        let mut status = BTreeMap::new();
+        status.insert("BlueRidge".into(), "working".into());
+        let mut queues = BTreeMap::new();
+        let inject = apply_watch_line(
+            kind9_at_blueridge(),
+            &SelfIndex::from_pins(["BlueRidge"]),
+            &status,
+            &mut queues,
+        );
+        assert!(inject.is_empty(), "working pin must not inject");
+        assert_eq!(queues.get("BlueRidge").map(DoorbellQueue::len), Some(1));
+        let drained = apply_status_change("BlueRidge", "working", "idle", &mut queues);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, "BlueRidge");
+        assert!(
+            drained[0].1.contains("[doorbell]"),
+            "drain is a doorbell, got {}",
+            drained[0].1
+        );
+        assert!(queues.get("BlueRidge").is_none_or(DoorbellQueue::is_empty));
+    }
+
+    #[test]
+    fn sc_d1_kind9_npub_p_tag_rings_pin() {
+        let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let line = format!(
+            r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["h","steer-x"]],"content":"@BlueRidge hi"}}"#
+        );
+        let mut index = SelfIndex::default();
+        index.insert_pin("BlueRidge".into(), Some(npub.into()));
+        index.insert_pin("LilacChapel".into(), None);
+        let mut status = BTreeMap::new();
+        status.insert("BlueRidge".into(), "idle".into());
+        status.insert("LilacChapel".into(), "idle".into());
+        let mut queues = BTreeMap::new();
+        let out = apply_watch_line(&line, &index, &status, &mut queues);
+        assert_eq!(out.len(), 1, "npub p-tag must resolve to pin, got {out:?}");
+        assert_eq!(out[0].0, "BlueRidge");
+        assert!(out[0].1.contains("[doorbell]"));
+    }
+
+    #[test]
+    fn sc_d1_kind9_at_pin_in_content_rings_without_pin_p_tag() {
+        let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let line = format!(
+            r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["h","steer-x"]],"content":"@BlueRidge take the repro"}}"#
+        );
+        let mut status = BTreeMap::new();
+        status.insert("BlueRidge".into(), "idle".into());
+        let mut queues = BTreeMap::new();
+        let out = apply_watch_line(
+            &line,
+            &SelfIndex::from_pins(["BlueRidge"]),
+            &status,
+            &mut queues,
+        );
+        assert_eq!(out.len(), 1, "content @pin must ring even when p is npub");
+        assert_eq!(out[0].0, "BlueRidge");
+    }
+
+    #[test]
+    fn sc_d2_inbox_request_release_rings() {
+        let raw = r#"{"importance":"high","tags":[["toron-kind","request-release"]],"created_ts":"2026-08-20T00:00:01Z"}"#;
+        let (class, hint) = parse_inbox_item(&serde_json::from_str(raw).unwrap()).expect("ring");
+        assert_eq!(class, EventClass::RequestRelease);
+        assert!(hint.contains("inbox --since"));
+    }
+
+    #[test]
+    fn sc_d2_routine_inbox_does_not_ring() {
+        let raw = r#"{"importance":"normal","ack_only":false}"#;
+        assert!(parse_inbox_item(&serde_json::from_str(raw).unwrap()).is_none());
+    }
+
+    #[test]
+    fn plane_p_urgent_injects_when_idle() {
+        let raw = r#"{"messages":[{"importance":"urgent","created_ts":"2026-08-20T00:00:02Z"}]}"#;
+        let mut status = BTreeMap::new();
+        status.insert("BlueRidge".into(), "idle".into());
+        let mut queues = BTreeMap::new();
+        let out = apply_inbox_json(raw, "BlueRidge", &status, &mut queues);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.contains("[doorbell]"));
+        assert!(out[0].1.contains("inbox --since"));
+        assert_eq!(
+            inbox_high_water(raw).as_deref(),
+            Some("2026-08-20T00:00:02Z")
+        );
+    }
+
+    #[test]
+    fn budget_stops_after_max_prompts() {
+        let mut budgets = BTreeMap::new();
+        budgets.insert("BlueRidge".into(), PinBudget::new(30, 1, 0));
+        let injects = vec![
+            ("BlueRidge".into(), "[doorbell] a".into()),
+            ("BlueRidge".into(), "[doorbell] b".into()),
+        ];
+        let out = take_allowed(injects, &mut budgets, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, "[doorbell] a");
+    }
+
+    #[test]
+    fn budget_expires_after_minutes() {
+        let mut budgets = BTreeMap::new();
+        budgets.insert("BlueRidge".into(), PinBudget::new(1, 3, 0));
+        let injects = vec![("BlueRidge".into(), "[doorbell] a".into())];
+        let out = take_allowed(injects, &mut budgets, 120);
+        assert!(out.is_empty(), "30s? 120s > 1 min budget");
+    }
+
+    #[test]
+    fn identity_prime_is_one_ascii_line() {
+        let line = identity_prime("flywheel-toron-coder", "BlueRidge");
+        assert!(line.contains("You are flywheel-toron-coder"));
+        assert!(line.contains("Your mail identity is BlueRidge"));
+        assert!(line.contains("Guard will block"));
+        assert!(line.is_ascii());
+        assert!(!line.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn sc_d5_status_line_up_and_down() {
+        let dir = std::env::temp_dir().join(format!("fw-doorbell-st-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join("doorbell"));
+        assert_eq!(dispatcher_status_line(&dir, "w1"), "dispatcher: down");
+        write_pid(&pid_file(&dir, "w1"), std::process::id()).expect("pid");
+        let line = dispatcher_status_line(&dir, "w1");
+        assert!(line.starts_with("dispatcher: up"), "{line}");
+        clear_pid(&pid_file(&dir, "w1"));
+        assert_eq!(dispatcher_status_line(&dir, "w1"), "dispatcher: down");
+        write_pid(&pid_file(&dir, "w1"), 999_998).expect("stale");
+        stop(&dir, "w1").expect("stop");
+        assert!(!pid_file(&dir, "w1").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hear_pubkey_clears_pending() {
+        let mut h = HearTracker::default();
+        let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        h.note_inject("PaleHarbor", Some(npub), 10);
+        h.note_heard_pubkey(npub);
+        assert!(h.unanswered_pins().is_empty());
+        assert!(h.expire(200, UNANSWERED_SECS).is_empty());
+    }
+
+    #[test]
+    fn hear_timeout_marks_unanswered() {
+        let mut h = HearTracker::default();
+        h.note_inject("PaleHarbor", None, 10);
+        assert!(
+            h.expire(10 + UNANSWERED_SECS - 1, UNANSWERED_SECS)
+                .is_empty()
+        );
+        let expired = h.expire(10 + UNANSWERED_SECS, UNANSWERED_SECS);
+        assert_eq!(expired, vec!["PaleHarbor".to_string()]);
+        assert_eq!(h.unanswered_pins(), vec!["PaleHarbor".to_string()]);
+    }
+
+    #[test]
+    fn hear_after_unanswered_clears() {
+        let mut h = HearTracker::default();
+        h.note_inject("PaleHarbor", None, 0);
+        let _ = h.expire(UNANSWERED_SECS, UNANSWERED_SECS);
+        h.note_heard_pin("PaleHarbor");
+        assert!(h.unanswered_pins().is_empty());
+    }
+
+    #[test]
+    fn hear_npub_filled_late_still_matches() {
+        let mut h = HearTracker::default();
+        let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        h.note_inject("PaleHarbor", None, 10);
+        h.remember_npub("PaleHarbor", Some(npub));
+        h.note_heard_pubkey(npub);
+        assert!(h.expire(10 + UNANSWERED_SECS, UNANSWERED_SECS).is_empty());
+        assert!(h.unanswered_pins().is_empty());
+    }
+
+    #[test]
+    fn hear_late_post_clears_unanswered() {
+        let mut h = HearTracker::default();
+        let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        h.note_inject("PaleHarbor", Some(npub), 0);
+        let _ = h.expire(UNANSWERED_SECS, UNANSWERED_SECS);
+        assert_eq!(h.unanswered_pins(), vec!["PaleHarbor".to_string()]);
+        h.note_heard_pubkey(npub);
+        assert!(h.unanswered_pins().is_empty());
+    }
+
+    #[test]
+    fn report_text_names_unanswered_pins() {
+        let dir = std::env::temp_dir().join(format!("fw-hear-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join("doorbell"));
+        write_unanswered(
+            &unanswered_file(&dir, "w1"),
+            &["PaleHarbor".into(), "LiveWillow".into()],
+        )
+        .expect("write");
+        let text = report_text(&dir, "w1");
+        assert!(text.contains("dispatcher: down"), "{text}");
+        assert!(
+            text.contains("doorbell: unanswered pin=") && text.contains("PaleHarbor"),
+            "{text}"
+        );
+        stop(&dir, "w1").expect("stop");
+        assert!(read_unanswered(&unanswered_file(&dir, "w1")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn watch_pubkey_from_live_shape() {
+        let line = r#"{"kind":9,"id":"ab","pubkey":"AABBCC","tags":[],"content":"hi"}"#;
+        assert_eq!(watch_pubkey(line).as_deref(), Some("aabbcc"));
+    }
+}

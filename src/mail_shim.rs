@@ -338,7 +338,6 @@ impl Mail {
         }))
     }
 
-
     /// Route a tool call through the remote daemon (in-process backend errors).
     fn call_remote(&self, tool: &str, args: Value) -> Result<Value> {
         match &self.backend {
@@ -456,11 +455,7 @@ impl Mail {
         match &self.backend {
             BackendKind::InProcess => {
                 let canonical_project = block_on(mailbox().canonical_project(project_key));
-                block_on(mailbox().fold_agent_name_alias(
-                    &canonical_project,
-                    alias,
-                    canonical,
-                ));
+                block_on(mailbox().fold_agent_name_alias(&canonical_project, alias, canonical));
                 Ok(())
             }
             BackendKind::Remote(_) => {

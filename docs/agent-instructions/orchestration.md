@@ -12,6 +12,7 @@ ADR-0005 + 0010 + 0011 + 0012. Authoring: [docs/workflow-authoring.md](../workfl
 | runs | `flywheel runs {list,show,pending,digest}` |
 | coalition | `flywheel coalition {form,status,disband}` — pane-crew-only |
 | steer | `flywheel steer "<target>" [--direct] [--project p]` |
+| doorbell | workspace `__doorbell` (ADR-0005 Layer 0). Spawn starts it. `flywheel kill` stops it. `/peer-aware` attaches. |
 
 ## Captain selector
 

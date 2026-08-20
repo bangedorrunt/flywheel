@@ -555,8 +555,7 @@ mod tests {
             })
         );
         // since_ts + thread_id omitted when None.
-        let no_since =
-            inbox_args("p", "a", false, false, false, false, 10, None, None);
+        let no_since = inbox_args("p", "a", false, false, false, false, 10, None, None);
         assert!(no_since.get("since_ts").is_none());
         assert!(no_since.get("thread_id").is_none());
         assert_eq!(

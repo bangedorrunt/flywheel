@@ -731,10 +731,8 @@ pub fn launch_spawn_job(
             .ok_or_else(|| anyhow!("spawn drain: no panes in workspace {ws_id}"))?;
         // bd-pin-public-plane-s-easy.2: draw the pin BEFORE the split so the
         // pane env carries AGENT_NAME/FLYWHEEL_MAIL_AS.
-        let mail_identity =
-            crate::pinned_mail_identity(cfg, project, &name, &plan.harness);
-        let pane_env =
-            crate::herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
+        let mail_identity = crate::pinned_mail_identity(cfg, project, &name, &plan.harness);
+        let pane_env = crate::herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
         let split = crate::herdr_shim::pane_split(
             &mut c,
             &prev,
