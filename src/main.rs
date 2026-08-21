@@ -5272,10 +5272,18 @@ fn needs_in_arg_prime(_kind: &str) -> bool {
 /// socket one-liner so an operator can prime the pane by hand instead of
 /// discovering `agent_not_ready` on the first send.
 fn prime_via_send_text(c: &mut Client, pane_id: &str) {
+    prime_line_via_send_text(c, pane_id, boot_prime_line());
+}
+
+/// One typed prime line with retries. bd-peeraware-enametoolong-iswg:
+/// launch text must NEVER ride agent.start args — opencode reads a
+/// positional arg as a DIRECTORY ("Failed to change directory to <prompt>");
+/// every prime is typed via pane.send_text after TUI readiness.
+fn prime_line_via_send_text(c: &mut Client, pane_id: &str, line: &str) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         let res = c
-            .pane_send_text(pane_id, boot_prime_line())
+            .pane_send_text(pane_id, line)
             .and_then(|_| c.pane_send_input(pane_id, &["Enter"]));
         match res {
             Ok(_) => return,
@@ -5291,7 +5299,7 @@ fn prime_via_send_text(c: &mut Client, pane_id: &str) {
                 );
                 eprintln!(
                     "flywheel:   manual socket prime: herdr pane send-text {pane_id} '{}' then send Enter (or herdr agent prompt {pane_id})",
-                    boot_prime_line()
+                    line
                 );
             }
         }
@@ -5911,8 +5919,10 @@ projects available: {}",
                 None => vec![],
             };
 
+            // bd-peeraware-enametoolong-iswg: launch text NEVER rides
+            // agent.start args (opencode reads a positional as a directory).
+            // The prime is typed post-readiness below; args carry flags only.
             let has_peer_prime = !peer_args.is_empty();
-            agent_args.extend(peer_args);
             // H2 (bd-harness-pane-send-text-7fe8): the boot prime is typed
             // into the pane via pane.send_text AFTER the TUI owns the
             // foreground + settle (see below) — works for any kind and for
@@ -5965,7 +5975,17 @@ projects available: {}",
             // in the boot window is lost to the shell, bd-eign.6). Universal
             // — any kind, non-agent panes too. Peer templates are their own
             // prime; never stack.
-            if !has_peer_prime {
+            if has_peer_prime {
+                // The peer template is its own prime — typed, never stacked.
+                prime_line_via_send_text(&mut c, &pane_id, &peer_args[0]);
+            } else {
+                // Identity first (mail identity + guard note), then the boot
+                // ready check (code-pointer gate keeps the boot-prime call).
+                prime_line_via_send_text(
+                    &mut c,
+                    &pane_id,
+                    &doorbell::identity_prime(&name, identity),
+                );
                 prime_via_send_text(&mut c, &pane_id);
             }
             // bd-spawn-omp-boot-reliability-3h06: post-boot dead-shell gate —
