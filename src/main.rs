@@ -11176,10 +11176,17 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 mail.ensure_project(&key)?;
                 let agents = mail.list_agents(&key, None)?;
                 let mut out = Vec::new();
+                let mut seen_identities = std::collections::HashSet::new();
                 if let Some(arr) = agents.as_array() {
                     for a in arr {
                         let n = a.get("name").and_then(|x| x.as_str()).unwrap_or("");
                         if let Ok(d) = digest_for(&mail, &key, n) {
+                            // bd-dbre: name-alias identities resolve to the
+                            // same pin inbox — emit one row per identity.
+                            let id = d.get("mail_identity").and_then(|v| v.as_str());
+                            if id.is_some_and(|i| !seen_identities.insert(i.to_string())) {
+                                continue;
+                            }
                             out.push(d);
                         }
                     }
@@ -11411,18 +11418,28 @@ fn cmd_toron(cfg: &Config, cmd: &ToronCmd) -> Result<()> {
 /// leaf, surfaced for the orchestrator). Reads `sender`/`from` aliases and
 /// counts high|urgent as urgent.
 ///
-/// NOTE on `unread`: toron's projection has NO read-state — `unread_only`
-/// is a documented no-op (messages are "fresh on first read" per pipeline
-/// dedup). The digest therefore reports the RECENT inbox (limit 10) with an
-/// honest label: `recent` = messages in the projection window, `urgent` =
-/// the [`wake_urgent`]-filtered high|urgent count among them (S8.2: read or
-/// already-executed assigns do not wake). The wake trigger uses
+/// NOTE on `unread`: toron's projection HAS per-recipient read-state since
+/// bd-5icg (`read_ts_us` on every row; `unread_only` filters). The digest
+/// still reports the RECENT inbox (limit 10) with an honest label:
+/// `recent` = messages in the projection window, `urgent` = the
+/// [`wake_urgent`]-filtered high|urgent count among them (S8.2 + bd-dbre:
+/// read rows — assign or not — do not wake). The wake trigger uses
 /// `urgent > 0`, which IS meaningful (importance is a real message
 /// attribute).
 fn digest_for(mail: &mail_shim::Mail, key: &str, name: &str) -> Result<Value> {
+    // bd-dbre: poll the inbox the agent actually READS. Herdr name and pin
+    // are separate recipients (message_reads is per-recipient, bd-5icg);
+    // waking on the name inbox means pin-side mark-read can never clear
+    // the wake. wake_identity_pin maps name -> pin, falling back to the
+    // name itself when nothing is registered.
+    let identity = {
+        let reg = state::load_spawn_registry(key);
+        let names = state::load_agent_names(std::path::Path::new(key));
+        wake_identity_pin(&reg, &names, name)
+    };
     let v = mail.inbox_filtered(
         key,
-        name,
+        &identity,
         &mail_shim::MailInboxFilter {
             unread_only: false,
             include_bodies: true,
@@ -11445,8 +11462,8 @@ fn digest_for(mail: &mail_shim::Mail, key: &str, name: &str) -> Result<Value> {
     });
     Ok(json!({
         "agent": name,
-        // the caller's mail is bound to this identity — wake fetches as it
-        "mail_identity": name,
+        // the identity whose inbox was polled — the pin the agent acts as
+        "mail_identity": identity,
         "recent": recent,
         "urgent": urgent,
         "last_id": last_urgent.and_then(|m| {
@@ -11482,14 +11499,15 @@ pub(crate) fn wake_identity_pin(
     name.to_string()
 }
 
-/// S8.2: which urgent inbox rows legitimately wake an agent.
+/// S8.2 + bd-dbre: which urgent inbox rows legitimately wake an agent.
 ///
-/// Assign messages (`[assign]` subjects) wake only when UNREAD
-/// (`read_ts_us` absent — the agent has not fetched them) AND not-yet-
-/// executed (no in-thread reply newer than the assign). Identical
+/// ANY row the agent already read (`read_ts_us` set — bd-5icg projection)
+/// does not wake; per-recipient read state is the once-only signal.
+/// Assign messages (`[assign]` subjects) additionally wake only when
+/// not-yet-executed (no in-thread reply newer than the assign). Identical
 /// (sender, subject, body) assigns within the window collapse to the first
 /// — the duplicate-assign double-wake (debrief D1: two identical assigns
-/// both woke the agent). All other urgent rows pass through unchanged.
+/// both woke the agent).
 ///
 /// Pure + deterministic; the digest paths (loop wake + operator `mail
 /// digest`) share this one filter.
@@ -11498,6 +11516,11 @@ pub(crate) fn wake_urgent(rows: &[Value]) -> Vec<&Value> {
         m.get("importance")
             .and_then(|i| i.as_str())
             .map(|i| i == "high" || i == "urgent")
+            .unwrap_or(false)
+    };
+    let is_read = |m: &Value| {
+        m.get("read_ts_us")
+            .map(|v| !v.is_null())
             .unwrap_or(false)
     };
     let is_assign = |m: &Value| {
@@ -11533,6 +11556,12 @@ pub(crate) fn wake_urgent(rows: &[Value]) -> Vec<&Value> {
     let mut deduped: Vec<&Value> = Vec::new();
     for m in rows {
         if !urgent(m) {
+            continue;
+        }
+        // bd-dbre: a read row never wakes — assign or not. Read state is
+        // per-recipient (bd-5icg); honoring it here is what makes wakes
+        // terminate once the agent fetches.
+        if is_read(m) {
             continue;
         }
         if is_assign(m) && !seen.insert(key_of(m)) {
@@ -11697,6 +11726,24 @@ mod wake_identity_tests {
             true,
         )];
         assert_eq!(wake_urgent(&rows).len(), 0, "read assign must not wake");
+    }
+
+    /// bd-dbre: a READ non-assign urgent row does not wake either —
+    /// per-recipient read state is the once-only signal for every urgent
+    /// row, not just assigns (the forever-wake defect).
+    #[test]
+    fn wake_urgent_skips_read_nonassign_urgent() {
+        let rows = vec![json!({
+            "id": "m1", "sender": "9150144f",
+            "subject": "", "body_md": "reservation released",
+            "importance": "high", "read_ts_us": 1787310913232405i64,
+            "created_ts_us": 1000,
+        })];
+        assert_eq!(
+            wake_urgent(&rows).len(),
+            0,
+            "read non-assign urgent must not wake"
+        );
     }
 
     /// S8.2: an assign whose thread already has a reply is executed — no wake.
@@ -21350,10 +21397,11 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
     if let Err(e) = backend::run_mail(mail.register_agent(&key, &auto_profile)) {
         eprintln!("flywheel: mail digest auto-register of {identity} failed (zeroing digest): {e}");
     }
-    // toron's projection has NO read-state: `unread_only` is a documented
-    // no-op ("fresh on first read"). Fetch the RECENT inbox (limit 10) with
-    // bodies (the S8.2 dedup keys on body) and report `recent` + the
-    // wake-filtered `urgent` (importance high|urgent, assigns filtered).
+    // bd-5icg: toron's projection HAS per-recipient read-state (`read_ts_us`
+    // on every row; `unread_only` filters). We still fetch the RECENT inbox
+    // (limit 10) with bodies (the S8.2 dedup keys on body) and report
+    // `recent` + the wake-filtered `urgent` (importance high|urgent; read
+    // rows and executed assigns filtered — bd-dbre).
     let v = match backend::run_mail(mail.inbox(&backend::InboxQuery {
         project: key,
         agent: identity.clone(),
