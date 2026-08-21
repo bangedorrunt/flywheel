@@ -3735,6 +3735,24 @@ async fn respawn_and_requeue(
 /// the 30-300s cadence. This boundary is the CRASH-ISOLATION design (a leaf
 /// panic cannot kill the loop's memory) — do not "optimize" it away without
 /// a crash-isolation replacement.
+///
+/// bd-aseq: match an expected-reply key (the MAIL identity collab stored at
+/// send time) back to a swarm state. Priority: direct herdr name → the
+/// state's pinned `mail_identity` → the spawn-registry pin → the legacy
+/// hash mapping. Pure.
+fn match_expected_agent<'a>(
+    project: &str,
+    states: &'a [AgentState],
+    agent: &str,
+) -> Option<&'a AgentState> {
+    states.iter().find(|s| {
+        s.name == agent
+            || s.mail_identity.as_deref() == Some(agent)
+            || crate::resolve_mail_target_registry(project, &s.name) == agent
+            || crate::resolve_mail_target(&s.name) == agent
+    })
+}
+
 #[function]
 async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     let mut queue = params.queue.clone();
@@ -4716,13 +4734,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // The file stores the MAIL identity (collab resolved it); the
             // swarm states use herdr names — map one to the other so the
             // settle check, the thread check, and the reminder target agree.
-            let herdr_name = states
-                .iter()
-                .find(|s| s.name == *agent || crate::resolve_mail_target(&s.name) == *agent)
-                .map(|s| s.name.clone());
-            let Some(herdr_name) = herdr_name else {
+            // bd-aseq: match through the pinned identity (state field or
+            // spawn registry), never the bare hash mapping alone.
+            let Some(matched) = match_expected_agent(&params.project, &states, agent) else {
                 continue; // agent not in this swarm (or expectation stale)
             };
+            let herdr_name = matched.name.clone();
             if dispatch_pending.contains(&herdr_name) {
                 continue; // just dispatched this iteration — give it time
             }
@@ -4750,8 +4767,11 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 }
             };
             // The thread head reports the MAIL identity (CalmGate), not the
-            // herdr name — verify against the resolved identity.
-            let mail_name = crate::resolve_mail_target(&herdr_name);
+            // herdr name — verify against the resolved identity. bd-aseq:
+            // prefer the state's pinned identity; registry pin, then hash.
+            let mail_name = matched.mail_identity.clone().unwrap_or_else(|| {
+                crate::resolve_mail_target_registry(&params.project, &herdr_name)
+            });
             match verify_reply(
                 exp.head.as_deref(),
                 newest_id.as_deref(),
@@ -5960,6 +5980,59 @@ mod tests {
             pane_id: pane.to_string(),
             mail_identity: None,
         }
+    }
+
+    fn st_pin(name: &str, status: &str, pin: &str) -> AgentState {
+        AgentState {
+            name: name.to_string(),
+            status: status.to_string(),
+            kind: "opencode".to_string(),
+            pane_id: String::new(),
+            mail_identity: Some(pin.to_string()),
+        }
+    }
+
+    /// bd-aseq regression: an expectation keyed by the PIN (what collab
+    /// stored at send time) matches the agent's state via mail_identity or
+    /// the spawn-registry pin — never stranded because the hash mapping
+    /// diverges from the pinned identity.
+    #[test]
+    fn match_expected_agent_keys_by_pin_not_hash() {
+        let _g = crate::config::lock_env();
+        let dir = std::env::temp_dir().join(format!("fw-aseq-mt-{}", uuid::Uuid::new_v4()));
+        unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
+
+        let states = vec![
+            st_pin("flywheel-aseq-oc2", "idle", "TanFern"),
+            st("flywheel-aseq-oc", "done"),
+        ];
+        // direct herdr name still matches
+        assert_eq!(
+            match_expected_agent("p", &states, "flywheel-aseq-oc").map(|s| s.name.as_str()),
+            Some("flywheel-aseq-oc")
+        );
+        // pin-keyed expectation matches via the state's pinned identity
+        assert_eq!(
+            match_expected_agent("p", &states, "TanFern").map(|s| s.name.as_str()),
+            Some("flywheel-aseq-oc2")
+        );
+        // unknown identity → no match (stale expectation)
+        assert!(match_expected_agent("p", &states, "GhostPin").is_none());
+
+        // registry-pinned slug matches even when the state lacks the field
+        let entries = vec![crate::state::SpawnEntry::with_mail_identity(
+            "w:p9",
+            "flywheel-aseq-gk",
+            "RoseDune",
+        )];
+        crate::state::save_spawn_registry("p", &entries).expect("save");
+        let states2 = vec![st("flywheel-aseq-gk", "idle")];
+        assert_eq!(
+            match_expected_agent("p", &states2, "RoseDune").map(|s| s.name.as_str()),
+            Some("flywheel-aseq-gk")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
