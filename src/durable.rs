@@ -7097,13 +7097,14 @@ mod tests {
         }
     }
 
-    /// bd-eign.2: >3 new ready beads in one poll = runaway create flood;
-    /// 0-3 is normal dispatch volume.
+    /// bd-eign.2: >6 new ready beads in one poll = runaway create flood;
+    /// 0-6 is normal dispatch volume (ADR-0022 waves are 5-6 beads).
     #[test]
     fn bead_flood_verdict_threshold() {
         assert!(!bead_flood_verdict(0));
         assert!(!bead_flood_verdict(3));
-        assert!(bead_flood_verdict(4));
+        assert!(!bead_flood_verdict(6));
+        assert!(bead_flood_verdict(7));
         assert!(bead_flood_verdict(40));
     }
 
