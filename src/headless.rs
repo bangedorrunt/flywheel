@@ -75,8 +75,15 @@ pub fn phase_launch_args(harness: &str, phase: &str) -> (Vec<String>, bool) {
     // - omp `--plan-yolo`: "Force read-only plan mode at start" (omp --help).
     // - opencode `--agent plan`: the builtin `plan` (primary) agent
     //   (`opencode agent list`). opencode reads `--agent <name>`.
+    // - opencode `--agent build` (bd-adr22-implement-not-degraded-puhs):
+    //   the builtin `build` (primary) implement agent, same list.
     // pi/grok expose no phase mechanic — documented loud degradation.
     match (harness, phase) {
+        // bd-adr22-implement-not-degraded-puhs: implement IS the no-flag
+        // baseline on every harness — baseline mode is not a degrade. The
+        // single exception: opencode's real `build` agent is mechanized.
+        ("opencode", "implement") => (vec!["--agent".to_string(), "build".to_string()], false),
+        (_, "implement") => (vec![], false),
         ("omp", "plan") => (vec!["--plan-yolo".to_string()], false),
         ("opencode", "plan") => (vec!["--agent".to_string(), "plan".to_string()], false),
         _ => (vec![], true),
@@ -357,22 +364,26 @@ pub fn phase_registry_probe(
         "opencode" => {
             let Some(out) = probe(harness, &["agent", "list"]) else {
                 return Some(
-                    "opencode: cannot probe plan-mode agent (opencode agent list failed) — verify the `plan` agent manually or fix the opencode install"
+                    "opencode: cannot probe wired agents (opencode agent list failed) — verify the `plan` and `build` agents manually or fix the opencode install"
                         .to_string(),
                 );
             };
-            // The builtin plan agent appears as "plan (primary)" / "plan":
-            // match the bare name on an agent-list line.
-            let has_plan = out
-                .lines()
-                .any(|l| l.trim_start().starts_with("plan ") || l.trim() == "plan");
-            if has_plan {
+            // Wired builtin agents appear as "<name> (primary)" / "<name>":
+            // match each bare name on an agent-list line.
+            let missing: Vec<&str> = ["plan", "build"]
+                .into_iter()
+                .filter(|agent| {
+                    !out.lines()
+                        .any(|l| l.trim_start().starts_with(*agent) || l.trim() == *agent)
+                })
+                .collect();
+            if missing.is_empty() {
                 None
             } else {
-                Some(
-                    "opencode: plan-mode agent `plan` not found in `opencode agent list` — update headless::phase_launch_args to the installed opencode's plan agent"
-                        .to_string(),
-                )
+                Some(format!(
+                    "opencode: wired agents not found in `opencode agent list`: {} — update headless::phase_launch_args to the installed opencode's agents",
+                    missing.join(", ")
+                ))
             }
         }
         // No mechanic registered -> nothing to probe.
@@ -687,14 +698,29 @@ mod tests {
         let drifted = |bin: &str, _args: &[&str]| -> Option<String> {
             match bin {
                 "omp" => Some("  --model=<value>  (plan flag renamed away)".into()),
-                "opencode" => Some("build (primary)\nexplore (subagent)".into()),
+                "opencode" => Some("explore (subagent)".into()),
                 _ => None,
             }
         };
         let omp_problem = phase_registry_probe("omp", &drifted).expect("omp drift caught");
         assert!(omp_problem.contains("--plan-yolo"), "{omp_problem}");
         let oc_problem = phase_registry_probe("opencode", &drifted).expect("opencode drift caught");
-        assert!(oc_problem.contains("plan-mode agent"), "{oc_problem}");
+        assert!(
+            oc_problem.contains("plan") && oc_problem.contains("build"),
+            "{oc_problem}"
+        );
+
+        // Partial drift: build lost but plan intact still names the missing
+        // wired agent (bd-adr22-implement-not-degraded-puhs).
+        let lost_build = |bin: &str, _args: &[&str]| -> Option<String> {
+            match bin {
+                "opencode" => Some("plan (primary)\nexplore (subagent)".into()),
+                _ => None,
+            }
+        };
+        let build_problem =
+            phase_registry_probe("opencode", &lost_build).expect("build drift caught");
+        assert!(build_problem.contains("build"), "{build_problem}");
 
         // Unprobeable harness (binary gone) -> warn, not panic.
         let dead = |_: &str, _: &[&str]| -> Option<String> { None };
@@ -713,7 +739,9 @@ mod tests {
             assert!(degraded, "{harness}: plan must degrade");
         }
         // Known harnesses degrade on phases they have no mechanic for.
-        for phase in ["resolve", "implement", "review", "ship"] {
+        // bd-adr22-implement-not-degraded-puhs: `implement` is NOT in this
+        // list anymore — it is the no-flag baseline (see the baseline test).
+        for phase in ["resolve", "review", "ship"] {
             let (_, degraded) = phase_launch_args("omp", phase);
             assert!(degraded, "omp {phase}: no mechanic -> degraded");
             let (_, degraded) = phase_launch_args("opencode", phase);
@@ -723,6 +751,33 @@ mod tests {
         let (args, degraded) = phase_launch_args("omp", "brainstorm");
         assert!(args.is_empty());
         assert!(degraded);
+    }
+
+    /// bd-adr22-implement-not-degraded-puhs: implement IS the no-flag
+    /// baseline — every harness dispatches it with zero extra args and
+    /// degraded=false. Tagging every implement step `phase_degraded` was
+    /// wrong and noisy: baseline mode is not a degrade. The one exception
+    /// is opencode, where a REAL mechanized implement agent exists
+    /// (`build (primary)` in `opencode agent list`) and gets wired.
+    #[test]
+    fn implement_phase_is_baseline_not_degraded_on_every_harness() {
+        // No-mechanic harnesses: plain baseline, NOT degraded.
+        for harness in ["pi", "grok", "omp", "pa", "hermes-unknown"] {
+            let (args, degraded) = phase_launch_args(harness, "implement");
+            assert!(
+                args.is_empty(),
+                "{harness}: implement baseline carries no args, got {args:?}"
+            );
+            assert!(
+                !degraded,
+                "{harness}: implement must not be tagged phase_degraded"
+            );
+        }
+        // opencode: the real builtin `build` agent is the implement
+        // mechanic — mechanized AND not degraded.
+        let (args, degraded) = phase_launch_args("opencode", "implement");
+        assert_eq!(args, vec!["--agent", "build"]);
+        assert!(!degraded, "opencode implement: wired agent is not degraded");
     }
 
     /// bd-gsvn.2: omp role models inject as `--smol/--slow/--plan`; every
