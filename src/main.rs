@@ -5003,7 +5003,12 @@ mod steer_engine_tests {
     use super::*;
     use toron_workflow::schema::Action;
 
-    const STEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    // bd-adr22-local-resonate-tx8q: engine runs now execute against the
+    // persistent server, where first task delivery can miss the SSE window
+    // and wait on the server's tasks-retry-timeout (default 30s) — under a
+    // fully parallel `cargo test` that plus slow CI boxes can exceed 60s.
+    // Solo runs settle in <250ms; 180s covers the redispatch path.
+    const STEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
     /// ADR-0022 W4: `flywheel steer` delegates to the durable Run arm —
     /// execute=true, pane mode, goal/goal-direct. The Run arm owns the
@@ -18446,16 +18451,20 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         .map_err(|_| anyhow!("spawn drainer thread panicked"))??;
                     out
                 }
-                None => rt.block_on(async {
-                    let engine = toron_workflow::WorkflowEngine::local_with_resolvers(
-                        runner,
-                        profile_resolver,
-                        workflow_resolver,
-                    )?;
-                    engine
-                        .invoke(&run_id, invoke_wf, inputs_value.clone())
-                        .await
-                }),
+                None => {
+                    // bd-adr22-local-resonate-tx8q: ONE engine rail — the
+                    // headless/record arm uses the same durable store
+                    // selection as pane mode (pane::local_engine), so a
+                    // kill -9 mid-run resumes on restart regardless of
+                    // --execute mode.
+                    let engine =
+                        pane::local_engine(&rt, runner, profile_resolver, workflow_resolver)?;
+                    rt.block_on(async {
+                        engine
+                            .invoke(&run_id, invoke_wf, inputs_value.clone())
+                            .await
+                    })
+                }
             }?;
             // P10.3 lifecycle: ephemeral default — reap the crew workspace
             // (close it + its panes) at run end unless --retain (keep) or

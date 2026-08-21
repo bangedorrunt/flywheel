@@ -17,7 +17,7 @@
 //!   + `--retain` (keep the spawned workspace). herdr owns the panes — they
 //!     survive a flywheel crash; the spawn registry re-binds them.
 //!
-//! governed-by: ADR-0010 (Spec A, Spec C, Spec E), ADR-0005 (Spec 1, Spec 4c)
+//! governed-by: ADR-0010 (Spec A, Spec C, Spec E), ADR-0005 (Spec 1, Spec 4c), ADR-0022 (W3/W4 durable engine runs)
 
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -848,14 +848,62 @@ pub fn launch_spawn_job(
 /// `Resonate::local` requires an entered Tokio runtime. Pane-mode keeps the
 /// engine alive across `invoke` so the spawn drainer can share it — enter
 /// the caller's runtime before construct, then drop the guard and `block_on`.
+///
+/// bd-adr22-local-resonate-tx8q: engine runs are wired to a PERSISTENT store
+/// whenever one answers — [`cli_engine_store_url`] order is `RESONATE_URL`
+/// env pin > host-local serve `http://localhost:8001` (TCP-probed) — so
+/// compose/steer runs survive kill -9 mid-run and resume on restart
+/// (ADR-0022 W3/W4). With no server answering, falls back to the embedded
+/// in-memory runtime (previous behavior; in-process replay only).
 pub fn local_engine(
     rt: &tokio::runtime::Runtime,
     runner: toron_workflow::ActionRunner,
     profile: toron_workflow::ProfileResolver,
     workflow: toron_workflow::WorkflowResolver,
 ) -> Result<toron_workflow::WorkflowEngine> {
+    let server_url = cli_engine_store_url();
+    local_engine_with(rt, server_url, runner, profile, workflow)
+}
+
+/// CLI engine store selection (bd-adr22-local-resonate-tx8q). The
+/// toron-workflow probe order also auto-probes the shared multi-host server
+/// (`https://resonate.alpine-tilapia.ts.net`) — deliberately NOT done here:
+/// on a shared server, foreign workers polling the same default group can
+/// claim a CLI run's tasks before this process does (observed: steer runs
+/// parked 60s with tasks executed elsewhere / never delivered). The shared
+/// server stays reachable via an explicit `RESONATE_URL` pin.
+///
+/// 127.0.0.1, NOT localhost: the host serve binds IPv4 while `localhost`
+/// resolves ::1-first here, so a naive probe silently demotes every run to
+/// the embedded in-memory store (observed live).
+fn cli_engine_store_url() -> Option<String> {
+    if let Ok(pin) = std::env::var("RESONATE_URL")
+        && !pin.trim().is_empty()
+    {
+        return Some(pin);
+    }
+    const HOST_LOCAL_RESONATE_URL: &str = "http://127.0.0.1:8001";
+    toron_workflow::engine::probe_candidate(HOST_LOCAL_RESONATE_URL)
+        .then(|| HOST_LOCAL_RESONATE_URL.to_string())
+}
+
+/// Store-selection seam: `Some(url)` => remote HttpNetwork-backed engine
+/// (durable), `None` => embedded in-memory runtime. Construction stays lazy;
+/// the URL is only dialed when runs/promise ops execute.
+fn local_engine_with(
+    rt: &tokio::runtime::Runtime,
+    server_url: Option<String>,
+    runner: toron_workflow::ActionRunner,
+    profile: toron_workflow::ProfileResolver,
+    workflow: toron_workflow::WorkflowResolver,
+) -> Result<toron_workflow::WorkflowEngine> {
     let _enter = rt.enter();
-    toron_workflow::WorkflowEngine::local_with_resolvers(runner, profile, workflow)
+    match server_url {
+        Some(url) => {
+            toron_workflow::WorkflowEngine::remote_with_resolvers(url, runner, profile, workflow)
+        }
+        None => toron_workflow::WorkflowEngine::local_with_resolvers(runner, profile, workflow),
+    }
 }
 
 /// bd-omwg: the pane-mode spawn drainer thread. Polls the engine's SpawnSink
@@ -1299,6 +1347,51 @@ steps:
         assert_eq!(
             output["job"]["result"]["pane"], "w1:p9",
             "job receipt captured, not a fake: {output}"
+        );
+    }
+
+    /// Store-flavor probe (bd-adr22-local-resonate-tx8q): the SDK gates its
+    /// introspection getters behind cfg(test), so the witness is behavioral.
+    /// A dead-port REMOTE store fails transport (`network error: …`); an
+    /// embedded LOCAL store answers authoritatively (`… not found`).
+    async fn store_error_flavor(engine: &toron_workflow::WorkflowEngine) -> String {
+        match engine.resonate().promises.get("__pane_probe__").await {
+            Ok(_) => "resolved:probe-exists".to_string(),
+            Err(e) => format!("{e}"),
+        }
+    }
+
+    #[test]
+    fn local_engine_prefers_remote_store_when_server_url_resolved() {
+        // bd-adr22-local-resonate-tx8q: CLI engine runs must land on the
+        // persistent store when one answers (host runs `resonate serve
+        // --storage-type sqlite` on :8001), not the in-memory LocalNetwork.
+        // Construction must stay lazy (dead port must not dial at build).
+        let runner = std::sync::Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let profile: toron_workflow::ProfileResolver = std::sync::Arc::new(|_| None);
+        let workflow: toron_workflow::WorkflowResolver = std::sync::Arc::new(|_| None);
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let engine = local_engine_with(
+            &rt,
+            Some("http://127.0.0.1:59999".into()),
+            runner.clone(),
+            profile.clone(),
+            workflow.clone(),
+        )
+        .expect("remote-backed engine constructs without dialing");
+
+        let remote_err = rt.block_on(store_error_flavor(&engine));
+        assert!(
+            remote_err.contains("error sending request") && !remote_err.contains("not found"),
+            "Some(url) must wire the REMOTE HttpNetwork (transport-level failure), got: {remote_err}"
+        );
+
+        let fallback =
+            local_engine_with(&rt, None, runner, profile, workflow).expect("fallback constructs");
+        let local_err = rt.block_on(store_error_flavor(&fallback));
+        assert!(
+            local_err.contains("not found") && !local_err.contains("network error"),
+            "None must stay embedded-local (authoritative miss, not transport failure), got: {local_err}"
         );
     }
 
