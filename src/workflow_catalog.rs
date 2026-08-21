@@ -103,6 +103,41 @@ impl WorkflowCatalog {
         Self::load_from(config_dir())
     }
 
+    /// [`load`] plus the PROJECT tier (ADR-0022 §3.8 / W6):
+    /// `<project>/.flywheel/workflows/*.yaml` shadows the user catalog,
+    /// which shadows built-ins. `project_root` is the project directory
+    /// (pass None where no project context exists).
+    pub fn load_layered(project_root: Option<&Path>) -> Result<Self> {
+        Self::load_layered_with(config_dir(), project_root)
+    }
+
+    /// [`load_layered`] against an explicit config root — the hermetic test
+    /// surface (no process-global env mutation).
+    pub fn load_layered_with(config_root: PathBuf, project_root: Option<&Path>) -> Result<Self> {
+        let mut catalog = Self::load_from(config_root)?;
+        if let Some(root) = project_root {
+            let dir = root.join(".flywheel").join("workflows");
+            if dir.is_dir() {
+                // Reuse the canonical loader shape against the project dir:
+                // parse each YAML and shadow same-named user entries.
+                let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+                    .with_context(|| format!("read {}", dir.display()))?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
+                    .collect();
+                entries.sort();
+                for path in entries {
+                    let raw = std::fs::read_to_string(&path)
+                        .with_context(|| format!("read {}", path.display()))?;
+                    let wf = parse_workflow(&raw)
+                        .with_context(|| format!("parse workflow {}", path.display()))?;
+                    catalog.workflows.insert(wf.name.clone(), wf);
+                }
+            }
+        }
+        Ok(catalog)
+    }
+
     /// Load the full catalog from an explicit config root (the config dir
     /// containing `workflows/`, `workflows.toml`, `pipelines.toml`). Tests
     /// pass a hermetic temp dir — no process-global env mutation.
@@ -327,6 +362,51 @@ fn absorb_pipeline(name: &str, chain: &[String]) -> (Workflow, Option<MappingNot
     (wf, Some(note))
 }
 
+/// Write one workflow as canonical catalog YAML — the W6 shared writer
+/// (§3.7 T3 / §3.8): `workflow new` and compose `--keep` produce IDENTICAL
+/// file shapes, so both paths lint identically. Overwrites a same-name entry.
+pub fn write_workflow_yaml(dir: &Path, wf: &Workflow) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(format!("{}.yaml", wf.name));
+    let raw = serde_yaml::to_string(wf).context("serialize workflow yaml")?;
+    std::fs::write(&path, raw).with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}
+
+#[cfg(test)]
+/// Parse the provenance tokens a kept workflow carries in its description
+/// (`origin: composed; from: <parts>; first-run: <ts>; author: <pin>`).
+/// Returns (origin, from, first_run, author) — None where absent. The
+/// keep-without-green-run refusal + provenance tests ride on these tokens.
+pub fn parse_provenance(description: &str) -> Option<(String, String, String, String)> {
+    let start = description.find("[origin:")?;
+    let end = description[start..].find(']')? + start;
+    let body = &description[start + 1..end];
+    let mut origin = None;
+    let mut from = None;
+    let mut first_run = None;
+    let mut author = None;
+    for part in body.split(';') {
+        let Some((k, v)) = part.split_once(':') else {
+            continue;
+        };
+        let v = v.trim().to_string();
+        match k.trim() {
+            "origin" => origin = Some(v),
+            "from" => from = Some(v),
+            "first-run" => first_run = Some(v),
+            "author" => author = Some(v),
+            _ => {}
+        }
+    }
+    Some((
+        origin?,
+        from.unwrap_or_default(),
+        first_run.unwrap_or_default(),
+        author.unwrap_or_default(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,6 +615,84 @@ msg = "legacy triage"
             "collision recorded: {:?}",
             catalog.notes
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- ADR-0022 W6 (bd-adr22-w6-stage-registry-0jgr) ----
+
+    /// W6 test helper: a minimal lint-clean workflow (send_dm steps).
+    fn w6_wf(name: &str, description: &str) -> Workflow {
+        Workflow {
+            name: name.to_string(),
+            description: Some(description.to_string()),
+            trigger: None,
+            guard: None,
+            crew: None,
+            policy: None,
+            graph: None,
+            principles: vec![],
+            inputs: vec![InputDecl {
+                name: "goal".into(),
+                default: None,
+            }],
+            steps: vec![Step {
+                name: Some("leaf".into()),
+                guard: None,
+                on_error: Default::default(),
+                build_slot: false,
+                action: Action::DispatchJob {
+                    assignee: "x".into(),
+                    spec: toron_workflow::schema::DispatchSpec {
+                        profile: Some("@coder".into()),
+                        task: Some("{{inputs.goal}}".into()),
+                        ..Default::default()
+                    },
+                    channel: None,
+                },
+            }],
+        }
+    }
+
+    /// W6 §3.7 T3: keep-after-green writes the project catalog entry the
+    /// resolver finds — load_layered_with sees it, shadowing user.
+    #[test]
+    fn w6_keep_after_green_resolves_in_project_tier() {
+        let dir = config_root("w6keep");
+        // User tier already has a same-name entry (older shape)…
+        write(
+            &dir.join("workflows/w6-kept.yaml"),
+            "name: w6-kept\ntrigger:\n  type: webhook\nsteps:\n  - name: old\n    action: send_dm\n    to: pi\n    body: x\n",
+        );
+        let wf = w6_wf(
+            "w6-kept",
+            "composed run [origin: composed; from: scout:p1; first-run: t; author: tealdune]",
+        );
+        let proj = dir.join("proj");
+        let path = write_workflow_yaml(&proj.join(".flywheel/workflows"), &wf).unwrap();
+        assert!(path.is_file(), "kept file written: {}", path.display());
+        let cat = WorkflowCatalog::load_layered_with(dir.clone(), Some(&proj)).unwrap();
+        let entry = cat.workflows.get("w6-kept").expect("resolver finds kept");
+        assert!(
+            entry.steps[0].action.type_name() == "dispatch_job",
+            "project tier shadows user"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// W6: provenance tokens survive the YAML round-trip and parse back.
+    #[test]
+    fn w6_provenance_fields_present_after_roundtrip() {
+        let dir = config_root("w6prov");
+        let desc = "composed run for obj [origin: composed; from: fresh-eyes-explore,systematic-execute; first-run: 2026-08-21T12:00:00Z; author: TealDune]";
+        let proj = dir.join("proj");
+        write_workflow_yaml(&proj.join(".flywheel/workflows"), &w6_wf("w6-prov", desc)).unwrap();
+        let cat = WorkflowCatalog::load_layered_with(dir.clone(), Some(&proj)).unwrap();
+        let got = parse_provenance(cat.workflows["w6-prov"].description.as_deref().unwrap());
+        let (origin, from, first_run, author) = got.expect("provenance parses");
+        assert_eq!(origin, "composed");
+        assert_eq!(from, "fresh-eyes-explore,systematic-execute");
+        assert_eq!(first_run, "2026-08-21T12:00:00Z");
+        assert_eq!(author, "TealDune");
         let _ = fs::remove_dir_all(&dir);
     }
 }

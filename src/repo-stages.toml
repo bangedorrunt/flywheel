@@ -1,0 +1,13 @@
+# Repo-tier stage DATA (ADR-0022 §3.8 permanence ladder).
+#
+# Entries here are NOT hand-authored: they arrive exclusively through
+# `flywheel stage promote <name> --to repo`, which enforces the evidence bar
+# (green across >=2 distinct objectives or projects + a review bead). The
+# compiled seed (stages.rs) remains the zero-config bootstrap; this file is
+# the promoted, reviewed layer between seed and user overrides
+# (precedence: seed < repo < user < project).
+#
+# The compiled seed set can be regenerated from promoted data over time;
+# Rust seeds stay bootstrap-only.
+
+[stages]
