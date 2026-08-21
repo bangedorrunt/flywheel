@@ -217,6 +217,43 @@ mailbox; replies must land in the thread before you claim a response
 
 ---
 
+## 5b. Principles — the awareness contract (SHIPPED)
+
+The 21 engineering principles (ADR-0019 Spec 5/6) are a closed registry.
+They are not decoration; two mechanisms consume them:
+
+1. **Workflow YAML**: declare `principles: [name, ...]` on any workflow
+   (catalog, promoted, composed). The lint validates every name against
+   the registry — a typo'd principle is a lint error, not a silent comment.
+2. **The durable loop**: priority beads must cite `name — decision` via
+   `check_principles` (durable.rs) — the loop refuses unprincipled
+   priority claims with the exact reason string.
+
+Authoring discipline:
+
+```bash
+flywheel principles list           # the 21 names — read before authoring
+flywheel principles show <name>    # full text of one principle
+```
+
+- BEFORE composing or authoring: name the 2-3 principles that govern the
+  task (e.g. a migration task → `migrate-callers-then-delete-legacy-apis`,
+  `boundary-discipline`; a perf task → `prove-it-works`,
+  `redesign-from-first-principles`). Declare them in the workflow.
+- A workflow whose behavior contradicts its declared principles is a lint
+  smell AND a review finding — reviewers check the declared set first.
+- Closing a priority bead on work that violated its cited principle is the
+  2026-08-17 mislabel class — the loop's refusal is correct; fix the work
+  or the citation, never the check.
+
+Phase affinities (guidance until ADR-0022 mechanizes injection): resolve →
+`foundational-thinking`, `model-the-domain`, `boundary-discipline`; plan →
+`sequence-verifiable-units`, `subtract-before-you-add`; implement →
+`prove-it-works`, `fix-root-causes`, `make-operations-idempotent`; review →
+`exhaust-the-design-space`, `minimize-reader-load`; verify →
+`prove-it-works`, `encode-lessons-in-structure`.
+
+
 ## 6. The archetype library (what to reach for)
 
 | Shape | Workflow | Why it wins |
