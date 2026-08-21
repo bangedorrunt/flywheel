@@ -11691,9 +11691,12 @@ fn digest_for(mail: &mail_shim::Mail, key: &str, name: &str) -> Result<Value> {
     let urgent_rows = wake_urgent(&arr);
     let urgent = urgent_rows.len();
     let last = arr.first();
-    // wake key: the most recent URGENT message that survives the wake
-    // filter (the loop wakes once per id)
-    let last_urgent = urgent_rows.first().copied().or(last);
+    // bd-vbf2: the wake key is the NEWEST URGENT message by created_ts_us
+    // (the loop wakes once per id) - never `.first()`, which cited the
+    // oldest row when the wire delivered ascending. Subject + thread ride
+    // the SAME chosen row so "Most recent urgent: id X re: S" /
+    // "Latest urgent thread: T" cannot disagree across threads.
+    let chosen = newest_urgent(&urgent_rows, last);
     let last_from = last.and_then(|m| {
         m.get("sender")
             .or_else(|| m.get("from"))
@@ -11705,12 +11708,12 @@ fn digest_for(mail: &mail_shim::Mail, key: &str, name: &str) -> Result<Value> {
         "mail_identity": identity,
         "recent": recent,
         "urgent": urgent,
-        "last_id": last_urgent.and_then(|m| {
+        "last_id": chosen.and_then(|m| {
             m.get("id").or_else(|| m.get("message_id")).and_then(|i| i.as_str())
         }),
         "last_from": last_from,
-        "last_subject": last.and_then(|m| m.get("subject").and_then(|s| s.as_str())),
-        "thread_id": last.and_then(|m| m.get("thread_id").and_then(|t| t.as_str())),
+        "last_subject": chosen.and_then(|m| m.get("subject").and_then(|s| s.as_str())),
+        "thread_id": chosen.and_then(|m| m.get("thread_id").and_then(|t| t.as_str())),
     }))
 }
 
@@ -11750,6 +11753,21 @@ pub(crate) fn wake_identity_pin(
 ///
 /// Pure + deterministic; the digest paths (loop wake + operator `mail
 /// digest`) share this one filter.
+/// bd-vbf2: the wake key is the NEWEST urgent row by `created_ts_us` —
+/// the wire may deliver rows oldest-first, so `.first()` cited stale ids
+/// and misdirected the mandated reply to the wrong thread. Deterministic
+/// fallback: the first raw row when nothing urgent survives the filter.
+pub(crate) fn newest_urgent<'a>(
+    urgent: &[&'a serde_json::Value],
+    fallback: Option<&'a serde_json::Value>,
+) -> Option<&'a serde_json::Value> {
+    urgent
+        .iter()
+        .copied()
+        .max_by_key(|m| m.get("created_ts_us").and_then(|t| t.as_u64()).unwrap_or(0))
+        .or(fallback)
+}
+
 pub(crate) fn wake_urgent(rows: &[Value]) -> Vec<&Value> {
     let urgent = |m: &Value| {
         m.get("importance")
@@ -11953,6 +11971,63 @@ mod wake_identity_tests {
             "created_ts_us": 1000,
         })];
         assert_eq!(wake_urgent(&rows).len(), 1);
+    }
+
+    // ---- bd-vbf2: the wake key is the NEWEST urgent row, not .first() ----
+
+    /// The observed defect: three urgent rows arrived oldest-first and
+    /// `urgent_rows.first()` cited created_ts 1787300794 while newer rows
+    /// sat at 1787302173 (same thread) and 1787304318 (a DIFFERENT thread).
+    /// The fence: seed 3 ack-required/high messages of differing ts across
+    /// 2 threads; the selector MUST return max(created_ts_us).
+    #[test]
+    fn vbf2_newest_urgent_wins_regardless_of_wire_order() {
+        let oldest = json!({
+            "id": "bc27c6a70fc8", "sender": "PinkCastle", "subject": "a needs review",
+            "body_md": "x", "importance": "high", "thread_id": "c43357a1",
+            "created_ts_us": 1_787_300_794u64,
+        });
+        let mid = json!({
+            "id": "d46880a2b0ef", "sender": "SandySparrow", "subject": "re: a",
+            "body_md": "x", "importance": "high", "thread_id": "c43357a1",
+            "created_ts_us": 1_787_302_173u64,
+        });
+        let newest = json!({
+            "id": "ccd46cbb7dc9", "sender": "TanFern", "subject": "[request-release] x",
+            "body_md": "x", "importance": "high", "thread_id": "344e63b7",
+            "created_ts_us": 1_787_304_318u64,
+        });
+        // Wire order as observed: oldest first.
+        let rows = vec![oldest.clone(), mid.clone(), newest.clone()];
+        let urgent = wake_urgent(&rows);
+        assert_eq!(urgent.len(), 3, "all three are urgent");
+        let picked = newest_urgent(&urgent, rows.first()).expect("pick");
+        assert_eq!(
+            picked.get("id").and_then(|i| i.as_str()),
+            Some("ccd46cbb7dc9"),
+            "max(created_ts_us) across threads wins"
+        );
+        // Reverse wire order must pick the same row.
+        let rev = vec![newest.clone(), mid, oldest];
+        let picked = newest_urgent(&wake_urgent(&rev), rev.first()).expect("pick");
+        assert_eq!(
+            picked.get("id").and_then(|i| i.as_str()),
+            Some("ccd46cbb7dc9")
+        );
+    }
+
+    #[test]
+    fn vbf2_falls_back_to_first_raw_row_when_nothing_urgent() {
+        let normal = json!({
+            "id": "n1", "sender": "A", "subject": "hi", "body_md": "x",
+            "importance": "normal", "created_ts_us": 5,
+        });
+        let rows = vec![normal];
+        let urgent = wake_urgent(&rows);
+        assert!(urgent.is_empty());
+        let picked = newest_urgent(&urgent, rows.first()).expect("fallback");
+        assert_eq!(picked.get("id").and_then(|i| i.as_str()), Some("n1"));
+        assert!(newest_urgent(&[], None).is_none());
     }
 
     /// bd-kryk: a system/transport notification (reservation release —
@@ -22153,9 +22228,12 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
     let urgent_rows = wake_urgent(&arr);
     let urgent = urgent_rows.len();
     let last = arr.first();
-    // wake key: the most recent URGENT message that survives the wake
-    // filter (the loop wakes once per id)
-    let last_urgent = urgent_rows.first().copied().or(last);
+    // bd-vbf2: the wake key is the NEWEST URGENT message by created_ts_us
+    // (the loop wakes once per id) - never `.first()`, which cited the
+    // oldest row when the wire delivered ascending. Subject + thread ride
+    // the SAME chosen row so "Most recent urgent: id X re: S" /
+    // "Latest urgent thread: T" cannot disagree across threads.
+    let chosen = newest_urgent(&urgent_rows, last);
     // the wire row names the sender `sender` (toron MCP) or `from`
     // (agent-mail MCP) — read both (MailItem aliases them, but the raw
     // serde_json::Value here is the untyped projection).
@@ -22173,12 +22251,12 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
         // jobs assigned to this agent, via the existing CLI (no new MCP
         // tool). Best-effort: a job-list failure just zeroes the count.
         "plane_s": plane_s_open_jobs_for(project, &identity),
-        "last_id": last_urgent.and_then(|m| {
+        "last_id": chosen.and_then(|m| {
             m.get("id").or_else(|| m.get("message_id")).and_then(|i| i.as_str())
         }),
         "last_from": last_from,
-        "last_subject": last.and_then(|m| m.get("subject").and_then(|s| s.as_str())),
-        "thread_id": last.and_then(|m| m.get("thread_id").and_then(|t| t.as_str())),
+        "last_subject": chosen.and_then(|m| m.get("subject").and_then(|s| s.as_str())),
+        "thread_id": chosen.and_then(|m| m.get("thread_id").and_then(|t| t.as_str())),
     }));
     Ok(())
 }
