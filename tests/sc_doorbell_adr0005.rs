@@ -477,8 +477,7 @@ async fn sc_d1_live_kind9_channel_post_rings() {
         "channel post: {}",
         String::from_utf8_lossy(&posted.stderr)
     );
-    let post: serde_json::Value =
-        serde_json::from_slice(&posted.stdout).expect("post JSON");
+    let post: serde_json::Value = serde_json::from_slice(&posted.stdout).expect("post JSON");
     let mentions = post["mentions"].as_array().expect("mentions");
     assert_eq!(mentions.len(), 1, "one mention npub");
     let npub = mentions[0].as_str().expect("npub str");
