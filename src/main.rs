@@ -6467,6 +6467,16 @@ fn cmd_internal_doorbell(
 
     let path = doorbell::pid_file(&config::state_dir(), workspace);
     doorbell::write_pid(&path, std::process::id())?;
+    // bd-stale-doorbell-wake-0fic: generation ground truth. The spawning
+    // parent normally wrote this record; self-stamp on manual start so the
+    // tick gate below always has a binary identity to compare against.
+    let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
+    let gen_path = doorbell::gen_file(&config::state_dir(), workspace);
+    let generation = match doorbell::read_gen(&gen_path) {
+        Some(record) => Some(record),
+        None => doorbell::WatcherGen::capture(&exe_path, doorbell_now_unix())
+            .filter(|record| doorbell::write_gen(&gen_path, record).is_ok()),
+    };
     let mut watch = match Command::new("toron")
         .args([
             "watch",
@@ -6543,6 +6553,7 @@ fn cmd_internal_doorbell(
         &mut hear,
         &index,
         workspace,
+        generation.as_ref(),
     );
 
     let mut subscribed = false;
@@ -6607,6 +6618,7 @@ fn cmd_internal_doorbell(
                     &mut hear,
                     &index,
                     workspace,
+                    generation.as_ref(),
                 );
             }
             Ok(Bell::Status { pane_id, to }) => {
@@ -6628,10 +6640,24 @@ fn cmd_internal_doorbell(
                     &mut hear,
                     &index,
                     workspace,
+                    generation.as_ref(),
                 );
             }
             Ok(Bell::Died) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // bd-stale-doorbell-wake-0fic: a watcher whose binary
+                // changed underneath it runs pre-fix wake logic. Refuse
+                // every further wake, log once, self-retire; the next
+                // spawn starts a fresh current-binary dispatcher.
+                if let Some(record) = &generation
+                    && !doorbell::inject_allowed(record, &exe_path)
+                {
+                    eprintln!(
+                        "flywheel doorbell: binary changed since watcher start (up={}, bin_mtime={}); retiring without further wakes",
+                        record.started_unix, record.binary_mtime_unix
+                    );
+                    break;
+                }
                 doorbell_sweep_inbox(
                     project,
                     &status_by_pin,
@@ -6642,6 +6668,7 @@ fn cmd_internal_doorbell(
                     &mut hear,
                     &index,
                     workspace,
+                    generation.as_ref(),
                 );
                 // ADR-0005: subscribe is the drain signal. Poll herdr only
                 // when the event spine is down.
@@ -6655,6 +6682,7 @@ fn cmd_internal_doorbell(
                         &mut hear,
                         &index,
                         workspace,
+                        generation.as_ref(),
                     );
                 } else {
                     doorbell_refresh_pins(project, &mut pane_to_pin);
@@ -6714,6 +6742,7 @@ fn doorbell_prompt(
     herdr: Option<&mut Client>,
     registry: &[state::SpawnEntry],
     injects: &[(String, String)],
+    generation: Option<&doorbell::WatcherGen>,
 ) -> Vec<String> {
     let Some(client) = herdr else {
         return Vec::new();
@@ -6726,7 +6755,11 @@ fn doorbell_prompt(
         else {
             continue;
         };
-        match client.agent_prompt(&entry.name, msg, None) {
+        // bd-stale-doorbell-wake-0fic: every wake banner carries the
+        // watcher generation so agents can tell stale noise from a live
+        // peer need (`flywheel __doorbell --report` prints the same fields).
+        let msg = generation.map_or(msg.clone(), |r| doorbell::stamp_line(msg, r));
+        match client.agent_prompt(&entry.name, &msg, None) {
             Ok(_) => ok.push(pin.clone()),
             Err(e) => eprintln!("flywheel doorbell: prompt {} failed: {e:#}", entry.name),
         }
@@ -6741,9 +6774,10 @@ fn doorbell_prompt_and_hear(
     hear: &mut doorbell::HearTracker,
     index: &doorbell::SelfIndex,
     workspace: &str,
+    generation: Option<&doorbell::WatcherGen>,
 ) {
     let now = doorbell_now_unix();
-    for pin in doorbell_prompt(herdr, registry, injects) {
+    for pin in doorbell_prompt(herdr, registry, injects, generation) {
         hear.note_inject(&pin, index.npub(&pin), now);
     }
     doorbell_persist_hear(workspace, hear);
@@ -6760,6 +6794,7 @@ fn doorbell_refresh_status(
     hear: &mut doorbell::HearTracker,
     index: &doorbell::SelfIndex,
     workspace: &str,
+    generation: Option<&doorbell::WatcherGen>,
 ) {
     let registry = state::load_spawn_registry(project);
     pane_to_pin.clear();
@@ -6793,7 +6828,15 @@ fn doorbell_refresh_status(
         status_by_pin.insert(pin.clone(), to.clone());
         injects.extend(doorbell::apply_status_change(&pin, &from, &to, queues));
     }
-    doorbell_prompt_and_hear(Some(client), &registry, &injects, hear, index, workspace);
+    doorbell_prompt_and_hear(
+        Some(client),
+        &registry,
+        &injects,
+        hear,
+        index,
+        workspace,
+        generation,
+    );
 }
 
 fn doorbell_refresh_pins(project: &str, pane_to_pin: &mut BTreeMap<String, String>) {
@@ -6820,6 +6863,7 @@ fn doorbell_sweep_inbox(
     hear: &mut doorbell::HearTracker,
     index: &doorbell::SelfIndex,
     workspace: &str,
+    generation: Option<&doorbell::WatcherGen>,
 ) {
     let registry = state::load_spawn_registry(project);
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -6861,7 +6905,9 @@ fn doorbell_sweep_inbox(
         }
     }
     let injects = doorbell::take_allowed(injects, budgets, doorbell_now_unix());
-    doorbell_prompt_and_hear(herdr, &registry, &injects, hear, index, workspace);
+    doorbell_prompt_and_hear(
+        herdr, &registry, &injects, hear, index, workspace, generation,
+    );
 }
 
 fn project_base(project: &str) -> String {
