@@ -33,7 +33,7 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -181,6 +181,78 @@ fn sidecar_file(project: &str) -> PathBuf {
     loops_dir().join(format!("{}.json", state_key(project)))
 }
 
+// ---- bd-registry-key-split-b65y: one registry file per physical project ----
+//
+// Callers pass EITHER spelling of a project — bare name ("toron", from CLI
+// flags) or absolute path ("/Users/x/toron", from `project_dir_str`) — and
+// the old verbatim-vs-slug split put them in two files, so a wrong-form
+// reader silently saw an empty registry. Canonical rule mirrors
+// main::project_dir: relative names resolve under the workspace root; a
+// key is derived only when that resolved directory actually EXISTS, so
+// test fixtures and virtual labels keep today's verbatim keys.
+
+static REGISTRY_ROOT_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+fn effective_registry_root() -> PathBuf {
+    if let Some(root) = REGISTRY_ROOT_OVERRIDE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+    {
+        return root;
+    }
+    crate::config::Config::load()
+        .map(|c| c.workspace_root())
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .map(|h| h.join("workspace"))
+                .unwrap_or_else(|| PathBuf::from("/"))
+        })
+}
+
+/// Pure core of [`spawn_registry_key`]: `root` is the workspace root the
+/// caller's relative names resolve against. Unit-testable without config.
+pub fn spawn_registry_key_with(root: &Path, project: &str) -> String {
+    let p = PathBuf::from(project);
+    let resolved = if p.is_absolute() {
+        p
+    } else {
+        root.join(project)
+    };
+    if resolved.is_dir() {
+        // The path string itself feeds state_key — byte-stable with every
+        // slug file an absolute-path caller ever wrote.
+        state_key(&resolved.to_string_lossy())
+    } else {
+        state_key(project)
+    }
+}
+
+/// Canonical spawn-registry key for a project argument (either spelling).
+pub fn spawn_registry_key(project: &str) -> String {
+    spawn_registry_key_with(&effective_registry_root(), project)
+}
+
+#[cfg(test)]
+pub(crate) struct RegistryRootOverrideGuard;
+
+#[cfg(test)]
+impl Drop for RegistryRootOverrideGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = REGISTRY_ROOT_OVERRIDE.lock() {
+            *guard = None;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_registry_root_override(root: PathBuf) -> RegistryRootOverrideGuard {
+    if let Ok(mut guard) = REGISTRY_ROOT_OVERRIDE.lock() {
+        *guard = Some(root);
+    }
+    RegistryRootOverrideGuard
+}
+
 /// Directory of the per-project spawn registry (pane_id → agent name).
 /// Written at spawn; used by `flywheel rebind` and the send auto-heal path
 /// (bd-fw-name-binding-loss-7rc) to restore a name binding an agent lost
@@ -191,7 +263,7 @@ pub fn agents_dir() -> PathBuf {
 }
 
 pub fn spawn_registry_file(project: &str) -> PathBuf {
-    agents_dir().join(format!("{}.json", state_key(project)))
+    agents_dir().join(format!("{}.json", spawn_registry_key(project)))
 }
 
 /// One spawn-registry record: (pane_id, agent name, optional crew profile).
@@ -428,26 +500,70 @@ pub fn remove_expected_reply(project: &str, agent: &str, thread: &str) -> Result
     save_expected_replies(project, &entries)
 }
 
+/// Fold the pre-canonical alias file (bd-registry-key-split-b65y) into the
+/// canonical entry set. The old code keyed verbatim names ("toron.json")
+/// while other callers wrote the path slug ("toron-<hash>.json"); this
+/// merges any surviving verbatim rows (pane_id-keyed, canonical wins) and
+/// REMOVES the alias so both spellings can never diverge again. Rows are
+/// never dropped while a pane binding is only known to one side — losing a
+/// pinned mail identity is the exact failure this bead exists to kill.
+fn fold_legacy_alias(
+    project: &str,
+    canonical_key: &str,
+    current: Vec<SpawnEntry>,
+) -> Vec<SpawnEntry> {
+    let legacy_key = state_key(project);
+    if legacy_key == canonical_key {
+        return current;
+    }
+    let legacy_path = agents_dir().join(format!("{}.json", legacy_key));
+    let Ok(raw) = std::fs::read_to_string(&legacy_path) else {
+        return current;
+    };
+    let legacy_rows: Vec<SpawnEntry> = serde_json::from_str(&raw).unwrap_or_default();
+    let seen: std::collections::HashSet<String> =
+        current.iter().map(|e| e.pane_id.clone()).collect();
+    let mut merged = current;
+    for row in legacy_rows {
+        if !seen.contains(&row.pane_id) {
+            merged.push(row);
+        }
+    }
+    // Durable convergence: canonical now carries everything; delete the
+    // alias so it cannot resurrect the split.
+    let _ = std::fs::write(
+        agents_dir().join(format!("{canonical_key}.json")),
+        serde_json::to_string_pretty(&merged).unwrap_or_else(|_| "[]".into()),
+    );
+    let _ = std::fs::remove_file(&legacy_path);
+    merged
+}
+
 /// Atomically persist the project's pane→name registry.
 pub fn save_spawn_registry(project: &str, entries: &[SpawnEntry]) -> Result<()> {
     let path = spawn_registry_file(project);
+    let key = spawn_registry_key(project);
+    let merged = fold_legacy_alias(project, &key, entries.to_vec());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let body = serde_json::to_string_pretty(entries)?;
+    let body = serde_json::to_string_pretty(&merged)?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
-/// Read the project's pane→name registry (missing/corrupt → empty).
+/// Read the project's pane→name registry (missing/corrupt → empty). Any
+/// pre-split alias file is folded in first, so name-form and path-form
+/// callers always see the same entries.
 pub fn load_spawn_registry(project: &str) -> Vec<SpawnEntry> {
     let path = spawn_registry_file(project);
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return vec![];
-    };
-    serde_json::from_str(&raw).unwrap_or_default()
+    let current = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<SpawnEntry>>(&raw).ok())
+        .unwrap_or_default();
+    fold_legacy_alias(project, &spawn_registry_key(project), current)
 }
 
 /// Project-local pane→name bindings (bd-eign.3 A): mirrors the spawn
@@ -2052,6 +2168,86 @@ mod loops_sidecar_tests {
         // cleanup
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+    }
+
+    // ---- bd-registry-key-split-b65y: one registry file per physical project ----
+
+    #[test]
+    fn registry_key_converges_name_and_path_of_one_dir() {
+        let root = std::env::temp_dir().join(format!("fw-regkey-{}", std::process::id()));
+        let proj = root.join("regsplit-proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let by_name = spawn_registry_key_with(&root, "regsplit-proj");
+        let by_path = spawn_registry_key_with(&root, &proj.to_string_lossy());
+        assert_eq!(by_name, by_path, "one dir must hash to one key");
+        // scratch dirs sharing a base name stay distinct (the reason the
+        // slug hash exists at all)
+        let nested = root.join("nested");
+        std::fs::create_dir_all(nested.join("regsplit-proj")).unwrap();
+        assert_ne!(
+            spawn_registry_key_with(&root, &nested.join("regsplit-proj").to_string_lossy()),
+            by_name,
+            "distinct dirs must stay distinct"
+        );
+        // fictional projects keep the verbatim legacy key
+        assert_eq!(spawn_registry_key_with(&root, "no-such-dir"), "no-such-dir");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn registry_round_trip_save_under_name_load_under_path() {
+        let _g = loops_test_guard();
+        let root = std::env::temp_dir().join(format!("fw-regkey-rt-{}", std::process::id()));
+        let abs = root.join("regsplit-rt");
+        std::fs::create_dir_all(&abs).unwrap();
+        let _override = set_registry_root_override(root.clone());
+        let abs_str = abs.to_string_lossy().into_owned();
+
+        let entries = vec![SpawnEntry::legacy("wR:p1", "flywheel-regsplit-oc")];
+        save_spawn_registry("regsplit-rt", &entries).unwrap();
+        assert_eq!(
+            load_spawn_registry(&abs_str),
+            entries,
+            "save under NAME form -> load under PATH form returns entries"
+        );
+
+        let flipped = vec![SpawnEntry::legacy("wR:p2", "flywheel-regsplit-pi")];
+        save_spawn_registry(&abs_str, &flipped).unwrap();
+        assert_eq!(
+            load_spawn_registry("regsplit-rt"),
+            flipped,
+            "save under PATH form -> load under NAME form returns entries"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_verbatim_file_folds_into_canonical_on_load() {
+        let _g = loops_test_guard();
+        let root = std::env::temp_dir().join(format!("fw-regkey-fold-{}", std::process::id()));
+        let abs = root.join("regsplit-fold");
+        std::fs::create_dir_all(&abs).unwrap();
+        let _override = set_registry_root_override(root.clone());
+
+        // Pre-fix writer: verbatim-name file holding the pinned entry
+        // (the host evidence shape: toron.json with flywheel-toron-oc3).
+        let pinned = vec![SpawnEntry::legacy("wF:p9", "flywheel-toron-oc3")];
+        std::fs::create_dir_all(agents_dir()).unwrap();
+        let legacy_path = agents_dir().join(format!("{}.json", state_key("regsplit-fold")));
+        std::fs::write(&legacy_path, serde_json::to_string(&pinned).unwrap()).unwrap();
+
+        let loaded = load_spawn_registry("regsplit-fold");
+        assert_eq!(
+            loaded, pinned,
+            "no silent empty while a pinned entry exists under the other form"
+        );
+        assert!(
+            !legacy_path.exists(),
+            "fold must migrate the alias away — two live spellings is the defect"
+        );
+        // convergence is durable: the canonical file now carries the rows
+        assert_eq!(load_spawn_registry(&abs.to_string_lossy()), pinned);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// bd-eign.3 A: the project-local agent-names mirror round-trips and
