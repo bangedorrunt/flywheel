@@ -1665,7 +1665,12 @@ fn queue_brief(
 /// checkpointed poll results (`ready` minus `assigned`), so the verdict is
 /// deterministic across replays. PURE + unit-tested.
 pub fn bead_flood_verdict(new_ready: usize) -> bool {
-    new_ready > 3
+    // Hotfix 2026-08-21: legitimate ADR-0022 wave is 5-6 beads at once;
+    // the durable replay resets flood_seen each poll, so the same 5 kept
+    // tripping the >3 guard and starving dispatch. Allow up to 6;
+    // real runaway mints 10+ with NEW ids and still trips. Proper fix:
+    // persist flood_seen via ctx (bead bd-eign.2 follow-up).
+    new_ready > 6
 }
 
 /// bd-eign.2.1: count ready beads the flood guard has NOT yet seen this
