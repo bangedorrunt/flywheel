@@ -329,7 +329,7 @@ flywheel steer "<objective>" [--direct]
 flywheel loop run <project> --work
 ```
 
-PROPOSED (ADR-0022, waves W1–W7): `phase:` in specs, `phase:stage` parts,
+PROPOSED (ADR-0022, waves W1–W7): `phase:` in specs, stage registry (`stage new/show/lint`, project tier, stage-first bare-name parts, promote ladder), `phase:stage` parts,
 `each:/when:/retry(n)/parallel:` parts, `--from-yaml -`, `--dry-run`
 first-class, `--keep` graduation, delegated compose via mail. Watch the
 ADR's Verification section for the ship markers before using them.
