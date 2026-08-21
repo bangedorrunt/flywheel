@@ -105,6 +105,9 @@ pub fn pid_file(state_dir: &Path, workspace: &str) -> PathBuf {
 pub fn dispatcher_status_line(state_dir: &Path, workspace: &str) -> String {
     match inspect_lock(&pid_file(state_dir, workspace)) {
         LockAction::Attach { pid } => format!("dispatcher: up pid={pid}"),
+        // inspect_lock is generation-blind; Superseded only arises from
+        // inspect_lock_generation, but stay exhaustive and truthful.
+        LockAction::Superseded { pid } => format!("dispatcher: up pid={pid} superseded"),
         LockAction::Reloaded { stale } => format!("dispatcher: down stale={stale}"),
         LockAction::Start => "dispatcher: down".into(),
     }
@@ -196,12 +199,128 @@ pub fn pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+fn kill_pid(pid: u32) {
+    if pid > 1 {
+        let _ = Command::new("kill")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Watcher generation record (bd-stale-doorbell-wake-0fic). A dispatcher
+/// writes this next to its pid file at start; a watcher whose recorded
+/// binary identity no longer matches the on-disk binary predates the
+/// current wake logic and must not inject wakes.
+///
+/// Sanctioned restart (operator/agent): rebuild, then re-run the workspace
+/// spawn command (`flywheel spawn …`). The next spawn supersedes any live
+/// watcher whose generation does not match the new binary; an already
+/// running current-binary watcher also self-retires on its 1s tick.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WatcherGen {
+    pub started_unix: u64,
+    pub binary_mtime_unix: u64,
+    pub binary_len: u64,
+}
+
+impl WatcherGen {
+    /// Identity snapshot of `exe` right now, stamped with `started_unix`.
+    pub fn capture(exe: &Path, started_unix: u64) -> Option<Self> {
+        let (binary_mtime_unix, binary_len) = binary_identity(exe)?;
+        Some(Self {
+            started_unix,
+            binary_mtime_unix,
+            binary_len,
+        })
+    }
+
+    fn matches(&self, mtime: u64, len: u64) -> bool {
+        self.binary_mtime_unix == mtime && self.binary_len == len
+    }
+
+    /// True when the on-disk binary differs from what this watcher was
+    /// started with — or cannot be read (fail closed): refuse wakes.
+    pub fn stale(&self, exe: &Path) -> bool {
+        match binary_identity(exe) {
+            Some((mtime, len)) => !self.matches(mtime, len),
+            None => true,
+        }
+    }
+
+    /// Banner suffix so agents can tell stale-watcher noise from a live
+    /// peer need: compare against `flywheel __doorbell --report`, which
+    /// prints the same fields for the pid-file owner.
+    pub fn stamp(&self) -> String {
+        format!(
+            "[doorbell watcher up={up} bin_mtime={mtime}]",
+            up = self.started_unix,
+            mtime = self.binary_mtime_unix
+        )
+    }
+}
+
+/// `<workspace>.gen`, sibling of [`pid_file`].
+pub fn gen_file(state_dir: &Path, workspace: &str) -> PathBuf {
+    state_dir.join("doorbell").join(format!("{workspace}.gen"))
+}
+
+/// On-disk identity of a binary: `(mtime unix secs, length bytes)`. Cheap
+/// and monotone under rebuilds; answers "did the file under me change"
+/// without hashing tens of MB every tick.
+pub fn binary_identity(exe: &Path) -> Option<(u64, u64)> {
+    let md = fs::metadata(exe).ok()?;
+    let mtime = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some((mtime, md.len()))
+}
+
+/// Inject-gate for the tick loop: stale watchers refuse all wakes.
+pub fn inject_allowed(record: &WatcherGen, exe: &Path) -> bool {
+    !record.stale(exe)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub fn write_gen(path: &Path, record: &WatcherGen) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    fs::write(path, serde_json::to_vec(record)?)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+pub fn read_gen(path: &Path) -> Option<WatcherGen> {
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+/// Append the watcher generation to an injected line so agents can tell a
+/// stale-watcher banner from a live one (compare with `__doorbell --report`).
+pub fn stamp_line(msg: &str, record: &WatcherGen) -> String {
+    format!("{msg} {}", record.stamp())
+}
+
 /// What spawn should do with the workspace lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockAction {
     Start,
     Attach { pid: u32 },
     Reloaded { stale: u32 },
+    /// Live pid whose generation is missing or predates the current
+    /// binary: it runs pre-fix wake code and must be replaced (a pre-fix
+    /// watcher can never retire itself — the retire logic does not exist
+    /// in its binary).
+    Superseded { pid: u32 },
 }
 
 pub fn inspect_lock_with(path: &Path, alive: impl Fn(u32) -> bool) -> LockAction {
@@ -216,25 +335,74 @@ pub fn inspect_lock(path: &Path) -> LockAction {
     inspect_lock_with(path, pid_alive)
 }
 
-/// Kill the dispatcher and drop the pid file (ADR-0005 D1 lifetime).
+/// Generation-aware lock decision (bd-stale-doorbell-wake-0fic). Attach
+/// requires BOTH a live pid and a recorded generation matching
+/// `current_identity`; anything alive otherwise is
+/// [`LockAction::Superseded`].
+pub fn inspect_lock_generation(
+    path: &Path,
+    gen_path: &Path,
+    current_identity: Option<(u64, u64)>,
+    alive: impl Fn(u32) -> bool,
+) -> LockAction {
+    match read_pid(path) {
+        None => LockAction::Start,
+        Some(pid) if !alive(pid) => LockAction::Reloaded { stale: pid },
+        Some(pid) => match (read_gen(gen_path), current_identity) {
+            (Some(record), Some((mtime, len))) if record.matches(mtime, len) => {
+                LockAction::Attach { pid }
+            }
+            _ => LockAction::Superseded { pid },
+        },
+    }
+}
+
+/// Kill the dispatcher and drop the pid + generation files (ADR-0005 D1).
 pub fn stop(state_dir: &Path, workspace: &str) -> Result<()> {
     let path = pid_file(state_dir, workspace);
-    if let Some(pid) = read_pid(&path)
-        && pid > 1
-    {
-        let _ = Command::new("kill")
-            .arg(pid.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    if let Some(pid) = read_pid(&path) {
+        kill_pid(pid);
     }
     clear_pid(&path);
     let _ = fs::remove_file(unanswered_file(state_dir, workspace));
+    let _ = fs::remove_file(gen_file(state_dir, workspace));
+    Ok(())
+}
+
+fn spawn_child(
+    exe: &Path,
+    project: &str,
+    workspace: &str,
+    path: &Path,
+    gen_path: &Path,
+) -> Result<()> {
+    let mut cmd = Command::new(exe);
+    cmd.args(["__doorbell", "--project", project, "--workspace", workspace]);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("spawn doorbell for {workspace}"))?;
+    write_pid(path, child.id())?;
+    // Generation stamp at spawn (bd-stale-doorbell-wake-0fic): the tick
+    // loop compares this record against `exe` every second and retires the
+    // watcher when the binary changes underneath it.
+    if let Some(record) = WatcherGen::capture(exe, unix_now()) {
+        let _ = write_gen(gen_path, &record);
+    }
     Ok(())
 }
 
 /// Start or attach the detached `__doorbell` child. Never forks a second
-/// live process for the same workspace lock.
+/// live process for the same workspace lock — and never attaches to a
+/// watcher whose generation predates `exe` (bd-stale-doorbell-wake-0fic):
+/// a live pre-fix watcher is killed and replaced by a fresh child.
 pub fn ensure_running(
     exe: &Path,
     state_dir: &Path,
@@ -242,27 +410,22 @@ pub fn ensure_running(
     project: &str,
 ) -> Result<LockAction> {
     let path = pid_file(state_dir, workspace);
-    let action = inspect_lock(&path);
+    let gen_path = gen_file(state_dir, workspace);
+    let action = inspect_lock_generation(&path, &gen_path, binary_identity(exe), pid_alive);
     match action {
         LockAction::Attach { .. } => Ok(action),
+        LockAction::Superseded { pid } => {
+            kill_pid(pid);
+            clear_pid(&path);
+            let _ = fs::remove_file(&gen_path);
+            spawn_child(exe, project, workspace, &path, &gen_path)?;
+            Ok(action)
+        }
         LockAction::Start | LockAction::Reloaded { .. } => {
             if matches!(action, LockAction::Reloaded { .. }) {
                 clear_pid(&path);
             }
-            let mut cmd = Command::new(exe);
-            cmd.args(["__doorbell", "--project", project, "--workspace", workspace]);
-            cmd.stdin(Stdio::null());
-            cmd.stdout(Stdio::null());
-            cmd.stderr(Stdio::null());
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                cmd.process_group(0);
-            }
-            let child = cmd
-                .spawn()
-                .with_context(|| format!("spawn doorbell for {workspace}"))?;
-            write_pid(&path, child.id())?;
+            spawn_child(exe, project, workspace, &path, &gen_path)?;
             Ok(action)
         }
     }
@@ -473,10 +636,17 @@ pub fn watch_pubkey(line: &str) -> Option<String> {
         .map(|s| s.to_lowercase())
 }
 
-/// `dispatcher: up|down` plus unanswered pins (digest / `--report`).
+/// `dispatcher: up|down` plus watcher generation (bd-stale-doorbell-wake-0fic)
+/// plus unanswered pins (digest / `--report`). The generation fields let an
+/// agent compare the banner stamp against the pid-file owner.
 pub fn report_text(state_dir: &Path, workspace: &str) -> String {
     let head = dispatcher_status_line(state_dir, workspace);
+    let gen_tail = match read_gen(&gen_file(state_dir, workspace)) {
+        Some(record) => format!(" {}", record.stamp()),
+        None => String::new(),
+    };
     let pins = read_unanswered(&unanswered_file(state_dir, workspace));
+    let head = format!("{head}{gen_tail}");
     if pins.is_empty() {
         format!("{head}\ndoorbell: ok")
     } else {
@@ -1128,5 +1298,171 @@ mod tests {
     fn watch_pubkey_from_live_shape() {
         let line = r#"{"kind":9,"id":"ab","pubkey":"AABBCC","tags":[],"content":"hi"}"#;
         assert_eq!(watch_pubkey(line).as_deref(), Some("aabbcc"));
+    }
+
+    // ---- bd-stale-doorbell-wake-0fic: watcher generation / self-retire ----
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("fw-gen-{name}-{}", std::process::id()));
+        let _ = fs::create_dir_all(d.join("doorbell"));
+        d
+    }
+
+    #[test]
+    fn gen_roundtrip_via_state_file() {
+        let dir = scratch("rt");
+        let path = gen_file(&dir, "w1");
+        let record = WatcherGen {
+            started_unix: 10,
+            binary_mtime_unix: 5,
+            binary_len: 77,
+        };
+        write_gen(&path, &record).expect("write");
+        assert_eq!(read_gen(&path), Some(record));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changed_binary_is_stale_and_refuses_inject() {
+        let dir = scratch("chg");
+        let exe = dir.join("fake-bin");
+        fs::write(&exe, b"v1").expect("exe");
+        let record = WatcherGen::capture(&exe, 100).expect("capture");
+        assert!(!record.stale(&exe), "unchanged binary is live");
+        assert!(inject_allowed(&record, &exe));
+        // Rebuild: different length (and near-certainly mtime).
+        fs::write(&exe, b"v2-longer").expect("rebuild");
+        assert!(record.stale(&exe), "changed binary must read stale");
+        assert!(
+            !inject_allowed(&record, &exe),
+            "acceptance: watcher older than its own binary must not inject"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn older_recorded_mtime_same_len_is_stale() {
+        let dir = scratch("mt");
+        let exe = dir.join("fake-bin-mtime");
+        fs::write(&exe, b"abcd").expect("exe");
+        let (mtime, len) = binary_identity(&exe).expect("identity");
+        let older = WatcherGen {
+            started_unix: 0,
+            binary_mtime_unix: mtime.max(1) - 1,
+            binary_len: len,
+        };
+        assert!(older.stale(&exe));
+        assert!(!inject_allowed(&older, &exe));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_binary_fails_closed_no_inject() {
+        let record = WatcherGen {
+            started_unix: 0,
+            binary_mtime_unix: 1,
+            binary_len: 1,
+        };
+        assert!(record.stale(Path::new("/nonexistent/flywheel-bin")));
+        assert!(!inject_allowed(&record, Path::new("/nonexistent/flywheel-bin")));
+    }
+
+    #[test]
+    fn banner_stamp_carries_up_and_bin_mtime() {
+        let record = WatcherGen {
+            started_unix: 1700,
+            binary_mtime_unix: 1600,
+            binary_len: 1,
+        };
+        let line = stamp_line(
+            &doorbell_line(EventClass::RequestRelease, "toron mail inbox --since"),
+            &record,
+        );
+        assert!(line.starts_with("[doorbell] request-release."), "{line}");
+        assert!(line.contains("Pull: toron mail inbox --since"), "{line}");
+        assert!(line.contains("watcher up=1700"), "{line}");
+        assert!(line.contains("bin_mtime=1600"), "{line}");
+    }
+
+    #[test]
+    fn report_text_carries_generation_when_present() {
+        let dir = scratch("rep");
+        let record = WatcherGen {
+            started_unix: 1234,
+            binary_mtime_unix: 1200,
+            binary_len: 9,
+        };
+        write_gen(&gen_file(&dir, "w9"), &record).expect("gen");
+        let text = report_text(&dir, "w9");
+        assert!(text.contains("dispatcher:"), "{text}");
+        assert!(
+            text.contains("watcher up=1234") && text.contains("bin_mtime=1200"),
+            "{text}"
+        );
+        assert_eq!(
+            report_text(&dir, "w10").lines().next(),
+            Some("dispatcher: down"),
+            "absent gen keeps the bare shape"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_generation_supersedes_live_pre_fix_watcher() {
+        let dir = scratch("lock");
+        let pid = pid_file(&dir, "ws");
+        write_pid(&pid, 424_242).expect("pid");
+        let gpath = gen_file(&dir, "ws");
+        let cur = Some((50u64, 10u64));
+        assert_eq!(
+            inspect_lock_generation(&pid, &gpath, cur, |_| true),
+            LockAction::Superseded { pid: 424_242 },
+            "alive pid with no gen file = pre-fix watcher, replace it"
+        );
+        write_gen(
+            &gpath,
+            &WatcherGen {
+                started_unix: 40,
+                binary_mtime_unix: 50,
+                binary_len: 10,
+            },
+        )
+        .expect("gen");
+        assert_eq!(
+            inspect_lock_generation(&pid, &gpath, cur, |_| true),
+            LockAction::Attach { pid: 424_242 }
+        );
+        write_gen(
+            &gpath,
+            &WatcherGen {
+                started_unix: 40,
+                binary_mtime_unix: 49,
+                binary_len: 10,
+            },
+        )
+        .expect("gen");
+        assert_eq!(
+            inspect_lock_generation(&pid, &gpath, cur, |_| true),
+            LockAction::Superseded { pid: 424_242 },
+            "rebuilt binary supersedes even with a gen file present"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stop_clears_generation_file() {
+        let dir = scratch("stop");
+        write_gen(
+            &gen_file(&dir, "wst"),
+            &WatcherGen {
+                started_unix: 1,
+                binary_mtime_unix: 1,
+                binary_len: 1,
+            },
+        )
+        .expect("gen");
+        stop(&dir, "wst").expect("stop");
+        assert!(read_gen(&gen_file(&dir, "wst")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
