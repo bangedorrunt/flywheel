@@ -8245,6 +8245,35 @@ mod agent_mail_name_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// bd-aseq regression: a registered slug whose PIN diverges from the
+    /// deterministic hash mapping resolves to the PIN — the send-shaped
+    /// chokepoint addresses the inbox the agent actually reads, never the
+    /// parallel hash-mapped one.
+    #[test]
+    fn registered_slug_resolves_to_pin_not_hash_mapping() {
+        let _g = crate::config::lock_env();
+        let dir = std::env::temp_dir().join(format!("fw-aseq-{}", uuid::Uuid::new_v4()));
+        unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
+
+        let project = "/tmp/fw-aseq-proj";
+        let entries = vec![state::SpawnEntry::with_mail_identity(
+            "w:p",
+            "flywheel-fw-aseq-oc2",
+            "TanFern",
+        )];
+        state::save_spawn_registry(project, &entries).expect("save");
+
+        let pin = resolve_mail_target_registry(project, "flywheel-fw-aseq-oc2");
+        assert_eq!(pin, "TanFern");
+        assert_ne!(
+            resolve_mail_target("flywheel-fw-aseq-oc2"),
+            pin,
+            "precondition: hash mapping diverges from the pinned identity"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// review-fix F7: bare shorts resolve to the spawned herdr name; concrete
     /// names pass through unchanged.
     #[test]
@@ -10646,18 +10675,23 @@ fn mail_or_die(cfg: &Config) -> Result<mail_shim::Mail> {
 /// Priority: explicit `--as` → `FLYWHEEL_MAIL_AS` → `AGENT_NAME` → config
 /// `[agent_mail].name` (orchestrator CoralFinch). Without this, every crew
 /// `flywheel mail send` collapsed to CoralFinch and peer collab was unreadable.
-fn resolve_mail_actor(explicit: Option<&str>) -> Option<String> {
+fn resolve_mail_actor(project: &str, explicit: Option<&str>) -> Option<String> {
+    // bd-aseq: the actor resolves through the spawn registry like any
+    // recipient — a slug `--as` / FLYWHEEL_MAIL_AS / AGENT_NAME must act as
+    // the pinned identity, not a parallel hash-mapped one. Registry miss
+    // falls back to the deterministic hash mapping.
+    let resolve = |t: &str| resolve_mail_target_registry(project, t.trim());
     if let Some(a) = explicit {
         let t = a.trim();
         if !t.is_empty() {
-            return Some(resolve_mail_target(t));
+            return Some(resolve(a));
         }
     }
     for key in ["FLYWHEEL_MAIL_AS", "AGENT_NAME"] {
         if let Ok(v) = std::env::var(key) {
             let t = v.trim();
             if !t.is_empty() {
-                return Some(resolve_mail_target(t));
+                return Some(resolve(&v));
             }
         }
     }
@@ -10667,7 +10701,10 @@ fn resolve_mail_actor(explicit: Option<&str>) -> Option<String> {
 /// Mail facade acting as resolved actor (registers identity best-effort).
 fn mail_as(cfg: &Config, project_key: &str, as_agent: Option<&str>) -> Result<mail_shim::Mail> {
     let mail = mail_or_die(cfg)?;
-    let mail = match resolve_mail_actor(as_agent) {
+    // bd-aseq: the registry is keyed by project NAME (state_key hashes path
+    // forms separately) — derive it from the project dir so the actor lookup
+    // hits the same file the spawn wrote. Miss → hash fallback.
+    let mail = match resolve_mail_actor(&project_base(project_key), as_agent) {
         Some(name) => mail.with_name(name),
         None => mail,
     };
@@ -11280,10 +11317,12 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
-            // herdr names resolve to their registered identities (bd-odc)
+            // herdr names resolve to their registered identities (bd-odc);
+            // bd-aseq: through the spawn registry pin first, never a parallel
+            // hash-mapped inbox
             let targets: Vec<String> = to
                 .split(',')
-                .map(|s| resolve_mail_target(s.trim()))
+                .map(|s| resolve_mail_target_registry(project, s.trim()))
                 .collect();
             let v = mail.send(
                 &key,
@@ -11366,7 +11405,9 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 let mail = mail_as(cfg, &key, None)?;
                 mail.ensure_project(&key)?;
                 let from = mail.name.clone();
-                let to_mail = resolve_mail_target(to);
+                // bd-aseq: registry pin first (same-project peers); a
+                // cross-project target misses and falls back to the hash.
+                let to_mail = resolve_mail_target_registry(project, to);
                 let to_proj = to_project
                     .as_ref()
                     .map(|p| project_dir_str(cfg, p))
@@ -11379,7 +11420,9 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 let key = project_dir_str(cfg, project)?;
                 let mail = mail_as(cfg, &key, None)?;
                 let to = mail.name.clone();
-                let from_mail = resolve_mail_target(from);
+                // bd-aseq: registry pin first (same-project peers); a
+                // cross-project requester misses and falls back to the hash.
+                let from_mail = resolve_mail_target_registry(project, from);
                 let v = mail.respond_contact(&key, &to, &from_mail, true)?;
                 print_json(&v);
             }
@@ -11387,7 +11430,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 let key = project_dir_str(cfg, project)?;
                 let mail = mail_as(cfg, &key, None)?;
                 let to = mail.name.clone();
-                let from_mail = resolve_mail_target(from);
+                let from_mail = resolve_mail_target_registry(project, from);
                 let v = mail.respond_contact(&key, &to, &from_mail, false)?;
                 print_json(&v);
             }
@@ -12191,9 +12234,12 @@ fn cmd_collab(
     let mail = mail_as(cfg, &key, as_agent)?;
     mail.ensure_project(&key)?;
     let thread_id = format!("collab-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"));
+    // bd-aseq: expectations are keyed by the identity stored HERE — resolve
+    // through the spawn registry pin so the thread lands in the inbox the
+    // agent actually reads (never a parallel hash-mapped one).
     let targets: Vec<String> = to
         .split(',')
-        .map(|s| resolve_mail_target(s.trim()))
+        .map(|s| resolve_mail_target_registry(project, s.trim()))
         .collect();
     let sent = mail.send(
         &key,
@@ -13647,8 +13693,9 @@ fn cmd_loop(
                                 let _ = m.ensure_project(&key);
                                 // the recipient is the agent's REGISTERED
                                 // agent-mail identity (bd-odc) — the herdr
-                                // name is not a registrable identity
-                                let mail_target = resolve_mail_target(name);
+                                // name is not a registrable identity;
+                                // bd-aseq: registry pin first, hash fallback
+                                let mail_target = resolve_mail_target_registry(project, name);
                                 let _ = m.send(
                                     &key,
                                     std::slice::from_ref(&mail_target),
@@ -19637,7 +19684,8 @@ fn cmd_debate(
             mail.as_ref(),
             &key,
             &thread,
-            &resolve_mail_target(speaker),
+            // bd-aseq: harvest against the pinned identity the send used
+            &mail_target(speaker),
         )?);
         println!("debate {thread}: {} replied (round {})", speaker, round);
     }
@@ -19657,7 +19705,7 @@ fn cmd_debate(
         Some(&thread),
     )?;
     settle_agent(&*mux, &j)?;
-    let verdict = harvest_latest(mail.as_ref(), &key, &thread, &resolve_mail_target(&j))?;
+    let verdict = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&j))?;
     println!("debate {thread} verdict: {verdict}");
     Ok(())
 }
@@ -21988,7 +22036,14 @@ fn cmd_internal_check_reply(cfg: &Config, project: &str, name: &str, thread: &st
         print_json(&zero);
         return Ok(());
     }
-    match thread_head(&*mail, &key, thread, &resolve_mail_target(name)) {
+    // bd-aseq: the reply lands under the pinned identity the send used —
+    // check the thread head against the registry pin, not the hash mapping.
+    match thread_head(
+        &*mail,
+        &key,
+        thread,
+        &resolve_mail_target_registry(project, name),
+    ) {
         Ok(Some((id, author))) => print_json(&json!({ "newest_id": id, "author": author })),
         _ => print_json(&zero),
     }
@@ -22191,8 +22246,9 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str, tier: u32)
     };
     let key = project_dir_str(cfg, project)?;
     // the recipient is the agent's REGISTERED agent-mail identity (bd-odc) —
-    // `name` is the herdr name, which is not a registrable identity
-    let mail_target = resolve_mail_target(name);
+    // `name` is the herdr name, which is not a registrable identity;
+    // bd-aseq: registry pin first, hash fallback
+    let mail_target = resolve_mail_target_registry(project, name);
     let thread = format!("health-{name}");
     let out = (|| -> Result<backend::SendReceipt> {
         backend::run_mail(mail.ensure_project(&key)).map_err(|e| anyhow!("{e}"))?;
