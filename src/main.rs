@@ -3,6 +3,9 @@
 //! NTM-parity daily loop for opencode/pi/grok: spawn swarms, dispatch work,
 //! monitor states, checkpoint progress. All tracker state lives in br/bv;
 //! all coordination lives in agent-mail; herdr is the backend.
+//!
+//! governed-by: ADR-0022 §3.6 (workflow compose --from-yaml / --dry-run
+//! surface + budget-cap fail-closed gate in the Compose arm)
 
 mod agentstate;
 mod backend;
@@ -2336,6 +2339,15 @@ enum WorkflowCmd {
         /// planner arm: an agent authors the workflow from the target
         #[arg(long)]
         agent: bool,
+        /// T2 (§3.6): author a FULL Workflow from YAML text instead of
+        /// assembling from parts — `-` reads stdin. Exclusive with
+        /// --agent/--parts/--base.
+        #[arg(long)]
+        from_yaml: Option<String>,
+        /// §3.6 safety envelope: structural dry-run — the resolved graph
+        /// with fanout counts + phase tags. NEVER dispatches.
+        #[arg(long)]
+        dry_run: bool,
         /// run the composed workflow (lint gate first, pane mode)
         #[arg(long)]
         run: bool,
@@ -5088,7 +5100,11 @@ mod steer_engine_tests {
     fn steer_direct_completes_as_engine_run() {
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (rt, engine, invoke_wf) = steer_engine(calls).expect("steer engine");
-        let out = rt.block_on(steered(&engine, "fw-cli-steer-engine-run-test", invoke_wf));
+        // bd-adr22-local-resonate-tx8q: engine runs are durably stored now —
+        // run_ids must be unique per execution or a completed promise from a
+        // prior run replays instead of executing.
+        let run_id = format!("fw-cli-steer-engine-run-test-{}", std::process::id());
+        let out = rt.block_on(steered(&engine, &run_id, invoke_wf));
         assert!(out.is_object(), "engine returns an output object");
     }
 
@@ -5099,14 +5115,14 @@ mod steer_engine_tests {
     fn steer_chain_redelivery_replays_recorded_run() {
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (rt, engine, invoke_wf) = steer_engine(calls.clone()).expect("steer engine");
-        let first = rt.block_on(steered(
-            &engine,
-            "fw-cli-steer-redelivery-test",
-            invoke_wf.clone(),
-        ));
+        // bd-adr22-local-resonate-tx8q: unique per PROCESS, stable within it —
+        // the redelivery contract needs same-id-twice in one lifetime, never
+        // across lifetimes once the store is persistent.
+        let run_id = format!("fw-cli-steer-redelivery-test-{}", std::process::id());
+        let first = rt.block_on(steered(&engine, run_id.as_str(), invoke_wf.clone()));
         let after_first = calls.lock().unwrap().len();
         assert!(after_first > 0, "first run executes the chain");
-        let redelivery = rt.block_on(steered(&engine, "fw-cli-steer-redelivery-test", invoke_wf));
+        let redelivery = rt.block_on(steered(&engine, run_id.as_str(), invoke_wf));
         assert_eq!(first, redelivery, "redelivery returns the recorded output");
         assert_eq!(
             calls.lock().unwrap().len(),
@@ -18546,28 +18562,42 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             base,
             parts,
             agent,
+            from_yaml,
+            dry_run,
             run,
             keep,
             project,
             json,
         } => {
             // W6: --keep is a graduation of a RUN — without --run there is no
-            // green to graduate.
-            if keep.is_some() && !*run {
+            // green to graduate (and a dry-run never produces a green).
+            if keep.is_some() && (!*run || *dry_run) {
                 bail!("workflow compose: --keep needs --run (graduation requires a green run)");
+            }
+            // §3.6 envelope: a dry-run renders structure only — it must not
+            // be combinable with the dispatch it exists to preview.
+            if *dry_run && *run {
+                bail!("workflow compose: --dry-run never dispatches — drop --run");
             }
             // bd-8xca deterministic arm: assemble from the parts spec.
             // `--agent` (planner arm, bd-u4cu): a headless planner-profile
             // run authors a Workflow YAML from the target + the workflow
             // catalog; the authored workflow goes through the SAME lint→run
-            // path as the deterministic assembly. The arms are exclusive.
-            if *agent && (!parts.is_empty() || base.is_some()) {
+            // path as the deterministic assembly. `--from-yaml -` (§3.6 T2):
+            // the captain authors the FULL Workflow directly. The arms are
+            // exclusive.
+            if from_yaml.is_some() && (*agent || !parts.is_empty() || base.is_some()) {
+                bail!("workflow compose: choose one arm — --from-yaml, --agent, or --parts/--base");
+            }
+            if !from_yaml.is_some() && *agent && (!parts.is_empty() || base.is_some()) {
                 bail!(
                     "workflow compose: choose one arm — --agent (planner-authored) or --parts/--base (deterministic)"
                 );
             }
-            if !*agent && parts.is_empty() {
-                bail!("workflow compose needs --parts (role:stage or workflow:name) or --agent");
+            if from_yaml.is_none() && !*agent && parts.is_empty() {
+                bail!(
+                    "workflow compose needs --parts (role:stage / workflow:name / each:|when:|retry(n):|parallel: forms) or --from-yaml - or --agent"
+                );
             }
             // W6: the project tier participates in BOTH the stage library
             // (stage-first affinities) and the workflow catalog (kept entries
@@ -18577,7 +18607,24 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let project_stages = project_root.join(".flywheel/stages.toml");
             let all = all_workflows_layered(Some(&project_root))?;
             let wf_name = format!("composed-{}", state::now_iso().replace([':', '-', '.'], ""));
-            let composed = if *agent {
+            let composed = if let Some(src) = from_yaml {
+                // §3.6 T2 author-from-scratch arm: the FULL Workflow comes
+                // verbatim from the captain (stdin or file); it rides the
+                // SAME lint → caps → run gate as the parts arm.
+                let text = if src == "-" {
+                    use std::io::Read as _;
+                    let mut buf = String::new();
+                    std::io::stdin()
+                        .lock()
+                        .read_to_string(&mut buf)
+                        .context("read workflow YAML from stdin")?;
+                    buf
+                } else {
+                    std::fs::read_to_string(src)
+                        .with_context(|| format!("read workflow YAML from {src}"))?
+                };
+                crew::workflow_from_yaml(&text)?
+            } else if *agent {
                 // Planner arm: author from the target + catalog (workflows,
                 // profiles, stages). The planner's response is the ONLY
                 // source of the workflow — a failed run or garbage YAML
@@ -18611,6 +18658,10 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 crew::compose_workflow_with(&wf_name, target, base_wf.as_ref(), &parsed, &affinity)?
             };
 
+            // §3.6 envelope #3: budget caps fail closed BEFORE the lint gate
+            // — an over-cap composition is refused regardless of lint state.
+            crew::enforce_budget_caps(&composed)?;
+
             // Fail-stop gate: lint before run / emit.
             let blocking = lint_one(&wf_name, &composed);
             if blocking > 0 {
@@ -18623,6 +18674,47 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // captain's fleet preview + the run's spawn.
             let resolve = |sub: &str| all.get(sub).map(|(w, _)| w.clone());
             let crew_plan = crew::plan_crew_with(&composed, &resolve);
+
+            // §3.6 envelope #2: structural dry-run first-class — resolved
+            // graph, fanout counts, phase tags. No dispatch, no persist.
+            if *dry_run {
+                let rendered = crew::render_dry_run(&composed);
+                if *json {
+                    print_json(&json!({
+                        "workflow": wf_name,
+                        "target": target,
+                        "dry_run": rendered,
+                    }));
+                } else {
+                    println!("dry-run graph for {wf_name} (no dispatch):");
+                    if let Some(steps) = rendered["steps"].as_array() {
+                        for s in steps {
+                            let mut line = format!(
+                                "  - {} ({})",
+                                s["path"].as_str().unwrap_or("<unnamed>"),
+                                s["action"].as_str().unwrap_or("?")
+                            );
+                            if let Some(f) = s["fanout"].as_u64() {
+                                line.push_str(&format!(" fanout={f}"));
+                            }
+                            if let Some(p) = s["phase"].as_str() {
+                                line.push_str(&format!(" phase={p}"));
+                            }
+                            if let Some(g) = s["guard"].as_str() {
+                                line.push_str(&format!(" guard={g:?}"));
+                            }
+                            println!("{line}");
+                        }
+                    }
+                    print_json(&json!({
+                        "workflow": wf_name,
+                        "target": target,
+                        "crew": crew_plan.members,
+                        "dry_run": rendered,
+                    }));
+                }
+                return Ok(());
+            }
 
             if !*run {
                 if *json {

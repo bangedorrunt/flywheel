@@ -17,6 +17,9 @@
 //!   to a concrete N before invoke — staged: sequential at P3, durable at P5).
 //!
 //! governed-by: ADR-0005 Spec 4c, P3.6
+//! governed-by: ADR-0022 §3.6 (compose versatility ladder T1/T2 + safety
+//! envelope: full-grammar part forms, --from-yaml, budget caps fail closed,
+//! structural dry-run rendering)
 
 use std::collections::BTreeMap;
 
@@ -143,6 +146,30 @@ pub enum ComposePart {
     PhaseStage { phase: String, stage: String },
     /// `workflow:name` → a call_workflow step (resolved at invoke).
     CallWorkflow { name: String },
+    /// `each:<over>:<part>` → foreach sub-runs, one per list item
+    /// (`over` is a template ref to the list). ADR-0022 §3.6 T1.
+    Each {
+        over: String,
+        inner: Box<ComposePart>,
+    },
+    /// `when:<guard>:<part>` → a branch running the part as the single
+    /// `then` step when the guard holds. ADR-0022 §3.6 T1.
+    When {
+        guard: String,
+        inner: Box<ComposePart>,
+    },
+    /// `retry(n):<part>` → bounded retries (n ≥ 1) around the part.
+    /// ADR-0022 §3.6 T1.
+    Retry {
+        max_attempts: u32,
+        inner: Box<ComposePart>,
+    },
+    /// `parallel:<over>:<part>` → elastic fan-out across N copies or a
+    /// crew role (`@crew.<role>`). ADR-0022 §3.6 T1.
+    Parallel {
+        over: String,
+        inner: Box<ComposePart>,
+    },
 }
 
 /// Parse one compose part token (`role:stage` | `phase:stage` | `workflow:name`
@@ -156,6 +183,17 @@ pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
         if stage.is_empty() {
             return Err(format!("compose part {token:?}: empty stage name"));
         }
+        // Fail closed (§3.6 envelope #1): a colon-less token SHAPED like a
+        // T1 control form — a lone keyword or `retry(n)` with no inner part
+        // — is a malformed structured form, never a stage literally named
+        // like one. Keywords shadow stage names the way phases shadow roles.
+        if matches!(stage, "each" | "when" | "parallel" | "retry") || stage.starts_with("retry(") {
+            return Err(format!(
+                "compose part {token:?}: incomplete compose form — \
+                 control parts need an inner part (`retry(n):<part>` / \
+                 `<keyword>:<param>:<part>`)"
+            ));
+        }
         return Ok(ComposePart::StageFirst {
             stage: stage.to_string(),
         });
@@ -168,6 +206,75 @@ pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
             }
             Ok(ComposePart::CallWorkflow {
                 name: name.to_string(),
+            })
+        }
+        // §3.6 T1 structured forms: `each:` / `parallel:` take <over> +
+        // inner part; `when:` takes a guard + inner part. Strict — missing
+        // or malformed pieces are parse errors, never silently dropped.
+        form @ ("each" | "parallel" | "when") => {
+            let (param, rest) = value.split_once(':').ok_or_else(|| {
+                format!(
+                    "compose part {token:?}: {form} needs `{form}:<param>:<part>` — \
+                     param and inner part required"
+                )
+            })?;
+            let param = param.trim();
+            if param.is_empty() {
+                return Err(format!("compose part {token:?}: empty {form} parameter"));
+            }
+            if rest.trim().is_empty() {
+                return Err(format!(
+                    "compose part {token:?}: {form} is missing its inner part"
+                ));
+            }
+            let inner = Box::new(
+                parse_compose_part(rest)
+                    .map_err(|e| format!("compose part {token:?}: invalid inner part ({e})"))?,
+            );
+            match form {
+                "each" => Ok(ComposePart::Each {
+                    over: param.to_string(),
+                    inner,
+                }),
+                "parallel" => Ok(ComposePart::Parallel {
+                    over: param.to_string(),
+                    inner,
+                }),
+                _ => Ok(ComposePart::When {
+                    guard: param.to_string(),
+                    inner,
+                }),
+            }
+        }
+        // `retry(n):<part>` — the count rides the keyword, so the value is
+        // the inner part directly. `retry` without `(n)` is an error (a role
+        // named e.g. `retry-team` still parses as a dispatch role).
+        kind if kind == "retry" || kind.starts_with("retry(") => {
+            let attempts = if kind == "retry" {
+                None
+            } else {
+                kind.strip_prefix("retry(")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                    .and_then(|n| n.trim().parse::<u32>().ok())
+                    .filter(|n| *n >= 1)
+            };
+            let Some(max_attempts) = attempts else {
+                return Err(format!(
+                    "compose part {token:?}: expected `retry(n):<part>` with numeric n ≥ 1"
+                ));
+            };
+            if value.trim().is_empty() {
+                return Err(format!(
+                    "compose part {token:?}: retry({max_attempts}) is missing its inner part"
+                ));
+            }
+            let inner = Box::new(
+                parse_compose_part(value)
+                    .map_err(|e| format!("compose part {token:?}: invalid inner part ({e})"))?,
+            );
+            Ok(ComposePart::Retry {
+                max_attempts,
+                inner,
             })
         }
         phase if crate::stages::PHASES.contains(&phase) => {
@@ -229,80 +336,7 @@ pub fn compose_workflow_with(
     let mut ordinal = 0u32;
     for part in parts {
         ordinal += 1;
-        let step_name = match part {
-            ComposePart::Dispatch { role, stage } => {
-                let slug = format!("{role}-{stage}")
-                    .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-                    .collect::<String>();
-                let mut s = Step {
-                    name: Some(slug),
-                    guard: None,
-                    on_error: StepOnError::Continue,
-                    build_slot: false,
-                    action: Action::DispatchJob {
-                        assignee: "x".to_string(),
-                        spec: toron_workflow::schema::DispatchSpec {
-                            profile: Some(format!("@{role}")),
-                            stage: Some(stage.clone()),
-                            task: Some(objective.to_string()),
-                            ..Default::default()
-                        },
-                        channel: None,
-                    },
-                };
-                // deterministic unique names across repeated roles
-                s.name = Some(format!("{}-{ordinal}", s.name.unwrap_or_default()));
-                steps.push(s);
-                continue;
-            }
-            ComposePart::StageFirst { stage } | ComposePart::PhaseStage { stage, phase: _ } => {
-                let phase = match part {
-                    ComposePart::PhaseStage { phase, .. } => Some(phase.clone()),
-                    _ => None,
-                };
-                let role = affinity(stage).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "stage {stage:?} declares no role affinity — use role:{stage} or \
-                         declare `role` in the stage (stage show {stage})"
-                    )
-                })?;
-                let slug = format!("{role}-{stage}")
-                    .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-                    .collect::<String>();
-                let s = Step {
-                    name: Some(format!("{slug}-{ordinal}")),
-                    guard: None,
-                    on_error: StepOnError::Continue,
-                    build_slot: false,
-                    action: Action::DispatchJob {
-                        assignee: "x".to_string(),
-                        spec: toron_workflow::schema::DispatchSpec {
-                            profile: Some(format!("@{role}")),
-                            stage: Some(stage.clone()),
-                            phase,
-                            task: Some(objective.to_string()),
-                            ..Default::default()
-                        },
-                        channel: None,
-                    },
-                };
-                steps.push(s);
-                continue;
-            }
-            ComposePart::CallWorkflow { name: sub } => Action::CallWorkflow {
-                workflow: sub.clone(),
-                inputs: serde_json::json!({ "goal": objective }),
-            },
-        };
-        steps.push(Step {
-            name: Some(format!("part-{ordinal}")),
-            guard: None,
-            on_error: StepOnError::Continue,
-            build_slot: false,
-            action: step_name,
-        });
+        steps.push(build_part_step(part, ordinal, objective, affinity)?);
     }
     Ok(Workflow {
         name: name.to_string(),
@@ -320,6 +354,318 @@ pub fn compose_workflow_with(
         }],
         crew: Some(CrewSpec::Auto),
         principles: vec![],
+    })
+}
+
+/// One part → one step (§3.6 T1): leaf parts (dispatch / stage-first /
+/// phase / workflow) build their dispatch or call step; control parts
+/// (`each:`/`when:`/`retry(n)`/`parallel:`) wrap the leaf in the matching
+/// composite `Action`. Pure + testable.
+fn build_part_step(
+    part: &ComposePart,
+    ordinal: u32,
+    objective: &str,
+    affinity: &dyn Fn(&str) -> Option<String>,
+) -> Result<Step> {
+    fn slugify(s: &str) -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect()
+    }
+    /// The leaf under a control part (or the whole step for a bare leaf).
+    fn leaf(
+        part: &ComposePart,
+        ordinal: u32,
+        objective: &str,
+        affinity: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Step> {
+        let base = |name: String, action: Action| Step {
+            name: Some(name),
+            guard: None,
+            on_error: StepOnError::Continue,
+            build_slot: false,
+            action,
+        };
+        Ok(match part {
+            ComposePart::Dispatch { role, stage } => {
+                // deterministic unique names across repeated roles
+                base(
+                    format!("{}-{ordinal}", slugify(&format!("{role}-{stage}"))),
+                    Action::DispatchJob {
+                        assignee: "x".to_string(),
+                        spec: toron_workflow::schema::DispatchSpec {
+                            profile: Some(format!("@{role}")),
+                            stage: Some(stage.clone()),
+                            task: Some(objective.to_string()),
+                            ..Default::default()
+                        },
+                        channel: None,
+                    },
+                )
+            }
+            ComposePart::StageFirst { stage } | ComposePart::PhaseStage { stage, phase: _ } => {
+                let phase = match part {
+                    ComposePart::PhaseStage { phase, .. } => Some(phase.clone()),
+                    _ => None,
+                };
+                let role = affinity(stage).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "stage {stage:?} declares no role affinity — use role:{stage} or \
+                         declare `role` in the stage (stage show {stage})"
+                    )
+                })?;
+                base(
+                    format!("{}-{ordinal}", slugify(&format!("{role}-{stage}"))),
+                    Action::DispatchJob {
+                        assignee: "x".to_string(),
+                        spec: toron_workflow::schema::DispatchSpec {
+                            profile: Some(format!("@{role}")),
+                            stage: Some(stage.clone()),
+                            phase,
+                            task: Some(objective.to_string()),
+                            ..Default::default()
+                        },
+                        channel: None,
+                    },
+                )
+            }
+            ComposePart::CallWorkflow { name: sub } => base(
+                format!("part-{ordinal}"),
+                Action::CallWorkflow {
+                    workflow: sub.clone(),
+                    inputs: serde_json::json!({ "goal": objective }),
+                },
+            ),
+            // A control form directly inside another control form wraps a
+            // synthetic dispatch-less leaf — unreachable via the parser
+            // (inner is always re-parsed to a concrete part), so treat it as
+            // a hard error instead of inventing a shape.
+            other => anyhow::bail!("compose part: unexpected nested form {other:?}"),
+        })
+    }
+    let wrapper = |action: Action| Step {
+        name: Some(format!("part-{ordinal}")),
+        guard: None,
+        on_error: StepOnError::Continue,
+        build_slot: false,
+        action,
+    };
+    match part {
+        ComposePart::Each { over, inner } => Ok(wrapper(Action::Foreach {
+            over: over.clone(),
+            each: Box::new(leaf(inner, ordinal, objective, affinity)?),
+        })),
+        ComposePart::Parallel { over, inner } => Ok(wrapper(Action::Parallel {
+            over: over.clone(),
+            each: Box::new(leaf(inner, ordinal, objective, affinity)?),
+        })),
+        ComposePart::When { guard, inner } => Ok(wrapper(Action::Branch {
+            if_guard: guard.clone(),
+            then: vec![leaf(inner, ordinal, objective, affinity)?],
+            else_steps: vec![],
+        })),
+        ComposePart::Retry {
+            max_attempts,
+            inner,
+        } => Ok(wrapper(Action::Retry {
+            max_attempts: *max_attempts,
+            backoff_secs: 0,
+            step: Box::new(leaf(inner, ordinal, objective, affinity)?),
+        })),
+        leaf_part @ (ComposePart::Dispatch { .. }
+        | ComposePart::StageFirst { .. }
+        | ComposePart::PhaseStage { .. }
+        | ComposePart::CallWorkflow { .. }) => leaf(leaf_part, ordinal, objective, affinity),
+    }
+}
+
+/// §3.6 safety envelope #3 — budget caps per composed run, fail closed at
+/// the compose gate (before lint/run). Dispatch-shaped leaves (`dispatch_job`
+/// AND `call_workflow` sub-runs — both spend crew attention) are capped, as
+/// is composite nesting depth (retry/branch/foreach/parallel chains).
+/// Constants, not config: a composed run that needs more should be split
+/// into base + parts (the base-seed mechanism), not tuned past the cap.
+pub const MAX_COMPOSED_DISPATCHES: usize = 32;
+pub const MAX_COMPOSED_NESTING: usize = 4;
+
+pub fn enforce_budget_caps(workflow: &Workflow) -> Result<()> {
+    fn walk(action: &Action, depth: usize, dispatches: &mut usize, max_depth: &mut usize) {
+        *max_depth = (*max_depth).max(depth);
+        match action {
+            Action::DispatchJob { .. } | Action::CallWorkflow { .. } => *dispatches += 1,
+            Action::Parallel { each, .. } | Action::Foreach { each, .. } => {
+                walk(&each.action, depth + 1, dispatches, max_depth)
+            }
+            Action::Retry { step, .. } => walk(&step.action, depth + 1, dispatches, max_depth),
+            Action::Branch {
+                then, else_steps, ..
+            } => {
+                for s in then.iter().chain(else_steps.iter()) {
+                    walk(&s.action, depth + 1, dispatches, max_depth);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut dispatches = 0usize;
+    let mut max_depth = 0usize;
+    for s in &workflow.steps {
+        walk(&s.action, 1, &mut dispatches, &mut max_depth);
+    }
+    if let Some(graph) = &workflow.graph {
+        for node in graph.nodes.values() {
+            walk(&node.action, 1, &mut dispatches, &mut max_depth);
+        }
+    }
+    if dispatches > MAX_COMPOSED_DISPATCHES {
+        anyhow::bail!(
+            "budget cap exceeded: {dispatches} dispatch/sub-run leaves > max \
+             {MAX_COMPOSED_DISPATCHES} per composed run — split into base + parts"
+        );
+    }
+    if max_depth > MAX_COMPOSED_NESTING {
+        anyhow::bail!(
+            "budget cap exceeded: composite nesting depth {max_depth} > max \
+             {MAX_COMPOSED_NESTING} per composed run"
+        );
+    }
+    Ok(())
+}
+
+/// T2 author-from-scratch: parse a FULL authored Workflow from YAML text
+/// (`compose --from-yaml -` reads stdin). Fail closed on garbage or an
+/// empty body — an unrunnable workflow must never reach the lint gate
+/// looking green.
+pub fn workflow_from_yaml(src: &str) -> Result<Workflow> {
+    let wf: Workflow = serde_yaml::from_str(src)
+        .map_err(|e| anyhow::anyhow!("compose --from-yaml: invalid workflow YAML: {e}"))?;
+    let has_steps = !wf.steps.is_empty() || wf.graph.as_ref().is_some_and(|g| !g.nodes.is_empty());
+    if !has_steps {
+        anyhow::bail!("compose --from-yaml: workflow has no steps");
+    }
+    Ok(wf)
+}
+
+/// §3.6 safety envelope #2 — structural dry-run rendering: every dispatch/
+/// call leaf flattened with its action kind, phase tag, step guard, and the
+/// RESOLVED fanout count for enclosing parallel/foreach scopes (@crew.<role>
+/// resolved through plan_crew). No dispatch happens; this is pure.
+pub fn render_dry_run(workflow: &Workflow) -> serde_json::Value {
+    #[derive(serde::Serialize)]
+    struct DryLeaf {
+        name: String,
+        path: String,
+        action: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        guard: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fanout: Option<u32>,
+    }
+
+    let plan = plan_crew(workflow);
+    let resolved = resolve_crew_fanouts(workflow, &plan);
+
+    /// Statically RESOLVABLE fan-out only: @crew.<role> members or a bare
+    /// N. A foreach over a runtime list ref stays None — rendering a fake
+    /// "1" would lie about the shape.
+    fn fanout_of(over: &str, plan: &CrewPlan) -> Option<u32> {
+        if let Some(role) = over.trim().strip_prefix("@crew.") {
+            Some(plan.members.get(role).copied().unwrap_or(1).max(1))
+        } else {
+            over.trim().parse::<u32>().ok().map(|n| n.max(1))
+        }
+    }
+
+    fn collect(
+        prefix: &str,
+        steps: &[Step],
+        scope_fanout: Option<u32>,
+        plan: &CrewPlan,
+        out: &mut Vec<DryLeaf>,
+    ) {
+        for s in steps {
+            collect_action(
+                s.name.as_deref().unwrap_or("<unnamed>"),
+                prefix,
+                &s.action,
+                s.guard.as_deref(),
+                scope_fanout,
+                plan,
+                out,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_action(
+        name: &str,
+        prefix: &str,
+        action: &Action,
+        guard: Option<&str>,
+        scope_fanout: Option<u32>,
+        plan: &CrewPlan,
+        out: &mut Vec<DryLeaf>,
+    ) {
+        let path = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        match action {
+            Action::DispatchJob { spec, .. } => out.push(DryLeaf {
+                name: name.to_string(),
+                path,
+                action: "dispatch_job".into(),
+                phase: spec.phase.clone(),
+                guard: guard.map(str::to_string),
+                fanout: scope_fanout,
+            }),
+            Action::CallWorkflow { workflow, .. } => out.push(DryLeaf {
+                name: name.to_string(),
+                path,
+                action: format!("call_workflow:{workflow}"),
+                phase: None,
+                guard: guard.map(str::to_string),
+                fanout: scope_fanout,
+            }),
+            Action::Parallel { over, each } => {
+                let f = fanout_of(over, plan);
+                collect_action(name, prefix, &each.action, guard, f, plan, out)
+            }
+            Action::Foreach { over, each } => {
+                let f = fanout_of(over, plan);
+                collect_action(name, prefix, &each.action, guard, f, plan, out)
+            }
+            Action::Retry { step, .. } => {
+                collect_action(name, prefix, &step.action, guard, scope_fanout, plan, out)
+            }
+            Action::Branch {
+                then, else_steps, ..
+            } => {
+                let then_path = format!("{path}/then");
+                let else_path = format!("{path}/else");
+                collect(&then_path, then, scope_fanout, plan, out);
+                collect(&else_path, else_steps, scope_fanout, plan, out);
+            }
+            other => out.push(DryLeaf {
+                name: name.to_string(),
+                path,
+                action: other.type_name().to_string(),
+                phase: None,
+                guard: guard.map(str::to_string),
+                fanout: None,
+            }),
+        }
+    }
+
+    let mut leaves = Vec::new();
+    collect("", &resolved.steps, None, &plan, &mut leaves);
+    serde_json::json!({
+        "workflow": resolved.name,
+        "crew": plan.members,
+        "steps": leaves,
     })
 }
 
@@ -850,6 +1196,266 @@ steps:
             Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("@coder")
         ));
+    }
+
+    // ---- bd-adr22-t1-grammar-residual-zjk0: §3.6 Tier-1 grammar + envelope ----
+
+    /// T1 grammar: `each:` / `when:` / `retry(n)` / `parallel:` cover the rest
+    /// of the Action vocabulary; the inner part nests recursively (a control
+    /// form wraps ANY part, including another control form).
+    #[test]
+    fn t1_parse_grammar_part_forms() {
+        assert_eq!(
+            parse_compose_part("each:@items:scout:fresh-eyes-explore").unwrap(),
+            ComposePart::Each {
+                over: "@items".into(),
+                inner: Box::new(ComposePart::Dispatch {
+                    role: "scout".into(),
+                    stage: "fresh-eyes-explore".into(),
+                }),
+            }
+        );
+        // Bare-name inner parts nest too (stage-first composes with T1).
+        assert_eq!(
+            parse_compose_part("each:items:fresh-eyes-explore").unwrap(),
+            ComposePart::Each {
+                over: "items".into(),
+                inner: Box::new(ComposePart::StageFirst {
+                    stage: "fresh-eyes-explore".into(),
+                }),
+            }
+        );
+        assert_eq!(
+            parse_compose_part("when:steps.gate.ok == true:reviewer:code-review").unwrap(),
+            ComposePart::When {
+                guard: "steps.gate.ok == true".into(),
+                inner: Box::new(ComposePart::Dispatch {
+                    role: "reviewer".into(),
+                    stage: "code-review".into(),
+                }),
+            }
+        );
+        assert_eq!(
+            parse_compose_part("retry(3):coder:systematic-execute").unwrap(),
+            ComposePart::Retry {
+                max_attempts: 3,
+                inner: Box::new(ComposePart::Dispatch {
+                    role: "coder".into(),
+                    stage: "systematic-execute".into(),
+                }),
+            }
+        );
+        assert_eq!(
+            parse_compose_part("parallel:@crew.coder:workflow:weekly-review").unwrap(),
+            ComposePart::Parallel {
+                over: "@crew.coder".into(),
+                inner: Box::new(ComposePart::CallWorkflow {
+                    name: "weekly-review".into(),
+                }),
+            }
+        );
+        let nested = parse_compose_part("each:items:retry(2):deploy:app").unwrap();
+        assert!(
+            matches!(&nested, ComposePart::Each { inner, .. }
+                if matches!(inner.as_ref(), ComposePart::Retry { max_attempts: 2, .. })),
+            "{nested:?}"
+        );
+    }
+
+    /// Unknown/malformed STRUCTURED forms are parse errors, never silently
+    /// dropped (§3.6 envelope #1). Ordinary `role:stage` dispatch keeps
+    /// working — only the new keywords gain strict grammar.
+    #[test]
+    fn t1_parse_grammar_errors_fail_closed() {
+        for bad in [
+            "each:items",       // missing inner part
+            "each::stage",      // empty over
+            "each:items:",      // empty inner
+            "when:guard-only",  // missing inner part
+            "when::reviewer:r", // empty guard
+            "retry:s:stage",    // retry without (n)
+            "retry(n):s:stage", // non-numeric n
+            "retry(0):s:stage", // zero attempts
+            "retry(2)",         // missing inner part
+            "parallel:@crew.c", // missing inner part
+        ] {
+            assert!(
+                parse_compose_part(bad).is_err(),
+                "{bad:?} must be a parse error"
+            );
+        }
+        assert!(
+            parse_compose_part("lead:oncall").is_ok(),
+            "role:stage unaffected"
+        );
+    }
+
+    /// T1 assembly: each → Foreach, when → Branch(then=1), retry(n) → Retry,
+    /// parallel → Parallel; the wrapped leaf keeps its role/stage/workflow.
+    /// The result lints clean and passes budget caps.
+    #[test]
+    fn t1_compose_grammar_parts_assemble_actions() {
+        use toron_workflow::schema::Action;
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
+        let parts: Vec<ComposePart> = [
+            "each:@items:scout:fresh-eyes-explore",
+            "retry(3):workflow:weekly-review",
+            "when:steps.a.ok:reviewer:code-review",
+            "parallel:2:coder:systematic-execute",
+        ]
+        .iter()
+        .map(|t| parse_compose_part(t).unwrap())
+        .collect();
+        let wf = compose_workflow_with("composed-t1", "obj", None, &parts, &affinity).unwrap();
+        assert_eq!(wf.steps.len(), 4);
+        assert!(matches!(
+            &wf.steps[0].action,
+            Action::Foreach { over, each }
+                if over == "@items"
+                    && matches!(&each.action,
+                        Action::DispatchJob { spec, .. }
+                            if spec.profile.as_deref() == Some("@scout"))
+        ));
+        assert!(matches!(
+            &wf.steps[1].action,
+            Action::Retry { max_attempts: 3, step, .. }
+                if matches!(&step.action,
+                    Action::CallWorkflow { workflow, .. } if workflow == "weekly-review")
+        ));
+        assert!(matches!(
+            &wf.steps[2].action,
+            Action::Branch { if_guard, then, else_steps }
+                if if_guard == "steps.a.ok" && then.len() == 1 && else_steps.is_empty()
+                    && matches!(&then[0].action,
+                        Action::DispatchJob { spec, .. }
+                            if spec.profile.as_deref() == Some("@reviewer"))
+        ));
+        assert!(matches!(
+            &wf.steps[3].action,
+            Action::Parallel { over, each }
+                if over == "2"
+                    && matches!(&each.action,
+                        Action::DispatchJob { spec, .. }
+                            if spec.profile.as_deref() == Some("@coder"))
+        ));
+        let report = toron_workflow::lint_workflow(&wf);
+        assert!(
+            report.is_clean(),
+            "T1-composed workflow must lint clean: {:?}",
+            report.issues
+        );
+        enforce_budget_caps(&wf).expect("within caps");
+    }
+
+    /// §3.6 envelope #3: budget caps fail closed at the compose gate.
+    #[test]
+    fn budget_caps_fail_closed() {
+        use toron_workflow::schema::{Action, Step};
+        // Over-cap dispatch leaves refuse.
+        let parts: Vec<ComposePart> = (0..MAX_COMPOSED_DISPATCHES as u32 + 1)
+            .map(|i| parse_compose_part(&format!("r{i}:stage{i}")).unwrap())
+            .collect();
+        let wf = compose_workflow("composed-cap", "obj", None, &parts).unwrap();
+        let err = enforce_budget_caps(&wf).expect_err("over-cap dispatches must fail closed");
+        assert!(err.to_string().contains("dispatch"), "{err}");
+        // A too-deep composite chain refuses regardless of leaf count.
+        let leaf = Step {
+            name: Some("leaf".into()),
+            guard: None,
+            on_error: toron_workflow::schema::StepOnError::Continue,
+            build_slot: false,
+            action: Action::SendDm {
+                to: "x".into(),
+                body: "y".into(),
+                project: None,
+            },
+        };
+        let mut deep = leaf.clone();
+        for _ in 0..MAX_COMPOSED_NESTING + 2 {
+            deep = Step {
+                name: Some("wrap".into()),
+                guard: None,
+                on_error: toron_workflow::schema::StepOnError::Continue,
+                build_slot: false,
+                action: Action::Retry {
+                    max_attempts: 2,
+                    backoff_secs: 0,
+                    step: Box::new(deep),
+                },
+            };
+        }
+        let wf = Workflow {
+            name: "composed-deep".into(),
+            description: None,
+            trigger: None,
+            policy: None,
+            guard: None,
+            steps: vec![deep],
+            graph: None,
+            inputs: vec![],
+            crew: None,
+            principles: vec![],
+        };
+        let err = enforce_budget_caps(&wf).expect_err("over-depth nesting must fail closed");
+        assert!(err.to_string().contains("nesting"), "{err}");
+    }
+
+    /// §3.6 envelope #2: structural dry-run renders fanout counts (resolved
+    /// from the crew plan) + phase tags, without any dispatch.
+    #[test]
+    fn dry_run_renders_fanouts_and_phase_tags() {
+        let wf = parse_workflow(
+            r##"
+name: ship
+trigger: { type: webhook }
+crew: { coder: 3 }
+steps:
+  - name: fan
+    action: parallel
+    over: "@crew.coder"
+    each:
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@coder", stage: systematic-execute, phase: implement }
+"##,
+        )
+        .expect("parse");
+        let rendered = render_dry_run(&wf);
+        let s = serde_json::to_string(&rendered).unwrap();
+        assert!(s.contains("\"fanout\":3"), "fanout count missing: {s}");
+        assert!(s.contains("implement"), "phase tag missing: {s}");
+    }
+
+    /// T2: a FULL authored Workflow round-trips through --from-yaml; an
+    /// empty-bodied workflow refuses (fail closed).
+    #[test]
+    fn from_yaml_round_trip_full_workflow() {
+        let src = r##"
+name: authored
+description: captain-authored
+trigger: { type: webhook }
+crew: auto
+steps:
+  - name: gate
+    action: request_approval
+    message: "go?"
+  - name: fan
+    action: parallel
+    over: "@crew.coder"
+    each: { action: send_dm, to: x, body: y }
+"##;
+        let wf = workflow_from_yaml(src).expect("round trip");
+        assert_eq!(wf.name, "authored");
+        assert_eq!(wf.steps.len(), 2);
+        assert!(matches!(
+            &wf.steps[1].action,
+            toron_workflow::schema::Action::Parallel { over, .. } if over == "@crew.coder"
+        ));
+        assert!(
+            workflow_from_yaml("name: empty\ntrigger: { type: webhook }\nsteps: []\n").is_err(),
+            "step-less workflow refuses"
+        );
     }
 
     /// Explicit `crew: { role: count }` spawns the squad (row `crew_explicit`).
