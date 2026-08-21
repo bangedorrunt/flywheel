@@ -124,9 +124,15 @@ flywheel workflow compose "<target>" --agent
 Part grammar (today): `role:stage` → dispatch_job to `@role` running the
 named stage; `workflow:name` → `call_workflow`. Parts comma-separate.
 
-PROPOSED (ADR-0022 W3, do not use yet): `phase:stage` parts,
-`each:`/`when:`/`retry(n)`/`parallel:` part forms, `--from-yaml -`,
-`--dry-run` first-class, `--keep <name>` graduation.
+SHIPPED (ADR-0022 waves, 2026-08-21/22): `phase:` in dispatch specs
+(registry: omp `--plan-yolo`, opencode `--agent plan`; others degrade
+loudly), stage-first bare-name parts (`--parts "fresh-eyes-explore,..."`
+picks each stage's default role), `--keep <name>` graduation after a
+GREEN run (refuses without), `cron run --live`.
+
+STILL PROPOSED (bd-adr22-t1-grammar-residual-zjk0): `each:`/`when:`/
+`retry(n)`/`parallel:` part forms, `--from-yaml -`, `--dry-run`
+first-class, compose budget caps.
 
 ### 3.4 Observe (SHIPPED)
 
@@ -329,7 +335,10 @@ flywheel steer "<objective>" [--direct]
 flywheel loop run <project> --work
 ```
 
-PROPOSED (ADR-0022, waves W1–W7): `phase:` in specs, stage registry (`stage new/show/lint`, project tier, stage-first bare-name parts, promote ladder), `phase:stage` parts,
-`each:/when:/retry(n)/parallel:` parts, `--from-yaml -`, `--dry-run`
-first-class, `--keep` graduation, delegated compose via mail. Watch the
-ADR's Verification section for the ship markers before using them.
+SHIPPED: `phase:` in specs; `stage {list,show,new,lint,promote}` + stage-first parts;
+`--keep` graduation; `cron run --live`; delegated compose via mail (W7
+allowlist-gated). STILL PROPOSED (bd-adr22-t1-grammar-residual-zjk0):
+`each:/when:/retry(n)/parallel:` parts, `--from-yaml -`, `--dry-run`,
+budget caps. Known deviations tracked in bd-adr22-phase-enum-lint-ahfh
+(open String phase, R-P lint absent) and bd-adr22-local-resonate-tx8q
+(engine is in-memory — no cross-process crash resume yet).
