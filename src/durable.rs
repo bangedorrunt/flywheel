@@ -2599,9 +2599,9 @@ pub enum LoopAction {
 }
 
 /// One-line mail digest prefix for a prompt, when the agent has recent mail.
-/// Uses `recent` (the honest toron projection window — there is no read
-/// state) and names the last sender/subject so the agent knows a peer asked
-/// it something.
+/// Uses `recent` (the honest toron projection window) and cites the last
+/// MESSAGE ID + subject — bd-kryk: the id is the replyable handle; a sender
+/// npub in this slot made reply-by-id fail and read like phantom mail.
 fn digest_prefix(d: &MailDigest) -> Option<String> {
     if d.recent == 0 {
         return None;
@@ -2610,10 +2610,10 @@ fn digest_prefix(d: &MailDigest) -> Option<String> {
     if d.urgent > 0 {
         line.push_str(&format!(" ({} urgent)", d.urgent));
     }
-    if let (Some(f), Some(s)) = (&d.last_from, &d.last_subject) {
-        line.push_str(&format!(" (last: {f} re: {s})"));
-    } else if let Some(f) = &d.last_from {
-        line.push_str(&format!(" (last: {f})"));
+    if let (Some(id), Some(s)) = (&d.last_id, &d.last_subject) {
+        line.push_str(&format!(" (id {id} re: {s})"));
+    } else if let Some(id) = &d.last_id {
+        line.push_str(&format!(" (id {id})"));
     }
     Some(line)
 }
@@ -2639,8 +2639,16 @@ fn urgent_wake_prompt(d: &MailDigest) -> String {
     if let Some(t) = &d.thread_id {
         line.push_str(&format!(" Latest urgent thread: {t}"));
     }
-    if let (Some(f), Some(s)) = (&d.last_from, &d.last_subject) {
-        line.push_str(&format!(" ({f} re: {s})"));
+    // bd-kryk: cite the MESSAGE id (the --message-id the reply needs), not
+    // the sender npub — an npub in this slot is not replyable and reads as
+    // phantom mail.
+    if let Some(id) = &d.last_id {
+        line.push_str(&format!(" Most recent urgent: id {id}"));
+        if let Some(s) = &d.last_subject
+            && !s.is_empty()
+        {
+            line.push_str(&format!(" re: {s}"));
+        }
     }
     line
 }
@@ -7241,8 +7249,8 @@ mod tests {
         match &actions[0] {
             LoopAction::Send { text, .. } => {
                 assert!(
-                    text.starts_with("[mail] 2 recent (1 urgent) (last: PinkGorge re: [bd-1] need input)\ndo the work"),
-                    "digest must prefix the prompt: {text}"
+                    text.starts_with("[mail] 2 recent (1 urgent) (id urgent-PinkGorge re: [bd-1] need input)\ndo the work"),
+                    "digest must prefix the prompt with the MESSAGE id, not the sender: {text}"
                 );
             }
             other => panic!("expected Send, got {other:?}"),
@@ -7286,10 +7294,46 @@ mod tests {
                     text.contains("MAIL WAKE: 1 urgent"),
                     "wake prompt must say urgent: {text}"
                 );
-                assert!(text.contains("PinkGorge re: [bd-1] help needed"));
+                assert!(
+                    text.contains("id urgent-PinkGorge re: [bd-1] help needed"),
+                    "wake must cite the replyable message id, not the sender npub (bd-kryk): {text}"
+                );
             }
             other => panic!("expected wake Send, got {other:?}"),
         }
+    }
+
+    /// bd-kryk regression: the wake banner cites the MESSAGE id — a sender
+    /// npub in that slot made reply-by-id fail and manufactured phantom mail.
+    #[test]
+    fn kryk_wake_banner_cites_message_id_not_sender() {
+        let d = MailDigest {
+            agent: "a".into(),
+            mail_identity: Some("TealDune".into()),
+            recent: 3,
+            urgent: 1,
+            plane_s: 0,
+            // The observed bug shape: last_id is the real message, while the
+            // sender field carries an npub.
+            last_id: Some("994d117d53db".into()),
+            last_from: Some(
+                "994d117d53db3b639f387f3686652cb6018325c403d633b933f6d19bf8c71d89".into(),
+            ),
+            last_subject: None,
+            thread_id: None,
+        };
+        let prompt = urgent_wake_prompt(&d);
+        assert!(
+            prompt.contains("id 994d117d53db"),
+            "banner must carry the message id: {prompt}"
+        );
+        assert!(
+            !prompt.contains("re: \n") && !prompt.contains("() re:"),
+            "empty subject renders no dangling re:"
+        );
+        let prefix = digest_prefix(&d).expect("recent>0 has a prefix");
+        assert!(prefix.contains("(id 994d117d53db)"), "{prefix}");
+        assert!(!prefix.contains("last:"), "sender-based rendering is gone");
     }
 
     /// bd-pin-public-plane-s-easy.5: an idle agent with OPEN plane-S work
