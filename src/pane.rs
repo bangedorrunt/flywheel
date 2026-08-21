@@ -566,6 +566,12 @@ pub struct SpawnJobLaunch {
     /// per-harness model/effort args (profile_launch_args — bd-eign.9);
     /// empty = bare launch (honest, never a silent skip)
     pub args: Vec<String>,
+    /// ADR-0022 W2: the lifecycle phase from the resolved spec, when the
+    /// step carried one (drives the phase registry).
+    pub phase: Option<String>,
+    /// ADR-0022 §3.2 R2: the harness had no native mechanic for the phase —
+    /// the drainer warns at launch and the launch proceeds in prompt mode.
+    pub phase_degraded: bool,
     /// `await: true` → the run parks: resolve the promise when the job
     /// finishes. `false` → fire-and-forget: launch, never resolve.
     pub await_job: bool,
@@ -591,10 +597,21 @@ pub fn spawn_launch_plan(
         .as_str()
         .unwrap_or_default()
         .to_string();
+    // ADR-0022 W2: the step's lifecycle phase (typed spec, resolved copy).
+    let phase = spec["resolved"]["spec"]["phase"]
+        .as_str()
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
     let args = match catalog.get(&profile) {
-        Some(p) => crate::profile_launch_args(&harness, p)
+        Some(p) => crate::profile_launch_args(&harness, p, phase.as_deref())
             .map_err(|e| anyhow::anyhow!("spawn plan '{profile}' model routing: {e}"))?,
         None => Vec::new(),
+    };
+    // Degradation is decided by the registry itself so the plan carries the
+    // flag to the drainer (loud at launch, never silent).
+    let phase_degraded = match &phase {
+        Some(ph) => headless::phase_launch_args(&harness, ph).1,
+        None => false,
     };
     Ok(SpawnJobLaunch {
         promise_id: promise_id.to_string(),
@@ -602,6 +619,8 @@ pub fn spawn_launch_plan(
         workflow,
         harness,
         args,
+        phase,
+        phase_degraded,
         await_job: spec["await"].as_bool().unwrap_or(false),
     })
 }
@@ -661,6 +680,12 @@ pub async fn drain_spawn_sink(
             };
             match launch(plan.clone()) {
                 Ok(receipt) => {
+                    if plan.phase_degraded {
+                        eprintln!(
+                            "flywheel: spawn drain: job {} phase {:?} DEGRADED on harness {} (no native mechanic) — prompt mode",
+                            plan.promise_id, plan.phase, plan.harness
+                        );
+                    }
                     eprintln!(
                         "flywheel: spawn drain: launched job {} (profile {}, harness {}){}",
                         plan.promise_id,
