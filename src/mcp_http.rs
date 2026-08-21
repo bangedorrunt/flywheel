@@ -80,6 +80,12 @@ impl std::error::Error for McpError {}
 /// synchronous (`ureq`), matching flywheel's sync dispatch; `call_tool` runs
 /// the `initialize` handshake once on first use (stateless mode accepts
 /// requests without it, but the handshake is part of the MCP contract).
+///
+/// Timeouts (bd-gtqe): every request carries a connect timeout and an overall
+/// timeout. A daemon that accepts TCP but never answers (wedged runtime)
+/// must surface a loud `McpError::Transport` within seconds — never park the
+/// CLI silently. Defaults: 3s connect / 10s total; override the total via
+/// env `FLYWHEEL_MCP_TIMEOUT_SECS`.
 #[derive(Debug)]
 pub struct McpClient {
     /// `{base}/mcp` — the Streamable HTTP mount both servers serve.
@@ -92,6 +98,21 @@ pub struct McpClient {
     initialized: OnceLock<()>,
     /// Monotonic JSON-RPC id.
     next_id: std::sync::atomic::AtomicU64,
+    /// Shared ureq agent carrying the bd-gtqe connect+overall timeouts.
+    agent: ureq::Agent,
+}
+
+/// Default connect timeout (bd-gtqe).
+const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Default overall request timeout (bd-gtqe); `FLYWHEEL_MCP_TIMEOUT_SECS` overrides.
+const DEFAULT_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn default_total_timeout() -> std::time::Duration {
+    std::env::var("FLYWHEEL_MCP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(DEFAULT_TOTAL_TIMEOUT)
 }
 
 impl Clone for McpClient {
@@ -104,6 +125,7 @@ impl Clone for McpClient {
             next_id: std::sync::atomic::AtomicU64::new(
                 self.next_id.load(std::sync::atomic::Ordering::Relaxed),
             ),
+            agent: self.agent.clone(),
         }
     }
 }
@@ -114,6 +136,25 @@ impl McpClient {
     /// never dials. A base already ending in `/mcp` is accepted as-is (no
     /// double-append — legacy configs carried the `/mcp` suffix).
     pub fn new(base_url: &str, token: Option<String>, kind: ServerKind) -> Result<Self> {
+        Self::with_timeouts(
+            base_url,
+            token,
+            kind,
+            DEFAULT_CONNECT_TIMEOUT,
+            default_total_timeout(),
+        )
+    }
+
+    /// Explicit connect + overall timeouts (tests; operators with slow relays).
+    /// The overall timeout is what turns a wedged daemon into a loud
+    /// `McpError::Transport` instead of an unbounded silent park (bd-gtqe).
+    pub fn with_timeouts(
+        base_url: &str,
+        token: Option<String>,
+        kind: ServerKind,
+        connect_timeout: std::time::Duration,
+        total_timeout: std::time::Duration,
+    ) -> Result<Self> {
         let base = base_url.trim_end_matches('/');
         if base.is_empty() {
             bail!("{} url is empty", kind.label());
@@ -123,12 +164,17 @@ impl McpClient {
         } else {
             format!("{base}/mcp")
         };
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(connect_timeout)
+            .timeout(total_timeout)
+            .build();
         Ok(Self {
             endpoint,
             token,
             kind,
             initialized: OnceLock::new(),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            agent,
         })
     }
 
@@ -209,7 +255,9 @@ impl McpClient {
         );
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": map });
 
-        let mut req = ureq::post(&self.endpoint)
+        let mut req = self
+            .agent
+            .post(&self.endpoint)
             .set("Content-Type", "application/json")
             .set("Accept", "application/json, text/event-stream")
             .set("MCP-Protocol-Version", PROTOCOL_VERSION);
@@ -373,6 +421,60 @@ mod tests {
         assert!(
             matches!(err, McpError::Transport(_)),
             "refused connection must be Transport, got: {err}"
+        );
+    }
+
+    /// A server that accepts TCP, reads the request, and NEVER responds —
+    /// the exact shape of the bd-gtqe wedge (daemon runtime starved, socket
+    /// open, handler never runs). The client must fail loudly as Transport
+    /// within its configured timeout instead of parking the CLI forever.
+    fn serve_wedged() -> String {
+        use std::io::Read as _;
+        use std::sync::{Arc, Mutex};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let kept: Arc<Mutex<Vec<std::net::TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+            for stream in listener.incoming().flatten() {
+                let mut s = stream;
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                // Hold the socket open without ever writing a response.
+                kept.lock().unwrap().push(s);
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[test]
+    fn wedged_server_times_out_as_transport() {
+        let base = serve_wedged();
+        let client = McpClient::with_timeouts(
+            &base,
+            None,
+            ServerKind::Toron,
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_millis(400),
+        )
+        .expect("client");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let r = client.call_tool("health_check", json!({}));
+            let _ = tx.send((r, started.elapsed()));
+        });
+        // The suite itself stays time-boxed even on RED: a regression back to
+        // an unbounded wait fails this assert instead of hanging cargo test.
+        let (res, elapsed) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("call_tool must return on a wedged server within 5s (bd-gtqe)");
+        assert!(
+            matches!(res, Err(McpError::Transport(_))),
+            "wedged server must be Transport, got: {res:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "timeout must fire promptly, took {elapsed:?}"
         );
     }
 
