@@ -30,30 +30,117 @@ pub const SEMANTIC_ALIASES: &[(&str, &str)] = &[
     ("systematic-execute", "p6"),
 ];
 
+/// Registry tier (ADR-0022 §3.8). Override precedence follows the Ord order:
+/// project wins over user, user over repo data, repo data over the compiled
+/// seed (`seed < repo < user < project`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Tier {
+    /// Compiled-in bootstrap prompts (nobody writable).
+    Seed,
+    /// Promoted DATA shipped in the flywheel repo (`repo-stages.toml`) —
+    /// reached only through the §3.8 evidence bar.
+    Repo,
+    /// `~/.config/flywheel/stages.toml` (this machine).
+    User,
+    /// `<project>/.flywheel/stages.toml` (ships with the repo, git).
+    Project,
+}
+
+impl Tier {
+    /// The tag surfaced by `stage list --all` / `stage show`.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Tier::Seed => "seed",
+            Tier::Repo => "repo",
+            Tier::User => "user",
+            Tier::Project => "project",
+        }
+    }
+}
+
+/// The §4 lifecycle phases — the only values a stage's `phase` metadata may
+/// carry (stage lint rejects anything else).
+pub const PHASES: &[&str] = &["resolve", "plan", "implement", "review", "verify"];
+
+/// Prompt size cap enforced by `stage lint` (§3.8 "size cap"). Generous —
+/// the largest seed prompt is ~1.5k chars — but bounded: stages are prompts,
+/// not documents.
+pub const PROMPT_SIZE_CAP: usize = 20_000;
+
 /// A named stage: a reusable prompt primitive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stage {
     /// Canonical name (semantic, e.g. `systematic-execute`).
     pub name: String,
     /// The p-code alias (e.g. `p6`) — backward compat.
+    #[serde(default)]
     pub alias: String,
     /// The prompt text.
     pub prompt: String,
+    /// Default role affinity (§3.8): the `@profile` a bare-name compose part
+    /// dispatches to. Must name a catalog profile (lint validates).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// The §4 lifecycle phase this stage serves (lint validates the name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Declared principles (ADR-0019 registry names; lint validates).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub principles: Vec<String>,
+    /// Provenance (§3.8): who authored it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// Provenance: the run that produced it (composed/kept lineage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_run: Option<String>,
 }
 
 /// The stages library: semantic name → stage.
 #[derive(Debug, Clone, Default)]
 pub struct StageLibrary {
     stages: BTreeMap<String, Stage>,
+    /// The tier each entry came from (§3.8). Same keys as `stages`.
+    tiers: BTreeMap<String, Tier>,
 }
 
+/// Seed role affinities (§3.8): the default `@profile` a bare-name compose
+/// part dispatches to. Data, not code — authored stages carry their own.
+const SEED_AFFINITY: &[(&str, &str)] = &[
+    ("fresh-eyes-explore", "scout"),
+    ("code-review", "reviewer"),
+    ("decompose-beads", "planner"),
+    ("plan-review", "planner"),
+    ("systematic-execute", "coder"),
+    ("repo-map", "scout"),
+    ("repro-baseline", "coder"),
+    ("tdd-red", "coder"),
+    ("minimal-fix", "coder"),
+    ("prove-verify", "reviewer"),
+    ("baseline-measure", "coder"),
+    ("measure-keep-or-discard", "coder"),
+    ("judge-arms", "oracle"),
+    ("diagnose-only", "scout"),
+    ("resume-pickup", "housekeeper"),
+];
+
 impl StageLibrary {
-    /// Build the library: compiled-in defaults layered under a user
-    /// `~/.config/flywheel/stages.toml` override (field-level — a user entry
-    /// replaces the prompt for an existing stage or adds a new one).
+    /// Build the library: compiled-in defaults, then the repo DATA tier
+    /// (`repo-stages.toml`, promotion-gated), the user `stages.toml`
+    /// override, and — when `project_stages` is given — the project tier
+    /// `<project>/.flywheel/stages.toml`. Later tiers win field-level.
     pub fn load() -> Result<Self> {
+        Self::load_layered(None)
+    }
+
+    /// [`load`] plus the project tier (ADR-0022 §3.8): pass the project's
+    /// `.flywheel/stages.toml` path when one may exist.
+    pub fn load_layered(project_stages: Option<&std::path::Path>) -> Result<Self> {
         let mut lib = Self::compiled_in();
+        lib.apply_embedded_repo_data()?;
         lib.override_from_toml()?;
+        if let Some(path) = project_stages {
+            lib.apply_toml_path(path, Tier::Project)?;
+        }
         Ok(lib)
     }
 
@@ -174,31 +261,103 @@ impl StageLibrary {
                     name: name.to_string(),
                     alias: alias.to_string(),
                     prompt: prompt.to_string(),
+                    role: None,
+                    phase: None,
+                    principles: vec![],
+                    author: None,
+                    origin_run: None,
                 },
             );
         }
-        StageLibrary { stages }
+        // Seed role affinities (§3.8 stage-first compose).
+        for (name, role) in SEED_AFFINITY {
+            if let Some(stage) = stages.get_mut(*name) {
+                stage.role = Some(role.to_string());
+            }
+        }
+        let tiers: BTreeMap<String, Tier> =
+            stages.keys().map(|k| (k.clone(), Tier::Seed)).collect();
+        StageLibrary { stages, tiers }
+    }
+
+    /// The repo DATA tier: `repo-stages.toml` compiled into the binary
+    /// (include_str!). Empty until a stage is promoted to the repo tier
+    /// through the §3.8 evidence bar.
+    fn apply_embedded_repo_data(&mut self) -> Result<()> {
+        const REPO_STAGES_TOML: &str = include_str!("repo-stages.toml");
+        self.apply_toml(REPO_STAGES_TOML, Tier::Repo)
+    }
+
+    /// Apply one tier's `stages.toml` (field-level merge, later tier wins).
+    fn apply_toml(&mut self, raw: &str, tier: Tier) -> Result<()> {
+        #[derive(Deserialize)]
+        struct TierStages {
+            #[serde(default)]
+            stages: BTreeMap<String, Stage>,
+        }
+        let parsed: TierStages =
+            toml::from_str(raw).with_context(|| format!("parse {tier:?} stages.toml"))?;
+        for (name, stage) in parsed.stages {
+            self.tiers.insert(name.clone(), tier);
+            self.stages.insert(name, stage);
+        }
+        Ok(())
+    }
+
+    /// Read + apply a tier file from disk. Missing file = empty tier (Ok).
+    fn apply_toml_path(&mut self, path: &std::path::Path, tier: Tier) -> Result<()> {
+        if !path.is_file() {
+            return Ok(());
+        }
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        self.apply_toml(&raw, tier)
     }
 
     /// Apply the user `stages.toml` override (field-level).
     fn override_from_toml(&mut self) -> Result<()> {
         let path = config_dir().join("stages.toml");
-        if !path.exists() {
-            return Ok(());
+        self.apply_toml_path(&path, Tier::User)
+    }
+
+    /// The tier a resolved name came from (§3.8 tier tags).
+    pub fn tier_of(&self, name: &str) -> Option<Tier> {
+        let canonical = self.canonical(name);
+        self.tiers.get(&canonical).copied()
+    }
+
+    /// Map an alias (p-code) to its canonical semantic name.
+    fn canonical(&self, name: &str) -> String {
+        if self.stages.contains_key(name) {
+            return name.to_string();
         }
-        let raw =
-            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        #[derive(Deserialize)]
-        struct UserStages {
-            #[serde(default)]
-            stages: BTreeMap<String, Stage>,
-        }
-        let user: UserStages =
-            toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
-        for (name, stage) in user.stages {
-            self.stages.insert(name, stage);
-        }
-        Ok(())
+        self.stages
+            .values()
+            .find(|s| s.alias == name)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    /// The full stage record for a name (semantic or p-code alias).
+    pub fn get_stage(&self, name: &str) -> Option<&Stage> {
+        let canonical = self.canonical(name);
+        self.stages.get(&canonical)
+    }
+
+    /// One `stage list --all` row: names + tier + the §3.8 metadata.
+    pub fn list_tiered(&self) -> Vec<StageRow> {
+        self.stages
+            .values()
+            .filter_map(|s| {
+                Some(StageRow {
+                    name: s.name.clone(),
+                    alias: s.alias.clone(),
+                    tier: self.tiers.get(&s.name).copied()?,
+                    role: s.role.clone(),
+                    phase: s.phase.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Resolve a stage name (semantic OR p-code alias) to its prompt.
@@ -236,6 +395,110 @@ impl StageLibrary {
 pub fn override_path() -> Option<PathBuf> {
     let path = config_dir().join("stages.toml");
     path.is_file().then_some(path)
+}
+
+/// One `stage list` row (§3.8: tier-tagged, phase + role affinity).
+#[derive(Debug, Clone, Serialize)]
+pub struct StageRow {
+    pub name: String,
+    pub alias: String,
+    pub tier: Tier,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+}
+
+/// Scaffold a new stage (§3.8 `stage new`): named body with role/phase/
+/// principles frontmatter slots left for the author. Pure.
+pub fn scaffold(name: &str) -> Stage {
+    Stage {
+        name: name.to_string(),
+        alias: String::new(),
+        prompt: format!("TODO: the {name} prompt body."),
+        role: None,
+        phase: None,
+        principles: vec![],
+        author: None,
+        origin_run: None,
+    }
+}
+
+/// Merge a stage into a tier file on disk (`stage new` project tier,
+/// `stage promote --to user`). Creates the file when missing; an existing
+/// same-name entry is REPLACED (field-level tier semantics).
+pub fn upsert_stage_in_file(path: &std::path::Path, stage: &Stage) -> Result<()> {
+    #[derive(Default, Deserialize, Serialize)]
+    struct FileStages {
+        #[serde(default)]
+        stages: BTreeMap<String, Stage>,
+    }
+    let mut file = FileStages::default();
+    if path.is_file() {
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        file = toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    }
+    file.stages.insert(stage.name.clone(), stage.clone());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let out = toml::to_string(&file).context("serialize stages.toml")?;
+    std::fs::write(path, out).with_context(|| format!("write {}", path.display()))
+}
+
+/// Lint one stage against the §3.8 rules: shape, size cap, affinity validity
+/// (must name a catalog profile), phase validity (§4 vocabulary), principle
+/// validity (ADR-0019 registry). Returns issue strings; empty = clean.
+/// Pure — the caller supplies the valid-role names.
+pub fn lint_stage(stage: &Stage, valid_roles: &[String]) -> Vec<String> {
+    let mut issues = Vec::new();
+    let label = format!("stage {}", stage.name);
+    if stage.name.trim().is_empty() {
+        issues.push(format!("{label}: empty name"));
+    }
+    if stage.prompt.trim().is_empty() {
+        issues.push(format!("{label}: empty prompt"));
+    }
+    if stage.prompt.len() > PROMPT_SIZE_CAP {
+        issues.push(format!(
+            "{label}: prompt {} bytes exceeds the {} cap",
+            stage.prompt.len(),
+            PROMPT_SIZE_CAP
+        ));
+    }
+    if let Some(role) = &stage.role
+        && !valid_roles.iter().any(|r| r == role)
+    {
+        issues.push(format!(
+            "{label}: unknown role affinity {role:?} (not a catalog profile)"
+        ));
+    }
+    if let Some(phase) = &stage.phase
+        && !PHASES.contains(&phase.as_str())
+    {
+        issues.push(format!(
+            "{label}: unknown phase {phase:?} (valid: {})",
+            PHASES.join(", ")
+        ));
+    }
+    for p in &stage.principles {
+        if !crate::principles::is_known_name(p) {
+            issues.push(format!(
+                "{label}: unknown principle {p:?} (ADR-0019 registry)"
+            ));
+        }
+    }
+    issues
+}
+
+/// The §3.8 repo-tier evidence bar: green across at least two distinct
+/// objectives or projects, PLUS a review bead. Projects are not recorded in
+/// the run log today, so the check enforces the objectives arm (at least 2
+/// distinct prompt hashes among successful runs) and requires the review bead —
+/// refusal is the honest default when evidence cannot be proven.
+pub fn check_repo_evidence(distinct_objective_greens: usize, review_bead_present: bool) -> bool {
+    distinct_objective_greens >= 2 && review_bead_present
 }
 #[cfg(test)]
 mod tests {
@@ -406,5 +669,125 @@ mod tests {
         assert_eq!(lib2.resolve("p6"), Some("MY OVERRIDE PROMPT"));
         assert_ne!(old, "MY OVERRIDE PROMPT");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- ADR-0022 W6 (bd-adr22-w6-stage-registry-0jgr) ----
+
+    /// W6: seed role affinities exist so stage-first compose can dispatch
+    /// the §3.8 example parts without extra declaration.
+    #[test]
+    fn w6_seed_affinities_present() {
+        let lib = StageLibrary::compiled_in();
+        assert_eq!(
+            lib.get_stage("fresh-eyes-explore").unwrap().role.as_deref(),
+            Some("scout")
+        );
+        assert_eq!(
+            lib.get_stage("systematic-execute").unwrap().role.as_deref(),
+            Some("coder")
+        );
+    }
+
+    /// W6: tier precedence is seed < repo < user < project — a project-tier
+    /// entry shadows user, user shadows seed, and tier tags report honestly.
+    #[test]
+    fn w6_tier_precedence_seed_user_project() {
+        let _g = crate::config::lock_env();
+        let dir = std::env::temp_dir().join(format!("fw-w6-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("flywheel")).unwrap();
+        std::fs::create_dir_all(dir.join("proj/.flywheel")).unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        std::fs::write(
+            dir.join("flywheel/stages.toml"),
+            "[stages.w6-layered]\nname = \"w6-layered\"\nprompt = \"USER TIER\"\nalias = \"w6l\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("proj/.flywheel/stages.toml"),
+            "[stages.w6-layered]\nname = \"w6-layered\"\nprompt = \"PROJECT TIER\"\nalias = \"w6l\"\n",
+        )
+        .unwrap();
+        let lib =
+            StageLibrary::load_layered(Some(&dir.join("proj/.flywheel/stages.toml"))).unwrap();
+        assert_eq!(lib.resolve("w6-layered"), Some("PROJECT TIER"));
+        assert_eq!(lib.resolve("w6l"), Some("PROJECT TIER"), "alias follows");
+        assert_eq!(lib.tier_of("w6-layered"), Some(Tier::Project));
+        // Without the project file, the user tier still resolves.
+        let lib_user_only = StageLibrary::load().unwrap();
+        assert_eq!(lib_user_only.resolve("w6-layered"), Some("USER TIER"));
+        assert_eq!(lib_user_only.tier_of("w6-layered"), Some(Tier::User));
+        // Seed tag on an untouched compiled entry.
+        assert_eq!(lib.tier_of("systematic-execute"), Some(Tier::Seed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W6: `stage lint` rejects bad affinity + phase names (and unknown
+    /// principles), accepts a well-formed authored stage.
+    #[test]
+    fn w6_lint_rejects_bad_affinity_and_phase() {
+        let valid_roles = vec!["coder".to_string(), "reviewer".to_string()];
+        let mut bad = scaffold("w6-bad");
+        bad.role = Some("wizard".to_string());
+        bad.phase = Some("vibes".to_string());
+        bad.principles = vec!["not-a-principle".to_string()];
+        let issues = lint_stage(&bad, &valid_roles);
+        assert!(
+            issues.iter().any(|i| i.contains("unknown role affinity")),
+            "affinity rejected: {issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| i.contains("unknown phase")),
+            "phase rejected: {issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| i.contains("unknown principle")),
+            "principle rejected: {issues:?}"
+        );
+        let mut good = scaffold("w6-good");
+        good.role = Some("coder".to_string());
+        good.phase = Some("implement".to_string());
+        good.principles = vec!["prove-it-works".to_string()];
+        assert!(
+            lint_stage(&good, &valid_roles).is_empty(),
+            "well-formed stage lints clean"
+        );
+    }
+
+    /// W6: the size cap fires on oversized prompts.
+    #[test]
+    fn w6_lint_size_cap() {
+        let mut big = scaffold("w6-big");
+        big.prompt = "x".repeat(PROMPT_SIZE_CAP + 1);
+        let issues = lint_stage(&big, &[]);
+        assert!(issues.iter().any(|i| i.contains("exceeds")), "{issues:?}");
+    }
+
+    /// W6: `stage new` scaffolds with frontmatter slots; the TOML file
+    /// round-trips (`upsert_stage_in_file`) and loads back at the right tier.
+    #[test]
+    fn w6_scaffold_and_upsert_roundtrip() {
+        let mut s = scaffold("w6-roundtrip");
+        s.role = Some("coder".to_string());
+        s.phase = Some("implement".to_string());
+        let dir = std::env::temp_dir().join(format!("fw-w6rt-{}", uuid::Uuid::new_v4()));
+        let path = dir.join(".flywheel/stages.toml");
+        upsert_stage_in_file(&path, &s).unwrap();
+        assert!(path.is_file(), "tier file created");
+        let lib = StageLibrary::load_layered(Some(&path)).unwrap();
+        let loaded = lib.get_stage("w6-roundtrip").unwrap();
+        assert_eq!(loaded.role.as_deref(), Some("coder"));
+        assert_eq!(loaded.phase.as_deref(), Some("implement"));
+        assert_eq!(lib.tier_of("w6-roundtrip"), Some(Tier::Project));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W6: the §3.8 repo evidence bar — <2 objective greens refuses, 2 greens
+    /// without a review bead refuses, both present passes.
+    #[test]
+    fn w6_repo_evidence_bar() {
+        assert!(!check_repo_evidence(0, false));
+        assert!(!check_repo_evidence(1, true));
+        assert!(!check_repo_evidence(2, false), "review bead required");
+        assert!(check_repo_evidence(2, true));
     }
 }

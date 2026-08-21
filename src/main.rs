@@ -1710,11 +1710,47 @@ enum AssetCmd {
     Run { name: String, project: String },
 }
 
-/// `flywheel stage` subcommands (ADR-0005 P3.3): the stage library surface.
+/// `flywheel stage` subcommands (ADR-0005 P3.3; ADR-0022 §3.8 W6): the
+/// layered stage registry surface.
 #[derive(Subcommand)]
 enum StageCmd {
-    /// List all stages: semantic name + p-code alias (and the override path)
-    List,
+    /// List stages (default: authored tiers repo/user/project; --all adds seed)
+    List {
+        /// include the compiled seed tier too
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show one stage: prompt body + metadata + tier
+    Show {
+        /// stage name (semantic or p-code alias)
+        name: String,
+    },
+    /// Scaffold a new stage into the project tier (.flywheel/stages.toml)
+    New {
+        /// stage name (must be a valid identifier)
+        name: String,
+    },
+    /// Lint every tier: shape, size cap, role affinity, phase, principles
+    Lint,
+    /// Promote a stage up the §3.8 permanence ladder (project → user → repo)
+    Promote {
+        /// stage name (must resolve at project or user tier)
+        name: String,
+        /// target tier: user | repo
+        #[arg(long, value_parser = ["user", "repo"])]
+        to: String,
+        /// repo tier only: >=2 successful run ids as evidence (distinct
+        /// objectives, verified against the durable run log)
+        #[arg(long, value_delimiter = ',')]
+        evidence: Vec<String>,
+        /// repo tier only: the review bead id witnessing the promotion
+        #[arg(long)]
+        review_bead: Option<String>,
+        /// repo tier only: flywheel repo checkout holding src/repo-stages.toml
+        /// (default: $FLYWHEEL_REPO_DIR)
+        #[arg(long)]
+        repo_dir: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2295,6 +2331,11 @@ enum WorkflowCmd {
         /// run the composed workflow (lint gate first, pane mode)
         #[arg(long)]
         run: bool,
+        /// W6 (§3.7 T3): after a GREEN --run, graduate the composed workflow
+        /// into the project catalog (.flywheel/workflows/<name>.yaml) with
+        /// provenance. Refuses without a green run.
+        #[arg(long)]
+        keep: Option<String>,
         /// pane mode: the project whose workspace hosts the crew
         #[arg(long)]
         project: Option<String>,
@@ -2318,6 +2359,22 @@ enum WorkflowCmd {
     Remove {
         /// workflow name (catalog only)
         name: String,
+    },
+    /// Promote a workflow up the §3.8 permanence ladder
+    /// (project → user → repo). The user write goes through the SAME
+    /// writer as compose --keep, so both lint identically.
+    Promote {
+        /// workflow name (must exist at project or user tier)
+        name: String,
+        /// target tier: user | repo
+        #[arg(long, value_parser = ["user", "repo"])]
+        to: String,
+        /// repo tier only: >=2 successful run ids as evidence
+        #[arg(long, value_delimiter = ',')]
+        evidence: Vec<String>,
+        /// repo tier only: the review bead id witnessing the promotion
+        #[arg(long)]
+        review_bead: Option<String>,
     },
 }
 
@@ -3325,7 +3382,7 @@ fn main() {
         Some(Commands::Workflows { cmd }) => cmd_asset(&cfg, "workflows", cmd),
         Some(Commands::Pipeline { cmd }) => cmd_asset(&cfg, "pipeline", cmd),
         Some(Commands::Template { cmd }) => cmd_asset(&cfg, "template", cmd),
-        Some(Commands::Stage { cmd }) => cmd_stage(cmd),
+        Some(Commands::Stage { cmd }) => cmd_stage(&cfg, cmd),
         Some(Commands::Ensemble {
             project,
             recipe,
@@ -4931,7 +4988,16 @@ mod steer_engine_tests {
     #[test]
     fn steer_targets_durable_run_arm() {
         for (direct, expected) in [(true, "goal-direct"), (false, "goal")] {
-            let cmd = steer_run_cmd("fix the flake", direct, None, None, None, false, false, false);
+            let cmd = steer_run_cmd(
+                "fix the flake",
+                direct,
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            );
             let WorkflowCmd::Run {
                 name,
                 inputs,
@@ -4944,10 +5010,7 @@ mod steer_engine_tests {
                 panic!("expected a Run command");
             };
             assert_eq!(name, expected);
-            assert_eq!(
-                inputs.as_deref(),
-                Some(r#"{"objective":"fix the flake"}"#)
-            );
+            assert_eq!(inputs.as_deref(), Some(r#"{"objective":"fix the flake"}"#));
             assert!(execute, "steer must execute, not record");
             assert_eq!(mode, "pane");
             assert!(!allow_worktree);
@@ -5014,11 +5077,7 @@ mod steer_engine_tests {
     fn steer_direct_completes_as_engine_run() {
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (rt, engine, invoke_wf) = steer_engine(calls).expect("steer engine");
-        let out = rt.block_on(steered(
-            &engine,
-            "fw-cli-steer-engine-run-test",
-            invoke_wf,
-        ));
+        let out = rt.block_on(steered(&engine, "fw-cli-steer-engine-run-test", invoke_wf));
         assert!(out.is_object(), "engine returns an output object");
     }
 
@@ -5036,15 +5095,8 @@ mod steer_engine_tests {
         ));
         let after_first = calls.lock().unwrap().len();
         assert!(after_first > 0, "first run executes the chain");
-        let redelivery = rt.block_on(steered(
-            &engine,
-            "fw-cli-steer-redelivery-test",
-            invoke_wf,
-        ));
-        assert_eq!(
-            first, redelivery,
-            "redelivery returns the recorded output"
-        );
+        let redelivery = rt.block_on(steered(&engine, "fw-cli-steer-redelivery-test", invoke_wf));
+        assert_eq!(first, redelivery, "redelivery returns the recorded output");
         assert_eq!(
             calls.lock().unwrap().len(),
             after_first,
@@ -12450,22 +12502,243 @@ fn cmd_asset(cfg: &Config, kind: &str, cmd: &AssetCmd) -> Result<()> {
 }
 
 /// `flywheel stage list`: the stage library surface (ADR-0005 P3.3).
-fn cmd_stage(cmd: &StageCmd) -> Result<()> {
+fn cmd_stage(cfg: &Config, cmd: &StageCmd) -> Result<()> {
+    // The project tier lives in the default project's workspace dir
+    // (<workspace-root>/flywheel/.flywheel/stages.toml) — the same project
+    // `workflow compose` defaults to.
+    let project_stages = project_dir(cfg, "flywheel").join(".flywheel/stages.toml");
     match cmd {
-        StageCmd::List => {
-            let lib = stages::StageLibrary::load()?;
-            println!("stages (semantic name <-> p-code alias):");
-            for (name, alias) in lib.list() {
-                println!("  {name} <-> {alias}");
+        StageCmd::List { all } => {
+            let lib = stages::StageLibrary::load_layered(Some(&project_stages))?;
+            println!("stages (semantic name <-> p-code alias, tier, role, phase):");
+            for row in lib.list_tiered() {
+                if row.tier == stages::Tier::Seed && !*all {
+                    continue;
+                }
+                println!(
+                    "  {:<28} {:<4} [{:<7}] role={} phase={}",
+                    row.name,
+                    if row.alias.is_empty() {
+                        "-"
+                    } else {
+                        &row.alias
+                    },
+                    row.tier.tag(),
+                    row.role.as_deref().unwrap_or("-"),
+                    row.phase.as_deref().unwrap_or("-"),
+                );
             }
             println!("semantic alias table (Spec 2a):");
             for (semantic, code) in lib.semantic_aliases() {
                 println!("  {semantic} = {code}");
             }
-            println!("override: {}", override_display());
+            println!("user override: {}", override_display());
+            println!("project tier: {}", project_stages.display());
             Ok(())
         }
+        StageCmd::Show { name } => {
+            let lib = stages::StageLibrary::load_layered(Some(&project_stages))?;
+            let stage = lib
+                .get_stage(name)
+                .ok_or_else(|| anyhow!("unknown stage {name:?} (flywheel stage list --all)"))?;
+            let tier = lib.tier_of(name).unwrap_or(stages::Tier::Seed);
+            println!("name:     {}", stage.name);
+            if !stage.alias.is_empty() {
+                println!("alias:    {}", stage.alias);
+            }
+            println!("tier:     {}", tier.tag());
+            if let Some(role) = &stage.role {
+                println!("role:     {role}");
+            }
+            if let Some(phase) = &stage.phase {
+                println!("phase:    {phase}");
+            }
+            if !stage.principles.is_empty() {
+                println!("principles: {}", stage.principles.join(", "));
+            }
+            if let Some(author) = &stage.author {
+                println!("author:   {author}");
+            }
+            if let Some(run) = &stage.origin_run {
+                println!("origin-run: {run}");
+            }
+            println!("---");
+            println!("{}", stage.prompt);
+            Ok(())
+        }
+        StageCmd::New { name } => {
+            if name.trim().is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                bail!("invalid stage name {name:?} (alnum/_/-)");
+            }
+            let lib = stages::StageLibrary::load_layered(Some(&project_stages))?;
+            if lib.has(name) {
+                bail!("stage {name:?} already exists (flywheel stage show {name})");
+            }
+            let mut stage = stages::scaffold(name);
+            stage.author = Some(operator_pin());
+            stages::upsert_stage_in_file(&project_stages, &stage)?;
+            println!("scaffolded [stages.{name}] in {}", project_stages.display());
+            println!(
+                "next: fill the prompt body + role/phase/principles, then `flywheel stage lint`"
+            );
+            Ok(())
+        }
+        StageCmd::Lint => {
+            let lib = stages::StageLibrary::load_layered(Some(&project_stages))?;
+            let valid_roles: Vec<String> = profile::ProfileCatalog::load()?.names();
+            let mut issues = 0;
+            for row in lib.list_tiered() {
+                let stage = lib.get_stage(&row.name).expect("row source");
+                for issue in stages::lint_stage(stage, &valid_roles) {
+                    issues += 1;
+                    println!("[{:<7}] {}", row.tier.tag(), issue);
+                }
+            }
+            if issues == 0 {
+                println!("stage lint clean (all tiers)");
+                Ok(())
+            } else {
+                bail!("{issues} stage lint issue(s)")
+            }
+        }
+        StageCmd::Promote {
+            name,
+            to,
+            evidence,
+            review_bead,
+            repo_dir,
+        } => {
+            let lib = stages::StageLibrary::load_layered(Some(&project_stages))?;
+            let stage = lib
+                .get_stage(name)
+                .ok_or_else(|| anyhow!("unknown stage {name:?} (flywheel stage list --all)"))?
+                .clone();
+            match to.as_str() {
+                "user" => {
+                    let tier = lib.tier_of(name).unwrap_or(stages::Tier::Seed);
+                    if tier == stages::Tier::User {
+                        bail!("stage {name:?} is already at the user tier");
+                    }
+                    let dest = config::config_dir().join("stages.toml");
+                    stages::upsert_stage_in_file(&dest, &stage)?;
+                    println!("promoted {name} → user tier ({})", dest.display());
+                    Ok(())
+                }
+                "repo" => {
+                    // §3.8 evidence bar: >=2 successful runs (distinct
+                    // objectives) + a review bead, then land as DATA.
+                    promote_to_repo(name, evidence, review_bead.as_deref(), repo_dir.as_deref())
+                }
+                other => bail!("unknown promote target {other:?} (user | repo)"),
+            }
+        }
     }
+}
+
+/// Verify the §3.8 repo-tier evidence bar against the durable run log +
+/// the beads ledger, shared by `stage promote --to repo` and
+/// `workflow promote --to repo`. Evidence = >=2 cited run ids that exist,
+/// carry status=success, and cover >=2 distinct objectives (prompt hashes);
+/// the review bead must exist. Returns the verified run count.
+fn repo_evidence_verified(
+    what: &str,
+    evidence: &[String],
+    review_bead: Option<&str>,
+) -> Result<usize> {
+    if evidence.len() < 2 {
+        bail!(
+            "{what}: repo promotion needs --evidence <run-id1>,<run-id2> (>=2 successful runs, \
+             distinct objectives) — the §3.8 evidence bar refuses unevidenced promotion"
+        );
+    }
+    let runs = run_log::read_runs();
+    let mut hashes = std::collections::HashSet::new();
+    for id in evidence {
+        let entry = runs
+            .iter()
+            .find(|r| &r.run_id == id)
+            .ok_or_else(|| anyhow!("{what}: evidence run {id:?} not found in the run log"))?;
+        if entry.status != "success" {
+            bail!(
+                "{what}: evidence run {id:?} status is {:?} — only success runs count",
+                entry.status
+            );
+        }
+        hashes.insert(entry.prompt_hash.clone());
+    }
+    if hashes.len() < 2 {
+        bail!(
+            "{what}: the {} evidence runs cover {} objective(s) — need >=2 distinct objectives",
+            evidence.len(),
+            hashes.len()
+        );
+    }
+    let bead =
+        review_bead.ok_or_else(|| anyhow!("{what}: repo promotion needs --review-bead <id>"))?;
+    let ok = std::process::Command::new("br")
+        .args(["show", bead])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        bail!("{what}: review bead {bead:?} not found (br show {bead})");
+    }
+    if !stages::check_repo_evidence(hashes.len(), true) {
+        bail!("{what}: evidence bar not met");
+    }
+    Ok(hashes.len())
+}
+
+/// `stage promote --to repo`: verify the evidence bar, then append the stage
+/// as DATA into the flywheel repo's src/repo-stages.toml.
+fn promote_to_repo(
+    name: &str,
+    evidence: &[String],
+    review_bead: Option<&str>,
+    repo_dir: Option<&str>,
+) -> Result<()> {
+    let objectives = repo_evidence_verified(name, evidence, review_bead)?;
+    let repo = repo_dir
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("FLYWHEEL_REPO_DIR").ok().map(PathBuf::from))
+        .ok_or_else(|| {
+            anyhow!(
+                "no flywheel repo dir — pass --repo-dir <checkout> or set FLYWHEEL_REPO_DIR \
+                 (the promoted stage lands as DATA in <repo>/src/repo-stages.toml)"
+            )
+        })?;
+    let dest = repo.join("src/repo-stages.toml");
+    if !dest.is_file() {
+        bail!(
+            "repo data file missing: {} (not a flywheel checkout?)",
+            dest.display()
+        );
+    }
+    let lib = stages::StageLibrary::compiled_in();
+    let stage = lib
+        .get_stage(name)
+        .ok_or_else(|| anyhow!("unknown stage {name:?}"))?
+        .clone();
+    stages::upsert_stage_in_file(&dest, &stage)?;
+    println!(
+        "promoted {name} → repo tier ({}; {objectives} distinct objectives verified; review bead witnessed)",
+        dest.display()
+    );
+    println!("next: commit the repo-data change upstream (the review bead is the witness)");
+    Ok(())
+}
+
+/// The author pin recorded in provenance (`stage new`, compose `--keep`).
+fn operator_pin() -> String {
+    std::env::var("AGENT_NAME")
+        .or_else(|_| std::env::var("USER").map_err(|_| std::env::VarError::NotPresent))
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 fn override_display() -> String {
@@ -17610,7 +17883,14 @@ fn cmd_steer(
     // panes as the executor surface only (ADR-0022 W4) — byte-identical to
     // running `workflow run goal` by hand, with the objective pre-filled.
     let run = steer_run_cmd(
-        objective, direct, crew, project, reuse, retain, retire_orphans, json,
+        objective,
+        direct,
+        crew,
+        project,
+        reuse,
+        retain,
+        retire_orphans,
+        json,
     );
     cmd_workflow(cfg, &run)
 }
@@ -17725,6 +18005,25 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
         for (name, wf) in cat.workflows {
             // Canonical YAML / absorbed legacy wins over a same-named built-in
             // (the catalog is the home; built-ins are zero-config defaults).
+            out.insert(name, (wf, "catalog"));
+        }
+        Ok(out)
+    }
+
+    /// W6 (§3.8): [`all_workflows`] plus the PROJECT tier —
+    /// `<project>/.flywheel/workflows/*.yaml` shadows user catalog entries,
+    /// which shadow built-ins.
+    fn all_workflows_layered(
+        project_root: Option<&Path>,
+    ) -> Result<BTreeMap<String, (Workflow, &'static str)>> {
+        let mut out: BTreeMap<String, (Workflow, &'static str)> = BTreeMap::new();
+        for (name, wf) in builtin_workflows::builtin_workflows() {
+            out.insert(name, (wf, "builtin"));
+        }
+        // load_layered merges user + project with project winning; the
+        // catalog-vs-builtin source tag stays the workflow-list vocabulary.
+        let cat = workflow_catalog::WorkflowCatalog::load_layered(project_root)?;
+        for (name, wf) in cat.workflows {
             out.insert(name, (wf, "catalog"));
         }
         Ok(out)
@@ -18137,9 +18436,15 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             parts,
             agent,
             run,
+            keep,
             project,
             json,
         } => {
+            // W6: --keep is a graduation of a RUN — without --run there is no
+            // green to graduate.
+            if keep.is_some() && !*run {
+                bail!("workflow compose: --keep needs --run (graduation requires a green run)");
+            }
             // bd-8xca deterministic arm: assemble from the parts spec.
             // `--agent` (planner arm, bd-u4cu): a headless planner-profile
             // run authors a Workflow YAML from the target + the workflow
@@ -18153,7 +18458,13 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             if !*agent && parts.is_empty() {
                 bail!("workflow compose needs --parts (role:stage or workflow:name) or --agent");
             }
-            let all = all_workflows()?;
+            // W6: the project tier participates in BOTH the stage library
+            // (stage-first affinities) and the workflow catalog (kept entries
+            // resolve for call_workflow).
+            let project_name = project.as_deref().unwrap_or("flywheel");
+            let project_root = project_dir(cfg, project_name);
+            let project_stages = project_root.join(".flywheel/stages.toml");
+            let all = all_workflows_layered(Some(&project_root))?;
             let wf_name = format!("composed-{}", state::now_iso().replace([':', '-', '.'], ""));
             let composed = if *agent {
                 // Planner arm: author from the target + catalog (workflows,
@@ -18166,7 +18477,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     .collect();
                 let profile_names = profile::ProfileCatalog::load()?.names();
                 let profile_refs: Vec<&str> = profile_names.iter().map(String::as_str).collect();
-                let stage_lib = stages::StageLibrary::load()?;
+                let stage_lib = stages::StageLibrary::load_layered(Some(&project_stages))?;
                 let stage_rows = stage_lib.list();
                 let prompt =
                     crew::planner_authoring_prompt(target, &wf_rows, &profile_refs, &stage_rows);
@@ -18182,7 +18493,11 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 for token in parts {
                     parsed.push(crew::parse_compose_part(token).map_err(anyhow::Error::msg)?);
                 }
-                crew::compose_workflow(&wf_name, target, base_wf.as_ref(), &parsed)
+                // §3.8 stage-first: bare stage names dispatch to the stage's
+                // declared role affinity (project tier overrides included).
+                let stage_lib = stages::StageLibrary::load_layered(Some(&project_stages))?;
+                let affinity = |s: &str| stage_lib.get_stage(s).and_then(|st| st.role.clone());
+                crew::compose_workflow_with(&wf_name, target, base_wf.as_ref(), &parsed, &affinity)?
             };
 
             // Fail-stop gate: lint before run / emit.
@@ -18233,7 +18548,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // steer/workflow run — lint passed, spawn the inferred crew +
             // dispatch each step via __send, reap on end. The composed struct
             // is invoked directly (the engine takes ANY Workflow).
-            let project_name = project.as_deref().unwrap_or("flywheel");
             let catalog = profile::ProfileCatalog::load()?;
             let ctx = pane::pre_spawn_crew(
                 cfg,
@@ -18259,8 +18573,12 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             let run_id = format!("fw-composed-{}", state::now_iso());
             let invoke_wf = crew::resolve_crew_fanouts(&composed, &crew_plan);
-            let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(|sub: &str| {
-                let cat = workflow_catalog::WorkflowCatalog::load().ok()?;
+            // W6: the project tier participates — a kept composed entry
+            // resolves for call_workflow sub-runs.
+            let resolver_root = project_root.clone();
+            let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(move |sub: &str| {
+                let cat =
+                    workflow_catalog::WorkflowCatalog::load_layered(Some(&resolver_root)).ok()?;
                 cat.workflows
                     .get(sub)
                     .cloned()
@@ -18352,6 +18670,48 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     "policy_events": policy_receipts_count,
                 }),
             );
+            // W6 (§3.7 T3): graduate a GREEN composed run into the project
+            // catalog. Green = invoke returned Ok and the terminal status is
+            // not "failed". A red run refuses — keep-without-green is the
+            // exact failure mode the evidence ladder exists to prevent.
+            if let Some(keep_name) = keep {
+                let green = output.get("status").and_then(|s| s.as_str()) != Some("failed");
+                if !green {
+                    bail!(
+                        "refusing to keep {keep_name:?}: the composed run {wf_name} did not go green \
+                         (status {:?}) — fix the run or drop --keep",
+                        output
+                            .get("status")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("<none>")
+                    );
+                }
+                let mut kept = composed.clone();
+                let from = if parts.is_empty() {
+                    base.clone().unwrap_or_else(|| "<planner>".to_string())
+                } else {
+                    parts.join(",")
+                };
+                kept.name = keep_name.clone();
+                kept.description = Some(format!(
+                    "{} [origin: composed; from: {from}; first-run: {}; author: {}]",
+                    kept.description.as_deref().unwrap_or("composed workflow"),
+                    state::now_iso(),
+                    operator_pin(),
+                ));
+                let blocking = lint_one(keep_name, &kept);
+                if blocking > 0 {
+                    bail!(
+                        "kept workflow {keep_name:?} has {blocking} blocking lint issue(s) — not kept"
+                    );
+                }
+                let dir = project_root.join(".flywheel/workflows");
+                let path = workflow_catalog::write_workflow_yaml(&dir, &kept)?;
+                println!(
+                    "kept {keep_name} → {} (green run {run_id}; provenance in description)",
+                    path.display()
+                );
+            }
             if *json {
                 print_json(&json!({
                     "workflow": wf_name,
@@ -18455,6 +18815,44 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 None => bail!("no workflow named {name:?}"),
             }
             Ok(())
+        }
+        WorkflowCmd::Promote {
+            name,
+            to,
+            evidence,
+            review_bead,
+        } => {
+            // The project tier participates: a kept composed entry promotes.
+            let root = project_dir(cfg, "flywheel");
+            let layered = workflow_catalog::WorkflowCatalog::load_layered(Some(&root))?;
+            let wf = layered
+                .workflows
+                .get(name)
+                .ok_or_else(|| {
+                    anyhow!("no promotable workflow named {name:?} (flywheel workflow list)")
+                })?
+                .clone();
+            match to.as_str() {
+                "user" => {
+                    // Same writer as compose --keep → identical lint outcomes
+                    // (the W6 unification contract).
+                    let dest = config::config_dir().join("workflows");
+                    let path = workflow_catalog::write_workflow_yaml(&dest, &wf)?;
+                    println!("promoted {name} → user tier ({})", path.display());
+                    Ok(())
+                }
+                "repo" => {
+                    // §3.8 evidence bar first — refusal is the default.
+                    repo_evidence_verified(name, evidence, review_bead.as_deref())?;
+                    bail!(
+                        "workflow repo tier lands via the review bead + an upstream flywheel commit \
+                         (evidence verified: {} greens) — stages automate this; workflows are code-adjacent \
+                         and need the seed regeneration pass (ADR-0022 §3.8)",
+                        evidence.len()
+                    );
+                }
+                other => bail!("unknown promote target {other:?} (user | repo)"),
+            }
         }
     }
 }

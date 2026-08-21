@@ -20,6 +20,8 @@
 
 use std::collections::BTreeMap;
 
+use anyhow::Result;
+
 use serde::{Deserialize, Serialize};
 
 use toron_workflow::schema::{Action, CrewSpec, InputDecl, Step, StepOnError, Workflow};
@@ -126,24 +128,37 @@ pub fn plan_crew(workflow: &Workflow) -> CrewPlan {
 }
 
 /// One compose part: a dispatch part (`role:stage` — a `@role` agent runs the
-/// named stage) or a workflow part (`workflow:name` — a `call_workflow`
-/// sub-run). Parsed from `flywheel workflow compose --parts`.
+/// named stage), a stage-first part (a bare stage name — dispatched to the
+/// stage's declared role affinity, §3.8), a phase-tagged part (`phase:stage`
+/// — affinity-resolved + the §4 lifecycle phase, W3), or a workflow part
+/// (`workflow:name` — a `call_workflow` sub-run). Parsed from
+/// `flywheel workflow compose --parts`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposePart {
     /// `role:stage` → a dispatch_job step (profile @role, stage prompt).
     Dispatch { role: String, stage: String },
+    /// bare `stage` → dispatch to the stage's declared role affinity.
+    StageFirst { stage: String },
+    /// `phase:stage` → affinity-resolved dispatch carrying the phase.
+    PhaseStage { phase: String, stage: String },
     /// `workflow:name` → a call_workflow step (resolved at invoke).
     CallWorkflow { name: String },
 }
 
-/// Parse one compose part token (`role:stage` | `workflow:name`). Pure —
-/// the unit surface for the compose CLI's deterministic arm (bd-8xca).
+/// Parse one compose part token (`role:stage` | `phase:stage` | `workflow:name`
+/// | bare `stage`). Pure — the unit surface for the compose CLI's
+/// deterministic arm (bd-8xca, §3.8 stage-first).
 pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
     let t = token.trim();
     let Some((kind, value)) = t.split_once(':') else {
-        return Err(format!(
-            "compose part {token:?} must be `role:stage` or `workflow:name`"
-        ));
+        // §3.8 stage-first: a bare stage name is a valid part.
+        let stage = t.trim();
+        if stage.is_empty() {
+            return Err(format!("compose part {token:?}: empty stage name"));
+        }
+        return Ok(ComposePart::StageFirst {
+            stage: stage.to_string(),
+        });
     };
     match kind.trim() {
         "workflow" => {
@@ -153,6 +168,16 @@ pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
             }
             Ok(ComposePart::CallWorkflow {
                 name: name.to_string(),
+            })
+        }
+        phase if crate::stages::PHASES.contains(&phase) => {
+            let stage = value.trim();
+            if stage.is_empty() {
+                return Err(format!("compose part {token:?}: empty stage name"));
+            }
+            Ok(ComposePart::PhaseStage {
+                phase: phase.to_string(),
+                stage: stage.to_string(),
             })
         }
         role => {
@@ -174,15 +199,32 @@ pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
 /// bd-8xca deterministic arm: assemble a NEW workflow from existing parts.
 /// `base` (optional) contributes its steps FIRST (the captain extends an
 /// existing shape); then each part becomes a step — `role:stage` → a
-/// dispatch_job (profile `@role`, stage `stage`), `workflow:name` → a
-/// call_workflow. `crew: auto` (the composed fleet is inferred from the
-/// parts). Pure + testable.
+/// dispatch_job (profile `@role`, stage `stage`), a bare stage → dispatch to
+/// the stage's declared affinity, `phase:stage` → affinity + §4 phase,
+/// `workflow:name` → a call_workflow. `crew: auto` (the composed fleet is
+/// inferred from the parts). Stage-first parts resolve their role through
+/// `affinity`; a stage with NO declared affinity is an error (use the
+/// explicit `role:stage` form). Pure + testable.
+/// [`compose_workflow_with`] without stage affinities — bare-name parts
+/// refuse (the §3.8 stage-first resolver is required for them).
+#[cfg(test)]
 pub fn compose_workflow(
     name: &str,
     objective: &str,
     base: Option<&Workflow>,
     parts: &[ComposePart],
-) -> Workflow {
+) -> Result<Workflow> {
+    compose_workflow_with(name, objective, base, parts, &|_| None)
+}
+
+/// Assemble with a stage-affinity resolver (§3.8 stage-first).
+pub fn compose_workflow_with(
+    name: &str,
+    objective: &str,
+    base: Option<&Workflow>,
+    parts: &[ComposePart],
+    affinity: &dyn Fn(&str) -> Option<String>,
+) -> Result<Workflow> {
     let mut steps: Vec<Step> = base.map(|b| b.steps.clone()).unwrap_or_default();
     let mut ordinal = 0u32;
     for part in parts {
@@ -214,6 +256,41 @@ pub fn compose_workflow(
                 steps.push(s);
                 continue;
             }
+            ComposePart::StageFirst { stage } | ComposePart::PhaseStage { stage, phase: _ } => {
+                let phase = match part {
+                    ComposePart::PhaseStage { phase, .. } => Some(phase.clone()),
+                    _ => None,
+                };
+                let role = affinity(stage).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "stage {stage:?} declares no role affinity — use role:{stage} or \
+                         declare `role` in the stage (stage show {stage})"
+                    )
+                })?;
+                let slug = format!("{role}-{stage}")
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                    .collect::<String>();
+                let s = Step {
+                    name: Some(format!("{slug}-{ordinal}")),
+                    guard: None,
+                    on_error: StepOnError::Continue,
+                    build_slot: false,
+                    action: Action::DispatchJob {
+                        assignee: "x".to_string(),
+                        spec: toron_workflow::schema::DispatchSpec {
+                            profile: Some(format!("@{role}")),
+                            stage: Some(stage.clone()),
+                            phase,
+                            task: Some(objective.to_string()),
+                            ..Default::default()
+                        },
+                        channel: None,
+                    },
+                };
+                steps.push(s);
+                continue;
+            }
             ComposePart::CallWorkflow { name: sub } => Action::CallWorkflow {
                 workflow: sub.clone(),
                 inputs: serde_json::json!({ "goal": objective }),
@@ -227,7 +304,7 @@ pub fn compose_workflow(
             action: step_name,
         });
     }
-    Workflow {
+    Ok(Workflow {
         name: name.to_string(),
         description: Some(format!(
             "Runtime-composed workflow for: {objective} (bd-8xca deterministic arm)"
@@ -243,7 +320,7 @@ pub fn compose_workflow(
         }],
         crew: Some(CrewSpec::Auto),
         principles: vec![],
-    }
+    })
 }
 
 /// bd-u4cu planner arm: the headless planner's authoring prompt — the target
@@ -608,7 +685,7 @@ steps:
     // ---- bd-8xca: runtime composition (deterministic arm) ----
 
     /// Parse: `role:stage` → dispatch; `workflow:name` → call_workflow;
-    /// malformed tokens error.
+    /// malformed tokens error. (bd-8xca + §3.8 stage-first.)
     #[test]
     fn compose_part_parses_dispatch_and_workflow() {
         assert_eq!(
@@ -624,12 +701,81 @@ steps:
                 name: "weekly-review".into(),
             }
         );
-        assert!(parse_compose_part("nonsense").is_err(), "no colon errors");
         assert!(parse_compose_part(":stage").is_err(), "empty role errors");
         assert!(
             parse_compose_part("workflow:").is_err(),
             "empty name errors"
         );
+    }
+
+    /// W6 (§3.8 stage-first): a bare stage name parses to StageFirst;
+    /// `phase:stage` parses to PhaseStage for the §4 phases.
+    #[test]
+    fn w6_parse_stage_first_and_phase_stage() {
+        assert_eq!(
+            parse_compose_part("fresh-eyes-explore").unwrap(),
+            ComposePart::StageFirst {
+                stage: "fresh-eyes-explore".into(),
+            }
+        );
+        assert_eq!(
+            parse_compose_part("review:code-review").unwrap(),
+            ComposePart::PhaseStage {
+                phase: "review".into(),
+                stage: "code-review".into(),
+            }
+        );
+        // A role named like a phase is shadowed by the phase grammar — the
+        // explicit form for a stage under a @reviewer ROLE is reviewer:stage.
+        assert_eq!(
+            parse_compose_part("plan:decompose-beads").unwrap(),
+            ComposePart::PhaseStage {
+                phase: "plan".into(),
+                stage: "decompose-beads".into(),
+            }
+        );
+    }
+
+    /// W6: stage-first parts resolve the role through the declared affinity;
+    /// an affinity-less stage is an ERROR pointing at the explicit form.
+    #[test]
+    fn w6_compose_stage_first_resolves_affinity() {
+        use toron_workflow::schema::Action;
+        let parts = vec![
+            ComposePart::StageFirst {
+                stage: "fresh-eyes-explore".into(),
+            },
+            ComposePart::PhaseStage {
+                phase: "implement".into(),
+                stage: "systematic-execute".into(),
+            },
+        ];
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
+        let wf =
+            compose_workflow_with("composed-w6", "the objective", None, &parts, &affinity).unwrap();
+        let roles: Vec<Option<&str>> = wf
+            .steps
+            .iter()
+            .map(|s| match &s.action {
+                Action::DispatchJob { spec, .. } => spec.profile.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(roles, vec![Some("@scout"), Some("@coder")], "{roles:?}");
+        // The phase rides the spec (W2 contract).
+        let phased = match &wf.steps[1].action {
+            Action::DispatchJob { spec, .. } => spec.phase.clone(),
+            _ => None,
+        };
+        assert_eq!(phased.as_deref(), Some("implement"));
+        // No affinity → hard error with remedy.
+        let bare = vec![ComposePart::StageFirst {
+            stage: "no-affinity-stage".into(),
+        }];
+        let err = compose_workflow_with("composed-x", "obj", None, &bare, &affinity)
+            .expect_err("affinity-less stage refuses");
+        assert!(err.to_string().contains("role:no-affinity-stage"));
     }
 
     /// The deterministic arm assembles a NEW workflow from parts: dispatch
@@ -648,7 +794,7 @@ steps:
                 name: "weekly-review".into(),
             },
         ];
-        let wf = compose_workflow("composed-x", "validate the new exchange", None, &parts);
+        let wf = compose_workflow("composed-x", "validate the new exchange", None, &parts).unwrap();
         assert_eq!(wf.name, "composed-x");
         assert_eq!(wf.steps.len(), 2);
         assert_eq!(wf.crew, Some(CrewSpec::Auto));
@@ -696,7 +842,7 @@ steps:
             role: "coder".into(),
             stage: "systematic-execute".into(),
         }];
-        let wf = compose_workflow("composed-base", "harden the loop", Some(&base), &parts);
+        let wf = compose_workflow("composed-base", "harden the loop", Some(&base), &parts).unwrap();
         assert_eq!(wf.steps.len(), 2, "base step + one part");
         assert!(matches!(&wf.steps[0].action, Action::SendDm { .. }));
         assert!(matches!(
