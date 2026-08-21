@@ -18009,6 +18009,7 @@ fn cmd_steer(
 /// delegates to — execute=true, pane mode, goal/goal-direct. Durability is
 /// owned downstream by the Run arm (engine.invoke over Resonate::local);
 /// steer only picks the workflow and pre-fills the objective.
+#[allow(clippy::too_many_arguments)] // CLI-flag mirror of Steer args; a struct would duplicate the clap surface
 fn steer_run_cmd(
     objective: &str,
     direct: bool,
