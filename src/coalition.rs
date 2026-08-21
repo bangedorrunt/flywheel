@@ -411,6 +411,8 @@ impl CoalitionStore {
             duration_ms: 0,
             exit_code: 0,
             error: None,
+            phase: None,
+            phase_degraded: false,
         })?;
 
         // NIP-29 channel: create + metadata (project-scoped, operator-signed).

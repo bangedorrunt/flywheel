@@ -35,6 +35,14 @@ pub struct RunLogEntry {
     pub exit_code: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// ADR-0022 W2: the lifecycle phase the dispatch ran under, when the
+    /// step's spec carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// ADR-0022 §3.2 R2: true when the harness had no native mechanic for
+    /// the phase (prompt-mode degradation) — never silent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub phase_degraded: bool,
 }
 
 /// The directory holding run logs: `$STATE/flywheel/runs`.
@@ -129,6 +137,8 @@ mod tests {
             duration_ms: 1500,
             exit_code: 0,
             error: None,
+            phase: None,
+            phase_degraded: false,
         }
     }
 

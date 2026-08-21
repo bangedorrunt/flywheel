@@ -64,6 +64,25 @@ pub fn model_args(harness: &str, model: &str, effort: Option<&str>) -> Vec<Strin
     }
 }
 
+/// ADR-0022 L2 (bd-adr22-w2-phase-registry-igya): per-harness launch args
+/// for an orchestration phase. Returns (args, degraded): degraded=true
+/// means the harness has no native mechanic for this phase — the caller
+/// WARNS (never silent), tags the run log `phase_degraded`, and the
+/// dispatch proceeds in prompt mode. One match arm per harness; this
+/// registry is the ONLY place a harness's phase vocabulary lives.
+pub fn phase_launch_args(harness: &str, phase: &str) -> (Vec<String>, bool) {
+    // Mechanics verified against the installed binaries 2026-08-21:
+    // - omp `--plan-yolo`: "Force read-only plan mode at start" (omp --help).
+    // - opencode `--agent plan`: the builtin `plan` (primary) agent
+    //   (`opencode agent list`). opencode reads `--agent <name>`.
+    // pi/grok expose no phase mechanic — documented loud degradation.
+    match (harness, phase) {
+        ("omp", "plan") => (vec!["--plan-yolo".to_string()], false),
+        ("opencode", "plan") => (vec!["--agent".to_string(), "plan".to_string()], false),
+        _ => (vec![], true),
+    }
+}
+
 /// The omp role-model flags (`--smol=<id>` / `--slow=<id>` / `--plan=<id>`,
 /// bd-gsvn.2). omp-only — other harnesses use `model` for every role and get
 /// no role flags (per-harness gate: absent role ids emit nothing). Each role
@@ -262,6 +281,103 @@ pub fn dispatch_spec_stage(spec: &DispatchSpec) -> Option<&str> {
 /// reviewer to opencode).
 pub fn dispatch_spec_harness(spec: &DispatchSpec) -> Option<&str> {
     spec.harness.as_deref()
+}
+
+/// The lifecycle phase in a dispatch spec (`spec.phase`, e.g. `plan` —
+/// ADR-0022 W2). Drives the phase registry ([`phase_launch_args`]) on both
+/// the headless and pane launch paths.
+pub fn dispatch_spec_phase(spec: &DispatchSpec) -> Option<&str> {
+    spec.phase.as_deref()
+}
+
+/// `build_argv_roles` + the ADR-0022 phase registry: when `phase` is set,
+/// the registry args are INSERTED BEFORE the trailing prompt positional
+/// (every harness arm ends its argv with the prompt; flags after it would
+/// be swallowed as prompt text). Returns `(argv, phase_degraded)` —
+/// degraded=true means the harness has no native mechanic for the phase
+/// and the caller must warn + tag the run log (never silent).
+#[allow(clippy::too_many_arguments)]
+pub fn build_argv_roles_phase(
+    harness: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    smol: &str,
+    slow: &str,
+    plan: &str,
+    prompt: &str,
+    phase: Option<&str>,
+) -> Result<(Vec<String>, bool)> {
+    let mut argv = build_argv_roles(harness, model, effort, smol, slow, plan, prompt)?;
+    let Some(phase) = phase.filter(|p| !p.is_empty()) else {
+        return Ok((argv, false));
+    };
+    let (mut extra, degraded) = phase_launch_args(harness, phase);
+    if degraded {
+        eprintln!(
+            "flywheel: phase {phase:?} has no native mechanic on harness {harness:?} — degrading to prompt mode (run log: phase_degraded)"
+        );
+    }
+    if !extra.is_empty() {
+        let insert_at = argv.len().saturating_sub(1); // before the prompt positional
+        argv.splice(insert_at..insert_at, extra.drain(..));
+    }
+    Ok((argv, degraded))
+}
+
+/// ADR-0022 §3.2 R3 (bd-adr22-w2-phase-registry-igya): the preflight
+/// phase-registry probe — does the flag/mode this registry names still
+/// exist in the INSTALLED harness? The anti-flag-drift defense: a renamed
+/// flag must surface as a named warning with the remedy, never a silent
+/// no-op at dispatch time. `probe` runs a harness self-description command
+/// and returns its stdout (None = the harness could not be probed at all).
+/// Returns `Some(problem)` naming the exact remedy, or `None` when the
+/// registry's mechanic is present (or the harness has no mechanic to
+/// probe). Pure via the `probe` closure — unit-tested with fakes.
+pub fn phase_registry_probe(
+    harness: &str,
+    probe: &dyn Fn(&str, &[&str]) -> Option<String>,
+) -> Option<String> {
+    match harness {
+        "omp" => {
+            let Some(out) = probe(harness, &["--help"]) else {
+                return Some(
+                    "omp: cannot probe plan-phase flag (omp --help failed) — verify --plan-yolo manually or fix the omp install"
+                        .to_string(),
+                );
+            };
+            if out.contains("--plan-yolo") {
+                None
+            } else {
+                Some(
+                    "omp: plan-phase flag --plan-yolo not found in `omp --help` — update headless::phase_launch_args to the installed omp's plan mechanic"
+                        .to_string(),
+                )
+            }
+        }
+        "opencode" => {
+            let Some(out) = probe(harness, &["agent", "list"]) else {
+                return Some(
+                    "opencode: cannot probe plan-mode agent (opencode agent list failed) — verify the `plan` agent manually or fix the opencode install"
+                        .to_string(),
+                );
+            };
+            // The builtin plan agent appears as "plan (primary)" / "plan":
+            // match the bare name on an agent-list line.
+            let has_plan = out
+                .lines()
+                .any(|l| l.trim_start().starts_with("plan ") || l.trim() == "plan");
+            if has_plan {
+                None
+            } else {
+                Some(
+                    "opencode: plan-mode agent `plan` not found in `opencode agent list` — update headless::phase_launch_args to the installed opencode's plan agent"
+                        .to_string(),
+                )
+            }
+        }
+        // No mechanic registered -> nothing to probe.
+        _ => None,
+    }
 }
 
 /// The task text in a dispatch spec (`spec.task`): an inline instruction that
@@ -472,6 +588,141 @@ mod tests {
             model_args("hermes", "x", None).is_empty(),
             "unknown harness: no model args"
         );
+    }
+
+    /// ADR-0022 W2 (bd-adr22-w2-phase-registry-igya): the phase registry —
+    /// one match arm per harness, verified against the installed binaries
+    /// 2026-08-21 (omp --plan-yolo --help; opencode agent list shows the
+    /// builtin `plan` agent). The registry is the ONLY place a harness's
+    /// phase vocabulary lives.
+    #[test]
+    fn phase_registry_table_per_harness() {
+        // omp: plan -> read-only plan mode at start (native mechanic).
+        let (args, degraded) = phase_launch_args("omp", "plan");
+        assert_eq!(args, vec!["--plan-yolo"]);
+        assert!(!degraded);
+        // opencode: plan -> the builtin plan-mode agent.
+        let (args, degraded) = phase_launch_args("opencode", "plan");
+        assert_eq!(args, vec!["--agent", "plan"]);
+        assert!(!degraded);
+    }
+
+    /// ADR-0022 W2: the argv wrapper inserts registry args BEFORE the
+    /// trailing prompt positional and reports degradation to the caller.
+    #[test]
+    fn build_argv_roles_phase_inserts_before_prompt() {
+        // omp + plan: --plan-yolo lands before the prompt, not after.
+        let (argv, degraded) = build_argv_roles_phase(
+            "omp",
+            Some("gpt-5.2"),
+            None,
+            "",
+            "",
+            "",
+            "do the thing",
+            Some("plan"),
+        )
+        .expect("argv");
+        assert!(!degraded);
+        let pos_prompt = argv
+            .iter()
+            .position(|a| a == "do the thing")
+            .expect("prompt last");
+        let pos_flag = argv
+            .iter()
+            .position(|a| a == "--plan-yolo")
+            .expect("flag present");
+        assert!(pos_flag < pos_prompt, "flag must precede prompt: {argv:?}");
+        assert_eq!(pos_prompt, argv.len() - 1, "prompt stays last");
+
+        // No phase -> byte-identical to build_argv_roles, never degraded.
+        let (plain, degraded) =
+            build_argv_roles_phase("omp", Some("gpt-5.2"), None, "", "", "", "hi", None)
+                .expect("argv");
+        assert!(!degraded);
+        assert_eq!(
+            plain,
+            build_argv_roles("omp", Some("gpt-5.2"), None, "", "", "", "hi").unwrap()
+        );
+
+        // Degraded pair: args stay empty, degraded reported (pi has no
+        // mechanic) — the caller warns + tags, argv unchanged shape.
+        let (argv, degraded) =
+            build_argv_roles_phase("pi", None, None, "", "", "", "hi", Some("plan")).expect("argv");
+        assert!(degraded);
+        assert!(!argv.iter().any(|a| a.contains("plan")));
+    }
+
+    /// ADR-0022 W2: spec.phase reaches the runner through the typed spec.
+    #[test]
+    fn dispatch_spec_phase_reads_typed_field() {
+        let spec: DispatchSpec =
+            serde_json::from_value(serde_json::json!({"profile": "@planner", "phase": "plan"}))
+                .expect("spec");
+        assert_eq!(dispatch_spec_phase(&spec), Some("plan"));
+        assert_eq!(dispatch_spec_phase(&DispatchSpec::default()), None);
+    }
+
+    /// ADR-0022 §3.2 R3: the preflight probe catches flag drift against a
+    /// fake harness self-description, names the remedy, and stays silent
+    /// when the mechanic is present. Harnesses without a mechanic are not
+    /// probed.
+    #[test]
+    fn phase_registry_probe_catches_drift() {
+        let good = |bin: &str, _args: &[&str]| -> Option<String> {
+            match bin {
+                "omp" => Some("  --plan-yolo   Force read-only plan mode".into()),
+                "opencode" => Some("build (primary)\nplan (primary)\nexplore (subagent)".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(phase_registry_probe("omp", &good), None);
+        assert_eq!(phase_registry_probe("opencode", &good), None);
+        assert_eq!(
+            phase_registry_probe("pi", &good),
+            None,
+            "no mechanic, no probe"
+        );
+
+        let drifted = |bin: &str, _args: &[&str]| -> Option<String> {
+            match bin {
+                "omp" => Some("  --model=<value>  (plan flag renamed away)".into()),
+                "opencode" => Some("build (primary)\nexplore (subagent)".into()),
+                _ => None,
+            }
+        };
+        let omp_problem = phase_registry_probe("omp", &drifted).expect("omp drift caught");
+        assert!(omp_problem.contains("--plan-yolo"), "{omp_problem}");
+        let oc_problem = phase_registry_probe("opencode", &drifted).expect("opencode drift caught");
+        assert!(oc_problem.contains("plan-mode agent"), "{oc_problem}");
+
+        // Unprobeable harness (binary gone) -> warn, not panic.
+        let dead = |_: &str, _: &[&str]| -> Option<String> { None };
+        assert!(phase_registry_probe("omp", &dead).is_some());
+    }
+
+    /// ADR-0022 §3.2 R2: loud degradation. A (harness, phase) pair with no
+    /// native mechanic returns empty args + degraded=true — the caller
+    /// warns, tags the run log `phase_degraded`, and the dispatch proceeds
+    /// in prompt mode. Never a silent no-op, never a panic.
+    #[test]
+    fn phase_registry_degrades_loudly_without_mechanic() {
+        for harness in ["pi", "grok", "pa", "hermes-unknown"] {
+            let (args, degraded) = phase_launch_args(harness, "plan");
+            assert!(args.is_empty(), "{harness}: no mechanic -> no args");
+            assert!(degraded, "{harness}: plan must degrade");
+        }
+        // Known harnesses degrade on phases they have no mechanic for.
+        for phase in ["resolve", "implement", "review", "ship"] {
+            let (_, degraded) = phase_launch_args("omp", phase);
+            assert!(degraded, "omp {phase}: no mechanic -> degraded");
+            let (_, degraded) = phase_launch_args("opencode", phase);
+            assert!(degraded, "opencode {phase}: no mechanic -> degraded");
+        }
+        // Unknown phase strings on a known harness degrade too.
+        let (args, degraded) = phase_launch_args("omp", "brainstorm");
+        assert!(args.is_empty());
+        assert!(degraded);
     }
 
     /// bd-gsvn.2: omp role models inject as `--smol/--slow/--plan`; every

@@ -974,6 +974,11 @@ enum Commands {
         /// owning cron name (P10.4 run-log attribution; `cron history` reads it)
         #[arg(long)]
         cron: Option<String>,
+        /// lifecycle phase (ADR-0022 W2): rides the phase registry
+        /// (`headless::phase_launch_args`); a harness without a native
+        /// mechanic degrades loudly + tags the run log `phase_degraded`
+        #[arg(long)]
+        phase: Option<String>,
         /// one JSON line for the parent runner (default: human summary)
         #[arg(long)]
         json: bool,
@@ -3626,6 +3631,7 @@ fn main() {
             harness,
             workflow,
             cron,
+            phase,
             json,
         }) => cmd_internal_run_headless(
             profile,
@@ -3634,6 +3640,7 @@ fn main() {
             harness.as_deref(),
             workflow.as_deref(),
             cron.as_deref(),
+            phase.as_deref(),
             *json,
         ),
         None => {
@@ -3889,7 +3896,17 @@ fn spawn_items_from_plan(
 /// add`). The routing registry layers compiled-in defaults under the
 /// user's models.toml. Explicit ad-hoc `--model` strings on the headless
 /// path keep the lenient passthrough.
-pub(crate) fn profile_launch_args(harness: &str, p: &profile::Profile) -> Result<Vec<String>> {
+/// ADR-0022 W2: `phase` (when the step's spec carries one) extends the
+/// launch args through the per-harness phase registry; a harness without a
+/// native mechanic for the phase degrades LOUDLY (warn here, `Ok` with the
+/// degraded flag surfaced via [`headless::phase_launch_args`] consumers —
+/// this fn keeps the plain `Vec<String>` contract, so degradation is
+/// reported on stderr only).
+pub(crate) fn profile_launch_args(
+    harness: &str,
+    p: &profile::Profile,
+    phase: Option<&str>,
+) -> Result<Vec<String>> {
     let registry = models::ModelRegistry::load_routing()?;
     let model = registry.resolve_strict(&p.model, harness)?;
     let mut args = headless::model_args(
@@ -3903,6 +3920,15 @@ pub(crate) fn profile_launch_args(harness: &str, p: &profile::Profile) -> Result
         &registry.resolve_strict(&p.slow, harness)?,
         &registry.resolve_strict(&p.plan, harness)?,
     ));
+    if let Some(phase) = phase.filter(|ph| !ph.is_empty()) {
+        let (extra, degraded) = headless::phase_launch_args(harness, phase);
+        if degraded {
+            eprintln!(
+                "flywheel: phase {phase:?} has no native mechanic on harness {harness:?} — degrading to prompt mode"
+            );
+        }
+        args.extend(extra);
+    }
     Ok(args)
 }
 /// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
@@ -4144,7 +4170,7 @@ mod spawn_profile_plan_tests {
         )
         .expect("models.toml");
         let p = profile("omp", "deepseek-v4-flash");
-        let args = profile_launch_args("omp", &p).expect("launch args");
+        let args = profile_launch_args("omp", &p, None).expect("launch args");
         assert_eq!(
             args,
             vec!["--model=opencode-go/deepseek-v4-flash"],
@@ -4160,19 +4186,19 @@ mod spawn_profile_plan_tests {
         // Compiled-in routing defaults apply zero-config (no models.toml).
         let p = profile("opencode", "deepseek-v4-flash");
         assert_eq!(
-            profile_launch_args("opencode", &p).expect("opencode"),
+            profile_launch_args("opencode", &p, None).expect("opencode"),
             vec!["-m", "opencode-go/deepseek-v4-flash"]
         );
         let pi = profile("pi", "glm-5.2");
         assert_eq!(
-            profile_launch_args("pi", &pi).expect("pi"),
+            profile_launch_args("pi", &pi, None).expect("pi"),
             vec!["--model", "zai/glm-5.2"]
         );
         let mut omp = profile("omp", "glm-5.2");
         omp.effort = "max".into();
         omp.smol = "deepseek-v4-flash".into();
         assert_eq!(
-            profile_launch_args("omp", &omp).expect("omp"),
+            profile_launch_args("omp", &omp, None).expect("omp"),
             vec![
                 "--model=zai/glm-5.2",
                 "--thinking=max",
@@ -4183,7 +4209,7 @@ mod spawn_profile_plan_tests {
         let mut unknown = profile("hermes", "glm-5.2");
         unknown.effort = "max".into();
         assert!(
-            profile_launch_args("hermes", &unknown)
+            profile_launch_args("hermes", &unknown, None)
                 .expect("unknown harness, routable model")
                 .is_empty()
         );
@@ -4198,28 +4224,28 @@ mod spawn_profile_plan_tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
         let p = profile("omp", "totally-unknown-model");
-        let err = profile_launch_args("omp", &p).expect_err("unknown id must fail");
+        let err = profile_launch_args("omp", &p, None).expect_err("unknown id must fail");
         assert!(
             err.to_string().contains("flywheel model add"),
             "error names the fix: {err}"
         );
         // big-pickle is opencode-only (free there alone): omp is refused.
         let bp = profile("omp", "big-pickle");
-        let err = profile_launch_args("omp", &bp).expect_err("caps must refuse omp");
+        let err = profile_launch_args("omp", &bp, None).expect_err("caps must refuse omp");
         assert!(
             err.to_string().contains("not routable"),
             "caps exclusion is an error: {err}"
         );
         // ...and routes on its capped harness.
         assert_eq!(
-            profile_launch_args("opencode", &profile("opencode", "big-pickle"))
+            profile_launch_args("opencode", &profile("opencode", "big-pickle"), None)
                 .expect("capped harness ok"),
             vec!["-m", "opencode/big-pickle"]
         );
         // A role model (smol) is held to the same standard.
         let mut role = profile("omp", "deepseek-v4-flash");
         role.smol = "ghost-role".into();
-        assert!(profile_launch_args("omp", &role).is_err());
+        assert!(profile_launch_args("omp", &role, None).is_err());
     }
 
     #[test]
@@ -4228,7 +4254,7 @@ mod spawn_profile_plan_tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
         let p = profile("opencode", "deepseek-v4-flash");
-        let mut args = profile_launch_args("opencode", &p).expect("launch args");
+        let mut args = profile_launch_args("opencode", &p, None).expect("launch args");
         args.extend(vec!["peer template".to_string()]);
         assert_eq!(
             args,
@@ -4305,7 +4331,7 @@ mod profile_run_spawn_tests {
         // `spawn --profile coder` — model + effort, never an empty arg list.
         let mut coder = profile("omp", "glm-5.2");
         coder.effort = "max".into();
-        let args = profile_launch_args("omp", &coder).expect("launch args");
+        let args = profile_launch_args("omp", &coder, None).expect("launch args");
         assert!(
             !args.is_empty(),
             "known profile must inject model/effort args"
@@ -5923,7 +5949,7 @@ projects available: {}",
                     let p = catalog
                         .get(pname)
                         .expect("profile resolved at plan build (bd-eign.13)");
-                    profile_launch_args(&kind, p)?
+                    profile_launch_args(&kind, p, None)?
                 }
                 None => vec![],
             };
@@ -15716,6 +15742,32 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
         }
     }
 
+    // ADR-0022 §3.2 R3 (bd-adr22-w2-phase-registry-igya): preflight
+    // phase-registry probe — per harness with a registered mechanic, verify
+    // the flag/mode still exists in the installed binary. A miss warns with
+    // the exact remedy (informational: drift degrades loudly at dispatch,
+    // it does not break deps).
+    {
+        let probe = |bin: &str, args: &[&str]| -> Option<String> {
+            let out = std::process::Command::new(bin).args(args).output().ok()?;
+            Some(String::from_utf8_lossy(&out.stdout).to_string())
+        };
+        let mut lines: Vec<String> = Vec::new();
+        for harness in ["omp", "opencode"] {
+            match headless::phase_registry_probe(harness, &probe) {
+                None => lines.push(format!("  {harness}: {}", status_paint(AgentStatus::Idle))),
+                Some(problem) => {
+                    lines.push(format!("  {harness}: {}", crate::output::warn("DRIFT")));
+                    eprintln!("flywheel: WARNING phase registry: {problem}");
+                }
+            }
+        }
+        println!("phase registry (plan):");
+        for l in &lines {
+            println!("{l}");
+        }
+    }
+
     match resonate_health(cfg) {
         Ok(_) => println!("resonate server: {}", status_paint(AgentStatus::Idle)),
         Err(e) => {
@@ -16070,7 +16122,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             let backend = backend::multiplexer_backend(cfg)?;
             let agent_name = format!("profile-{name}");
             let profile = cat.get(name).expect("resolve validated the profile above");
-            let args = profile_launch_args(&spec.harness, profile)?;
+            let args = profile_launch_args(&spec.harness, profile, None)?;
             // Find a pane in the default project workspace, or create one.
             let workspace = resolved_spec_workspace(cfg, backend.as_ref(), &spec.harness)?;
             let info = backend.agent_start(&agent_name, &spec.harness, &workspace, &args)?;
@@ -16836,7 +16888,7 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
                 for i in 0..n {
                     let agent_name = format!("squad-{name}-{profile_name}-{}", i + 1);
                     let workspace = resolved_spec_workspace(cfg, backend.as_ref(), &spec.harness)?;
-                    let args = profile_launch_args(&spec.harness, profile)?;
+                    let args = profile_launch_args(&spec.harness, profile, None)?;
                     let info =
                         backend.agent_start(&agent_name, &spec.harness, &workspace, &args)?;
                     // bd-l2ky: record the profiled entry so __send --profile
@@ -18015,8 +18067,43 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 engine.clone(),
                 stop.clone(),
             )?;
-            let output =
-                rt.block_on(async { engine.invoke(&run_id, invoke_wf, inputs_c.clone()).await })?;
+            let policy_receipts_count;
+            let output = {
+                // bd-compose-not-durable-oxjy: composed runs carry the same
+                // on_failure policy as catalog runs. The engine records
+                // PolicyEvents during invoke; drain them on the same runtime
+                // (one-shot — no cron loop) and execute the side-effects here,
+                // never silently dropping the decision.
+                let (output, policy_events) = rt.block_on(async {
+                    let out = engine.invoke(&run_id, invoke_wf, inputs_c.clone()).await?;
+                    let drained: Vec<toron_workflow::PolicyEvent> = {
+                        let mut guard = engine.policy_sink().lock().await;
+                        std::mem::take(&mut *guard)
+                    };
+                    Ok::<_, anyhow::Error>((out, drained))
+                })?;
+                let policy_receipts_count_ = policy_events.len();
+                for ev in &policy_events {
+                    match ev.action {
+                        toron_workflow::schema::FailureAction::Bead => {
+                            match cron::spawn_failure_bead(&ev.bundle) {
+                                Ok(id) => eprintln!(
+                                    "composed run {wf_name}: failure -> bead {id} ({}#{})",
+                                    ev.bundle.workflow, ev.bundle.consecutive
+                                ),
+                                Err(e) => eprintln!(
+                                    "composed run {wf_name}: policy bead side-effect failed: {e:#}"
+                                ),
+                            }
+                        }
+                        other => eprintln!(
+                            "composed run {wf_name}: policy action {other:?} recorded (side-effect not wired)"
+                        ),
+                    }
+                }
+                policy_receipts_count = policy_receipts_count_;
+                output
+            };
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             spawn_receipts = drainer
                 .join()
@@ -18043,6 +18130,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     "mode": "pane",
                     "panes": entries.len(),
                     "reaped": reaped,
+                    "policy_events": policy_receipts_count,
                 }),
             );
             if *json {
@@ -20114,6 +20202,8 @@ fn log_engine_dispatch(
         duration_ms: started.elapsed().as_millis() as u64,
         exit_code: if landed { 0 } else { 1 },
         error: None,
+        phase: None,
+        phase_degraded: false,
     };
     if let Err(e) = run_log::write_run(&entry) {
         eprintln!("flywheel: cannot write run log for @{profile_name}: {e:#}");
@@ -20523,7 +20613,7 @@ fn respawn_launch_args(cfg: &Config, project: &str, name: &str, kind: &str) -> V
     };
     match catalog
         .get(&profile_name)
-        .map(|p| profile_launch_args(kind, p))
+        .map(|p| profile_launch_args(kind, p, None))
     {
         Some(Ok(args)) => args,
         Some(Err(e)) => {
@@ -20555,6 +20645,7 @@ fn is_rate_limited(outcome: &headless::HarnessOutcome) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_internal_run_headless(
     profile_ref: &str,
     prompt: &str,
@@ -20562,6 +20653,7 @@ fn cmd_internal_run_headless(
     harness_override: Option<&str>,
     workflow: Option<&str>,
     cron: Option<&str>,
+    phase: Option<&str>,
     json: bool,
 ) -> Result<()> {
     use sha1::Digest;
@@ -20572,6 +20664,7 @@ fn cmd_internal_run_headless(
         model: String,
         outcome: headless::HarnessOutcome,
         rate_limited: bool,
+        phase_degraded: bool,
     }
 
     let profile_name = headless::strip_profile_ref(profile_ref);
@@ -20628,7 +20721,11 @@ fn cmd_internal_run_headless(
     // `model` (the actual used id).
     let run_once =
         |harness: &str, model_id: &str, model: &str, effort: &str| -> Result<RunAttempt> {
-            let argv = headless::build_argv_roles(
+            // ADR-0022 W2: the phase registry rides the launch argv (args
+            // inserted before the prompt positional); a harness without a
+            // native mechanic for the phase degrades LOUDLY here and the
+            // run entry is tagged below.
+            let (argv, phase_degraded) = headless::build_argv_roles_phase(
                 harness,
                 (!model.is_empty()).then_some(model),
                 (!effort.is_empty()).then_some(effort),
@@ -20636,6 +20733,7 @@ fn cmd_internal_run_headless(
                 &role_slow,
                 &role_plan,
                 prompt,
+                phase,
             )
             .map_err(|e| anyhow!("headless run for @{profile_name}: {e}"))?;
             let started = std::time::Instant::now();
@@ -20665,6 +20763,7 @@ fn cmd_internal_run_headless(
                 model: model.to_string(),
                 outcome,
                 rate_limited,
+                phase_degraded,
             })
         };
 
@@ -20700,6 +20799,7 @@ fn cmd_internal_run_headless(
         model_id: used_model_id,
         model: used_model,
         outcome,
+        phase_degraded,
         ..
     } = attempt;
 
@@ -20724,6 +20824,8 @@ fn cmd_internal_run_headless(
         duration_ms: outcome.duration_ms,
         exit_code: outcome.exit_code,
         error: outcome.error.clone(),
+        phase: phase.filter(|p| !p.is_empty()).map(str::to_string),
+        phase_degraded,
     };
     run_log::write_run(&entry)?;
 
@@ -20740,6 +20842,10 @@ fn cmd_internal_run_headless(
             "retried_fallback": retried_fallback,
             "duration_ms": entry.duration_ms,
         });
+        if let Some(p) = &entry.phase {
+            v["phase"] = json!(p);
+            v["phase_degraded"] = json!(phase_degraded);
+        }
         if let Some(e) = &entry.error {
             v["error"] = json!(e);
         }
@@ -20851,6 +20957,13 @@ pub(crate) fn headless_dispatch(
         && !h.trim().is_empty()
     {
         cmd.arg("--harness").arg(h);
+    }
+    // ADR-0022 W2: the spec's lifecycle phase rides to the leaf, which
+    // applies the per-harness phase registry (or degrades loudly).
+    if let Some(p) = headless::dispatch_spec_phase(spec)
+        && !p.trim().is_empty()
+    {
+        cmd.arg("--phase").arg(p);
     }
     if let Some(cron) = cron {
         cmd.arg("--cron").arg(cron);
