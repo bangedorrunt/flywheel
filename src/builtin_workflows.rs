@@ -1059,7 +1059,6 @@ pub fn builtin_workflows() -> BTreeMap<String, Workflow> {
 mod tests {
     use super::*;
     use crate::crew;
-    use serde_json::Value;
     use toron_workflow::lint_yaml;
     use toron_workflow::schema::CrewSpec;
 
@@ -1207,10 +1206,7 @@ mod tests {
         let Action::DispatchJob { spec, .. } = &ship.steps[0].action else {
             panic!("verify-predicate is a dispatch");
         };
-        let task = spec
-            .get("task")
-            .and_then(serde_json::Value::as_str)
-            .unwrap();
+        let task = spec.task.as_deref().unwrap();
         assert!(task.contains("br list --status ready"), "no ready beads");
         assert!(task.contains("claim-watch"), "claim-watch empty");
         assert!(task.contains("ledger check"), "ledger legal");
@@ -1218,7 +1214,7 @@ mod tests {
             panic!("ship is a dispatch");
         };
         assert_eq!(
-            spec.get("stage").and_then(serde_json::Value::as_str),
+            spec.stage.as_deref(),
             Some("commit-and-push"),
             "ship = p8 commit-and-push"
         );
@@ -1234,10 +1230,7 @@ mod tests {
         let Action::DispatchJob { spec, .. } = &aw.steps[0].action else {
             panic!("run-loop is a dispatch");
         };
-        let task = spec
-            .get("task")
-            .and_then(serde_json::Value::as_str)
-            .unwrap();
+        let task = spec.task.as_deref().unwrap();
         assert!(
             task.contains("flywheel loop run --work --on-blocked mail"),
             "the REAL loop"
@@ -1273,10 +1266,7 @@ mod tests {
         let Action::DispatchJob { spec, .. } = &pause.steps[0].action else {
             panic!("pause is a dispatch");
         };
-        let task = spec
-            .get("task")
-            .and_then(serde_json::Value::as_str)
-            .unwrap();
+        let task = spec.task.as_deref().unwrap();
         assert!(task.contains("checkpoint save"), "durable state snapshot");
         assert!(task.contains("EXACT resume command"), "standing handoff");
         assert!(
@@ -1296,10 +1286,7 @@ mod tests {
         let Action::DispatchJob { spec, .. } = &bb.steps[0].action else {
             panic!("babysit is a dispatch");
         };
-        let task = spec
-            .get("task")
-            .and_then(serde_json::Value::as_str)
-            .unwrap();
+        let task = spec.task.as_deref().unwrap();
         assert!(task.contains("ONE BEAD"), "one bead");
         assert!(
             task.contains("NEVER start new beads"),
@@ -1490,10 +1477,10 @@ mod tests {
         fn scan_action(action: &Action, name: &str, found: &mut u32) {
             match action {
                 Action::DispatchJob { spec, .. }
-                    if spec.get("profile").and_then(Value::as_str) == Some("@reviewer") =>
+                    if spec.profile.as_deref() == Some("@reviewer") =>
                 {
                     assert_eq!(
-                        spec.get("harness").and_then(Value::as_str),
+                        spec.harness.as_deref(),
                         Some("opencode"),
                         "{name}: reviewer step must override harness to opencode"
                     );
@@ -1574,11 +1561,11 @@ mod tests {
         let mut checked = 0u32;
         fn scan_action(action: &Action, name: &str, checked: &mut u32) {
             if let Action::DispatchJob { spec, .. } = action
-                && spec.get("stage").and_then(Value::as_str).is_some()
+                && spec.stage.as_deref().is_some()
             {
                 assert!(
-                    spec.get("task").is_none(),
-                    "{name}: a stage-ref dispatch must not carry inline task: {spec}"
+                    spec.task.is_none(),
+                    "{name}: a stage-ref dispatch must not carry inline task: {spec:?}"
                 );
                 *checked += 1;
             }
@@ -1617,7 +1604,7 @@ mod tests {
         if let Some(g) = &bug_fix.graph {
             for node in g.nodes.values() {
                 if let Action::DispatchJob { spec, .. } = &node.action
-                    && spec.get("task").and_then(Value::as_str).is_some()
+                    && spec.task.as_deref().is_some()
                 {
                     bug_fix_tasks += 1;
                 }
@@ -1703,10 +1690,7 @@ mod tests {
         let Action::DispatchJob { spec, .. } = &oracle.action else {
             unreachable!()
         };
-        let task = spec
-            .get("task")
-            .and_then(serde_json::Value::as_str)
-            .expect("oracle task present");
+        let task = spec.task.as_deref().expect("oracle task present");
         assert!(
             task.contains("{{steps.scout-fanout}}"),
             "oracle consumes scout findings"
@@ -1808,14 +1792,11 @@ mod tests {
             panic!("judge is a dispatch");
         };
         assert_eq!(
-            spec.get("stage").and_then(serde_json::Value::as_str),
+            spec.stage.as_deref(),
             Some("judge-arms"),
             "judge composes from the judge-arms stage"
         );
-        let plan = spec
-            .get("plan")
-            .and_then(serde_json::Value::as_str)
-            .expect("judge plan");
+        let plan = spec.plan.as_deref().expect("judge plan");
         assert!(
             plan.contains("Prototype arms"),
             "plan names the arms: {plan}"
@@ -1844,14 +1825,11 @@ mod tests {
             panic!("judge is a dispatch");
         };
         assert_eq!(
-            spec.get("stage").and_then(serde_json::Value::as_str),
+            spec.stage.as_deref(),
             Some("judge-arms"),
             "arena judge composes from judge-arms"
         );
-        let plan = spec
-            .get("plan")
-            .and_then(serde_json::Value::as_str)
-            .expect("judge plan");
+        let plan = spec.plan.as_deref().expect("judge plan");
         assert!(
             plan.contains("{{inputs.selection}}"),
             "selection rule declared up front"
@@ -1889,10 +1867,7 @@ mod tests {
                 let Action::DispatchJob { spec, .. } = &each.action else {
                     panic!("{name}: arm each is a dispatch_job");
                 };
-                let task = spec
-                    .get("task")
-                    .and_then(serde_json::Value::as_str)
-                    .expect("{name} arm dispatch task");
+                let task = spec.task.as_deref().expect("{name} arm dispatch task");
                 // the ban is EXPLICIT (no worktree) and no creation
                 // instruction exists (no `git worktree` command text)
                 assert!(
@@ -1953,7 +1928,7 @@ mod tests {
             panic!("beads step 0 is a dispatch_job");
         };
         assert_eq!(
-            spec.get("plan").and_then(Value::as_str),
+            spec.plan.as_deref(),
             Some("{{inputs.plan}}"),
             "beads dispatch spec carries the plan input"
         );
@@ -1980,7 +1955,7 @@ mod tests {
             panic!("triage step 1 is a dispatch_job");
         };
         assert_eq!(
-            spec.get("profile").and_then(Value::as_str),
+            spec.profile.as_deref(),
             Some("@housekeeper"),
             "triage dispatches via a profile, not a hardcoded name"
         );
@@ -2003,8 +1978,8 @@ mod tests {
                 panic!("{name}.{node} is a dispatch_job");
             };
             let task = spec
-                .get("task")
-                .and_then(Value::as_str)
+                .task
+                .as_deref()
                 .unwrap_or_else(|| panic!("{name}.{node} has a task"));
             assert!(
                 task.contains(token),
@@ -2022,7 +1997,7 @@ mod tests {
         let wfs = builtin_workflows();
         fn scan_action(action: &Action, wf: &str, dead: &mut Vec<String>) {
             match action {
-                Action::DispatchJob { spec, .. } if spec.get("prompt").is_some() => {
+                Action::DispatchJob { spec, .. } if spec.extra.contains_key("prompt") => {
                     dead.push(wf.to_string());
                 }
                 Action::Parallel { each, .. } => scan_action(&each.action, wf, dead),
@@ -2079,19 +2054,19 @@ mod tests {
                 panic!("goal.{step_name} is a dispatch_job");
             };
             assert_eq!(
-                spec.get("plan").and_then(Value::as_str),
+                spec.plan.as_deref(),
                 Some(plan_token),
                 "goal.{step_name} carries the prior output"
             );
             if let Some(h) = harness {
                 assert_eq!(
-                    spec.get("harness").and_then(Value::as_str),
+                    spec.harness.as_deref(),
                     Some(h),
                     "goal.{step_name} keeps the harness override"
                 );
             }
             assert_eq!(
-                spec.get("profile").and_then(Value::as_str).unwrap(),
+                spec.profile.as_deref().unwrap(),
                 match step_name {
                     "build" => "@coder",
                     "review" => "@reviewer",
@@ -2108,7 +2083,7 @@ mod tests {
             panic!("ship is a dispatch_job, not call_workflow triage");
         };
         assert_eq!(
-            spec.get("stage").and_then(Value::as_str),
+            spec.stage.as_deref(),
             Some("commit-and-push"),
             "ship reuses the commit-and-push stage"
         );
@@ -2209,7 +2184,7 @@ mod tests {
                 panic!("{name}.{step_name} is a dispatch_job");
             };
             assert_eq!(
-                spec.get("plan").and_then(Value::as_str),
+                spec.plan.as_deref(),
                 Some(token),
                 "{name}.{step_name} consumes the prior step output"
             );
@@ -2246,24 +2221,21 @@ mod tests {
         let Action::DispatchJob { spec, .. } = &gather.action else {
             panic!("gather is a dispatch_job");
         };
-        assert_eq!(spec.get("profile").and_then(Value::as_str), Some("@scout"));
+        assert_eq!(spec.profile.as_deref(), Some("@scout"));
         let synthesize = &g.nodes["synthesize"];
         let Action::DispatchJob { spec, .. } = &synthesize.action else {
             panic!("synthesize is a dispatch_job");
         };
-        assert_eq!(spec.get("profile").and_then(Value::as_str), Some("@oracle"));
+        assert_eq!(spec.profile.as_deref(), Some("@oracle"));
         assert!(synthesize.needs.contains(&"gather".to_string()));
         assert_eq!(synthesize.on_error, StepOnError::FailRun);
         let challenge = &g.nodes["challenge"];
         let Action::DispatchJob { spec, .. } = &challenge.action else {
             panic!("challenge is a dispatch_job");
         };
+        assert_eq!(spec.profile.as_deref(), Some("@reviewer"));
         assert_eq!(
-            spec.get("profile").and_then(Value::as_str),
-            Some("@reviewer")
-        );
-        assert_eq!(
-            spec.get("harness").and_then(Value::as_str),
+            spec.harness.as_deref(),
             Some("opencode"),
             "reviewer step pins the opencode harness (bd-42fs policy)"
         );
@@ -2380,14 +2352,8 @@ mod tests {
         let Action::DispatchJob { spec, .. } = &graph.nodes["prove"].action else {
             panic!("prove is a dispatch_job");
         };
-        assert_eq!(
-            spec.get("profile").and_then(Value::as_str),
-            Some("@reviewer")
-        );
-        assert_eq!(
-            spec.get("harness").and_then(Value::as_str),
-            Some("opencode")
-        );
+        assert_eq!(spec.profile.as_deref(), Some("@reviewer"));
+        assert_eq!(spec.harness.as_deref(), Some("opencode"));
     }
 
     /// The principle tags ride in the raw YAML with their CANONICAL names
@@ -2563,11 +2529,11 @@ mod tests {
         // The keep/discard discipline is the measure-keep-or-discard stage
         // (bd-h9xn extraction); the plan carries the iteration specifics.
         assert_eq!(
-            spec.get("stage").and_then(Value::as_str),
+            spec.stage.as_deref(),
             Some("measure-keep-or-discard"),
             "hillclimb attempts compose from measure-keep-or-discard"
         );
-        let plan = spec.get("plan").and_then(Value::as_str).unwrap_or("");
+        let plan = spec.plan.as_deref().unwrap_or("");
         assert!(
             plan.contains("DISCARD"),
             "attempt carries the discard rule: {plan}"

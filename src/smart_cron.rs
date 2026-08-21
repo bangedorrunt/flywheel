@@ -165,7 +165,7 @@ mod tests {
             match action {
                 Action::Spawn { profile, .. } => cb(profile),
                 Action::DispatchJob { spec, .. } => {
-                    if let Some(p) = spec.get("profile").and_then(|v| v.as_str()) {
+                    if let Some(p) = spec.profile.as_deref() {
                         cb(p);
                     }
                 }

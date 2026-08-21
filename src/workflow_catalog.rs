@@ -204,12 +204,24 @@ fn absorb_workflow_steps(name: &str, steps: &[LegacyStep]) -> (Workflow, Vec<Map
             LegacyStep::Send { to, stage, msg } => {
                 // Send{to,stage,msg} -> dispatch_job. The stage prompt / raw
                 // message is carried in the spec so the injected ActionRunner
-                // (the herdr-direct surface) preserves semantics.
-                let spec = serde_json::json!({
-                    "to": to,
-                    "stage": stage,
-                    "msg": msg,
-                });
+                // (the herdr-direct surface) preserves semantics. `stage` is
+                // a contract field; the legacy `to`/`msg` pair rides in
+                // `extra` (bd-dispatch-spec-untyped-0iud).
+                let spec = toron_workflow::schema::DispatchSpec {
+                    stage: stage.clone(),
+                    extra: [
+                        ("to".to_string(), serde_json::Value::String(to.clone())),
+                        (
+                            "msg".to_string(),
+                            msg.clone()
+                                .map(serde_json::Value::String)
+                                .unwrap_or(serde_json::Value::Null),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                };
                 unified.push(Step {
                     name: Some(format!("send-{i}")),
                     guard: None,
@@ -282,7 +294,12 @@ fn absorb_pipeline(name: &str, chain: &[String]) -> (Workflow, Option<MappingNot
             // not runnable until P5 lands.
             action: Action::DispatchJob {
                 assignee: wf_name.clone(),
-                spec: serde_json::json!({ "call_workflow": true }),
+                spec: toron_workflow::schema::DispatchSpec {
+                    extra: [("call_workflow".to_string(), serde_json::Value::Bool(true))]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
                 channel: None,
             },
         });
@@ -463,9 +480,15 @@ timeout_ms = 500
         match &wf.steps[0].action {
             Action::DispatchJob { assignee, spec, .. } => {
                 assert_eq!(assignee, "oc");
-                assert_eq!(spec["to"], "oc");
-                assert_eq!(spec["stage"], "p1");
-                assert_eq!(spec["msg"], "hello");
+                assert_eq!(
+                    spec.extra.get("to").and_then(serde_json::Value::as_str),
+                    Some("oc")
+                );
+                assert_eq!(spec.stage.as_deref(), Some("p1"));
+                assert_eq!(
+                    spec.extra.get("msg").and_then(serde_json::Value::as_str),
+                    Some("hello")
+                );
             }
             other => panic!("Send absorbed to DispatchJob, got {other:?}"),
         }
