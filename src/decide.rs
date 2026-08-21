@@ -391,6 +391,180 @@ pub fn decide(target: &str, snap: &Snapshot) -> Decision {
     )
 }
 
+// ---- ADR-0022 §3.7 T4 / W7: delegated composition coverage (bd-adr22-w7) ----
+
+/// The compose-request archetype (§3.7 T4): the shape of work a mailed
+/// objective asks for, driving which stage-first parts a candidate carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Archetype {
+    /// explore/map/survey — fan a scout across the target
+    ScoutFanout,
+    /// verify/prove/fence — repro → red → fix → prove
+    VerifyFence,
+    /// debate/argue/compare arms — judge competing approaches
+    Debate,
+    /// hillclimb/measure/optimize — baseline → keep-or-discard
+    Hillclimb,
+    /// review/audit — adversarial read of existing work
+    Review,
+}
+
+impl Archetype {
+    /// The tag surfaced in candidate rendering.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Archetype::ScoutFanout => "scout-fanout",
+            Archetype::VerifyFence => "verify-fence",
+            Archetype::Debate => "debate",
+            Archetype::Hillclimb => "hillclimb",
+            Archetype::Review => "review",
+        }
+    }
+
+    /// The stage-first parts this archetype composes from (real seed stages;
+    /// W6's affinity resolution dispatches each to its default role).
+    pub fn default_parts(self) -> &'static [&'static str] {
+        match self {
+            Archetype::ScoutFanout => &["fresh-eyes-explore"],
+            Archetype::VerifyFence => &["repro-baseline", "tdd-red", "minimal-fix", "prove-verify"],
+            Archetype::Debate => &["judge-arms"],
+            Archetype::Hillclimb => &["baseline-measure", "measure-keep-or-discard"],
+            Archetype::Review => &["code-review"],
+        }
+    }
+
+    fn classify(goal: &str) -> Self {
+        let t = goal.to_lowercase();
+        if has(
+            &t,
+            &[
+                "debate",
+                "argue",
+                "compare arms",
+                "judge arms",
+                "two approaches",
+            ],
+        ) {
+            Archetype::Debate
+        } else if has(
+            &t,
+            &["hillclimb", "keep-or-discard", "measure against baseline"],
+        ) {
+            Archetype::Hillclimb
+        } else if has(
+            &t,
+            &[
+                "verify",
+                "fence",
+                "repro",
+                "regression",
+                "prove",
+                "red-green",
+                "failing test",
+            ],
+        ) {
+            Archetype::VerifyFence
+        } else if has(&t, &["review", "audit", "fresh eyes", "code check"]) {
+            Archetype::Review
+        } else {
+            Archetype::ScoutFanout
+        }
+    }
+}
+
+/// One catalog entry as (name, description?) for coverage matching.
+pub type CatalogEntry<'a> = (&'a str, Option<&'a str>);
+
+/// The §3.7 T4 coverage report: does ANY catalog workflow cover `goal`?
+/// A hit names the workflow; a miss renders the archetype-matched compose
+/// candidate FOR APPROVAL (W7 never auto-runs it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageReport {
+    pub covered: bool,
+    /// The covering workflow name when covered.
+    pub matched: Option<String>,
+    pub archetype: Archetype,
+    /// Some(...) only on a miss — the rendered-for-approval candidate.
+    pub candidate_parts: Option<Vec<String>>,
+}
+
+/// Significant-token coverage: a goal token counts when >=4 chars and not a
+/// stopword; the entry covers when every such token appears in its name or
+/// description. Pure + deterministic.
+fn goal_tokens(goal: &str) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "the", "and", "for", "with", "this", "that", "then", "into", "from", "make", "make",
+        "want", "need", "please", "should", "would", "work", "workflow",
+    ];
+    goal.split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|w| w.len() >= 4 && !STOP.contains(&w.as_str()))
+        .collect()
+}
+
+pub fn coverage_report(goal: &str, catalog: &[CatalogEntry]) -> CoverageReport {
+    let tokens = goal_tokens(goal);
+    let archetype = Archetype::classify(goal);
+    let mut matched = None;
+    if !tokens.is_empty() {
+        for (name, desc) in catalog {
+            let hay = format!("{name} {}", desc.unwrap_or("")).to_lowercase();
+            if tokens.iter().all(|t| hay.contains(t.as_str())) {
+                matched = Some((*name).to_string());
+                break;
+            }
+        }
+    }
+    let covered = matched.is_some();
+    CoverageReport {
+        covered,
+        matched,
+        archetype,
+        candidate_parts: if covered {
+            None
+        } else {
+            Some(
+                archetype
+                    .default_parts()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            )
+        },
+    }
+}
+
+/// Render a coverage-miss candidate FOR APPROVAL. The text is the contract:
+/// it names the objective, archetype, proposed parts, and says explicitly
+/// that nothing runs until an operator approves (`workflow compose --run`).
+pub fn render_compose_candidate_for_approval(
+    requester: &str,
+    objective: &str,
+    archetype: Archetype,
+    parts: &[String],
+) -> String {
+    format!(
+        "COMPOSE CANDIDATE (approval required — W7 never auto-runs): requester {requester} \
+         mailed a compose-request with no catalog coverage.\n  objective: {objective}\n  \
+         archetype: {}\n  parts: {}\nApprove with: flywheel workflow compose '{objective}' \
+         --parts '{}' --run",
+        archetype.tag(),
+        parts.join(","),
+        parts.join(",")
+    )
+}
+
+/// The contact/policy allowlist gate (§3.7 T4): a compose-request dispatches
+/// ONLY from an allowlisted sender. Exact pin match after trim — deny is the
+/// default, and the deny case NEVER dispatches (the loop drops it with a log).
+pub fn compose_request_allowed(sender: &str, allowlist: &[String]) -> bool {
+    let s = sender.trim();
+    !s.is_empty() && allowlist.iter().any(|a| a.trim() == s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,12 +1030,80 @@ mod tests {
     fn rows_keep_audit_loop_work_and_steer_anchors() {
         // audit + implement still steers (no bug-shaped needle).
         let d = decide("audit then fix the tracker", &snap());
-        assert_eq!(d.primitive, "steer");
-        // plain implement without a playbook needle still steers.
+        assert_eq!(d.primitive, "steer"); // plain implement without a playbook needle still steers.
         let d2 = decide("fix the tracker", &snap());
         assert_eq!(d2.primitive, "steer");
         // ready beads + work intent still loop-work (no new-row needle hits).
         let d3 = decide("work the ready beads", &with_beads(3));
         assert_eq!(d3.primitive, "loop-work");
+    }
+
+    // ---- W7 (§3.7 T4): coverage report + archetype + allowlist ----
+
+    #[test]
+    fn w7_coverage_hit_names_workflow_no_candidate() {
+        let cat = vec![
+            ("weekly-review", Some("review the week and land beads")),
+            ("nightly-fence", Some("run the verify fence nightly")),
+        ];
+        let r = coverage_report("run the verify fence for me", &cat);
+        assert!(r.covered, "token-covered entry matches");
+        assert_eq!(r.matched.as_deref(), Some("nightly-fence"));
+        assert!(r.candidate_parts.is_none(), "no candidate on a hit");
+    }
+
+    #[test]
+    fn w7_coverage_miss_renders_candidate_not_autorun() {
+        let cat = vec![("totally-unrelated", Some("ships widgets"))];
+        let r = coverage_report("adversarial review of the parser module", &cat);
+        assert!(!r.covered);
+        assert_eq!(r.matched, None);
+        let parts = r.candidate_parts.expect("miss renders candidate parts");
+        assert_eq!(parts.join(","), "code-review", "review archetype parts");
+        let rendered = render_compose_candidate_for_approval(
+            "SandySparrow",
+            "adversarial review of the parser module",
+            r.archetype,
+            &parts,
+        );
+        assert!(
+            rendered.contains("approval required") && rendered.contains("--parts"),
+            "candidate is for APPROVAL with the exact command: {rendered}"
+        );
+        assert!(
+            !rendered.contains("--run --keep") || rendered.contains("Approve with"),
+            "never auto-run in W7"
+        );
+    }
+
+    #[test]
+    fn w7_archetype_classification_table() {
+        use Archetype::*;
+        assert_eq!(Archetype::classify("debate the two approaches"), Debate);
+        assert_eq!(Archetype::classify("hillclimb the cache policy"), Hillclimb);
+        assert_eq!(
+            Archetype::classify("verify the fence around flaky repro"),
+            VerifyFence
+        );
+        assert_eq!(Archetype::classify("fresh-eyes review of cron.rs"), Review);
+        assert_eq!(
+            Archetype::classify("explore and map this unknown crate"),
+            ScoutFanout,
+            "fallback archetype"
+        );
+    }
+
+    #[test]
+    fn w7_allowlist_gate_deny_never_dispatches() {
+        let allow = vec!["SandySparrow".to_string(), "TanFern".to_string()];
+        assert!(compose_request_allowed("SandySparrow", &allow));
+        assert!(
+            !compose_request_allowed("SomeImpostor", &allow),
+            "deny default"
+        );
+        assert!(!compose_request_allowed("", &allow), "empty sender denies");
+        assert!(!compose_request_allowed("  ", &allow));
+        // Case-exact pins: near-miss casing denies (pins are CamelCase).
+        assert!(!compose_request_allowed("sandysparrow", &allow));
     }
 }

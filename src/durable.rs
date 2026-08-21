@@ -2328,6 +2328,104 @@ async fn notify_blocked(args: NotifyArgs) -> Result<EscalationOutcome> {
     Ok(EscalationOutcome { tier, ping_count })
 }
 
+// ---- ADR-0022 §3.7 T4 / W7: delegated composition via mail --------------
+// Any allowlisted agent mails a `[compose-request]` job; the loop honors it
+// ONLY through two gates: the contact/policy allowlist (deny NEVER
+// dispatches) and decide's coverage report. A catalog hit queues guidance
+// naming the existing workflow; a miss renders the archetype-matched compose
+// candidate FOR APPROVAL — W7 never auto-runs a composed workflow from mail.
+
+/// One compose-request row's loop-side decision. Pure — unit-tested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposeRequestOutcome {
+    /// Sender not on the allowlist: dropped with a log line, never queued.
+    Denied,
+    /// The catalog already covers the objective: guidance names the workflow.
+    Covered { workflow: String },
+    /// No coverage: the rendered candidate is queued FOR APPROVAL.
+    CandidateForApproval { prompt: String },
+}
+
+/// Decide one compose-request mail row. `spec_json` is the message body
+/// (a ComposeRequestSpec value); `catalog` is (name, description?) pairs.
+pub fn plan_compose_request(
+    sender: &str,
+    spec_json: &str,
+    allowlist: &[String],
+    catalog: &[crate::decide::CatalogEntry],
+) -> ComposeRequestOutcome {
+    // Gate 1 — contact/policy allowlist. Deny is silent-ish (log at the call
+    // site) and terminal: no parse, no coverage, no queue.
+    if !crate::decide::compose_request_allowed(sender, allowlist) {
+        return ComposeRequestOutcome::Denied;
+    }
+    // Parse the spec shape (toron-workflow jobs).
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(spec_json.trim()) else {
+        return ComposeRequestOutcome::Denied; // unparseable = not dispatchable
+    };
+    let Ok(spec) = toron_workflow::jobs::ComposeRequestSpec::parse(&v) else {
+        return ComposeRequestOutcome::Denied;
+    };
+    // Gate 2 — decide's coverage report.
+    let report = crate::decide::coverage_report(&spec.objective, catalog);
+    if report.covered {
+        return ComposeRequestOutcome::Covered {
+            workflow: report.matched.unwrap_or_default(),
+        };
+    }
+    let parts = report.candidate_parts.unwrap_or_default();
+    let prompt = crate::decide::render_compose_candidate_for_approval(
+        sender,
+        &spec.objective,
+        report.archetype,
+        &parts,
+    );
+    ComposeRequestOutcome::CandidateForApproval { prompt }
+}
+
+/// Fetch `[compose-request]` rows + the project allowlist (checkpointed
+/// leaf; all file/mail access stays in the subprocess). Soft-fail empty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeRequestRow {
+    pub id: String,
+    pub from: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeInboxArgs {
+    pub project: String,
+    pub limit: u32,
+}
+
+#[function]
+async fn poll_compose_requests(
+    args: ComposeInboxArgs,
+) -> Result<(Vec<ComposeRequestRow>, Vec<String>)> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args([
+        "__compose-inbox",
+        &args.project,
+        "--limit",
+        &args.limit.to_string(),
+    ]);
+    let out = run_leaf_cmd(cmd, "__compose-inbox").await?;
+    if !out.status.success() {
+        return Ok((vec![], vec![]));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v: Value =
+        serde_json::from_str(raw.trim()).unwrap_or(json!({ "items": [], "allowlist": [] }));
+    let items = v.get("items").cloned().unwrap_or(json!([]));
+    let rows: Vec<ComposeRequestRow> = serde_json::from_value(items).unwrap_or_default();
+    let allowlist = v
+        .get("allowlist")
+        .and_then(|a| serde_json::from_value::<Vec<String>>(a.clone()).ok())
+        .unwrap_or_default();
+    Ok((rows, allowlist))
+}
+
 /// Scan orchestrator inbox for `[xproj]` requests. Soft-fail empty.
 #[function]
 async fn poll_xproj_inbox(args: XprojInboxArgs) -> Result<Vec<crate::XprojInboxItem>> {
@@ -4025,6 +4123,64 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 "queued"
             };
             eprintln!("flywheel: cross-project request msg {} {action}", item.id);
+        }
+
+        // ---- delegated composition (ADR-0022 §3.7 T4, W7) ----
+        // Scan inbox for [compose-request] jobs. Two gates, in order:
+        // allowlist (deny NEVER dispatches) then decide's coverage report.
+        // A catalog hit queues guidance; a miss queues the candidate FOR
+        // APPROVAL — W7 never auto-runs a composed workflow from mail.
+        let (compose_rows, compose_allowlist) = ctx
+            .run(
+                poll_compose_requests,
+                ComposeInboxArgs {
+                    project: params.project.clone(),
+                    limit: 30,
+                },
+            )
+            .await
+            .unwrap_or_else(|_| (vec![], vec![]));
+        if !compose_rows.is_empty() {
+            let catalog_owned: Vec<(String, Option<String>)> =
+                crate::workflow_catalog::WorkflowCatalog::load_layered(None)
+                    .map(|cat| {
+                        cat.workflows
+                            .iter()
+                            .map(|(n, w)| {
+                                (n.clone(), Some(w.description.clone().unwrap_or_default()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            let catalog: Vec<crate::decide::CatalogEntry> = catalog_owned
+                .iter()
+                .map(|(n, d)| (n.as_str(), d.as_deref()))
+                .collect();
+            for row in &compose_rows {
+                let outcome =
+                    plan_compose_request(&row.from, &row.body, &compose_allowlist, &catalog);
+                match outcome {
+                    ComposeRequestOutcome::Denied => {
+                        seen_xproj.insert(row.id.clone()); // handled = dropped
+                        eprintln!(
+                            "flywheel: compose-request msg {} denied (sender not allowlisted) — never dispatched",
+                            row.id
+                        );
+                    }
+                    ComposeRequestOutcome::Covered { workflow } => {
+                        queue.push(format!(
+                            "COMPOSE-REQUEST covered: catalog workflow {workflow:?} already covers the objective from {}. \
+                             Reply in-thread pointing the requester at `flywheel workflow run {workflow}`.",
+                            row.from
+                        ));
+                        seen_xproj.insert(row.id.clone());
+                    }
+                    ComposeRequestOutcome::CandidateForApproval { prompt } => {
+                        queue.push(prompt);
+                        seen_xproj.insert(row.id.clone()); // queued = handled
+                    }
+                }
+            }
         }
 
         // self-heal (bd-event-self-heal): diagnose → respawn (budgeted) → blocked.
@@ -5959,6 +6115,88 @@ mod reply_verify_tests {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- W7 (§3.7 T4): delegated composition gates (bd-adr22-w7) ----
+
+    const W7_CATALOG: &[crate::decide::CatalogEntry] = &[
+        ("nightly-fence", Some("run the verify fence nightly")),
+        ("weekly-review", Some("review the week and land beads")),
+    ];
+
+    fn w7_spec_json(objective: &str) -> String {
+        serde_json::json!({ "objective": objective, "requester": "SandySparrow" }).to_string()
+    }
+
+    /// REQUIRED W7 test: the allowlist gate — a non-allowlisted sender's
+    /// compose-request is Denied and NEVER dispatches (no queue prompt,
+    /// no candidate, nothing).
+    #[test]
+    fn w7_allowlist_deny_never_dispatches() {
+        let allow = vec!["SandySparrow".to_string()];
+        // Allowed sender on an uncovered objective -> candidate.
+        assert!(matches!(
+            plan_compose_request(
+                "SandySparrow",
+                &w7_spec_json("map the unknown frobnicator"),
+                &allow,
+                W7_CATALOG
+            ),
+            ComposeRequestOutcome::CandidateForApproval { .. }
+        ));
+        // Same body from a NON-allowlisted sender -> Denied, full stop.
+        assert_eq!(
+            plan_compose_request(
+                "SomeImpostor",
+                &w7_spec_json("map the unknown frobnicator"),
+                &allow,
+                W7_CATALOG
+            ),
+            ComposeRequestOutcome::Denied
+        );
+        // Even garbage/unparseable bodies stay Denied for outsiders.
+        assert_eq!(
+            plan_compose_request("SomeImpostor", "not json at all", &allow, W7_CATALOG),
+            ComposeRequestOutcome::Denied
+        );
+    }
+
+    /// REQUIRED W7 test: decide coverage miss renders the compose candidate
+    /// FOR APPROVAL (never auto-run); a hit names the covering workflow.
+    #[test]
+    fn w7_coverage_miss_renders_for_approval_hit_names_workflow() {
+        let allow = vec!["SandySparrow".to_string()];
+        // MISS: uncovered objective -> approval-required candidate.
+        let miss = plan_compose_request(
+            "SandySparrow",
+            &w7_spec_json("adversarial review of the parser module"),
+            &allow,
+            W7_CATALOG,
+        );
+        let ComposeRequestOutcome::CandidateForApproval { prompt } = miss else {
+            panic!("expected candidate, got {miss:?}");
+        };
+        assert!(
+            prompt.contains("approval required") && prompt.contains("--parts"),
+            "candidate carries the approval contract + exact command: {prompt}"
+        );
+        assert!(
+            prompt.contains("never auto-runs"),
+            "W7 approval contract explicit: {prompt}"
+        );
+        // HIT: covered objective -> guidance naming the workflow.
+        let hit = plan_compose_request(
+            "SandySparrow",
+            &w7_spec_json("run the verify fence for me"),
+            &allow,
+            W7_CATALOG,
+        );
+        assert_eq!(
+            hit,
+            ComposeRequestOutcome::Covered {
+                workflow: "nightly-fence".to_string()
+            }
+        );
+    }
     use super::*;
     use crate::agentstate::AgentStateFile;
 

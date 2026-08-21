@@ -855,6 +855,14 @@ enum Commands {
         #[arg(long, default_value = "30")]
         limit: u32,
     },
+    /// internal: scan inbox for `[compose-request]` jobs + the allowlist
+    /// (ADR-0022 §3.7 T4, W7 delegated composition)
+    #[command(name = "__compose-inbox", hide = true)]
+    __ComposeInbox {
+        project: String,
+        #[arg(long, default_value = "30")]
+        limit: u32,
+    },
     /// internal: mail digest for one agent (unread counts + last sender/subject)
     #[command(name = "__mail-digest", hide = true)]
     __MailDigest { project: String, agent: String },
@@ -3593,6 +3601,9 @@ fn main() {
         }) => cmd_internal_diagnose(&cfg, project, name, reason),
         Some(Commands::__XprojInbox { project, limit }) => {
             cmd_internal_xproj_inbox(&cfg, project, *limit)
+        }
+        Some(Commands::__ComposeInbox { project, limit }) => {
+            cmd_internal_compose_inbox(&cfg, project, *limit)
         }
         Some(Commands::__MailDigest { project, agent }) => {
             cmd_internal_mail_digest(&cfg, project, agent)
@@ -22099,6 +22110,120 @@ fn cmd_internal_remind_reply(
     let v: serde_json::Value = serde_json::from_str(raw.trim())
         .map_err(|e| anyhow!("__remind-reply: bad __send JSON: {e}: {raw}"))?;
     print_json(&v);
+    Ok(())
+}
+
+/// Extract `[compose-request]` items from a `fetch_inbox` JSON value
+/// (ADR-0022 §3.7 T4, W7) — same envelope as xproj items, subject-prefix
+/// filter `[compose-request]`. Pure + unit-tested.
+pub fn extract_compose_requests_from_inbox(v: &serde_json::Value) -> Vec<XprojInboxItem> {
+    let arr = v
+        .as_array()
+        .or_else(|| v.get("messages").and_then(|m| m.as_array()))
+        .or_else(|| v.get("result").and_then(|m| m.as_array()))
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for m in arr {
+        let subject = m
+            .get("subject")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !subject
+            .to_ascii_lowercase()
+            .starts_with("[compose-request]")
+        {
+            continue;
+        }
+        let body = m
+            .get("body_md")
+            .or_else(|| m.get("body"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        let id = match m.get("id") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            _ => String::new(),
+        };
+        let thread_id = m
+            .get("thread_id")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        let from = m
+            .get("from")
+            .or_else(|| m.get("sender"))
+            .and_then(|f| f.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(XprojInboxItem {
+            id,
+            subject,
+            body,
+            thread_id,
+            from,
+        });
+    }
+    out
+}
+
+/// The compose-request allowlist (§3.7 T4): `<project>/.flywheel/compose-
+/// allowlist.toml` — `senders = ["Pin", ...]`. Missing file = empty list =
+/// every request denied (deny is the default; the gate never dispatches on
+/// an unconfigured project).
+pub fn load_compose_allowlist(project_root: &Path) -> Vec<String> {
+    #[derive(Deserialize)]
+    struct Allowlist {
+        #[serde(default)]
+        senders: Vec<String>,
+    }
+    let path = project_root.join(".flywheel/compose-allowlist.toml");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| toml::from_str::<Allowlist>(&raw).ok())
+        .map(|a| a.senders)
+        .unwrap_or_default()
+}
+
+fn cmd_internal_compose_inbox(cfg: &Config, project: &str, limit: u32) -> Result<()> {
+    // W7 leaf: [compose-request] rows + the allowlist, resolved in the
+    // subprocess (checkpoint-safe); the loop applies the pure gates.
+    let mail = match backend::mail_backend(cfg) {
+        Ok(m) => m,
+        Err(_) => {
+            print_json(&json!({ "items": [], "allowlist": [] }));
+            return Ok(());
+        }
+    };
+    let key = project_dir_str(cfg, project)?;
+    if backend::run_mail(mail.ensure_project(&key)).is_err() {
+        print_json(&json!({ "items": [], "allowlist": [] }));
+        return Ok(());
+    }
+    let name = mail.agent_name().to_string();
+    let v = match backend::run_mail(mail.inbox(&backend::InboxQuery {
+        project: key.clone(),
+        agent: name,
+        unread_only: false,
+        urgent_only: false,
+        include_bodies: true,
+        limit: Some(limit as usize),
+        since_ts: None,
+        thread_id: None,
+    })) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("flywheel: compose-inbox fetch failed: {e:#}");
+            print_json(&json!({ "items": [], "allowlist": [] }));
+            return Ok(());
+        }
+    };
+    let v_json = serde_json::to_value(&v).unwrap_or_default();
+    let items = extract_compose_requests_from_inbox(&v_json);
+    let allowlist = load_compose_allowlist(&project_dir(cfg, project));
+    print_json(&json!({ "items": items, "allowlist": allowlist }));
     Ok(())
 }
 
