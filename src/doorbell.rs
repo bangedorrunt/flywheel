@@ -314,13 +314,19 @@ pub fn stamp_line(msg: &str, record: &WatcherGen) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockAction {
     Start,
-    Attach { pid: u32 },
-    Reloaded { stale: u32 },
+    Attach {
+        pid: u32,
+    },
+    Reloaded {
+        stale: u32,
+    },
     /// Live pid whose generation is missing or predates the current
     /// binary: it runs pre-fix wake code and must be replaced (a pre-fix
     /// watcher can never retire itself — the retire logic does not exist
     /// in its binary).
-    Superseded { pid: u32 },
+    Superseded {
+        pid: u32,
+    },
 }
 
 pub fn inspect_lock_with(path: &Path, alive: impl Fn(u32) -> bool) -> LockAction {
@@ -1364,7 +1370,10 @@ mod tests {
             binary_len: 1,
         };
         assert!(record.stale(Path::new("/nonexistent/flywheel-bin")));
-        assert!(!inject_allowed(&record, Path::new("/nonexistent/flywheel-bin")));
+        assert!(!inject_allowed(
+            &record,
+            Path::new("/nonexistent/flywheel-bin")
+        ));
     }
 
     #[test]
