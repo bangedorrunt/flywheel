@@ -11570,11 +11570,21 @@ pub(crate) fn wake_urgent(rows: &[Value]) -> Vec<&Value> {
             .map(|i| i == "high" || i == "urgent")
             .unwrap_or(false)
     };
-    let is_read = |m: &Value| {
-        m.get("read_ts_us")
-            .map(|v| !v.is_null())
-            .unwrap_or(false)
+    // bd-kryk: system/transport notifications never wake — a reservation
+    // release (empty subject, "reservation … released …" body) is the loop
+    // talking to itself. Shape-matched so a mis-tagged importance=high copy
+    // still cannot manufacture a phantom urgent.
+    let is_transport_noise = |m: &Value| {
+        let subj_empty = m
+            .get("subject")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .trim()
+            .is_empty();
+        let body = m.get("body_md").and_then(|b| b.as_str()).unwrap_or("");
+        subj_empty && body.trim_start().starts_with("reservation ") && body.contains("released")
     };
+    let is_read = |m: &Value| m.get("read_ts_us").map(|v| !v.is_null()).unwrap_or(false);
     let is_assign = |m: &Value| {
         m.get("subject")
             .and_then(|s| s.as_str())
@@ -11607,6 +11617,9 @@ pub(crate) fn wake_urgent(rows: &[Value]) -> Vec<&Value> {
     let mut duplicate_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut deduped: Vec<&Value> = Vec::new();
     for m in rows {
+        if is_transport_noise(m) {
+            continue;
+        }
         if !urgent(m) {
             continue;
         }
@@ -11751,6 +11764,45 @@ mod wake_identity_tests {
             "id": "m1", "sender": "PinkGorge", "subject": "[bd-1] help",
             "body_md": "x", "importance": "urgent", "thread_id": "t1",
             "created_ts_us": 1000,
+        })];
+        assert_eq!(wake_urgent(&rows).len(), 1);
+    }
+
+    /// bd-kryk: a system/transport notification (reservation release —
+    /// empty subject, "reservation … released …" body) NEVER wakes, even
+    /// when mis-tagged importance=high. This is the phantom-urgent bug: the
+    /// loop's own transport chatter manufactured wake banners.
+    #[test]
+    fn kryk_wake_urgent_excludes_reservation_release_noise() {
+        let noise_high = json!({
+            "id": "n1", "sender": "994d117d", "subject": "",
+            "body_md": "reservation crates/x.rs (TealDune by CoralFinch) released because bead bd-x closed",
+            "importance": "high", "created_ts_us": 1000,
+        });
+        let noise_normal = json!({
+            "id": "n2", "sender": "994d117d", "subject": "",
+            "body_md": "reservation src/y.rs (A by B) released because bead bd-y closed",
+            "importance": "normal", "created_ts_us": 1001,
+        });
+        let real = json!({
+            "id": "m1", "sender": "PinkGorge", "subject": "[bd-1] help",
+            "body_md": "x", "importance": "urgent", "thread_id": "t1",
+            "created_ts_us": 1002,
+        });
+        let rows = vec![noise_high, noise_normal, real];
+        let out = wake_urgent(&rows);
+        assert_eq!(out.len(), 1, "only the real message wakes: {out:?}");
+        assert_eq!(out[0]["id"], "m1");
+    }
+
+    /// bd-kryk: a REAL peer message with an empty subject still wakes —
+    /// the transport-noise shape requires the reservation-release body.
+    #[test]
+    fn kryk_empty_subject_non_transport_still_wakes() {
+        let rows = vec![json!({
+            "id": "m2", "sender": "SandySparrow", "subject": "",
+            "body_md": "decision: agreed — lease released to you",
+            "importance": "high", "created_ts_us": 1000,
         })];
         assert_eq!(wake_urgent(&rows).len(), 1);
     }
