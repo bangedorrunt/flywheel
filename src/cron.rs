@@ -1461,7 +1461,10 @@ owner = "housekeeper"
         let runner = cron_runner(&e);
         let err = runner(&Action::DispatchJob {
             assignee: "x".into(),
-            spec: serde_json::json!({ "profile": "@planner" }),
+            spec: toron_workflow::schema::DispatchSpec {
+                profile: Some("@planner".into()),
+                ..Default::default()
+            },
             channel: None,
         })
         .unwrap_err();
@@ -1491,7 +1494,11 @@ owner = "housekeeper"
         for a in [
             Action::DispatchJob {
                 assignee: "x".into(),
-                spec: serde_json::json!({ "profile": "@scout", "task": "..." }),
+                spec: toron_workflow::schema::DispatchSpec {
+                    profile: Some("@scout".into()),
+                    task: Some("...".into()),
+                    ..Default::default()
+                },
                 channel: None,
             },
             Action::CallWebhook {

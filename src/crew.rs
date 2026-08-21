@@ -200,11 +200,12 @@ pub fn compose_workflow(
                     build_slot: false,
                     action: Action::DispatchJob {
                         assignee: "x".to_string(),
-                        spec: serde_json::json!({
-                            "profile": format!("@{role}"),
-                            "stage": stage,
-                            "task": objective,
-                        }),
+                        spec: toron_workflow::schema::DispatchSpec {
+                            profile: Some(format!("@{role}")),
+                            stage: Some(stage.clone()),
+                            task: Some(objective.to_string()),
+                            ..Default::default()
+                        },
                         channel: None,
                     },
                 };
@@ -416,7 +417,7 @@ fn infer_auto(
     ) {
         match action {
             Action::DispatchJob { spec, .. } => {
-                if let Some(role) = spec.get("profile").and_then(|p| p.as_str()) {
+                if let Some(role) = spec.profile.as_deref() {
                     bump_role(role, counts);
                 }
             }
@@ -466,7 +467,6 @@ fn infer_auto(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
     use toron_workflow::schema::parse_workflow;
 
     /// `crew: auto` infers members from the workflow's profile refs
@@ -655,8 +655,8 @@ steps:
         assert!(matches!(
             &wf.steps[0].action,
             Action::DispatchJob { spec, .. }
-                if spec.get("profile").and_then(Value::as_str) == Some("@scout")
-                    && spec.get("stage").and_then(Value::as_str) == Some("fresh-eyes-explore")
+                if spec.profile.as_deref() == Some("@scout")
+                    && spec.stage.as_deref() == Some("fresh-eyes-explore")
         ));
         assert!(matches!(
             &wf.steps[1].action,
@@ -702,7 +702,7 @@ steps:
         assert!(matches!(
             &wf.steps[1].action,
             Action::DispatchJob { spec, .. }
-                if spec.get("profile").and_then(Value::as_str) == Some("@coder")
+                if spec.profile.as_deref() == Some("@coder")
         ));
     }
 
@@ -966,7 +966,10 @@ steps:
             build_slot: false,
             action: Action::DispatchJob {
                 assignee: "x".into(),
-                spec: serde_json::json!({ "profile": profile }),
+                spec: toron_workflow::schema::DispatchSpec {
+                    profile: Some(profile.to_string()),
+                    ..Default::default()
+                },
                 channel: None,
             },
         };

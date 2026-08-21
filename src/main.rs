@@ -17884,10 +17884,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                             "  - {} ({})",
                             s.name.as_deref().unwrap_or("<unnamed>"),
                             match &s.action {
-                                Action::DispatchJob { spec, .. } => spec
-                                    .get("profile")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("dispatch"),
+                                Action::DispatchJob { spec, .. } =>
+                                    spec.profile.as_deref().unwrap_or("dispatch"),
                                 Action::CallWorkflow { workflow, .. } => workflow.as_str(),
                                 other => other.type_name(),
                             }

@@ -16,6 +16,7 @@
 
 use anyhow::{Result, bail};
 use serde_json::Value;
+use toron_workflow::schema::DispatchSpec;
 
 /// The outcome of one headless harness invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,29 +247,29 @@ pub fn conditioned_prompt(behavior: &str, base: &str) -> String {
 }
 
 /// The profile reference in a dispatch spec (`spec.profile`, e.g. `@planner`).
-pub fn dispatch_spec_profile(spec: &Value) -> Option<&str> {
-    spec.get("profile").and_then(Value::as_str)
+pub fn dispatch_spec_profile(spec: &DispatchSpec) -> Option<&str> {
+    spec.profile.as_deref()
 }
 
 /// The stage name in a dispatch spec (`spec.stage`, e.g. `systematic-execute`).
-pub fn dispatch_spec_stage(spec: &Value) -> Option<&str> {
-    spec.get("stage").and_then(Value::as_str)
+pub fn dispatch_spec_stage(spec: &DispatchSpec) -> Option<&str> {
+    spec.stage.as_deref()
 }
 
 /// The per-step harness override in a dispatch spec (`spec.harness`, e.g.
 /// `opencode` — bd-42fs step 5). When present, the runner uses this harness
 /// INSTEAD of the profile's default (review/debate workflows pin the
 /// reviewer to opencode).
-pub fn dispatch_spec_harness(spec: &Value) -> Option<&str> {
-    spec.get("harness").and_then(Value::as_str)
+pub fn dispatch_spec_harness(spec: &DispatchSpec) -> Option<&str> {
+    spec.harness.as_deref()
 }
 
 /// The task text in a dispatch spec (`spec.task`): an inline instruction that
 /// replaces the workflow-default base prompt (bd-m7ac weekly-review — scouts
 /// and the oracle carry their mission inline). `None` when absent (the
 /// stage/base-prompt fallback applies).
-pub fn dispatch_spec_task(spec: &Value) -> Option<&str> {
-    spec.get("task").and_then(Value::as_str)
+pub fn dispatch_spec_task(spec: &DispatchSpec) -> Option<&str> {
+    spec.task.as_deref()
 }
 
 /// The base prompt for a headless dispatch with no explicit stage: the
@@ -284,8 +285,20 @@ pub fn base_prompt_for(wf_name: &str, inputs: &Value) -> String {
 /// against the run inputs: `{{inputs.X}}` refs resolve to the input value;
 /// an unresolvable ref stays literal (never drops the text). Empty result →
 /// `None` (no extra to append).
-pub fn spec_extra(spec: &Value, key: &str, inputs: &Value) -> Option<String> {
-    let raw = spec.get(key).and_then(Value::as_str)?.trim();
+pub fn spec_extra(spec: &DispatchSpec, key: &str, inputs: &Value) -> Option<String> {
+    let raw = match key {
+        "profile" => spec.profile.as_deref(),
+        "task" => spec.task.as_deref(),
+        "stage" => spec.stage.as_deref(),
+        "harness" => spec.harness.as_deref(),
+        "model" => spec.model.as_deref(),
+        "effort" => spec.effort.as_deref(),
+        "phase" => spec.phase.as_deref(),
+        "plan" => spec.plan.as_deref(),
+        "project" => spec.project.as_deref(),
+        other => spec.extra.get(other).and_then(Value::as_str),
+    }?
+    .trim();
     if raw.is_empty() {
         return None;
     }
@@ -590,12 +603,19 @@ mod tests {
     /// spec; absent tasks fall back to the stage/base-prompt path.
     #[test]
     fn dispatch_spec_task_resolves_inline_mission() {
-        let with_task = json!({ "profile": "@scout", "task": "Map toron gaps." });
+        let with_task = DispatchSpec {
+            profile: Some("@scout".into()),
+            task: Some("Map toron gaps.".into()),
+            ..Default::default()
+        };
         assert_eq!(dispatch_spec_task(&with_task), Some("Map toron gaps."));
         assert_eq!(dispatch_spec_profile(&with_task), Some("@scout"));
-        let no_task = json!({ "profile": "@planner" });
+        let no_task = DispatchSpec {
+            profile: Some("@planner".into()),
+            ..Default::default()
+        };
         assert_eq!(dispatch_spec_task(&no_task), None);
-        assert_eq!(dispatch_spec_task(&json!({})), None);
+        assert_eq!(dispatch_spec_task(&DispatchSpec::default()), None);
     }
 
     #[test]
@@ -611,10 +631,17 @@ mod tests {
 
     #[test]
     fn dispatch_spec_extracts_profile_and_stage() {
-        let spec = json!({ "profile": "@planner", "stage": "systematic-execute" });
+        let spec = DispatchSpec {
+            profile: Some("@planner".into()),
+            stage: Some("systematic-execute".into()),
+            ..Default::default()
+        };
         assert_eq!(dispatch_spec_profile(&spec), Some("@planner"));
         assert_eq!(dispatch_spec_stage(&spec), Some("systematic-execute"));
-        let bare = json!({ "profile": "@coder" });
+        let bare = DispatchSpec {
+            profile: Some("@coder".into()),
+            ..Default::default()
+        };
         assert_eq!(dispatch_spec_profile(&bare), Some("@coder"));
         assert_eq!(dispatch_spec_stage(&bare), None);
     }
@@ -622,9 +649,16 @@ mod tests {
     /// bd-42fs step 5: the per-step harness override rides in the spec.
     #[test]
     fn dispatch_spec_extracts_harness_override() {
-        let spec = json!({ "profile": "@reviewer", "harness": "opencode" });
+        let spec = DispatchSpec {
+            profile: Some("@reviewer".into()),
+            harness: Some("opencode".into()),
+            ..Default::default()
+        };
         assert_eq!(dispatch_spec_harness(&spec), Some("opencode"));
-        let bare = json!({ "profile": "@reviewer" });
+        let bare = DispatchSpec {
+            profile: Some("@reviewer".into()),
+            ..Default::default()
+        };
         assert_eq!(dispatch_spec_harness(&bare), None);
     }
 
@@ -646,7 +680,10 @@ mod tests {
     /// beads workflow's plan reaches the planner headlessly — bd-oj9o).
     #[test]
     fn spec_extra_renders_inputs_ref() {
-        let spec = json!({ "profile": "@planner", "plan": "{{inputs.plan}}" });
+        let spec = DispatchSpec {
+            plan: Some("{{inputs.plan}}".into()),
+            ..Default::default()
+        };
         let inputs = json!({ "plan": "1. fix auth 2. ship" });
         assert_eq!(
             spec_extra(&spec, "plan", &inputs).as_deref(),
@@ -657,7 +694,10 @@ mod tests {
     /// An unresolvable ref stays literal — the text is never dropped.
     #[test]
     fn spec_extra_keeps_unresolved_ref_literal() {
-        let spec = json!({ "plan": "Work from {{inputs.missing}}" });
+        let spec = DispatchSpec {
+            plan: Some("Work from {{inputs.missing}}".into()),
+            ..Default::default()
+        };
         assert_eq!(
             spec_extra(&spec, "plan", &json!({})).as_deref(),
             Some("Work from {{inputs.missing}}")
@@ -667,9 +707,19 @@ mod tests {
     /// Missing or empty extra → None (nothing appended to the prompt).
     #[test]
     fn spec_extra_none_when_absent_or_empty() {
-        assert_eq!(spec_extra(&json!({}), "plan", &json!({})), None);
         assert_eq!(
-            spec_extra(&json!({ "plan": "  " }), "plan", &json!({})),
+            spec_extra(&DispatchSpec::default(), "plan", &json!({})),
+            None
+        );
+        assert_eq!(
+            spec_extra(
+                &DispatchSpec {
+                    plan: Some("  ".into()),
+                    ..Default::default()
+                },
+                "plan",
+                &json!({})
+            ),
             None
         );
     }
