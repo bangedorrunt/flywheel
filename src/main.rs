@@ -17776,7 +17776,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 bail!("workflow already exists: {}", path.display());
             }
             let scaffold = format!(
-                "name: {name}\ndescription: \"\"\ntrigger:\n  type: webhook\ninputs:\n  - name: goal\nsteps:\n  - name: step-1\n    action: send_dm\n    to: operator\n    body: \"started {{name}}\"\n"
+                "name: {name}\ndescription: \"\"\n# Declare 2-3 governing principles (names from `flywheel principles list`;\n# the lint validates every name against the ADR-0019 21-name registry):\nprinciples: []\ntrigger:\n  type: webhook\ninputs:\n  - name: goal\nsteps:\n  - name: step-1\n    action: send_dm\n    to: operator\n    body: \"started {{{{name}}}}\"\n"
             );
             std::fs::write(&path, scaffold)?;
             println!("wrote {}", path.display());
