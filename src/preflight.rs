@@ -163,7 +163,7 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
     // 4. project directory exists
     if mode.needs_project {
         if let Some(p) = project {
-            checks.push(check_project_dir(p));
+            checks.push(check_project_dir(cfg, p));
         } else {
             checks.push(Check::skip("project-dir", "no project specified"));
         }
@@ -172,7 +172,7 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
     // 5. .beads/ exists (--work mode only)
     if mode.needs_beads {
         if let Some(p) = project {
-            checks.push(check_beads(p));
+            checks.push(check_beads(cfg, p));
         } else {
             checks.push(Check::fail(
                 "beads-db",
@@ -324,16 +324,23 @@ fn check_br() -> Check {
     }
 }
 
-fn check_project_dir(project: &str) -> Check {
-    if Path::new(project).exists() {
+fn check_project_dir(cfg: &Config, project: &str) -> Check {
+    // bd-adr22-loop-preflight: resolve through project_dir (slug keys join
+    // the workspace root; absolute paths pass through). The literal
+    // Path::new(project) form broke BOTH spellings: a slug arg only passed
+    // when cwd happened to contain it, and an absolute-path arg then failed
+    // the slug-keyed swarm lookup (worktree check) — the two checks
+    // demanded different keys.
+    let dir = crate::project_dir(cfg, project);
+    if dir.exists() {
         Check::pass("project-dir")
     } else {
         Check::fail("project-dir", format!("{project} does not exist"))
     }
 }
 
-fn check_beads(project: &str) -> Check {
-    let beads = Path::new(project).join(".beads");
+fn check_beads(cfg: &Config, project: &str) -> Check {
+    let beads = crate::project_dir(cfg, project).join(".beads");
     if beads.exists() {
         Check::pass("beads-db")
     } else {
