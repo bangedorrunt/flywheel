@@ -7109,8 +7109,9 @@ mod tests {
     }
 
     /// bd-eign.2.1: the flood guard's paused beads enter the seen-set, so a
-    /// legitimate pre-created batch of 4+ is counted ONCE and then
-    /// dispatches; a runaway minting new ids keeps tripping.
+    /// pre-created flood-sized batch is counted ONCE and then dispatches; a
+    /// runaway minting new ids keeps tripping. Batch is 7 to clear the
+    /// hotfix-472e4ca threshold (verdict trips at >6; bd-e7ev).
     #[test]
     fn flood_new_count_absorbs_paused_batch_and_catches_runaway() {
         let rb = |id: &str| ReadyBead {
@@ -7122,10 +7123,18 @@ mod tests {
             verify: Some("true".into()),
             labels: Vec::new(),
         };
-        let batch = [rb("bd-a"), rb("bd-b"), rb("bd-c"), rb("bd-d")];
+        let batch = [
+            rb("bd-a"),
+            rb("bd-b"),
+            rb("bd-c"),
+            rb("bd-d"),
+            rb("bd-e"),
+            rb("bd-f"),
+            rb("bd-g"),
+        ];
         let mut seen = std::collections::HashSet::new();
         let first = flood_new_count(batch.iter(), &seen);
-        assert_eq!(first, 4, "fresh batch counts fully");
+        assert_eq!(first, 7, "fresh batch counts fully");
         assert!(bead_flood_verdict(first), "batch trips the pause");
         for b in &batch {
             seen.insert(b.id.clone());
@@ -7135,7 +7144,7 @@ mod tests {
             0,
             "paused batch dispatches on the next poll (no repeat pause)"
         );
-        let runaway = rb("bd-e");
+        let runaway = rb("bd-runaway");
         assert_eq!(
             flood_new_count(std::iter::once(&runaway), &seen),
             1,
