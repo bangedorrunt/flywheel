@@ -4919,6 +4919,141 @@ mod steer_safety_tests {
 }
 
 #[cfg(test)]
+mod steer_engine_tests {
+    use super::*;
+    use toron_workflow::schema::Action;
+
+    const STEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// ADR-0022 W4: `flywheel steer` delegates to the durable Run arm —
+    /// execute=true, pane mode, goal/goal-direct. The Run arm owns the
+    /// engine.invoke door; steer must never grow a second execution path.
+    #[test]
+    fn steer_targets_durable_run_arm() {
+        for (direct, expected) in [(true, "goal-direct"), (false, "goal")] {
+            let cmd = steer_run_cmd("fix the flake", direct, None, None, None, false, false, false);
+            let WorkflowCmd::Run {
+                name,
+                inputs,
+                execute,
+                mode,
+                allow_worktree,
+                ..
+            } = cmd
+            else {
+                panic!("expected a Run command");
+            };
+            assert_eq!(name, expected);
+            assert_eq!(
+                inputs.as_deref(),
+                Some(r#"{"objective":"fix the flake"}"#)
+            );
+            assert!(execute, "steer must execute, not record");
+            assert_eq!(mode, "pane");
+            assert!(!allow_worktree);
+        }
+    }
+
+    /// Shared harness: the exact execution shape the Run arm builds for a
+    /// pane-mode steer — recording/counting runner, builtin+catalog
+    /// workflow resolver, crew fan-out resolution, local engine over
+    /// Resonate::local. No herdr panes needed: dispatch_job side-effects
+    /// are recorded, control flow is real.
+    fn steer_engine(
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Result<(
+        tokio::runtime::Runtime,
+        std::sync::Arc<toron_workflow::WorkflowEngine>,
+        toron_workflow::schema::Workflow,
+    )> {
+        let mut builtins = builtin_workflows::builtin_workflows();
+        let wf = builtins
+            .remove("goal-direct")
+            .expect("goal-direct builtin workflow");
+        let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(|sub: &str| {
+            let cat = workflow_catalog::WorkflowCatalog::load().ok()?;
+            cat.workflows
+                .get(sub)
+                .cloned()
+                .or_else(|| builtin_workflows::builtin_workflows().get(sub).cloned())
+        });
+        let crew_plan = crew::plan_crew_with(&wf, &|sub| workflow_resolver(sub));
+        let invoke_wf = crew::resolve_crew_fanouts(&wf, &crew_plan);
+        let runner: toron_workflow::ActionRunner = Arc::new(move |a: &Action| {
+            calls.lock().unwrap().push(a.type_name().to_string());
+            Ok(json!({ "action": a.type_name() }))
+        });
+        let rt = tokio::runtime::Runtime::new()?;
+        let engine = std::sync::Arc::new(pane::local_engine(
+            &rt,
+            runner,
+            profile::ProfileCatalog::catalog_profile_resolver(),
+            workflow_resolver,
+        )?);
+        Ok((rt, engine, invoke_wf))
+    }
+
+    async fn steered(
+        engine: &toron_workflow::WorkflowEngine,
+        run_id: &str,
+        invoke_wf: toron_workflow::schema::Workflow,
+    ) -> Value {
+        tokio::time::timeout(
+            STEER_TIMEOUT,
+            engine.invoke(run_id, invoke_wf, json!({ "objective": "w4 gate" })),
+        )
+        .await
+        .expect("steer chain must not park (no approval gate on --direct)")
+        .expect("engine invoke ok")
+    }
+
+    /// ADR-0022 W4 gate 1: the steer chain completes as an ENGINE run —
+    /// same invoke door as catalog/trigger runs, real control flow over
+    /// the composed goal-direct steps.
+    #[test]
+    fn steer_direct_completes_as_engine_run() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (rt, engine, invoke_wf) = steer_engine(calls).expect("steer engine");
+        let out = rt.block_on(steered(
+            &engine,
+            "fw-cli-steer-engine-run-test",
+            invoke_wf,
+        ));
+        assert!(out.is_object(), "engine returns an output object");
+    }
+
+    /// ADR-0022 W4 gate 2: crash-resume equivalence — a redelivered run_id
+    /// replays the RECORDED execution (steps execute exactly once, output
+    /// identical), the property that makes steer == catalog runs.
+    #[test]
+    fn steer_chain_redelivery_replays_recorded_run() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (rt, engine, invoke_wf) = steer_engine(calls.clone()).expect("steer engine");
+        let first = rt.block_on(steered(
+            &engine,
+            "fw-cli-steer-redelivery-test",
+            invoke_wf.clone(),
+        ));
+        let after_first = calls.lock().unwrap().len();
+        assert!(after_first > 0, "first run executes the chain");
+        let redelivery = rt.block_on(steered(
+            &engine,
+            "fw-cli-steer-redelivery-test",
+            invoke_wf,
+        ));
+        assert_eq!(
+            first, redelivery,
+            "redelivery returns the recorded output"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            after_first,
+            "steps execute exactly once across redelivery"
+        );
+    }
+}
+
+#[cfg(test)]
 mod workspace_origin_tests {
     use super::*;
     use crate::herdr_shim::{AgentInfo, WorkspaceInfo};
@@ -17074,6 +17209,11 @@ fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
                             "model": hl.model,
                             "cron": hl.cron,
                             "workflow": hl.workflow,
+                            // ADR-0022 W4: surface the W2 phase fields in the
+                            // runs dashboard — per-phase cycle time needs the
+                            // column to exist first.
+                            "phase": hl.phase,
+                            "phase_degraded": hl.phase_degraded,
                         }),
                     },
                 ));
@@ -17104,6 +17244,19 @@ fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
                         "state": raw_status,
                         "status": normalize_run_status(raw_status),
                         "cost": run_cost(e),
+                        // ADR-0022 W4: phase column (null for state-log runs
+                        // that never carried a phase; `phase_degraded` marks
+                        // loud prompt-mode fallback, never silent).
+                        "phase": e
+                            .data
+                            .get("phase")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        "phase_degraded": e
+                            .data
+                            .get("phase_degraded")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
                     })
                 })
                 .collect();
@@ -17406,12 +17559,32 @@ fn cmd_steer(
     // bd-t86p: ONE compose call — the goal workflow (bead-tracked) or its
     // direct arm (non-bead targets: no tracker, no plan approval gate). The
     // delegate is the full `workflow run --execute --mode pane` machinery:
-    // lint gate, crew auto-infer, pane pre-spawn, step dispatch via __send,
-    // reap-on-end — byte-identical to running `workflow run goal` by hand,
-    // with the objective pre-filled.
+    // lint gate, crew auto-infer, pane pre-spawn, durable engine.invoke with
+    // panes as the executor surface only (ADR-0022 W4) — byte-identical to
+    // running `workflow run goal` by hand, with the objective pre-filled.
+    let run = steer_run_cmd(
+        objective, direct, crew, project, reuse, retain, retire_orphans, json,
+    );
+    cmd_workflow(cfg, &run)
+}
+
+/// ADR-0022 W4 testable seam: the exact Run command `flywheel steer`
+/// delegates to — execute=true, pane mode, goal/goal-direct. Durability is
+/// owned downstream by the Run arm (engine.invoke over Resonate::local);
+/// steer only picks the workflow and pre-fills the objective.
+fn steer_run_cmd(
+    objective: &str,
+    direct: bool,
+    crew: Option<&str>,
+    project: Option<&str>,
+    reuse: Option<&str>,
+    retain: bool,
+    retire_orphans: bool,
+    json: bool,
+) -> WorkflowCmd {
     let wf_name = if direct { "goal-direct" } else { "goal" };
     let inputs = serde_json::json!({ "objective": objective });
-    let run = WorkflowCmd::Run {
+    WorkflowCmd::Run {
         name: wf_name.to_string(),
         inputs: Some(inputs.to_string()),
         crew: crew.map(String::from),
@@ -17423,8 +17596,7 @@ fn cmd_steer(
         retire_orphans,
         json,
         allow_worktree: false,
-    };
-    cmd_workflow(cfg, &run)
+    }
 }
 
 /// `profile run --workflow` (bd-6zsl): the invoke command — run the named
