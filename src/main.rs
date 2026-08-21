@@ -858,6 +858,14 @@ enum Commands {
         #[arg(long, default_value = "30")]
         limit: u32,
     },
+    /// internal: scan the orchestrator inbox for exact-body CONTEXT_LIMIT
+    /// crew replies (bd-context-limit-honor-luqg respawn trigger)
+    #[command(name = "__context-inbox", hide = true)]
+    __ContextInbox {
+        project: String,
+        #[arg(long, default_value = "30")]
+        limit: u32,
+    },
     /// internal: scan inbox for `[compose-request]` jobs + the allowlist
     /// (ADR-0022 §3.7 T4, W7 delegated composition)
     #[command(name = "__compose-inbox", hide = true)]
@@ -3613,6 +3621,9 @@ fn main() {
         }) => cmd_internal_diagnose(&cfg, project, name, reason),
         Some(Commands::__XprojInbox { project, limit }) => {
             cmd_internal_xproj_inbox(&cfg, project, *limit)
+        }
+        Some(Commands::__ContextInbox { project, limit }) => {
+            cmd_internal_context_inbox(&cfg, project, *limit)
         }
         Some(Commands::__ComposeInbox { project, limit }) => {
             cmd_internal_compose_inbox(&cfg, project, *limit)
@@ -10928,6 +10939,61 @@ pub fn xproj_prompts_for_unseen(
         if let Some(req) = parse_xproj_request(&combined) {
             out.push((item.id.clone(), xproj_queue_prompt(item, &req)));
         }
+    }
+    out
+}
+
+/// bd-context-limit-honor-luqg: extract exact-body CONTEXT_LIMIT messages
+/// from an orchestrator-inbox JSON value — the crew saturation contract's
+/// respawn trigger. The BODY must equal `CONTEXT_LIMIT` after trimming (a
+/// subject mention or "CONTEXT_LIMIT\nall done" is NOT the signal; the
+/// contract says reply EXACTLY that). Same envelope tolerance as the xproj
+/// scan (bare array / `{messages}` / `{result}`); carries id/thread/from so
+/// the loop can dedup + map the sender to a pane.
+pub fn extract_context_limit_from_inbox(v: &serde_json::Value) -> Vec<XprojInboxItem> {
+    const MARKER: &str = "CONTEXT_LIMIT";
+    let arr = v
+        .as_array()
+        .or_else(|| v.get("messages").and_then(|m| m.as_array()))
+        .or_else(|| v.get("result").and_then(|m| m.as_array()))
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for m in arr {
+        let body = m
+            .get("body_md")
+            .or_else(|| m.get("body"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .trim();
+        if body != MARKER {
+            continue;
+        }
+        let id = match m.get("id") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            _ => String::new(),
+        };
+        out.push(XprojInboxItem {
+            id,
+            subject: m
+                .get("subject")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            body: MARKER.to_string(),
+            thread_id: m
+                .get("thread_id")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string(),
+            from: m
+                .get("from")
+                .or_else(|| m.get("sender"))
+                .and_then(|f| f.as_str())
+                .unwrap_or("")
+                .to_string(),
+        });
     }
     out
 }
@@ -21333,11 +21399,17 @@ fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
     // state-file fallback channel: parse the agent's state file when present.
     // Malformed/absent files yield null — never an error (the loop treats
     // null as "terminal channel only", identical to pre-zwa behavior).
+    // bd-context-limit-honor-luqg: try BOTH identity files (herdr name +
+    // registry mail pin) — the contract has pin-identity crews write the
+    // PIN file, which the herdr-keyed lookup never saw.
+    let dir = project_dir(cfg, project);
+    let pin_identity = {
+        let reg = state::load_spawn_registry(project);
+        let names = state::load_agent_names(&dir);
+        wake_identity_pin(&reg, &names, name)
+    };
     let state: Option<agentstate::AgentStateFile> =
-        agentstate::state_file_path(&project_dir(cfg, project), &target)
-            .ok()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|content| agentstate::parse_state_file(&content));
+        agentstate::read_state_for_agent(&dir, name, Some(&pin_identity));
     print_json(&json!({ "terminal": text, "state": state }));
     Ok(())
 }
@@ -22409,6 +22481,47 @@ fn cmd_internal_xproj_inbox(cfg: &Config, project: &str, limit: u32) -> Result<(
     };
     let v_json = serde_json::to_value(&v).unwrap_or_default();
     let items = extract_xproj_from_inbox(&v_json);
+    print_json(&json!({ "items": items }));
+    Ok(())
+}
+
+/// internal leaf: scan the orchestrator inbox for exact-body CONTEXT_LIMIT
+/// crew replies (bd-context-limit-honor-luqg). Same fetch shape as the
+/// xproj scan — bodies included, orchestrator's own identity — filtered to
+/// the exact saturation marker by [`extract_context_limit_from_inbox`].
+fn cmd_internal_context_inbox(cfg: &Config, project: &str, limit: u32) -> Result<()> {
+    let mail = match backend::mail_backend(cfg) {
+        Ok(m) => m,
+        Err(_) => {
+            print_json(&json!({ "items": [] }));
+            return Ok(());
+        }
+    };
+    let key = project_dir_str(cfg, project)?;
+    if backend::run_mail(mail.ensure_project(&key)).is_err() {
+        print_json(&json!({ "items": [] }));
+        return Ok(());
+    }
+    let name = mail.agent_name().to_string();
+    let v = match backend::run_mail(mail.inbox(&backend::InboxQuery {
+        project: key,
+        agent: name,
+        unread_only: false,
+        urgent_only: false,
+        include_bodies: true,
+        limit: Some(limit as usize),
+        since_ts: None,
+        thread_id: None,
+    })) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("flywheel: context-inbox fetch failed: {e:#}");
+            print_json(&json!({ "items": [] }));
+            return Ok(());
+        }
+    };
+    let v_json = serde_json::to_value(&v).unwrap_or_default();
+    let items = extract_context_limit_from_inbox(&v_json);
     print_json(&json!({ "items": items }));
     Ok(())
 }
@@ -24653,6 +24766,41 @@ mod xproj_tests {
         assert!(prompts[0].1.contains("recipe=daily"));
         seen.insert("2".to_string());
         assert!(xproj_prompts_for_unseen(&items, &seen).is_empty());
+    }
+
+    // ---- bd-context-limit-honor-luqg: exact-body CONTEXT_LIMIT scan ----
+
+    /// The saturation signal is the EXACT trimmed body — a subject mention
+    /// or a body that says more than `CONTEXT_LIMIT` is not the contract.
+    #[test]
+    fn extract_context_limit_exact_body_only() {
+        let v = json!([
+            {"id": 1, "subject": "[bd-x] done", "body_md": "CONTEXT_LIMIT", "thread_id": "t1", "from": "TanFern"},
+            {"id": 2, "subject": "note", "body_md": "CONTEXT_LIMIT\nall done", "thread_id": "t2", "from": "TanFern"},
+            {"id": 3, "subject": "CONTEXT_LIMIT", "body_md": "just mentioning it in passing", "thread_id": "t3", "from": "TanFern"},
+            {"id": 4, "subject": "s", "body_md": "  CONTEXT_LIMIT  \n", "thread_id": "t4", "from": "TealDune"},
+        ]);
+        let items = extract_context_limit_from_inbox(&v);
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "4"], "exact trimmed body only: {ids:?}");
+    }
+
+    /// Same envelope tolerance as the xproj scan: bare array,
+    /// `{messages:[...]}`, and `{result:[...]}` all parse.
+    #[test]
+    fn extract_context_limit_envelope_shapes() {
+        let row = json!({"id": "9", "subject": "s", "body_md": "CONTEXT_LIMIT", "thread_id": "t", "from": "P"});
+        for envelope in [
+            json!([row]),
+            json!({"messages": [row]}),
+            json!({"result": [row]}),
+        ] {
+            assert_eq!(
+                extract_context_limit_from_inbox(&envelope).len(),
+                1,
+                "{envelope}"
+            );
+        }
     }
 }
 

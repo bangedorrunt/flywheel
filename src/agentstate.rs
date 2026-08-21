@@ -87,6 +87,39 @@ pub fn validate_name(name: &str) -> Result<(), NameError> {
     Ok(())
 }
 
+/// Parse one agent's state file, if present and well-formed.
+pub fn read_one_state_file(project_dir: &Path, name: &str) -> Option<AgentStateFile> {
+    let p = state_file_path(project_dir, name).ok()?;
+    let content = std::fs::read_to_string(p).ok()?;
+    parse_state_file(&content)
+}
+
+/// Read an agent's saturation state trying BOTH identity files: the herdr
+/// pane name AND (when different) the spawn-registry mail pin. The standing-
+/// orders contract substitutes `{AGENT_NAME}` with the PIN (the identity the
+/// crew is addressed by), so a pin-identity crew writes `<pin>.json` while
+/// the loop keys panes by herdr name — checking only the herdr name made the
+/// file channel permanently blind for exactly those agents
+/// (bd-context-limit-honor-luqg). The FRESHER file wins when both exist.
+pub fn read_state_for_agent(
+    project_dir: &Path,
+    herdr_name: &str,
+    mail_pin: Option<&str>,
+) -> Option<AgentStateFile> {
+    let mut best: Option<(u64, AgentStateFile)> = None;
+    for name in std::iter::once(herdr_name).chain(mail_pin.into_iter().filter(|p| *p != herdr_name))
+    {
+        let Some(f) = read_one_state_file(project_dir, name) else {
+            continue;
+        };
+        let ts = parse_ts(&f.ts).unwrap_or(0);
+        if best.as_ref().is_none_or(|(bts, _)| ts >= *bts) {
+            best = Some((ts, f));
+        }
+    }
+    best.map(|(_, f)| f)
+}
+
 /// Parse an agent state file. Malformed JSON, out-of-range `context_pct`, or an
 /// unparseable `ts` all yield `None` — never an error or panic.
 pub fn parse_state_file(content: &str) -> Option<AgentStateFile> {
@@ -183,6 +216,42 @@ mod tests {
         // any separator must fail even when the name looks plausible
         assert!(state_file_path(Path::new("/proj"), "a/b").is_err());
         assert!(state_file_path(Path::new("/proj"), "a\\b").is_err());
+    }
+
+    /// bd-context-limit-honor-luqg: the reader must try BOTH identity files
+    /// — the herdr pane name AND the spawn-registry mail pin (the contract's
+    /// `{AGENT_NAME}` substitutes the pin) — preferring the FRESHER file.
+    #[test]
+    fn read_state_for_agent_tries_pin_alias_prefers_fresher() {
+        let root = std::env::temp_dir().join(format!(
+            "fw-agentstate-luqg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir = project_state_dir(&root);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let write = |name: &str, pct: u8, ts: &str| {
+            std::fs::write(
+                state_file_path(&root, name).unwrap(),
+                format!(r#"{{"context_pct": {pct}, "ts": "{ts}"}}"#),
+            )
+            .unwrap();
+        };
+        // herdr-name file present, pin file fresher → pin wins.
+        write("oc3", 85, "2026-08-22T01:00:00Z");
+        write("TanFern", 92, "2026-08-22T01:05:00Z");
+        let s = read_state_for_agent(&root, "oc3", Some("TanFern")).expect("some state");
+        assert_eq!(s.context_pct, 92, "fresher pin file preferred");
+        // pin file absent → herdr-name file still found (no regression).
+        write("oc2", 80, "2026-08-22T01:00:00Z");
+        let s2 = read_state_for_agent(&root, "oc2", Some("NoSuchPin")).expect("fallback");
+        assert_eq!(s2.context_pct, 80);
+        // neither identity has a file → None.
+        assert!(read_state_for_agent(&root, "ghost", Some("GhostPin")).is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ---- parse ----

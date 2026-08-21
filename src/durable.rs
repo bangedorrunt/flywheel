@@ -2696,6 +2696,52 @@ pub enum LoopAction {
     Wait,
 }
 
+/// Args for the context-limit inbox leaf (bd-context-limit-honor-luqg).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextInboxArgs {
+    pub project: String,
+    pub limit: u32,
+}
+
+/// Scan the orchestrator inbox for exact-body CONTEXT_LIMIT crew replies
+/// (bd-context-limit-honor-luqg). Runs `__context-inbox`; a failure yields
+/// an empty list — a mail hiccup must never stall the loop.
+#[function]
+async fn poll_context_inbox(args: ContextInboxArgs) -> Result<Vec<crate::XprojInboxItem>> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args([
+        "__context-inbox",
+        &args.project,
+        "--limit",
+        &args.limit.to_string(),
+    ]);
+    let out = run_leaf_cmd(cmd, "__context-inbox").await?;
+    if !out.status.success() {
+        return Ok(vec![]);
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v: Value = serde_json::from_str(raw.trim()).unwrap_or(json!({ "items": [] }));
+    let items = v.get("items").cloned().unwrap_or(json!([]));
+    let parsed: Vec<crate::XprojInboxItem> = serde_json::from_value(items).unwrap_or_default();
+    Ok(parsed)
+}
+
+/// Map a CONTEXT_LIMIT sender to the crew agent it saturates: MAIL PIN
+/// first (the identity the contract addresses), then the bare herdr name.
+/// An unknown sender maps to NOTHING — a human pasting the marker into a
+/// reply must never respawn an agent.
+pub fn context_limit_target(from: &str, states: &[AgentState]) -> Option<String> {
+    if from.trim().is_empty() {
+        return None;
+    }
+    states
+        .iter()
+        .find(|s| s.mail_identity.as_deref() == Some(from))
+        .or_else(|| states.iter().find(|s| s.name == from))
+        .map(|s| s.name.clone())
+}
+
 /// One-line mail digest prefix for a prompt, when the agent has recent mail.
 /// Uses `recent` (the honest toron projection window) and cites the last
 /// MESSAGE ID + subject — bd-kryk: the id is the replyable handle; a sender
@@ -3932,6 +3978,14 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // cross-project [xproj] message ids already queued (avoid re-enqueue).
     // String: toron ids are hex event ids; agent-mail ids normalize to string.
     let mut seen_xproj: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // bd-context-limit-honor-luqg: exact-body CONTEXT_LIMIT replies already
+    // honored (respawned) — body-side dedup so a replayed poll cannot
+    // respawn twice for one message.
+    let mut seen_ctx_limit: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // panes respawned for a CONTEXT_LIMIT signal THIS iteration — merged
+    // into wake_suppressed so no MAIL WAKE banner lands on the saturated
+    // pane between the signal and the fresh boot.
+    let mut ctx_suppressed: std::collections::HashSet<String> = std::collections::HashSet::new();
     // mail-wake dedup: agent herdr name → last urgent message id it was woken
     // for. An agent is woken ONCE per message id; a still-unreplied urgent
     // message does not re-prompt every iteration (the reply changes the
@@ -4181,6 +4235,53 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     }
                 }
             }
+        }
+
+        // ---- saturation respawn (bd-context-limit-honor-luqg) ----
+        // An exact-body CONTEXT_LIMIT reply from a KNOWN crew agent is a
+        // respawn trigger, honored HERE — before plan_actions can pick a
+        // wake banner for the same saturated pane. The agent is re-booted
+        // fresh (standing orders ride the boot prime; open thread refs ride
+        // the digest prefix on later prompts) within this poll cycle; the
+        // sender pin → pane mapping refuses strangers.
+        let ctx_items: Vec<crate::XprojInboxItem> = ctx
+            .run(
+                poll_context_inbox,
+                ContextInboxArgs {
+                    project: params.project.clone(),
+                    limit: 30,
+                },
+            )
+            .await
+            .unwrap_or_default();
+        for item in &ctx_items {
+            if seen_ctx_limit.contains(&item.id) {
+                continue;
+            }
+            seen_ctx_limit.insert(item.id.clone()); // handled either way
+            let Some(target) = context_limit_target(&item.from, &states) else {
+                eprintln!(
+                    "flywheel: CONTEXT_LIMIT msg {} from unknown sender {:?} — ignored",
+                    item.id, item.from
+                );
+                continue;
+            };
+            eprintln!(
+                "flywheel: CONTEXT_LIMIT from {} → respawning {target} fresh this cycle",
+                item.from
+            );
+            ctx_suppressed.insert(target.clone());
+            respawn_and_requeue(
+                ctx,
+                &params,
+                &mut queue,
+                &agent_kinds,
+                &target,
+                None, // fresh boot: no work text requeued
+                "context_limit",
+                0,
+            )
+            .await;
         }
 
         // self-heal (bd-event-self-heal): diagnose → respawn (budgeted) → blocked.
@@ -4785,6 +4886,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     }
             })
             .map(|(k, _)| k.clone())
+            // bd-context-limit-honor-luqg: a pane being respawned for a
+            // saturation signal this cycle never gets a wake banner.
+            .chain(ctx_suppressed.iter().cloned())
             .collect();
         clear_stale_landed_for_idle(&params.project, &params.invocation, &states);
         let mut poll_actions = plan_actions(
@@ -6433,6 +6537,35 @@ mod tests {
         );
     }
 
+    /// bd-context-limit-honor-luqg: a CONTEXT_LIMIT sender maps to the crew
+    /// agent by MAIL PIN first, then herdr name; an unknown sender maps to
+    /// nothing (a human pasting the marker must never trigger a respawn).
+    #[test]
+    fn context_limit_target_maps_pin_then_name_never_strangers() {
+        fn agent(name: &str, pin: Option<&str>) -> AgentState {
+            AgentState {
+                mail_identity: pin.map(str::to_string),
+                ..st(name, "idle")
+            }
+        }
+        let states = vec![
+            agent("flywheel-toron-oc3", Some("TanFern")),
+            agent("oc2", None),
+        ];
+        assert_eq!(
+            context_limit_target("TanFern", &states).as_deref(),
+            Some("flywheel-toron-oc3"),
+            "pin match wins"
+        );
+        assert_eq!(
+            context_limit_target("oc2", &states).as_deref(),
+            Some("oc2"),
+            "bare herdr name matches itself"
+        );
+        assert_eq!(context_limit_target("StrangerPin", &states), None);
+        assert_eq!(context_limit_target("", &states), None);
+    }
+
     #[test]
     fn queue_drains_across_idle_agents_in_order() {
         let states = vec![st("a", "idle"), st("b", "done")];
@@ -7612,6 +7745,23 @@ mod tests {
             }
             other => panic!("expected wake Send, got {other:?}"),
         }
+    }
+
+    /// bd-context-limit-honor-luqg: a pane being respawned for a saturation
+    /// signal is wake-suppressed — no MAIL WAKE banner can land on the same
+    /// saturated session between the signal and the fresh boot.
+    #[test]
+    fn plan_actions_never_wakes_a_context_respawned_pane() {
+        let mut queue: Vec<String> = Vec::new();
+        let states = vec![st("flywheel-toron-oc3", "idle")];
+        let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] help needed"));
+        let suppressed: std::collections::HashSet<String> =
+            ["flywheel-toron-oc3".to_string()].into();
+        let actions = plan_actions(&states, &mut queue, None, &d, &suppressed);
+        assert!(
+            actions.iter().all(|a| matches!(a, LoopAction::Wait)),
+            "suppressed saturated pane must Wait, got {actions:?}"
+        );
     }
 
     /// bd-kryk regression: the wake banner cites the MESSAGE id — a sender
