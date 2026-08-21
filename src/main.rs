@@ -2177,7 +2177,11 @@ enum CoalitionCmd {
 #[derive(Subcommand)]
 enum RunsCmd {
     /// List runs across projects: state + owner + per-run model/token cost
-    List,
+    List {
+        /// One JSON array for agent drivers (bd-cron-run-no-live-u9tg)
+        #[arg(long)]
+        json: bool,
+    },
     /// Show one run's step trace / outputs
     Show {
         /// run id (the log entry id)
@@ -2410,6 +2414,11 @@ enum CronCmd {
         /// JSON output for agent drivers
         #[arg(long)]
         json: bool,
+        /// REALLY dispatch the body through the spec's mode runner (the same
+        /// headless/pane path the durable loop fires) instead of the
+        /// structural dry-run (bd-cron-run-no-live-u9tg)
+        #[arg(long)]
+        live: bool,
     },
     /// Pause a cron (entry preserved; nothing fires) — persists `enabled:
     /// false` in the tier's YAML
@@ -16897,6 +16906,43 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
 /// `flywheel runs` — the captain's daily dashboard (ADR-0005 P6.3). Reads the
 /// per-project JSONL logs (workflow/pipeline/loop events) and aggregates them
 /// into a run list with state + owner + advisory per-run cost.
+///
+/// bd-cron-run-no-live-u9tg: `--json` drivers get ONE stable status
+/// vocabulary instead of each writer's local spelling.
+fn normalize_run_status(raw: &str) -> String {
+    match raw {
+        "done" | "success" | "succeeded" | "completed" | "ok" => "completed".to_string(),
+        "fail" | "failed" | "error" => "failed".to_string(),
+        "pending" | "awaiting_approval" | "parked" => "pending".to_string(),
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod runs_status_tests {
+    use super::normalize_run_status;
+
+    #[test]
+    fn normalizes_writer_vocabularies_to_three_states() {
+        // state-log writers (workflow run arm, cron loop) + headless leaf
+        for raw in ["done", "success", "succeeded", "completed", "ok"] {
+            assert_eq!(normalize_run_status(raw), "completed", "raw={raw}");
+        }
+        for raw in ["fail", "failed", "error"] {
+            assert_eq!(normalize_run_status(raw), "failed", "raw={raw}");
+        }
+        for raw in ["pending", "awaiting_approval", "parked"] {
+            assert_eq!(normalize_run_status(raw), "pending", "raw={raw}");
+        }
+    }
+
+    #[test]
+    fn unknown_status_passes_through_verbatim() {
+        assert_eq!(normalize_run_status("weird"), "weird");
+        assert_eq!(normalize_run_status(""), "");
+    }
+}
+
 fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
     use state::{EventKind, LogEntry};
 
@@ -16958,7 +17004,7 @@ fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
     }
 
     match cmd {
-        RunsCmd::List => {
+        RunsCmd::List { json } => {
             let mut runs = all_run_entries()?;
             // Headless run logs (ADR-0010 Spec E, P10.1/P10.4): the leaf
             // writes runs/<run_id>.jsonl — list them alongside the state-log
@@ -16988,6 +17034,11 @@ fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
             let rows: Vec<Value> = runs
                 .iter()
                 .map(|(project, e)| {
+                    let raw_status = e
+                        .data
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("done");
                     json!({
                         "id": format!("{project}:{}", &e.ts),
                         "ts": e.ts,
@@ -16998,11 +17049,18 @@ fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
                             format!("{:?}", e.kind).to_lowercase()
                         },
                         "owner": run_owner(e),
-                        "state": e.data.get("status").and_then(Value::as_str).unwrap_or("done"),
+                        "state": raw_status,
+                        "status": normalize_run_status(raw_status),
                         "cost": run_cost(e),
                     })
                 })
                 .collect();
+            if *json {
+                // bd-cron-run-no-live-u9tg: one JSON array for drivers —
+                // jq-able (.[0].status) instead of per-line pretty objects.
+                print_json(&Value::Array(rows.clone()));
+                return Ok(());
+            }
             for r in &rows {
                 println!("{}", serde_json::to_string_pretty(r)?);
             }
@@ -18266,6 +18324,7 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
             name,
             project,
             json,
+            live,
         } => {
             let rows = cron::load_crons(cfg, project.as_deref())?;
             let row = resolve(&rows, name)?.clone();
@@ -18280,13 +18339,6 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
             // The tick body: the SAME spec-derived workflow the durable loop
             // fires (one engine, two input types — ADR-0012 Spec 2).
             let wf = toron_workflow::cron::spec_tick_workflow(&spec);
-            // bd-8wvz: on-demand `cron run` is a structural DRY-RUN of the
-            // body, never a live agent dispatch. The production durable loop
-            // (start_loops -> spec_runner -> headless_dispatch) owns real
-            // dispatch; here the recording runner completes immediately and
-            // prints the step-output map so the run is always visible (never
-            // exit 0 with zero output).
-            let runner = cron::recording_runner();
             let rt = tokio::runtime::Runtime::new()?;
             let run_id = format!("cron-run-{}", state::now_iso());
             // ADR-0012: the cron body composes workflows via call_workflow —
@@ -18299,52 +18351,129 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
                     .or_else(|| builtin_workflows::builtin_workflows().get(name).cloned())
             });
             let profile_resolver = profile::ProfileCatalog::catalog_profile_resolver();
-            // bd-8wvz: even a dry-run must never hang — a body with
-            // `delay`/`request_approval`/`spawn` steps parks on a promise the
-            // recording runner cannot resolve. 25s cap → explicit timeout
-            // error, never a silent never-returning command.
-            let output = rt.block_on(async {
-                let engine = toron_workflow::WorkflowEngine::local_with_resolvers(
-                    runner,
-                    profile_resolver,
-                    workflow_resolver,
-                )?;
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(25),
-                    engine.invoke(&run_id, wf, json!({})),
-                )
-                .await
-                .map_err(|_elapsed| {
-                    anyhow::anyhow!(
-                        "cron {name} on-demand dry-run timed out after 25s (a delay/approval/spawn step parks the body — the scheduled durable-loop path is the real execution)"
-                    )
-                })?
-            })?;
-            log(
-                "workflow",
-                EventKind::Workflow,
-                json!({
-                    "workflow": name,
-                    "status": "done",
-                    "run_id": run_id,
-                    "cron": name,
-                }),
-            );
-            if *json {
-                print_json(&json!({
-                    "cron": name,
-                    "run_id": run_id,
-                    "source": source,
-                    "dry_run": true,
-                    "output": output,
-                }));
+            if *live {
+                // bd-cron-run-no-live-u9tg: --live force-fires the body
+                // through the SAME runner the durable loop uses
+                // (start_loops -> spec_runner -> headless/pane dispatch) —
+                // real agent work, not the recording dry-run. No internal
+                // cap: a live body runs as long as its leaves run; the
+                // caller's timeout governs (the durable loop has none
+                // either). Failures are recorded before the error returns so
+                // `runs list` shows them.
+                let runner = cron::spec_runner(&spec);
+                let mode = match spec.mode {
+                    toron_workflow::schema::CronMode::Headless => "headless",
+                    toron_workflow::schema::CronMode::Pane => "pane",
+                };
+                let result = rt.block_on(async {
+                    let engine = toron_workflow::WorkflowEngine::local_with_resolvers(
+                        runner,
+                        profile_resolver,
+                        workflow_resolver,
+                    )?;
+                    engine.invoke(&run_id, wf, json!({})).await
+                });
+                match result {
+                    Ok(output) => {
+                        log(
+                            "workflow",
+                            EventKind::Workflow,
+                            json!({
+                                "workflow": name,
+                                "status": "completed",
+                                "run_id": run_id,
+                                "cron": name,
+                                "live": true,
+                            }),
+                        );
+                        if *json {
+                            print_json(&json!({
+                                "cron": name,
+                                "run_id": run_id,
+                                "source": source,
+                                "live": true,
+                                "dry_run": false,
+                                "output": output,
+                            }));
+                        } else {
+                            println!(
+                                "cron {name} live run ok (run_id {run_id}, source {source}, mode {mode}) — dispatched via the durable-loop runner; output:"
+                            );
+                            print_json(&output);
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        log(
+                            "workflow",
+                            EventKind::Workflow,
+                            json!({
+                                "workflow": name,
+                                "status": "failed",
+                                "run_id": run_id,
+                                "cron": name,
+                                "live": true,
+                                "error": e.to_string(),
+                            }),
+                        );
+                        Err(e)
+                    }
+                }
             } else {
-                println!(
-                    "cron {name} dry-run ok (run_id {run_id}, source {source}) — no live dispatch; recorded steps:"
+                // bd-8wvz: on-demand `cron run` is a structural DRY-RUN of the
+                // body, never a live agent dispatch. The production durable loop
+                // (start_loops -> spec_runner -> headless_dispatch) owns real
+                // dispatch; here the recording runner completes immediately and
+                // prints the step-output map so the run is always visible (never
+                // exit 0 with zero output).
+                let runner = cron::recording_runner();
+                // bd-8wvz: even a dry-run must never hang — a body with
+                // `delay`/`request_approval`/`spawn` steps parks on a promise the
+                // recording runner cannot resolve. 25s cap → explicit timeout
+                // error, never a silent never-returning command.
+                let output = rt.block_on(async {
+                    let engine = toron_workflow::WorkflowEngine::local_with_resolvers(
+                        runner,
+                        profile_resolver,
+                        workflow_resolver,
+                    )?;
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(25),
+                        engine.invoke(&run_id, wf, json!({})),
+                    )
+                    .await
+                    .map_err(|_elapsed| {
+                        anyhow::anyhow!(
+                            "cron {name} on-demand dry-run timed out after 25s (a delay/approval/spawn step parks the body — use --live for real dispatch)"
+                        )
+                    })?
+                })?;
+                log(
+                    "workflow",
+                    EventKind::Workflow,
+                    json!({
+                        "workflow": name,
+                        "status": "done",
+                        "run_id": run_id,
+                        "cron": name,
+                    }),
                 );
-                print_json(&output);
+                if *json {
+                    print_json(&json!({
+                        "cron": name,
+                        "run_id": run_id,
+                        "source": source,
+                        "dry_run": true,
+                        "output": output,
+                    }));
+                } else {
+                    println!(
+                        "cron {name} dry-run ok (run_id {run_id}, source {source}) — no live dispatch; recorded steps:"
+                    );
+                    print_json(&output);
+                }
+                Ok(())
             }
-            Ok(())
         }
         CronCmd::Pause { name, project } => {
             cron::set_cron_enabled(cfg, project.as_deref(), name, false)?;
