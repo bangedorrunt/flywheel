@@ -11058,9 +11058,9 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                      first: flywheel mail register {project} --name <adjnoun-pin>"
                 );
             }
-            // --unread needs the filtered surface; --urgent and the plain
-            // path share the legacy inbox() call (toron's in-process fetch
-            // ignores urgent_only, the filter applies it in inbox_filtered).
+            // --unread needs the filtered surface; --urgent rides the same
+            // inbox() call, which honors the flag with id-set parity to
+            // inbox_filtered/MCP urgent_only (bd-mail-surface-drift-7r2o).
             let v = if *unread {
                 mail.inbox_filtered(
                     &key,

@@ -508,9 +508,14 @@ impl Mail {
         &self,
         project_key: &str,
         agent_name: &str,
-        _urgent_only: bool,
+        urgent_only: bool,
         limit: u32,
     ) -> Result<Value> {
+        // bd-mail-surface-drift-7r2o: the flag is honored on BOTH backends —
+        // id-set parity with `inbox_filtered(urgent_only=true)` / MCP
+        // fetch_inbox(urgent_only). The legacy surface ignored it entirely,
+        // so --urgent callers (and anything counting "urgent" off this dump)
+        // saw every row regardless of importance.
         match &self.backend {
             BackendKind::InProcess => {
                 let msgs = block_on(mailbox().fetch_inbox(&FetchInbox {
@@ -519,7 +524,7 @@ impl Mail {
                     unread_only: false,
                     limit: Some(limit as usize),
                     include_bodies: true,
-                    urgent_only: false,
+                    urgent_only,
                     since_ts: None,
                     thread_id: None,
                 }))?;
@@ -530,7 +535,7 @@ impl Mail {
                 crate::backend::wire::inbox_args(
                     project_key,
                     agent_name,
-                    false,
+                    urgent_only,
                     false,
                     false,
                     true,
@@ -2377,6 +2382,58 @@ mod tests {
     /// c3b.3: `urgent_only` + `since_ts` filter the toron inbox; the row
     /// model supports them (importance + created_ts_us). Seeded via real
     /// send_message round trips so the projection is the code under test.
+    #[test]
+    fn inbox_honors_urgent_flag_parity_with_mcp() {
+        // bd-mail-surface-drift-7r2o: `inbox(urgent_only=true)` must return
+        // the SAME id set as `inbox_filtered(urgent_only=true)` — the flag
+        // is not decorative. The legacy surface ignored it entirely, so an
+        // --urgent caller counted every row in an unfiltered dump.
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let project = format!("drift-urgent-{}", std::process::id());
+        mail.ensure_project(&project).expect("project");
+        mail.register_agent(&project, "DriftRecv", "opencode", "test", "seed")
+            .expect("recipient registered");
+        mail.register_agent(&project, &mail.name, "opencode", "test", "seed")
+            .expect("facade identity registered");
+        let recv = vec!["DriftRecv".to_string()];
+        mail.send(&project, &recv, "u1", "body", "urgent", false, None)
+            .expect("send");
+        mail.send(&project, &recv, "n1", "body", "normal", false, None)
+            .expect("send");
+
+        let via_inbox = mail.inbox(&project, "DriftRecv", true, 100).expect("inbox");
+        let via_filtered = mail
+            .inbox_filtered(
+                &project,
+                "DriftRecv",
+                &MailInboxFilter {
+                    urgent_only: true,
+                    include_bodies: false,
+                    limit: 100,
+                    ..Default::default()
+                },
+            )
+            .expect("filtered inbox");
+
+        let ids = |v: &Value| -> Vec<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
+                .collect()
+        };
+        assert_eq!(
+            ids(&via_inbox),
+            ids(&via_filtered),
+            "--urgent must match the MCP urgent_only id set"
+        );
+        assert_eq!(
+            ids(&via_inbox).len(),
+            1,
+            "only the high/urgent row survives"
+        );
+    }
+
     #[test]
     fn inbox_filtered_applies_urgent_and_since_on_toron() {
         let mail = Mail::from_config(None).expect("ok").expect("Some");
