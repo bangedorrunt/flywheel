@@ -11147,21 +11147,9 @@ fn resolve_mail_actor(project: &str, explicit: Option<&str>) -> Option<String> {
     // the pinned identity, not a parallel hash-mapped one. Registry miss
     // falls back to the deterministic hash mapping.
     let resolve = |t: &str| resolve_mail_target_registry(project, t.trim());
-    if let Some(a) = explicit {
-        let t = a.trim();
-        if !t.is_empty() {
-            return Some(resolve(a));
-        }
-    }
-    for key in ["TORON_AGENT", "FLYWHEEL_MAIL_AS", "AGENT_NAME"] {
-        if let Ok(v) = std::env::var(key) {
-            let t = v.trim();
-            if !t.is_empty() {
-                return Some(resolve(&v));
-            }
-        }
-    }
-    None
+    // bd-reservation-identity-tlnf: ONE selection function feeds every
+    // actor path — send/inbox/locks and (by order parity) the guard.
+    select_reservation_identity(explicit, &|k| std::env::var(k).ok()).map(|t| resolve(&t))
 }
 
 /// bd-reservation-identity-tlnf: the pure selection half of reservation
