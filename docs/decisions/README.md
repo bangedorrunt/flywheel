@@ -9,7 +9,7 @@ This directory contains records of the major architectural decisions made for th
 | [0003](0003-reintroduce-agent-mail-backend.md) | Reintroduce a Real agent-mail Backend (per-backend config, XDG, parity) | **Partially superseded** by toron ADR-0007 se2.3 (MailSurface trait unification) — config split, parity harness, per-backend routing survive |
 | [0004](0004-flywheel-web-presence.md) | flywheel Web Presence — Orchestration-Layer Presentation | **Accepted** (2026-08-13; flywheel = section of toron.dev per toron ADR-0013 D5; layer-ownership table, Orchestration pillar, 3 diagrams E/W/CO, docs sections, spin-out path to flywheel.dev) |
 | [0005](0005-always-on-collab-baseline-and-command-surface.md) | Always-On Collaboration Baseline + Composable Markdown Command Surface | **Accepted** (2026-08-20; D5 captain ±loop; §9 SC-D1–D10; `verify-0005.sh`) |
-| [0006](0006-parameterized-stage-payloads-and-wave-scoped-dispatch.md) | Parameterized Stage Payloads + Wave-Scoped Dispatch (the unattended wave swarm) | **Accepted** (2026-08-22; D1 stage params, D2 wave filter, D3 wave-swarm recipe, D4 report conventions; `verify-0006.sh` pending) |
+| [0006](0006-parameterized-stage-payloads-and-wave-scoped-dispatch.md) | Parameterized Stage Payloads + Wave-Scoped Dispatch (the unattended wave swarm) | **Accepted** (2026-08-22; D1–D4; `verify-0006.sh` 9/9; graduation GREEN 2026-08-23 — composed wave-swarm closed fixture bead grad-fw-43424-9da via legal close, kept to catalog) |
 
 ## Related toron ADRs
 
