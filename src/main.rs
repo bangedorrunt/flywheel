@@ -10864,9 +10864,12 @@ fn mail_or_die(cfg: &Config) -> Result<mail_shim::Mail> {
 
 /// Who this CLI mail invocation acts as (bd-mail-actor-identity-nze).
 ///
-/// Priority: explicit `--as` → `FLYWHEEL_MAIL_AS` → `AGENT_NAME` → config
-/// `[agent_mail].name` (orchestrator CoralFinch). Without this, every crew
-/// `flywheel mail send` collapsed to CoralFinch and peer collab was unreadable.
+/// Priority: explicit `--as` → `TORON_AGENT` → `FLYWHEEL_MAIL_AS` →
+/// `AGENT_NAME` → config `[agent_mail].name`. bd-reservation-identity-tlnf:
+/// the env ladder MUST mirror toron's `guard_agent` attribution order
+/// exactly (TORON_AGENT > FLYWHEEL_MAIL_AS > AGENT_NAME) — two orders was
+/// the seam where leases landed under one identity and commits were
+/// attributed to another.
 fn resolve_mail_actor(project: &str, explicit: Option<&str>) -> Option<String> {
     // bd-aseq: the actor resolves through the spawn registry like any
     // recipient — a slug `--as` / FLYWHEEL_MAIL_AS / AGENT_NAME must act as
@@ -10879,12 +10882,31 @@ fn resolve_mail_actor(project: &str, explicit: Option<&str>) -> Option<String> {
             return Some(resolve(a));
         }
     }
-    for key in ["FLYWHEEL_MAIL_AS", "AGENT_NAME"] {
+    for key in ["TORON_AGENT", "FLYWHEEL_MAIL_AS", "AGENT_NAME"] {
         if let Ok(v) = std::env::var(key) {
             let t = v.trim();
             if !t.is_empty() {
                 return Some(resolve(&v));
             }
+        }
+    }
+    None
+}
+
+/// bd-reservation-identity-tlnf: the pure selection half of reservation
+/// identity — explicit `--as`, then the env ladder in the guard's exact
+/// order ([`resolve_mail_actor`] docs), empty values never winning. The
+/// caller feeds the real env lookup; tests inject closures.
+fn select_reservation_identity(
+    explicit: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if let Some(a) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(a.to_string());
+    }
+    for key in ["TORON_AGENT", "FLYWHEEL_MAIL_AS", "AGENT_NAME"] {
+        if let Some(v) = env(key).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            return Some(v);
         }
     }
     None
@@ -11630,7 +11652,12 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 let key = project_dir_str(cfg, project)?;
                 let mail = mail_as(cfg, &key, as_agent.as_deref())?;
                 mail.ensure_project(&key)?;
-                let agent = as_agent.clone().unwrap_or_else(|| mail.name.clone());
+                // bd-reservation-identity-tlnf: the lease holder is the
+                // RESOLVED actor (mail.name), never the raw `--as` spelling —
+                // the guard attributes commits to the resolved identity, so a
+                // slug-held lease and its pin-attributed commit were two
+                // different holders.
+                let agent = mail.name.clone();
                 let v = mail.reserve(&key, &agent, paths, *ttl_seconds, *exclusive, reason)?;
                 print_json(&v);
             }
@@ -11650,7 +11677,8 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         MailCmd::Unlock { project, as_agent } => {
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
-            let agent = as_agent.clone().unwrap_or_else(|| mail.name.clone());
+            // bd-reservation-identity-tlnf: resolved actor, never the raw slug.
+            let agent = mail.name.clone();
             let v = mail.release_paths(&key, &agent, &[])?;
             print_json(&v);
         }
@@ -11662,7 +11690,8 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
-            let agent = as_agent.clone().unwrap_or_else(|| mail.name.clone());
+            // bd-reservation-identity-tlnf: resolved actor, never the raw slug.
+            let agent = mail.name.clone();
             let v = mail.conflicts_for(&key, &agent, paths)?;
             print_json(&v);
         }
@@ -26152,5 +26181,92 @@ mod send_result_row_tests {
             interrupt_guard_working(AgentStatus::Idle, false).is_ok(),
             "idle needs no force"
         );
+    }
+}
+
+#[cfg(test)]
+mod reservation_identity_tests {
+    use super::*;
+    use toron_core::mailbox::guard::{guard_check_strict, Reservation, SHARED_SAFE_PATHS};
+
+    /// Pure selection: explicit --as wins, then the env ladder in the SAME
+    /// order the toron guard attributes commits (TORON_AGENT >
+    /// FLYWHEEL_MAIL_AS > AGENT_NAME); empty strings never win.
+    #[test]
+    fn reservation_identity_selection_matches_guard_order() {
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "TORON_AGENT" => None,
+                "FLYWHEEL_MAIL_AS" => Some("MailAs".into()),
+                "AGENT_NAME" => Some("AgentName".into()),
+                _ => None,
+            }
+        };
+        // explicit beats everything
+        assert_eq!(
+            select_reservation_identity(Some("Explicit"), &env).as_deref(),
+            Some("Explicit")
+        );
+        // FLYWHEEL_MAIL_AS before AGENT_NAME (TORON_AGENT unset here)
+        assert_eq!(
+            select_reservation_identity(None, &env).as_deref(),
+            Some("MailAs")
+        );
+        // TORON_AGENT jumps the queue when set (guard parity)
+        let env_t = |k: &str| -> Option<String> {
+            match k {
+                "TORON_AGENT" => Some("Toron".into()),
+                "FLYWHEEL_MAIL_AS" => Some("MailAs".into()),
+                "AGENT_NAME" => Some("AgentName".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            select_reservation_identity(None, &env_t).as_deref(),
+            Some("Toron")
+        );
+        // empty-string vars are skipped, not selected
+        let env_empty = |k: &str| -> Option<String> {
+            match k {
+                "TORON_AGENT" => Some("  ".into()),
+                "FLYWHEEL_MAIL_AS" => Some("MailAs".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            select_reservation_identity(None, &env_empty).as_deref(),
+            Some("MailAs")
+        );
+        // nothing anywhere -> config default
+        assert_eq!(select_reservation_identity(None, &|_| None).as_deref(), None);
+    }
+
+    /// THE failing sequence from tonight, as a self-test: the wrapper binds
+    /// a lease as identity X; the guard attributes the commit to X — the
+    /// strict sweep-guard must PASS its own holder's commit and BLOCK any
+    /// other attribution (the ~6 blocked commits failure mode).
+    #[test]
+    fn reservation_identity_holder_passes_own_commit_guard() {
+        let holder = select_reservation_identity(
+            None,
+            &|k| (k == "AGENT_NAME").then(|| "IronSummit".to_string()),
+        )
+        .expect("env-bound identity");
+        let staged = vec!["src/main.rs".to_string(), "src/stages.rs".to_string()];
+        let own = vec![Reservation {
+            holder: holder.clone(),
+            pattern: "src/**".to_string(),
+            exclusive: true,
+        }];
+        let blocks =
+            guard_check_strict(Some(&holder), &staged, &own, SHARED_SAFE_PATHS);
+        assert!(
+            blocks.is_empty(),
+            "own lease must not block own commit: {blocks:?}"
+        );
+        // The asymmetry this bead kills: same lease, DIFFERENT attributed
+        // committer (config-default identity) -> blocked.
+        let other = guard_check_strict(Some("Flywheel"), &staged, &own, SHARED_SAFE_PATHS);
+        assert!(!other.is_empty(), "foreign attribution must block");
     }
 }

@@ -20,6 +20,12 @@ Live ignored tests need herdr + mail. `cargo test --exclude-ignored` is invalid.
 - **Classify first:** `flywheel decide "<target>" --json`. Run `argv`. Do not invent a second selector.
 - **Deps:** flywheel → toron-workflow → toron-core. Never reverse.
 - **Mail:** `toron_core::mailbox::surface::MailSurface`. Local `MailBackend` is deleted. Default mail = toron (absent `[mail.toron] url` → embed).
+- **Identity resolution is ONE ladder everywhere** (bd-reservation-identity-tlnf): explicit
+  `--as` → `TORON_AGENT` → `FLYWHEEL_MAIL_AS` → `AGENT_NAME` → config `[agent_mail].name`,
+  spawn-registry-resolved. Both sides of the seam use it: `mail locks reserve/release/renew`
+  bind the lease holder to the RESOLVED actor (never the raw slug), and the toron strict guard
+  attributes commits through the same order — so a wrapper-acquired lease always covers its own
+  holder's commits. Self-test: `cargo test reservation_identity`.
 - **Tracker:** `br` CLI + `--json`. No beads MCP. Never bare `bv`.
 - **Kill:** `--force` skips confirm. Working agents also need `--force-working`.
 - **workflow run** without `--execute` dispatches nothing. `--mode` default is headless.
@@ -52,6 +58,7 @@ Live ignored tests need herdr + mail. `cargo test --exclude-ignored` is invalid.
 - **Engineering principles (ADR-0019 Spec 5/6):** `flywheel principles list`. Cite the name that changed the decision. Full leaves: `flywheel principles show <name>`.
 - **Wave 1-2 landed surface (ADR-0019):** `ledger {check,receipt}` = br-gate verdict store + SHA-bound legal close (close without a legal verdict reopens); `ledger receipt --close-reason <text>` runs the advisory VERIFY-tail + principles-citation check (lint warnings, ADR-0006 D3 shared with the wave-swarm VERIFY stage); `workflow lint` enforces playbook structure (feature `data_shape`, bug-fix `repro` predecessor, prototype/arena `n>=2` + mode rules, forensics read-only — lints live in toron-workflow); playbook builtins landed (bug-fix, feature, refactoring, prototype, arena, perf, hillclimb, interrogate, forensics, figure-it-out, babysit-bead, ship-beads, autonomous-work, pickup, pause); decide rows gained the `!implement` guard (fix-the-leak → bug-fix, never forensics).
 - **Preflight:** `steer`/`loop run`/`workflow run --execute` auto-run prerequisite checks (herdr, resonate, br, beads, operator key, mail). `--skip-preflight` bypasses. Standalone: `flywheel preflight --mode {steer|loop|workflow|cron}`.
+- **Durable doorbell (bd-durable-doorbell-lngf):** dispatchers are supervised — `recover`/`status` lazily heal dead ones (only workspaces that ever ran one); `flywheel doorbell {status,start,stop,re-inject <project>}` is the explicit surface; wake state (`since_by_pin` + last_wake) persists per workspace so pending wakes survive crashes at-least-once; `doctor` warns on dead dispatchers; re-inject restores the peer-aware handler on pane-split/post-crash panes.
 
 ## Skill Sync Contract
 
