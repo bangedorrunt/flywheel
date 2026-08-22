@@ -350,6 +350,13 @@ enum Commands {
         #[arg(long)]
         timeout_ms: Option<u64>,
     },
+    /// bd-durable-doorbell-lngf: supervised pane-wake layer surface.
+    /// Dispatchers are lazily healed — any of these (plus `recover`/`status`)
+    /// restarts a dead one for workspaces that ever ran one.
+    Doorbell {
+        #[command(subcommand)]
+        cmd: DoorbellCmd,
+    },
     /// Monitor a swarm: poll every N seconds, feed queued instructions to
     /// idle/finished agents, report blockers. Exits 0 when the queue is drained
     /// and the swarm settles. Runs as a durable Resonate workflow by default —
@@ -1052,6 +1059,34 @@ struct AgentCounts {
     pi: Option<u32>,
     #[arg(long)]
     gk: Option<u32>,
+}
+
+/// Subcommands of `flywheel doorbell` (bd-durable-doorbell-lngf): the
+/// supervised pane-wake layer surface.
+#[derive(Subcommand)]
+enum DoorbellCmd {
+    /// per-workspace liveness: dispatcher up/down, last wake, unanswered
+    /// pins. Lazily heals dead dispatchers while reporting.
+    Status {
+        project: String,
+    },
+    /// start/attach dispatchers for every registered workspace that ever
+    /// ran one (the crash-recovery entry point).
+    Start {
+        project: String,
+    },
+    /// stop dispatchers (per workspace; `all` for every registered one)
+    Stop {
+        project: String,
+        /// workspace id, or `all`
+        #[arg(default_value = "all")]
+        workspace: String,
+    },
+    /// re-inject the peer-aware handler + identity line into EXISTING panes
+    /// (covers herdr pane-split additions and post-crash respawns).
+    ReInject {
+        project: String,
+    },
 }
 
 /// Subcommands of `flywheel loop` (bd-fw-stale-loop-processes-gac
@@ -3205,8 +3240,9 @@ fn main() {
             "backend": format!("herdr (socket protocol v{})", herdr_shim::HDR_PROTOCOL),
             "commands": [
                 "init spawn add list status decide rebind recover",
-                "send interrupt view output watch zoom attach kill",
-                "loop work assign collab xproj mail toron steer ledger principles",
+            "send interrupt view output watch zoom attach kill",
+            "loop work assign collab xproj mail toron steer ledger principles",
+            "doorbell status/start/stop/re-inject (supervised pane-wake layer: lazy-heal + persisted wake state)",
                 "coalition debate plan-review profile squad model runs",
                 "workflow cron recipes workflows pipeline template stage ensemble",
                 "checkpoint timeline audit history changes resume analytics",
@@ -3367,6 +3403,14 @@ fn main() {
             until,
             timeout_ms,
         }) => cmd_watch(&cfg, project, to, until.as_deref(), *timeout_ms),
+        Some(Commands::Doorbell { cmd }) => match cmd {
+            DoorbellCmd::Status { project } => cmd_doorbell_status(&cfg, project),
+            DoorbellCmd::Start { project } => cmd_doorbell_start(&cfg, project),
+            DoorbellCmd::Stop { project, workspace } => {
+                cmd_doorbell_stop(&cfg, project, workspace)
+            }
+            DoorbellCmd::ReInject { project } => cmd_doorbell_re_inject(&cfg, project),
+        },
         Some(Commands::Loop { cmd }) => match cmd {
             LoopCmd::Run {
                 project,
@@ -5553,6 +5597,47 @@ mod spawn_boot_reliability_tests {
         );
     }
 
+    /// bd-durable-doorbell-lngf: the wake layer is supervised and
+    /// observable — status shows liveness AND lazy-heals; recover restores
+    /// dispatchers after a crash; doctor warns on dead ones; the persisted
+    /// wake state feeds at-least-once redelivery.
+    #[test]
+    fn doorbell_layer_is_supervised_observable_durable() {
+        let src = include_str!("main.rs");
+        assert!(src.contains("enum DoorbellCmd"), "explicit surface exists");
+        for needle in [
+            "cmd_doorbell_status",
+            "cmd_doorbell_start",
+            "cmd_doorbell_stop",
+            "cmd_doorbell_re_inject",
+        ] {
+            assert!(src.contains(needle), "{needle} wired into the surface");
+        }
+        let recover = src.rfind("fn cmd_recover(").expect("cmd_recover");
+        let recover_body = &src[recover..recover + 6000];
+        assert!(
+            recover_body.contains("doorbell::ensure_running"),
+            "recover must heal dead dispatchers"
+        );
+        let status = src.rfind("fn cmd_status(").expect("cmd_status");
+        let status_body = &src[status..status + 5000];
+        assert!(
+            status_body.contains("doorbell::ensure_running")
+                && status_body.contains("wake_state"),
+            "status shows last_wake and lazy-heals"
+        );
+        assert!(
+            src.contains("doorbell_persist_wake"),
+            "dispatcher persists wake state (at-least-once redelivery)"
+        );
+        let internal = src.rfind("fn cmd_internal_doorbell(").expect("internal");
+        let internal_body = &src[internal..internal + 9000];
+        assert!(
+            internal_body.contains("doorbell::load_wake_state"),
+            "dispatcher restarts from persisted high-waters"
+        );
+    }
+
     // bd-spawn-omp-boot-reliability-3h06: the final gate's pure verdict —
     // only panes with a confirmed live process pass; a dead process, an
     // inconclusive probe, and a probe error all count as dead.
@@ -6523,6 +6608,119 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
     Ok(())
 }
 
+/// bd-durable-doorbell-lngf: the registered workspaces of `project` that
+/// ever ran a dispatcher (the lazy-heal scope).
+fn doorbell_project_workspaces(project: &str) -> Vec<String> {
+    let registry = state::load_spawn_registry(project);
+    doorbell::workspaces_to_heal(&config::state_dir(), &registry)
+}
+
+fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
+    let _ = cfg;
+    let state_dir = config::state_dir();
+    for ws in doorbell_project_workspaces(project) {
+        let pid = doorbell::read_pid(&doorbell::pid_file(&state_dir, &ws));
+        let alive = pid.is_some_and(doorbell::pid_alive);
+        let wake = doorbell::load_wake_state(&doorbell::wake_state_file(&state_dir, &ws));
+        let last = wake
+            .last_wake_unix
+            .map(|t| format!("last_wake={t} pin={}", wake.last_wake_pin.as_deref().unwrap_or("?")))
+            .unwrap_or_else(|| "last_wake=never".into());
+        println!(
+            "{project}/{ws}: dispatcher {} {last}{}",
+            if alive { "up" } else { "DOWN" },
+            {
+                let pins = doorbell::read_unanswered(&doorbell::unanswered_file(&state_dir, &ws));
+                if pins.is_empty() {
+                    String::new()
+                } else {
+                    format!(" unanswered={}", pins.join(","))
+                }
+            }
+        );
+        if !alive {
+            // lazy heal: report AND restart (requirement 1)
+            match doorbell::ensure_running(
+                &std::env::current_exe()?,
+                &config::state_dir(),
+                &ws,
+                project,
+            ) {
+                Ok(a) => println!("  healed ({a:?})"),
+                Err(e) => println!("  heal FAILED: {e:#}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_doorbell_start(_cfg: &Config, project: &str) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    for ws in doorbell_project_workspaces(project) {
+        let action = doorbell::ensure_running(&exe, &config::state_dir(), &ws, project)
+            .with_context(|| format!("doorbell start {project}/{ws}"))?;
+        println!("{project}/{ws}: {action:?}");
+    }
+    Ok(())
+}
+
+fn cmd_doorbell_stop(_cfg: &Config, project: &str, workspace: &str) -> Result<()> {
+    let workspaces: Vec<String> = if workspace == "all" {
+        doorbell_project_workspaces(project)
+    } else {
+        vec![workspace.to_string()]
+    };
+    for ws in workspaces {
+        doorbell::stop(&config::state_dir(), &ws)
+            .with_context(|| format!("doorbell stop {project}/{ws}"))?;
+        println!("{project}/{ws}: stopped");
+    }
+    Ok(())
+}
+
+/// bd-durable-doorbell-lngf requirement 4: re-inject the peer-aware handler
+/// + identity line into EXISTING panes — covers herdr pane-split additions
+/// and post-crash respawns that never got the spawn-time injection.
+///
+/// (oc5: `select_reservation_identity` below is yours — landing your bead
+/// resolves the dead-code warning.)
+fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> {
+    let registry = state::load_spawn_registry(project);
+    let peer_tpl = include_str!("../integrations/peer-aware.md.tpl");
+    let mut c = Client::connect(Some(&cfg.socket_path()))?;
+    let mut injected = 0;
+    for e in &registry {
+        if e.pane_id.is_empty() {
+            continue;
+        }
+        let Some(identity) = e.mail_identity.as_deref() else {
+            continue;
+        };
+        let mut lines = vec![doorbell::identity_prime(&e.name, identity)];
+        lines.push(peer_prompt_template(
+            peer_tpl,
+            &e.name,
+            identity,
+            // ADR-0005 budget defaults (5/30/3) — same as `spawn`'s.
+            5,
+            30,
+            3,
+        ));
+        for line in lines {
+            // ADR-0005 H2: agent.prompt is gated until the pane's first
+            // prompt lands — the identity prime IS that neutral opener, so
+            // the handler inject behind it goes through.
+            c.agent_prompt(&e.pane_id, &line, None).map_err(|err| {
+                anyhow!("re-inject {}: pane {} not promptable ({err}) — is the agent up?", e.name, e.pane_id)
+            })?;
+        }
+        injected += 1;
+        println!("{} ({}): handler + identity re-injected", e.name, e.pane_id);
+    }
+    println!("re-injected {injected} pane(s) in {project}");
+    Ok(())
+}
+
 fn cmd_internal_doorbell(
     cfg: &Config,
     project: &str,
@@ -6615,7 +6813,11 @@ fn cmd_internal_doorbell(
     let mut pane_to_pin: BTreeMap<String, String> = BTreeMap::new();
     let mut queues: BTreeMap<String, doorbell::DoorbellQueue> = BTreeMap::new();
     let mut budgets: BTreeMap<String, doorbell::PinBudget> = BTreeMap::new();
-    let mut since_by_pin: BTreeMap<String, String> = BTreeMap::new();
+    // bd-durable-doorbell-lngf: plane-P high-waters + the last-wake stamp
+    // survive a crash — at-least-once redelivery with an idempotent line.
+    let wake_state_path = doorbell::wake_state_file(&config::state_dir(), workspace);
+    let mut since_by_pin: BTreeMap<String, String> =
+        doorbell::load_wake_state(&wake_state_path).since_by_pin;
     let mut hear = doorbell::HearTracker::default();
     hear.seed_unanswered(doorbell::read_unanswered(&doorbell::unanswered_file(
         &config::state_dir(),
@@ -6705,6 +6907,11 @@ fn cmd_internal_doorbell(
                     workspace,
                     generation.as_ref(),
                 );
+                doorbell_persist_wake(
+                    workspace,
+                    &since_by_pin,
+                    injects.first().map(|(pin, _)| pin.as_str()),
+                );
             }
             Ok(Bell::Status { pane_id, to }) => {
                 let Some(pin) = pane_to_pin.get(&pane_id).cloned() else {
@@ -6726,6 +6933,11 @@ fn cmd_internal_doorbell(
                     &index,
                     workspace,
                     generation.as_ref(),
+                );
+                doorbell_persist_wake(
+                    workspace,
+                    &since_by_pin,
+                    injects.first().map(|(pin, _)| pin.as_str()),
                 );
             }
             Ok(Bell::Died) => break,
@@ -6774,6 +6986,7 @@ fn cmd_internal_doorbell(
                 }
                 let _ = hear.expire(doorbell_now_unix(), doorbell::UNANSWERED_SECS);
                 doorbell_persist_hear(workspace, &hear);
+                doorbell_persist_wake(workspace, &since_by_pin, None);
                 let pins: Vec<String> = state::load_spawn_registry(project)
                     .iter()
                     .filter_map(|e| e.mail_identity.clone())
@@ -6821,6 +7034,23 @@ fn doorbell_persist_hear(workspace: &str, hear: &doorbell::HearTracker) {
         &doorbell::unanswered_file(&config::state_dir(), workspace),
         &hear.unanswered_pins(),
     );
+}
+
+/// bd-durable-doorbell-lngf: persist the wake state after a delivery pass —
+/// since high-waters + the last-wake stamp survive a crash (at-least-once
+/// redelivery reads this on restart; the `[doorbell]` line is idempotent).
+fn doorbell_persist_wake(
+    workspace: &str,
+    since_by_pin: &BTreeMap<String, String>,
+    woke_pin: Option<&str>,
+) {
+    let path = doorbell::wake_state_file(&config::state_dir(), workspace);
+    let mut st = doorbell::load_wake_state(&path);
+    st.since_by_pin = since_by_pin.clone();
+    if let Some(pin) = woke_pin {
+        doorbell::note_wake(&mut st, pin, doorbell_now_unix());
+    }
+    let _ = doorbell::save_wake_state(&path, &st);
 }
 
 fn doorbell_prompt(
@@ -8877,6 +9107,23 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     let unanswered =
         doorbell::read_unanswered(&doorbell::unanswered_file(&config::state_dir(), &ws_label));
     let report = doorbell::report_text(&config::state_dir(), &ws_label);
+    // bd-durable-doorbell-lngf: liveness = a field here, not a ps invocation;
+    // and status is also a lazy-heal site — a dead dispatcher restarts now.
+    let wake_state =
+        doorbell::load_wake_state(&doorbell::wake_state_file(&config::state_dir(), &ws_label));
+    let dispatcher_alive = doorbell::read_pid(&doorbell::pid_file(
+        &config::state_dir(),
+        &ws_label,
+    ))
+    .is_some_and(doorbell::pid_alive);
+    if !dispatcher_alive {
+        let _ = doorbell::ensure_running(
+            &std::env::current_exe()?,
+            &config::state_dir(),
+            &ws_label,
+            project,
+        );
+    }
     if std::io::stdout().is_terminal() {
         for r in &rows {
             let st = r["status"].as_str().unwrap_or("unknown");
@@ -8895,11 +9142,25 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             println!("  {}", integration_status_line(k, st));
         }
         println!("{report}");
+        println!(
+            "doorbell: {} last_wake={} pin={}",
+            if dispatcher_alive { "up" } else { "DOWN (healed)" },
+            wake_state
+                .last_wake_unix
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "never".into()),
+            wake_state.last_wake_pin.as_deref().unwrap_or("?")
+        );
     } else {
         print_json(&json!({
             "workspace_id": ws_id, "agents": rows, "integrations": integrations,
             "dispatcher": dispatcher,
-            "unanswered": unanswered
+            "unanswered": unanswered,
+            "doorbell": {
+                "alive": dispatcher_alive,
+                "last_wake_unix": wake_state.last_wake_unix,
+                "last_wake_pin": wake_state.last_wake_pin,
+            }
         }));
     }
     Ok(())
@@ -9174,6 +9435,16 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
         "recovered": recovered.len(),
         "details": recovered,
     }));
+    // bd-durable-doorbell-lngf: recover restored the agents — now restore
+    // the WAKE LAYER (the crash that killed the panes killed the
+    // dispatchers too). Lazy-heal every registered workspace.
+    let exe = std::env::current_exe()?;
+    for ws in doorbell_project_workspaces(project) {
+        match doorbell::ensure_running(&exe, &config::state_dir(), &ws, project) {
+            Ok(action) => eprintln!("flywheel: doorbell {ws} healed ({action:?})"),
+            Err(e) => eprintln!("flywheel: doorbell {ws} heal FAILED: {e:#}"),
+        }
+    }
     Ok(())
 }
 
@@ -13615,7 +13886,33 @@ fn cmd_loop_prune() -> Result<()> {
 /// Logic lives in durable::loop_doctor; this is a thin runtime + render stub.
 fn cmd_loop_doctor(cfg: &Config, fix: bool, json: bool) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    let report = rt.block_on(durable::loop_doctor(cfg, fix))?;
+    let mut report = rt.block_on(durable::loop_doctor(cfg, fix))?;
+    // bd-durable-doorbell-lngf: liveness of the wake layer — every
+    // registered workspace dispatcher that is DEAD is a warning (doctor
+    // only WARNS; healing lives in recover/status/doorbell). Projects are
+    // enumerated from the spawn-registry files in the agents dir.
+    let mut dead_doorbells: Vec<String> = Vec::new();
+    let agents_dir = config::state_dir().join("agents");
+    if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|x| x.to_str()) else {
+                continue;
+            };
+            let registry = state::load_spawn_registry(stem);
+            for ws in doorbell::workspaces_to_heal(&config::state_dir(), &registry) {
+                let alive = doorbell::read_pid(&doorbell::pid_file(&config::state_dir(), &ws))
+                    .is_some_and(doorbell::pid_alive);
+                if !alive {
+                    dead_doorbells.push(format!("{stem}/{ws}"));
+                }
+            }
+        }
+    }
+    report["doorbell"] = json!({ "dead_dispatchers": { "count": dead_doorbells.len(), "entries": dead_doorbells } });
     if json {
         print_json(&report);
         return Ok(());
@@ -13676,6 +13973,24 @@ fn cmd_loop_doctor(cfg: &Config, fix: bool, json: bool) -> Result<()> {
             e["pid"].as_u64().unwrap_or(0),
             e["started_at"].as_str().unwrap_or("?")
         );
+    }
+    let dead_db = report["doorbell"]["dead_dispatchers"]["count"].as_u64().unwrap_or(0);
+    println!(
+        "Doorbell dispatchers: {}",
+        if dead_db == 0 {
+            output::ok("all up")
+        } else {
+            output::warn(&format!("{dead_db} DEAD"))
+        }
+    );
+    for entry in report["doorbell"]["dead_dispatchers"]["entries"]
+        .as_array()
+        .map(|a| a.iter())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+    {
+        println!("  {entry} (heal: flywheel doorbell start <project>)");
     }
     println!(
         "Registry entries: {}",
