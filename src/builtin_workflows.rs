@@ -1149,6 +1149,8 @@ inputs:
     default: "wave-1"
   - name: steer_channel
     default: "adr0006-steer"
+  - name: captain_pin
+    default: ""
 steps:
   - name: gate
     action: dispatch_job
@@ -1164,7 +1166,7 @@ steps:
     spec:
       profile: "@planner"
       stage: wave-dispatch
-      task: 'Dispatch ONLY the beads in .flywheel/wave/{{inputs.wave_label}}-ready.json — one send --stage p1 --param payload per bead, each naming its bead id + the claim/close contract; onto {{inputs.steer_channel}}. Objective: {{inputs.objective}}'
+      task: 'Dispatch ONLY the beads in .flywheel/wave/{{inputs.wave_label}}-ready.json — one send --stage p1 --param payload per bead, each naming its bead id + the claim/close contract; onto {{inputs.steer_channel}}. The crew escalates to orchestrator pin {{inputs.captain_pin}}. Objective: {{inputs.objective}}'
     on_error: fail_run
   - name: execute
     action: dispatch_job
@@ -1180,7 +1182,7 @@ steps:
     spec:
       profile: "@scout"
       stage: wave-observe
-      task: 'Watch {{inputs.steer_channel}}: escalate, never adjudicate. Objective: {{inputs.objective}}'
+      task: 'Watch {{inputs.steer_channel}}: escalate, never adjudicate. Escalation target = the orchestrator pin {{inputs.captain_pin}} (flywheel mail send --project <slug> --to {{inputs.captain_pin}}) — DM THAT pin, never guess. Objective: {{inputs.objective}}'
     on_error: continue
   - name: verify
     action: dispatch_job
