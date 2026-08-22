@@ -1156,7 +1156,7 @@ steps:
     spec:
       profile: "@planner"
       stage: wave-gate
-      task: 'Gate the wave: preflight + scope `br ready` to {{inputs.wave_label}}; a lower open wave holds. Objective: {{inputs.objective}}'
+      task: 'Gate the wave {{inputs.wave_label}}: preflight + scope `br ready` to the label; write .flywheel/wave/{{inputs.wave_label}}-ready.json (the DISPATCH binding artifact); a lower open wave holds. Objective: {{inputs.objective}}'
     on_error: fail_run
   - name: dispatch
     action: dispatch_job
@@ -1164,7 +1164,7 @@ steps:
     spec:
       profile: "@planner"
       stage: wave-dispatch
-      task: 'Emit one D1 payload per gated ready bead onto {{inputs.steer_channel}}. Objective: {{inputs.objective}}'
+      task: 'Dispatch ONLY the beads in .flywheel/wave/{{inputs.wave_label}}-ready.json — one send --stage p1 --param payload per bead, each naming its bead id + the claim/close contract; onto {{inputs.steer_channel}}. Objective: {{inputs.objective}}'
     on_error: fail_run
   - name: observe
     action: dispatch_job
