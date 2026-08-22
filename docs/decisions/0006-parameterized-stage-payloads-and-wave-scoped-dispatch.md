@@ -146,3 +146,26 @@ Filed in this repo's tracker (`br list --labels adr-0006`): `stage-params` (D1),
 `wave-scoped-dispatch` (D2), `wave-swarm-recipe` (D3, depends on D1+D2),
 `principles-aware-receipts` (VERIFY-stage citation checks, extends `ledger receipt`),
 `adr-0006-docs-sync` (Skill Sync Contract + verify script + README row; depends on all).
+
+---
+
+## 9. Addendum (2026-08-23): implementation deltas from the graduation fix (bd-wave-swarm-graduation-fix-98io)
+
+The first graduation runs exposed two spec gaps; the fixes (72bfe5f, 9ad47e9, d2d6f3e, b800381)
+landed three deltas beyond §3 as written:
+
+1. **EXECUTE phase.** The §3 pipeline (GATE→DISPATCH→OBSERVE→VERIFY→SIGNOFF) assumed the
+   dispatched crew executes the bead. It does not — dispatch stages prompt, crews answer, nothing
+   moves the tracker. Implemented pipeline is GATE→**EXECUTE**→OBSERVE→VERIFY→SIGNOFF: the EXECUTE
+   stage carries the claim/close contract so a claimed bead reaches a legal close. Verified in the
+   green run (fixture bead grad-fw-43424-9da, legal close, verdict worker-receipt).
+2. **`--inputs '<json>'` + captain_pin.** Composed runs take structured inputs; the wave-swarm
+   recipe consumes `captain_pin` (the orchestrator identity for SIGNOFF routing) alongside the D1
+   `--param` stage payloads.
+3. **Boot-race retry.** First-dispatch `agent_pane_busy` transients are retried instead of eating
+   the wall-clock budget.
+
+Graduation verified 2026-08-23 by captain inspection: green run end-to-end, workflow kept to
+`.flywheel/workflows/wave-swarm.yaml` with provenance. Non-blocking cosmetics filed as
+bd-adr0006-cosmetic-sweep-q0g0. Skill Sync re-done for this addendum (AGENTS.md D3 line, SKILL.md
+compose section); installed binary refreshed per §130 of the skill.

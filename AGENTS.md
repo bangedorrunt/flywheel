@@ -42,9 +42,11 @@ Live ignored tests need herdr + mail. `cargo test --exclude-ignored` is invalid.
 - **Wave-scoped dispatch (ADR-0006 D2):** `loop run --work --wave-label wave-N` = ready ∩ exact
   label, held with named blockers while any open/in_progress bead carries wave-M (M<N). Default
   `--work` unchanged. Label-based hold is transitional (TODO → beads ADR-0001 schema-18 typed field).
-- **wave-swarm recipe (ADR-0006 D3):** `workflow compose "<objective>" --parts wave-swarm` expands
-  GATE→DISPATCH→OBSERVE→VERIFY→SIGNOFF over the compiled-in `wave-*` stages; SIGNOFF suspends the
-  run on `request_approval` (captain-only by construction). Bounded by `FLYWHEEL_COMPOSE_MAX_SECONDS`.
+- **wave-swarm recipe (ADR-0006 D3 + §9 addendum):** `workflow compose "<objective>" --parts wave-swarm
+  [--inputs '<json>']` expands GATE→DISPATCH→EXECUTE→OBSERVE→VERIFY→SIGNOFF over the compiled-in
+  `wave-*` stages (EXECUTE landed 9ad47e9 — dispatch-only crews never touched the bead; `--inputs`
+  carries captain_pin etc., b800381/d2d6f3e); SIGNOFF suspends the run on `request_approval`
+  (captain-only by construction). Bounded by `FLYWHEEL_COMPOSE_MAX_SECONDS`.
 - TDD. No script-based code edits. No file deletion without permission.
 - **Model routing is STRICT (nothing bypasses the registry):** profile models are registry ids — `ModelRegistry::load_routing()` (compiled-in defaults + user `models.toml`) + `resolve_strict()` add the provider prefix and enforce `caps`. An unregistered id or caps-excluded harness fails the spawn naming the fix. big-pickle is opencode-only (scout). Explicit ad-hoc `--model` keeps lenient passthrough. Dot-bearing ids must be quoted in models.toml (`[models."glm-5.2"]`).
 - **Engineering principles (ADR-0019 Spec 5/6):** `flywheel principles list`. Cite the name that changed the decision. Full leaves: `flywheel principles show <name>`.
