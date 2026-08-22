@@ -26,6 +26,11 @@ Live ignored tests need herdr + mail. `cargo test --exclude-ignored` is invalid.
   bind the lease holder to the RESOLVED actor (never the raw slug), and the toron strict guard
   attributes commits through the same order — so a wrapper-acquired lease always covers its own
   holder's commits. Self-test: `cargo test reservation_identity`.
+- **One operator is one npub across projects** (bd-register-portability-3c2b): `mail register`
+  requires `--name` (it never silently mints an unnamed key) and binds instead of forking via
+  `--from-project <slug>` (reuse that project's key for the pin) or `--adopt-unnamed <name>`
+  (move a prior unnamed mint into a named slot). A returning operator registering bare gets an
+  error naming these fixes — never a second identity.
 - **Tracker:** `br` CLI + `--json`. No beads MCP. Never bare `bv`.
 - **Kill:** `--force` skips confirm. Working agents also need `--force-working`.
 - **workflow run** without `--execute` dispatches nothing. `--mode` default is headless.
