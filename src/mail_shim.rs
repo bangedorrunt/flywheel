@@ -1204,9 +1204,21 @@ impl Mail {
                     "reservations": reservations,
                 }))
             }
-            BackendKind::Remote(_) => Err(anyhow::anyhow!(
-                "locks list requires the in-process toron mailbox (the remote-daemon MCP surface has no active_reservations tool)"
-            )),
+            BackendKind::Remote(_) => {
+                // bd-locks-list-daemon-xetz: the daemon exposes the lease
+                // board via the additive read tool (toron-mcp
+                // `list_file_reservations`) — same shape as the in-process
+                // arm, so `mail locks list` works at both ends of the seam.
+                let v = self.call_remote(
+                    "list_file_reservations",
+                    serde_json::json!({
+                        "project_key": project_key,
+                        "holder": holder,
+                        "path": path,
+                    }),
+                )?;
+                Ok(remotes_to_board(project_key, v))
+            }
         }
     }
 
@@ -2857,5 +2869,57 @@ mod inbox_json_rows_tests {
     #[test]
     fn non_array_input_yields_empty_array() {
         assert_eq!(inbox_json_rows(&json!({"workflows": []})), json!([]));
+    }
+}
+
+/// bd-locks-list-daemon-xetz: map the daemon `list_file_reservations`
+/// envelope onto the in-process board shape (`project`/`count`/
+/// `reservations[{id,path,holder,exclusive,reason,expires_ts_us}]`) so
+/// `mail locks list` is byte-shape-identical at both ends of the seam.
+fn remotes_to_board(project_key: &str, v: Value) -> Value {
+    let rows = v
+        .get("reservations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let count = rows.len();
+    Value::Object(
+        json!({
+            "project": project_key,
+            "count": count,
+            "reservations": rows,
+        })
+        .as_object()
+        .expect("literal object")
+        .clone(),
+    )
+}
+
+#[cfg(test)]
+mod locks_list_tests {
+    use super::*;
+
+    /// Remote envelope -> board shape mapping (holder/path filters are
+    /// applied daemon-side; the wrapper only reshapes).
+    #[test]
+    fn locks_list_remote_envelope_maps_to_board() {
+        let envelope = json!({
+            "project_key": "beads",
+            "count": 1,
+            "reservations": [
+                {"id": "abc", "path": "src/**", "holder": "BlueLake",
+                 "exclusive": true, "reason": "br-123",
+                 "expires_ts_us": 1787500000i64}
+            ]
+        });
+        let board = remotes_to_board("beads", envelope);
+        assert_eq!(board["project"], "beads");
+        assert_eq!(board["count"], 1);
+        assert_eq!(board["reservations"][0]["holder"], "BlueLake");
+        assert_eq!(board["reservations"][0]["path"], "src/**");
+        // degenerate daemon reply: empty rows still a well-formed board
+        let empty = remotes_to_board("x", json!({}));
+        assert_eq!(empty["count"], 0);
+        assert!(empty["reservations"].as_array().expect("rows").is_empty());
     }
 }
