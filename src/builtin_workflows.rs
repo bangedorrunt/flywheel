@@ -1323,25 +1323,19 @@ mod tests {
         let resolver = |sub: &str| builtin_workflows().get(sub).cloned();
         let rendered = crate::crew::render_dry_run(ship, &resolver);
         let steps = rendered["steps"].as_array().expect("dry-run steps");
-        let mut links: Vec<String> = Vec::new();
-        for s in steps {
-            if s["action"] == "call_workflow" {
-                links.push(
-                    s["path"]
-                        .as_str()
-                        .unwrap_or("<unnamed>")
-                        .split('.')
-                        .next_back()
-                        .unwrap_or("<unnamed>")
-                        .to_string(),
-                );
-            }
-        }
+        // The links EXPAND: each call_workflow renders its nested dispatch
+        // with its phase tag, in chain order (resolve→…→verify).
+        let phases: Vec<&str> = steps.iter().filter_map(|s| s["phase"].as_str()).collect();
         assert_eq!(
-            links,
+            phases,
             vec!["resolve", "plan", "implement", "review", "verify"],
             "ship renders the 5-link chain: {rendered}"
         );
+        let review = steps
+            .iter()
+            .find(|s| s["path"].as_str().is_some_and(|p| p.starts_with("review/")))
+            .expect("expanded review leaf");
+        assert_eq!(review["fanout"], serde_json::json!(2), "R-P3 n=2 visible");
     }
 
     /// bd-w2-review-s6ij: interrogate defaults N=2 with a @reviewer briefs
@@ -1783,7 +1777,9 @@ mod tests {
             })
             .collect();
         assert!(
-            chain.contains(&"brainstorm") && chain.contains(&"plan") && chain.contains(&"beads"),
+            chain.contains(&"brainstorm")
+                && chain.contains(&"phase-plan")
+                && chain.contains(&"beads"),
             "goal chains the built-ins: {chain:?}"
         );
     }
