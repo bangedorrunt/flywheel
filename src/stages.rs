@@ -257,6 +257,28 @@ impl StageLibrary {
                 "",
                 "Session pickup (ADR-0019): read .flywheel/agent-state/, `br list --status in_progress --json` for stranded beads, ledger gaps, and the last-sent registry; respawn context-exhausted panes; resume briefs for stranded in_progress beads. Idempotent: a done pickup finds nothing to do. Keep SUMMARIES in your report, not raw dumps (guard-the-context-window).",
             ),
+            // ---- ADR-0006 D3 wave-swarm recipe stages (bd-wave-swarm-recipe-
+            // wsot): one stage per composed phase. p-code-free: alias empty.
+            (
+                "wave-gate",
+                "",
+                "Wave gate (ADR-0006 D3): run `flywheel preflight --mode workflow` — a failed check STOPS the wave (post `[gate] blocked: <check>` to the steer channel; never fix infra yourself mid-gate). Then scope the ready set for this wave: the loop's D2 filter (`loop run --work --wave-label <wave-N>`) is the code path — you are its readable echo: `br ready --json` intersected with the wave label, and if ANY bead with an earlier wave-M (M<N) is open or in_progress, post `[gate] held: <bead ids>` and STOP (waves run in order, never around them). Otherwise post `[gate] open: <n> beads: <ids>`. Never dispatch, never adjudicate — gate and report only.",
+            ),
+            (
+                "wave-dispatch",
+                "",
+                "Wave dispatch (ADR-0006 D3/D1/D4): for EACH bead in the gated ready set emit ONE payload: `flywheel send --stage p1 --param bead=<id> --param scope=<owned globs> --param exit=<the bead's VERIFY command> --param channel=<steer-channel> --param pin=<owner pin> --param report_file=/tmp/<id>-report-<epoch>.md`. The payload IS the task contract; a missing required param fails naming the slot. Full reports go to report_file; the steer channel gets a <=700-char summary plus the file path (never paste full reports into the channel).",
+            ),
+            (
+                "wave-observe",
+                "",
+                "Wave observe (ADR-0006 D3): watch the steer channel for claims, receipts, and blocks. ESCALATE, never adjudicate: a bead blocked >10min, a reservation-ladder timeout, a fix-vs-hand-over fork, regression suspicion, or any judgment call -> mail the captain on the task thread with the evidence. You do NOT decide fixes, reassign work, or close beads. Escalations wake the captain; everything else runs unattended.",
+            ),
+            (
+                "wave-verify",
+                "",
+                "Wave verify (ADR-0006 D3): for each close claim confirm ALL of: (1) the receipt exists at the committed HEAD — `flywheel ledger check <bead-id>`; (2) the close reason carries its VERIFY tail (what was actually run + the result tail); (3) PRINCIPLES citations name decisions (`<name> — <decision>`, cargo-cult bare names are rejects). A close missing any of these REOPENS: post `[verify] reopen <id>: <missing>` on the steer channel. Verify against the real artifact, never a self-report.",
+            ),
         ];
         let mut stages = BTreeMap::new();
         for (name, alias, prompt) in defaults {
@@ -944,5 +966,14 @@ mod tests {
         assert!(!check_repo_evidence(1, true));
         assert!(!check_repo_evidence(2, false), "review bead required");
         assert!(check_repo_evidence(2, true));
+    }
+
+    /// ADR-0006 D3: the wave-swarm recipe's compiled-in stages resolve.
+    #[test]
+    fn wave_swarm_stages_resolve_compiled_in() {
+        let lib = StageLibrary::compiled_in();
+        for stage in ["wave-gate", "wave-dispatch", "wave-observe", "wave-verify"] {
+            assert!(lib.has(stage), "compiled-in stage {stage} resolves");
+        }
     }
 }

@@ -10644,6 +10644,13 @@ fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
                         c.citations.len()
                     );
                 }
+                // ADR-0006 D3: the wave-swarm VERIFY stage's hard verdict on
+                // the same reason — advisory lint stays advisory, the gate
+                // does not.
+                match verdict::verify_close_reason(reason) {
+                    Ok(()) => println!("wave-verify gate: PASS"),
+                    Err(e) => println!("wave-verify gate: REJECT ({e})"),
+                }
             }
             Ok(())
         }

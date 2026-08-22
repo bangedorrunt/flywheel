@@ -1124,6 +1124,69 @@ steps:
     on_error: fail_run
 "##,
     ),
+    // ---- ADR-0006 D3 wave-swarm recipe (bd-wave-swarm-recipe-wsot) ------
+    // The composed unattended wave swarm: GATE (D2 filter + preflight) ->
+    // DISPATCH (D1 --param payloads per ready bead, D4 report_file contract)
+    // -> OBSERVE (escalate, never adjudicate) -> VERIFY (receipt at HEAD +
+    // VERIFY tail + principles citations) -> SIGNOFF (request_approval — the
+    // engine SUSPENDS until the captain settles; captain-only by
+    // construction). Bounded by FLYWHEEL_COMPOSE_MAX_SECONDS at run time.
+    (
+        "wave-swarm",
+        r##"
+name: wave-swarm
+description: "ADR-0006 D3: the composed wave swarm. GATE scopes br ready to one wave label and holds on any open lower wave; DISPATCH emits send --stage p1 --param payloads (bead/scope/exit/channel/pin/report_file); OBSERVE escalates to the captain and never adjudicates; VERIFY checks receipts at committed HEAD + close-reason VERIFY tails + decision-naming principles citations; SIGNOFF suspends for captain-only approval."
+trigger:
+  type: webhook
+crew: auto
+principles:
+  - never-block-on-the-human
+  - guard-the-context-window
+  - subtract-before-you-add
+inputs:
+  - name: objective
+  - name: wave_label
+    default: "wave-1"
+  - name: steer_channel
+    default: "adr0006-steer"
+steps:
+  - name: gate
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@planner"
+      stage: wave-gate
+      task: 'Gate the wave: preflight + scope `br ready` to {{inputs.wave_label}}; a lower open wave holds. Objective: {{inputs.objective}}'
+    on_error: fail_run
+  - name: dispatch
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@planner"
+      stage: wave-dispatch
+      task: 'Emit one D1 payload per gated ready bead onto {{inputs.steer_channel}}. Objective: {{inputs.objective}}'
+    on_error: fail_run
+  - name: observe
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@scout"
+      stage: wave-observe
+      task: 'Watch {{inputs.steer_channel}}: escalate, never adjudicate. Objective: {{inputs.objective}}'
+    on_error: continue
+  - name: verify
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@reviewer"
+      stage: wave-verify
+      task: 'Verify every close claim: receipt at committed HEAD + VERIFY tail + principles citations. Objective: {{inputs.objective}}'
+    on_error: fail_run
+  - name: signoff
+    action: request_approval
+    message: "Wave signoff (captain-only) for {{inputs.objective}} [{{inputs.wave_label}}]: review the VERIFY receipts and the steer-channel summary; approve closes the wave gate, reject reopens."
+"##,
+    ),
     // ---- ADR-0019 Spec 7.2 reflect (wave 6, bd-w6-reflect-8gp5) ----
     (
         "reflect",
@@ -1207,6 +1270,22 @@ pub fn builtin_workflows() -> BTreeMap<String, Workflow> {
         }
     }
     map
+}
+
+/// ADR-0006 D3 (bd-wave-swarm-recipe-wsot): is `name` a builtin RECIPE — a
+/// composed multi-phase workflow addressable as a single `--parts` token?
+/// Deliberately NOT every builtin: only the composed recipes (today:
+/// wave-swarm) expand on the compose grammar; phase/playbook builtins keep
+/// their own routing (`decide`, cron templates).
+pub fn is_builtin_recipe(name: &str) -> bool {
+    name == "wave-swarm"
+}
+
+/// ADR-0006 D3: a builtin RECIPE's parsed workflow for compose expansion
+/// (a recipe token expands where it sits; its `inputs:` declarations merge
+/// into the composed workflow so template refs lint clean). Pure.
+pub fn builtin_recipe(name: &str) -> Option<Workflow> {
+    builtin_workflows().remove(name)
 }
 
 #[cfg(test)]
