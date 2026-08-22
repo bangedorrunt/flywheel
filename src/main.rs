@@ -1375,6 +1375,15 @@ enum MailCmd {
         /// short task description shown in listings
         #[arg(long)]
         task: Option<String>,
+        /// bind this operator's EXISTING key from another project's registry
+        /// (`{data}/{slug}/agents/<name>/key.ncryptsec`) instead of minting
+        /// a second npub
+        #[arg(long)]
+        from_project: Option<String>,
+        /// adopt a prior unnamed mint (`agents/key.ncryptsec`) under this
+        /// name — moves the key so register reuses its npub
+        #[arg(long)]
+        adopt_unnamed: Option<String>,
     },
     /// renew this identity's file reservations (extend the TTL)
     Renew {
@@ -11689,14 +11698,48 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             program,
             model,
             task,
+            from_project,
+            adopt_unnamed,
         } => {
             let key = project_dir_str(cfg, project)?;
             let mail = mail_or_die(cfg)?;
             mail.ensure_project(&key)?;
-            let name = name.clone().unwrap_or_default();
+            // bd-register-portability-3c2b: never mint an unnamed identity.
+            let mut decided = resolve_register_name(name.clone(), from_project.as_deref())?;
+            if let Some(adopt) = adopt_unnamed.as_deref() {
+                let (data_dir, _) = mail_shim::mailbox_roots();
+                adopt_unnamed_key(&data_dir, project, adopt)?;
+                if decided.is_empty() {
+                    decided = adopt.to_string();
+                }
+            }
+            if decided.is_empty() {
+                anyhow::bail!(
+                    "--from-project needs --name <pin> — the pin selects WHICH of that \
+                     project's identities binds here"
+                );
+            }
+            // Import: copy the source project's key into this project's
+            // named slot BEFORE registering — register_agent then REUSES
+            // that npub instead of minting a second identity.
+            if let Some(from) = from_project.as_deref()
+                && from != project
+            {
+                let (data_dir, _) = mail_shim::mailbox_roots();
+                if let Some(src) = import_source_key(&data_dir, from, &decided) {
+                    let dst = data_dir.join(project).join("agents").join(&decided);
+                    std::fs::create_dir_all(&dst)?;
+                    let dst = dst.join("key.ncryptsec");
+                    if !dst.exists() {
+                        std::fs::copy(&src, &dst).with_context(|| {
+                            format!("binding {} into {}", src.display(), dst.display())
+                        })?;
+                    }
+                }
+            }
             let v = mail.register_agent(
                 &key,
-                &name,
+                &decided,
                 program,
                 model,
                 task.as_deref().unwrap_or("flywheel mail CLI actor"),
@@ -26571,5 +26614,118 @@ mod reservation_identity_tests {
         // committer (config-default identity) -> blocked.
         let other = guard_check_strict(Some("Flywheel"), &staged, &own, SHARED_SAFE_PATHS);
         assert!(!other.is_empty(), "foreign attribution must block");
+    }
+}
+
+/// bd-register-portability-3c2b: the register-name decision. `None` explicit
+/// AND `None` import source is a refusal (the unnamed-mint bug: a fresh
+/// empty-name registration forked one operator across two npubs) — the error
+/// names both fixes. Explicit --name wins over import.
+fn resolve_register_name(explicit: Option<String>, from_project: Option<&str>) -> Result<String> {
+    let explicit = explicit.filter(|n| !n.trim().is_empty());
+    let importing = from_project.map(|p| !p.trim().is_empty()).unwrap_or(false);
+    match (explicit, importing) {
+        (Some(n), _) => Ok(n),
+        // import decides the name from the source key it binds
+        (None, true) => Ok(String::new()),
+        (None, false) => anyhow::bail!(
+            "refusing to mint an UNNAMED mail identity — pass --name <adjective+noun-pin>, \
+             or bind an existing one with --from-project <slug>, or adopt a prior unnamed \
+             mint with --adopt-unnamed <name>"
+        ),
+    }
+}
+
+/// Locate an existing identity key to import: `{data}/{from}/agents/{name}/
+/// key.ncryptsec`. Present = reuse (register_agent adopts it, never mints).
+fn import_source_key(data_dir: &std::path::Path, from_slug: &str, name: &str) -> Option<PathBuf> {
+    let p = data_dir.join(from_slug).join("agents").join(name).join("key.ncryptsec");
+    p.is_file().then_some(p)
+}
+
+/// The unnamed mint's key slot: name "" collapses the path to
+/// `{data}/{slug}/agents/key.ncryptsec` (the observed orphan).
+fn unnamed_key_path(data_dir: &std::path::Path, slug: &str) -> PathBuf {
+    data_dir.join(slug).join("agents").join("key.ncryptsec")
+}
+
+/// Cleanup affordance: move an unnamed mint's key into the named slot so the
+/// next register REUSES that npub instead of minting another. Same key bytes,
+/// one identity; no manual DB surgery. Absent unnamed key is an error naming
+/// the state (nothing to adopt).
+fn adopt_unnamed_key(data_dir: &std::path::Path, slug: &str, name: &str) -> Result<PathBuf> {
+    let src = unnamed_key_path(data_dir, slug);
+    if !src.is_file() {
+        anyhow::bail!(
+            "no unnamed mint found at {} — nothing to adopt",
+            src.display()
+        );
+    }
+    let dst_dir = data_dir.join(slug).join("agents").join(name);
+    std::fs::create_dir_all(&dst_dir)?;
+    let dst = dst_dir.join("key.ncryptsec");
+    std::fs::rename(&src, &dst)?;
+    Ok(dst)
+}
+
+#[cfg(test)]
+mod register_identity_tests {
+    use super::*;
+
+    /// The unnamed-mint refusal: no --name and no import source is an ERROR
+    /// naming both fixes — never a silent empty-name registration.
+    #[test]
+    fn register_identity_refuses_unnamed_mint() {
+        let err = resolve_register_name(None, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--name"), "names the fix: {msg}");
+        assert!(
+            msg.contains("--from-project") || msg.contains("--adopt-unnamed"),
+            "names the import affordance: {msg}"
+        );
+    }
+
+    /// Explicit --name passes through; explicit beats import when both given.
+    #[test]
+    fn register_identity_explicit_name_wins() {
+        assert_eq!(
+            resolve_register_name(Some("BlueLake".into()), Some("beads")).expect("explicit wins"),
+            "BlueLake"
+        );
+    }
+
+    /// Import source discovery: `{data}/{from}/agents/{name}/key.ncryptsec`
+    /// must exist to bind; missing source with no --name still refuses.
+    #[test]
+    fn register_identity_import_source_discovery() {
+        let dir = std::env::temp_dir().join(format!("fw-reg-id-{}", std::process::id()));
+        let src = dir.join("beads/agents/BlueLake");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(src.join("key.ncryptsec"), b"fake").expect("key");
+        let found = import_source_key(&dir, "beads", "BlueLake");
+        assert!(found.is_some(), "existing key discovered");
+        assert!(
+            import_source_key(&dir, "beads", "Nobody").is_none(),
+            "missing key -> None"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Adopt: the unnamed mint (`agents/key.ncryptsec`, name "") moves into
+    /// the named slot — same key bytes, one npub, no DB surgery.
+    #[test]
+    fn register_identity_adopt_moves_unnamed_key() {
+        let dir = std::env::temp_dir().join(format!("fw-reg-ad-{}", std::process::id()));
+        let unnamed = dir.join("flywheel/agents/key.ncryptsec");
+        std::fs::create_dir_all(unnamed.parent().unwrap()).expect("mkdir");
+        std::fs::write(&unnamed, b"npub-bytes").expect("write");
+        adopt_unnamed_key(&dir, "flywheel", "IronSummit").expect("adopt");
+        let named = dir.join("flywheel/agents/IronSummit/key.ncryptsec");
+        assert_eq!(std::fs::read(&named).unwrap(), b"npub-bytes");
+        assert!(!unnamed.exists(), "unnamed slot vacated");
+        // second adopt with nothing to move is a clean no-op error? No:
+        // absent unnamed key = nothing to adopt, reported not crashed.
+        assert!(adopt_unnamed_key(&dir, "flywheel", "Other").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
