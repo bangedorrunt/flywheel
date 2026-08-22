@@ -552,6 +552,99 @@ fn parse_recorded_at(s: &str) -> Option<DateTime<Utc>> {
         })
 }
 
+/// ADR-0006 VERIFY-stage piece (bd-principles-receipts-mmzc): the reusable
+/// close-reason check shared by `flywheel ledger receipt --close-reason` and
+/// the wave-swarm VERIFY stage. Pure — no IO, fixture-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseReasonCheck {
+    /// The close reason carries the VERIFY tail (what was actually run).
+    pub verify_tail_present: bool,
+    /// Well-formed `name — decision` citations parsed from the close
+    /// reason's PRINCIPLES section.
+    pub citations: Vec<(String, String)>,
+    /// Lint-level warnings: unknown principle names, cargo-cult decoration
+    /// (registry names dropped in prose without a decision clause), and
+    /// citation-count drift outside 1-3. Advisory until proven — nothing
+    /// here hard-fails a close yet (ADR-0006 §3 D3).
+    pub lint_warnings: Vec<String>,
+}
+
+impl CloseReasonCheck {
+    /// The advisory stance: decoration detection is a lint warning, not a
+    /// gate, until proven in practice (ADR-0006 D3 VERIFY stage).
+    pub fn is_hard_fail(&self) -> bool {
+        false
+    }
+}
+
+/// Check a bead close reason for its VERIFY tail and principles citations:
+///
+/// - VERIFY tail: the reason must name what was actually run (`VERIFY`
+///   marker present).
+/// - Citations live in a `PRINCIPLES:` section; each line/clause must be
+///   `name — decision it changed` (em-dash, matching the report checker in
+///   [`crate::principles::check_principles`]); 1-3 citations expected.
+/// - Every cited name must exist in the canonical 21-name registry.
+/// - A registry name appearing OUTSIDE a well-formed citation is a
+///   decoration (cargo-cult prose) — flagged, not failed.
+pub fn check_close_reason(reason: &str) -> CloseReasonCheck {
+    let mut out = CloseReasonCheck {
+        verify_tail_present: reason.contains("VERIFY"),
+        citations: Vec::new(),
+        lint_warnings: Vec::new(),
+    };
+    let (principles_text, prose) = match reason.find("PRINCIPLES") {
+        Some(i) => (&reason[i + "PRINCIPLES".len()..], &reason[..i]),
+        None => ("", reason),
+    };
+    // Clauses are newline- or semicolon-separated citation candidates.
+    for clause in principles_text.split(['\n', ';']) {
+        let clause = clause.trim().trim_start_matches(':').trim();
+        if clause.is_empty() {
+            continue;
+        }
+        if !clause.contains('—') && !clause.contains("—") {
+            // No separator at all: not a citation; the decoration scan below
+            // decides whether registry names were dropped in prose.
+            continue;
+        }
+        let Some((name, decision)) = clause.split_once('—').or_else(|| clause.split_once('\u{2014}')) else {
+            continue;
+        };
+        let name = name.trim();
+        let decision = decision.trim();
+        if decision.is_empty() {
+            out.lint_warnings.push(format!(
+                "citation has no decision clause (decoration?): {clause:?}"
+            ));
+            continue;
+        }
+        out.citations.push((name.to_string(), decision.to_string()));
+        if !crate::principles::is_known_name(name) {
+            out.lint_warnings.push(format!(
+                "unknown principle name {name:?} in citation (canonical 21, see `flywheel principles list`)"
+            ));
+        }
+    }
+    if out.citations.is_empty() || out.citations.len() > 3 {
+        out.lint_warnings.push(format!(
+            "close reason carries {} principles citations, expected 1-3",
+            out.citations.len()
+        ));
+    }
+    // Decoration scan: registry names dropped in prose outside the
+    // PRINCIPLES section are cargo-cult mentions, not citations.
+    for p in crate::principles::PRINCIPLES {
+        if prose.contains(p.name) {
+            out.lint_warnings.push(format!(
+                "decoration: principle `{}` named in prose without a `name — decision` citation",
+                p.name
+            ));
+        }
+    }
+    out
+}
+
 /// `flywheel ledger check` core: wrap `br gate list <id> --json`, apply
 /// `legal_close`, and report whether any history row is a legal verdict bound
 /// to `sha`. Exits 0 only on a legal verdict for the current SHA (the CLI
@@ -1453,5 +1546,70 @@ mod tests {
             other => panic!("expected Missing(receipt-eligible), got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod principles_receipt_tests {
+    use super::*;
+
+    /// VALID: a close reason with a VERIFY tail and 1-3 well-formed
+    /// `name — decision` citations passes clean, zero lint warnings.
+    #[test]
+    fn principles_receipt_valid_close_reason_is_clean() {
+        let reason = "VERIFY: cargo test --offline stage_param -> 5 passed. \
+PRINCIPLES: build-the-lever — one substitution engine serves every future \
+stage/workflow/repo; encode-lessons-in-structure — the contract becomes data.";
+        let c = check_close_reason(reason);
+        assert!(c.verify_tail_present, "VERIFY tail detected");
+        assert_eq!(c.citations.len(), 2, "both citations parsed");
+        assert!(
+            c.lint_warnings.is_empty(),
+            "clean close has no warnings: {:?}",
+            c.lint_warnings
+        );
+    }
+
+    /// UNKNOWN NAME: a citation naming a principle outside the 21-name
+    /// registry is flagged (warning names the bad name).
+    #[test]
+    fn principles_receipt_unknown_name_flagged() {
+        let reason = "VERIFY: cargo test ok\nPRINCIPLES: prove-it-work — the close gate";
+        let c = check_close_reason(reason);
+        assert!(c.verify_tail_present);
+        assert_eq!(c.citations.len(), 1);
+        assert!(
+            c.lint_warnings
+                .iter()
+                .any(|w| w.contains("prove-it-work") && w.contains("unknown")),
+            "unknown-name warning present: {:?}",
+            c.lint_warnings
+        );
+    }
+
+    /// DECORATION: a principle name dropped without its decision clause is
+    /// a cargo-cult decoration — lint WARNING, not a hard failure.
+    #[test]
+    fn principles_receipt_decoration_is_lint_not_hard_fail() {
+        let reason = "VERIFY: make check\nwe honored prove-it-works and minimize-reader-load here";
+        let c = check_close_reason(reason);
+        assert!(c.verify_tail_present);
+        assert!(c.citations.is_empty(), "prose mentions are not citations");
+        assert!(
+            c.lint_warnings
+                .iter()
+                .any(|w| w.to_lowercase().contains("decoration")),
+            "decoration warning present: {:?}",
+            c.lint_warnings
+        );
+        // The advisory stance: nothing in the check is a hard error yet.
+        assert!(!c.is_hard_fail());
+    }
+
+    /// Missing VERIFY tail is detected by the reusable shared check.
+    #[test]
+    fn principles_receipt_missing_verify_tail_detected() {
+        let c = check_close_reason("closed, all good");
+        assert!(!c.verify_tail_present);
     }
 }

@@ -1205,6 +1205,11 @@ enum LedgerCmd {
         /// commit SHA (default: derived via git log --grep=<bead-id>)
         #[arg(long)]
         sha: Option<String>,
+        /// ADR-0006 VERIFY piece: the bead close reason to check for a
+        /// VERIFY tail + principles citations (reusable with the wave-swarm
+        /// VERIFY stage). Advisory — findings print as lint warnings.
+        #[arg(long)]
+        close_reason: Option<String>,
         /// repo dir (default: current directory)
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -10606,6 +10611,7 @@ fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
             bead_id,
             kind,
             sha,
+            close_reason,
             dir,
         } => {
             let cwd = dir
@@ -10621,6 +10627,24 @@ fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut content)?;
             let path = verdict::write_receipt(&cwd, bead_id, &sha, kind, &content)?;
             println!("receipt {}", path.display());
+            // ADR-0006 VERIFY piece (bd-principles-receipts-mmzc): advisory
+            // close-reason check — findings are lint warnings, never a
+            // hard failure of the receipt write.
+            if let Some(reason) = close_reason {
+                let c = verdict::check_close_reason(reason);
+                if !c.verify_tail_present {
+                    println!("lint: close reason carries no VERIFY tail (what was actually run)");
+                }
+                for w in &c.lint_warnings {
+                    println!("lint: {w}");
+                }
+                if c.lint_warnings.is_empty() && c.verify_tail_present {
+                    println!(
+                        "close-reason check: clean ({} citation(s), verify tail present)",
+                        c.citations.len()
+                    );
+                }
+            }
             Ok(())
         }
     }
