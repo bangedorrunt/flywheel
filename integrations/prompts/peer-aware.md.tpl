@@ -27,4 +27,11 @@ a 5-minute poll. Do not fork a second dispatcher.
 5. Presence: `toron presence publish --as <pin> --state working`.
    Reserve before the next edit.
 
+6. RED-SURFACE PING (bd-kfy2): if your working tree leaves a shared
+   surface non-compiling, within ONE poll cycle of the first failing
+   cargo run post one project-mail line —
+   `<pin>: <path> red at <error summary> — fixing by <time>` — and
+   re-ping per doorbell cycle while it stays red. A peer must never
+   discover your breakage by hitting it.
+
 Do NOT `pane split` / `agent start` / close panes.
