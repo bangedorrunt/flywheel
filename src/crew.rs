@@ -550,7 +550,10 @@ pub fn workflow_from_yaml(src: &str) -> Result<Workflow> {
 /// call leaf flattened with its action kind, phase tag, step guard, and the
 /// RESOLVED fanout count for enclosing parallel/foreach scopes (@crew.<role>
 /// resolved through plan_crew). No dispatch happens; this is pure.
-pub fn render_dry_run(workflow: &Workflow) -> serde_json::Value {
+pub fn render_dry_run(
+    workflow: &Workflow,
+    resolver: &dyn Fn(&str) -> Option<Workflow>,
+) -> serde_json::Value {
     #[derive(serde::Serialize)]
     struct DryLeaf {
         name: String,
@@ -583,6 +586,8 @@ pub fn render_dry_run(workflow: &Workflow) -> serde_json::Value {
         steps: &[Step],
         scope_fanout: Option<u32>,
         plan: &CrewPlan,
+        resolver: &dyn Fn(&str) -> Option<Workflow>,
+        depth: usize,
         out: &mut Vec<DryLeaf>,
     ) {
         for s in steps {
@@ -593,6 +598,8 @@ pub fn render_dry_run(workflow: &Workflow) -> serde_json::Value {
                 s.guard.as_deref(),
                 scope_fanout,
                 plan,
+                resolver,
+                depth,
                 out,
             );
         }
@@ -606,6 +613,8 @@ pub fn render_dry_run(workflow: &Workflow) -> serde_json::Value {
         guard: Option<&str>,
         scope_fanout: Option<u32>,
         plan: &CrewPlan,
+        resolver: &dyn Fn(&str) -> Option<Workflow>,
+        depth: usize,
         out: &mut Vec<DryLeaf>,
     ) {
         let path = if prefix.is_empty() {
@@ -622,6 +631,32 @@ pub fn render_dry_run(workflow: &Workflow) -> serde_json::Value {
                 guard: guard.map(str::to_string),
                 fanout: scope_fanout,
             }),
+            // bd-cvv9 (§8 W3): a RESOLVABLE call_workflow link expands into
+            // its linked steps (nested path), so chain built-ins like `ship`
+            // render their full 5-link graph with phase tags. Unresolvable
+            // links keep the flat leaf; depth-capped against self-referential
+            // catalogs.
+            Action::CallWorkflow { workflow, .. } if depth < 8 => match resolver(workflow) {
+                Some(linked) => {
+                    collect(
+                        &path,
+                        &linked.steps,
+                        scope_fanout,
+                        plan,
+                        resolver,
+                        depth + 1,
+                        out,
+                    );
+                }
+                None => out.push(DryLeaf {
+                    name: name.to_string(),
+                    path,
+                    action: format!("call_workflow:{workflow}"),
+                    phase: None,
+                    guard: guard.map(str::to_string),
+                    fanout: scope_fanout,
+                }),
+            },
             Action::CallWorkflow { workflow, .. } => out.push(DryLeaf {
                 name: name.to_string(),
                 path,
@@ -632,22 +667,58 @@ pub fn render_dry_run(workflow: &Workflow) -> serde_json::Value {
             }),
             Action::Parallel { over, each } => {
                 let f = fanout_of(over, plan);
-                collect_action(name, prefix, &each.action, guard, f, plan, out)
+                collect_action(
+                    name,
+                    prefix,
+                    &each.action,
+                    guard,
+                    f,
+                    plan,
+                    resolver,
+                    depth,
+                    out,
+                )
             }
             Action::Foreach { over, each } => {
                 let f = fanout_of(over, plan);
-                collect_action(name, prefix, &each.action, guard, f, plan, out)
+                collect_action(
+                    name,
+                    prefix,
+                    &each.action,
+                    guard,
+                    f,
+                    plan,
+                    resolver,
+                    depth,
+                    out,
+                )
             }
-            Action::Retry { step, .. } => {
-                collect_action(name, prefix, &step.action, guard, scope_fanout, plan, out)
-            }
+            Action::Retry { step, .. } => collect_action(
+                name,
+                prefix,
+                &step.action,
+                guard,
+                scope_fanout,
+                plan,
+                resolver,
+                depth,
+                out,
+            ),
             Action::Branch {
                 then, else_steps, ..
             } => {
                 let then_path = format!("{path}/then");
                 let else_path = format!("{path}/else");
-                collect(&then_path, then, scope_fanout, plan, out);
-                collect(&else_path, else_steps, scope_fanout, plan, out);
+                collect(&then_path, then, scope_fanout, plan, resolver, depth, out);
+                collect(
+                    &else_path,
+                    else_steps,
+                    scope_fanout,
+                    plan,
+                    resolver,
+                    depth,
+                    out,
+                );
             }
             other => out.push(DryLeaf {
                 name: name.to_string(),
@@ -661,7 +732,7 @@ pub fn render_dry_run(workflow: &Workflow) -> serde_json::Value {
     }
 
     let mut leaves = Vec::new();
-    collect("", &resolved.steps, None, &plan, &mut leaves);
+    collect("", &resolved.steps, None, &plan, resolver, 0, &mut leaves);
     serde_json::json!({
         "workflow": resolved.name,
         "crew": plan.members,
@@ -1484,10 +1555,74 @@ steps:
 "##,
         )
         .expect("parse");
-        let rendered = render_dry_run(&wf);
+        let rendered = render_dry_run(&wf, &|_| None);
         let s = serde_json::to_string(&rendered).unwrap();
         assert!(s.contains("\"fanout\":3"), "fanout count missing: {s}");
         assert!(s.contains("implement"), "phase tag missing: {s}");
+    }
+
+    /// bd-cvv9 (ADR-0022 §8 W3): the ship chain dry-run renders the expected
+    /// 5-link graph — resolvable call_workflow links EXPAND so the nested
+    /// dispatch steps surface their phase tags (and review's static n=2
+    /// fanout), in chain order.
+    #[test]
+    fn ship_dry_run_expands_links_with_phase_tags() {
+        let ship = crate::builtin_workflows::builtin_workflows()
+            .get("ship")
+            .expect("ship builtin")
+            .clone();
+        let resolver = |name: &str| {
+            crate::builtin_workflows::builtin_workflows()
+                .get(name)
+                .cloned()
+        };
+        let rendered = render_dry_run(&ship, &resolver);
+        let steps = rendered["steps"].as_array().expect("steps array");
+        let paths: Vec<&str> = steps.iter().filter_map(|s| s["path"].as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "resolve/phase-resolve",
+                "plan/phase-plan",
+                "implement/phase-implement",
+                "review/review",
+                "verify/phase-verify"
+            ],
+            "5-link graph in chain order: {paths:?}"
+        );
+        let phases: Vec<&str> = steps.iter().filter_map(|s| s["phase"].as_str()).collect();
+        assert_eq!(
+            phases,
+            vec!["resolve", "plan", "implement", "review", "verify"],
+            "every link's dispatch carries its phase tag: {phases:?}"
+        );
+        let review = steps
+            .iter()
+            .find(|s| s["path"] == "review/review")
+            .expect("review leaf");
+        assert_eq!(review["fanout"], serde_json::json!(2), "R-P3 n=2 visible");
+    }
+
+    /// An UNRESOLVABLE call_workflow keeps the flat leaf (never a silent
+    /// expansion of nothing).
+    #[test]
+    fn dry_run_keeps_flat_leaf_for_unresolvable_link() {
+        let wf = parse_workflow(
+            r##"
+name: chain
+trigger: { type: webhook }
+crew: auto
+steps:
+  - name: hop
+    action: call_workflow
+    workflow: not-anywhere
+"##,
+        )
+        .expect("parse");
+        let rendered = render_dry_run(&wf, &|_| None);
+        let steps = rendered["steps"].as_array().expect("steps array");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["action"], "call_workflow:not-anywhere");
     }
 
     /// T2: a FULL authored Workflow round-trips through --from-yaml; an

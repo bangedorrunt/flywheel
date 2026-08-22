@@ -532,11 +532,23 @@ pub fn pane_dispatch(
                 std::thread::sleep(std::time::Duration::from_secs(10));
                 continue;
             }
-            return Ok(json!({
+            // ADR-0022 §3.5 warn-first plan-artifact gate (bd-cvv9): same
+            // contract as the headless path — warn + tag, never block
+            // (the W5 flip owns blocking).
+            if crate::phase_chain::plan_artifact_missing(spec, inputs) {
+                eprintln!(
+                    "flywheel: phase implement dispatch has NO completed plan artifact — \
+                     warn-first gate (ADR-0022 §3.5); step output tagged plan_artifact_missing"
+                );
+            }
+            let out = json!({
                 "profile": profile_name,
                 "agent": entry.name,
                 "send": v,
-            }));
+            });
+            return Ok(crate::phase_chain::annotate_dispatch_output(
+                spec, inputs, out,
+            ));
         }
         let err = String::from_utf8_lossy(&output.stderr).to_string();
         return Ok(json!({
