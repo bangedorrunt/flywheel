@@ -1543,7 +1543,7 @@ steps:
         let part = parse_compose_part("wave-swarm").expect("builtin recipe token parses");
         let wf =
             compose_workflow_with("composed-wave", "obj", None, &[part], &affinity).unwrap();
-        assert_eq!(wf.steps.len(), 5, "{:?}", wf.steps.iter().map(|s| &s.name));
+        assert_eq!(wf.steps.len(), 6, "{:?}", wf.steps.iter().map(|s| &s.name));
         assert!(
             matches!(&wf.steps[0].action, Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("@planner")
@@ -1558,21 +1558,27 @@ steps:
         );
         assert!(
             matches!(&wf.steps[2].action, Action::DispatchJob { spec, .. }
-                if spec.profile.as_deref() == Some("@scout")
-                    && spec.stage.as_deref() == Some("wave-observe")),
-            "OBSERVE third"
+                if spec.profile.as_deref() == Some("@coder")
+                    && spec.stage.as_deref() == Some("systematic-execute")),
+            "EXECUTE third (bd-wave-swarm-graduation-fix-98io: the crew needs an executor)"
         );
         assert!(
             matches!(&wf.steps[3].action, Action::DispatchJob { spec, .. }
-                if spec.profile.as_deref() == Some("@reviewer")
-                    && spec.stage.as_deref() == Some("wave-verify")),
-            "VERIFY fourth"
+                if spec.profile.as_deref() == Some("@scout")
+                    && spec.stage.as_deref() == Some("wave-observe")),
+            "OBSERVE fourth"
         );
         assert!(
-            matches!(&wf.steps[4].action, Action::RequestApproval { message }
+            matches!(&wf.steps[4].action, Action::DispatchJob { spec, .. }
+                if spec.profile.as_deref() == Some("@reviewer")
+                    && spec.stage.as_deref() == Some("wave-verify")),
+            "VERIFY fifth"
+        );
+        assert!(
+            matches!(&wf.steps[5].action, Action::RequestApproval { message }
                 if message.contains("captain")),
             "SIGNOFF last, captain-only: {:?}",
-            wf.steps[4].action.type_name()
+            wf.steps[5].action.type_name()
         );
         let report = toron_workflow::lint_workflow(&wf);
         assert!(
@@ -1594,7 +1600,7 @@ steps:
             .map(|t| parse_compose_part(t).unwrap())
             .collect();
         let wf = compose_workflow_with("mixed", "obj", None, &parts, &affinity).unwrap();
-        assert_eq!(wf.steps.len(), 6, "1 plain + 5 recipe");
+        assert_eq!(wf.steps.len(), 7, "1 plain + 6 recipe");
     }
 
     /// §3.6 envelope #3: budget caps fail closed at the compose gate.
