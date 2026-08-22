@@ -1719,10 +1719,8 @@ pub(crate) fn classify_guard_signal(subject: &str, body: &str) -> Option<GuardSi
     // Handoff needs an explicit transfer marker; "concurrent executor is
     // live" is the W7 anti-pattern — someone ELSE is executing, that is a
     // stand-down for us even when the word handoff appears nearby.
-    let handoff_marker =
-        s.contains("handoff") || b.contains("handoff") || s.contains("hand-off");
-    let concurrent_live =
-        s.contains("concurrent executor") || b.contains("concurrent executor");
+    let handoff_marker = s.contains("handoff") || b.contains("handoff") || s.contains("hand-off");
+    let concurrent_live = s.contains("concurrent executor") || b.contains("concurrent executor");
     if handoff_marker && !concurrent_live {
         return Some(GuardSignalKind::Handoff);
     }
@@ -1797,10 +1795,7 @@ pub fn eval_dispatch_guard(
     }
 
     // Rule 2: stand-down after the last done holds absolutely.
-    if recent
-        .iter()
-        .any(|(_, k)| *k == GuardSignalKind::StandDown)
-    {
+    if recent.iter().any(|(_, k)| *k == GuardSignalKind::StandDown) {
         return Err("peer stood down — executor flagged live".into());
     }
 
@@ -1828,13 +1823,14 @@ pub fn eval_dispatch_guard(
     }
 
     // Rule 4: fresh receipts are executor evidence.
-    if let Some(r) = facts.receipts_fresh_us {
-        if r > close && now_us - r <= ttl_us {
-            return Err(format!(
-                "receipts written {}s ago — executor evidence",
-                (now_us - r) / 1_000_000
-            ));
-        }
+    if let Some(r) = facts.receipts_fresh_us
+        && r > close
+        && now_us - r <= ttl_us
+    {
+        return Err(format!(
+            "receipts written {}s ago — executor evidence",
+            (now_us - r) / 1_000_000
+        ));
     }
     Ok(())
 }
@@ -4787,14 +4783,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     match ctx.run(dispatch_guard_scan, g_args).await {
                         Ok(v) => {
                             if v.get("dispatch").and_then(Value::as_bool) == Some(false) {
-                                let reason = v
-                                    .get("reason")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("held");
-                                eprintln!(
-                                    "flywheel: dispatch-guard HOLD {}: {reason}",
-                                    bead.id
-                                );
+                                let reason =
+                                    v.get("reason").and_then(Value::as_str).unwrap_or("held");
+                                eprintln!("flywheel: dispatch-guard HOLD {}: {reason}", bead.id);
                                 continue;
                             }
                         }
@@ -4885,10 +4876,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         };
                         match ctx.run(dispatch_guard_scan, g_args).await {
                             Ok(v) if v.get("dispatch").and_then(Value::as_bool) == Some(false) => {
-                                let reason = v
-                                    .get("reason")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("held");
+                                let reason =
+                                    v.get("reason").and_then(Value::as_str).unwrap_or("held");
                                 eprintln!(
                                     "flywheel: dispatch-guard HOLD re-dispatch {bead_id}: {reason}"
                                 );
@@ -4924,10 +4913,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         };
                         match ctx.run(dispatch_guard_scan, g_args).await {
                             Ok(v) if v.get("dispatch").and_then(Value::as_bool) == Some(false) => {
-                                let reason = v
-                                    .get("reason")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("held");
+                                let reason =
+                                    v.get("reason").and_then(Value::as_str).unwrap_or("held");
                                 eprintln!(
                                     "flywheel: dispatch-guard HOLD resume {bead_id}: {reason}"
                                 );
@@ -6657,8 +6644,7 @@ mod dispatch_guard_tests {
             ],
             receipts_fresh_us: None,
         };
-        let err =
-            eval_dispatch_guard(&facts, now, DISPATCH_GUARD_TTL_US).expect_err("done skips");
+        let err = eval_dispatch_guard(&facts, now, DISPATCH_GUARD_TTL_US).expect_err("done skips");
         assert!(err.contains("ledger sync gap"), "{err}");
     }
 
@@ -6668,7 +6654,7 @@ mod dispatch_guard_tests {
         let facts = DispatchGuardFacts {
             signals: vec![
                 sig(now - 90 * MIN, GuardSignalKind::Done),
-                sig(now - 1 * MIN, GuardSignalKind::Claim),
+                sig(now - MIN, GuardSignalKind::Claim),
             ],
             receipts_fresh_us: None,
         };
