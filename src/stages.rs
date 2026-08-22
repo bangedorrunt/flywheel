@@ -93,6 +93,11 @@ pub struct Stage {
     /// Provenance: the run that produced it (composed/kept lineage).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_run: Option<String>,
+    /// Required D1 payload params (ADR-0006 §3 D1): every name here must be
+    /// supplied via `send --param k=v` before the prompt renders. Empty for
+    /// all seed stages → zero-param sends stay byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<String>,
 }
 
 /// The stages library: semantic name → stage.
@@ -266,6 +271,7 @@ impl StageLibrary {
                     principles: vec![],
                     author: None,
                     origin_run: None,
+                    params: vec![],
                 },
             );
         }
@@ -421,6 +427,7 @@ pub fn scaffold(name: &str) -> Stage {
         principles: vec![],
         author: None,
         origin_run: None,
+        params: vec![],
     }
 }
 
@@ -500,9 +507,157 @@ pub fn lint_stage(stage: &Stage, valid_roles: &[String]) -> Vec<String> {
 pub fn check_repo_evidence(distinct_objective_greens: usize, review_bead_present: bool) -> bool {
     distinct_objective_greens >= 2 && review_bead_present
 }
+/// The reserved D1 payload slots (ADR-0006 §3 D1). Documented vocabulary;
+/// substitution itself accepts any `--param k=v` key. Consumed by the test
+/// vocabulary gate and by future D3/D4 payload emitters.
+#[expect(dead_code)]
+pub const RESERVED_SLOTS: &[&str] =
+    &["bead", "scope", "exit", "channel", "pin", "report_file"];
+
+/// Parse repeatable `--param k=v` argv pairs into a map. A pair without `=`
+/// is a usage error naming the offending argument.
+pub fn parse_params(raw: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for pair in raw {
+        let Some((k, v)) = pair.split_once('=') else {
+            return Err(anyhow::anyhow!(
+                "--param {pair:?} is not k=v (missing '=')"
+            ));
+        };
+        if k.is_empty() || v.is_empty() {
+            return Err(anyhow::anyhow!("--param {pair:?} needs both k and v"));
+        }
+        if out.insert(k.to_string(), v.to_string()).is_some() {
+            return Err(anyhow::anyhow!(
+                "--param {k} given twice with different values"
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Render a stage prompt through the D1 substitution engine.
+///
+/// - Every declared required param must be present in `params`, else a usage
+///   error NAMING each missing slot.
+/// - Each provided param substitutes its `{{k}}` slots verbatim (prompt text,
+///   never shell interpolation).
+/// - No params + no declared params → byte-identical passthrough.
+pub fn render_stage(
+    prompt: &str,
+    required: &[String],
+    params: &BTreeMap<String, String>,
+) -> Result<String> {
+    let missing: Vec<&str> = required
+        .iter()
+        .map(|r| r.as_str())
+        .filter(|r| !params.contains_key(*r))
+        .collect();
+    if !missing.is_empty() {
+        return Err(anyhow::anyhow!(
+            "stage requires --param for missing slot(s): {}",
+            missing.join(", ")
+        ));
+    }
+    let mut out = prompt.to_string();
+    for (k, v) in params {
+        let slot = format!("{{{{{k}}}}}");
+        if prompt.contains(&slot) {
+            // verbatim: values are prompt text, never interpreted
+            out = out.replace(&slot, v);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- ADR-0006 D1: parameterized stage payloads (bd-stage-params-pqo9) ----
+
+    /// `--param k=v` parses into a map; a pair without `=` is an error naming
+    /// the offending argument.
+    #[test]
+    fn stage_param_parse_k_v_and_reject_bare() {
+        let raw = vec![
+            "bead=br-123".to_string(),
+            "scope=src/main.rs,integrations/**".to_string(),
+        ];
+        let m = parse_params(&raw).expect("k=v pairs parse");
+        assert_eq!(m.get("bead").map(String::as_str), Some("br-123"));
+        assert_eq!(
+            m.get("scope").map(String::as_str),
+            Some("src/main.rs,integrations/**")
+        );
+        let bare = vec!["nobang".to_string()];
+        let err = format!("{}", parse_params(&bare).unwrap_err());
+        assert!(err.contains("nobang"), "error names the bad pair: {err}");
+        let empty_v = vec!["k=".to_string()];
+        assert!(parse_params(&empty_v).is_err(), "empty value rejected");
+    }
+
+    /// `{{slot}}` substitution is verbatim (prompt text, not argv) and hits
+    /// repeated occurrences of the same slot.
+    #[test]
+    fn stage_param_substitutes_slots_verbatim() {
+        let prompt = "Work {{bead}} in {{scope}}; report on {{channel}}; bead again: {{bead}}.";
+        let params = parse_params(&[
+            "bead=bd-x-1".to_string(),
+            "scope=a,b".to_string(),
+            "channel=adr0006-steer".to_string(),
+        ])
+        .expect("params parse");
+        let out = render_stage(prompt, &[], &params).expect("renders");
+        assert_eq!(
+            out,
+            "Work bd-x-1 in a,b; report on adr0006-steer; bead again: bd-x-1."
+        );
+    }
+
+    /// A declared required param that was not supplied is a usage error
+    /// NAMING each missing slot.
+    #[test]
+    fn stage_param_missing_required_names_slot() {
+        let prompt = "do {{bead}} within {{exit}}";
+        let required = vec!["bead".to_string(), "exit".to_string()];
+        let params = parse_params(&["bead=br-1".to_string()]).expect("parses");
+        let err = format!("{}", render_stage(prompt, &required, &params).unwrap_err());
+        assert!(
+            err.contains("exit"),
+            "missing slot named in error: {err}"
+        );
+        assert!(!err.contains("bead,"), "supplied param not flagged: {err}");
+    }
+
+    /// Zero params + no declared required params → byte-identical passthrough
+    /// for EVERY compiled-in stage (the golden back-compat bar).
+    #[test]
+    fn stage_param_zero_param_byte_identical_golden() {
+        let lib = StageLibrary::compiled_in();
+        for (name, _) in lib.list() {
+            let stage = lib.get_stage(name).expect("stage exists");
+            let empty = BTreeMap::new();
+            let out =
+                render_stage(&stage.prompt.clone(), &stage.params, &empty)
+                    .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            assert_eq!(out, stage.prompt, "{name} zero-param byte-identical");
+        }
+    }
+
+    /// The reserved D1 slot vocabulary is present ({{bead}} … {{report_file}}).
+    #[test]
+    fn stage_param_reserved_slot_vocabulary() {
+        for slot in RESERVED_SLOTS {
+            let rendered = render_stage(
+                &format!("x {{{{{slot}}}}} y"),
+                &[],
+                &parse_params(&[format!("{slot}=v")]).expect("parses"),
+            )
+            .expect("renders");
+            assert_eq!(rendered, "x v y", "{{{slot}}} substitutes");
+        }
+    }
 
     /// `stage: p6` == `stage: systematic-execute` (the `stage_alias`
     /// acceptance) — the same resolved prompt.
