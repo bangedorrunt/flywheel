@@ -885,6 +885,11 @@ enum Commands {
         name: String,
         thread: String,
     },
+    /// internal: bd-dispatch-dedupe-2zlz — collect the dispatch-guard facts
+    /// for a bead thread (classified peer signals + receipts freshness).
+    /// Pure decision lives in durable::eval_dispatch_guard.
+    #[command(name = "__dispatch-guard", hide = true)]
+    __DispatchGuard { project: String, bead: String },
     /// internal: the project's expected-reply entries (checkpointed leaf —
     /// collab may have written new ones while the loop runs)
     #[command(name = "__expected-replies", hide = true)]
@@ -3636,6 +3641,9 @@ fn main() {
             name,
             thread,
         }) => cmd_internal_check_reply(&cfg, project, name, thread),
+        Some(Commands::__DispatchGuard { project, bead }) => {
+            cmd_internal_dispatch_guard(&cfg, project, bead)
+        }
         Some(Commands::__ReplySettled {
             project,
             name,
@@ -22326,6 +22334,68 @@ fn thread_head(
     }))?;
     Ok(newest_in_thread(&items, thread, sender, &sender_npub)
         .map(|m| (m.id.to_string(), m.sender.clone())))
+}
+
+/// bd-dispatch-dedupe-2zlz collector: classify the bead thread's messages
+/// into guard signals and stat the receipts dir. Emits RAW FACTS only — the
+/// go/hold decision is durable::eval_dispatch_guard (pure, unit-tested).
+/// Mail failures print an empty-facts shape (fail-open at the collector;
+/// the leaf logs loudly so a dead daemon never silently gates dispatches).
+fn cmd_internal_dispatch_guard(cfg: &Config, project: &str, bead: &str) -> Result<()> {
+    let mut facts = json!({ "signals": [], "receipts_fresh_us": null });
+    if let Ok(mail) = backend::mail_backend(cfg) {
+        let key = project_dir_str(cfg, project)?;
+        if backend::run_mail(mail.ensure_project(&key)).is_ok() {
+            match backend::run_mail(mail.inbox(&backend::InboxQuery {
+                project: key.clone(),
+                agent: mail.agent_name().to_string(),
+                unread_only: false,
+                include_bodies: true,
+                limit: Some(100),
+                urgent_only: false,
+                since_ts: None,
+                thread_id: Some(bead.to_string()),
+            })) {
+                Ok(items) => {
+                    let signals: Vec<Value> = items
+                        .iter()
+                        .filter_map(|m| {
+                            durable::classify_guard_signal(&m.subject, &m.body_md).map(|k| {
+                                json!({ "ts_us": m.created_ts_us, "kind": k.as_str() })
+                            })
+                        })
+                        .collect();
+                    facts["signals"] = json!(signals);
+                }
+                Err(e) => eprintln!("flywheel: __dispatch-guard inbox scan failed: {e}"),
+            }
+        }
+    }
+    // Receipts freshness: newest mtime among receipt files naming this bead.
+    let receipts = project_dir(cfg, project).join(".flywheel").join("receipts");
+    if let Ok(rd) = std::fs::read_dir(&receipts) {
+        let mut newest: Option<i64> = None;
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.contains(bead) {
+                continue;
+            }
+            if let Ok(md) = entry.metadata() {
+                if let Ok(modified) = md.modified() {
+                    let us = modified
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_micros() as i64)
+                        .unwrap_or(0);
+                    if newest.is_none() || us > newest.unwrap_or(0) {
+                        newest = Some(us);
+                    }
+                }
+            }
+        }
+        facts["receipts_fresh_us"] = json!(newest);
+    }
+    print_json(&facts);
+    Ok(())
 }
 
 /// bd-a7j leaf: newest message id + author in `thread` BY `name` (or nulls).
