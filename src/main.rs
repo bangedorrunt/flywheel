@@ -87,6 +87,26 @@ pub(crate) fn stage_prompt(name: &str) -> Result<String> {
     })
 }
 
+/// ADR-0006 D1: resolve a stage and render its payload params. Missing
+/// required slots are a usage error naming the slot; zero `--param` on a
+/// param-free stage is byte-identical to [`stage_prompt`].
+pub(crate) fn stage_prompt_with_params(name: &str, raw_params: &[String]) -> Result<String> {
+    let lib = stages::StageLibrary::load()?;
+    let unknown = || {
+        anyhow!(
+            "unknown stage: {name} (known: {})",
+            lib.list()
+                .iter()
+                .map(|(n, a)| format!("{n} ({a})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let stage = lib.get_stage(name).ok_or_else(unknown)?;
+    let params = stages::parse_params(raw_params)?;
+    stages::render_stage(&stage.prompt.clone(), &stage.params.clone(), &params)
+}
+
 // ---- CLI surface ----
 
 #[derive(Parser)]
@@ -251,6 +271,11 @@ enum Commands {
         /// daily-driver stage name: p1|p2|p4|p5|p6|p8
         #[arg(long)]
         stage: Option<String>,
+        /// ADR-0006 D1: payload param k=v substituted into the stage
+        /// template's {{k}} slots (repeatable). Required slots are declared
+        /// per-stage; a missing one is a usage error naming the slot.
+        #[arg(long = "param")]
+        params: Vec<String>,
         /// wait for the agents to settle (idle/done/blocked)
         #[arg(long)]
         wait: bool,
@@ -3180,6 +3205,7 @@ fn main() {
             "tracker": "br/bv (CLI, no MCP)",
             "coordination": "toron mail",
             "stages": ["p1", "p2", "p4", "p5", "p6", "p8"],
+            "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
             "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error" }
         }));
         return;
@@ -3286,6 +3312,7 @@ fn main() {
             msg,
             to,
             stage,
+            params,
             wait,
             timeout_ms,
             force,
@@ -3297,6 +3324,7 @@ fn main() {
             msg.as_deref(),
             to,
             stage.as_deref(),
+            params,
             *wait,
             *timeout_ms,
             *force,
@@ -9246,6 +9274,7 @@ fn cmd_send(
     msg: Option<&str>,
     to: &str,
     stage: Option<&str>,
+    params: &[String],
     wait: bool,
     timeout_ms: Option<u64>,
     force: bool,
@@ -9253,7 +9282,9 @@ fn cmd_send(
     raw: bool,
 ) -> Result<()> {
     let text = match (stage, msg) {
-        (Some(s), _) => stage_prompt(s)?,
+        // ADR-0006 D1: --param k=v substitutes the stage template's {{k}}
+        // slots; a declared-but-missing required slot is a usage error.
+        (Some(s), _) => stage_prompt_with_params(s, params)?,
         (None, Some(m)) => m.to_string(),
         (None, None) => bail!("provide --stage NAME or a message text"),
     };
