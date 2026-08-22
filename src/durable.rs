@@ -68,6 +68,12 @@ pub struct LoopParams {
     /// for graphs that do not use wave labels. Default false = gating ON.
     #[serde(default)]
     pub no_wave_gates: bool,
+    /// ADR-0006 D2 wave-scoped dispatch (`--wave-label wave-N`): restrict
+    /// --work to ready beads labeled `wave-N`, held while any lower wave is
+    /// open/in_progress. None = default behavior, unchanged. `#[serde(default)]`
+    /// keeps pre-D2 saved params loadable.
+    #[serde(default)]
+    pub wave_label: Option<String>,
     /// send every prompt via `__send --confirm` (landing confirmation).
     /// Default true — reliability is the default, --no-confirm is the escape
     /// hatch. `#[serde(default)]` keeps pre-confirm saved params loadable.
@@ -397,6 +403,44 @@ pub fn wave_gate_held(ready: &[ReadyBead], inprogress: &[ReadyBead]) -> Vec<Stri
         .filter(|b| bead_wave(b).is_some_and(|w| w > floor))
         .map(|b| b.id.clone())
         .collect()
+}
+
+/// ADR-0006 D2 wave-scoped dispatch (`loop run --work --wave-label wave-N`):
+/// the ready set is `br ready` ∩ labels containing exactly `label`, AND a
+/// hold ASSERT when any open (ready, unclaimed) or in_progress bead carries
+/// `wave-M` with M < N — earlier waves run to completion first. The error
+/// names every blocking bead so the operator sees the full hold. Pure —
+/// shared by both dispatch paths.
+///
+// TODO(beads ADR-0001 schema-18): label parsing here is TRANSITIONAL. When
+// beads ships the typed `wave` field in ready JSON, read that field and keep
+// this label path only as fallback (ADR-0006 §D2).
+pub fn wave_scope_filter(
+    ready: &[ReadyBead],
+    inprogress: &[ReadyBead],
+    label: &str,
+) -> std::result::Result<Vec<ReadyBead>, String> {
+    let Some(wave_n) = label.strip_prefix("wave-").and_then(|n| n.parse::<u32>().ok()) else {
+        return Err(format!("--wave-label must be `wave-<N>` (got `{label}`)"));
+    };
+    let blockers: Vec<String> = ready
+        .iter()
+        .chain(inprogress.iter())
+        .filter(|b| bead_wave(b).is_some_and(|w| w < wave_n))
+        .map(|b| b.id.clone())
+        .collect();
+    if !blockers.is_empty() {
+        return Err(format!(
+            "wave-gate: {} blocked — lower wave still open/in_progress: {}",
+            label,
+            blockers.join(", ")
+        ));
+    }
+    Ok(ready
+        .iter()
+        .filter(|b| b.labels.iter().any(|l| l == label))
+        .cloned()
+        .collect())
 }
 
 /// Args for the `__mail-not-ready` leaf (ADR-0019): tell the planner a
@@ -4726,9 +4770,29 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             } else {
                 wave_gate_held(&ready, &inprog)
             };
+            // ADR-0006 D2 wave-scoped dispatch: with --wave-label the ready
+            // set narrows to exactly that label's beads and ANY open lower
+            // wave blocks (error names the blockers). None = unchanged.
+            let mut scope_block: Option<String> = None;
+            let scope_ids: Option<std::collections::HashSet<String>> =
+                params.wave_label.as_ref().map(|label| {
+                    match wave_scope_filter(&ready, &inprog, label) {
+                        Ok(scoped) => scoped.into_iter().map(|b| b.id).collect(),
+                        Err(e) => {
+                            eprintln!("flywheel: {e}");
+                            scope_block = Some(e);
+                            Default::default()
+                        }
+                    }
+                });
             let to_assign: Vec<&ReadyBead> = dispatchable
                 .iter()
                 .filter(|b| !assigned.contains(&b.id) && !wave_held.contains(&b.id))
+                .filter(|b| match (&scope_ids, &scope_block) {
+                    (Some(ids), _) => ids.contains(&b.id),
+                    (None, Some(_)) => false,
+                    (None, None) => true,
+                })
                 .copied()
                 .collect();
             if !wave_held.is_empty() {
@@ -7283,6 +7347,94 @@ mod tests {
         assert_eq!(held, vec!["bd-w2", "bd-w3"], "{held:?}");
     }
 
+    // ---- ADR-0006 D2: wave-scoped dispatch (--wave-label) -----------------
+
+    /// Labeled fixture: `--wave-label wave-2` selects EXACTLY the wave-2
+    /// beads; wave-3/unlabeled siblings drop out. (Lower-wave OPEN beads
+    /// blocking is asserted separately — this fixture is hold-free.)
+    #[test]
+    fn wave_scope_filters_to_exact_label() {
+        let ready = vec![
+            rb_wave("bd-w2a", 2),
+            rb_wave("bd-w2b", 2),
+            rb("bd-unlabeled", None),
+            rb_wave("bd-w3", 3),
+        ];
+        let inprog: Vec<ReadyBead> = Vec::new();
+        let scoped =
+            wave_scope_filter(&ready, &inprog, "wave-2").expect("no lower wave open");
+        let ids: Vec<&str> = scoped.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, vec!["bd-w2a", "bd-w2b"], "{ids:?}");
+    }
+
+    /// Unlabeled fixture: a ready set with NO matching labels scopes to an
+    /// empty set (nothing to dispatch this label), never an error.
+    #[test]
+    fn wave_scope_unlabeled_ready_set_is_empty() {
+        let ready = vec![rb("bd-a", None), rb("bd-b", None)];
+        let inprog: Vec<ReadyBead> = Vec::new();
+        let scoped =
+            wave_scope_filter(&ready, &inprog, "wave-1").expect("no lower wave open");
+        assert!(scoped.is_empty(), "{scoped:?}");
+    }
+
+    /// Mixed fixture: lower waves CLOSED (absent from ready AND
+    /// in_progress) do NOT block — wave-3 dispatches once wave-1/2 are done.
+    #[test]
+    fn wave_scope_closed_lower_waves_do_not_block() {
+        let ready = vec![rb_wave("bd-w3a", 3), rb_wave("bd-w3b", 3)];
+        // wave-1 + wave-2 already closed: they appear NOWHERE here.
+        let inprog: Vec<ReadyBead> = Vec::new();
+        let scoped =
+            wave_scope_filter(&ready, &inprog, "wave-3").expect("earlier waves closed");
+        let ids: Vec<&str> = scoped.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, vec!["bd-w3a", "bd-w3b"], "{ids:?}");
+    }
+
+    /// Lower-wave-open fixture: an IN_PROGRESS wave-1 bead blocks all wave-2
+    /// dispatch — the error names the blocking bead (assert, not silent hold).
+    #[test]
+    fn wave_scope_inprogress_lower_wave_blocks_with_named_bead() {
+        let ready = vec![rb_wave("bd-w2", 2)];
+        let inprog = vec![rb_wave("bd-w1", 1)];
+        let err = wave_scope_filter(&ready, &inprog, "wave-2")
+            .expect_err("wave-1 still in progress");
+        assert!(err.contains("bd-w1"), "must name the blocker: {err}");
+    }
+
+    /// A READY-but-unclaimed wave-1 bead is still OPEN — it blocks wave-2
+    /// too (waves run to completion before the next wave starts).
+    #[test]
+    fn wave_scope_ready_lower_wave_blocks() {
+        let ready = vec![rb_wave("bd-w1", 1), rb_wave("bd-w2", 2)];
+        let inprog: Vec<ReadyBead> = Vec::new();
+        let err = wave_scope_filter(&ready, &inprog, "wave-2")
+            .expect_err("wave-1 is open (ready, unclaimed)");
+        assert!(err.contains("bd-w1"), "must name the blocker: {err}");
+    }
+
+    /// Multiple open lower-wave beads: ALL of them are named in the error,
+    /// so the operator sees the full hold at a glance.
+    #[test]
+    fn wave_scope_names_every_lower_wave_blocker() {
+        let ready = vec![rb_wave("bd-w2", 2), rb_wave("bd-w3", 3)];
+        let inprog = vec![rb_wave("bd-w1a", 1), rb_wave("bd-w1b", 1)];
+        let err = wave_scope_filter(&ready, &inprog, "wave-3")
+            .expect_err("two wave-1 beads still open");
+        assert!(err.contains("bd-w1a") && err.contains("bd-w1b"), "{err}");
+    }
+
+    /// Same-wave in_progress siblings never block their own wave.
+    #[test]
+    fn wave_scope_same_wave_inprogress_does_not_block() {
+        let ready = vec![rb_wave("bd-w2b", 2)];
+        let inprog = vec![rb_wave("bd-w2a", 2)];
+        let scoped =
+            wave_scope_filter(&ready, &inprog, "wave-2").expect("same wave runs together");
+        let ids: Vec<&str> = scoped.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, vec!["bd-w2b"], "{ids:?}");
+    }
+
     /// A bead held by a NON-live assignee (captain, dead agent, unknown
     /// identity) is stranded — reclaim it.
     #[test]
@@ -8980,6 +9132,7 @@ mod tests {
             max_iterations: Some(10),
             work: false,
             no_wave_gates: false,
+            wave_label: None,
             confirm_sends: true,
             confirm_timeout_ms: Some(45_000),
             invocation: "inv-1".into(),
