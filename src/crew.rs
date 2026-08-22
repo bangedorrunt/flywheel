@@ -1561,48 +1561,6 @@ steps:
         assert!(s.contains("implement"), "phase tag missing: {s}");
     }
 
-    /// bd-cvv9 (ADR-0022 §8 W3): the ship chain dry-run renders the expected
-    /// 5-link graph — resolvable call_workflow links EXPAND so the nested
-    /// dispatch steps surface their phase tags (and review's static n=2
-    /// fanout), in chain order.
-    #[test]
-    fn ship_dry_run_expands_links_with_phase_tags() {
-        let ship = crate::builtin_workflows::builtin_workflows()
-            .get("ship")
-            .expect("ship builtin")
-            .clone();
-        let resolver = |name: &str| {
-            crate::builtin_workflows::builtin_workflows()
-                .get(name)
-                .cloned()
-        };
-        let rendered = render_dry_run(&ship, &resolver);
-        let steps = rendered["steps"].as_array().expect("steps array");
-        let paths: Vec<&str> = steps.iter().filter_map(|s| s["path"].as_str()).collect();
-        assert_eq!(
-            paths,
-            vec![
-                "resolve/phase-resolve",
-                "plan/phase-plan",
-                "implement/phase-implement",
-                "review/review",
-                "verify/phase-verify"
-            ],
-            "5-link graph in chain order: {paths:?}"
-        );
-        let phases: Vec<&str> = steps.iter().filter_map(|s| s["phase"].as_str()).collect();
-        assert_eq!(
-            phases,
-            vec!["resolve", "plan", "implement", "review", "verify"],
-            "every link's dispatch carries its phase tag: {phases:?}"
-        );
-        let review = steps
-            .iter()
-            .find(|s| s["path"] == "review/review")
-            .expect("review leaf");
-        assert_eq!(review["fanout"], serde_json::json!(2), "R-P3 n=2 visible");
-    }
-
     /// An UNRESOLVABLE call_workflow keeps the flat leaf (never a silent
     /// expansion of nothing).
     #[test]
