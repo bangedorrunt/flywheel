@@ -58,10 +58,7 @@ fn recording_runner(log: Arc<Mutex<Vec<String>>>) -> ActionRunner {
             Action::DispatchJob { spec, .. } => {
                 // Rendered task text (templates already expanded). Normalized
                 // to lowercase + trimmed for keyword matching.
-                spec.get("task")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase()
+                spec.task.as_deref().unwrap_or("").to_ascii_lowercase()
             }
             other => other.type_name().to_string(),
         };
@@ -120,10 +117,7 @@ async fn bug_fix_control_flow_orders_repro_tdd_fix_prove() {
     let Action::DispatchJob { spec, .. } = &graph.nodes["prove"].action else {
         panic!("prove is a dispatch_job");
     };
-    assert_eq!(
-        spec.get("harness").and_then(|h| h.as_str()),
-        Some("opencode")
-    );
+    assert_eq!(spec.harness.as_deref(), Some("opencode"));
 
     // Outputs map carries per-node results.
     for node in ["repro", "tdd", "fix", "prove"] {

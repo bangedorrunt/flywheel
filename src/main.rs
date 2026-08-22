@@ -18356,6 +18356,18 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
         Ok(out)
     }
 
+    /// §3.6 envelope #3 (wall-clock half): seconds a composed `--run` may
+    /// take in THIS process. Default 3600; `FLYWHEEL_COMPOSE_MAX_SECONDS`
+    /// overrides (parsed values < 1 fall back to the default — never 0).
+    /// The bound errors the attempt; the durable run stays resumable.
+    fn compose_wall_clock_cap() -> u64 {
+        std::env::var("FLYWHEEL_COMPOSE_MAX_SECONDS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|s| *s >= 1)
+            .unwrap_or(3600)
+    }
+
     /// Lint one workflow; print issues; return the blocking (Error-level) count.
     fn lint_one(name: &str, wf: &Workflow) -> usize {
         // Engine tier (toron-workflow lint): schema, guards (evalexpr +
@@ -19019,7 +19031,16 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 // (one-shot — no cron loop) and execute the side-effects here,
                 // never silently dropping the decision.
                 let (output, policy_events) = rt.block_on(async {
-                    let out = engine.invoke(&run_id, invoke_wf, inputs_c.clone()).await?;
+                    // §3.6 envelope #3 (wall-clock half): bounded_invoke caps
+                    // this attempt; the durable run stays resumable.
+                    let out = crew::bounded_invoke(
+                        &engine,
+                        &run_id,
+                        invoke_wf,
+                        inputs_c.clone(),
+                        compose_wall_clock_cap(),
+                    )
+                    .await?;
                     let drained: Vec<toron_workflow::PolicyEvent> = {
                         let mut guard = engine.policy_sink().lock().await;
                         std::mem::take(&mut *guard)
@@ -19477,14 +19498,13 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
                     toron_workflow::schema::CronMode::Headless => "headless",
                     toron_workflow::schema::CronMode::Pane => "pane",
                 };
-                let result = rt.block_on(async {
-                    let engine = toron_workflow::WorkflowEngine::local_with_resolvers(
-                        runner,
-                        profile_resolver,
-                        workflow_resolver,
-                    )?;
-                    engine.invoke(&run_id, wf, json!({})).await
-                });
+                // ADR-0022 §3.4 one-rail: construct through the SAME
+                // store-selection seam as compose/steer (`pane::local_engine`
+                // — RESONATE_URL pin > host-local serve > in-memory), never a
+                // private in-memory constructor. A live fire is a durable run
+                // when a Resonate store answers.
+                let engine = pane::local_engine(&rt, runner, profile_resolver, workflow_resolver)?;
+                let result = rt.block_on(async { engine.invoke(&run_id, wf, json!({})).await });
                 match result {
                     Ok(output) => {
                         log(
@@ -22360,9 +22380,8 @@ fn cmd_internal_dispatch_guard(cfg: &Config, project: &str, bead: &str) -> Resul
                     let signals: Vec<Value> = items
                         .iter()
                         .filter_map(|m| {
-                            durable::classify_guard_signal(&m.subject, &m.body_md).map(|k| {
-                                json!({ "ts_us": m.created_ts_us, "kind": k.as_str() })
-                            })
+                            durable::classify_guard_signal(&m.subject, &m.body_md)
+                                .map(|k| json!({ "ts_us": m.created_ts_us, "kind": k.as_str() }))
                         })
                         .collect();
                     facts["signals"] = json!(signals);
@@ -22380,15 +22399,13 @@ fn cmd_internal_dispatch_guard(cfg: &Config, project: &str, bead: &str) -> Resul
             if !name.contains(bead) {
                 continue;
             }
-            if let Ok(md) = entry.metadata() {
-                if let Ok(modified) = md.modified() {
-                    let us = modified
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_micros() as i64)
-                        .unwrap_or(0);
-                    if newest.is_none() || us > newest.unwrap_or(0) {
-                        newest = Some(us);
-                    }
+            if let Some(modified) = entry.metadata().ok().and_then(|md| md.modified().ok()) {
+                let us = modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros() as i64)
+                    .unwrap_or(0);
+                if newest.is_none() || us > newest.unwrap_or(0) {
+                    newest = Some(us);
                 }
             }
         }
