@@ -617,7 +617,23 @@ impl MailSurface for AgentMailBackend {
             .and_then(Value::as_array)
             .map(|arr| arr.iter().map(path_conflict).collect())
             .unwrap_or_default();
+        let slot_holders: Vec<toron_core::mailbox::reservations::SlotHolder> = v
+            .get("slot_holders")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|h| toron_core::mailbox::reservations::SlotHolder {
+                        slot: opt_string_field(h, &["slot"]).unwrap_or_default(),
+                        agent_name: opt_string_field(h, &["agent_name"]).unwrap_or_default(),
+                        exclusive: bool_field(h, &["exclusive"], "slot_holders.exclusive")
+                            .unwrap_or(false),
+                        expires_ts_us: h.get("expires_ts_us").and_then(Value::as_i64),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(ConflictReport {
+            slot_holders,
             conflict_free: v
                 .get("conflict_free")
                 .and_then(Value::as_bool)
