@@ -26,6 +26,8 @@ mod mcp_http;
 mod models;
 mod output;
 mod pane;
+mod phase_chain;
+mod phase_contracts;
 mod preflight;
 mod principles;
 mod profile;
@@ -18636,7 +18638,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         &rt,
                         runner,
                         profile_resolver,
-                        workflow_resolver,
+                        workflow_resolver.clone(),
                     )?);
                     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let drainer = pane::start_spawn_drainer(
@@ -18648,9 +18650,20 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         stop.clone(),
                     )?;
                     let out = rt.block_on(async {
-                        engine
-                            .invoke(&run_id, invoke_wf, inputs_value.clone())
-                            .await
+                        // bd-cvv9: the ship chain routes through the gated
+                        // runner — same engine rail, §4.5 contracts between
+                        // links (warn-first; block after the W5 flip).
+                        phase_chain::invoke_or_ship_chain(
+                            &engine,
+                            &workflow_resolver,
+                            &project_dir(cfg, project.as_deref().unwrap_or("flywheel")),
+                            project.as_deref().unwrap_or("flywheel"),
+                            &run_id,
+                            name,
+                            &invoke_wf,
+                            inputs_value.clone(),
+                        )
+                        .await
                     });
                     stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     spawn_receipts = drainer
@@ -18664,12 +18677,25 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     // selection as pane mode (pane::local_engine), so a
                     // kill -9 mid-run resumes on restart regardless of
                     // --execute mode.
-                    let engine =
-                        pane::local_engine(&rt, runner, profile_resolver, workflow_resolver)?;
+                    let engine = pane::local_engine(
+                        &rt,
+                        runner,
+                        profile_resolver,
+                        workflow_resolver.clone(),
+                    )?;
                     rt.block_on(async {
-                        engine
-                            .invoke(&run_id, invoke_wf, inputs_value.clone())
-                            .await
+                        // bd-cvv9: ship runs gated on the same rail headless.
+                        phase_chain::invoke_or_ship_chain(
+                            &engine,
+                            &workflow_resolver,
+                            &project_dir(cfg, project.as_deref().unwrap_or("flywheel")),
+                            project.as_deref().unwrap_or("flywheel"),
+                            &run_id,
+                            name,
+                            &invoke_wf,
+                            inputs_value.clone(),
+                        )
+                        .await
                     })
                 }
             }?;
@@ -18894,7 +18920,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // §3.6 envelope #2: structural dry-run first-class — resolved
             // graph, fanout counts, phase tags. No dispatch, no persist.
             if *dry_run {
-                let rendered = crew::render_dry_run(&composed);
+                let rendered = crew::render_dry_run(&composed, &resolve);
                 if *json {
                     print_json(&json!({
                         "workflow": wf_name,
@@ -19503,7 +19529,8 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
                 // — RESONATE_URL pin > host-local serve > in-memory), never a
                 // private in-memory constructor. A live fire is a durable run
                 // when a Resonate store answers.
-                let engine = pane::local_engine(&rt, runner, profile_resolver, workflow_resolver)?;
+                let engine =
+                    pane::local_engine(&rt, runner, profile_resolver, workflow_resolver.clone())?;
                 let result = rt.block_on(async { engine.invoke(&run_id, wf, json!({})).await });
                 match result {
                     Ok(output) => {
@@ -22030,7 +22057,30 @@ pub(crate) fn headless_dispatch(
     // The leaf prints ONE json line on success / on captured failure. Any
     // other output (spawn failure, panic) becomes a per-step error value.
     if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-        return Ok(v);
+        // ADR-0022 §3.5 warn-first plan-artifact gate (bd-cvv9): an
+        // `implement` dispatch with no plan artifact warns loudly, tags the
+        // run log AND the step output — never blocks (the W5 flip owns
+        // blocking).
+        if phase_chain::plan_artifact_missing(spec, inputs) {
+            eprintln!(
+                "flywheel: phase implement dispatch has NO completed plan artifact — \
+                 warn-first gate (ADR-0022 §3.5); step output tagged plan_artifact_missing"
+            );
+            // headless_dispatch has no project param; warn telemetry lands
+            // in the default project's state log.
+            crate::state::log_event(
+                "flywheel",
+                crate::state::EventKind::Workflow,
+                serde_json::json!({
+                    "workflow": wf_name,
+                    "phase": "implement",
+                    "plan_artifact_missing": true,
+                    "gate_mode": "warn",
+                }),
+            )
+            .ok();
+        }
+        return Ok(phase_chain::annotate_dispatch_output(spec, inputs, v));
     }
     let err = String::from_utf8_lossy(&output.stderr).to_string();
     Ok(json!({ "ok": false, "error": if err.trim().is_empty() { raw } else { err } }))

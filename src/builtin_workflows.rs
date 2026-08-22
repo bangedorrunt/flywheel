@@ -51,8 +51,162 @@ use std::collections::BTreeMap;
 
 use toron_workflow::schema::{Workflow, parse_workflow};
 
+// governed-by: ADR-0022 §3.3 (phase-native built-ins, bd-cvv9)
 /// The compiled-in built-in workflows, name → YAML text.
 pub const BUILTIN_WORKFLOWS_YAML: &[(&str, &str)] = &[
+    (
+        "phase-resolve",
+        r##"
+name: phase-resolve
+description: "ADR-0022 §3.3 phase built-in (resolve): reduce ambiguity to a goal statement. The resolver posts the statement to the project thread (plane P) and replies with the machine-checkable §4.5 report: target, non_goals, blast_radius, open_questions."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: objective
+steps:
+  - name: phase-resolve
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@scout"
+      phase: resolve
+      task: 'Resolve the objective into a goal statement. 1) Post the statement to the project thread (toron mail, plane P) with subject [resolve]. 2) Reply with ONLY a JSON object: {"target": "<one sentence>", "non_goals": ["..."], "blast_radius": "<files/areas>", "open_questions": []} — every field present; open_questions may be an empty array. Objective: {{inputs.objective}}'
+    on_error: fail_run
+"##,
+    ),
+    (
+        "phase-plan",
+        r##"
+name: phase-plan
+description: "ADR-0022 §3.3 phase built-in (plan): decompose into verifiable beads. §4.5 contract: ≥1 bead with non-empty acceptance, br-verified dep_cycles=0 (the chain runner injects it; do not self-report)."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: goal
+  - name: data_shape
+steps:
+  - name: phase-plan
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@planner"
+      phase: plan
+      task: 'Decompose the goal into beads (br create) in this repo: every bead carries a non-empty acceptance criteria with a runnable VERIFY command and explicit dependencies; run `br dep cycles --json` and confirm count stays 0. Reply with ONLY a JSON object: {"beads": [{"id": "bd-xxxx", "acceptance": "<command>"}], "dep_cycles_note": "runner verifies"}. Goal: {{inputs.goal}}. Data shape (what exists to work with): {{inputs.data_shape}}'
+    on_error: fail_run
+"##,
+    ),
+    (
+        "phase-implement",
+        r##"
+name: phase-implement
+description: "ADR-0022 §3.3 phase built-in (implement): build against a bead. §4.5 contract: a commit whose message cites the bead id + the bead's acceptance gate exit 0 with output recorded."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: goal
+  - name: plan
+steps:
+  - name: phase-implement
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@coder"
+      phase: implement
+      harness: opencode
+      acceptance: "test -f .flywheel/receipts/latest-implement.verify.txt"
+      plan: "{{inputs.plan}}"
+      task: 'Implement the plan against your bead: commit BEFORE closing with the bead id IN the commit message, then run the bead''s acceptance command. Reply with ONLY a JSON object: {"commit_sha": "<sha>", "commit_message": "<full message>", "gate": {"command": "<acceptance cmd>", "exit": <code>, "output": "<tail>"}}. Goal: {{inputs.goal}}'
+    on_error: fail_run
+"##,
+    ),
+    (
+        "phase-review",
+        r##"
+name: phase-review
+description: "ADR-0022 §3.3 phase built-in (review): adversarial falsification, n=2 fanout (R-P3). §4.5 contract: findings posted + verdict ∈ {AGREE, AGREE-WITH-CHANGES, REJECT}."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: target
+  - name: artifact
+steps:
+  - name: review
+    action: parallel
+    over: "2"
+    each:
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@reviewer"
+        phase: review
+        n: 2
+        harness: opencode
+        plan: "{{inputs.artifact}}"
+        task: 'Adversarially review the artifact for the target: hunt material defects (soundness, complexity, preservation), NOT style. Reply with ONLY a JSON object: {"findings": ["<finding>"], "verdict": "AGREE|AGREE-WITH-CHANGES|REJECT"}. Target: {{inputs.target}}'
+    on_error: fail_run
+"##,
+    ),
+    (
+        "phase-verify",
+        r##"
+name: phase-verify
+description: "ADR-0022 §3.3 phase built-in (verify): prove the contract by running the named gate. §4.5 contract: gate exit 0 with output recorded."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: goal
+  - name: gate
+steps:
+  - name: phase-verify
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@housekeeper"
+      phase: verify
+      task: 'Run the named gate command and record its outcome verbatim. Reply with ONLY a JSON object: {"gate": {"command": "<cmd>", "exit": <code>, "output": "<last lines>"}}. Gate: {{inputs.gate}}. Goal: {{inputs.goal}}'
+    on_error: fail_run
+"##,
+    ),
+    (
+        "ship",
+        r##"
+name: ship
+description: "ADR-0022 §3.3 chain built-in: resolve → plan → implement → review → verify with the §4.5 completion-contract gates between links. `flywheel workflow run ship --execute` routes through the gated chain runner (phase_chain::run_ship_chain); a plain engine invoke runs the links without gates. crew: auto."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: objective
+  - name: data_shape
+  - name: gate
+steps:
+  - name: resolve
+    action: call_workflow
+    workflow: phase-resolve
+    inputs: { objective: "{{inputs.objective}}" }
+  - name: plan
+    action: call_workflow
+    workflow: phase-plan
+    inputs: { goal: "{{inputs.objective}}", data_shape: "{{inputs.data_shape}}" }
+  - name: implement
+    action: call_workflow
+    workflow: phase-implement
+    inputs: { goal: "{{inputs.objective}}", plan: "{{steps.plan}}" }
+  - name: review
+    action: call_workflow
+    workflow: phase-review
+    inputs: { target: "{{inputs.objective}}", artifact: "{{steps.implement}}" }
+  - name: verify
+    action: call_workflow
+    workflow: phase-verify
+    inputs: { goal: "{{inputs.objective}}", gate: "{{inputs.gate}}" }
+"##,
+    ),
     (
         "brainstorm",
         r##"
@@ -157,7 +311,7 @@ steps:
     inputs: { question: "{{inputs.objective}}" }
   - name: plan
     action: call_workflow
-    workflow: plan
+    workflow: phase-plan
     inputs: { goal: "{{inputs.objective}}" }
   - name: track
     action: call_workflow
@@ -1088,6 +1242,106 @@ mod tests {
         ] {
             assert!(wfs.contains_key(name), "built-in {name} present");
         }
+    }
+
+    /// bd-cvv9 (ADR-0022 §3.3): the five phase built-ins parse, are
+    /// phase-tagged, and lint CLEAN under the full rule family including
+    /// the R-P1..P4 phase gates (plan: data_shape + planner role;
+    /// implement: acceptance; review: n >= 2).
+    #[test]
+    fn phase_builtins_lint_clean_under_phase_rules() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        for name in [
+            "phase-resolve",
+            "phase-plan",
+            "phase-implement",
+            "phase-review",
+            "phase-verify",
+        ] {
+            let wf = &wfs[name];
+            let report = toron_workflow::lint_workflow(wf);
+            assert!(
+                report.is_clean(),
+                "{name} must lint clean incl. R-P1..P4: {:?}",
+                report.issues
+            );
+        }
+        // phase tags land on the dispatch specs
+        assert_eq!(
+            dispatch_phase(&wfs["phase-resolve"], "phase-resolve"),
+            Some("resolve".to_string())
+        );
+        assert_eq!(
+            dispatch_phase(&wfs["phase-plan"], "phase-plan"),
+            Some("plan".to_string())
+        );
+        assert_eq!(
+            dispatch_phase(&wfs["phase-implement"], "phase-implement"),
+            Some("implement".to_string())
+        );
+        assert_eq!(
+            dispatch_phase(&wfs["phase-verify"], "phase-verify"),
+            Some("verify".to_string())
+        );
+        // review's dispatch lives inside the parallel fanout
+        let review = &wfs["phase-review"];
+        let fan = review
+            .steps
+            .iter()
+            .find_map(|s| match &s.action {
+                Action::Parallel { each, .. } => Some(each),
+                _ => None,
+            })
+            .expect("review fans out via parallel");
+        match &fan.action {
+            Action::DispatchJob { spec, .. } => {
+                assert_eq!(spec.phase.as_deref(), Some("review"));
+                assert_eq!(spec.extra.get("n").and_then(|n| n.as_u64()), Some(2));
+            }
+            other => panic!("review fanout leaf is a dispatch, got {other:?}"),
+        }
+    }
+
+    fn dispatch_phase(wf: &Workflow, step: &str) -> Option<String> {
+        use toron_workflow::schema::Action;
+        wf.steps.iter().find_map(|s| {
+            (s.name.as_deref() == Some(step)).then(|| match &s.action {
+                Action::DispatchJob { spec, .. } => spec.phase.clone(),
+                _ => None,
+            })?
+        })
+    }
+
+    /// bd-cvv9 (ADR-0022 §8 W3 box): `ship` renders the FIVE-link chain
+    /// (resolve → plan → implement → review → verify) in the structural
+    /// dry-run — the graph the gated runner walks.
+    #[test]
+    fn ship_dry_run_renders_the_five_link_chain() {
+        let wfs = builtin_workflows();
+        let ship = &wfs["ship"];
+        let resolver = |sub: &str| builtin_workflows().get(sub).cloned();
+        let rendered = crate::crew::render_dry_run(ship, &resolver);
+        let steps = rendered["steps"].as_array().expect("dry-run steps");
+        let mut links: Vec<String> = Vec::new();
+        for s in steps {
+            if s["action"] == "call_workflow" {
+                links.push(
+                    s["path"]
+                        .as_str()
+                        .unwrap_or("<unnamed>")
+                        .split('.')
+                        .next_back()
+                        .unwrap_or("<unnamed>")
+                        .to_string(),
+                );
+            }
+        }
+        assert_eq!(
+            links,
+            vec!["resolve", "plan", "implement", "review", "verify"],
+            "ship renders the 5-link chain: {rendered}"
+        );
     }
 
     /// bd-w2-review-s6ij: interrogate defaults N=2 with a @reviewer briefs
