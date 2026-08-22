@@ -1083,6 +1083,14 @@ pub struct MailDigestArgs {
     pub agents: Vec<String>,
 }
 
+/// Args for the dispatch-dedupe guard leaf (bd-dispatch-dedupe-2zlz):
+/// which bead's thread to scan before a GOAL dispatch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchGuardArgs {
+    pub project: String,
+    pub bead: String,
+}
+
 /// Args for the xproj-spawn leaf (cross-project swarm receive, full branch).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XprojSpawnArgs {
@@ -1657,6 +1665,178 @@ fn queue_brief(
             "flywheel: CRITICAL: {e} — bead {id} NOT dispatched (loop bug; no truncation)"
         ),
     }
+}
+
+// ---- bd-dispatch-dedupe-2zlz: no second dispatch over a live peer claim ----
+//
+// The orchestrator double-dispatched beads peers had already claimed or
+// announced on their thread (W4 -> SandySparrow while TanFern's claim +
+// "starting now" were already posted, then re-dispatched AFTER a
+// stand-down; W7 dispatched while a concurrent executor was mid-write).
+// Before any GOAL dispatch the loop scans thread-id=<bead> and holds when
+// a live peer signal says the work is taken.
+
+/// Freshness window for peer claim/announce signals. Mirrors the ~90-minute
+/// TIMEBOX in the dispatch brief; `FLYWHEEL_DISPATCH_TTL_SECS` overrides.
+pub const DISPATCH_GUARD_TTL_US: i64 = 90 * 60 * 1_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardSignalKind {
+    Claim,
+    Announce,
+    Done,
+    StandDown,
+    Handoff,
+}
+
+impl GuardSignalKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            GuardSignalKind::Claim => "claim",
+            GuardSignalKind::Announce => "announce",
+            GuardSignalKind::Done => "done",
+            GuardSignalKind::StandDown => "stand_down",
+            GuardSignalKind::Handoff => "handoff",
+        }
+    }
+}
+
+/// bd-dispatch-dedupe-2zlz: classify one bead-thread message into the
+/// dispatch-guard signal vocabulary. Precedence matters — done beats
+/// everything (the executor's close report settles the thread), a genuine
+/// handoff beats a stand-down phrase, and claim/announce come last.
+/// Keyword-based on purpose: the guard must read BOTH harness mails and
+/// human posts without a schema.
+pub(crate) fn classify_guard_signal(subject: &str, body: &str) -> Option<GuardSignalKind> {
+    let s = subject.to_lowercase();
+    let b = body.to_lowercase();
+    // Done: "[<bead>] done" close reports.
+    if s.contains("] done") {
+        return Some(GuardSignalKind::Done);
+    }
+    let standdown =
+        s.contains("stand-down") || s.contains("stand down") || b.contains("stand down");
+    // Handoff needs an explicit transfer marker; "concurrent executor is
+    // live" is the W7 anti-pattern — someone ELSE is executing, that is a
+    // stand-down for us even when the word handoff appears nearby.
+    let handoff_marker =
+        s.contains("handoff") || b.contains("handoff") || s.contains("hand-off");
+    let concurrent_live =
+        s.contains("concurrent executor") || b.contains("concurrent executor");
+    if handoff_marker && !concurrent_live {
+        return Some(GuardSignalKind::Handoff);
+    }
+    if standdown || concurrent_live {
+        return Some(GuardSignalKind::StandDown);
+    }
+    if s.contains("starting") || s.contains("executing") {
+        return Some(GuardSignalKind::Announce);
+    }
+    // Claim: explicit claim language, never "unclaimed"/"claim-watch".
+    let claim_word = (s.contains("claim") || b.contains("claim"))
+        && !s.contains("unclaim")
+        && !b.contains("unclaim")
+        && !s.contains("claim-watch")
+        && !b.contains("claim-watch");
+    if claim_word {
+        return Some(GuardSignalKind::Claim);
+    }
+    None
+}
+
+/// Everything the guard weighs, collected by the `__dispatch-guard` scan.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DispatchGuardFacts {
+    /// (created_ts_us, kind) for every classified message in the thread.
+    pub signals: Vec<(i64, GuardSignalKind)>,
+    /// Newest mtime (µs) under `.flywheel/receipts/` matching the bead id,
+    /// when one exists — executor liveness without any mail signal.
+    pub receipts_fresh_us: Option<i64>,
+}
+
+/// The GOAL gate: Ok(()) = dispatch may proceed; Err(reason) = hold with
+/// the operator-facing reason.
+///
+/// Rules, in order:
+/// 1. The newest signal overall is `Done` → skip: work finished, ledger
+///    row is out of sync (re-dispatching would double-execute).
+/// 2. Any `StandDown` newer than the last done → hold: a peer explicitly
+///    yielded/flagged a live executor (W7).
+/// 3. Newest `Claim`/`Announce`: hold while unexpired unless a `Handoff`
+///    was posted at-or-after it; stale (> TTL) announces fall through.
+/// 4. Receipts touched within the TTL after the last done → hold: executor
+///    evidence without a ledger row.
+pub fn eval_dispatch_guard(
+    facts: &DispatchGuardFacts,
+    now_us: i64,
+    ttl_us: i64,
+) -> std::result::Result<(), String> {
+    let done_max = facts
+        .signals
+        .iter()
+        .filter(|(_, k)| *k == GuardSignalKind::Done)
+        .map(|(ts, _)| *ts)
+        .max();
+    let close = done_max.unwrap_or(i64::MIN);
+    let recent: Vec<(i64, GuardSignalKind)> = facts
+        .signals
+        .iter()
+        .copied()
+        .filter(|(ts, _)| *ts > close)
+        .collect();
+
+    // Rule 1: newest overall is Done (nothing newer after the close report).
+    if let Some(done_ts) = done_max {
+        let newer = recent.iter().any(|(ts, _)| *ts > done_ts);
+        if !newer && !recent.is_empty() {
+            return Err("peer reported done — ledger sync gap".into());
+        }
+        if recent.is_empty() {
+            return Err("peer reported done — ledger sync gap".into());
+        }
+    }
+
+    // Rule 2: stand-down after the last done holds absolutely.
+    if recent
+        .iter()
+        .any(|(_, k)| *k == GuardSignalKind::StandDown)
+    {
+        return Err("peer stood down — executor flagged live".into());
+    }
+
+    // Rule 3: unexpired claim/announce holds unless handed off.
+    let newest_of = |k: GuardSignalKind| {
+        recent
+            .iter()
+            .filter(|(_, x)| *x == k)
+            .map(|(ts, _)| *ts)
+            .max()
+    };
+    let claimed_at = newest_of(GuardSignalKind::Claim).or(newest_of(GuardSignalKind::Announce));
+    if let Some(a) = claimed_at {
+        match newest_of(GuardSignalKind::Handoff) {
+            Some(h) if h >= a => {}
+            _ => {
+                if now_us - a <= ttl_us {
+                    return Err(format!(
+                        "unexpired peer announce ({}s old)",
+                        (now_us - a) / 1_000_000
+                    ));
+                }
+            }
+        }
+    }
+
+    // Rule 4: fresh receipts are executor evidence.
+    if let Some(r) = facts.receipts_fresh_us {
+        if r > close && now_us - r <= ttl_us {
+            return Err(format!(
+                "receipts written {}s ago — executor evidence",
+                (now_us - r) / 1_000_000
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Bead-creation flood verdict (bd-eign.2): more than 3 previously-unassigned
@@ -2446,6 +2626,73 @@ async fn poll_xproj_inbox(args: XprojInboxArgs) -> Result<Vec<crate::XprojInboxI
     let items = v.get("items").cloned().unwrap_or(json!([]));
     let parsed: Vec<crate::XprojInboxItem> = serde_json::from_value(items).unwrap_or_default();
     Ok(parsed)
+}
+
+/// bd-dispatch-dedupe-2zlz leaf: run the GOAL gate for one bead. Collects
+/// thread signals + receipts freshness via the `__dispatch-guard` collector,
+/// then applies the pure [`eval_dispatch_guard`] verdict. Scan INFRA
+/// failures (collector crash, bad JSON, mail daemon down) fail OPEN with a
+/// loud log — a broken scanner must not freeze all dispatch; a SUCCESSFUL
+/// scan that says hold always wins.
+#[function]
+async fn dispatch_guard_scan(args: DispatchGuardArgs) -> Result<Value> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__dispatch-guard", &args.project, &args.bead]);
+    let out = match run_leaf_cmd(cmd, "__dispatch-guard").await {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            eprintln!(
+                "flywheel: dispatch-guard scan failed (fail-open): {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return Ok(json!({ "bead": args.bead, "dispatch": true, "reason": "scan failed" }));
+        }
+        Err(e) => {
+            eprintln!("flywheel: dispatch-guard scan error (fail-open): {e}");
+            return Ok(json!({ "bead": args.bead, "dispatch": true, "reason": "scan error" }));
+        }
+    };
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let facts: Value = serde_json::from_str(raw.trim())
+        .map_err(|e| map_err(anyhow::anyhow!("__dispatch-guard bad JSON: {e}: {raw}")))?;
+    let signals: Vec<(i64, GuardSignalKind)> = facts
+        .get("signals")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let ts = s.get("ts_us").and_then(Value::as_i64)?;
+                    let kind = match s.get("kind").and_then(Value::as_str)? {
+                        "claim" => GuardSignalKind::Claim,
+                        "announce" => GuardSignalKind::Announce,
+                        "done" => GuardSignalKind::Done,
+                        "stand_down" => GuardSignalKind::StandDown,
+                        "handoff" => GuardSignalKind::Handoff,
+                        _ => return None,
+                    };
+                    Some((ts, kind))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let facts = DispatchGuardFacts {
+        signals,
+        receipts_fresh_us: facts.get("receipts_fresh_us").and_then(Value::as_i64),
+    };
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let ttl_us = std::env::var("FLYWHEEL_DISPATCH_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .map(|secs| secs * 1_000_000)
+        .unwrap_or(DISPATCH_GUARD_TTL_US);
+    match eval_dispatch_guard(&facts, now_us, ttl_us) {
+        Ok(()) => Ok(json!({ "bead": args.bead, "dispatch": true, "reason": null })),
+        Err(reason) => Ok(json!({ "bead": args.bead, "dispatch": false, "reason": reason })),
+    }
 }
 
 /// Fetch one mail digest per agent (loop-side wake signal). Runs `__mail-
@@ -4530,6 +4777,34 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 );
             } else {
                 for bead in to_assign {
+                    // bd-dispatch-dedupe-2zlz: GOAL gate — a live peer
+                    // claim/announce/stand-down on the bead thread holds
+                    // this dispatch (fail-open on scan infra failure).
+                    let g_args = DispatchGuardArgs {
+                        project: params.project.clone(),
+                        bead: bead.id.clone(),
+                    };
+                    match ctx.run(dispatch_guard_scan, g_args).await {
+                        Ok(v) => {
+                            if v.get("dispatch").and_then(Value::as_bool) == Some(false) {
+                                let reason = v
+                                    .get("reason")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("held");
+                                eprintln!(
+                                    "flywheel: dispatch-guard HOLD {}: {reason}",
+                                    bead.id
+                                );
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "flywheel: dispatch-guard leaf failed for {} (fail-open): {e}",
+                                bead.id
+                            );
+                        }
+                    }
                     queue_brief(
                         &mut queue,
                         &bead.id,
@@ -4601,7 +4876,34 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         });
                     }
                     ClaimWatchAction::RedispatchBead { bead_id, title } => {
-                        queue_brief(&mut queue, &bead_id, &title, &params.project, false, true);
+                        // bd-dispatch-dedupe-2zlz: the claim-watch fired, but
+                        // a LATE claim/announce may have landed since — scan
+                        // before re-dispatching (W4 second-occurrence fix).
+                        let g_args = DispatchGuardArgs {
+                            project: params.project.clone(),
+                            bead: bead_id.clone(),
+                        };
+                        match ctx.run(dispatch_guard_scan, g_args).await {
+                            Ok(v) if v.get("dispatch").and_then(Value::as_bool) == Some(false) => {
+                                let reason = v
+                                    .get("reason")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("held");
+                                eprintln!(
+                                    "flywheel: dispatch-guard HOLD re-dispatch {bead_id}: {reason}"
+                                );
+                            }
+                            _ => {
+                                queue_brief(
+                                    &mut queue,
+                                    &bead_id,
+                                    &title,
+                                    &params.project,
+                                    false,
+                                    true,
+                                );
+                            }
+                        }
                     }
                     ClaimWatchAction::NudgeClose {
                         agent,
@@ -4614,7 +4916,33 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         });
                     }
                     ClaimWatchAction::RedispatchResume { bead_id, title } => {
-                        queue_brief(&mut queue, &bead_id, &title, &params.project, true, true);
+                        // bd-dispatch-dedupe-2zlz: same gate for the resume
+                        // re-dispatch — a posted stand-down holds it.
+                        let g_args = DispatchGuardArgs {
+                            project: params.project.clone(),
+                            bead: bead_id.clone(),
+                        };
+                        match ctx.run(dispatch_guard_scan, g_args).await {
+                            Ok(v) if v.get("dispatch").and_then(Value::as_bool) == Some(false) => {
+                                let reason = v
+                                    .get("reason")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("held");
+                                eprintln!(
+                                    "flywheel: dispatch-guard HOLD resume {bead_id}: {reason}"
+                                );
+                            }
+                            _ => {
+                                queue_brief(
+                                    &mut queue,
+                                    &bead_id,
+                                    &title,
+                                    &params.project,
+                                    true,
+                                    true,
+                                );
+                            }
+                        }
                     }
                     ClaimWatchAction::ReleaseReservations { bead_id } => {
                         // ADR-0019 (bd-w1-reopen-f6tw): close-detect
@@ -5608,6 +5936,9 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
         .register(poll_ready)
         .map_err(|e| anyhow::anyhow!("register poll_ready: {e}"))?;
     resonate
+        .register(dispatch_guard_scan)
+        .map_err(|e| anyhow::anyhow!("register dispatch_guard_scan: {e}"))?;
+    resonate
         .register(mail_not_ready)
         .map_err(|e| anyhow::anyhow!("register mail_not_ready: {e}"))?;
     resonate
@@ -6214,6 +6545,158 @@ mod reply_verify_tests {
             reply_settled_argv(&sa),
             vec!["__reply-settled", "proj", "oc", "t1"]
         );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_guard_tests {
+    use super::*;
+
+    const MIN: i64 = 60 * 1_000_000;
+    fn sig(ts_us: i64, k: GuardSignalKind) -> (i64, GuardSignalKind) {
+        (ts_us, k)
+    }
+
+    #[test]
+    fn classify_reads_real_thread_shapes() {
+        use GuardSignalKind::*;
+        // Real shapes from the W4/W7/oqe6 incidents + standard reports.
+        assert_eq!(
+            classify_guard_signal(
+                "[bd-adr22-w4-steer-engine-w69z] starting — steer durable-rail survey + plan",
+                "Claimed bd-adr22-w4-steer-engine-w69z. Write-set: flywheel src/main.rs...",
+            ),
+            Some(Announce)
+        );
+        assert_eq!(
+            classify_guard_signal(
+                "[bd-adr22-w7-delegated-compose-fhdy] STAND-DOWN — live concurrent executor on full surface",
+                "Retracting my earlier split proposal — superseded by events.",
+            ),
+            Some(StandDown)
+        );
+        assert_eq!(
+            classify_guard_signal(
+                "oqe6: agreed + cli lease released — you execute; full handoff inside",
+                "**agreed + released** — lease is released to you. You are the executor; I stand down.",
+            ),
+            Some(Handoff),
+            "explicit transfer beats a passing stand-down phrase"
+        );
+        assert_eq!(
+            classify_guard_signal("[bd-x] done", "**status**: closed"),
+            Some(Done)
+        );
+        assert_eq!(
+            classify_guard_signal("re: bd-y question", "is claim-watch armed for this bead?"),
+            None,
+            "claim-watch mentions are not claims"
+        );
+    }
+
+    #[test]
+    fn unexpired_peer_announce_holds_fresh_dispatch() {
+        let now = 1_000 * MIN;
+        let facts = DispatchGuardFacts {
+            signals: vec![sig(now - 5 * MIN, GuardSignalKind::Announce)],
+            receipts_fresh_us: None,
+        };
+        let err = eval_dispatch_guard(&facts, now, DISPATCH_GUARD_TTL_US)
+            .expect_err("unexpired announce must hold");
+        assert!(err.contains("unexpired peer announce"), "{err}");
+    }
+
+    #[test]
+    fn stale_announce_falls_through_to_dispatch() {
+        let now = 10_000 * MIN;
+        let facts = DispatchGuardFacts {
+            signals: vec![sig(now - 4 * 60 * MIN, GuardSignalKind::Announce)],
+            receipts_fresh_us: None,
+        };
+        assert!(
+            eval_dispatch_guard(&facts, now, DISPATCH_GUARD_TTL_US).is_ok(),
+            ">TTL announce is stale: re-dispatch allowed"
+        );
+    }
+
+    #[test]
+    fn handoff_after_claim_reopens_dispatch() {
+        let now = 1_000 * MIN;
+        let facts = DispatchGuardFacts {
+            signals: vec![
+                sig(now - 20 * MIN, GuardSignalKind::Claim),
+                sig(now - 2 * MIN, GuardSignalKind::Handoff),
+            ],
+            receipts_fresh_us: None,
+        };
+        assert!(
+            eval_dispatch_guard(&facts, now, DISPATCH_GUARD_TTL_US).is_ok(),
+            "handoff posted at/after the claim authorizes dispatch"
+        );
+    }
+
+    #[test]
+    fn stand_down_holds_absolutely() {
+        let now = 1_000 * MIN;
+        let facts = DispatchGuardFacts {
+            signals: vec![sig(now - 3 * MIN, GuardSignalKind::StandDown)],
+            receipts_fresh_us: None,
+        };
+        let err =
+            eval_dispatch_guard(&facts, now, DISPATCH_GUARD_TTL_US).expect_err("stand-down holds");
+        assert!(err.contains("stood down"), "{err}");
+    }
+
+    #[test]
+    fn done_newest_skips_ledger_sync_gap() {
+        let now = 1_000 * MIN;
+        let facts = DispatchGuardFacts {
+            signals: vec![
+                sig(now - 60 * MIN, GuardSignalKind::Announce),
+                sig(now - 2 * MIN, GuardSignalKind::Done),
+            ],
+            receipts_fresh_us: None,
+        };
+        let err =
+            eval_dispatch_guard(&facts, now, DISPATCH_GUARD_TTL_US).expect_err("done skips");
+        assert!(err.contains("ledger sync gap"), "{err}");
+    }
+
+    #[test]
+    fn fresh_claim_after_done_restarts_the_clock() {
+        let now = 1_000 * MIN;
+        let facts = DispatchGuardFacts {
+            signals: vec![
+                sig(now - 90 * MIN, GuardSignalKind::Done),
+                sig(now - 1 * MIN, GuardSignalKind::Claim),
+            ],
+            receipts_fresh_us: None,
+        };
+        let err = eval_dispatch_guard(&facts, now, DISPATCH_GUARD_TTL_US)
+            .expect_err("claim newer than done holds again");
+        assert!(err.contains("unexpired peer announce"), "{err}");
+    }
+
+    #[test]
+    fn receipts_within_ttl_are_executor_evidence() {
+        let now = 1_000 * MIN;
+        let facts = DispatchGuardFacts {
+            signals: vec![],
+            receipts_fresh_us: Some(now - 30 * MIN),
+        };
+        let err = eval_dispatch_guard(&facts, now, DISPATCH_GUARD_TTL_US)
+            .expect_err("fresh receipts hold");
+        assert!(err.contains("receipts"), "{err}");
+    }
+
+    #[test]
+    fn silence_and_cold_receipts_dispatch() {
+        let now = 1_000 * MIN;
+        let facts = DispatchGuardFacts {
+            signals: vec![],
+            receipts_fresh_us: Some(now - 5 * 60 * MIN),
+        };
+        assert!(eval_dispatch_guard(&facts, now, DISPATCH_GUARD_TTL_US).is_ok());
     }
 }
 
