@@ -1210,6 +1210,13 @@ enum MailCmd {
         /// act as this registered agent (adjective+noun or herdr short name)
         #[arg(long = "as")]
         as_agent: Option<String>,
+        /// bd-mail-inbox-json-a7wc: emit a STABLE machine contract — one JSON
+        /// array of rows, exactly these keys per row: id, thread_id, sender,
+        /// subject, importance, ack_required, read_ts_us, created_ts_us,
+        /// duplicate_of, body_md (nullable: thread_id/duplicate_of/
+        /// read_ts_us). Without it the human/legacy dump is unchanged.
+        #[arg(long)]
+        json: bool,
     },
     /// reply to a message in its thread (thread = the message id or thread id)
     Reply {
@@ -11187,6 +11194,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             unread,
             limit,
             as_agent,
+            json,
         } => {
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
@@ -11217,7 +11225,14 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             } else {
                 mail.inbox(&key, &name, *urgent, *limit)?
             };
-            print_json(&v);
+            // bd-mail-inbox-json-a7wc: --json is the DOCUMENTED machine
+            // contract (stable keys + types); the default dump stays
+            // byte-identical to before.
+            print_json(&if *json {
+                mail_shim::inbox_json_rows(&v)
+            } else {
+                v
+            });
         }
         MailCmd::Reply {
             project,
