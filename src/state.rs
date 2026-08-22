@@ -540,6 +540,23 @@ fn fold_legacy_alias(
 }
 
 /// Atomically persist the project's pane→name registry.
+/// bd-mail-crew-fanout-xq6b: expand the spawn registry into mail
+/// recipients — one addressed copy per live crew pin. Registry
+/// `mail_identity` wins (bd-627z.4 pin), falling back to the herdr name;
+/// the sender is excluded (never mail yourself); duplicates collapse,
+/// registry order preserved.
+pub fn crew_recipients(entries: &[SpawnEntry], sender: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for e in entries {
+        let id = e.mail_identity.clone().unwrap_or_else(|| e.name.clone());
+        if Some(id.as_str()) == sender || out.contains(&id) {
+            continue;
+        }
+        out.push(id);
+    }
+    out
+}
+
 pub fn save_spawn_registry(project: &str, entries: &[SpawnEntry]) -> Result<()> {
     let path = spawn_registry_file(project);
     let key = spawn_registry_key(project);
@@ -1547,6 +1564,38 @@ mod loops_schema_v2_tests {
 
 #[cfg(test)]
 mod tests {
+    mod crew_recipients_tests {
+        use super::*;
+
+        fn entry(name: &str, identity: Option<&str>) -> SpawnEntry {
+            let mut e = SpawnEntry::legacy(format!("w:p-{name}"), name.to_string());
+            if let Some(id) = identity {
+                e.mail_identity = Some(id.to_string());
+            }
+            e
+        }
+
+        #[test]
+        fn crew_recipients_identity_wins_sender_excluded_dedup() {
+            let entries = vec![
+                entry("flywheel-flywheel-oc", Some("FoggyDesert")),
+                entry("flywheel-flywheel-omp", Some("NobleMoose")),
+                entry("flywheel-flywheel-oc2", Some("FoggyDesert")), // dup identity
+                entry("legacy-no-id", None),                         // falls back to name
+            ];
+            let out = crew_recipients(&entries, Some("FoggyDesert"));
+            assert_eq!(
+                out,
+                vec!["NobleMoose".to_string(), "legacy-no-id".to_string()],
+                "sender excluded, dup collapsed, legacy name fallback"
+            );
+        }
+
+        #[test]
+        fn crew_recipients_empty_registry_is_empty() {
+            assert!(crew_recipients(&[], None).is_empty());
+        }
+    }
     use super::*;
     use serde_json::json;
 

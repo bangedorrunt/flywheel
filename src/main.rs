@@ -1379,8 +1379,16 @@ enum MailCmd {
     /// send a message to registered agents
     Send {
         project: String,
+        /// recipients: comma-separated pins/herdr shorts; REQUIRED unless
+        /// --crew expands them for you (bd-mail-crew-fanout-xq6b)
         #[arg(long)]
-        to: String,
+        to: Option<String>,
+        /// bd-mail-crew-fanout-xq6b: expand the project spawn registry into
+        /// recipients — every live crew pin gets one addressed copy (sender
+        /// excluded, deduped, --to entries unioned on top). The broadcast-
+        /// free alternative toron's rejection error names.
+        #[arg(long = "crew")]
+        crew: bool,
         #[arg(long)]
         subject: String,
         #[arg(long)]
@@ -11476,6 +11484,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         MailCmd::Send {
             project,
             to,
+            crew,
             subject,
             body,
             importance,
@@ -11486,13 +11495,40 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
-            // herdr names resolve to their registered identities (bd-odc);
-            // bd-aseq: through the spawn registry pin first, never a parallel
-            // hash-mapped inbox
-            let targets: Vec<String> = to
-                .split(',')
-                .map(|s| resolve_mail_target_registry(project, s.trim()))
-                .collect();
+            // bd-mail-crew-fanout-xq6b: --crew expands the project spawn
+            // registry into recipients (sender excluded, deduped); explicit
+            // --to entries union on top. toron rejects broadcast=true (AM
+            // invariant) — this is the supported per-recipient alternative.
+            let mut targets: Vec<String> = Vec::new();
+            if *crew {
+                let entries = state::load_spawn_registry(project);
+                if entries.is_empty() {
+                    anyhow::bail!(
+                        "mail send --crew: no live crew in the {project} spawn registry — \
+                         spawn a swarm first (flywheel spawn) or pass explicit --to"
+                    );
+                }
+                let sender = Some(mail.name.as_str());
+                for r in state::crew_recipients(&entries, sender) {
+                    if !targets.contains(&r) {
+                        targets.push(r);
+                    }
+                }
+            }
+            match to.as_deref() {
+                Some(tos) => {
+                    for s in tos.split(',') {
+                        let t = resolve_mail_target_registry(project, s.trim());
+                        if !targets.contains(&t) {
+                            targets.push(t);
+                        }
+                    }
+                }
+                None if !*crew => anyhow::bail!(
+                    "mail send: pass --to <recipients> or --crew (spawn-registry fan-out)"
+                ),
+                None => {}
+            }
             let v = mail.send(
                 &key,
                 &targets,
