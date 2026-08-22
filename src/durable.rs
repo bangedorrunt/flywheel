@@ -3016,6 +3016,12 @@ fn digest_prefix(d: &MailDigest) -> Option<String> {
 /// is not registered (debrief D1/D2).
 fn urgent_wake_prompt(d: &MailDigest) -> String {
     let identity = d.mail_identity.as_deref().unwrap_or(d.agent.as_str());
+    // bd-wake-id-contract-1jz1 clause 1: every id this banner cites must be
+    // a RESOLVABLE mail-surface handle. Unresolvable handles are dropped
+    // from the CITATION (the wake itself still fires — the agent polls
+    // their inbox without a broken reply key).
+    let cite_thread = citable_wake_id(d.thread_id.as_deref());
+    let cite_id = citable_wake_id(d.last_id.as_deref());
     let mut line = format!(
         "MAIL WAKE: {} urgent message(s) in your inbox — a peer needs you. \
          Fetch with `flywheel mail inbox <project> --as {identity} --urgent`, then \
@@ -3023,13 +3029,13 @@ fn urgent_wake_prompt(d: &MailDigest) -> String {
          (or toron `reply_message` with the same thread_id). Your reply IS the work — do not just acknowledge in chat.",
         d.urgent,
     );
-    if let Some(t) = &d.thread_id {
+    if let (Some(t), true) = (&d.thread_id, cite_thread) {
         line.push_str(&format!(" Latest urgent thread: {t}"));
     }
     // bd-kryk: cite the MESSAGE id (the --message-id the reply needs), not
     // the sender npub — an npub in this slot is not replyable and reads as
     // phantom mail.
-    if let Some(id) = &d.last_id {
+    if let (Some(id), true) = (&d.last_id, cite_id) {
         line.push_str(&format!(" Most recent urgent: id {id}"));
         if let Some(s) = &d.last_subject
             && !s.is_empty()
@@ -3038,6 +3044,22 @@ fn urgent_wake_prompt(d: &MailDigest) -> String {
         }
     }
     line
+}
+
+/// bd-wake-id-contract-1jz1 clause 1: a wake-citable id is a RESOLVABLE
+/// mail-surface handle — a non-empty hex event id (toron ids are content-
+/// addressed hex, 8+ chars). Reservation paths, thread labels, npubs, or
+/// placeholder strings in an id slot are phantom handles: the banner drops
+/// them rather than sending the agent hunting for a message that does not
+/// exist.
+pub(crate) fn citable_wake_id(id: Option<&str>) -> bool {
+    match id {
+        Some(id) => {
+            let id = id.trim();
+            !id.is_empty() && id.len() >= 8 && id.chars().all(|c| c.is_ascii_hexdigit())
+        }
+        None => false,
+    }
 }
 
 /// Wake prompt for an idle agent with plane-S work (open jobs / channel
@@ -8134,7 +8156,10 @@ mod tests {
             recent,
             urgent,
             plane_s: 0,
-            last_id: (urgent > 0).then(|| format!("urgent-{from}")),
+            // bd-wake-id-contract-1jz1: fixture ids are hex event handles —
+            // the citation gate drops non-hex placeholders.
+            last_id: (urgent > 0)
+                .then(|| format!("{:012x}", from.bytes().map(usize::from).sum::<usize>())),
             last_from: (!from.is_empty()).then(|| from.to_string()),
             last_subject: (!subj.is_empty()).then(|| subj.to_string()),
             thread_id: None,
@@ -8162,7 +8187,7 @@ mod tests {
         match &actions[0] {
             LoopAction::Send { text, .. } => {
                 assert!(
-                    text.starts_with("[mail] 2 recent (1 urgent) (id urgent-PinkGorge re: [bd-1] need input)\ndo the work"),
+                    text.starts_with("[mail] 2 recent (1 urgent) (id 000000000386 re: [bd-1] need input)\ndo the work"),
                     "digest must prefix the prompt with the MESSAGE id, not the sender: {text}"
                 );
             }
@@ -8208,7 +8233,7 @@ mod tests {
                     "wake prompt must say urgent: {text}"
                 );
                 assert!(
-                    text.contains("id urgent-PinkGorge re: [bd-1] help needed"),
+                    text.contains("id 000000000386 re: [bd-1] help needed"),
                     "wake must cite the replyable message id, not the sender npub (bd-kryk): {text}"
                 );
             }
@@ -8231,6 +8256,50 @@ mod tests {
             actions.iter().all(|a| matches!(a, LoopAction::Wait)),
             "suppressed saturated pane must Wait, got {actions:?}"
         );
+    }
+
+    /// bd-wake-id-contract-1jz1 clause 1: unresolvable handles in the id /
+    /// thread slots are DROPPED from the citation — the banner never sends
+    /// the agent hunting a phantom handle.
+    #[test]
+    fn wake_banner_drops_unresolvable_ids() {
+        let d = digest(1, 1, "PinkGorge", "[request-release] crates/toron-cli/**");
+        let mut bad = d;
+        bad.last_id = Some("reservation-30078".into()); // non-hex: not an event id
+        bad.thread_id = Some("thread-9844e931".into());
+        let prompt = urgent_wake_prompt(&bad);
+        assert!(!prompt.contains("Most recent urgent:"), "{prompt}");
+        assert!(!prompt.contains("Latest urgent thread:"), "{prompt}");
+        assert!(
+            prompt.starts_with("MAIL WAKE:"),
+            "the wake itself still fires: {prompt}"
+        );
+    }
+
+    #[test]
+    fn wake_banner_keeps_resolvable_hex_ids() {
+        let mut d = digest(1, 1, "PinkGorge", "[bd-1] need input");
+        d.last_id = Some("994d117d53db".into());
+        d.thread_id = Some("a1b2c3d4e5f60718".into());
+        let prompt = urgent_wake_prompt(&d);
+        assert!(
+            prompt.contains("Most recent urgent: id 994d117d53db"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Latest urgent thread: a1b2c3d4e5f60718"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn citable_wake_id_table() {
+        assert!(citable_wake_id(Some("994d117d53db")));
+        assert!(citable_wake_id(Some("A1B2C3D4")));
+        assert!(!citable_wake_id(Some("reservation-30078")));
+        assert!(!citable_wake_id(Some("short")));
+        assert!(!citable_wake_id(Some("")));
+        assert!(!citable_wake_id(None));
     }
 
     /// bd-kryk regression: the wake banner cites the MESSAGE id — a sender
