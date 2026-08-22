@@ -1903,6 +1903,61 @@ pub fn list_own_reservations(resp: &Value) -> Vec<RenewedReservation> {
     out
 }
 
+/// bd-mail-inbox-json-a7wc: the DOCUMENTED `mail inbox --json` contract.
+/// One JSON array; each row carries EXACTLY these keys with stable types:
+/// id (string — legacy numeric ids are stringified), thread_id (string|null),
+/// sender, subject, importance, body_md (string), ack_required (bool —
+/// AM 0/1 coerced), read_ts_us / created_ts_us (i64|null), duplicate_of
+/// (string|null). Unknown upstream keys are dropped so the shape cannot
+/// drift under callers; a non-array input yields an empty array.
+pub fn inbox_json_rows(v: &serde_json::Value) -> serde_json::Value {
+    use serde_json::json;
+    let rows = match v.as_array() {
+        Some(a) => a,
+        None => return json!([]),
+    };
+    let opt_str = |r: &serde_json::Value, k: &str| {
+        r.get(k)
+            .and_then(|x| x.as_str())
+            .map(|s| json!(s))
+            .unwrap_or(json!(null))
+    };
+    let str_coerce = |r: &serde_json::Value, k: &str| match r.get(k) {
+        Some(serde_json::Value::String(s)) => json!(s),
+        Some(serde_json::Value::Number(n)) => json!(n.to_string()),
+        _ => json!(null),
+    };
+    let ts = |r: &serde_json::Value, k: &str| {
+        r.get(k)
+            .and_then(|x| x.as_i64())
+            .map(|n| json!(n))
+            .unwrap_or(json!(null))
+    };
+    let ack = |r: &serde_json::Value| match r.get("ack_required") {
+        Some(serde_json::Value::Bool(b)) => json!(b),
+        Some(serde_json::Value::Number(n)) => json!(n.as_i64().unwrap_or(0) != 0),
+        _ => json!(false),
+    };
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|r| {
+                json!({
+                    "id": str_coerce(r, "id"),
+                    "thread_id": opt_str(r, "thread_id"),
+                    "sender": opt_str(r, "sender"),
+                    "subject": opt_str(r, "subject"),
+                    "importance": opt_str(r, "importance"),
+                    "ack_required": ack(r),
+                    "read_ts_us": ts(r, "read_ts_us"),
+                    "created_ts_us": ts(r, "created_ts_us"),
+                    "duplicate_of": opt_str(r, "duplicate_of"),
+                    "body_md": opt_str(r, "body_md"),
+                })
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2730,5 +2785,77 @@ mod tests {
             "note explains the config fact: {note}"
         );
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+    }
+}
+
+#[cfg(test)]
+mod inbox_json_rows_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn stable_contract_full_row() {
+        let row = json!({
+            "id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "thread_id": "t-1",
+            "sender": "TealDune",
+            "subject": "s",
+            "importance": "urgent",
+            "ack_required": true,
+            "read_ts_us": 1_700_000_000_000_000i64,
+            "created_ts_us": 1_699_999_000_000_000i64,
+            "duplicate_of": null,
+            "body_md": "body",
+            "extra_upstream_key": "dropped"
+        });
+        let out = inbox_json_rows(&json!([row]));
+        let arr = out.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        let mut keys: Vec<&str> = arr[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "ack_required",
+                "body_md",
+                "created_ts_us",
+                "duplicate_of",
+                "id",
+                "importance",
+                "read_ts_us",
+                "sender",
+                "subject",
+                "thread_id"
+            ],
+            "exactly the 10 contract keys, no extras"
+        );
+        assert_eq!(arr[0]["thread_id"], "t-1");
+        assert_eq!(arr[0]["read_ts_us"], 1_700_000_000_000_000i64);
+        assert_eq!(arr[0]["duplicate_of"], serde_json::Value::Null);
+        assert!(
+            arr[0].get("extra_upstream_key").is_none(),
+            "unknown keys dropped"
+        );
+    }
+
+    #[test]
+    fn stable_contract_coercions_and_missing_fields() {
+        let out = inbox_json_rows(&json!([{ "id": 42, "subject": "legacy", "ack_required": 1 }]));
+        let r = &out[0];
+        assert_eq!(r["id"], "42", "legacy numeric id stringified");
+        assert_eq!(r["ack_required"], json!(true), "AM 0/1 coerced");
+        assert_eq!(r["thread_id"], serde_json::Value::Null);
+        assert_eq!(r["body_md"], serde_json::Value::Null);
+        assert_eq!(r["created_ts_us"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn non_array_input_yields_empty_array() {
+        assert_eq!(inbox_json_rows(&json!({"workflows": []})), json!([]));
     }
 }
