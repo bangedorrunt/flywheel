@@ -1166,6 +1166,14 @@ steps:
       stage: wave-dispatch
       task: 'Dispatch ONLY the beads in .flywheel/wave/{{inputs.wave_label}}-ready.json — one send --stage p1 --param payload per bead, each naming its bead id + the claim/close contract; onto {{inputs.steer_channel}}. Objective: {{inputs.objective}}'
     on_error: fail_run
+  - name: execute
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@coder"
+      stage: systematic-execute
+      task: 'Execute the wave beads listed in .flywheel/wave/{{inputs.wave_label}}-ready.json (claim -> run each bead''s VERIFY -> commit before close -> ledger-legal close with VERIFY tail + principles citations). Objective: {{inputs.objective}}'
+    on_error: fail_run
   - name: observe
     action: dispatch_job
     assignee: x
