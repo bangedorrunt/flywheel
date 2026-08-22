@@ -3211,6 +3211,8 @@ fn main() {
             "coordination": "toron mail",
             "stages": ["p1", "p2", "p4", "p5", "p6", "p8"],
             "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
+            "wave_dispatch": "loop run --work --wave-label wave-N scopes the ready set to that label and holds (naming blockers) while any lower wave-M (M<N) is open/in_progress; default --work unchanged; label-based transitional until beads ADR-0001 schema-18 (ADR-0006 D2)",
+            "wave_swarm_recipe": "workflow compose \"<objective>\" --parts wave-swarm expands GATE/DISPATCH/OBSERVE/VERIFY/SIGNOFF over the compiled-in wave-* stages; SIGNOFF is request_approval — the run suspends for captain-only sign-off; bounded by FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
             "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error" }
         }));
         return;
