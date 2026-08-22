@@ -90,7 +90,8 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
 
     // Capture the dispatch payloads so we assert the legacy Send semantics
     // (to/stage/msg) survive absorption, not just that the engine runs.
-    let dispatches: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    let dispatches: Arc<Mutex<Vec<(String, toron_workflow::schema::DispatchSpec)>>> =
+        Arc::new(Mutex::new(Vec::new()));
     let captured = dispatches.clone();
     let runner: ActionRunner = Arc::new(move |a: &Action| {
         if let Action::DispatchJob { assignee, spec, .. } = a {
@@ -120,11 +121,14 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
                 build_slot: false,
                 action: Action::DispatchJob {
                     assignee: "pi".into(),
-                    spec: serde_json::json!({
+                    // Legacy send-absorb shape: to/msg round-trip through
+                    // `extra`, stage is a named DispatchSpec field.
+                    spec: serde_json::from_value(serde_json::json!({
                         "to": "pi",
                         "stage": "p6",
                         "msg": null,
-                    }),
+                    }))
+                    .expect("legacy spec parses"),
                     channel: None,
                 },
             },
@@ -163,6 +167,6 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
     assert_eq!(jobs.len(), 1, "one DispatchJob from the legacy Send step");
     let (assignee, spec) = &jobs[0];
     assert_eq!(assignee, "pi");
-    assert_eq!(spec["to"], "pi");
-    assert_eq!(spec["stage"], "p6");
+    assert_eq!(spec.extra["to"], "pi");
+    assert_eq!(spec.stage.as_deref(), Some("p6"));
 }

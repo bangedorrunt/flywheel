@@ -887,10 +887,73 @@ fn infer_auto(
     CrewPlan { members: counts }
 }
 
+/// §3.6 safety envelope #3, wall-clock half (ADR-0022): a composed run is
+/// bounded in time. The bound errors THIS process attempt only — the
+/// durable run stays resumable on the engine store, and `--keep` sees a
+/// non-green outcome and refuses, so a timed-out composition can never
+/// graduate into the catalog.
+pub async fn bounded_invoke(
+    engine: &toron_workflow::WorkflowEngine,
+    run_id: &str,
+    wf: Workflow,
+    inputs: serde_json::Value,
+    max_seconds: u64,
+) -> Result<serde_json::Value> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(max_seconds),
+        engine.invoke(run_id, wf, inputs),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "composed run {run_id} exceeded the wall-clock budget ({max_seconds}s) — the durable \
+             run stays resumable; raise FLYWHEEL_COMPOSE_MAX_SECONDS or slim the composition"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use toron_workflow::schema::parse_workflow;
+
+    /// §3.6 envelope #3 (wall-clock): a composed run whose leaves outlive
+    /// the cap fails with the wall-clock error naming the remedy — never a
+    /// silent hang. RED before `bounded_invoke` existed: the compose arm
+    /// invoked with no time bound at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bounded_invoke_enforces_wall_clock_cap() {
+        let runner: toron_workflow::ActionRunner = std::sync::Arc::new(|_a: &Action| {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            Ok(serde_json::json!({ "ok": true }))
+        });
+        let engine = toron_workflow::WorkflowEngine::local(runner).expect("local engine");
+        let wf = parse_workflow(
+            "name: t\nsteps:\n  - name: a\n    action: send_message\n    to: [x]\n    subject: s\n    body: b\n  - name: b\n    action: send_message\n    to: [x]\n    subject: s\n    body: b\n",
+        )
+        .expect("parse");
+        let err = bounded_invoke(&engine, "wallclock-cap-test", wf, serde_json::json!({}), 1)
+            .await
+            .expect_err("two 700ms leaves cannot fit a 1s cap");
+        assert!(
+            err.to_string().contains("wall-clock budget"),
+            "error names the cap: {err:#}"
+        );
+        // Control: the same helper under a generous cap completes normally —
+        // the bound is a budget, not a blanket failure.
+        let fast: toron_workflow::ActionRunner =
+            std::sync::Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+        let engine2 = toron_workflow::WorkflowEngine::local(fast).expect("local engine 2");
+        let wf2 = parse_workflow(
+            "name: t\nsteps:\n  - name: a\n    action: send_message\n    to: [x]\n    subject: s\n    body: b\n",
+        )
+        .expect("parse");
+        let out = bounded_invoke(&engine2, "wallclock-cap-ok", wf2, serde_json::json!({}), 60)
+            .await
+            .expect("under the cap completes");
+        assert_eq!(out["a"]["ok"], true, "under-cap run completes: {out}");
+    }
 
     /// `crew: auto` infers members from the workflow's profile refs
     /// (Behavior Test Matrix row `crew_auto_infer`).
