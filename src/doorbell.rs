@@ -645,6 +645,70 @@ pub fn watch_pubkey(line: &str) -> Option<String> {
 /// `dispatcher: up|down` plus watcher generation (bd-stale-doorbell-wake-0fic)
 /// plus unanswered pins (digest / `--report`). The generation fields let an
 /// agent compare the banner stamp against the pid-file owner.
+/// bd-durable-doorbell-lngf: persisted per-workspace wake state. The
+/// dispatcher loads it at start and saves after every processed wake — a
+/// crash loses nothing that matters: plane-P high-waters survive (no replay
+/// storms), the last-wake stamp feeds `status` liveness, and redelivery is
+/// at-least-once with an idempotent `[doorbell]` line.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct WakeState {
+    /// plane-P inbox high-water per pin (RFC3339) — survives restarts.
+    #[serde(default)]
+    pub since_by_pin: BTreeMap<String, String>,
+    /// last successful wake injection (unix secs) — status liveness.
+    #[serde(default)]
+    pub last_wake_unix: Option<u64>,
+    #[serde(default)]
+    pub last_wake_pin: Option<String>,
+}
+
+pub fn wake_state_file(state_dir: &Path, workspace: &str) -> PathBuf {
+    state_dir.join(format!("doorbell-wake-{workspace}.json"))
+}
+
+/// Missing or corrupt file → DEFAULT (never a crash): at-least-once
+/// degrades to re-delivery, which the `[doorbell]` line makes idempotent.
+pub fn load_wake_state(path: &Path) -> WakeState {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_wake_state(path: &Path, st: &WakeState) -> Result<()> {
+    let json = serde_json::to_string(st)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, json)?;
+    Ok(())
+}
+
+/// Record one delivered wake (the stamp `status` liveness reads).
+pub fn note_wake(st: &mut WakeState, pin: &str, now_unix: u64) {
+    st.last_wake_unix = Some(now_unix);
+    st.last_wake_pin = Some(pin.to_string());
+}
+
+/// bd-durable-doorbell-lngf heal scope: the DISTINCT workspaces of `entries`
+/// that EVER ran a dispatcher (a gen file exists — the lazy-heal sweep never
+/// creates daemons for --no-peer-aware projects). Pure given the dir.
+pub fn workspaces_to_heal(state_dir: &Path, entries: &[crate::state::SpawnEntry]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for e in entries {
+        let Some(ws) = e.pane_id.split(':').next() else {
+            continue;
+        };
+        if ws.is_empty() || out.iter().any(|w| w == ws) {
+            continue;
+        }
+        if read_gen(&gen_file(state_dir, ws)).is_some() {
+            out.push(ws.to_string());
+        }
+    }
+    out
+}
+
 pub fn report_text(state_dir: &Path, workspace: &str) -> String {
     let head = dispatcher_status_line(state_dir, workspace);
     let gen_tail = match read_gen(&gen_file(state_dir, workspace)) {
@@ -1472,6 +1536,80 @@ mod tests {
         .expect("gen");
         stop(&dir, "wst").expect("stop");
         assert!(read_gen(&gen_file(&dir, "wst")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- bd-durable-doorbell-lngf: durable wake state + heal scope --------
+
+    fn entry_with_pane(pane_id: &str) -> crate::state::SpawnEntry {
+        crate::state::SpawnEntry {
+            pane_id: pane_id.into(),
+            name: format!("agent-{pane_id}"),
+            profile: None,
+            harness: None,
+            mail_identity: None,
+            skills_injected: false,
+        }
+    }
+
+    /// Wake state round-trips through disk: since_by_pin high-waters + the
+    /// last-wake stamp survive a dispatcher crash (at-least-once redelivery
+    /// reads the same file on restart).
+    #[test]
+    fn wake_state_roundtrips_through_disk() {
+        let dir = std::env::temp_dir().join(format!("dbllngf-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = wake_state_file(&dir, "wst");
+        let mut st = WakeState::default();
+        st.since_by_pin.insert("QuietFjord".into(), "2026-08-23T01:00:00Z".into());
+        st.since_by_pin.insert("IronHarbor".into(), "2026-08-23T02:00:00Z".into());
+        note_wake(&mut st, "QuietFjord", 1_787_440_000);
+        save_wake_state(&path, &st).expect("save");
+
+        let back = load_wake_state(&path);
+        assert_eq!(
+            back.since_by_pin.get("QuietFjord").map(String::as_str),
+            Some("2026-08-23T01:00:00Z")
+        );
+        assert_eq!(back.last_wake_unix, Some(1_787_440_000));
+        assert_eq!(back.last_wake_pin.as_deref(), Some("QuietFjord"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing/corrupt wake state file loads as DEFAULT (never a crash) —
+    /// at-least-once degrades to re-delivery, which is idempotent.
+    #[test]
+    fn load_wake_state_defaults_on_missing_or_corrupt() {
+        let dir = std::env::temp_dir().join(format!("dbllngf-miss-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let st = load_wake_state(&wake_state_file(&dir, "nope"));
+        assert!(st.since_by_pin.is_empty());
+        assert!(st.last_wake_unix.is_none());
+        let corrupt = dir.join("corrupt.json");
+        std::fs::write(&corrupt, "{not json").unwrap();
+        assert!(load_wake_state(&corrupt).since_by_pin.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Heal scope: only workspaces that EVER ran a dispatcher (gen file
+    /// exists) are healed — --no-peer-aware projects never gain daemons.
+    #[test]
+    fn workspaces_to_heal_requires_prior_dispatcher() {
+        let dir = std::env::temp_dir().join(format!("dbllngf-heal-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        write_gen(
+            &gen_file(&dir, "w8C"),
+            &WatcherGen::capture(Path::new("/bin/echo"), 42).expect("gen"),
+        )
+        .expect("write gen");
+        let entries = vec![
+            entry_with_pane("w8C:p1"),
+            entry_with_pane("w8C:p2"),
+            entry_with_pane("w89:p3"), // no gen file -> not healed
+            entry_with_pane(""),       // no pane -> skipped
+        ];
+        let healed = workspaces_to_heal(&dir, &entries);
+        assert_eq!(healed, vec!["w8C".to_string()], "{healed:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
