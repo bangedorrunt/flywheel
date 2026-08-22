@@ -2426,6 +2426,11 @@ enum WorkflowCmd {
         /// pane mode: the project whose workspace hosts the crew
         #[arg(long)]
         project: Option<String>,
+        /// bd-wave-swarm-graduation-fix-98io: run inputs as a JSON object
+        /// (merged over {"objective": target}) — e.g. the orchestrator pin
+        /// the recipe escalates to: --inputs '{"captain_pin":"<pin>"}'
+        #[arg(long)]
+        inputs: Option<String>,
         /// JSON output
         #[arg(long)]
         json: bool,
@@ -18966,6 +18971,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             run,
             keep,
             project,
+            inputs,
             json,
         } => {
             // W6: --keep is a graduation of a RUN — without --run there is no
@@ -19164,7 +19170,24 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let entries = ctx.entries.clone();
             let project_c = project_name.to_string();
             let wf_name_c = wf_name.clone();
-            let inputs_c = json!({ "objective": target });
+            // bd-wave-swarm-graduation-fix-98io: --inputs merges over the
+            // objective — recipe inputs (captain_pin, wave_label, ...) reach
+            // the task templates.
+            let mut inputs_value = serde_json::Map::new();
+            inputs_value.insert("objective".into(), json!(target));
+            if let Some(txt) = inputs.as_deref() {
+                let extra: Value = serde_json::from_str(txt)
+                    .map_err(|e| anyhow!("--inputs must be a JSON object: {e}"))?;
+                match extra {
+                    Value::Object(m) => {
+                        for (k, v) in m {
+                            inputs_value.insert(k, v);
+                        }
+                    }
+                    _ => bail!("--inputs must be a JSON object"),
+                }
+            }
+            let inputs_c = Value::Object(inputs_value);
             let runner: toron_workflow::ActionRunner = {
                 let entries = entries.clone();
                 let inputs_c = inputs_c.clone();
