@@ -1080,6 +1080,13 @@ enum LoopCmd {
         /// graphs that do not use wave labels. Default: gating ON.
         #[arg(long)]
         no_wave_gates: bool,
+        /// ADR-0006 D2 (requires --work): wave-scoped dispatch — the ready
+        /// set is `br ready` ∩ beads labeled `wave-N`, held (error naming
+        /// the blockers) while any lower wave-M (M<N) bead is open or
+        /// in_progress. Label-based, transitional until beads ADR-0001
+        /// schema-18 ships the typed `wave` field.
+        #[arg(long)]
+        wave_label: Option<String>,
         /// send prompts without landing confirmation (escape hatch; confirm
         /// is the default). Only affects the durable workflow.
         #[arg(long)]
@@ -3335,6 +3342,7 @@ fn main() {
                 local,
                 work,
                 no_wave_gates,
+                wave_label,
                 no_confirm,
                 confirm_timeout_ms,
                 engine,
@@ -3370,6 +3378,7 @@ fn main() {
                             *local,
                             *work,
                             *no_wave_gates,
+                            wave_label.as_deref(),
                             on_blocked,
                             to,
                             *no_confirm,
@@ -13626,6 +13635,7 @@ fn cmd_loop(
     local: bool,
     work: bool,
     no_wave_gates: bool,
+    wave_label: Option<&str>,
     on_blocked: &str,
     to: &str,
     no_confirm: bool,
@@ -13664,6 +13674,16 @@ fn cmd_loop(
     if !matches!(on_blocked, "continue" | "stop" | "mail") {
         bail!("--on-blocked must be continue|stop|mail");
     }
+    // ADR-0006 D2: the wave scope is a --work modifier — fail fast on a
+    // malformed label or an orphaned flag instead of mis-dispatching later.
+    if let Some(label) = wave_label {
+        if !work {
+            bail!("--wave-label requires --work");
+        }
+        if label.strip_prefix("wave-").and_then(|n| n.parse::<u32>().ok()).is_none() {
+            bail!("--wave-label must be `wave-<N>` (got `{label}`)");
+        }
+    }
     let mut queue_items = build_queue(queue, workflow)?;
 
     // durable mode (default): run the loop as a Resonate workflow so it
@@ -13683,6 +13703,7 @@ fn cmd_loop(
             max_iterations,
             work,
             no_wave_gates,
+            wave_label: wave_label.map(String::from),
             confirm_sends: !no_confirm,
             confirm_timeout_ms,
             invocation: String::new(),
@@ -13810,9 +13831,30 @@ fn cmd_loop(
                             wave_held.join(", ")
                         );
                     }
+                    // ADR-0006 D2 wave-scoped dispatch: with --wave-label the
+                    // ready set narrows to exactly that label's beads and ANY
+                    // open lower wave blocks (names the blockers). None =
+                    // default behavior, byte-identical.
+                    let mut scope_block: Option<String> = None;
+                    let scope_ids: Option<std::collections::HashSet<String>> =
+                        wave_label.map(|label| {
+                            match durable::wave_scope_filter(&ready, &inprog_now, label) {
+                                Ok(scoped) => scoped.into_iter().map(|b| b.id).collect(),
+                                Err(e) => {
+                                    eprintln!("flywheel: {e}");
+                                    scope_block = Some(e);
+                                    Default::default()
+                                }
+                            }
+                        });
                     let to_assign: Vec<durable::ReadyBead> = ok
                         .into_iter()
                         .filter(|b| !wave_held.contains(&b.id))
+                        .filter(|b| match (&scope_ids, &scope_block) {
+                            (Some(ids), _) => ids.contains(&b.id),
+                            (None, Some(_)) => false,
+                            (None, None) => true,
+                        })
                         .collect();
                     let to_assign: Vec<String> =
                         work_prompts(&[], &to_assign, &mut assigned, project);
