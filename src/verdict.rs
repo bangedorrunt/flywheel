@@ -645,6 +645,36 @@ pub fn check_close_reason(reason: &str) -> CloseReasonCheck {
     out
 }
 
+/// ADR-0006 D3 (bd-wave-swarm-recipe-wsot): the wave-swarm VERIFY stage's
+/// HARD close-reason gate. `check_close_reason` stays advisory (receipt
+/// writes never fail on lint); the composed VERIFY stage needs a verdict —
+/// every advisory warning is a reject here. Pure; the fixture surface the
+/// graduation bar tests.
+pub fn verify_close_reason(reason: &str) -> Result<(), String> {
+    let c = check_close_reason(reason);
+    if !c.verify_tail_present {
+        return Err("close reason carries no VERIFY tail (what was actually run)".to_string());
+    }
+    // A bare name with an em-dash but NO decision clause is named first —
+    // it is a citation attempt, not an absence.
+    if let Some(w) = c
+        .lint_warnings
+        .iter()
+        .find(|w| w.contains("no decision clause"))
+    {
+        return Err(w.clone());
+    }
+    if c.citations.is_empty() {
+        return Err(
+            "close reason cites no principles (`<known-name> — <decision>` required)".to_string(),
+        );
+    }
+    if !c.lint_warnings.is_empty() {
+        return Err(c.lint_warnings.join("; "));
+    }
+    Ok(())
+}
+
 /// `flywheel ledger check` core: wrap `br gate list <id> --json`, apply
 /// `legal_close`, and report whether any history row is a legal verdict bound
 /// to `sha`. Exits 0 only on a legal verdict for the current SHA (the CLI
@@ -1611,5 +1641,40 @@ stage/workflow/repo; encode-lessons-in-structure — the contract becomes data."
     fn principles_receipt_missing_verify_tail_detected() {
         let c = check_close_reason("closed, all good");
         assert!(!c.verify_tail_present);
+    }
+
+    // ---- ADR-0006 D3: the wave-swarm VERIFY stage's HARD gate -------------
+
+    /// A legal close reason passes the hard gate.
+    #[test]
+    fn verify_close_reason_accepts_tail_and_citation() {
+        let reason = "VERIFY: cargo test --offline wave_swarm -> 12 passed\n\
+PRINCIPLES: prove-it-works — ran the fixture suite before plumbing";
+        verify_close_reason(reason).expect("legal close reason");
+    }
+
+    /// No VERIFY tail → rejected, naming the missing tail.
+    #[test]
+    fn verify_close_reason_rejects_missing_verify_tail() {
+        let err = verify_close_reason("PRINCIPLES: prove-it-works — ran it")
+            .expect_err("no VERIFY tail");
+        assert!(err.contains("VERIFY"), "{err}");
+    }
+
+    /// No principles citation → rejected.
+    #[test]
+    fn verify_close_reason_rejects_missing_citation() {
+        let err =
+            verify_close_reason("VERIFY: cargo test -> ok").expect_err("no citation");
+        assert!(err.contains("principles"), "{err}");
+    }
+
+    /// A cargo-cult citation — a known name with NO decision clause after
+    /// the em-dash — is rejected and NAMES the clause.
+    #[test]
+    fn verify_close_reason_rejects_citation_without_decision() {
+        let reason = "VERIFY: cargo test -> ok\nPRINCIPLES: prove-it-works —";
+        let err = verify_close_reason(reason).expect_err("bare name, no decision");
+        assert!(err.contains("prove-it-works"), "must name it: {err}");
     }
 }
