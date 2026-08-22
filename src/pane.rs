@@ -397,6 +397,15 @@ fn spawn_crew_into(
     Ok(registry)
 }
 
+/// bd-wave-swarm-graduation-fix-98io: dispatch-reason transiency, named.
+/// `agent_not_ready` (agent still booting) AND `agent_pane_busy` (pane not
+/// yet an available shell — the graduation run's boot race) are both
+/// transient: retry with backoff instead of burning the step. Pure +
+/// testable.
+pub fn is_transient_dispatch_reason(reason: &str) -> bool {
+    reason.contains("agent_not_ready") || reason.contains("agent_pane_busy")
+}
+
 /// bd-42fs step 5: does a per-step harness override conflict with the
 /// profile's harness? Pane crews pre-spawn per profile, so an override that
 /// differs cannot be satisfied by an existing pane — the headless runner is
@@ -522,7 +531,7 @@ pub fn pane_dispatch(
             let transient = v
                 .get("reason")
                 .and_then(Value::as_str)
-                .map(|r| r.contains("agent_not_ready"))
+                .map(is_transient_dispatch_reason)
                 .unwrap_or(false);
             if transient && attempts < MAX_ATTEMPTS {
                 attempts += 1;
@@ -982,6 +991,20 @@ pub fn start_spawn_drainer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-wave-swarm-graduation-fix-98io: both boot-race signatures are
+    /// transient (retry), other reasons are not.
+    #[test]
+    fn transient_dispatch_reason_covers_boot_race() {
+        assert!(is_transient_dispatch_reason(
+            "agent_not_ready: agent target pane w8D:p1 pending"
+        ));
+        assert!(is_transient_dispatch_reason(
+            "agent_pane_busy: agent target pane w8D:p1 is not an available shell"
+        ));
+        assert!(!is_transient_dispatch_reason("unknown profile @nope"));
+        assert!(!is_transient_dispatch_reason(""));
+    }
 
     /// P10.3: `@role` resolves via the registry PROFILE column; a bare name
     /// falls back to the name match; missing → None (never a panic).
