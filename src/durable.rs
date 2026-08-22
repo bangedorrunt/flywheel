@@ -7370,7 +7370,7 @@ mod tests {
     /// Unlabeled fixture: a ready set with NO matching labels scopes to an
     /// empty set (nothing to dispatch this label), never an error.
     #[test]
-    fn wave_scope_unlabeled_ready_set_is_empty() {
+    fn wave_scoped_unlabeled_ready_set_is_empty() {
         let ready = vec![rb("bd-a", None), rb("bd-b", None)];
         let inprog: Vec<ReadyBead> = Vec::new();
         let scoped =
