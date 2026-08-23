@@ -1362,10 +1362,12 @@ enum MailCmd {
         /// agent (adjective+noun or herdr short name)
         agent: String,
     },
-    /// register/refresh an agent identity (upsert)
+    /// register/refresh an agent identity (upsert). One operator is one
+    /// identity (bd-register-portability-3c2b): a name is REQUIRED — bind an
+    /// existing key with --from-project/--adopt-unnamed instead of minting.
     Register {
         project: String,
-        /// agent name (adjective+noun; omit to auto-generate)
+        /// agent name (adjective+noun pin; REQUIRED unless importing)
         #[arg(long)]
         name: Option<String>,
         #[arg(long, default_value = "flywheel")]
@@ -6618,13 +6620,65 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
 }
 
 /// bd-durable-doorbell-lngf: the registered workspaces of `project` that
-/// ever ran a dispatcher (the lazy-heal scope).
+/// ever ran a dispatcher (the lazy-heal scope). The dispatcher key is the
+/// workspace LABEL (`swarm_label`, e.g. `flywheel-flywheel`) — the same key
+/// `cmd_spawn` writes pid/gen files under — never the herdr pane-id prefix.
 fn doorbell_project_workspaces(project: &str) -> Vec<String> {
     let registry = state::load_spawn_registry(project);
-    doorbell::workspaces_to_heal(&config::state_dir(), &registry)
+    if registry.is_empty() {
+        return Vec::new();
+    }
+    let label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+    if doorbell::gen_file(&config::state_dir(), &label).exists() {
+        vec![label]
+    } else {
+        Vec::new()
+    }
+}
+
+/// bd-durable-doorbell-lngf: register the Resonate-primary supervisor —
+/// `heal_tick` + a every-minute schedule on the host server (idempotent by
+/// name). This process becomes a supervisor WORKER until it exits; the
+/// schedule itself lives server-side, so ticks that land while nothing is
+/// connected stay queued and execute at-least-once later. Server
+/// unreachable → skip silently; the lazy fallback still covers us.
+fn ensure_doorbell_supervisor() {
+    use resonate_sdk::prelude::ResonateConfig;
+    let Some(url) = pane::cli_engine_store_url() else {
+        return;
+    };
+    // The runtime + Resonate instance are leaked deliberately: the network
+    // pollers must stay alive for the PROCESS lifetime so this process
+    // works as a supervisor worker (the __doorbell children are long-lived;
+    // short CLI commands contribute one poll cycle then exit).
+    let rt = Box::leak(Box::new(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("supervisor runtime"),
+    ));
+    let result: anyhow::Result<()> = rt.block_on(async {
+        let mut r = resonate_sdk::prelude::Resonate::new(ResonateConfig {
+            url: Some(url),
+            group: Some("flywheel-doorbell".into()),
+            ..Default::default()
+        });
+        doorbell::supervisor_function_registered(&mut r)?;
+        // Idempotent by name: an existing schedule is fine.
+        let _ = r
+            .schedule(doorbell::SUPERVISOR_NAME, doorbell::SUPERVISOR_CRON, "heal_tick", ())
+            .await;
+        // Keep the instance alive (never stopped — worker for life).
+        std::mem::forget(r);
+        Ok(())
+    });
+    if let Err(e) = result {
+        eprintln!("flywheel: doorbell supervisor setup skipped: {e:#}");
+    }
 }
 
 fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
+    ensure_doorbell_supervisor();
     let _ = cfg;
     let state_dir = config::state_dir();
     for ws in doorbell_project_workspaces(project) {
@@ -6664,6 +6718,7 @@ fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
 }
 
 fn cmd_doorbell_start(_cfg: &Config, project: &str) -> Result<()> {
+    ensure_doorbell_supervisor();
     let exe = std::env::current_exe()?;
     for ws in doorbell_project_workspaces(project) {
         let action = doorbell::ensure_running(&exe, &config::state_dir(), &ws, project)
@@ -6688,12 +6743,10 @@ fn cmd_doorbell_stop(_cfg: &Config, project: &str, workspace: &str) -> Result<()
 }
 
 /// bd-durable-doorbell-lngf requirement 4: re-inject the peer-aware handler
-/// + identity line into EXISTING panes — covers herdr pane-split additions
+/// and identity line into EXISTING panes — covers herdr pane-split additions
 /// and post-crash respawns that never got the spawn-time injection.
-///
-/// (oc5: `select_reservation_identity` below is yours — landing your bead
-/// resolves the dead-code warning.)
 fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> {
+    ensure_doorbell_supervisor();
     let registry = state::load_spawn_registry(project);
     let peer_tpl = include_str!("../integrations/peer-aware.md.tpl");
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
@@ -9448,6 +9501,7 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
     // the WAKE LAYER (the crash that killed the panes killed the
     // dispatchers too). Lazy-heal every registered workspace.
     let exe = std::env::current_exe()?;
+    ensure_doorbell_supervisor();
     for ws in doorbell_project_workspaces(project) {
         match doorbell::ensure_running(&exe, &config::state_dir(), &ws, project) {
             Ok(action) => eprintln!("flywheel: doorbell {ws} healed ({action:?})"),
@@ -13919,27 +13973,25 @@ fn cmd_loop_doctor(cfg: &Config, fix: bool, json: bool) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let mut report = rt.block_on(durable::loop_doctor(cfg, fix))?;
     // bd-durable-doorbell-lngf: liveness of the wake layer — every
-    // registered workspace dispatcher that is DEAD is a warning (doctor
-    // only WARNS; healing lives in recover/status/doorbell). Projects are
-    // enumerated from the spawn-registry files in the agents dir.
+    // dispatcher workspace that is DEAD is a warning (doctor only WARNS;
+    // healing lives in recover/status/doorbell). Workspaces are enumerated
+    // from the doorbell dir itself (*.gen = ran a dispatcher once); the
+    // file stem is the workspace label — the pid/gen key.
     let mut dead_doorbells: Vec<String> = Vec::new();
-    let agents_dir = config::state_dir().join("agents");
-    if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+    let db_dir = config::state_dir().join("doorbell");
+    if let Ok(entries) = std::fs::read_dir(&db_dir) {
         for e in entries.flatten() {
             let path = e.path();
-            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            if path.extension().and_then(|x| x.to_str()) != Some("gen") {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|x| x.to_str()) else {
+            let Some(label) = path.file_stem().and_then(|x| x.to_str()) else {
                 continue;
             };
-            let registry = state::load_spawn_registry(stem);
-            for ws in doorbell::workspaces_to_heal(&config::state_dir(), &registry) {
-                let alive = doorbell::read_pid(&doorbell::pid_file(&config::state_dir(), &ws))
-                    .is_some_and(doorbell::pid_alive);
-                if !alive {
-                    dead_doorbells.push(format!("{stem}/{ws}"));
-                }
+            let alive = doorbell::read_pid(&doorbell::pid_file(&config::state_dir(), label))
+                .is_some_and(doorbell::pid_alive);
+            if !alive {
+                dead_doorbells.push(label.to_string());
             }
         }
     }

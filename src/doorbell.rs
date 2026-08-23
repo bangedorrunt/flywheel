@@ -382,6 +382,13 @@ fn spawn_child(
     path: &Path,
     gen_path: &Path,
 ) -> Result<()> {
+    // bd-durable-doorbell-lngf: record which project owns this workspace —
+    // the Resonate supervisor reads the sidecar to re-spawn the right
+    // `__doorbell --project <p>` after a crash (the pid/gen files alone
+    // don't carry it).
+    if let Some(parent) = gen_path.parent() {
+        let _ = fs::write(parent.join(format!("{workspace}.project")), project);
+    }
     let mut cmd = Command::new(exe);
     cmd.args(["__doorbell", "--project", project, "--workspace", workspace]);
     cmd.stdin(Stdio::null());
@@ -690,24 +697,80 @@ pub fn note_wake(st: &mut WakeState, pin: &str, now_unix: u64) {
     st.last_wake_pin = Some(pin.to_string());
 }
 
-/// bd-durable-doorbell-lngf heal scope: the DISTINCT workspaces of `entries`
-/// that EVER ran a dispatcher (a gen file exists — the lazy-heal sweep never
-/// creates daemons for --no-peer-aware projects). Pure given the dir.
-pub fn workspaces_to_heal(state_dir: &Path, entries: &[crate::state::SpawnEntry]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for e in entries {
-        let Some(ws) = e.pane_id.split(':').next() else {
-            continue;
-        };
-        if ws.is_empty() || out.iter().any(|w| w == ws) {
+// ---- bd-durable-doorbell-lngf: Resonate-primary supervision --------------
+// The lazily-healed watcher is the LOW-LATENCY push path; the Resonate
+// schedule is the GUARANTEED path: the host server fires the supervisor
+// tick every minute whether or not any human touches flywheel. A tick that
+// lands while no worker is connected stays queued server-side and executes
+// at-least-once as soon as any flywheel process with this function
+// registered comes alive (the `[doorbell]` line keeps redelivery
+// idempotent). Server unreachable → the lazy fallback covers every
+// interactive invocation (subtract-before-you-add: no new daemon).
+
+/// Sidecar: which project owns a workspace dispatcher (written by
+/// `spawn_child`; the pid/gen files alone don't carry it).
+pub fn project_sidecar(state_dir: &Path, workspace: &str) -> PathBuf {
+    state_dir.join("doorbell").join(format!("{workspace}.project"))
+}
+
+pub fn read_project_sidecar(state_dir: &Path, workspace: &str) -> Option<String> {
+    fs::read_to_string(project_sidecar(state_dir, workspace))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Every dispatcher workspace whose pid is missing or dead: (label, project).
+/// Workspaces without a sidecar are skipped — they predate the supervisor.
+pub fn dead_dispatchers(state_dir: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(state_dir.join("doorbell")) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("gen") {
             continue;
         }
-        if read_gen(&gen_file(state_dir, ws)).is_some() {
-            out.push(ws.to_string());
+        let Some(label) = path.file_stem().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        let alive = read_pid(&pid_file(state_dir, label)).is_some_and(pid_alive);
+        if !alive && let Some(project) = read_project_sidecar(state_dir, label) {
+            out.push((label.to_string(), project));
         }
     }
     out
 }
+
+/// The durable supervisor leaf: heal every dead dispatcher. Checkpointed —
+/// a replay returns the stored result and never double-spawns a child.
+#[resonate_sdk::function]
+async fn heal_tick(_args: ()) -> Result<Vec<String>> {
+    let state_dir = crate::config::state_dir();
+    let exe = std::env::current_exe()?;
+    let mut healed = Vec::new();
+    for (label, project) in dead_dispatchers(&state_dir) {
+        if let Err(e) = ensure_running(&exe, &state_dir, &label, &project) {
+            return Err(resonate_sdk::error::Error::Application {
+                message: format!("supervisor heal {label}: {e:#}"),
+            });
+        }
+        healed.push(label.clone());
+    }
+    Ok(healed)
+}
+
+/// Register the supervisor leaf on a Resonate instance (the schedule fires
+/// `heal_tick`; see SUPERVISOR_CRON).
+pub fn supervisor_function_registered(r: &mut resonate_sdk::prelude::Resonate) -> Result<()> {
+    r.register(heal_tick)
+        .map_err(|e| anyhow::anyhow!("register doorbell heal_tick: {e}"))
+}
+
+/// The cron the schedule fires on: every minute.
+pub const SUPERVISOR_CRON: &str = "* * * * *";
+pub const SUPERVISOR_NAME: &str = "doorbell-supervisor";
 
 pub fn report_text(state_dir: &Path, workspace: &str) -> String {
     let head = dispatcher_status_line(state_dir, workspace);
@@ -1591,25 +1654,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Heal scope: only workspaces that EVER ran a dispatcher (gen file
-    /// exists) are healed — --no-peer-aware projects never gain daemons.
+    /// Heal scope: the dispatcher key is the workspace LABEL (the pid/gen
+    /// file stem `swarm_label` writes), NEVER the herdr pane-id prefix —
+    /// a label-keyed heal finds the real pid files (bd-durable-doorbell-
+    /// lngf graduation finding: w8B vs flywheel-flywheel).
     #[test]
-    fn workspaces_to_heal_requires_prior_dispatcher() {
-        let dir = std::env::temp_dir().join(format!("dbllngf-heal-{}", std::process::id()));
+    fn wake_state_file_uses_workspace_label_key() {
+        let dir = std::env::temp_dir().join(format!("dbllngf-label-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        write_gen(
-            &gen_file(&dir, "w8C"),
-            &WatcherGen::capture(Path::new("/bin/echo"), 42).expect("gen"),
-        )
-        .expect("write gen");
-        let entries = vec![
-            entry_with_pane("w8C:p1"),
-            entry_with_pane("w8C:p2"),
-            entry_with_pane("w89:p3"), // no gen file -> not healed
-            entry_with_pane(""),       // no pane -> skipped
-        ];
-        let healed = workspaces_to_heal(&dir, &entries);
-        assert_eq!(healed, vec!["w8C".to_string()], "{healed:?}");
+        let path = wake_state_file(&dir, "flywheel-flywheel");
+        assert!(path.to_string_lossy().contains("doorbell-wake-flywheel-flywheel"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

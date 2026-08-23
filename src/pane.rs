@@ -897,7 +897,7 @@ pub fn local_engine(
 /// 127.0.0.1, NOT localhost: the host serve binds IPv4 while `localhost`
 /// resolves ::1-first here, so a naive probe silently demotes every run to
 /// the embedded in-memory store (observed live).
-fn cli_engine_store_url() -> Option<String> {
+pub(crate) fn cli_engine_store_url() -> Option<String> {
     if let Ok(pin) = std::env::var("RESONATE_URL")
         && !pin.trim().is_empty()
     {
