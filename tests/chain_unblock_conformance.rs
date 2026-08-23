@@ -87,8 +87,29 @@ fn closing_blocker_unblocks_dependent() {
         "dependent must NOT be ready while the blocker is open: {ready_before:?}"
     );
 
-    // Close the blocker.
-    br_ok(&dir, &["close", &id1, "--reason", "done"]);
+    // Close the blocker. schema-18 fail-closed br demands a commit-sha (no
+    // git repo here to cite) — this test is about dependency resolution, not
+    // close legality, so manufacture it via operator bypass
+    // (bd-adr0006-cosmetic-sweep-q0g0).
+    let out = Command::new("br")
+        .args([
+            "close",
+            &id1,
+            "--reason",
+            "done",
+            "--bypass-policy",
+            "--bypass-reason",
+            "conformance fixture: dependency-unblock precondition, not close legality",
+        ])
+        .current_dir(&dir)
+        .env("BR_OPERATOR", "1")
+        .output()
+        .expect("br runs");
+    assert!(
+        out.status.success(),
+        "br close failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Now b2 IS ready — the chain unblocked.
     let ready_after = ready_ids(&br_stdout(&dir, &["ready", "--json"]));
