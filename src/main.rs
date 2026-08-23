@@ -6628,12 +6628,21 @@ fn doorbell_project_workspaces(project: &str) -> Vec<String> {
     if registry.is_empty() {
         return Vec::new();
     }
-    let label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
-    if doorbell::gen_file(&config::state_dir(), &label).exists() {
-        vec![label]
-    } else {
-        Vec::new()
+    let state_dir = config::state_dir();
+    // Preferred: the label recorded at spawn. Fallback: swarm_label — a
+    // STALE meta label from a probe run must not hide the real dispatcher
+    // files (bd-durable-doorbell-lngf graduation finding).
+    let mut candidates = Vec::new();
+    if let Some(meta) = state::load_spawn_meta(project) {
+        candidates.push(meta);
     }
+    candidates.push(swarm_label(project));
+    candidates
+        .into_iter()
+        .filter(|l| doorbell::gen_file(&state_dir, l).exists())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// bd-durable-doorbell-lngf: register the Resonate-primary supervisor —
@@ -7249,10 +7258,17 @@ fn doorbell_sweep_inbox(
         let Some(pin) = e.mail_identity.as_deref() else {
             continue;
         };
+        // bd-durable-doorbell-lngf: NO persisted high-water (first run or
+        // pre-supervisor state) → look BACK a bounded window, not `now` —
+        // mail that arrived while the dispatcher was dead must still wake
+        // (at-least-once; the [doorbell] line + budget make replay safe).
         let since = since_by_pin
             .get(pin)
             .cloned()
-            .unwrap_or_else(|| now.clone());
+            .unwrap_or_else(|| {
+                (chrono::Utc::now() - chrono::Duration::hours(doorbell::REDELIVERY_LOOKBACK_HOURS as i64))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            });
         let output = Command::new("toron")
             .args([
                 "mail",

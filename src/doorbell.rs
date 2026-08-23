@@ -515,6 +515,13 @@ impl SelfIndex {
 /// unanswered (presence / kind-9 / reaction from their npub).
 pub const UNANSWERED_SECS: u64 = 120;
 
+/// bd-durable-doorbell-lngf: when NO wake-state high-water exists (first
+/// run, or state lost), the inbox sweep looks this far back instead of
+/// `now` — mail that arrived while the dispatcher was dead still wakes.
+/// Bounded so a never-seen inbox does not replay forever; the `[doorbell]`
+/// line + per-pin budget keep the replay idempotent and cheap.
+pub const REDELIVERY_LOOKBACK_HOURS: u64 = 24;
+
 #[derive(Debug, Clone)]
 struct PendingRing {
     npub: String,
