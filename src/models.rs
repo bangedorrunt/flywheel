@@ -48,13 +48,34 @@ pub fn verifier_required(bead: &BeadUnit, ac: AcShape) -> bool {
     ac == AcShape::Judgment || bead.priority <= 1 || bead.blast == Blast::High
 }
 
-/// One registry entry (`[models.ID]`).
+/// Split a registry key into `(provider, model)`. Registry keys are
+/// `provider/model` composites (bd-1t3j): one model id can exist under
+/// multiple providers, so the provider prefix lives IN the key.
+pub fn split_key(key: &str) -> (&str, &str) {
+    match key.split_once('/') {
+        Some((p, m)) => (p, m),
+        None => ("", key),
+    }
+}
+
+/// Validate a registry key at parse time: it MUST be a non-empty
+/// `provider/model` composite. A legacy bare id is a loud error naming the
+/// rewrite — never silent misresolution.
+fn validate_key(key: &str) -> Result<()> {
+    let (p, m) = split_key(key);
+    if p.is_empty() || m.is_empty() || !key.contains('/') {
+        anyhow::bail!(
+            "models.toml: key \"{key}\" must be provider/model — \
+             rewrite as [models.\"provider/{key}\"]"
+        );
+    }
+    Ok(())
+}
+
+/// One registry entry (`[models."provider/id"]`). The provider prefix is
+/// part of the KEY, not a field (bd-1j3t composite keying).
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelEntry {
-    /// Provider prefix for harnesses that want `provider/model` (opencode,
-    /// pi, omp — omp routes `--model=provider/id` through its provider
-    /// catalog, verified 2026-08-10). `grok` takes the bare id.
-    pub provider: String,
     /// Advisory per-mtok cost (run-cost reporting; 0 = unknown).
     #[serde(default)]
     pub cost_in_per_mtok: f64,
@@ -77,21 +98,14 @@ pub struct ModelEntry {
 }
 
 impl ModelEntry {
-    /// The injection string for one harness: `provider/ID` for opencode+pi
-    /// and omp (omp's provider catalog needs the prefix — `zai/glm-5.2`,
-    /// `opencode-go/deepseek-v4-flash`, `opencode/big-pickle`, verified
-    /// 2026-08-10); the bare ID for grok. Unknown harness: id passthrough
-    /// (never block).
-    pub fn flag_for(&self, id: &str, harness: &str) -> String {
+    /// The injection string for one harness given the entry's full registry
+    /// KEY (`provider/model` for opencode+pi and omp — omp's provider
+    /// catalog needs the prefix, verified 2026-08-10); the bare model id
+    /// for grok. Unknown harness: key passthrough (never block).
+    pub fn flag_for(&self, key: &str, harness: &str) -> String {
         match harness {
-            "grok" => id.to_string(),
-            _ => {
-                if self.provider.is_empty() {
-                    id.to_string()
-                } else {
-                    format!("{}/{}", self.provider, id)
-                }
-            }
+            "grok" => split_key(key).1.to_string(),
+            _ => key.to_string(),
         }
     }
 }
@@ -103,10 +117,15 @@ pub struct ModelsFile {
     pub models: BTreeMap<String, ModelEntry>,
 }
 
-/// The registry: parsed `models.toml` entries keyed by id.
+/// The registry: parsed `models.toml` entries keyed by `provider/model`.
 #[derive(Debug, Default)]
 pub struct ModelRegistry {
     pub models: BTreeMap<String, ModelEntry>,
+    /// Keys sourced from the USER file in [`ModelRegistry::load_routing`]
+    /// (vs compiled-in defaults). The bare-id default-provider fallback
+    /// prefers these, so a user override wins even when its provider name
+    /// sorts after the compiled-in one.
+    pub user_keys: std::collections::BTreeSet<String>,
 }
 
 impl ModelRegistry {
@@ -118,6 +137,8 @@ impl ModelRegistry {
     }
 
     /// Load from an explicit path (`None` = empty registry; test seam).
+    /// Every user-file key is validated as a `provider/model` composite:
+    /// a legacy bare id fails LOUDLY naming the rewrite (bd-1t3j).
     pub fn load_from(path: Option<&Path>) -> Result<Self> {
         let mut models = BTreeMap::new();
         if let Some(path) = path
@@ -127,9 +148,15 @@ impl ModelRegistry {
                 .with_context(|| format!("read {}", path.display()))?;
             let file: ModelsFile =
                 toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+            for key in file.models.keys() {
+                validate_key(key).with_context(|| format!("parse {}", path.display()))?;
+            }
             models = file.models;
         }
-        Ok(Self { models })
+        Ok(Self {
+            models,
+            user_keys: Default::default(),
+        })
     }
 
     /// The ROUTING registry: compiled-in fleet defaults layered under the
@@ -143,25 +170,62 @@ impl ModelRegistry {
         // file is a loud error — silently skipping it would quietly drop
         // the user's routing entries (a bypass).
         let user = Self::load_from(Some(&path))?;
+        let user_keys: std::collections::BTreeSet<String> =
+            user.models.keys().cloned().collect();
         if !user.models.is_empty() {
             models.extend(user.models);
         }
-        Ok(Self { models })
+        Ok(Self { models, user_keys })
     }
 
-    /// Look up one id.
+    /// Resolve a lookup id to its registry KEY. A full `provider/model`
+    /// id must hit exactly; a bare model id falls back to the DEFAULT
+    /// provider for that id — a user-sourced entry if one exists, else
+    /// the alphabetically-first registry key carrying it (deterministic).
+    fn key_for(&self, id: &str) -> Option<String> {
+        if self.models.contains_key(id) {
+            return Some(id.to_string());
+        }
+        if id.contains('/') {
+            return None;
+        }
+        let mut default: Option<&str> = None;
+        for k in self.models.keys() {
+            if split_key(k).1 == id {
+                if self.user_keys.contains(k) {
+                    return Some(k.clone());
+                }
+                default = default.or(Some(k.as_str()));
+            }
+        }
+        default.map(|s| s.to_string())
+    }
+
+    /// Look up one id: an exact `provider/model` composite, or a bare
+    /// model id resolved to its default provider.
     pub fn get(&self, id: &str) -> Option<&ModelEntry> {
-        self.models.get(id)
+        let key = self.key_for(id)?;
+        self.models.get(key.as_str())
+    }
+
+    /// The provider half of an id's resolved key (`provider/model`).
+    /// Unknown id -> empty string.
+    pub fn provider_of(&self, id: &str) -> String {
+        match self.key_for(id) {
+            Some(key) => split_key(&key).0.to_string(),
+            None => String::new(),
+        }
     }
 
     /// Resolve a model id to the injection string for one harness. Known
     /// registry id → the per-harness flag form (honoring `caps`/`fallback`);
     /// unknown id → passthrough (the caller warns; we never block).
     pub fn resolve(&self, id: &str, harness: &str) -> String {
-        match self.models.get(id) {
-            Some(entry) => {
+        match self.key_for(id) {
+            Some(key) => {
+                let entry = &self.models[key.as_str()];
                 if entry.caps.is_empty() || entry.caps.iter().any(|c| c == harness) {
-                    entry.flag_for(id, harness)
+                    entry.flag_for(&key, harness)
                 } else {
                     match &entry.fallback {
                         Some(fb) => self.resolve(fb, harness),
@@ -182,10 +246,11 @@ impl ModelRegistry {
         if id.is_empty() {
             return Ok(String::new());
         }
-        match self.models.get(id) {
-            Some(entry) => {
+        match self.key_for(id) {
+            Some(key) => {
+                let entry = &self.models[key.as_str()];
                 if entry.caps.is_empty() || entry.caps.iter().any(|c| c == harness) {
-                    Ok(entry.flag_for(id, harness))
+                    Ok(entry.flag_for(&key, harness))
                 } else {
                     match &entry.fallback {
                         Some(fb) => self.resolve_strict(fb, harness).with_context(|| {
@@ -215,13 +280,14 @@ impl ModelRegistry {
     }
 
     /// The model family of an id (ADR-0019 Spec 4: "worker grok -> reviewer
-    /// not grok"): the registry `provider` prefix. Unknown id -> the id
-    /// itself (a one-model registry is one family; never guess a family).
+    /// not grok"): the provider half of the resolved registry key. Unknown
+    /// id -> the id itself (a one-model registry is one family; never guess
+    /// a family).
     pub fn family_of(&self, id: &str) -> String {
-        self.models
-            .get(id)
-            .and_then(|e| (!e.provider.is_empty()).then(|| e.provider.clone()))
-            .unwrap_or_else(|| id.to_string())
+        match self.key_for(id) {
+            Some(key) => split_key(&key).0.to_string(),
+            None => id.to_string(),
+        }
     }
 
     /// Verifier model resolution (ADR-0019 Spec 4): pick the first
@@ -319,27 +385,17 @@ impl ModelRegistry {
 pub fn compiled_in_models() -> BTreeMap<String, ModelEntry> {
     let mut m = BTreeMap::new();
     m.insert(
-        "deepseek-v4-flash".to_string(),
-        ModelEntry {
-            provider: "opencode-go".into(),
-            ..ModelEntry::default()
-        },
+        "opencode-go/deepseek-v4-flash".to_string(),
+        ModelEntry::default(),
     );
     m.insert(
-        "big-pickle".to_string(),
+        "opencode/big-pickle".to_string(),
         ModelEntry {
-            provider: "opencode".into(),
             caps: vec!["opencode".into()],
             ..ModelEntry::default()
         },
     );
-    m.insert(
-        "glm-5.2".to_string(),
-        ModelEntry {
-            provider: "zai".into(),
-            ..ModelEntry::default()
-        },
-    );
+    m.insert("zai/glm-5.2".to_string(), ModelEntry::default());
     m
 }
 
@@ -360,7 +416,6 @@ mod tests {
 
     fn sample_entry() -> ModelEntry {
         ModelEntry {
-            provider: "anthropic".into(),
             cost_in_per_mtok: 3.0,
             cost_out_per_mtok: 15.0,
             caps: vec![],
@@ -376,10 +431,14 @@ mod tests {
         let _g = with_config_dir();
         let path = crate::config::config_dir().join("models.toml");
         let mut reg = ModelRegistry::default();
-        reg.models.insert("claude-sonnet-4".into(), sample_entry());
+        reg.models
+            .insert("anthropic/claude-sonnet-4".into(), sample_entry());
         reg.save().expect("save");
         let got = ModelRegistry::load().expect("load");
-        assert_eq!(got.models.get("claude-sonnet-4"), Some(&sample_entry()));
+        assert_eq!(
+            got.models.get("anthropic/claude-sonnet-4"),
+            Some(&sample_entry())
+        );
         assert!(path.exists(), "models.toml written");
     }
 
@@ -393,25 +452,16 @@ mod tests {
     }
 
     /// Per-harness injection forms (bd-42fs): opencode + pi + omp get
-    /// `provider/id` (omp's provider catalog needs the prefix — verified
-    /// 2026-08-10); grok gets the bare id.
+    /// the full `provider/model` key (omp's provider catalog needs the
+    /// prefix — verified 2026-08-10); grok gets the bare model id.
     #[test]
     fn flag_for_injects_per_harness() {
         let e = sample_entry();
-        assert_eq!(
-            e.flag_for("claude-sonnet-4", "opencode"),
-            "anthropic/claude-sonnet-4"
-        );
-        assert_eq!(
-            e.flag_for("claude-sonnet-4", "pi"),
-            "anthropic/claude-sonnet-4"
-        );
-        assert_eq!(
-            e.flag_for("claude-sonnet-4", "omp"),
-            "anthropic/claude-sonnet-4",
-            "omp needs the provider prefix"
-        );
-        assert_eq!(e.flag_for("claude-sonnet-4", "grok"), "claude-sonnet-4");
+        let key = "anthropic/claude-sonnet-4";
+        assert_eq!(e.flag_for(key, "opencode"), key);
+        assert_eq!(e.flag_for(key, "pi"), key);
+        assert_eq!(e.flag_for(key, "omp"), key, "omp needs the provider prefix");
+        assert_eq!(e.flag_for(key, "grok"), "claude-sonnet-4");
     }
 
     /// bd-42fs: an unknown model passes through for omp (no provider entry)
@@ -422,32 +472,33 @@ mod tests {
         let reg = ModelRegistry::default();
         assert_eq!(reg.resolve("no-such-model", "omp"), "no-such-model");
         let e = ModelEntry {
-            provider: "zai".into(),
             cost_in_per_mtok: 0.0,
             cost_out_per_mtok: 0.0,
             caps: vec![],
-            fallback: Some("grok-4.5".into()),
+            fallback: Some("grok/grok-4.5".into()),
             effort: Some("high".into()),
         };
         assert_eq!(e.effort.as_deref(), Some("high"));
-        assert_eq!(e.fallback.as_deref(), Some("grok-4.5"));
-        assert_eq!(e.flag_for("glm-5.2", "omp"), "zai/glm-5.2");
+        assert_eq!(e.fallback.as_deref(), Some("grok/grok-4.5"));
+        assert_eq!(e.flag_for("zai/glm-5.2", "omp"), "zai/glm-5.2");
     }
 
-    /// Known registry id resolves to the injected form.
+    /// Known registry id resolves to the injected form — via its full
+    /// composite key OR a bare id falling back to the default provider.
     #[test]
     fn resolve_known_id_injects_harness_form() {
         let _g = with_config_dir();
         let mut reg = ModelRegistry::default();
-        reg.models.insert("claude-sonnet-4".into(), sample_entry());
+        reg.models
+            .insert("anthropic/claude-sonnet-4".into(), sample_entry());
         assert_eq!(
-            reg.resolve("claude-sonnet-4", "opencode"),
+            reg.resolve("anthropic/claude-sonnet-4", "opencode"),
             "anthropic/claude-sonnet-4"
         );
         assert_eq!(
             reg.resolve("claude-sonnet-4", "omp"),
             "anthropic/claude-sonnet-4",
-            "omp needs the provider prefix (bd-42fs)"
+            "bare id falls back to the default provider (bd-1t3j)"
         );
     }
 
@@ -466,20 +517,18 @@ mod tests {
         let _g = with_config_dir();
         let mut reg = ModelRegistry::default();
         reg.models.insert(
-            "claude-sonnet-4".into(),
+            "anthropic/claude-sonnet-4".into(),
             ModelEntry {
-                provider: "anthropic".into(),
                 cost_in_per_mtok: 3.0,
                 cost_out_per_mtok: 15.0,
                 caps: vec!["opencode".into()],
-                fallback: Some("claude-opus-4".into()),
+                fallback: Some("anthropic/claude-opus-4".into()),
                 effort: None,
             },
         );
         reg.models.insert(
-            "claude-opus-4".into(),
+            "anthropic/claude-opus-4".into(),
             ModelEntry {
-                provider: "anthropic".into(),
                 cost_in_per_mtok: 5.0,
                 cost_out_per_mtok: 25.0,
                 caps: vec![],
@@ -488,14 +537,14 @@ mod tests {
             },
         );
         assert_eq!(
-            reg.resolve("claude-sonnet-4", "opencode"),
+            reg.resolve("anthropic/claude-sonnet-4", "opencode"),
             "anthropic/claude-sonnet-4",
             "harness inside caps uses the id"
         );
         assert_eq!(
             reg.resolve("claude-sonnet-4", "grok"),
             "claude-opus-4",
-            "harness outside caps falls back (grok takes the bare id)"
+            "harness outside caps falls back (grok takes the bare model id)"
         );
     }
 
@@ -505,9 +554,8 @@ mod tests {
         let _g = with_config_dir();
         let mut reg = ModelRegistry::default();
         reg.models.insert(
-            "gpt-5.2".into(),
+            "openai/gpt-5.2".into(),
             ModelEntry {
-                provider: "openai".into(),
                 cost_in_per_mtok: 2.0,
                 cost_out_per_mtok: 10.0,
                 caps: vec!["omp".into()],
@@ -515,7 +563,11 @@ mod tests {
                 effort: None,
             },
         );
-        assert_eq!(reg.resolve("gpt-5.2", "grok"), "gpt-5.2");
+        assert_eq!(
+            reg.resolve("openai/gpt-5.2", "grok"),
+            "openai/gpt-5.2",
+            "caps-excluded without fallback passes the id through untouched"
+        );
     }
 
     /// `model add` then `model list`-style roundtrip: ids + entries survive.
@@ -523,11 +575,12 @@ mod tests {
     fn added_entry_survives_reload() {
         let _g = with_config_dir();
         let mut reg = ModelRegistry::default();
-        reg.models.insert("grok-4".into(), sample_entry());
+        reg.models
+            .insert("anthropic/grok-4".into(), sample_entry());
         reg.save().expect("save");
         let reloaded = ModelRegistry::load().expect("load");
         let ids: Vec<&String> = reloaded.models.keys().collect();
-        assert_eq!(ids, vec!["grok-4"]);
+        assert_eq!(ids, vec!["anthropic/grok-4"]);
     }
 
     /// Cost fields are advisory and default to 0 (no requirement to set).
@@ -535,8 +588,7 @@ mod tests {
     fn cost_defaults_to_zero() {
         let _g = with_config_dir();
         let toml = r#"
-[models.free-model]
-provider = "local"
+[models."local/free-model"]
 "#;
         let path = crate::config::config_dir().join("models.toml");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -551,33 +603,30 @@ provider = "local"
 
     // ---- ADR-0019 Spec 4: verifier family resolution + single-family degrade
 
-    fn reg_with(entries: &[(&str, &str)]) -> ModelRegistry {
+    /// Build a registry from full composite keys (provider = key prefix).
+    fn reg_with_keys(keys: &[&str]) -> ModelRegistry {
         ModelRegistry {
-            models: entries
+            models: keys
                 .iter()
-                .map(|(id, provider)| {
-                    (
-                        (*id).to_string(),
-                        ModelEntry {
-                            provider: (*provider).to_string(),
-                            cost_in_per_mtok: 0.0,
-                            cost_out_per_mtok: 0.0,
-                            caps: vec![],
-                            fallback: None,
-                            effort: None,
-                        },
-                    )
-                })
+                .map(|k| ((*k).to_string(), ModelEntry::default()))
                 .collect(),
+            user_keys: Default::default(),
         }
     }
 
-    /// Family = registry provider prefix; unknown ids are their own family.
+    /// Family = the provider half of the resolved key; unknown ids are
+    /// their own family. A bare id resolves through the default-provider
+    /// fallback before the family is read.
     #[test]
     fn verifier_family_of_uses_registry_provider() {
-        let reg = reg_with(&[("deepseek-v4", "deepseek"), ("opus-5", "anthropic")]);
-        assert_eq!(reg.family_of("deepseek-v4"), "deepseek");
-        assert_eq!(reg.family_of("opus-5"), "anthropic");
+        let reg = reg_with_keys(&["deepseek/deepseek-v4", "anthropic/opus-5"]);
+        assert_eq!(reg.family_of("deepseek/deepseek-v4"), "deepseek");
+        assert_eq!(
+            reg.family_of("deepseek-v4"),
+            "deepseek",
+            "bare id -> default provider's family"
+        );
+        assert_eq!(reg.family_of("anthropic/opus-5"), "anthropic");
         // Unknown id: the id itself is the family (never guess).
         assert_eq!(reg.family_of("unregistered-model"), "unregistered-model");
     }
@@ -585,59 +634,79 @@ provider = "local"
     /// A different-family candidate wins (worker deepseek -> anthropic).
     #[test]
     fn verifier_resolution_prefers_different_family() {
-        let reg = reg_with(&[
-            ("deepseek-v4", "deepseek"),
-            ("opus-5", "anthropic"),
-            ("flash-x", "google"),
-        ]);
+        let reg = reg_with_keys(&["deepseek/deepseek-v4", "anthropic/opus-5", "google/flash-x"]);
         let v = reg
-            .verifier_for("deepseek-v4", &["deepseek-v4", "opus-5", "flash-x"], None)
+            .verifier_for(
+                "deepseek/deepseek-v4",
+                &[
+                    "deepseek/deepseek-v4",
+                    "anthropic/opus-5",
+                    "google/flash-x",
+                ],
+                None,
+            )
             .expect("different family exists");
-        assert_eq!(v, "opus-5");
+        assert_eq!(v, "anthropic/opus-5");
         // Candidate order matters: first different-family entry wins.
         let v = reg
-            .verifier_for("deepseek-v4", &["deepseek-v4", "flash-x"], None)
+            .verifier_for(
+                "deepseek/deepseek-v4",
+                &["deepseek/deepseek-v4", "google/flash-x"],
+                None,
+            )
             .expect("different family exists");
-        assert_eq!(v, "flash-x");
+        assert_eq!(v, "google/flash-x");
     }
 
     /// Single-family swarm: no second family -> None (the degrade signal).
     #[test]
     fn verifier_resolution_degrades_single_family() {
-        let reg = reg_with(&[("deepseek-v4", "deepseek"), ("deepseek-v3", "deepseek")]);
+        let reg = reg_with_keys(&["deepseek/deepseek-v4", "deepseek/deepseek-v3"]);
         assert_eq!(
-            reg.verifier_for("deepseek-v4", &["deepseek-v4", "deepseek-v3"], None),
+            reg.verifier_for(
+                "deepseek/deepseek-v4",
+                &["deepseek/deepseek-v4", "deepseek/deepseek-v3"],
+                None
+            ),
             None
         );
         // Empty candidate list degrades too.
-        let reg = reg_with(&[("deepseek-v4", "deepseek")]);
-        assert_eq!(reg.verifier_for("deepseek-v4", &[], None), None);
+        let reg = reg_with_keys(&["deepseek/deepseek-v4"]);
+        assert_eq!(reg.verifier_for("deepseek/deepseek-v4", &[], None), None);
     }
 
     /// An explicit captain override (config verifier_family_override) allows
     /// the same family when no second family exists.
     #[test]
     fn verifier_resolution_honors_family_override() {
-        let reg = reg_with(&[("deepseek-v4", "deepseek"), ("deepseek-v3", "deepseek")]);
+        let reg = reg_with_keys(&["deepseek/deepseek-v4", "deepseek/deepseek-v3"]);
         let v = reg
             .verifier_for(
-                "deepseek-v4",
-                &["deepseek-v4", "deepseek-v3"],
+                "deepseek/deepseek-v4",
+                &["deepseek/deepseek-v4", "deepseek/deepseek-v3"],
                 Some("deepseek"),
             )
             .expect("override allows the family");
-        assert_eq!(v, "deepseek-v3");
+        assert_eq!(v, "deepseek/deepseek-v3");
         // Override for a family with no candidate still degrades.
         assert_eq!(
-            reg.verifier_for("deepseek-v4", &["deepseek-v4"], Some("anthropic")),
+            reg.verifier_for(
+                "deepseek/deepseek-v4",
+                &["deepseek/deepseek-v4"],
+                Some("anthropic")
+            ),
             None
         );
         // Override never kicks in when a different family already exists.
-        let reg = reg_with(&[("deepseek-v4", "deepseek"), ("opus-5", "anthropic")]);
+        let reg = reg_with_keys(&["deepseek/deepseek-v4", "anthropic/opus-5"]);
         let v = reg
-            .verifier_for("deepseek-v4", &["deepseek-v4", "opus-5"], Some("deepseek"))
+            .verifier_for(
+                "deepseek/deepseek-v4",
+                &["deepseek/deepseek-v4", "anthropic/opus-5"],
+                Some("deepseek"),
+            )
             .expect("different family wins before override");
-        assert_eq!(v, "opus-5");
+        assert_eq!(v, "anthropic/opus-5");
     }
 
     /// The degrade constant is the documented blocked reason.
@@ -666,13 +735,13 @@ provider = "local"
     /// no independent verifier, even in a single-family swarm.
     #[test]
     fn verifier_plan_none_required_on_cheap_band() {
-        let reg = reg_with(&[("deepseek-v4", "deepseek")]);
+        let reg = reg_with_keys(&["deepseek/deepseek-v4"]);
         let b = bead(3, Blast::Normal, true);
         let plan = reg.verifier_plan(
             &b,
             AcShape::Checkable,
-            "deepseek-v4",
-            &["deepseek-v4"],
+            "deepseek/deepseek-v4",
+            &["deepseek/deepseek-v4"],
             None,
         );
         assert_eq!(plan, VerifierPlan::NoneRequired);
@@ -681,8 +750,8 @@ provider = "local"
         let plan = reg.verifier_plan(
             &b,
             AcShape::Checkable,
-            "deepseek-v4",
-            &["deepseek-v4"],
+            "deepseek/deepseek-v4",
+            &["deepseek/deepseek-v4"],
             None,
         );
         assert_eq!(plan, VerifierPlan::NoneRequired);
@@ -692,29 +761,29 @@ provider = "local"
     /// verifier.
     #[test]
     fn verifier_plan_dispatches_different_family_for_p0() {
-        let reg = reg_with(&[("deepseek-v4", "deepseek"), ("opus-5", "anthropic")]);
+        let reg = reg_with_keys(&["deepseek/deepseek-v4", "anthropic/opus-5"]);
         let b = bead(0, Blast::Normal, true);
         let plan = reg.verifier_plan(
             &b,
             AcShape::Checkable,
-            "deepseek-v4",
-            &["deepseek-v4", "opus-5"],
+            "deepseek/deepseek-v4",
+            &["deepseek/deepseek-v4", "anthropic/opus-5"],
             None,
         );
-        assert_eq!(plan, VerifierPlan::Dispatch("opus-5".into()));
+        assert_eq!(plan, VerifierPlan::Dispatch("anthropic/opus-5".into()));
     }
 
     /// Single-family swarm + P0: Degrade (blocked verifier-family-missing,
     /// one captain mail, no respawn loop).
     #[test]
     fn verifier_plan_degrades_single_family_for_p0() {
-        let reg = reg_with(&[("deepseek-v4", "deepseek"), ("deepseek-v3", "deepseek")]);
+        let reg = reg_with_keys(&["deepseek/deepseek-v4", "deepseek/deepseek-v3"]);
         let b = bead(0, Blast::Normal, true);
         let plan = reg.verifier_plan(
             &b,
             AcShape::Checkable,
-            "deepseek-v4",
-            &["deepseek-v4", "deepseek-v3"],
+            "deepseek/deepseek-v4",
+            &["deepseek/deepseek-v4", "deepseek/deepseek-v3"],
             None,
         );
         assert_eq!(plan, VerifierPlan::Degrade);
@@ -724,14 +793,14 @@ provider = "local"
     /// override makes it dispatchable.
     #[test]
     fn verifier_plan_judgment_ac_requires_reviewer() {
-        let reg = reg_with(&[("deepseek-v4", "deepseek"), ("deepseek-v3", "deepseek")]);
+        let reg = reg_with_keys(&["deepseek/deepseek-v4", "deepseek/deepseek-v3"]);
         let b = bead(2, Blast::Normal, true);
         // Judgment + no override: degrade (no second family).
         let plan = reg.verifier_plan(
             &b,
             AcShape::Judgment,
-            "deepseek-v4",
-            &["deepseek-v4", "deepseek-v3"],
+            "deepseek/deepseek-v4",
+            &["deepseek/deepseek-v4", "deepseek/deepseek-v3"],
             None,
         );
         assert_eq!(plan, VerifierPlan::Degrade);
@@ -739,27 +808,27 @@ provider = "local"
         let plan = reg.verifier_plan(
             &b,
             AcShape::Judgment,
-            "deepseek-v4",
-            &["deepseek-v4", "deepseek-v3"],
+            "deepseek/deepseek-v4",
+            &["deepseek/deepseek-v4", "deepseek/deepseek-v3"],
             Some("deepseek"),
         );
-        assert_eq!(plan, VerifierPlan::Dispatch("deepseek-v3".into()));
+        assert_eq!(plan, VerifierPlan::Dispatch("deepseek/deepseek-v3".into()));
     }
 
     /// High blast (overlap) needs an independent verifier too.
     #[test]
     fn verifier_plan_required_for_high_blast() {
-        let reg = reg_with(&[("deepseek-v4", "deepseek"), ("opus-5", "anthropic")]);
+        let reg = reg_with_keys(&["deepseek/deepseek-v4", "anthropic/opus-5"]);
         let b = bead(3, Blast::High, true);
         let plan = reg.verifier_plan(
             &b,
             AcShape::Checkable,
-            "deepseek-v4",
-            &["deepseek-v4", "opus-5"],
+            "deepseek/deepseek-v4",
+            &["deepseek/deepseek-v4", "anthropic/opus-5"],
             None,
         );
 
-        assert_eq!(plan, VerifierPlan::Dispatch("opus-5".into()));
+        assert_eq!(plan, VerifierPlan::Dispatch("anthropic/opus-5".into()));
     }
     /// Routing registry layers compiled-in fleet defaults under user
     /// entries (user wins per id); `load()` stays the USER FILE ONLY so
@@ -772,9 +841,14 @@ provider = "local"
 
         let reg = ModelRegistry::load_routing().expect("routing registry");
         assert_eq!(
+            reg.resolve("opencode-go/deepseek-v4-flash", "omp"),
+            "opencode-go/deepseek-v4-flash",
+            "compiled-in deepseek routes zero-config (composite key)"
+        );
+        assert_eq!(
             reg.resolve("deepseek-v4-flash", "omp"),
             "opencode-go/deepseek-v4-flash",
-            "compiled-in deepseek routes zero-config"
+            "bare id falls back to the compiled-in default provider"
         );
         assert_eq!(reg.resolve("glm-5.2", "omp"), "zai/glm-5.2");
         // big-pickle is free ONLY on the opencode harness (caps whitelist).
@@ -783,7 +857,7 @@ provider = "local"
         // A user entry OVERRIDES the compiled-in default for the same id.
         fs::write(
             &path,
-            "[models.deepseek-v4-flash]\nprovider = \"my-gateway\"\n",
+            "[models.\"my-gateway/deepseek-v4-flash\"]\n",
         )
         .expect("write user models.toml");
         let reg = ModelRegistry::load_routing().expect("reload routing");
@@ -848,27 +922,94 @@ provider = "local"
         std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
         fs::write(
             &path,
-            "[models.flagship]\nprovider = \"p\"\ncaps = [\"omp\"]\nfallback = \"glm-5.2\"\n",
+            "[models.\"p/flagship\"]\ncaps = [\"omp\"]\nfallback = \"zai/glm-5.2\"\n",
         )
         .expect("write");
         let reg = ModelRegistry::load_routing().expect("reg");
         assert_eq!(
-            reg.resolve_strict("flagship", "omp").expect("caps allow"),
+            reg.resolve_strict("p/flagship", "omp").expect("caps allow"),
             "p/flagship"
         );
         assert_eq!(
             reg.resolve_strict("flagship", "opencode")
                 .expect("fallback"),
             "zai/glm-5.2",
-            "caps-excluded -> compiled-in fallback routes strictly"
+            "caps-excluded -> compiled-in fallback routes strictly (bare id too)"
         );
         // A fallback pointing at an unknown id stays an error (no bypass).
         fs::write(
             &path,
-            "[models.flagship]\nprovider = \"p\"\ncaps = [\"omp\"]\nfallback = \"ghost\"\n",
+            "[models.\"p/flagship\"]\ncaps = [\"omp\"]\nfallback = \"ghost\"\n",
         )
         .expect("rewrite");
         let reg = ModelRegistry::load_routing().expect("reg");
         assert!(reg.resolve_strict("flagship", "opencode").is_err());
+    }
+
+    // ---- bd-1t3j: provider/model composite keys
+
+    /// Composite lookup hits exactly; a bare model id falls back to the
+    /// DEFAULT provider for that id (alphabetically-first registry key
+    /// carrying it) so one model id can exist under multiple providers.
+    #[test]
+    fn composite_lookup_and_bare_id_default_provider_fallback() {
+        let _g = with_config_dir();
+        let mut reg = ModelRegistry::default();
+        reg.models.insert(
+            "alpha/flash".into(),
+            ModelEntry::default(),
+        );
+        reg.models.insert(
+            "zeta/flash".into(),
+            ModelEntry {
+                caps: vec!["opencode".into()],
+                ..ModelEntry::default()
+            },
+        );
+        // Exact composite hit wins over the bare-id fallback.
+        assert_eq!(reg.get("zeta/flash").map(|e| e.caps.join(",")), Some("opencode".into()));
+        // Bare id resolves to the default (first sorted = alpha).
+        assert_eq!(
+            reg.resolve("flash", "omp"),
+            "alpha/flash",
+            "bare id -> default provider, injected form"
+        );
+        assert_eq!(reg.resolve("alpha/flash", "grok"), "flash");
+    }
+
+    /// Strict resolution fails on an unknown provider: a well-formed but
+    /// unregistered composite id is an error naming the fix.
+    #[test]
+    fn resolve_strict_fails_unknown_provider() {
+        let reg = reg_with_keys(&["deepseek/deepseek-v4"]);
+        let err = reg
+            .resolve_strict("ghost/deepseek-v4", "omp")
+            .expect_err("unknown provider must fail");
+        assert!(
+            err.to_string().contains("flywheel model add"),
+            "error names the fix: {err}"
+        );
+    }
+
+    /// A legacy bare key in user models.toml is a LOUD parse error naming
+    /// the rewrite — never silent misresolution. Both load() and
+    /// load_routing() refuse it.
+    #[test]
+    fn bare_toml_key_is_loud_parse_error() {
+        let _g = with_config_dir();
+        let path = crate::config::config_dir().join("models.toml");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
+        fs::write(&path, "[models.deepseek-v4-flash]\nprovider = \"x\"\n").expect("write legacy");
+        let err = ModelRegistry::load().expect_err("bare key must fail load()");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("must be provider/model") && chain.contains("deepseek-v4-flash"),
+            "error names the rewrite: {chain}"
+        );
+        let err = ModelRegistry::load_routing().expect_err("bare key must fail load_routing()");
+        assert!(
+            format!("{err:#}").contains("must be provider/model"),
+            "routing layer is loud too: {err:#}"
+        );
     }
 }

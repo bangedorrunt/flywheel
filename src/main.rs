@@ -4386,7 +4386,7 @@ mod spawn_profile_plan_tests {
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
         std::fs::write(
             cfg_home.join("flywheel/models.toml"),
-            "[models.deepseek-v4-flash]\nprovider = \"opencode-go\"\n",
+            "[models.\"opencode-go/deepseek-v4-flash\"]\n",
         )
         .expect("models.toml");
         let p = profile("omp", "deepseek-v4-flash");
@@ -4770,7 +4770,7 @@ mod internal_respawn_tests {
         // compiled-in defaults) — respawn must route through both.
         std::fs::write(
             dir.path().join("config/flywheel/models.toml"),
-            "[models.\"glm-4.5-air\"]\nprovider = \"zai\"\n",
+            "[models.\"zai/glm-4.5-air\"]\n",
         )
         .expect("models.toml");
     }
@@ -14712,7 +14712,7 @@ mod verifier_dispatch_tests {
         let dir = std::env::temp_dir().join(format!("vd-degrade-{}", std::process::id()));
         let bead_id = scratch_vd(&dir, "vd-deg", "0");
         write_registry(
-            "[models.deepseek-v4]\nprovider = \"deepseek\"\n[models.deepseek-v3]\nprovider = \"deepseek\"\n",
+            "[models.\"deepseek/deepseek-v4\"]\n[models.\"deepseek/deepseek-v3\"]\n",
         );
         let out = cmd_internal_verify_dispatch(
             &cfg,
@@ -14755,7 +14755,7 @@ mod verifier_dispatch_tests {
         let dir = std::env::temp_dir().join(format!("vd-dispatch-{}", std::process::id()));
         let bead_id = scratch_vd(&dir, "vd-disp", "0");
         write_registry(
-            "[models.deepseek-v4]\nprovider = \"deepseek\"\n[models.opus-5]\nprovider = \"anthropic\"\n",
+            "[models.\"deepseek/deepseek-v4\"]\n[models.\"anthropic/opus-5\"]\n",
         );
         let out = cmd_internal_verify_dispatch(
             &cfg,
@@ -14783,7 +14783,7 @@ mod verifier_dispatch_tests {
         let dir = std::env::temp_dir().join(format!("vd-cheap-{}", std::process::id()));
         let bead_id = scratch_vd(&dir, "vd-cheap", "3");
         write_registry(
-            "[models.deepseek-v4]\nprovider = \"deepseek\"\n[models.deepseek-v3]\nprovider = \"deepseek\"\n",
+            "[models.\"deepseek/deepseek-v4\"]\n[models.\"deepseek/deepseek-v3\"]\n",
         );
         let out = cmd_internal_verify_dispatch(
             &cfg,
@@ -17515,6 +17515,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 backend: backend.clone().unwrap_or(base.backend),
                 default_workflow: default_workflow.clone().unwrap_or(base.default_workflow),
                 skills: base.skills,
+                provider: base.provider,
             };
             if merged.harness.is_empty() || merged.model.is_empty() {
                 bail!("profile {name} needs at least --harness and --model");
@@ -18745,7 +18746,7 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                 .map(|(id, e)| {
                     json!({
                         "id": id,
-                        "provider": e.provider,
+                        "provider": models::split_key(id).0,
                         "cost_in_per_mtok": e.cost_in_per_mtok,
                         "cost_out_per_mtok": e.cost_out_per_mtok,
                         "caps": e.caps,
@@ -18781,7 +18782,7 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
             match reg.get(id) {
                 Some(e) => print_json(&json!({
                     "id": id,
-                    "provider": e.provider,
+                    "provider": reg.provider_of(id),
                     "cost_in_per_mtok": e.cost_in_per_mtok,
                     "cost_out_per_mtok": e.cost_out_per_mtok,
                     "caps": e.caps,
@@ -18804,6 +18805,12 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
             if id.trim().is_empty() {
                 bail!("model id cannot be empty");
             }
+            if id.contains('/') {
+                bail!(
+                    "--id must be the bare model id; the registry key is \
+                     '{{provider}}/{id}' — pass --provider instead"
+                );
+            }
             let mut reg = models::ModelRegistry::load()?;
             let caps_list: Vec<String> = match caps {
                 Some(c) if !c.trim().is_empty() => c
@@ -18813,10 +18820,13 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                     .collect(),
                 _ => vec![],
             };
+            if provider.trim().is_empty() {
+                bail!("--provider is required (registry keys are provider/model)");
+            }
+            let key = format!("{provider}/{id}");
             reg.models.insert(
-                id.clone(),
+                key.clone(),
                 models::ModelEntry {
-                    provider: provider.clone(),
                     cost_in_per_mtok: *cost_in_per_mtok,
                     cost_out_per_mtok: *cost_out_per_mtok,
                     caps: caps_list,
@@ -18825,7 +18835,7 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                 },
             );
             reg.save()?;
-            println!("registered model {id} (provider {provider})");
+            println!("registered model {key}");
             Ok(())
         }
         ModelCmd::Remove { id } => {
@@ -22543,7 +22553,8 @@ fn cmd_internal_run_headless(
                 "flywheel: @{profile_name} rate-limited on {model_id} (429) — retrying with fallback {fallback_id}"
             );
             let fb_entry = registry.get(&fallback_id);
-            let fb_harness = if fb_entry.map(|e| e.provider.as_str()) == Some("grok") {
+            let _ = fb_entry;
+            let fb_harness = if registry.family_of(&fallback_id) == "grok" {
                 "grok"
             } else {
                 harness
@@ -25543,20 +25554,18 @@ mod headless_retry_tests {
         let _g = crate::config::lock_env();
         let mut reg = models::ModelRegistry::default();
         reg.models.insert(
-            "glm-5.2".into(),
+            "zai/glm-5.2".into(),
             models::ModelEntry {
-                provider: "zai".into(),
                 cost_in_per_mtok: 0.0,
                 cost_out_per_mtok: 0.0,
                 caps: vec![],
-                fallback: Some("grok-4.5".into()),
+                fallback: Some("grok/grok-4.5".into()),
                 effort: Some("max".into()),
             },
         );
         reg.models.insert(
-            "grok-4.5".into(),
+            "grok/grok-4.5".into(),
             models::ModelEntry {
-                provider: "grok".into(),
                 cost_in_per_mtok: 0.0,
                 cost_out_per_mtok: 0.0,
                 caps: vec![],
@@ -25568,11 +25577,11 @@ mod headless_retry_tests {
             .get("glm-5.2")
             .and_then(|e| e.fallback.clone())
             .expect("fallback declared");
-        assert_eq!(fb, "grok-4.5");
+        assert_eq!(fb, "grok/grok-4.5");
         assert_eq!(
             reg.resolve(&fb, "grok"),
             "grok-4.5",
-            "grok takes the bare id"
+            "grok takes the bare model id"
         );
         assert_eq!(
             reg.resolve(&fb, "omp"),
