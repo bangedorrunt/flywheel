@@ -1611,17 +1611,6 @@ mod tests {
 
     // ---- bd-durable-doorbell-lngf: durable wake state + heal scope --------
 
-    fn entry_with_pane(pane_id: &str) -> crate::state::SpawnEntry {
-        crate::state::SpawnEntry {
-            pane_id: pane_id.into(),
-            name: format!("agent-{pane_id}"),
-            profile: None,
-            harness: None,
-            mail_identity: None,
-            skills_injected: false,
-        }
-    }
-
     /// Wake state round-trips through disk: since_by_pin high-waters + the
     /// last-wake stamp survive a dispatcher crash (at-least-once redelivery
     /// reads the same file on restart).

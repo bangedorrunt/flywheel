@@ -14610,6 +14610,15 @@ mod verifier_dispatch_tests {
             .output()
             .expect("br init");
         assert!(bi.status.success());
+        // schema-18 fail-closed br: the default strict workflow does not
+        // admit `blocked`; verifier-dispatch's degrade plan blocks the bead,
+        // so the fixture policy must declare the status + transition
+        // (bd-adr0006-cosmetic-sweep-q0g0).
+        std::fs::write(
+            dir.join(".beads/policy.yaml"),
+            "workflow:\n  strict: true\n  statuses: [open, in_progress, closed, deferred, blocked]\n  transitions:\n    open: [in_progress, closed, deferred, blocked]\n    in_progress: [open, closed, deferred]\n    deferred: [open]\n    closed: [open]\n",
+        )
+        .unwrap();
         let created = std::process::Command::new("br")
             .args([
                 "create",
@@ -14895,8 +14904,10 @@ mod loop_run_verify_tests {
         let bead_id = scratch_lrv(&dir, "lrv-ok", "test -f work.txt");
         let sha = commit_and_sha(&dir, &bead_id);
         // Worker closes (the loop's close-detect would see `closed`).
+        // schema-18 fail-closed br requires the bead-carrying commit's sha
+        // (bd-adr0006-cosmetic-sweep-q0g0).
         let close = std::process::Command::new("br")
-            .args(["close", &bead_id, "--reason", "worker done"])
+            .args(["close", &bead_id, "--reason", "worker done", "--commit-sha", &sha])
             .current_dir(&dir)
             .output()
             .unwrap();
@@ -15415,13 +15426,25 @@ mod loop_tests {
         use crate::backend::MailSurface as _;
         let (dir, bead_id) = scratch_workspace("reopen-flow");
         let dir_str = dir.to_string_lossy().to_string();
-        // worker closes with NO gate row
-        let close = std::process::Command::new("br")
-            .args(["close", &bead_id, "--reason", "worker says done"])
+        // worker closes with NO gate row — an ILLEGAL close by design (the
+        // reopen floor is the thing under test). schema-18 fail-closed br
+        // refuses it outright, so manufacture the state via operator bypass
+        // (same fixture pattern as verdict.rs, bd-adr0006-cosmetic-sweep-q0g0).
+        let bypass = std::process::Command::new("br")
+            .args([
+                "close",
+                &bead_id,
+                "--reason",
+                "worker says done",
+                "--bypass-policy",
+                "--bypass-reason",
+                "test fixture: illegal no-gate-row close, loop floor must catch it",
+            ])
             .current_dir(&dir)
+            .env("BR_OPERATOR", "1")
             .output()
-            .expect("br close");
-        assert!(close.status.success(), "br close: {close:?}");
+            .expect("br close bypass");
+        assert!(bypass.status.success(), "br close bypass: {bypass:?}");
         // close-detect: sha derived (commit carries the id), ledger missing
         match verdict::close_check(&dir, &bead_id).unwrap() {
             verdict::CloseCheck::Missing {
@@ -21831,27 +21854,43 @@ fn cmd_internal_send(
         landing
     };
     let verdict = classify_send_result(landing.code.as_deref(), landing.status);
-    let (landed, status, reason) = match verdict {
-        SendVerdict::Landed(st) => (
-            true,
-            st.map(|s| s.as_str().to_string()),
-            "landed".to_string(),
-        ),
-        SendVerdict::Stalled => (false, None, "stalled".to_string()),
-        SendVerdict::TimedOut => (false, None, "timeout".to_string()),
-        SendVerdict::Coded(code) => (false, None, format!("error:{code}")),
-    };
+    let body = confirm_send_json(name, verdict.clone());
     // cg6.5: a timeout is AMBIGUOUS (the prompt may have started) — record it
     // as such so resume never re-delegates a possibly-mid-flight prompt.
-    record(landed, reason == "timeout");
+    let landed = matches!(verdict, SendVerdict::Landed(_));
+    record(landed, matches!(verdict, SendVerdict::TimedOut));
     if let Some((pname, _, _, _, _)) = &profile_obj {
         log_engine_dispatch(project, pname, text, &send_text, started, landed);
     }
-    print_json(&json!({
-        "ok": true, "name": name, "landed": landed,
-        "status": status, "reason": reason,
-    }));
+    print_json(&body);
     Ok(())
+}
+
+/// The confirmed-send leaf JSON for ONE classified landing. Honesty contract
+/// (bd-adr0006-cosmetic-sweep-q0g0): a timeout is AMBIGUOUS — the prompt may
+/// have started — so it emits `landed: null` + `ambiguous: true`, never a
+/// definitive false that green completions would carry as a miss. Stalled and
+/// coded errors ARE definitive non-landings and keep `landed: false`.
+fn confirm_send_json(name: &str, verdict: SendVerdict) -> Value {
+    match verdict {
+        SendVerdict::Landed(st) => json!({
+            "ok": true, "name": name, "landed": true,
+            "status": st.map(|s| s.as_str().to_string()),
+            "reason": "landed",
+        }),
+        SendVerdict::Stalled => json!({
+            "ok": true, "name": name, "landed": false,
+            "status": Value::Null, "reason": "stalled",
+        }),
+        SendVerdict::TimedOut => json!({
+            "ok": true, "name": name, "landed": Value::Null,
+            "ambiguous": true, "status": Value::Null, "reason": "timeout",
+        }),
+        SendVerdict::Coded(code) => json!({
+            "ok": true, "name": name, "landed": false,
+            "status": Value::Null, "reason": format!("error:{code}"),
+        }),
+    }
 }
 
 /// bd-gsvn.1: write the runs/ entry for a profile-conditioned loop/pane
@@ -26576,6 +26615,47 @@ mod send_result_row_tests {
         let row = send_result_row("flywheel-toron-coder", "working", "w1:p1", None, None);
         assert_eq!(row["dispatched"], true);
         assert_eq!(row["prior_status"], "working");
+    }
+
+    /// bd-adr0006-cosmetic-sweep-q0g0: a confirm TIMEOUT is AMBIGUOUS (the
+    /// prompt may have started — cg6.5), so the leaf JSON must NOT claim a
+    /// definitive `landed: false`. The 98io graduation run surfaced this:
+    /// the verify-stage reviewer's 45s confirm expired, the step output read
+    /// `landed: false`, and the run still completed green — the flag lied.
+    #[test]
+    fn confirm_send_json_timeout_is_ambiguous_not_false() {
+        let v = confirm_send_json("reviewer-1", SendVerdict::TimedOut);
+        assert_eq!(v["reason"], "timeout");
+        assert!(
+            v["landed"].is_null(),
+            "timeout is unknown, never a definitive false: {v}"
+        );
+        assert_eq!(v["ambiguous"], true);
+        // The durable consumer parses null as no-verdict and ACCEPTS (the
+        // next poll is the correctness floor) — semantics unchanged.
+        let outcome: durable::SendOutcome = serde_json::from_value(v).expect("parse");
+        assert_eq!(outcome.landed, None);
+        assert_eq!(
+            durable::escalate(&outcome, 9),
+            durable::Escalation::Accept,
+            "timeout stays an accept at any failure count"
+        );
+    }
+
+    /// bd-adr0006-cosmetic-sweep-q0g0: the other verdicts keep their exact
+    /// wire shape — only the timeout flag was dishonest.
+    #[test]
+    fn confirm_send_json_landed_and_stalled_unchanged() {
+        let landed = confirm_send_json("a", SendVerdict::Landed(Some(AgentStatus::Working)));
+        assert_eq!(landed["landed"], true);
+        assert_eq!(landed["status"], "working");
+        assert_eq!(landed["reason"], "landed");
+        let stalled = confirm_send_json("a", SendVerdict::Stalled);
+        assert_eq!(stalled["landed"], false, "stall IS a definitive non-landing");
+        assert_eq!(stalled["reason"], "stalled");
+        let coded = confirm_send_json("a", SendVerdict::Coded("agent_not_found".into()));
+        assert_eq!(coded["landed"], false);
+        assert_eq!(coded["reason"], "error:agent_not_found");
     }
 
     /// bd-pin-public-plane-s-easy.9: interrupt of a working agent needs

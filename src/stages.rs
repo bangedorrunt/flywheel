@@ -529,12 +529,6 @@ pub fn lint_stage(stage: &Stage, valid_roles: &[String]) -> Vec<String> {
 pub fn check_repo_evidence(distinct_objective_greens: usize, review_bead_present: bool) -> bool {
     distinct_objective_greens >= 2 && review_bead_present
 }
-/// The reserved D1 payload slots (ADR-0006 §3 D1). Documented vocabulary;
-/// substitution itself accepts any `--param k=v` key. Consumed by the test
-/// vocabulary gate and by future D3/D4 payload emitters.
-#[expect(dead_code)]
-pub const RESERVED_SLOTS: &[&str] =
-    &["bead", "scope", "exit", "channel", "pin", "report_file"];
 
 /// Parse repeatable `--param k=v` argv pairs into a map. A pair without `=`
 /// is a usage error naming the offending argument.
@@ -597,6 +591,10 @@ mod tests {
     use super::*;
 
     // ---- ADR-0006 D1: parameterized stage payloads (bd-stage-params-pqo9) ----
+
+    /// The reserved D1 payload slots (ADR-0006 §3 D1). Test-only vocabulary
+    /// today; promote to production when a D3/D4 payload emitter consumes it.
+    const RESERVED_SLOTS: &[&str] = &["bead", "scope", "exit", "channel", "pin", "report_file"];
 
     /// `--param k=v` parses into a map; a pair without `=` is an error naming
     /// the offending argument.
