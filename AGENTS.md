@@ -22,10 +22,12 @@ Live ignored tests need herdr + mail. `cargo test --exclude-ignored` is invalid.
 - **Mail:** `toron_core::mailbox::surface::MailSurface`. Local `MailBackend` is deleted. Default mail = toron (absent `[mail.toron] url` → embed).
 - **Identity resolution is ONE ladder everywhere** (bd-reservation-identity-tlnf): explicit
   `--as` → `TORON_AGENT` → `FLYWHEEL_MAIL_AS` → `AGENT_NAME` → config `[agent_mail].name`,
-  spawn-registry-resolved. Both sides of the seam use it: `mail locks reserve/release/renew`
+  spawn-registry-resolved. A selected token naming a REGISTERED mailbox identity passes
+  through verbatim (bd-2mdo) — the hash fallback is for unregistered herdr slugs only.
+  Both sides of the seam use it: `mail locks reserve/release/renew`
   bind the lease holder to the RESOLVED actor (never the raw slug), and the toron strict guard
   attributes commits through the same order — so a wrapper-acquired lease always covers its own
-  holder's commits. Self-test: `cargo test reservation_identity`.
+  holder's commits. Self-test: `cargo test reservation_identity actor_resolution_passthrough`.
 - **One operator is one npub across projects** (bd-register-portability-3c2b): `mail register`
   requires `--name` (it never silently mints an unnamed key) and binds instead of forking via
   `--from-project <slug>` (reuse that project's key for the pin) or `--adopt-unnamed <name>`
