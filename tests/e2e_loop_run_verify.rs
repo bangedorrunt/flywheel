@@ -222,11 +222,18 @@ fn scratch_runnable_bead(tag: &str, verify: &str) -> (Scratch, String, String) {
     (s, bead_id, sha)
 }
 
-fn close(dir: &Path, bead_id: &str) {
+fn close(dir: &Path, bead_id: &str, sha: &str) {
     run_ok(
         dir,
         "br",
-        &["close", bead_id, "--reason", "worker done"],
+        &[
+            "close",
+            bead_id,
+            "--reason",
+            "worker done",
+            "--commit-sha",
+            sha,
+        ],
         "br close",
     );
 }
@@ -267,7 +274,7 @@ fn loop_run_verify_cheap_band_executes_and_legal_close_stays_closed() {
     let dir = s.dir.clone();
 
     // worker commits (SHA rule) + closes without a verdict
-    close(&dir, &bead_id);
+    close(&dir, &bead_id, &sha);
     assert_eq!(bead_status(&dir, &bead_id), "closed");
 
     // tick part 1: close-check -> missing (loop-runnable VERIFY, no row)
@@ -318,7 +325,7 @@ fn loop_run_verify_cheap_band_executes_and_legal_close_stays_closed() {
 fn loop_run_verify_failure_marks_failed_head_and_reopens() {
     let (s, bead_id, sha) = scratch_runnable_bead("vsca-neg", "test -f NO_SUCH_FILE_9cf0");
     let dir = s.dir.clone();
-    close(&dir, &bead_id);
+    close(&dir, &bead_id, &sha);
 
     // tick: close-check -> missing, then loop-run VERIFY -> non-zero exit
     let cc = s.flywheel_json(&["__close-check", dir.to_str().unwrap(), &bead_id]);

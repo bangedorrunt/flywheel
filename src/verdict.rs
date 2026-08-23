@@ -310,9 +310,15 @@ pub fn legal_close(verdict: &Verdict, bead: &BeadUnit, ac: AcShape) -> bool {
                 && bead.blast == Blast::Normal
                 && !runnable
         }
-        // Row 3 — P0/P1 or High blast: independent verification only.
+        // Rows 2+3 — independent verification closes the non-runnable band
+        // (P>=2, Normal, VERIFY not loop-runnable) as well as P0/P1 / High
+        // blast. Illegal in the cheap band, where CommandVerified is
+        // exclusive (ancestor table: toron ADR-0019 Spec 1;
+        // bd-legal-close-row2-reconcile-2m34).
         VerdictKind::UnitTestVerified | VerdictKind::LiveVerified => {
-            ac == AcShape::Checkable && (bead.priority <= 1 || bead.blast == Blast::High)
+            ac == AcShape::Checkable
+                && ((bead.priority <= 1 || bead.blast == Blast::High)
+                    || (bead.priority >= 2 && bead.blast == Blast::Normal && !runnable))
         }
         // Row 4 — judgment AC: ReviewerSigned only. Recording any other kind
         // for a judgment bead is a false verdict.
@@ -895,8 +901,14 @@ mod tests {
             CommandVerified => ac == Checkable && priority >= 2 && blast == Normal && runnable,
             // Row 2 — non-runnable band: WorkerReceipt or unit/live verified.
             WorkerReceipt => ac == Checkable && priority >= 2 && blast == Normal && !runnable,
-            // Row 3 — P0/P1 or High blast: independent verification only.
-            UnitTestVerified | LiveVerified => ac == Checkable && (priority <= 1 || blast == High),
+            // Row 3 — P0/P1 or High blast: independent verification only
+            // (row 2's non-runnable band also admits unit/live — bd-legal-
+            // close-row2-reconcile-2m34).
+            UnitTestVerified | LiveVerified => {
+                ac == Checkable
+                    && ((priority <= 1 || blast == High)
+                        || (priority >= 2 && blast == Normal && !runnable))
+            }
         }
     }
 
@@ -1408,8 +1420,10 @@ mod tests {
     #[test]
     fn close_check_reopens_when_worker_closes_without_gate_row() {
         let (dir, bead_id) = scratch_workspace("reopen-red-green");
+        // schema-18 fail-closed br requires the bead-carrying commit's sha.
+        let sha = derive_head_sha(&dir, &bead_id).unwrap();
         let cm = StdCommand::new("br")
-            .args(["close", &bead_id, "--reason", "worker says done"])
+            .args(["close", &bead_id, "--reason", "worker says done", "--commit-sha", &sha])
             .current_dir(&dir)
             .output()
             .expect("br close");
@@ -1457,7 +1471,14 @@ mod tests {
             .expect("br gate report");
         assert!(gate.status.success(), "br gate report: {gate:?}");
         let cm = StdCommand::new("br")
-            .args(["close", &bead_id, "--reason", "verified"])
+            .args([
+                "close",
+                &bead_id,
+                "--reason",
+                "verified",
+                "--commit-sha",
+                &sha,
+            ])
             .current_dir(&dir)
             .output()
             .expect("br close");
@@ -1475,8 +1496,16 @@ mod tests {
     #[test]
     fn close_check_no_commit_is_no_commit() {
         let (dir, bead_id) = scratch_workspace("reopen-nocommit");
+        let sha = derive_head_sha(&dir, &bead_id).unwrap();
         let cm = StdCommand::new("br")
-            .args(["close", &bead_id, "--reason", "no commit behind this"])
+            .args([
+                "close",
+                &bead_id,
+                "--reason",
+                "no commit behind this",
+                "--commit-sha",
+                &sha,
+            ])
             .current_dir(&dir)
             .output()
             .expect("br close");
@@ -1556,8 +1585,16 @@ mod tests {
             .output()
             .expect("git commit");
         assert!(cm.status.success(), "git commit: {cm:?}");
+        let close_sha = derive_head_sha(&dir, &bead_id).unwrap();
         let close = StdCommand::new("br")
-            .args(["close", &bead_id, "--reason", "receipt on the way"])
+            .args([
+                "close",
+                &bead_id,
+                "--reason",
+                "receipt on the way",
+                "--commit-sha",
+                &close_sha,
+            ])
             .current_dir(&dir)
             .output()
             .expect("br close");

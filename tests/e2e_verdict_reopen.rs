@@ -281,12 +281,47 @@ fn bead_status(dir: &Path, bead_id: &str) -> String {
         .to_string()
 }
 
-fn close(dir: &Path, bead_id: &str) {
+fn close(dir: &Path, bead_id: &str, sha: &str) {
     run_ok(
         dir,
         "br",
-        &["close", bead_id, "--reason", "worker says done"],
+        &[
+            "close",
+            bead_id,
+            "--reason",
+            "worker says done",
+            "--commit-sha",
+            sha,
+        ],
         "br close",
+    );
+}
+
+/// Schema-18 br refuses any close without a bead-carrying commit; an
+/// operator bypass is the only way to manufacture that illegal state. The
+/// loop-side NoCommit reopen stays the enforcement floor (ADR-0001 §5.3).
+fn close_operator_bypass(dir: &Path, bead_id: &str) {
+    let out = Command::new("br")
+        .args([
+            "close",
+            bead_id,
+            "--reason",
+            "worker says done (no commit)",
+            "--bypass-policy",
+            "--bypass-reason",
+            "test fixture: illegal no-commit close, loop floor must catch it",
+        ])
+        .current_dir(dir)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+        .env("BR_OPERATOR", "1")
+        .output()
+        .expect("br close bypass");
+    assert!(
+        out.status.success(),
+        "br close bypass failed: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -324,8 +359,10 @@ fn unverified_close_without_commit_reopens_once_and_mails_once() {
     s.register(&created_by);
 
     // worker closes — no gate row, no commit carrying the id (the repo has
-    // NO commits at all, so `git log --all --grep=<id>` finds nothing)
-    close(&dir, &bead_id);
+    // NO commits at all, so `git log --all --grep=<id>` finds nothing).
+    // schema-18 br would refuse this close outright; the operator bypass
+    // manufactures the illegal state the loop floor must catch.
+    close_operator_bypass(&dir, &bead_id);
     assert_eq!(bead_status(&dir, &bead_id), "closed");
 
     // tick part 1: close-check -> no-commit
@@ -372,7 +409,10 @@ fn unverified_close_without_commit_reopens_once_and_mails_once() {
 fn close_with_commit_but_no_gate_row_reopens() {
     let (s, bead_id, sha) = scratch_bead("nee7-missing", "test -f README.md", true, false);
     let dir = s.dir.clone();
-    close(&dir, &bead_id);
+    // schema-18 fail-closed br refuses a no-gate-row close outright; the
+    // operator bypass manufactures the missing-verdict state whose
+    // loop-side reopen floor this test verifies.
+    close_operator_bypass(&dir, &bead_id);
 
     let cc = s.flywheel_json(&["__close-check", dir.to_str().unwrap(), &bead_id]);
     assert_eq!(cc["status"], "missing", "close-check: {cc}");
@@ -417,7 +457,7 @@ fn legal_close_with_commit_and_gate_row_stays_closed() {
     // exactly what the armed `report_pass` invokes; the note carries
     // sha + receipt. The policy's `closed -> closed` gated self-transition
     // is what makes post-close recording legal.
-    close(&dir, &bead_id);
+    close(&dir, &bead_id, &sha);
     run_ok(
         &dir,
         "br",
