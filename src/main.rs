@@ -11212,23 +11212,28 @@ fn mail_or_die(cfg: &Config) -> Result<mail_shim::Mail> {
     })
 }
 
-/// Who this CLI mail invocation acts as (bd-mail-actor-identity-nze).
+/// Who this CLI mail invocation acts as — the ONE selection+resolution
+/// ladder (bd-mail-actor-identity-nze, bd-reservation-identity-tlnf,
+/// bd-2mdo).
 ///
 /// Priority: explicit `--as` → `TORON_AGENT` → `FLYWHEEL_MAIL_AS` →
-/// `AGENT_NAME` → config `[agent_mail].name`. bd-reservation-identity-tlnf:
-/// the env ladder MUST mirror toron's `guard_agent` attribution order
-/// exactly (TORON_AGENT > FLYWHEEL_MAIL_AS > AGENT_NAME) — two orders was
-/// the seam where leases landed under one identity and commits were
-/// attributed to another.
-fn resolve_mail_actor(project: &str, explicit: Option<&str>) -> Option<String> {
-    // bd-aseq: the actor resolves through the spawn registry like any
-    // recipient — a slug `--as` / FLYWHEEL_MAIL_AS / AGENT_NAME must act as
-    // the pinned identity, not a parallel hash-mapped one. Registry miss
-    // falls back to the deterministic hash mapping.
-    let resolve = |t: &str| resolve_mail_target_registry(project, t.trim());
-    // bd-reservation-identity-tlnf: ONE selection function feeds every
-    // actor path — send/inbox/locks and (by order parity) the guard.
-    select_reservation_identity(explicit, &|k| std::env::var(k).ok()).map(|t| resolve(&t))
+/// `AGENT_NAME` → config `[agent_mail].name`; the env ladder mirrors toron's
+/// `guard_agent` attribution order exactly (TORON_AGENT > FLYWHEEL_MAIL_AS >
+/// AGENT_NAME) — two orders was the seam where leases landed under one
+/// identity and commits were attributed to another. A selected token naming
+/// a REGISTERED mailbox identity passes through verbatim; only unregistered
+/// tokens defer to the spawn-registry → hash resolver.
+fn resolve_mail_actor_roster(
+    project: &str,
+    explicit: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+    roster: &[String],
+) -> Option<String> {
+    let token = select_reservation_identity(explicit, env)?;
+    if roster.iter().any(|n| n == &token) {
+        return Some(token);
+    }
+    Some(resolve_mail_target_registry(project, &token))
 }
 
 /// bd-reservation-identity-tlnf: the pure selection half of reservation
@@ -11256,7 +11261,25 @@ fn mail_as(cfg: &Config, project_key: &str, as_agent: Option<&str>) -> Result<ma
     // bd-aseq: the registry is keyed by project NAME (state_key hashes path
     // forms separately) — derive it from the project dir so the actor lookup
     // hits the same file the spawn wrote. Miss → hash fallback.
-    let mail = match resolve_mail_actor(&project_base(project_key), as_agent) {
+    let base = project_base(project_key);
+    // bd-2mdo: the roster of record feeds the resolver — an actor token that
+    // names a REGISTERED identity passes through verbatim instead of being
+    // hash-mangled into a stranger. Roster read is best-effort: a daemon
+    // hiccup degrades to the pre-bd-2mdo behavior, never blocks the call.
+    let roster: Vec<String> = mail
+        .list_agents(project_key, None)
+        .ok()
+        .map(|v| {
+            v.as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|a| a.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mail = match resolve_mail_actor_roster(&base, as_agent, &|k| std::env::var(k).ok(), &roster)
+    {
         Some(name) => mail.with_name(name),
         None => mail,
     };
@@ -26733,6 +26756,42 @@ mod reservation_identity_tests {
         );
         // nothing anywhere -> config default
         assert_eq!(select_reservation_identity(None, &|_| None).as_deref(), None);
+    }
+
+    /// bd-2mdo RED: an actor token that names a REGISTERED mailbox identity
+    /// passes through VERBATIM — it is an address, not a herdr slug to
+    /// re-derive. The hash fallback minted RainyElk for the literally-
+    /// registered e2e-zord (e2e_serialize_worktree canary), a stranger no
+    /// crew knows and the one-ladder rule forbids.
+    #[test]
+    fn actor_resolution_passthrough_for_registered_identity() {
+        let env = |k: &str| -> Option<String> {
+            (k == "AGENT_NAME").then(|| "oc5".to_string())
+        };
+        let roster = vec!["e2e-zord".to_string(), "FoggyDesert".to_string()];
+        // explicit --as naming a registered identity: verbatim, never hashed.
+        assert_eq!(
+            resolve_mail_actor_roster("proj", Some("e2e-zord"), &env, &roster).as_deref(),
+            Some("e2e-zord"),
+            "registered explicit --as must not be hash-mangled"
+        );
+        // env-derived UNREGISTERED slug: defers to the registry/hash
+        // resolver exactly as before (oc5 is not in the roster).
+        assert_eq!(
+            resolve_mail_actor_roster("proj", None, &env, &roster).as_deref(),
+            Some(resolve_mail_target_registry("proj", "oc5")).as_deref(),
+        );
+        // env-derived token that is itself a registered identity: passthrough.
+        let env_pin = |k: &str| -> Option<String> {
+            (k == "AGENT_NAME").then(|| "FoggyDesert".to_string())
+        };
+        assert_eq!(
+            resolve_mail_actor_roster("proj", None, &env_pin, &roster).as_deref(),
+            Some("FoggyDesert"),
+            "registered pin must survive unchanged"
+        );
+        // nothing selected -> nothing resolved.
+        assert_eq!(resolve_mail_actor_roster("proj", None, &|_| None, &roster), None);
     }
 
     /// THE failing sequence from tonight, as a self-test: the wrapper binds
