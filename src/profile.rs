@@ -48,6 +48,12 @@ pub struct Profile {
     /// `AgentProfile.model` on the bus.
     #[serde(default)]
     pub model: String,
+    /// Optional provider pin for the model registry's composite key
+    /// (`provider/model`, bd-1t3j): explicit provider wins over the
+    /// registry's default-provider fallback when one model id exists under
+    /// multiple providers. Empty = registry default (bd-62ke).
+    #[serde(default)]
+    pub provider: String,
     /// Thinking/effort level for harnesses that take one (omp
     /// `--thinking=<level>`, bd-42fs). Advisory — absent = harness default.
     #[serde(default)]
@@ -126,6 +132,9 @@ pub struct ProfileCatalog {
 pub struct SpawnSpec {
     pub harness: String,
     pub model: String,
+    /// Optional explicit provider for the composite registry key (bd-62ke);
+    /// empty = registry default provider for the model id.
+    pub provider: String,
     pub backend: String,
 }
 
@@ -224,6 +233,7 @@ impl ProfileCatalog {
                         let merged = Profile {
                             harness: pick(user.harness, &base.harness),
                             model: pick(user.model, &base.model),
+                            provider: pick(user.provider, &base.provider),
                             effort: pick(user.effort, &base.effort),
                             smol: pick(user.smol, &base.smol),
                             slow: pick(user.slow, &base.slow),
@@ -307,6 +317,7 @@ impl ProfileCatalog {
         let spec = SpawnSpec {
             harness: profile.harness.clone(),
             model: profile.model.clone(),
+            provider: profile.provider.clone(),
             backend: self.backend(name).to_string(),
         };
         match project_scope {
@@ -698,6 +709,69 @@ plan = "glm-5.2"
             assert_eq!(p.slow, "", "{name}.slow should default empty");
             assert_eq!(p.plan, "", "{name}.plan should default empty");
         }
+    }
+
+    /// bd-62ke: the optional `provider` field layers like model/effort and
+    /// feeds SpawnSpec passthrough — explicit provider wins over the
+    /// registry's default-provider fallback for the same model id.
+    #[test]
+    fn provider_field_layers_and_defaults_empty() {
+        let path = tmp_profiles_toml(
+            r#"
+[profiles.coder]
+model = "deepseek-v4-flash"
+provider = "deepseek"
+
+[profiles.scout]
+model = "big-pickle"
+"#,
+        );
+        let cat = ProfileCatalog::load_from(Some(&path)).expect("load");
+        let c = cat.get("coder").expect("coder present");
+        assert_eq!(c.provider, "deepseek", "explicit provider parsed");
+        assert_eq!(c.model, "deepseek-v4-flash");
+        // Built-in untouched by an unrelated override keeps empty provider.
+        let s = cat.get("scout").expect("scout present");
+        assert_eq!(s.provider, "", "absent provider defaults empty");
+        assert_eq!(s.harness, "opencode", "built-in harness preserved");
+        // A partial user override with NO provider inherits the built-in's
+        // (empty) provider — same layering rule as every other field.
+        let path2 = tmp_profiles_toml(
+            r#"
+[profiles.coder]
+effort = "max"
+"#,
+        );
+        let cat2 = ProfileCatalog::load_from(Some(&path2)).expect("load 2");
+        let c2 = cat2.get("coder").expect("coder present 2");
+        assert_eq!(c2.provider, "", "partial override inherits built-in provider");
+        assert_eq!(c2.effort, "max");
+    }
+
+    /// bd-62ke: SpawnSpec carries the profile's provider through resolve()
+    /// so the spawn path can pin the provider half of the registry key.
+    #[test]
+    fn spawn_spec_passthrough_carries_provider() {
+        let path = tmp_profiles_toml(
+            r#"
+[profiles.coder]
+harness = "omp"
+model = "glm-5.2"
+provider = "opencode-go"
+"#,
+        );
+        let cat = ProfileCatalog::load_from(Some(&path)).expect("load");
+        let r = cat.resolve("coder", None, "npub-operator", &no_project).expect("resolve");
+        assert_eq!(r.spec.model, "glm-5.2");
+        assert_eq!(
+            r.spec.provider, "opencode-go",
+            "explicit provider passes into SpawnSpec"
+        );
+        // Default catalog profiles carry no provider.
+        let base = catalog()
+            .resolve("planner", None, "npub-operator", &no_project)
+            .expect("base resolve");
+        assert_eq!(base.spec.provider, "", "default provider stays empty");
     }
 
     #[test]
