@@ -4128,7 +4128,15 @@ pub(crate) fn profile_launch_args(
     phase: Option<&str>,
 ) -> Result<Vec<String>> {
     let registry = models::ModelRegistry::load_routing()?;
-    let model = registry.resolve_strict(&p.model, harness)?;
+    // bd-62ke: an explicit profile provider pins the provider half of the
+    // composite registry key (bd-1t3j) — it overrides the default-provider
+    // fallback for a bare id, and an unknown provider pair fails loudly.
+    let lookup = if p.provider.is_empty() {
+        p.model.clone()
+    } else {
+        format!("{}/{}", p.provider, p.model)
+    };
+    let model = registry.resolve_strict(&lookup, harness)?;
     let mut args = headless::model_args(
         harness,
         &model,
@@ -4438,6 +4446,46 @@ mod spawn_profile_plan_tests {
     /// STRICT routing: a profile model that is NOT a registry id fails the
     /// launch naming the fix — nothing bypasses the registry (the old
     /// passthrough spawned broken bare ids).
+    /// bd-62ke: an explicit Profile.provider pins the provider half of the
+    /// composite registry key (bd-1t3j) — it overrides the registry's
+    /// default-provider fallback when one model id exists under multiple
+    /// providers, and an unknown provider fails loudly naming the pair.
+    #[test]
+    fn launch_args_explicit_provider_wins_over_default() {
+        let _g = lock_env();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let cfg_home = dir.path().join("config");
+        std::fs::create_dir_all(cfg_home.join("flywheel")).expect("config dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
+        std::fs::write(
+            cfg_home.join("flywheel/models.toml"),
+            "[models.\"aaa/glm-5.2\"]\n[models.\"zzz/glm-5.2\"]\n",
+        )
+        .expect("models.toml");
+        // Bare id: alphabetical default provider (aaa).
+        let bare = profile("omp", "glm-5.2");
+        assert_eq!(
+            profile_launch_args("omp", &bare, None).expect("bare"),
+            vec!["--model=aaa/glm-5.2"]
+        );
+        // Explicit provider pins the other provider carrying the same id.
+        let mut pinned = profile("omp", "glm-5.2");
+        pinned.provider = "zzz".into();
+        assert_eq!(
+            profile_launch_args("omp", &pinned, None).expect("pinned"),
+            vec!["--model=zzz/glm-5.2"]
+        );
+        // Unknown provider: loud failure naming the composite — never a
+        // silent fall back to the default provider.
+        let mut ghost = profile("omp", "glm-5.2");
+        ghost.provider = "qqq".into();
+        let err = profile_launch_args("omp", &ghost, None).expect_err("unknown provider");
+        assert!(
+            err.to_string().contains("qqq/glm-5.2"),
+            "error names the composite pair: {err}"
+        );
+    }
+
     #[test]
     fn launch_args_fail_loud_on_unregistered_model() {
         let _g = lock_env();
@@ -4549,6 +4597,11 @@ mod profile_run_spawn_tests {
     fn profile_run_launch_args_non_empty_for_known_profile() {
         // bd-l2ky: `profile run coder` must launch with the SAME args as
         // `spawn --profile coder` — model + effort, never an empty arg list.
+        // Hermetic (bd-62ke): profile_launch_args consults load_routing(),
+        // so the REAL user models.toml must stay out of the read — a legacy
+        // bare key there is a loud parse error by design (bd-1t3j AC 1).
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
         let mut coder = profile("omp", "glm-5.2");
         coder.effort = "max".into();
         let args = profile_launch_args("omp", &coder, None).expect("launch args");
@@ -16823,7 +16876,13 @@ fn pretty_path(p: &std::path::Path) -> String {
 /// TORON_KEY_PASSPHRASE from the current env.
 fn boot_toron_server(port: u16) -> Result<()> {
     let bind = format!("127.0.0.1:{port}");
-    // refuse if a toron is already listening
+    // bd-741i: never sidecar-serve when the launchd daemon (18080) is already
+    // up — a second `toron serve` against the same data dir grew 24–64GB RSS
+    // overnight and watchdog-panicked the host.
+    if std::net::TcpStream::connect("127.0.0.1:18080").is_ok() {
+        println!("toron MCP daemon already listening at 127.0.0.1:18080 — skipping boot.");
+        return Ok(());
+    }
     if std::net::TcpStream::connect(bind.as_str().parse::<std::net::SocketAddr>()?).is_ok() {
         println!("toron MCP server already listening at {bind} — skipping boot.");
         return Ok(());
