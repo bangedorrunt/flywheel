@@ -9942,6 +9942,16 @@ fn cmd_send(
         (None, Some(m)) => m.to_string(),
         (None, None) => bail!("provide --stage NAME or a message text"),
     };
+    // bd-task-id-threading-xl2k: every dispatched task carries a stable
+    // task-id — the completion mail threads on it (`mail send
+    // --thread-id <task-id>`, subject `[<task-id>] ...`), so non-bead work
+    // has greppable history instead of subject-only drift. Explicit
+    // `--param task_id=...` wins; otherwise one is minted per send.
+    let task_id = match params.iter().find(|p| p.starts_with("task_id=")) {
+        Some(kv) => kv.trim_start_matches("task_id=").to_string(),
+        None => mint_task_id(),
+    };
+    let text = format!("TASK-ID: {task_id}\n\n{text}");
 
     // safety guard: refuse destructive prompts unless --force
     if !force {
@@ -10193,6 +10203,20 @@ enum StallStep {
 
 // ---- send result JSON (bd-pin-public-plane-s-easy.9) ----
 
+/// bd-task-id-threading-xl2k: `task-<short-hash>` — stable, greppable,
+/// collision-unlikely at crew scale (time + a process counter).
+fn mint_task_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let h = format!("{:016x}", nanos as u64 ^ (n << 48));
+    format!("task-{}", &h[..8])
+}
+
 /// One send-result row. `dispatched: true` is the fire-and-forget success
 /// signal; `prior_status` names the herdr status at target time (never a
 /// bare `status` a captain parses as a miss when the agent was idle at
@@ -10217,6 +10241,27 @@ fn send_result_row(
         v["settled_status"] = json!(s);
     }
     v
+}
+
+#[cfg(test)]
+mod task_id_tests {
+    use super::mint_task_id;
+
+    /// bd-task-id-threading-xl2k: minted ids are `task-<8 hex>` and unique
+    /// across a burst (the completion mail threads on them — a collision
+    /// would merge two unrelated tasks' history).
+    #[test]
+    fn task_ids_are_prefixed_unique_and_greppable() {
+        let a = mint_task_id();
+        assert!(a.starts_with("task-"), "prefix: {a}");
+        assert_eq!(a.len(), "task-".len() + 8, "shape: {a}");
+        assert!(
+            a["task-".len()..].chars().all(|c| c.is_ascii_hexdigit()),
+            "hex suffix: {a}"
+        );
+        let b = mint_task_id();
+        assert_ne!(a, b, "consecutive mints differ");
+    }
 }
 
 /// bd-pin-public-plane-s-easy.9: interrupt of a WORKING agent needs --force
