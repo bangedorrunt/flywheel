@@ -375,11 +375,13 @@ enum Commands {
     /// Monitor a swarm: poll every N seconds, feed queued instructions to
     /// idle/finished agents, report blockers. Exits 0 when the queue is drained
     /// and the swarm settles. Runs as a durable Resonate workflow by default —
-    /// crashes resume via `flywheel loop run <project>` (same invocation id).
-    /// For back-compat, the bare legacy form `flywheel loop <project>` is
-    /// rewritten to `loop run <project>` before parsing (see
-    /// `rewrite_legacy_loop_args`).
-    Loop {
+    /// crashes resume via `flywheel loop-mode run <project>` (same invocation
+    /// id). For back-compat, the bare legacy form `flywheel loop <project>`
+    /// (alias) is rewritten to `loop-mode run <project>` before parsing (see
+    /// `rewrite_legacy_loop_args`). Renamed from `loop` to avoid harness
+    /// built-in conflicts (bd-loop-mode-rename-0tqy).
+    #[command(name = "loop-mode", visible_alias = "loop")]
+    LoopMode {
         #[command(subcommand)]
         cmd: LoopCmd,
     },
@@ -3252,12 +3254,13 @@ fn log(project: &str, kind: EventKind, data: Value) {
 
 /// Rewrite the legacy bare form `flywheel loop <project> [flags]` into the
 /// canonical `flywheel loop run <project> [flags]` before clap parsing.
-/// `run` is the default subcommand; any first token after `loop` that is not
-/// a known subcommand name is treated as the project. Pure + unit-tested.
+/// `run` is the default subcommand; any first token after `loop`/`loop-mode`
+/// that is not a known subcommand name is treated as the project. Pure +
+/// unit-tested.
 fn rewrite_legacy_loop_args(args: &[String]) -> Vec<String> {
     const SUBCOMMANDS: [&str; 5] = ["run", "status", "list", "prune", "doctor"];
     if args.len() >= 2
-        && args[1] == "loop"
+        && matches!(args[1].as_str(), "loop" | "loop-mode")
         // A flag (--help, -h, global options) keeps the parent context;
         // anything else is the legacy positional project → default `run`.
         && let Some(next) = args.get(2)
@@ -3285,7 +3288,7 @@ fn main() {
             "commands": [
                 "init spawn add list status decide rebind recover",
             "send interrupt view output watch zoom attach kill",
-            "loop work assign collab xproj mail toron steer ledger principles",
+            "loop-mode (alias: loop) work assign collab xproj mail toron steer ledger principles",
             "doorbell status/start/stop/re-inject (supervised pane-wake layer: lazy-heal + persisted wake state)",
                 "coalition debate plan-review profile squad model runs",
                 "workflow cron recipes workflows pipeline template stage ensemble",
@@ -3459,7 +3462,7 @@ fn main() {
             DoorbellCmd::Stop { project, workspace } => cmd_doorbell_stop(&cfg, project, workspace),
             DoorbellCmd::ReInject { project } => cmd_doorbell_re_inject(&cfg, project),
         },
-        Some(Commands::Loop { cmd }) => match cmd {
+        Some(Commands::LoopMode { cmd }) => match cmd {
             LoopCmd::Run {
                 project,
                 interval,
@@ -15407,6 +15410,56 @@ mod loop_run_verify_tests {
 #[cfg(test)]
 mod loop_tests {
     use super::*;
+
+    /// bd-loop-mode-rename-0tqy: the clap subcommand is `loop-mode` with a
+    /// back-compat visible alias `loop` — harness built-in `loop` conflicts
+    /// with the old name, so the primary name moves and scripts keep working.
+    #[test]
+    fn loop_subcommand_is_loop_mode_with_loop_alias() {
+        use clap::CommandFactory;
+        // The Cli derive tree is enormous; build it on a big-stack thread so
+        // the 2 MiB test-thread default cannot overflow while expanding it.
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let cmd = Cli::command();
+                let lm = cmd
+                    .find_subcommand("loop-mode")
+                    .expect("loop-mode subcommand exists");
+                assert!(
+                    lm.get_visible_aliases().any(|a| a == "loop"),
+                    "visible alias 'loop' keeps existing scripts working"
+                );
+                assert!(
+                    !cmd.get_subcommands().any(|s| s.get_name() == "loop"),
+                    "'loop' must be an alias, never the primary name"
+                );
+            })
+            .expect("spawn briefing probe");
+        handle.join().expect("probe thread");
+    }
+
+    /// bd-loop-mode-rename-0tqy: the legacy bare form (`flywheel loop <proj>`
+    /// → `run`) rewrites under BOTH names.
+    #[test]
+    fn rewrite_legacy_loop_args_handles_loop_mode_name() {
+        let args = vec![
+            "flywheel".to_string(),
+            "loop-mode".to_string(),
+            "toron".to_string(),
+        ];
+        assert_eq!(
+            rewrite_legacy_loop_args(&args),
+            vec!["flywheel", "loop-mode", "run", "toron"]
+        );
+        let explicit = vec![
+            "flywheel".to_string(),
+            "loop-mode".to_string(),
+            "run".to_string(),
+            "toron".to_string(),
+        ];
+        assert_eq!(rewrite_legacy_loop_args(&explicit), explicit);
+    }
 
     fn st(name: &str, s: AgentStatus) -> durable::AgentState {
         // the sync planner tests delegate to the SINGLE durable::plan_actions
