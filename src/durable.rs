@@ -210,55 +210,27 @@ fn default_priority() -> u8 {
     3
 }
 
-/// Parse the exact `## VERIFY` fence from a bead description (ADR-0019
-/// Spec 1). Required block, exact shape:
-///
-/// ```text
-/// ## VERIFY
-/// ```
-/// <one command, one line>
-/// ```
-/// ```
-///
-/// `Some(cmd)` only when the heading exists, is followed by ONE fenced
-/// block, and the fence holds exactly ONE non-empty line (whitespace
-/// trimmed; a ` ```lang ` opener is tolerated). Anything else — missing
-/// heading, missing/truncated fence, multi-line or empty command — is
-/// `None`: the bead is NOT ready.
-pub fn parse_verify_fence(description: &str) -> Option<String> {
-    let lines: Vec<&str> = description.lines().collect();
-    // The heading must be present and exact (`## VERIFY`, trimmed).
-    let heading = lines.iter().position(|l| l.trim() == "## VERIFY")?;
-    let rest = &lines[heading + 1..];
-    // First fenced block after the heading (blank lines allowed between).
-    let open = rest.iter().position(|l| is_fence_line(l))?;
-    let mut content: Vec<&str> = Vec::new();
-    for line in &rest[open + 1..] {
-        if is_fence_line(line) {
-            // closing fence found
-            if content.len() != 1 {
-                return None;
-            }
-            let cmd = content[0].trim();
-            if cmd.is_empty() {
-                return None;
-            }
-            return Some(cmd.to_string());
-        }
-        content.push(line);
-    }
-    // no closing fence
-    None
-}
-
-/// A fence line: a line whose trimmed form starts with ` ``` `, with at
-/// most one trailing language token (` ``` `, ` ```bash `). The closing
-/// fence is the bare ` ``` `.
-fn is_fence_line(line: &str) -> bool {
-    match line.trim().strip_prefix("```") {
-        Some(rest) => rest.is_empty() || !rest.contains(' '),
-        None => false,
-    }
+/// Format br's typed schema-v18 principles citations (`[{"name": …,
+/// "decision": …}]`) into the line-per-citation text `check_principles`
+/// consumes (ADR-0001 wave 5, bd-wave5-flywheel-parser-strip-dkpvi — the
+/// description markdown is no longer read). Absent/empty array → empty
+/// string, which the P<=2 gate refuses exactly like before.
+pub fn principles_typed_field(bead: &serde_json::Value) -> String {
+    bead.get("principles")
+        .and_then(serde_json::Value::as_array)
+        .map(|citations| {
+            citations
+                .iter()
+                .filter_map(|c| {
+                    let name = c.get("name")?.as_str()?.trim();
+                    let decision = c.get("decision")?.as_str()?.trim();
+                    (!name.is_empty() && !decision.is_empty())
+                        .then(|| format!("{name} — {decision}"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 /// Split ready beads into dispatchable (valid `## VERIFY` fence) and
@@ -292,11 +264,12 @@ pub fn principles_block_reason(b: &ReadyBead) -> Option<String> {
 
 /// bd-bead-create-contract-lint-4tdd: the not-ready REASON for a bead —
 /// the loop's exact dispatch decision (partition_ready), named. `None` =
-/// dispatchable. Fence failures name the gate; PRINCIPLES failures carry
-/// the exact `check_principles` reason (the 2026-08-17 mislabel class).
+/// dispatchable. A missing typed verify field names the gate; PRINCIPLES
+/// failures carry the exact `check_principles` reason (the 2026-08-17
+/// mislabel class).
 pub fn not_ready_reason(b: &ReadyBead) -> Option<String> {
     if b.verify.is_none() {
-        return Some("missing/malformed ## VERIFY fence".to_string());
+        return Some("missing/empty typed verify field".to_string());
     }
     principles_block_reason(b)
 }
@@ -313,40 +286,34 @@ pub struct BeadContractIssue {
 }
 
 /// The corrected snippet for a blocked bead: name the exact edit — the
-/// `## VERIFY` fence block, the bare-`PRINCIPLES` heading fix, or the
-/// canonical-name guidance for a citation failure.
-fn contract_fix(description: &str, reason: &str) -> String {
-    let lines: Vec<&str> = description.lines().map(str::trim).collect();
-    if !lines.contains(&"## VERIFY") {
-        return "add `## VERIFY` plus one fenced single-line command to the description"
-            .to_string();
-    }
-    if reason.starts_with("PRINCIPLES is required") && lines.contains(&"PRINCIPLES") {
-        return "bare `PRINCIPLES` heading — write `## PRINCIPLES`".to_string();
+/// typed verify field, or the canonical-name guidance for a citation
+/// failure.
+fn contract_fix(_description: &str, reason: &str) -> String {
+    if reason.starts_with("missing/empty typed verify") {
+        return "set the single-line command: `br update <id> --verify '<command>'`".to_string();
     }
     "see reason (canonical names via `flywheel principles list`)".to_string()
 }
 
 /// The contract verdict of one ready bead (with its raw description):
-/// `None` = dispatchable.
-pub fn contract_issue(b: &ReadyBead, description: &str) -> Option<BeadContractIssue> {
+/// `None` = dispatchable. ADR-0001 wave 5 (bd-wave5-flywheel-parser-strip-dkpvi):
+/// the verify gate reads the TYPED field off the parsed bead — a description
+/// fence no longer makes a bead dispatchable, so the report says to set
+/// `br create --verify` / `br update --verify`.
+pub fn contract_issue(b: &ReadyBead, _description: &str) -> Option<BeadContractIssue> {
     if b.verify.is_none() {
-        let has_heading = description.lines().any(|l| l.trim() == "## VERIFY");
-        let reason = if has_heading {
-            "## VERIFY fence is malformed (must be ONE fenced command on a single line)"
-        } else {
-            "missing ## VERIFY fence (a `## VERIFY` heading + one fenced single-line command)"
-        };
         return Some(BeadContractIssue {
             id: b.id.clone(),
-            reason: reason.to_string(),
-            fix: "add `## VERIFY` plus one fenced single-line command to the description"
+            reason: "missing/empty typed verify field (set it via `br create --verify` or \
+                     `br update --verify`)"
+                .to_string(),
+            fix: "add the single-line verify command: br update <id> --verify '<command>'"
                 .to_string(),
         });
     }
     principles_block_reason(b).map(|reason| BeadContractIssue {
         id: b.id.clone(),
-        fix: contract_fix(description, &reason),
+        fix: contract_fix(_description, &reason),
         reason,
     })
 }
@@ -420,7 +387,10 @@ pub fn wave_scope_filter(
     inprogress: &[ReadyBead],
     label: &str,
 ) -> std::result::Result<Vec<ReadyBead>, String> {
-    let Some(wave_n) = label.strip_prefix("wave-").and_then(|n| n.parse::<u32>().ok()) else {
+    let Some(wave_n) = label
+        .strip_prefix("wave-")
+        .and_then(|n| n.parse::<u32>().ok())
+    else {
         return Err(format!("--wave-label must be `wave-<N>` (got `{label}`)"));
     };
     let blockers: Vec<String> = ready
@@ -4775,15 +4745,15 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // set narrows to exactly that label's beads and ANY open lower
             // wave blocks (error names the blockers). None = unchanged.
             let mut scope_block: Option<String> = None;
-            let scope_ids: Option<std::collections::HashSet<String>> =
-                params.wave_label.as_ref().map(|label| {
-                    match wave_scope_filter(&ready, &inprog, label) {
-                        Ok(scoped) => scoped.into_iter().map(|b| b.id).collect(),
-                        Err(e) => {
-                            eprintln!("flywheel: {e}");
-                            scope_block = Some(e);
-                            Default::default()
-                        }
+            let scope_ids: Option<std::collections::HashSet<String>> = params
+                .wave_label
+                .as_ref()
+                .map(|label| match wave_scope_filter(&ready, &inprog, label) {
+                    Ok(scoped) => scoped.into_iter().map(|b| b.id).collect(),
+                    Err(e) => {
+                        eprintln!("flywheel: {e}");
+                        scope_block = Some(e);
+                        Default::default()
                     }
                 });
             let to_assign: Vec<&ReadyBead> = dispatchable
@@ -7362,8 +7332,7 @@ mod tests {
             rb_wave("bd-w3", 3),
         ];
         let inprog: Vec<ReadyBead> = Vec::new();
-        let scoped =
-            wave_scope_filter(&ready, &inprog, "wave-2").expect("no lower wave open");
+        let scoped = wave_scope_filter(&ready, &inprog, "wave-2").expect("no lower wave open");
         let ids: Vec<&str> = scoped.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(ids, vec!["bd-w2a", "bd-w2b"], "{ids:?}");
     }
@@ -7374,8 +7343,7 @@ mod tests {
     fn wave_scoped_unlabeled_ready_set_is_empty() {
         let ready = vec![rb("bd-a", None), rb("bd-b", None)];
         let inprog: Vec<ReadyBead> = Vec::new();
-        let scoped =
-            wave_scope_filter(&ready, &inprog, "wave-1").expect("no lower wave open");
+        let scoped = wave_scope_filter(&ready, &inprog, "wave-1").expect("no lower wave open");
         assert!(scoped.is_empty(), "{scoped:?}");
     }
 
@@ -7386,8 +7354,7 @@ mod tests {
         let ready = vec![rb_wave("bd-w3a", 3), rb_wave("bd-w3b", 3)];
         // wave-1 + wave-2 already closed: they appear NOWHERE here.
         let inprog: Vec<ReadyBead> = Vec::new();
-        let scoped =
-            wave_scope_filter(&ready, &inprog, "wave-3").expect("earlier waves closed");
+        let scoped = wave_scope_filter(&ready, &inprog, "wave-3").expect("earlier waves closed");
         let ids: Vec<&str> = scoped.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(ids, vec!["bd-w3a", "bd-w3b"], "{ids:?}");
     }
@@ -7398,8 +7365,8 @@ mod tests {
     fn wave_scope_inprogress_lower_wave_blocks_with_named_bead() {
         let ready = vec![rb_wave("bd-w2", 2)];
         let inprog = vec![rb_wave("bd-w1", 1)];
-        let err = wave_scope_filter(&ready, &inprog, "wave-2")
-            .expect_err("wave-1 still in progress");
+        let err =
+            wave_scope_filter(&ready, &inprog, "wave-2").expect_err("wave-1 still in progress");
         assert!(err.contains("bd-w1"), "must name the blocker: {err}");
     }
 
@@ -7420,8 +7387,8 @@ mod tests {
     fn wave_scope_names_every_lower_wave_blocker() {
         let ready = vec![rb_wave("bd-w2", 2), rb_wave("bd-w3", 3)];
         let inprog = vec![rb_wave("bd-w1a", 1), rb_wave("bd-w1b", 1)];
-        let err = wave_scope_filter(&ready, &inprog, "wave-3")
-            .expect_err("two wave-1 beads still open");
+        let err =
+            wave_scope_filter(&ready, &inprog, "wave-3").expect_err("two wave-1 beads still open");
         assert!(err.contains("bd-w1a") && err.contains("bd-w1b"), "{err}");
     }
 
@@ -7430,8 +7397,7 @@ mod tests {
     fn wave_scope_same_wave_inprogress_does_not_block() {
         let ready = vec![rb_wave("bd-w2b", 2)];
         let inprog = vec![rb_wave("bd-w2a", 2)];
-        let scoped =
-            wave_scope_filter(&ready, &inprog, "wave-2").expect("same wave runs together");
+        let scoped = wave_scope_filter(&ready, &inprog, "wave-2").expect("same wave runs together");
         let ids: Vec<&str> = scoped.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(ids, vec!["bd-w2b"], "{ids:?}");
     }
@@ -10714,92 +10680,49 @@ mod resume_dedup_tests {
 }
 
 #[cfg(test)]
-mod verify_fence_tests {
+mod verify_field_tests {
     use super::*;
 
-    // ---- ADR-0019: ## VERIFY fence parsing --------------------------------
+    // ---- ADR-0001 wave 5: typed verify field -------------------------------
 
-    /// The exact fence (a `## VERIFY` heading + ONE fenced single-line
-    /// command) parses to the command line — the bead is dispatchable.
+    /// The typed `verify` field flows through unchanged; an absent or empty
+    /// field is `None`/empty — the bead is NOT dispatchable.
     #[test]
-    fn parse_verify_fence_valid_single_line() {
-        let desc = "\
-Part of ADR-0019.
-
-## Background
-Some body text.
-
-## VERIFY
-```
-cd ~/workspace/flywheel && cargo test -p flywheel verify_fence
-```
-
-Dependencies:
-  -> bd-w1-epic-119n (parent-child)
-";
+    fn typed_verify_field_read_from_json() {
+        let bead: serde_json::Value =
+            serde_json::from_str(r#"{"id":"bd-x","verify":"cargo test"}"#).unwrap();
         assert_eq!(
-            parse_verify_fence(desc).as_deref(),
-            Some("cd ~/workspace/flywheel && cargo test -p flywheel verify_fence")
+            bead.get("verify")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty()),
+            Some("cargo test")
         );
-    }
-
-    /// Missing `## VERIFY` heading -> the bead is NOT ready (fixture A).
-    #[test]
-    fn parse_verify_fence_missing_heading_is_not_ready() {
-        assert_eq!(parse_verify_fence("## Background\nbody\n"), None);
-        assert_eq!(parse_verify_fence(""), None);
-        // a different heading level is not the exact shape
-        assert_eq!(parse_verify_fence("### VERIFY\n```\necho hi\n```\n"), None);
-        // heading with extra text is not the exact shape
+        let empty: serde_json::Value = serde_json::json!({"id": "bd-x", "verify": ""});
         assert_eq!(
-            parse_verify_fence("## VERIFY: run tests\n```\necho hi\n```\n"),
+            empty
+                .get("verify")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty()),
             None
         );
     }
 
-    /// Multi-line command inside the fence -> NOT ready (fixture B).
+    /// Typed principles citations format into the line-per-citation text
+    /// `check_principles` consumes.
     #[test]
-    fn parse_verify_fence_multi_line_is_not_ready() {
-        let desc = "## VERIFY\n```\nline one\nline two\n```\n";
-        assert_eq!(parse_verify_fence(desc), None);
-    }
-
-    /// Empty fence -> NOT ready (fixture B).
-    #[test]
-    fn parse_verify_fence_empty_is_not_ready() {
-        assert_eq!(parse_verify_fence("## VERIFY\n```\n```\n"), None);
-        assert_eq!(parse_verify_fence("## VERIFY\n```\n   \n```\n"), None);
-    }
-
-    /// Heading with no fence at all -> NOT ready.
-    #[test]
-    fn parse_verify_fence_missing_fence_is_not_ready() {
-        assert_eq!(parse_verify_fence("## VERIFY\nno fence here\n"), None);
-    }
-
-    /// Truncated fence (no closing ```) -> NOT ready.
-    #[test]
-    fn parse_verify_fence_truncated_fence_is_not_ready() {
-        assert_eq!(parse_verify_fence("## VERIFY\n```\necho hi\n"), None);
-    }
-
-    /// A language tag on the opener (```bash) still yields the command.
-    #[test]
-    fn parse_verify_fence_language_tag_accepted() {
+    fn principles_typed_field_formats_citations() {
+        let bead = serde_json::json!({
+            "principles": [
+                {"name": "prove-it-works", "decision": "proof survives git clone"},
+                {"name": "", "decision": "skipped empty name"},
+                {"name": "fix-root-causes", "decision": ""}
+            ]
+        });
         assert_eq!(
-            parse_verify_fence("## VERIFY\n```bash\necho hi\n```\n").as_deref(),
-            Some("echo hi")
+            principles_typed_field(&bead),
+            "prove-it-works — proof survives git clone"
         );
-    }
-
-    /// Blank lines between heading and fence are tolerated; the command is
-    /// whitespace-trimmed.
-    #[test]
-    fn parse_verify_fence_blank_lines_and_trim() {
-        assert_eq!(
-            parse_verify_fence("## VERIFY\n\n\n```\n  echo hi  \n```\n").as_deref(),
-            Some("echo hi")
-        );
+        assert_eq!(principles_typed_field(&serde_json::json!({})), "");
     }
 
     // ---- ADR-0019: refuse-to-dispatch partition ---------------------------
@@ -10972,76 +10895,38 @@ Dependencies:
 
     /// bd-bead-create-contract-lint-4tdd: the creation-time contract check
     /// reports the EXACT reason + corrected snippet for each block class:
-    /// bare `PRINCIPLES` heading (missing `##`), missing `## VERIFY` fence,
-    /// malformed/multi-line fence, unknown principle name — and passes a
-    /// fully-compliant set (P3 exempt).
+    /// missing/empty typed verify field, unknown principle name — and
+    /// passes a fully-compliant set (P3 exempt). ADR-0001 wave 5
+    /// (bd-wave5-flywheel-parser-strip-dkpvi): fences are no longer read,
+    /// so the old bare-heading/malformed-fence classes are gone.
     #[test]
     fn contract_check_reports_exact_reason_and_fix() {
-        let rb = |id: &str, priority: u8, verify: Option<&str>, desc: &str| ReadyBead {
+        let rb = |id: &str, priority: u8, verify: Option<&str>, principles: &str| ReadyBead {
             id: id.into(),
             title: String::new(),
             assignee: None,
             priority,
-            principles: parse_principles_field(desc),
+            principles: principles.into(),
             verify: verify.map(str::to_string),
             labels: Vec::new(),
         };
-        // Bare `PRINCIPLES` (no `##`) on a P2 → the exact missing-heading fix.
-        let bare_desc =
-            "goal\n\nPRINCIPLES\nprove-it-works — x.\n\n## VERIFY\n```\ncargo test x\n```";
-        let bare = rb("bd-bare", 2, Some("true"), bare_desc);
-        let issue = contract_issue(&bare, bare_desc).expect("bare PRINCIPLES blocks");
+        // Missing typed verify field.
+        let noverify = rb("bd-noverify", 2, None, "prove-it-works — x.");
+        let issue = contract_issue(&noverify, "").expect("missing verify blocks");
         assert!(
-            issue.reason.contains("PRINCIPLES is required"),
+            issue.reason.contains("missing/empty typed verify"),
             "reason: {}",
             issue.reason
         );
-        assert_eq!(
-            issue.fix,
-            "bare `PRINCIPLES` heading — write `## PRINCIPLES`"
-        );
-
-        // Missing ## VERIFY fence.
-        let nofence = rb(
-            "bd-nofence",
-            2,
-            None,
-            "goal\n\n## PRINCIPLES\nprove-it-works — x.",
-        );
-        let issue2 = contract_issue(&nofence, "goal\n\n## PRINCIPLES\nprove-it-works — x.")
-            .expect("missing fence blocks");
         assert!(
-            issue2.reason.contains("missing ## VERIFY fence"),
-            "reason: {}",
-            issue2.reason
-        );
-        assert!(issue2.fix.contains("## VERIFY"), "fix: {}", issue2.fix);
-
-        // Malformed/multi-line fence: heading present, fence not single-line
-        // (br's parse yields `verify: None` for that shape).
-        let multi = rb(
-            "bd-multi",
-            2,
-            None,
-            "## VERIFY\n```\ncargo test a\ncargo test b\n```",
-        );
-        let issue3 = contract_issue(&multi, "## VERIFY\n```\ncargo test a\ncargo test b\n```")
-            .expect("multi-line fence blocks");
-        assert!(
-            issue3.reason.contains("malformed"),
-            "reason: {}",
-            issue3.reason
+            issue.fix.contains("--verify"),
+            "fix names the typed flag: {}",
+            issue.fix
         );
 
         // Unknown principle name.
-        let unknown = rb(
-            "bd-unk",
-            2,
-            Some("true"),
-            "## PRINCIPLES\nnot-a-principle — changed x.",
-        );
-        let issue4 = contract_issue(&unknown, "## PRINCIPLES\nnot-a-principle — changed x.")
-            .expect("unknown name blocks");
+        let unknown = rb("bd-unk", 2, Some("true"), "not-a-principle — changed x.");
+        let issue4 = contract_issue(&unknown, "").expect("unknown name blocks");
         assert!(
             issue4.reason.contains("unknown principle name"),
             "reason: {}",
@@ -11049,19 +10934,27 @@ Dependencies:
         );
 
         // Fully compliant P2 + P3-with-no-principles → dispatchable.
-        let ok_desc = "goal\n\n## PRINCIPLES\nprove-it-works — wired the gate.\n\n## VERIFY\n```\ncargo test x\n```";
         assert!(
-            contract_issue(&rb("bd-ok", 2, Some("true"), ok_desc), ok_desc).is_none(),
+            contract_issue(
+                &rb(
+                    "bd-ok",
+                    2,
+                    Some("cargo test x"),
+                    "prove-it-works — wired the gate."
+                ),
+                ""
+            )
+            .is_none(),
             "compliant P2 passes"
         );
         assert!(
-            contract_issue(&rb("bd-p3", 3, Some("true"), "goal"), "goal").is_none(),
+            contract_issue(&rb("bd-p3", 3, Some("true"), ""), "").is_none(),
             "P3 empty PRINCIPLES is exempt"
         );
     }
 
     /// bd-bead-create-contract-lint-4tdd: the planner-mail reason must be
-    /// the EXACT `principles_block_reason` / fence-error string, not a
+    /// the EXACT `principles_block_reason` / verify-field string, not a
     /// generic label (the 2026-08-17 mislabel class).
     #[test]
     fn not_ready_reason_carries_exact_block_string() {
@@ -11080,9 +10973,12 @@ Dependencies:
             principles_block_reason(&nameonly).as_deref(),
             "P<=2 reason must be the exact check_principles string"
         );
-        let nofence = rb("bd-f", 2, None, "");
-        let r = not_ready_reason(&nofence).expect("fence blocks");
-        assert!(r.contains("## VERIFY"), "fence reason names the gate: {r}");
+        let noverify = rb("bd-f", 2, None, "");
+        let r = not_ready_reason(&noverify).expect("missing verify blocks");
+        assert!(
+            r.contains("typed verify"),
+            "verify reason names the gate: {r}"
+        );
     }
 
     /// bd-bead-create-contract-lint-4tdd: the checkpointed mail args carry
