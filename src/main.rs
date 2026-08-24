@@ -600,6 +600,11 @@ enum Commands {
     /// brainstorm → plan → beads → build → review → ship); `--direct` skips
     /// the tracker (non-bead targets: the plan flows straight to the coder,
     /// no approval gate — truly autonomous).
+    /// Interactive TTY briefing (bd-xe9r/bd-nmzk): `steer` and
+    /// `workflow run --execute` prompt before dispatch — crew counts, per-role
+    /// model menus w/ cost/caps, squad/bare-harness shape, stage-chain preview,
+    /// go/no-go. Skipped by `--json`, `--yes`, or explicit `--crew`; non-TTY
+    /// byte-identical (`src/steer_brief.rs`, `source` fork only).
     Steer {
         /// the objective/target ("implement the auth refactor")
         objective: String,
@@ -2397,6 +2402,8 @@ enum WorkflowCmd {
         name: Option<String>,
     },
     /// Run a workflow by name through the unified engine (lint gate first)
+    /// Interactive TTY briefing when `--execute` (bd-nmzk): same skip
+    /// matrix as `steer` — shared prompt module (`source = workflow`).
     Run {
         /// workflow name (built-in or catalog)
         name: String,
