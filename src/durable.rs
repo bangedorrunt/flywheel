@@ -2930,6 +2930,17 @@ pub enum LoopAction {
         name: String,
         text: String,
     },
+    /// ADR-0001 Wave 3 / Layer 3 (beads_rust-wave3-pin-reservation-jxsyt):
+    /// stamp the dispatched bead's `pin` field with the receiving agent's
+    /// mail identity BEFORE the brief lands — ownership is recorded by the
+    /// orchestrator on dispatch, not left to agent discipline. Emitted only
+    /// when the queue item is a bead/resume brief AND the pin is known.
+    /// Best-effort at the execution site: a tracker hiccup never blocks the
+    /// dispatch itself.
+    PinStamp {
+        bead_id: String,
+        pin: String,
+    },
     /// Event-wake redispatch: same leaf as `Send`, skips poll batching.
     DispatchImmediate {
         name: String,
@@ -3242,6 +3253,21 @@ pub fn bead_id_from_prompt(text: &str) -> Option<&str> {
     if id.is_empty() { None } else { Some(id) }
 }
 
+/// ADR-0001 Wave 3 / Layer 3 (beads_rust-wave3-pin-reservation-jxsyt):
+/// argv for the orchestrator-side pin stamp — the `__pin-stamp` leaf runs
+/// `br update <id> --pin <pin> --json` in the project dir. Pure: both loop
+/// execution sites (durable + sync) run it best-effort right before a bead
+/// dispatch; failure is logged, never blocks the dispatch.
+#[must_use]
+pub fn pin_stamp_argv(bead_id: &str, pin: &str) -> Vec<String> {
+    vec![
+        "update".to_string(),
+        bead_id.to_string(),
+        format!("--pin={pin}"),
+        "--json".to_string(),
+    ]
+}
+
 /// The claim-focused nudge prompt (bd-efk1 option A): one explicit command,
 /// not the dense lifecycle. The agent is WORKING — it just never claimed.
 pub fn claim_nudge_prompt(bead_id: &str) -> String {
@@ -3425,10 +3451,8 @@ pub fn plan_actions(
                     // substitute the receiving agent's mail PIN (the
                     // identity it is addressed by; bd-pin-public-plane-s-easy.2),
                     // falling back to the herdr name when no pin is known
-                    let base = text.replace(
-                        "{AGENT_NAME}",
-                        s.mail_identity.as_deref().unwrap_or(&s.name),
-                    );
+                    let pin = s.mail_identity.clone().unwrap_or_else(|| s.name.clone());
+                    let base = text.replace("{AGENT_NAME}", &pin);
                     let text = match digests.get(&s.name) {
                         Some(d) => match digest_prefix(d) {
                             Some(p) => format!("{p}\n{base}"),
@@ -3436,6 +3460,17 @@ pub fn plan_actions(
                         },
                         None => base,
                     };
+                    // ADR-0001 Wave 3: a dispatched BEAD brief gets its `pin`
+                    // stamped by the orchestrator (mail identity from the
+                    // spawn registry) — flywheel fills pin on claim, toron/
+                    // br stay display-only. Nudges and wake prompts are not
+                    // bead dispatches and never stamp.
+                    if let Some(bead_id) = bead_id_from_prompt(&text) {
+                        actions.push(LoopAction::PinStamp {
+                            bead_id: bead_id.to_string(),
+                            pin,
+                        });
+                    }
                     actions.push(LoopAction::Send {
                         name: s.name.clone(),
                         text,
@@ -5471,6 +5506,41 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         let mut any_work = false;
         for action in &actions {
             match action {
+                // ADR-0001 Wave 3: the pin stamp rides ahead of the send —
+                // run it best-effort through the __pin-stamp leaf (the
+                // orchestrator fills pin; failure never blocks dispatch).
+                LoopAction::PinStamp { bead_id, pin } => {
+                    let exe = self_exe().map_err(map_err)?;
+                    let mut cmd = Command::new(&exe);
+                    cmd.args(["__pin-stamp", &params.project, bead_id, pin]);
+                    match run_leaf_cmd_bounded(cmd, "__pin-stamp", LEAF_WATCHDOG_GRACE).await {
+                        Ok(out) if out.status.success() => {}
+                        Ok(out) => {
+                            let _ = crate::state::log_event(
+                                &params.project,
+                                crate::state::EventKind::Send,
+                                serde_json::json!({
+                                    "pin_stamp": bead_id,
+                                    "pin": pin,
+                                    "ok": false,
+                                    "stderr": String::from_utf8_lossy(&out.stderr),
+                                }),
+                            );
+                        }
+                        Err(e) => {
+                            let _ = crate::state::log_event(
+                                &params.project,
+                                crate::state::EventKind::Send,
+                                serde_json::json!({
+                                    "pin_stamp": bead_id,
+                                    "pin": pin,
+                                    "ok": false,
+                                    "error": e.to_string(),
+                                }),
+                            );
+                        }
+                    }
+                }
                 LoopAction::Send { name, text } | LoopAction::DispatchImmediate { name, text } => {
                     // context guard: if the idle agent is context-exhausted,
                     // respawn a fresh instance instead of delegating to it
@@ -8097,7 +8167,12 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
+        // ADR-0001 Wave 3: the bead dispatch now carries a PinStamp first.
         match &actions[0] {
+            LoopAction::PinStamp { .. } => {}
+            other => panic!("expected PinStamp first, got {other:?}"),
+        }
+        match &actions[1] {
             LoopAction::Send { name, text } => {
                 assert_eq!(name, "flywheel-proj-oc");
                 assert!(text.contains(".flywheel/agent-state/flywheel-proj-oc.json"));
@@ -8124,7 +8199,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
-        match &actions[0] {
+        match &actions[1] {
             LoopAction::Send { name, text } => {
                 assert_eq!(name, "flywheel-proj-oc", "send target stays the herdr name");
                 assert!(
@@ -8235,6 +8310,78 @@ mod tests {
     /// `__send` — the engine-dispatch coexistence bridge is deleted, so the
     /// plan\u2192send boundary is the invariant that matters.
     #[test]
+    /// ADR-0001 Wave 3 / Layer 3 (beads_rust-wave3-pin-reservation-jxsyt):
+    /// dispatching a BEAD brief emits a PinStamp carrying the mail identity
+    /// BEFORE the Send — flywheel fills pin, not the agent.
+    #[test]
+    fn plan_actions_stamps_pin_before_bead_dispatch() {
+        let mut queue = vec![brief("bd-12", "fix auth flow")];
+        let mut s = st("flywheel-proj-oc", "idle");
+        s.mail_identity = Some("DustySparrow".to_string());
+        let states = vec![s];
+        let actions = plan_actions(
+            &states,
+            &mut queue,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        assert!(actions.len() >= 2, "stamp + send: {actions:?}");
+        assert!(
+            matches!(&actions[0], LoopAction::PinStamp { bead_id, pin }
+                if bead_id == "bd-12" && pin == "DustySparrow"),
+            "PinStamp precedes the dispatch: {actions:?}"
+        );
+        assert!(matches!(&actions[1], LoopAction::Send { .. }));
+    }
+
+    /// No known pin → the stamp falls back to the herdr name (still a
+    /// deterministic owner), and non-bead prompts never stamp.
+    #[test]
+    fn plan_actions_pin_stamp_falls_back_and_skips_non_bead_prompts() {
+        // herdr-name fallback for a bead brief with no registered pin.
+        let mut queue = vec![brief("bd-13", "fallback owner")];
+        let states = vec![st("flywheel-proj-oc", "idle")];
+        let actions = plan_actions(
+            &states,
+            &mut queue,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            matches!(&actions[0], LoopAction::PinStamp { pin, .. } if pin == "flywheel-proj-oc"),
+            "herdr fallback stamps: {actions:?}"
+        );
+
+        // A plain instruction is dispatched without any stamp.
+        let mut plain_queue = vec!["run the nightly sweep".to_string()];
+        let states_plain = vec![st("flywheel-proj-oc", "idle")];
+        let plain_actions = plan_actions(
+            &states_plain,
+            &mut plain_queue,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            plain_actions
+                .iter()
+                .all(|a| !matches!(a, LoopAction::PinStamp { .. })),
+            "non-bead prompt must not stamp: {plain_actions:?}"
+        );
+    }
+
+    /// The stamp argv targets `br update <id> --pin <pin>` — read it back.
+    #[test]
+    fn pin_stamp_argv_targets_br_update_pin_field() {
+        let argv = pin_stamp_argv("bd-12", "DustySparrow");
+        assert_eq!(argv[0], "update");
+        assert_eq!(argv[1], "bd-12");
+        assert_eq!(argv[2], "--pin=DustySparrow");
+        assert_eq!(argv[3], "--json");
+    }
+
     fn plan_actions_to_dispatch_parity() {
         let mut queue = vec![brief("bd-12", "fix auth flow")];
         let states = vec![st("flywheel-proj-oc", "idle")];
@@ -9847,6 +9994,9 @@ mod tests {
                     content: text.clone(),
                 })
             }
+            // pin stamps are orchestrator-side tracker writes, not agent
+            // dispatches — no DispatchRec (nothing lands on a pane).
+            LoopAction::PinStamp { .. } => None,
             LoopAction::Blocked { name } => Some(DispatchRec {
                 agent: name.clone(),
                 kind: "blocked",
