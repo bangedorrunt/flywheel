@@ -1,8 +1,10 @@
-//! Interactive captain briefing for `flywheel steer` (bd-xe9r, ADR-0006).
+//! Interactive captain briefing for `flywheel steer` (bd-xe9r, ADR-0006) and
+//! `flywheel workflow run --execute` (bd-nmzk) — same skip matrix, shared
+//! prompt module.
 //!
 //! On a TTY (and only there — `--json`, `--yes`, and an explicit `--crew`
-//! all skip it), steer prompts before dispatch: the inferred crew plan with
-//! editable per-role counts, per-role model defaults + registry
+//! all skip it), the briefing prompts before dispatch: the inferred crew plan
+//! with editable per-role counts, per-role model defaults + registry
 //! alternatives (cost/caps), the squad/bare-harness choice, and the
 //! resolved stage-chain preview — then go/no-go.
 //!
@@ -11,7 +13,7 @@
 //! TTY is ever touched. Non-TTY invocations never reach this module — the
 //! dispatch output stays byte-identical to the pre-briefing binary.
 
-// governed-by: ADR-0006 (D1 stage payloads / briefing surface)
+// governed-by: ADR-0006 (D1 stage payloads / briefing surface) + bd-nmzk shared briefing
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -37,6 +39,9 @@ pub struct RoleModelChoice {
 pub struct BriefingContext {
     pub objective: String,
     pub workflow: String,
+    /// source of the briefing: "steer" or "workflow" (empty = "steer" for
+    /// back-compat — bd-nmzk shared prompt module).
+    pub source: String,
     /// inferred crew plan: role -> count (editable)
     pub crew_plan: BTreeMap<String, u32>,
     /// per-role model menus
@@ -69,7 +74,12 @@ pub fn run_briefing(
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> std::io::Result<BriefingOutcome> {
-    writeln!(out, "== captain briefing: steer {:?}", ctx.workflow)?;
+    let kind = if ctx.source.is_empty() {
+        "steer"
+    } else {
+        ctx.source.as_str()
+    };
+    writeln!(out, "== captain briefing: {} {:?}", kind, ctx.workflow)?;
     writeln!(out, "objective: {}", ctx.objective)?;
 
     // (1) inferred crew plan with editable counts.
@@ -168,6 +178,7 @@ mod tests {
         BriefingContext {
             objective: "implement the auth refactor".into(),
             workflow: "goal".into(),
+            source: "steer".into(),
             crew_plan: BTreeMap::from([("planner".into(), 1), ("coder".into(), 2)]),
             models: vec![RoleModelChoice {
                 role: "coder".into(),
@@ -254,5 +265,53 @@ mod tests {
         let rendered = String::from_utf8(out).expect("utf8");
         assert!(rendered.contains("recommended squad: none"));
         assert!(rendered.contains("bare harness+model: available via spawn --model/--provider"));
+    }
+
+    #[test]
+    fn workflow_source_renders_workflow_prefix_and_shared_shape() {
+        // bd-nmzk: same prompt module, same 4 sections — only the header
+        // source differs (workflow vs steer). Lockstep guarantee.
+        let c = BriefingContext {
+            objective: "run the weekly-review flow".into(),
+            workflow: "weekly-review".into(),
+            source: "workflow".into(),
+            crew_plan: BTreeMap::from([("coder".into(), 1)]),
+            models: vec![],
+            squad_recommendation: None,
+            bare_override: None,
+            stage_chain: vec!["review".into(), "ship".into()],
+        };
+        let mut inp = std::io::Cursor::new("\n\n\n");
+        let mut out: Vec<u8> = Vec::new();
+        run_briefing(&c, &mut inp, &mut out).expect("briefing");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("== captain briefing: workflow \"weekly-review\""),
+            "workflow prefix: {rendered}"
+        );
+        assert!(rendered.contains("objective: run the weekly-review flow"));
+        assert!(rendered.contains("[1/4] inferred crew plan"));
+        assert!(rendered.contains("[2/4] per-role models"));
+        assert!(rendered.contains("[3/4] fleet shape"));
+        assert!(rendered.contains("[4/4] stage chain"));
+        assert!(rendered.contains("- review"));
+        assert!(rendered.contains("dispatching."));
+    }
+
+    #[test]
+    fn empty_source_defaults_to_steer_for_back_compat() {
+        let c = BriefingContext {
+            workflow: "goal".into(),
+            source: "".into(),
+            ..Default::default()
+        };
+        let mut inp = std::io::Cursor::new("\n");
+        let mut out: Vec<u8> = Vec::new();
+        run_briefing(&c, &mut inp, &mut out).expect("briefing");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("== captain briefing: steer \"goal\""),
+            "empty source defaults to steer: {rendered}"
+        );
     }
 }
