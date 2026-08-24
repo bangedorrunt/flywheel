@@ -2436,6 +2436,10 @@ enum WorkflowCmd {
         /// JSON output for agent drivers
         #[arg(long)]
         json: bool,
+        /// skip the interactive captain briefing (bd-nmzk; implied by --json
+        /// and an explicit --crew — shared surface with `steer`)
+        #[arg(long)]
+        yes: bool,
         /// ADR-0019 Spec 3.3 (operator-only, logged): allow `workflow run
         /// --execute` in a workspace that carries an extra linked worktree.
         /// Requires the operator key.
@@ -5363,6 +5367,54 @@ mod steer_engine_tests {
         assert_eq!(mode, "pane");
         assert!(!json);
         assert!(!allow_worktree);
+    }
+
+    /// bd-nmzk: workflow run --execute shares the same skip matrix as steer,
+    /// but also gates on `execute == true` — recording runs never brief.
+    /// Lockstep via `briefing_enabled` + `workflow_briefing_context` (same
+    /// crew/model/squad/stage path, `source = "workflow"`).
+    #[test]
+    fn workflow_briefing_skip_matrix_matches_steer() {
+        // helper: workflow briefs iff execute && briefing_enabled
+        let workflow_briefs = |json, yes, crew, is_tty, execute| {
+            execute && briefing_enabled(json, yes, crew, is_tty)
+        };
+        // Non-TTY never briefs, even with execute.
+        for (json, yes, crew) in [
+            (false, false, None),
+            (true, false, None),
+            (false, true, None),
+            (false, false, Some("build")),
+        ] {
+            assert!(
+                !workflow_briefs(json, yes, crew, false, true),
+                "non-TTY must never brief workflow (json={json}, yes={yes}, crew={crew:?})"
+            );
+            // execute == false also never briefs, even on TTY
+            assert!(
+                !workflow_briefs(json, yes, crew, true, false),
+                "non-execute must never brief (json={json}, yes={yes}, crew={crew:?})"
+            );
+        }
+        assert!(workflow_briefs(false, false, None, true, true));
+        assert!(!workflow_briefs(true, false, None, true, true), "--json skips");
+        assert!(!workflow_briefs(false, true, None, true, true), "--yes skips");
+        assert!(
+            !workflow_briefs(false, false, Some("build"), true, true),
+            "explicit --crew skips"
+        );
+        // The shared context path: workflow context uses the same crew/model
+        // inference as steer, only `source` differs.
+        let steer_ctx = steer_briefing_context("fix the flake", "goal").expect("steer ctx");
+        let wf_ctx = workflow_briefing_context("goal", Some(r#"{"objective":"fix the flake"}"#))
+            .expect("workflow ctx");
+        assert_eq!(steer_ctx.source, "steer");
+        assert_eq!(wf_ctx.source, "workflow");
+        assert_eq!(steer_ctx.workflow, wf_ctx.workflow);
+        assert_eq!(steer_ctx.objective, wf_ctx.objective);
+        // stage chain and crew plan are identical for same workflow
+        assert_eq!(steer_ctx.stage_chain, wf_ctx.stage_chain);
+        assert_eq!(steer_ctx.crew_plan, wf_ctx.crew_plan);
     }
 
     /// Shared harness: the exact execution shape the Run arm builds for a
@@ -19134,6 +19186,7 @@ fn steer_run_cmd(
         retain,
         retire_orphans,
         json,
+        yes: false,
         allow_worktree: false,
     }
 }
@@ -19142,7 +19195,47 @@ fn steer_run_cmd(
 /// IO — the pure data half of the briefing seam. Resolves the target
 /// workflow (catalog overrides built-in), infers the crew plan, and builds
 /// per-role model menus from the composite registry (cost/caps on screen).
+/// bd-nmzk: shared prompt module — steer and workflow run stay in lockstep
+/// via `briefing_context_inner` (one crew/model/squad/stage path, `source`
+/// is the only fork).
 fn steer_briefing_context(objective: &str, wf_name: &str) -> Result<steer_brief::BriefingContext> {
+    briefing_context_inner(objective, wf_name, "steer")
+}
+
+/// bd-nmzk: workflow run briefing context — same shared module as steer,
+/// `source = "workflow"` so the header reads `workflow "name"` and the
+/// objective is derived from the run inputs (objective/goal/target key or
+/// raw JSON, fallback to workflow name).
+fn workflow_briefing_context(
+    wf_name: &str,
+    inputs: Option<&str>,
+) -> Result<steer_brief::BriefingContext> {
+    let objective = match inputs {
+        Some(s) if !s.trim().is_empty() => {
+            if let Ok(v) = serde_json::from_str::<Value>(s) {
+                if let Some(o) = v.get("objective").and_then(|x| x.as_str()) {
+                    o.to_string()
+                } else if let Some(g) = v.get("goal").and_then(|x| x.as_str()) {
+                    g.to_string()
+                } else if let Some(t) = v.get("target").and_then(|x| x.as_str()) {
+                    t.to_string()
+                } else {
+                    s.to_string()
+                }
+            } else {
+                s.to_string()
+            }
+        }
+        _ => wf_name.to_string(),
+    };
+    briefing_context_inner(&objective, wf_name, "workflow")
+}
+
+fn briefing_context_inner(
+    objective: &str,
+    wf_name: &str,
+    source: &str,
+) -> Result<steer_brief::BriefingContext> {
     let mut all: std::collections::BTreeMap<String, toron_workflow::Workflow> =
         builtin_workflows::builtin_workflows();
     if let Ok(cat) = workflow_catalog::WorkflowCatalog::load() {
@@ -19152,7 +19245,7 @@ fn steer_briefing_context(objective: &str, wf_name: &str) -> Result<steer_brief:
     }
     let wf = all
         .get(wf_name)
-        .ok_or_else(|| anyhow!("unknown workflow {wf_name:?} for steer briefing"))?
+        .ok_or_else(|| anyhow!("unknown workflow {wf_name:?} for {source} briefing"))?
         .clone();
     let resolve = |sub: &str| all.get(sub).cloned();
     let plan = crew::plan_crew_with(&wf, &resolve);
@@ -19212,6 +19305,7 @@ fn steer_briefing_context(objective: &str, wf_name: &str) -> Result<steer_brief:
     Ok(steer_brief::BriefingContext {
         objective: objective.to_string(),
         workflow: wf_name.to_string(),
+        source: source.to_string(),
         crew_plan: plan.members,
         models,
         squad_recommendation,
@@ -19253,6 +19347,7 @@ fn profile_workflow_invoke(
         retain: false,
         retire_orphans: false,
         json: false,
+        yes: false,
         allow_worktree: false,
     }
 }
@@ -19482,10 +19577,30 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             retain,
             retire_orphans,
             json,
+            yes,
             // the preflight gate consumed --allow-worktree (operator-only);
             // cmd_workflow itself needs no opt-out state
             allow_worktree: _,
         } => {
+            // bd-nmzk: interactive captain briefing for `workflow run --execute`
+            // (same skip flags as `steer` — shared prompt module so both stay
+            // in lockstep). Arms only on an interactive TTY with --execute.
+            if *execute && briefing_enabled(*json, *yes, crew.as_deref(), std::io::stdin().is_terminal()) {
+                if !json && *yes && crew.is_some() {
+                    eprintln!("flywheel: warn: --yes is redundant with an explicit --crew (briefing already skipped)");
+                }
+                let ctx = workflow_briefing_context(name, inputs.as_deref())?;
+                let outcome = steer_brief::run_briefing(
+                    &ctx,
+                    &mut std::io::stdin().lock(),
+                    &mut std::io::stdout(),
+                )?;
+                if outcome == steer_brief::BriefingOutcome::Abort {
+                    bail!("workflow run: aborted by the operator at the briefing gate");
+                }
+            } else if *execute && !json && *yes && crew.is_some() {
+                eprintln!("flywheel: warn: --yes is redundant with an explicit --crew (briefing already skipped)");
+            }
             let all = all_workflows()?;
             let wf = resolve_workflow(name, &all)?.clone();
             // Fail-stop gate: lint before running.
