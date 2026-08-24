@@ -27,6 +27,7 @@ mod models;
 mod output;
 mod pane;
 mod phase_chain;
+mod steer_brief;
 mod phase_contracts;
 mod preflight;
 mod principles;
@@ -624,6 +625,10 @@ enum Commands {
         /// JSON output for agent drivers
         #[arg(long)]
         json: bool,
+        /// skip the interactive captain briefing (bd-xe9r; implied by --json
+        /// and an explicit --crew)
+        #[arg(long)]
+        yes: bool,
     },
     /// Unified workflow surface (ADR-0005 Spec 5 / P3.7) — catalog, lint,
     /// run, scaffold, history, and auto-crew preview. One vocabulary, one
@@ -3576,6 +3581,7 @@ fn main() {
             retain,
             retire_orphans,
             json,
+            yes,
         }) => preflight_gate(
             &cfg,
             cli.skip_preflight,
@@ -3593,6 +3599,7 @@ fn main() {
                 *retain,
                 *retire_orphans,
                 *json,
+                *yes,
             )
         }),
         Some(Commands::Workflow { cmd }) => {
@@ -5307,6 +5314,55 @@ mod steer_engine_tests {
             assert_eq!(mode, "pane");
             assert!(!allow_worktree);
         }
+    }
+
+    /// bd-xe9r: the interactive briefing arms ONLY on an interactive TTY
+    /// with no explicit fleet. Every skip path keeps the dispatch
+    /// byte-identical to the pre-briefing binary (golden matrix).
+    #[test]
+    fn briefing_skip_matrix_matches_non_tty_golden() {
+        // Non-TTY: never briefs, whatever the flags.
+        for (json, yes, crew) in [
+            (false, false, None),
+            (true, false, None),
+            (false, true, None),
+            (false, false, Some("build")),
+            (true, true, Some("build")),
+        ] {
+            assert!(
+                !briefing_enabled(json, yes, crew, false),
+                "non-TTY must never brief (json={json}, yes={yes}, crew={crew:?})"
+            );
+        }
+        // Interactive: briefs unless an explicit opt-out applies.
+        assert!(briefing_enabled(false, false, None, true));
+        assert!(!briefing_enabled(true, false, None, true), "--json skips");
+        assert!(!briefing_enabled(false, true, None, true), "--yes skips");
+        assert!(
+            !briefing_enabled(false, false, Some("build"), true),
+            "explicit --crew skips"
+        );
+        // The non-TTY dispatch output is the pre-briefing golden: the Run
+        // command steer builds is untouched by the briefing feature.
+        let cmd = steer_run_cmd("fix the flake", false, None, None, None, false, false, false);
+        let WorkflowCmd::Run {
+            name,
+            inputs,
+            execute,
+            mode,
+            json,
+            allow_worktree,
+            ..
+        } = cmd
+        else {
+            panic!("expected a Run command");
+        };
+        assert_eq!(name, "goal");
+        assert_eq!(inputs.as_deref(), Some(r#"{"objective":"fix the flake"}"#));
+        assert!(execute);
+        assert_eq!(mode, "pane");
+        assert!(!json);
+        assert!(!allow_worktree);
     }
 
     /// Shared harness: the exact execution shape the Run arm builds for a
@@ -18988,6 +19044,16 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)] // one param per CLI flag, mirrors cmd_spawn
+/// bd-xe9r: the briefing skip matrix, pure so tests cover it without a TTY.
+/// The briefing arms ONLY on an interactive terminal with no explicit
+/// fleet: --json (agent drivers), --yes (operator pre-approved), and an
+/// explicit --crew (the fleet is already named) all skip byte-identically.
+fn briefing_enabled(json: bool, yes: bool, crew: Option<&str>, is_tty: bool) -> bool {
+    !json && !yes && crew.is_none() && is_tty
+}
+
+/// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
+#[allow(clippy::too_many_arguments)]
 fn cmd_steer(
     cfg: &Config,
     objective: &str,
@@ -18998,9 +19064,28 @@ fn cmd_steer(
     retain: bool,
     retire_orphans: bool,
     json: bool,
+    yes: bool,
 ) -> Result<()> {
     if objective.trim().is_empty() {
         bail!("steer: objective must not be empty");
+    }
+    // bd-xe9r: on an INTERACTIVE TTY — skipped by --json, --yes, or an
+    // explicit --crew (an agent driver knows its fleet already) — brief the
+    // operator before dispatch. Non-TTY output stays byte-identical.
+    if !json && yes && crew.is_some() {
+        eprintln!("flywheel: warn: --yes is redundant with an explicit --crew (briefing already skipped)");
+    }
+    let brief = briefing_enabled(json, yes, crew, std::io::stdin().is_terminal());
+    if brief {
+        let ctx = steer_briefing_context(objective, if direct { "goal-direct" } else { "goal" })?;
+        let outcome = steer_brief::run_briefing(
+            &ctx,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+        )?;
+        if outcome == steer_brief::BriefingOutcome::Abort {
+            bail!("steer: aborted by the operator at the briefing gate");
+        }
     }
     // bd-t86p: ONE compose call — the goal workflow (bead-tracked) or its
     // direct arm (non-bead targets: no tracker, no plan approval gate). The
@@ -19050,6 +19135,100 @@ fn steer_run_cmd(
         retire_orphans,
         json,
         allow_worktree: false,
+    }
+}
+
+/// bd-xe9r: everything the interactive briefing renders, computed BEFORE any
+/// IO — the pure data half of the briefing seam. Resolves the target
+/// workflow (catalog overrides built-in), infers the crew plan, and builds
+/// per-role model menus from the composite registry (cost/caps on screen).
+fn steer_briefing_context(objective: &str, wf_name: &str) -> Result<steer_brief::BriefingContext> {
+    let mut all: std::collections::BTreeMap<String, toron_workflow::Workflow> =
+        builtin_workflows::builtin_workflows();
+    if let Ok(cat) = workflow_catalog::WorkflowCatalog::load() {
+        for (name, wf) in cat.workflows {
+            all.insert(name, wf);
+        }
+    }
+    let wf = all
+        .get(wf_name)
+        .ok_or_else(|| anyhow!("unknown workflow {wf_name:?} for steer briefing"))?
+        .clone();
+    let resolve = |sub: &str| all.get(sub).cloned();
+    let plan = crew::plan_crew_with(&wf, &resolve);
+    let stage_chain: Vec<String> = wf
+        .steps
+        .iter()
+        .filter_map(|s| s.name.clone())
+        .collect();
+
+    let cat_profiles = profile::ProfileCatalog::load().unwrap_or_default();
+    let registry = models::ModelRegistry::load_routing().unwrap_or_default();
+    let models = plan
+        .members
+        .keys()
+        .map(|role| {
+            let profile = cat_profiles.get(role);
+            let harness = profile
+                .map(|p| p.harness.clone())
+                .unwrap_or_else(|| cfg_resolve_kind_default(role));
+            let default_model = profile.map(|p| p.model.clone()).unwrap_or_default();
+            let mut alternatives: Vec<(String, f64, Vec<String>)> = registry
+                .models
+                .iter()
+                .filter(|(_, e)| e.caps.is_empty() || e.caps.iter().any(|c| c == &harness))
+                .map(|(id, e)| (id.clone(), e.cost_in_per_mtok, e.caps.clone()))
+                .collect();
+            // Default first, then alphabetical — deterministic menus.
+            alternatives.sort_by(|a, b| {
+                let da = a.0 == default_model;
+                let db = b.0 == default_model;
+                db.cmp(&da).then_with(|| a.0.cmp(&b.0))
+            });
+            steer_brief::RoleModelChoice {
+                role: role.clone(),
+                harness,
+                default_model,
+                alternatives,
+            }
+        })
+        .collect();
+
+    // Squad recommendation: recommend a recipes.toml squad only when its
+    // member set EXACTLY equals the inferred crew's role set (never a fit).
+    let recipes = config::Recipes::load()
+        .map(|r| r.recipes)
+        .unwrap_or_default();
+    let plan_roles: std::collections::BTreeSet<&str> =
+        plan.members.keys().map(String::as_str).collect();
+    let squad_recommendation = recipes
+        .iter()
+        .find(|(_name, recipe)| {
+            let members = profile::Squad::from_recipe(recipe);
+            members.counts.len() == plan_roles.len()
+                && members.counts.keys().all(|m| plan_roles.contains(m.as_str()))
+        })
+        .map(|(name, _)| name.clone());
+    Ok(steer_brief::BriefingContext {
+        objective: objective.to_string(),
+        workflow: wf_name.to_string(),
+        crew_plan: plan.members,
+        models,
+        squad_recommendation,
+        bare_override: None,
+        stage_chain,
+    })
+}
+
+/// Harness fallback for a briefing role with NO profile entry: the role
+/// name IS the kind short on this CLI (`oc`/`pi`/`gk`/kind), resolved via
+/// the same config map spawn uses; unknown -> the bare name.
+fn cfg_resolve_kind_default(role: &str) -> String {
+    let resolved = crate::config::Config::default().resolve_kind(role);
+    if resolved == role || resolved.is_empty() {
+        role.to_string()
+    } else {
+        resolved
     }
 }
 
