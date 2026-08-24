@@ -155,6 +155,12 @@ enum Commands {
         /// extra herdr agent kind counts: --kind claude=1 (repeatable)
         #[arg(long = "kind", value_name = "KIND=COUNT", value_parser = parse_kind_count)]
         kinds: Vec<(String, u32)>,
+        /// steer channels every spawned agent joins at pane creation
+        /// (bd-kbl1c join-before-post: membership is the only gate — the
+        /// dispatcher auto-joins declared channels so a first post never
+        /// bounces). Repeatable/comma-separated.
+        #[arg(long = "join-channel", value_delimiter = ',')]
+        join_channels: Vec<String>,
         #[arg(long)]
         label: Option<String>,
         /// do not focus the new workspace
@@ -3342,6 +3348,7 @@ fn main() {
             peer_poll_budget_minutes,
             peer_max_prompts,
             settle_secs,
+            join_channels,
             profile,
             count,
             model,
@@ -3363,6 +3370,7 @@ fn main() {
                 peer_poll_budget_minutes: *peer_poll_budget_minutes,
                 peer_max_prompts: *peer_max_prompts,
                 settle_secs: *settle_secs,
+                join_channels: join_channels.clone(),
             profile_name: profile.clone(),
             profile_count: *count,
             bare_model: model.clone().unwrap_or_default(),
@@ -6114,6 +6122,9 @@ struct SpawnOpts {
     counts: AgentCounts,
     recipe: Option<String>,
     kinds: Vec<(String, u32)>,
+    /// bd-kbl1c join-before-post: steer channels every spawned agent joins
+    /// at pane creation (membership is the only gate).
+    join_channels: Vec<String>,
     label_override: Option<String>,
     no_focus: bool,
     no_verify: bool,
@@ -6137,6 +6148,7 @@ impl Default for SpawnOpts {
             counts: AgentCounts::default(),
             recipe: None,
             kinds: Vec::new(),
+            join_channels: Vec::new(),
             label_override: None,
             no_focus: false,
             no_verify: false,
@@ -6844,6 +6856,40 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
                     String::from_utf8_lossy(&o.stderr).trim()
                 ),
                 Err(e) => eprintln!("flywheel: presence publish failed for {pin}: {e}"),
+            }
+        }
+    }
+
+    // bd-kbl1c join-before-post: auto-join every --join-channel for every
+    // spawned identity BEFORE first doorbell — membership is the only gate,
+    // and a non-member post is a refused write (the 2026-08-22 silent-drop
+    // incident class). --if-missing keeps re-spawns idempotent (no duplicate
+    // bus event). Best-effort: a failed join never fails the spawn (the
+    // gate's remedy error still names the exact join command).
+    if !opts.join_channels.is_empty() {
+        for e in &registry {
+            let Some(pin) = &e.mail_identity else { continue };
+            for ch in &opts.join_channels {
+                let status = Command::new("toron")
+                    .args([
+                        "channel",
+                        "join",
+                        ch,
+                        "--project",
+                        project,
+                        "--as",
+                        pin,
+                        "--if-missing",
+                    ])
+                    .output();
+                match status {
+                    Ok(o) if o.status.success() => {}
+                    Ok(o) => eprintln!(
+                        "flywheel: warn: channel join {ch} failed for {pin}: {}",
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    ),
+                    Err(e) => eprintln!("flywheel: warn: channel join {ch} failed for {pin}: {e}"),
+                }
             }
         }
     }
