@@ -203,6 +203,14 @@ enum Commands {
         /// how many profile agents to spawn (with --profile; default 1)
         #[arg(long, default_value_t = 1)]
         count: u32,
+        /// bd-j3so: bare harness+model override for kind/count spawns (no
+        /// --profile): launch args route through the composite registry,
+        /// lenient — registered ids route, unregistered pairs pass through.
+        #[arg(long)]
+        model: Option<String>,
+        /// provider pin for --model's composite registry key
+        #[arg(long, requires = "model")]
+        provider: Option<String>,
     },
     /// Extend a running swarm with more agent panes
     Add {
@@ -3320,6 +3328,8 @@ fn main() {
             settle_secs,
             profile,
             count,
+            model,
+            provider,
         }) => cmd_spawn(
             &cfg,
             project,
@@ -3337,10 +3347,12 @@ fn main() {
                 peer_poll_budget_minutes: *peer_poll_budget_minutes,
                 peer_max_prompts: *peer_max_prompts,
                 settle_secs: *settle_secs,
-                profile_name: profile.clone(),
-                profile_count: *count,
-            },
-        ),
+            profile_name: profile.clone(),
+            profile_count: *count,
+            bare_model: model.clone().unwrap_or_default(),
+            bare_provider: provider.clone().unwrap_or_default(),
+        },
+    ),
         Some(Commands::Add {
             project,
             counts,
@@ -4122,6 +4134,29 @@ fn spawn_items_from_plan(
 /// degraded flag surfaced via [`headless::phase_launch_args`] consumers —
 /// this fn keeps the plain `Vec<String>` contract, so degradation is
 /// reported on stderr only).
+/// bd-j3so: launch args for a BARE harness + provider/model pair (no named
+/// profile). LENIENT routing — an id registered in the composite registry
+/// routes through it (default-provider fallback; an explicit provider pins
+/// the pair), an unregistered id passes through verbatim. The strict check
+/// stays profile-only: the operator named this pair explicitly, so there is
+/// no profile indirection to protect. Empty model -> no flags.
+fn bare_model_launch_args(
+    harness: &str,
+    model: &str,
+    provider: &str,
+) -> Result<Vec<String>> {
+    if model.is_empty() {
+        return Ok(vec![]);
+    }
+    let registry = models::ModelRegistry::load_routing()?;
+    let lookup = if provider.is_empty() {
+        model.to_string()
+    } else {
+        format!("{provider}/{model}")
+    };
+    Ok(headless::model_args(harness, &registry.resolve(&lookup, harness), None))
+}
+
 pub(crate) fn profile_launch_args(
     harness: &str,
     p: &profile::Profile,
@@ -4484,6 +4519,42 @@ mod spawn_profile_plan_tests {
             err.to_string().contains("qqq/glm-5.2"),
             "error names the composite pair: {err}"
         );
+    }
+
+    /// bd-j3so: a BARE harness + provider/model pair spawns without a named
+    /// profile. Lenient routing by design — an id REGISTERED in the composite
+    /// registry routes through it (default-provider fallback, explicit
+    /// provider pin), an unregistered pair passes through verbatim (the
+    /// operator named it explicitly; no profile indirection to protect).
+    #[test]
+    fn bare_harness_model_pair_routes_without_profile() {
+        let _g = lock_env();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let cfg_home = dir.path().join("config");
+        std::fs::create_dir_all(cfg_home.join("flywheel")).expect("config dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
+        std::fs::write(
+            cfg_home.join("flywheel/models.toml"),
+            "[models.\"aaa/glm-5.2\"]\n[models.\"zzz/glm-5.2\"]\n",
+        )
+        .expect("models.toml");
+        // Bare model id: registered -> default-provider route.
+        let args = bare_model_launch_args("omp", "glm-5.2", "").expect("bare id");
+        assert_eq!(args, vec!["--model=aaa/glm-5.2"], "registered bare id routes");
+        // Explicit provider pins the other provider carrying the same id.
+        let args = bare_model_launch_args("omp", "glm-5.2", "zzz").expect("pinned");
+        assert_eq!(args, vec!["--model=zzz/glm-5.2"], "explicit provider wins");
+        // Unregistered pair: LENIENT passthrough (never a strict failure —
+        // the strict check is for profile-sourced ids only).
+        let args =
+            bare_model_launch_args("omp", "ghost-model", "").expect("lenient passthrough");
+        assert_eq!(args, vec!["--model=ghost-model"]);
+        let args = bare_model_launch_args("omp", "ghost-model", "qqq").expect("pair passthrough");
+        assert_eq!(args, vec!["--model=qqq/ghost-model"]);
+        // Empty model: no flags at all.
+        assert!(bare_model_launch_args("omp", "", "")
+            .expect("empty model")
+            .is_empty());
     }
 
     #[test]
@@ -5940,6 +6011,9 @@ struct SpawnOpts {
     settle_secs: u64,
     profile_name: Option<String>,
     profile_count: u32,
+    /// bd-j3so: bare harness+model override (kind/count spawns, no profile)
+    bare_model: String,
+    bare_provider: String,
 }
 
 impl Default for SpawnOpts {
@@ -5960,6 +6034,8 @@ impl Default for SpawnOpts {
             settle_secs: 30,
             profile_name: None,
             profile_count: 1,
+            bare_model: String::new(),
+            bare_provider: String::new(),
         }
     }
 }
@@ -6404,7 +6480,9 @@ projects available: {}",
                         .expect("profile resolved at plan build (bd-eign.13)");
                     profile_launch_args(&kind, p, None)?
                 }
-                None => vec![],
+                // bd-j3so: bare harness+model override for kind/count spawns
+                // (no --profile) — lenient registry routing.
+                None => bare_model_launch_args(&kind, &opts.bare_model, &opts.bare_provider)?,
             };
 
             // bd-peeraware-enametoolong-iswg: launch text NEVER rides
