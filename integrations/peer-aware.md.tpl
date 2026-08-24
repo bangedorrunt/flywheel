@@ -20,8 +20,17 @@ Two planes (ADR-0020):
   `toron job list|claim|result`. Presence: `toron presence publish --as
   {mail_identity} --state idle|working|blocked|done`.
 - Plane P (private, NIP-17 gift-wrap): secrets and 1:1 only. `toron mail
-  send|inbox|reply`. `unread_only` is a documented no-op -- pull by
-  `since_ts` high-water.
+  send|inbox|reply`. Pull with `toron mail inbox --since last`
+  (bd-since-cursor-70cf: the daemon persists your per-(project, agent)
+  high-water `since_ts` cursor; read-then-bump is atomic and crash-proof).
+  `unread_only` remains a documented no-op.
+
+Membership is the only gate (bd-kbl1c join-before-post): `channel read`
+works without membership, `post` does not -- and a non-member post FAILS
+LOUDLY (nonzero exit, no event id). STEP 0, before any doorbell work:
+join your lane channels -- `toron channel join <channel> --project
+<project> --as {mail_identity}` (idempotent). A bounce names this exact
+remedy.
 
 File conflict ladder: soft conflict (want a held path) -> `toron reserve
 request-release --target <holder-pin> --ask release|defer:<secs>` (plane P)
@@ -32,15 +41,25 @@ control. A grant is a lease transfer, never commit-on-behalf.
 
 On `[doorbell]` (the dispatcher injects this line; do not start a watch
 timer):
+  0. JOIN first (above) if you have not already -- posting without
+     membership is a refused write.
   1. FIRST, show you heard (120s or you are unanswered): `toron presence
      publish --as {mail_identity} --state working` OR one kind-9 line.
   2. Pull: `toron channel read` / `toron job list` / `toron mail inbox
-     --since <last_seen>` (plane P only). Use `since_ts` high-water.
+     --since last` (plane P only).
   3. For each URGENT or doorbell-named item:
        - reply/ack if plane P requires it
        - do the work, or escalate via kind 9 / captain mail
   4. acknowledge_message on each ack_required message you have acted on
-  5. update <last_seen> to the latest timestamp you processed
+
+Verify-after-send (bd-nk2dk): after any load-bearing post, confirm
+delivery ONCE -- `toron channel post ... --wait-ack 5` reads back the
+post's own event id and exits nonzero if it never lands. One read-back,
+never a poll loop. Delivery is claimed only after it is observed.
+
+Delivery visibility (bd-qf833): "did X report?" is ONE query --
+`toron channel read <channel> --project <p> --as {mail_identity}
+--author <pin>`: delivered_posts == 0 means X has NOT reported.
 
 Safety-net (not the driver): if no doorbell arrives for
 {poll_interval_minutes} minutes of idle AND you are waiting on a peer,
@@ -51,8 +70,10 @@ Continue your primary task. Exit when the primary task is done OR your
 context budget is reached.
 
 ON COMPLETION (every crew, not just bead crews): mail the
-orchestrator/captain on the TASK thread (thread_id=<task-id>) with
-subject '[<task-id>] done' and a BODY carrying the report fields:
+orchestrator/captain on the TASK thread -- the TASK-ID line at the top of
+your dispatch IS the thread anchor (bd-task-id-threading-xl2k):
+`flywheel mail send --thread-id <task-id> --subject '[<task-id>] done'`
+with a BODY carrying the report fields:
 status, commit sha, verdict kind, what you ran + the result tail,
 deviations, PRINCIPLES cited. Bead-closed + commit are the durable
 signal; this mail is courtesy. Same for 'starting' when you claim a task.
@@ -74,8 +95,14 @@ prompt existing peers, never create them.
   (default 3). Enforced by the dispatcher, not by hoping the model polls.
 - **Safety**: a peer-aware agent may `herdr agent prompt` an existing peer
   but must NEVER `pane split`/`agent start`/`close`.
-- **`since_ts` incremental fetch** keeps the plane-P pull cheap.
+- **`--since last` incremental fetch** keeps the plane-P pull cheap and
+  crash-proof (the cursor lives server-side, not in model memory).
   `unread_only` is a no-op and is never taught as a filter.
+- **File-first deliverables** (bd-tdjaz): any finding over ~20 lines is
+  written to a durable file FIRST; the channel post carries a summary +
+  the file path (prefer toron `attachment_paths`). File-first is also the
+  silent-failure recovery path -- redeliver from the file, never from
+  scrollback.
 - **Plane S is the room, plane P is the whisper.**
 - **`[doorbell]` is the wake.** A 5-minute self-watch loop is not the
   driver.
