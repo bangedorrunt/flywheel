@@ -277,7 +277,7 @@ impl StageLibrary {
             (
                 "wave-verify",
                 "",
-                "Wave verify (ADR-0006 D3): for each close claim confirm ALL of: (1) the receipt exists at the committed HEAD — `flywheel ledger check <bead-id>`; (2) the close reason carries its VERIFY tail (what was actually run + the result tail); (3) PRINCIPLES citations name decisions (`<name> — <decision>`, cargo-cult bare names are rejects). A close missing any of these REOPENS: post `[verify] reopen <id>: <missing>` on the steer channel. Verify against the real artifact, never a self-report.",
+                "Wave verify (ADR-0006 D3): for each close claim confirm ALL of: (1) the receipt exists at the committed HEAD — `flywheel ledger check <bead-id>`; (2) the close reason carries its VERIFY tail (what was actually run + the result tail); (3) PRINCIPLES citations name decisions (`<name> — <decision>`, cargo-cult bare names are rejects). A close missing any of these REOPENS: post `[verify] reopen <id>: <missing>` on the steer channel. Verify against the real artifact, never a self-report. DIRT POLICY: only dirt under source/, tests/, benches/, Cargo.toml, Cargo.lock, and pinned toolchain files blocks a receipt. Tracker state (.beads/), orchestrator bookkeeping (.flywheel/), and editor artifacts are always-allowed dirt — note them and proceed; never stall a receipt on them. Anything else dirty: post-and-stop.",
             ),
         ];
         let mut stages = BTreeMap::new();
