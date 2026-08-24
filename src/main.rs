@@ -27,7 +27,6 @@ mod models;
 mod output;
 mod pane;
 mod phase_chain;
-mod steer_brief;
 mod phase_contracts;
 mod preflight;
 mod principles;
@@ -37,6 +36,7 @@ mod smart_cron;
 mod stages;
 mod standing_orders;
 mod state;
+mod steer_brief;
 mod toron_embed;
 mod verdict;
 mod work;
@@ -1091,14 +1091,10 @@ struct AgentCounts {
 enum DoorbellCmd {
     /// per-workspace liveness: dispatcher up/down, last wake, unanswered
     /// pins. Lazily heals dead dispatchers while reporting.
-    Status {
-        project: String,
-    },
+    Status { project: String },
     /// start/attach dispatchers for every registered workspace that ever
     /// ran one (the crash-recovery entry point).
-    Start {
-        project: String,
-    },
+    Start { project: String },
     /// stop dispatchers (per workspace; `all` for every registered one)
     Stop {
         project: String,
@@ -1108,9 +1104,7 @@ enum DoorbellCmd {
     },
     /// re-inject the peer-aware handler + identity line into EXISTING panes
     /// (covers herdr pane-split additions and post-crash respawns).
-    ReInject {
-        project: String,
-    },
+    ReInject { project: String },
 }
 
 /// Subcommands of `flywheel loop` (bd-fw-stale-loop-processes-gac
@@ -3371,12 +3365,12 @@ fn main() {
                 peer_max_prompts: *peer_max_prompts,
                 settle_secs: *settle_secs,
                 join_channels: join_channels.clone(),
-            profile_name: profile.clone(),
-            profile_count: *count,
-            bare_model: model.clone().unwrap_or_default(),
-            bare_provider: provider.clone().unwrap_or_default(),
-        },
-    ),
+                profile_name: profile.clone(),
+                profile_count: *count,
+                bare_model: model.clone().unwrap_or_default(),
+                bare_provider: provider.clone().unwrap_or_default(),
+            },
+        ),
         Some(Commands::Add {
             project,
             counts,
@@ -3453,9 +3447,7 @@ fn main() {
         Some(Commands::Doorbell { cmd }) => match cmd {
             DoorbellCmd::Status { project } => cmd_doorbell_status(&cfg, project),
             DoorbellCmd::Start { project } => cmd_doorbell_start(&cfg, project),
-            DoorbellCmd::Stop { project, workspace } => {
-                cmd_doorbell_stop(&cfg, project, workspace)
-            }
+            DoorbellCmd::Stop { project, workspace } => cmd_doorbell_stop(&cfg, project, workspace),
             DoorbellCmd::ReInject { project } => cmd_doorbell_re_inject(&cfg, project),
         },
         Some(Commands::Loop { cmd }) => match cmd {
@@ -4166,11 +4158,7 @@ fn spawn_items_from_plan(
 /// the pair), an unregistered id passes through verbatim. The strict check
 /// stays profile-only: the operator named this pair explicitly, so there is
 /// no profile indirection to protect. Empty model -> no flags.
-fn bare_model_launch_args(
-    harness: &str,
-    model: &str,
-    provider: &str,
-) -> Result<Vec<String>> {
+fn bare_model_launch_args(harness: &str, model: &str, provider: &str) -> Result<Vec<String>> {
     if model.is_empty() {
         return Ok(vec![]);
     }
@@ -4180,7 +4168,11 @@ fn bare_model_launch_args(
     } else {
         format!("{provider}/{model}")
     };
-    Ok(headless::model_args(harness, &registry.resolve(&lookup, harness), None))
+    Ok(headless::model_args(
+        harness,
+        &registry.resolve(&lookup, harness),
+        None,
+    ))
 }
 
 pub(crate) fn profile_launch_args(
@@ -4566,21 +4558,26 @@ mod spawn_profile_plan_tests {
         .expect("models.toml");
         // Bare model id: registered -> default-provider route.
         let args = bare_model_launch_args("omp", "glm-5.2", "").expect("bare id");
-        assert_eq!(args, vec!["--model=aaa/glm-5.2"], "registered bare id routes");
+        assert_eq!(
+            args,
+            vec!["--model=aaa/glm-5.2"],
+            "registered bare id routes"
+        );
         // Explicit provider pins the other provider carrying the same id.
         let args = bare_model_launch_args("omp", "glm-5.2", "zzz").expect("pinned");
         assert_eq!(args, vec!["--model=zzz/glm-5.2"], "explicit provider wins");
         // Unregistered pair: LENIENT passthrough (never a strict failure —
         // the strict check is for profile-sourced ids only).
-        let args =
-            bare_model_launch_args("omp", "ghost-model", "").expect("lenient passthrough");
+        let args = bare_model_launch_args("omp", "ghost-model", "").expect("lenient passthrough");
         assert_eq!(args, vec!["--model=ghost-model"]);
         let args = bare_model_launch_args("omp", "ghost-model", "qqq").expect("pair passthrough");
         assert_eq!(args, vec!["--model=qqq/ghost-model"]);
         // Empty model: no flags at all.
-        assert!(bare_model_launch_args("omp", "", "")
-            .expect("empty model")
-            .is_empty());
+        assert!(
+            bare_model_launch_args("omp", "", "")
+                .expect("empty model")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5363,7 +5360,16 @@ mod steer_engine_tests {
         );
         // The non-TTY dispatch output is the pre-briefing golden: the Run
         // command steer builds is untouched by the briefing feature.
-        let cmd = steer_run_cmd("fix the flake", false, None, None, None, false, false, false);
+        let cmd = steer_run_cmd(
+            "fix the flake",
+            false,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+        );
         let WorkflowCmd::Run {
             name,
             inputs,
@@ -5391,9 +5397,8 @@ mod steer_engine_tests {
     #[test]
     fn workflow_briefing_skip_matrix_matches_steer() {
         // helper: workflow briefs iff execute && briefing_enabled
-        let workflow_briefs = |json, yes, crew, is_tty, execute| {
-            execute && briefing_enabled(json, yes, crew, is_tty)
-        };
+        let workflow_briefs =
+            |json, yes, crew, is_tty, execute| execute && briefing_enabled(json, yes, crew, is_tty);
         // Non-TTY never briefs, even with execute.
         for (json, yes, crew) in [
             (false, false, None),
@@ -5412,8 +5417,14 @@ mod steer_engine_tests {
             );
         }
         assert!(workflow_briefs(false, false, None, true, true));
-        assert!(!workflow_briefs(true, false, None, true, true), "--json skips");
-        assert!(!workflow_briefs(false, true, None, true, true), "--yes skips");
+        assert!(
+            !workflow_briefs(true, false, None, true, true),
+            "--json skips"
+        );
+        assert!(
+            !workflow_briefs(false, true, None, true, true),
+            "--yes skips"
+        );
         assert!(
             !workflow_briefs(false, false, Some("build"), true, true),
             "explicit --crew skips"
@@ -5880,8 +5891,7 @@ mod spawn_boot_reliability_tests {
         let status = src.rfind("fn cmd_status(").expect("cmd_status");
         let status_body = &src[status..status + 5000];
         assert!(
-            status_body.contains("doorbell::ensure_running")
-                && status_body.contains("wake_state"),
+            status_body.contains("doorbell::ensure_running") && status_body.contains("wake_state"),
             "status shows last_wake and lazy-heals"
         );
         assert!(
@@ -6868,7 +6878,9 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
     // gate's remedy error still names the exact join command).
     if !opts.join_channels.is_empty() {
         for e in &registry {
-            let Some(pin) = &e.mail_identity else { continue };
+            let Some(pin) = &e.mail_identity else {
+                continue;
+            };
             for ch in &opts.join_channels {
                 let status = Command::new("toron")
                     .args([
@@ -6967,7 +6979,12 @@ fn ensure_doorbell_supervisor() {
         doorbell::supervisor_function_registered(&mut r)?;
         // Idempotent by name: an existing schedule is fine.
         let _ = r
-            .schedule(doorbell::SUPERVISOR_NAME, doorbell::SUPERVISOR_CRON, "heal_tick", ())
+            .schedule(
+                doorbell::SUPERVISOR_NAME,
+                doorbell::SUPERVISOR_CRON,
+                "heal_tick",
+                (),
+            )
             .await;
         // Keep the instance alive (never stopped — worker for life).
         std::mem::forget(r);
@@ -6988,7 +7005,12 @@ fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
         let wake = doorbell::load_wake_state(&doorbell::wake_state_file(&state_dir, &ws));
         let last = wake
             .last_wake_unix
-            .map(|t| format!("last_wake={t} pin={}", wake.last_wake_pin.as_deref().unwrap_or("?")))
+            .map(|t| {
+                format!(
+                    "last_wake={t} pin={}",
+                    wake.last_wake_pin.as_deref().unwrap_or("?")
+                )
+            })
             .unwrap_or_else(|| "last_wake=never".into());
         println!(
             "{project}/{ws}: dispatcher {} {last}{}",
@@ -7061,20 +7083,20 @@ fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> {
         };
         let mut lines = vec![doorbell::identity_prime(&e.name, identity)];
         lines.push(peer_prompt_template(
-            peer_tpl,
-            &e.name,
-            identity,
+            peer_tpl, &e.name, identity,
             // ADR-0005 budget defaults (5/30/3) — same as `spawn`'s.
-            5,
-            30,
-            3,
+            5, 30, 3,
         ));
         for line in lines {
             // ADR-0005 H2: agent.prompt is gated until the pane's first
             // prompt lands — the identity prime IS that neutral opener, so
             // the handler inject behind it goes through.
             c.agent_prompt(&e.pane_id, &line, None).map_err(|err| {
-                anyhow!("re-inject {}: pane {} not promptable ({err}) — is the agent up?", e.name, e.pane_id)
+                anyhow!(
+                    "re-inject {}: pane {} not promptable ({err}) — is the agent up?",
+                    e.name,
+                    e.pane_id
+                )
             })?;
         }
         injected += 1;
@@ -7554,13 +7576,11 @@ fn doorbell_sweep_inbox(
         // pre-supervisor state) → look BACK a bounded window, not `now` —
         // mail that arrived while the dispatcher was dead must still wake
         // (at-least-once; the [doorbell] line + budget make replay safe).
-        let since = since_by_pin
-            .get(pin)
-            .cloned()
-            .unwrap_or_else(|| {
-                (chrono::Utc::now() - chrono::Duration::hours(doorbell::REDELIVERY_LOOKBACK_HOURS as i64))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-            });
+        let since = since_by_pin.get(pin).cloned().unwrap_or_else(|| {
+            (chrono::Utc::now()
+                - chrono::Duration::hours(doorbell::REDELIVERY_LOOKBACK_HOURS as i64))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        });
         let output = Command::new("toron")
             .args([
                 "mail",
@@ -9481,11 +9501,8 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     // and status is also a lazy-heal site — a dead dispatcher restarts now.
     let wake_state =
         doorbell::load_wake_state(&doorbell::wake_state_file(&config::state_dir(), &ws_label));
-    let dispatcher_alive = doorbell::read_pid(&doorbell::pid_file(
-        &config::state_dir(),
-        &ws_label,
-    ))
-    .is_some_and(doorbell::pid_alive);
+    let dispatcher_alive = doorbell::read_pid(&doorbell::pid_file(&config::state_dir(), &ws_label))
+        .is_some_and(doorbell::pid_alive);
     if !dispatcher_alive {
         let _ = doorbell::ensure_running(
             &std::env::current_exe()?,
@@ -9514,7 +9531,11 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
         println!("{report}");
         println!(
             "doorbell: {} last_wake={} pin={}",
-            if dispatcher_alive { "up" } else { "DOWN (healed)" },
+            if dispatcher_alive {
+                "up"
+            } else {
+                "DOWN (healed)"
+            },
             wake_state
                 .last_wake_unix
                 .map(|t| t.to_string())
@@ -11383,7 +11404,7 @@ fn cmd_work(cfg: &Config, cmd: &WorkCmd) -> Result<()> {
 
 fn cmd_work_check(cfg: &Config, project: Option<&str>) -> Result<()> {
     // bd-bead-create-contract-lint-4tdd: creation-time contract check —
-    // the EXACT loop parsers over the ready set (parse_verify_fence +
+    // the EXACT loop parsers over the ready set (typed verify presence +
     // principles_block_reason via not_ready_reason), per-bead report with
     // the corrected snippet. Non-zero exit when any bead is not
     // dispatchable, so planner lanes can gate "beads created" on it.
@@ -11402,13 +11423,13 @@ fn cmd_work_check(cfg: &Config, project: Option<&str>) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    // The loop's exact ready parse (array shape, `parse_verify_fence` on
-    // the description — the flywheel parser, not br's own) — same source
-    // of truth as the __ready leaf the durable loop consumes.
+    // The loop's exact ready parse (array shape, the typed `verify` field
+    // br emits — same source of truth as the __ready leaf the durable loop
+    // consumes).
     let ready = parse_ready_beads_json(&String::from_utf8_lossy(&out.stdout))?;
-    // The check runs the EXACT loop parsers over each bead's raw
-    // description (parse_verify_fence + the PRINCIPLES section check) —
-    // fetch descriptions per bead; the ready set is small.
+    // The check runs the EXACT loop gate over each bead (verify presence +
+    // the principles check) — fetch descriptions per bead; the ready set
+    // is small.
     let mut issues: Vec<crate::durable::BeadContractIssue> = Vec::new();
     for b in &ready {
         let desc = bead_description(&dir, &b.id);
@@ -11585,7 +11606,10 @@ fn select_reservation_identity(
         return Some(a.to_string());
     }
     for key in ["TORON_AGENT", "FLYWHEEL_MAIL_AS", "AGENT_NAME"] {
-        if let Some(v) = env(key).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        if let Some(v) = env(key)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
             return Some(v);
         }
     }
@@ -14126,12 +14150,14 @@ fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
-            // ADR-0019 (bd-w1-verify-fence): the single-line command from the
-            // bead's `## VERIFY` fence; None = missing/malformed -> NOT ready.
+            // ADR-0001 wave 5 (bd-wave5-flywheel-parser-strip-dkpvi): the
+            // typed schema-v18 `verify` field from br; None = missing/empty
+            // -> NOT ready. The description fence is no longer read.
             verify: b
-                .get("description")
+                .get("verify")
                 .and_then(Value::as_str)
-                .and_then(durable::parse_verify_fence),
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             // bd-gnej: wave labels (`wave-N`) for the loop wave-gate.
             labels: b
                 .get("labels")
@@ -14143,18 +14169,14 @@ fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                         .collect()
                 })
                 .unwrap_or_default(),
-            // bd-4spn: priority + `## PRINCIPLES` section feed the dispatch
-            // gate (PRINCIPLES required for P<=2).
+            // bd-4spn: priority + the typed `principles` citations feed the
+            // dispatch gate (PRINCIPLES required for P<=2).
             priority: b
                 .get("priority")
                 .and_then(Value::as_u64)
                 .map(|p| p.min(u8::MAX as u64) as u8)
                 .unwrap_or(3),
-            principles: b
-                .get("description")
-                .and_then(Value::as_str)
-                .map(durable::parse_principles_field)
-                .unwrap_or_default(),
+            principles: durable::principles_typed_field(&b),
         })
         .collect())
 }
@@ -14187,12 +14209,14 @@ fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
-            // ADR-0019 (bd-w1-verify-fence): same fence parse as the ready
-            // path — close-detect / claim-watch consumers read it later.
+            // ADR-0001 wave 5 (bd-wave5-flywheel-parser-strip-dkpvi): same
+            // typed `verify` field as the ready path — close-detect /
+            // claim-watch consumers read it later.
             verify: b
-                .get("description")
+                .get("verify")
                 .and_then(Value::as_str)
-                .and_then(durable::parse_verify_fence),
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             // bd-gnej: wave labels (`wave-N`) for the loop wave-gate.
             labels: b
                 .get("labels")
@@ -14204,18 +14228,14 @@ fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                         .collect()
                 })
                 .unwrap_or_default(),
-            // bd-4spn: priority + `## PRINCIPLES` section (the resume path
-            // reads the same gate fields as the ready path).
+            // bd-4spn: priority + the typed `principles` citations (the
+            // resume path reads the same gate fields as the ready path).
             priority: b
                 .get("priority")
                 .and_then(Value::as_u64)
                 .map(|p| p.min(u8::MAX as u64) as u8)
                 .unwrap_or(3),
-            principles: b
-                .get("description")
-                .and_then(Value::as_str)
-                .map(durable::parse_principles_field)
-                .unwrap_or_default(),
+            principles: durable::principles_typed_field(b),
         })
         .collect())
 }
@@ -14371,7 +14391,8 @@ fn cmd_loop_doctor(cfg: &Config, fix: bool, json: bool) -> Result<()> {
             }
         }
     }
-    report["doorbell"] = json!({ "dead_dispatchers": { "count": dead_doorbells.len(), "entries": dead_doorbells } });
+    report["doorbell"] =
+        json!({ "dead_dispatchers": { "count": dead_doorbells.len(), "entries": dead_doorbells } });
     if json {
         print_json(&report);
         return Ok(());
@@ -14433,7 +14454,9 @@ fn cmd_loop_doctor(cfg: &Config, fix: bool, json: bool) -> Result<()> {
             e["started_at"].as_str().unwrap_or("?")
         );
     }
-    let dead_db = report["doorbell"]["dead_dispatchers"]["count"].as_u64().unwrap_or(0);
+    let dead_db = report["doorbell"]["dead_dispatchers"]["count"]
+        .as_u64()
+        .unwrap_or(0);
     println!(
         "Doorbell dispatchers: {}",
         if dead_db == 0 {
@@ -14552,7 +14575,11 @@ fn cmd_loop(
         if !work {
             bail!("--wave-label requires --work");
         }
-        if label.strip_prefix("wave-").and_then(|n| n.parse::<u32>().ok()).is_none() {
+        if label
+            .strip_prefix("wave-")
+            .and_then(|n| n.parse::<u32>().ok())
+            .is_none()
+        {
             bail!("--wave-label must be `wave-<N>` (got `{label}`)");
         }
     }
@@ -14954,7 +14981,7 @@ fn cmd_loop(
 mod verifier_dispatch_tests {
     use super::*;
 
-    /// Scratch workspace: git + br + one bead with a `## VERIFY` fence.
+    /// Scratch workspace: git + br + one bead with a typed `verify` field.
     fn scratch_vd(dir: &Path, slug: &str, priority: &str) -> String {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
@@ -14989,7 +15016,9 @@ mod verifier_dispatch_tests {
                 "-p",
                 priority,
                 "-d",
-                "work\n\n## VERIFY\n```\ncargo test -p flywheel verifier\n```",
+                "work",
+                "--verify",
+                "cargo test -p flywheel verifier",
             ])
             .current_dir(dir)
             .output()
@@ -15048,9 +15077,7 @@ mod verifier_dispatch_tests {
         let cfg = no_mail_cfg();
         let dir = std::env::temp_dir().join(format!("vd-degrade-{}", std::process::id()));
         let bead_id = scratch_vd(&dir, "vd-deg", "0");
-        write_registry(
-            "[models.\"deepseek/deepseek-v4\"]\n[models.\"deepseek/deepseek-v3\"]\n",
-        );
+        write_registry("[models.\"deepseek/deepseek-v4\"]\n[models.\"deepseek/deepseek-v3\"]\n");
         let out = cmd_internal_verify_dispatch(
             &cfg,
             "vd-test",
@@ -15091,9 +15118,7 @@ mod verifier_dispatch_tests {
         let cfg = no_mail_cfg();
         let dir = std::env::temp_dir().join(format!("vd-dispatch-{}", std::process::id()));
         let bead_id = scratch_vd(&dir, "vd-disp", "0");
-        write_registry(
-            "[models.\"deepseek/deepseek-v4\"]\n[models.\"anthropic/opus-5\"]\n",
-        );
+        write_registry("[models.\"deepseek/deepseek-v4\"]\n[models.\"anthropic/opus-5\"]\n");
         let out = cmd_internal_verify_dispatch(
             &cfg,
             "vd-test",
@@ -15119,9 +15144,7 @@ mod verifier_dispatch_tests {
         let cfg = no_mail_cfg();
         let dir = std::env::temp_dir().join(format!("vd-cheap-{}", std::process::id()));
         let bead_id = scratch_vd(&dir, "vd-cheap", "3");
-        write_registry(
-            "[models.\"deepseek/deepseek-v4\"]\n[models.\"deepseek/deepseek-v3\"]\n",
-        );
+        write_registry("[models.\"deepseek/deepseek-v4\"]\n[models.\"deepseek/deepseek-v3\"]\n");
         let out = cmd_internal_verify_dispatch(
             &cfg,
             "vd-test",
@@ -15168,10 +15191,10 @@ mod loop_run_verify_tests {
             "workflow:\n  transitions:\n    open:\n      - closed\n    closed:\n      - closed\n  gates:\n    open -> closed:\n      require_all:\n        - command-verified\n    closed -> closed:\n      require_all:\n        - command-verified\n",
         )
         .unwrap();
-        let desc = format!("work\n\n## VERIFY\n```\n{verify}\n```");
         let created = std::process::Command::new("br")
             .args([
-                "create", "--title", "lrv", "--slug", slug, "-p", "3", "-d", &desc,
+                "create", "--title", "lrv", "--slug", slug, "-p", "3", "-d", "work", "--verify",
+                verify,
             ])
             .current_dir(dir)
             .output()
@@ -15267,7 +15290,14 @@ mod loop_run_verify_tests {
         // schema-18 fail-closed br requires the bead-carrying commit's sha
         // (bd-adr0006-cosmetic-sweep-q0g0).
         let close = std::process::Command::new("br")
-            .args(["close", &bead_id, "--reason", "worker done", "--commit-sha", &sha])
+            .args([
+                "close",
+                &bead_id,
+                "--reason",
+                "worker done",
+                "--commit-sha",
+                &sha,
+            ])
             .current_dir(&dir)
             .output()
             .unwrap();
@@ -15511,17 +15541,16 @@ mod loop_tests {
         assert_eq!(beads[3].assignee, None, "empty assignee -> None");
     }
 
-    // ---- ADR-0019: VERIFY fence -> ReadyBead.verify -----------------------
+    // ---- ADR-0001 wave 5: typed verify field -> ReadyBead.verify ----------
 
-    /// `br ready --json` rows carry the description; the fence parses into
-    /// `ReadyBead.verify`. Missing/malformed fence -> verify = None (the
-    /// bead is NOT ready — refuse-to-dispatch).
+    /// `br ready --json` rows carry the typed `verify` field; it flows into
+    /// `ReadyBead.verify`. Missing/empty field -> verify = None (the bead
+    /// is NOT ready — refuse-to-dispatch).
     #[test]
-    fn verify_fence_parse_ready_beads_json_populates_verify() {
-        // built via json! so the `## VERIFY` + fence bytes escape cleanly
+    fn typed_verify_parse_ready_beads_json_populates_verify() {
         let raw = serde_json::to_string(&serde_json::json!([
-            {"id":"bd-a","title":"one","description":"## VERIFY\n```\ncargo test -p flywheel verify_fence\n```\n"},
-            {"id":"bd-b","title":"two","description":"no fence here"}
+            {"id":"bd-a","title":"one","verify":"cargo test -p flywheel verify_fence"},
+            {"id":"bd-b","title":"two","verify":""}
         ]))
         .unwrap();
         let beads = parse_ready_beads_json(&raw).unwrap();
@@ -15529,16 +15558,9 @@ mod loop_tests {
         assert_eq!(
             beads[0].verify.as_deref(),
             Some("cargo test -p flywheel verify_fence"),
-            "valid fence -> verify command"
+            "typed field -> verify command"
         );
-        assert_eq!(beads[1].verify, None, "no fence -> not ready");
-        // multi-line fence -> not ready
-        let raw_multi = serde_json::to_string(&serde_json::json!([
-            {"id":"bd-c","title":"three","description":"## VERIFY\n```\na\nb\n```\n"}
-        ]))
-        .unwrap();
-        let beads = parse_ready_beads_json(&raw_multi).unwrap();
-        assert_eq!(beads[0].verify, None, "multi-line fence -> not ready");
+        assert_eq!(beads[1].verify, None, "empty field -> not ready");
     }
 
     /// ADR-0019 acceptance: a bead without a fence must be refused at
@@ -15706,8 +15728,14 @@ mod loop_tests {
 
     // ---- bd-w1-reopen-f6tw: the red-then-green of the program ----
 
-    /// Scratch workspace (git + br + one bead with a VERIFY fence + a commit
-    /// whose message carries the bead id + gate policy).
+    /// Scratch workspace (git + br + one bead with a typed `verify` field +
+    /// a commit whose message carries the bead id + gate policy).
+    /// bd-3566 (beads_rust-wave5-flywheel-parser-strip-dkpvi): the fixture
+    /// sets the TYPED verify field (`br create --verify`) — a description
+    /// fence no longer makes a bead ready under the schema-v18 predicate,
+    /// and after bypass-close + reopen the fence-import never runs, so the
+    /// reopened bead would be missing from `br ready` (the env-dependency
+    /// this test used to trip on).
     fn scratch_workspace(tag: &str) -> (std::path::PathBuf, String) {
         let dir = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -15739,7 +15767,9 @@ mod loop_tests {
                 "-p",
                 "3",
                 "-d",
-                "work\n\n## VERIFY\n```\ncargo test -p flywheel reopen::\n```",
+                "work",
+                "--verify",
+                "cargo test -p flywheel reopen::",
             ])
             .current_dir(&dir)
             .output()
@@ -19223,16 +19253,15 @@ fn cmd_steer(
     // explicit --crew (an agent driver knows its fleet already) — brief the
     // operator before dispatch. Non-TTY output stays byte-identical.
     if !json && yes && crew.is_some() {
-        eprintln!("flywheel: warn: --yes is redundant with an explicit --crew (briefing already skipped)");
+        eprintln!(
+            "flywheel: warn: --yes is redundant with an explicit --crew (briefing already skipped)"
+        );
     }
     let brief = briefing_enabled(json, yes, crew, std::io::stdin().is_terminal());
     if brief {
         let ctx = steer_briefing_context(objective, if direct { "goal-direct" } else { "goal" })?;
-        let outcome = steer_brief::run_briefing(
-            &ctx,
-            &mut std::io::stdin().lock(),
-            &mut std::io::stdout(),
-        )?;
+        let outcome =
+            steer_brief::run_briefing(&ctx, &mut std::io::stdin().lock(), &mut std::io::stdout())?;
         if outcome == steer_brief::BriefingOutcome::Abort {
             bail!("steer: aborted by the operator at the briefing gate");
         }
@@ -19347,11 +19376,7 @@ fn briefing_context_inner(
         .clone();
     let resolve = |sub: &str| all.get(sub).cloned();
     let plan = crew::plan_crew_with(&wf, &resolve);
-    let stage_chain: Vec<String> = wf
-        .steps
-        .iter()
-        .filter_map(|s| s.name.clone())
-        .collect();
+    let stage_chain: Vec<String> = wf.steps.iter().filter_map(|s| s.name.clone()).collect();
 
     let cat_profiles = profile::ProfileCatalog::load().unwrap_or_default();
     let registry = models::ModelRegistry::load_routing().unwrap_or_default();
@@ -19397,7 +19422,10 @@ fn briefing_context_inner(
         .find(|(_name, recipe)| {
             let members = profile::Squad::from_recipe(recipe);
             members.counts.len() == plan_roles.len()
-                && members.counts.keys().all(|m| plan_roles.contains(m.as_str()))
+                && members
+                    .counts
+                    .keys()
+                    .all(|m| plan_roles.contains(m.as_str()))
         })
         .map(|(name, _)| name.clone());
     Ok(steer_brief::BriefingContext {
@@ -19683,9 +19711,13 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // bd-nmzk: interactive captain briefing for `workflow run --execute`
             // (same skip flags as `steer` — shared prompt module so both stay
             // in lockstep). Arms only on an interactive TTY with --execute.
-            if *execute && briefing_enabled(*json, *yes, crew.as_deref(), std::io::stdin().is_terminal()) {
+            if *execute
+                && briefing_enabled(*json, *yes, crew.as_deref(), std::io::stdin().is_terminal())
+            {
                 if !json && *yes && crew.is_some() {
-                    eprintln!("flywheel: warn: --yes is redundant with an explicit --crew (briefing already skipped)");
+                    eprintln!(
+                        "flywheel: warn: --yes is redundant with an explicit --crew (briefing already skipped)"
+                    );
                 }
                 let ctx = workflow_briefing_context(name, inputs.as_deref())?;
                 let outcome = steer_brief::run_briefing(
@@ -19697,7 +19729,9 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     bail!("workflow run: aborted by the operator at the briefing gate");
                 }
             } else if *execute && !json && *yes && crew.is_some() {
-                eprintln!("flywheel: warn: --yes is redundant with an explicit --crew (briefing already skipped)");
+                eprintln!(
+                    "flywheel: warn: --yes is redundant with an explicit --crew (briefing already skipped)"
+                );
             }
             let all = all_workflows()?;
             let wf = resolve_workflow(name, &all)?.clone();
@@ -27212,7 +27246,10 @@ mod send_result_row_tests {
         assert_eq!(landed["status"], "working");
         assert_eq!(landed["reason"], "landed");
         let stalled = confirm_send_json("a", SendVerdict::Stalled);
-        assert_eq!(stalled["landed"], false, "stall IS a definitive non-landing");
+        assert_eq!(
+            stalled["landed"], false,
+            "stall IS a definitive non-landing"
+        );
         assert_eq!(stalled["reason"], "stalled");
         let coded = confirm_send_json("a", SendVerdict::Coded("agent_not_found".into()));
         assert_eq!(coded["landed"], false);
@@ -27242,7 +27279,7 @@ mod send_result_row_tests {
 #[cfg(test)]
 mod reservation_identity_tests {
     use super::*;
-    use toron_core::mailbox::guard::{guard_check_strict, Reservation, SHARED_SAFE_PATHS};
+    use toron_core::mailbox::guard::{Reservation, SHARED_SAFE_PATHS, guard_check_strict};
 
     /// Pure selection: explicit --as wins, then the env ladder in the SAME
     /// order the toron guard attributes commits (TORON_AGENT >
@@ -27293,7 +27330,10 @@ mod reservation_identity_tests {
             Some("MailAs")
         );
         // nothing anywhere -> config default
-        assert_eq!(select_reservation_identity(None, &|_| None).as_deref(), None);
+        assert_eq!(
+            select_reservation_identity(None, &|_| None).as_deref(),
+            None
+        );
     }
 
     /// bd-2mdo RED: an actor token that names a REGISTERED mailbox identity
@@ -27303,9 +27343,7 @@ mod reservation_identity_tests {
     /// crew knows and the one-ladder rule forbids.
     #[test]
     fn actor_resolution_passthrough_for_registered_identity() {
-        let env = |k: &str| -> Option<String> {
-            (k == "AGENT_NAME").then(|| "oc5".to_string())
-        };
+        let env = |k: &str| -> Option<String> { (k == "AGENT_NAME").then(|| "oc5".to_string()) };
         let roster = vec!["e2e-zord".to_string(), "FoggyDesert".to_string()];
         // explicit --as naming a registered identity: verbatim, never hashed.
         assert_eq!(
@@ -27320,16 +27358,18 @@ mod reservation_identity_tests {
             Some(resolve_mail_target_registry("proj", "oc5")).as_deref(),
         );
         // env-derived token that is itself a registered identity: passthrough.
-        let env_pin = |k: &str| -> Option<String> {
-            (k == "AGENT_NAME").then(|| "FoggyDesert".to_string())
-        };
+        let env_pin =
+            |k: &str| -> Option<String> { (k == "AGENT_NAME").then(|| "FoggyDesert".to_string()) };
         assert_eq!(
             resolve_mail_actor_roster("proj", None, &env_pin, &roster).as_deref(),
             Some("FoggyDesert"),
             "registered pin must survive unchanged"
         );
         // nothing selected -> nothing resolved.
-        assert_eq!(resolve_mail_actor_roster("proj", None, &|_| None, &roster), None);
+        assert_eq!(
+            resolve_mail_actor_roster("proj", None, &|_| None, &roster),
+            None
+        );
     }
 
     /// THE failing sequence from tonight, as a self-test: the wrapper binds
@@ -27338,10 +27378,9 @@ mod reservation_identity_tests {
     /// other attribution (the ~6 blocked commits failure mode).
     #[test]
     fn reservation_identity_holder_passes_own_commit_guard() {
-        let holder = select_reservation_identity(
-            None,
-            &|k| (k == "AGENT_NAME").then(|| "IronSummit".to_string()),
-        )
+        let holder = select_reservation_identity(None, &|k| {
+            (k == "AGENT_NAME").then(|| "IronSummit".to_string())
+        })
         .expect("env-bound identity");
         let staged = vec!["src/main.rs".to_string(), "src/stages.rs".to_string()];
         let own = vec![Reservation {
@@ -27349,8 +27388,7 @@ mod reservation_identity_tests {
             pattern: "src/**".to_string(),
             exclusive: true,
         }];
-        let blocks =
-            guard_check_strict(Some(&holder), &staged, &own, SHARED_SAFE_PATHS);
+        let blocks = guard_check_strict(Some(&holder), &staged, &own, SHARED_SAFE_PATHS);
         assert!(
             blocks.is_empty(),
             "own lease must not block own commit: {blocks:?}"
@@ -27384,7 +27422,11 @@ fn resolve_register_name(explicit: Option<String>, from_project: Option<&str>) -
 /// Locate an existing identity key to import: `{data}/{from}/agents/{name}/
 /// key.ncryptsec`. Present = reuse (register_agent adopts it, never mints).
 fn import_source_key(data_dir: &std::path::Path, from_slug: &str, name: &str) -> Option<PathBuf> {
-    let p = data_dir.join(from_slug).join("agents").join(name).join("key.ncryptsec");
+    let p = data_dir
+        .join(from_slug)
+        .join("agents")
+        .join(name)
+        .join("key.ncryptsec");
     p.is_file().then_some(p)
 }
 

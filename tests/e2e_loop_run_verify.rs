@@ -187,11 +187,13 @@ fn scratch_runnable_bead(tag: &str, verify: &str) -> (Scratch, String, String) {
         "workflow:\n  transitions:\n    open:\n      - closed\n    closed:\n      - closed\n  gates:\n    open -> closed:\n      require_all:\n        - command-verified\n    closed -> closed:\n      require_all:\n        - command-verified\n",
     )
     .unwrap();
-    let desc = format!("work\n\n## VERIFY\n```\n{verify}\n```");
+    // bd-3566 (beads_rust-wave5-flywheel-parser-strip-dkpvi): TYPED verify
+    // field — description fences no longer make a bead ready.
     let created = br_json(
         &dir,
         &[
-            "create", "--title", tag, "--slug", tag, "-p", "3", "-d", &desc, "--json",
+            "create", "--title", tag, "--slug", tag, "-p", "3", "-d", "work", "--verify", verify,
+            "--json",
         ],
     );
     let bead_id = created["id"].as_str().expect("bead id").to_string();

@@ -502,22 +502,23 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
 }
 
 /// Rebuild a `BeadUnit` from `br show <id> --json`: priority, title, and the
-/// `## VERIFY` fence parsed from the description (shared parser in durable.rs,
-/// bd-w1-verify-fence). Blast/AC-shape are not in br; the caller supplies them
-/// (the loop derives blast from reservation overlap + AC shape at ready-parse).
+/// typed `verify` field (ADR-0001 wave 5, bd-wave5-flywheel-parser-strip-dkpvi —
+/// the description fence is no longer read). Blast/AC-shape are not in br; the
+/// caller supplies them (the loop derives blast from reservation overlap + AC
+/// shape at ready-parse).
 pub fn bead_from_br_show(cwd: &Path, bead_id: &str) -> anyhow::Result<BeadUnit> {
     #[derive(Deserialize)]
     struct BrShow {
         id: String,
         title: String,
         priority: u8,
-        description: String,
+        verify: Option<String>,
     }
     let stdout = run_br(cwd, &["show", bead_id, "--json"])?;
     let v: serde_json::Value = serde_json::from_str(stdout.trim())?;
     let row: BrShow = serde_json::from_value(v[0].clone())?;
-    let verify = crate::durable::parse_verify_fence(&row.description).ok_or_else(|| {
-        anyhow::anyhow!("bead {bead_id}: missing/malformed ## VERIFY fence — refuse to dispatch")
+    let verify = row.verify.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+        anyhow::anyhow!("bead {bead_id}: missing/empty typed verify field — refuse to dispatch")
     })?;
     Ok(BeadUnit {
         id: row.id,
@@ -614,7 +615,10 @@ pub fn check_close_reason(reason: &str) -> CloseReasonCheck {
             // decides whether registry names were dropped in prose.
             continue;
         }
-        let Some((name, decision)) = clause.split_once('—').or_else(|| clause.split_once('\u{2014}')) else {
+        let Some((name, decision)) = clause
+            .split_once('—')
+            .or_else(|| clause.split_once('\u{2014}'))
+        else {
             continue;
         };
         let name = name.trim();
@@ -1167,7 +1171,9 @@ mod tests {
                 "-p",
                 "3",
                 "-d",
-                "work\n\n## VERIFY\n```\ncargo test -p flywheel verdict::\n```",
+                "work",
+                "--verify",
+                "cargo test -p flywheel verdict::",
             ])
             .current_dir(&dir)
             .output()
@@ -1423,7 +1429,14 @@ mod tests {
         // schema-18 fail-closed br requires the bead-carrying commit's sha.
         let sha = derive_head_sha(&dir, &bead_id).unwrap();
         let cm = StdCommand::new("br")
-            .args(["close", &bead_id, "--reason", "worker says done", "--commit-sha", &sha])
+            .args([
+                "close",
+                &bead_id,
+                "--reason",
+                "worker says done",
+                "--commit-sha",
+                &sha,
+            ])
             .current_dir(&dir)
             .output()
             .expect("br close");
@@ -1541,7 +1554,9 @@ mod tests {
                 "-p",
                 "3",
                 "-d",
-                "work\n\n## VERIFY\n```\ncd x && cargo test -p y z\n```",
+                "work",
+                "--verify",
+                "cd x && cargo test -p y z",
             ])
             .current_dir(&dir)
             .output()
@@ -1693,16 +1708,15 @@ PRINCIPLES: prove-it-works — ran the fixture suite before plumbing";
     /// No VERIFY tail → rejected, naming the missing tail.
     #[test]
     fn verify_close_reason_rejects_missing_verify_tail() {
-        let err = verify_close_reason("PRINCIPLES: prove-it-works — ran it")
-            .expect_err("no VERIFY tail");
+        let err =
+            verify_close_reason("PRINCIPLES: prove-it-works — ran it").expect_err("no VERIFY tail");
         assert!(err.contains("VERIFY"), "{err}");
     }
 
     /// No principles citation → rejected.
     #[test]
     fn verify_close_reason_rejects_missing_citation() {
-        let err =
-            verify_close_reason("VERIFY: cargo test -> ok").expect_err("no citation");
+        let err = verify_close_reason("VERIFY: cargo test -> ok").expect_err("no citation");
         assert!(err.contains("principles"), "{err}");
     }
 

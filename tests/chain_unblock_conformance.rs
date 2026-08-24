@@ -73,9 +73,33 @@ fn closing_blocker_unblocks_dependent() {
     std::fs::create_dir_all(&dir).unwrap();
     br_ok(&dir, &["init", "--json"]);
 
-    // b1 is the blocker; b2 depends on b1.
-    let b1 = br_stdout(&dir, &["create", "blocker task", "--json"]);
-    let b2 = br_stdout(&dir, &["create", "dependent task", "--json"]);
+    // b1 is the blocker; b2 depends on b1. Both carry a TYPED verify field —
+    // schema-18 br's ready predicate refuses verify-less beads (bd-3566,
+    // beads_rust-wave5-flywheel-parser-strip-dkpvi).
+    let b1 = br_stdout(
+        &dir,
+        &[
+            "create",
+            "blocker task",
+            "-p",
+            "3",
+            "--verify",
+            "test -f README.md",
+            "--json",
+        ],
+    );
+    let b2 = br_stdout(
+        &dir,
+        &[
+            "create",
+            "dependent task",
+            "-p",
+            "3",
+            "--verify",
+            "test -f README.md",
+            "--json",
+        ],
+    );
     let id1 = b1["id"].as_str().expect("b1 id").to_string();
     let id2 = b2["id"].as_str().expect("b2 id").to_string();
     br_ok(&dir, &["dep", "add", &id2, &id1]);

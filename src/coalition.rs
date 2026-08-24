@@ -1276,8 +1276,8 @@ impl CoalitionStore {
         let tags = toron_core::bus::scoping::with_project_scoping(
             toron_kind(kind),
             vec![
-                toron_core::nostr_sdk::nostr::Tag::parse(["h", channel_id]).expect("h"),
-                toron_core::nostr_sdk::nostr::Tag::parse(["name", channel_id]).expect("name"),
+                toron_core::nostr::Tag::parse(["h", channel_id]).expect("h"),
+                toron_core::nostr::Tag::parse(["name", channel_id]).expect("name"),
             ],
             Some(&self.project),
         );
@@ -1286,7 +1286,7 @@ impl CoalitionStore {
             toron_kind(kind),
             content,
             tags,
-            toron_core::nostr_sdk::nostr::Timestamp::now(),
+            toron_core::nostr::Timestamp::now(),
         )?;
         runtime()?
             .block_on(self.bus.publish(event))
@@ -1297,8 +1297,8 @@ impl CoalitionStore {
     /// Drain the bus replay for `filter` (history only, stops at EOSE).
     async fn replay(
         &self,
-        filter: toron_core::nostr_sdk::nostr::Filter,
-    ) -> Result<Vec<toron_core::nostr_sdk::nostr::Event>> {
+        filter: toron_core::nostr::Filter,
+    ) -> Result<Vec<toron_core::nostr::Event>> {
         let mut sub = self.bus.subscribe(filter).await?;
         let mut events = Vec::new();
         while let Some(toron_core::bus::subscription::SubscriptionEvent::Event(e)) =
@@ -1422,7 +1422,7 @@ fn resolve_goal_workflow(goal: &str) -> Result<toron_workflow::schema::Workflow>
 }
 
 /// The `h` tag of a NIP-29 event (the channel id).
-fn channel_tag(event: &toron_core::nostr_sdk::nostr::Event) -> Option<String> {
+fn channel_tag(event: &toron_core::nostr::Event) -> Option<String> {
     event
         .tags
         .iter()
@@ -1512,7 +1512,7 @@ mod tests {
 
     #[test]
     fn test_channel_tag_extraction() {
-        use toron_core::nostr_sdk::nostr::{Keys, Tag, Timestamp};
+        use toron_core::nostr::{Keys, Tag, Timestamp};
         let keys = Keys::generate();
         let ev = build_event(
             &keys,
