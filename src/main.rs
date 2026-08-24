@@ -901,6 +901,15 @@ enum Commands {
     /// 3.4/3.5, bd-w1-reserve-serialize-2mam) — serialize-on-overlap data
     #[command(name = "__reservation-board", hide = true)]
     __ReservationBoard { project: String },
+    /// internal: stamp a dispatched bead's pin with the agent's mail identity
+    /// (ADR-0001 Wave 3, beads_rust-wave3-pin-reservation-jxsyt) — best-effort,
+    /// exit 0 even when br fails (the dispatch must never be blocked)
+    #[command(name = "__pin-stamp", hide = true)]
+    __PinStamp {
+        project: String,
+        bead_id: String,
+        pin: String,
+    },
     /// internal: diagnose unresponsive agent (tail + health mail)
     #[command(name = "__diagnose", hide = true)]
     __Diagnose {
@@ -3770,6 +3779,11 @@ fn main() {
         Some(Commands::__ReservationBoard { project }) => {
             cmd_internal_reservation_board(&cfg, project)
         }
+        Some(Commands::__PinStamp {
+            project,
+            bead_id,
+            pin,
+        }) => cmd_internal_pin_stamp(&cfg, project, bead_id, pin),
         Some(Commands::__Diagnose {
             project,
             name,
@@ -14844,6 +14858,19 @@ fn cmd_loop(
         let mut any_work = false;
         for action in &actions {
             match action {
+                // ADR-0001 Wave 3: stamp pin before dispatch — same leaf as
+                // the durable loop, best-effort, never blocks the send.
+                durable::LoopAction::PinStamp { bead_id, pin } => {
+                    let exe = std::env::current_exe()?;
+                    let out = std::process::Command::new(exe)
+                        .args(["__pin-stamp", project, bead_id, pin])
+                        .output();
+                    if let Ok(o) = out
+                        && !o.status.success()
+                    {
+                        eprintln!("flywheel: __pin-stamp for {bead_id} failed");
+                    }
+                }
                 durable::LoopAction::Send { name, text }
                 | durable::LoopAction::DispatchImmediate { name, text } => {
                     // bd-gsvn.1: the sync loop routes through the same
@@ -24458,6 +24485,37 @@ fn cmd_internal_reservation_board(cfg: &Config, project: &str) -> Result<()> {
         }
     };
     print_json(&v);
+    Ok(())
+}
+
+/// ADR-0001 Wave 3 / Layer 3 (beads_rust-wave3-pin-reservation-jxsyt):
+/// stamp a dispatched bead's `pin` field with the receiving agent's mail
+/// identity. Flywheel fills pin at dispatch time — the tracker stays the
+/// ledger, toron stays the grantor. ALWAYS exits 0: a failed stamp is logged
+/// and dropped; blocking a dispatch over ownership metadata would be worse
+/// than an unstamped pin.
+fn cmd_internal_pin_stamp(cfg: &Config, project: &str, bead_id: &str, pin: &str) -> Result<()> {
+    let dir = project_dir(cfg, project);
+    let out = std::process::Command::new("br")
+        .args(durable::pin_stamp_argv(bead_id, pin))
+        .current_dir(&dir)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            print_json(&json!({ "ok": true, "bead_id": bead_id, "pin": pin }));
+        }
+        Ok(o) => {
+            eprintln!(
+                "flywheel: pin stamp failed for {bead_id}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            print_json(&json!({ "ok": false, "bead_id": bead_id, "pin": pin }));
+        }
+        Err(e) => {
+            eprintln!("flywheel: pin stamp failed for {bead_id}: {e}");
+            print_json(&json!({ "ok": false, "bead_id": bead_id, "pin": pin }));
+        }
+    }
     Ok(())
 }
 
