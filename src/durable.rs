@@ -1725,8 +1725,8 @@ impl GuardSignalKind {
 pub(crate) fn classify_guard_signal(subject: &str, body: &str) -> Option<GuardSignalKind> {
     let s = subject.to_lowercase();
     let b = body.to_lowercase();
-    // Done: "[<bead>] done" close reports.
-    if s.contains("] done") {
+    // Done: "[<bead>] done" close reports — anchored (see subject_done).
+    if subject_done(&s) {
         return Some(GuardSignalKind::Done);
     }
     let standdown =
@@ -1755,6 +1755,16 @@ pub(crate) fn classify_guard_signal(subject: &str, body: &str) -> Option<GuardSi
         return Some(GuardSignalKind::Claim);
     }
     None
+}
+
+/// bd-dispatch-dedupe-2zlz done anchoring: `done` is the close-report verb
+/// only when the subject ENDS with `] done`. The bare `"] done"` substring
+/// false-classified `[bd-123] done investigating` (a participle, not a close
+/// report) as done and held dispatch on probe/analysis subjects. A `Re:`/
+/// `Fwd:` prefix still matches because the anchor is at the end, not the
+/// start.
+fn subject_done(s: &str) -> bool {
+    s.trim_end().ends_with("] done")
 }
 
 /// Everything the guard weighs, collected by the `__dispatch-guard` scan.
@@ -6702,10 +6712,67 @@ mod dispatch_guard_tests {
             Some(Done)
         );
         assert_eq!(
+            classify_guard_signal("[bd-123] done investigating", "still reproing"),
+            None,
+            "participle 'done' is not a close report"
+        );
+        assert_eq!(
+            classify_guard_signal("Re: [bd-x] done", "closed"),
+            Some(Done),
+            "a reply prefix does not break the anchored done"
+        );
+        assert_eq!(
+            classify_guard_signal("[bd-x] done ", "closed"),
+            Some(Done),
+            "trailing whitespace does not break the anchored done"
+        );
+        assert_eq!(
             classify_guard_signal("re: bd-y question", "is claim-watch armed for this bead?"),
             None,
             "claim-watch mentions are not claims"
         );
+        assert_eq!(
+            classify_guard_signal("[BD-X] DONE", "closed"),
+            Some(Done),
+            "the anchored done is case-insensitive (classify lowercases first)"
+        );
+    }
+
+    /// bd-dispatch-dedupe-2zlz: `done` is the close-report verb ONLY as the
+    /// terminal `] done`. A subject ending in another word — a participle
+    /// ("done reviewing"), an adverb ("well done"), punctuation — is not a
+    /// close report and must not hold dispatch. Locks the anchor in so a
+    /// future loosening back to a bare `contains("] done")` fails red.
+    #[test]
+    fn subject_done_anchors_the_terminal_verb() {
+        // canonical + tolerated shapes (must match)
+        assert!(subject_done("[bd-x] done"), "canonical close report");
+        assert!(subject_done("[bd-x] done "), "trailing whitespace tolerated");
+        assert!(subject_done("re: [bd-x] done"), "reply prefix tolerated");
+        assert!(subject_done("fwd: [bd-x] done"), "forward prefix tolerated");
+
+        // participle / adverb subjects (must NOT match — the false-Done bug)
+        assert!(!subject_done("done reviewing"), "participle");
+        assert!(!subject_done("well done"), "adverb + participle");
+        assert!(!subject_done("all done"), "not a close-report subject");
+        assert!(
+            !subject_done("[bd-123] done investigating"),
+            "participle after done"
+        );
+        assert!(
+            !subject_done("[bd-123] done with the repro"),
+            "participle phrase"
+        );
+        assert!(
+            !subject_done("I have done the work"),
+            "done mid-subject, not terminal"
+        );
+
+        // strict anchor: a trailing period breaks the match. The canonical
+        // emitters produce exactly `[{id}] done`; the guard is a dedupe hold,
+        // not a parser — a missed hold is low-harm (br close is the primary
+        // signal), a false hold is not.
+        assert!(!subject_done("[bd-x] done."), "punctuation after done");
     }
 
     #[test]
