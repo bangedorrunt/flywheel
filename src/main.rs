@@ -7162,53 +7162,108 @@ fn cmd_internal_doorbell(
         None => doorbell::WatcherGen::capture(&exe_path, doorbell_now_unix())
             .filter(|record| doorbell::write_gen(&gen_path, record).is_ok()),
     };
-    let mut watch = match Command::new("toron")
-        .args([
-            "watch",
-            "--project",
-            project,
-            "--kinds",
-            "9,43001,30031",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("flywheel doorbell: toron watch failed ({e}); idle until pid file drops");
-            loop {
-                std::thread::sleep(Duration::from_secs(30));
-                if !path.exists() {
-                    break;
-                }
-            }
-            return Ok(());
-        }
-    };
-    let stdout = watch.stdout.take().context("doorbell watch stdout")?;
-
     enum Bell {
         Watch(String),
         Status { pane_id: String, to: String },
         Died,
     }
     let (tx, rx) = std::sync::mpsc::channel::<Bell>();
-    let tx_watch = tx.clone();
-    std::thread::spawn(move || {
-        use std::io::BufRead;
-        for line in std::io::BufReader::new(stdout).lines() {
-            match line {
-                Ok(l) => {
-                    if tx_watch.send(Bell::Watch(l)).is_err() {
+    let mut watch_child: Option<std::process::Child> = None;
+    // Try in-process bus watch first (zero fork, gap 13) — fallback to CLI
+    let in_process_ok = (|| -> Option<()> {
+        let _mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
+            .ok()
+            .flatten()?;
+        let bus = crate::mail_shim::block_on(async {
+            Ok::<std::sync::Arc<dyn toron_core::bus::Bus>, anyhow::Error>(
+                crate::mail_shim::mailbox().bus().clone(),
+            )
+        })
+        .ok()?;
+        let filter = {
+            use toron_core::bus::Filter;
+            use toron_core::nostr::kinds::toron_kind;
+            Filter::new()
+                .kinds([toron_kind(9), toron_kind(43001), toron_kind(30031)])
+                .hashtag(project)
+        };
+        let mut sub = crate::mail_shim::block_on(bus.subscribe_trusted(filter)).ok()?;
+        let tx_in = tx.clone();
+        std::thread::spawn(move || {
+            loop {
+                let ev_opt = crate::mail_shim::block_on(sub.next());
+                match ev_opt {
+                    Some(toron_core::bus::SubscriptionEvent::Event(e)) => {
+                        let tags: Vec<Vec<String>> = e.tags.iter().map(|t| t.clone().to_vec()).collect();
+                        let v = serde_json::json!({
+                            "kind": e.kind.as_u16(),
+                            "id": e.id.to_hex(),
+                            "pubkey": e.pubkey.to_hex(),
+                            "content": e.content,
+                            "tags": tags,
+                            "created_at": e.created_at.as_secs(),
+                        });
+                        if let Ok(line) = serde_json::to_string(&v)
+                            && tx_in.send(Bell::Watch(line)).is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Some(toron_core::bus::SubscriptionEvent::Eose) => continue,
+                    Some(toron_core::bus::SubscriptionEvent::Closed(_)) | None => {
+                        let _ = tx_in.send(Bell::Died);
                         break;
                     }
                 }
-                Err(_) => break,
             }
-        }
-        let _ = tx_watch.send(Bell::Died);
-    });
+        });
+        Some(())
+    })();
+    if in_process_ok.is_none() {
+        let mut child = match Command::new("toron")
+            .args([
+                "watch",
+                "--project",
+                project,
+                "--kinds",
+                "9,43001,30031",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("flywheel doorbell: toron watch failed ({e}); idle until pid file drops");
+                loop {
+                    std::thread::sleep(Duration::from_secs(30));
+                    if !path.exists() {
+                        break;
+                    }
+                }
+                return Ok(());
+            }
+        };
+        let stdout = child.stdout.take().context("doorbell watch stdout")?;
+        let tx_watch = tx.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout).lines() {
+                match line {
+                    Ok(l) => {
+                        if tx_watch.send(Bell::Watch(l)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = tx_watch.send(Bell::Died);
+        });
+        watch_child = Some(child);
+    } else {
+        eprintln!("flywheel doorbell: using in-process watch for {}", project);
+    }
 
     let mut herdr = Client::connect(Some(&cfg.socket_path())).ok();
     let mut status_by_pin: BTreeMap<String, String> = BTreeMap::new();
@@ -7304,9 +7359,37 @@ fn cmd_internal_doorbell(
                 for pin in &pins {
                     index.insert_pin(pin.clone(), None);
                 }
-                let injects =
+                let raw_injects =
                     doorbell::apply_watch_line(&line, &index, &status_by_pin, &mut queues);
-                let injects = doorbell::take_allowed(injects, &mut budgets, doorbell_now_unix());
+                let budget_before = raw_injects.len();
+                let injects = doorbell::take_allowed(raw_injects, &mut budgets, doorbell_now_unix());
+                if budget_before != injects.len() {
+                    doorbell::audit_append(
+                        &config::state_dir(),
+                        workspace,
+                        serde_json::json!({
+                            "ts": chrono::Utc::now().to_rfc3339(),
+                            "workspace": workspace,
+                            "kind": "budget_drop",
+                            "event_id": doorbell::watch_id(&line).unwrap_or_default(),
+                            "dropped": budget_before - injects.len(),
+                        }),
+                    );
+                }
+                // Audit every watch ring
+                doorbell::audit_append(
+                    &config::state_dir(),
+                    workspace,
+                    serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                        "workspace": workspace,
+                        "kind": "watch",
+                        "event_id": doorbell::watch_id(&line).unwrap_or_default(),
+                        "created_at": doorbell::watch_created_at(&line),
+                        "targets": doorbell::watch_targets(&line, &index),
+                        "injected": injects.iter().map(|(p,_)| p).collect::<Vec<_>>(),
+                    }),
+                );
                 if let Some(pk) = doorbell::watch_pubkey(&line) {
                     hear.note_heard_pubkey(&pk);
                     if let Some(pin) = index.resolve(&pk) {
@@ -7378,7 +7461,7 @@ fn cmd_internal_doorbell(
                     {
                         Ok(mut child) => {
                             if let Some(stdout) = child.stdout.take() {
-                                watch = child;
+                                watch_child = Some(child);
                                 let tx_w = tx.clone();
                                 std::thread::spawn(move || {
                                     use std::io::BufRead;
@@ -7395,6 +7478,15 @@ fn cmd_internal_doorbell(
                                     let _ = tx_w.send(Bell::Died);
                                 });
                                 eprintln!("flywheel doorbell: watch restarted");
+                                doorbell::audit_append(
+                                    &config::state_dir(),
+                                    workspace,
+                                    serde_json::json!({
+                                        "ts": chrono::Utc::now().to_rfc3339(),
+                                        "workspace": workspace,
+                                        "kind": "watch_restart",
+                                    }),
+                                );
                                 restarted = true;
                                 break;
                             }
@@ -7426,6 +7518,7 @@ fn cmd_internal_doorbell(
                     break;
                 }
                 doorbell_sweep_inbox(
+                    cfg,
                     project,
                     &status_by_pin,
                     &mut queues,
@@ -7504,7 +7597,9 @@ fn cmd_internal_doorbell(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    let _ = watch.kill();
+    if let Some(mut c) = watch_child {
+        let _ = c.kill();
+    }
     Ok(())
 }
 
@@ -7581,6 +7676,7 @@ fn doorbell_prompt(
     registry: &[state::SpawnEntry],
     injects: &[(String, String)],
     generation: Option<&doorbell::WatcherGen>,
+    workspace: &str,
 ) -> Vec<String> {
     let Some(client) = herdr else {
         return Vec::new();
@@ -7599,7 +7695,20 @@ fn doorbell_prompt(
         let msg = generation.map_or(msg.clone(), |r| doorbell::stamp_line(msg, r));
         match client.agent_prompt(&entry.name, &msg, None) {
             Ok(_) => ok.push(pin.clone()),
-            Err(e) => eprintln!("flywheel doorbell: prompt {} failed: {e:#}", entry.name),
+            Err(e) => {
+                eprintln!("flywheel doorbell: prompt {} failed: {e:#}", entry.name);
+                doorbell::audit_append(
+                    &config::state_dir(),
+                    workspace,
+                    serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                        "workspace": workspace,
+                        "kind": "prompt_failure",
+                        "pin": pin,
+                        "error": e.to_string(),
+                    }),
+                );
+            }
         }
     }
     ok
@@ -7615,7 +7724,7 @@ fn doorbell_prompt_and_hear(
     generation: Option<&doorbell::WatcherGen>,
 ) {
     let now = doorbell_now_unix();
-    for pin in doorbell_prompt(herdr, registry, injects, generation) {
+    for pin in doorbell_prompt(herdr, registry, injects, generation, workspace) {
         hear.note_inject(&pin, index.npub(&pin), now);
     }
     doorbell_persist_hear(workspace, hear);
@@ -7690,8 +7799,11 @@ fn doorbell_refresh_pins(project: &str, pane_to_pin: &mut BTreeMap<String, Strin
 }
 
 /// Plane P: one `toron mail inbox --since` per pin, batched on the 1s tick.
+/// Gap 13: prefers in-process `Mailbox::fetch_inbox` (zero fork) and falls back
+/// to `toron mail inbox` CLI only when the in-process mailbox is unavailable.
 #[allow(clippy::too_many_arguments)]
 fn doorbell_sweep_inbox(
+    cfg: &Config,
     project: &str,
     status_by_pin: &BTreeMap<String, String>,
     queues: &mut BTreeMap<String, doorbell::DoorbellQueue>,
@@ -7719,6 +7831,52 @@ fn doorbell_sweep_inbox(
                 - chrono::Duration::hours(doorbell::REDELIVERY_LOOKBACK_HOURS as i64))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         });
+        // Prefer in-process mailbox (zero fork) — fallback to CLI only if unavailable
+        let in_process_ok = (|| -> Option<()> {
+            let mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
+                .ok()
+                .flatten()?;
+            let filter = crate::mail_shim::MailInboxFilter {
+                since_ts: Some(since.clone()),
+                limit: 50,
+                include_bodies: true,
+                ..Default::default()
+            };
+            let v = mail.inbox_filtered(project, pin, &filter).ok()?;
+            let arr = v.as_array()?;
+            // Directly classify each returned row (no JSON string round-trip)
+            let status = status_by_pin.get(pin).map(String::as_str).unwrap_or("idle");
+            let mut local = Vec::new();
+            for item in arr {
+                if let Some((class, hint)) = doorbell::parse_inbox_item(item) {
+                    let msg = doorbell::doorbell_line(class, &hint);
+                    if doorbell::should_inject(status) {
+                        local.push((pin.to_string(), msg));
+                    } else {
+                        queues.entry(pin.to_string()).or_default().push(class, msg);
+                    }
+                }
+            }
+            injects.extend(local);
+            // High-water from the returned rows (max created_ts)
+            if let Some(hw) = arr
+                .iter()
+                .filter_map(|it| it.get("created_ts").and_then(|t| t.as_str()))
+                .max()
+                .map(|s| s.to_string())
+            {
+                since_by_pin.insert(pin.to_string(), hw);
+            } else if arr.is_empty() {
+                // keep high-water unchanged
+            } else {
+                since_by_pin.insert(pin.to_string(), now.clone());
+            }
+            Some(())
+        })();
+        if in_process_ok.is_some() {
+            continue;
+        }
+        // Fallback: CLI spawn (when in-process mailbox unavailable, e.g. tests)
         let output = Command::new("toron")
             .args([
                 "mail",
@@ -7734,9 +7892,31 @@ fn doorbell_sweep_inbox(
             ])
             .output();
         let Ok(output) = output else {
+            doorbell::audit_append(
+                &config::state_dir(),
+                workspace,
+                serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "workspace": workspace,
+                    "kind": "inbox_error",
+                    "pin": pin,
+                    "error": "toron spawn failed",
+                }),
+            );
             continue;
         };
         if !output.status.success() {
+            doorbell::audit_append(
+                &config::state_dir(),
+                workspace,
+                serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "workspace": workspace,
+                    "kind": "inbox_error",
+                    "pin": pin,
+                    "error": String::from_utf8_lossy(&output.stderr).to_string(),
+                }),
+            );
             continue;
         }
         let raw = String::from_utf8_lossy(&output.stdout);
@@ -7750,7 +7930,31 @@ fn doorbell_sweep_inbox(
             since_by_pin.insert(pin.to_string(), now.clone());
         }
     }
+    let took = injects.len();
     let injects = doorbell::take_allowed(injects, budgets, doorbell_now_unix());
+    if took != injects.len() {
+        doorbell::audit_append(
+            &config::state_dir(),
+            workspace,
+            serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339(),
+                "workspace": workspace,
+                "kind": "budget_drop",
+                "scope": "inbox",
+                "dropped": took - injects.len(),
+            }),
+        );
+    }
+    doorbell::audit_append(
+        &config::state_dir(),
+        workspace,
+        serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "workspace": workspace,
+            "kind": "inbox_sweep",
+            "injected": injects.iter().map(|(p,_)| p).collect::<Vec<_>>(),
+        }),
+    );
     doorbell_prompt_and_hear(
         herdr, &registry, &injects, hear, index, workspace, generation,
     );
