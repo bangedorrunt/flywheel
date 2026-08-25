@@ -134,7 +134,10 @@ pub fn run_briefing(
     }
     match &ctx.bare_override {
         Some(bare) => writeln!(out, "  bare override accepted: {bare}")?,
-        None => writeln!(out, "  bare harness+model: available via spawn --model/--provider")?,
+        None => writeln!(
+            out,
+            "  bare harness+model: available via spawn --model/--provider"
+        )?,
     }
 
     // (4) resolved stage-chain preview.

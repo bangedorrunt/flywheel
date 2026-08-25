@@ -1,7 +1,7 @@
 {{TOOL_FRONTMATTER}}
 # Workflow: triage
 
-Run the triage-deep workflow: backlog triage — bv robot-triage, prioritize + assign, spawn the crew.
+Run the triage-deep workflow: backlog triage — br triage --json, prioritize + assign, spawn the crew.
 
 ## This command's focus
 

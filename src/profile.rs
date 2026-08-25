@@ -744,7 +744,10 @@ effort = "max"
         );
         let cat2 = ProfileCatalog::load_from(Some(&path2)).expect("load 2");
         let c2 = cat2.get("coder").expect("coder present 2");
-        assert_eq!(c2.provider, "", "partial override inherits built-in provider");
+        assert_eq!(
+            c2.provider, "",
+            "partial override inherits built-in provider"
+        );
         assert_eq!(c2.effort, "max");
     }
 
@@ -761,7 +764,9 @@ provider = "opencode-go"
 "#,
         );
         let cat = ProfileCatalog::load_from(Some(&path)).expect("load");
-        let r = cat.resolve("coder", None, "npub-operator", &no_project).expect("resolve");
+        let r = cat
+            .resolve("coder", None, "npub-operator", &no_project)
+            .expect("resolve");
         assert_eq!(r.spec.model, "glm-5.2");
         assert_eq!(
             r.spec.provider, "opencode-go",

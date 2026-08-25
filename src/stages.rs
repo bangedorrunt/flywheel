@@ -536,9 +536,7 @@ pub fn parse_params(raw: &[String]) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for pair in raw {
         let Some((k, v)) = pair.split_once('=') else {
-            return Err(anyhow::anyhow!(
-                "--param {pair:?} is not k=v (missing '=')"
-            ));
+            return Err(anyhow::anyhow!("--param {pair:?} is not k=v (missing '=')"));
         };
         if k.is_empty() || v.is_empty() {
             return Err(anyhow::anyhow!("--param {pair:?} needs both k and v"));
@@ -643,10 +641,7 @@ mod tests {
         let required = vec!["bead".to_string(), "exit".to_string()];
         let params = parse_params(&["bead=br-1".to_string()]).expect("parses");
         let err = format!("{}", render_stage(prompt, &required, &params).unwrap_err());
-        assert!(
-            err.contains("exit"),
-            "missing slot named in error: {err}"
-        );
+        assert!(err.contains("exit"), "missing slot named in error: {err}");
         assert!(!err.contains("bead,"), "supplied param not flagged: {err}");
     }
 
@@ -658,9 +653,8 @@ mod tests {
         for (name, _) in lib.list() {
             let stage = lib.get_stage(name).expect("stage exists");
             let empty = BTreeMap::new();
-            let out =
-                render_stage(&stage.prompt.clone(), &stage.params, &empty)
-                    .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            let out = render_stage(&stage.prompt.clone(), &stage.params, &empty)
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"));
             assert_eq!(out, stage.prompt, "{name} zero-param byte-identical");
         }
     }

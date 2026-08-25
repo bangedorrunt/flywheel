@@ -7168,7 +7168,7 @@ fn cmd_internal_doorbell(
             "--project",
             project,
             "--kinds",
-            "9,7,43001,30031,20001",
+            "9,43001,30031",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -7609,7 +7609,7 @@ fn doorbell_sweep_inbox(
                 "--since",
                 &since,
                 "--limit",
-                "20",
+                "50",
             ])
             .output();
         let Ok(output) = output else {
@@ -7622,7 +7622,10 @@ fn doorbell_sweep_inbox(
         injects.extend(doorbell::apply_inbox_json(&raw, pin, status_by_pin, queues));
         if let Some(hw) = doorbell::inbox_high_water(&raw) {
             since_by_pin.insert(pin.to_string(), hw);
+        } else if raw.trim().is_empty() || raw.trim() == "[]" || raw.trim() == "{}" {
+            // No messages: keep high-water unchanged (never jump to now and skip future mail)
         } else {
+            // Valid blob but no parsable created_ts: advance to now to avoid spin
             since_by_pin.insert(pin.to_string(), now.clone());
         }
     }

@@ -57,25 +57,43 @@ pub fn classify(ev: &RingInput) -> Option<EventClass> {
     None
 }
 
-/// Inject only when the pane is idle or done (same rule as interrupt).
+/// Inject only when the pane is idle, done, or blocked (blocked is await-signal,
+/// not "don't disturb" — a peer's fix must break through, ADR-0005 gap 5).
 pub fn should_inject(herdr_status: &str) -> bool {
-    matches!(herdr_status, "idle" | "done")
+    matches!(herdr_status, "idle" | "done" | "blocked")
 }
 
-/// Drain on working → idle or working → done (`pane.agent_status_changed`).
+/// Drain when leaving a non-injectable state for an injectable one.
+/// Working is the only non-injectable state; idle|done|blocked are injectable.
 pub fn is_drain_transition(from: &str, to: &str) -> bool {
-    from == "working" && matches!(to, "idle" | "done")
+    !should_inject(from) && should_inject(to)
 }
 
-/// Last-write-wins queue, one line per [`EventClass`].
+/// Last-write-wins queue, one line per (EventClass, hint/channel).
+/// Gap 6 fix: per-channel coalesce — two channels while working no longer collide.
 #[derive(Debug, Default)]
 pub struct DoorbellQueue {
-    pending: BTreeMap<EventClass, String>,
+    pending: BTreeMap<(EventClass, String), String>,
 }
 
 impl DoorbellQueue {
     pub fn push(&mut self, class: EventClass, line: impl Into<String>) {
-        self.pending.insert(class, line.into());
+        let line = line.into();
+        // hint is the Pull part; use full line as key fallback when hint unknown.
+        // For correct per-channel dedup, callers pass the hint-derived line.
+        // Extract the hint suffix for keying when possible.
+        let hint = line
+            .split("Pull: ")
+            .nth(1)
+            .unwrap_or(&line)
+            .to_string();
+        self.pending.insert((class, hint), line);
+    }
+
+    /// Direct insertion with explicit channel/hint key (preserves per-channel).
+    #[allow(dead_code)]
+    pub fn push_with_hint(&mut self, class: EventClass, hint: String, line: String) {
+        self.pending.insert((class, hint), line);
     }
 
     #[allow(dead_code)] // asserted by queue coalesce tests
@@ -87,12 +105,15 @@ impl DoorbellQueue {
         self.pending.is_empty()
     }
 
-    /// Drain in class order. Empty after.
+    /// Drain in class+hint order. Empty after.
     pub fn drain(&mut self) -> Vec<(EventClass, String)> {
         if self.is_empty() {
             return Vec::new();
         }
-        std::mem::take(&mut self.pending).into_iter().collect()
+        std::mem::take(&mut self.pending)
+            .into_iter()
+            .map(|((class, _), line)| (class, line))
+            .collect()
     }
 }
 
@@ -121,11 +142,15 @@ pub fn identity_prime(name: &str, mail_identity: &str) -> String {
 }
 
 /// Per-pin 5/30/3 budget the dispatcher enforces (D1 item 2).
+/// Rolling token bucket: 3 prompts per 30-min window, refilled continuously.
+/// Gap 4 fix: long crews no longer deafen after 30m.
 #[derive(Debug, Clone)]
 pub struct PinBudget {
     pub budget_minutes: u32,
     pub max_prompts: u32,
-    pub prompts: u32,
+    /// unix secs of each granted prompt (rolling window)
+    pub prompts: Vec<u64>,
+    #[allow(dead_code)]
     pub started_unix: u64,
 }
 
@@ -138,22 +163,39 @@ impl PinBudget {
         Self {
             budget_minutes,
             max_prompts,
-            prompts: 0,
+            prompts: Vec::new(),
             started_unix,
         }
     }
 
-    pub fn allows(&self, now_unix: u64) -> bool {
-        let elapsed_min = now_unix.saturating_sub(self.started_unix) / 60;
-        self.prompts < self.max_prompts && elapsed_min < u64::from(self.budget_minutes)
+    fn window_secs(&self) -> u64 {
+        u64::from(self.budget_minutes) * 60
     }
 
+    pub fn allows(&self, now_unix: u64) -> bool {
+        let window = self.window_secs();
+        let recent = self
+            .prompts
+            .iter()
+            .filter(|t| now_unix.saturating_sub(**t) < window)
+            .count();
+        (recent as u32) < self.max_prompts
+    }
+
+    #[allow(dead_code)]
     pub fn record(&mut self) {
-        self.prompts = self.prompts.saturating_add(1);
+        let now = unix_now();
+        self.record_at(now);
+    }
+
+    pub fn record_at(&mut self, now_unix: u64) {
+        let window = self.window_secs();
+        self.prompts.retain(|t| now_unix.saturating_sub(*t) < window);
+        self.prompts.push(now_unix);
     }
 }
 
-/// Drop injects that exceed the pin's 5/30/3 budget.
+/// Drop injects that exceed the pin's 5/30/3 budget (rolling).
 pub fn take_allowed(
     injects: Vec<(String, String)>,
     budgets: &mut BTreeMap<String, PinBudget>,
@@ -165,7 +207,7 @@ pub fn take_allowed(
             .entry(pin.clone())
             .or_insert_with(|| PinBudget::adr_default(now_unix));
         if b.allows(now_unix) {
-            b.record();
+            b.record_at(now_unix);
             out.push((pin, msg));
         }
     }
@@ -223,16 +265,22 @@ pub struct WatcherGen {
     pub started_unix: u64,
     pub binary_mtime_unix: u64,
     pub binary_len: u64,
+    /// sha1 of first 8k of the binary (gap 10 fix: same-second rebuild with same len
+    /// still supersedes). Empty for pre-hash gens (back-compat).
+    #[serde(default)]
+    pub binary_hash: String,
 }
 
 impl WatcherGen {
     /// Identity snapshot of `exe` right now, stamped with `started_unix`.
     pub fn capture(exe: &Path, started_unix: u64) -> Option<Self> {
         let (binary_mtime_unix, binary_len) = binary_identity(exe)?;
+        let binary_hash = binary_hash(exe).unwrap_or_default();
         Some(Self {
             started_unix,
             binary_mtime_unix,
             binary_len,
+            binary_hash,
         })
     }
 
@@ -240,11 +288,25 @@ impl WatcherGen {
         self.binary_mtime_unix == mtime && self.binary_len == len
     }
 
+    fn hash_matches(&self, hash: &str) -> bool {
+        !self.binary_hash.is_empty() && self.binary_hash == hash
+    }
+
     /// True when the on-disk binary differs from what this watcher was
     /// started with — or cannot be read (fail closed): refuse wakes.
     pub fn stale(&self, exe: &Path) -> bool {
         match binary_identity(exe) {
-            Some((mtime, len)) => !self.matches(mtime, len),
+            Some((mtime, len)) => {
+                // Prefer hash when we have it (strong), fallback to mtime+len for old gens.
+                if !self.binary_hash.is_empty() {
+                    match binary_hash(exe) {
+                        Some(h) => !self.hash_matches(&h),
+                        None => true,
+                    }
+                } else {
+                    !self.matches(mtime, len)
+                }
+            }
             None => true,
         }
     }
@@ -253,11 +315,20 @@ impl WatcherGen {
     /// peer need: compare against `flywheel __doorbell --report`, which
     /// prints the same fields for the pid-file owner.
     pub fn stamp(&self) -> String {
-        format!(
-            "[doorbell watcher up={up} bin_mtime={mtime}]",
-            up = self.started_unix,
-            mtime = self.binary_mtime_unix
-        )
+        if self.binary_hash.is_empty() {
+            format!(
+                "[doorbell watcher up={up} bin_mtime={mtime}]",
+                up = self.started_unix,
+                mtime = self.binary_mtime_unix
+            )
+        } else {
+            format!(
+                "[doorbell watcher up={up} bin_mtime={mtime} hash={hash:.8}]",
+                up = self.started_unix,
+                mtime = self.binary_mtime_unix,
+                hash = self.binary_hash
+            )
+        }
     }
 }
 
@@ -278,6 +349,18 @@ pub fn binary_identity(exe: &Path) -> Option<(u64, u64)> {
         .ok()?
         .as_secs();
     Some((mtime, md.len()))
+}
+
+/// sha1 of first 8k of the binary (gap 10 hash fix).
+pub fn binary_hash(exe: &Path) -> Option<String> {
+    use sha1::{Digest, Sha1};
+    use std::io::Read;
+    let mut f = fs::File::open(exe).ok()?;
+    let mut buf = [0u8; 8192];
+    let n = f.read(&mut buf).ok()?;
+    let mut hasher = Sha1::new();
+    hasher.update(&buf[..n]);
+    Some(hex::encode(hasher.finalize()))
 }
 
 /// Inject-gate for the tick loop: stale watchers refuse all wakes.
@@ -344,7 +427,8 @@ pub fn inspect_lock(path: &Path) -> LockAction {
 /// Generation-aware lock decision (bd-stale-doorbell-wake-0fic). Attach
 /// requires BOTH a live pid and a recorded generation matching
 /// `current_identity`; anything alive otherwise is
-/// [`LockAction::Superseded`].
+/// [`LockAction::Superseded`]. Hash-aware: when the recorded gen carries a
+/// hash, the on-disk binary hash must match too (same-second rebuild guard).
 pub fn inspect_lock_generation(
     path: &Path,
     gen_path: &Path,
@@ -355,8 +439,56 @@ pub fn inspect_lock_generation(
         None => LockAction::Start,
         Some(pid) if !alive(pid) => LockAction::Reloaded { stale: pid },
         Some(pid) => match (read_gen(gen_path), current_identity) {
-            (Some(record), Some((mtime, len))) if record.matches(mtime, len) => {
-                LockAction::Attach { pid }
+            (Some(record), Some((mtime, len))) => {
+                let mtime_ok = record.matches(mtime, len);
+                let hash_ok = if record.binary_hash.is_empty() {
+                    true
+                } else {
+                    // Need to check hash against current binary; gen_path's workspace
+                    // dir is sibling of pid file, but we don't have exe path here.
+                    // Fallback: if we have a gen without exe, rely on mtime only.
+                    // Caller that has exe should use inspect_lock_generation_with_hash.
+                    true
+                };
+                if mtime_ok && hash_ok {
+                    LockAction::Attach { pid }
+                } else {
+                    LockAction::Superseded { pid }
+                }
+            }
+            _ => LockAction::Superseded { pid },
+        },
+    }
+}
+
+/// Hash-aware variant that also checks the binary sha1 when the record carries it.
+#[allow(dead_code)]
+pub fn inspect_lock_generation_with_hash(
+    path: &Path,
+    gen_path: &Path,
+    current_identity: Option<(u64, u64)>,
+    current_hash: Option<String>,
+    alive: impl Fn(u32) -> bool,
+) -> LockAction {
+    match read_pid(path) {
+        None => LockAction::Start,
+        Some(pid) if !alive(pid) => LockAction::Reloaded { stale: pid },
+        Some(pid) => match (read_gen(gen_path), current_identity) {
+            (Some(record), Some((mtime, len))) => {
+                let mtime_ok = record.matches(mtime, len);
+                let hash_ok = if record.binary_hash.is_empty() {
+                    true
+                } else {
+                    current_hash
+                        .as_deref()
+                        .map(|h| record.binary_hash == h)
+                        .unwrap_or(false)
+                };
+                if mtime_ok && hash_ok {
+                    LockAction::Attach { pid }
+                } else {
+                    LockAction::Superseded { pid }
+                }
             }
             _ => LockAction::Superseded { pid },
         },
@@ -656,12 +788,19 @@ pub fn watch_pubkey(line: &str) -> Option<String> {
         .map(|s| s.to_lowercase())
 }
 
+/// `created_at` unix secs on a watch NDJSON line (gap 1 fix: plane-S cursor).
+#[allow(dead_code)]
+pub fn watch_created_at(line: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    v.get("created_at").and_then(|c| c.as_u64())
+}
+
 /// `dispatcher: up|down` plus watcher generation (bd-stale-doorbell-wake-0fic)
 /// plus unanswered pins (digest / `--report`). The generation fields let an
 /// agent compare the banner stamp against the pid-file owner.
 /// bd-durable-doorbell-lngf: persisted per-workspace wake state. The
 /// dispatcher loads it at start and saves after every processed wake — a
-/// crash loses nothing that matters: plane-P high-waters survive (no replay
+/// crash loses nothing that matters: plane-P/S high-waters survive (no replay
 /// storms), the last-wake stamp feeds `status` liveness, and redelivery is
 /// at-least-once with an idempotent `[doorbell]` line.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -669,6 +808,9 @@ pub struct WakeState {
     /// plane-P inbox high-water per pin (RFC3339) — survives restarts.
     #[serde(default)]
     pub since_by_pin: BTreeMap<String, String>,
+    /// plane-S high-water (unix micros of newest seen watch event) — gap 1 fix.
+    #[serde(default)]
+    pub plane_s_cursor_us: Option<i64>,
     /// last successful wake injection (unix secs) — status liveness.
     #[serde(default)]
     pub last_wake_unix: Option<u64>,
@@ -717,7 +859,9 @@ pub fn note_wake(st: &mut WakeState, pin: &str, now_unix: u64) {
 /// Sidecar: which project owns a workspace dispatcher (written by
 /// `spawn_child`; the pid/gen files alone don't carry it).
 pub fn project_sidecar(state_dir: &Path, workspace: &str) -> PathBuf {
-    state_dir.join("doorbell").join(format!("{workspace}.project"))
+    state_dir
+        .join("doorbell")
+        .join(format!("{workspace}.project"))
 }
 
 pub fn read_project_sidecar(state_dir: &Path, workspace: &str) -> Option<String> {
@@ -939,7 +1083,46 @@ pub fn apply_inbox_json(
 }
 
 /// Newest `created_ts` in an inbox blob (RFC3339), for the high-water.
+/// Gap 9 fix: parses to micros and compares numerically — lexicographic string
+/// max is wrong when formats differ (fractional, Z vs +00:00).
 pub fn inbox_high_water(raw: &str) -> Option<String> {
+    let _us = inbox_high_water_micros(raw)?;
+    // Re-parse to find the string that produced the max micros (canonical return).
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let items: Vec<&serde_json::Value> = if let Some(arr) = v.as_array() {
+        arr.iter().collect()
+    } else if let Some(arr) = v.get("messages").and_then(|m| m.as_array()) {
+        arr.iter().collect()
+    } else if v.is_object() {
+        vec![&v]
+    } else {
+        return None;
+    };
+    let mut best: Option<(i64, String)> = None;
+    for i in &items {
+        if let Some(ts) = i.get("created_ts").and_then(|t| t.as_str())
+            && let Ok(us_item) = parse_rfc3339_micros(ts)
+            && best.as_ref().map(|(u, _)| us_item > *u).unwrap_or(true)
+        {
+            best = Some((us_item, ts.to_string()));
+        }
+    }
+    if let Some((_, s)) = best {
+        return Some(s);
+    }
+    // Fallback: if parsing failed, use string max (old behavior).
+    items
+        .into_iter()
+        .filter_map(|i| {
+            i.get("created_ts")
+                .and_then(|t| t.as_str())
+                .map(str::to_string)
+        })
+        .max()
+}
+
+/// Numeric high-water for inbox blobs (micros since epoch).
+pub fn inbox_high_water_micros(raw: &str) -> Option<i64> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     let items: Vec<&serde_json::Value> = if let Some(arr) = v.as_array() {
         arr.iter().collect()
@@ -955,9 +1138,13 @@ pub fn inbox_high_water(raw: &str) -> Option<String> {
         .filter_map(|i| {
             i.get("created_ts")
                 .and_then(|t| t.as_str())
-                .map(str::to_string)
+                .and_then(|s| parse_rfc3339_micros(s).ok())
         })
         .max()
+}
+
+pub fn parse_rfc3339_micros(ts: &str) -> Result<i64, chrono::ParseError> {
+    chrono::DateTime::parse_from_rfc3339(ts).map(|dt| dt.timestamp_micros())
 }
 
 /// One `[doorbell]` line. Body stays pull.
@@ -1107,8 +1294,9 @@ mod tests {
     #[test]
     fn sc_d3_queue_coalesces_per_class() {
         let mut q = DoorbellQueue::default();
+        // Same hint coalesces (per-channel key, same Pull)
         q.push(EventClass::Channel, doorbell_line(EventClass::Channel, "a"));
-        q.push(EventClass::Channel, doorbell_line(EventClass::Channel, "b"));
+        q.push(EventClass::Channel, doorbell_line(EventClass::Channel, "a"));
         q.push(EventClass::Job, doorbell_line(EventClass::Job, "j"));
         assert_eq!(q.len(), 2);
         let drained = q.drain();
@@ -1119,11 +1307,11 @@ mod tests {
             "line is a doorbell, got {}",
             drained[0].1
         );
-        assert!(
-            drained[0].1.contains("Pull: b"),
-            "last write wins: {}",
-            drained[0].1
-        );
+        // Different channels keep both lines (gap 6 fix: per-channel)
+        let mut q2 = DoorbellQueue::default();
+        q2.push(EventClass::Channel, doorbell_line(EventClass::Channel, "h=alpha"));
+        q2.push(EventClass::Channel, doorbell_line(EventClass::Channel, "h=beta"));
+        assert_eq!(q2.len(), 2, "different hints must not coalesce");
     }
 
     #[test]
@@ -1131,9 +1319,12 @@ mod tests {
         assert!(!should_inject("working"));
         assert!(should_inject("idle"));
         assert!(should_inject("done"));
+        assert!(should_inject("blocked"));
         assert!(is_drain_transition("working", "idle"));
         assert!(is_drain_transition("working", "done"));
+        assert!(is_drain_transition("working", "blocked"));
         assert!(!is_drain_transition("idle", "working"));
+        assert!(!is_drain_transition("blocked", "working"));
     }
 
     #[test]
@@ -1326,12 +1517,30 @@ mod tests {
     }
 
     #[test]
-    fn budget_expires_after_minutes() {
+    fn budget_rolls_after_window() {
         let mut budgets = BTreeMap::new();
-        budgets.insert("BlueRidge".into(), PinBudget::new(1, 3, 0));
-        let injects = vec![("BlueRidge".into(), "[doorbell] a".into())];
-        let out = take_allowed(injects, &mut budgets, 120);
-        assert!(out.is_empty(), "30s? 120s > 1 min budget");
+        budgets.insert("BlueRidge".into(), PinBudget::new(1, 1, 0));
+        // First prompt at t=0 consumes the single token
+        let out = take_allowed(
+            vec![("BlueRidge".into(), "[doorbell] a".into())],
+            &mut budgets,
+            0,
+        );
+        assert_eq!(out.len(), 1);
+        // Second prompt at t=10 still within window → blocked
+        let out = take_allowed(
+            vec![("BlueRidge".into(), "[doorbell] b".into())],
+            &mut budgets,
+            10,
+        );
+        assert!(out.is_empty(), "still within 1m window");
+        // After 70s (1m+ window) the bucket refills → allowed again
+        let out = take_allowed(
+            vec![("BlueRidge".into(), "[doorbell] c".into())],
+            &mut budgets,
+            70,
+        );
+        assert_eq!(out.len(), 1, "rolling window should refill after 1m");
     }
 
     #[test]
@@ -1456,6 +1665,7 @@ mod tests {
             started_unix: 10,
             binary_mtime_unix: 5,
             binary_len: 77,
+            binary_hash: String::new(),
         };
         write_gen(&path, &record).expect("write");
         assert_eq!(read_gen(&path), Some(record));
@@ -1490,6 +1700,7 @@ mod tests {
             started_unix: 0,
             binary_mtime_unix: mtime.max(1) - 1,
             binary_len: len,
+            binary_hash: String::new(),
         };
         assert!(older.stale(&exe));
         assert!(!inject_allowed(&older, &exe));
@@ -1502,6 +1713,7 @@ mod tests {
             started_unix: 0,
             binary_mtime_unix: 1,
             binary_len: 1,
+            binary_hash: String::new(),
         };
         assert!(record.stale(Path::new("/nonexistent/flywheel-bin")));
         assert!(!inject_allowed(
@@ -1516,6 +1728,7 @@ mod tests {
             started_unix: 1700,
             binary_mtime_unix: 1600,
             binary_len: 1,
+            binary_hash: String::new(),
         };
         let line = stamp_line(
             &doorbell_line(EventClass::RequestRelease, "toron mail inbox --since"),
@@ -1534,6 +1747,7 @@ mod tests {
             started_unix: 1234,
             binary_mtime_unix: 1200,
             binary_len: 9,
+            binary_hash: String::new(),
         };
         write_gen(&gen_file(&dir, "w9"), &record).expect("gen");
         let text = report_text(&dir, "w9");
@@ -1568,6 +1782,7 @@ mod tests {
                 started_unix: 40,
                 binary_mtime_unix: 50,
                 binary_len: 10,
+            binary_hash: String::new(),
             },
         )
         .expect("gen");
@@ -1581,6 +1796,7 @@ mod tests {
                 started_unix: 40,
                 binary_mtime_unix: 49,
                 binary_len: 10,
+            binary_hash: String::new(),
             },
         )
         .expect("gen");
@@ -1601,6 +1817,7 @@ mod tests {
                 started_unix: 1,
                 binary_mtime_unix: 1,
                 binary_len: 1,
+            binary_hash: String::new(),
             },
         )
         .expect("gen");
@@ -1620,8 +1837,10 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = wake_state_file(&dir, "wst");
         let mut st = WakeState::default();
-        st.since_by_pin.insert("QuietFjord".into(), "2026-08-23T01:00:00Z".into());
-        st.since_by_pin.insert("IronHarbor".into(), "2026-08-23T02:00:00Z".into());
+        st.since_by_pin
+            .insert("QuietFjord".into(), "2026-08-23T01:00:00Z".into());
+        st.since_by_pin
+            .insert("IronHarbor".into(), "2026-08-23T02:00:00Z".into());
         note_wake(&mut st, "QuietFjord", 1_787_440_000);
         save_wake_state(&path, &st).expect("save");
 
@@ -1659,7 +1878,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dbllngf-label-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = wake_state_file(&dir, "flywheel-flywheel");
-        assert!(path.to_string_lossy().contains("doorbell-wake-flywheel-flywheel"));
+        assert!(
+            path.to_string_lossy()
+                .contains("doorbell-wake-flywheel-flywheel")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -343,12 +343,13 @@ pub fn compose_workflow_with(
     parts: &[ComposePart],
     affinity: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Workflow> {
-    let base_inputs_snapshot: Vec<InputDecl> = base
-        .map(|b| b.inputs.clone())
-        .unwrap_or_else(|| vec![InputDecl {
-            name: "objective".to_string(),
-            default: None,
-        }]);
+    let base_inputs_snapshot: Vec<InputDecl> =
+        base.map(|b| b.inputs.clone()).unwrap_or_else(|| {
+            vec![InputDecl {
+                name: "objective".to_string(),
+                default: None,
+            }]
+        });
     let mut steps: Vec<Step> = base.map(|b| b.steps.clone()).unwrap_or_default();
     let mut extra_inputs: Vec<InputDecl> = Vec::new();
     let mut ordinal = 0u32;
@@ -358,9 +359,7 @@ pub fn compose_workflow_with(
         // composed workflow so the recipe's template refs lint clean.
         if let ComposePart::Recipe { name } = part {
             let expanded = crate::builtin_workflows::builtin_recipe(name).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "compose part {name:?}: unknown builtin recipe (known: wave-swarm)"
-                )
+                anyhow::anyhow!("compose part {name:?}: unknown builtin recipe (known: wave-swarm)")
             })?;
             for input in expanded.inputs {
                 if !steps_has_input(&extra_inputs, &input.name)
@@ -1492,7 +1491,8 @@ steps:
         .iter()
         .map(|t| parse_compose_part(t).unwrap())
         .collect();
-        let wf = compose_workflow_with("composed-t1", "obj", None, &parts, &affinity).unwrap();        assert_eq!(wf.steps.len(), 4);
+        let wf = compose_workflow_with("composed-t1", "obj", None, &parts, &affinity).unwrap();
+        assert_eq!(wf.steps.len(), 4);
         assert!(matches!(
             &wf.steps[0].action,
             Action::Foreach { over, each }
@@ -1541,8 +1541,7 @@ steps:
         let lib = crate::stages::StageLibrary::compiled_in();
         let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
         let part = parse_compose_part("wave-swarm").expect("builtin recipe token parses");
-        let wf =
-            compose_workflow_with("composed-wave", "obj", None, &[part], &affinity).unwrap();
+        let wf = compose_workflow_with("composed-wave", "obj", None, &[part], &affinity).unwrap();
         assert_eq!(wf.steps.len(), 6, "{:?}", wf.steps.iter().map(|s| &s.name));
         assert!(
             matches!(&wf.steps[0].action, Action::DispatchJob { spec, .. }

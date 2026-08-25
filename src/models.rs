@@ -170,8 +170,7 @@ impl ModelRegistry {
         // file is a loud error — silently skipping it would quietly drop
         // the user's routing entries (a bypass).
         let user = Self::load_from(Some(&path))?;
-        let user_keys: std::collections::BTreeSet<String> =
-            user.models.keys().cloned().collect();
+        let user_keys: std::collections::BTreeSet<String> = user.models.keys().cloned().collect();
         if !user.models.is_empty() {
             models.extend(user.models);
         }
@@ -575,8 +574,7 @@ mod tests {
     fn added_entry_survives_reload() {
         let _g = with_config_dir();
         let mut reg = ModelRegistry::default();
-        reg.models
-            .insert("anthropic/grok-4".into(), sample_entry());
+        reg.models.insert("anthropic/grok-4".into(), sample_entry());
         reg.save().expect("save");
         let reloaded = ModelRegistry::load().expect("load");
         let ids: Vec<&String> = reloaded.models.keys().collect();
@@ -638,11 +636,7 @@ mod tests {
         let v = reg
             .verifier_for(
                 "deepseek/deepseek-v4",
-                &[
-                    "deepseek/deepseek-v4",
-                    "anthropic/opus-5",
-                    "google/flash-x",
-                ],
+                &["deepseek/deepseek-v4", "anthropic/opus-5", "google/flash-x"],
                 None,
             )
             .expect("different family exists");
@@ -855,11 +849,8 @@ mod tests {
         assert_eq!(reg.resolve("big-pickle", "opencode"), "opencode/big-pickle");
         std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
         // A user entry OVERRIDES the compiled-in default for the same id.
-        fs::write(
-            &path,
-            "[models.\"my-gateway/deepseek-v4-flash\"]\n",
-        )
-        .expect("write user models.toml");
+        fs::write(&path, "[models.\"my-gateway/deepseek-v4-flash\"]\n")
+            .expect("write user models.toml");
         let reg = ModelRegistry::load_routing().expect("reload routing");
         assert_eq!(
             reg.resolve("deepseek-v4-flash", "omp"),
@@ -955,10 +946,8 @@ mod tests {
     fn composite_lookup_and_bare_id_default_provider_fallback() {
         let _g = with_config_dir();
         let mut reg = ModelRegistry::default();
-        reg.models.insert(
-            "alpha/flash".into(),
-            ModelEntry::default(),
-        );
+        reg.models
+            .insert("alpha/flash".into(), ModelEntry::default());
         reg.models.insert(
             "zeta/flash".into(),
             ModelEntry {
@@ -967,7 +956,10 @@ mod tests {
             },
         );
         // Exact composite hit wins over the bare-id fallback.
-        assert_eq!(reg.get("zeta/flash").map(|e| e.caps.join(",")), Some("opencode".into()));
+        assert_eq!(
+            reg.get("zeta/flash").map(|e| e.caps.join(",")),
+            Some("opencode".into())
+        );
         // Bare id resolves to the default (first sorted = alpha).
         assert_eq!(
             reg.resolve("flash", "omp"),
