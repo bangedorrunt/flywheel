@@ -7215,11 +7215,12 @@ fn cmd_internal_doorbell(
     let mut pane_to_pin: BTreeMap<String, String> = BTreeMap::new();
     let mut queues: BTreeMap<String, doorbell::DoorbellQueue> = BTreeMap::new();
     let mut budgets: BTreeMap<String, doorbell::PinBudget> = BTreeMap::new();
-    // bd-durable-doorbell-lngf: plane-P high-waters + the last-wake stamp
+    // bd-durable-doorbell-lngf: plane-P/S high-waters + the last-wake stamp
     // survive a crash — at-least-once redelivery with an idempotent line.
     let wake_state_path = doorbell::wake_state_file(&config::state_dir(), workspace);
-    let mut since_by_pin: BTreeMap<String, String> =
-        doorbell::load_wake_state(&wake_state_path).since_by_pin;
+    let wake_state = doorbell::load_wake_state(&wake_state_path);
+    let mut since_by_pin: BTreeMap<String, String> = wake_state.since_by_pin.clone();
+    let mut plane_s_cursor_us: Option<i64> = wake_state.plane_s_cursor_us;
     let mut hear = doorbell::HearTracker::default();
     hear.seed_unanswered(doorbell::read_unanswered(&doorbell::unanswered_file(
         &config::state_dir(),
@@ -7257,7 +7258,7 @@ fn cmd_internal_doorbell(
             && let Ok(mut stream) = herdr_shim::subscribe(&mut sub_client, &subs)
         {
             subscribed = true;
-            let tx_st = tx;
+            let tx_st = tx.clone();
             std::thread::spawn(move || {
                 while let Ok(Some(ev)) = stream.read_event() {
                     if let herdr_shim::HerdrEventData::PaneAgentStatusChanged(change)
@@ -7282,6 +7283,19 @@ fn cmd_internal_doorbell(
         }
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Bell::Watch(line)) => {
+                // Gap 1: plane-S cursor — skip old history on restart
+                if let Some(created_at) = doorbell::watch_created_at(&line) {
+                    let us = (created_at as i64) * 1_000_000;
+                    if plane_s_cursor_us.is_some_and(|c| us <= c) {
+                        continue;
+                    }
+                    plane_s_cursor_us = Some(plane_s_cursor_us.map(|c| c.max(us)).unwrap_or(us));
+                    // Persist cursor early so a crash right after doesn't re-ring
+                    let path = doorbell::wake_state_file(&config::state_dir(), workspace);
+                    let mut st = doorbell::load_wake_state(&path);
+                    st.plane_s_cursor_us = plane_s_cursor_us;
+                    let _ = doorbell::save_wake_state(&path, &st);
+                }
                 let registry = state::load_spawn_registry(project);
                 let pins: Vec<String> = registry
                     .iter()
@@ -7309,9 +7323,10 @@ fn cmd_internal_doorbell(
                     workspace,
                     generation.as_ref(),
                 );
-                doorbell_persist_wake(
+                doorbell_persist_wake_with_plane_s(
                     workspace,
                     &since_by_pin,
+                    plane_s_cursor_us,
                     injects.first().map(|(pin, _)| pin.as_str()),
                 );
             }
@@ -7342,7 +7357,60 @@ fn cmd_internal_doorbell(
                     injects.first().map(|(pin, _)| pin.as_str()),
                 );
             }
-            Ok(Bell::Died) => break,
+            Ok(Bell::Died) => {
+                // Gap 3 fix: watch self-restart with backoff instead of deaf break
+                eprintln!("flywheel doorbell: watch died, restarting with backoff");
+                let mut backoff = 1u64;
+                let mut restarted = false;
+                for _ in 0..5 {
+                    std::thread::sleep(Duration::from_secs(backoff));
+                    match Command::new("toron")
+                        .args([
+                            "watch",
+                            "--project",
+                            project,
+                            "--kinds",
+                            "9,43001,30031",
+                        ])
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null())
+                        .spawn()
+                    {
+                        Ok(mut child) => {
+                            if let Some(stdout) = child.stdout.take() {
+                                watch = child;
+                                let tx_w = tx.clone();
+                                std::thread::spawn(move || {
+                                    use std::io::BufRead;
+                                    for line in std::io::BufReader::new(stdout).lines() {
+                                        match line {
+                                            Ok(l) => {
+                                                if tx_w.send(Bell::Watch(l)).is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    let _ = tx_w.send(Bell::Died);
+                                });
+                                eprintln!("flywheel doorbell: watch restarted");
+                                restarted = true;
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("flywheel doorbell: watch restart failed ({e})");
+                        }
+                    }
+                    backoff = (backoff * 2).min(16);
+                }
+                if restarted {
+                    continue;
+                } else {
+                    break;
+                }
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // bd-stale-doorbell-wake-0fic: a watcher whose binary
                 // changed underneath it runs pre-fix wake logic. Refuse
@@ -7388,7 +7456,12 @@ fn cmd_internal_doorbell(
                 }
                 let _ = hear.expire(doorbell_now_unix(), doorbell::UNANSWERED_SECS);
                 doorbell_persist_hear(workspace, &hear);
-                doorbell_persist_wake(workspace, &since_by_pin, None);
+                doorbell_persist_wake_with_plane_s(
+                    workspace,
+                    &since_by_pin,
+                    plane_s_cursor_us,
+                    None,
+                );
                 let pins: Vec<String> = state::load_spawn_registry(project)
                     .iter()
                     .filter_map(|e| e.mail_identity.clone())
@@ -7396,6 +7469,36 @@ fn cmd_internal_doorbell(
                 index = doorbell_self_index(cfg, project, &pins);
                 for pin in &pins {
                     hear.remember_npub(pin, index.npub(pin));
+                }
+                // Gap 2: presence hear — presence.jsonl is the real projection for
+                // ephemeral 20001 (bus never stores it). A recent presence (<30s)
+                // means the agent heard, even if no channel post arrived.
+                let presence_path = crate::mail_shim::mailbox_roots().0.join("presence.jsonl");
+                if let Ok(body) = std::fs::read_to_string(&presence_path) {
+                    let now = doorbell_now_unix();
+                    let mut latest_by_pin: std::collections::HashMap<String, u64> =
+                        std::collections::HashMap::new();
+                    for line in body.lines() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+                            && let (Some(name), Some(ts)) = (
+                                v.get("name").and_then(|n| n.as_str()),
+                                v.get("ts").and_then(|t| t.as_u64()),
+                            )
+                        {
+                            latest_by_pin
+                                .entry(name.to_string())
+                                .and_modify(|e| *e = (*e).max(ts))
+                                .or_insert(ts);
+                        }
+                    }
+                    for pin in &pins {
+                        if let Some(ts) = latest_by_pin.get(pin)
+                            && now.saturating_sub(*ts) < 30
+                        {
+                            hear.note_heard_pin(pin);
+                        }
+                    }
+                    doorbell_persist_hear(workspace, &hear);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -7449,6 +7552,24 @@ fn doorbell_persist_wake(
     let path = doorbell::wake_state_file(&config::state_dir(), workspace);
     let mut st = doorbell::load_wake_state(&path);
     st.since_by_pin = since_by_pin.clone();
+    if let Some(pin) = woke_pin {
+        doorbell::note_wake(&mut st, pin, doorbell_now_unix());
+    }
+    let _ = doorbell::save_wake_state(&path, &st);
+}
+
+fn doorbell_persist_wake_with_plane_s(
+    workspace: &str,
+    since_by_pin: &BTreeMap<String, String>,
+    plane_s_cursor_us: Option<i64>,
+    woke_pin: Option<&str>,
+) {
+    let path = doorbell::wake_state_file(&config::state_dir(), workspace);
+    let mut st = doorbell::load_wake_state(&path);
+    st.since_by_pin = since_by_pin.clone();
+    if plane_s_cursor_us.is_some() {
+        st.plane_s_cursor_us = plane_s_cursor_us;
+    }
     if let Some(pin) = woke_pin {
         doorbell::note_wake(&mut st, pin, doorbell_now_unix());
     }
