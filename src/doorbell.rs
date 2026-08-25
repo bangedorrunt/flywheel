@@ -788,6 +788,12 @@ pub fn watch_pubkey(line: &str) -> Option<String> {
         .map(|s| s.to_lowercase())
 }
 
+/// Event id on a watch NDJSON line (gap 17 trust: hint carries proof).
+pub fn watch_id(line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    v.get("id").and_then(|p| p.as_str()).map(|s| s.to_string())
+}
+
 /// `created_at` unix secs on a watch NDJSON line (gap 1 fix: plane-S cursor).
 #[allow(dead_code)]
 pub fn watch_created_at(line: &str) -> Option<u64> {
@@ -1159,6 +1165,22 @@ pub fn doorbell_line(class: EventClass, hint: &str) -> String {
     format!("[doorbell] {kind}. Pull: {hint}")
 }
 
+/// Trust-aware line that carries the triggering event id for proof (gap 17).
+pub fn doorbell_line_with_event(class: EventClass, hint: &str, event_id: &str) -> String {
+    if event_id.is_empty() {
+        doorbell_line(class, hint)
+    } else {
+        let kind = match class {
+            EventClass::Channel => "kind 9",
+            EventClass::Job => "kind 43001",
+            EventClass::RequestRelease => "request-release",
+            EventClass::ReservationConflict => "kind 30031",
+            EventClass::PlanePUrgent => "plane-P urgent",
+        };
+        format!("[doorbell] {kind} event={event_id}. Pull: {hint}")
+    }
+}
+
 /// Parse `--status pin=idle` pairs for the herdr-mock (`__doorbell --once`).
 pub fn parse_status_pair(s: &str) -> Option<(String, String)> {
     let (pin, st) = s.split_once('=')?;
@@ -1170,6 +1192,7 @@ pub fn parse_status_pair(s: &str) -> Option<(String, String)> {
 
 /// Classify one watch NDJSON line. Idle/done pins inject now; working pins
 /// queue (last-write-wins per class). Unmentioned pins stay quiet.
+/// Trust: line carries triggering event id for proof (gap 17).
 pub fn apply_watch_line(
     line: &str,
     index: &SelfIndex,
@@ -1179,7 +1202,8 @@ pub fn apply_watch_line(
     let Some((class, hint)) = parse_watch_ndjson(line, index) else {
         return Vec::new();
     };
-    let msg = doorbell_line(class, &hint);
+    let id = watch_id(line).unwrap_or_default();
+    let msg = doorbell_line_with_event(class, &hint, &id);
     let mut inject = Vec::new();
     for pin in watch_targets(line, index) {
         let status = status_by_pin
