@@ -944,6 +944,30 @@ pub fn report_text(state_dir: &Path, workspace: &str) -> String {
     }
 }
 
+/// Gap 20: audit JSONL per decision — why each wake fired.
+pub fn audit_file(state_dir: &Path, workspace: &str) -> PathBuf {
+    state_dir
+        .join("doorbell")
+        .join(format!("{workspace}.audit.jsonl"))
+}
+
+pub fn audit_append(state_dir: &Path, workspace: &str, entry: serde_json::Value) {
+    use std::io::Write;
+    let path = audit_file(state_dir, workspace);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let mut line = serde_json::to_string(&entry).unwrap_or_default();
+        line.push('\n');
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// Pins addressed by this watch line: `p`/`assignee` (pin or npub) plus
 /// kind-9 `@pin` in content (live posts do both; `p` is npub).
 pub fn watch_targets(line: &str, index: &SelfIndex) -> Vec<String> {

@@ -84,7 +84,7 @@ fn init_mailbox() -> Result<()> {
 /// The shared in-process mailbox. Only reachable after a successful
 /// `init_mailbox` (via `Mail::from_config`) — an unreachable panic here means
 /// a call path skipped construction, which is a programming error.
-fn mailbox() -> &'static toron_core::mailbox::Mailbox {
+pub(crate) fn mailbox() -> &'static toron_core::mailbox::Mailbox {
     match MAILBOX.get() {
         Some(Ok(mb)) => mb,
         Some(Err(e)) => {
