@@ -395,6 +395,15 @@ pub fn compiled_in_models() -> BTreeMap<String, ModelEntry> {
         },
     );
     m.insert("zai/glm-5.2".to_string(), ModelEntry::default());
+    // H2 (bd-harness-jcode): coder's default model on the jcode harness.
+    // `opencode-go` is a native jcode provider (`-p opencode-go`), so the
+    // composite key routes through resolve_strict for harness `jcode`
+    // (empty caps = routable everywhere) and `model_args` splits it into
+    // `-p opencode-go -m muse-spark-1.2-contributor`.
+    m.insert(
+        "opencode-go/muse-spark-1.2-contributor".to_string(),
+        ModelEntry::default(),
+    );
     m
 }
 

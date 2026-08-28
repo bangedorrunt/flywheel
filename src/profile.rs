@@ -463,8 +463,9 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
         (
             "coder",
             Profile {
-                harness: "omp".into(),
-                model: "deepseek-v4-flash".into(),
+                harness: "jcode".into(),
+                model: "muse-spark-1.2-contributor".into(),
+                provider: "opencode-go".into(),
                 effort: "high".into(),
                 role: "coder".into(),
                 task_hint: "TDD, no scripts, functional core, verify before claim".into(),
@@ -563,6 +564,24 @@ pub fn compiled_in_harnesses() -> BTreeMap<String, HarnessConfig> {
         "pa".to_string(),
         HarnessConfig {
             spawn_cmd: Some("prime-agent --offline".to_string()),
+        },
+    );
+    // H2 (bd-harness-jcode): jcode (the open-source terminal coding agent) is a
+    // flywheel custom kind — herdr has NO `jcode` kind, so the spawn path falls
+    // back to this recipe via `pane.run` (same as `pa`). herdr's standard pane
+    // launch env already carries HERDR_ENV / HERDR_SOCKET_PATH / HERDR_PANE_ID,
+    // so jcode's own herdr integration (the `herdr-agent-state.sh` lifecycle
+    // hook adapter, source `herdr:jcode`) activates and self-reports lifecycle
+    // (working/idle/blocked) through the socket — which herdr accepts as hook
+    // authority even for unknown kinds. The boot-prime line is appended as a
+    // launch arg by `recipe_launch_command`; jcode runs as its TUI in the pane
+    // and is primed via `pane.send_text` like any other agent. jcode's own
+    // default model/provider is used when the profile leaves `model` empty; a
+    // pinned model is injected as `-m <bare-id>` via the `model_args` jcode arm.
+    m.insert(
+        "jcode".to_string(),
+        HarnessConfig {
+            spawn_cmd: Some("jcode".to_string()),
         },
     );
     m
@@ -665,6 +684,25 @@ behavior = "be terse"
             Some("prime-agent --offline"),
             "pa spawn recipe launches the prime-agent TUI"
         );
+        // H2 (bd-harness-jcode): jcode is a compiled-in harness recipe and
+        // the coder profile defaults to it (jcode harness + muse-spark via
+        // the pinned opencode-go provider).
+        let jcode = cat.harness("jcode").expect("jcode harness recipe");
+        assert_eq!(
+            jcode.spawn_cmd.as_deref(),
+            Some("jcode"),
+            "jcode spawn recipe launches the jcode TUI"
+        );
+        let coder = cat.get("coder").expect("coder present");
+        assert_eq!(coder.harness, "jcode", "coder defaults to the jcode harness");
+        assert_eq!(
+            coder.provider, "opencode-go",
+            "coder pins the opencode-go provider"
+        );
+        assert_eq!(
+            coder.model, "muse-spark-1.2-contributor",
+            "coder default model"
+        );
     }
 
     #[test]
@@ -699,8 +737,11 @@ plan = "glm-5.2"
         assert_eq!(c.smol, "deepseek-v4-flash");
         assert_eq!(c.plan, "glm-5.2");
         assert_eq!(c.slow, "", "absent role stays empty");
-        assert_eq!(c.model, "deepseek-v4-flash", "base model untouched");
-        assert_eq!(c.harness, "omp", "built-in harness preserved");
+        assert_eq!(
+            c.model, "muse-spark-1.2-contributor",
+            "base model untouched (H2 jcode default)"
+        );
+        assert_eq!(c.harness, "jcode", "built-in harness preserved");
         // Built-ins themselves carry no role models by default (coder is
         // overridden in this test's toml — check the untouched ones).
         for name in ["oracle", "planner", "reviewer", "scout", "housekeeper"] {
@@ -745,8 +786,8 @@ effort = "max"
         let cat2 = ProfileCatalog::load_from(Some(&path2)).expect("load 2");
         let c2 = cat2.get("coder").expect("coder present 2");
         assert_eq!(
-            c2.provider, "",
-            "partial override inherits built-in provider"
+            c2.provider, "opencode-go",
+            "partial override inherits built-in provider (H2 jcode coder pins opencode-go)"
         );
         assert_eq!(c2.effort, "max");
     }

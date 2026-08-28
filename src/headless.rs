@@ -47,6 +47,22 @@ pub fn model_args(harness: &str, model: &str, effort: Option<&str>) -> Vec<Strin
             args
         }
         "pi" => vec!["--model".to_string(), model.to_string()],
+        // H2 (bd-harness-jcode): jcode takes provider and model as SEPARATE
+        // flags (`-p opencode-go -m muse-spark-1.2-contributor`); the
+        // composite registry key is split so `-m` carries the bare id.
+        "jcode" => {
+            let (provider, bare) = crate::models::split_key(model);
+            let mut args = Vec::new();
+            if !provider.is_empty() {
+                args.push("-p".to_string());
+                args.push(provider.to_string());
+            }
+            if !bare.is_empty() {
+                args.push("-m".to_string());
+                args.push(bare.to_string());
+            }
+            args
+        }
         // H1 (bd-harness-prime-agent-818f): prime-agent takes `--model` +
         // `--thinking` (levels: off/minimal/low/medium/high/xhigh/max).
         // `--offline` lives in the spawn recipe, not here — launch args may
@@ -139,6 +155,15 @@ pub fn build_argv_roles(
             argv.extend(["opencode", "run", "--format", "json"].map(String::from));
             if let Some(m) = model {
                 argv.extend(model_args("opencode", m, None));
+            }
+        }
+        // H2 (bd-harness-jcode): headless one-shot via `jcode run`. Plain
+        // output (parse_stream falls back to raw stdout as the response when
+        // no NDJSON stream is present), so no `--json` flag here.
+        "jcode" => {
+            argv.extend(["jcode", "run"].map(String::from));
+            if let Some(m) = model {
+                argv.extend(model_args("jcode", m, None));
             }
         }
         "grok" => {
@@ -568,6 +593,16 @@ mod tests {
         );
         assert_eq!(model_args("grok", "grok-4", None), vec!["-m", "grok-4"]);
         assert_eq!(model_args("omp", "gpt-5.2", None), vec!["--model=gpt-5.2"]);
+        // H2 (bd-harness-jcode): jcode takes provider and model separately.
+        assert_eq!(
+            model_args("jcode", "opencode-go/muse-spark-1.2-contributor", None),
+            vec!["-p", "opencode-go", "-m", "muse-spark-1.2-contributor"]
+        );
+        // A bare (provider-less) model id emits only -m.
+        assert_eq!(
+            model_args("jcode", "gpt-5.5", None),
+            vec!["-m", "gpt-5.5"]
+        );
         assert_eq!(
             model_args("omp", "glm-5.2", Some("max")),
             vec!["--model=glm-5.2", "--thinking=max"]
