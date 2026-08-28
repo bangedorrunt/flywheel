@@ -1126,6 +1126,9 @@ pub fn kind_process_names(kind: &str) -> &'static [&'static str] {
         "pi" => &["pi", "gemini"],
         "grok" => &["grok", "grok-build"],
         "omp" => &["omp"],
+        // H2 (bd-harness-jcode): the jcode TUI runs as the `jcode` binary in
+        // the pane's foreground process group while the agent lives.
+        "jcode" => &["jcode"],
         // unknown kind — no process-name mapping; the caller must treat the
         // probe as inconclusive rather than false-negative "healthy".
         _ => &[],

@@ -4513,6 +4513,28 @@ mod spawn_profile_plan_tests {
         );
     }
 
+    /// H2 (bd-harness-jcode): the coder profile's default model routes
+    /// through the compiled-in registry for harness `jcode` and lands as
+    /// jcode's separate provider/model flags.
+    #[test]
+    fn launch_args_jcode_coder_routes_muse_spark() {
+        let _g = lock_env();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+        let p = crate::profile::Profile {
+            harness: "jcode".into(),
+            model: "muse-spark-1.2-contributor".into(),
+            provider: "opencode-go".into(),
+            ..Default::default()
+        };
+        let args = profile_launch_args("jcode", &p, None).expect("jcode launch args");
+        assert_eq!(
+            args,
+            vec!["-p", "opencode-go", "-m", "muse-spark-1.2-contributor"],
+            "coder on jcode must resolve via the compiled-in registry: {args:?}"
+        );
+    }
+
     /// STRICT routing: a profile model that is NOT a registry id fails the
     /// launch naming the fix — nothing bypasses the registry (the old
     /// passthrough spawned broken bare ids).
@@ -7403,6 +7425,7 @@ fn cmd_internal_doorbell(
                     &injects,
                     &mut hear,
                     &index,
+                    project,
                     workspace,
                     generation.as_ref(),
                 );
@@ -7431,6 +7454,7 @@ fn cmd_internal_doorbell(
                     &injects,
                     &mut hear,
                     &index,
+                    project,
                     workspace,
                     generation.as_ref(),
                 );
@@ -7676,6 +7700,7 @@ fn doorbell_prompt(
     registry: &[state::SpawnEntry],
     injects: &[(String, String)],
     generation: Option<&doorbell::WatcherGen>,
+    project: &str,
     workspace: &str,
 ) -> Vec<String> {
     let Some(client) = herdr else {
@@ -7695,6 +7720,32 @@ fn doorbell_prompt(
         let msg = generation.map_or(msg.clone(), |r| doorbell::stamp_line(msg, r));
         match client.agent_prompt(&entry.name, &msg, None) {
             Ok(_) => ok.push(pin.clone()),
+            // H2 (bd-harness-jcode): recipe-harness panes (`pa`/`jcode`)
+            // reject agent.prompt (no herdr kind -> agent_not_ready) — fall
+            // back to the pane primitives, then count the wake as delivered.
+            Err(e) if is_agent_not_ready(&e.code) => {
+                let pane = entry.pane_id.clone();
+                match try_send_text_delivery(client, project, &entry.name, &pane, &msg) {
+                    Ok(true) => ok.push(pin.clone()),
+                    _ => {
+                        eprintln!(
+                            "flywheel doorbell: prompt {} failed: {e:#}",
+                            entry.name
+                        );
+                        doorbell::audit_append(
+                            &config::state_dir(),
+                            workspace,
+                            serde_json::json!({
+                                "ts": chrono::Utc::now().to_rfc3339(),
+                                "workspace": workspace,
+                                "kind": "prompt_failure",
+                                "pin": pin,
+                                "error": e.to_string(),
+                            }),
+                        );
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("flywheel doorbell: prompt {} failed: {e:#}", entry.name);
                 doorbell::audit_append(
@@ -7714,17 +7765,19 @@ fn doorbell_prompt(
     ok
 }
 
+#[allow(clippy::too_many_arguments)]
 fn doorbell_prompt_and_hear(
     herdr: Option<&mut Client>,
     registry: &[state::SpawnEntry],
     injects: &[(String, String)],
     hear: &mut doorbell::HearTracker,
     index: &doorbell::SelfIndex,
+    project: &str,
     workspace: &str,
     generation: Option<&doorbell::WatcherGen>,
 ) {
     let now = doorbell_now_unix();
-    for pin in doorbell_prompt(herdr, registry, injects, generation, workspace) {
+    for pin in doorbell_prompt(herdr, registry, injects, generation, project, workspace) {
         hear.note_inject(&pin, index.npub(&pin), now);
     }
     doorbell_persist_hear(workspace, hear);
@@ -7781,6 +7834,7 @@ fn doorbell_refresh_status(
         &injects,
         hear,
         index,
+        project,
         workspace,
         generation,
     );
@@ -7956,7 +8010,7 @@ fn doorbell_sweep_inbox(
         }),
     );
     doorbell_prompt_and_hear(
-        herdr, &registry, &injects, hear, index, workspace, generation,
+        herdr, &registry, &injects, hear, index, project, workspace, generation,
     );
 }
 
@@ -10452,7 +10506,41 @@ fn cmd_send(
                             );
                             target = pane;
                         }
-                        None => return Err(e.into()),
+                        // H2 (bd-harness-jcode): a recipe-harness pane
+                        // (`pa`/`jcode`) never satisfies the agent.prompt
+                        // gate — deliver through pane primitives instead of
+                        // failing the send.
+                        // H2 (bd-harness-jcode) arm is terminal (break or
+                        // return on every path) — no re-delivery guard needed.
+                        None => {
+                            if try_send_text_delivery(
+                                &mut c,
+                                project,
+                                &name,
+                                &target,
+                                &send_text,
+                            )? {
+                                // Deliverable confirmation: resolve the
+                                // agent from the registry so the normal
+                                // result row (dispatched/prior_status) is
+                                // emitted for this target.
+                                if let Some(agent) = c
+                                    .agent_list()
+                                    .ok()
+                                    .and_then(|list| {
+                                        list.iter()
+                                            .find(|ag| {
+                                                ag.pane_id == target
+                                                    || ag.name.as_deref() == Some(name.as_str())
+                                            })
+                                            .cloned()
+                                    })
+                                {
+                                    break agent;
+                                }
+                            }
+                            return Err(e.into());
+                        }
                     }
                 }
                 // bd-bug-omp-herdr-wedge: omp's herdr integration re-reports
@@ -10701,6 +10789,44 @@ fn not_ready_retry_target(
 /// keeps its existing handling.
 fn is_agent_not_ready(code: &BackendErrorCode) -> bool {
     matches!(code, BackendErrorCode::Other(c) if c == "agent_not_ready")
+}
+
+/// H2 (bd-harness-jcode): herdr's `agent.prompt` gates on a recognized
+/// lifecycle-authority kind; recipe-launched harnesses (`pa`, `jcode`, ...)
+/// report state via their own hooks but have no herdr kind, so their panes
+/// reject `agent.prompt` with `agent_not_ready` even while idle. Deliver the
+/// prompt through the pane primitives instead: `pane.send_text` + Enter —
+/// the same path the boot prime uses. Returns `Ok(true)` when the text was
+/// delivered (the caller treats it as a successful send: jcode/prime-agent
+/// TUIs submit on Enter), `Ok(false)` when this kind has no recipe (caller
+/// falls through to the normal error), `Err` on delivery failure.
+fn try_send_text_delivery(
+    c: &mut Client,
+    project: &str,
+    name: &str,
+    pane_id: &str,
+    text: &str,
+) -> Result<bool> {
+    let recipe_kind = state::load_spawn_registry(project)
+        .iter()
+        .find(|en| en.name == name)
+        .map(|en| en.harness.clone().unwrap_or_default())
+        .or_else(|| spawn_kinds_from_log(project).get(name).cloned());
+    let Some(kind) = recipe_kind else {
+        return Ok(false);
+    };
+    let has_recipe = ProfileCatalog::load()
+        .ok()
+        .and_then(|cat| cat.harness(&kind).and_then(|h| h.spawn_cmd.clone()))
+        .is_some();
+    if !has_recipe {
+        return Ok(false);
+    }
+    eprintln!(
+        "flywheel: {name} ({pane_id}) is a recipe-harness pane (kind {kind}) — delivering via pane.send_text"
+    );
+    prime_line_via_send_text(c, pane_id, text);
+    Ok(true)
 }
 
 /// bd-4pxy: a launch_pending agent is NOT idle — it is still booting
