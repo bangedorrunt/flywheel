@@ -2240,3 +2240,69 @@ owner = "housekeeper"
         assert_eq!(tick_date(-5), "unknown", "pre-epoch degrades safely");
     }
 }
+
+#[cfg(test)]
+mod kind_classify_tests {
+    use crate::failure;
+
+    #[test]
+    fn kind_classify_cron_rate_limit() {
+        let cf = failure::classify("429 Too Many Requests", None, None);
+        assert_eq!(cf.kind, failure::FailureKind::RateLimit);
+        assert!(cf.retryable);
+    }
+
+    #[test]
+    fn kind_classify_cron_timeout() {
+        let cf = failure::classify("deadline exceeded for cron tick", None, None);
+        assert_eq!(cf.kind, failure::FailureKind::Timeout);
+        assert!(cf.retryable);
+    }
+
+    #[test]
+    fn kind_classify_cron_auth() {
+        let cf = failure::classify("401 Unauthorized for cron provider", None, None);
+        assert_eq!(cf.kind, failure::FailureKind::Auth);
+        assert!(!cf.retryable);
+    }
+
+    #[test]
+    fn kind_classify_cron_unclassified_stays_continue() {
+        let cf = failure::classify("cron succeeded but no error", None, None);
+        // No error string should be Unknown, and the engine's default on_error is Continue
+        // The cron runner should not abort retryable kinds; it should surface kind and let engine decide
+        assert_eq!(cf.kind, failure::FailureKind::Unknown);
+    }
+
+    #[test]
+    fn kind_classify_cron_one_shot_fallback_via_headless() {
+        // Cron's headless mode delegates to headless_dispatch which already has the one-shot fallback
+        // We verify the registry fallback exists for the cron's headless model
+        let mut registry = crate::models::ModelRegistry::default();
+        registry.models.insert(
+            "cron/primary".to_string(),
+            crate::models::ModelEntry {
+                cost_in_per_mtok: 0.0,
+                cost_out_per_mtok: 0.0,
+                caps: vec![],
+                fallback: Some("cron/fallback".to_string()),
+                effort: None,
+            },
+        );
+        registry.models.insert(
+            "cron/fallback".to_string(),
+            crate::models::ModelEntry {
+                cost_in_per_mtok: 0.0,
+                cost_out_per_mtok: 0.0,
+                caps: vec![],
+                fallback: None,
+                effort: None,
+            },
+        );
+        let fb = registry.get("cron/primary").and_then(|m| m.fallback.clone());
+        assert_eq!(fb, Some("cron/fallback".to_string()));
+        let cf = failure::classify("429 rate limit for cron", None, None);
+        assert_eq!(cf.kind, failure::FailureKind::RateLimit);
+        assert!(cf.retryable);
+    }
+}

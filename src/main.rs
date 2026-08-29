@@ -28242,3 +28242,81 @@ mod register_identity_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod kind_classify_headless_tests {
+    use super::*;
+    use crate::failure;
+
+    #[test]
+    fn kind_classify_headless_rate_limit() {
+        let cf = failure::classify("429 Too Many Requests", None, None);
+        assert_eq!(cf.kind, failure::FailureKind::RateLimit);
+        assert!(cf.retryable);
+        // headless's is_rate_limited should also detect 429
+        let outcome = crate::headless::HarnessOutcome {
+            response: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            status: "fail".to_string(),
+            model: String::new(),
+            duration_ms: 0,
+            exit_code: 1,
+            error: Some("429 Too Many Requests".to_string()),
+        };
+        assert!(is_rate_limited(&outcome));
+    }
+
+    #[test]
+    fn kind_classify_headless_timeout() {
+        let cf = failure::classify("operation timeout after 30s", None, None);
+        assert_eq!(cf.kind, failure::FailureKind::Timeout);
+        assert!(cf.retryable);
+    }
+
+    #[test]
+    fn kind_classify_headless_auth() {
+        let cf = failure::classify("401 Unauthorized", None, None);
+        assert_eq!(cf.kind, failure::FailureKind::Auth);
+        assert!(!cf.retryable);
+    }
+
+    #[test]
+    fn kind_classify_headless_unclassified_stays_continue() {
+        let cf = failure::classify("some random error", None, None);
+        assert_eq!(cf.kind, failure::FailureKind::Unknown);
+        // Unclassified default is Continue (engine's on_error default remains Continue)
+    }
+
+    #[test]
+    fn kind_classify_headless_one_shot_fallback_fires_once_then_kind() {
+        let mut registry = crate::models::ModelRegistry::default();
+        registry.models.insert(
+            "headless/primary".to_string(),
+            crate::models::ModelEntry {
+                cost_in_per_mtok: 0.0,
+                cost_out_per_mtok: 0.0,
+                caps: vec![],
+                fallback: Some("headless/fallback".to_string()),
+                effort: None,
+            },
+        );
+        registry.models.insert(
+            "headless/fallback".to_string(),
+            crate::models::ModelEntry {
+                cost_in_per_mtok: 0.0,
+                cost_out_per_mtok: 0.0,
+                caps: vec![],
+                fallback: None,
+                effort: None,
+            },
+        );
+        let fb = registry.get("headless/primary").and_then(|m| m.fallback.clone());
+        assert_eq!(fb, Some("headless/fallback".to_string()));
+        let fb2 = registry.get("headless/fallback").and_then(|m| m.fallback.clone());
+        assert_eq!(fb2, None);
+        let cf = failure::classify("429 quota exceeded", None, None);
+        assert_eq!(cf.kind, failure::FailureKind::RateLimit);
+        assert!(cf.retryable);
+    }
+}

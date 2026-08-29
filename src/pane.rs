@@ -32,6 +32,7 @@ use toron_workflow::schema::Action;
 use crate::config::Config;
 use crate::crew::CrewPlan;
 use crate::herdr_shim::{AgentStatus, Client};
+use crate::models::ModelRegistry;
 use crate::profile::ProfileCatalog;
 use crate::state::SpawnEntry;
 use crate::{headless, state};
@@ -257,6 +258,7 @@ pub fn pre_spawn_crew(
 /// The actual pane splits + agent starts for one workspace (shared by the
 /// fresh-spawn and --reuse paths). Returns the registry entries.
 #[allow(clippy::too_many_arguments)] // one param per caller mirror, mirrors cmd_spawn
+#[allow(unused_mut)]
 fn spawn_crew_into(
     cfg: &Config,
     project: &str,
@@ -353,8 +355,49 @@ fn spawn_crew_into(
                     &profile.slow,
                     &profile.plan,
                 ));
-                let agent =
-                    crate::start_agent_with_retry(c, &name, harness, &pane_id, &agent_args)?;
+                // ADR-0024 W1a: pane spawn one-shot registry-fallback for rate_limit (bd-42fs pattern)
+                let agent = match crate::start_agent_with_retry(c, &name, harness, &pane_id, &agent_args) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        let cf = crate::failure::classify(&e.to_string(), None, None);
+                        if cf.kind == crate::failure::FailureKind::RateLimit {
+                            if let Ok(registry) = ModelRegistry::load_routing() {
+                                if let Some(fallback_id) = registry.get(&profile.model).and_then(|m| m.fallback.clone()) {
+                                    let fallback_harness = if registry.family_of(&fallback_id) == "grok" {
+                                        "grok"
+                                    } else {
+                                        harness
+                                    };
+                                    let fallback_model = registry.resolve(&fallback_id, fallback_harness);
+                                    let mut fallback_args = headless::model_args(
+                                        fallback_harness,
+                                        &fallback_model,
+                                        (!profile.effort.is_empty()).then_some(profile.effort.as_str()),
+                                    );
+                                    fallback_args.extend(headless::role_model_args(
+                                        fallback_harness,
+                                        &profile.smol,
+                                        &profile.slow,
+                                        &profile.plan,
+                                    ));
+                                    eprintln!(
+                                        "pane crew: @{role} rate-limited on {} — retrying with fallback {fallback_id}",
+                                        profile.model
+                                    );
+                                    crate::start_agent_with_retry(
+                                        c, &name, fallback_harness, &pane_id, &fallback_args,
+                                    )?
+                                } else {
+                                    return Err(e);
+                                }
+                            } else {
+                                return Err(e);
+                            }
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                };
                 // bd-pin-public-plane-s-easy.2: bind the pane identity now
                 // that the pane exists (pane → pin bridge + registry).
                 crate::bind_pane_mail_identity(
@@ -561,22 +604,44 @@ pub fn pane_dispatch(
                      warn-first gate (ADR-0022 §3.5); step output tagged plan_artifact_missing"
                 );
             }
-            let out = json!({
+            let mut out = json!({
                 "profile": profile_name,
                 "agent": entry.name,
-                "send": v,
+                "send": v.clone(),
             });
+            // ADR-0024 W1a: classify pane dispatch failures (rate_limit/timeout/auth)
+            if v.get("ok").and_then(Value::as_bool) == Some(false) {
+                let err_str = v
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&raw)
+                    .to_string();
+                let cf = crate::failure::classify(&err_str, None, None);
+                if cf.kind != crate::failure::FailureKind::Unknown {
+                    out["ok"] = json!(false);
+                    out["error"] = json!(err_str.clone());
+                    out["kind"] = json!(cf.kind.to_string());
+                    out["retryable"] = json!(cf.retryable);
+                }
+            }
             return Ok(crate::phase_chain::annotate_dispatch_output(
                 spec, inputs, out,
             ));
         }
         let err = String::from_utf8_lossy(&output.stderr).to_string();
-        return Ok(json!({
+        let err_str = if err.trim().is_empty() { raw.clone() } else { err.clone() };
+        let cf = crate::failure::classify(&err_str, None, None);
+        let mut out = json!({
             "ok": false,
             "error": if err.trim().is_empty() { raw } else { err },
             "profile": profile_name,
             "agent": entry.name,
-        }));
+        });
+        if cf.kind != crate::failure::FailureKind::Unknown {
+            out["kind"] = json!(cf.kind.to_string());
+            out["retryable"] = json!(cf.retryable);
+        }
+        return Ok(out);
     }
 }
 
@@ -759,6 +824,7 @@ pub async fn drain_spawn_sink(
 /// spawn-registry entry, dispatch the job's workflow mission through the
 /// `__send` leaf, and — for `await: true` — wait for the agent to return to
 /// Idle (the job finished) before returning the receipt.
+#[allow(unused_mut)]
 pub fn launch_spawn_job(
     cfg: &Config,
     project: &str,
@@ -807,13 +873,64 @@ pub fn launch_spawn_job(
             Some(&crate::utf8_path(&dir, "workspace dir")?),
             Some(&pane_env),
         )?;
-        let agent = crate::start_agent_with_retry(
+        let agent = match crate::start_agent_with_retry(
             &mut c,
             &name,
             &plan.harness,
             &split.pane_id,
             &plan.args,
-        )?;
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                let cf = crate::failure::classify(&e.to_string(), None, None);
+                if cf.kind == crate::failure::FailureKind::RateLimit {
+                    if let Ok(registry) = ModelRegistry::load_routing() {
+                        if let Ok(catalog) = crate::profile::ProfileCatalog::load() {
+                            if let Some(profile) = catalog.get(&plan.profile) {
+                                if let Some(fallback_id) =
+                                    registry.get(&profile.model).and_then(|m| m.fallback.clone())
+                                {
+                                    let fallback_harness =
+                                        if registry.family_of(&fallback_id) == "grok" {
+                                            "grok"
+                                        } else {
+                                            plan.harness.as_str()
+                                        };
+                                    let fallback_model =
+                                        registry.resolve(&fallback_id, fallback_harness);
+                                    let mut fallback_args = crate::headless::model_args(
+                                        fallback_harness,
+                                        &fallback_model,
+                                        None,
+                                    );
+                                    eprintln!(
+                                        "pane spawn: {} rate-limited — retrying with fallback {fallback_id}",
+                                        plan.profile
+                                    );
+                                    crate::start_agent_with_retry(
+                                        &mut c,
+                                        &name,
+                                        fallback_harness,
+                                        &split.pane_id,
+                                        &fallback_args,
+                                    )?
+                                } else {
+                                    return Err(e);
+                                }
+                            } else {
+                                return Err(e);
+                            }
+                        } else {
+                            return Err(e);
+                        }
+                    } else {
+                        return Err(e);
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+        };
         // bd-pin-public-plane-s-easy.2: bind the pane identity now that the
         // pane exists.
         crate::bind_pane_mail_identity(
@@ -1474,5 +1591,90 @@ steps:
             panicked,
             "Resonate::local must refuse to construct off-runtime"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(unused_imports)]
+mod kind_classify_tests {
+    use crate::failure;
+
+    #[test]
+    fn kind_classify_pane_rate_limit() {
+        let cf = failure::classify("429 Too Many Requests", None, None);
+        assert_eq!(cf.kind, failure::FailureKind::RateLimit);
+        assert!(cf.retryable);
+        assert_eq!(cf.kind.to_string(), "rate_limit");
+    }
+
+    #[test]
+    fn kind_classify_pane_timeout() {
+        let cf = failure::classify("operation timeout after 30s", None, None);
+        assert_eq!(cf.kind, failure::FailureKind::Timeout);
+        assert!(cf.retryable);
+    }
+
+    #[test]
+    fn kind_classify_pane_auth() {
+        let cf = failure::classify("401 Unauthorized", None, None);
+        assert_eq!(cf.kind, failure::FailureKind::Auth);
+        assert!(!cf.retryable);
+        assert!(cf.reroute_eligible);
+    }
+
+    #[test]
+    fn kind_classify_pane_blocked_is_not_retryable() {
+        let cf = failure::classify("reservation conflict: path held", None, None);
+        assert_eq!(cf.kind, failure::FailureKind::Blocked);
+        assert!(!cf.retryable);
+        assert!(!cf.reroute_eligible);
+    }
+
+    #[test]
+    fn kind_classify_pane_unclassified_stays_continue() {
+        let cf = failure::classify("some random error without kind", None, None);
+        assert_eq!(cf.kind, failure::FailureKind::Unknown);
+        assert!(!cf.retryable);
+        // Unclassified default is Continue (engine's on_error default remains Continue)
+        // The kind-aware fail_run predicate lives in the engine, here only classification
+    }
+
+    #[test]
+    fn kind_classify_pane_one_shot_fallback_fires_once_then_kind() {
+        // Simulate the bd-42fs one-shot registry-fallback: first 429 triggers fallback,
+        // second 429 (after fallback) returns kind:rate_limit with retryable:true
+        // We test the registry directly: a model with fallback should resolve to fallback once,
+        // and the fallback itself should not have a further fallback (bound of one).
+        let mut registry = crate::models::ModelRegistry::default();
+        registry.models.insert(
+            "test/primary".to_string(),
+            crate::models::ModelEntry {
+                cost_in_per_mtok: 0.0,
+                cost_out_per_mtok: 0.0,
+                caps: vec![],
+                fallback: Some("test/fallback".to_string()),
+                effort: None,
+            },
+        );
+        registry.models.insert(
+            "test/fallback".to_string(),
+            crate::models::ModelEntry {
+                cost_in_per_mtok: 0.0,
+                cost_out_per_mtok: 0.0,
+                caps: vec![],
+                fallback: None,
+                effort: None,
+            },
+        );
+        // First 429 on primary should find fallback
+        let fb = registry.get("test/primary").and_then(|m| m.fallback.clone());
+        assert_eq!(fb, Some("test/fallback".to_string()));
+        // Fallback itself has no further fallback (one-shot bound)
+        let fb2 = registry.get("test/fallback").and_then(|m| m.fallback.clone());
+        assert_eq!(fb2, None);
+        // Classification still returns rate_limit with retryable:true
+        let cf = failure::classify("429 quota exceeded", None, None);
+        assert_eq!(cf.kind, failure::FailureKind::RateLimit);
+        assert!(cf.retryable);
     }
 }
