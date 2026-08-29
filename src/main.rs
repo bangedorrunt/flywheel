@@ -14727,6 +14727,7 @@ fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                 .map(|p| p.min(u8::MAX as u64) as u8)
                 .unwrap_or(3),
             principles: durable::principles_typed_field(&b),
+            updated_at: None,
         })
         .collect())
 }
@@ -14786,6 +14787,7 @@ fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                 .map(|p| p.min(u8::MAX as u64) as u8)
                 .unwrap_or(3),
             principles: durable::principles_typed_field(b),
+            updated_at: None,
         })
         .collect())
 }
@@ -15503,7 +15505,9 @@ fn cmd_loop(
                 // Self-heal actions never come out of plan_actions (the
                 // durable loop's heal step is a separate phase); if one ever
                 // appears here the sync path has no heal machine — skip.
-                durable::LoopAction::Diagnose { .. } | durable::LoopAction::Respawn { .. } => {}
+                durable::LoopAction::Diagnose { .. }
+                | durable::LoopAction::Respawn { .. }
+                | durable::LoopAction::Reclaim { .. } => {}
             }
         }
 
@@ -16026,6 +16030,7 @@ mod loop_tests {
                 labels: Vec::new(),
                 priority: 3,
                 principles: String::new(),
+                updated_at: None,
             },
             durable::ReadyBead {
                 id: "bd-r2".into(),
@@ -16035,6 +16040,7 @@ mod loop_tests {
                 labels: Vec::new(),
                 priority: 3,
                 principles: String::new(),
+                updated_at: None,
             },
         ];
         let ready = vec![durable::ReadyBead {
@@ -16045,6 +16051,7 @@ mod loop_tests {
             labels: Vec::new(),
             priority: 3,
             principles: String::new(),
+            updated_at: None,
         }];
         let mut assigned = Vec::new();
         let prompts = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
@@ -16069,6 +16076,7 @@ mod loop_tests {
             labels: Vec::new(),
             priority: 3,
             principles: String::new(),
+            updated_at: None,
         }];
         let ready = vec![durable::ReadyBead {
             id: "bd-r1".into(),
@@ -16078,6 +16086,7 @@ mod loop_tests {
             labels: Vec::new(),
             priority: 3,
             principles: String::new(),
+            updated_at: None,
         }];
         let mut assigned = vec!["bd-r1".to_string()];
         let prompts = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
@@ -16094,6 +16103,7 @@ mod loop_tests {
             labels: Vec::new(),
             priority: 3,
             principles: String::new(),
+            updated_at: None,
         }];
         let mut assigned = Vec::new();
         let prompts = work_prompts(&[], &ready, &mut assigned, "flywheel");

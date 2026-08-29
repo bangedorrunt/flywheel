@@ -204,6 +204,10 @@ pub struct ReadyBead {
     /// Empty = the section is absent (dispatch gate refuses P<=2).
     #[serde(default)]
     pub principles: String,
+    /// ADR-0025 reclaim: ISO8601 updated_at from br JSON (e.g. "2026-08-28T05:18:45Z").
+    /// `None` = unknown age (never reclaim on stale).
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 fn default_priority() -> u8 {
@@ -1499,6 +1503,7 @@ pub(crate) fn parse_bead_list(v: &serde_json::Value, what: &str) -> anyhow::Resu
                         .map(parse_principles_field)
                 })
                 .unwrap_or_default(),
+            updated_at: None,
         })
         .collect())
 }
@@ -2972,6 +2977,13 @@ pub enum LoopAction {
         name: String,
         reason: String,
     },
+    /// ADR-0025 Wave 1: reclaim a dead/stale in_progress bead to open.
+    Reclaim {
+        bead_id: String,
+        pin: String,
+        herdr_name: String,
+        reason: String,
+    },
     Wait,
 }
 
@@ -4004,6 +4016,313 @@ fn blind_completion_count(complete_now: bool, leaf_failed: bool, consecutive: u3
 /// working agent to `br update --claim` it.
 pub const DEFAULT_CLAIM_NUDGE_AFTER_POLLS: u32 = 2;
 
+/// ADR-0025 reclaim: stale thresholds (swarm vs human), env overridable.
+pub const FLYWHEEL_RECLAIM_SWARM_SECS: u64 = 7200;
+pub const FLYWHEEL_RECLAIM_HUMAN_SECS: u64 = 86400;
+
+pub fn reclaim_swarm_secs() -> u64 {
+    std::env::var("FLYWHEEL_RECLAIM_SWARM_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(FLYWHEEL_RECLAIM_SWARM_SECS)
+}
+pub fn reclaim_human_secs() -> u64 {
+    std::env::var("FLYWHEEL_RECLAIM_HUMAN_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(FLYWHEEL_RECLAIM_HUMAN_SECS)
+}
+pub fn is_swarm_assignee(assignee: &str) -> bool {
+    if assignee.contains('-') {
+        return true;
+    }
+    assignee.chars().any(|c| c.is_uppercase())
+}
+pub fn parse_updated_at_secs(s: Option<&str>) -> Option<i64> {
+    let raw = s?;
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.timestamp())
+        .ok()
+}
+pub fn stale_reclaim_due(
+    bead: &ReadyBead,
+    now_secs: i64,
+    panes: &[AgentState],
+    reservations: &[(String, String, String)],
+    last_comment_ts: Option<i64>,
+    last_comment_body: Option<&str>,
+    dirty_files: &[String],
+) -> bool {
+    let assignee = match &bead.assignee {
+        Some(a) => a,
+        None => return false,
+    };
+    let updated = match parse_updated_at_secs(bead.updated_at.as_deref()) {
+        Some(t) => t,
+        None => return false,
+    };
+    let age = now_secs.saturating_sub(updated);
+    let threshold = if is_swarm_assignee(assignee) {
+        reclaim_swarm_secs() as i64
+    } else {
+        reclaim_human_secs() as i64
+    };
+    if age <= threshold {
+        return false;
+    }
+    if reservations.iter().any(|(_, reason, _)| reason == &bead.id) {
+        return false;
+    }
+    if panes
+        .iter()
+        .any(|p| p.name == *assignee && p.status == "working")
+    {
+        return false;
+    }
+    if let Some(ts) = last_comment_ts {
+        if now_secs.saturating_sub(ts) < 3600 {
+            return false;
+        }
+    }
+    if let Some(body) = last_comment_body {
+        for f in dirty_files {
+            if body.contains(f) {
+                return false;
+            }
+        }
+    }
+    true
+}
+pub fn plan_reclaim(
+    now_secs: i64,
+    beads: &[ReadyBead],
+    panes: &[AgentState],
+    reservations: &[(String, String)],
+) -> Vec<LoopAction> {
+    let ext_res: Vec<(String, String, String)> = reservations
+        .iter()
+        .map(|(p, r)| (p.clone(), r.clone(), String::new()))
+        .collect();
+    let mut out = Vec::new();
+    for b in beads {
+        if stale_reclaim_due(b, now_secs, panes, &ext_res, None, None, &[]) {
+            let pin = b.assignee.clone().unwrap_or_default();
+            let herdr_name = panes
+                .iter()
+                .find(|p| p.name == pin)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| pin.clone());
+            out.push(LoopAction::Reclaim {
+                bead_id: b.id.clone(),
+                pin: pin.clone(),
+                herdr_name,
+                reason: "stale".to_string(),
+            });
+        }
+    }
+    out
+}
+
+#[allow(dead_code)]
+pub fn plan_reclaim_ex(
+    now_secs: i64,
+    beads: &[ReadyBead],
+    panes: &[AgentState],
+    reservations: &[(String, String, String)],
+    comments: &std::collections::HashMap<String, (i64, String)>,
+    dirty_files: &[String],
+) -> Vec<LoopAction> {
+    let mut out = Vec::new();
+    for b in beads {
+        let (last_ts, last_body) = comments
+            .get(&b.id)
+            .map(|(ts, body)| (Some(*ts), Some(body.as_str())))
+            .unwrap_or((None, None));
+        let holder_mismatch = reservations.iter().any(|(_, reason, holder)| {
+            reason == &b.id && holder != b.assignee.as_deref().unwrap_or("") && !holder.is_empty()
+        });
+        if holder_mismatch {
+            continue;
+        }
+        if stale_reclaim_due(
+            b,
+            now_secs,
+            panes,
+            reservations,
+            last_ts,
+            last_body,
+            dirty_files,
+        ) {
+            let pin = b.assignee.clone().unwrap_or_default();
+            let herdr_name = panes
+                .iter()
+                .find(|p| p.name == pin)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| pin.clone());
+            out.push(LoopAction::Reclaim {
+                bead_id: b.id.clone(),
+                pin: pin.clone(),
+                herdr_name,
+                reason: "stale".to_string(),
+            });
+        }
+    }
+    out
+}
+
+pub fn reclaim_on_pane_exited(
+    bead: &ReadyBead,
+    exited_name: &str,
+    panes: &[AgentState],
+    heal: &HealState,
+    respawn_budget: u32,
+) -> Option<LoopAction> {
+    let assignee = bead.assignee.as_deref()?;
+    if assignee != exited_name {
+        return None;
+    }
+    let pane_still_listed = panes.iter().any(|p| p.name == exited_name);
+    let budget_exhausted = heal.respawn_count >= respawn_budget;
+    if !budget_exhausted && pane_still_listed {
+        return None;
+    }
+    Some(LoopAction::Reclaim {
+        bead_id: bead.id.clone(),
+        pin: assignee.to_string(),
+        herdr_name: exited_name.to_string(),
+        reason: "pane_exited".to_string(),
+    })
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReclaimBeadArgs {
+    pub project: String,
+    pub bead_id: String,
+    pub pin: String,
+    pub herdr_name: String,
+    pub reason: String,
+}
+#[function]
+async fn reclaim_bead(args: ReclaimBeadArgs) -> Result<Value> {
+    let exe = self_exe().map_err(map_err)?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__release-bead-locks", &args.project, &args.bead_id]);
+    let rel_out = run_leaf_cmd(cmd, "__release-bead-locks").await;
+    let released = match rel_out {
+        Ok(o) if o.status.success() => {
+            let raw = String::from_utf8_lossy(&o.stdout);
+            serde_json::from_str::<Value>(raw.trim())
+                .ok()
+                .and_then(|v| v.get("released").and_then(Value::as_u64))
+                .unwrap_or(0)
+        }
+        Ok(o) => {
+            eprintln!(
+                "flywheel: reclaim release for {} failed: {}",
+                args.bead_id,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!(
+                "flywheel: reclaim release leaf error for {}: {e}",
+                args.bead_id
+            );
+            0
+        }
+    };
+    let evidence = format!(
+        "reclaim: previous in_progress claim appears abandoned; evidence: pin={}, herdr={}, reason={}, updated_at stale or pane_exited",
+        args.pin, args.herdr_name, args.reason
+    );
+    let project_dir = {
+        let p = std::path::Path::new(&args.project);
+        if p.is_dir() {
+            p.to_path_buf()
+        } else {
+            let ws =
+                std::path::PathBuf::from(format!("/Users/bangedorrunt/workspace/{}", args.project));
+            if ws.is_dir() {
+                ws
+            } else {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            }
+        }
+    };
+    let commented = {
+        let mut cmd = Command::new("br");
+        cmd.args([
+            "comments",
+            "add",
+            &args.bead_id,
+            "--message",
+            &evidence,
+            "--actor",
+            "flywheel-toron-loop1",
+        ]);
+        cmd.current_dir(&project_dir);
+        let mut c = cmd;
+        let res = tokio::task::spawn_blocking(move || c.output())
+            .await
+            .map_err(|e| map_err(anyhow::anyhow!("br comment task join failed: {e}")))?;
+        match res {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                eprintln!(
+                    "flywheel: reclaim comment for {} failed: {}",
+                    args.bead_id,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!(
+                    "flywheel: reclaim comment leaf error for {}: {e}",
+                    args.bead_id
+                );
+                false
+            }
+        }
+    };
+    let opened = {
+        let mut cmd = Command::new("br");
+        cmd.args([
+            "update",
+            &args.bead_id,
+            "--status",
+            "open",
+            "--actor",
+            "flywheel-toron-loop1",
+        ]);
+        cmd.current_dir(&project_dir);
+        let mut c = cmd;
+        let res = tokio::task::spawn_blocking(move || c.output())
+            .await
+            .map_err(|e| map_err(anyhow::anyhow!("br open task join failed: {e}")))?;
+        match res {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                eprintln!(
+                    "flywheel: reclaim open for {} failed: {}",
+                    args.bead_id,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!(
+                    "flywheel: reclaim open leaf error for {}: {e}",
+                    args.bead_id
+                );
+                false
+            }
+        }
+    };
+    Ok(
+        serde_json::json!({"bead_id": args.bead_id, "released": released, "commented": commented, "opened": opened}),
+    )
+}
+
 /// Legacy alias: old tests/callers used a hard respawn threshold of 2.
 /// Per-agent self-heal bookkeeping (bd-event-self-heal-unknown).
 /// Survives within a run; optionally mirrored into `loops.json` `respawn`.
@@ -4840,6 +5159,30 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 bead_overlap_waits(&board, &in_flight)
             };
             let serialize_all = always_serialize_held(&board);
+            // ADR-0025 reclaim: pane-exited gate (step 0) + stale tick (7200/86400)
+            {
+                for bead in &inprog {
+                    for exited in &exited_names {
+                        if let Some(act) = reclaim_on_pane_exited(
+                            bead,
+                            exited,
+                            &states,
+                            heal_states.get(exited).unwrap_or(&HealState::default()),
+                            params.respawn_budget,
+                        ) {
+                            if board.iter().any(|(_, reason)| reason == &bead.id) {
+                                continue;
+                            }
+                            heal_actions.push(act);
+                        }
+                    }
+                }
+                let now_secs = chrono::Utc::now().timestamp();
+                let stale = plan_reclaim(now_secs, &inprog, &states, &board);
+                for act in stale {
+                    heal_actions.push(act);
+                }
+            }
             // bd-eign.2: bead-creation flood guard — >3 NEW ready beads in
             // ONE poll is the runaway-create signature (40 junk beads in
             // ~4 min, RC2). CRITICAL warn + PAUSE dispatch this poll: feeding
@@ -5853,6 +6196,26 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     .await; // cg6.2: soft — leaf failures logged inside
                     any_work = true;
                 }
+                LoopAction::Reclaim {
+                    bead_id,
+                    pin,
+                    herdr_name,
+                    reason,
+                } => {
+                    let _ = ctx
+                        .run(
+                            reclaim_bead,
+                            ReclaimBeadArgs {
+                                project: params.project.clone(),
+                                bead_id: bead_id.clone(),
+                                pin: pin.clone(),
+                                herdr_name: herdr_name.clone(),
+                                reason: reason.clone(),
+                            },
+                        )
+                        .await;
+                    any_work = true;
+                }
                 LoopAction::Wait => {}
             }
         }
@@ -6747,7 +7110,10 @@ mod dispatch_guard_tests {
     fn subject_done_anchors_the_terminal_verb() {
         // canonical + tolerated shapes (must match)
         assert!(subject_done("[bd-x] done"), "canonical close report");
-        assert!(subject_done("[bd-x] done "), "trailing whitespace tolerated");
+        assert!(
+            subject_done("[bd-x] done "),
+            "trailing whitespace tolerated"
+        );
         assert!(subject_done("re: [bd-x] done"), "reply prefix tolerated");
         assert!(subject_done("fwd: [bd-x] done"), "forward prefix tolerated");
 
@@ -7371,6 +7737,7 @@ mod tests {
             labels: Vec::new(),
             priority: 3,
             principles: String::new(),
+            updated_at: None,
         }
     }
 
@@ -7384,6 +7751,7 @@ mod tests {
             labels: vec![format!("wave-{wave}")],
             priority: 3,
             principles: String::new(),
+            updated_at: None,
         }
     }
 
@@ -8326,6 +8694,7 @@ mod tests {
             principles: String::new(),
             verify: Some("true".into()),
             labels: Vec::new(),
+            updated_at: None,
         };
         let batch = [
             rb("bd-a"),
@@ -8828,6 +9197,7 @@ mod tests {
             labels: Vec::new(),
             priority: 3,
             principles: String::new(),
+            updated_at: None,
         }
     }
 
@@ -8840,6 +9210,7 @@ mod tests {
             labels: Vec::new(),
             priority: 3,
             principles: String::new(),
+            updated_at: None,
         }
     }
 
@@ -10084,6 +10455,16 @@ mod tests {
                 kind: "nudge",
                 content: String::new(),
             }),
+            LoopAction::Reclaim {
+                bead_id,
+                pin,
+                herdr_name,
+                reason,
+            } => Some(DispatchRec {
+                agent: herdr_name.clone(),
+                kind: "reclaim",
+                content: format!("{bead_id}:{pin}:{reason}"),
+            }),
             LoopAction::Wait => None,
         }
     }
@@ -10958,6 +11339,7 @@ mod verify_field_tests {
                 labels: Vec::new(),
                 priority: 3,
                 principles: String::new(),
+                updated_at: None,
             },
             ReadyBead {
                 id: "bd-no-fence".into(),
@@ -10967,6 +11349,7 @@ mod verify_field_tests {
                 labels: Vec::new(),
                 priority: 3,
                 principles: String::new(),
+                updated_at: None,
             },
             ReadyBead {
                 id: "bd-multi".into(),
@@ -10976,6 +11359,7 @@ mod verify_field_tests {
                 labels: Vec::new(),
                 priority: 3,
                 principles: String::new(),
+                updated_at: None,
             },
         ];
         let (dispatchable, not_ready) = partition_ready(&ready);
@@ -10999,6 +11383,7 @@ mod verify_field_tests {
             principles: principles.into(),
             verify: verify.map(str::to_string),
             labels: Vec::new(),
+            updated_at: None,
         };
         let ready = vec![
             // P2 with an empty PRINCIPLES section -> refuse
@@ -11046,6 +11431,7 @@ mod verify_field_tests {
             labels: vec!["wave-1".into()],
             priority: 2,
             principles: String::new(),
+            updated_at: None,
         };
         let p2_ok = ReadyBead {
             id: "bd-rt-ok".into(),
@@ -11055,6 +11441,7 @@ mod verify_field_tests {
             labels: Vec::new(),
             priority: 2,
             principles: "prove-it-works — ran the VERIFY fence".into(),
+            updated_at: None,
         };
         let env = ready_leaf_envelope(&[p2_blocked, p2_ok]);
         let parsed = parse_bead_list(&env, "__ready").expect("leaf JSON parses");
@@ -11087,6 +11474,7 @@ mod verify_field_tests {
             principles: principles.into(),
             verify: Some("true".into()),
             labels: Vec::new(),
+            updated_at: None,
         };
         let empty = rb("bd-x", 2, "");
         let r = principles_block_reason(&empty).expect("P2 empty blocks");
@@ -11126,6 +11514,7 @@ mod verify_field_tests {
             principles: principles.into(),
             verify: verify.map(str::to_string),
             labels: Vec::new(),
+            updated_at: None,
         };
         // Missing typed verify field.
         let noverify = rb("bd-noverify", 2, None, "prove-it-works — x.");
@@ -11183,6 +11572,7 @@ mod verify_field_tests {
             principles: principles.into(),
             verify: verify.map(str::to_string),
             labels: Vec::new(),
+            updated_at: None,
         };
         let nameonly = rb("bd-n", 2, Some("true"), "prove-it-works");
         assert_eq!(
@@ -11252,5 +11642,278 @@ mod verify_field_tests {
                 needle
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reclaim_tests {
+    use super::*;
+    use chrono::TimeZone;
+    fn iso_at(secs: i64) -> String {
+        chrono::Utc.timestamp_opt(secs, 0).unwrap().to_rfc3339()
+    }
+    fn bead_with_age(id: &str, assignee: &str, age_secs: i64, now_secs: i64) -> ReadyBead {
+        ReadyBead {
+            id: id.into(),
+            title: "reclaim test".into(),
+            assignee: Some(assignee.into()),
+            verify: Some("cargo test reclaim".into()),
+            labels: Vec::new(),
+            priority: 1,
+            principles: "never-block-on-the-human — pane death is observable".into(),
+            updated_at: Some(iso_at(now_secs - age_secs)),
+        }
+    }
+    #[test]
+    fn reclaim_pane_exited_emits_for_in_progress_no_herdr() {
+        let bead = ReadyBead {
+            id: "bd-test".into(),
+            title: "t".into(),
+            assignee: Some("GoldCove".into()),
+            verify: Some("cargo test reclaim".into()),
+            labels: Vec::new(),
+            priority: 1,
+            principles: String::new(),
+            updated_at: None,
+        };
+        let panes: Vec<AgentState> = vec![];
+        let heal = HealState {
+            respawn_count: 2,
+            ..Default::default()
+        };
+        let act =
+            reclaim_on_pane_exited(&bead, "GoldCove", &panes, &heal, 2).expect("should reclaim");
+        match act {
+            LoopAction::Reclaim {
+                bead_id,
+                pin,
+                herdr_name,
+                reason,
+            } => {
+                assert_eq!(bead_id, "bd-test");
+                assert_eq!(pin, "GoldCove");
+                assert_eq!(herdr_name, "GoldCove");
+                assert_eq!(reason, "pane_exited");
+            }
+            _ => panic!("wrong"),
+        }
+    }
+    #[test]
+    fn reclaim_suppressed_while_budget_remains() {
+        let bead = ReadyBead {
+            id: "bd-test".into(),
+            title: "t".into(),
+            assignee: Some("GoldCove".into()),
+            verify: Some("cargo test reclaim".into()),
+            labels: Vec::new(),
+            priority: 1,
+            principles: String::new(),
+            updated_at: None,
+        };
+        let panes = vec![AgentState {
+            name: "GoldCove".into(),
+            status: "unknown".into(),
+            kind: "opencode".into(),
+            pane_id: "p1".into(),
+            mail_identity: Some("GoldCove".into()),
+        }];
+        let heal = HealState {
+            respawn_count: 0,
+            ..Default::default()
+        };
+        assert!(reclaim_on_pane_exited(&bead, "GoldCove", &panes, &heal, 2).is_none());
+        let heal2 = HealState {
+            respawn_count: 1,
+            ..Default::default()
+        };
+        assert!(reclaim_on_pane_exited(&bead, "GoldCove", &panes, &heal2, 2).is_none());
+        let heal3 = HealState {
+            respawn_count: 2,
+            ..Default::default()
+        };
+        assert!(reclaim_on_pane_exited(&bead, "GoldCove", &panes, &heal3, 2).is_some());
+    }
+    #[test]
+    fn reclaim_both_orderings() {
+        let bead = ReadyBead {
+            id: "bd-a".into(),
+            title: "t".into(),
+            assignee: Some("GoldCove".into()),
+            verify: Some("cargo test reclaim".into()),
+            labels: Vec::new(),
+            priority: 1,
+            principles: String::new(),
+            updated_at: None,
+        };
+        let panes_listed = vec![AgentState {
+            name: "GoldCove".into(),
+            status: "unknown".into(),
+            kind: "opencode".into(),
+            pane_id: "p1".into(),
+            mail_identity: Some("GoldCove".into()),
+        }];
+        let panes_gone: Vec<AgentState> = vec![];
+        let heal0 = HealState::default();
+        assert!(reclaim_on_pane_exited(&bead, "GoldCove", &panes_listed, &heal0, 2).is_none());
+        let heal1 = HealState {
+            respawn_count: 1,
+            ..Default::default()
+        };
+        assert!(reclaim_on_pane_exited(&bead, "GoldCove", &panes_listed, &heal1, 2).is_none());
+        let heal2 = HealState {
+            respawn_count: 2,
+            ..Default::default()
+        };
+        assert!(reclaim_on_pane_exited(&bead, "GoldCove", &panes_listed, &heal2, 2).is_some());
+        let heal_exhausted = HealState {
+            respawn_count: 2,
+            ..Default::default()
+        };
+        assert!(
+            reclaim_on_pane_exited(&bead, "OtherPane", &panes_listed, &heal_exhausted, 2).is_none()
+        );
+        assert!(
+            reclaim_on_pane_exited(&bead, "GoldCove", &panes_listed, &heal_exhausted, 2).is_some()
+        );
+        let heal_fresh = HealState::default();
+        assert!(reclaim_on_pane_exited(&bead, "GoldCove", &panes_gone, &heal_fresh, 2).is_some());
+    }
+    #[test]
+    fn reclaim_stale_7201_fires_7199_not() {
+        let now = 1_700_000_000;
+        let panes: Vec<AgentState> = vec![];
+        let board: Vec<(String, String)> = vec![];
+        let bead_old = bead_with_age("bd-old", "GoldCove", 7201, now);
+        let bead_new = bead_with_age("bd-new", "GoldCove", 7199, now);
+        let actions_old = plan_reclaim(now, &[bead_old], &panes, &board);
+        assert_eq!(actions_old.len(), 1);
+        let actions_new = plan_reclaim(now, &[bead_new], &panes, &board);
+        assert!(actions_new.is_empty());
+    }
+    #[test]
+    fn reclaim_human_86400_not_7200() {
+        let now = 1_700_000_000;
+        let panes: Vec<AgentState> = vec![];
+        let board: Vec<(String, String)> = vec![];
+        let bead_human_8000 = bead_with_age("bd-h", "bangedorrunt", 8000, now);
+        assert!(plan_reclaim(now, &[bead_human_8000], &panes, &board).is_empty());
+        let bead_human_old = bead_with_age("bd-h2", "bangedorrunt", 86401, now);
+        assert_eq!(
+            plan_reclaim(now, &[bead_human_old], &panes, &board).len(),
+            1
+        );
+        let bead_swarm = bead_with_age("bd-s", "GoldCove", 8000, now);
+        assert_eq!(plan_reclaim(now, &[bead_swarm], &panes, &board).len(), 1);
+    }
+    #[test]
+    fn reclaim_different_pin_reservation_skip() {
+        let now = 1_700_000_000;
+        let bead = bead_with_age("bd-x", "GoldCove", 8000, now);
+        let panes: Vec<AgentState> = vec![];
+        let reservations = vec![(
+            "src/foo.rs".to_string(),
+            "bd-x".to_string(),
+            "OtherPin".to_string(),
+        )];
+        let comments = std::collections::HashMap::new();
+        let dirty: Vec<String> = vec![];
+        assert!(plan_reclaim_ex(now, &[bead], &panes, &reservations, &comments, &dirty).is_empty());
+        let reservations2 = vec![(
+            "src/foo.rs".to_string(),
+            "bd-x".to_string(),
+            "GoldCove".to_string(),
+        )];
+        let bead2 = bead_with_age("bd-x", "GoldCove", 9000, now);
+        assert!(
+            plan_reclaim_ex(now, &[bead2], &panes, &reservations2, &comments, &dirty).is_empty()
+        );
+        let bead3 = bead_with_age("bd-x", "GoldCove", 9000, now);
+        assert_eq!(
+            plan_reclaim_ex(now, &[bead3], &panes, &[], &comments, &dirty).len(),
+            1
+        );
+    }
+    #[test]
+    fn reclaim_working_status_blocks() {
+        let now = 1_700_000_000;
+        let bead = bead_with_age("bd-w", "GoldCove", 9000, now);
+        let panes = vec![AgentState {
+            name: "GoldCove".into(),
+            status: "working".into(),
+            kind: "opencode".into(),
+            pane_id: "p1".into(),
+            mail_identity: Some("GoldCove".into()),
+        }];
+        let board: Vec<(String, String)> = vec![];
+        assert!(plan_reclaim(now, &[bead], &panes, &board).is_empty());
+    }
+    #[test]
+    fn reclaim_recent_comment_blocks() {
+        let now = 1_700_000_000;
+        let bead = bead_with_age("bd-c", "GoldCove", 9000, now);
+        let panes: Vec<AgentState> = vec![];
+        let reservations: Vec<(String, String, String)> = vec![];
+        let mut comments = std::collections::HashMap::new();
+        comments.insert("bd-c".into(), (now - 100, "some comment".into()));
+        let dirty: Vec<String> = vec![];
+        assert!(plan_reclaim_ex(now, &[bead], &panes, &reservations, &comments, &dirty).is_empty());
+        let mut comments2 = std::collections::HashMap::new();
+        comments2.insert("bd-c".into(), (now - 5000, "old".into()));
+        let bead2 = bead_with_age("bd-c", "GoldCove", 9000, now);
+        assert_eq!(
+            plan_reclaim_ex(now, &[bead2], &panes, &reservations, &comments2, &dirty).len(),
+            1
+        );
+    }
+    #[test]
+    fn reclaim_dirty_files_blocks() {
+        let now = 1_700_000_000;
+        let bead = bead_with_age("bd-d", "GoldCove", 9000, now);
+        let panes: Vec<AgentState> = vec![];
+        let reservations: Vec<(String, String, String)> = vec![];
+        let mut comments = std::collections::HashMap::new();
+        comments.insert(
+            "bd-d".into(),
+            (now - 5000, "touched src/foo.rs and tests/bar.rs".into()),
+        );
+        let dirty = vec!["src/foo.rs".into()];
+        assert!(plan_reclaim_ex(now, &[bead], &panes, &reservations, &comments, &dirty).is_empty());
+    }
+    #[test]
+    fn reclaim_leaf_no_br_close() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/durable.rs");
+        let src = std::fs::read_to_string(&path).expect("read");
+        let start = src.find("async fn reclaim_bead").expect("found");
+        let end = src[start..].find("/// Legacy alias").expect("end");
+        let leaf_src = &src[start..start + end];
+        assert!(!leaf_src.contains("br close"));
+    }
+    #[test]
+    fn reclaim_leaf_comment_then_open() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/durable.rs");
+        let src = std::fs::read_to_string(&path).expect("read");
+        let start = src.find("async fn reclaim_bead").expect("found");
+        let snippet = &src[start..start + 4000];
+        let comment_pos = snippet.find("comments").expect("comments");
+        let open_pos = snippet.find("--status").expect("open");
+        assert!(comment_pos < open_pos);
+        assert!(snippet.contains("reclaim: previous in_progress claim appears abandoned"));
+    }
+    #[test]
+    fn reclaim_env_override() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("FLYWHEEL_RECLAIM_SWARM_SECS", "10");
+            std::env::set_var("FLYWHEEL_RECLAIM_HUMAN_SECS", "20");
+        }
+        assert_eq!(reclaim_swarm_secs(), 10);
+        assert_eq!(reclaim_human_secs(), 20);
+        unsafe {
+            std::env::remove_var("FLYWHEEL_RECLAIM_SWARM_SECS");
+            std::env::remove_var("FLYWHEEL_RECLAIM_HUMAN_SECS");
+        }
+        assert_eq!(reclaim_swarm_secs(), 7200);
+        assert_eq!(reclaim_human_secs(), 86400);
     }
 }

@@ -82,11 +82,7 @@ impl DoorbellQueue {
         // hint is the Pull part; use full line as key fallback when hint unknown.
         // For correct per-channel dedup, callers pass the hint-derived line.
         // Extract the hint suffix for keying when possible.
-        let hint = line
-            .split("Pull: ")
-            .nth(1)
-            .unwrap_or(&line)
-            .to_string();
+        let hint = line.split("Pull: ").nth(1).unwrap_or(&line).to_string();
         self.pending.insert((class, hint), line);
     }
 
@@ -190,7 +186,8 @@ impl PinBudget {
 
     pub fn record_at(&mut self, now_unix: u64) {
         let window = self.window_secs();
-        self.prompts.retain(|t| now_unix.saturating_sub(*t) < window);
+        self.prompts
+            .retain(|t| now_unix.saturating_sub(*t) < window);
         self.prompts.push(now_unix);
     }
 }
@@ -957,11 +954,7 @@ pub fn audit_append(state_dir: &Path, workspace: &str, entry: serde_json::Value)
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if let Ok(mut f) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         let mut line = serde_json::to_string(&entry).unwrap_or_default();
         line.push('\n');
         let _ = f.write_all(line.as_bytes());
@@ -1357,8 +1350,14 @@ mod tests {
         );
         // Different channels keep both lines (gap 6 fix: per-channel)
         let mut q2 = DoorbellQueue::default();
-        q2.push(EventClass::Channel, doorbell_line(EventClass::Channel, "h=alpha"));
-        q2.push(EventClass::Channel, doorbell_line(EventClass::Channel, "h=beta"));
+        q2.push(
+            EventClass::Channel,
+            doorbell_line(EventClass::Channel, "h=alpha"),
+        );
+        q2.push(
+            EventClass::Channel,
+            doorbell_line(EventClass::Channel, "h=beta"),
+        );
         assert_eq!(q2.len(), 2, "different hints must not coalesce");
     }
 
@@ -1830,7 +1829,7 @@ mod tests {
                 started_unix: 40,
                 binary_mtime_unix: 50,
                 binary_len: 10,
-            binary_hash: String::new(),
+                binary_hash: String::new(),
             },
         )
         .expect("gen");
@@ -1844,7 +1843,7 @@ mod tests {
                 started_unix: 40,
                 binary_mtime_unix: 49,
                 binary_len: 10,
-            binary_hash: String::new(),
+                binary_hash: String::new(),
             },
         )
         .expect("gen");
@@ -1865,7 +1864,7 @@ mod tests {
                 started_unix: 1,
                 binary_mtime_unix: 1,
                 binary_len: 1,
-            binary_hash: String::new(),
+                binary_hash: String::new(),
             },
         )
         .expect("gen");

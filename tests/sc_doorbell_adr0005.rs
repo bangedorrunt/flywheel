@@ -214,7 +214,10 @@ fn sc_d1_peer_template_is_handler_not_timer() {
     let tpl = read("integrations/peer-aware.md.tpl");
     assert!(tpl.contains("{mail_identity}"), "identity prime must stay");
     assert!(tpl.contains("[doorbell]"), "handler must teach [doorbell]");
-    assert!(tpl.contains("--since"), "pull uses incremental since cursor");
+    assert!(
+        tpl.contains("--since"),
+        "pull uses incremental since cursor"
+    );
     assert!(
         tpl.contains("Safety-net"),
         "crash-to-next-spawn safety-net must be named, not the driver"
@@ -367,10 +370,10 @@ fn adr_d5_names_collab_without_loop_and_bead_dispatch() {
     assert!(
         adr.contains("### D5 — Execution topology and captain operation (binding)"),
         "D5 heading missing"
-    );    assert!(adr.contains("**Open**"), "no-loop captain mode missing");
+    );
+    assert!(adr.contains("**Open**"), "no-loop captain mode missing");
     assert!(
         adr.contains("**Solo loop + beads**"),
-
         "loop captain mode missing"
     );
     assert!(adr.contains("SC-D9"), "scenario SC-D9 missing from §9");
