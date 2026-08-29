@@ -29753,6 +29753,9 @@ mod ingress_wiring_tests {
                 herdr_name: "oc".into(),
                 last_status: "idle".into(),
                 bead_id: Some("bd-1".into()),
+                reason: "silent_idle".into(),
+                evidence_tail: String::new(),
+                severity: "stalled".into(),
             },
             crate::ingress::IngressEvent::LeaseLapsed {
                 path: "src/main.rs".into(),
@@ -29798,6 +29801,9 @@ mod ingress_wiring_tests {
             herdr_name: "pi".into(),
             last_status: "working".into(),
             bead_id: None,
+            reason: "silent_idle".into(),
+            evidence_tail: String::new(),
+            severity: "stalled".into(),
         };
         assert!(
             crate::ingress::fact_summary(&stalled)

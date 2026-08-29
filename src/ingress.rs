@@ -60,6 +60,12 @@ pub enum IngressEvent {
         herdr_name: String,
         last_status: String,
         bead_id: Option<String>,
+        #[serde(default = "default_stall_reason")]
+        reason: String,
+        #[serde(default = "default_evidence_tail")]
+        evidence_tail: String,
+        #[serde(default = "default_stall_severity")]
+        severity: String,
     },
     LeaseLapsed {
         path: String,
@@ -71,6 +77,16 @@ pub enum IngressEvent {
         subject: String,
         bead_id: Option<String>,
     },
+}
+
+fn default_stall_reason() -> String {
+    "silent_idle".to_string()
+}
+fn default_evidence_tail() -> String {
+    String::new()
+}
+fn default_stall_severity() -> String {
+    "stalled".to_string()
 }
 
 /// Human-readable summary for a fact — the `[doorbell] <fact-summary>` line
@@ -91,13 +107,16 @@ pub fn fact_summary(event: &IngressEvent) -> Option<String> {
             herdr_name,
             last_status,
             bead_id,
+            reason,
+            severity,
+            ..
         } => {
             let bead = bead_id
                 .as_deref()
                 .map(|b| format!(" bead {b}"))
                 .unwrap_or_default();
             Some(format!(
-                "pane stalled {pane_id} ({herdr_name} {last_status}){bead}"
+                "pane stalled {pane_id} ({herdr_name} {last_status} {reason}/{severity}){bead}"
             ))
         }
         IngressEvent::LeaseLapsed { path, bead_id } => {
@@ -278,6 +297,9 @@ mod tests {
                 herdr_name: "oc".into(),
                 last_status: "idle".into(),
                 bead_id: Some("bd-123".into()),
+                reason: "silent_idle".into(),
+                evidence_tail: String::new(),
+                severity: "stalled".into(),
             },
             IngressEvent::LeaseLapsed {
                 path: "src/main.rs".into(),
@@ -325,6 +347,9 @@ mod tests {
                 herdr_name: "oc".into(),
                 last_status: "idle".into(),
                 bead_id: None,
+                reason: "silent_idle".into(),
+                evidence_tail: String::new(),
+                severity: "stalled".into(),
             },
             IngressEvent::LeaseLapsed {
                 path: "src/durable.rs".into(),
@@ -367,6 +392,9 @@ mod tests {
             herdr_name: "oc".into(),
             last_status: "idle".into(),
             bead_id: Some("bd-9".into()),
+            reason: "silent_idle".into(),
+            evidence_tail: String::new(),
+            severity: "stalled".into(),
         };
         assert!(
             fact_summary(&stalled)

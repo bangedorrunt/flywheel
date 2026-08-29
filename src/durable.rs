@@ -3444,16 +3444,202 @@ pub fn pane_stall_threshold_secs() -> u64 {
         .unwrap_or(1800)
 }
 
+/// Pane-stall evidence + classification (extends bd-cy0s).
+pub const STALL_EVIDENCE_TAIL_LINES: usize = 40;
+pub const STALL_EVIDENCE_MAX_CHARS: usize = 2000;
+
+/// Watching tier threshold: quick-check at FLYWHEEL_PANE_STALL_SECS/4.
+/// Floor at 1s so a tiny threshold still yields a watching tier.
+pub fn stall_watching_threshold_secs(threshold_secs: u64) -> u64 {
+    (threshold_secs / 4).max(1)
+}
+
+/// Classify stall reason from evidence tail (case-insensitive substring match).
+/// Precedence: rate_limit > network > model_truncated > silent_idle.
+pub fn classify_stall_reason(evidence: &str) -> String {
+    let lower = evidence.to_ascii_lowercase();
+    if lower.contains("rate limit")
+        || lower.contains("quota")
+        || lower.contains("429")
+        || lower.contains("overloaded")
+    {
+        "rate_limit".to_string()
+    } else if lower.contains("connection")
+        || lower.contains("timeout")
+        || lower.contains("reset")
+        || lower.contains("unreachable")
+    {
+        "network".to_string()
+    } else if lower.contains("unterminated tool call")
+        || lower.contains("max tokens")
+        || lower.contains("abruptly ended")
+    {
+        "model_truncated".to_string()
+    } else {
+        "silent_idle".to_string()
+    }
+}
+
+fn truncate_tail(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push_str("\n…(truncated)");
+    out
+}
+
+fn redact_secrets_tail(s: &str) -> String {
+    // Cheap redaction without heavy regex: line-wise check + token replace.
+    // Patterns are matched case-insensitively.
+    let mut out_lines = Vec::new();
+    for line in s.lines() {
+        let lower = line.to_ascii_lowercase();
+        // Token patterns that indicate a secret — replace whole line.
+        // Keep the replacement short and non-leaking.
+        let is_secret_line = lower.contains("nsec1")
+            || lower.contains("ncryptsec")
+            || lower.contains("private key")
+            || lower.contains("secret")
+            || lower.contains("api_key")
+            || lower.contains("apikey")
+            || lower.contains("password")
+            || lower.contains("token=")
+            || lower.contains("token:")
+            || lower.contains("sk-")
+            || lower.contains("sk_");
+        if is_secret_line {
+            // Replace known token substrings, then mask the line.
+            // We keep a marker so the evidence still shows a secret was present.
+            let mut redacted = line.to_string();
+            // Mask common token prefixes — simple substring replace (case-sensitive
+            // variants covered by lower check, but we replace case-insensitively by
+            // scanning lower and replacing slice).
+            // For now, replace entire line with a safe marker to avoid leaking.
+            // A full value redaction is more important than preserving surrounding text.
+            redacted = "[REDACTED secret]".to_string();
+            out_lines.push(redacted);
+        } else {
+            // Inline nsec/ncryptsec token may appear in otherwise benign line —
+            // still redact the token but keep the line.
+            let mut cur = line.to_string();
+            let lower_cur = cur.to_ascii_lowercase();
+            if lower_cur.contains("nsec1") || lower_cur.contains("ncryptsec") {
+                // Mask any such token by replacing the whole line marker.
+                cur = "[REDACTED nsec/ncryptsec token present]".to_string();
+            }
+            out_lines.push(cur);
+        }
+    }
+    let joined = out_lines.join("\n");
+    // Also mask sk- tokens inline — replace with marker without dropping line.
+    // Do a simple scan for "sk-" prefix followed by base64ish chars.
+    let mut final_out = String::new();
+    let mut chars = joined.chars().peekable();
+    while let Some(c) = chars.next() {
+        if (c == 's' || c == 'S') && chars.peek().is_some_and(|n| *n == 'k' || *n == 'K') {
+            // Peek ahead for sk-/sk_ pattern
+            let mut buf = String::new();
+            buf.push(c);
+            if let Some(k) = chars.next() {
+                buf.push(k);
+                if let Some(sep) = chars.next() {
+                    if sep == '-' || sep == '_' {
+                        buf.push(sep);
+                        let mut token_len = 0;
+                        let mut token_buf = String::new();
+                        while let Some(&ch) = chars.peek() {
+                            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                                token_buf.push(ch);
+                                chars.next();
+                                token_len += 1;
+                                if token_len > 64 {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        if token_len >= 8 {
+                            final_out.push_str("[REDACTED_sk]");
+                            // consume token already
+                        } else {
+                            final_out.push_str(&buf);
+                            final_out.push_str(&token_buf);
+                        }
+                        continue;
+                    } else {
+                        final_out.push_str(&buf);
+                        final_out.push(sep);
+                        continue;
+                    }
+                } else {
+                    final_out.push_str(&buf);
+                    continue;
+                }
+            } else {
+                final_out.push_str(&buf);
+                continue;
+            }
+        } else {
+            final_out.push(c);
+        }
+    }
+    final_out
+}
+
+/// Take last STALL_EVIDENCE_TAIL_LINES lines, redact secrets, truncate.
+/// Pure — unit-testable, no I/O.
+pub fn sanitize_evidence_tail(raw: &str) -> String {
+    let lines: Vec<&str> = raw.lines().collect();
+    let tail = if lines.len() > STALL_EVIDENCE_TAIL_LINES {
+        lines[lines.len() - STALL_EVIDENCE_TAIL_LINES..].join("\n")
+    } else {
+        raw.to_string()
+    };
+    let redacted = redact_secrets_tail(&tail);
+    truncate_tail(&redacted, STALL_EVIDENCE_MAX_CHARS)
+}
+
 /// Pure: detect stalled panes — bead in_progress + assignee pane listed +
 /// agent idle/silent past threshold. Returns PaneStalled facts (feeds Diagnose,
 /// NOT auto-reclaim). `now_secs` is wall clock secs, `updated_at` is bead's
 /// ISO8601 timestamp.
+///
+/// Two-tier: `watching` at threshold/4 (visible early, no Diagnose) and
+/// `stalled` at threshold (with evidence + reason, feeds Diagnose). Evidence
+/// sampling is one scrollback read per detection, not per tick — the caller
+/// samples the tail via `evidence_fn` only when a pane crosses a tier.
 pub fn detect_stalled_panes(
     in_progress: &[ReadyBead],
     states: &[AgentState],
     now_secs: i64,
     threshold_secs: u64,
 ) -> Vec<IngressEvent> {
+    detect_stalled_panes_with_evidence(
+        in_progress,
+        states,
+        now_secs,
+        threshold_secs,
+        stall_watching_threshold_secs(threshold_secs),
+        |_| String::new(),
+    )
+}
+
+/// Tiered detection with evidence sampling callback. `evidence_fn` is called
+/// once per pane that crosses a tier (one read per detection, not per tick)
+/// and its raw tail is sanitized + classified before emitting.
+pub fn detect_stalled_panes_with_evidence<F>(
+    in_progress: &[ReadyBead],
+    states: &[AgentState],
+    now_secs: i64,
+    threshold_secs: u64,
+    watching_threshold_secs: u64,
+    mut evidence_fn: F,
+) -> Vec<IngressEvent>
+where
+    F: FnMut(&AgentState) -> String,
+{
     let mut out = Vec::new();
     for bead in in_progress {
         let Some(assignee) = bead.assignee.as_deref() else {
@@ -3462,7 +3648,6 @@ pub fn detect_stalled_panes(
         let Some(state) = states.iter().find(|s| s.name == assignee) else {
             continue;
         };
-        // pane listed + agent idle/silent past threshold
         if !matches!(state.status.as_str(), "idle" | "done") {
             continue;
         }
@@ -3475,17 +3660,50 @@ pub fn detect_stalled_panes(
             continue;
         };
         let age = now_secs.saturating_sub(updated);
-        if age < threshold_secs as i64 {
+        let severity = if age >= threshold_secs as i64 {
+            "stalled"
+        } else if age >= watching_threshold_secs as i64 {
+            "watching"
+        } else {
             continue;
-        }
+        };
+        // One scrollback read per detection — only when a tier is crossed.
+        let raw_tail = evidence_fn(state);
+        let evidence_tail = sanitize_evidence_tail(&raw_tail);
+        let reason = if evidence_tail.is_empty() {
+            "silent_idle".to_string()
+        } else {
+            classify_stall_reason(&evidence_tail)
+        };
         out.push(IngressEvent::PaneStalled {
             pane_id: state.pane_id.clone(),
             herdr_name: state.name.clone(),
             last_status: state.status.clone(),
             bead_id: Some(bead.id.clone()),
+            reason,
+            evidence_tail,
+            severity: severity.to_string(),
         });
     }
     out
+}
+
+/// Convenience: tiered detection without evidence (empty tail, silent_idle reason).
+pub fn detect_stalled_panes_tiered(
+    in_progress: &[ReadyBead],
+    states: &[AgentState],
+    now_secs: i64,
+    threshold_secs: u64,
+    watching_threshold_secs: u64,
+) -> Vec<IngressEvent> {
+    detect_stalled_panes_with_evidence(
+        in_progress,
+        states,
+        now_secs,
+        threshold_secs,
+        watching_threshold_secs,
+        |_| String::new(),
+    )
 }
 
 /// Internal: emit a fact to journal + handle_ingress (captain surface).
@@ -12067,6 +12285,7 @@ mod tests {
                 herdr_name,
                 last_status,
                 bead_id,
+                ..
             } => {
                 assert_eq!(pane_id, "w1:p1");
                 assert_eq!(herdr_name, "StallAgent");
@@ -12120,6 +12339,346 @@ mod tests {
                 .contains("lease lapsed src/durable.rs")
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stall_classifier_maps_evidence_signatures_to_reasons() {
+        assert_eq!(classify_stall_reason("rate limit exceeded"), "rate_limit");
+        assert_eq!(
+            classify_stall_reason("Quota exceeded for model"),
+            "rate_limit"
+        );
+        assert_eq!(classify_stall_reason("got 429 error"), "rate_limit");
+        assert_eq!(
+            classify_stall_reason("model overloaded try later"),
+            "rate_limit"
+        );
+        assert_eq!(classify_stall_reason("connection refused"), "network");
+        assert_eq!(
+            classify_stall_reason("timeout waiting for response"),
+            "network"
+        );
+        assert_eq!(classify_stall_reason("reset by peer"), "network");
+        assert_eq!(classify_stall_reason("host unreachable"), "network");
+        assert_eq!(
+            classify_stall_reason("unterminated tool call in response"),
+            "model_truncated"
+        );
+        assert_eq!(
+            classify_stall_reason("max tokens reached"),
+            "model_truncated"
+        );
+        assert_eq!(
+            classify_stall_reason("response abruptly ended"),
+            "model_truncated"
+        );
+        assert_eq!(classify_stall_reason("just idle no output"), "silent_idle");
+        assert_eq!(classify_stall_reason(""), "silent_idle");
+        // precedence: rate_limit over network
+        assert_eq!(
+            classify_stall_reason("rate limit and timeout both present"),
+            "rate_limit"
+        );
+    }
+
+    #[test]
+    fn stall_watching_tier_emits_before_diagnose_tier() {
+        let now = chrono::Utc::now().timestamp();
+        let threshold = 1800;
+        let watching = stall_watching_threshold_secs(threshold);
+        assert_eq!(watching, 450, "watching is threshold/4");
+        // Bead age between watching and threshold -> watching
+        let watching_bead = ReadyBead {
+            id: "bd-watch".into(),
+            title: "watching".into(),
+            assignee: Some("WatchAgent".into()),
+            verify: Some("true".into()),
+            labels: vec![],
+            priority: 2,
+            principles: "p — d".into(),
+            updated_at: Some(
+                (chrono::Utc::now() - chrono::Duration::seconds((watching + 10) as i64))
+                    .to_rfc3339(),
+            ),
+        };
+        // Bead age past threshold -> stalled
+        let stalled_bead = ReadyBead {
+            id: "bd-stalled".into(),
+            title: "stalled".into(),
+            assignee: Some("StallAgent".into()),
+            verify: Some("true".into()),
+            labels: vec![],
+            priority: 2,
+            principles: "p — d".into(),
+            updated_at: Some(
+                (chrono::Utc::now() - chrono::Duration::seconds((threshold + 10) as i64))
+                    .to_rfc3339(),
+            ),
+        };
+        let states = vec![
+            AgentState {
+                name: "WatchAgent".into(),
+                status: "idle".into(),
+                kind: "opencode".into(),
+                pane_id: "w1:p1".into(),
+                mail_identity: None,
+            },
+            AgentState {
+                name: "StallAgent".into(),
+                status: "idle".into(),
+                kind: "opencode".into(),
+                pane_id: "w1:p2".into(),
+                mail_identity: None,
+            },
+        ];
+        // watching bead should emit watching severity
+        let watching_events = detect_stalled_panes_tiered(
+            &[watching_bead.clone()],
+            &states,
+            now,
+            threshold,
+            watching,
+        );
+        assert_eq!(watching_events.len(), 1);
+        match &watching_events[0] {
+            IngressEvent::PaneStalled {
+                severity, reason, ..
+            } => {
+                assert_eq!(severity, "watching", "watching tier severity");
+                assert_eq!(reason, "silent_idle");
+            }
+            other => panic!("expected PaneStalled watching, got {other:?}"),
+        }
+        // stalled bead should emit stalled severity
+        let stalled_events =
+            detect_stalled_panes_tiered(&[stalled_bead.clone()], &states, now, threshold, watching);
+        assert_eq!(stalled_events.len(), 1);
+        match &stalled_events[0] {
+            IngressEvent::PaneStalled { severity, .. } => {
+                assert_eq!(severity, "stalled");
+            }
+            other => panic!("expected stalled, got {other:?}"),
+        }
+        // Both together: watching + stalled visible, ordered as input
+        let both = detect_stalled_panes_tiered(
+            &[watching_bead, stalled_bead],
+            &states,
+            now,
+            threshold,
+            watching,
+        );
+        assert_eq!(both.len(), 2);
+        // watching should be distinct from stalled — watching does NOT feed Diagnose
+        // (severity watching is the signal without Diagnose, stalled feeds Diagnose)
+        let watching_count = both
+            .iter()
+            .filter(|e| matches!(e, IngressEvent::PaneStalled { severity, .. } if severity == "watching"))
+            .count();
+        let stalled_count = both
+            .iter()
+            .filter(|e| matches!(e, IngressEvent::PaneStalled { severity, .. } if severity == "stalled"))
+            .count();
+        assert_eq!(watching_count, 1);
+        assert_eq!(stalled_count, 1);
+    }
+
+    #[test]
+    fn stall_evidence_sampling_classifies_and_redacts() {
+        let now = chrono::Utc::now().timestamp();
+        let threshold = 1800;
+        let watching = stall_watching_threshold_secs(threshold);
+        let old_bead = ReadyBead {
+            id: "bd-evid".into(),
+            title: "evid".into(),
+            assignee: Some("EvidAgent".into()),
+            verify: Some("true".into()),
+            labels: vec![],
+            priority: 2,
+            principles: "p — d".into(),
+            updated_at: Some(
+                (chrono::Utc::now() - chrono::Duration::seconds((threshold + 10) as i64))
+                    .to_rfc3339(),
+            ),
+        };
+        let states = vec![AgentState {
+            name: "EvidAgent".into(),
+            status: "idle".into(),
+            kind: "opencode".into(),
+            pane_id: "w1:p1".into(),
+            mail_identity: None,
+        }];
+        // Evidence with rate_limit signature + secret — should classify rate_limit and redact
+        let raw_tail = "some log line\nrate limit hit: 429 overloaded\nnsec1abc123 secret token=xyz\nfinal line";
+        let events = detect_stalled_panes_with_evidence(
+            &[old_bead],
+            &states,
+            now,
+            threshold,
+            watching,
+            |_| raw_tail.to_string(),
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            IngressEvent::PaneStalled {
+                reason,
+                evidence_tail,
+                severity,
+                ..
+            } => {
+                assert_eq!(reason, "rate_limit");
+                assert_eq!(severity, "stalled");
+                assert!(
+                    !evidence_tail.contains("nsec1"),
+                    "secret must be redacted: {evidence_tail}"
+                );
+                assert!(
+                    evidence_tail.contains("[REDACTED"),
+                    "redacted marker present: {evidence_tail}"
+                );
+            }
+            other => panic!("expected PaneStalled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stall_redaction_truncates() {
+        // Last 40 lines + truncation at STALL_EVIDENCE_MAX_CHARS
+        let many_lines: String = (0..100)
+            .map(|i| format!("line {i} content here"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sanitized = sanitize_evidence_tail(&many_lines);
+        // Should keep only last 40 lines
+        let line_count = sanitized.lines().count();
+        // truncated marker adds a line, so <= 41
+        assert!(
+            line_count <= STALL_EVIDENCE_TAIL_LINES + 1,
+            "must keep last 40 lines, got {line_count}"
+        );
+        assert!(
+            !sanitized.contains("line 0 content"),
+            "old lines beyond tail must be dropped"
+        );
+        assert!(
+            sanitized.contains("line 99 content"),
+            "latest line must be present"
+        );
+        // Truncation at max chars
+        let long_tail = "x".repeat(STALL_EVIDENCE_MAX_CHARS + 500);
+        let sanitized_long = sanitize_evidence_tail(&long_tail);
+        assert!(
+            sanitized_long.contains("…(truncated)"),
+            "long tail must be truncated"
+        );
+        assert!(
+            sanitized_long.chars().count() <= STALL_EVIDENCE_MAX_CHARS + "…(truncated)".len() + 1,
+            "truncated length bounded"
+        );
+        // Secret redaction
+        let secret_raw = "here is a token=supersecret123 and more";
+        let sanitized_secret = sanitize_evidence_tail(secret_raw);
+        assert!(
+            !sanitized_secret.contains("supersecret123"),
+            "secret value must be redacted"
+        );
+        assert!(sanitized_secret.contains("[REDACTED"), "redacted marker");
+        let nsec_raw = "key nsec1qwertyuiopasdfghjkl1234567890";
+        let sanitized_nsec = sanitize_evidence_tail(nsec_raw);
+        assert!(
+            !sanitized_nsec.contains("nsec1qwerty"),
+            "nsec must be redacted"
+        );
+    }
+
+    #[test]
+    fn stall_one_read_per_detection_not_per_tick() {
+        // Verify the evidence_fn is called once per detection, not per tick for idle non-stalled.
+        let now = chrono::Utc::now().timestamp();
+        let threshold = 1800;
+        let watching = stall_watching_threshold_secs(threshold);
+        let old_bead = ReadyBead {
+            id: "bd-read".into(),
+            title: "read".into(),
+            assignee: Some("ReadAgent".into()),
+            verify: Some("true".into()),
+            labels: vec![],
+            priority: 2,
+            principles: "p — d".into(),
+            updated_at: Some(
+                (chrono::Utc::now() - chrono::Duration::seconds((threshold + 10) as i64))
+                    .to_rfc3339(),
+            ),
+        };
+        let recent_bead = ReadyBead {
+            id: "bd-recent".into(),
+            title: "recent".into(),
+            assignee: Some("ReadAgent".into()),
+            verify: Some("true".into()),
+            labels: vec![],
+            priority: 2,
+            principles: "p — d".into(),
+            updated_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+        let states = vec![AgentState {
+            name: "ReadAgent".into(),
+            status: "idle".into(),
+            kind: "opencode".into(),
+            pane_id: "w1:p1".into(),
+            mail_identity: None,
+        }];
+        let mut read_count = 0usize;
+        let _ = detect_stalled_panes_with_evidence(
+            &[old_bead.clone()],
+            &states,
+            now,
+            threshold,
+            watching,
+            |_| {
+                read_count += 1;
+                "some tail".to_string()
+            },
+        );
+        assert_eq!(read_count, 1, "one read per detection (stalled)");
+        read_count = 0;
+        let _ = detect_stalled_panes_with_evidence(
+            &[recent_bead],
+            &states,
+            now,
+            threshold,
+            watching,
+            |_| {
+                read_count += 1;
+                "some tail".to_string()
+            },
+        );
+        assert_eq!(read_count, 0, "no read when not crossing tier");
+        // Watching tier also triggers one read
+        let watching_bead = ReadyBead {
+            id: "bd-watch2".into(),
+            title: "watch".into(),
+            assignee: Some("ReadAgent".into()),
+            verify: Some("true".into()),
+            labels: vec![],
+            priority: 2,
+            principles: "p — d".into(),
+            updated_at: Some(
+                (chrono::Utc::now() - chrono::Duration::seconds((watching + 5) as i64))
+                    .to_rfc3339(),
+            ),
+        };
+        read_count = 0;
+        let _ = detect_stalled_panes_with_evidence(
+            &[watching_bead],
+            &states,
+            now,
+            threshold,
+            watching,
+            |_| {
+                read_count += 1;
+                "tail".to_string()
+            },
+        );
+        assert_eq!(read_count, 1, "watching also one read");
     }
 }
 
