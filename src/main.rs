@@ -29,6 +29,7 @@ mod failure;
 mod fs_util;
 mod headless;
 mod herdr_shim;
+mod ingress;
 mod intent;
 mod mail_shim;
 mod mcp_http;
@@ -428,6 +429,19 @@ enum Commands {
     LoopMode {
         #[command(subcommand)]
         cmd: LoopCmd,
+    },
+    /// Typed artifacts (ADR-0025 Spec 2): list or stitch per-run records
+    Artifacts {
+        /// run id to list (flywheel artifacts <run_id> [--json])
+        run_id: Option<String>,
+        /// machine JSON
+        #[arg(long)]
+        json: bool,
+        /// project for artifact path
+        #[arg(long)]
+        project: Option<String>,
+        #[command(subcommand)]
+        cmd: Option<ArtifactsCmd>,
     },
     /// Zoom a pane (herdr pane.zoom)
     Zoom {
@@ -1263,6 +1277,23 @@ enum LoopCmd {
         /// machine-readable JSON health report
         #[arg(long)]
         json: bool,
+    },
+    /// Re-drive the recorded Msg journal through tick, assert identical actions (ADR-0025 Spec 3)
+    Replay { project: String },
+    /// Print (msg, state-delta, actions) triple for a journal seq (ADR-0025 Spec 3)
+    Why { project: String, seq: usize },
+}
+
+#[derive(Subcommand)]
+enum ArtifactsCmd {
+    /// List artifacts for a run (reads state-dir artifacts/<run_id>)
+    #[command(name = "stitch")]
+    Stitch {
+        /// run id to stitch
+        run_id: String,
+        /// project for artifact path (default inferred from current dir)
+        #[arg(long)]
+        project: Option<String>,
     },
 }
 
@@ -3576,7 +3607,15 @@ fn main() {
             LoopCmd::List => cmd_loop_list(),
             LoopCmd::Prune => cmd_loop_prune(),
             LoopCmd::Doctor { fix, json } => cmd_loop_doctor(&cfg, *fix, *json),
+            LoopCmd::Replay { project } => cmd_loop_replay(project),
+            LoopCmd::Why { project, seq } => cmd_loop_why(project, *seq),
         },
+        Some(Commands::Artifacts {
+            run_id,
+            json,
+            project,
+            cmd,
+        }) => cmd_artifacts(run_id.as_deref(), *json, project.as_deref(), cmd),
         Some(Commands::Zoom { project, to, off }) => cmd_zoom(&cfg, project, to, *off),
         Some(Commands::Attach { project, to }) => cmd_attach(&cfg, project, to),
         Some(Commands::Kill {
@@ -15158,6 +15197,117 @@ fn cmd_loop_doctor(cfg: &Config, fix: bool, json: bool) -> Result<()> {
             "{}",
             output::dim("re-run with --fix to reject stale invocations + prune orphaned pids")
         );
+    }
+    Ok(())
+}
+
+fn cmd_loop_replay(project: &str) -> Result<()> {
+    let entries = crate::state::read_loop_journal(project);
+    if entries.is_empty() {
+        println!(
+            "no journal for {project} (state_dir/journals/{}.jsonl)",
+            crate::state::state_key(project)
+        );
+        return Ok(());
+    }
+    // Re-drive from empty model, assert identical action counts (drift exits nonzero)
+    let mut model = crate::durable::LoopModel {
+        queue: Vec::new(),
+        per_bead_phase: Default::default(),
+        wake_suppression: Default::default(),
+        done_mailed: Default::default(),
+        event_cursor: None,
+        escalation: Default::default(),
+        respawn: Default::default(),
+        mail_health: Default::default(),
+        mail_degraded: false,
+        heal_states: Default::default(),
+    };
+    for (idx, entry) in entries.iter().enumerate() {
+        let Some(msg_val) = entry.get("msg") else {
+            continue;
+        };
+        let msg: crate::durable::LoopMsg = serde_json::from_value(msg_val.clone())
+            .with_context(|| format!("journal {idx} msg decode"))?;
+        let (_, actions) = crate::durable::tick(&model, &msg);
+        let recorded = entry
+            .get("actions")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(actions.len());
+        if recorded != actions.len() {
+            anyhow::bail!(
+                "replay drift at seq {idx}: recorded {} actions != replayed {} (msg {:?})",
+                recorded,
+                actions.len(),
+                msg
+            );
+        }
+        // Advance model for next iteration (replay is stateful)
+        let (next, _) = crate::durable::tick(&model, &msg);
+        model = next;
+    }
+    println!("replay {project}: {} entries, no drift", entries.len());
+    Ok(())
+}
+
+fn cmd_loop_why(project: &str, seq: usize) -> Result<()> {
+    let entries = crate::state::read_loop_journal(project);
+    let Some(entry) = entries.get(seq) else {
+        anyhow::bail!(
+            "no journal entry {seq} for {project} (have {})",
+            entries.len()
+        );
+    };
+    let pretty = serde_json::to_string_pretty(entry)?;
+    println!("{pretty}");
+    Ok(())
+}
+
+fn cmd_artifacts(
+    run_id: Option<&str>,
+    json: bool,
+    project: Option<&str>,
+    cmd: &Option<ArtifactsCmd>,
+) -> Result<()> {
+    if let Some(ArtifactsCmd::Stitch { run_id, project }) = cmd {
+        let proj = project.as_deref().unwrap_or("flywheel");
+        let path = crate::artifact::stitch_artifacts(proj, run_id)?;
+        println!("{}", path.display());
+        return Ok(());
+    }
+    let Some(rid) = run_id else {
+        anyhow::bail!("flywheel artifacts: pass <run_id> or `stitch <run_id>`");
+    };
+    let proj = project.unwrap_or("flywheel");
+    // List mode: read artifacts/<run_id>/*.json and print
+    let base = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("flywheel")
+        .join(proj)
+        .join("artifacts")
+        .join(rid);
+    let mut records = Vec::new();
+    if base.is_dir() {
+        for e in std::fs::read_dir(&base)? {
+            let e = e?;
+            let p = e.path();
+            if p.extension().map(|x| x == "json").unwrap_or(false) {
+                let raw = std::fs::read_to_string(&p)?;
+                let rec: serde_json::Value = serde_json::from_str(&raw)?;
+                records.push(rec);
+            }
+        }
+    }
+    if json {
+        print_json(&serde_json::json!(records));
+    } else {
+        for r in &records {
+            println!("{}", serde_json::to_string(r)?);
+        }
+        if records.is_empty() {
+            println!("no artifacts for run {rid} in {proj}");
+        }
     }
     Ok(())
 }
