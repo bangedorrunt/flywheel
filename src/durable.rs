@@ -168,6 +168,288 @@ fn default_drain_grace_polls() -> u32 {
     DEFAULT_DRAIN_GRACE_POLLS
 }
 
+/// Loop-owned bead lifecycle (Spec 3) — closed enum, illegal transitions unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LoopPhase {
+    #[default]
+    Idle,
+    Dispatched,
+    ClaimWatch,
+    Verify,
+    Complete,
+    WaveHeld,
+    Blocked,
+    Reclaim,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoopEvent {
+    Dispatch {
+        agent_status: String,
+        force: bool,
+    },
+    ClaimSeen,
+    PaneExited,
+    BrClose,
+    Verify,
+    Complete {
+        has_command_verified: bool,
+        wave_gate: bool,
+    },
+    WaveGate {
+        bead_id: String,
+    },
+    Reclaim {
+        holder_pin: String,
+        claimant_pin: String,
+        is_live: bool,
+    },
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IllegalTransition {
+    pub from: LoopPhase,
+    pub event: LoopEvent,
+    pub reason: &'static str,
+}
+
+pub fn transition(
+    from: &LoopPhase,
+    event: &LoopEvent,
+) -> std::result::Result<LoopPhase, IllegalTransition> {
+    match (from, event) {
+        (LoopPhase::ClaimWatch, LoopEvent::Verify) => Err(IllegalTransition {
+            from: from.clone(),
+            event: event.clone(),
+            reason: "Verify without close",
+        }),
+        (
+            LoopPhase::Verify,
+            LoopEvent::Complete {
+                wave_gate: true, ..
+            },
+        ) => Err(IllegalTransition {
+            from: from.clone(),
+            event: event.clone(),
+            reason: "Complete while WaveGate",
+        }),
+        (
+            LoopPhase::Verify,
+            LoopEvent::Complete {
+                has_command_verified: false,
+                wave_gate: false,
+            },
+        ) => Err(IllegalTransition {
+            from: from.clone(),
+            event: event.clone(),
+            reason: "Complete without CommandVerified",
+        }),
+        (
+            LoopPhase::Idle,
+            LoopEvent::Dispatch {
+                agent_status,
+                force: false,
+            },
+        ) if agent_status == "working" => Err(IllegalTransition {
+            from: from.clone(),
+            event: event.clone(),
+            reason: "Dispatch to working without force",
+        }),
+        (
+            LoopPhase::Reclaim,
+            LoopEvent::Reclaim {
+                holder_pin,
+                claimant_pin,
+                is_live: true,
+            },
+        ) if holder_pin != claimant_pin => Err(IllegalTransition {
+            from: from.clone(),
+            event: event.clone(),
+            reason: "Reclaim foreign reservation",
+        }),
+        // Legal transitions
+        (LoopPhase::Idle, LoopEvent::Dispatch { .. }) => Ok(LoopPhase::Dispatched),
+        (LoopPhase::Dispatched, LoopEvent::ClaimSeen) => Ok(LoopPhase::ClaimWatch),
+        (LoopPhase::Dispatched, LoopEvent::PaneExited) => Ok(LoopPhase::Reclaim),
+        (LoopPhase::ClaimWatch, LoopEvent::PaneExited) => Ok(LoopPhase::Reclaim),
+        (LoopPhase::Reclaim, LoopEvent::Reclaim { .. }) => Ok(LoopPhase::Idle),
+        (LoopPhase::ClaimWatch, LoopEvent::BrClose) => Ok(LoopPhase::Verify),
+        (
+            LoopPhase::Verify,
+            LoopEvent::Complete {
+                has_command_verified: true,
+                wave_gate: false,
+            },
+        ) => Ok(LoopPhase::Complete),
+        (LoopPhase::Verify, LoopEvent::WaveGate { .. }) => Ok(LoopPhase::WaveHeld),
+        (LoopPhase::WaveHeld, LoopEvent::BrClose) => Ok(LoopPhase::Idle),
+        (LoopPhase::Idle, LoopEvent::Blocked) => Ok(LoopPhase::Blocked),
+        _ => Err(IllegalTransition {
+            from: from.clone(),
+            event: event.clone(),
+            reason: "illegal transition",
+        }),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct LoopModel {
+    pub queue: Vec<String>,
+    pub per_bead_phase: std::collections::BTreeMap<String, LoopPhase>,
+    pub wake_suppression: std::collections::HashSet<String>,
+    pub done_mailed: std::collections::HashSet<String>,
+    pub event_cursor: Option<crate::state::EventCursor>,
+    pub escalation: std::collections::BTreeMap<String, crate::state::EscalationState>,
+    pub respawn: std::collections::BTreeMap<String, crate::state::RespawnBudget>,
+    pub mail_health: crate::state::MailHealth,
+    pub mail_degraded: bool,
+    pub heal_states: std::collections::HashMap<String, HealState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum LoopMsg {
+    Herdr(PollEvent),
+    BrClose {
+        bead_id: String,
+    },
+    WaveGate {
+        bead_id: String,
+    },
+    CommandVerified {
+        bead_id: String,
+        verified: bool,
+    },
+    Dispatch {
+        bead_id: String,
+        agent_status: String,
+        force: bool,
+    },
+    Reclaim {
+        bead_id: String,
+        holder_pin: String,
+        claimant_pin: String,
+        is_live: bool,
+    },
+    Tick {
+        states: Vec<AgentState>,
+        digests: std::collections::HashMap<String, MailDigest>,
+        nudge: Option<String>,
+        wake_suppressed: std::collections::HashSet<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LoopSnapshot {
+    pub per_bead_phase: std::collections::BTreeMap<String, LoopPhase>,
+    pub mail_degraded: bool,
+    pub queue_len: usize,
+    pub event_cursor: Option<crate::state::EventCursor>,
+}
+
+impl LoopSnapshot {
+    pub fn from_model(model: &LoopModel) -> Self {
+        Self {
+            per_bead_phase: model.per_bead_phase.clone(),
+            mail_degraded: model.mail_degraded,
+            queue_len: model.queue.len(),
+            event_cursor: model.event_cursor.clone(),
+        }
+    }
+}
+
+pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
+    let mut next = model.clone();
+    let mut actions = Vec::new();
+    // Pure, total, deterministic: no I/O, no &mut, no br/herdr calls
+    // Queue pop lives in model' where it is visible and replayable
+    match msg {
+        LoopMsg::Dispatch {
+            bead_id,
+            agent_status,
+            force,
+        } => {
+            let from = model
+                .per_bead_phase
+                .get(bead_id)
+                .cloned()
+                .unwrap_or(LoopPhase::Idle);
+            let event = LoopEvent::Dispatch {
+                agent_status: agent_status.clone(),
+                force: *force,
+            };
+            if let Ok(to) = transition(&from, &event) {
+                next.per_bead_phase.insert(bead_id.clone(), to);
+                // Pop queue FIFO into model' where visible
+                if !next.queue.is_empty() {
+                    next.queue.remove(0);
+                }
+                actions.push(LoopAction::Send {
+                    name: bead_id.clone(),
+                    text: format!("dispatch {bead_id}"),
+                });
+            }
+        }
+        LoopMsg::BrClose { bead_id } => {
+            let from = model
+                .per_bead_phase
+                .get(bead_id)
+                .cloned()
+                .unwrap_or(LoopPhase::Idle);
+            if let Ok(to) = transition(&from, &LoopEvent::BrClose) {
+                next.per_bead_phase.insert(bead_id.clone(), to);
+            }
+        }
+        LoopMsg::Reclaim {
+            bead_id,
+            holder_pin,
+            claimant_pin,
+            is_live,
+        } => {
+            let from = model
+                .per_bead_phase
+                .get(bead_id)
+                .cloned()
+                .unwrap_or(LoopPhase::Idle);
+            let event = LoopEvent::Reclaim {
+                holder_pin: holder_pin.clone(),
+                claimant_pin: claimant_pin.clone(),
+                is_live: *is_live,
+            };
+            if let Ok(to) = transition(&from, &event) {
+                next.per_bead_phase.insert(bead_id.clone(), to);
+                actions.push(LoopAction::Reclaim {
+                    bead_id: bead_id.clone(),
+                    pin: claimant_pin.clone(),
+                    herdr_name: bead_id.clone(),
+                    reason: "reclaim".to_string(),
+                });
+            }
+        }
+        LoopMsg::Tick {
+            states,
+            digests,
+            nudge,
+            wake_suppressed,
+        } => {
+            let actions_from_plan =
+                plan_actions(&next, states, nudge.as_deref(), digests, wake_suppressed);
+            let send_count = actions_from_plan
+                .iter()
+                .filter(|a| matches!(a, LoopAction::Send { .. }))
+                .count();
+            for _ in 0..send_count {
+                if !next.queue.is_empty() {
+                    next.queue.remove(0);
+                }
+            }
+            actions.extend(actions_from_plan);
+        }
+        LoopMsg::Herdr(_) | LoopMsg::WaveGate { .. } | LoopMsg::CommandVerified { .. } => {}
+    }
+    (next, actions)
+}
+
 fn default_claim_nudge_after_polls() -> u32 {
     DEFAULT_CLAIM_NUDGE_AFTER_POLLS
 }
@@ -1090,7 +1372,7 @@ fn default_xproj_limit() -> u32 {
 /// documented no-op — "fresh on first read"), so the digest reports the
 /// RECENT inbox window plus URGENT (importance high|urgent) — both real
 /// message attributes. `urgent` is the wake trigger.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MailDigest {
     /// the herdr agent name — the loop's digest-map key (plan_actions looks
     /// digests up by the agent state name)
@@ -3479,8 +3761,8 @@ pub fn claim_watch_step(
 }
 
 pub fn plan_actions(
+    model: &LoopModel,
     states: &[AgentState],
-    queue: &mut Vec<String>,
     nudge: Option<&str>,
     digests: &HashMap<String, MailDigest>,
     wake_suppressed: &std::collections::HashSet<String>,
@@ -3496,8 +3778,8 @@ pub fn plan_actions(
             "unknown" => actions.push(LoopAction::Wait),
             _ => {
                 // idle / done → feed work or nudge
-                if !queue.is_empty() {
-                    let text = queue.remove(0); // FIFO: stages in declared order
+                if !model.queue.is_empty() {
+                    let text = model.queue[0].clone(); // peek, pop lives in tick's model'
                     // bead/resume prompts carry a {AGENT_NAME} placeholder —
                     // substitute the receiving agent's mail PIN (the
                     // identity it is addressed by; bd-pin-public-plane-s-easy.2),
@@ -5712,8 +5994,19 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 .collect()
         } else {
             plan_actions(
+                &LoopModel {
+                    queue: queue.clone(),
+                    per_bead_phase: Default::default(),
+                    wake_suppression: Default::default(),
+                    done_mailed: Default::default(),
+                    event_cursor: None,
+                    escalation: Default::default(),
+                    respawn: Default::default(),
+                    mail_health: Default::default(),
+                    mail_degraded: false,
+                    heal_states: Default::default(),
+                },
                 &states,
-                &mut queue,
                 params.nudge.as_deref(),
                 &digests,
                 &wake_suppressed,
@@ -7626,8 +7919,19 @@ mod tests {
         let states = vec![st("a", "idle")];
         let mut q = vec!["p1".to_string(), "p6".to_string()];
         let actions = plan_actions(
+            &LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -7672,8 +7976,19 @@ mod tests {
         let states = vec![st("a", "idle"), st("b", "done")];
         let mut q = vec!["p1".to_string(), "p6".to_string()];
         let actions = plan_actions(
+            &LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -7695,8 +8010,19 @@ mod tests {
         let states = vec![st("a", "working")];
         let mut q = vec!["p1".to_string()];
         let actions = plan_actions(
+            &LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -7710,8 +8036,19 @@ mod tests {
         let states = vec![st("a", "blocked")];
         let mut q = vec!["p1".to_string()];
         let actions = plan_actions(
+            &LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -7725,8 +8062,19 @@ mod tests {
         let states = vec![st("a", "idle")];
         let mut q: Vec<String> = vec![];
         let actions = plan_actions(
+            &LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             Some("proceed"),
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -7739,8 +8087,19 @@ mod tests {
         let states = vec![st("a", "done")];
         let mut q: Vec<String> = vec![];
         let actions = plan_actions(
+            &LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -7755,8 +8114,19 @@ mod tests {
         let states = vec![st("a", "unknown")];
         let mut q = vec!["p1".to_string()];
         let actions = plan_actions(
+            &LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -7770,8 +8140,19 @@ mod tests {
         let states = vec![st("a", "unknown")];
         let mut q: Vec<String> = vec![];
         let actions = plan_actions(
+            &LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             Some("proceed"),
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -8668,8 +9049,19 @@ mod tests {
         let mut queue = vec![brief("bd-12", "fix auth flow")];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut queue,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -8700,8 +9092,19 @@ mod tests {
         s.mail_identity = Some("DustySparrow".to_string());
         let states = vec![s];
         let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut queue,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -8729,8 +9132,19 @@ mod tests {
         let mut queue = vec!["t1".to_string()];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut queue,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -8827,8 +9241,19 @@ mod tests {
         s.mail_identity = Some("DustySparrow".to_string());
         let states = vec![s];
         let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut queue,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -8850,8 +9275,19 @@ mod tests {
         let mut queue = vec![brief("bd-13", "fallback owner")];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut queue,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -8865,8 +9301,19 @@ mod tests {
         let mut plain_queue = vec!["run the nightly sweep".to_string()];
         let states_plain = vec![st("flywheel-proj-oc", "idle")];
         let plain_actions = plan_actions(
+            &LoopModel {
+                queue: plain_queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states_plain,
-            &mut plain_queue,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -8894,8 +9341,19 @@ mod tests {
         let mut queue = vec![brief("bd-12", "fix auth flow")];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut queue,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -8952,8 +9410,19 @@ mod tests {
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(2, 1, "PinkGorge", "[bd-1] need input"));
         let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut queue,
             None,
             &d,
             &std::collections::HashSet::new(),
@@ -8975,8 +9444,19 @@ mod tests {
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(0, 0, "", ""));
         let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut queue,
             None,
             &d,
             &std::collections::HashSet::new(),
@@ -8994,8 +9474,19 @@ mod tests {
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] help needed"));
         let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut queue,
             None,
             &d,
             &std::collections::HashSet::new(),
@@ -9025,7 +9516,24 @@ mod tests {
         let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] help needed"));
         let suppressed: std::collections::HashSet<String> =
             ["flywheel-toron-oc3".to_string()].into();
-        let actions = plan_actions(&states, &mut queue, None, &d, &suppressed);
+        let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
+            &states,
+            None,
+            &d,
+            &suppressed,
+        );
         assert!(
             actions.iter().all(|a| matches!(a, LoopAction::Wait)),
             "suppressed saturated pane must Wait, got {actions:?}"
@@ -9119,8 +9627,19 @@ mod tests {
         let mut d = digest(0, 0, "", "");
         d.plane_s = 2;
         let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut queue,
             None,
             &digest_map(d),
             &std::collections::HashSet::new(),
@@ -9170,8 +9689,19 @@ mod tests {
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(0, 0, "", ""));
         let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut queue,
             None,
             &d,
             &std::collections::HashSet::new(),
@@ -9187,8 +9717,19 @@ mod tests {
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(3, 2, "PinkGorge", "[bd-1] urgent"));
         let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut queue,
             Some("proceed"),
             &d,
             &std::collections::HashSet::new(),
@@ -9209,7 +9750,24 @@ mod tests {
         let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] help"));
         let mut suppressed = std::collections::HashSet::new();
         suppressed.insert("flywheel-proj-oc".to_string());
-        let actions = plan_actions(&states, &mut queue, None, &d, &suppressed);
+        let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
+            &states,
+            None,
+            &d,
+            &suppressed,
+        );
         assert_eq!(
             actions[0],
             LoopAction::Wait,
@@ -9225,8 +9783,19 @@ mod tests {
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] new help"));
         let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut queue,
             None,
             &d,
             &std::collections::HashSet::new(),
@@ -9244,8 +9813,19 @@ mod tests {
         let states = vec![st("flywheel-proj-oc", "working")];
         let d = digest_map(digest(5, 1, "PinkGorge", "[bd-1] input"));
         let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut queue,
             None,
             &d,
             &std::collections::HashSet::new(),
@@ -10541,10 +11121,22 @@ mod tests {
         }
     }
 
+    #[allow(clippy::ptr_arg)]
     fn poll_dispatch(states: &[AgentState], queue: &mut Vec<String>) -> Vec<DispatchRec> {
         plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             states,
-            queue,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -12068,5 +12660,241 @@ mod mail_health_tests {
         assert_eq!(al4.mail_health.consecutive_failures, 0);
         assert!(!al4.mail_degraded);
         let _ = crate::state::remove_active_loop(&project);
+    }
+}
+
+#[cfg(test)]
+mod loop_phase_tests {
+    use super::*;
+
+    #[test]
+    fn loop_phase_illegal_transitions() {
+        // Verify-without-close
+        assert!(transition(&LoopPhase::ClaimWatch, &LoopEvent::Verify).is_err());
+        // Complete while WaveGate
+        assert!(
+            transition(
+                &LoopPhase::Verify,
+                &LoopEvent::Complete {
+                    has_command_verified: true,
+                    wave_gate: true
+                }
+            )
+            .is_err()
+        );
+        // Complete without CommandVerified
+        assert!(
+            transition(
+                &LoopPhase::Verify,
+                &LoopEvent::Complete {
+                    has_command_verified: false,
+                    wave_gate: false
+                }
+            )
+            .is_err()
+        );
+        // Dispatch to working without force
+        assert!(
+            transition(
+                &LoopPhase::Idle,
+                &LoopEvent::Dispatch {
+                    agent_status: "working".to_string(),
+                    force: false
+                }
+            )
+            .is_err()
+        );
+        // Reclaim foreign reservation
+        assert!(
+            transition(
+                &LoopPhase::Reclaim,
+                &LoopEvent::Reclaim {
+                    holder_pin: "pin-a".to_string(),
+                    claimant_pin: "pin-b".to_string(),
+                    is_live: true
+                }
+            )
+            .is_err()
+        );
+        // Legal transitions should succeed
+        assert_eq!(
+            transition(
+                &LoopPhase::Idle,
+                &LoopEvent::Dispatch {
+                    agent_status: "idle".to_string(),
+                    force: false
+                }
+            )
+            .unwrap(),
+            LoopPhase::Dispatched
+        );
+        assert_eq!(
+            transition(&LoopPhase::ClaimWatch, &LoopEvent::BrClose).unwrap(),
+            LoopPhase::Verify
+        );
+        assert_eq!(
+            transition(
+                &LoopPhase::Verify,
+                &LoopEvent::Complete {
+                    has_command_verified: true,
+                    wave_gate: false
+                }
+            )
+            .unwrap(),
+            LoopPhase::Complete
+        );
+    }
+
+    #[test]
+    fn loop_phase_complete_with_wavegate_is_illegal() {
+        let res = transition(
+            &LoopPhase::Verify,
+            &LoopEvent::Complete {
+                has_command_verified: true,
+                wave_gate: true,
+            },
+        );
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().reason, "Complete while WaveGate");
+    }
+}
+
+#[cfg(test)]
+mod tick_replay_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn tick_replay_differential() {
+        // Record a fact sequence and replay it, asserting identical actions
+        let mut model = LoopModel {
+            queue: vec!["task1".to_string(), "task2".to_string()],
+            per_bead_phase: Default::default(),
+            wake_suppression: Default::default(),
+            done_mailed: Default::default(),
+            event_cursor: None,
+            escalation: Default::default(),
+            respawn: Default::default(),
+            mail_health: Default::default(),
+            mail_degraded: false,
+            heal_states: Default::default(),
+        };
+        let msgs = vec![
+            LoopMsg::Tick {
+                states: vec![AgentState {
+                    name: "a".to_string(),
+                    status: "idle".to_string(),
+                    kind: "opencode".to_string(),
+                    pane_id: "p1".to_string(),
+                    mail_identity: None,
+                }],
+                digests: HashMap::new(),
+                nudge: None,
+                wake_suppressed: HashSet::new(),
+            },
+            LoopMsg::Dispatch {
+                bead_id: "bd-1".to_string(),
+                agent_status: "idle".to_string(),
+                force: false,
+            },
+            LoopMsg::BrClose {
+                bead_id: "bd-1".to_string(),
+            },
+        ];
+        let mut actions_log = Vec::new();
+        let mut model_replay = model.clone();
+        for msg in &msgs {
+            let (next, actions) = tick(&model, msg);
+            actions_log.push(actions.clone());
+            model = next;
+        }
+        // Replay from scratch with same initial model and same msgs should produce identical actions
+        let mut model2 = LoopModel {
+            queue: vec!["task1".to_string(), "task2".to_string()],
+            per_bead_phase: Default::default(),
+            wake_suppression: Default::default(),
+            done_mailed: Default::default(),
+            event_cursor: None,
+            escalation: Default::default(),
+            respawn: Default::default(),
+            mail_health: Default::default(),
+            mail_degraded: false,
+            heal_states: Default::default(),
+        };
+        let mut actions_log2 = Vec::new();
+        for msg in &msgs {
+            let (next, actions) = tick(&model2, msg);
+            actions_log2.push(actions.clone());
+            model2 = next;
+        }
+        assert_eq!(actions_log, actions_log2);
+        assert_eq!(model, model2);
+    }
+
+    #[test]
+    fn tick_is_pure_and_deterministic() {
+        let model = LoopModel {
+            queue: vec!["q1".to_string()],
+            per_bead_phase: Default::default(),
+            wake_suppression: Default::default(),
+            done_mailed: Default::default(),
+            event_cursor: None,
+            escalation: Default::default(),
+            respawn: Default::default(),
+            mail_health: Default::default(),
+            mail_degraded: false,
+            heal_states: Default::default(),
+        };
+        let msg = LoopMsg::Tick {
+            states: vec![AgentState {
+                name: "a".to_string(),
+                status: "idle".to_string(),
+                kind: "opencode".to_string(),
+                pane_id: "p1".to_string(),
+                mail_identity: None,
+            }],
+            digests: HashMap::new(),
+            nudge: None,
+            wake_suppressed: HashSet::new(),
+        };
+        let (m1, a1) = tick(&model, &msg);
+        let (m2, a2) = tick(&model, &msg);
+        assert_eq!(m1, m2);
+        assert_eq!(a1, a2);
+    }
+
+    #[test]
+    fn tick_has_no_mut_queue_param() {
+        // Compile-level witness: tick takes &LoopModel, not &mut Vec<String>
+        // This test ensures the old &mut queue param is gone
+        let model = LoopModel {
+            queue: vec!["a".to_string(), "b".to_string()],
+            per_bead_phase: Default::default(),
+            wake_suppression: Default::default(),
+            done_mailed: Default::default(),
+            event_cursor: None,
+            escalation: Default::default(),
+            respawn: Default::default(),
+            mail_health: Default::default(),
+            mail_degraded: false,
+            heal_states: Default::default(),
+        };
+        let msg = LoopMsg::Tick {
+            states: vec![AgentState {
+                name: "idle1".to_string(),
+                status: "idle".to_string(),
+                kind: "opencode".to_string(),
+                pane_id: "p1".to_string(),
+                mail_identity: None,
+            }],
+            digests: HashMap::new(),
+            nudge: None,
+            wake_suppressed: HashSet::new(),
+        };
+        let (next, actions) = tick(&model, &msg);
+        // Queue pop should be visible in next.queue
+        assert_eq!(next.queue, vec!["b".to_string()]);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], LoopAction::Send { .. }));
     }
 }
