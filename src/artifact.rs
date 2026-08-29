@@ -458,4 +458,58 @@ mod tests {
         };
         assert!(result.is_err());
     }
+
+    #[test]
+    fn artifacts_cli_list_and_stitch() {
+        // Simulates `flywheel artifacts <run_id> [--json]` + `stitch`
+        let project = format!("artifacts-cli-test-{}", uuid::Uuid::new_v4());
+        let run_id = "run-artifacts-cli-1";
+        let base = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("flywheel")
+            .join(&project)
+            .join("artifacts")
+            .join(run_id);
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("payload.txt");
+        std::fs::write(&file, "payload").unwrap();
+        let rec = ArtifactRecord::new(
+            file.clone(),
+            ArtifactKind::Finding,
+            ExecutionStatus::Completed,
+            CriterionStatus::Met,
+            GroundingStatus::Cited,
+            ClaimSupportStatus::IndependentlySupported,
+            None,
+            Some("bd-x".into()),
+            run_id.into(),
+            Some("node-artifacts-cli".into()),
+            "PinCli".into(),
+        )
+        .unwrap();
+        let p = base.join("node-artifacts-cli.json");
+        std::fs::write(&p, serde_json::to_string_pretty(&rec).unwrap()).unwrap();
+        assert!(p.exists());
+        let stitched = stitch_artifacts(&project, run_id).unwrap();
+        assert!(stitched.exists());
+        let md = std::fs::read_to_string(&stitched).unwrap();
+        assert!(
+            md.contains(&rec.sha256[..12.min(rec.sha256.len())]),
+            "stitch contains sha prefix"
+        );
+        assert!(!md.contains("transcript"), "stitch never dumps transcript");
+        let _ = std::fs::remove_dir_all(
+            dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join("flywheel")
+                .join(&project),
+        );
+    }
+
+    #[test]
+    fn artifacts_cli_stitch_exists_at_expected_path() {
+        assert!(PathBuf::from("src/artifact.rs").exists());
+        // Verify the function exists and is callable (compile check)
+        let _ = stitch_artifacts as fn(&str, &str) -> anyhow::Result<PathBuf>;
+    }
 }

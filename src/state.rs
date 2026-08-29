@@ -736,6 +736,7 @@ pub fn journal_loop_msg(
     project: &str,
     msg: &crate::durable::LoopMsg,
     model: &crate::durable::LoopModel,
+    actions: &[crate::durable::LoopAction],
 ) -> Result<()> {
     let path = loop_journal_file(project);
     if let Some(parent) = path.parent() {
@@ -748,7 +749,8 @@ pub fn journal_loop_msg(
             "queue_len": model.queue.len(),
             "per_bead_phase": model.per_bead_phase,
             "mail_degraded": model.mail_degraded,
-        }
+        },
+        "actions": actions,
     });
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()

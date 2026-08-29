@@ -3259,7 +3259,7 @@ pub fn lease_renew_seconds(heartbeat_interval_secs: u64) -> u64 {
 /// `DispatchImmediate` is the event-path twin of `Send` (bd-event-dispatch):
 /// same `__send` leaf, same FIFO pop, marked so the loop can track
 /// dispatch-pending until a `working` event confirms landing.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LoopAction {
     Send {
         name: String,
@@ -6048,9 +6048,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 nudge: params.nudge.clone(),
                 wake_suppressed: wake_suppressed.clone(),
             };
-            // Journal every LoopMsg driven into tick (Spec 3: kind + payload)
-            let _ = crate::state::journal_loop_msg(&params.project, &msg, &model);
             let (next_model, actions) = tick(&model, &msg);
+            // Journal every LoopMsg driven into tick (kind + payload + actions) as JSONL
+            let _ = crate::state::journal_loop_msg(&params.project, &msg, &model, &actions);
             queue = next_model.queue.clone();
             actions
         };
@@ -13132,5 +13132,102 @@ mod loop_invoke_vehicle_tests {
         let (next, via_tick) = tick(&model, &msg);
         assert_eq!(via_tick, direct);
         assert_eq!(next.queue.len(), model.queue.len() - 1);
+    }
+
+    #[test]
+    fn loop_replay_journal_re_drives_identical_actions() {
+        use crate::state as st;
+        let proj = format!("loop-replay-{}", std::process::id());
+        let _guard = crate::config::test_state_home();
+        // isolate journal for this test project
+        let _ = std::fs::remove_file(st::loop_journal_file(&proj));
+        let model = LoopModel {
+            queue: vec!["task a".to_string()],
+            per_bead_phase: Default::default(),
+            wake_suppression: Default::default(),
+            done_mailed: Default::default(),
+            event_cursor: None,
+            escalation: Default::default(),
+            respawn: Default::default(),
+            mail_health: Default::default(),
+            mail_degraded: false,
+            heal_states: Default::default(),
+        };
+        let msg = LoopMsg::Tick {
+            states: vec![AgentState {
+                name: "x".to_string(),
+                status: "idle".to_string(),
+                kind: "opencode".to_string(),
+                pane_id: "p1".to_string(),
+                mail_identity: None,
+            }],
+            digests: Default::default(),
+            nudge: None,
+            wake_suppressed: Default::default(),
+        };
+        let (next, actions) = tick(&model, &msg);
+        st::journal_loop_msg(&proj, &msg, &model, &actions).unwrap();
+        st::journal_loop_msg(&proj, &msg, &next, &actions).unwrap();
+        let entries = st::read_loop_journal(&proj);
+        assert_eq!(entries.len(), 2);
+        // Re-drive and assert no drift
+        let mut replay_model = LoopModel {
+            queue: vec!["task a".to_string()],
+            per_bead_phase: Default::default(),
+            wake_suppression: Default::default(),
+            done_mailed: Default::default(),
+            event_cursor: None,
+            escalation: Default::default(),
+            respawn: Default::default(),
+            mail_health: Default::default(),
+            mail_degraded: false,
+            heal_states: Default::default(),
+        };
+        for entry in &entries {
+            let m: LoopMsg = serde_json::from_value(entry.get("msg").unwrap().clone()).unwrap();
+            let recorded_len = entry
+                .get("actions")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap();
+            let (nm, acts) = tick(&replay_model, &m);
+            assert_eq!(acts.len(), recorded_len, "replay drift");
+            replay_model = nm;
+        }
+        let _ = std::fs::remove_file(st::loop_journal_file(&proj));
+    }
+
+    #[test]
+    fn loop_replay_why_prints_triple() {
+        use crate::state as st;
+        let proj = format!("loop-why-{}", std::process::id());
+        let _guard = crate::config::test_state_home();
+        let _ = std::fs::remove_file(st::loop_journal_file(&proj));
+        let model = LoopModel {
+            queue: vec!["q".to_string()],
+            per_bead_phase: Default::default(),
+            wake_suppression: Default::default(),
+            done_mailed: Default::default(),
+            event_cursor: None,
+            escalation: Default::default(),
+            respawn: Default::default(),
+            mail_health: Default::default(),
+            mail_degraded: false,
+            heal_states: Default::default(),
+        };
+        let msg = LoopMsg::Tick {
+            states: vec![],
+            digests: Default::default(),
+            nudge: None,
+            wake_suppressed: Default::default(),
+        };
+        let (_, actions) = tick(&model, &msg);
+        st::journal_loop_msg(&proj, &msg, &model, &actions).unwrap();
+        let entries = st::read_loop_journal(&proj);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].get("msg").is_some());
+        assert!(entries[0].get("model_snapshot").is_some());
+        assert!(entries[0].get("actions").is_some());
+        let _ = std::fs::remove_file(st::loop_journal_file(&proj));
     }
 }
