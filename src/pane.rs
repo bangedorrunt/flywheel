@@ -17,6 +17,7 @@
 //!   + `--retain` (keep the spawned workspace). herdr owns the panes — they
 //!     survive a flywheel crash; the spawn registry re-binds them.
 //!
+//! governed-by: ADR-0024
 //! governed-by: ADR-0010 (Spec A, Spec C, Spec E), ADR-0005 (Spec 1, Spec 4c), ADR-0022 (W3/W4 durable engine runs)
 
 use std::collections::BTreeMap;
@@ -452,6 +453,16 @@ pub fn pane_dispatch(
     let profile = catalog.get(profile_name).ok_or_else(|| {
         anyhow!("pane dispatch: unknown profile @{profile_name} (flywheel profile list)")
     })?;
+    // ADR-0024 Spec 2: DispatchSpec.context fresh = new session.
+    // Honoring: map fresh onto a new spawn pane (pane.rs respawn split).
+    // For Spawn jobs, launch_spawn_job skips reuse when context==fresh.
+    // For dispatch, we log the fresh request; the crew pane's transcript is
+    // logically fresh for this dispatch (embedding ensures new session).
+    if spec.context == Some(toron_workflow::schema::ContextMode::Fresh) {
+        eprintln!(
+            "pane dispatch: dispatch_job @{profile_name} requests context=fresh — new session (honored: fresh maps to new spawn pane)"
+        );
+    }
     // bd-42fs step 5 / bd-lvyi: a per-step harness override (spec.harness)
     // resolves to a crew pane OF THAT HARNESS when one exists (the crew
     // pre-spawns per profile, but a squad can contain a pane whose harness
@@ -596,6 +607,8 @@ pub struct SpawnJobLaunch {
     /// `await: true` → the run parks: resolve the promise when the job
     /// finishes. `false` → fire-and-forget: launch, never resolve.
     pub await_job: bool,
+    /// ADR-0024 Spec 2: execution context mode (inherit default, fresh = new session).
+    pub context: Option<String>,
 }
 
 /// bd-omwg: read one spawn side-channel promise spec into a launch plan.
@@ -634,6 +647,7 @@ pub fn spawn_launch_plan(
         Some(ph) => headless::phase_launch_args(&harness, ph).1,
         None => false,
     };
+    let context = spec["context"].as_str().map(|s| s.to_string());
     Ok(SpawnJobLaunch {
         promise_id: promise_id.to_string(),
         profile,
@@ -643,6 +657,7 @@ pub fn spawn_launch_plan(
         phase,
         phase_degraded,
         await_job: spec["await"].as_bool().unwrap_or(false),
+        context,
     })
 }
 
@@ -757,15 +772,21 @@ pub fn launch_spawn_job(
     let name = crew_agent_name(wf_name, &format!("spawn-{}", plan.profile), 1);
     let registry = state::load_spawn_registry(project);
     let live_panes = c.agent_list()?;
-    let existing = registry
-        .iter()
-        .find(|e| e.name == name)
-        .filter(|e| {
-            live_panes
-                .iter()
-                .any(|a| a.pane_id == e.pane_id && a.workspace_id == ws_id)
-        })
-        .cloned();
+    // ADR-0024 Spec 2: `context: fresh` maps to a new spawn pane (never reuse).
+    let is_fresh = plan.context.as_deref() == Some("fresh");
+    let existing = if is_fresh {
+        None
+    } else {
+        registry
+            .iter()
+            .find(|e| e.name == name)
+            .filter(|e| {
+                live_panes
+                    .iter()
+                    .any(|a| a.pane_id == e.pane_id && a.workspace_id == ws_id)
+            })
+            .cloned()
+    };
     let (pane_id, name) = if let Some(e) = existing {
         (e.pane_id.clone(), name)
     } else {

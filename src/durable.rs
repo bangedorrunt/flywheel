@@ -8376,7 +8376,6 @@ mod tests {
     /// byte-identical to the text the single dispatch path shells to
     /// `__send` — the engine-dispatch coexistence bridge is deleted, so the
     /// plan\u2192send boundary is the invariant that matters.
-    #[test]
     /// ADR-0001 Wave 3 / Layer 3 (beads_rust-wave3-pin-reservation-jxsyt):
     /// dispatching a BEAD brief emits a PinStamp carrying the mail identity
     /// BEFORE the Send — flywheel fills pin, not the agent.
@@ -8449,6 +8448,7 @@ mod tests {
         assert_eq!(argv[3], "--json");
     }
 
+    #[test]
     fn plan_actions_to_dispatch_parity() {
         let mut queue = vec![brief("bd-12", "fix auth flow")];
         let states = vec![st("flywheel-proj-oc", "idle")];
