@@ -3769,7 +3769,7 @@ pub fn claim_watch_step(
     actions
 }
 
-pub fn plan_actions(
+pub(crate) fn plan_actions(
     model: &LoopModel,
     states: &[AgentState],
     nudge: Option<&str>,
@@ -6015,24 +6015,44 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 })
                 .collect()
         } else {
-            plan_actions(
-                &LoopModel {
-                    queue: queue.clone(),
-                    per_bead_phase: Default::default(),
-                    wake_suppression: Default::default(),
-                    done_mailed: Default::default(),
-                    event_cursor: None,
-                    escalation: Default::default(),
-                    respawn: Default::default(),
-                    mail_health: Default::default(),
-                    mail_degraded: false,
-                    heal_states: Default::default(),
-                },
-                &states,
-                params.nudge.as_deref(),
-                &digests,
-                &wake_suppressed,
-            )
+            // Runtime cutover: build LoopModel from loops.json v3 control state
+            // and drive through tick (behavior-preserving; plan_actions is now
+            // an internal helper of tick).
+            let active = crate::state::load_active_loop(&params.project)
+                .ok()
+                .flatten();
+            let model = LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: wake_suppressed.clone(),
+                done_mailed: Default::default(),
+                event_cursor: active.as_ref().and_then(|a| a.event_cursor.clone()),
+                escalation: active
+                    .as_ref()
+                    .map(|a| a.escalation.clone())
+                    .unwrap_or_default(),
+                respawn: active
+                    .as_ref()
+                    .map(|a| a.respawn.clone())
+                    .unwrap_or_default(),
+                mail_health: active
+                    .as_ref()
+                    .map(|a| a.mail_health.clone())
+                    .unwrap_or_default(),
+                mail_degraded: active.as_ref().map(|a| a.mail_degraded).unwrap_or(false),
+                heal_states: Default::default(),
+            };
+            let msg = LoopMsg::Tick {
+                states: states.clone(),
+                digests: digests.clone(),
+                nudge: params.nudge.clone(),
+                wake_suppressed: wake_suppressed.clone(),
+            };
+            // Journal every LoopMsg driven into tick (Spec 3: kind + payload)
+            let _ = crate::state::journal_loop_msg(&params.project, &msg, &model);
+            let (next_model, actions) = tick(&model, &msg);
+            queue = next_model.queue.clone();
+            actions
         };
         // record wake decisions so the same urgent message does not re-wake
         for a in &poll_actions {
@@ -13076,5 +13096,41 @@ mod loop_invoke_vehicle_tests {
         // Should have popped the queue and created a Send action (normal path)
         assert_eq!(next.queue.len(), 0);
         assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
+    fn loop_runtime_tick_delegates_to_plan_actions() {
+        // Behavior-preserving: Tick via tick must match direct plan_actions
+        let model = LoopModel {
+            queue: vec!["hello".to_string(), "world".to_string()],
+            per_bead_phase: Default::default(),
+            wake_suppression: Default::default(),
+            done_mailed: Default::default(),
+            event_cursor: None,
+            escalation: Default::default(),
+            respawn: Default::default(),
+            mail_health: Default::default(),
+            mail_degraded: false,
+            heal_states: Default::default(),
+        };
+        let states = vec![AgentState {
+            name: "a".to_string(),
+            status: "idle".to_string(),
+            kind: "opencode".to_string(),
+            pane_id: "p1".to_string(),
+            mail_identity: None,
+        }];
+        let digests = std::collections::HashMap::new();
+        let wake = Default::default();
+        let direct = plan_actions(&model, &states, None, &digests, &wake);
+        let msg = LoopMsg::Tick {
+            states: states.clone(),
+            digests: digests.clone(),
+            nudge: None,
+            wake_suppressed: wake.clone(),
+        };
+        let (next, via_tick) = tick(&model, &msg);
+        assert_eq!(via_tick, direct);
+        assert_eq!(next.queue.len(), model.queue.len() - 1);
     }
 }
