@@ -27172,9 +27172,9 @@ mod integration_tests {
     #[test]
     fn peer_aware_command_renders_attach_and_budget() {
         for kind in ["opencode", "pi", "grok", "omp", "pa"] {
-            let out = render_orchestration_prompt(kind, "peer-aware", "0.1.0", "ts").unwrap();
+            let out = render_orchestration_prompt(kind, "peer-aware-mode", "0.1.0", "ts").unwrap();
             assert!(
-                out.contains("# Orchestration: peer-aware"),
+                out.contains("# Orchestration: peer-aware-mode"),
                 "{kind} heading"
             );
             assert!(
@@ -27191,7 +27191,7 @@ mod integration_tests {
 
     #[test]
     fn argument_adapter_opencode_uses_dollar_arguments() {
-        let out = render_orchestration_prompt("opencode", "swarm", "0.1.0", "ts").unwrap();
+        let out = render_orchestration_prompt("opencode", "swarm-mode", "0.1.0", "ts").unwrap();
         assert!(
             out.contains("$ARGUMENTS"),
             "opencode interpolates $ARGUMENTS"
@@ -27286,14 +27286,15 @@ mod integration_tests {
     /// plus the frontmatter description and stamps.
     #[test]
     fn render_loop_prompt_has_frontmatter_and_steps() {
-        let out = render_orchestration_prompt("opencode", "loop", "9.9.9", "2026-08-10T00:00:00Z")
-            .unwrap();
+        let out =
+            render_orchestration_prompt("opencode", "loop-mode", "9.9.9", "2026-08-10T00:00:00Z")
+                .unwrap();
         assert!(out.starts_with("---\n"), "frontmatter");
         assert!(
-            out.contains("single-agent autonomy"),
+            out.contains("durable solo execution"),
             "description in frontmatter"
         );
-        assert!(out.contains("# Orchestration: loop"));
+        assert!(out.contains("# Orchestration: loop-mode"));
         for step in [
             "SETUP",
             "EXECUTE",

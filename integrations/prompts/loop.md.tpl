@@ -67,10 +67,7 @@ profile/model for the run and record the choice in the launch/report summary.
    thread when one exists. Include status, commit, verification command and
    result, deviations, and the exact resume point if incomplete.
 
-7. PROMOTE (optional): switch explicitly to `/swarm-mode` only when the
-   operator chooses multi-crew execution. Do not silently spawn peers: solo
-   mode remains one current harness plus any explicitly summoned reviewer.
-
-Never ship unverified work; never stall waiting for the human.
+7. PROMOTE (optional): switch to `/swarm-mode` only on operator choice.
+   Solo stays one harness + reviewer.
 
 {{VERSION}} {{GENERATED}}
