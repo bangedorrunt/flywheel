@@ -803,7 +803,7 @@ steps:
         "prototype",
         r##"
 name: prototype
-description: "Exhaust-the-design-space (ADR-0019 Spec 7.2, as amended 2026-08-15 — no /tmp crate-copy): n arms (2-3) prototype the question, an @oracle judge picks ONE. Sketch mode (default): arms run PARALLEL and write NON-COMPILING design sketches — API shapes, state machines, tradeoff table — TEXT ONLY to /tmp/flywheel-proto-<run>-<arm>/; no crate copy, no br, no .beads/ writes. Compile mode: arms run SEQUENTIALLY (one at a time) in the primary tree on a scratch git ref under the build slot; arm N+1 starts only after arm N is measured and reset. Judge compares on named criteria, picks one, discards the rest; no merge of a bit-of-each unless the oracle writes a graft bead. Principles: exhaust-the-design-space, separate-before-serializing-shared-state."
+description: "Exhaust-the-design-space (ADR-0019 Spec 7.2, as amended 2026-08-15 — no /tmp crate-copy): n arms (2-3) prototype the question, an @oracle judge picks ONE. Sketch mode (default): arms run PARALLEL and write NON-COMPILING design sketches — API shapes, state machines, tradeoff table — TEXT ONLY to /tmp/flywheel-proto-<run>-<arm>/; no crate copy, no br, no tracker writes. Compile mode: arms run SEQUENTIALLY (one at a time) in the primary tree on a scratch git ref under the build slot; arm N+1 starts only after arm N is measured and reset. Judge compares on named criteria, picks one, discards the rest; no merge of a bit-of-each unless the oracle writes a graft bead. Principles: exhaust-the-design-space, separate-before-serializing-shared-state."
 trigger:
   type: webhook
 crew: auto
@@ -822,7 +822,7 @@ graph:
   nodes:
     arms:
       action: branch
-      if: "str_contains(trigger_inputs, \"compile\")"
+      if: "inputs.mode == \"compile\""
       then:
         - name: arm
           action: foreach
@@ -832,7 +832,7 @@ graph:
             action: dispatch_job
             assignee: x
             build_slot: true
-            spec: { profile: "@coder", harness: "opencode", task: "PROTOTYPE COMPILE ARM {{item}} (of {{inputs.arms}}): implement your arm of the question in the PRIMARY TREE on a SCRATCH git ref (branch off current HEAD, never a herdr worktree). Question: {{inputs.question}}. One arm at a time: after implementing, MEASURE (build + test under the build slot — toron slot acquire before any cargo) and RESET the tree (git checkout the base + clean) so arm {{item}} leaves NO residue — the next arm starts only after your reset. No br, no .beads/ writes. Report: what you built, the measurement result, the reset proof." }
+            spec: { profile: "@coder", harness: "opencode", task: "PROTOTYPE COMPILE ARM {{item}} (of {{inputs.arms}}): implement your arm of the question in the PRIMARY TREE on a SCRATCH git ref (branch off current HEAD, never a herdr worktree). Question: {{inputs.question}}. One arm at a time: after implementing, MEASURE (build + test under the build slot — toron slot acquire before any cargo) and RESET the tree (git checkout the base + clean) so arm {{item}} leaves NO residue — the next arm starts only after your reset. No br, no .beads/ writes, no tracker writes. Report: what you built, the measurement result, the reset proof." }
       else:
         - name: arm
           action: parallel
@@ -840,7 +840,7 @@ graph:
           each:
             action: dispatch_job
             assignee: x
-            spec: { profile: "@coder", harness: "opencode", task: "PROTOTYPE SKETCH ARM (you are ONE of {{inputs.n}} arms): NON-COMPILING design sketch for the question — API shapes, state machines, a tradeoff table, and the blast radius of each choice. Write TEXT ONLY to /tmp/flywheel-proto-{{inputs.run}}-<YOUR-AGENT-NAME>/ (no crate copy, no compile, no br, no .beads/ writes, no worktree). Question: {{inputs.question}}." }
+            spec: { profile: "@coder", harness: "opencode", task: "PROTOTYPE SKETCH ARM (you are ONE of {{inputs.n}} arms): NON-COMPILING design sketch for the question — API shapes, state machines, a tradeoff table, and the blast radius of each choice. Write TEXT ONLY to /tmp/flywheel-proto-{{inputs.run}}-<YOUR-AGENT-NAME>/ (no crate copy, no compile, no br, no .beads/ writes, no tracker writes, no worktree). Question: {{inputs.question}}." }
     judge:
       action: dispatch_job
       assignee: x
@@ -873,7 +873,7 @@ graph:
   nodes:
     arms:
       action: branch
-      if: "str_contains(trigger_inputs, \"compile\")"
+      if: "inputs.mode == \"compile\""
       then:
         - name: arm
           action: foreach
@@ -883,7 +883,7 @@ graph:
             action: dispatch_job
             assignee: x
             build_slot: true
-            spec: { profile: "@coder", harness: "opencode", task: "ARENA COMPILE ARM {{item}} (of {{inputs.arms}}): run the SAME brief on YOUR assigned model on the SCRATCH git ref in the PRIMARY TREE (no herdr worktree). Brief: {{inputs.question}}. One arm at a time under the build slot (toron slot acquire before any cargo): after implementing, MEASURE (build + test) and RESET the tree (git checkout base + clean) — arm {{item}} must leave no residue; the next arm starts only after your reset. No br, no .beads/ writes. Report: model used, what you built, measurement, reset proof." }
+            spec: { profile: "@coder", harness: "opencode", task: "ARENA COMPILE ARM {{item}} (of {{inputs.arms}}): run the SAME brief on YOUR assigned model on the SCRATCH git ref in the PRIMARY TREE (no herdr worktree). Brief: {{inputs.question}}. One arm at a time under the build slot (toron slot acquire before any cargo): after implementing, MEASURE (build + test) and RESET the tree (git checkout base + clean) — arm {{item}} must leave no residue; the next arm starts only after your reset. No br, no .beads/ writes, no tracker writes. Report: model used, what you built, measurement, reset proof." }
       else:
         - name: arm
           action: parallel
@@ -891,7 +891,7 @@ graph:
           each:
             action: dispatch_job
             assignee: x
-            spec: { profile: "@coder", harness: "opencode", task: "ARENA SKETCH ARM (you are ONE of {{inputs.n}} arms): NON-COMPILING design sketch for the SAME brief on your assigned model — API shapes, state machines, tradeoff table. Write TEXT ONLY to /tmp/flywheel-proto-{{inputs.run}}-<YOUR-AGENT-NAME>/ (no crate copy, no br, no .beads/ writes, no worktree). Brief: {{inputs.question}}." }
+            spec: { profile: "@coder", harness: "opencode", task: "ARENA SKETCH ARM (you are ONE of {{inputs.n}} arms): NON-COMPILING design sketch for the SAME brief on your assigned model — API shapes, state machines, tradeoff table. Write TEXT ONLY to /tmp/flywheel-proto-{{inputs.run}}-<YOUR-AGENT-NAME>/ (no crate copy, no br, no .beads/ writes, no tracker writes, no worktree). Brief: {{inputs.question}}." }
     judge:
       action: dispatch_job
       assignee: x

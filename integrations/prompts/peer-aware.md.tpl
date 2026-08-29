@@ -29,7 +29,7 @@ them as implementation work.
 
 3. HANDLER: on `[doorbell]`, FIRST show you heard (120s): presence
    `working` or one kind-9 line. Then pull (`toron channel read` /
-   `toron job list` / `toron mail inbox --since <ts>`) and act only if the
+   `toron job list` / `toron mail inbox --since <ts>` — since_ts high-water) and act only if the
    item is compatible with the captain's task. Gift-wrap body stays pull.
    Unanswered pins are a digest conflict.
 

@@ -43,6 +43,7 @@ Two coordination planes:
   {mail_identity} --state idle|working|blocked|done`.
 - Plane P (private, NIP-17 gift-wrap): secrets and 1:1 only. `toron mail
   send|inbox|reply`. Pull with `toron mail inbox --since last`
+  (since_ts high-water; cursor `since_ts`/`created_ts`, never unread).
   The daemon persists the incremental cursor; read-then-bump is atomic and
 crash-safe.
   `unread_only` remains a documented no-op.
