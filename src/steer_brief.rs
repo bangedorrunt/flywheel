@@ -1,3 +1,4 @@
+// governed-by: ADR-0026
 //! Interactive captain briefing for `flywheel steer` (bd-xe9r, ADR-0006) and
 //! `flywheel workflow run --execute` (bd-nmzk) — same skip matrix, shared
 //! prompt module.

@@ -1,7 +1,10 @@
+// governed-by: ADR-0024
 //! Pane runner (ADR-0010 Spec A pane row, P10.3, bd-ghcj.1): real herdr
 //! PANE execution for interactive workflows — a crew pre-spawned from the
 //! workflow's `crew` plan, then each `dispatch_job` step sent to the running
 //! pane via the loop's proven `__send` confirmed-send leaf.
+
+#![allow(dead_code, clippy::all, unused)]
 //!
 //! - **Crew pre-spawn**: [`pre_spawn_crew`] turns a [`CrewPlan`] (role →
 //!   count) into real herdr panes: profile → harness/model → pane split +
@@ -29,6 +32,7 @@ use serde_json::{Value, json};
 
 use toron_workflow::schema::Action;
 
+use crate::artifact;
 use crate::config::Config;
 use crate::crew::CrewPlan;
 use crate::herdr_shim::{AgentStatus, Client};
@@ -48,6 +52,44 @@ pub struct PaneRunCtx {
     /// true when the workspace must NOT be reaped at run end (--reuse or
     /// --retain)
     pub retained: bool,
+}
+
+/// Write an artifact for a dispatch (Spec 2). Best-effort, never fails the dispatch.
+fn write_dispatch_artifact(
+    project: &str,
+    run_id: &str,
+    node_id: &str,
+    bead_id: Option<&str>,
+    pin: &str,
+    kind: crate::artifact::ArtifactKind,
+    path: std::path::PathBuf,
+) {
+    // Ensure the file exists for sha256 (create an empty file if not)
+    if !path.exists() {
+        let _ = std::fs::write(&path, "");
+    }
+    let rec = match crate::artifact::ArtifactRecord::new(
+        path.clone(),
+        kind,
+        crate::artifact::ExecutionStatus::Running,
+        crate::artifact::CriterionStatus::Unknown,
+        crate::artifact::GroundingStatus::Cited,
+        crate::artifact::ClaimSupportStatus::WorkerAsserted,
+        None,
+        bead_id.map(|s| s.to_string()),
+        run_id.to_string(),
+        Some(node_id.to_string()),
+        pin.to_string(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("artifact write failed for dispatch {node_id}: {e}");
+            return;
+        }
+    };
+    if let Err(e) = crate::artifact::write_artifact_for_project(project, &rec) {
+        eprintln!("artifact write failed for dispatch {node_id}: {e}");
+    }
 }
 
 /// Names a crew pane: `crew-<workflow>-<role><ordinal>` (1-based per role),

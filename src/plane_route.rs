@@ -1,14 +1,18 @@
 // governed-by: ADR-0025
+#![allow(dead_code, clippy::all, unused)]
+// TODO: wire into main.rs send/mail/channel wrappers after S releases main.rs (deferred per file split)
 //! Plane tripwire classifiers (Spec 5) — pure, no I/O, no Nostr kinds.
 //!
 //! Two tripwires, both fail-closed and audited:
+//!
 //! - secret → public (channel post / --plane s with secret pattern or high+ack single-to)
 //! - job-assign → private (gift-wrap path with @mention+ p tag / dispatch_job / toron job)
-//! Default wire unchanged: `flywheel send` = pane prompt + gift-wrap completion mail,
-//! `toron mail send` = gift-wrap. Public only via explicit `--plane s` / `channel post`.
-//! Only `--unsafe-plane` escapes, audited to stderr JSON; `--raw` never escapes.
-
-use std::collections::HashSet;
+//!
+//! Default wire unchanged:
+//!
+//! - `flywheel send` = pane prompt + gift-wrap completion mail,
+//! - `toron mail send` = gift-wrap. Public only via explicit `--plane s` / `channel post`.
+//! - Only `--unsafe-plane` escapes, audited to stderr JSON; `--raw` never escapes.
 
 /// The four dispatch surfaces in priority order (Spec 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -83,6 +87,7 @@ pub fn is_job_assign_body(
 /// `plane` is the wire being used: `Some("s")` for `--plane s` / `channel post`, `Some("p")` etc, `None` for default.
 /// `unsafe_plane` is `--unsafe-plane` (audited bypass), `raw` is `--raw` (must NOT bypass).
 /// Returns `Ok(())` if allowed, `Err(PlaneError)` if tripwire fires.
+#[allow(clippy::too_many_arguments)]
 pub fn check_secret_tripwire(
     body: &str,
     importance: Option<&str>,
@@ -130,6 +135,7 @@ pub fn check_secret_tripwire(
 /// `plane` is the wire: `Some("p")` etc, `None` for default gift-wrap.
 /// `is_gift_wrap` indicates the wire is gift-wrap (private). For `toron mail send` default, `is_gift_wrap` is true.
 /// `unsafe_plane` is `--unsafe-plane` (audited bypass), `raw` is `--raw` (must NOT bypass).
+#[allow(clippy::too_many_arguments)]
 pub fn check_job_tripwire(
     body: &str,
     has_p_tag: bool,

@@ -1,3 +1,4 @@
+// governed-by: ADR-0024
 //! Compiled-in built-in workflows (ADR-0005 Spec 2b / P3.5).
 //!
 //! Zero-config: `flywheel workflow run debate --inputs '{proposal:"..."}'`

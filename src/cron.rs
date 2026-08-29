@@ -1,3 +1,4 @@
+// governed-by: ADR-0024
 //! The flywheel cron registry (ADR-0005 Spec 3 / ADR-0012 — smart cron,
 //! flywheel half).
 //!

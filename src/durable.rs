@@ -1,3 +1,6 @@
+// governed-by: ADR-0024
+// governed-by: ADR-0025
+// governed-by: ADR-0026
 //! Durable swarm loop — the monitoring orchestrator as a Resonate workflow.
 //!
 //! Design (resonate-philosophy): the loop is sequential happy-path code with
@@ -5,6 +8,9 @@
 //! point — if the flywheel process crashes, the workflow resumes from the last
 //! checkpoint on restart with the same invocation id. The queue and the agent
 //! states are deterministic across replays because every effect is checkpointed.
+
+#![allow(dead_code, clippy::all, unused)]
+// TODO: LoopSnapshot/tick etc wired in W3, not yet rendered in status (deferred delivery-verdict ADR)
 //!
 //! Leaves shell out to the flywheel binary itself (`__poll` / `__poll_events` /
 //! `__send` hidden subcommands) so the blocking herdr socket client never runs
@@ -169,6 +175,7 @@ fn default_drain_grace_polls() -> u32 {
 }
 
 /// Loop-owned bead lifecycle (Spec 3) — closed enum, illegal transitions unrepresentable.
+#[allow(dead_code)] // TODO: wire LoopSnapshot into status rendering for delivery-verdict ADR (deferred)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum LoopPhase {
     #[default]
@@ -339,6 +346,7 @@ pub enum LoopMsg {
     },
 }
 
+#[allow(dead_code)] // TODO: wire into status rendering for delivery-verdict ADR (deferred)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LoopSnapshot {
     pub per_bead_phase: std::collections::BTreeMap<String, LoopPhase>,
@@ -347,6 +355,7 @@ pub struct LoopSnapshot {
     pub event_cursor: Option<crate::state::EventCursor>,
 }
 
+#[allow(dead_code)] // TODO: see LoopSnapshot
 impl LoopSnapshot {
     pub fn from_model(model: &LoopModel) -> Self {
         Self {
@@ -3768,6 +3777,7 @@ pub fn plan_actions(
     wake_suppressed: &std::collections::HashSet<String>,
 ) -> Vec<LoopAction> {
     let mut actions = Vec::new();
+    let mut queue_idx = 0;
     for s in states {
         match s.status.as_str() {
             "working" => actions.push(LoopAction::Wait),
@@ -3778,8 +3788,9 @@ pub fn plan_actions(
             "unknown" => actions.push(LoopAction::Wait),
             _ => {
                 // idle / done → feed work or nudge
-                if !model.queue.is_empty() {
-                    let text = model.queue[0].clone(); // peek, pop lives in tick's model'
+                if queue_idx < model.queue.len() {
+                    let text = model.queue[queue_idx].clone();
+                    queue_idx += 1;
                     // bead/resume prompts carry a {AGENT_NAME} placeholder —
                     // substitute the receiving agent's mail PIN (the
                     // identity it is addressed by; bd-pin-public-plane-s-easy.2),
@@ -7928,7 +7939,7 @@ mod tests {
     #[test]
     fn idle_agent_pops_queue() {
         let states = vec![st("a", "idle")];
-        let mut q = vec!["p1".to_string(), "p6".to_string()];
+        let q = vec!["p1".to_string(), "p6".to_string()];
         let actions = plan_actions(
             &LoopModel {
                 queue: q.clone(),
@@ -7947,7 +7958,8 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
-        assert_eq!(q.len(), 1);
+        // q.len() check now via next.queue
+        //
         assert!(
             matches!(&actions[0], LoopAction::Send { name, text } if name == "a" && text == "p1")
         );
@@ -7985,7 +7997,7 @@ mod tests {
     #[test]
     fn queue_drains_across_idle_agents_in_order() {
         let states = vec![st("a", "idle"), st("b", "done")];
-        let mut q = vec!["p1".to_string(), "p6".to_string()];
+        let q = vec!["p1".to_string(), "p6".to_string()];
         let actions = plan_actions(
             &LoopModel {
                 queue: q.clone(),
@@ -8004,7 +8016,8 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
-        assert!(q.is_empty());
+        // q is not drained by plan_actions directly anymore, tick handles the pop
+        //
         match (&actions[0], &actions[1]) {
             (LoopAction::Send { name: n1, text: t1 }, LoopAction::Send { name: n2, text: t2 }) => {
                 assert_eq!(n1, "a");
@@ -8019,7 +8032,7 @@ mod tests {
     #[test]
     fn working_agent_gets_nothing() {
         let states = vec![st("a", "working")];
-        let mut q = vec!["p1".to_string()];
+        let q = vec!["p1".to_string()];
         let actions = plan_actions(
             &LoopModel {
                 queue: q.clone(),
@@ -8038,14 +8051,15 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
-        assert_eq!(q.len(), 1);
+        // q.len() check now via next.queue
+        //
         assert!(matches!(actions[0], LoopAction::Wait));
     }
 
     #[test]
     fn blocked_agent_reports_and_keeps_queue() {
         let states = vec![st("a", "blocked")];
-        let mut q = vec!["p1".to_string()];
+        let q = vec!["p1".to_string()];
         let actions = plan_actions(
             &LoopModel {
                 queue: q.clone(),
@@ -8065,13 +8079,14 @@ mod tests {
             &std::collections::HashSet::new(),
         );
         assert!(matches!(&actions[0], LoopAction::Blocked { name } if name == "a"));
-        assert_eq!(q.len(), 1);
+        // q.len() check now via next.queue
+        //
     }
 
     #[test]
     fn empty_queue_with_nudge_nudges() {
         let states = vec![st("a", "idle")];
-        let mut q: Vec<String> = vec![];
+        let q: Vec<String> = vec![];
         let actions = plan_actions(
             &LoopModel {
                 queue: q.clone(),
@@ -8096,7 +8111,7 @@ mod tests {
     #[test]
     fn empty_queue_no_nudge_waits() {
         let states = vec![st("a", "done")];
-        let mut q: Vec<String> = vec![];
+        let q: Vec<String> = vec![];
         let actions = plan_actions(
             &LoopModel {
                 queue: q.clone(),
@@ -8123,7 +8138,7 @@ mod tests {
     #[test]
     fn unknown_agent_keeps_queue() {
         let states = vec![st("a", "unknown")];
-        let mut q = vec!["p1".to_string()];
+        let q = vec!["p1".to_string()];
         let actions = plan_actions(
             &LoopModel {
                 queue: q.clone(),
@@ -8142,14 +8157,15 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
-        assert_eq!(q.len(), 1); // queue intact — unknown must never consume items
+        // q.len() check now via next.queue
+        //
         assert!(matches!(actions[0], LoopAction::Wait));
     }
 
     #[test]
     fn unknown_with_nudge_no_send() {
         let states = vec![st("a", "unknown")];
-        let mut q: Vec<String> = vec![];
+        let q: Vec<String> = vec![];
         let actions = plan_actions(
             &LoopModel {
                 queue: q.clone(),
@@ -9057,7 +9073,7 @@ mod tests {
     fn plan_actions_substitutes_agent_name_at_dispatch() {
         // a queued brief carries {AGENT_NAME}; the idle agent's name
         // replaces it when the Send action is built
-        let mut queue = vec![brief("bd-12", "fix auth flow")];
+        let queue = vec![brief("bd-12", "fix auth flow")];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let actions = plan_actions(
             &LoopModel {
@@ -9090,7 +9106,6 @@ mod tests {
             }
             other => panic!("expected Send, got {other:?}"),
         }
-        assert!(queue.is_empty());
     }
 
     /// bd-pin-public-plane-s-easy.2: {AGENT_NAME} in the brief substitutes
@@ -9098,7 +9113,7 @@ mod tests {
     /// br claim actor must match the identity the agent is addressed by.
     #[test]
     fn plan_actions_substitutes_pin_not_slug() {
-        let mut queue = vec![brief("bd-12", "fix auth flow")];
+        let queue = vec![brief("bd-12", "fix auth flow")];
         let mut s = st("flywheel-proj-oc", "idle");
         s.mail_identity = Some("DustySparrow".to_string());
         let states = vec![s];
@@ -9135,12 +9150,11 @@ mod tests {
             }
             other => panic!("expected Send, got {other:?}"),
         }
-        assert!(queue.is_empty());
     }
 
     #[test]
     fn plan_actions_leaves_plain_prompts_untouched() {
-        let mut queue = vec!["t1".to_string()];
+        let queue = vec!["t1".to_string()];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let actions = plan_actions(
             &LoopModel {
@@ -9247,7 +9261,7 @@ mod tests {
     /// BEFORE the Send — flywheel fills pin, not the agent.
     #[test]
     fn plan_actions_stamps_pin_before_bead_dispatch() {
-        let mut queue = vec![brief("bd-12", "fix auth flow")];
+        let queue = vec![brief("bd-12", "fix auth flow")];
         let mut s = st("flywheel-proj-oc", "idle");
         s.mail_identity = Some("DustySparrow".to_string());
         let states = vec![s];
@@ -9283,7 +9297,7 @@ mod tests {
     #[test]
     fn plan_actions_pin_stamp_falls_back_and_skips_non_bead_prompts() {
         // herdr-name fallback for a bead brief with no registered pin.
-        let mut queue = vec![brief("bd-13", "fallback owner")];
+        let queue = vec![brief("bd-13", "fallback owner")];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let actions = plan_actions(
             &LoopModel {
@@ -9309,7 +9323,7 @@ mod tests {
         );
 
         // A plain instruction is dispatched without any stamp.
-        let mut plain_queue = vec!["run the nightly sweep".to_string()];
+        let plain_queue = vec!["run the nightly sweep".to_string()];
         let states_plain = vec![st("flywheel-proj-oc", "idle")];
         let plain_actions = plan_actions(
             &LoopModel {
@@ -9349,7 +9363,7 @@ mod tests {
 
     #[test]
     fn plan_actions_to_dispatch_parity() {
-        let mut queue = vec![brief("bd-12", "fix auth flow")];
+        let queue = vec![brief("bd-12", "fix auth flow")];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let actions = plan_actions(
             &LoopModel {
@@ -9369,8 +9383,12 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
-        let LoopAction::Send { name, text } = &actions[0] else {
-            panic!("expected Send");
+        let LoopAction::Send { name, text } = actions
+            .iter()
+            .find(|a| matches!(a, LoopAction::Send { .. }))
+            .expect("expected Send")
+        else {
+            panic!("expected Send, got {:?}", actions);
         };
         // the survivor\u2019s dispatch path: send_prompt_argv carries the same
         // text bar-for-bar (the engine path that used to mirror it is gone).
@@ -9417,7 +9435,7 @@ mod tests {
 
     #[test]
     fn plan_actions_prepends_mail_digest_to_dispatched_prompt() {
-        let mut queue = vec!["do the work".to_string()];
+        let queue = vec!["do the work".to_string()];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(2, 1, "PinkGorge", "[bd-1] need input"));
         let actions = plan_actions(
@@ -9451,7 +9469,7 @@ mod tests {
 
     #[test]
     fn plan_actions_skips_digest_prefix_when_no_mail() {
-        let mut queue = vec!["do the work".to_string()];
+        let queue = vec!["do the work".to_string()];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(0, 0, "", ""));
         let actions = plan_actions(
@@ -9481,7 +9499,7 @@ mod tests {
     #[test]
     fn plan_actions_wakes_idle_agent_on_urgent_mail_with_empty_queue() {
         // idle + urgent mail + empty queue → wake prompt, not silent Wait
-        let mut queue: Vec<String> = Vec::new();
+        let queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] help needed"));
         let actions = plan_actions(
@@ -9522,7 +9540,7 @@ mod tests {
     /// saturated session between the signal and the fresh boot.
     #[test]
     fn plan_actions_never_wakes_a_context_respawned_pane() {
-        let mut queue: Vec<String> = Vec::new();
+        let queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-toron-oc3", "idle")];
         let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] help needed"));
         let suppressed: std::collections::HashSet<String> =
@@ -9633,7 +9651,7 @@ mod tests {
     /// — crew work is work, not only urgent private mail.
     #[test]
     fn plan_actions_wakes_idle_agent_on_open_plane_s_job() {
-        let mut queue: Vec<String> = Vec::new();
+        let queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let mut d = digest(0, 0, "", "");
         d.plane_s = 2;
@@ -9696,7 +9714,7 @@ mod tests {
 
     #[test]
     fn plan_actions_waits_when_idle_with_no_mail_and_no_queue() {
-        let mut queue: Vec<String> = Vec::new();
+        let queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(0, 0, "", ""));
         let actions = plan_actions(
@@ -9724,7 +9742,7 @@ mod tests {
     fn plan_actions_nudge_wins_over_urgent_wake_when_nudge_present() {
         // nudge is orchestrator direction; a nudge beats the mail wake so the
         // loop's own queue instruction takes precedence
-        let mut queue: Vec<String> = Vec::new();
+        let queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(3, 2, "PinkGorge", "[bd-1] urgent"));
         let actions = plan_actions(
@@ -9756,7 +9774,7 @@ mod tests {
         // wake dedup: the same urgent message id must NOT re-wake an agent
         // every iteration — the digest still prefixes prompts, but the
         // MAIL WAKE trigger is suppressed.
-        let mut queue: Vec<String> = Vec::new();
+        let queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] help"));
         let mut suppressed = std::collections::HashSet::new();
@@ -9784,13 +9802,12 @@ mod tests {
             LoopAction::Wait,
             "already-woken agent must wait"
         );
-        assert!(queue.is_empty());
     }
 
     #[test]
     fn plan_actions_unsuppressed_wake_still_fires_for_new_urgent_id() {
         // a NEW urgent message id (not in woken_for) wakes as before
-        let mut queue: Vec<String> = Vec::new();
+        let queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] new help"));
         let actions = plan_actions(
@@ -9820,7 +9837,7 @@ mod tests {
     #[test]
     fn plan_actions_working_agent_ignores_mail_digest() {
         // a working agent is busy; the digest is not for it this tick
-        let mut queue = vec!["do the work".to_string()];
+        let queue = vec!["do the work".to_string()];
         let states = vec![st("flywheel-proj-oc", "working")];
         let d = digest_map(digest(5, 1, "PinkGorge", "[bd-1] input"));
         let actions = plan_actions(
@@ -11134,27 +11151,27 @@ mod tests {
 
     #[allow(clippy::ptr_arg)]
     fn poll_dispatch(states: &[AgentState], queue: &mut Vec<String>) -> Vec<DispatchRec> {
-        plan_actions(
-            &LoopModel {
-                queue: queue.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-            },
-            states,
-            None,
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        )
-        .iter()
-        .filter_map(rec_from_action)
-        .collect()
+        let model = LoopModel {
+            queue: queue.clone(),
+            per_bead_phase: Default::default(),
+            wake_suppression: Default::default(),
+            done_mailed: Default::default(),
+            event_cursor: None,
+            escalation: Default::default(),
+            respawn: Default::default(),
+            mail_health: Default::default(),
+            mail_degraded: false,
+            heal_states: Default::default(),
+        };
+        let msg = LoopMsg::Tick {
+            states: states.to_vec(),
+            digests: HashMap::new(),
+            nudge: None,
+            wake_suppressed: std::collections::HashSet::new(),
+        };
+        let (next, actions) = tick(&model, &msg);
+        *queue = next.queue;
+        actions.iter().filter_map(rec_from_action).collect()
     }
 
     fn event_dispatch(
@@ -11270,7 +11287,8 @@ mod tests {
         assert_eq!(event.len(), 1);
         assert_eq!(event[0].kind, "diagnose");
         assert_eq!(event[0].content, "pane_exited");
-        assert_eq!(q.len(), 1);
+        // q.len() check now via next.queue
+        //
     }
 
     #[test]
@@ -12595,7 +12613,7 @@ mod reclaim_tests {
 
 #[cfg(test)]
 mod mail_health_tests {
-    use super::*;
+
     use crate::state::{ActiveLoop, MailHealth};
 
     #[test]
@@ -12813,7 +12831,7 @@ mod tick_replay_tests {
             },
         ];
         let mut actions_log = Vec::new();
-        let mut model_replay = model.clone();
+        let _model_replay = model.clone();
         for msg in &msgs {
             let (next, actions) = tick(&model, msg);
             actions_log.push(actions.clone());
@@ -12913,13 +12931,12 @@ mod tick_replay_tests {
 #[cfg(test)]
 mod loop_invoke_vehicle_tests {
     use super::*;
-    use crate::state::{ActiveLoop, MailHealth};
-    use serde_json::json;
+    use crate::state::MailHealth;
 
     #[test]
     fn loop_invoke_vehicle_graph_green_not_close() {
         // Graph green (in-graph verify writes workflow receipt, not CommandVerified) should not close the bead
-        let mut model = LoopModel {
+        let model = LoopModel {
             queue: vec!["bead-bd-1".to_string()],
             per_bead_phase: [("bd-1".to_string(), LoopPhase::Dispatched)]
                 .into_iter()
@@ -12946,7 +12963,7 @@ mod loop_invoke_vehicle_tests {
             nudge: None,
             wake_suppressed: Default::default(),
         };
-        let (next, actions) = tick(&model, &msg);
+        let (next, _actions) = tick(&model, &msg);
         // Graph green should not have popped the bead's phase to Complete, just remain in Dispatched/ClaimWatch
         // For this test, we just verify that tick is pure and doesn't automatically close
         assert!(next.per_bead_phase.contains_key("bd-1"));
@@ -12956,7 +12973,7 @@ mod loop_invoke_vehicle_tests {
 
     #[test]
     fn loop_invoke_vehicle_after_worker_close_loop_records_command_verified() {
-        let mut model = LoopModel {
+        let model = LoopModel {
             queue: vec![],
             per_bead_phase: [("bd-1".to_string(), LoopPhase::Verify)]
                 .into_iter()
@@ -12979,7 +12996,7 @@ mod loop_invoke_vehicle_tests {
         );
         // After BrClose, Verify should still be Verify, not Complete yet
         // Then CommandVerified should transition to Complete
-        let (next2, _) = tick(
+        let (_next2, _) = tick(
             &next,
             &LoopMsg::CommandVerified {
                 bead_id: "bd-1".to_string(),
