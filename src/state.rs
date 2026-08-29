@@ -665,6 +665,62 @@ pub fn load_agent_names(dir: &std::path::Path) -> Vec<SpawnEntry> {
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
+/// Captain alias persistence (ADR-0025 Spec 4 Wave 4a).
+///
+/// Production alias lives in toron (`contact captain --clear` / --pin);
+/// flywheel mirrors the *presence* of the alias in the state dir so
+/// `mail send --to captain` can fail loud when alias is cleared under
+/// `continue` / `adopt` until rebound, and so `recover` (= adopt) can
+/// rebind it without a toron flag. File: `state_dir/captain_alias/<key>.json`.
+pub fn captain_alias_file(project: &str) -> PathBuf {
+    state_dir()
+        .join("captain_alias")
+        .join(format!("{}.json", state_key(project)))
+}
+
+pub fn load_captain_alias(project: &str) -> Option<String> {
+    let path = captain_alias_file(project);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("pin").and_then(|p| p.as_str()).map(|s| s.to_string())
+}
+
+pub fn save_captain_alias(project: &str, pin: &str) -> Result<()> {
+    let path = captain_alias_file(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_string_pretty(&serde_json::json!({ "pin": pin }))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+pub fn clear_captain_alias_file(project: &str) -> Result<()> {
+    let path = captain_alias_file(project);
+    let _ = std::fs::remove_file(&path);
+    // best-effort: also remove empty dir
+    Ok(())
+}
+
+pub fn is_captain_alias_cleared(project: &str) -> bool {
+    load_captain_alias(project).is_none()
+}
+
+/// Resolve `captain` target for `mail send --to captain`.
+///
+/// When alias is cleared (continue left it), fail loud with named remedy
+/// until `recover` (= adopt) or `toron contact captain --pin` rebounds it.
+pub fn resolve_captain_target(project: &str, to: &str) -> Result<String> {
+    if to.eq_ignore_ascii_case("captain") && is_captain_alias_cleared(project) {
+        anyhow::bail!(
+            "mail send --to captain fails: alias cleared until rebound (on_captain_death=continue/adopt; run `flywheel recover {project}` or `toron contact captain --pin <pin> --project {project}`)"
+        );
+    }
+    Ok(to.to_string())
+}
+
 /// One-time migration of the legacy SHARED `loops.json` into per-project
 /// sidecars (l4s.1): each entry becomes `loops/<project>.json` (atomic
 /// temp+rename), then the legacy file is renamed to

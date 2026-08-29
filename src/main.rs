@@ -453,6 +453,10 @@ enum Commands {
         /// jobs routinely exceed 15m — a plain --force used to reap them)
         #[arg(long)]
         force_working: bool,
+        /// unconditional override: kill captain + all crews regardless of
+        /// on_captain_death (ADR-0025 Spec 4)
+        #[arg(long)]
+        reap_crews: bool,
     },
     /// bead-verdict ledger (ADR-0019): br gate wrappers + receipt helper.
     /// `check` exits 0 only on a legal verdict for the current SHA; `receipt`
@@ -3579,7 +3583,8 @@ fn main() {
             project,
             force,
             force_working,
-        }) => cmd_kill(&cfg, project, *force, *force_working),
+            reap_crews,
+        }) => cmd_kill(&cfg, project, *force, *force_working, *reap_crews),
         Some(Commands::Ledger { cmd }) => cmd_ledger(&cfg, cmd),
         Some(Commands::Principles { cmd }) => cmd_principles(cmd),
         Some(Commands::StandingOrders { cmd }) => cmd_standing_orders(cmd),
@@ -10316,6 +10321,26 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
             Err(e) => eprintln!("flywheel: doorbell {ws} heal FAILED: {e:#}"),
         }
     }
+    // ADR-0025 Spec 4: recover == adopt — rebind captain alias to the
+    // recovering pin. Production `contact captain --pin` lives in toron;
+    // flywheel mirrors it in the state-dir alias file so `mail --to captain`
+    // rebounds immediately after recover.
+    let recovering_pin = cfg
+        .agent_mail
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .or_else(|| {
+            state::load_spawn_registry(project)
+                .first()
+                .and_then(|e| e.mail_identity.clone())
+                .or_else(|| {
+                    state::load_spawn_registry(project)
+                        .first()
+                        .map(|e| e.name.clone())
+                })
+        })
+        .unwrap_or_else(|| "captain".to_string());
+    let _ = state::save_captain_alias(project, &recovering_pin);
     Ok(())
 }
 
@@ -11725,7 +11750,13 @@ fn working_agent_names(agents: &[AgentInfo]) -> Vec<String> {
         .collect()
 }
 
-fn cmd_kill(cfg: &Config, project: &str, force: bool, force_working: bool) -> Result<()> {
+fn cmd_kill(
+    cfg: &Config,
+    project: &str,
+    force: bool,
+    force_working: bool,
+    reap_crews: bool,
+) -> Result<()> {
     if !force {
         if std::io::stdin().is_terminal() {
             eprintln!("close swarm for {project}? [y/N] ");
@@ -11751,19 +11782,69 @@ fn cmd_kill(cfg: &Config, project: &str, force: bool, force_working: bool) -> Re
         .into_iter()
         .filter(|a| a.workspace_id == ws_id)
         .collect();
+    // ADR-0025 Spec 4: on_captain_death + --reap-crews
+    let mut policy = cfg.on_captain_death();
+    if reap_crews {
+        policy = config::OnCaptainDeath::Stop;
+    }
+    let registry = state::load_spawn_registry(project);
+    let captain_pin = state::load_captain_alias(project)
+        .or_else(|| cfg.agent_mail.as_ref().and_then(|m| m.name.clone()))
+        .unwrap_or_else(|| "captain".to_string());
     let working = working_agent_names(&agents);
-    if !working.is_empty() && !force_working {
+    let blocked: Vec<String> = if policy == config::OnCaptainDeath::Stop || reap_crews {
+        working
+            .iter()
+            .filter(|w| !config::is_captain_child(&registry, &captain_pin, w))
+            .cloned()
+            .collect()
+    } else {
+        working.clone()
+    };
+    if !blocked.is_empty() && !force_working {
         bail!(
             "refuse kill: {} agent(s) still working ({}). Long jobs (cargo test) often exceed 15m. Pass --force-working to reap anyway.",
-            working.len(),
-            working.join(", ")
+            blocked.len(),
+            blocked.join(", ")
         );
     }
-    c.workspace_close(&ws_id)?;
+    // Policy-aware close
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+    match policy {
+        config::OnCaptainDeath::Continue | config::OnCaptainDeath::Adopt if !reap_crews => {
+            // Continue/Adopt without --reap-crews: crews+doorbell stay, alias cleared.
+            let remaining = config::registry_after_captain_death(&registry, &captain_pin, policy);
+            let _ = state::save_spawn_registry(project, &remaining);
+            let _ = state::clear_captain_alias_file(project);
+            // Fall back to closing only if no children remain (empty workspace
+            // is still torn down); otherwise keep workspace alive so child panes
+            // stay listed. For now the workspace still closes when only the
+            // captain remains; child panes survive via the saved registry.
+            // To keep child panes alive, we close only when Stop/reap; Continue
+            // skips workspace_close entirely.
+            // See §9 w4a: continue leaves child pane listed in mocked registry.
+            println!(
+                "closed captain for {project} (policy {} — crews remain, alias cleared)",
+                policy
+            );
+            log(
+                project,
+                EventKind::Close,
+                json!({ "workspace_id": ws_id, "policy": policy.as_str() }),
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
+    c.workspace_close(&ws_id)?;
     if let Err(e) = doorbell::stop(&config::state_dir(), &ws_label) {
         eprintln!("flywheel: doorbell stop failed: {e:#}");
     }
+    // Persist policy effect on registry + alias (Stop / reap_crews)
+    let remaining =
+        config::registry_after_captain_death(&registry, &captain_pin, config::OnCaptainDeath::Stop);
+    let _ = state::save_spawn_registry(project, &remaining);
+    let _ = state::clear_captain_alias_file(project);
     // tidy-up: drop the project's agent state files (stale context signals
     // must not survive into the next spawn — freshness only protects so much)
     let _ = std::fs::remove_dir_all(agentstate::project_state_dir(&project_dir(cfg, project)));
@@ -12941,6 +13022,12 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                     "mail send: pass --to <recipients> or --crew (spawn-registry fan-out)"
                 ),
                 None => {}
+            }
+            // ADR-0025 Spec 4: alias cleared under continue/adopt — --to captain fails loud until rebound
+            for t in &targets {
+                if t.eq_ignore_ascii_case("captain") {
+                    state::resolve_captain_target(project, t)?;
+                }
             }
             let v = mail.send(
                 &key,
