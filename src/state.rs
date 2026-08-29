@@ -721,6 +721,54 @@ pub fn resolve_captain_target(project: &str, to: &str) -> Result<String> {
     Ok(to.to_string())
 }
 
+// ---- Msg journal (ADR-0025 Spec 3 Wave 3) ----
+// Every LoopMsg driven into tick is journaled (kind + payload) as JSONL
+// under the flywheel state dir. The journal is display for `loop why`
+// and replay source for `loop replay` (identical actions asserted).
+
+pub fn loop_journal_file(project: &str) -> PathBuf {
+    state_dir()
+        .join("journals")
+        .join(format!("{}.jsonl", state_key(project)))
+}
+
+pub fn journal_loop_msg(
+    project: &str,
+    msg: &crate::durable::LoopMsg,
+    model: &crate::durable::LoopModel,
+) -> Result<()> {
+    let path = loop_journal_file(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let entry = serde_json::json!({
+        "ts": now_iso(),
+        "msg": msg,
+        "model_snapshot": {
+            "queue_len": model.queue.len(),
+            "per_bead_phase": model.per_bead_phase,
+            "mail_degraded": model.mail_degraded,
+        }
+    });
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(f, "{}", serde_json::to_string(&entry)?)?;
+    Ok(())
+}
+
+pub fn read_loop_journal(project: &str) -> Vec<serde_json::Value> {
+    let path = loop_journal_file(project);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return vec![];
+    };
+    raw.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect()
+}
+
 /// One-time migration of the legacy SHARED `loops.json` into per-project
 /// sidecars (l4s.1): each entry becomes `loops/<project>.json` (atomic
 /// temp+rename), then the legacy file is renamed to
