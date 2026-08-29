@@ -356,23 +356,35 @@ fn spawn_crew_into(
                     &profile.plan,
                 ));
                 // ADR-0024 W1a: pane spawn one-shot registry-fallback for rate_limit (bd-42fs pattern)
-                let agent = match crate::start_agent_with_retry(c, &name, harness, &pane_id, &agent_args) {
+                let agent = match crate::start_agent_with_retry(
+                    c,
+                    &name,
+                    harness,
+                    &pane_id,
+                    &agent_args,
+                ) {
                     Ok(a) => a,
                     Err(e) => {
                         let cf = crate::failure::classify(&e.to_string(), None, None);
                         if cf.kind == crate::failure::FailureKind::RateLimit {
                             if let Ok(registry) = ModelRegistry::load_routing() {
-                                if let Some(fallback_id) = registry.get(&profile.model).and_then(|m| m.fallback.clone()) {
-                                    let fallback_harness = if registry.family_of(&fallback_id) == "grok" {
-                                        "grok"
-                                    } else {
-                                        harness
-                                    };
-                                    let fallback_model = registry.resolve(&fallback_id, fallback_harness);
+                                if let Some(fallback_id) = registry
+                                    .get(&profile.model)
+                                    .and_then(|m| m.fallback.clone())
+                                {
+                                    let fallback_harness =
+                                        if registry.family_of(&fallback_id) == "grok" {
+                                            "grok"
+                                        } else {
+                                            harness
+                                        };
+                                    let fallback_model =
+                                        registry.resolve(&fallback_id, fallback_harness);
                                     let mut fallback_args = headless::model_args(
                                         fallback_harness,
                                         &fallback_model,
-                                        (!profile.effort.is_empty()).then_some(profile.effort.as_str()),
+                                        (!profile.effort.is_empty())
+                                            .then_some(profile.effort.as_str()),
                                     );
                                     fallback_args.extend(headless::role_model_args(
                                         fallback_harness,
@@ -385,7 +397,11 @@ fn spawn_crew_into(
                                         profile.model
                                     );
                                     crate::start_agent_with_retry(
-                                        c, &name, fallback_harness, &pane_id, &fallback_args,
+                                        c,
+                                        &name,
+                                        fallback_harness,
+                                        &pane_id,
+                                        &fallback_args,
                                     )?
                                 } else {
                                     return Err(e);
@@ -629,7 +645,11 @@ pub fn pane_dispatch(
             ));
         }
         let err = String::from_utf8_lossy(&output.stderr).to_string();
-        let err_str = if err.trim().is_empty() { raw.clone() } else { err.clone() };
+        let err_str = if err.trim().is_empty() {
+            raw.clone()
+        } else {
+            err.clone()
+        };
         let cf = crate::failure::classify(&err_str, None, None);
         let mut out = json!({
             "ok": false,
@@ -887,8 +907,9 @@ pub fn launch_spawn_job(
                     if let Ok(registry) = ModelRegistry::load_routing() {
                         if let Ok(catalog) = crate::profile::ProfileCatalog::load() {
                             if let Some(profile) = catalog.get(&plan.profile) {
-                                if let Some(fallback_id) =
-                                    registry.get(&profile.model).and_then(|m| m.fallback.clone())
+                                if let Some(fallback_id) = registry
+                                    .get(&profile.model)
+                                    .and_then(|m| m.fallback.clone())
                                 {
                                     let fallback_harness =
                                         if registry.family_of(&fallback_id) == "grok" {
@@ -1667,10 +1688,14 @@ mod kind_classify_tests {
             },
         );
         // First 429 on primary should find fallback
-        let fb = registry.get("test/primary").and_then(|m| m.fallback.clone());
+        let fb = registry
+            .get("test/primary")
+            .and_then(|m| m.fallback.clone());
         assert_eq!(fb, Some("test/fallback".to_string()));
         // Fallback itself has no further fallback (one-shot bound)
-        let fb2 = registry.get("test/fallback").and_then(|m| m.fallback.clone());
+        let fb2 = registry
+            .get("test/fallback")
+            .and_then(|m| m.fallback.clone());
         assert_eq!(fb2, None);
         // Classification still returns rate_limit with retryable:true
         let cf = failure::classify("429 quota exceeded", None, None);

@@ -1197,6 +1197,93 @@ steps:
     message: "Wave signoff (captain-only) for {{inputs.objective}} [{{inputs.wave_label}}]: review the VERIFY receipts and the steer-channel summary; approve closes the wave gate, reject reopens."
 "##,
     ),
+    (
+        "repair-until-verified",
+        r##"
+name: repair-until-verified
+description: "Unrolled repair loop (ADR-0024 Spec 2): fresh-context repair → evaluate → VERIFY, bounded, ledger JSON, one writer. Runs --mode pane only."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: bead_id
+  - name: verify
+  - name: max_iterations
+    default: 3
+  - name: run_id
+  - name: ledger_path
+graph:
+  nodes:
+    repair-1:
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@coder"
+        context: fresh
+        task: "Repair iteration 1 for {{inputs.bead_id}}: remaining work from ledger {{inputs.ledger_path}} (read the file, do not trust prompt). VERIFY: {{inputs.verify}}"
+      on_error: fail_run
+    evaluate-1:
+      needs: [repair-1]
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@reviewer"
+        context: fresh
+        task: "Evaluate iteration 1 for {{inputs.bead_id}} against VERIFY {{inputs.verify}} and ledger {{inputs.ledger_path}}. Return JSON {done, remaining_work, failures, validation_evidence}."
+      on_error: fail_run
+    verify-1:
+      needs: [evaluate-1]
+      action: verify
+      command: "{{inputs.verify}}"
+      on_error: fail_run
+    repair-2:
+      needs: [verify-1]
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@coder"
+        context: fresh
+        task: "Repair iteration 2 for {{inputs.bead_id}}: remaining work from ledger {{inputs.ledger_path}}."
+      on_error: fail_run
+    evaluate-2:
+      needs: [repair-2]
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@reviewer"
+        context: fresh
+        task: "Evaluate iteration 2 for {{inputs.bead_id}}."
+      on_error: fail_run
+    verify-2:
+      needs: [evaluate-2]
+      action: verify
+      command: "{{inputs.verify}}"
+      on_error: fail_run
+    repair-3:
+      needs: [verify-2]
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@coder"
+        context: fresh
+        task: "Repair iteration 3 for {{inputs.bead_id}}."
+      on_error: fail_run
+    evaluate-3:
+      needs: [repair-3]
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@reviewer"
+        context: fresh
+        task: "Evaluate iteration 3 for {{inputs.bead_id}}."
+      on_error: fail_run
+    verify-3:
+      needs: [evaluate-3]
+      action: verify
+      command: "{{inputs.verify}}"
+      on_error: fail_run
+"##,
+    ),
     // ---- ADR-0019 Spec 7.2 reflect (wave 6, bd-w6-reflect-8gp5) ----
     (
         "reflect",
@@ -1288,7 +1375,7 @@ pub fn builtin_workflows() -> BTreeMap<String, Workflow> {
 /// wave-swarm) expand on the compose grammar; phase/playbook builtins keep
 /// their own routing (`decide`, cron templates).
 pub fn is_builtin_recipe(name: &str) -> bool {
-    name == "wave-swarm"
+    matches!(name, "wave-swarm" | "repair-until-verified")
 }
 
 /// ADR-0006 D3: a builtin RECIPE's parsed workflow for compose expansion

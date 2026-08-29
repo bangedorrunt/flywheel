@@ -2299,7 +2299,9 @@ mod kind_classify_tests {
                 effort: None,
             },
         );
-        let fb = registry.get("cron/primary").and_then(|m| m.fallback.clone());
+        let fb = registry
+            .get("cron/primary")
+            .and_then(|m| m.fallback.clone());
         assert_eq!(fb, Some("cron/fallback".to_string()));
         let cf = failure::classify("429 rate limit for cron", None, None);
         assert_eq!(cf.kind, failure::FailureKind::RateLimit);
