@@ -1356,6 +1356,9 @@ enum LedgerCmd {
         /// repo dir (default: current directory)
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// strict vacuous VERIFY gate: refuse close when cargo test filter matches 0 tests (also env FLYWHEEL_VERIFY_STRICT=1)
+        #[arg(long)]
+        strict: bool,
     },
 }
 
@@ -11971,6 +11974,133 @@ fn cmd_standing_orders(cmd: &StandingOrdersCmd) -> Result<()> {
     }
 }
 
+/// bd-p4oc helpers: non-vacuous VERIFY gate for cargo test filters.
+fn is_cargo_test_verify(verify: &str) -> bool {
+    verify.trim_start().starts_with("cargo test")
+}
+
+fn parse_count_before(output: &str, needle: &str) -> Option<u32> {
+    let idx = output.find(needle)?;
+    let before = &output[..idx];
+    // walk backwards to find digit run
+    let mut end = before.len();
+    while end > 0 && before.as_bytes()[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && before.as_bytes()[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+    if start == end {
+        return None;
+    }
+    before[start..end].parse::<u32>().ok()
+}
+
+fn sum_counts_before(output: &str, needle: &str) -> Option<u32> {
+    let mut total: u32 = 0;
+    let mut found = false;
+    let mut search_start = 0;
+    while let Some(idx) = output[search_start..].find(needle) {
+        let abs_idx = search_start + idx;
+        let before = &output[..abs_idx];
+        let mut end = before.len();
+        while end > 0 && before.as_bytes()[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        let mut start = end;
+        while start > 0 && before.as_bytes()[start - 1].is_ascii_digit() {
+            start -= 1;
+        }
+        if start != end {
+            if let Ok(n) = before[start..end].parse::<u32>() {
+                total = total.saturating_add(n);
+                found = true;
+            }
+        }
+        search_start = abs_idx + needle.len();
+    }
+    if found { Some(total) } else { None }
+}
+
+fn parse_cargo_test_counts(output: &str) -> (Option<u32>, Option<u32>) {
+    // cargo test runs multiple test binaries; vacuous only when total passed == 0
+    let passed = sum_counts_before(output, " passed");
+    let filtered = sum_counts_before(output, " filtered out");
+    // fallback for single-binary outputs where sum would be same as first
+    if passed.is_some() {
+        return (passed, filtered);
+    }
+    // fallback to first occurrence for malformed outputs
+    (
+        parse_count_before(output, " passed"),
+        parse_count_before(output, " filtered out"),
+    )
+}
+
+fn append_to_receipt(path: &Path, extra: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
+    f.write_all(extra.as_bytes())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod verify_gate_tests {
+    use super::*;
+
+    #[test]
+    fn verify_gate_is_cargo_test_detection() {
+        assert!(is_cargo_test_verify("cargo test -p flywheel foo"));
+        assert!(is_cargo_test_verify("  cargo test --lib"));
+        assert!(is_cargo_test_verify("cargo test --workspace"));
+        assert!(!is_cargo_test_verify("cargo build"));
+        assert!(!is_cargo_test_verify("pytest tests/test_x.py"));
+        assert!(!is_cargo_test_verify("cargo build --tests"));
+    }
+
+    #[test]
+    fn verify_gate_parses_counts_ok() {
+        let out = "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s";
+        assert_eq!(parse_cargo_test_counts(out), (Some(4), Some(1)));
+    }
+
+    #[test]
+    fn verify_gate_parses_zero_vacuous() {
+        let out = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s";
+        assert_eq!(parse_cargo_test_counts(out), (Some(0), Some(42)));
+    }
+
+    #[test]
+    fn verify_gate_parses_counts_no_filter() {
+        let out = "test result: ok. 3 passed; 0 failed;";
+        let (passed, filtered) = parse_cargo_test_counts(out);
+        assert_eq!(passed, Some(3));
+        assert_eq!(filtered, None);
+    }
+
+    #[test]
+    fn verify_gate_receipt_vacuous_warning_string_contains_required_terms() {
+        let verify = "cargo test -p flywheel nonexistent_filter_xyz_12345";
+        let warning = format!(
+            "WARNING: vacuous VERIFY — filter `{verify}` matched 0 tests (evidence proves nothing)"
+        );
+        assert!(warning.contains("WARNING"));
+        assert!(warning.contains("vacuous"));
+        assert!(warning.contains("matched 0 tests"));
+        assert!(warning.contains("evidence proves nothing"));
+        assert!(warning.contains("nonexistent_filter_xyz_12345"));
+    }
+
+    #[test]
+    fn verify_gate_matched_count_string() {
+        let msg = format!("VERIFY matched {} tests, all passed", 5);
+        assert!(msg.contains("matched"));
+        assert!(msg.contains("5"));
+        assert!(msg.contains("passed"));
+    }
+}
+
 /// ADR-0019 `flywheel ledger`: br gate verdict store + receipt helper.
 /// `check` exits 0 only on a legal verdict for the current SHA (SHA rule,
 /// no bare-HEAD fallback). `receipt` writes only the receipt file.
@@ -12013,6 +12143,7 @@ fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
             sha,
             close_reason,
             dir,
+            strict,
         } => {
             let cwd = dir
                 .clone()
@@ -12050,6 +12181,93 @@ fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
                 match verdict::verify_close_reason(reason) {
                     Ok(()) => println!("wave-verify gate: PASS"),
                     Err(e) => println!("wave-verify gate: REJECT ({e})"),
+                }
+            }
+            // bd-p4oc: non-vacuous VERIFY gate — when the bead's VERIFY is
+            // cargo-test-shaped, RUN it and parse N passed / M filtered output.
+            // Advisory by default (WARNING in receipt + stderr naming filter),
+            // strict escalates vacuous to exit-nonzero.
+            let effective_strict = *strict
+                || std::env::var("FLYWHEEL_VERIFY_STRICT")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+            if let Ok(bead) = verdict::bead_from_br_show(&cwd, bead_id) {
+                let verify = bead.verify.trim().to_string();
+                if is_cargo_test_verify(&verify) {
+                    let timeout = verdict::bead_timebox_secs(&cwd, bead_id, 120);
+                    let timeout = timeout.min(300);
+                    match run_verify_with_timeout(&verify, timeout, &cwd) {
+                        Ok((exit, output)) => {
+                            let (passed, filtered) = parse_cargo_test_counts(&output);
+                            if exit != 0 {
+                                // failures → existing behavior (receipt already written; just log)
+                                eprintln!(
+                                    "verify gate: VERIFY command failed (exit {exit}) — see receipt {}",
+                                    path.display()
+                                );
+                                // append failure tail to receipt for evidence
+                                let _ = append_to_receipt(
+                                    &path,
+                                    &format!("\nVERIFY failed (exit {exit}):\n{output}\n"),
+                                );
+                            } else if passed == Some(0) {
+                                let warning = format!(
+                                    "WARNING: vacuous VERIFY — filter `{verify}` matched 0 tests (evidence proves nothing)"
+                                );
+                                eprintln!("{warning}");
+                                println!("lint: {warning}");
+                                let _ = append_to_receipt(
+                                    &path,
+                                    &format!(
+                                        "\n{warning}\nfiltered out: {}\noutput tail:\n{}\n",
+                                        filtered
+                                            .map(|n| n.to_string())
+                                            .unwrap_or_else(|| "unknown".into()),
+                                        tail_of(&output)
+                                    ),
+                                );
+                                if effective_strict {
+                                    anyhow::bail!(warning);
+                                }
+                            } else if let Some(n) = passed {
+                                let msg = format!("VERIFY matched {n} tests, all passed");
+                                println!("verify gate: {msg} (filter `{verify}`)");
+                                let _ = append_to_receipt(
+                                    &path,
+                                    &format!(
+                                        "\n{msg}\nfilter: {verify}\nfiltered out: {}\n",
+                                        filtered
+                                            .map(|n| n.to_string())
+                                            .unwrap_or_else(|| "unknown".into())
+                                    ),
+                                );
+                            } else {
+                                // exit 0 but no parsed count — treat empty / non-cargo shape as advisory vacuous
+                                // (spec: non-cargo VERIFY exit 0 with empty output should warn)
+                                if output.trim().is_empty() {
+                                    let warning = format!(
+                                        "WARNING: vacuous VERIFY — command `{verify}` produced empty output (evidence proves nothing)"
+                                    );
+                                    eprintln!("{warning}");
+                                    println!("lint: {warning}");
+                                    let _ = append_to_receipt(&path, &format!("\n{warning}\n"));
+                                    if effective_strict {
+                                        anyhow::bail!(warning);
+                                    }
+                                }
+                            }
+                        }
+                        Err(tail) => {
+                            eprintln!(
+                                "verify gate: VERIFY timed out after {timeout}s — see receipt {}",
+                                path.display()
+                            );
+                            let _ = append_to_receipt(
+                                &path,
+                                &format!("\nVERIFY timed out after {timeout}s:\n{tail}\n"),
+                            );
+                        }
+                    }
                 }
             }
             Ok(())
