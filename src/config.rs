@@ -1,3 +1,4 @@
+// governed-by: ADR-0025
 //! XDG configuration: ~/.config/flywheel/{config.toml, recipes.toml, workflows.toml, pipelines.toml, policy.toml}
 //! Precedence: flags > env (FLYWHEEL_SOCKET / FLYWHEEL_ROOT / FLYWHEEL_TIMEOUT /
 //! FLYWHEEL_BACKEND / FLYWHEEL_MAIL) > `.env` (dotenvy, project-local) >
@@ -148,6 +149,73 @@ pub struct Config {
     /// durable-loop self-heal knobs (bd-event-self-heal-unknown)
     #[serde(default)]
     pub r#loop: Option<LoopConfig>,
+    /// Parent-death policy (ADR-0025 Spec 4): what happens to crews when the
+    /// captain pane dies. Default `stop`.
+    #[serde(default)]
+    pub on_captain_death: Option<OnCaptainDeath>,
+}
+
+/// Parent-death policy for the captain (ADR-0025 Spec 4, Wave 4a).
+///
+/// `stop` (default) — killing the captain also kills its crews (implies
+/// `--force-working` for attributed pins). `continue` — crews+doorbell stay,
+/// captain alias cleared until rebound. `adopt` — new pin takes captain alias
+/// (alias of `recover`; both spellings parse to Adopt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnCaptainDeath {
+    #[default]
+    Stop,
+    Continue,
+    Adopt,
+}
+
+impl OnCaptainDeath {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Continue => "continue",
+            Self::Adopt => "adopt",
+        }
+    }
+}
+
+impl std::fmt::Display for OnCaptainDeath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for OnCaptainDeath {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "stop" => Ok(Self::Stop),
+            "continue" => Ok(Self::Continue),
+            "adopt" | "recover" => Ok(Self::Adopt),
+            other => Err(format!(
+                "invalid on_captain_death {other:?}: expected stop|continue|adopt (recover is alias for adopt)"
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OnCaptainDeath {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for OnCaptainDeath {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        s.serialize_str(self.as_str())
+    }
 }
 
 /// `[loop]` section: self-heal thresholds for the durable swarm loop.
@@ -229,6 +297,11 @@ impl Config {
         self.r#loop
             .as_ref()
             .and_then(|l| l.verifier_family_override.as_deref())
+    }
+
+    /// Parent-death policy (ADR-0025 Spec 4, Wave 4a): `stop` by default.
+    pub fn on_captain_death(&self) -> OnCaptainDeath {
+        self.on_captain_death.unwrap_or_default()
     }
 
     pub fn load() -> Result<Self> {
@@ -421,6 +494,94 @@ impl Config {
             other => other.into(),
         }
     }
+}
+
+// ---- parent-death policy helpers (ADR-0025 Spec 4, Wave 4a Phase 1) ----
+// Pure helpers over the spawn registry. Phase 2 wires these into
+// `kill`/`recover` in main.rs; Phase 1 only proves the policy + attribution.
+
+/// Pins the spawn registry attributes to `captain_pin`.
+///
+/// Attribution is project-scoped: every entry in the project's registry
+/// whose `mail_identity` (or fallback `name`) is not the captain itself is
+/// considered a child of that captain. This matches the "spawn registry +
+/// captain alias" hierarchy (peers, not OTP children) for the phase-1
+/// mocked registry used in tests.
+pub fn captain_attributed_pins(
+    registry: &[crate::state::SpawnEntry],
+    captain_pin: &str,
+) -> Vec<String> {
+    registry
+        .iter()
+        .filter_map(|e| {
+            let pin = e.mail_identity.as_deref().unwrap_or(e.name.as_str());
+            if pin == captain_pin {
+                None
+            } else {
+                Some(pin.to_string())
+            }
+        })
+        .collect()
+}
+
+/// Whether `pin` is considered a captain child under `captain_pin`.
+pub fn is_captain_child(
+    registry: &[crate::state::SpawnEntry],
+    captain_pin: &str,
+    pin: &str,
+) -> bool {
+    if pin == captain_pin {
+        return false;
+    }
+    captain_attributed_pins(registry, captain_pin).contains(&pin.to_string())
+}
+
+/// Registry after applying `policy` for a dead captain.
+///
+/// - `Stop`  — captain + attributed children removed (implies --force-working
+///   for those children; unrelated working pins unchanged — caller enforces
+///   the gate, this helper only projects the registry).
+/// - `Continue` — captain removed, children + doorbell stay (alias cleared).
+/// - `Adopt` — registry unchanged; alias will be rebound to the recovering pin
+///   (pure alias map change, not a registry mutation).
+pub fn registry_after_captain_death(
+    registry: &[crate::state::SpawnEntry],
+    captain_pin: &str,
+    policy: OnCaptainDeath,
+) -> Vec<crate::state::SpawnEntry> {
+    match policy {
+        OnCaptainDeath::Stop => registry
+            .iter()
+            .filter(|e| {
+                let pin = e.mail_identity.as_deref().unwrap_or(e.name.as_str());
+                pin != captain_pin && !is_captain_child(registry, captain_pin, pin)
+            })
+            .cloned()
+            .collect(),
+        OnCaptainDeath::Continue | OnCaptainDeath::Adopt => registry
+            .iter()
+            .filter(|e| e.mail_identity.as_deref().unwrap_or(e.name.as_str()) != captain_pin)
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Mocked captain-alias store helpers for phase-1 tests.
+///
+/// Production alias lives in toron (`contact captain --clear` / --pin);
+/// phase 1 proves the semantics with an in-memory map so tests do not
+/// require a daemon.
+pub fn apply_captain_adopt(alias_map: &mut BTreeMap<String, String>, project: &str, new_pin: &str) {
+    alias_map.insert(project.to_string(), new_pin.to_string());
+}
+
+pub fn clear_captain_alias(alias_map: &mut BTreeMap<String, String>, project: &str) {
+    alias_map.remove(project);
+}
+
+/// Whether the alias for `project` is cleared (absent) in the mocked store.
+pub fn captain_alias_cleared(alias_map: &BTreeMap<String, String>, project: &str) -> bool {
+    !alias_map.contains_key(project)
 }
 
 /// The XDG config BASE (is1.6): `$XDG_CONFIG_HOME` when set, else
@@ -1078,5 +1239,109 @@ daily = [
         );
         unsafe { std::env::remove_var("HOME") };
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    // ---- ADR-0025 Spec 4 Wave 4a Phase 1 ----
+
+    #[test]
+    fn on_captain_death_default_is_stop() {
+        let cfg = Config::default();
+        assert_eq!(cfg.on_captain_death(), OnCaptainDeath::Stop);
+        let cfg2: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg2.on_captain_death(), OnCaptainDeath::Stop);
+    }
+
+    #[test]
+    fn on_captain_death_parse_all_three() {
+        let c: Config = toml::from_str(r#"on_captain_death = "stop""#).unwrap();
+        assert_eq!(c.on_captain_death(), OnCaptainDeath::Stop);
+        let c: Config = toml::from_str(r#"on_captain_death = "continue""#).unwrap();
+        assert_eq!(c.on_captain_death(), OnCaptainDeath::Continue);
+        let c: Config = toml::from_str(r#"on_captain_death = "adopt""#).unwrap();
+        assert_eq!(c.on_captain_death(), OnCaptainDeath::Adopt);
+        // recover is alias for adopt (Spec 4: recover == adopt)
+        let c: Config = toml::from_str(r#"on_captain_death = "recover""#).unwrap();
+        assert_eq!(c.on_captain_death(), OnCaptainDeath::Adopt);
+        // case-insensitive
+        let c: Config = toml::from_str(r#"on_captain_death = "STOP""#).unwrap();
+        assert_eq!(c.on_captain_death(), OnCaptainDeath::Stop);
+    }
+
+    #[test]
+    fn on_captain_death_invalid_rejected() {
+        let err = toml::from_str::<Config>(r#"on_captain_death = "explode""#)
+            .expect_err("invalid value must fail");
+        assert!(format!("{err}").contains("on_captain_death"));
+    }
+
+    #[test]
+    fn on_captain_death_recover_sets_alias() {
+        let mut aliases: BTreeMap<String, String> = BTreeMap::new();
+        aliases.insert("proj".into(), "OldCaptain".into());
+        // recover == adopt: alias rebound to recovering pin
+        apply_captain_adopt(&mut aliases, "proj", "NewCaptain");
+        assert_eq!(aliases.get("proj").map(|s| s.as_str()), Some("NewCaptain"));
+        // clear helper (toron contact captain --clear)
+        clear_captain_alias(&mut aliases, "proj");
+        assert!(captain_alias_cleared(&aliases, "proj"));
+    }
+
+    #[test]
+    fn on_captain_death_continue_leaves_child_pane_listed() {
+        use crate::state::SpawnEntry;
+        let captain = "BraveCaptain";
+        let child = SpawnEntry::with_mail_identity("pane-child", "child1", "ChildPin");
+        let captain_entry = SpawnEntry::with_mail_identity("pane-cap", "cap", captain);
+        let unrelated = SpawnEntry::with_mail_identity("pane-other", "other", "UnrelatedPin");
+        let registry = vec![captain_entry.clone(), child.clone(), unrelated.clone()];
+
+        // continue: captain removed, children + unrelated stay
+        let after_continue =
+            registry_after_captain_death(&registry, captain, OnCaptainDeath::Continue);
+        assert!(
+            after_continue.iter().any(|e| e.pane_id == "pane-child"),
+            "continue must leave child pane listed"
+        );
+        assert!(
+            after_continue.iter().any(|e| e.pane_id == "pane-other"),
+            "unrelated working pin unchanged"
+        );
+        assert!(
+            !after_continue.iter().any(|e| e.pane_id == "pane-cap"),
+            "captain itself cleared"
+        );
+        // alias cleared on continue
+        let mut aliases = BTreeMap::from([("proj".to_string(), captain.to_string())]);
+        clear_captain_alias(&mut aliases, "proj");
+        assert!(captain_alias_cleared(&aliases, "proj"));
+    }
+
+    #[test]
+    fn on_captain_death_stop_implies_force_working_for_attributed_only() {
+        use crate::state::SpawnEntry;
+        let captain = "BraveCaptain";
+        let child = SpawnEntry::with_mail_identity("pane-child", "child1", "ChildPin");
+        let captain_entry = SpawnEntry::with_mail_identity("pane-cap", "cap", captain);
+        // Unrelated pin lives outside this project's registry (different project / no entry)
+        let registry = vec![captain_entry, child.clone()];
+
+        let attributed = captain_attributed_pins(&registry, captain);
+        assert_eq!(attributed, vec!["ChildPin".to_string()]);
+        assert!(
+            !is_captain_child(&registry, captain, "UnrelatedPin"),
+            "unrelated working pin (outside registry) not attributed"
+        );
+
+        let after_stop = registry_after_captain_death(&registry, captain, OnCaptainDeath::Stop);
+        assert!(
+            !after_stop.iter().any(|e| e.pane_id == "pane-child"),
+            "stop removes attributed child"
+        );
+        // unrelated outside registry is trivially unchanged — not in filtered set
+        assert!(
+            !after_stop
+                .iter()
+                .any(|e| e.mail_identity.as_deref() == Some("UnrelatedPin"))
+        );
     }
 }
