@@ -157,6 +157,9 @@ pub struct LoopParams {
     /// params loadable.
     #[serde(default)]
     pub force: bool,
+    /// bd-p4oc strict vacuous gate: refuse 0-test VERIFY (also FLYWHEEL_VERIFY_STRICT=1)
+    #[serde(default)]
+    pub strict: bool,
 }
 
 fn default_unknown_diagnose_threshold() -> u32 {
@@ -980,6 +983,8 @@ pub struct LoopRunVerifyArgs {
     pub sha: Option<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub strict: bool,
 }
 
 /// Checkpointed leaf — close-detect loop-run VERIFY (cheap band): the LOOP
@@ -1032,10 +1037,85 @@ async fn loop_run_verify(args: LoopRunVerifyArgs) -> Result<Value> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        // bd-p4oc: vacuous VERIFY gate — reuse part-1 parse. Cargo-test-shaped
+        // filters that matched 0 tests are evidence of nothing.
+        let is_cargo = crate::is_cargo_test_verify(&verify_cmd);
+        let (passed, filtered) = if is_cargo {
+            crate::parse_cargo_test_counts(output)
+        } else {
+            (None, None)
+        };
+        let is_vacuous = is_cargo && passed == Some(0);
+        let effective_strict = args.strict
+            || std::env::var("FLYWHEEL_VERIFY_STRICT")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+        if is_vacuous {
+            let warning = format!(
+                "WARNING: vacuous VERIFY — filter `{verify_cmd}` matched 0 tests (evidence proves nothing)"
+            );
+            eprintln!("{warning}");
+            if effective_strict {
+                // Strict: refuse to write verdict, keep bead open with evidence.
+                // Write vacuous evidence receipt for inspection, then reopen.
+                let evidence = format!(
+                    "{warning}\nfiltered out: {}\noutput tail:\n{}\n",
+                    filtered
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    output
+                );
+                // Best-effort evidence write (arm check still required for the
+                // real receipt, but vacuous evidence is advisory — ignore errors)
+                let _ = (|| -> anyhow::Result<()> {
+                    // Use the loop-armed writer if armed, else fallback to plain write
+                    let dir = cwd.join(".flywheel").join("receipts");
+                    std::fs::create_dir_all(&dir)?;
+                    let path = dir.join(format!("{}-{}.vacuous.txt", args.bead_id, sha));
+                    std::fs::write(&path, &evidence)?;
+                    Ok(())
+                })();
+                let mut cmd = Command::new(&exe);
+                cmd.args(["__reopen-bead", &args.project, &args.bead_id, &sha]);
+                let out = run_leaf_cmd(cmd, "__reopen-bead").await?;
+                if !out.status.success() {
+                    return Err(map_err(anyhow::anyhow!(
+                        "__reopen-bead failed: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    )));
+                }
+                return Ok(serde_json::json!({
+                    "band": "loop-runnable",
+                    "reopened": true,
+                    "vacuous": true,
+                    "bead_id": args.bead_id,
+                    "warning": warning,
+                    "filtered": filtered,
+                }));
+            } else {
+                // Advisory: annotate + warn, but still record the proof.
+                // The warning will be appended to the receipt after it is written.
+            }
+        }
         let receipt =
             crate::verdict::write_command_verified_receipt(cwd, &args.bead_id, &sha, output);
         match receipt {
             Ok(receipt_path) => {
+                // advisory vacuous: annotate the receipt even though we still record
+                if is_vacuous && !effective_strict {
+                    let warning = format!(
+                        "WARNING: vacuous VERIFY — filter `{verify_cmd}` matched 0 tests (evidence proves nothing)"
+                    );
+                    let _ = crate::append_to_receipt(
+                        &receipt_path,
+                        &format!(
+                            "\n{warning}\nfiltered out: {}\n",
+                            filtered
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "unknown".into())
+                        ),
+                    );
+                }
                 let verdict = crate::verdict::Verdict {
                     kind: crate::verdict::VerdictKind::CommandVerified,
                     bead_id: args.bead_id.clone(),
@@ -5919,6 +5999,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                             bead_id: bead_id.clone(),
                                             sha: Some(sha.clone()),
                                             timeout_secs: None,
+                                            strict: params.strict
+                                                || std::env::var("FLYWHEEL_VERIFY_STRICT")
+                                                    .map(|v| {
+                                                        v == "1" || v.eq_ignore_ascii_case("true")
+                                                    })
+                                                    .unwrap_or(false),
                                         };
                                         match ctx.run(loop_run_verify, lr_args).await {
                                             Ok(v) => {
@@ -10552,6 +10638,7 @@ mod tests {
             claim_nudge_after_polls: 2,
             resonate_url: String::new(),
             force: false,
+            strict: false,
         };
         let v = serde_json::to_value(&p).unwrap();
         let back: LoopParams = serde_json::from_value(v).unwrap();
