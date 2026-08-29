@@ -29,6 +29,16 @@ pub struct WatchHit {
     pub event_id: Option<String>,
 }
 
+/// Ledger fact event kind (bd-cy0s).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum LedgerEvent {
+    Claimed,
+    Closed,
+    Reopened,
+    Blocked,
+}
+
 /// The one ingress type: Jido's sensor shape onto the spine we already run
 /// (ADR-0025 Spec 6). Unification is the enum — no new bus. Adjacent
 /// tagging so the inner `HerdrEvent` type tag never collides.
@@ -38,7 +48,89 @@ pub enum IngressEvent {
     Herdr(HerdrEvent),
     Watch(WatchHit),
     WorkflowTrigger(Trigger),
-    CronTick { name: String },
+    CronTick {
+        name: String,
+    },
+    LedgerFact {
+        bead_id: String,
+        event: LedgerEvent,
+    },
+    PaneStalled {
+        pane_id: String,
+        herdr_name: String,
+        last_status: String,
+        bead_id: Option<String>,
+    },
+    LeaseLapsed {
+        path: String,
+        bead_id: Option<String>,
+    },
+    GitFact {
+        repo: String,
+        sha: String,
+        subject: String,
+        bead_id: Option<String>,
+    },
+}
+
+/// Human-readable summary for a fact — the `[doorbell] <fact-summary>` line
+/// the captain pane receives (bd-cy0s captain surface). Pure, unit-tested.
+pub fn fact_summary(event: &IngressEvent) -> Option<String> {
+    match event {
+        IngressEvent::LedgerFact { bead_id, event } => {
+            let ev = match event {
+                LedgerEvent::Claimed => "claimed",
+                LedgerEvent::Closed => "closed",
+                LedgerEvent::Reopened => "reopened",
+                LedgerEvent::Blocked => "blocked",
+            };
+            Some(format!("ledger {bead_id} {ev}"))
+        }
+        IngressEvent::PaneStalled {
+            pane_id,
+            herdr_name,
+            last_status,
+            bead_id,
+        } => {
+            let bead = bead_id
+                .as_deref()
+                .map(|b| format!(" bead {b}"))
+                .unwrap_or_default();
+            Some(format!(
+                "pane stalled {pane_id} ({herdr_name} {last_status}){bead}"
+            ))
+        }
+        IngressEvent::LeaseLapsed { path, bead_id } => {
+            let bead = bead_id
+                .as_deref()
+                .map(|b| format!(" bead {b}"))
+                .unwrap_or_default();
+            Some(format!("lease lapsed {path}{bead}"))
+        }
+        IngressEvent::GitFact {
+            repo,
+            sha,
+            subject,
+            bead_id,
+        } => {
+            let bead = bead_id
+                .as_deref()
+                .map(|b| format!(" bead {b}"))
+                .unwrap_or_default();
+            let short = if sha.len() > 7 { &sha[..7] } else { sha };
+            Some(format!("git {repo} {short} {subject}{bead}"))
+        }
+        _ => None,
+    }
+}
+
+/// Doorbell line for a fact — reuse existing wake path.
+pub fn fact_doorbell_line(event: &IngressEvent) -> Option<String> {
+    fact_summary(event).map(|s| format!("[doorbell] {s}"))
+}
+
+pub fn is_fact(event: &IngressEvent) -> bool {
+    fact_summary(event).is_some()
 }
 
 /// Adapter sinks [`handle_ingress`] fans out to. Injected, never global.
@@ -47,6 +139,19 @@ pub struct IngressAdapters {
     pub watch: Box<dyn Fn(&WatchHit) + Send + Sync>,
     pub workflow: Box<dyn Fn(&Trigger) + Send + Sync>,
     pub cron: Box<dyn Fn(&str) + Send + Sync>,
+    pub fact: Box<dyn Fn(&IngressEvent) + Send + Sync>,
+}
+
+impl Default for IngressAdapters {
+    fn default() -> Self {
+        Self {
+            herdr: Box::new(|_| {}),
+            watch: Box::new(|_| {}),
+            workflow: Box::new(|_| {}),
+            cron: Box::new(|_| {}),
+            fact: Box::new(|_| {}),
+        }
+    }
 }
 
 /// One router: every external fact enters the system here. A `pane_exited`
@@ -57,6 +162,10 @@ pub fn handle_ingress(event: &IngressEvent, adapters: &IngressAdapters) {
         IngressEvent::Watch(w) => (adapters.watch)(w),
         IngressEvent::WorkflowTrigger(t) => (adapters.workflow)(t),
         IngressEvent::CronTick { name } => (adapters.cron)(name),
+        IngressEvent::LedgerFact { .. }
+        | IngressEvent::PaneStalled { .. }
+        | IngressEvent::LeaseLapsed { .. }
+        | IngressEvent::GitFact { .. } => (adapters.fact)(event),
     }
 }
 
@@ -103,6 +212,7 @@ mod tests {
                     hits.lock().unwrap().push(name.to_string());
                 })
             },
+            fact: Box::new(|_| {}),
         };
 
         let exited = IngressEvent::Herdr(HerdrEvent::PaneExited {
@@ -159,6 +269,26 @@ mod tests {
             IngressEvent::CronTick {
                 name: "digest".into(),
             },
+            IngressEvent::LedgerFact {
+                bead_id: "bd-123".into(),
+                event: LedgerEvent::Closed,
+            },
+            IngressEvent::PaneStalled {
+                pane_id: "w1:p1".into(),
+                herdr_name: "oc".into(),
+                last_status: "idle".into(),
+                bead_id: Some("bd-123".into()),
+            },
+            IngressEvent::LeaseLapsed {
+                path: "src/main.rs".into(),
+                bead_id: Some("bd-123".into()),
+            },
+            IngressEvent::GitFact {
+                repo: "flywheel".into(),
+                sha: "abc123def".into(),
+                subject: "fix".into(),
+                bead_id: None,
+            },
         ];
         for e in events {
             let json = serde_json::to_string(&e).expect("serialize");
@@ -166,5 +296,131 @@ mod tests {
             let back_json = serde_json::to_string(&back).expect("serialize back");
             assert_eq!(back_json, json, "round trip lossless for {json}");
         }
+    }
+
+    #[test]
+    fn facts_variants_route_through_handle_ingress() {
+        let fact_hits: Hits = Arc::new(Mutex::new(Vec::new()));
+        let adapters = IngressAdapters {
+            herdr: Box::new(|_| {}),
+            watch: Box::new(|_| {}),
+            workflow: Box::new(|_| {}),
+            cron: Box::new(|_| {}),
+            fact: {
+                let hits = fact_hits.clone();
+                Box::new(move |e: &IngressEvent| {
+                    if let Some(s) = fact_summary(e) {
+                        hits.lock().unwrap().push(s);
+                    }
+                })
+            },
+        };
+        for ev in [
+            IngressEvent::LedgerFact {
+                bead_id: "bd-1".into(),
+                event: LedgerEvent::Claimed,
+            },
+            IngressEvent::PaneStalled {
+                pane_id: "w1:p1".into(),
+                herdr_name: "oc".into(),
+                last_status: "idle".into(),
+                bead_id: None,
+            },
+            IngressEvent::LeaseLapsed {
+                path: "src/durable.rs".into(),
+                bead_id: Some("bd-1".into()),
+            },
+            IngressEvent::GitFact {
+                repo: "flywheel".into(),
+                sha: "deadbeefcafe".into(),
+                subject: "commit".into(),
+                bead_id: Some("bd-1".into()),
+            },
+        ] {
+            handle_ingress(&ev, &adapters);
+        }
+        let hits = fact_hits.lock().unwrap();
+        assert_eq!(
+            hits.len(),
+            4,
+            "all fact variants routed through handle_ingress"
+        );
+        assert!(hits[0].contains("ledger bd-1 claimed"));
+        assert!(hits[1].contains("pane stalled"));
+        assert!(hits[2].contains("lease lapsed"));
+        assert!(hits[3].contains("git flywheel"));
+    }
+
+    #[test]
+    fn facts_captain_surface_renders_summaries() {
+        let ledger = IngressEvent::LedgerFact {
+            bead_id: "bd-9".into(),
+            event: LedgerEvent::Closed,
+        };
+        assert_eq!(fact_summary(&ledger).unwrap(), "ledger bd-9 closed");
+        assert_eq!(
+            fact_doorbell_line(&ledger).unwrap(),
+            "[doorbell] ledger bd-9 closed"
+        );
+        let stalled = IngressEvent::PaneStalled {
+            pane_id: "w1:p1".into(),
+            herdr_name: "oc".into(),
+            last_status: "idle".into(),
+            bead_id: Some("bd-9".into()),
+        };
+        assert!(
+            fact_summary(&stalled)
+                .unwrap()
+                .contains("pane stalled w1:p1")
+        );
+        assert!(
+            fact_doorbell_line(&stalled)
+                .unwrap()
+                .starts_with("[doorbell] pane stalled")
+        );
+        let lapsed = IngressEvent::LeaseLapsed {
+            path: "src/main.rs".into(),
+            bead_id: None,
+        };
+        assert_eq!(fact_summary(&lapsed).unwrap(), "lease lapsed src/main.rs");
+        assert_eq!(
+            fact_doorbell_line(&lapsed).unwrap(),
+            "[doorbell] lease lapsed src/main.rs"
+        );
+        let git = IngressEvent::GitFact {
+            repo: "flywheel".into(),
+            sha: "abc123def456".into(),
+            subject: "fix guard".into(),
+            bead_id: None,
+        };
+        assert!(fact_summary(&git).unwrap().contains("git flywheel abc123d"));
+        assert!(
+            fact_doorbell_line(&git)
+                .unwrap()
+                .starts_with("[doorbell] git")
+        );
+        // non-fact returns None
+        let herdr = IngressEvent::Herdr(HerdrEvent::PaneExited {
+            pane_id: "w1:p1".into(),
+            herdr_name: "oc".into(),
+        });
+        assert!(fact_summary(&herdr).is_none());
+        assert!(fact_doorbell_line(&herdr).is_none());
+    }
+
+    #[test]
+    fn facts_serde_adjacent_tag_style_consistent() {
+        let ev = IngressEvent::LedgerFact {
+            bead_id: "bd-xyz".into(),
+            event: LedgerEvent::Blocked,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["ingress"], "ledger_fact");
+        assert!(v["payload"]["bead_id"].is_string());
+        assert_eq!(v["payload"]["event"], "blocked");
+        let back: IngressEvent = serde_json::from_str(&json).unwrap();
+        let back_json = serde_json::to_string(&back).unwrap();
+        assert_eq!(back_json, json);
     }
 }

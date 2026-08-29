@@ -9988,6 +9988,114 @@ fn cmd_decide(
     Ok(())
 }
 
+// ---- bd-cy0s: event-driven facts (captain surface) ----
+
+pub fn facts_journal_path(project: &str) -> std::path::PathBuf {
+    config::state_dir()
+        .join("facts")
+        .join(format!("{}.jsonl", state::state_key(project)))
+}
+
+pub fn append_fact(project: &str, event: &ingress::IngressEvent) -> Result<()> {
+    if !ingress::is_fact(event) {
+        return Ok(());
+    }
+    let path = facts_journal_path(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let line = serde_json::to_string(event)?;
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(f, "{line}")?;
+    Ok(())
+}
+
+pub fn load_facts(project: &str) -> Vec<ingress::IngressEvent> {
+    let path = facts_journal_path(project);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .filter_map(|l| serde_json::from_str(l.trim()).ok())
+        .collect()
+}
+
+pub fn facts_count_and_last(project: &str) -> (usize, Option<String>) {
+    let facts = load_facts(project);
+    let count = facts.len();
+    let last = facts
+        .last()
+        .and_then(ingress::fact_summary)
+        .or_else(|| facts.last().map(|e| format!("{e:?}")));
+    (count, last)
+}
+
+/// Captain surface: a fact becomes a single `[doorbell] <summary>` inject
+/// line for the captain pane. Reuses the existing `doorbell_prompt` wake
+/// path (herdr `agent_prompt` with pane fallback). No new Nostr kinds.
+pub fn captain_fact_inject(project: &str, event: &ingress::IngressEvent) -> Result<()> {
+    let Some(line) = ingress::fact_doorbell_line(event) else {
+        return Ok(());
+    };
+    // persist for status (facts ride the journal/watch line, ADR-0014 intact)
+    let _ = append_fact(project, event);
+    // find captain pin — alias first, then first registry pin as fallback
+    let captain_pin = state::load_captain_alias(project).or_else(|| {
+        state::load_spawn_registry(project)
+            .first()
+            .and_then(|e| e.mail_identity.clone())
+    });
+    let Some(pin) = captain_pin else {
+        return Ok(());
+    };
+    // reuse doorbell_prompt path (herdr inject, pane fallback)
+    let registry = state::load_spawn_registry(project);
+    let entry = registry
+        .iter()
+        .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()));
+    let Some(entry) = entry else {
+        return Ok(());
+    };
+    // best-effort herdr connect; silent if herdr down (facts still journaled)
+    let Ok(mut client) = Client::connect(Some(
+        &config::Config::load().unwrap_or_default().socket_path(),
+    )) else {
+        return Ok(());
+    };
+    match client.agent_prompt(&entry.name, &line, None) {
+        Ok(_) => {}
+        Err(e) if is_agent_not_ready(&e.code) => {
+            let pane = entry.pane_id.clone();
+            let _ = try_send_text_delivery(&mut client, project, &entry.name, &pane, &line);
+        }
+        Err(e) => {
+            eprintln!(
+                "flywheel: captain fact inject failed for {}: {e:#}",
+                entry.name
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Adapter wiring for `handle_ingress`: facts → journal + captain doorbell.
+pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
+    let proj = project.to_string();
+    ingress::IngressAdapters {
+        herdr: Box::new(|_| {}),
+        watch: Box::new(|_| {}),
+        workflow: Box::new(|_| {}),
+        cron: Box::new(|_| {}),
+        fact: Box::new(move |ev: &ingress::IngressEvent| {
+            let _ = captain_fact_inject(&proj, ev);
+        }),
+    }
+}
+
 fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let Some(project) = project else {
@@ -10050,6 +10158,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             project,
         );
     }
+    let (facts_count, last_fact) = facts_count_and_last(project);
     if std::io::stdout().is_terminal() {
         for r in &rows {
             let st = r["status"].as_str().unwrap_or("unknown");
@@ -10081,6 +10190,11 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
                 .unwrap_or_else(|| "never".into()),
             wake_state.last_wake_pin.as_deref().unwrap_or("?")
         );
+        println!(
+            "facts: {} last={}",
+            facts_count,
+            last_fact.as_deref().unwrap_or("none")
+        );
     } else {
         print_json(&json!({
             "workspace_id": ws_id, "agents": rows, "integrations": integrations,
@@ -10090,6 +10204,10 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
                 "alive": dispatcher_alive,
                 "last_wake_unix": wake_state.last_wake_unix,
                 "last_wake_pin": wake_state.last_wake_pin,
+            },
+            "facts": {
+                "count": facts_count,
+                "last": last_fact,
             }
         }));
     }
@@ -29606,5 +29724,109 @@ mod ingress_wiring_tests {
         assert!(h.iter().any(|s| *s == "watch"));
         assert!(h.iter().any(|s| *s == "workflow"));
         assert!(h.iter().any(|s| *s == "cron"));
+    }
+
+    #[test]
+    fn facts_variants_route_through_handle_ingress() {
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapters = crate::ingress::IngressAdapters {
+            herdr: Box::new(|_| {}),
+            watch: Box::new(|_| {}),
+            workflow: Box::new(|_| {}),
+            cron: Box::new(|_| {}),
+            fact: {
+                let h = hits.clone();
+                Box::new(move |e: &crate::ingress::IngressEvent| {
+                    if let Some(s) = crate::ingress::fact_summary(e) {
+                        h.lock().unwrap().push(s);
+                    }
+                })
+            },
+        };
+        for ev in [
+            crate::ingress::IngressEvent::LedgerFact {
+                bead_id: "bd-1".into(),
+                event: crate::ingress::LedgerEvent::Closed,
+            },
+            crate::ingress::IngressEvent::PaneStalled {
+                pane_id: "w1:p1".into(),
+                herdr_name: "oc".into(),
+                last_status: "idle".into(),
+                bead_id: Some("bd-1".into()),
+            },
+            crate::ingress::IngressEvent::LeaseLapsed {
+                path: "src/main.rs".into(),
+                bead_id: None,
+            },
+            crate::ingress::IngressEvent::GitFact {
+                repo: "flywheel".into(),
+                sha: "abc123def456".into(),
+                subject: "fix".into(),
+                bead_id: None,
+            },
+        ] {
+            crate::ingress::handle_ingress(&ev, &adapters);
+        }
+        let h = hits.lock().unwrap();
+        assert_eq!(
+            h.len(),
+            4,
+            "all fact variants must route through handle_ingress"
+        );
+        assert!(h.iter().any(|s| s.contains("ledger bd-1 closed")));
+        assert!(h.iter().any(|s| s.contains("pane stalled")));
+        assert!(h.iter().any(|s| s.contains("lease lapsed")));
+        assert!(h.iter().any(|s| s.contains("git flywheel")));
+    }
+
+    #[test]
+    fn facts_captain_surface_renders_summaries() {
+        let ledger = crate::ingress::IngressEvent::LedgerFact {
+            bead_id: "bd-9".into(),
+            event: crate::ingress::LedgerEvent::Blocked,
+        };
+        assert_eq!(
+            crate::ingress::fact_summary(&ledger).unwrap(),
+            "ledger bd-9 blocked"
+        );
+        assert_eq!(
+            crate::ingress::fact_doorbell_line(&ledger).unwrap(),
+            "[doorbell] ledger bd-9 blocked"
+        );
+        let stalled = crate::ingress::IngressEvent::PaneStalled {
+            pane_id: "w2:p2".into(),
+            herdr_name: "pi".into(),
+            last_status: "working".into(),
+            bead_id: None,
+        };
+        assert!(
+            crate::ingress::fact_summary(&stalled)
+                .unwrap()
+                .contains("pane stalled w2:p2")
+        );
+        assert!(
+            crate::ingress::fact_doorbell_line(&stalled)
+                .unwrap()
+                .starts_with("[doorbell] pane stalled")
+        );
+        // status helper: append fact and count
+        let proj = format!("facts-test-{}", uuid::Uuid::new_v4());
+        let ev = crate::ingress::IngressEvent::LeaseLapsed {
+            path: "src/lib.rs".into(),
+            bead_id: Some("bd-99".into()),
+        };
+        let (c0, _) = crate::facts_count_and_last(&proj);
+        assert_eq!(c0, 0);
+        crate::append_fact(&proj, &ev).unwrap();
+        let (c1, last) = crate::facts_count_and_last(&proj);
+        assert_eq!(c1, 1);
+        assert!(last.unwrap().contains("lease lapsed src/lib.rs"));
+        // non-fact does not increment
+        let non = crate::ingress::IngressEvent::CronTick {
+            name: "tick".into(),
+        };
+        crate::append_fact(&proj, &non).unwrap();
+        let (c2, _) = crate::facts_count_and_last(&proj);
+        assert_eq!(c2, 1, "non-fact must not be journaled");
     }
 }
