@@ -10,6 +10,7 @@
 #![allow(clippy::collapsible_if)]
 
 mod agentstate;
+mod artifact;
 mod backend;
 mod builtin_workflows;
 mod coalition;
@@ -31,6 +32,7 @@ mod output;
 mod pane;
 mod phase_chain;
 mod phase_contracts;
+mod plane_route;
 mod preflight;
 mod principles;
 mod profile;
@@ -15371,8 +15373,19 @@ fn cmd_loop(
             })
             .collect();
         let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: queue_items.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &d_states,
-            &mut queue_items,
             nudge,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -16693,8 +16706,19 @@ mod loop_tests {
         let states = vec![st("a", AgentStatus::Idle)];
         let mut q = vec!["p1".into(), "p6".into()];
         let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -16716,8 +16740,19 @@ mod loop_tests {
         let states = vec![st("a", AgentStatus::Done)];
         let mut q = vec!["p1".into(), "p6".into()];
         let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -16734,8 +16769,19 @@ mod loop_tests {
         let states = vec![st("a", AgentStatus::Done)];
         let mut q2: Vec<String> = vec![];
         let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q2.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q2,
             Some("continue"),
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -16753,8 +16799,19 @@ mod loop_tests {
         let states = vec![st("flywheel-proj-oc", AgentStatus::Idle)];
         let mut q = vec!["write to .flywheel/agent-state/{AGENT_NAME}.json".into()];
         let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -16770,8 +16827,19 @@ mod loop_tests {
         let states = vec![st("a", AgentStatus::Idle)];
         let mut q = vec!["t1".into()];
         let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -16787,8 +16855,19 @@ mod loop_tests {
         let states = vec![st("a", AgentStatus::Idle), st("b", AgentStatus::Idle)];
         let mut q = vec!["p1".into(), "p6".into()];
         let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -16811,8 +16890,19 @@ mod loop_tests {
         let states = vec![st("a", AgentStatus::Working)];
         let mut q = vec!["p1".into()];
         let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -16826,8 +16916,19 @@ mod loop_tests {
         let states = vec![st("a", AgentStatus::Blocked)];
         let mut q = vec!["p1".into()];
         let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -16845,8 +16946,19 @@ mod loop_tests {
         let states = vec![st("a", AgentStatus::Unknown)];
         let mut q = vec!["p1".into()];
         let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -16855,8 +16967,19 @@ mod loop_tests {
         assert!(matches!(actions[0], durable::LoopAction::Wait));
         let mut q2: Vec<String> = vec![];
         let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q2.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q2,
             Some("proceed"),
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -16872,8 +16995,19 @@ mod loop_tests {
         let states = vec![st("a", AgentStatus::Idle)];
         let mut q: Vec<String> = vec![];
         let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             Some("proceed"),
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -16886,8 +17020,19 @@ mod loop_tests {
         let states = vec![st("a", AgentStatus::Done)];
         let mut q: Vec<String> = vec![];
         let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -16900,8 +17045,19 @@ mod loop_tests {
         let states = vec![st("a", AgentStatus::Done)];
         let mut q = vec!["p8".into()];
         let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+            },
             &states,
-            &mut q,
             None,
             &HashMap::new(),
             &std::collections::HashSet::new(),
@@ -25581,6 +25737,95 @@ fn cmd_internal_loop_run_verify(
     Ok(())
 }
 
+fn make_verify_sink(cfg: Config, project: String) -> toron_workflow::engine::VerifySink {
+    let sink = toron_workflow::engine::VerifySink::default();
+    let cfg_clone = cfg.clone();
+    let project_clone = project.clone();
+    *sink.0.lock().unwrap() = Some(std::sync::Arc::new(
+        move |req: &toron_workflow::engine::VerifyRequest| {
+            // Acquire cargo slot (advisory, best-effort)
+            let _slot = acquire_cargo_slot(&cfg_clone, &project_clone);
+            // Reuse loop-run-verify exec (cargo under slot, TIMEBOX)
+            let _out = match loop_run_verify_exec(
+                &cfg_clone,
+                &project_clone,
+                "verify-sink-bead",
+                "",
+                Some(600),
+                None,
+            ) {
+                Ok(o) => o,
+                Err(e) => {
+                    return Ok(toron_workflow::engine::VerifyResult {
+                        ok: false,
+                        exit: -1,
+                        stdout_path: None,
+                        stderr_path: None,
+                        error: Some(format!("verify sink missing: {e}")),
+                    });
+                }
+            };
+            // For workflow runs, we don't have a real bead_id/sha, so we use the command from the request
+            // Run the verify command directly via loop_run_verify_exec's underlying shell
+            // Instead, run the requested command via the same exec path but with the request's command
+            // For now, delegate to a direct shell run under the slot
+            let cmd = req.command.clone();
+            // Use the same TIMEBOX and cargo slot already held
+            let cwd = project_dir(&cfg_clone, &project_clone);
+            // Write a workflow receipt (not command-verified) via write_receipt
+            // For the test harness, we just return ok:true with a temp path
+            // Real impl would run `sh -c <cmd>` and write receipt
+            // Simplified: run the command and capture
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .current_dir(&cwd)
+                .output();
+            match output {
+                Ok(o) if o.status.success() => {
+                    // Write workflow receipt (WorkerReceipt) to .flywheel/receipts/<run>-<sha>.txt via write_receipt
+                    let receipt_content = String::from_utf8_lossy(&o.stdout).to_string();
+                    let receipt_path = match crate::verdict::write_receipt(
+                        &cwd,
+                        "verify-sink",
+                        "workflow-sha",
+                        crate::verdict::VerdictKind::WorkerReceipt,
+                        &receipt_content,
+                    ) {
+                        Ok(p) => Some(p.to_string_lossy().to_string()),
+                        Err(_) => None,
+                    };
+                    Ok(toron_workflow::engine::VerifyResult {
+                        ok: true,
+                        exit: 0,
+                        stdout_path: receipt_path,
+                        stderr_path: None,
+                        error: None,
+                    })
+                }
+                Ok(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr).to_string();
+                    Ok(toron_workflow::engine::VerifyResult {
+                        ok: false,
+                        exit: o.status.code().unwrap_or(1),
+                        stdout_path: None,
+                        stderr_path: None,
+                        error: Some(err),
+                    })
+                }
+                Err(e) => Ok(toron_workflow::engine::VerifyResult {
+                    ok: false,
+                    exit: -1,
+                    stdout_path: None,
+                    stderr_path: None,
+                    error: Some(e.to_string()),
+                }),
+            }
+        },
+    ));
+    sink
+}
+
 /// The loop-run VERIFY executor core: classify the bead's VERIFY; on the
 /// loop-runnable band run it under `sh -c` with the TIMEBOX timeout (cargo
 /// under the build slot), writing a failed-head marker on non-zero exit or
@@ -28311,9 +28556,13 @@ mod kind_classify_headless_tests {
                 effort: None,
             },
         );
-        let fb = registry.get("headless/primary").and_then(|m| m.fallback.clone());
+        let fb = registry
+            .get("headless/primary")
+            .and_then(|m| m.fallback.clone());
         assert_eq!(fb, Some("headless/fallback".to_string()));
-        let fb2 = registry.get("headless/fallback").and_then(|m| m.fallback.clone());
+        let fb2 = registry
+            .get("headless/fallback")
+            .and_then(|m| m.fallback.clone());
         assert_eq!(fb2, None);
         let cf = failure::classify("429 quota exceeded", None, None);
         assert_eq!(cf.kind, failure::FailureKind::RateLimit);
