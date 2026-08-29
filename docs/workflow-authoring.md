@@ -7,8 +7,10 @@
 > (execution wiring + model registry + headless).
 >
 > **One-line mental model:** a **profile** is a role template (behavior + model + harness); a
-> **recipe/squad** is a group of profiles; a **workflow** is a multi-step procedure that uses
-> profiles; a **cron** is a workflow on a schedule. You compose them; flywheel executes.
+> **recipe/squad** is a group of profiles; a **workflow** is a reusable multi-step procedure;
+> **loop mode** is durable solo execution of one objective; **swarm mode** is captain-led
+> multi-crew execution; **open mode** is direct current-pane work; a **cron** runs a workflow on
+> a schedule. You compose procedures with an execution topology; flywheel executes.
 
 ---
 
@@ -310,8 +312,13 @@ Headless run logs (`runs/*.jsonl`) feed this view; pane runs feed from the proje
 | You want to... | Use |
 |---|---|
 | run one agent on one task, watch it | `flywheel profile run <role>` or `flywheel send` |
-| run a fixed daily stage sequence on a live swarm | `flywheel loop run <project> --work` (the legacy imperative path; still primary for live swarms) |
+| run one objective durably in one current harness | `flywheel loop-mode run <project>` |
+| run bead-backed solo work durably | `flywheel loop-mode run <project> --work` |
+| run a fixed daily stage sequence on a live swarm | use `/swarm` and optionally supervise beads with `flywheel loop-mode run <project> --work` |
+| perform one immediate task without orchestration | `/open` or work directly in the current pane |
 | run a reusable multi-step procedure once | `flywheel workflow run <name> --execute` |
+| run a procedure in solo durable mode | `/loop` / `flywheel loop-mode run <project>` |
+| run a procedure in captain-led multi-crew mode | `/swarm` / `flywheel steer ...` |
 | run that procedure on a schedule, unattended | `flywheel cron add ...` + `flywheel cron start` |
 | spawn a fixed team shape repeatedly | define a recipe/squad → `flywheel squad spawn <name>` |
 | fan out N agents on one step | `parallel over: "@crew.<role>"` in a workflow |
@@ -322,6 +329,5 @@ Headless run logs (`runs/*.jsonl`) feed this view; pane runs feed from the proje
 > **Status note (ADR-0010):** the `--execute` real runner, `--mode headless`, model injection,
 > and the `remove`/`model` commands land in the P10.1–P10.5 beads. Until P10.3 lands,
 > `workflow run` (no `--execute`) is the no-op control-flow-only path; the **live swarm path
-> remains `flywheel loop run <project> --work`**. This guide documents the target surface so
-> agents author against it; the ADR's verification gates mark each command live as its bead
-> closes.
+> remains the bead-backed path `flywheel loop-mode run <project> --work`**. The broader
+> loop-mode surface is durable solo execution; `--work` is its bead-dispatch specialization.

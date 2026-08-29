@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Doorbell Analysis — flywheel × toron</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  *{font-family:Inter,system-ui,sans-serif}
+  .mono{font-family:"JetBrains Mono",monospace}
+  .card{border:1px solid #e5e7eb;background:#fff;border-radius:16px}
+  .pill{border-radius:999px;padding:2px 10px;font-size:11px;font-weight:700;letter-spacing:.04em}
+</style>
+</head>
+<body class="bg-[#f8f7f5] text-zinc-900">
+<!-- header -->
+<div class="max-w-[1160px] mx-auto px-6 pt-8 pb-6">
+  <div class="flex flex-wrap gap-3 items-center text-xs mono text-zinc-500">
+    <span class="px-2 py-1 rounded bg-zinc-900 text-white font-bold">ADR-0005 D1</span>
+    <span>flywheel/src/doorbell.rs</span>
+    <span>·</span>
+    <span>flywheel/src/main.rs:__doorbell</span>
+    <span>·</span>
+    <span>toron/crates/toron-cli/src/plane.rs:watch</span>
+    <span>·</span>
+    <span>toron/crates/toron-core/src/bus/in_process.rs</span>
+  </div>
+  <h1 class="text-[30px] font-extrabold tracking-tight leading-none mt-4">Doorbell: flywheel × toron</h1>
+  <p class="text-[15px] text-zinc-600 mt-2 max-w-[820px] leading-relaxed">One workspace watcher wakes idle panes. <b>Bus push → dispatcher → herdr agent.prompt → agent pulls body.</b> The piece below is full depth because you asked for it — every gap is named with its line, why it bites, and what a durable fix looks like.</p>
+
+  <!-- bottom line -->
+  <div class="card p-5 mt-5 bg-amber-50 border-amber-200">
+    <div class="text-xs font-extrabold tracking-widest text-amber-700">BOTTOM LINE — ONE SENTENCE</div>
+    <div class="text-[16px] font-semibold leading-snug mt-1">Doorbell is <b>correct in shape, brittle in runtime</b>: the ring rules and queue are right (ADR-0005), but the watcher is a poll loop over CLI subprocesses with <b>no plane-S high-water, no presence, no self-restart, and a spend-once budget</b> — so it can go deaf, re-ring history, or starve after 30 min. Fix is <b>in-process bus subscription + persisted cursors + rolling budget + real presence</b> — half the processes, twice the trust.</div>
+    <div class="flex flex-wrap gap-2 mt-3">
+      <span class="pill bg-emerald-600 text-white">SHAPE: SOUND</span>
+      <span class="pill bg-amber-600 text-white">RUNTIME: BRITTLE</span>
+      <span class="pill bg-zinc-900 text-white">EFFICIENCY: HEAVY</span>
+      <span class="pill bg-red-600 text-white">TRUST: GAPS</span>
+    </div>
+  </div>
+</div>
+
+<!-- diagram -->
+<div class="max-w-[1160px] mx-auto px-6">
+  <div class="card p-6">
+    <div class="flex justify-between items-center">
+      <h2 class="text-sm font-extrabold tracking-widest text-zinc-700">HOW IT WORKS TODAY</h2>
+      <span class="mono text-xs text-zinc-500">solid = hot path · dashed = sweep · red = gap</span>
+    </div>
+    <svg viewBox="0 0 1120 300" class="w-full h-auto mt-4" xmlns="http://www.w3.org/2000/svg">
+      <!-- bus -->
+      <rect x="160" y="18" width="800" height="64" rx="14" fill="#fff7ed" stroke="#fdba74" stroke-width="1.6"/>
+      <text x="560" y="40" text-anchor="middle" font-size="11" font-weight="800" fill="#9a3412" style="letter-spacing:.08em">TORON BUS — InProcessBus (sqlite) + ephemeral (presence)</text>
+      <text x="560" y="56" text-anchor="middle" font-size="10" fill="#9a3412">store: 9/39000/39002/43001/30031 · ephemeral: 20001 dropped on store</text>
+      <text x="560" y="70" text-anchor="middle" font-size="9" fill="#b45309">publish verifies sig `bus/in_process.rs:366` · addressable collapse per (kind,author,d)</text>
+      <!-- toron watch -->
+      <rect x="60" y="122" width="220" height="62" rx="12" fill="#eff6ff" stroke="#93c5fd"/>
+      <text x="170" y="142" text-anchor="middle" font-size="11" font-weight="800" fill="#1e40af">toron watch</text>
+      <text x="170" y="157" text-anchor="middle" font-size="9.5" fill="#1e40af">`toron watch --kinds 9,7,43001,30031,20001`</text>
+      <text x="170" y="170" text-anchor="middle" font-size="9" fill="#64748b">plane.rs:1338 — 1s tick, collect_trusted rebuild</text>
+      <!-- dispatcher -->
+      <rect x="410" y="110" width="300" height="86" rx="14" fill="#f5f3ff" stroke="#c4b5fd" stroke-width="1.8"/>
+      <text x="560" y="132" text-anchor="middle" font-size="13" font-weight="900" fill="#4c1d95">flywheel __doorbell</text>
+      <text x="560" y="148" text-anchor="middle" font-size="9.5" fill="#4c1d95">1 workspace = 1 detached child `main.rs:7126`</text>
+      <text x="560" y="162" text-anchor="middle" font-size="9" fill="#6d28d9">pid file `doorbell/<ws>.pid` + gen `doorbell/<ws>.gen`</text>
+      <text x="560" y="176" text-anchor="middle" font-size="9" fill="#6d28d9">queue per class · budget 5/30/3 · HearTracker 120s</text>
+      <!-- inbox sweep -->
+      <rect x="840" y="122" width="220" height="62" rx="12" fill="#ecfdf5" stroke="#6ee7b7"/>
+      <text x="950" y="142" text-anchor="middle" font-size="11" font-weight="800" fill="#065f46">inbox sweep</text>
+      <text x="950" y="157" text-anchor="middle" font-size="9.5" fill="#065f46">`toron mail inbox --since --limit 20`</text>
+      <text x="950" y="170" text-anchor="middle" font-size="9" fill="#047857">per pin, 1s batched `main.rs:7571`</text>
+      <!-- herdr -->
+      <rect x="410" y="222" width="300" height="58" rx="14" fill="#fff" stroke="#d6d3d1"/>
+      <text x="560" y="243" text-anchor="middle" font-size="12" font-weight="800" fill="#44403c">herdr — agent.prompt</text>
+      <text x="560" y="258" text-anchor="middle" font-size="9.5" fill="#78716c">only idle|done injects `doorbell.rs:61` · working queues</text>
+      <text x="560" y="270" text-anchor="middle" font-size="8.5" fill="#a8a29e">queue drain on pane_agent_status_changed w→idle|done</text>
+      <!-- arrows -->
+      <line x1="280" y1="140" x2="410" y2="140" stroke="#3b82f6" stroke-width="2.2" marker-end="url(#arrow)"/>
+      <line x1="840" y1="140" x2="710" y2="140" stroke="#10b981" stroke-width="2.2" stroke-dasharray="7 5" marker-end="url(#arrow)"/>
+      <line x1="560" y1="196" x2="560" y2="222" stroke="#7c3aed" stroke-width="2.2" marker-end="url(#arrow)"/>
+      <!-- gap badges -->
+      <rect x="300" y="96" width="84" height="18" rx="9" fill="#fee2e2" stroke="#fca5a5"/><text x="342" y="108" text-anchor="middle" font-size="8" font-weight="800" fill="#991b1b">REPLAY GAP</text>
+      <rect x="738" y="96" width="84" height="18" rx="9" fill="#fef3c7" stroke="#fcd34d"/><text x="780" y="108" text-anchor="middle" font-size="8" font-weight="800" fill="#92400e">CLI SPAWN</text>
+      <rect x="470" y="282" width="100" height="16" rx="8" fill="#fee2e2" stroke="#fca5a5"/><text x="520" y="292" text-anchor="middle" font-size="7.5" font-weight="800" fill="#991b1b">BUDGET BURNS</text>
+      <rect x="620" y="282" width="96" height="16" rx="8" fill="#fee2e2" stroke="#fca5a5"/><text x="668" y="292" text-anchor="middle" font-size="7.5" font-weight="800" fill="#991b1b">NO SELF-HEAL</text>
+      <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#57534e"/></marker></defs>
+    </svg>
+    <div class="grid grid-cols-3 gap-3 mt-2 mono text-[11px] leading-relaxed">
+      <div class="rounded-lg bg-blue-50 border border-blue-200 p-2.5"><b>Plane S</b> ring: @pin on 9 · job 43001 · reserve 30031 conflict · <span class="text-red-600">reaction 7 & presence 20001 watched but never ring</span> `doorbell.rs:38`</div>
+      <div class="rounded-lg bg-violet-50 border border-violet-200 p-2.5"><b>Queue</b> last-write-wins per EventClass `doorbell.rs:72` · drain on `pane_agent_status_changed` `main.rs:7318` · coalesce hides per-channel loss</div>
+      <div class="rounded-lg bg-emerald-50 border border-emerald-200 p-2.5"><b>Plane P</b> since_by_pin persisted `doorbell.rs:677` · lookback 24h `doorbell.rs:523` · <span class="text-amber-700">limit 20 truncates bursts</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- what's good -->
+<div class="max-w-[1160px] mx-auto px-6 mt-5">
+  <div class="card p-6">
+    <h2 class="text-sm font-extrabold tracking-widest text-emerald-700">WHAT'S STRONG — KEEP IT</h2>
+    <div class="grid md:grid-cols-3 gap-4 mt-3 text-[13px] leading-relaxed">
+      <div class="rounded-xl bg-emerald-50 border border-emerald-200 p-4">
+        <div class="font-bold">Ring rules are crisp</div>
+        <div class="mono text-xs text-zinc-600 mt-1">doorbell.rs:38 classify()</div>
+        <div class="mt-2">Five classes, is_presence / is_ack_only filters, addressed_to_self gate, @pin content fallback for npub p-tags. Single function, fully unit-tested. Don't touch shape.</div>
+      </div>
+      <div class="rounded-xl bg-emerald-50 border border-emerald-200 p-4">
+        <div class="font-bold">Queue + inject gate correct</div>
+        <div class="mono text-xs text-zinc-600 mt-1">should_inject idle|done · is_drain_transition w→idle|done</div>
+        <div class="mt-2">Working-pane queue, last-write-wins coalesce, drain on herdr subscribe (not poll). Matches ADR-0005 D1.6 and interrupt semantics.</div>
+      </div>
+      <div class="rounded-xl bg-emerald-50 border border-emerald-200 p-4">
+        <div class="font-bold">Generation stamping</div>
+        <div class="mono text-xs text-zinc-600 mt-1">WatcherGen mtime+len + pid supersede main.rs:7140</div>
+        <div class="mt-2">Pre-fix stale watchers self-retire, stamp every wake banner so agents can tell noise from live. The 0fic fix is load-bearing — keep it.</div>
+      </div>
+      <div class="rounded-xl bg-zinc-50 border border-zinc-200 p-4">
+        <div class="font-bold">Wake state durability</div>
+        <div class="mono text-xs text-zinc-600 mt-1">WakeState since_by_pin + last_wake `doorbell.rs:668`</div>
+        <div class="mt-2">Survives crash, at-least-once replay is idempotent via `[doorbell]` line. The 24h lookback on first run is the right call.</div>
+      </div>
+      <div class="rounded-xl bg-zinc-50 border border-zinc-200 p-4">
+        <div class="font-bold">Hear-or-deaf</div>
+        <div class="mono text-xs text-zinc-600 mt-1">HearTracker 120s `doorbell.rs:518`</div>
+        <div class="mt-2">Inject → expect presence/kind-9 within 120s, else `doorbell: unanswered pin=`. Digest surfaces it. Right shape, wrong sensor (see gaps).</div>
+      </div>
+      <div class="rounded-xl bg-zinc-50 border border-zinc-200 p-4">
+        <div class="font-bold">Bus pipeline is lossless</div>
+        <div class="mono text-xs text-zinc-600 mt-1">InProcessBus snapshot→delta→EOSE `in_process.rs:280`</div>
+        <div class="mt-2">Per-subscriber mpsc, exactly-once dedup, prune every PRUNE_INTERVAL. Publish never blocks on slow sub. Keep this invariant.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- gaps -->
+<div class="max-w-[1160px] mx-auto px-6 mt-5">
+  <h2 class="text-sm font-extrabold tracking-widest text-zinc-700">GAPS — BY PILLAR</h2>
+  <p class="text-xs mono text-zinc-500 mt-1">Severity: <span class="pill bg-red-600 text-white">P0 load-bearing</span> <span class="pill bg-amber-500 text-white">P1 reliability</span> <span class="pill bg-zinc-700 text-white">P2 efficiency</span> <span class="pill bg-sky-600 text-white">trust</span></p>
+
+  <!-- robust -->
+  <div class="card p-6 mt-3">
+    <div class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-red-600"></span><h3 class="font-extrabold">Robustness — it can go deaf silently</h3><span class="pill bg-red-600 text-white">P0 ×3</span></div>
+    <div class="mt-4 space-y-4 text-[13px] leading-relaxed">
+      <div class="rounded-xl border border-red-200 bg-red-50 p-4">
+        <div class="flex flex-wrap justify-between gap-2"><span class="font-bold">1. Plane-S has no persisted high-water — restart replays all history</span><span class="pill bg-red-600 text-white">P0</span></div>
+        <div class="mono text-xs text-zinc-600 mt-1">plane.rs:1337 collect_trusted every 1s + seen: HashSet&lt;id&gt; · doorbell.rs:677 WakeState only for plane-P</div>
+        <div class="mt-2"><b>Logic:</b> toron watch dedupes only in-process memory. Dispatcher restart (crash, heal, binary bump) clears <code class="mono bg-white px-1 rounded">seen</code> and re-emits every channel/job event for the project from sqlite. The dispatcher then re-rings each as a doorbell — <b>replay storm</b>.</div>
+        <div class="mt-2"><b>Bite:</b> old `@BlueRidge` in a 3-month-old steer channel re-wakes the agent on every restart. Budget 3/30 starves the real new mention.</div>
+        <div class="mt-2 mono text-xs bg-white border border-red-200 rounded p-2">Fix: store plane-S cursor (max created_at or max event id) in WakeState alongside since_by_pin. Watch filter becomes `created_at &gt; cursor` (or `id &gt; cursor` if ids monotonic). On restart, emit only &gt; cursor. Test: restart → zero injects for old history.</div>
+      </div>
+      <div class="rounded-xl border border-red-200 bg-red-50 p-4">
+        <div class="flex flex-wrap justify-between gap-2"><span class="font-bold">2. Presence never reaches HearTracker — every inject times out as unanswered</span><span class="pill bg-red-600 text-white">P0</span></div>
+        <div class="mono text-xs text-zinc-600 mt-1">in_process.rs:385 ephemeral 20001 not stored · plane.rs:200 presence via presence.jsonl · doorbell watch Pubkey only from Watch lines</div>
+        <div class="mt-2"><b>Logic:</b> HearTracker expects <code class="mono bg-white px-1 rounded">presence 20001 OR kind-9 from npub</code> within 120s (`doorbell.rs:518`). But presence is ephemeral — bus drops it before store, collect_trusted never returns it, and <code class="mono bg-white px-1 rounded">presence list</code> is a file tail not a bus feed. So <code class="mono bg-white px-1 rounded">watch_pubkey</code> only sees channel posts.</div>
+        <div class="mt-2"><b>Bite:</b> an idle agent that hears via <code class="mono bg-white px-1 rounded">presence publish --state working</code> still shows <code class="mono bg-white px-1 rounded">doorbell: unanswered pin=…</code> after 120s — false deaf alarm that pages the captain.</div>
+        <div class="mt-2 mono text-xs bg-white border border-red-200 rounded p-2">Fix: make HearTracker read presence.jsonl (the real projection) OR subscribe to live ephemeral fanout via InProcessBus::subscribe (not collect_trusted replay). Bus already fans ephemeral live — doorbell just isn't listening there.</div>
+      </div>
+      <div class="rounded-xl border border-red-200 bg-red-50 p-4">
+        <div class="flex flex-wrap justify-between gap-2"><span class="font-bold">3. Watch dies = dispatcher deaf until next human command</span><span class="pill bg-red-600 text-white">P0</span></div>
+        <div class="mono text-xs text-zinc-600 mt-1">main.rs:7165 spawn toron watch once · Bell::Died =&gt; break (`main.rs:7345`) · no in-process restart</div>
+        <div class="mt-2"><b>Logic:</b> one watch child per workspace. If it exits (panic, OOM, db lock, herdr socket hiccup), dispatcher breaks the main loop outright. Heal is only external: Resonate `heal_tick` every 60s <i>if</i> server reachable, else lazy on next <code class="mono bg-white px-1 rounded">flywheel spawn/status/doorbell</code>.</div>
+        <div class="mt-2"><b>Bite:</b> overnight crash with no human touch = hours of deaf panes. The 1-minute supervisor is best-effort; offline or queue-full → no heal.</div>
+        <div class="mt-2 mono text-xs bg-white border border-red-200 rounded p-2">Fix: in-process watch restart with backoff (1s,2s,4s, cap 30s) inside __doorbell. Log to doorbell log file, expose `watch_restarts` counter in status.</div>
+      </div>
+      <div class="rounded-xl border border-amber-200 bg-amber-50 p-4">
+        <div class="flex flex-wrap justify-between gap-2"><span class="font-bold">4. Budget is spend-once, not rolling — long crews go deaf after 30 min</span><span class="pill bg-amber-500 text-white">P1</span></div>
+        <div class="mono text-xs text-zinc-600 mt-1">doorbell.rs:146 PinBudget { started_unix, prompts } · allows = elapsed &lt; budget && prompts &lt; max · never resets</div>
+        <div class="mt-2"><b>Logic:</b> first prompt stamps <code class="mono bg-white px-1 rounded">started_unix</code>; after 30 min or 3 prompts, <code class="mono bg-white px-1 rounded">allows()</code> is false forever until dispatcher restart. A 4-hour bead that gets two peer questions at +10 min and a captain nudge at +35 min drops the nudge.</div>
+        <div class="mt-2"><b>Dropped rings are not queued and not reported</b> — `take_allowed` filters after queue drain, silently discarding.</div>
+        <div class="mt-2 mono text-xs bg-white border border-amber-200 rounded p-2">Fix: rolling window (e.g. token bucket 3 per 30 min) OR per-task budget keyed to bead id, not wall-clock since first prompt. On budget hit, queue for later + surface `budget_exhausted pin=…` in status.</div>
+      </div>
+      <div class="rounded-xl border border-amber-200 bg-amber-50 p-4">
+        <div class="flex flex-wrap justify-between gap-2"><span class="font-bold">5. Blocked agents never get the wake they need most</span><span class="pill bg-amber-500 text-white">P1</span></div>
+        <div class="mono text-xs text-zinc-600 mt-1">doorbell.rs:61 should_inject = idle|done only · blocked never injects</div>
+        <div class="mt-2"><b>Logic:</b> doorbell queues if not idle|done. A blocked agent's peer posting a fix on the steer channel or a `request-release` grant via mail will queue, then drain only on <code class="mono bg-white px-1 rounded">working→idle|done</code> — which never comes while blocked. The durable loop escalates blocked separately, but the peer-to-peer unblock path is dead.</div>
+        <div class="mt-2 mono text-xs bg-white border border-amber-200 rounded p-2">Fix: inject into blocked too (blocked is await-signal, not "don't disturb"). Or special-case: Channel+PlanePUrgent bypass the idle gate for blocked pins.</div>
+      </div>
+      <div class="rounded-xl border border-zinc-300 bg-white p-4">
+        <div class="flex flex-wrap justify-between gap-2"><span class="font-bold">6. Coalesce loses per-channel granularity</span><span class="pill bg-zinc-700 text-white">P2</span></div>
+        <div class="mono text-xs text-zinc-600 mt-1">doorbell.rs:72 DoorbellQueue: BTreeMap EventClass → line · pull_hint picks one h tag</div>
+        <div class="mt-2"><b>Logic:</b> two channel mentions on different channels (steer-x and review-y) while working collapse to one line — the last <code class="mono bg-white px-1 rounded">h</code> wins, first channel never hinted. Agent pulls only the hinted channel and misses the other.</div>
+        <div class="mt-2 mono text-xs bg-zinc-50 border rounded p-2">Fix: queue per (EventClass, channel) or store Set&lt;h&gt; and hint `toron channel read h=…` for each. At least dedup per hint, not per class.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- reliability -->
+  <div class="card p-6 mt-4">
+    <div class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-amber-500"></span><h3 class="font-extrabold">Reliability — will it be up when you need it</h3><span class="pill bg-amber-500 text-white">P1 ×4</span></div>
+    <div class="mt-4 space-y-4 text-[13px] leading-relaxed">
+      <div class="rounded-xl border border-amber-200 bg-amber-50 p-4">
+        <div class="font-bold">7. inbox sweep silently skips on any failure — lost wake with no signal</div>
+        <div class="mono text-xs text-zinc-600 mt-1">main.rs:7601 Command::new("toron") · continue on spawn fail or non-zero exit</div>
+        <div class="mt-1">Any toron failure (daemon down, db locked, arg error) just <code class="mono bg-white px-1 rounded">continue</code>s. No retry, no metric, no `unanswered` change. And <code class="mono bg-white px-1 rounded">since_by_pin</code> jumps to <code class="mono bg-white px-1 rounded">now</code> even when raw was empty/invalid — future mail between last real high-water and now can be skipped.</div>
+        <div class="mono text-xs bg-white border border-amber-200 rounded p-2 mt-2">Fix: advance high-water only when a valid high-water was returned. On Command failure, keep since unchanged + increment `inbox_errors` exposed in status.</div>
+      </div>
+      <div class="rounded-xl border border-amber-200 bg-amber-50 p-4">
+        <div class="font-bold">8. Limit 20 truncates bursts — tail urgent mail never wakes</div>
+        <div class="mono text-xs text-zinc-600 mt-1">main.rs:7608 --limit 20 · doorbell.rs:944 inbox_high_water = max created_ts</div>
+        <div class="mt-1">24h lookback can hold &gt;20 messages (storm, swarm broadcast). Only the first 20 returned are scanned for PlanePUrgent/request-release. Tail beyond 20 is invisible, but high-water still jumps to max — lost forever.</div>
+        <div class="mono text-xs bg-white border border-amber-200 rounded p-2 mt-2">Fix: page `--limit 100` + paginate by moving since forward per page, or call mailbox directly with no limit and scan all.</div>
+      </div>
+      <div class="rounded-xl border border-amber-200 bg-amber-50 p-4">
+        <div class="font-bold">9. High-water compares strings, not instants — wrongmax</div>
+        <div class="mono text-xs text-zinc-600 mt-1">doorbell.rs:963 .max() on RFC3339 strings</div>
+        <div class="mt-1">Lexicographic max is not chronological when formats differ (with/without fractional, Z vs +00:00). Two messages in same second with different serialization can invert. Clock skew across toron writers makes it worse.</div>
+        <div class="mono text-xs bg-white border border-amber-200 rounded p-2 mt-2">Fix: parse to unix micros and compare numbers; store since as micros or canonical RFC3339. Use `created_ts_us` where available (InboxMessage already has it).</div>
+      </div>
+      <div class="rounded-xl border border-amber-200 bg-amber-50 p-4">
+        <div class="font-bold">10. Pid liveness via kill -0 + mtime×len is forgeable</div>
+        <div class="mono text-xs text-zinc-600 mt-1">doorbell.rs:191 pid_alive kill -0 · WatcherGen mtime+len `doorbell.rs:272`</div>
+        <div class="mt-1">Pid reuse: a new unrelated process with same pid looks alive → false Attach. Mtime second granularity: rebuild within same second with same len → stale watcher not superseded, false wakes loop forever (the 0fic class). No flock.</div>
+        <div class="mono text-xs bg-white border border-amber-200 rounded p-2 mt-2">Fix: flock the pid file (advisory), store pid start-time or ppid, identity = hash of binary (first 4k or sha256) not just len.</div>
+      </div>
+      <div class="rounded-xl border border-zinc-200 bg-white p-4">
+        <div class="font-bold">11. Supervisor only heals workspaces that already have a .gen</div>
+        <div class="mono text-xs text-zinc-600 mt-1">doorbell.rs:736 dead_dispatchers scans doorbell/*.gen only · wakeState at top-level not scanned</div>
+        <div class="mt-1">Fresh workspace that failed its first spawn, or a state dir migrated without .gen, never healed. Also supervisor needs a running Resonate worker to fire — offline machine never self-heals.</div>
+        <div class="mono text-xs bg-zinc-50 border rounded p-2 mt-2">Fix: heal from spawn-registry workspaces (Flywheel's source of truth) plus .gen, and add a launchd/systemd fallback note for offline hosts (opt-in).</div>
+      </div>
+      <div class="rounded-xl border border-zinc-200 bg-white p-4">
+        <div class="font-bold">12. herdr agent.prompt fail = prompt loss, hear not marked, no retry</div>
+        <div class="mono text-xs text-zinc-600 mt-1">main.rs:7479 agent_prompt · eprintln only · doorbell_prompt returns ok list only for success</div>
+        <div class="mt-1">Socket hiccup while prompting = silent drop. Agent never wakes, HearTracker never arms, so no `unanswered` signal either. Double loss.</div>
+        <div class="mono text-xs bg-zinc-50 border rounded p-2 mt-2">Fix: retry once with 1s backoff + surface `prompt_failures` counter; on fail, still arm HearTracker so unanswered fires.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- efficiency -->
+  <div class="card p-6 mt-4">
+    <div class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-zinc-600"></span><h3 class="font-extrabold">Efficiency — why it cost 24 GB and still lags</h3><span class="pill bg-zinc-700 text-white">P2</span></div>
+    <div class="mt-1 mono text-xs text-zinc-500">Incident: bd-741i — 100ms watch + full replay → 24GB/5h RSS, 84 swapfiles, kernel panic</div>
+    <div class="mt-4 space-y-4 text-[13px] leading-relaxed">
+      <div class="rounded-xl border border-zinc-200 bg-white p-4">
+        <div class="font-bold">13. Two poll loops doing the same sqlite scan — doubled I/O</div>
+        <div class="mono text-xs text-zinc-600 mt-1">toron watch 1s full collect_trusted rebuilds ChannelStore from all lifecycle events · doorbell inbox sweep spawns 5 toron processes per second</div>
+        <div class="mt-1"><b>Now:</b> 1s is better than 100ms, but still N Workspaces × (1 watch full-scan + P pins × toron spawn) per second. For 5 crews that's ~6 full bus replays/sec, each deserializing all kind-9s. As history grows (1k msgs) cost grows O(history) per tick.</div>
+        <div class="mono text-xs bg-zinc-50 border rounded p-2 mt-2">Fix (biggest win): <b>don't shell out</b>. Call mailbox/bus directly in-process: one Bus::subscribe with Filter (kinds + hashtag) keeps a live channel, zero polls. Replace toron CLI spawn with mailbox.fetch_inbox / bus.subscribe. One connection, incremental.</div>
+      </div>
+      <div class="rounded-xl border border-zinc-200 bg-white p-4">
+        <div class="font-bold">14. Snapshot memo helps but channel post still deserializes everything</div>
+        <div class="mono text-xs text-zinc-600 mt-1">BusEventStore snapshot memo keyed by (filter, mutation version) — second identical subscribe skips scan `in_process.rs:569`</div>
+        <div class="mt-1">Memo hides the SQL scan, but the dispatcher still rebuilds ChannelStore from every replayed event on every spawn of watch. With long-lived watch it's once, but inbox sweep still paginates naively.</div>
+        <div class="mono text-xs bg-zinc-50 border rounded p-2 mt-2">Fix: use `since` cursor on the store (WHERE created_at &gt; cursor) so each tick reads only new rows, not full replay.</div>
+      </div>
+      <div class="rounded-xl border border-zinc-200 bg-white p-4">
+        <div class="font-bold">15. Main loop blocks on subprocess while watch lines queue</div>
+        <div class="mono text-xs text-zinc-600 mt-1">main.rs:7282 recv_timeout(1s) then doorbell_sweep_inbox which runs 5 sequential Command::output</div>
+        <div class="mt-1">Sweep holds the dispatcher thread for hundreds of ms; watch lines buffer in the mpsc channel and drain late. Under load, inject latency spikes from 10ms to 500ms. The mpsc is unbounded-ish but prompt ordering suffers.</div>
+        <div class="mono text-xs bg-zinc-50 border rounded p-2 mt-2">Fix: sweep in a separate task or batch via in-process async, keep main loop only for routing (watch, status, timeout). One task = watch→inject, one task = sweep→inject.</div>
+      </div>
+      <div class="rounded-xl border border-zinc-200 bg-white p-4">
+        <div class="font-bold">16. Watching 7 & 20001 for rings that never ring</div>
+        <div class="mono text-xs text-zinc-600 mt-1">kinds 9,7,43001,30031,20001 watched; classify never returns for 7</div>
+        <div class="mt-1">Wasted filter width and wasted InboxSweeps matching. Reactions are deliver-only, presence is ephemeral anyway. Filter should be tight: <code class="mono bg-white px-1 rounded">9,43001,30031</code> for rings + live 20001 subscription for hear only.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- trust -->
+  <div class="card p-6 mt-4">
+    <div class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-sky-600"></span><h3 class="font-extrabold">Trustworthiness — can you act on a wake</h3><span class="pill bg-sky-600 text-white">trust</span></div>
+    <div class="mt-4 space-y-4 text-[13px] leading-relaxed">
+      <div class="rounded-xl border border-sky-200 bg-sky-50 p-4">
+        <div class="font-bold">17. Doorbell line is pull-hint, not proof — but agents may treat it as fact</div>
+        <div class="mono text-xs text-zinc-600 mt-1">doorbell.rs:966 doorbell_line "kind 9. Pull: toron channel read h=…"</div>
+        <div class="mt-1"><b>Good:</b> body stays pull (gift-wrap never pushed). <b>Gap:</b> hint is a suggestion; if the read races ahead of the write (watch→bus visibility 50ms), `channel read` returns empty and a naive agent concludes "nothing to do" and exits. No generation or event id in the hint to prove there is work.</div>
+        <div class="mono text-xs bg-white border border-sky-200 rounded p-2 mt-2">Fix: include event id in hint (`Pull: toron channel read h=x --since &lt;ts&gt; # event id abc`). Or better: include the triggering event id set so agent can assert non-empty.</div>
+      </div>
+      <div class="rounded-xl border border-sky-200 bg-sky-50 p-4">
+        <div class="font-bold">18. Spend-once budget is an untrusted DoS — any mention can burn the 3</div>
+        <div class="mono text-xs text-zinc-600 mt-1">take_allowed drops silently when prompts &gt;=3</div>
+        <div class="mt-1">Any project member (or compromised agent) can `@mention` a pin 3 times and exhaust its budget early, silencing legitimate captain wake for the next 30 min. No per-sender limit, no priority (urgent vs chatter equal).</div>
+        <div class="mono text-xs bg-white border border-sky-200 rounded p-2 mt-2">Fix: budget per (sender, class) or reserve 1 slot for captain/plane-P urgent. Log budget burns with sender.</div>
+      </div>
+      <div class="rounded-xl border border-sky-200 bg-sky-50 p-4">
+        <div class="font-bold">19. p-tag is trusted after verify, but @pin content is not</div>
+        <div class="mono text-xs text-zinc-600 mt-1">doorbell.rs:822 content.contains("@BlueRidge")</div>
+        <div class="mt-1">Channel `p` tags are signed (verified at `publish:366`). `@pin` in content is not — anyone can write `@Victim` in a room the victim never joined and trigger a wake. Harmless today (just a pull), but if future code auto-acts on content mentions, it's an injection vector.</div>
+        <div class="mono text-xs bg-white border border-sky-200 rounded p-2 mt-2">Fix: ring only on signed p/assignee tags; treat @pin content as advisory, not wake-worthy, or require membership for content-mention wakes.</div>
+      </div>
+      <div class="rounded-xl border border-sky-200 bg-sky-50 p-4">
+        <div class="font-bold">20. No audit of doorbell decisions</div>
+        <div class="mono text-xs text-zinc-600 mt-1">HearTracker + budget + queue are in-memory only; status prints only unanswered pins</div>
+        <div class="mt-1">Operator cannot answer "why didn't BlueRidge wake at 14:03?" — no log of classified, queued, budget-dropped, or prompt-failed lines. The durable loop has a JSONL event log; doorbell does not.</div>
+        <div class="mono text-xs bg-white border border-sky-200 rounded p-2 mt-2">Fix: append one JSON line per decision to `{state_dir}/doorbell/{ws}.log` (ring, class, pin, queued|injected|dropped-budget|prompt-ok|fail). Zero new deps, priceless for forensics.</div>
+      </div>
+      <div class="rounded-xl border border-zinc-200 bg-white p-4">
+        <div class="font-bold">21. Index npub learn is best-effort and racy</div>
+        <div class="mono text-xs text-zinc-600 mt-1">doorbell_self_index does whois per pin on 1s tick `main.rs:7408` · watch tick inserts pins with None</div>
+        <div class="mt-1">New pin's npub unknown for up to 1s; channel post in that window misses. Also whois fails when daemon down → index stale forever until next tick's retry. No backoff.</div>
+        <div class="mono text-xs bg-zinc-50 border rounded p-2 mt-2">Fix: resolve npub on watch_targets miss immediately (single whois), not just on tick. Cache negative with TTL.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- what better looks like -->
+  <div class="card p-6 mt-4 bg-zinc-900 text-zinc-100">
+    <h2 class="text-sm font-extrabold tracking-widest text-white">WHAT BETTER LOOKS LIKE — ONE FEASIBLE RE-DESIGN</h2>
+    <p class="mono text-xs text-zinc-400 mt-1">Same ADR-0005 shape, new plumbing. No new MCP tools, no daemon→herdr socket breaking ADR-0015.</p>
+    <div class="grid md:grid-cols-2 gap-4 mt-4 text-[13px] leading-relaxed">
+      <div class="rounded-xl bg-zinc-800 border border-zinc-700 p-4">
+        <div class="font-bold text-white">A. In-process bus, not CLI</div>
+        <div class="mt-2 text-zinc-300">Drop <code class="mono bg-zinc-900 px-1 rounded">Command::new("toron")</code> entirely. Dispatcher holds an <code class="mono bg-zinc-900 px-1 rounded">Arc&lt;InProcessBus&gt;</code> (flywheel already has the mailbox via <code class="mono bg-zinc-900 px-1 rounded">mail_shim::mailbox()</code> — reuse its bus). One <code class="mono bg-zinc-900 px-1 rounded">subscribe_trusted(Filter{kinds,hashtag})</code> yields live events + replay via the lossless channel. No fork, no JSONL parse, no seen set reimplementing what the bus already does. Sweep becomes <code class="mono bg-zinc-900 px-1 rounded">mailbox().fetch_inbox(FetchInbox{since_ts})</code> direct — no limit-20 pagination loss.</div>
+        <div class="mt-2 mono text-xs bg-zinc-900 border border-zinc-700 rounded p-2">From ~6 proc/sec → 2 subs total. Latency 50ms → &lt;5ms. RSS bomb gone (bus memo does its job once).</div>
+      </div>
+      <div class="rounded-xl bg-zinc-800 border border-zinc-700 p-4">
+        <div class="font-bold text-white">B. Two persisted cursors</div>
+        <div class="mt-2 text-zinc-300">WakeState grows one field: <code class="mono bg-zinc-900 px-1 rounded">plane_s_cursor_us: u64</code> (max seen <code class="mono bg-zinc-900 px-1 rounded">created_at</code> or id-lexicographic). On each batch, advance cursor only after successful inject. On restart, filter is <code class="mono bg-zinc-900 px-1 rounded">created_at &gt; cursor</code> — old history never re-rings. Plane-P keeps <code class="mono bg-zinc-900 px-1 rounded">since_by_pin</code> but stored as micros, compared numerically, and only advanced on valid high-water.</div>
+      </div>
+      <div class="rounded-xl bg-zinc-800 border border-zinc-700 p-4">
+        <div class="font-bold text-white">C. Rolling budget + priority</div>
+        <div class="mt-2 text-zinc-300">Token bucket: 3 tokens per 30 min rolling, refill continuously. Urgent plane-P borrows from captain reserve (1 token). On exhaust, don't drop — queue with <code class="mono bg-zinc-900 px-1 rounded">budget_queued</code> and surface <code class="mono bg-zinc-900 px-1 rounded">doorbell: budget_queued pin=… class=…</code>. Log every decision. Long crews stay woken.</div>
+      </div>
+      <div class="rounded-xl bg-zinc-800 border border-zinc-700 p-4">
+        <div class="font-bold text-white">D. Real presence + self-heal</div>
+        <div class="mt-2 text-zinc-300">HearTracker subscribes to live ephemeral stream (<code class="mono bg-zinc-900 px-1 rounded">bus.subscribe</code> for kind 20001) plus file tail as fallback. Watch restart with 1-2-4-8s backoff inside dispatcher. Pid file flocked, identity = sha256(first 8k of binary). Status shows <code class="mono bg-zinc-900 px-1 rounded">restarts</code>, <code class="mono bg-zinc-900 px-1 rounded">dropped_budget</code>, <code class="mono bg-zinc-900 px-1 rounded">prompt_failures</code>.</div>
+      </div>
+      <div class="rounded-xl bg-zinc-800 border border-zinc-700 p-4">
+        <div class="font-bold text-white">E. Tight filters</div>
+        <div class="mt-2 text-zinc-300">Watch only <code class="mono bg-zinc-900 px-1 rounded">9,43001,30031</code> for rings. Presence 20001 on a separate live sub for hear only. Reactions 7 not watched at all (they're presence-ish, not wake). Queue key becomes <code class="mono bg-zinc-900 px-1 rounded">(EventClass, channel)</code> — per-channel, not per-class.</div>
+      </div>
+      <div class="rounded-xl bg-zinc-800 border border-zinc-700 p-4">
+        <div class="font-bold text-white">F. Inject into blocked</div>
+        <div class="mt-2 text-zinc-300">Change <code class="mono bg-zinc-900 px-1 rounded">should_inject</code> to <code class="mono bg-zinc-900 px-1 rounded">idle|done|blocked</code>, or at minimum let Channel + PlanePUrgent through for blocked. Peer unblock is the whole point of the ladder — don't gate it.</div>
+      </div>
+    </div>
+    <div class="mt-4 rounded-xl bg-white text-zinc-900 p-4">
+      <div class="font-bold">Effort sketch (one engineer, 2–3 days)</div>
+      <div class="grid md:grid-cols-3 gap-3 mt-3 mono text-xs leading-relaxed">
+        <div class="rounded-lg bg-zinc-50 border p-3"><b>Day 1</b><br>Wire in-process bus+mailbox into __doorbell (no CLI). Persist plane-S cursor + fix high-water to micros. PR: eliminates replay storm.</div>
+        <div class="rounded-lg bg-zinc-50 border p-3"><b>Day 2</b><br>Rolling budget, per-channel queue, inject-into-blocked, audit log. PR: fixes deaf-after-30m and blocked-unblock.</div>
+        <div class="rounded-lg bg-zinc-50 border p-3"><b>Day 3</b><br>Live presence sub, watch self-restart, pid flock+hash, tight filters. PR: closes the 3 P0s. Gate: `cargo test doorbell` + live watch-restart chaos test.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- verification -->
+  <div class="card p-6 mt-4">
+    <h2 class="text-sm font-extrabold tracking-widest text-zinc-700">HOW TO PROVE IT — GATE BEFORE YOU SHIP</h2>
+    <div class="grid md:grid-cols-2 gap-4 mt-3 text-[13px] leading-relaxed mono">
+      <div class="rounded-xl bg-zinc-50 border p-4">
+        <div class="font-bold text-zinc-900" style="font-family:Inter">Kept from today (must stay green)</div>
+        <div class="mt-2 text-zinc-700">cargo test doorbell:: (SC-D1..D3) · sc_doorbell_adr0005 · verify-0005.sh · catalog_freshness · backstop: 1 workspace = 1 watch</div>
+      </div>
+      <div class="rounded-xl bg-amber-50 border border-amber-200 p-4">
+        <div class="font-bold text-zinc-900" style="font-family:Inter">New chaos gates</div>
+        <div class="mt-2 text-zinc-700">kill toron watch → dispatcher self-restarts in &lt;5s, no history re-ring · kill dispatcher → Resonate heal_tick + lazy spawn both heal, status shows restarts · flood 30 mentions while working → per-channel queue delivers each channel once · 35min long task still wakes on urgent · blocked agent receives channel wake</div>
+      </div>
+    </div>
+    <div class="mono text-xs text-zinc-500 mt-4">Files referenced: flywheel/src/doorbell.rs:2,38,61,72,146,191,272,668,944 — flywheel/src/main.rs:7126,7165,7282,7571,7408,7479 — toron/crates/toron-cli/src/plane.rs:1338,1301 — toron/crates/toron-core/src/bus/in_process.rs:366,385 — flywheel/integrations/peer-aware.md.tpl</div>
+  </div>
+
+  <div class="text-center mono text-xs text-zinc-400 py-8">Built for the ADHD operator — bottom line first, full receipts behind. ADHD tax paid: every fix names its line so you can grep, not guess.</div>
+</div>
+</body>
+</html>
