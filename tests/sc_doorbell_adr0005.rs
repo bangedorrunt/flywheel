@@ -26,7 +26,9 @@ fn flywheel() -> &'static str {
 fn sc_d9_swarm_playbook_loop_optional_for_peer_wake() {
     let tpl = read("integrations/prompts/swarm.md.tpl");
     assert!(
-        tpl.contains("Keep wake\n   coordination separate") || tpl.contains("peer-aware wake"),
+        tpl.contains("Keep wake\n   coordination separate")
+            || tpl.contains("peer-aware wake")
+            || tpl.contains("Keep wake separate from supervision"),
         "swarm playbook must separate wake from supervision, got a snippet: {}",
         tpl.lines()
             .find(|l| l.contains("SPAWN") || l.contains("loop run"))
@@ -167,14 +169,22 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         !body.contains("loop run"),
         "doorbell must not start the loop"
     );
+    // Two spawn-path literals are the contract now: cold-start start and
+    // the lazy heal/re-inject path — each workspace still gets exactly ONE
+    // watch child (the third "watch" literal in the region is the audit
+    // trail's kind tag, and an inbox sweep is not a second watch).
     assert_eq!(
-        body.matches("\"watch\"").count(),
-        1,
-        "one workspace = one toron watch child (inbox sweep is not a second watch)"
+        body.matches(".args([\"watch\"").count(),
+        2,
+        "dispatcher spawns the watch child from exactly the start + heal paths"
     );
     assert!(
-        body.contains("9,7,43001,30031"),
-        "watch kinds must include 30031"
+        body.contains("9,43001,30031"),
+        "watch kinds must include reservations (30031)"
+    );
+    assert!(
+        !body.contains("9,7,43001"),
+        "watch filter stays tight: reactions (kind 7) are not wake-worthy (bd-qsed.4)"
     );
     assert!(
         body.contains("mail") && body.contains("inbox"),
@@ -334,7 +344,10 @@ fn integration_writes_orchestration_commands() {
 fn sc_kill_stops_doorbell() {
     let src = read("src/main.rs");
     let start = src.rfind("fn cmd_kill(").expect("cmd_kill");
-    let body = &src[start..start + 2500];
+    // cmd_kill now carries the ADR-0025 parent-death policy (stop/continue/
+    // adopt + --reap-crews) before the doorbell teardown — window wide
+    // enough for the policy block plus the stop call.
+    let body = &src[start..start + 12000];
     assert!(body.contains("doorbell::stop"));
 }
 
