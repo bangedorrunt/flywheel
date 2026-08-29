@@ -569,13 +569,14 @@ graph:
         "bug-fix",
         r##"
 name: bug-fix
-description: "Fix-path playbook (ADR-0019 Spec 7.2): repro → failing test → minimal fix → independent proof. No fix node without a repro predecessor (lint)."
+description: "Fix-path playbook (ADR-0019 Spec 7.2): repro → repair-until-verified fix loop → independent proof. No fix node without a repro predecessor (lint). ADR-0024 Scenario B: fix path via repair-until-verified."
 trigger:
   type: webhook
 crew: auto
 inputs:
   - name: symptom
   - name: repro
+  - name: verify
 principles:
   - fix-root-causes
   - prove-it-works
@@ -589,21 +590,13 @@ graph:
         profile: "@scout"
         task: "Run or write the repro for: {{inputs.symptom}}\n\nRepro: {{inputs.repro}}\nACCEPTANCE: the command exits non-zero (or visibly shows the bug). Record the exact failing output as the baseline."
       on_error: fail_run
-    tdd:
-      action: dispatch_job
-      assignee: x
-      spec:
-        profile: "@coder"
-        task: "Write the FAILING test first (RED) for: {{inputs.symptom}}\n\nRepro: {{inputs.repro}}\nVERIFY: the new test FAILS. Do not fix anything yet."
-      needs: [repro]
-      on_error: fail_run
     fix:
-      action: dispatch_job
-      assignee: x
-      spec:
-        profile: "@coder"
-        task: "Apply the MINIMAL fix for {{inputs.symptom}} against the failing test from step tdd.\nVERIFY: the test PASSES AND the original repro ({{inputs.repro}}) no longer reproduces."
-      needs: [tdd]
+      action: call_workflow
+      workflow: repair-until-verified
+      needs: [repro]
+      inputs:
+        verify: "cargo test --offline --bin flywheel bug_fix_recipe"
+        max_iterations: 3
       on_error: fail_run
     prove:
       action: dispatch_job
@@ -2025,21 +2018,97 @@ mod tests {
             checked >= 10,
             "expected >=10 stage-ref dispatches, saw {checked}"
         );
-        // The documented exception stays inline (ORDER-test contract).
+        // ADR-0024 Scenario B: bug-fix routes the fix path through
+        // repair-until-verified (repro stays fail_run, prove stays @reviewer).
         let bug_fix = &wfs["bug-fix"];
-        let mut bug_fix_tasks = 0u32;
-        if let Some(g) = &bug_fix.graph {
-            for node in g.nodes.values() {
-                if let Action::DispatchJob { spec, .. } = &node.action
-                    && spec.task.as_deref().is_some()
-                {
-                    bug_fix_tasks += 1;
-                }
-            }
+        let g = bug_fix.graph.as_ref().expect("bug-fix is a graph");
+        // repro stays dispatch_job (inline task)
+        let repro = &g.nodes["repro"];
+        assert!(
+            matches!(repro.action, Action::DispatchJob { .. }),
+            "repro stays dispatch_job"
+        );
+        if let Action::DispatchJob { spec, .. } = &repro.action {
+            assert!(spec.task.is_some(), "repro keeps inline task");
+            assert_eq!(
+                repro.on_error,
+                toron_workflow::schema::StepOnError::FailRun,
+                "repro fail_run"
+            );
         }
+        // fix path uses the recipe (call_workflow repair-until-verified)
+        let fix = &g.nodes["fix"];
+        match &fix.action {
+            Action::CallWorkflow {
+                workflow, inputs, ..
+            } => {
+                assert_eq!(workflow, "repair-until-verified", "fix calls repair recipe");
+                let verify = inputs.get("verify").expect("fix inputs verify");
+                let verify_str = verify.as_str().expect("verify is string");
+                assert!(
+                    verify_str.contains("cargo test") || verify_str.contains("{{inputs."),
+                    "verify from bead's VERIFY placeholder or cargo test: {verify_str}"
+                );
+                let max_iter = inputs.get("max_iterations").expect("max_iterations");
+                assert_eq!(max_iter.as_u64(), Some(3), "max_iterations 3: {max_iter:?}");
+            }
+            other => panic!("fix must be call_workflow repair-until-verified, got {other:?}"),
+        }
+        assert_eq!(fix.needs, vec!["repro".to_string()], "fix needs repro");
         assert_eq!(
-            bug_fix_tasks, 4,
-            "bug-fix keeps its four inline task: nodes"
+            fix.on_error,
+            toron_workflow::schema::StepOnError::FailRun,
+            "fix fail_run"
+        );
+        // prove stays @reviewer dispatch
+        let prove = &g.nodes["prove"];
+        assert!(
+            matches!(prove.action, Action::DispatchJob { .. }),
+            "prove stays dispatch_job"
+        );
+        if let Action::DispatchJob { spec, .. } = &prove.action {
+            assert_eq!(spec.profile.as_deref(), Some("@reviewer"));
+            assert_eq!(spec.harness.as_deref(), Some("opencode"));
+        }
+        assert_eq!(prove.needs, vec!["fix".to_string()], "prove needs fix");
+    }
+
+    /// ADR-0024 Scenario B: bug-fix fix path via repair-until-verified (verify + max_iterations 3)
+    #[test]
+    fn bug_fix_recipe_uses_repair_until_verified() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let bug = &wfs["bug-fix"];
+        let g = bug.graph.as_ref().expect("bug-fix is a graph");
+        assert_eq!(g.nodes.len(), 3, "repro, fix (recipe), prove: {g:?}");
+        assert!(g.nodes.contains_key("repro"), "repro present");
+        assert!(g.nodes.contains_key("fix"), "fix present");
+        assert!(g.nodes.contains_key("prove"), "prove present");
+        // fix is the recipe
+        match &g.nodes["fix"].action {
+            Action::CallWorkflow {
+                workflow, inputs, ..
+            } => {
+                assert_eq!(workflow, "repair-until-verified");
+                assert!(inputs.get("verify").is_some(), "verify input present");
+                assert_eq!(
+                    inputs.get("max_iterations").and_then(|v| v.as_u64()),
+                    Some(3)
+                );
+                let verify = inputs.get("verify").and_then(|v| v.as_str()).unwrap();
+                assert!(
+                    verify.contains("cargo test") || verify.contains("{{inputs."),
+                    "verify placeholder: {verify}"
+                );
+            }
+            other => panic!("fix must be call_workflow: {other:?}"),
+        }
+        // lint clean
+        let report = toron_workflow::lint_workflow(bug);
+        assert!(
+            report.is_clean(),
+            "bug-fix must lint clean: {:?}",
+            report.issues
         );
     }
 
@@ -2727,8 +2796,8 @@ mod tests {
                 .iter()
                 .map(|i| i.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["symptom", "repro"],
-            "bug-fix inputs"
+            vec!["symptom", "repro", "verify"],
+            "bug-fix inputs — verify via repair recipe (ADR-0024 Scenario B)"
         );
         let feat = &wfs["feature"];
         assert_eq!(
@@ -2751,9 +2820,9 @@ mod tests {
         );
     }
 
-    /// bug-fix is a DAG with the TDD chain explicit: prove needs fix, fix
-    /// needs tdd, tdd needs repro — a fix node without a repro predecessor
-    /// cannot exist (the wave-2 structural lint reads exactly this shape).
+    /// bug-fix is a DAG with the repair loop explicit: prove needs fix, fix
+    /// (repair-until-verified) needs repro — a fix node without a repro predecessor
+    /// cannot exist (ADR-0024 Scenario B).
     #[test]
     fn bug_fix_graph_orders_repro_before_fix() {
         use toron_workflow::schema::Action;
@@ -2761,19 +2830,19 @@ mod tests {
         let bug = &wfs["bug-fix"];
         let graph = bug.graph.as_ref().expect("bug-fix is a graph");
         assert_eq!(
-            graph.nodes["tdd"].needs,
-            vec!["repro".to_string()],
-            "tdd runs after the repro"
-        );
-        assert_eq!(
             graph.nodes["fix"].needs,
-            vec!["tdd".to_string()],
-            "fix runs after the failing test"
+            vec!["repro".to_string()],
+            "fix (repair recipe) runs after the repro"
         );
         assert_eq!(
             graph.nodes["prove"].needs,
             vec!["fix".to_string()],
             "prove runs after the fix"
+        );
+        assert!(graph.nodes["repro"].needs.is_empty(), "repro is root");
+        assert!(
+            !graph.nodes.contains_key("tdd"),
+            "tdd collapsed into repair loop"
         );
         // the reviewer prove node carries the opencode harness override
         let Action::DispatchJob { spec, .. } = &graph.nodes["prove"].action else {
@@ -2781,6 +2850,19 @@ mod tests {
         };
         assert_eq!(spec.profile.as_deref(), Some("@reviewer"));
         assert_eq!(spec.harness.as_deref(), Some("opencode"));
+        // fix is the repair recipe
+        let Action::CallWorkflow {
+            workflow, inputs, ..
+        } = &graph.nodes["fix"].action
+        else {
+            panic!("fix is call_workflow repair-until-verified");
+        };
+        assert_eq!(workflow, "repair-until-verified");
+        assert!(inputs.get("verify").is_some());
+        assert_eq!(
+            inputs.get("max_iterations").and_then(|v| v.as_u64()),
+            Some(3)
+        );
     }
 
     /// The principle tags ride in the raw YAML with their CANONICAL names

@@ -7347,8 +7347,9 @@ fn cmd_internal_doorbell(
         Some(())
     })();
     if in_process_ok.is_none() {
+        let kinds = "9,43001,30031,39002";
         let mut child = match Command::new("toron")
-            .args(["watch", "--project", project, "--kinds", "9,43001,30031"])
+            .args(["watch", "--project", project, "--kinds", kinds])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -7571,8 +7572,9 @@ fn cmd_internal_doorbell(
                 let mut restarted = false;
                 for _ in 0..5 {
                     std::thread::sleep(Duration::from_secs(backoff));
+                    let kinds = "9,43001,30031,39002";
                     match Command::new("toron")
-                        .args(["watch", "--project", project, "--kinds", "9,43001,30031"])
+                        .args(["watch", "--project", project, "--kinds", kinds])
                         .stdout(Stdio::piped())
                         .stderr(Stdio::null())
                         .spawn()
