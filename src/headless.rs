@@ -599,10 +599,7 @@ mod tests {
             vec!["-p", "opencode-go", "-m", "muse-spark-1.2-contributor"]
         );
         // A bare (provider-less) model id emits only -m.
-        assert_eq!(
-            model_args("jcode", "gpt-5.5", None),
-            vec!["-m", "gpt-5.5"]
-        );
+        assert_eq!(model_args("jcode", "gpt-5.5", None), vec!["-m", "gpt-5.5"]);
         assert_eq!(
             model_args("omp", "glm-5.2", Some("max")),
             vec!["--model=glm-5.2", "--thinking=max"]
