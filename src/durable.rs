@@ -48,6 +48,7 @@ use resonate_sdk::prelude::*;
 use toron_core::mailbox::overlaps;
 
 use crate::config::Config;
+use crate::ingress::{IngressEvent, LedgerEvent};
 
 fn mail_health_n() -> u32 {
     crate::state::mail_health_escalate_at()
@@ -3434,6 +3435,90 @@ pub fn leases_to_renew_simple(
     leases_to_renew(&with_none, in_progress, live_names, 0, 0)
 }
 
+/// bd-cy0s: pane stall threshold — env FLYWHEEL_PANE_STALL_SECS, default 1800s.
+/// Reuses herdr status facts the tick already polls.
+pub fn pane_stall_threshold_secs() -> u64 {
+    std::env::var("FLYWHEEL_PANE_STALL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1800)
+}
+
+/// Pure: detect stalled panes — bead in_progress + assignee pane listed +
+/// agent idle/silent past threshold. Returns PaneStalled facts (feeds Diagnose,
+/// NOT auto-reclaim). `now_secs` is wall clock secs, `updated_at` is bead's
+/// ISO8601 timestamp.
+pub fn detect_stalled_panes(
+    in_progress: &[ReadyBead],
+    states: &[AgentState],
+    now_secs: i64,
+    threshold_secs: u64,
+) -> Vec<IngressEvent> {
+    let mut out = Vec::new();
+    for bead in in_progress {
+        let Some(assignee) = bead.assignee.as_deref() else {
+            continue;
+        };
+        let Some(state) = states.iter().find(|s| s.name == assignee) else {
+            continue;
+        };
+        // pane listed + agent idle/silent past threshold
+        if !matches!(state.status.as_str(), "idle" | "done") {
+            continue;
+        }
+        let Some(updated) = bead
+            .updated_at
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp())
+        else {
+            continue;
+        };
+        let age = now_secs.saturating_sub(updated);
+        if age < threshold_secs as i64 {
+            continue;
+        }
+        out.push(IngressEvent::PaneStalled {
+            pane_id: state.pane_id.clone(),
+            herdr_name: state.name.clone(),
+            last_status: state.status.clone(),
+            bead_id: Some(bead.id.clone()),
+        });
+    }
+    out
+}
+
+/// Internal: emit a fact to journal + handle_ingress (captain surface).
+/// Best-effort: journal failures are ignored (facts are at-least-once), and
+/// handle_ingress failures never kill the loop.
+fn emit_fact(project: &str, event: IngressEvent) {
+    // route through ingress (captain doorbell + status) — the adapter
+    // handles journaling (same file main.rs status reads), so we don't
+    // double-append here.
+    let adapters = crate::ingress_adapters_for_project(project);
+    crate::ingress::handle_ingress(&event, &adapters);
+}
+
+fn emit_ledger_fact(project: &str, bead_id: &str, event: LedgerEvent) {
+    emit_fact(
+        project,
+        IngressEvent::LedgerFact {
+            bead_id: bead_id.to_string(),
+            event,
+        },
+    );
+}
+
+fn emit_lease_lapsed(project: &str, path: &str, bead_id: Option<&str>) {
+    emit_fact(
+        project,
+        IngressEvent::LeaseLapsed {
+            path: path.to_string(),
+            bead_id: bead_id.map(|s| s.to_string()),
+        },
+    );
+}
+
 /// Pure planning: given current states, decide actions and drain the queue.
 /// Deterministic dispatch plan for one poll: working agents wait, blocked
 /// agents report, idle/done agents get the next queue item (or a nudge, or
@@ -5940,6 +6025,11 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                         eprintln!(
                                             "flywheel: close of {bead_id} verified (legal verdict bound to sha)"
                                         );
+                                        emit_ledger_fact(
+                                            &params.project,
+                                            &bead_id,
+                                            LedgerEvent::Closed,
+                                        );
                                         // programmatic done-mail (2026-08-18):
                                         // the loop is the reporter of record —
                                         // mail the captain the close-reason
@@ -5962,6 +6052,11 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                     }
                                     "no-commit" => {
                                         close_grace_ticks.remove(&bead_id);
+                                        emit_ledger_fact(
+                                            &params.project,
+                                            &bead_id,
+                                            LedgerEvent::Reopened,
+                                        );
                                         let rb = ReopenBeadArgs {
                                             project: params.project.clone(),
                                             bead_id: bead_id.clone(),
@@ -6045,6 +6140,11 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                                 );
                                             } else {
                                                 close_grace_ticks.remove(&bead_id);
+                                                emit_ledger_fact(
+                                                    &params.project,
+                                                    &bead_id,
+                                                    LedgerEvent::Reopened,
+                                                );
                                                 let rb = ReopenBeadArgs {
                                                     project: params.project.clone(),
                                                     bead_id: bead_id.clone(),
@@ -6064,6 +6164,11 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                             // (legal, stays closed) or reopened
                                             // the bead — not in verdict limbo.
                                             close_grace_ticks.remove(&bead_id);
+                                            emit_ledger_fact(
+                                                &params.project,
+                                                &bead_id,
+                                                LedgerEvent::Closed,
+                                            );
                                         }
                                     }
                                     other => eprintln!(
@@ -6261,9 +6366,35 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             "flywheel: lease renew failed before dispatch (continuing): {err_str}"
                         );
                         record_renew_failure("batch", "batch", &err_str);
+                        for (path, bead_id) in &to_renew {
+                            emit_lease_lapsed(&params.project, path, Some(bead_id));
+                        }
                         update_mail_health(&params.project, false, "renew_leases", &err_str);
                     }
                 }
+            }
+        }
+        // bd-cy0s: tick stall detection — bead in_progress + pane listed + idle past threshold
+        {
+            let now_secs = chrono::Utc::now().timestamp();
+            let threshold = pane_stall_threshold_secs();
+            let inprog_for_stall: Vec<ReadyBead> = if params.work {
+                // reuse already-fetched inprog_for_renew if available, else fetch
+                ctx.run(
+                    poll_inprogress,
+                    ReadyArgs {
+                        project: params.project.clone(),
+                    },
+                )
+                .await
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let stalled = detect_stalled_panes(&inprog_for_stall, &states, now_secs, threshold);
+            for ev in stalled {
+                // emit fact (journal + doorbell) — feeds Diagnose, not auto-reclaim
+                emit_fact(&params.project, ev);
             }
         }
         // ADR-0026 Spec 4: mail-health dispatch-hold at N
@@ -11852,6 +11983,143 @@ mod tests {
         let simple_renew = leases_to_renew_simple(&simple_leases, &inprog, &live);
         assert_eq!(simple_renew.len(), 1);
         assert_eq!(simple_renew[0].0, "src/durable.rs");
+    }
+
+    #[test]
+    fn facts_close_emits_closed_fact() {
+        let proj = format!(
+            "facts-close-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        // ensure clean
+        let path = crate::facts_journal_path(&proj);
+        let _ = std::fs::remove_file(&path);
+        emit_ledger_fact(&proj, "bd-test-close", LedgerEvent::Closed);
+        let facts = crate::load_facts(&proj);
+        assert_eq!(facts.len(), 1);
+        match &facts[0] {
+            IngressEvent::LedgerFact { bead_id, event } => {
+                assert_eq!(bead_id, "bd-test-close");
+                assert_eq!(*event, LedgerEvent::Closed);
+            }
+            other => panic!("expected LedgerFact, got {other:?}"),
+        }
+        // also routes through handle_ingress — fact_summary must be Some
+        assert!(crate::ingress::fact_summary(&facts[0]).is_some());
+        assert!(
+            crate::ingress::fact_summary(&facts[0])
+                .unwrap()
+                .contains("ledger bd-test-close closed")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn facts_stall_detection_fires_and_suppresses() {
+        let now = chrono::Utc::now().timestamp();
+        let threshold = 1800;
+        // bead updated 1 hour ago, agent idle — should stall
+        let old_bead = ReadyBead {
+            id: "bd-stall-1".into(),
+            title: "stall".into(),
+            assignee: Some("StallAgent".into()),
+            verify: Some("true".into()),
+            labels: vec![],
+            priority: 2,
+            principles: "p — d".into(),
+            updated_at: Some((chrono::Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339()),
+        };
+        // recent bead — should not stall
+        let recent_bead = ReadyBead {
+            id: "bd-stall-2".into(),
+            title: "recent".into(),
+            assignee: Some("StallAgent".into()),
+            verify: Some("true".into()),
+            labels: vec![],
+            priority: 2,
+            principles: "p — d".into(),
+            updated_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+        let states = vec![
+            AgentState {
+                name: "StallAgent".into(),
+                status: "idle".into(),
+                kind: "opencode".into(),
+                pane_id: "w1:p1".into(),
+                mail_identity: None,
+            },
+            AgentState {
+                name: "WorkingAgent".into(),
+                status: "working".into(),
+                kind: "opencode".into(),
+                pane_id: "w1:p2".into(),
+                mail_identity: None,
+            },
+        ];
+        let stalled = detect_stalled_panes(&[old_bead.clone()], &states, now, threshold);
+        assert_eq!(stalled.len(), 1, "old idle bead should stall");
+        match &stalled[0] {
+            IngressEvent::PaneStalled {
+                pane_id,
+                herdr_name,
+                last_status,
+                bead_id,
+            } => {
+                assert_eq!(pane_id, "w1:p1");
+                assert_eq!(herdr_name, "StallAgent");
+                assert_eq!(last_status, "idle");
+                assert_eq!(bead_id.as_deref(), Some("bd-stall-1"));
+            }
+            other => panic!("expected PaneStalled, got {other:?}"),
+        }
+        // recent bead should not stall (age < threshold)
+        let stalled_recent = detect_stalled_panes(&[recent_bead], &states, now, threshold);
+        assert!(stalled_recent.is_empty(), "recent bead must not stall");
+        // working agent should not stall even if old
+        let working_states = vec![AgentState {
+            name: "StallAgent".into(),
+            status: "working".into(),
+            kind: "opencode".into(),
+            pane_id: "w1:p1".into(),
+            mail_identity: None,
+        }];
+        let stalled_working = detect_stalled_panes(&[old_bead], &working_states, now, threshold);
+        assert!(
+            stalled_working.is_empty(),
+            "working agent must not be considered stalled"
+        );
+    }
+
+    #[test]
+    fn facts_lapsed_renewal_emits() {
+        let proj = format!(
+            "facts-lapsed-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = crate::facts_journal_path(&proj);
+        let _ = std::fs::remove_file(&path);
+        emit_lease_lapsed(&proj, "src/durable.rs", Some("bd-lapsed-1"));
+        let facts = crate::load_facts(&proj);
+        assert_eq!(facts.len(), 1);
+        match &facts[0] {
+            IngressEvent::LeaseLapsed { path, bead_id } => {
+                assert_eq!(path, "src/durable.rs");
+                assert_eq!(bead_id.as_deref(), Some("bd-lapsed-1"));
+            }
+            other => panic!("expected LeaseLapsed, got {other:?}"),
+        }
+        assert!(
+            crate::ingress::fact_summary(&facts[0])
+                .unwrap()
+                .contains("lease lapsed src/durable.rs")
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
 
