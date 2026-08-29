@@ -4,7 +4,7 @@
 //! environment/dependency failures in <1s instead of 30s+ into a Resonate
 //! cycle. `--skip-preflight` on each command bypasses the auto-check.
 //!
-//! governed-by: ADR-0005, ADR-0010
+//! governed-by: ADR-0005, ADR-0010, ADR-0026
 
 use std::path::Path;
 
@@ -234,6 +234,11 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
                 "no project specified (required for the new-file scan)",
             ));
         }
+    }
+
+    checks.extend(provider_funded_checks(cfg, project));
+    if mode.needs_beads || mode.needs_worktree {
+        checks.push(check_loop_identity(cfg, project));
     }
 
     checks
@@ -543,6 +548,71 @@ fn check_mail(cfg: &Config) -> Check {
         Err(e) => Check::fail("toron-mail", format!("{e}")),
     }
 }
+pub fn check_provider_funded(provider: &str, profile: &str) -> Check {
+    let env_key = format!("FLYWHEEL_FUNDED_BALANCE_{}", provider.to_ascii_uppercase());
+    if let Ok(val) = std::env::var(&env_key) {
+        let lower = val.to_ascii_lowercase();
+        if lower == "0" || lower == "0.00" || lower.contains("insufficient") || lower == "empty" {
+            return Check::fail(
+                "provider-funded",
+                format!(
+                    "provider '{provider}' (profile '{profile}') funded check failed: balance {val}"
+                ),
+            );
+        }
+        if lower == "ok" || lower.contains("sufficient") {
+            return Check::pass("provider-funded");
+        }
+    }
+    Check::skip(
+        "provider-funded",
+        "no funded endpoint — classifier+fallback cover it",
+    )
+}
+fn provider_funded_checks(_cfg: &Config, project: Option<&str>) -> Vec<Check> {
+    let Some(_proj) = project else {
+        return Vec::new();
+    };
+    let catalog = match crate::profile::ProfileCatalog::load() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    use std::collections::BTreeSet;
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut providers: Vec<(String, String)> = Vec::new();
+    for (name, profile) in catalog.profiles.iter() {
+        let prov = profile.provider.trim();
+        if prov.is_empty() {
+            continue;
+        }
+        if seen.insert(prov.to_string()) {
+            providers.push((prov.to_string(), name.clone()));
+        }
+    }
+    if providers.is_empty() {
+        return vec![Check::skip(
+            "provider-funded",
+            "no funded endpoint — classifier+fallback cover it",
+        )];
+    }
+    providers
+        .into_iter()
+        .map(|(prov, prof)| check_provider_funded(&prov, &prof))
+        .collect()
+}
+pub fn check_loop_identity(_cfg: &Config, project: Option<&str>) -> Check {
+    if crate::preflight::operator_key_configured() {
+        Check::pass("loop-identity")
+    } else {
+        let proj = project.unwrap_or("<project>");
+        Check::fail(
+            "loop-identity",
+            format!(
+                "loop identity for '{proj}' has no local key — register or bind it before dispatching; renewals would soft-fail forever (ADR-0026 Spec 4)"
+            ),
+        )
+    }
+}
 
 // ─── tests ───────────────────────────────────────────────────────────────────
 
@@ -799,6 +869,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn provider_funded_no_endpoint_is_skip_with_honest_reason() {
+        let c = check_provider_funded("zai", "coder");
+        match c.status {
+            Status::Skip(r) => assert!(r.contains("no funded endpoint")),
+            _ => panic!(),
+        }
+    }
+    #[test]
+    fn provider_funded_zero_balance_fails_naming_provider() {
+        let _g = crate::config::lock_env();
+        unsafe { std::env::set_var("FLYWHEEL_FUNDED_BALANCE_ZAI", "0") };
+        let c = check_provider_funded("zai", "oracle");
+        match c.status {
+            Status::Fail(m) => {
+                assert!(m.contains("zai"));
+                assert!(m.contains("oracle"));
+            }
+            _ => panic!(),
+        }
+        unsafe { std::env::remove_var("FLYWHEEL_FUNDED_BALANCE_ZAI") };
+    }
+    #[test]
+    fn loop_identity_fails_without_key() {
+        let cfg = crate::config::Config::default();
+        let _g = crate::config::lock_env();
+        unsafe { std::env::remove_var("TORON_OPERATOR_KEY") };
+        let home = std::env::temp_dir().join(format!("loop-id-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        unsafe { std::env::set_var("HOME", &home) };
+        let c = check_loop_identity(&cfg, Some("demo"));
+        assert!(matches!(c.status, Status::Fail(_)));
+        unsafe { std::env::remove_var("HOME") };
+        let _ = std::fs::remove_dir_all(&home);
+    }
     /// THE fixture: a playbook run creating fooV2.rs fails preflight; a
     /// normal new file passes (acceptance).
     #[test]

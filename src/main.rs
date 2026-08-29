@@ -5,7 +5,9 @@
 //! all coordination lives in agent-mail; herdr is the backend.
 //!
 //! governed-by: ADR-0022 §3.6 (workflow compose --from-yaml / --dry-run
-//! surface + budget-cap fail-closed gate in the Compose arm)
+//! surface + budget-cap fail-closed gate in the Compose arm), ADR-0026
+
+#![allow(clippy::collapsible_if)]
 
 mod agentstate;
 mod backend;
@@ -17,6 +19,7 @@ mod cron;
 mod decide;
 mod doorbell;
 mod durable;
+mod failure;
 mod fs_util;
 mod headless;
 mod herdr_shim;
@@ -65,6 +68,40 @@ use state::{EventKind, log_event};
 use toron_core::backend::error::BackendErrorCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// ---- ADR-0026 helpers: fallback chain + reroute audit ----
+
+fn fallback_chain_for(profile_name: &str) -> Vec<String> {
+    ProfileCatalog::load()
+        .ok()
+        .and_then(|cat| cat.get(profile_name).map(|p| p.fallback.clone()))
+        .unwrap_or_default()
+}
+
+fn next_fallback(profile_name: &str, attempted: &[String]) -> Option<String> {
+    fallback_chain_for(profile_name)
+        .into_iter()
+        .find(|fb| !attempted.contains(fb))
+}
+
+fn record_reroute_audit(
+    project: &str,
+    attempt: u32,
+    profile: &str,
+    kind: failure::FailureKind,
+    evidence: &str,
+) {
+    let entry = serde_json::json!({
+        "attempt": attempt,
+        "profile": profile,
+        "kind": kind.to_string(),
+        "evidence": evidence,
+    });
+    let _ = state::log_event(project, state::EventKind::Spawn, entry.clone());
+    eprintln!(
+        "flywheel: reroute audit attempt={attempt} profile={profile} kind={kind} evidence={evidence}"
+    );
+}
 
 // ---- stage prompts (ADR-0005 Spec 2a / P3.3) ----
 //
@@ -7216,7 +7253,8 @@ fn cmd_internal_doorbell(
                 let ev_opt = crate::mail_shim::block_on(sub.next());
                 match ev_opt {
                     Some(toron_core::bus::SubscriptionEvent::Event(e)) => {
-                        let tags: Vec<Vec<String>> = e.tags.iter().map(|t| t.clone().to_vec()).collect();
+                        let tags: Vec<Vec<String>> =
+                            e.tags.iter().map(|t| t.clone().to_vec()).collect();
                         let v = serde_json::json!({
                             "kind": e.kind.as_u16(),
                             "id": e.id.to_hex(),
@@ -7243,13 +7281,7 @@ fn cmd_internal_doorbell(
     })();
     if in_process_ok.is_none() {
         let mut child = match Command::new("toron")
-            .args([
-                "watch",
-                "--project",
-                project,
-                "--kinds",
-                "9,43001,30031",
-            ])
+            .args(["watch", "--project", project, "--kinds", "9,43001,30031"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -7384,7 +7416,8 @@ fn cmd_internal_doorbell(
                 let raw_injects =
                     doorbell::apply_watch_line(&line, &index, &status_by_pin, &mut queues);
                 let budget_before = raw_injects.len();
-                let injects = doorbell::take_allowed(raw_injects, &mut budgets, doorbell_now_unix());
+                let injects =
+                    doorbell::take_allowed(raw_injects, &mut budgets, doorbell_now_unix());
                 if budget_before != injects.len() {
                     doorbell::audit_append(
                         &config::state_dir(),
@@ -7472,13 +7505,7 @@ fn cmd_internal_doorbell(
                 for _ in 0..5 {
                     std::thread::sleep(Duration::from_secs(backoff));
                     match Command::new("toron")
-                        .args([
-                            "watch",
-                            "--project",
-                            project,
-                            "--kinds",
-                            "9,43001,30031",
-                        ])
+                        .args(["watch", "--project", project, "--kinds", "9,43001,30031"])
                         .stdout(Stdio::piped())
                         .stderr(Stdio::null())
                         .spawn()
@@ -7728,10 +7755,7 @@ fn doorbell_prompt(
                 match try_send_text_delivery(client, project, &entry.name, &pane, &msg) {
                     Ok(true) => ok.push(pin.clone()),
                     _ => {
-                        eprintln!(
-                            "flywheel doorbell: prompt {} failed: {e:#}",
-                            entry.name
-                        );
+                        eprintln!("flywheel doorbell: prompt {} failed: {e:#}", entry.name);
                         doorbell::audit_append(
                             &config::state_dir(),
                             workspace,
@@ -8164,15 +8188,40 @@ pub(crate) fn start_agent_with_retry(
                 Err(e) => {
                     if attempt == 0 {
                         eprintln!("agent.start error: {e:#}");
+                        let cf = failure::classify(&e.to_string(), None, None);
+                        if cf.reroute_eligible {
+                            eprintln!(
+                                "flywheel: classified spawn failure kind={} evidence={}",
+                                cf.kind, cf.evidence
+                            );
+                            record_reroute_audit(
+                                "flywheel",
+                                attempt as u32,
+                                kind,
+                                cf.kind,
+                                &cf.evidence,
+                            );
+                        }
                         // Deterministic herdr rejection for a kind it does not
                         // know: fall back to the harness spawn recipe once.
                         // No recipe -> fail fast instead of burning 30 retries.
+                        // Classifier only sees it when recipes fail (ADR-0026).
                         if matches!(&e.code, BackendErrorCode::Other(c) if c == "unsupported_agent_kind")
                         {
                             if try_recipe_launch(c, kind, pane_id, args)? {
                                 recipe_launched = true;
                             } else {
                                 return Err(e.into());
+                            }
+                        } else if cf.kind == failure::FailureKind::Billing
+                            || cf.kind == failure::FailureKind::Auth
+                        {
+                            if fallback_chain_for(kind).is_empty() {
+                                return Err(anyhow::anyhow!(
+                                    "spawn failed ({}): {} — no fallback chain",
+                                    cf.kind,
+                                    cf.evidence
+                                ));
                             }
                         }
                     }
@@ -8231,6 +8280,20 @@ fn start_agent_with_retry_dyn(
                 Err(e) => {
                     if attempt == 0 {
                         eprintln!("agent.start error: {e:#}");
+                        let cf = failure::classify(&e.to_string(), None, None);
+                        if cf.reroute_eligible {
+                            eprintln!(
+                                "flywheel: classified spawn failure kind={} evidence={}",
+                                cf.kind, cf.evidence
+                            );
+                            record_reroute_audit(
+                                "flywheel",
+                                attempt as u32,
+                                kind,
+                                cf.kind,
+                                &cf.evidence,
+                            );
+                        }
                         // H1 (bd-harness-prime-agent-818f): same recipe
                         // fallback as the concrete-client variant — herdr
                         // rejects unknown kinds deterministically.
@@ -8240,6 +8303,16 @@ fn start_agent_with_retry_dyn(
                                 recipe_launched = true;
                             } else {
                                 return Err(e.into());
+                            }
+                        } else if cf.kind == failure::FailureKind::Billing
+                            || cf.kind == failure::FailureKind::Auth
+                        {
+                            if fallback_chain_for(kind).is_empty() {
+                                return Err(anyhow::anyhow!(
+                                    "spawn failed ({}): {} — no fallback chain",
+                                    cf.kind,
+                                    cf.evidence
+                                ));
                             }
                         }
                     }
@@ -10513,29 +10586,20 @@ fn cmd_send(
                         // H2 (bd-harness-jcode) arm is terminal (break or
                         // return on every path) — no re-delivery guard needed.
                         None => {
-                            if try_send_text_delivery(
-                                &mut c,
-                                project,
-                                &name,
-                                &target,
-                                &send_text,
-                            )? {
+                            if try_send_text_delivery(&mut c, project, &name, &target, &send_text)?
+                            {
                                 // Deliverable confirmation: resolve the
                                 // agent from the registry so the normal
                                 // result row (dispatched/prior_status) is
                                 // emitted for this target.
-                                if let Some(agent) = c
-                                    .agent_list()
-                                    .ok()
-                                    .and_then(|list| {
-                                        list.iter()
-                                            .find(|ag| {
-                                                ag.pane_id == target
-                                                    || ag.name.as_deref() == Some(name.as_str())
-                                            })
-                                            .cloned()
-                                    })
-                                {
+                                if let Some(agent) = c.agent_list().ok().and_then(|list| {
+                                    list.iter()
+                                        .find(|ag| {
+                                            ag.pane_id == target
+                                                || ag.name.as_deref() == Some(name.as_str())
+                                        })
+                                        .cloned()
+                                }) {
                                     break agent;
                                 }
                             }
@@ -10571,28 +10635,43 @@ fn cmd_send(
                         None => return Err(e.into()),
                     }
                 }
-                Err(e) => match stall_step(&e.code, stalls_seen, respawn_on_stall) {
-                    None => return Err(e.into()),
-                    Some(StallStep::Retry) => {
+                Err(e) => {
+                    let cf = failure::classify(&e.to_string(), None, None);
+                    if cf.reroute_eligible
+                        || cf.kind == failure::FailureKind::RateLimit
+                        || cf.kind == failure::FailureKind::Timeout
+                    {
                         eprintln!(
-                            "flywheel: {target} agent_prompt_stalled — retrying once in {STALL_RETRY_DELAY_SECS}s"
+                            "flywheel: send classified kind={} evidence={}",
+                            cf.kind, cf.evidence
                         );
-                        std::thread::sleep(Duration::from_secs(STALL_RETRY_DELAY_SECS));
-                        stalls_seen += 1;
+                        if let Some(profile) = cond_profile.as_deref() {
+                            record_reroute_audit(project, 0, profile, cf.kind, &cf.evidence);
+                        }
                     }
-                    Some(StallStep::Respawn) => {
-                        let kinds = spawn_kinds_from_log(project);
-                        let kind = kinds.get(&name).map(String::as_str).unwrap_or("opencode");
-                        eprintln!(
-                            "flywheel: {target} stalled again — respawning ({kind}) and re-sending (--respawn-on-stall)"
-                        );
-                        cmd_internal_respawn(cfg, project, &name, kind, true)?;
-                        stalls_seen += 1;
+                    match stall_step(&e.code, stalls_seen, respawn_on_stall) {
+                        None => return Err(e.into()),
+                        Some(StallStep::Retry) => {
+                            eprintln!(
+                                "flywheel: {target} agent_prompt_stalled — retrying once in {STALL_RETRY_DELAY_SECS}s"
+                            );
+                            std::thread::sleep(Duration::from_secs(STALL_RETRY_DELAY_SECS));
+                            stalls_seen += 1;
+                        }
+                        Some(StallStep::Respawn) => {
+                            let kinds = spawn_kinds_from_log(project);
+                            let kind = kinds.get(&name).map(String::as_str).unwrap_or("opencode");
+                            eprintln!(
+                                "flywheel: {target} stalled again — respawning ({kind}) and re-sending (--respawn-on-stall)"
+                            );
+                            cmd_internal_respawn(cfg, project, &name, kind, true)?;
+                            stalls_seen += 1;
+                        }
+                        Some(StallStep::GiveUp) => {
+                            return Err(stall_giveup_error(&target, project));
+                        }
                     }
-                    Some(StallStep::GiveUp) => {
-                        return Err(stall_giveup_error(&target, project));
-                    }
-                },
+                }
             }
         };
         let status = agent.agent_status.as_str();
@@ -18436,6 +18515,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 default_workflow: default_workflow.clone().unwrap_or(base.default_workflow),
                 skills: base.skills,
                 provider: base.provider,
+                fallback: base.fallback,
             };
             if merged.harness.is_empty() || merged.model.is_empty() {
                 bail!("profile {name} needs at least --harness and --model");
@@ -19984,6 +20064,7 @@ fn briefing_context_inner(
         squad_recommendation,
         bare_override: None,
         stage_chain,
+        funded: std::collections::BTreeMap::new(),
     })
 }
 
@@ -23652,6 +23733,45 @@ fn cmd_internal_run_headless(
 
     let mut attempt = run_once(harness, &model_id, &model, &profile.effort)?;
     let mut retried_fallback = false;
+    {
+        let err_str = attempt.outcome.error.as_deref().unwrap_or("");
+        let cf = failure::classify(err_str, Some(attempt.outcome.exit_code), None);
+        if cf.reroute_eligible && !cf.evidence.is_empty() {
+            eprintln!(
+                "flywheel: headless classified kind={} evidence={}",
+                cf.kind, cf.evidence
+            );
+            record_reroute_audit("flywheel", 0, profile_name, cf.kind, &cf.evidence);
+            if let Some(next_profile) = next_fallback(profile_name, &[]) {
+                if let Some(fb_prof) = catalog.get(&next_profile) {
+                    let fb_harness = if fb_prof.harness.is_empty() {
+                        harness
+                    } else {
+                        fb_prof.harness.as_str()
+                    };
+                    let fb_model_id = if fb_prof.model.is_empty() {
+                        model_id.clone()
+                    } else {
+                        fb_prof.model.clone()
+                    };
+                    let fb_model = registry.resolve(&fb_model_id, fb_harness);
+                    eprintln!(
+                        "flywheel: headless reroute {} -> {} (profile fallback)",
+                        profile_name, next_profile
+                    );
+                    match run_once(fb_harness, &fb_model_id, &fb_model, &fb_prof.effort) {
+                        Ok(fb) => {
+                            attempt = fb;
+                            retried_fallback = true;
+                        }
+                        Err(e) => {
+                            eprintln!("flywheel: profile fallback run {next_profile} failed: {e:#}")
+                        }
+                    }
+                }
+            }
+        }
+    }
     if attempt.rate_limited && !model_id.is_empty() {
         // fallback = the registry's `fallback` for the primary id; absent ->
         // no retry. A fallback whose entry provider is `grok` runs on the
@@ -23732,6 +23852,14 @@ fn cmd_internal_run_headless(
         }
         if let Some(e) = &entry.error {
             v["error"] = json!(e);
+            let cf = failure::classify(e, Some(outcome.exit_code), None);
+            if cf.kind == failure::FailureKind::RateLimit
+                || cf.kind == failure::FailureKind::Timeout
+                || cf.kind == failure::FailureKind::Billing
+                || cf.kind == failure::FailureKind::Auth
+            {
+                v["kind"] = json!(cf.kind.to_string());
+            }
         }
         print_json(&v);
     } else {
@@ -26405,11 +26533,17 @@ mod integration_tests {
         assert!(!description.is_empty(), "/swarm has a description");
         assert!(template.ends_with(".tpl"), "template file referenced");
         let (name, description, template) = ORCHESTRATION_COMMANDS[2];
-        assert_eq!(name, "loop-mode", "loop mode avoids harness command collisions");
+        assert_eq!(
+            name, "loop-mode",
+            "loop mode avoids harness command collisions"
+        );
         assert!(!description.is_empty(), "/loop has a description");
         assert!(template.ends_with(".tpl"), "template file referenced");
         let (name, description, template) = ORCHESTRATION_COMMANDS[3];
-        assert_eq!(name, "peer-aware-mode", "peer-aware mode avoids harness command collisions");
+        assert_eq!(
+            name, "peer-aware-mode",
+            "peer-aware mode avoids harness command collisions"
+        );
         assert!(!description.is_empty(), "/peer-aware has a description");
         assert!(template.ends_with(".tpl"), "template file referenced");
     }
@@ -26418,8 +26552,9 @@ mod integration_tests {
     /// description) + the playbook template + stamps; no beads body.
     #[test]
     fn render_orchestration_prompt_has_frontmatter_and_focus() {
-        let out = render_orchestration_prompt("opencode", "swarm-mode", "9.9.9", "2026-08-10T00:00:00Z")
-            .unwrap();
+        let out =
+            render_orchestration_prompt("opencode", "swarm-mode", "9.9.9", "2026-08-10T00:00:00Z")
+                .unwrap();
         assert!(out.starts_with("---\n"), "frontmatter");
         assert!(
             out.contains("captain-led multi-crew execution"),

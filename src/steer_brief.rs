@@ -13,7 +13,7 @@
 //! TTY is ever touched. Non-TTY invocations never reach this module — the
 //! dispatch output stays byte-identical to the pre-briefing binary.
 
-// governed-by: ADR-0006 (D1 stage payloads / briefing surface) + bd-nmzk shared briefing
+// governed-by: ADR-0006 (D1 stage payloads / briefing surface) + bd-nmzk shared briefing, ADR-0026
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -53,6 +53,8 @@ pub struct BriefingContext {
     pub bare_override: Option<String>,
     /// resolved stage chain of the target workflow
     pub stage_chain: Vec<String>,
+    /// funded status per role (ADR-0026 Spec 2)
+    pub funded: BTreeMap<String, String>,
 }
 
 /// The operator's verdict plus the confirmed plan (post-edit).
@@ -95,7 +97,7 @@ pub fn run_briefing(
         }
     }
 
-    // (2) per-role models with cost/caps.
+    // (2) per-role models with cost/caps + funded column (ADR-0026 Spec 2).
     writeln!(out, "\n[2/4] per-role models (Enter keeps the default):")?;
     for m in &ctx.models {
         writeln!(
@@ -115,6 +117,9 @@ pub fn run_briefing(
                 format!(" caps={}", caps.join(","))
             };
             writeln!(out, "    [{i}] {id} ({cost_s}{caps_s})")?;
+        }
+        if let Some(funded) = ctx.funded.get(&m.role) {
+            writeln!(out, "    funded: {funded}")?;
         }
         write!(out, "  select > ")?;
         out.flush()?;
@@ -200,6 +205,7 @@ mod tests {
             squad_recommendation: Some("build".into()),
             bare_override: None,
             stage_chain: vec!["plan".into(), "implement".into(), "review".into()],
+            funded: BTreeMap::new(),
         }
     }
 
@@ -283,6 +289,7 @@ mod tests {
             squad_recommendation: None,
             bare_override: None,
             stage_chain: vec!["review".into(), "ship".into()],
+            funded: BTreeMap::new(),
         };
         let mut inp = std::io::Cursor::new("\n\n\n");
         let mut out: Vec<u8> = Vec::new();
@@ -299,6 +306,23 @@ mod tests {
         assert!(rendered.contains("[4/4] stage chain"));
         assert!(rendered.contains("- review"));
         assert!(rendered.contains("dispatching."));
+    }
+
+    #[test]
+    fn funded_column_renders_when_present() {
+        let mut c = ctx();
+        c.funded.insert(
+            "coder".into(),
+            "no funded endpoint — classifier+fallback cover it".into(),
+        );
+        let mut inp = std::io::Cursor::new("\n\n\n\n");
+        let mut out: Vec<u8> = Vec::new();
+        run_briefing(&c, &mut inp, &mut out).expect("briefing");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("funded: no funded endpoint"),
+            "{rendered}"
+        );
     }
 
     #[test]
