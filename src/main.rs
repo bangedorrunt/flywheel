@@ -3337,7 +3337,7 @@ fn log(project: &str, kind: EventKind, data: Value) {
 /// that is not a known subcommand name is treated as the project. Pure +
 /// unit-tested.
 fn rewrite_legacy_loop_args(args: &[String]) -> Vec<String> {
-    const SUBCOMMANDS: [&str; 5] = ["run", "status", "list", "prune", "doctor"];
+    const SUBCOMMANDS: [&str; 7] = ["run", "status", "list", "prune", "doctor", "replay", "why"];
     if args.len() >= 2
         && matches!(args[1].as_str(), "loop" | "loop-mode")
         // A flag (--help, -h, global options) keeps the parent context;
@@ -3367,7 +3367,8 @@ fn main() {
             "commands": [
                 "init spawn add list status decide rebind recover",
             "send interrupt view output watch zoom attach kill",
-            "loop-mode (alias: loop) work assign collab xproj mail toron steer ledger principles",
+            "loop-mode (alias: loop) run/status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts",
+            "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
             "doorbell status/start/stop/re-inject (supervised pane-wake layer: lazy-heal + persisted wake state)",
                 "coalition debate plan-review profile squad model runs",
                 "workflow cron recipes workflows pipeline template stage ensemble",

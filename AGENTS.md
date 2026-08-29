@@ -34,7 +34,8 @@ Live ignored tests need herdr + mail. `cargo test --exclude-ignored` is invalid.
   (move a prior unnamed mint into a named slot). A returning operator registering bare gets an
   error naming these fixes — never a second identity.
 - **Tracker:** `br` CLI + `--json`. No beads MCP. Never bare `bv`. Mode commands must ask for the profile/model routing before launching managed work; show the profile default and compatible registry alternatives, and preserve the operator's selection.
-- **Kill:** `--force` skips confirm. Working agents also need `--force-working`.
+- **Kill:** `--force` skips confirm. Working agents also need `--force-working`. `--reap-crews` overrides `on_captain_death` (ADR-0025 Spec 4).
+- **Artifacts + loop journal (ADR-0025 Spec 2/3):** `flywheel artifacts <run_id> [--json]` / `flywheel artifacts stitch <run_id>` (lists/stitches per-run `ArtifactRecord` JSON; stitch at `artifact.rs:233`); `flywheel loop replay <project>` (re-drives Msg journal JSONL through `tick`, exits nonzero on drift) / `flywheel loop why <project> <seq>` (prints msg, state-delta, actions triple); poll path journals every `LoopMsg` (kind+payload+actions) under `state_dir/journals/<project>.jsonl` and `LoopModel` queue pop is in `model'` (replayable). `IngressEvent` is `LoopMsg` (herdr/watch/trigger/cron via `handle_ingress`).
 - **Execution topologies:** `open-mode` = direct current-pane work with no lifecycle; `loop-mode` = durable solo execution in one current harness (`--work` opts into tracked work); `swarm-mode`/`steer` = captain-led multi-crew execution. A workflow is a reusable procedure, not a topology. `workflow run` without `--execute` dispatches nothing. `--mode` default is headless.
 - **`cron run`** is a 25s dry-run by default; `--live` force-fires once
   through the durable-loop runner (real dispatch). Recurring ticks are
