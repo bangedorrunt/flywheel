@@ -20664,12 +20664,28 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let mut spawn_receipts: Vec<Value> = vec![];
             let output = match pane_ctx.as_ref() {
                 Some(pane_ctx) => {
-                    let engine = std::sync::Arc::new(pane::local_engine(
-                        &rt,
-                        runner,
-                        profile_resolver,
-                        workflow_resolver.clone(),
-                    )?);
+                    let engine = std::sync::Arc::new({
+                        let eng = pane::local_engine(
+                            &rt,
+                            runner,
+                            profile_resolver,
+                            workflow_resolver.clone(),
+                        )?;
+                        let sink = make_verify_sink(
+                            cfg.clone(),
+                            project.as_deref().unwrap_or("flywheel").to_string(),
+                        );
+                        *eng.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
+                        eng
+                    });
+                    let approval_stop =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let approval_drainer = pane::start_approval_drainer(
+                        cfg.clone(),
+                        project.as_deref().unwrap_or("flywheel").to_string(),
+                        engine.clone(),
+                        approval_stop.clone(),
+                    )?;
                     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let drainer = pane::start_spawn_drainer(
                         cfg.clone(),
@@ -20696,9 +20712,13 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         .await
                     });
                     stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    approval_stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     spawn_receipts = drainer
                         .join()
                         .map_err(|_| anyhow!("spawn drainer thread panicked"))??;
+                    let _ = approval_drainer
+                        .join()
+                        .map_err(|_| anyhow!("approval drainer thread panicked"));
                     out
                 }
                 None => {
@@ -20707,13 +20727,29 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     // selection as pane mode (pane::local_engine), so a
                     // kill -9 mid-run resumes on restart regardless of
                     // --execute mode.
-                    let engine = pane::local_engine(
-                        &rt,
-                        runner,
-                        profile_resolver,
-                        workflow_resolver.clone(),
+                    let engine = std::sync::Arc::new({
+                        let eng = pane::local_engine(
+                            &rt,
+                            runner,
+                            profile_resolver,
+                            workflow_resolver.clone(),
+                        )?;
+                        let sink = make_verify_sink(
+                            cfg.clone(),
+                            project.as_deref().unwrap_or("flywheel").to_string(),
+                        );
+                        *eng.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
+                        eng
+                    });
+                    let approval_stop =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let approval_drainer = pane::start_approval_drainer(
+                        cfg.clone(),
+                        project.as_deref().unwrap_or("flywheel").to_string(),
+                        engine.clone(),
+                        approval_stop.clone(),
                     )?;
-                    rt.block_on(async {
+                    let out = rt.block_on(async {
                         // bd-cvv9: ship runs gated on the same rail headless.
                         phase_chain::invoke_or_ship_chain(
                             &engine,
@@ -20726,7 +20762,12 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                             inputs_value.clone(),
                         )
                         .await
-                    })
+                    });
+                    approval_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let _ = approval_drainer
+                        .join()
+                        .map_err(|_| anyhow!("approval drainer thread panicked"));
+                    out
                 }
             }?;
             // P10.3 lifecycle: ephemeral default — reap the crew workspace
@@ -28725,5 +28766,115 @@ mod repair_recipe_tests {
             .values()
             .any(|n| format!("{:?}", n.action).contains("ledger_path"));
         assert!(has_ledger_in_task);
+    }
+}
+
+#[cfg(test)]
+mod approval_drain_tests {
+    use super::*;
+    use toron_workflow::engine::{Decision, RunInput};
+
+    fn approval_workflow() -> toron_workflow::schema::Workflow {
+        toron_workflow::schema::parse_workflow(
+            r#"name: approval-test
+trigger: { type: webhook }
+steps:
+  - name: ask
+    action: request_approval
+    message: "approve?"
+"#,
+        )
+        .expect("parse approval workflow")
+    }
+
+    #[tokio::test]
+    async fn approval_drain_approve_resumes() {
+        let engine = toron_workflow::WorkflowEngine::local(std::sync::Arc::new(
+            |_: &toron_workflow::schema::Action| Ok(serde_json::json!({ "ok": true })),
+        ))
+        .expect("engine");
+        let wf = approval_workflow();
+        let run_id = format!("approval-approve-{}", uuid::Uuid::new_v4());
+        let input = RunInput {
+            run_id: Some(run_id.clone()),
+            workflow: wf,
+            trigger: serde_json::json!({}),
+        };
+        let handle = engine
+            .resonate()
+            .run(&run_id, toron_workflow::engine::run_workflow, input)
+            .spawn()
+            .await
+            .expect("spawn");
+        // Wait for the approval promise to appear in the sink
+        let promise_id = {
+            let mut tries = 0;
+            loop {
+                let ids = engine.approval_sink().lock().await.clone();
+                if let Some(id) = ids.first().cloned() {
+                    break id;
+                }
+                if tries > 20 {
+                    panic!("approval promise never appeared");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tries += 1;
+            }
+        };
+        assert!(!handle.done().await.expect("done check"));
+        engine
+            .resolve_approval(&promise_id, &Decision::approved("ok"))
+            .await
+            .expect("resolve");
+        let out = handle.result().await.expect("run should resume");
+        // After approve, the run should complete (not failed)
+        assert!(out.get("ask").is_some() || out.get("decision").is_some());
+    }
+
+    #[tokio::test]
+    async fn approval_drain_reject_records_rejected() {
+        let engine = toron_workflow::WorkflowEngine::local(std::sync::Arc::new(
+            |_: &toron_workflow::schema::Action| Ok(serde_json::json!({ "ok": true })),
+        ))
+        .expect("engine");
+        let wf = approval_workflow();
+        let run_id = format!("approval-reject-{}", uuid::Uuid::new_v4());
+        let input = RunInput {
+            run_id: Some(run_id.clone()),
+            workflow: wf,
+            trigger: serde_json::json!({}),
+        };
+        let handle = engine
+            .resonate()
+            .run(&run_id, toron_workflow::engine::run_workflow, input)
+            .spawn()
+            .await
+            .expect("spawn");
+        let promise_id = {
+            let mut tries = 0;
+            loop {
+                let ids = engine.approval_sink().lock().await.clone();
+                if let Some(id) = ids.first().cloned() {
+                    break id;
+                }
+                if tries > 20 {
+                    panic!("approval promise never appeared");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tries += 1;
+            }
+        };
+        engine
+            .reject_approval(&promise_id, &Decision::rejected("nope"))
+            .await
+            .expect("reject");
+        let out = handle
+            .result()
+            .await
+            .expect("run should complete even on reject");
+        // Reject is a decision, not a crash — WF-08
+        // The output should contain the decision with outcome rejected or status rejected
+        let has_rejected = out.to_string().contains("rejected");
+        assert!(has_rejected, "reject should record rejected: {out}");
     }
 }

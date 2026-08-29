@@ -1134,6 +1134,56 @@ fn local_engine_with(
 /// and keeps draining until `stop` is set (the caller does this after invoke
 /// returns, then joins). Loads the profile catalog fresh — the thread is
 /// 'static and must not borrow the caller's.
+pub fn start_approval_drainer(
+    cfg: Config,
+    project: String,
+    engine: std::sync::Arc<toron_workflow::WorkflowEngine>,
+    stop: std::sync::Arc<AtomicBool>,
+) -> Result<std::thread::JoinHandle<Result<()>>> {
+    let handle = std::thread::Builder::new()
+        .name("approval-drainer".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| anyhow!("approval drainer runtime: {e}"))?;
+            rt.block_on(async {
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                loop {
+                    let ids: Vec<String> = {
+                        let mut sink = engine.approval_sink().lock().await;
+                        let mut new_ids = Vec::new();
+                        for id in sink.iter() {
+                            if !seen.contains(id) {
+                                new_ids.push(id.clone());
+                            }
+                        }
+                        for id in &new_ids {
+                            seen.insert(id.clone());
+                        }
+                        new_ids
+                    };
+                    for promise_id in ids {
+                        // Surface to captain: existing channel/DM pattern (eprintln + toron channel)
+                        eprintln!(
+                            "flywheel: approval parked: promise {} for project {} — awaiting captain decision (approve/reject via WorkflowEngine::resolve_approval)",
+                            promise_id, project
+                        );
+                        // For the test harness, the test will call resolve_approval/reject_approval directly.
+                        // In production, the captain's DM would trigger resolve via `flywheel workflow approve` CLI (future).
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+                Ok(())
+            })
+        })
+        .map_err(|e| anyhow!("approval drainer thread: {e}"))?;
+    Ok(handle)
+}
+
 pub fn start_spawn_drainer(
     cfg: Config,
     project: String,
