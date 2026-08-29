@@ -1259,6 +1259,9 @@ enum LoopCmd {
         /// dispatches `--work` INTO the linked tree.
         #[arg(long)]
         allow_worktree: bool,
+        /// bd-p4oc strict vacuous gate: refuse 0-test VERIFY (also FLYWHEEL_VERIFY_STRICT=1)
+        #[arg(long)]
+        strict: bool,
     },
     /// Query the state of a durable loop invocation on the Resonate server
     Status { project: String },
@@ -3570,6 +3573,7 @@ fn main() {
                 engine,
                 force,
                 allow_worktree,
+                strict,
             } => {
                 let mut pf_mode = if *work {
                     preflight::Mode::loop_work()
@@ -3607,6 +3611,7 @@ fn main() {
                             *confirm_timeout_ms,
                             *engine,
                             *force,
+                            *strict,
                         )
                     },
                 )
@@ -11975,11 +11980,11 @@ fn cmd_standing_orders(cmd: &StandingOrdersCmd) -> Result<()> {
 }
 
 /// bd-p4oc helpers: non-vacuous VERIFY gate for cargo test filters.
-fn is_cargo_test_verify(verify: &str) -> bool {
+pub(crate) fn is_cargo_test_verify(verify: &str) -> bool {
     verify.trim_start().starts_with("cargo test")
 }
 
-fn parse_count_before(output: &str, needle: &str) -> Option<u32> {
+pub(crate) fn parse_count_before(output: &str, needle: &str) -> Option<u32> {
     let idx = output.find(needle)?;
     let before = &output[..idx];
     // walk backwards to find digit run
@@ -11997,7 +12002,7 @@ fn parse_count_before(output: &str, needle: &str) -> Option<u32> {
     before[start..end].parse::<u32>().ok()
 }
 
-fn sum_counts_before(output: &str, needle: &str) -> Option<u32> {
+pub(crate) fn sum_counts_before(output: &str, needle: &str) -> Option<u32> {
     let mut total: u32 = 0;
     let mut found = false;
     let mut search_start = 0;
@@ -12023,7 +12028,7 @@ fn sum_counts_before(output: &str, needle: &str) -> Option<u32> {
     if found { Some(total) } else { None }
 }
 
-fn parse_cargo_test_counts(output: &str) -> (Option<u32>, Option<u32>) {
+pub(crate) fn parse_cargo_test_counts(output: &str) -> (Option<u32>, Option<u32>) {
     // cargo test runs multiple test binaries; vacuous only when total passed == 0
     let passed = sum_counts_before(output, " passed");
     let filtered = sum_counts_before(output, " filtered out");
@@ -12038,7 +12043,7 @@ fn parse_cargo_test_counts(output: &str) -> (Option<u32>, Option<u32>) {
     )
 }
 
-fn append_to_receipt(path: &Path, extra: &str) -> std::io::Result<()> {
+pub(crate) fn append_to_receipt(path: &Path, extra: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
     f.write_all(extra.as_bytes())?;
@@ -12098,6 +12103,31 @@ mod verify_gate_tests {
         assert!(msg.contains("matched"));
         assert!(msg.contains("5"));
         assert!(msg.contains("passed"));
+    }
+
+    #[test]
+    fn verify_gate_loop_vacuous_detection() {
+        let verify = "cargo test -p flywheel verify_gate_loop";
+        assert!(is_cargo_test_verify(verify));
+        let out = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s";
+        let (passed, filtered) = parse_cargo_test_counts(out);
+        assert_eq!(passed, Some(0));
+        assert_eq!(filtered, Some(5));
+        let is_vacuous = is_cargo_test_verify(verify) && passed == Some(0);
+        assert!(is_vacuous, "verify_gate_loop should be vacuous");
+        let warning = format!(
+            "WARNING: vacuous VERIFY — filter `{verify}` matched 0 tests (evidence proves nothing)"
+        );
+        assert!(warning.contains("vacuous"));
+    }
+
+    #[test]
+    fn verify_gate_loop_strict_refuses_logic() {
+        let verify = "cargo test -p flywheel verify_gate_loop";
+        let out = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s";
+        let (passed, _) = parse_cargo_test_counts(out);
+        let is_vacuous = is_cargo_test_verify(verify) && passed == Some(0);
+        assert!(is_vacuous);
     }
 }
 
@@ -15559,6 +15589,7 @@ fn cmd_loop(
     confirm_timeout_ms: Option<u64>,
     engine: bool,
     force: bool,
+    strict: bool,
 ) -> Result<()> {
     if interval_secs < 5 {
         bail!("--interval must be >= 5 seconds");
@@ -15635,6 +15666,7 @@ fn cmd_loop(
             claim_nudge_after_polls: cfg.claim_nudge_after_polls(),
             resonate_url: String::new(),
             force,
+            strict,
         };
         let rt = tokio::runtime::Runtime::new()?;
         if engine {
@@ -29481,6 +29513,7 @@ mod ingress_wiring_tests {
             watch: Box::new(|_| {}),
             workflow: Box::new(|_| {}),
             cron: Box::new(|_| {}),
+            fact: Box::new(|_| {}),
         };
         // Use the real handle_ingress to ensure both go through it
         let exited = IngressEvent::Herdr(HerdrEvent::PaneExited {
@@ -29530,6 +29563,12 @@ mod ingress_wiring_tests {
                 let h = hits.clone();
                 Box::new(move |_: &str| {
                     h.lock().unwrap().push("cron");
+                })
+            },
+            fact: {
+                let h = hits.clone();
+                Box::new(move |_: &crate::ingress::IngressEvent| {
+                    h.lock().unwrap().push("fact");
                 })
             },
         };
