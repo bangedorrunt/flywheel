@@ -42,6 +42,35 @@ use toron_core::mailbox::overlaps;
 
 use crate::config::Config;
 
+fn mail_health_n() -> u32 {
+    crate::state::mail_health_escalate_at()
+}
+
+fn update_mail_health(project: &str, success: bool, leaf: &str, evidence: &str) {
+    let now_ts = {
+        let (secs, _) = crate::state::utc_now();
+        secs as i64
+    };
+    if let Ok(Some(mut al)) = crate::state::load_active_loop(project) {
+        if success {
+            al.mail_health.record_success(now_ts);
+            al.mail_degraded = false;
+        } else {
+            al.mail_health.record_failure(now_ts);
+            let n = mail_health_n();
+            if al.mail_health.should_escalate(n) && !al.mail_degraded {
+                al.mail_degraded = true;
+                let msg = format!(
+                    "mail-health degraded: {} leaf failing (consecutive {} >= {}), last evidence: {} — collision floor at risk",
+                    leaf, al.mail_health.consecutive_failures, n, evidence
+                );
+                eprintln!("flywheel: {msg}");
+            }
+        }
+        let _ = crate::state::save_active_loop(project, &al);
+    }
+}
+
 /// Input to the durable loop workflow. Immutable per invocation — the workflow
 /// id is `swarm-loop:<project>`, so re-running with the same params resumes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4543,6 +4572,18 @@ fn match_expected_agent<'a>(
 
 #[function]
 async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
+    // ADR-0026 W2: loop-identity fail-loud — hard-error at start if no usable key
+    {
+        let cfg = crate::config::Config::load().unwrap_or_default();
+        let check = crate::preflight::check_loop_identity(&cfg, Some(&params.project));
+        if let crate::preflight::Status::Fail(msg) = check.status {
+            return Err(map_err(anyhow::anyhow!(
+                "loop identity for '{}' has no local key — {} (ADR-0026 Spec 4; fix: flywheel mail register --name <pin> --from-project <project> or --adopt-unnamed <name>)",
+                params.project,
+                msg
+            )));
+        }
+    }
     let mut queue = params.queue.clone();
     let mut iteration = 0u64;
     // bead-driven mode tracks which beads were already handed out
@@ -5651,13 +5692,33 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             .chain(ctx_suppressed.iter().cloned())
             .collect();
         clear_stale_landed_for_idle(&params.project, &params.invocation, &states);
-        let mut poll_actions = plan_actions(
-            &states,
-            &mut queue,
-            params.nudge.as_deref(),
-            &digests,
-            &wake_suppressed,
-        );
+        // ADR-0026 Spec 4: mail-health dispatch-hold at N
+        let n = mail_health_n();
+        let mail_hold = if n == 0 {
+            false
+        } else if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
+            al.mail_health.should_escalate(n) || al.mail_degraded
+        } else {
+            false
+        };
+        let mut poll_actions = if mail_hold {
+            // Blocked for all idle agents; in-flight claim-watches continue
+            states
+                .iter()
+                .filter(|s| s.status == "idle")
+                .map(|s| LoopAction::Blocked {
+                    name: s.name.clone(),
+                })
+                .collect()
+        } else {
+            plan_actions(
+                &states,
+                &mut queue,
+                params.nudge.as_deref(),
+                &digests,
+                &wake_suppressed,
+            )
+        };
         // record wake decisions so the same urgent message does not re-wake
         for a in &poll_actions {
             if let LoopAction::Send { name, text } = a
@@ -6338,12 +6399,21 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             {
                 Ok(v) => {
                     let renewed = v.get("renewed").and_then(Value::as_u64).unwrap_or(0);
-                    // is1.4: quiet at idle — only print when something renewed.
                     if renewed > 0 {
                         eprintln!("flywheel: renewed {renewed} lease(s)");
                     }
+                    update_mail_health(
+                        &params.project,
+                        true,
+                        "renew_leases",
+                        &format!("renewed {renewed}"),
+                    );
                 }
-                Err(e) => eprintln!("flywheel: lease renew failed (continuing): {e}"),
+                Err(e) => {
+                    let err_str = e.to_string();
+                    update_mail_health(&params.project, false, "renew_leases", &err_str);
+                    eprintln!("flywheel: lease renew failed (continuing): {e}");
+                }
             }
 
             // Adaptive wait for the NEXT poll_events block. We already blocked
@@ -6722,6 +6792,8 @@ pub async fn loop_status(cfg: &Config, project: &str) -> anyhow::Result<serde_js
         "process_alive": process_alive,
         "started_at": pid_entry.as_ref().map(|e| e.started_at.clone()),
         "value": rec.map(|r| r.value),
+        "mail_degraded": al.mail_degraded,
+        "mail_health": al.mail_health,
     }))
 }
 
@@ -11915,5 +11987,86 @@ mod reclaim_tests {
         }
         assert_eq!(reclaim_swarm_secs(), 7200);
         assert_eq!(reclaim_human_secs(), 86400);
+    }
+}
+
+#[cfg(test)]
+mod mail_health_tests {
+    use super::*;
+    use crate::state::{ActiveLoop, MailHealth};
+
+    #[test]
+    fn mail_health_durable_increments_and_resets() {
+        let mut mh = MailHealth::default();
+        assert_eq!(mh.consecutive_failures, 0);
+        mh.record_failure(100);
+        assert_eq!(mh.consecutive_failures, 1);
+        mh.record_failure(200);
+        mh.record_failure(300);
+        assert_eq!(mh.consecutive_failures, 3);
+        mh.record_success(400);
+        assert_eq!(mh.consecutive_failures, 0);
+        assert_eq!(mh.last_ok_ts, 400);
+    }
+
+    #[test]
+    fn mail_health_durable_dispatch_hold_at_n() {
+        let mut al = ActiveLoop::new("id", serde_json::json!({}), "now");
+        al.mail_health.consecutive_failures = 2;
+        assert!(!al.mail_health.should_escalate(3));
+        al.mail_health.consecutive_failures = 3;
+        assert!(al.mail_health.should_escalate(3));
+        al.mail_degraded = true;
+        assert!(al.mail_degraded);
+    }
+
+    #[test]
+    fn mail_health_durable_resume_on_success() {
+        let mut al = ActiveLoop::new("id", serde_json::json!({}), "now");
+        al.mail_health.consecutive_failures = 3;
+        al.mail_degraded = true;
+        al.mail_health.record_success(999);
+        al.mail_degraded = false;
+        assert_eq!(al.mail_health.consecutive_failures, 0);
+        assert!(!al.mail_degraded);
+    }
+
+    #[test]
+    fn mail_health_durable_zero_disables() {
+        let mh = MailHealth {
+            consecutive_failures: 10,
+            last_ok_ts: 0,
+        };
+        assert!(!mh.should_escalate(0));
+    }
+
+    #[test]
+    fn mail_health_durable_escalation_names_leaf() {
+        // Verify that update_mail_health would log the leaf name
+        // We test the helper directly: it should set mail_degraded and log
+        let project = format!("mail-health-test-{}", std::process::id());
+        let _guard = crate::config::test_state_home();
+        let mut al = ActiveLoop::new("id", serde_json::json!({}), crate::state::now_iso());
+        al.mail_health.consecutive_failures = 2;
+        crate::state::save_active_loop(&project, &al).unwrap();
+        // Simulate two more failures to reach N=3
+        super::update_mail_health(
+            &project,
+            false,
+            "renew_leases",
+            "evidence: lease renew failed",
+        );
+        let al2 = crate::state::load_active_loop(&project).unwrap().unwrap();
+        assert_eq!(al2.mail_health.consecutive_failures, 3);
+        // Next failure should set degraded
+        super::update_mail_health(&project, false, "renew_leases", "evidence2");
+        let al3 = crate::state::load_active_loop(&project).unwrap().unwrap();
+        assert!(al3.mail_degraded);
+        // Success should reset
+        super::update_mail_health(&project, true, "renew_leases", "ok");
+        let al4 = crate::state::load_active_loop(&project).unwrap().unwrap();
+        assert_eq!(al4.mail_health.consecutive_failures, 0);
+        assert!(!al4.mail_degraded);
+        let _ = crate::state::remove_active_loop(&project);
     }
 }

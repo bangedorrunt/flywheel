@@ -1,14 +1,14 @@
 //! Local durable state: append-only JSONL event log + checkpoint snapshots.
 //! Location: ~/.local/state/flywheel/<project>.jsonl and checkpoints/<project>/<ts>-<slug>.json
 //!
-//! # `loops.json` schema (bd-loop-state-schema-v2)
+//! # `loops.json` schema (bd-loop-state-schema-v3 — MailHealth)
 //!
 //! Registry of active durable loop runs at `~/.local/state/flywheel/loops.json`.
 //!
 //! **v1 (legacy):** flat object `{ "<project>": { id, params, created }, ... }`.
 //! No `schema` field. New control fields are absent.
 //!
-//! **v2 (current):** same flat project map **plus** a top-level `"schema": 2`
+//! **v2:** same flat project map **plus** a top-level `"schema": 2`
 //! and optional per-loop control fields for crash-resume:
 //! - `event_cursor: { max_seq, pane_ids }` — high-watermark for event subscribe
 //!   (`bd-event-subscribe-reactor`); `null`/absent = start fresh.
@@ -19,12 +19,18 @@
 //! - `respawn: { "<agent>": { diagnose_count, respawn_count } }` — bounded
 //!   self-heal budget (`bd-event-self-heal-unknown`).
 //!
+//! **v3 (current, ADR-0026 Spec 4):** v2 plus `mail_health: { consecutive_failures, last_ok_ts }`
+//! and `mail_degraded: bool` for bounded mail-health escalation. `mail_health`
+//! counts renew/lease/mail leaf failures; `mail_degraded` is true when
+//! `consecutive_failures >= N` (default 3, 0 disables). Additive, same
+//! back-compat as v2.
+//!
 //! **Back-compat (both directions):**
-//! - v2 binary reading v1 file: missing `schema` → treat as v1; new fields
-//!   default via `#[serde(default)]` (`event_cursor=None`, empty maps). On
-//!   first write, migrate in place: set `schema: 2`, log to stderr, preserve
+//! - v2/v3 binary reading v1 file: missing `schema` → treat as v1; new fields
+//!   default via `#[serde(default)]` (`event_cursor=None`, empty maps, `mail_health` default, `mail_degraded` false). On
+//!   first write, migrate in place: set `schema: 3`, log to stderr, preserve
 //!   all v1 base fields (additive — no data loss).
-//! - v1 binary reading v2 file: serde ignores unknown fields (no
+//! - v1 binary reading v2/v3 file: serde ignores unknown fields (no
 //!   `deny_unknown_fields`); base `id`/`params`/`created` still load.
 //!
 //! State file = resumable control state only. Telemetry (counts, latencies)
@@ -41,8 +47,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::state_dir;
 use crate::herdr_shim::AgentStatus;
 
-/// Current `loops.json` schema version (bd-loop-state-schema-v2).
-pub const LOOPS_SCHEMA_VERSION: u32 = 2;
+/// Current `loops.json` schema version (bd-loop-state-schema-v3 — MailHealth).
+pub const LOOPS_SCHEMA_VERSION: u32 = 3;
 
 /// Reserved top-level key in `loops.json` (not a project path).
 const LOOPS_SCHEMA_KEY: &str = "schema";
@@ -110,10 +116,45 @@ pub struct RespawnBudget {
     pub respawn_count: u32,
 }
 
-/// One active durable loop run: invocation id + params + v2 control state.
+/// Mail-health for bounded escalation (ADR-0026 Spec 4 — 2026-08-08 soft-fail).
+/// `consecutive_failures` counts renew/lease/mail leaf failures; any success resets.
+/// At N (default 3, 0 disables) the loop stops dispatching new work and escalates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct MailHealth {
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub last_ok_ts: i64,
+}
+
+impl MailHealth {
+    #[allow(dead_code)]
+    pub fn is_default(&self) -> bool {
+        self.consecutive_failures == 0 && self.last_ok_ts == 0
+    }
+    pub fn should_escalate(&self, n: u32) -> bool {
+        n != 0 && self.consecutive_failures >= n
+    }
+    pub fn record_success(&mut self, now: i64) {
+        self.consecutive_failures = 0;
+        self.last_ok_ts = now;
+    }
+    pub fn record_failure(&mut self, _now: i64) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+    }
+}
+
+/// Env knob for mail-health escalation threshold (0 disables).
+pub fn mail_health_escalate_at() -> u32 {
+    std::env::var("FLYWHEEL_MAIL_HEALTH_ESCALATE_AT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3)
+}
+
+/// One active durable loop run: invocation id + params + v2/v3 control state.
 ///
 /// New fields use `#[serde(default)]` so a v1-shaped JSON still deserializes
-/// (fresh defaults). A v1 binary reading this struct's v2 JSON ignores the
+/// (fresh defaults). A v1 binary reading this struct's v2/v3 JSON ignores the
 /// extra keys (serde default for structs without `deny_unknown_fields`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActiveLoop {
@@ -129,10 +170,16 @@ pub struct ActiveLoop {
     /// Per-agent diagnose/respawn budget (must not reset on crash).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub respawn: BTreeMap<String, RespawnBudget>,
+    /// Mail-health counter for bounded escalation (ADR-0026 Spec 4, v3 additive).
+    #[serde(default)]
+    pub mail_health: MailHealth,
+    /// Whether the loop is in mail-degraded dispatch-hold (consecutive_failures >= N).
+    #[serde(default)]
+    pub mail_degraded: bool,
 }
 
 impl ActiveLoop {
-    /// Construct a v2 entry with empty control fields (fresh loop start).
+    /// Construct a v3 entry with empty control fields (fresh loop start).
     pub fn new(
         id: impl Into<String>,
         params: serde_json::Value,
@@ -145,6 +192,8 @@ impl ActiveLoop {
             event_cursor: None,
             escalation: BTreeMap::new(),
             respawn: BTreeMap::new(),
+            mail_health: MailHealth::default(),
+            mail_degraded: false,
         }
     }
 }
@@ -1487,13 +1536,18 @@ mod loops_schema_v2_tests {
             }),
             escalation,
             respawn,
+            mail_health: MailHealth {
+                consecutive_failures: 1,
+                last_ok_ts: 123,
+            },
+            mail_degraded: false,
         };
         let mut map = BTreeMap::new();
         map.insert("/tmp/p".into(), al.clone());
 
         let body = serialize_loops_registry(&map).unwrap();
         let (schema, map2) = parse_loops_registry(&body);
-        assert_eq!(schema, 2);
+        assert_eq!(schema, 3);
         let got = map2.get("/tmp/p").unwrap();
         assert_eq!(got, &al);
         assert_eq!(got.event_cursor.as_ref().unwrap().max_seq, 42);
@@ -1552,6 +1606,114 @@ mod loops_schema_v2_tests {
         assert!(al.event_cursor.is_none());
         assert!(al.escalation.is_empty());
         assert!(al.respawn.is_empty());
+        assert_eq!(al.mail_health.consecutive_failures, 0);
+        assert!(!al.mail_degraded);
+    }
+
+    #[test]
+    fn mail_health_increments_and_resets() {
+        let mut mh = MailHealth::default();
+        assert_eq!(mh.consecutive_failures, 0);
+        assert!(!mh.should_escalate(3));
+        mh.record_failure(100);
+        assert_eq!(mh.consecutive_failures, 1);
+        assert!(!mh.should_escalate(3));
+        mh.record_failure(200);
+        mh.record_failure(300);
+        assert_eq!(mh.consecutive_failures, 3);
+        assert!(mh.should_escalate(3));
+        assert!(!mh.should_escalate(0)); // 0 disables
+        mh.record_success(400);
+        assert_eq!(mh.consecutive_failures, 0);
+        assert_eq!(mh.last_ok_ts, 400);
+        assert!(!mh.should_escalate(3));
+    }
+
+    #[test]
+    fn mail_health_escalate_at_env() {
+        let _g = crate::config::lock_env();
+        unsafe { std::env::remove_var("FLYWHEEL_MAIL_HEALTH_ESCALATE_AT") };
+        assert_eq!(mail_health_escalate_at(), 3);
+        unsafe { std::env::set_var("FLYWHEEL_MAIL_HEALTH_ESCALATE_AT", "0") };
+        assert_eq!(mail_health_escalate_at(), 0);
+        unsafe { std::env::set_var("FLYWHEEL_MAIL_HEALTH_ESCALATE_AT", "5") };
+        assert_eq!(mail_health_escalate_at(), 5);
+        unsafe { std::env::remove_var("FLYWHEEL_MAIL_HEALTH_ESCALATE_AT") };
+    }
+
+    #[test]
+    fn mail_health_v3_roundtrip_and_v2_backcompat() {
+        // v3 round-trip
+        let mut al = ActiveLoop::new("swarm-loop:/tmp/p", json!({}), "now");
+        al.mail_health = MailHealth {
+            consecutive_failures: 2,
+            last_ok_ts: 999,
+        };
+        al.mail_degraded = true;
+        let mut map = BTreeMap::new();
+        map.insert("/tmp/p".into(), al.clone());
+        let body = serialize_loops_registry(&map).unwrap();
+        let (schema, map2) = parse_loops_registry(&body);
+        assert_eq!(schema, 3);
+        let got = map2.get("/tmp/p").unwrap();
+        assert_eq!(got.mail_health.consecutive_failures, 2);
+        assert_eq!(got.mail_health.last_ok_ts, 999);
+        assert!(got.mail_degraded);
+        // v2 back-compat: old JSON without mail_health should load with defaults
+        let v2_body = json!({
+            "schema": 2,
+            "/tmp/q": {
+                "id": "swarm-loop:/tmp/q",
+                "params": {},
+                "created": "now",
+                "event_cursor": null,
+                "escalation": {},
+                "respawn": {}
+            }
+        })
+        .to_string();
+        let (schema2, map3) = parse_loops_registry(&v2_body);
+        assert_eq!(schema2, 2);
+        let got2 = map3.get("/tmp/q").unwrap();
+        assert_eq!(got2.mail_health.consecutive_failures, 0);
+        assert!(!got2.mail_degraded);
+    }
+
+    #[test]
+    fn mail_health_dispatch_hold_at_n_and_resume() {
+        let mut al = ActiveLoop::new("id", json!({}), "now");
+        let n = 3;
+        al.mail_health.consecutive_failures = 2;
+        assert!(!al.mail_health.should_escalate(n));
+        al.mail_health.consecutive_failures = 3;
+        assert!(al.mail_health.should_escalate(n));
+        al.mail_degraded = true;
+        assert!(al.mail_degraded);
+        al.mail_health.record_success(999);
+        al.mail_degraded = false;
+        assert_eq!(al.mail_health.consecutive_failures, 0);
+        assert!(!al.mail_degraded);
+        assert!(!al.mail_health.should_escalate(0));
+    }
+
+    #[test]
+    fn mail_health_loop_start_errors_without_key() {
+        // Loop-identity fail-loud: without a usable key, preflight and swarm_loop start should Fail
+        let _g = crate::config::lock_env();
+        unsafe { std::env::remove_var("TORON_OPERATOR_KEY") };
+        let home =
+            std::env::temp_dir().join(format!("mail-health-loop-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        unsafe { std::env::set_var("HOME", &home) };
+        let cfg = crate::config::Config::load().unwrap_or_default();
+        let check = crate::preflight::check_loop_identity(&cfg, Some("test-proj"));
+        assert!(
+            matches!(check.status, crate::preflight::Status::Fail(_)),
+            "loop start without key should be Fail: {check:?}"
+        );
+        unsafe { std::env::remove_var("HOME") };
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
