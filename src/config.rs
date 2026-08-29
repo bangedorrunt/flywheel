@@ -1344,4 +1344,86 @@ daily = [
                 .any(|e| e.mail_identity.as_deref() == Some("UnrelatedPin"))
         );
     }
+
+    #[test]
+    fn on_captain_death_reap_crews_unconditional_override() {
+        use crate::state::SpawnEntry;
+        let captain = "BraveCaptain";
+        let child = SpawnEntry::with_mail_identity("pane-child", "child1", "ChildPin");
+        let registry = vec![
+            SpawnEntry::with_mail_identity("pane-cap", "cap", captain),
+            child.clone(),
+        ];
+        // reap_crews overrides continue → behaves like Stop (children reaped)
+        let with_reap = {
+            let policy = if true {
+                OnCaptainDeath::Stop
+            } else {
+                OnCaptainDeath::Continue
+            };
+            registry_after_captain_death(&registry, captain, policy)
+        };
+        assert!(
+            !with_reap.iter().any(|e| e.pane_id == "pane-child"),
+            "--reap-crews must reap crews even under continue"
+        );
+        // without reap, continue leaves child
+        let without_reap =
+            registry_after_captain_death(&registry, captain, OnCaptainDeath::Continue);
+        assert!(without_reap.iter().any(|e| e.pane_id == "pane-child"));
+    }
+
+    #[test]
+    fn on_captain_death_mail_to_captain_fails_when_alias_cleared_until_rebound() {
+        use crate::state as st;
+        let _home = test_state_home();
+        let proj = format!("oncap-mail-{}", std::process::id());
+        // initially alias present
+        st::save_captain_alias(&proj, "BraveCaptain").unwrap();
+        assert!(st::resolve_captain_target(&proj, "captain").is_ok());
+        // continue clears alias → mail --to captain fails loud
+        st::clear_captain_alias_file(&proj).unwrap();
+        let err =
+            st::resolve_captain_target(&proj, "captain").expect_err("cleared alias must fail");
+        assert!(format!("{err}").contains("alias cleared"));
+        assert!(format!("{err}").contains("recover"));
+        // recover (= adopt) rebounds alias → mail succeeds again
+        st::save_captain_alias(&proj, "NewCaptain").unwrap();
+        assert!(st::resolve_captain_target(&proj, "captain").is_ok());
+        assert!(st::resolve_captain_target(&proj, "CAPTAIN").is_ok());
+        let _ = st::clear_captain_alias_file(&proj);
+    }
+
+    #[test]
+    fn on_captain_death_kill_continue_keeps_doorbell_and_crews() {
+        use crate::state::{self as st, SpawnEntry};
+        let _home = test_state_home();
+        let proj = format!("oncap-kill-{}", std::process::id());
+        let captain = "BraveCaptain";
+        let child = SpawnEntry::with_mail_identity("pane-child", "child1", "ChildPin");
+        st::save_spawn_registry(&proj, &[child.clone()]).unwrap();
+        st::save_captain_alias(&proj, captain).unwrap();
+        // simulate kill with continue: crews remain, alias cleared, doorbell would stay (not stopped)
+        let registry = st::load_spawn_registry(&proj);
+        let remain = registry_after_captain_death(&registry, captain, OnCaptainDeath::Continue);
+        st::save_spawn_registry(&proj, &remain).unwrap();
+        st::clear_captain_alias_file(&proj).unwrap();
+        let after = st::load_spawn_registry(&proj);
+        assert!(
+            after.iter().any(|e| e.pane_id == "pane-child"),
+            "continue must leave child pane listed"
+        );
+        assert!(
+            st::is_captain_alias_cleared(&proj),
+            "alias cleared until rebound"
+        );
+        // adopt via recover
+        st::save_captain_alias(&proj, "AdoptedCaptain").unwrap();
+        assert_eq!(
+            st::load_captain_alias(&proj).as_deref(),
+            Some("AdoptedCaptain")
+        );
+        let _ = st::clear_captain_alias_file(&proj);
+        let _ = std::fs::remove_file(st::spawn_registry_file(&proj));
+    }
 }
