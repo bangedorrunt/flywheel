@@ -41,11 +41,13 @@ Labor: **mail = state and protocol; dispatcher = wake; template =
 behavior; loop/swarm = dispatch.** Peer-collab works with no loop
 because the dispatcher, not the captain loop, is on the peer path.
 
-**Captain triggers (binding):** `/swarm` and `/loop` remain Layer 1
-commands. They do **not** own wake. Spawn (or `/swarm`'s spawn step)
-starts the dispatcher. `/loop` is bead dispatch (`loop run --work`:
-claim, wave-gate, VERIFY). Skip the loop when the job is peer collab
-only. Run the loop when beads need an owner. Both modes share Layer 0.
+**Captain triggers (binding):** `/open`, `/loop`, and `/swarm` are Layer 1
+commands with different execution topologies. `/open` is direct current-pane
+work with no orchestration lifecycle. `/loop` is durable solo execution in one
+current harness; `--work` selects its bead-backed specialization, but beads
+are optional for loop mode generally. `/swarm` is captain-led multi-crew
+execution. None of these commands owns wake: spawn starts the dispatcher and
+both loop and swarm may share Layer 0.
 
 ---
 
@@ -245,26 +247,34 @@ remain the cross-harness floor.
 
 `IdentityMode` stays toron-side per-project routing policy (ADR-0018 D3:
 `Open` = any registered name; `Swarm` = canonical `flywheel-<project>-
-<role><seq>` or npub only). Flywheel projects SHOULD run `swarm` mode (the
-pin-public-plane wave's `set_identity_mode` wiring); this ADR depends on
-it, does not change it.
+<role><seq>` or npub only). Flywheel projects SHOULD run `swarm` identity mode when coordinated crews
+are active (the pin-public-plane wave's `set_identity_mode` wiring). `open`
+identity mode is for direct mailbox use and passes registered names through;
+it does not imply a captain, crew, bead graph, or durable loop. This ADR
+clarifies the execution modes but does not change Toron's identity rules.
 
-### D5 — Captain with and without a loop (binding)
+### D5 — Execution topology and captain operation (binding)
 
 The captain has two live modes. They compose; neither is a fallback
 hack.
 
 | Mode | How the captain starts it | Loop? | What it is for |
 |---|---|---|---|
-| **Collab, no loop** | `flywheel spawn` (Layer 0). Optional `/swarm` for classify/lanes/brief. | **No.** | Peer wake is the dispatcher. Digest is cron. Captain `send` is optional steer. |
-| **Bead dispatch** | `/loop` → `flywheel loop run <p> --work`, or `/swarm` that includes the loop step. | **Yes.** | Claim, wave-gate, VERIFY, reopen. Loop does **not** ring panes. |
+| **Open** | `/open` or direct current-pane work | **No.** | Immediate task execution; no crew, durable loop, bead lifecycle, or captain semantics. |
+| **Solo loop** | `/loop` → `flywheel loop-mode run <p>` | **Yes.** | One current harness drives one objective; queue/workflow/objective may be the work source. |
+| **Solo loop + beads** | `/loop` → `flywheel loop-mode run <p> --work` | **Yes.** | Same solo topology plus claim, wave-gate, VERIFY, and legal bead close/reopen. |
+| **Swarm** | `/swarm` / `steer` → multiple profiles/crews | Optional | Captain-led parallel lanes. Peer wake is the dispatcher; bead loop supervision is optional. |
 
-`/swarm` playbook: spawn starts the doorbell. `loop run` is **optional**
-and only for bead work. Saying "peer collab needs `/loop`" is a bug
-after this ADR.
+`/swarm` playbook: spawn starts the doorbell. `loop-mode` is **optional**
+and is only required when durable solo execution or bead supervision is
+wanted. Saying "peer collab needs `/loop`" is a bug after this ADR.
 
-`/loop` playbook: still one pane, one objective, verified close. Inbox
-wake is the dispatcher, not "poll every 5 min."
+`/loop` playbook: one pane, one objective, durable execution. Add `--work`
+when the objective is bead-backed. Inbox wake is the dispatcher, not "poll
+every 5 min."
+
+`/open` playbook: direct current-pane work. It does not silently become a
+loop or swarm and does not claim or close beads unless explicitly instructed.
 
 MCP-only sessions (no herdr pane) stay pull. Push is a pane feature.
 

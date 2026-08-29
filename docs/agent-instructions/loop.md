@@ -1,8 +1,19 @@
 # Durable loop
 
-`flywheel loop run <project> [--work]` is a Resonate workflow. Re-run the same
-command to resume. One live loop per project (`loop list` / `loop prune`).
-`--force` takes over a corrupted invocation.
+`flywheel loop-mode run <project> [--work]` is the durable **solo execution
+loop**, implemented with Resonate workflow machinery. Re-run the same command
+to resume. One live loop per project (`loop-mode list` / `loop-mode prune`).
+
+Solo is the topology; the work source is separate:
+
+- without `--work`: drive the current objective, queue, or named workflow with
+  one current harness/pane;
+- with `--work`: use `br ready` as the work source, claim beads, enforce wave
+  gates, run VERIFY, and close/reopen legally.
+
+`--work` therefore requires beads; loop mode itself does not. Loop mode does
+not spawn a parallel crew. A reviewer may be summoned explicitly, but that is
+not swarm execution. `--force` takes over a corrupted invocation.
 
 State: `~/.local/state/flywheel/loops.json` (schema 2) + `last_sent/<project>.json`.
 
@@ -20,7 +31,7 @@ Confirmed send is default (`__send --confirm` → working|blocked landing). `--n
 - idle/done → next queue item
 - unknown → never dispatch; 2+ consecutive polls → respawn
 
-Work mode (`--work`): `br ready` → claim/execute prompts. Claim watchdog: unclaimed-while-working gets a claim nudge; settled-unclaimed is re-dispatched; completion requires an empty claim-watch.
+Work mode (`--work`): `br ready` → claim/execute prompts. Claim watchdog: unclaimed-while-working gets a claim nudge; settled-unclaimed is re-dispatched; completion requires an empty claim-watch. This is the bead-backed specialization of solo loop mode, not the definition of loop mode itself.
 
 Mail wake: idle agents with urgent mail get one MAIL WAKE per message id.
 

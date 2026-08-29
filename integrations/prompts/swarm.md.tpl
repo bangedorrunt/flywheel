@@ -1,16 +1,30 @@
 {{TOOL_FRONTMATTER}}
-# Orchestration: swarm
+# Orchestration: swarm-mode
 
-Run the /swarm slash command: the wave-gated bead-graph swarm playbook. One
-captain orchestrates up to 5 crews across a bead graph; waves run one at a
-time; epics are gates, not tasks. Distilled from the ADR-0019 program
-(2026-08-15, 34/34 beads).
+Run the /swarm-mode slash command: the multi-crew, captain-led execution
+mode.
+
+Arguments are supplied by the harness adapter above. Treat the supplied text as
+the objective, scope, crew shape, and mode flags for this invocation.
+The captain steers multiple crews, normally using the current harness/profile
+for each role. This is the parallel counterpart to `/loop`, which is solo
+execution in one current harness. Swarm is for independent lanes and waves;
+loop is for one objective driven end-to-end by one pane.
+
+One captain orchestrates up to 5 crews across a work graph; independent lanes
+run in parallel when their file ownership does not overlap. Keep the captain's objective authoritative and make each lane independently
+verifiable.
 
 ## The 8-step playbook
 
-1. CLASSIFY: `flywheel decide "<target>" --json --ready-beads N`. If beads
-   already exist for the objective -> THIS playbook, not steer. Record the
-   deviation if you override decide.
+Before spawning or dispatching, ask the operator to choose the model routing for
+each profile (for example planner, coder, reviewer, scout). Present each
+profile's default model and compatible registry alternatives. Blank input keeps
+the profile default; an explicit provider/model selection is an override.
+Use the selected profile/model consistently for that lane.
+
+1. CLASSIFY: `flywheel decide "<target>" --json --ready-beads N`. Follow the
+   returned primitive rather than inventing a second execution path.
 
 2. GATE PREP: `br sync --flush-only`; clear stale assignees; commit the
    tracker. Map the bead graph (deps, wave epics). Waves run ONE AT A TIME;
@@ -23,15 +37,16 @@ time; epics are gates, not tasks. Distilled from the ADR-0019 program
    bead's ## VERIFY at clean HEAD, posts VERIFIED/FAILED; br sync
    housekeeping).
 
-4. SPAWN: `flywheel spawn <proj> --profile <role> --count N` (doorbell
-   ON; `/swarm peer-aware=off` maps to `--no-peer-aware`). Steer
-   channel: `toron channel create <slug>-steer`; captain mail thread
-   <slug>-captain. Captain posts the lane map + contract. Peer wake is
-   Layer 0 (ADR-0005): no `loop run` required. Optional:
-   `flywheel loop run <proj>` from PARENT cwd when beads need
-   claim/wave-gate/VERIFY. Loop is bead dispatch, not wake.
+4. SELECT AND SPAWN: before dispatch, ask the operator to choose the
+   profile and model for each role. Show the profile default and available
+   registry alternatives, including harness compatibility and cost when known.
+   Then use `flywheel spawn <proj> --profile <role> --count N`; use an explicit
+   provider/model only when the operator selects an override. Keep wake
+   coordination separate from work-graph supervision.
 
-5. BRIEF each lane: bead ids in order, files owned, pin, claim
+5. BRIEF each lane: the captain's lane dispatch is authoritative for that
+   crew. Peer-aware wake messages are coordination signals, not replacement
+   tasks. Bead ids in order, files owned, pin, claim
    (br update --status=in_progress), reserve before edit
    (toron reserve acquire, renew 4min), build slot before cargo, TDD
    (RED test first), commit-before-close with bead id in the message, close
@@ -40,7 +55,7 @@ time; epics are gates, not tasks. Distilled from the ADR-0019 program
    (no 5-min inbox timer), post
    claim/close/blocked to the steer channel, blocked >10min -> mail the
    captain, TIMEBOX 90min then partial report with exact resume point.
-   AGENT_NAME=<pin> env for repo hooks (guard-the-context-window).
+   Use the resolved public mail identity for coordination and repository hooks.
 
 6. CONFLICT / COLLAB LADDER: soft conflict (TTL overlap / want a held
    path) -> `toron reserve request-release --target <holder-pin> --ask
@@ -65,13 +80,9 @@ time; epics are gates, not tasks. Distilled from the ADR-0019 program
    - build slot: `flywheel mail slot release <project> --slot cargo --as <pin>`.
    - kill: `flywheel kill <project> --force --force-working`.
 
-9. DONE-MAIL (every crew): when your wave/lane is done, mail the captain on
-   the lane thread (`thread_id=<lane-bead-id>`) with subject
-   `[<lane-bead-id>] done` and a BODY with the report fields: status,
-   commit sha, verdict kind, what you ran + the result tail, deviations,
-   PRINCIPLES cited. The
-   captain has no push; this mail is the courtesy signal on top of the
-   durable commit+close.
+9. REPORT (every crew): when your lane is done, send the captain a concise
+   report on the lane thread when one exists. Include status, commit,
+   verification command and result, and deviations.
 
 Never block on the captain for reversible calls: if a fact is observable by
 running something, run it (never-block-on-the-human).

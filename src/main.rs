@@ -557,7 +557,7 @@ enum Commands {
     /// Generate the beads-agent integration prompts for an agent kind.
     /// Writes the beads files (beads-{triage,execute,review,commit,create}.md),
     /// the workflow slash commands (workflow-{...}.md), and the orchestration
-    /// slash commands (swarm.md, loop.md) into the tool's prompts dir.
+    /// slash commands (open.md, swarm.md, loop.md, peer-aware.md) into the tool's prompts dir.
     /// Kinds: opencode|pi|grok|omp|pa (shorts oc|pi|gk accepted); omit to
     /// list kinds. Re-run after a flywheel rebuild to refresh the generated
     /// prompts.
@@ -17220,27 +17220,31 @@ fn prompt_workflow_template(name: &str) -> Option<&'static str> {
     }
 }
 
-/// The orchestration slash-command set (bd-glup /swarm; bd-ug9z /loop):
-/// command name → (description, template file). These are the
-/// captain/steering commands — wave-gated bead-graph swarms and
-/// single-agent autonomous loops — distinct from PROMPT_WORKFLOWS (workflow
-/// commands) and the beads lifecycle commands. The template files live in
-/// integrations/prompts/ and are rendered per agent kind like the workflow
-/// commands.
+/// The orchestration slash-command set: open-mode, swarm-mode, loop-mode, and peer-aware-mode.
+/// These are agent operating modes/coordination commands, distinct from
+/// PROMPT_WORKFLOWS (reusable procedures) and beads lifecycle commands.
+/// `open-mode` is direct current-pane work; `loop-mode` is durable solo execution;
+/// `swarm-mode` is captain-led multi-crew execution; `peer-aware-mode` installs
+/// wake coordination across either topology.
 const ORCHESTRATION_COMMANDS: &[(&str, &str, &str)] = &[
     (
-        "swarm",
-        "Run the /swarm command — the wave-gated bead-graph swarm playbook: classify, gate-prep, lanes, spawn, brief, conflict ladder, wave gate, teardown.",
+        "open-mode",
+        "Run the /open-mode command — direct current-pane work with no swarm or durable loop lifecycle.",
+        "open.md.tpl",
+    ),
+    (
+        "swarm-mode",
+        "Run the /swarm-mode command — captain-led multi-crew execution with parallel lanes; peer-aware wake is independent of work tracking.",
         "swarm.md.tpl",
     ),
     (
-        "loop",
-        "Run the /loop command — single-agent autonomy: one objective, TDD per unit, in-flight peer checkpoints (summoned reviewer instead of blocking on the captain), VERIFY receipt, commit-before-close.",
+        "loop-mode",
+        "Run the /loop-mode command — durable solo execution in one current harness; work tracking is optional and enabled by --work.",
         "loop.md.tpl",
     ),
     (
-        "peer-aware",
-        "Retro-prime a running pane (ADR-0005): attach to the workspace doorbell dispatcher, inject the pin identity line, load the handler. --budget maps to the 5/30/3 knobs.",
+        "peer-aware-mode",
+        "Retro-prime a running pane: attach to the workspace doorbell dispatcher, inject the identity line, and load the handler. --budget maps to the 5/30/3 limits.",
         "peer-aware.md.tpl",
     ),
 ];
@@ -17249,15 +17253,16 @@ const ORCHESTRATION_COMMANDS: &[(&str, &str, &str)] = &[
 /// playbook body. Standalone — no beads body.
 fn prompt_orchestration_template(name: &str) -> Option<&'static str> {
     match name {
-        "swarm" => Some(include_str!("../integrations/prompts/swarm.md.tpl")),
-        "loop" => Some(include_str!("../integrations/prompts/loop.md.tpl")),
-        "peer-aware" => Some(include_str!("../integrations/prompts/peer-aware.md.tpl")),
+        "open-mode" => Some(include_str!("../integrations/prompts/open.md.tpl")),
+        "swarm-mode" => Some(include_str!("../integrations/prompts/swarm.md.tpl")),
+        "loop-mode" => Some(include_str!("../integrations/prompts/loop.md.tpl")),
+        "peer-aware-mode" => Some(include_str!("../integrations/prompts/peer-aware.md.tpl")),
         _ => None,
     }
 }
 
-/// The prompts directory for one agent kind (the dir the 5 command files
-/// are written into). Purely conventional per tool.
+/// The prompts directory for one agent kind (the dir the generated
+/// commands are written into). Purely conventional per tool.
 pub fn prompts_dir(kind: &str) -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
     let home = std::path::Path::new(&home);
@@ -17330,7 +17335,7 @@ fn render_workflow_prompt(
         .replace("{{GENERATED}}", generated))
 }
 
-/// Render one orchestration command (/swarm, /loop) for one agent kind.
+/// Render one orchestration command (/open-mode, /swarm-mode, /loop-mode, /peer-aware-mode) for one agent kind.
 /// Pure (deterministic tests): frontmatter (with the command's description)
 /// + the playbook template + version/generated stamps.
 fn render_orchestration_prompt(
@@ -17375,9 +17380,9 @@ fn argument_note(kind: &str) -> &'static str {
 
 fn apply_argument_adapter(kind: &str, frontmatter: &str, body: &str) -> (String, String) {
     let hint = match kind {
-        "opencode" => "peer-aware=off crews=3  OR  --budget 5/30/3",
-        "pi" | "omp" | "pa" => "[peer-aware=off] [crews=N] [--budget 5/30/3]",
-        "grok" => "peer-aware=off crews=3 (trailing text, not interpolated)",
+        "opencode" => "objective=... OR --work OR peer-aware=off crews=3",
+        "pi" | "omp" | "pa" => "[objective=...] [--work] [peer-aware=off] [crews=N]",
+        "grok" => "objective=... --work (trailing text, not interpolated)",
         _ => "args",
     };
     let fm = if frontmatter.contains("argument-hint:") {
@@ -17487,11 +17492,19 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
         );
         written += 1;
     }
-    // The orchestration slash commands (bd-glup /swarm; bd-ug9z /loop):
-    // captain/steering playbooks, rendered as {name}.md.
+    // The orchestration slash commands (/open-mode, /swarm-mode, /loop-mode,
+    // /peer-aware-mode): operating modes and coordination playbooks, rendered
+    // as {name}.md.
     for (name, _, _) in ORCHESTRATION_COMMANDS {
         let rendered = render_orchestration_prompt(kind, name, VERSION, &generated)?;
-        let path = dir.join(format!("{name}.md"));
+        let filename = match *name {
+            "open-mode" => "open-mode.md",
+            "swarm-mode" => "swarm-mode.md",
+            "loop-mode" => "loop-mode.md",
+            "peer-aware-mode" => "peer-aware-mode.md",
+            _ => unreachable!("all orchestration commands use the -mode suffix"),
+        };
+        let path = dir.join(filename);
         std::fs::write(&path, &rendered).with_context(|| format!("write {}", path.display()))?;
         println!(
             "wrote {} ({} bytes)",
@@ -26370,9 +26383,8 @@ mod integration_tests {
         assert!(render_workflow_prompt("opencode", "beads", "0.1.0", "ts").is_err());
     }
 
-    /// bd-glup: the ORCHESTRATION_COMMANDS set holds the swarm/loop slash
-    /// commands — distinct from the workflow command set; PROMPT_WORKFLOWS
-    /// stays workflow-only. bd-ug9z (/loop) extends this set.
+    /// ORCHESTRATION_COMMANDS holds operating-mode slash commands, distinct
+    /// from reusable workflow commands; PROMPT_WORKFLOWS stays workflow-only.
     #[test]
     fn orchestration_command_set_has_swarm() {
         assert!(
@@ -26381,19 +26393,23 @@ mod integration_tests {
         );
         assert_eq!(
             ORCHESTRATION_COMMANDS.len(),
-            3,
-            "exactly three orchestration commands (swarm + loop + peer-aware)"
+            4,
+            "four orchestration commands (open + swarm + loop + peer-aware)"
         );
         let (name, description, template) = ORCHESTRATION_COMMANDS[0];
-        assert_eq!(name, "swarm");
-        assert!(!description.is_empty(), "/swarm has a description");
+        assert_eq!(name, "open-mode");
+        assert!(!description.is_empty(), "/open has a description");
         assert!(template.ends_with(".tpl"), "template file referenced");
         let (name, description, template) = ORCHESTRATION_COMMANDS[1];
-        assert_eq!(name, "loop", "bd-ug9z adds /loop");
-        assert!(!description.is_empty(), "/loop has a description");
+        assert_eq!(name, "swarm-mode");
+        assert!(!description.is_empty(), "/swarm has a description");
         assert!(template.ends_with(".tpl"), "template file referenced");
         let (name, description, template) = ORCHESTRATION_COMMANDS[2];
-        assert_eq!(name, "peer-aware", "ADR-0005 adds /peer-aware");
+        assert_eq!(name, "loop-mode", "loop mode avoids harness command collisions");
+        assert!(!description.is_empty(), "/loop has a description");
+        assert!(template.ends_with(".tpl"), "template file referenced");
+        let (name, description, template) = ORCHESTRATION_COMMANDS[3];
+        assert_eq!(name, "peer-aware-mode", "peer-aware mode avoids harness command collisions");
         assert!(!description.is_empty(), "/peer-aware has a description");
         assert!(template.ends_with(".tpl"), "template file referenced");
     }
@@ -26402,14 +26418,14 @@ mod integration_tests {
     /// description) + the playbook template + stamps; no beads body.
     #[test]
     fn render_orchestration_prompt_has_frontmatter_and_focus() {
-        let out = render_orchestration_prompt("opencode", "swarm", "9.9.9", "2026-08-10T00:00:00Z")
+        let out = render_orchestration_prompt("opencode", "swarm-mode", "9.9.9", "2026-08-10T00:00:00Z")
             .unwrap();
         assert!(out.starts_with("---\n"), "frontmatter");
         assert!(
-            out.contains("wave-gated bead-graph swarm playbook"),
+            out.contains("captain-led multi-crew execution"),
             "description in frontmatter"
         );
-        assert!(out.contains("# Orchestration: swarm"));
+        assert!(out.contains("# Orchestration: swarm-mode"));
         for step in [
             "CLASSIFY",
             "GATE PREP",
@@ -26479,14 +26495,14 @@ mod integration_tests {
 
     #[test]
     fn argument_adapter_pi_has_argument_hint() {
-        let out = render_orchestration_prompt("pi", "loop", "0.1.0", "ts").unwrap();
+        let out = render_orchestration_prompt("pi", "loop-mode", "0.1.0", "ts").unwrap();
         assert!(out.contains("argument-hint:"));
         assert!(out.contains("$1") || out.contains("$@"));
     }
 
     #[test]
     fn argument_adapter_grok_has_no_dollar_arguments() {
-        let out = render_orchestration_prompt("grok", "swarm", "0.1.0", "ts").unwrap();
+        let out = render_orchestration_prompt("grok", "swarm-mode", "0.1.0", "ts").unwrap();
         assert!(
             !out.contains("Arguments: `$ARGUMENTS`"),
             "grok prompts must not fake $ARGUMENTS interpolation"
@@ -26497,7 +26513,7 @@ mod integration_tests {
 
     #[test]
     fn render_orchestration_rejects_unknown() {
-        assert!(render_orchestration_prompt("claude", "swarm", "0.1.0", "ts").is_err());
+        assert!(render_orchestration_prompt("claude", "swarm-mode", "0.1.0", "ts").is_err());
         assert!(render_orchestration_prompt("opencode", "bogus-cmd", "0.1.0", "ts").is_err());
     }
 
@@ -26505,7 +26521,7 @@ mod integration_tests {
     /// "cannot be encoded safely" failure mode) and under 4 KiB.
     #[test]
     fn swarm_template_is_ascii_only_and_bounded() {
-        let tpl: &str = prompt_orchestration_template("swarm").expect("swarm template");
+        let tpl: &str = prompt_orchestration_template("swarm-mode").expect("swarm template");
         assert!(tpl.is_ascii(), "swarm.md.tpl must be ASCII-only");
         assert!(
             tpl.len() < 4 * 1024,
@@ -26518,7 +26534,7 @@ mod integration_tests {
     /// (ADR-0019 Spec 5 steering vocabulary).
     #[test]
     fn swarm_template_cites_principles() {
-        let tpl: &str = prompt_orchestration_template("swarm").expect("swarm template");
+        let tpl: &str = prompt_orchestration_template("swarm-mode").expect("swarm template");
         for p in [
             "prove-it-works",
             "sequence-verifiable-units",
@@ -26533,7 +26549,7 @@ mod integration_tests {
     /// "cannot be encoded safely" failure mode) and under 4 KiB.
     #[test]
     fn loop_template_is_ascii_only_and_bounded() {
-        let tpl: &str = prompt_orchestration_template("loop").expect("loop template");
+        let tpl: &str = prompt_orchestration_template("loop-mode").expect("loop template");
         assert!(tpl.is_ascii(), "loop.md.tpl must be ASCII-only");
         assert!(
             tpl.len() < 4 * 1024,
@@ -26548,7 +26564,7 @@ mod integration_tests {
     /// sequence-verifiable-units.
     #[test]
     fn loop_template_cites_principles() {
-        let tpl: &str = prompt_orchestration_template("loop").expect("loop template");
+        let tpl: &str = prompt_orchestration_template("loop-mode").expect("loop template");
         for p in [
             "prove-it-works",
             "fix-root-causes",

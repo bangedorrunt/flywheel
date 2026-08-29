@@ -21,13 +21,13 @@ fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
 }
 
-/// SC-D9: `/swarm` must not require `loop run` for peer wake.
+/// SC-D9: `/swarm-mode` must not require loop supervision for peer wake.
 #[test]
 fn sc_d9_swarm_playbook_loop_optional_for_peer_wake() {
     let tpl = read("integrations/prompts/swarm.md.tpl");
     assert!(
-        tpl.contains("no `loop run` required") || tpl.contains("Loop is bead dispatch, not wake"),
-        "swarm playbook must say loop is optional for peer wake, got a snippet: {}",
+        tpl.contains("Keep wake\n   coordination separate") || tpl.contains("peer-aware wake"),
+        "swarm playbook must separate wake from supervision, got a snippet: {}",
         tpl.lines()
             .find(|l| l.contains("SPAWN") || l.contains("loop run"))
             .unwrap_or("")
@@ -198,6 +198,15 @@ fn sc_d1_handler_requires_heard_signal() {
         tpl.contains("120s") && (tpl.contains("unanswered") || tpl.contains("presence")),
         "handler must teach 120s heard-or-deaf"
     );
+    assert!(
+        tpl.contains("captain's current dispatch is authoritative"),
+        "peer-aware handler must not outrank captain dispatch"
+    );
+    assert!(
+        tpl.contains("do not\ninvent implementation work")
+            || tpl.contains("do not invent implementation work"),
+        "peer-aware handler must not invent a competing task"
+    );
 }
 
 #[test]
@@ -205,7 +214,7 @@ fn sc_d1_peer_template_is_handler_not_timer() {
     let tpl = read("integrations/peer-aware.md.tpl");
     assert!(tpl.contains("{mail_identity}"), "identity prime must stay");
     assert!(tpl.contains("[doorbell]"), "handler must teach [doorbell]");
-    assert!(tpl.contains("since_ts"), "pull uses since_ts high-water");
+    assert!(tpl.contains("--since"), "pull uses incremental since cursor");
     assert!(
         tpl.contains("Safety-net"),
         "crash-to-next-spawn safety-net must be named, not the driver"
@@ -275,6 +284,16 @@ fn sc_d7_spawn_identity_without_dispatcher() {
 
 /// `/swarm peer-aware=off` maps to `--no-peer-aware`.
 #[test]
+fn swarm_and_loop_modes_are_distinct() {
+    let swarm = read("integrations/prompts/swarm.md.tpl");
+    let loop_tpl = read("integrations/prompts/loop.md.tpl");
+    assert!(swarm.contains("multi-crew") && swarm.contains("captain-led"));
+    assert!(loop_tpl.contains("solo mode") && loop_tpl.contains("current harness"));
+    assert!(loop_tpl.contains("opposite of /swarm"));
+}
+
+/// `/swarm peer-aware=off` maps to `--no-peer-aware`.
+#[allow(dead_code)]
 fn swarm_peer_aware_off_maps_to_flag() {
     let tpl = read("integrations/prompts/swarm.md.tpl");
     assert!(
@@ -346,15 +365,12 @@ fn captain_triggers_spawn_loop_and_integration_exist() {
 fn adr_d5_names_collab_without_loop_and_bead_dispatch() {
     let adr = read("docs/decisions/0005-always-on-collab-baseline-and-command-surface.md");
     assert!(
-        adr.contains("### D5 — Captain with and without a loop"),
+        adr.contains("### D5 — Execution topology and captain operation (binding)"),
         "D5 heading missing"
-    );
+    );    assert!(adr.contains("**Open**"), "no-loop captain mode missing");
     assert!(
-        adr.contains("**Collab, no loop**"),
-        "no-loop captain mode missing"
-    );
-    assert!(
-        adr.contains("**Bead dispatch**"),
+        adr.contains("**Solo loop + beads**"),
+
         "loop captain mode missing"
     );
     assert!(adr.contains("SC-D9"), "scenario SC-D9 missing from §9");

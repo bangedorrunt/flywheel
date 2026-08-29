@@ -1,23 +1,37 @@
 {{TOOL_FRONTMATTER}}
-# Orchestration: loop
+# Orchestration: loop-mode
 
-Run the /loop slash command: ONE agent, ONE objective, fully automated, but
-able to deploy a peer (@reviewer, different model family) mid-flight at
-defined checkpoints instead of shipping unverified. The opposite of /swarm:
-no crew, no waves -- a single pane drives a bead to a verified close. The
-summoned reviewer substitutes for the captain (never-block-on-the-human).
+Run the /loop-mode slash command: solo mode.
+
+Arguments are supplied by the harness adapter above. Treat the supplied text as
+the objective, scope, and any mode flags for this invocation. ONE current harness/pane drives ONE
+objective end-to-end. It is a durable execution loop implemented with workflow
+runtime machinery, but it is not the same thing as a reusable workflow
+ definition. Beads are optional: `--work` selects bead-backed execution;
+without `--work`, the loop may drive an objective, queue, or workflow. It is
+the opposite of /swarm: no parallel crew lanes and no wave fan-out. A reviewer
+may be summoned at checkpoints, but that reviewer is an exception, not a
+second execution crew.
+
+The solo agent is its own captain for reversible decisions. The human/captain
+objective and scope remain authoritative; peer-aware messages must not replace
+the primary objective.
 
 ## The 6-step loop
 
+Before starting a new managed run, ask the operator to choose the profile and
+model routing for this role. Present the profile default plus compatible model
+registry alternatives and their known cost/capabilities. Blank input keeps the
+default; an explicit provider/model selection overrides it. Use the selected
+profile/model for the run and record the choice in the launch/report summary.
+
 1. SETUP: one pane via `flywheel spawn <proj> --profile <role>` (or run
-   in-place if already pane'd). Write the objective as a brief:
-   GOAL / SCOPE / CONTEXT / ACCEPTANCE / VERIFY / TIMEBOX / FORBIDDEN /
-   REPORT / PRINCIPLES / STANDING (ADR-0019 Spec 2). Reserve files before
-   edit (toron reserve acquire; renew 4min); build slot for cargo. Wake is
-   the workspace doorbell (`[doorbell]` then show heard within 120s:
-   presence working or one kind-9 line; then pull `inbox --since` /
-   captain thread). Unanswered is a digest conflict. Do not start a
-   5-min inbox timer.
+   in-place if already pane'd). The selected/current harness is the execution
+   harness for the whole solo run. Write the objective as a brief with GOAL / SCOPE / CONTEXT / ACCEPTANCE / VERIFY /
+   TIMEBOX / FORBIDDEN / REPORT. Keep it specific enough to execute and verify. Reserve files before
+   edit   (toron reserve acquire; renew 4min); build slot for cargo. Wake is
+   the workspace doorbell: show you heard it, then pull the relevant inbox,
+   channel, or job. Do not start a self-managed polling timer.
 
 2. EXECUTE: TDD red-green per unit (RED test first, GREEN minimal code,
    REFACTOR while green). Stage ONLY reserved paths (never git add -A --
@@ -35,24 +49,27 @@ summoned reviewer substitutes for the captain (never-block-on-the-human).
    captain for reversible calls: if a fact is observable by running
    something, run it; peers substitute (never-block-on-the-human).
 
-4. VERIFY: run the ## VERIFY command from the brief; save the receipt.
-   On failure -> fix-root-causes loop: reproduce first, ask why until the
+4. VERIFY: run the ## VERIFY command from the brief when one exists; for
+   non-bead objectives, run the explicit acceptance/verification command from
+   the objective. Save the receipt. On failure -> fix-root-causes loop:
+   reproduce first, ask why until the
    root, never re-verify a broken head (fix-root-causes). Check the real
    artifact, not "it compiles" (prove-it-works).
 
-5. CLOSE: commit-before-close with the bead id in the message; close
-   reason MUST include the ## VERIFY output tail; cite PRINCIPLES by name   -- which decision each changed. On TIMEBOX expiry: report the partial
+5. CLOSE: when bead-backed, commit-before-close with the bead id in the
+   message and include the ## VERIFY output tail in the close reason. For a
+   non-bead objective, report the commit/result without pretending a bead was
+   closed.   Report the verification evidence and any important deviations. On TIMEBOX
+   expiry: report the partial
    state + the exact resume point, then stop (outcome-oriented-execution).
 
-6. DONE-MAIL: after closing, mail the captain on `thread_id=<bead-id>`;
-   subject `[<bead-id>] done`, BODY with the report fields (status, commit
-   sha, verdict kind, the VERIFY command + result tail, deviations,
-   PRINCIPLES cited). One report, two channels: the close reason is the
-   durable copy, the mail is the captain's copy. The captain has no push.
+6. REPORT: after completion, send the captain a concise report on the task
+   thread when one exists. Include status, commit, verification command and
+   result, deviations, and the exact resume point if incomplete.
 
-7. PROMOTE (optional): the loop MAY promote itself to /swarm -- spawn
-   peers -- only when the bead graph shows parallelizable disjoint lanes.
-   Otherwise stay one agent + the summoned reviewer.
+7. PROMOTE (optional): switch explicitly to `/swarm-mode` only when the
+   operator chooses multi-crew execution. Do not silently spawn peers: solo
+   mode remains one current harness plus any explicitly summoned reviewer.
 
 Never ship unverified work; never stall waiting for the human.
 
