@@ -1,3 +1,4 @@
+// governed-by: ADR-0025
 // governed-by: ADR-0005
 //! Workspace doorbell (ADR-0005 D1): ring rules, queue coalesce, inject
 //! gate. The live dispatcher process is spawn-owned; this module is the

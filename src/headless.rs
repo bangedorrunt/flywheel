@@ -1,3 +1,4 @@
+// governed-by: ADR-0025
 //! Headless harness adapter (ADR-0010 Spec A/E, P10.1): runs
 //! `harness -p --mode=json PROMPT` per harness, captures the JSON stream,
 //! and returns response + token usage.

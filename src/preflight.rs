@@ -1,3 +1,4 @@
+// governed-by: ADR-0026
 //! Preflight checks — verify prerequisites for a fleet operation before dispatching.
 //!
 //! Runs before `steer`, `loop run`, and `workflow run --execute` to catch

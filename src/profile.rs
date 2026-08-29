@@ -1,3 +1,4 @@
+// governed-by: ADR-0026
 //! Agent profile catalog (ADR-0005 Spec 1 / Spec 1b).
 //!
 //! A **Profile** is a named, reusable agent composition — the "role template"

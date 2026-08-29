@@ -1,3 +1,6 @@
+// governed-by: ADR-0024
+// governed-by: ADR-0025
+// governed-by: ADR-0026
 //! Local durable state: append-only JSONL event log + checkpoint snapshots.
 //! Location: ~/.local/state/flywheel/<project>.jsonl and checkpoints/<project>/<ts>-<slug>.json
 //!

@@ -1,3 +1,4 @@
+// governed-by: ADR-0024
 //! Auto-crew / smart steering (ADR-0005 Spec 4c / P3.6).
 //!
 //! The orchestrator smartly steers the crew FROM the workflow. The captain
