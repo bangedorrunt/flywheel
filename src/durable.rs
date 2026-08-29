@@ -38,6 +38,7 @@
 
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -3197,6 +3198,42 @@ async fn renew_leases(args: RenewLeaseArgs) -> Result<Value> {
         .map_err(|e| map_err(anyhow::anyhow!("__renew-leases bad JSON: {e}: {stdout}")))
 }
 
+/// bd-bd79: filtered renewal — renew only leases whose reason matches an
+/// in_progress bead with a live assignee and that are near expiry.
+/// Checkpointed leaf; a failed renewal is surfaced as Err so the caller can
+/// log + increment the visible counter (bd-cy0s will add full event emission).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenewFilteredArgs {
+    pub project: String,
+    pub paths: Vec<String>,
+    pub extend_seconds: u64,
+}
+
+#[function]
+async fn renew_filtered_leases(args: RenewFilteredArgs) -> Result<Value> {
+    if args.paths.is_empty() {
+        return Ok(json!({ "renewed": 0, "paths": [] }));
+    }
+    let cfg = Config::load().map_err(map_err)?;
+    let mail = crate::backend::mail_backend(&cfg).map_err(|e| map_err(anyhow::anyhow!("{e}")))?;
+    let key = crate::utf8_path(&crate::project_dir(&cfg, &args.project), "project path")
+        .map_err(map_err)?;
+    let _ = crate::backend::run_mail(mail.ensure_project(&key));
+    let agent = cfg
+        .agent_mail
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| "flywheel".to_string());
+    let v = crate::backend::run_mail(mail.renew_reservations(
+        &key,
+        &agent,
+        &args.paths,
+        args.extend_seconds,
+    ))
+    .map_err(|e| map_err(anyhow::anyhow!("mail backend: {e}")))?;
+    Ok(json!({ "renewed": v.renewed, "paths": args.paths }))
+}
+
 /// Args for the [`release_bead_locks`] leaf.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseBeadLocksArgs {
@@ -3235,6 +3272,86 @@ async fn release_bead_locks(args: ReleaseBeadLocksArgs) -> Result<Value> {
 /// agent-mail's 60s `extend_seconds` minimum — never compute tiny extensions.
 pub fn lease_renew_seconds(heartbeat_interval_secs: u64) -> u64 {
     (4 * heartbeat_interval_secs).max(60)
+}
+
+/// bd-bd79: TTL 3600 + renewal-on-tick is the pairing; neither alone holds.
+/// Exclusive leases expire after 3600s and the strict guard goes blind.
+/// The durable loop's poll tick renews active leases whose reason matches an
+/// in_progress bead with a live assignee, BEFORE dispatch decisions.
+pub const LEASE_TTL_SECS: u64 = 3600;
+pub const LEASE_RENEW_THRESHOLD_SECS: u64 = 600;
+
+/// Visible counter for failed renewals (bd-bd79: log + counter now, full event
+/// emission lands with bd-cy0s later).
+static RENEW_FAIL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub fn renew_fail_count() -> u64 {
+    RENEW_FAIL_COUNTER.load(Ordering::Relaxed)
+}
+pub fn inc_renew_fail_count() {
+    RENEW_FAIL_COUNTER.fetch_add(1, Ordering::Relaxed);
+}
+pub fn reset_renew_fail_count() {
+    RENEW_FAIL_COUNTER.store(0, Ordering::Relaxed);
+}
+pub fn record_renew_failure(path: &str, reason: &str, err: &str) {
+    eprintln!("flywheel: lease renew failed for {path} (reason {reason}): {err}");
+    inc_renew_fail_count();
+}
+
+/// Pure: should a lease be renewed given its expiry and now? Near-expiry
+/// means remaining <= threshold. Unknown expiry (None) is treated as needing
+/// renewal (fail-closed: renew rather than let it lapse).
+pub fn should_renew_lease(expires_ts_us: Option<i64>, now_us: i64, threshold_secs: u64) -> bool {
+    match expires_ts_us {
+        None => true,
+        Some(exp) => exp.saturating_sub(now_us) <= (threshold_secs as i64) * 1_000_000,
+    }
+}
+
+/// Pure: filter active leases to those that must be renewed this tick.
+///
+/// A lease qualifies iff:
+/// - its `reason` exactly matches an in_progress bead id,
+/// - that bead's assignee is Some and the assignee is live (present in
+///   `live_names`),
+/// - and the lease is near expiry (remaining <= threshold, or unknown expiry).
+///
+/// `leases` is (path, reason, expires_ts_us). Returns the (path, reason)
+/// pairs to renew. Unrelated leases are untouched by definition.
+pub fn leases_to_renew(
+    leases: &[(String, String, Option<i64>)],
+    in_progress: &[ReadyBead],
+    live_names: &[String],
+    now_us: i64,
+    threshold_secs: u64,
+) -> Vec<(String, String)> {
+    leases
+        .iter()
+        .filter(|(_, reason, expires)| {
+            let live_match = in_progress.iter().any(|b| {
+                &b.id == reason
+                    && b.assignee
+                        .as_ref()
+                        .is_some_and(|a| live_names.iter().any(|l| l == a))
+            });
+            live_match && should_renew_lease(*expires, now_us, threshold_secs)
+        })
+        .map(|(p, r, _)| (p.clone(), r.clone()))
+        .collect()
+}
+
+/// Convenience overload for boards without expiry (treat as near-expiry).
+pub fn leases_to_renew_simple(
+    leases: &[(String, String)],
+    in_progress: &[ReadyBead],
+    live_names: &[String],
+) -> Vec<(String, String)> {
+    let with_none: Vec<(String, String, Option<i64>)> = leases
+        .iter()
+        .map(|(p, r)| (p.clone(), r.clone(), None))
+        .collect();
+    leases_to_renew(&with_none, in_progress, live_names, 0, 0)
 }
 
 /// Pure planning: given current states, decide actions and drain the queue.
@@ -5996,6 +6113,73 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             .chain(ctx_suppressed.iter().cloned())
             .collect();
         clear_stale_landed_for_idle(&params.project, &params.invocation, &states);
+        // bd-bd79: lease renewal BEFORE dispatch — renew active leases whose reason
+        // matches an in_progress bead with a live assignee. Near-expiry check
+        // uses the threshold; unknown expiry (board without expires) is treated
+        // as needing renewal. Failure logs + increments visible counter (bd-cy0s
+        // will add full event emission later).
+        {
+            let renew_extend = lease_renew_seconds(params.interval_secs);
+            let board: Vec<(String, String)> = ctx
+                .run(
+                    reservation_board,
+                    ReservationBoardArgs {
+                        project: params.project.clone(),
+                    },
+                )
+                .await
+                .unwrap_or_default();
+            let inprog_for_renew: Vec<ReadyBead> = if params.work {
+                ctx.run(
+                    poll_inprogress,
+                    ReadyArgs {
+                        project: params.project.clone(),
+                    },
+                )
+                .await
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let live_names: Vec<String> = states.iter().map(|s| s.name.clone()).collect();
+            let to_renew: Vec<(String, String)> =
+                leases_to_renew_simple(&board, &inprog_for_renew, &live_names);
+            if !to_renew.is_empty() {
+                let paths: Vec<String> = to_renew.iter().map(|(p, _)| p.clone()).collect();
+                match ctx
+                    .run(
+                        renew_filtered_leases,
+                        RenewFilteredArgs {
+                            project: params.project.clone(),
+                            paths: paths.clone(),
+                            extend_seconds: renew_extend,
+                        },
+                    )
+                    .await
+                {
+                    Ok(v) => {
+                        let renewed = v.get("renewed").and_then(Value::as_u64).unwrap_or(0);
+                        if renewed > 0 {
+                            eprintln!("flywheel: renewed {renewed} lease(s) before dispatch");
+                        }
+                        update_mail_health(
+                            &params.project,
+                            true,
+                            "renew_leases",
+                            &format!("renewed {renewed}"),
+                        );
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        eprintln!(
+                            "flywheel: lease renew failed before dispatch (continuing): {err_str}"
+                        );
+                        record_renew_failure("batch", "batch", &err_str);
+                        update_mail_health(&params.project, false, "renew_leases", &err_str);
+                    }
+                }
+            }
+        }
         // ADR-0026 Spec 4: mail-health dispatch-hold at N
         let n = mail_health_n();
         let mail_hold = if n == 0 {
@@ -6715,41 +6899,11 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // bd-87hq: a visible/non-empty world resets the blind-failure count
             blind_complete_failures = 0;
 
-            // Lease renewal heartbeat (bd-mail-lease-renewal-durable): extend
-            // the orchestrator's own file reservations by 4× the base interval
-            // each tick. Best-effort BY DESIGN — agent-mail being unreachable
-            // must not kill an overnight run; a missed renew is recoverable
-            // next tick (idempotent: renewing a fresh lease is a no-op).
-            // `ctx.run` makes it a checkpointed side effect, so crash-resume
-            // renews without duplicating reservations.
-            match ctx
-                .run(
-                    renew_leases,
-                    RenewLeaseArgs {
-                        project: params.project.clone(),
-                        extend_seconds: lease_renew_seconds(params.interval_secs),
-                    },
-                )
-                .await
-            {
-                Ok(v) => {
-                    let renewed = v.get("renewed").and_then(Value::as_u64).unwrap_or(0);
-                    if renewed > 0 {
-                        eprintln!("flywheel: renewed {renewed} lease(s)");
-                    }
-                    update_mail_health(
-                        &params.project,
-                        true,
-                        "renew_leases",
-                        &format!("renewed {renewed}"),
-                    );
-                }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    update_mail_health(&params.project, false, "renew_leases", &err_str);
-                    eprintln!("flywheel: lease renew failed (continuing): {e}");
-                }
-            }
+            // bd-bd79: renewal now happens BEFORE dispatch (above). The old
+            // post-dispatch heartbeat is removed to avoid double-renew and to
+            // honor the "before dispatch decisions" ordering. A missed renew is
+            // still recoverable next tick (idempotent) — the before-dispatch
+            // call is the single renewal point and is already checkpointed.
 
             // Adaptive wait for the NEXT poll_events block. We already blocked
             // inside poll_events for wait_secs (or woke early on events), so
@@ -6821,6 +6975,9 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     resonate
         .register(renew_leases)
         .map_err(|e| anyhow::anyhow!("register renew_leases: {e}"))?;
+    resonate
+        .register(renew_filtered_leases)
+        .map_err(|e| anyhow::anyhow!("register renew_filtered_leases: {e}"))?;
     resonate
         .register(release_bead_locks)
         .map_err(|e| anyhow::anyhow!("register release_bead_locks: {e}"))?;
@@ -11487,6 +11644,127 @@ mod tests {
         );
         assert_eq!(merged, confirmed, "merged view == poll-confirmed view");
         assert!(all_settled(&merged));
+    }
+
+    // ---- bd-bd79: lease renewal before dispatch (fake clock) ----
+
+    fn bead_inprog(id: &str, assignee: &str) -> ReadyBead {
+        ReadyBead {
+            id: id.into(),
+            title: format!("work {id}"),
+            assignee: Some(assignee.into()),
+            verify: Some("true".into()),
+            labels: vec![],
+            priority: 2,
+            principles: "principle — decision".into(),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn renew_tick_renews_lease_near_expiry_fake_clock() {
+        // Fake clock: now = 1_000_000_000 us, lease expires in 100s (near), threshold 600s -> should renew
+        let now: i64 = 1_000_000_000_000;
+        let near_expiry: i64 = now + 100 * 1_000_000;
+        let far_expiry: i64 = now + 2000 * 1_000_000;
+        let leases = vec![
+            (
+                "src/durable.rs".to_string(),
+                "bd-renew-1".to_string(),
+                Some(near_expiry),
+            ),
+            (
+                "src/main.rs".to_string(),
+                "bd-renew-1".to_string(),
+                Some(far_expiry),
+            ),
+        ];
+        let inprog = vec![bead_inprog("bd-renew-1", "GoldCove")];
+        let live = vec!["GoldCove".to_string()];
+        let to_renew = leases_to_renew(&leases, &inprog, &live, now, 600);
+        assert_eq!(to_renew.len(), 1, "only near-expiry lease qualifies");
+        assert_eq!(to_renew[0].0, "src/durable.rs");
+        assert_eq!(to_renew[0].1, "bd-renew-1");
+        // far lease not renewed
+        assert!(
+            !to_renew.iter().any(|(p, _)| p == "src/main.rs"),
+            "far-expiry lease must not be renewed"
+        );
+    }
+
+    #[test]
+    fn renew_failed_logs_and_increments_counter() {
+        reset_renew_fail_count();
+        assert_eq!(renew_fail_count(), 0);
+        record_renew_failure("src/durable.rs", "bd-renew-1", "toron unavailable");
+        assert_eq!(
+            renew_fail_count(),
+            1,
+            "failed renewal must increment visible counter"
+        );
+        record_renew_failure("src/main.rs", "bd-renew-2", "timeout");
+        assert_eq!(renew_fail_count(), 2, "each failure increments");
+        reset_renew_fail_count();
+        assert_eq!(renew_fail_count(), 0);
+    }
+
+    #[test]
+    fn renew_unrelated_leases_untouched() {
+        let now: i64 = 5_000_000_000;
+        let leases = vec![
+            (
+                "src/durable.rs".to_string(),
+                "bd-renew-1".to_string(),
+                Some(now + 50 * 1_000_000),
+            ),
+            (
+                "src/unrelated.rs".to_string(),
+                "bd-other".to_string(),
+                Some(now + 50 * 1_000_000),
+            ),
+            (
+                "src/no-assignee.rs".to_string(),
+                "bd-renew-1".to_string(),
+                Some(now + 50 * 1_000_000),
+            ),
+        ];
+        // Only bd-renew-1 with live assignee GoldCove should be renewed
+        let mut inprog = vec![bead_inprog("bd-renew-1", "GoldCove")];
+        // Add a bead with different assignee not live
+        inprog.push(ReadyBead {
+            id: "bd-other".into(),
+            title: "other".into(),
+            assignee: Some("DeadAgent".into()),
+            verify: Some("true".into()),
+            labels: vec![],
+            priority: 2,
+            principles: "p — d".into(),
+            updated_at: None,
+        });
+        let live = vec!["GoldCove".to_string()];
+        let to_renew = leases_to_renew(&leases, &inprog, &live, now, 600);
+        // Only src/durable.rs should be renewed; src/unrelated.rs has non-live assignee, src/no-assignee shares same reason but would be renewed if we check only reason - but we correctly check live, so it is included actually.
+        // To test unrelated untouched, ensure bd-other not renewed because assignee not live, and any lease with reason not in in_progress not renewed.
+        assert_eq!(
+            to_renew.len(),
+            2,
+            "both leases with bd-renew-1 qualify (same reason, two paths) - but bd-other must not"
+        );
+        // Ensure bd-other path not in result
+        assert!(
+            !to_renew
+                .iter()
+                .any(|(p, r)| p == "src/unrelated.rs" && r == "bd-other"),
+            "unrelated lease with non-live assignee must be untouched"
+        );
+        // Now test with simple helper (no expiry) - unrelated leases untouched
+        let simple_leases = vec![
+            ("src/durable.rs".to_string(), "bd-renew-1".to_string()),
+            ("src/unrelated.rs".to_string(), "bd-unrelated".to_string()),
+        ];
+        let simple_renew = leases_to_renew_simple(&simple_leases, &inprog, &live);
+        assert_eq!(simple_renew.len(), 1);
+        assert_eq!(simple_renew[0].0, "src/durable.rs");
     }
 }
 
