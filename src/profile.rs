@@ -22,7 +22,7 @@
 //! prime-agent, ...) needs a `program` value + a spawn recipe in config — no
 //! code change for a harness speaking an existing backend protocol.
 //!
-//! governed-by: ADR-0005 (Spec 1, Spec 1b), ADR-0003 (G14)
+//! governed-by: ADR-0005 (Spec 1, Spec 1b), ADR-0003 (G14), ADR-0026
 
 // TODO(bd-p2-cli-wn8): drop this allow once `flywheel profile {list,show,...}`
 // consumes the catalog (the module is test-exercised until then).
@@ -93,6 +93,9 @@ pub struct Profile {
     /// layer may wire them as extra context. Catalog-only, never on the bus.
     #[serde(default)]
     pub skills: Vec<String>,
+    /// Fallback chain for this profile (ADR-0026 Spec 3)
+    #[serde(default)]
+    pub fallback: Vec<String>,
 }
 
 /// `[harness.<name>]` section (ADR-0005 Spec 1): a spawn recipe for a harness
@@ -248,6 +251,11 @@ impl ProfileCatalog {
                             } else {
                                 user.skills
                             },
+                            fallback: if user.fallback.is_empty() {
+                                base.fallback.clone()
+                            } else {
+                                user.fallback
+                            },
                         };
                         profiles.insert(name, merged);
                     }
@@ -259,6 +267,13 @@ impl ProfileCatalog {
             harnesses.extend(toml.harness);
         }
 
+        for (name, profile) in &profiles {
+            for fb in &profile.fallback {
+                if !profiles.contains_key(fb) {
+                    anyhow::bail!("profile '{name}' fallback '{fb}' is not in the catalog");
+                }
+            }
+        }
         Ok(Self {
             profiles,
             harnesses,
@@ -694,7 +709,10 @@ behavior = "be terse"
             "jcode spawn recipe launches the jcode TUI"
         );
         let coder = cat.get("coder").expect("coder present");
-        assert_eq!(coder.harness, "jcode", "coder defaults to the jcode harness");
+        assert_eq!(
+            coder.harness, "jcode",
+            "coder defaults to the jcode harness"
+        );
         assert_eq!(
             coder.provider, "opencode-go",
             "coder pins the opencode-go provider"
@@ -1090,5 +1108,44 @@ spawn_cmd = "hermes --project {project} --role {role}"
         use crate::config::Recipe;
         let squad = Squad::from_recipe(&Recipe::default());
         assert!(squad.counts.is_empty(), "empty recipe -> empty squad");
+    }
+    #[test]
+    fn fallback_unknown_name_fails_at_load() {
+        let path = tmp_profiles_toml(
+            r#"
+[profiles.coder]
+harness = "jcode"
+model = "muse-spark-1.2-contributor"
+fallback = ["coder-backup", "ghost"]
+[profiles.coder-backup]
+harness = "jcode"
+model = "muse-spark-1.2-contributor"
+"#,
+        );
+        let err = ProfileCatalog::load_from(Some(&path)).expect_err("unknown fallback must fail");
+        assert!(err.to_string().contains("ghost"));
+    }
+    #[test]
+    fn fallback_chain_loads_when_known() {
+        let path = tmp_profiles_toml(
+            r#"
+[profiles.coder]
+harness = "jcode"
+model = "muse-spark-1.2-contributor"
+fallback = ["scout"]
+[profiles.scout]
+harness = "opencode"
+model = "big-pickle"
+"#,
+        );
+        let cat = ProfileCatalog::load_from(Some(&path)).expect("known fallback loads");
+        assert_eq!(cat.get("coder").unwrap().fallback, vec!["scout"]);
+    }
+    #[test]
+    fn fallback_empty_by_default() {
+        let cat = ProfileCatalog::load_from(None).expect("defaults");
+        for name in cat.names() {
+            assert!(cat.get(&name).unwrap().fallback.is_empty());
+        }
     }
 }
