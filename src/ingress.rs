@@ -30,9 +30,10 @@ pub struct WatchHit {
 }
 
 /// The one ingress type: Jido's sensor shape onto the spine we already run
-/// (ADR-0025 Spec 6). Unification is the enum — no new bus.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// (ADR-0025 Spec 6). Unification is the enum — no new bus. Adjacent
+/// tagging so the inner `HerdrEvent` type tag never collides.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "ingress", content = "payload", rename_all = "snake_case")]
 pub enum IngressEvent {
     Herdr(HerdrEvent),
     Watch(WatchHit),
@@ -41,12 +42,9 @@ pub enum IngressEvent {
 }
 
 /// Adapter sinks [`handle_ingress`] fans out to. Injected, never global.
-/// The one ingress type: Jido's sensor shape onto the spine we already run
-/// (ADR-0025 Spec 6). Unification is the enum — no new bus. Adjacent
-/// tagging so inner enums (HerdrEvent's own `type` tag) never collide.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "ingress", content = "payload", rename_all = "snake_case")]
-pub enum IngressEvent {
+pub struct IngressAdapters {
+    pub herdr: Box<dyn Fn(&HerdrEvent) + Send + Sync>,
+    pub watch: Box<dyn Fn(&WatchHit) + Send + Sync>,
     pub workflow: Box<dyn Fn(&Trigger) + Send + Sync>,
     pub cron: Box<dyn Fn(&str) + Send + Sync>,
 }
@@ -65,7 +63,8 @@ pub fn handle_ingress(event: &IngressEvent, adapters: &IngressAdapters) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     type Hits = Arc<Mutex<Vec<String>>>;
 
@@ -83,26 +82,26 @@ mod tests {
                 let hits = herdr_hits.clone();
                 Box::new(move |e: &HerdrEvent| {
                     if let HerdrEvent::PaneExited { herdr_name, .. } = e {
-                        hits.lock().unwrap().push(herdr_name.clone());
+                        hits.lock().push(herdr_name.clone());
                     }
                 })
             },
             watch: {
                 let hits = watch_hits.clone();
                 Box::new(move |_w: &WatchHit| {
-                    hits.lock().unwrap().push("watch".into());
+                    hits.lock().push("watch".into());
                 })
             },
             workflow: {
                 let hits = wf_hits.clone();
                 Box::new(move |_t: &Trigger| {
-                    hits.lock().unwrap().push("trigger".into());
+                    hits.lock().push("trigger".into());
                 })
             },
             cron: {
                 let hits = cron_hits.clone();
                 Box::new(move |name: &str| {
-                    hits.lock().unwrap().push(name.to_string());
+                    hits.lock().push(name.to_string());
                 })
             },
         };
@@ -132,10 +131,10 @@ mod tests {
             &adapters,
         );
 
-        assert_eq!(herdr_hits.lock().unwrap().len(), 1, "pane_exited routed");
-        assert_eq!(wf_hits.lock().unwrap().len(), 1, "trigger routed");
-        assert_eq!(*cron_hits.lock().unwrap(), vec!["weekly".to_string()]);
-        assert_eq!(watch_hits.lock().unwrap().len(), 1, "watch routed");
+        assert_eq!(herdr_hits.lock().len(), 1, "pane_exited routed");
+        assert_eq!(wf_hits.lock().len(), 1, "trigger routed");
+        assert_eq!(*cron_hits.lock(), vec!["weekly".to_string()]);
+        assert_eq!(watch_hits.lock().len(), 1, "watch routed");
     }
 
     #[test]
@@ -165,8 +164,7 @@ mod tests {
         for e in events {
             let json = serde_json::to_string(&e).expect("serialize");
             let back: IngressEvent = serde_json::from_str(&json).expect("deserialize");
-            let back_json = serde_json::to_string(&back).expect("serialize back");
-            assert_eq!(back_json, json, "round trip lossless for {json}");
+            assert_eq!(back, e, "round trip lossless for {json}");
         }
     }
 }
