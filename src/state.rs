@@ -1487,12 +1487,12 @@ mod loops_schema_v2_tests {
         assert_eq!(schema, 1);
 
         let body = serialize_loops_registry(&map).unwrap();
-        // written body is always schema v2
+        // written body is always current schema version (v3 after mail_health)
         let written: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(written["schema"], 2);
+        assert_eq!(written["schema"], LOOPS_SCHEMA_VERSION);
 
         let (schema2, map2) = parse_loops_registry(&body);
-        assert_eq!(schema2, 2);
+        assert_eq!(schema2, LOOPS_SCHEMA_VERSION);
         assert_eq!(map2.len(), 2);
 
         let a1 = map.get("/tmp/proj-a").unwrap();

@@ -359,7 +359,9 @@ pub fn compose_workflow_with(
         // composed workflow so the recipe's template refs lint clean.
         if let ComposePart::Recipe { name } = part {
             let expanded = crate::builtin_workflows::builtin_recipe(name).ok_or_else(|| {
-                anyhow::anyhow!("compose part {name:?}: unknown builtin recipe (known: wave-swarm)")
+                anyhow::anyhow!(
+                    "compose part {name:?}: unknown builtin recipe (known: wave-swarm, repair-until-verified)"
+                )
             })?;
             for input in expanded.inputs {
                 if !steps_has_input(&extra_inputs, &input.name)
