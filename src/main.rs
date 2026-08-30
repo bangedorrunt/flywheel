@@ -111,6 +111,84 @@ fn record_reroute_audit(
     );
 }
 
+/// ADR-0025 Spec 5 plane tripwires — pure, testable helper for `cmd_send`.
+/// - secret → public fires only on explicit `--plane s` (or channel post);
+///   default (no plane) stays private — classifier never flips to public.
+/// - job-assign → private fires on gift-wrap (private) wires.
+/// - `--unsafe-plane` is the only audited escape (stderr JSON inside check_*);
+///   `--raw` never bypasses.
+fn check_send_plane_tripwires(
+    text: &str,
+    plane: Option<&str>,
+    unsafe_plane: bool,
+    raw: bool,
+) -> Result<()> {
+    let is_public = matches!(plane, Some("s"));
+    if is_public {
+        plane_route::check_secret_tripwire(text, None, false, &[], plane, unsafe_plane, raw)
+            .map_err(|e| anyhow!(e))?;
+    }
+    let is_gift_wrap = !is_public && !matches!(plane, Some("j") | Some("job"));
+    if is_gift_wrap {
+        let has_mention = text.contains('@');
+        let has_p = has_mention;
+        plane_route::check_job_tripwire(text, has_p, false, false, true, plane, unsafe_plane, raw)
+            .map_err(|e| anyhow!(e))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod plane_tripwire_tests {
+    use super::check_send_plane_tripwires;
+
+    #[test]
+    fn plane_tripwire_secret_via_plane_s_errors() {
+        let err = check_send_plane_tripwires("nsec1abc secret", Some("s"), false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plane_error: secrets use mail send"), "{err}");
+        assert!(err.contains("toron mail send"), "{err}");
+    }
+
+    #[test]
+    fn plane_tripwire_unsafe_plane_overrides_audited() {
+        assert!(check_send_plane_tripwires("nsec1abc secret", Some("s"), true, false).is_ok());
+        assert!(check_send_plane_tripwires("@Alice fix job", None, true, false).is_ok());
+    }
+
+    #[test]
+    fn plane_tripwire_raw_does_not_bypass() {
+        let err = check_send_plane_tripwires("nsec1abc secret", Some("s"), false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plane_error"), "raw should not bypass: {err}");
+        let err2 = check_send_plane_tripwires("@Bob work assign", None, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err2.contains("plane_error"),
+            "raw should not bypass job: {err2}"
+        );
+    }
+
+    #[test]
+    fn plane_tripwire_default_private_unchanged() {
+        assert!(check_send_plane_tripwires("hello world", None, false, false).is_ok());
+        assert!(check_send_plane_tripwires("hello world", Some("s"), false, false).is_ok());
+        // job assign on default private should error
+        let err = check_send_plane_tripwires("@Alice fix the bug", None, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("plane_error: work assignment uses the job plane"),
+            "{err}"
+        );
+        // but on job plane it should not error
+        assert!(check_send_plane_tripwires("@Alice fix", Some("j"), false, false).is_ok());
+    }
+}
+
 // ---- stage prompts (ADR-0005 Spec 2a / P3.3) ----
 //
 // Resolved through the `stages` library: compiled-in defaults (the former
@@ -355,6 +433,17 @@ enum Commands {
         /// for nudges and mail wakes that must not carry role behavior.
         #[arg(long)]
         raw: bool,
+        /// ADR-0025 Spec 5: explicit plane override. Private by default
+        /// (pane prompt + gift-wrap completion mail); `--plane s` is the
+        /// explicit public act (kind-9 / channel). Classifier never flips
+        /// default to public.
+        #[arg(long)]
+        plane: Option<String>,
+        /// ADR-0025 Spec 5: audited escape for plane tripwires. Only
+        /// `--unsafe-plane` bypasses a tripwire (audited to stderr JSON);
+        /// `--raw` never bypasses.
+        #[arg(long = "unsafe-plane")]
+        unsafe_plane: bool,
     },
     /// Interrupt an agent (sends Escape by default — cancels the current
     /// tool call and returns to the prompt). Kill-style keys (ctrl+c) are
@@ -3509,6 +3598,8 @@ fn main() {
             force,
             respawn_on_stall,
             raw,
+            plane,
+            unsafe_plane,
         }) => cmd_send(
             &cfg,
             project,
@@ -3521,6 +3612,8 @@ fn main() {
             *force,
             *respawn_on_stall,
             *raw,
+            plane.as_deref(),
+            *unsafe_plane,
         ),
         Some(Commands::Interrupt {
             project,
@@ -10634,6 +10727,8 @@ fn cmd_send(
     force: bool,
     respawn_on_stall: bool,
     raw: bool,
+    plane: Option<&str>,
+    unsafe_plane: bool,
 ) -> Result<()> {
     let text = match (stage, msg) {
         // ADR-0006 D1: --param k=v substitutes the stage template's {{k}}
@@ -10662,6 +10757,8 @@ fn cmd_send(
             );
         }
     }
+
+    check_send_plane_tripwires(&text, plane, unsafe_plane, raw)?;
 
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
@@ -21051,6 +21148,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     "steps": wf.steps.len(),
                     "graph_nodes": wf.graph.as_ref().map(|g| g.nodes.len()),
                     "inputs": wf.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(),
+                    "decide_trigger": crate::decide::decide_trigger_for(name),
                 }));
             }
             print_json(&json!({ "workflows": rows }));
