@@ -5,7 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] — 2026-08-29/30 orchestration campaign (ADR-0024/0025/0026)
+
+### ✨ Added
+
+- **Engine kind-aware `fail_run` (ADR-0024 Spec 1)** — `rate_limit`/`timeout` retry the same
+  node with backoff (bounded by the enclosing `retry`, default 3) before escalating;
+  `auth`/`blocked`/`cancelled` abort. R-E1/E2/E3 lint rules fire at compose time.
+- **RECIPE compose expansion keeps `graph`** — `--parts repair-until-verified` yields the full
+  3-cycle graph (was: steps-only copy expanded empty). Collision-safe node merging; builtin
+  `on_error` preserved verbatim through expansion.
+- **Loop graph vehicle (bd-27d0/bd-bpd9)** — a bead opting in via `## WORKFLOW <name>` (or a
+  `workflow:<name>` label) runs its composed builtin through a detached pane-mode engine
+  invocation; in-graph verify writes a workflow receipt; close still requires loop VERIFY +
+  `CommandVerified`; bare path byte-identical; marker-file dedupe survives loop recovery.
+  Title text never opts in (the c57dfd4-era stub removed).
+- **Failure taxonomy + funded preflight + fallback chains (ADR-0026 W1)** — `FailureKind`
+  classifier at spawn/send/headless (signature table, no-match = Unknown with evidence),
+  one-reroute-per-class fallback chains with audit rows, provider-funded preflight, pane-path
+  fallback hop, unknown fallback names fail at catalog load.
+- **Bounded mail-health escalation (ADR-0026 W2)** — `loops.json` v3 `mail_health`; 3 consecutive
+  renew/lease failures stop new dispatch + escalate (kind-14) until a success; loop-start
+  fails loud without a usable identity key.
+- **Lease reclaim (ADR-0025 W1)** — `pane_exited` reclaim with respawn-race suppression,
+  7200s/86400s staleness tiers, reservation release by reason, audit comment; never `br close`.
+- **Typed artifacts + stitcher (ADR-0025 W2)** — `ArtifactRecord` (four status vocabularies +
+  grounding), `flywheel artifacts <run_id> [--json]` / `artifacts stitch`; admission requires
+  embedding support, never worker self-rating.
+- **Loop reducer + journal (ADR-0025 W3)** — `tick(&LoopModel, &LoopMsg)` total reducer,
+  `LoopPhase` illegal transitions unrepresentable, Msg journal + `loop replay` / `loop why`,
+  `LoopSnapshot` (delivery-verdict carrier, deferred).
+- **Parent-death policy (ADR-0025 W4a)** — `on_captain_death: stop|continue|adopt` (default
+  stop; stop implies `--force-working` for attributed pins); `toron contact captain --clear`.
+- **Plane tripwires (ADR-0025 W4b)** — secret→public and job-assign→private fail closed at
+  send with named remedies; `--unsafe-plane` audited; `--raw` does not bypass.
+- **Ingress + launch idempotency (ADR-0025 W5)** — `IngressEvent` seam + `handle_ingress`;
+  spawn/compose keyed by `(project, run_id|bead, profile)`, dead-pane = respawn; compose
+  `--run` replays recorded executions.
+- **Evidence-bearing approvals (ADR-0024 Spec 3)** — promise payload carries
+  `nodes_completed/failed/pending`, artifact paths, `ledger_path`, `evidence_hash`; a different
+  hash is a new question; reject is a decision.
+- **PaneStalled classification** — stall detection with evidence-tail sampling classifies
+  `rate_limit`/`network`/`model_truncated`/`silent_idle`; watching tier before Diagnose.
+- **Mailbox/channel wake completeness** — `MailDelivered` metadata ring (content stays sealed),
+  `AckSlaExpired` events, watch kinds include channel join/leave (39002).
+- **GitFact producer** — the strict pre-commit guard appends attributed commit facts to the
+  flywheel fact journal (best-effort, never blocks).
+
+### 🔧 Fixed
+
+- **Non-vacuous VERIFY evidence** — receipt/loop paths parse test counts; a zero-match filter
+  warns (and refuses in strict mode) instead of closing green on nothing.
+- **channel react after post** — react target hydrates from the bus (was: unknown-message
+  failure right after post; also unblocked e2e sc30).
+- **reopen_flow fixture** — carries the loop-ready fence `br ready` now requires.
+
+### 🧹 Removed
+
+- Unused `figure-it-out` builtin YAML (decide routes it to `compose --agent`).
+- `assert!(true)` padding tests and the title-contains-`graph` vehicle stub.
+
+
+
 
 ### ✨ Added
 
