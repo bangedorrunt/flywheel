@@ -1,11 +1,12 @@
 // governed-by: ADR-0025
 //! One ingress seam (ADR-0025 Spec 6): herdr events, toron watch hits, YAML
-//! workflow triggers, and cron ticks all arrive as one [`IngressEvent`] —
-//! the same Msg type as Spec 3's `LoopMsg` — and flow through
-//! [`handle_ingress`]. Adapters are injected closures; this module does no
-//! IO. The runtime wires the real leaves (herdr subscribe, doorbell,
-//! WorkflowHost notify, cron runner) at the call sites.
-
+//! workflow triggers, and cron ticks all arrive as one [`IngressEvent`] and
+//! are mapped into Spec 3's [`crate::durable::LoopMsg`] at the
+//! [`handle_ingress`] boundary (bd-0or2). Two enums, one seam — no new bus.
+//! Adapters are injected closures; this module does no IO. The runtime wires
+//! the real leaves (herdr subscribe, doorbell, WorkflowHost notify, cron
+//! runner) at the call sites. Zero behavior change: `tick` + journal remain
+//! the pins.
 use serde::{Deserialize, Serialize};
 use toron_workflow::schema::Trigger;
 
@@ -170,6 +171,46 @@ impl Default for IngressAdapters {
             cron: Box::new(|_| {}),
             fact: Box::new(|_| {}),
         }
+    }
+}
+
+/// bd-0or2 seam: map the unified [`IngressEvent`] bus into the typed
+/// [`crate::durable::LoopMsg`] boundary (ADR-0025 Spec 6 deviation noted in
+/// AGENTS.md 2026-08-30). Zero behavior change — `tick` + journal stay the
+/// reducer pins; this is the typed conversion at the `handle_ingress` seam.
+pub fn ingress_to_loop_msg(event: &IngressEvent) -> Option<crate::durable::LoopMsg> {
+    match event {
+        IngressEvent::Herdr(he) => {
+            let pe = match he {
+                HerdrEvent::PaneAgentStatusChanged { pane_id, status } => {
+                    crate::durable::PollEvent {
+                        event_type: "agent_status".into(),
+                        pane_id: pane_id.clone(),
+                        agent: None,
+                        status: Some(status.clone()),
+                        seq: 0,
+                    }
+                }
+                HerdrEvent::PaneExited {
+                    pane_id,
+                    herdr_name,
+                } => crate::durable::PollEvent {
+                    event_type: "pane_exited".into(),
+                    pane_id: pane_id.clone(),
+                    agent: Some(herdr_name.clone()),
+                    status: None,
+                    seq: 0,
+                },
+            };
+            Some(crate::durable::LoopMsg::Herdr(pe))
+        }
+        IngressEvent::LedgerFact { bead_id, .. } => Some(crate::durable::LoopMsg::BrClose {
+            bead_id: bead_id.clone(),
+        }),
+        // Watch/Workflow/Cron/Fact map is intentionally None today — they fan
+        // into doorbell or fact journal, not LoopMsg::Tick. The seam exists so
+        // a future tick arm can be added without a second bus.
+        _ => None,
     }
 }
 
@@ -450,5 +491,30 @@ mod tests {
         let back: IngressEvent = serde_json::from_str(&json).unwrap();
         let back_json = serde_json::to_string(&back).unwrap();
         assert_eq!(back_json, json);
+    }
+
+    #[test]
+    fn bd0or2_ingress_to_loop_msg_seam_exists_and_maps_herdr() {
+        let he = IngressEvent::Herdr(HerdrEvent::PaneExited {
+            pane_id: "w1:p1".into(),
+            herdr_name: "oc".into(),
+        });
+        let lm = ingress_to_loop_msg(&he).expect("herdr must map to LoopMsg::Herdr");
+        assert!(matches!(lm, crate::durable::LoopMsg::Herdr(_)));
+        let lf = IngressEvent::LedgerFact {
+            bead_id: "bd-123".into(),
+            event: LedgerEvent::Closed,
+        };
+        let lm2 = ingress_to_loop_msg(&lf).expect("ledger fact maps to BrClose");
+        assert!(matches!(lm2, crate::durable::LoopMsg::BrClose { .. }));
+        let watch = IngressEvent::Watch(WatchHit {
+            project: "flywheel".into(),
+            kind: "9".into(),
+            event_id: None,
+        });
+        assert!(
+            ingress_to_loop_msg(&watch).is_none(),
+            "watch stays on doorbell, not loop"
+        );
     }
 }

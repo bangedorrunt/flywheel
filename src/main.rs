@@ -7543,7 +7543,12 @@ fn cmd_internal_doorbell(
             use toron_core::bus::Filter;
             use toron_core::nostr::kinds::toron_kind;
             Filter::new()
-                .kinds([toron_kind(9), toron_kind(43001), toron_kind(30031)])
+                .kinds([
+                    toron_kind(9),
+                    toron_kind(43001),
+                    toron_kind(30031),
+                    toron_kind(39002),
+                ])
                 .hashtag(project)
         };
         let mut sub = crate::mail_shim::block_on(bus.subscribe_trusted(filter)).ok()?;
@@ -7883,6 +7888,11 @@ fn cmd_internal_doorbell(
                     workspace,
                     generation.as_ref(),
                 );
+                // GS-006 bug 3: Ack-SLA was test-only (0 production callers). Doorbell 1s tick is the live caller.
+                // Pin audience now includes raw pin names (messaging.rs fix), so the kind-9 wake addresses.
+                if let Some(mb) = crate::mail_shim::try_mailbox() {
+                    let _ = crate::mail_shim::block_on(mb.check_ack_sla_expired(project, None));
+                }
                 // ADR-0005: subscribe is the drain signal. Poll herdr only
                 // when the event spine is down.
                 if !subscribed {
@@ -10415,20 +10425,20 @@ pub fn facts_count_and_last(project: &str) -> (usize, Option<String>) {
 /// Captain surface: a fact becomes a single `[doorbell] <summary>` inject
 /// line for the captain pane. Reuses the existing `doorbell_prompt` wake
 /// path (herdr `agent_prompt` with pane fallback). No new Nostr kinds.
+/// GS-006: NO alias or alias not in registry is a loud miss (FactMiss), not
+/// silent Ok(()), and never falls back to registry.first() (crew[0] misroute).
 pub fn captain_fact_inject(project: &str, event: &ingress::IngressEvent) -> Result<()> {
     let Some(line) = ingress::fact_doorbell_line(event) else {
         return Ok(());
     };
     // persist for status (facts ride the journal/watch line, ADR-0014 intact)
     let _ = append_fact(project, event);
-    // find captain pin — alias first, then first registry pin as fallback
-    let captain_pin = state::load_captain_alias(project).or_else(|| {
-        state::load_spawn_registry(project)
-            .first()
-            .and_then(|e| e.mail_identity.clone())
-    });
-    let Some(pin) = captain_pin else {
-        return Ok(());
+    // GS-006: alias is the ONLY captain route; empty after Continue/Adopt means nowhere loud.
+    let Some(pin) = state::load_captain_alias(project) else {
+        eprintln!(
+            "flywheel: [FactMiss] no captain alias for project {project}: fact not injected (loud)"
+        );
+        anyhow::bail!("captain fact miss: no alias for project {project}");
     };
     // reuse doorbell_prompt path (herdr inject, pane fallback)
     let registry = state::load_spawn_registry(project);
@@ -10436,14 +10446,16 @@ pub fn captain_fact_inject(project: &str, event: &ingress::IngressEvent) -> Resu
         .iter()
         .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()));
     let Some(entry) = entry else {
-        return Ok(());
+        eprintln!(
+            "flywheel: [FactMiss] captain alias {pin} not in registry for {project}: fact not injected (loud)"
+        );
+        anyhow::bail!("captain fact miss: alias {pin} not in registry for {project}");
     };
-    // best-effort herdr connect; silent if herdr down (facts still journaled)
-    let Ok(mut client) = Client::connect(Some(
+    // best-effort herdr connect; loud if herdr down (facts still journaled)
+    let mut client = Client::connect(Some(
         &config::Config::load().unwrap_or_default().socket_path(),
-    )) else {
-        return Ok(());
-    };
+    ))
+    .context("captain fact miss: herdr unavailable")?;
     match client.agent_prompt(&entry.name, &line, None) {
         Ok(_) => {}
         Err(e) if is_agent_not_ready(&e.code) => {
@@ -10453,6 +10465,10 @@ pub fn captain_fact_inject(project: &str, event: &ingress::IngressEvent) -> Resu
         Err(e) => {
             eprintln!(
                 "flywheel: captain fact inject failed for {}: {e:#}",
+                entry.name
+            );
+            anyhow::bail!(
+                "captain fact miss: herdr inject failed for {}: {e:#}",
                 entry.name
             );
         }
@@ -13822,6 +13838,16 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             for t in &targets {
                 if t.eq_ignore_ascii_case("captain") {
                     state::resolve_captain_target(project, t)?;
+                }
+            }
+            // GS-006 plane tripwire: mail is gift-wrap private. Job-assign via private gift-wrap is the wrong plane
+            // (should be channel/doorbell/job). Secret→public does not fire here (mail is private, safe), but job→private does.
+            {
+                let has_p = !targets.is_empty();
+                if let Err(e) = crate::plane_route::check_job_tripwire(
+                    body, has_p, false, false, true, None, false, false,
+                ) {
+                    anyhow::bail!(e);
                 }
             }
             let v = mail.send(
