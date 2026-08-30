@@ -15687,6 +15687,7 @@ fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                 .unwrap_or(3),
             principles: durable::principles_typed_field(&b),
             updated_at: None,
+            ..Default::default()
         })
         .collect())
 }
@@ -15747,6 +15748,7 @@ fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                 .unwrap_or(3),
             principles: durable::principles_typed_field(b),
             updated_at: None,
+            ..Default::default()
         })
         .collect())
 }
@@ -16479,6 +16481,16 @@ fn cmd_loop(
         let mut any_work = false;
         for action in &actions {
             match action {
+                // bd-bpd9: graph vehicles spawn inline in the durable
+                // swarm loop; the sync planner never emits InvokeGraph.
+                // Covered for exhaustiveness.
+                durable::LoopAction::InvokeGraph {
+                    bead_id, workflow, ..
+                } => {
+                    eprintln!(
+                        "flywheel: [bd-bpd9] sync loop ignored InvokeGraph for {bead_id} ({workflow}) — vehicle spawns in the durable loop"
+                    );
+                }
                 // ADR-0001 Wave 3: stamp pin before dispatch — same leaf as
                 // the durable loop, best-effort, never blocks the send.
                 durable::LoopAction::PinStamp { bead_id, pin } => {
@@ -17114,6 +17126,7 @@ mod loop_tests {
                 priority: 3,
                 principles: String::new(),
                 updated_at: None,
+                ..Default::default()
             },
             durable::ReadyBead {
                 id: "bd-r2".into(),
@@ -17124,6 +17137,7 @@ mod loop_tests {
                 priority: 3,
                 principles: String::new(),
                 updated_at: None,
+                ..Default::default()
             },
         ];
         let ready = vec![durable::ReadyBead {
@@ -17135,6 +17149,7 @@ mod loop_tests {
             priority: 3,
             principles: String::new(),
             updated_at: None,
+            ..Default::default()
         }];
         let mut assigned = Vec::new();
         let prompts = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
@@ -17160,6 +17175,7 @@ mod loop_tests {
             priority: 3,
             principles: String::new(),
             updated_at: None,
+            ..Default::default()
         }];
         let ready = vec![durable::ReadyBead {
             id: "bd-r1".into(),
@@ -17170,6 +17186,7 @@ mod loop_tests {
             priority: 3,
             principles: String::new(),
             updated_at: None,
+            ..Default::default()
         }];
         let mut assigned = vec!["bd-r1".to_string()];
         let prompts = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
@@ -17187,6 +17204,7 @@ mod loop_tests {
             priority: 3,
             principles: String::new(),
             updated_at: None,
+            ..Default::default()
         }];
         let mut assigned = Vec::new();
         let prompts = work_prompts(&[], &ready, &mut assigned, "flywheel");
