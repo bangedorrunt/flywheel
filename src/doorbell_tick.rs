@@ -84,6 +84,13 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             };
             let items: Vec<&serde_json::Value> = match &v {
                 serde_json::Value::Array(arr) => arr.iter().collect(),
+                // `fetch_inbox` also emits a {"messages":[...]} wrapper —
+                // treat it as the row list, not a single unparseable item.
+                other if other.get("messages").is_some() => other
+                    .get("messages")
+                    .and_then(|m| m.as_array())
+                    .map(|arr| arr.iter().collect())
+                    .unwrap_or_default(),
                 other => vec![other],
             };
             for item in items {
@@ -240,6 +247,39 @@ mod tests {
         let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
         assert!(actions.is_empty(), "unaddressed chatter must not ring");
         assert!(next.queues.is_empty());
+    }
+
+    #[test]
+    fn doorbell_tick_inbox_messages_wrapper_parses() {
+        // fetch_inbox also emits {"messages":[...]} — must expand, not treat
+        // the wrapper as one unparseable row.
+        let model = model_with("BlueRidge");
+        let raw = r#"{"messages":[{"importance":"urgent"},{"importance":"high"},{"importance":"normal"}]}"#;
+        let (_, actions) = tick(
+            &model,
+            &DoorbellMsg::InboxItems {
+                raw: raw.into(),
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert_eq!(actions.len(), 2, "urgent+high ring, normal stays quiet");
+    }
+
+    #[test]
+    fn doorbell_tick_bad_inbox_json_is_loud_audit() {
+        let model = model_with("BlueRidge");
+        let (_, actions) = tick(
+            &model,
+            &DoorbellMsg::InboxItems {
+                raw: "{not json".into(),
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "inbox_parse_failure"),
+            "parse failure must be a loud audit, got {:?}",
+            actions
+        );
     }
 }
 

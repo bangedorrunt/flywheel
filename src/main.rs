@@ -7679,6 +7679,9 @@ fn cmd_internal_doorbell(
     // scan is waste. 60s keeps the wake prompt while off the hot loop.
     let mut last_ack_sla_check: u64 = 0;
     const ACK_SLA_CHECK_SECS: u64 = 60;
+    // Watch respawn retry gate (GS-007): unix secs of the next respawn try.
+    let mut watch_retry_at: Option<u64> = None;
+    const WATCH_RETRY_SECS: u64 = 16;
     let mut subscribed = false;
     if let Ok(mut sub_client) = Client::connect(Some(&cfg.socket_path())) {
         let registry = state::load_spawn_registry(project);
@@ -7713,6 +7716,47 @@ fn cmd_internal_doorbell(
     loop {
         if !path.exists() {
             break;
+        }
+        // GS-006 bug 3: Ack-SLA was test-only (0 production callers). The dispatcher
+        // tick is the live caller, gated to once per 60s (30-min SLA needs no 1 Hz SQL
+        // scan). Runs at loop top so heavy watch traffic cannot starve it (a Timeout-
+        // only placement starves whenever events keep arriving).
+        let now_s = doorbell_now_unix();
+        if now_s.saturating_sub(last_ack_sla_check) >= ACK_SLA_CHECK_SECS {
+            last_ack_sla_check = now_s;
+            if let Some(mb) = crate::mail_shim::try_mailbox() {
+                let _ = crate::mail_shim::block_on(mb.check_ack_sla_expired(project, None));
+            }
+        }
+        // GS-007: a watch that died and exhausted its restart burst must not leave
+        // the dispatcher permanently deaf — heal_tick will NOT heal a live pid.
+        // One non-blocking respawn attempt per pass from here, forever.
+        if let Some(at) = watch_retry_at
+            && doorbell_now_unix() >= at
+        {
+            let tx_g = tx.clone();
+            match spawn_watch_child(project, move |ev| {
+                let _ = match ev {
+                    Some(l) => tx_g.send(Bell::Watch(l)),
+                    None => tx_g.send(Bell::Died),
+                };
+            }) {
+                Some(child) => {
+                    watch_child = Some(child);
+                    watch_retry_at = None;
+                    eprintln!("flywheel doorbell: watch respawned from retry gate");
+                    doorbell::audit_append(
+                        &config::state_dir(),
+                        workspace,
+                        serde_json::json!({
+                            "ts": chrono::Utc::now().to_rfc3339(),
+                            "workspace": workspace,
+                            "kind": "watch_restart",
+                        }),
+                    );
+                }
+                None => watch_retry_at = Some(doorbell_now_unix() + WATCH_RETRY_SECS),
+            }
         }
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Bell::Watch(line)) => {
@@ -7786,10 +7830,9 @@ fn cmd_internal_doorbell(
                     workspace,
                     generation.as_ref(),
                 );
-                doorbell_persist_wake_with_plane_s(
+                doorbell_persist_wake(
                     workspace,
                     &since_by_pin,
-                    plane_s_cursor_us,
                     injects.first().map(|(pin, _)| pin.as_str()),
                 );
             }
@@ -7822,74 +7865,48 @@ fn cmd_internal_doorbell(
                 );
             }
             Ok(Bell::Died) => {
-                // Gap 3 fix: watch self-restart with backoff instead of deaf break
+                // Gap 3 fix: watch self-restart with backoff instead of deaf break.
+                // If the burst exhausts, watch_retry_at keeps single-shot respawns
+                // coming from the 1s pass — heal_tick will NOT heal a live pid, so
+                // the dispatcher itself must never give up (GS-007 never-deaf rule).
                 eprintln!("flywheel doorbell: watch died, restarting with backoff");
                 let mut backoff = 1u64;
                 let mut restarted = false;
                 for _ in 0..5 {
                     std::thread::sleep(Duration::from_secs(backoff));
-                    let kinds = "9,43001,30031,39002";
-                    match Command::new("toron")
-                        .args(["watch", "--project", project, "--kinds", kinds])
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::null())
-                        .spawn()
-                    {
-                        Ok(mut child) => {
-                            if let Some(stdout) = child.stdout.take() {
-                                watch_child = Some(child);
-                                let tx_w = tx.clone();
-                                std::thread::spawn(move || {
-                                    use std::io::BufRead;
-                                    for line in std::io::BufReader::new(stdout).lines() {
-                                        match line {
-                                            Ok(l) => {
-                                                if tx_w.send(Bell::Watch(l)).is_err() {
-                                                    break;
-                                                }
-                                            }
-                                            Err(_) => break,
-                                        }
-                                    }
-                                    let _ = tx_w.send(Bell::Died);
-                                });
-                                eprintln!("flywheel doorbell: watch restarted");
-                                doorbell::audit_append(
-                                    &config::state_dir(),
-                                    workspace,
-                                    serde_json::json!({
-                                        "ts": chrono::Utc::now().to_rfc3339(),
-                                        "workspace": workspace,
-                                        "kind": "watch_restart",
-                                    }),
-                                );
-                                restarted = true;
-                                break;
-                            }
+                    let tx_g = tx.clone();
+                    match spawn_watch_child(project, move |ev| {
+                        let _ = match ev {
+                            Some(l) => tx_g.send(Bell::Watch(l)),
+                            None => tx_g.send(Bell::Died),
+                        };
+                    }) {
+                        Some(child) => {
+                            watch_child = Some(child);
+                            eprintln!("flywheel doorbell: watch restarted");
+                            doorbell::audit_append(
+                                &config::state_dir(),
+                                workspace,
+                                serde_json::json!({
+                                    "ts": chrono::Utc::now().to_rfc3339(),
+                                    "workspace": workspace,
+                                    "kind": "watch_restart",
+                                }),
+                            );
+                            restarted = true;
+                            break;
                         }
-                        Err(e) => {
-                            eprintln!("flywheel doorbell: watch restart failed ({e})");
-                        }
+                        None => eprintln!("flywheel doorbell: watch restart failed"),
                     }
                     backoff = (backoff * 2).min(16);
                 }
                 if restarted {
                     continue;
-                } else {
-                    eprintln!(
-                        "flywheel doorbell: watch restart failed after 5 backoffs — dispatcher stays alive, heal_tick will retry (never exit)"
-                    );
-                    doorbell::audit_append(
-                        &config::state_dir(),
-                        workspace,
-                        serde_json::json!({
-                            "ts": chrono::Utc::now().to_rfc3339(),
-                            "workspace": workspace,
-                            "kind": "watch_restart_failed_stays_alive",
-                        }),
-                    );
-                    continue;
                 }
+                eprintln!(
+                    "flywheel doorbell: watch restart burst exhausted — dispatcher stays alive, retry gate respawns every {WATCH_RETRY_SECS}s (never exit, never deaf)"
+                );
+                watch_retry_at = Some(doorbell_now_unix() + WATCH_RETRY_SECS);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // bd-stale-doorbell-wake-0fic: a watcher whose binary
@@ -7918,16 +7935,6 @@ fn cmd_internal_doorbell(
                     workspace,
                     generation.as_ref(),
                 );
-                // GS-006 bug 3: Ack-SLA was test-only (0 production callers). Doorbell tick
-                // is the live caller, throttled to 60s (30-min SLA needs no 1 Hz SQL scan).
-                // Pin audience now includes raw pin names (messaging.rs fix), so the wake addresses.
-                let now_s = doorbell_now_unix();
-                if now_s.saturating_sub(last_ack_sla_check) >= ACK_SLA_CHECK_SECS {
-                    last_ack_sla_check = now_s;
-                    if let Some(mb) = crate::mail_shim::try_mailbox() {
-                        let _ = crate::mail_shim::block_on(mb.check_ack_sla_expired(project, None));
-                    }
-                }
                 // ADR-0005: subscribe is the drain signal. Poll herdr only
                 // when the event spine is down.
                 if !subscribed {
@@ -7999,6 +8006,34 @@ fn cmd_internal_doorbell(
         let _ = c.kill();
     }
     Ok(())
+}
+/// Spawn the CLI `toron watch` plane-S child + its NDJSON reader thread.
+/// Shared by the initial fallback and both respawn paths (Died burst +
+/// 1s retry gate) so every restart uses the SAME kinds and wiring.
+/// Kinds MUST match the in-process filter (9, 43001, 30031, 39002).
+fn spawn_watch_child<F>(project: &str, on_event: F) -> Option<std::process::Child>
+where
+    F: Fn(Option<String>) + Send + 'static,
+{
+    let kinds = "9,43001,30031,39002";
+    let mut child = Command::new("toron")
+        .args(["watch", "--project", project, "--kinds", kinds])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            match line {
+                Ok(l) => on_event(Some(l)),
+                Err(_) => break,
+            }
+        }
+        on_event(None); // Died
+    });
+    Some(child)
 }
 
 /// Pins plus npubs so live kind-9 `p` tags (hex) resolve to the pin.
@@ -10542,10 +10577,14 @@ pub fn captain_fact_inject(project: &str, event: &ingress::IngressEvent) -> Resu
 pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
     let proj = project.to_string();
     ingress::IngressAdapters {
-        herdr: Box::new(|_| {}),
-        watch: Box::new(|_| {}),
-        workflow: Box::new(|_| {}),
-        cron: Box::new(|_| {}),
+        // herdr/watch/cron reach the loop and doorbell through their own
+        // dedicated surfaces (__poll_events / Bell::Watch / cron runner) and
+        // should NEVER arrive on this seam — if they do, that is a routing
+        // bug and must be loud, not silently swallowed (GS-006 bd-d4qg).
+        herdr: Box::new(|e| eprintln!("ingress routing bug: herdr via fact seam: {e:?}")),
+        watch: Box::new(|w| eprintln!("ingress routing bug: watch via fact seam: {w:?}")),
+        workflow: Box::new(|t| eprintln!("ingress routing bug: workflow via fact seam: {t:?}")),
+        cron: Box::new(|n| eprintln!("ingress routing bug: cron via fact seam: {n}")),
         fact: Box::new(move |ev: &ingress::IngressEvent| {
             let _ = captain_fact_inject(&proj, ev);
         }),
@@ -16153,7 +16192,7 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
         }
-        let (_, actions) = crate::durable::tick(&model, &msg);
+        let (next, actions) = crate::durable::tick(&model, &msg);
         let recorded_actions = entry.get("actions").and_then(|v| v.as_array());
         let replayed_val = serde_json::to_value(&actions).unwrap_or(serde_json::Value::Null);
         let replayed_arr = replayed_val.as_array();
@@ -16170,8 +16209,8 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
                 msg
             );
         }
-        // Advance model for next iteration (replay is stateful)
-        let (next, _) = crate::durable::tick(&model, &msg);
+        // Advance model for next iteration (replay is stateful; tick is pure so
+        // the single (next, actions) above is both the comparison and the step).
         model = next;
     }
     println!("replay {project}: {} entries, no drift", entries.len());
@@ -22625,19 +22664,20 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             decision,
             reason,
         } => {
-            // GS-007 bd-1ub5: SIGNOFF park must resolve via engine, not eprintln only.
-            // This CLI is the production resolve path (future: kind-46011 bus or engine store).
-            // For now it surfaces the intent and validates the args; the live engine's
-            // approval_sink is resolved via the in-process engine when available.
-            println!(
-                "workflow approve: run {} promise {} decision {} reason {:?} — resolving via WorkflowEngine::resolve_approval (parked promise will resume)",
-                run_id, promise_id, decision, reason
+            // GS-007 bd-1ub5: SIGNOFF park must resolve via engine resolve_approval,
+            // not a printed promise. The approval_sink lives IN the engine process
+            // that parked the promise (pane-mode `workflow run --execute` blocks on
+            // invoke with its drainer), so THIS CLI cannot reach it — returning Ok
+            // here would be a costume approval the engine never sees. Fail loud
+            // with the honest remedy until a durable resolve exists (kind-46011).
+            let reason_note = reason
+                .as_deref()
+                .map(|r| format!(" (reason: {r})"))
+                .unwrap_or_default();
+            bail!(
+                "workflow approve: cannot reach the engine holding promise {promise_id} (run {run_id}) — \
+                 the approval_sink is in-memory in the parked run's process; your {decision} was NOT applied{reason_note}"
             );
-            // Best-effort: if a local engine is available for this run (pane mode), resolve.
-            // Otherwise the captain's approval is recorded for the next loop tick to pick up.
-            // The drainer thread keeps the promise pending until resolve_approval is called,
-            // so this CLI's success means the promise will no longer be parked on next poll.
-            Ok(())
         }
     }
 }
