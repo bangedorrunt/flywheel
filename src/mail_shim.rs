@@ -94,6 +94,14 @@ pub(crate) fn mailbox() -> &'static toron_core::mailbox::Mailbox {
     }
 }
 
+/// Non-panicking mailbox access for background ticks (GS-006 Ack-SLA).
+pub(crate) fn try_mailbox() -> Option<&'static toron_core::mailbox::Mailbox> {
+    match MAILBOX.get() {
+        Some(Ok(mb)) => Some(mb),
+        _ => None,
+    }
+}
+
 /// Root dirs for the in-process mailbox (se2.1 Phase B, bd-t9ey): the
 /// durable D3 root via `toron_core::config::resolve_data_root` (ADR-0007
 /// D3) — `TORON_DATA_DIR` > `$XDG_DATA_HOME/toron` > `~/.local/share/toron`

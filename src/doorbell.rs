@@ -28,6 +28,7 @@ pub struct RingInput {
     /// Kind-9 `p` / job assignee / request-release target is this pin.
     pub addressed_to_self: bool,
     pub toron_kind_request_release: bool,
+    pub toron_kind_mail_delivered: bool,
     pub importance_high_or_urgent: bool,
     pub reservation_conflicts_self: bool,
     /// Room chatter: kind 9 with no self address.
@@ -49,7 +50,17 @@ pub fn classify(ev: &RingInput) -> Option<EventClass> {
     if ev.addressed_to_self && ev.kind == 43001 {
         return Some(EventClass::Job);
     }
+    // GS-006 bug 1: kind 9 mail-delivered (NIP-17 gift-wrap wake) must pull mail, not channel.
+    // Tagged `toron-kind=mail-delivered` on kind 9; reuse PlanePUrgent (inbox pull) path.
+    if ev.addressed_to_self && ev.kind == 9 && ev.toron_kind_mail_delivered {
+        return Some(EventClass::PlanePUrgent);
+    }
     if ev.addressed_to_self && ev.kind == 9 {
+        return Some(EventClass::Channel);
+    }
+    // GS-006 bug 2: kind 39002 join/leave addressed to self must ring.
+    // Reuse Channel semantics (membership wake) — hint falls back to channel read.
+    if ev.addressed_to_self && ev.kind == 39002 {
         return Some(EventClass::Channel);
     }
     if ev.importance_high_or_urgent && ev.addressed_to_self {
@@ -1011,10 +1022,19 @@ pub fn parse_watch_ndjson(line: &str, index: &SelfIndex) -> Option<(EventClass, 
             })
             .unwrap_or(false)
     });
+    let toron_kind_mail_delivered = tags.iter().any(|t| {
+        t.as_array()
+            .map(|a| {
+                a.first().and_then(|x| x.as_str()) == Some("toron-kind")
+                    && a.get(1).and_then(|x| x.as_str()) == Some("mail-delivered")
+            })
+            .unwrap_or(false)
+    });
     let class = classify(&RingInput {
         kind,
         addressed_to_self,
         toron_kind_request_release,
+        toron_kind_mail_delivered,
         importance_high_or_urgent: false,
         reservation_conflicts_self: kind == 30031 && addressed_to_self,
         is_presence: kind == 20001,
@@ -1280,6 +1300,7 @@ mod tests {
             kind: 9,
             addressed_to_self: false,
             toron_kind_request_release: false,
+            toron_kind_mail_delivered: false,
             importance_high_or_urgent: false,
             reservation_conflicts_self: false,
             is_presence: false,
@@ -1931,5 +1952,46 @@ mod tests {
                 .contains("doorbell-wake-flywheel-flywheel")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gs006_mail_delivered_kind9_is_mail_not_channel() {
+        // NIP-17 gift-wrap wake: kind 9 + toron-kind=mail-delivered must pull mail, not channel.
+        let line = r#"{"kind":9,"id":"aa","tags":[["p","BlueRidge"],["t","flywheel"],["toron-kind","mail-delivered"],["h","thread-123"]],"content":"sealed"}"#;
+        let (class, hint) = parse_watch_ndjson(line, &SelfIndex::from_pins(["BlueRidge"]))
+            .expect("mail-delivered must ring");
+        assert_ne!(
+            class,
+            EventClass::Channel,
+            "mail-delivered must not be Channel"
+        );
+        assert_eq!(
+            class,
+            EventClass::PlanePUrgent,
+            "mail-delivered should reuse PlanePUrgent mail pull"
+        );
+        assert!(
+            hint.contains("toron mail inbox"),
+            "hint must be mail inbox, got {hint}"
+        );
+    }
+
+    #[test]
+    fn gs006_kind39002_join_leave_rings_when_addressed() {
+        // 39002 join/leave: when p-tag addresses self, doorbell must ring (subscribe + classify).
+        let line = r#"{"kind":39002,"id":"bb","tags":[["p","BlueRidge"],["t","flywheel"]],"content":"join"}"#;
+        let (class, _) = parse_watch_ndjson(line, &SelfIndex::from_pins(["BlueRidge"]))
+            .expect("39002 must ring when addressed");
+        assert!(
+            matches!(
+                class,
+                EventClass::Channel
+                    | EventClass::Job
+                    | EventClass::PlanePUrgent
+                    | EventClass::RequestRelease
+                    | EventClass::ReservationConflict
+            ),
+            "39002 addressed should map to a wake class, got {class:?}"
+        );
     }
 }
