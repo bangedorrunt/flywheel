@@ -15529,23 +15529,93 @@ fn clamp_active_interval(v: u64) -> u64 {
 fn build_queue(queue: Option<&str>, workflow: Option<&str>) -> Result<Vec<String>> {
     let mut items: Vec<String> = Vec::new();
     if let Some(wf) = workflow {
-        let workflows = config::Workflows::load()?;
-        let steps = workflows
-            .workflows
-            .get(wf)
-            .ok_or_else(|| anyhow!("workflow not found: {wf} (flywheel workflows list)"))?;
-        for step in steps {
-            match step {
-                WorkflowStep::Send { stage, msg, .. } => {
-                    let text = match (stage.as_deref(), msg.as_deref()) {
-                        (Some(s), _) => stage_prompt(s)?,
-                        (None, Some(m)) => m.to_string(),
-                        (None, None) => bail!("workflow {wf}: send step needs stage or msg"),
-                    };
-                    items.push(text);
+        // Resolve from the builtin catalog/all_workflows FIRST (38 builtins runnable),
+        // falling back to legacy workflows.toml Send/Wait (config.rs:725).
+        let mut handled = false;
+        {
+            // Inline all_workflows() logic (builtin + catalog, catalog wins) — the inner
+            // all_workflows() lives inside cmd_workflow and is not in scope here.
+            let mut all: std::collections::BTreeMap<String, toron_workflow::schema::Workflow> =
+                std::collections::BTreeMap::new();
+            for (name, wf) in builtin_workflows::builtin_workflows() {
+                all.insert(name, wf);
+            }
+            if let Ok(cat) = workflow_catalog::WorkflowCatalog::load() {
+                for (name, wf) in cat.workflows {
+                    all.insert(name, wf);
                 }
-                // wait steps are implicit in the polling loop
-                WorkflowStep::Wait { .. } => {}
+            }
+            if let Some(uwf) = all.get(wf) {
+                use toron_workflow::schema::Action;
+                fn spec_to_prompt(spec: &toron_workflow::schema::DispatchSpec) -> Option<String> {
+                    if let Some(t) = spec.task.as_deref().filter(|s| !s.trim().is_empty()) {
+                        return Some(t.to_string());
+                    }
+                    if let Some(pl) = spec.plan.as_deref().filter(|s| !s.trim().is_empty()) {
+                        return Some(pl.to_string());
+                    }
+                    if let Some(stage) = spec.stage.as_deref() {
+                        if let Ok(p) = stage_prompt(stage) {
+                            return Some(p);
+                        }
+                        return Some(stage.to_string());
+                    }
+                    spec.profile.clone()
+                }
+                fn walk_action(action: &Action, out: &mut Vec<String>) {
+                    match action {
+                        Action::DispatchJob { spec, .. } => {
+                            if let Some(p) = spec_to_prompt(spec) {
+                                out.push(p);
+                            }
+                        }
+                        Action::Parallel { each, .. } | Action::Foreach { each, .. } => {
+                            walk_action(&each.action, out)
+                        }
+                        Action::Retry { step, .. } => walk_action(&step.action, out),
+                        Action::Branch {
+                            then, else_steps, ..
+                        } => {
+                            for s in then.iter().chain(else_steps.iter()) {
+                                walk_action(&s.action, out);
+                            }
+                        }
+                        Action::CallWorkflow { workflow, .. } => {
+                            out.push(format!("call workflow {workflow}"));
+                        }
+                        _ => {}
+                    }
+                }
+                for step in &uwf.steps {
+                    walk_action(&step.action, &mut items);
+                }
+                if let Some(graph) = &uwf.graph {
+                    for node in graph.nodes.values() {
+                        walk_action(&node.action, &mut items);
+                    }
+                }
+                handled = true;
+            }
+        }
+        if !handled {
+            let workflows = config::Workflows::load()?;
+            let steps = workflows
+                .workflows
+                .get(wf)
+                .ok_or_else(|| anyhow!("workflow not found: {wf} (flywheel workflows list)"))?;
+            for step in steps {
+                match step {
+                    WorkflowStep::Send { stage, msg, .. } => {
+                        let text = match (stage.as_deref(), msg.as_deref()) {
+                            (Some(s), _) => stage_prompt(s)?,
+                            (None, Some(m)) => m.to_string(),
+                            (None, None) => bail!("workflow {wf}: send step needs stage or msg"),
+                        };
+                        items.push(text);
+                    }
+                    // wait steps are implicit in the polling loop
+                    WorkflowStep::Wait { .. } => {}
+                }
             }
         }
     }

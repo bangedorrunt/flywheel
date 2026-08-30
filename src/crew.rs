@@ -352,12 +352,17 @@ pub fn compose_workflow_with(
             }]
         });
     let mut steps: Vec<Step> = base.map(|b| b.steps.clone()).unwrap_or_default();
+    let mut graph_nodes: BTreeMap<String, toron_workflow::schema::GraphNode> = base
+        .and_then(|b| b.graph.as_ref().map(|g| g.nodes.clone()))
+        .unwrap_or_default();
     let mut extra_inputs: Vec<InputDecl> = Vec::new();
     let mut ordinal = 0u32;
     for part in parts {
         // ADR-0006 D3: a builtin recipe token expands to its compiled-in
         // steps right where it sits; its declared inputs merge into the
         // composed workflow so the recipe's template refs lint clean.
+        // The builtin's own on_error (e.g. bug-fix fail_run) is preserved
+        // verbatim; bare non-recipe parts keep Continue via build_part_step.
         if let ComposePart::Recipe { name } = part {
             let expanded = crate::builtin_workflows::builtin_recipe(name).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -371,13 +376,30 @@ pub fn compose_workflow_with(
                     extra_inputs.push(input);
                 }
             }
-            steps.extend(expanded.steps);
+            // Preserve the builtin's own step on_error verbatim.
+            steps.extend(expanded.steps.clone());
+            if let Some(g) = expanded.graph {
+                for (k, v) in g.nodes {
+                    let mut key = k.clone();
+                    let mut ctr = 1u32;
+                    while graph_nodes.contains_key(&key) {
+                        key = format!("{k}-{ctr}");
+                        ctr += 1;
+                    }
+                    graph_nodes.insert(key, v);
+                }
+            }
             ordinal += 1;
             continue;
         }
         ordinal += 1;
         steps.push(build_part_step(part, ordinal, objective, affinity)?);
     }
+    let graph = if graph_nodes.is_empty() {
+        None
+    } else {
+        Some(toron_workflow::schema::Graph { nodes: graph_nodes })
+    };
     Ok(Workflow {
         name: name.to_string(),
         description: Some(format!(
@@ -387,7 +409,7 @@ pub fn compose_workflow_with(
         policy: None,
         guard: None,
         steps,
-        graph: None,
+        graph,
         inputs: {
             let mut inputs = base_inputs_snapshot;
             for input in extra_inputs {

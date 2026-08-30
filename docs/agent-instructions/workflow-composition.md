@@ -130,7 +130,7 @@ loudly), stage-first bare-name parts (`--parts "fresh-eyes-explore,..."`
 picks each stage's default role), `--keep <name>` graduation after a
 GREEN run (refuses without), `cron run --live`.
 
-STILL PROPOSED (bd-adr22-t1-grammar-residual-zjk0): `each:`/`when:`/
+SHIPPED (bd-adr22-t1-grammar-residual-zjk0): `each:`/`when:`/
 `retry(n)`/`parallel:` part forms, `--from-yaml -`, `--dry-run`
 first-class, compose budget caps.
 
@@ -157,8 +157,8 @@ flywheel workflow new <name>    # scaffold a catalog entry
 flywheel workflow lint --only <name>
 ```
 
-PROPOSED (W6): `--keep <name>` automates graduation from a green composed
-run with provenance. Until then, promote by hand via `workflow new`, and
+SHIPPED (W6): `--keep <name>` automates graduation from a green composed
+run with provenance. Promote by hand via `workflow new` when not using `--keep`, and
 say so in the bead/commit.
 
 ---
@@ -337,8 +337,7 @@ flywheel loop run <project> --work
 
 SHIPPED: `phase:` in specs; `stage {list,show,new,lint,promote}` + stage-first parts;
 `--keep` graduation; `cron run --live`; delegated compose via mail (W7
-allowlist-gated). STILL PROPOSED (bd-adr22-t1-grammar-residual-zjk0):
-`each:/when:/retry(n)/parallel:` parts, `--from-yaml -`, `--dry-run`,
-budget caps. Known deviations tracked in bd-adr22-phase-enum-lint-ahfh
+allowlist-gated); `each:`/`when:`/`retry(n)`/`parallel:` parts; `--from-yaml -`;
+`--dry-run`; budget caps. Known deviations tracked in bd-adr22-phase-enum-lint-ahfh
 (open String phase, R-P lint absent) and bd-adr22-local-resonate-tx8q
 (engine is in-memory — no cross-process crash resume yet).
