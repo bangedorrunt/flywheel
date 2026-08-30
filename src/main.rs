@@ -7858,7 +7858,19 @@ fn cmd_internal_doorbell(
                 if restarted {
                     continue;
                 } else {
-                    break;
+                    eprintln!(
+                        "flywheel doorbell: watch restart failed after 5 backoffs — dispatcher stays alive, heal_tick will retry (never exit)"
+                    );
+                    doorbell::audit_append(
+                        &config::state_dir(),
+                        workspace,
+                        serde_json::json!({
+                            "ts": chrono::Utc::now().to_rfc3339(),
+                            "workspace": workspace,
+                            "kind": "watch_restart_failed_stays_alive",
+                        }),
+                    );
+                    continue;
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -8051,6 +8063,21 @@ fn doorbell_prompt(
             .iter()
             .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()))
         else {
+            // GS-007 gap 9: unknown pin silently dropped with `continue` — now loud miss.
+            eprintln!(
+                "flywheel doorbell: [DoorbellMiss] pin {pin} not in registry — no pane to prompt (loud)"
+            );
+            doorbell::audit_append(
+                &config::state_dir(),
+                workspace,
+                serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "workspace": workspace,
+                    "kind": "doorbell_miss_unknown_pin",
+                    "pin": pin,
+                    "msg": msg,
+                }),
+            );
             continue;
         };
         // bd-stale-doorbell-wake-0fic: every wake banner carries the
@@ -16059,7 +16086,8 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
         );
         return Ok(());
     }
-    // Re-drive from empty model, assert identical action counts (drift exits nonzero)
+    // Re-drive from snapshot model, assert identical action sequences (GS-007 bd-fiyx, not just len)
+    // Journal now stores queue (was queue_len) and full actions array; replay compares sequences.
     let mut model = crate::durable::LoopModel {
         queue: Vec::new(),
         per_bead_phase: Default::default(),
@@ -16078,17 +16106,31 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
         };
         let msg: crate::durable::LoopMsg = serde_json::from_value(msg_val.clone())
             .with_context(|| format!("journal {idx} msg decode"))?;
+        // If journal has snapshot queue, restore it for this replay step (future journal entries have it)
+        if let Some(q) = entry
+            .get("model_snapshot")
+            .and_then(|m| m.get("queue"))
+            .and_then(|q| q.as_array())
+        {
+            model.queue = q
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+        }
         let (_, actions) = crate::durable::tick(&model, &msg);
-        let recorded = entry
-            .get("actions")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(actions.len());
-        if recorded != actions.len() {
+        let recorded_actions = entry.get("actions").and_then(|v| v.as_array());
+        let replayed_val = serde_json::to_value(&actions).unwrap_or(serde_json::Value::Null);
+        let replayed_arr = replayed_val.as_array();
+        let drift = match (recorded_actions, replayed_arr) {
+            (Some(rec), Some(rep)) => rec != rep,
+            (None, _) => false,
+            (Some(_), None) => true,
+        };
+        if drift {
             anyhow::bail!(
-                "replay drift at seq {idx}: recorded {} actions != replayed {} (msg {:?})",
-                recorded,
-                actions.len(),
+                "replay drift at seq {idx}: recorded actions != replayed {} vs {} (msg {:?})",
+                entry.get("actions").unwrap_or(&serde_json::Value::Null),
+                replayed_val,
                 msg
             );
         }

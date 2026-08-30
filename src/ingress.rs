@@ -165,10 +165,18 @@ pub struct IngressAdapters {
 impl Default for IngressAdapters {
     fn default() -> Self {
         Self {
-            herdr: Box::new(|_| {}),
-            watch: Box::new(|_| {}),
-            workflow: Box::new(|_| {}),
-            cron: Box::new(|_| {}),
+            herdr: Box::new(|ev| {
+                eprintln!("ingress miss (no handler): herdr {:?}", ev);
+            }),
+            watch: Box::new(|ev| {
+                eprintln!("ingress miss (no handler): watch {:?}", ev);
+            }),
+            workflow: Box::new(|ev| {
+                eprintln!("ingress miss (no handler): workflow {:?}", ev);
+            }),
+            cron: Box::new(|ev| {
+                eprintln!("ingress miss (no handler): cron {:?}", ev);
+            }),
             fact: Box::new(|_| {}),
         }
     }
