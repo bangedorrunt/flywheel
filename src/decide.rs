@@ -449,7 +449,23 @@ pub fn decide(target: &str, snap: &Snapshot) -> Decision {
             ],
         );
     }
-    // 24. Ready beads + work-ish intent → run the loop, not hand-rolled sends.
+    // 24. wave-swarm -> wave-swarm (ADR-0006 D3 composed wave swarm).
+    if has(&t, &["wave-swarm", "wave swarm"]) {
+        return dec(
+            "wave-swarm",
+            "wave-swarm — composed wave swarm (GATE -> DISPATCH -> OBSERVE -> VERIFY -> SIGNOFF)",
+            &[
+                "flywheel",
+                "workflow",
+                "compose",
+                target,
+                "--parts",
+                "wave-swarm",
+                "--run",
+            ],
+        );
+    }
+    // 25. Ready beads + work-ish intent → run the loop, not hand-rolled sends.
     if snap.ready_bead_count > 0
         && !implement
         && (t.trim().is_empty() || has(&t, &["work", "loop", "beads"]))
@@ -567,6 +583,7 @@ pub fn decide_trigger_for(workflow: &str) -> Option<&'static str> {
         "reflect" => Some("reflect"),
         "awareness-digest" => Some("awareness-digest"),
         "onboard" => Some("onboard"),
+        "wave-swarm" => Some("wave-swarm"),
         _ => None,
     }
 }
@@ -1354,7 +1371,7 @@ mod tests {
         assert_eq!(decide_trigger_for("plan-review"), None);
         assert_eq!(decide_trigger_for("phase-resolve"), None);
         assert_eq!(decide_trigger_for("ship"), None);
-        assert_eq!(decide_trigger_for("wave-swarm"), None);
+        assert_eq!(decide_trigger_for("wave-swarm"), Some("wave-swarm"));
         assert_eq!(decide_trigger_for("repair-until-verified"), None);
     }
 

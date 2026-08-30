@@ -362,7 +362,7 @@ pub fn compose_workflow_with(
         // steps right where it sits; its declared inputs merge into the
         // composed workflow so the recipe's template refs lint clean.
         // The builtin's own on_error (e.g. bug-fix fail_run) is preserved
-        // verbatim; bare non-recipe parts keep Continue via build_part_step.
+        // verbatim; bare non-recipe parts are FailRun via build_part_step (bd-gs005).
         if let ComposePart::Recipe { name } = part {
             let expanded = crate::builtin_workflows::builtin_recipe(name).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1340,9 +1340,10 @@ steps:
     /// parts become dispatch_job steps (@role + stage), workflow parts become
     /// call_workflow steps, the objective flows into each; crew:auto + the
     /// objective input declared. Lint-clean (the compose gate).
+    /// Bare parts default FailRun (bd-gs005 — red fails the run, not silent green).
     #[test]
     fn compose_workflow_assembles_parts_and_lints_clean() {
-        use toron_workflow::schema::Action;
+        use toron_workflow::schema::{Action, StepOnError};
         let parts = vec![
             ComposePart::Dispatch {
                 role: "scout".into(),
@@ -1366,6 +1367,17 @@ steps:
             &wf.steps[1].action,
             Action::CallWorkflow { workflow, .. } if workflow == "weekly-review"
         ));
+        // bd-gs005: bare parts default FailRun — a red part must fail the run.
+        assert_eq!(
+            wf.steps[0].on_error,
+            StepOnError::FailRun,
+            "bare dispatch is FailRun"
+        );
+        assert_eq!(
+            wf.steps[1].on_error,
+            StepOnError::FailRun,
+            "bare call_workflow is FailRun"
+        );
         // The compose gate: lint clean.
         let report = toron_workflow::lint_workflow(&wf);
         assert!(
@@ -1505,9 +1517,12 @@ steps:
     /// T1 assembly: each → Foreach, when → Branch(then=1), retry(n) → Retry,
     /// parallel → Parallel; the wrapped leaf keeps its role/stage/workflow.
     /// The result lints clean and passes budget caps.
+    /// Leaf on_error is FailRun (bd-gs005); outer control wrapper stays
+    /// Continue — the R-E1/R-E3 downgrade handles retry-on-blocked at lint time,
+    /// not by silently downgrading FailRun at compose.
     #[test]
     fn t1_compose_grammar_parts_assemble_actions() {
-        use toron_workflow::schema::Action;
+        use toron_workflow::schema::{Action, StepOnError};
         let lib = crate::stages::StageLibrary::compiled_in();
         let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
         let parts: Vec<ComposePart> = [
@@ -1551,6 +1566,22 @@ steps:
                         Action::DispatchJob { spec, .. }
                             if spec.profile.as_deref() == Some("@coder"))
         ));
+        // Outer wrappers stay Continue; inner leaves are FailRun (bd-gs005).
+        for step in &wf.steps {
+            assert_eq!(
+                step.on_error,
+                StepOnError::Continue,
+                "outer T1 wrapper is Continue"
+            );
+            match &step.action {
+                Action::Foreach { each, .. } | Action::Parallel { each, .. } => {
+                    assert_eq!(each.on_error, StepOnError::FailRun)
+                }
+                Action::Branch { then, .. } => assert_eq!(then[0].on_error, StepOnError::FailRun),
+                Action::Retry { step, .. } => assert_eq!(step.on_error, StepOnError::FailRun),
+                _ => panic!("unexpected T1 outer"),
+            }
+        }
         let report = toron_workflow::lint_workflow(&wf);
         assert!(
             report.is_clean(),
@@ -2172,5 +2203,190 @@ steps:
         let wf = parse_planner_workflow(response, "composed-x").expect("map inputs ok");
         assert_eq!(wf.inputs.len(), 1);
         assert_eq!(wf.inputs[0].name, "objective");
+    }
+
+    /// bd-gs005: bare parts default FailRun — a red dispatch must fail the
+    /// composed workflow, not sail through as Continue (first-prompt trust).
+    /// Verifies the t1 bare expectation is FailRun and that a failing bare
+    /// part fails the run (R-E1/R-E3 downgrade handles retry-on-blocked at lint).
+    #[tokio::test]
+    async fn bare_dispatch_red_fails_composed_workflow_not_silent_green() {
+        use toron_workflow::schema::{Action, StepOnError};
+        // Single bare dispatch part via compose.
+        let part = parse_compose_part("coder:systematic-execute").unwrap();
+        let wf = compose_workflow("composed-bare-red", "fix the bug", None, &[part]).unwrap();
+        assert_eq!(wf.steps.len(), 1);
+        assert_eq!(
+            wf.steps[0].on_error,
+            StepOnError::FailRun,
+            "bare dispatch is FailRun"
+        );
+        // Runner that fails the dispatch step (red).
+        let runner: toron_workflow::ActionRunner = std::sync::Arc::new(|a: &Action| {
+            if matches!(a, Action::DispatchJob { .. }) {
+                Ok(serde_json::json!({ "ok": false, "error": "simulated red", "kind": "unknown" }))
+            } else {
+                Ok(serde_json::json!({ "ok": true }))
+            }
+        });
+        let engine = toron_workflow::WorkflowEngine::local(runner).expect("engine");
+        let out = engine
+            .run(
+                "bare-red-1",
+                toron_workflow::RunInput {
+                    run_id: None,
+                    workflow: wf,
+                    trigger: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("run");
+        assert_eq!(
+            out["status"], "failed",
+            "red bare dispatch must fail the run: {out}"
+        );
+        assert!(
+            out["failed_step"].as_str().unwrap().contains("coder"),
+            "{out}"
+        );
+        // Green control: same workflow with ok runner succeeds.
+        let ok_runner: toron_workflow::ActionRunner =
+            std::sync::Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+        let engine2 = toron_workflow::WorkflowEngine::local(ok_runner).expect("engine2");
+        let part2 = parse_compose_part("coder:systematic-execute").unwrap();
+        let wf2 = compose_workflow("composed-bare-green", "fix the bug", None, &[part2]).unwrap();
+        let out2 = engine2
+            .run(
+                "bare-green-1",
+                toron_workflow::RunInput {
+                    run_id: None,
+                    workflow: wf2,
+                    trigger: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("run2");
+        assert!(
+            out2.get("status").is_none() || out2["status"] != "failed",
+            "green must not fail: {out2}"
+        );
+    }
+
+    /// Compose --run VerifySink: a bare dispatch followed by a verify node
+    /// must execute the verify (not "verify sink missing") and red must fail
+    /// the run. Pins the make_verify_sink attachment in the compose --run arm
+    /// (flywheel/src/main.rs) — the engine never shells out; the sink executes.
+    #[tokio::test]
+    async fn compose_dispatch_plus_verify_red_fails_and_sink_not_missing() {
+        use std::sync::{Arc, Mutex};
+        use toron_workflow::schema::{Action, StepOnError};
+        // Compose one bare dispatch, then append a verify step (the pattern
+        // `compose --run` produces when a verify stage is included).
+        let part = parse_compose_part("coder:systematic-execute").unwrap();
+        let mut wf = compose_workflow("composed-verify", "harden the loop", None, &[part]).unwrap();
+        assert_eq!(wf.steps[0].on_error, StepOnError::FailRun);
+        wf.steps.push(toron_workflow::schema::Step {
+            name: Some("verify-1".into()),
+            guard: None,
+            on_error: StepOnError::FailRun,
+            build_slot: false,
+            action: Action::Verify {
+                command: "cargo test --lib".into(),
+            },
+        });
+        // Runner succeeds on dispatch; verify outcome comes from the sink.
+        let runner: toron_workflow::ActionRunner =
+            Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+        let engine = toron_workflow::WorkflowEngine::local(runner).expect("engine");
+        // Attach a RED verify sink (simulates `cargo test` failing).
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        let sink = toron_workflow::engine::VerifySink::default();
+        *sink.0.lock().unwrap() = Some(Arc::new(
+            move |req: &toron_workflow::engine::VerifyRequest| {
+                seen_c.lock().unwrap().push(req.command.clone());
+                Ok(toron_workflow::engine::VerifyResult {
+                    ok: false,
+                    exit: 1,
+                    stdout_path: None,
+                    stderr_path: None,
+                    error: Some("simulated test failure".into()),
+                })
+            },
+        ));
+        *engine.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
+        let out = engine
+            .run(
+                "compose-verify-red-1",
+                toron_workflow::RunInput {
+                    run_id: None,
+                    workflow: wf.clone(),
+                    trigger: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("run red");
+        assert_eq!(seen.lock().unwrap().len(), 1, "verify must have executed");
+        assert_eq!(seen.lock().unwrap()[0], "cargo test --lib");
+        assert_eq!(
+            out["status"], "failed",
+            "red verify must fail the run: {out}"
+        );
+        assert_eq!(out["failed_step"], "verify-1");
+        assert!(
+            !out.get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("verify sink missing"),
+            "sink must be attached, not missing: {out}"
+        );
+        let runner2: toron_workflow::ActionRunner =
+            Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+        let engine2 = toron_workflow::WorkflowEngine::local(runner2).expect("engine2");
+        let sink2 = toron_workflow::engine::VerifySink::default();
+        *sink2.0.lock().unwrap() =
+            Some(Arc::new(|_req: &toron_workflow::engine::VerifyRequest| {
+                Ok(toron_workflow::engine::VerifyResult {
+                    ok: true,
+                    exit: 0,
+                    stdout_path: Some("/tmp/out".into()),
+                    stderr_path: None,
+                    error: None,
+                })
+            }));
+        *engine2.verify_sink().0.lock().unwrap() = sink2.0.lock().unwrap().clone();
+        // Need fresh workflow (steps cloned) — verify sink green path.
+        let mut wf_green = compose_workflow(
+            "composed-verify-green",
+            "harden the loop",
+            None,
+            &[parse_compose_part("coder:systematic-execute").unwrap()],
+        )
+        .unwrap();
+        wf_green.steps.push(toron_workflow::schema::Step {
+            name: Some("verify-1".into()),
+            guard: None,
+            on_error: StepOnError::FailRun,
+            build_slot: false,
+            action: Action::Verify {
+                command: "cargo test --lib".into(),
+            },
+        });
+        let out2 = engine2
+            .run(
+                "compose-verify-green-1",
+                toron_workflow::RunInput {
+                    run_id: None,
+                    workflow: wf_green,
+                    trigger: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("run green");
+        assert!(
+            out2.get("status").is_none() || out2["status"] != "failed",
+            "green verify must not fail: {out2}"
+        );
+        assert_eq!(out2["verify-1"]["ok"], true, "green verify ok: {out2}");
     }
 }

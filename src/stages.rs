@@ -126,6 +126,10 @@ const SEED_AFFINITY: &[(&str, &str)] = &[
     ("judge-arms", "oracle"),
     ("diagnose-only", "scout"),
     ("resume-pickup", "housekeeper"),
+    ("wave-gate", "planner"),
+    ("wave-dispatch", "planner"),
+    ("wave-observe", "scout"),
+    ("wave-verify", "reviewer"),
 ];
 
 impl StageLibrary {
