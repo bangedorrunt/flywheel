@@ -3829,16 +3829,9 @@ pub enum LoopAction {
         herdr_name: String,
         reason: String,
     },
-    /// ADR-0024 W3 graph vehicle (bd-bpd9 / bd-27d0): engine.invoke a composed graph for a ready bead.
-    /// Opt-in per bead via `## WORKFLOW <name>` or `workflow:<name>` label. Never title text.
-    /// Inputs carry the bead's VERIFY fence and goal; execution leaf composes the builtin
-    /// (resolver serves builtins WITH graph) and runs via engine with --mode pane semantics.
-    /// In-graph verify writes a WORKFLOW receipt, never CommandVerified; close stays loop VERIFY.
-    InvokeGraph {
-        bead_id: String,
-        workflow: String,
-        inputs: serde_json::Value,
-    },
+    /// bd-bpd9: the graph vehicle spawns a detached pane-mode engine run at
+    /// dispatch time (spawn_graph_vehicle) — a subprocess, not a LoopAction.
+    /// LoopAction stays the loop's own decision set.
     Wait,
 }
 
@@ -6175,6 +6168,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     // bd-bpd9 graph vehicle: opted-in beads run their composed
                     // graph via the detached subprocess leaf; the loop keeps
                     // claim-watch and close stays VERIFY + CommandVerified.
+                    // Marker without VERIFY/principles: LOUD refusal, not a
+                    // silent normal brief (GS-005 §9.4).
                     if let Some(wf_name) = workflow_for_bead(bead) {
                         if bead.verify.is_some() && principles_block_reason(bead).is_none() {
                             match spawn_graph_vehicle(
@@ -6194,6 +6189,19 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                     bead.id
                                 ),
                             }
+                        } else {
+                            let why = if bead.verify.is_none() {
+                                "VERIFY fence missing — the vehicle needs the bead's VERIFY command"
+                                    .to_string()
+                            } else {
+                                principles_block_reason(bead)
+                                    .unwrap_or_else(|| "principles block".to_string())
+                            };
+                            eprintln!(
+                                "flywheel: [bd-bpd9] refusing graph vehicle for {}:                                  marker workflow:{} present but {why} — add the fence                                  (## VERIFY) or fix principles, or remove the marker",
+                                bead.id, wf_name
+                            );
+                            continue;
                         }
                     }
                     // bd-dispatch-dedupe-2zlz: GOAL gate — a live peer
@@ -7007,17 +7015,6 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         let mut any_work = false;
         for action in &actions {
             match action {
-                // bd-bpd9: graph vehicles are spawned inline at dispatch
-                // time (see the to_assign leaf); nothing should re-emit
-                // them here. Covered for exhaustiveness.
-                LoopAction::InvokeGraph {
-                    bead_id, workflow, ..
-                } => {
-                    eprintln!(
-                        "flywheel: [bd-bpd9] duplicate InvokeGraph action for {bead_id} ({workflow}) — ignored"
-                    );
-                }
-
                 // ADR-0001 Wave 3: the pin stamp rides ahead of the send —
                 // run it best-effort through the __pin-stamp leaf (the
                 // orchestrator fills pin; failure never blocks dispatch).
@@ -11877,9 +11874,6 @@ mod tests {
             // pin stamps are orchestrator-side tracker writes, not agent
             // dispatches — no DispatchRec (nothing lands on a pane).
             LoopAction::PinStamp { .. } => None,
-            // bd-bpd9: InvokeGraph spawns the vehicle subprocess at the
-            // dispatch leaf — it is not an agent dispatch, so no DispatchRec.
-            LoopAction::InvokeGraph { .. } => None,
             LoopAction::Blocked { name } => Some(DispatchRec {
                 agent: name.clone(),
                 kind: "blocked",
@@ -14431,7 +14425,6 @@ mod loop_invoke_vehicle_tests {
         );
     }
 
-    #[test]
     #[test]
     fn workflow_for_bead_marker_section_opts_in() {
         let bead = ReadyBead {

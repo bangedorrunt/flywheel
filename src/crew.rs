@@ -452,7 +452,10 @@ fn build_part_step(
         let base = |name: String, action: Action| Step {
             name: Some(name),
             guard: None,
-            on_error: StepOnError::Continue,
+            // bd-gs005: composed bare parts default fail_run — a red part
+            // must fail the run visibly, not sail through as Continue
+            // (first-prompt trust; builtins already carry their own).
+            on_error: StepOnError::FailRun,
             build_slot: false,
             action,
         };

@@ -15586,15 +15586,10 @@ fn build_queue(queue: Option<&str>, workflow: Option<&str>) -> Result<Vec<String
                         _ => {}
                     }
                 }
-                for step in &uwf.steps {
-                    walk_action(&step.action, &mut items);
-                }
-                if let Some(graph) = &uwf.graph {
-                    for node in graph.nodes.values() {
-                        walk_action(&node.action, &mut items);
-                    }
-                }
-                handled = true;
+                anyhow::bail!(
+                    "workflow {0}: builtins run via the engine, not the queue — use                      'flywheel workflow run {0} --execute --mode pane --inputs \'{}\' --project <proj>'                      (or remove --workflow and use --work for beads)",
+                    wf
+                );
             }
         }
         if !handled {
@@ -16481,16 +16476,6 @@ fn cmd_loop(
         let mut any_work = false;
         for action in &actions {
             match action {
-                // bd-bpd9: graph vehicles spawn inline in the durable
-                // swarm loop; the sync planner never emits InvokeGraph.
-                // Covered for exhaustiveness.
-                durable::LoopAction::InvokeGraph {
-                    bead_id, workflow, ..
-                } => {
-                    eprintln!(
-                        "flywheel: [bd-bpd9] sync loop ignored InvokeGraph for {bead_id} ({workflow}) — vehicle spawns in the durable loop"
-                    );
-                }
                 // ADR-0001 Wave 3: stamp pin before dispatch — same leaf as
                 // the durable loop, best-effort, never blocks the send.
                 durable::LoopAction::PinStamp { bead_id, pin } => {
@@ -18852,6 +18837,21 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
             rendered.len()
         );
         written += 1;
+    }
+    // bd-gs005: remove pre-rename bare-named leftovers (swarm.md / loop.md /
+    // peer-aware.md). Harnesses key slash commands on the file stem, so those
+    // collide with built-in /swarm //loop commands.
+    for legacy in ["swarm.md", "loop.md", "peer-aware.md"] {
+        let p = dir.join(legacy);
+        if p.exists() {
+            match std::fs::remove_file(&p) {
+                Ok(()) => println!(
+                    "removed stale {} (renamed to -mode)",
+                    dim(&p.display().to_string())
+                ),
+                Err(e) => eprintln!("flywheel: could not remove stale {}: {e}", p.display()),
+            }
+        }
     }
     println!(
         "flywheel integration {kind}: {written} prompt file(s) in {}",
@@ -22224,12 +22224,15 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // alive across invoke so the drainer thread can launch a real
             // pane per spawned job and settle await:true promises.
             let mut spawn_receipts: Vec<Value> = vec![];
-            let engine = std::sync::Arc::new(pane::local_engine(
-                &rt,
-                runner,
-                profile_resolver,
-                workflow_resolver,
-            )?);
+            let engine = std::sync::Arc::new({
+                // bd-gs005: compose --run attaches the VerifySink exactly like
+                // the workflow-run arm — `action: verify` must execute, not
+                // abort with "verify sink missing".
+                let eng = pane::local_engine(&rt, runner, profile_resolver, workflow_resolver)?;
+                let sink = make_verify_sink(cfg.clone(), project_name.to_string());
+                *eng.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
+                eng
+            });
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let drainer = pane::start_spawn_drainer(
                 cfg.clone(),

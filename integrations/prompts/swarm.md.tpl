@@ -29,13 +29,14 @@ default, explicit provider/model overrides. Use consistently.
    summaries in main thread.
 
 4. WAVES + SPAWN (waves are the default for supervised multi-lane
-   work; spawn is the manual escape): run the wave as a
-   recipe: `flywheel workflow compose --parts wave-swarm --run --mode pane
-   --inputs '{"objective": "<target>"}'`: GATE->DISPATCH->OBSERVE->VERIFY->
-   SIGNOFF; swarm-mode is the crew, wave-swarm is the recipe. MANUAL
-   ESCAPE (un-waved ad-hoc lanes): `flywheel spawn <proj> --profile
-   <role> --count N`; explicit provider/model only on override.
-   Keep wake separate from supervision.
+   work; spawn is the manual escape): run the wave as a recipe:
+   `flywheel workflow compose --parts wave-swarm --run --inputs
+   '{"objective": "<target>"}'` -- GATE->DISPATCH->OBSERVE->VERIFY->
+   SIGNOFF; swarm-mode is the crew, wave-swarm is the recipe. The run
+   parks at SIGNOFF: you resolve the approval (flywheel runs list).
+   MANUAL ESCAPE (un-waved ad-hoc lanes): `flywheel spawn <proj>
+   --profile <role> --count N`; explicit provider/model only on
+   override. Keep wake separate from supervision.
 
 5. BRIEF: lane dispatch authoritative. Peer wakes are signals, not tasks.
    Bead ids, files, pin, claim (br update in_progress), reserve (toron
