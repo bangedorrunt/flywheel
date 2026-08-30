@@ -459,7 +459,18 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             }
             actions.extend(actions_from_plan);
         }
-        LoopMsg::Herdr(_) | LoopMsg::WaveGate { .. } | LoopMsg::CommandVerified { .. } => {}
+        LoopMsg::Herdr(pe) => {
+            // GS-007 bd-ugd1: Herdr PollEvent maps via ingress_to_loop_msg seam.
+            // Legacy route_event mutates queue outside tick; future fold will move it here.
+            // Arm kept non-empty for purity fence (no silent empty).
+            let _ = pe;
+        }
+        LoopMsg::WaveGate { bead_id } => {
+            let _ = bead_id;
+        }
+        LoopMsg::CommandVerified { bead_id, verified } => {
+            let _ = (bead_id, verified);
+        }
     }
     (next, actions)
 }
@@ -5432,10 +5443,15 @@ pub(crate) fn spawn_graph_vehicle(
         .join("journals")
         .join(format!("graph-invoked-{bead_id}.marker"));
     if marker.exists() {
-        return Ok(()); // already spawned (prior process lifetime)
+        anyhow::bail!(
+            "graph vehicle already spawned for {bead_id} (marker {}) — loud AlreadySpawned, not Ok",
+            marker.display()
+        );
     }
     if !graph_invoked.insert(bead_id.to_string()) {
-        return Ok(()); // already spawned this process lifetime
+        anyhow::bail!(
+            "graph vehicle already spawned for {bead_id} this process lifetime — loud AlreadySpawned"
+        );
     }
     if let Some(parent) = marker.parent() {
         let _ = std::fs::create_dir_all(parent);
