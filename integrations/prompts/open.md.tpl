@@ -48,6 +48,8 @@ mail. Do not invent a pin or use an internal pane slug as a public identity.
 - `/swarm-mode`: captain-led multi-crew execution with lanes and optional
   work-graph supervision.
 
+Builtin playbooks are discoverable via `flywheel decide <target>` (routes to the playbook) and `flywheel workflow list --json` (lists builtins with their decide trigger).
+
 Continue the supplied task. Report what you changed and what you verified;
 do not claim bead closure or swarm completion unless those actions were
 explicitly performed.

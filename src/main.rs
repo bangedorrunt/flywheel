@@ -111,6 +111,24 @@ fn record_reroute_audit(
     );
 }
 
+/// ADR-0026 Spec 3: shared reroute helper for headless and pane paths.
+/// Returns the next fallback profile to try, audited. ONE hop per reroute_eligible
+/// failure; second same-class failure is terminal (no further hop when the chain
+/// is exhausted). Caller checks `reroute_eligible` and `evidence` before calling.
+fn reroute_next_profile(
+    profile_name: &str,
+    kind: failure::FailureKind,
+    evidence: &str,
+    attempted: &[String],
+    attempt: u32,
+) -> Option<String> {
+    if evidence.is_empty() {
+        return None;
+    }
+    record_reroute_audit("flywheel", attempt, profile_name, kind, evidence);
+    next_fallback(profile_name, attempted)
+}
+
 /// ADR-0025 Spec 5 plane tripwires — pure, testable helper for `cmd_send`.
 /// - secret → public fires only on explicit `--plane s` (or channel post);
 ///   default (no plane) stays private — classifier never flips to public.
@@ -8340,12 +8358,29 @@ pub(crate) fn start_agent_with_retry(
     pane_id: &str,
     args: &[String],
 ) -> Result<AgentInfo> {
+    start_agent_with_retry_profile(c, name, kind, pane_id, args, None)
+}
+
+pub(crate) fn start_agent_with_retry_profile(
+    c: &mut Client,
+    name: &str,
+    kind: &str,
+    pane_id: &str,
+    args: &[String],
+    profile_name: Option<&str>,
+) -> Result<AgentInfo> {
     // bd-zq8u: fail fast on un-encodable launch text before any retry burn.
     ensure_ascii_launch_args(args)?;
     let mut recipe_launched = false;
+    // ADR-0026 Spec 3 pane fallback: track one hop per reroute_eligible class.
+    let mut current_kind = kind.to_string();
+    let mut current_args = args.to_vec();
+    let mut current_profile = profile_name.map(|s| s.to_string());
+    let mut attempted_profiles: Vec<String> = current_profile.clone().into_iter().collect();
+    let mut already_rerouted = false;
     for attempt in 0..30 {
         if !recipe_launched {
-            match c.agent_start(name, kind, pane_id, 45_000, args) {
+            match c.agent_start(name, &current_kind, pane_id, 45_000, &current_args) {
                 Ok(_) => {}
                 Err(e) => {
                     if attempt == 0 {
@@ -8356,13 +8391,67 @@ pub(crate) fn start_agent_with_retry(
                                 "flywheel: classified spawn failure kind={} evidence={}",
                                 cf.kind, cf.evidence
                             );
-                            record_reroute_audit(
-                                "flywheel",
-                                attempt as u32,
-                                kind,
+                        }
+                        // ADR-0026 pane fallback: on reroute_eligible, hop to
+                        // next profile via the shared helper (audited, ONE hop
+                        // per class, second same-class failure terminal).
+                        if cf.reroute_eligible && !already_rerouted {
+                            if let Some(orig) = current_profile.as_deref() {
+                                if let Some(next) = reroute_next_profile(
+                                    orig,
+                                    cf.kind,
+                                    &cf.evidence,
+                                    &attempted_profiles,
+                                    attempt as u32,
+                                ) {
+                                    if let Ok(cat) = ProfileCatalog::load() {
+                                        if let Some(next_prof) = cat.get(&next) {
+                                            let next_kind = if next_prof.harness.is_empty() {
+                                                current_kind.clone()
+                                            } else {
+                                                next_prof.harness.clone()
+                                            };
+                                            if let Ok(next_args) =
+                                                profile_launch_args(&next_kind, next_prof, None)
+                                            {
+                                                eprintln!(
+                                                    "flywheel: pane reroute {} -> {} (profile fallback)",
+                                                    orig, next
+                                                );
+                                                current_kind = next_kind;
+                                                current_args = next_args;
+                                                current_profile = Some(next.clone());
+                                                attempted_profiles.push(next);
+                                                already_rerouted = true;
+                                                std::thread::sleep(Duration::from_secs(1));
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // No hop available or not profiled: terminal if no fallback chain
+                            let fallback_key = profile_name.unwrap_or(kind);
+                            if fallback_chain_for(fallback_key).is_empty() {
+                                return Err(anyhow::anyhow!(
+                                    "spawn failed ({}): {} — no fallback chain",
+                                    cf.kind,
+                                    cf.evidence
+                                ));
+                            }
+                            // Fallback chain exists but hop failed (e.g. load error) — still terminal
+                            return Err(anyhow::anyhow!(
+                                "spawn failed ({}): {} — reroute hop failed",
                                 cf.kind,
-                                &cf.evidence,
-                            );
+                                cf.evidence
+                            ));
+                        }
+                        if cf.reroute_eligible && already_rerouted {
+                            return Err(anyhow::anyhow!(
+                                "spawn failed ({}): {} — fallback also failed (terminal, one hop per class)",
+                                cf.kind,
+                                cf.evidence
+                            ));
                         }
                         // Deterministic herdr rejection for a kind it does not
                         // know: fall back to the harness spawn recipe once.
@@ -8370,7 +8459,7 @@ pub(crate) fn start_agent_with_retry(
                         // Classifier only sees it when recipes fail (ADR-0026).
                         if matches!(&e.code, BackendErrorCode::Other(c) if c == "unsupported_agent_kind")
                         {
-                            if try_recipe_launch(c, kind, pane_id, args)? {
+                            if try_recipe_launch(c, &current_kind, pane_id, &current_args)? {
                                 recipe_launched = true;
                             } else {
                                 return Err(e.into());
@@ -8378,7 +8467,8 @@ pub(crate) fn start_agent_with_retry(
                         } else if cf.kind == failure::FailureKind::Billing
                             || cf.kind == failure::FailureKind::Auth
                         {
-                            if fallback_chain_for(kind).is_empty() {
+                            let fallback_key = profile_name.unwrap_or(kind);
+                            if fallback_chain_for(fallback_key).is_empty() {
                                 return Err(anyhow::anyhow!(
                                     "spawn failed ({}): {} — no fallback chain",
                                     cf.kind,
@@ -24685,13 +24775,14 @@ fn cmd_internal_run_headless(
     {
         let err_str = attempt.outcome.error.as_deref().unwrap_or("");
         let cf = failure::classify(err_str, Some(attempt.outcome.exit_code), None);
-        if cf.reroute_eligible && !cf.evidence.is_empty() {
+        if cf.reroute_eligible {
             eprintln!(
                 "flywheel: headless classified kind={} evidence={}",
                 cf.kind, cf.evidence
             );
-            record_reroute_audit("flywheel", 0, profile_name, cf.kind, &cf.evidence);
-            if let Some(next_profile) = next_fallback(profile_name, &[]) {
+            if let Some(next_profile) =
+                reroute_next_profile(profile_name, cf.kind, &cf.evidence, &[], 0)
+            {
                 if let Some(fb_prof) = catalog.get(&next_profile) {
                     let fb_harness = if fb_prof.harness.is_empty() {
                         harness

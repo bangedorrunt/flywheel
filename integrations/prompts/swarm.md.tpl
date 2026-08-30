@@ -38,6 +38,7 @@ default, explicit provider/model overrides. Use consistently.
    on [doorbell] pull then act, post to steer channel, blocked >10m mail
    captain, TIMEBOX 90m partial report. Use public mail identity.
    prove-it-works.
+   Supervised wave execution: `flywheel workflow compose --parts wave-swarm` -- swarm-mode is the crew, wave-swarm is the recipe.
 
 6. CONFLICT: soft -> `toron reserve request-release` -> respond
    agreed|denied|deferred -> escalate on steer channel, captain LAST.

@@ -305,7 +305,151 @@ pub fn decide(target: &str, snap: &Snapshot) -> Decision {
             ],
         );
     }
-    // 15. Ready beads + work-ish intent → run the loop, not hand-rolled sends.
+    // 15. feature -> feature (bd-x6x4: shape the domain then TDD build).
+    if has(&t, &["feature"]) {
+        return dec(
+            "feature",
+            "feature — feature workflow (shape -> build -> prove)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "feature",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 16. goal -> goal (meta: brainstorm -> plan -> beads -> build -> review -> ship).
+    if has(&t, &["goal"]) {
+        return dec(
+            "goal",
+            "goal — meta-workflow (brainstorm -> plan -> beads -> build)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "goal",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 17. triage-deep before triage (longer phrase wins).
+    if has(&t, &["triage-deep", "triage deep", "deep triage"]) {
+        return dec(
+            "triage-deep",
+            "triage-deep — deep backlog triage (bv robot-triage -> spawn crew)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "triage-deep",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 18. triage -> triage (canonical reactive workflow).
+    if has(&t, &["triage"]) {
+        return dec(
+            "triage",
+            "triage — inbound message triage (ack + dispatch)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "triage",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 19. weekly-review -> weekly-review (schedule: scout fanout 3 -> oracle).
+    if has(&t, &["weekly-review", "weekly review"]) {
+        return dec(
+            "weekly-review",
+            "weekly-review — weekly repo review (scout fanout -> oracle idea)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "weekly-review",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 20. autonomous-work -> autonomous-work (real loop then ship-beads).
+    if has(&t, &["autonomous-work", "autonomous work"]) {
+        return dec(
+            "autonomous-work",
+            "autonomous-work — autonomous overnight work (loop run --work then ship)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "autonomous-work",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 21. reflect -> reflect (corrections become structure).
+    if has(&t, &["reflect"]) {
+        return dec(
+            "reflect",
+            "reflect — corrections become structure (scan -> emit hook bead -> prune)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "reflect",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 22. awareness-digest -> awareness-digest (read-only digest, headless).
+    if has(&t, &["awareness-digest", "awareness digest"]) {
+        return dec(
+            "awareness-digest",
+            "awareness-digest — captain digest (presence + reservations + guard)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "awareness-digest",
+                "--execute",
+                "--mode",
+                "headless",
+            ],
+        );
+    }
+    // 23. onboard -> onboard (cold-start map + seed).
+    if has(&t, &["onboard"]) {
+        return dec(
+            "onboard",
+            "onboard — cold-start newcomer (map repo -> seed first task)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "onboard",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 24. Ready beads + work-ish intent → run the loop, not hand-rolled sends.
     if snap.ready_bead_count > 0
         && !implement
         && (t.trim().is_empty() || has(&t, &["work", "loop", "beads"]))
@@ -389,6 +533,42 @@ pub fn decide(target: &str, snap: &Snapshot) -> Decision {
         "default — steer from catalog",
         &["flywheel", "steer", target],
     )
+}
+
+// ---- bd-x6x4: decide trigger phrase per builtin (workflow list --json) ----
+/// The decide keyword phrase that routes to a builtin via `flywheel decide`.
+/// Returns the primary trigger phrase (the first `has()` needle) for each
+/// routed builtin, or None for command-adjacent / recipe / phase-chain
+/// builtins that are deliberately NOT keyword-routed.
+pub fn decide_trigger_for(workflow: &str) -> Option<&'static str> {
+    match workflow {
+        // Existing 13
+        "captain-audit" => Some("audit"),
+        "bug-fix" => Some("repro"),
+        "refactoring" => Some("refactor"),
+        "prototype" => Some("prototype"),
+        "arena" => Some("arena"),
+        "perf" => Some("perf"),
+        "hillclimb" => Some("hillclimb"),
+        "forensics" => Some("forensic"),
+        "babysit-bead" => Some("babysit"),
+        "pickup" => Some("pickup"),
+        "pause" => Some("pause"),
+        "interrogate" => Some("interrogate"),
+        "figure-it-out" => Some("figure it out"),
+        "ship-beads" => Some("ship beads"),
+        // New 9 (bd-x6x4)
+        "feature" => Some("feature"),
+        "goal" => Some("goal"),
+        "triage-deep" => Some("triage-deep"),
+        "triage" => Some("triage"),
+        "weekly-review" => Some("weekly-review"),
+        "autonomous-work" => Some("autonomous-work"),
+        "reflect" => Some("reflect"),
+        "awareness-digest" => Some("awareness-digest"),
+        "onboard" => Some("onboard"),
+        _ => None,
+    }
 }
 
 // ---- ADR-0022 §3.7 T4 / W7: delegated composition coverage (bd-adr22-w7) ----
@@ -1023,6 +1203,159 @@ mod tests {
                 d.argv
             );
         }
+    }
+
+    // ---- bd-x6x4: high-value unrouted builtins (feature, goal, triage, triage-deep,
+    //      weekly-review, autonomous-work, reflect, awareness-digest, onboard) ----
+
+    #[test]
+    fn row15_feature_goes_to_feature() {
+        for t in [
+            "feature: add domain type for ingest",
+            "implement the feature",
+        ] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "feature", "target: {t}");
+            assert!(
+                d.argv.contains(&"feature".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
+            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
+        }
+    }
+
+    #[test]
+    fn row16_goal_goes_to_goal() {
+        for t in ["goal: ship the onboarding flow", "run the goal workflow"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "goal", "target: {t}");
+            assert!(d.argv.contains(&"goal".to_string()), "argv: {:?}", d.argv);
+            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
+        }
+    }
+
+    #[test]
+    fn row17_triage_deep_goes_to_triage_deep() {
+        for t in [
+            "triage-deep the backlog",
+            "triage deep across 50 beads",
+            "deep triage for the repo",
+        ] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "triage-deep", "target: {t}");
+            assert!(
+                d.argv.contains(&"triage-deep".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
+            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
+        }
+        // triage-deep must win over plain triage
+        let d = decide("triage-deep backlog", &snap());
+        assert_eq!(d.primitive, "triage-deep");
+    }
+
+    #[test]
+    fn row18_triage_goes_to_triage() {
+        for t in ["triage the support inbox", "triage inbound messages"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "triage", "target: {t}");
+            assert!(d.argv.contains(&"triage".to_string()), "argv: {:?}", d.argv);
+            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
+        }
+    }
+
+    #[test]
+    fn row19_weekly_review_goes_to_weekly_review() {
+        for t in ["weekly-review the repo", "weekly review on Sunday"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "weekly-review", "target: {t}");
+            assert!(
+                d.argv.contains(&"weekly-review".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
+            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
+        }
+    }
+
+    #[test]
+    fn row20_autonomous_work_goes_to_autonomous_work() {
+        for t in ["autonomous-work tonight", "autonomous work the backlog"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "autonomous-work", "target: {t}");
+            assert!(
+                d.argv.contains(&"autonomous-work".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
+            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
+        }
+    }
+
+    #[test]
+    fn row21_reflect_goes_to_reflect() {
+        for t in ["reflect on standing orders", "run reflect for the project"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "reflect", "target: {t}");
+            assert!(
+                d.argv.contains(&"reflect".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
+            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
+        }
+    }
+
+    #[test]
+    fn row22_awareness_digest_goes_to_awareness_digest() {
+        for t in ["awareness-digest for flywheel", "awareness digest check"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "awareness-digest", "target: {t}");
+            assert!(
+                d.argv.contains(&"awareness-digest".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
+            assert!(
+                d.argv.contains(&"headless".to_string()),
+                "headless: {:?}",
+                d.argv
+            );
+        }
+    }
+
+    #[test]
+    fn row23_onboard_goes_to_onboard() {
+        for t in ["onboard the newcomer", "run onboard for the repo"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "onboard", "target: {t}");
+            assert!(
+                d.argv.contains(&"onboard".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
+            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
+        }
+    }
+
+    #[test]
+    fn decide_trigger_for_maps_routed_and_unrouted() {
+        assert_eq!(decide_trigger_for("feature"), Some("feature"));
+        assert_eq!(decide_trigger_for("triage-deep"), Some("triage-deep"));
+        assert_eq!(decide_trigger_for("weekly-review"), Some("weekly-review"));
+        assert_eq!(
+            decide_trigger_for("awareness-digest"),
+            Some("awareness-digest")
+        );
+        // deliberately unrouted
+        assert_eq!(decide_trigger_for("debate"), None);
+        assert_eq!(decide_trigger_for("plan-review"), None);
+        assert_eq!(decide_trigger_for("phase-resolve"), None);
+        assert_eq!(decide_trigger_for("ship"), None);
+        assert_eq!(decide_trigger_for("wave-swarm"), None);
+        assert_eq!(decide_trigger_for("repair-until-verified"), None);
     }
 
     // Existing rows still win where they should (regression anchors).
