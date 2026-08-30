@@ -7675,6 +7675,10 @@ fn cmd_internal_doorbell(
         generation.as_ref(),
     );
 
+    // Ack-SLA scanner cadence: the SLA is 30-min granularity — a 1 Hz SQL
+    // scan is waste. 60s keeps the wake prompt while off the hot loop.
+    let mut last_ack_sla_check: u64 = 0;
+    const ACK_SLA_CHECK_SECS: u64 = 60;
     let mut subscribed = false;
     if let Ok(mut sub_client) = Client::connect(Some(&cfg.socket_path())) {
         let registry = state::load_spawn_registry(project);
@@ -7914,10 +7918,15 @@ fn cmd_internal_doorbell(
                     workspace,
                     generation.as_ref(),
                 );
-                // GS-006 bug 3: Ack-SLA was test-only (0 production callers). Doorbell 1s tick is the live caller.
-                // Pin audience now includes raw pin names (messaging.rs fix), so the kind-9 wake addresses.
-                if let Some(mb) = crate::mail_shim::try_mailbox() {
-                    let _ = crate::mail_shim::block_on(mb.check_ack_sla_expired(project, None));
+                // GS-006 bug 3: Ack-SLA was test-only (0 production callers). Doorbell tick
+                // is the live caller, throttled to 60s (30-min SLA needs no 1 Hz SQL scan).
+                // Pin audience now includes raw pin names (messaging.rs fix), so the wake addresses.
+                let now_s = doorbell_now_unix();
+                if now_s.saturating_sub(last_ack_sla_check) >= ACK_SLA_CHECK_SECS {
+                    last_ack_sla_check = now_s;
+                    if let Some(mb) = crate::mail_shim::try_mailbox() {
+                        let _ = crate::mail_shim::block_on(mb.check_ack_sla_expired(project, None));
+                    }
                 }
                 // ADR-0005: subscribe is the drain signal. Poll herdr only
                 // when the event spine is down.
@@ -10501,7 +10510,19 @@ pub fn captain_fact_inject(project: &str, event: &ingress::IngressEvent) -> Resu
         Ok(_) => {}
         Err(e) if is_agent_not_ready(&e.code) => {
             let pane = entry.pane_id.clone();
-            let _ = try_send_text_delivery(&mut client, project, &entry.name, &pane, &line);
+            match try_send_text_delivery(&mut client, project, &entry.name, &pane, &line) {
+                Ok(true) => {}
+                ok_failed => {
+                    eprintln!(
+                        "flywheel: [FactMiss] send_text delivery failed for {} (pane {}): {:?}",
+                        entry.name, pane, ok_failed
+                    );
+                    anyhow::bail!(
+                        "captain fact miss: send_text delivery failed for {}",
+                        entry.name
+                    );
+                }
+            }
         }
         Err(e) => {
             eprintln!(
@@ -16113,6 +16134,7 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
         mail_health: Default::default(),
         mail_degraded: false,
         heal_states: Default::default(),
+        pending_events: Default::default(),
     };
     for (idx, entry) in entries.iter().enumerate() {
         let Some(msg_val) = entry.get("msg") else {
@@ -16533,6 +16555,7 @@ fn cmd_loop(
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &d_states,
             nudge,
@@ -17872,6 +17895,7 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -17907,6 +17931,7 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -17937,6 +17962,7 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             Some("continue"),
@@ -17967,6 +17993,7 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -17995,6 +18022,7 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -18023,6 +18051,7 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -18059,6 +18088,7 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -18086,6 +18116,7 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -18117,6 +18148,7 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -18139,6 +18171,7 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             Some("proceed"),
@@ -18167,6 +18200,7 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             Some("proceed"),
@@ -18192,6 +18226,7 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -18217,6 +18252,7 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,

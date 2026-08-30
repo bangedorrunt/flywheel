@@ -317,6 +317,12 @@ pub struct LoopModel {
     pub mail_health: crate::state::MailHealth,
     pub mail_degraded: bool,
     pub heal_states: std::collections::HashMap<String, HealState>,
+    /// Herdr events folded into tick (bd-ugd1): `LoopMsg::Herdr` buffers the
+    /// PollEvent here; the next `LoopMsg::Tick` drains it through
+    /// `apply_events_to_states` so plan_actions sees event-asserted statuses.
+    /// serde default keeps stored loops.json / journals loading unchanged.
+    #[serde(default)]
+    pub pending_events: Vec<PollEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -446,8 +452,16 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             nudge,
             wake_suppressed,
         } => {
+            // Fold buffered Herdr events (LoopMsg::Herdr) into the states
+            // BEFORE planning, so plan_actions sees event-asserted statuses
+            // without waiting for the heartbeat snapshot (bd-ugd1).
+            let mut states = states.clone();
+            if !next.pending_events.is_empty() {
+                let pending = std::mem::take(&mut next.pending_events);
+                apply_events_to_states(&mut states, &pending);
+            }
             let actions_from_plan =
-                plan_actions(&next, states, nudge.as_deref(), digests, wake_suppressed);
+                plan_actions(&next, &states, nudge.as_deref(), digests, wake_suppressed);
             let send_count = actions_from_plan
                 .iter()
                 .filter(|a| matches!(a, LoopAction::Send { .. }))
@@ -460,16 +474,42 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             actions.extend(actions_from_plan);
         }
         LoopMsg::Herdr(pe) => {
-            // GS-007 bd-ugd1: Herdr PollEvent maps via ingress_to_loop_msg seam.
-            // Legacy route_event mutates queue outside tick; future fold will move it here.
-            // Arm kept non-empty for purity fence (no silent empty).
-            let _ = pe;
+            // bd-ugd1: buffer into model' (visible + replayable); the next
+            // Tick drains it through apply_events_to_states.
+            next.pending_events.push(pe.clone());
         }
         LoopMsg::WaveGate { bead_id } => {
-            let _ = bead_id;
+            // Same state machine as the live loop: Verify --WaveGate--> WaveHeld.
+            let from = model
+                .per_bead_phase
+                .get(bead_id)
+                .cloned()
+                .unwrap_or(LoopPhase::Idle);
+            if let Ok(to) = transition(
+                &from,
+                &LoopEvent::WaveGate {
+                    bead_id: bead_id.clone(),
+                },
+            ) {
+                next.per_bead_phase.insert(bead_id.clone(), to);
+            }
         }
         LoopMsg::CommandVerified { bead_id, verified } => {
-            let _ = (bead_id, verified);
+            // Verify --Complete{has_command_verified, wave_gate:false}--> Complete.
+            let from = model
+                .per_bead_phase
+                .get(bead_id)
+                .cloned()
+                .unwrap_or(LoopPhase::Idle);
+            if let Ok(to) = transition(
+                &from,
+                &LoopEvent::Complete {
+                    has_command_verified: *verified,
+                    wave_gate: false,
+                },
+            ) {
+                next.per_bead_phase.insert(bead_id.clone(), to);
+            }
         }
     }
     (next, actions)
@@ -5420,14 +5460,22 @@ pub(crate) fn workflow_for_bead(bead: &ReadyBead) -> Option<String> {
         .find_map(|l| l.strip_prefix("workflow:").map(|s| s.to_string()))
 }
 
+/// Outcome of a graph-vehicle spawn attempt. AlreadySpawned is a DISTINCT
+/// ok-arm: the vehicle owns the bead (loop keeps claim-watch), and the
+/// caller must NOT fall through to a normal brief (that would double-
+/// dispatch the bead every poll while the vehicle runs).
+pub(crate) enum VehicleOutcome {
+    Spawned,
+    AlreadySpawned,
+}
+
 /// bd-bpd9 execution leaf: spawn the opted-in bead's graph vehicle as a
 /// detached `workflow run <name> --execute --mode pane` subprocess — the
 /// full engine rail (pane runner + VerifySink + drainers) without
 /// duplicating it inside the loop. In-graph verify writes a WORKFLOW
 /// receipt; close still requires loop VERIFY + CommandVerified.
-/// `graph_invoked` dedupes within one loop process; across restarts a
-/// re-invoke re-runs the graph (documented v1 limit — W5 compose run-id
-/// unification removes it).
+/// `graph_invoked` dedupes within one loop process; across restarts the
+/// marker file answers AlreadySpawned (loud, typed — never a silent Ok).
 pub(crate) fn spawn_graph_vehicle(
     project: &str,
     bead_id: &str,
@@ -5435,7 +5483,7 @@ pub(crate) fn spawn_graph_vehicle(
     title: &str,
     verify: Option<&str>,
     graph_invoked: &mut std::collections::HashSet<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<VehicleOutcome> {
     // Marker file survives loop recovery: a durable-fn replay after a crash
     // must not spawn a second crew for the same bead (the std HashSet only
     // dedupes within one process lifetime).
@@ -5443,15 +5491,17 @@ pub(crate) fn spawn_graph_vehicle(
         .join("journals")
         .join(format!("graph-invoked-{bead_id}.marker"));
     if marker.exists() {
-        anyhow::bail!(
-            "graph vehicle already spawned for {bead_id} (marker {}) — loud AlreadySpawned, not Ok",
+        eprintln!(
+            "flywheel: [bd-bpd9] AlreadySpawned for {bead_id} (marker {}) — vehicle owns the bead, no re-brief",
             marker.display()
         );
+        return Ok(VehicleOutcome::AlreadySpawned);
     }
     if !graph_invoked.insert(bead_id.to_string()) {
-        anyhow::bail!(
-            "graph vehicle already spawned for {bead_id} this process lifetime — loud AlreadySpawned"
+        eprintln!(
+            "flywheel: [bd-bpd9] AlreadySpawned for {bead_id} (this process) — vehicle owns the bead, no re-brief"
         );
+        return Ok(VehicleOutcome::AlreadySpawned);
     }
     if let Some(parent) = marker.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -5487,7 +5537,7 @@ pub(crate) fn spawn_graph_vehicle(
         "flywheel: [bd-bpd9] graph vehicle pid={} workflow={workflow} bead={bead_id}",
         child.id()
     );
-    Ok(())
+    Ok(VehicleOutcome::Spawned)
 }
 
 #[function]
@@ -6196,7 +6246,13 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 bead.verify.as_deref(),
                                 &mut graph_invoked,
                             ) {
-                                Ok(()) => {
+                                Ok(_outcome) => {
+                                    // Both arms: the vehicle owns the bead.
+                                    // Spawned just launched it; AlreadySpawned
+                                    // is loud in the leaf — either way NEVER
+                                    // fall through to a normal brief (that
+                                    // would re-dispatch the bead every poll
+                                    // while the vehicle runs).
                                     assigned.push(bead.id.clone());
                                     continue;
                                 }
@@ -6817,6 +6873,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     .unwrap_or_default(),
                 mail_degraded: active.as_ref().map(|a| a.mail_degraded).unwrap_or(false),
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             };
             let msg = LoopMsg::Tick {
                 states: states.clone(),
@@ -8721,6 +8778,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -8779,6 +8837,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -8814,6 +8873,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -8841,6 +8901,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -8868,6 +8929,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             Some("proceed"),
@@ -8893,6 +8955,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -8920,6 +8983,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -8947,6 +9011,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             Some("proceed"),
@@ -9858,6 +9923,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -9900,6 +9966,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -9939,6 +10006,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -10049,6 +10117,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -10083,6 +10152,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -10109,6 +10179,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states_plain,
             None,
@@ -10149,6 +10220,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -10222,6 +10294,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -10256,6 +10329,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -10286,6 +10360,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -10329,6 +10404,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -10439,6 +10515,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -10501,6 +10578,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -10529,6 +10607,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             Some("proceed"),
@@ -10563,6 +10642,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -10594,6 +10674,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -10624,6 +10705,7 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+                pending_events: Default::default(),
             },
             &states,
             None,
@@ -11937,6 +12019,7 @@ mod tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            pending_events: Default::default(),
         };
         let msg = LoopMsg::Tick {
             states: states.to_vec(),
@@ -14205,6 +14288,7 @@ mod tick_replay_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            pending_events: Default::default(),
         };
         let msgs = vec![
             LoopMsg::Tick {
@@ -14247,6 +14331,7 @@ mod tick_replay_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            pending_events: Default::default(),
         };
         let mut actions_log2 = Vec::new();
         for msg in &msgs {
@@ -14271,6 +14356,7 @@ mod tick_replay_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            pending_events: Default::default(),
         };
         let msg = LoopMsg::Tick {
             states: vec![AgentState {
@@ -14305,6 +14391,7 @@ mod tick_replay_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            pending_events: Default::default(),
         };
         let msg = LoopMsg::Tick {
             states: vec![AgentState {
@@ -14347,6 +14434,7 @@ mod loop_invoke_vehicle_tests {
             mail_health: MailHealth::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            pending_events: Default::default(),
         };
         // Simulate a graph invoke for bd-1 that succeeds (in-graph green)
         let msg = LoopMsg::Tick {
@@ -14384,6 +14472,7 @@ mod loop_invoke_vehicle_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            pending_events: Default::default(),
         };
         // Simulate worker closing the bead via br close (BrClose event)
         let (next, _) = tick(
@@ -14424,6 +14513,7 @@ mod loop_invoke_vehicle_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            pending_events: Default::default(),
         };
         let msg = LoopMsg::BrClose {
             bead_id: "bd-1".to_string(),
@@ -14487,6 +14577,7 @@ mod loop_invoke_vehicle_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            pending_events: Default::default(),
         };
         // For a bead that is not opted-in for graph, tick with Tick should just do normal plan_actions
         let msg = LoopMsg::Tick {
@@ -14521,6 +14612,7 @@ mod loop_invoke_vehicle_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            pending_events: Default::default(),
         };
         let states = vec![AgentState {
             name: "a".to_string(),
@@ -14561,6 +14653,7 @@ mod loop_invoke_vehicle_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            pending_events: Default::default(),
         };
         let msg = LoopMsg::Tick {
             states: vec![AgentState {
@@ -14591,6 +14684,7 @@ mod loop_invoke_vehicle_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            pending_events: Default::default(),
         };
         for entry in &entries {
             let m: LoopMsg = serde_json::from_value(entry.get("msg").unwrap().clone()).unwrap();
@@ -14623,6 +14717,7 @@ mod loop_invoke_vehicle_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            pending_events: Default::default(),
         };
         let msg = LoopMsg::Tick {
             states: vec![],

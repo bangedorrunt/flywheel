@@ -16,3 +16,4 @@ agents/
 messages/
 .projected/
 .beads/beads.db-wal-cert*
+toron-data/
