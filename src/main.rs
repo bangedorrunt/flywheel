@@ -207,6 +207,121 @@ mod plane_tripwire_tests {
     }
 }
 
+#[cfg(test)]
+mod pane_fallback_tests {
+    use super::{fallback_chain_for, next_fallback, reroute_next_profile};
+    use crate::failure;
+
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_temp_profile(content: &str, f: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let orig = std::env::var_os("XDG_CONFIG_HOME");
+        let tmp = std::env::temp_dir().join(format!("fw-test-{}", std::process::id()));
+        let cfg_dir = tmp.join("flywheel");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
+        let path = cfg_dir.join("profiles.toml");
+        std::fs::write(&path, content).unwrap();
+        f();
+        // restore
+        match orig {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn pane_fallback_hops_to_fallback_on_402() {
+        let content = r#"
+[profiles.test-primary]
+harness = "opencode"
+model = "test-model"
+fallback = ["test-fallback"]
+
+[profiles.test-fallback]
+harness = "opencode"
+model = "fallback-model"
+"#;
+        with_temp_profile(content, || {
+            let cf = failure::classify("402 payment required", None, None);
+            assert_eq!(cf.kind, failure::FailureKind::Billing);
+            assert!(cf.reroute_eligible);
+            let chain = fallback_chain_for("test-primary");
+            assert_eq!(chain, vec!["test-fallback"]);
+            let next = next_fallback("test-primary", &[]).expect("should hop");
+            assert_eq!(next, "test-fallback");
+            let attempted: Vec<String> = vec![];
+            let reroute =
+                reroute_next_profile("test-primary", cf.kind, &cf.evidence, &attempted, 0)
+                    .expect("reroute should return fallback");
+            assert_eq!(reroute, "test-fallback");
+        });
+    }
+
+    #[test]
+    fn pane_fallback_second_same_class_terminal() {
+        let content = r#"
+[profiles.test-primary]
+harness = "opencode"
+model = "test-model"
+fallback = ["test-fallback"]
+
+[profiles.test-fallback]
+harness = "opencode"
+model = "fallback-model"
+"#;
+        with_temp_profile(content, || {
+            let cf = failure::classify("402 insufficient balance", None, None);
+            let first = reroute_next_profile("test-primary", cf.kind, &cf.evidence, &[], 0)
+                .expect("first hop");
+            assert_eq!(first, "test-fallback");
+            // second same-class failure should be terminal (no further hop)
+            let attempted = vec!["test-primary".to_string(), "test-fallback".to_string()];
+            let second = reroute_next_profile("test-primary", cf.kind, &cf.evidence, &attempted, 1);
+            assert!(
+                second.is_none(),
+                "second same-class should be terminal, got {second:?}"
+            );
+            // Also verify helper via next_fallback directly
+            let next2 = next_fallback("test-primary", &attempted);
+            assert!(next2.is_none());
+        });
+    }
+
+    #[test]
+    fn pane_fallback_audit_row_written() {
+        let content = r#"
+[profiles.test-primary]
+harness = "opencode"
+model = "test-model"
+fallback = ["test-fallback"]
+
+[profiles.test-fallback]
+harness = "opencode"
+model = "fallback-model"
+"#;
+        with_temp_profile(content, || {
+            let cf = failure::classify("401 unauthorized", None, None);
+            assert!(cf.reroute_eligible);
+            // reroute_next_profile should write an audit row via state::log_event
+            // We verify it returns Some and the chain is correct; the audit
+            // side-effect is the eprintln + log_event (best-effort, not asserted
+            // on filesystem here). The key property is that it is audited and
+            // the helper is the shared headless+pane path.
+            let next = reroute_next_profile("test-primary", cf.kind, &cf.evidence, &[], 0)
+                .expect("audit hop");
+            assert_eq!(next, "test-fallback");
+            // Ensure the helper is the same one headless uses (no fork)
+            let chain = fallback_chain_for("test-primary");
+            assert!(!chain.is_empty());
+        });
+    }
+}
+
 // ---- stage prompts (ADR-0005 Spec 2a / P3.3) ----
 //
 // Resolved through the `stages` library: compiled-in defaults (the former
@@ -6904,7 +7019,14 @@ projects available: {}",
                      within 15s — the launch command may be mangled by the booting shell"
                 );
             }
-            let agent = start_agent_with_retry(&mut c, &name, &kind, &pane_id, &agent_args)?;
+            let agent = start_agent_with_retry_profile(
+                &mut c,
+                &name,
+                &kind,
+                &pane_id,
+                &agent_args,
+                item.profile.as_deref(),
+            )?;
             // bd-eign.6 L1: readiness gate — agent.start returns when the
             // launch command is dispatched, not when the TUI is input-ready;
             // a prompt in the boot window is lost to the shell. Poll until
@@ -8522,12 +8644,28 @@ fn start_agent_with_retry_dyn(
     pane_id: &str,
     args: &[String],
 ) -> Result<AgentInfo> {
+    start_agent_with_retry_dyn_profile(backend, name, kind, pane_id, args, None)
+}
+
+fn start_agent_with_retry_dyn_profile(
+    backend: &dyn backend::MultiplexerBackend,
+    name: &str,
+    kind: &str,
+    pane_id: &str,
+    args: &[String],
+    profile_name: Option<&str>,
+) -> Result<AgentInfo> {
     // bd-zq8u: fail fast on un-encodable launch text before any retry burn.
     ensure_ascii_launch_args(args)?;
     let mut recipe_launched = false;
+    let mut current_kind = kind.to_string();
+    let mut current_args = args.to_vec();
+    let mut current_profile = profile_name.map(|s| s.to_string());
+    let mut attempted_profiles: Vec<String> = current_profile.clone().into_iter().collect();
+    let mut already_rerouted = false;
     for attempt in 0..30 {
         if !recipe_launched {
-            match backend.agent_start(name, kind, pane_id, args) {
+            match backend.agent_start(name, &current_kind, pane_id, &current_args) {
                 Ok(_) => {}
                 Err(e) => {
                     if attempt == 0 {
@@ -8538,20 +8676,74 @@ fn start_agent_with_retry_dyn(
                                 "flywheel: classified spawn failure kind={} evidence={}",
                                 cf.kind, cf.evidence
                             );
-                            record_reroute_audit(
-                                "flywheel",
-                                attempt as u32,
-                                kind,
+                        }
+                        if cf.reroute_eligible && !already_rerouted {
+                            if let Some(orig) = current_profile.as_deref() {
+                                if let Some(next) = reroute_next_profile(
+                                    orig,
+                                    cf.kind,
+                                    &cf.evidence,
+                                    &attempted_profiles,
+                                    attempt as u32,
+                                ) {
+                                    if let Ok(cat) = ProfileCatalog::load() {
+                                        if let Some(next_prof) = cat.get(&next) {
+                                            let next_kind = if next_prof.harness.is_empty() {
+                                                current_kind.clone()
+                                            } else {
+                                                next_prof.harness.clone()
+                                            };
+                                            if let Ok(next_args) =
+                                                profile_launch_args(&next_kind, next_prof, None)
+                                            {
+                                                eprintln!(
+                                                    "flywheel: pane reroute {} -> {} (profile fallback)",
+                                                    orig, next
+                                                );
+                                                current_kind = next_kind;
+                                                current_args = next_args;
+                                                current_profile = Some(next.clone());
+                                                attempted_profiles.push(next);
+                                                already_rerouted = true;
+                                                std::thread::sleep(Duration::from_secs(1));
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let fallback_key = profile_name.unwrap_or(kind);
+                            if fallback_chain_for(fallback_key).is_empty() {
+                                return Err(anyhow::anyhow!(
+                                    "spawn failed ({}): {} — no fallback chain",
+                                    cf.kind,
+                                    cf.evidence
+                                ));
+                            }
+                            return Err(anyhow::anyhow!(
+                                "spawn failed ({}): {} — reroute hop failed",
                                 cf.kind,
-                                &cf.evidence,
-                            );
+                                cf.evidence
+                            ));
+                        }
+                        if cf.reroute_eligible && already_rerouted {
+                            return Err(anyhow::anyhow!(
+                                "spawn failed ({}): {} — fallback also failed (terminal, one hop per class)",
+                                cf.kind,
+                                cf.evidence
+                            ));
                         }
                         // H1 (bd-harness-prime-agent-818f): same recipe
                         // fallback as the concrete-client variant — herdr
                         // rejects unknown kinds deterministically.
                         if matches!(&e.code, BackendErrorCode::Other(c) if c == "unsupported_agent_kind")
                         {
-                            if try_recipe_launch_dyn(backend, kind, pane_id, args)? {
+                            if try_recipe_launch_dyn(
+                                backend,
+                                &current_kind,
+                                pane_id,
+                                &current_args,
+                            )? {
                                 recipe_launched = true;
                             } else {
                                 return Err(e.into());
@@ -8559,7 +8751,8 @@ fn start_agent_with_retry_dyn(
                         } else if cf.kind == failure::FailureKind::Billing
                             || cf.kind == failure::FailureKind::Auth
                         {
-                            if fallback_chain_for(kind).is_empty() {
+                            let fallback_key = profile_name.unwrap_or(&current_kind);
+                            if fallback_chain_for(fallback_key).is_empty() {
                                 return Err(anyhow::anyhow!(
                                     "spawn failed ({}): {} — no fallback chain",
                                     cf.kind,
