@@ -28,3 +28,4 @@
 {"id":28,"issue_id":"bd-3566","from_status":"in_progress","to_status":"closed","status_revision":1824,"gate":"unit-test-verified","provider":"verifier:GoldenCove","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-29 23:22:13"}
 {"id":29,"issue_id":"bd-4y0s","from_status":"in_progress","to_status":"closed","status_revision":1827,"gate":"unit-test-verified","provider":"verifier:GoldenCove","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-29 23:22:21"}
 {"id":30,"issue_id":"bd-wsa0","from_status":"in_progress","to_status":"closed","status_revision":1877,"gate":"unit-test-verified","provider":"flywheel-flywheel-oc3","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-30 03:14:56"}
+{"id":31,"issue_id":"bd-bpd9","from_status":"in_progress","to_status":"closed","status_revision":1878,"gate":"unit-test-verified","provider":"TealDune-captain","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-30 05:28:13"}
