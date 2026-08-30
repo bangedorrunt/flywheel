@@ -24,9 +24,7 @@ Run `flywheel decide "<target>" --json` (pure classifier in `src/decide.rs`). Ru
 | primitive | argv |
 |-----------|------|
 | captain-audit | `workflow run captain-audit --execute --mode headless` |
-| loop-solo | `loop-mode run <project>` |
 | loop-work | `loop-mode run <project> --work` |
-| open | current pane / `/open` |
 | steer / steer-direct | `steer` / `steer --direct` |
 | compose-parts / compose-agent | `workflow compose --parts` / `--agent` |
 | coalition-form | `coalition form` |

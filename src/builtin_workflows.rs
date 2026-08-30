@@ -33,9 +33,7 @@
 //! - `forensics` — diagnosis-only (bd-w2-review-s6ij): diagnose @scout —
 //!   instrument or read the artifact; the deliverable is the DIAGNOSIS. NO
 //!   fix step (lint-enforced); a fix is a separate bug-fix.
-//! - `figure-it-out` — no bundled playbook (bd-w2-review-s6ij): the planner
-//!   authors workflow YAML (lint is the gate); the captain executes via
-//!   `workflow compose --agent` then `--execute`.
+//! - `figure-it-out` — decide-only, no builtin YAML (bd-w2-review-s6ij): `figure it out` → `workflow compose --agent` (planner authors YAML, lint is the gate; the captain executes via --execute).
 //! - `babysit-bead` / `ship-beads` / `autonomous-work` / `pickup` / `pause`
 //!   — the operations playbooks (ADR-0019 Spec 7.2, bd-w2-ops-szky):
 //!   babysit drives ONE bead to a legal ledger row; ship-beads gates on the
@@ -393,7 +391,7 @@ steps:
         "triage",
         r##"
 name: triage
-description: Triage inbound messages — the canonical reactive workflow.
+description: "Triage inbound messages — the canonical reactive workflow (auto #support message_posted trigger; for interactive use run triage-deep)."
 trigger:
   type: message_posted
   channel: "#support"
@@ -454,7 +452,7 @@ steps:
         "triage-deep",
         r##"
 name: triage-deep
-description: Deep backlog triage — bv robot-triage, prioritize + assign, spawn the crew.
+description: "Deep backlog triage — bv robot-triage, prioritize + assign, spawn the crew. NOTE: /triage -> triage-deep is intentional (triage = auto #support trigger; triage-deep = interactive)."
 trigger:
   type: webhook
 crew: auto
@@ -957,29 +955,6 @@ graph:
 "##,
     ),
     (
-        "figure-it-out",
-        r##"
-name: figure-it-out
-description: "No bundled playbook matches — the planner authors workflow YAML (lint is the gate); the captain executes it via workflow compose --agent then --execute."
-trigger:
-  type: webhook
-crew: auto
-inputs:
-  - name: objective
-principles:
-  - foundational-thinking
-  - encode-lessons-in-structure
-steps:
-  - name: author
-    action: dispatch_job
-    assignee: x
-    spec:
-      profile: "@planner"
-      task: "Author a workflow YAML for this objective — name the data shapes, sequence verifiable units, declare principles; lint is the gate. Return the YAML document. Objective: {{inputs.objective}}"
-    on_error: fail_run
-"##,
-    ),
-    (
         "babysit-bead",
         r##"
 name: babysit-bead
@@ -1408,10 +1383,13 @@ mod tests {
             "captain-audit",
             "interrogate",
             "forensics",
-            "figure-it-out",
         ] {
             assert!(wfs.contains_key(name), "built-in {name} present");
         }
+        assert!(
+            !wfs.contains_key("figure-it-out"),
+            "figure-it-out is decide-routed to compose --agent, not a builtin YAML"
+        );
     }
 
     /// bd-cvv9 (ADR-0022 §3.3): the five phase built-ins parse, are
@@ -1550,14 +1528,17 @@ mod tests {
             matches!(diagnose.action, Action::DispatchJob { .. }),
             "diagnose is a dispatch"
         );
-        // figure-it-out: @planner author step.
-        let fio = &wfs["figure-it-out"];
+        // figure-it-out: routed via decide to compose --agent, not a builtin YAML
         assert!(
-            fio.steps
-                .iter()
-                .any(|s| s.name.as_deref() == Some("author")),
-            "figure-it-out has an author step"
+            !wfs.contains_key("figure-it-out"),
+            "figure-it-out is decide-routed, not a builtin YAML"
         );
+        let d = crate::decide::decide("figure it out", &crate::decide::Snapshot::default());
+        assert_eq!(
+            d.primitive, "figure-it-out",
+            "decide routes figure-it-out to compose --agent"
+        );
+        assert!(d.argv.contains(&"--agent".to_string()));
     }
 
     /// bd-t86p: the goal DIRECT arm is a built-in (`goal-direct` + its
