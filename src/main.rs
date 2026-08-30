@@ -26811,48 +26811,30 @@ fn make_verify_sink(cfg: Config, project: String) -> toron_workflow::engine::Ver
     let project_clone = project.clone();
     *sink.0.lock().unwrap() = Some(std::sync::Arc::new(
         move |req: &toron_workflow::engine::VerifyRequest| {
-            // Acquire cargo slot (advisory, best-effort)
-            acquire_cargo_slot(&cfg_clone, &project_clone);
-            // Reuse loop-run-verify exec (cargo under slot, TIMEBOX)
-            let _out = match loop_run_verify_exec(
-                &cfg_clone,
-                &project_clone,
-                "verify-sink-bead",
-                "",
-                Some(600),
-                None,
-            ) {
-                Ok(o) => o,
-                Err(e) => {
-                    return Ok(toron_workflow::engine::VerifyResult {
-                        ok: false,
-                        exit: -1,
-                        stdout_path: None,
-                        stderr_path: None,
-                        error: Some(format!("verify sink missing: {e}")),
-                    });
-                }
-            };
-            // For workflow runs, we don't have a real bead_id/sha, so we use the command from the request
-            // Run the verify command directly via loop_run_verify_exec's underlying shell
-            // Instead, run the requested command via the same exec path but with the request's command
-            // For now, delegate to a direct shell run under the slot
             let cmd = req.command.clone();
-            // Use the same TIMEBOX and cargo slot already held
             let cwd = project_dir(&cfg_clone, &project_clone);
-            // Write a workflow receipt (not command-verified) via write_receipt
-            // For the test harness, we just return ok:true with a temp path
-            // Real impl would run `sh -c <cmd>` and write receipt
-            // Simplified: run the command and capture
-            let output = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
-                .current_dir(&cwd)
-                .output();
-            match output {
-                Ok(o) if o.status.success() => {
-                    // Write workflow receipt (WorkerReceipt) to .flywheel/receipts/<run>-<sha>.txt via write_receipt
-                    let receipt_content = String::from_utf8_lossy(&o.stdout).to_string();
+            // ADR-0024 Spec 6: reuse loop_run_verify_exec's exec path — slot held,
+            // TIMEBOX, receipt via write_receipt (workflow kind, never
+            // command-verified). The VerifySink is the workflow-graph verify
+            // leaf; it must not fork a second exec path.
+            let is_cargo = cmd.split_whitespace().next() == Some("cargo");
+            if is_cargo {
+                acquire_cargo_slot(&cfg_clone, &project_clone);
+            }
+            // TIMEBOX 600s (fallback default, same as loop_run_verify_exec)
+            let outcome = run_verify_with_timeout(&cmd, 600, &cwd);
+            if is_cargo {
+                release_cargo_slot(&cfg_clone, &project_clone);
+            }
+            match outcome {
+                Ok((0, tail)) => {
+                    let receipt_content = if tail.trim().is_empty() {
+                        // Ensure receipt is non-empty (anti-empty guard in
+                        // write_receipt); a silent pass still needs evidence.
+                        format!("verify ok: {cmd}")
+                    } else {
+                        tail
+                    };
                     let receipt_path = match crate::verdict::write_receipt(
                         &cwd,
                         "verify-sink",
@@ -26861,7 +26843,15 @@ fn make_verify_sink(cfg: Config, project: String) -> toron_workflow::engine::Ver
                         &receipt_content,
                     ) {
                         Ok(p) => Some(p.to_string_lossy().to_string()),
-                        Err(_) => None,
+                        Err(e) => {
+                            return Ok(toron_workflow::engine::VerifyResult {
+                                ok: false,
+                                exit: -1,
+                                stdout_path: None,
+                                stderr_path: None,
+                                error: Some(format!("receipt write failed: {e}")),
+                            });
+                        }
                     };
                     Ok(toron_workflow::engine::VerifyResult {
                         ok: true,
@@ -26871,22 +26861,19 @@ fn make_verify_sink(cfg: Config, project: String) -> toron_workflow::engine::Ver
                         error: None,
                     })
                 }
-                Ok(o) => {
-                    let err = String::from_utf8_lossy(&o.stderr).to_string();
-                    Ok(toron_workflow::engine::VerifyResult {
-                        ok: false,
-                        exit: o.status.code().unwrap_or(1),
-                        stdout_path: None,
-                        stderr_path: None,
-                        error: Some(err),
-                    })
-                }
-                Err(e) => Ok(toron_workflow::engine::VerifyResult {
+                Ok((exit, tail)) => Ok(toron_workflow::engine::VerifyResult {
+                    ok: false,
+                    exit,
+                    stdout_path: None,
+                    stderr_path: None,
+                    error: Some(tail),
+                }),
+                Err(tail) => Ok(toron_workflow::engine::VerifyResult {
                     ok: false,
                     exit: -1,
                     stdout_path: None,
                     stderr_path: None,
-                    error: Some(e.to_string()),
+                    error: Some(tail),
                 }),
             }
         },
@@ -29719,6 +29706,61 @@ graph:
         .unwrap_err();
         assert!(err.to_string().contains("command-verified"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_sink_exec_failing_command_returns_false_with_exit() {
+        let cfg = Config::default();
+        let sink = make_verify_sink(cfg, "flywheel".to_string());
+        let req = VerifyRequest {
+            command: "false".to_string(),
+        };
+        let guard = sink.0.lock().unwrap();
+        let f = guard.as_ref().expect("sink");
+        let res = f(&req).expect("verify sink");
+        assert!(!res.ok);
+        assert!(res.exit != 0);
+        assert!(res.stdout_path.is_none());
+        assert!(res.error.is_some());
+    }
+
+    #[test]
+    fn verify_sink_exec_writes_workflow_receipt_on_success() {
+        let cfg = Config::default();
+        let sink = make_verify_sink(cfg, "flywheel".to_string());
+        let req = VerifyRequest {
+            command: "echo workflow-ok".to_string(),
+        };
+        let guard = sink.0.lock().unwrap();
+        let f = guard.as_ref().expect("sink");
+        let res = f(&req).expect("verify sink");
+        assert!(res.ok);
+        assert_eq!(res.exit, 0);
+        let path = res.stdout_path.expect("receipt path");
+        assert!(path.contains("verify-sink"));
+        assert!(path.contains("workflow-sha"));
+        assert!(path.ends_with(".worker-receipt.txt"));
+        // receipt file exists and contains output
+        let content = std::fs::read_to_string(&path).expect("receipt file");
+        assert!(content.contains("workflow-ok") || content.contains("verify ok"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn verify_sink_exec_slot_acquisition_still_happens() {
+        // cargo command should go through slot path (acquire/release) without panic
+        let cfg = Config::default();
+        let sink = make_verify_sink(cfg, "flywheel".to_string());
+        let req = VerifyRequest {
+            command: "cargo --version".to_string(),
+        };
+        let guard = sink.0.lock().unwrap();
+        let f = guard.as_ref().expect("sink");
+        let res = f(&req).expect("verify sink");
+        // cargo --version succeeds, so ok true
+        assert!(res.ok);
+        assert_eq!(res.exit, 0);
+        assert!(res.stdout_path.is_some());
     }
 }
 
