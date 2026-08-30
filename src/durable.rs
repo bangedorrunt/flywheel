@@ -533,10 +533,29 @@ pub struct ReadyBead {
     /// `None` = unknown age (never reclaim on stale).
     #[serde(default)]
     pub updated_at: Option<String>,
+    /// The bead's description (markdown). Used for WORKFLOW opt-in and goal extraction.
+    #[serde(default)]
+    pub description: String,
 }
 
 fn default_priority() -> u8 {
     3
+}
+
+impl Default for ReadyBead {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            title: String::new(),
+            assignee: None,
+            verify: None,
+            labels: Vec::new(),
+            priority: 3,
+            principles: String::new(),
+            updated_at: None,
+            description: String::new(),
+        }
+    }
 }
 
 /// Format br's typed schema-v18 principles citations (`[{"name": …,
@@ -1905,7 +1924,13 @@ pub(crate) fn parse_bead_list(v: &serde_json::Value, what: &str) -> anyhow::Resu
                         .map(parse_principles_field)
                 })
                 .unwrap_or_default(),
+            description: b
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
             updated_at: None,
+            ..Default::default()
         })
         .collect())
 }
@@ -3804,6 +3829,16 @@ pub enum LoopAction {
         herdr_name: String,
         reason: String,
     },
+    /// ADR-0024 W3 graph vehicle (bd-bpd9 / bd-27d0): engine.invoke a composed graph for a ready bead.
+    /// Opt-in per bead via `## WORKFLOW <name>` or `workflow:<name>` label. Never title text.
+    /// Inputs carry the bead's VERIFY fence and goal; execution leaf composes the builtin
+    /// (resolver serves builtins WITH graph) and runs via engine with --mode pane semantics.
+    /// In-graph verify writes a WORKFLOW receipt, never CommandVerified; close stays loop VERIFY.
+    InvokeGraph {
+        bead_id: String,
+        workflow: String,
+        inputs: serde_json::Value,
+    },
     Wait,
 }
 
@@ -5363,8 +5398,93 @@ fn match_expected_agent<'a>(
     })
 }
 
+/// bd-bpd9: the per-bead graph opt-in. `## WORKFLOW <name>` in the bead
+/// description, or a `workflow:<name>` label. Title text NEVER opts in —
+/// the c57dfd4-era stub logged "invoking graph" for any bead with "graph"
+/// in its title and then did nothing.
+pub(crate) fn workflow_for_bead(bead: &ReadyBead) -> Option<String> {
+    for line in bead.description.lines() {
+        if let Some(rest) = line.trim().strip_prefix("## WORKFLOW ") {
+            let name = rest.trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    bead.labels
+        .iter()
+        .find_map(|l| l.strip_prefix("workflow:").map(|s| s.to_string()))
+}
+
+/// bd-bpd9 execution leaf: spawn the opted-in bead's graph vehicle as a
+/// detached `workflow run <name> --execute --mode pane` subprocess — the
+/// full engine rail (pane runner + VerifySink + drainers) without
+/// duplicating it inside the loop. In-graph verify writes a WORKFLOW
+/// receipt; close still requires loop VERIFY + CommandVerified.
+/// `graph_invoked` dedupes within one loop process; across restarts a
+/// re-invoke re-runs the graph (documented v1 limit — W5 compose run-id
+/// unification removes it).
+pub(crate) fn spawn_graph_vehicle(
+    project: &str,
+    bead_id: &str,
+    workflow: &str,
+    title: &str,
+    verify: Option<&str>,
+    graph_invoked: &mut std::collections::HashSet<String>,
+) -> anyhow::Result<()> {
+    // Marker file survives loop recovery: a durable-fn replay after a crash
+    // must not spawn a second crew for the same bead (the std HashSet only
+    // dedupes within one process lifetime).
+    let marker = std::path::Path::new(&crate::config::state_dir())
+        .join("journals")
+        .join(format!("graph-invoked-{bead_id}.marker"));
+    if marker.exists() {
+        return Ok(()); // already spawned (prior process lifetime)
+    }
+    if !graph_invoked.insert(bead_id.to_string()) {
+        return Ok(()); // already spawned this process lifetime
+    }
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Write the marker BEFORE the spawn (at-most-once beats at-least-once
+    // here: a crash between write and spawn strands the bead claimed, and
+    // the loop's own claim-watch/redispatch re-drives it — never two crews).
+    let _ = std::fs::write(&marker, workflow);
+    let inputs = serde_json::json!({
+        "bead_id": bead_id,
+        "verify": verify,
+        "symptom": title,
+        "goal": title,
+    });
+    let exe = std::env::current_exe()?;
+    let child = std::process::Command::new(exe)
+        .args([
+            "workflow",
+            "run",
+            workflow,
+            "--execute",
+            "--mode",
+            "pane",
+            "--project",
+            project,
+            "--inputs",
+            &inputs.to_string(),
+            "--yes",
+            "--json",
+        ])
+        .spawn()?;
+    eprintln!(
+        "flywheel: [bd-bpd9] graph vehicle pid={} workflow={workflow} bead={bead_id}",
+        child.id()
+    );
+    Ok(())
+}
+
 #[function]
 async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
+    // bd-bpd9: beads whose graph vehicle was already spawned this process.
+    let mut graph_invoked: std::collections::HashSet<String> = std::collections::HashSet::new();
     // ADR-0026 W2: loop-identity fail-loud — hard-error at start if no usable key
     {
         let cfg = crate::config::Config::load().unwrap_or_default();
@@ -6052,16 +6172,29 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 );
             } else {
                 for bead in to_assign {
-                    // W3: opt-in per bead for engine.invoke vehicle (compose/steer) — coexistence with bare br close
-                    if bead.labels.iter().any(|l| l == "graph") || bead.title.contains("graph") {
-                        eprintln!(
-                            "flywheel: loop invoking graph for ready bead {} via compose_workflow vehicle (opt-in, bare br close still green)",
-                            bead.id
-                        );
-                        // Minimal vehicle: log and still do queue_brief for coexistence
-                        // Real vehicle would: let wf = crew::compose_workflow(&format!("{}-graph", bead.id), &bead.title, None, &["verify".to_string()]).unwrap();
-                        // let _ = ctx.run(run_workflow, RunInput { workflow: wf, trigger: json!({"bead_id": bead.id}), run_id: None }).await;
-                        // Graph VerifySink writes a workflow receipt (not CommandVerified); after worker closes, armed loop still runs loop_run_verify and records CommandVerified
+                    // bd-bpd9 graph vehicle: opted-in beads run their composed
+                    // graph via the detached subprocess leaf; the loop keeps
+                    // claim-watch and close stays VERIFY + CommandVerified.
+                    if let Some(wf_name) = workflow_for_bead(bead) {
+                        if bead.verify.is_some() && principles_block_reason(bead).is_none() {
+                            match spawn_graph_vehicle(
+                                &params.project,
+                                &bead.id,
+                                &wf_name,
+                                &bead.title,
+                                bead.verify.as_deref(),
+                                &mut graph_invoked,
+                            ) {
+                                Ok(()) => {
+                                    assigned.push(bead.id.clone());
+                                    continue;
+                                }
+                                Err(e) => eprintln!(
+                                    "flywheel: [bd-bpd9] vehicle spawn failed for {} (falling back to brief): {e}",
+                                    bead.id
+                                ),
+                            }
+                        }
                     }
                     // bd-dispatch-dedupe-2zlz: GOAL gate — a live peer
                     // claim/announce/stand-down on the bead thread holds
@@ -6874,6 +7007,17 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         let mut any_work = false;
         for action in &actions {
             match action {
+                // bd-bpd9: graph vehicles are spawned inline at dispatch
+                // time (see the to_assign leaf); nothing should re-emit
+                // them here. Covered for exhaustiveness.
+                LoopAction::InvokeGraph {
+                    bead_id, workflow, ..
+                } => {
+                    eprintln!(
+                        "flywheel: [bd-bpd9] duplicate InvokeGraph action for {bead_id} ({workflow}) — ignored"
+                    );
+                }
+
                 // ADR-0001 Wave 3: the pin stamp rides ahead of the send —
                 // run it best-effort through the __pin-stamp leaf (the
                 // orchestrator fills pin; failure never blocks dispatch).
@@ -8830,6 +8974,7 @@ mod tests {
             priority: 3,
             principles: String::new(),
             updated_at: None,
+            ..Default::default()
         }
     }
 
@@ -8844,6 +8989,7 @@ mod tests {
             priority: 3,
             principles: String::new(),
             updated_at: None,
+            ..Default::default()
         }
     }
 
@@ -9818,6 +9964,7 @@ mod tests {
             verify: Some("true".into()),
             labels: Vec::new(),
             updated_at: None,
+            ..Default::default()
         };
         let batch = [
             rb("bd-a"),
@@ -10490,6 +10637,7 @@ mod tests {
             priority: 3,
             principles: String::new(),
             updated_at: None,
+            ..Default::default()
         }
     }
 
@@ -10503,6 +10651,7 @@ mod tests {
             priority: 3,
             principles: String::new(),
             updated_at: None,
+            ..Default::default()
         }
     }
 
@@ -11728,6 +11877,9 @@ mod tests {
             // pin stamps are orchestrator-side tracker writes, not agent
             // dispatches — no DispatchRec (nothing lands on a pane).
             LoopAction::PinStamp { .. } => None,
+            // bd-bpd9: InvokeGraph spawns the vehicle subprocess at the
+            // dispatch leaf — it is not an agent dispatch, so no DispatchRec.
+            LoopAction::InvokeGraph { .. } => None,
             LoopAction::Blocked { name } => Some(DispatchRec {
                 agent: name.clone(),
                 kind: "blocked",
@@ -12094,6 +12246,7 @@ mod tests {
             priority: 2,
             principles: "principle — decision".into(),
             updated_at: None,
+            ..Default::default()
         }
     }
 
@@ -12176,6 +12329,7 @@ mod tests {
             priority: 2,
             principles: "p — d".into(),
             updated_at: None,
+            ..Default::default()
         });
         let live = vec!["GoldCove".to_string()];
         let to_renew = leases_to_renew(&leases, &inprog, &live, now, 600);
@@ -12249,6 +12403,7 @@ mod tests {
             priority: 2,
             principles: "p — d".into(),
             updated_at: Some((chrono::Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339()),
+            ..Default::default()
         };
         // recent bead — should not stall
         let recent_bead = ReadyBead {
@@ -12260,6 +12415,7 @@ mod tests {
             priority: 2,
             principles: "p — d".into(),
             updated_at: Some(chrono::Utc::now().to_rfc3339()),
+            ..Default::default()
         };
         let states = vec![
             AgentState {
@@ -12400,6 +12556,7 @@ mod tests {
                 (chrono::Utc::now() - chrono::Duration::seconds((watching + 10) as i64))
                     .to_rfc3339(),
             ),
+            ..Default::default()
         };
         // Bead age past threshold -> stalled
         let stalled_bead = ReadyBead {
@@ -12414,6 +12571,7 @@ mod tests {
                 (chrono::Utc::now() - chrono::Duration::seconds((threshold + 10) as i64))
                     .to_rfc3339(),
             ),
+            ..Default::default()
         };
         let states = vec![
             AgentState {
@@ -12499,6 +12657,7 @@ mod tests {
                 (chrono::Utc::now() - chrono::Duration::seconds((threshold + 10) as i64))
                     .to_rfc3339(),
             ),
+            ..Default::default()
         };
         let states = vec![AgentState {
             name: "EvidAgent".into(),
@@ -12608,6 +12767,7 @@ mod tests {
                 (chrono::Utc::now() - chrono::Duration::seconds((threshold + 10) as i64))
                     .to_rfc3339(),
             ),
+            ..Default::default()
         };
         let recent_bead = ReadyBead {
             id: "bd-recent".into(),
@@ -12618,6 +12778,7 @@ mod tests {
             priority: 2,
             principles: "p — d".into(),
             updated_at: Some(chrono::Utc::now().to_rfc3339()),
+            ..Default::default()
         };
         let states = vec![AgentState {
             name: "ReadAgent".into(),
@@ -12665,6 +12826,7 @@ mod tests {
                 (chrono::Utc::now() - chrono::Duration::seconds((watching + 5) as i64))
                     .to_rfc3339(),
             ),
+            ..Default::default()
         };
         read_count = 0;
         let _ = detect_stalled_panes_with_evidence(
@@ -13245,6 +13407,7 @@ mod verify_field_tests {
                 priority: 3,
                 principles: String::new(),
                 updated_at: None,
+                ..Default::default()
             },
             ReadyBead {
                 id: "bd-no-fence".into(),
@@ -13255,6 +13418,7 @@ mod verify_field_tests {
                 priority: 3,
                 principles: String::new(),
                 updated_at: None,
+                ..Default::default()
             },
             ReadyBead {
                 id: "bd-multi".into(),
@@ -13265,6 +13429,7 @@ mod verify_field_tests {
                 priority: 3,
                 principles: String::new(),
                 updated_at: None,
+                ..Default::default()
             },
         ];
         let (dispatchable, not_ready) = partition_ready(&ready);
@@ -13289,6 +13454,7 @@ mod verify_field_tests {
             verify: verify.map(str::to_string),
             labels: Vec::new(),
             updated_at: None,
+            ..Default::default()
         };
         let ready = vec![
             // P2 with an empty PRINCIPLES section -> refuse
@@ -13337,6 +13503,7 @@ mod verify_field_tests {
             priority: 2,
             principles: String::new(),
             updated_at: None,
+            ..Default::default()
         };
         let p2_ok = ReadyBead {
             id: "bd-rt-ok".into(),
@@ -13347,6 +13514,7 @@ mod verify_field_tests {
             priority: 2,
             principles: "prove-it-works — ran the VERIFY fence".into(),
             updated_at: None,
+            ..Default::default()
         };
         let env = ready_leaf_envelope(&[p2_blocked, p2_ok]);
         let parsed = parse_bead_list(&env, "__ready").expect("leaf JSON parses");
@@ -13380,6 +13548,7 @@ mod verify_field_tests {
             verify: Some("true".into()),
             labels: Vec::new(),
             updated_at: None,
+            ..Default::default()
         };
         let empty = rb("bd-x", 2, "");
         let r = principles_block_reason(&empty).expect("P2 empty blocks");
@@ -13420,6 +13589,7 @@ mod verify_field_tests {
             verify: verify.map(str::to_string),
             labels: Vec::new(),
             updated_at: None,
+            ..Default::default()
         };
         // Missing typed verify field.
         let noverify = rb("bd-noverify", 2, None, "prove-it-works — x.");
@@ -13478,6 +13648,7 @@ mod verify_field_tests {
             verify: verify.map(str::to_string),
             labels: Vec::new(),
             updated_at: None,
+            ..Default::default()
         };
         let nameonly = rb("bd-n", 2, Some("true"), "prove-it-works");
         assert_eq!(
@@ -13567,8 +13738,10 @@ mod reclaim_tests {
             priority: 1,
             principles: "never-block-on-the-human — pane death is observable".into(),
             updated_at: Some(iso_at(now_secs - age_secs)),
+            ..Default::default()
         }
     }
+
     #[test]
     fn reclaim_pane_exited_emits_for_in_progress_no_herdr() {
         let bead = ReadyBead {
@@ -13580,6 +13753,7 @@ mod reclaim_tests {
             priority: 1,
             principles: String::new(),
             updated_at: None,
+            ..Default::default()
         };
         let panes: Vec<AgentState> = vec![];
         let heal = HealState {
@@ -13614,6 +13788,7 @@ mod reclaim_tests {
             priority: 1,
             principles: String::new(),
             updated_at: None,
+            ..Default::default()
         };
         let panes = vec![AgentState {
             name: "GoldCove".into(),
@@ -13649,6 +13824,7 @@ mod reclaim_tests {
             priority: 1,
             principles: String::new(),
             updated_at: None,
+            ..Default::default()
         };
         let panes_listed = vec![AgentState {
             name: "GoldCove".into(),
@@ -14253,6 +14429,38 @@ mod loop_invoke_vehicle_tests {
                     LoopAction::Blocked { .. } | LoopAction::Wait | LoopAction::Send { .. }
                 ))
         );
+    }
+
+    #[test]
+    #[test]
+    fn workflow_for_bead_marker_section_opts_in() {
+        let bead = ReadyBead {
+            description: "Do the thing.\n\n## WORKFLOW bug-fix\n\nDetails.".into(),
+            ..Default::default()
+        };
+        assert_eq!(workflow_for_bead(&bead), Some("bug-fix".to_string()));
+    }
+
+    #[test]
+    fn workflow_for_bead_label_opts_in() {
+        let bead = ReadyBead {
+            description: "no marker here".into(),
+            labels: vec!["workflow:refactoring".into()],
+            ..Default::default()
+        };
+        assert_eq!(workflow_for_bead(&bead), Some("refactoring".to_string()));
+    }
+
+    #[test]
+    fn workflow_for_bead_title_never_opts_in() {
+        // The c57dfd4 stub keyed on title text — that logged a vehicle that
+        // never ran. Titles must never opt in.
+        let bead = ReadyBead {
+            title: "fix the graph layout bug".into(),
+            description: "no marker".into(),
+            ..Default::default()
+        };
+        assert_eq!(workflow_for_bead(&bead), None);
     }
 
     #[test]
