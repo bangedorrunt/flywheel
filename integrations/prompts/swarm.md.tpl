@@ -30,7 +30,7 @@ default, explicit provider/model overrides. Use consistently.
 
 4. WAVES + SPAWN (waves are the default for supervised multi-lane
    work; spawn is the manual escape): run the wave as a recipe:
-   `flywheel workflow compose --parts wave-swarm --run --inputs
+   `flywheel workflow compose "<objective>" --parts wave-swarm --run --inputs
    '{"objective": "<target>"}'` -- GATE->DISPATCH->OBSERVE->VERIFY->
    SIGNOFF; swarm-mode is the crew, wave-swarm is the recipe. The run
    parks at SIGNOFF: you resolve the approval (flywheel runs list).
