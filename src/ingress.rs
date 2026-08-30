@@ -189,10 +189,13 @@ impl Default for IngressAdapters {
 pub fn ingress_to_loop_msg(event: &IngressEvent) -> Option<crate::durable::LoopMsg> {
     match event {
         IngressEvent::Herdr(he) => {
+            // event_type strings MUST match what apply_events_to_states
+            // consumes ("pane.agent_status_changed" / "pane.exited") —
+            // an invented string here is a silent no-op downstream.
             let pe = match he {
                 HerdrEvent::PaneAgentStatusChanged { pane_id, status } => {
                     crate::durable::PollEvent {
-                        event_type: "agent_status".into(),
+                        event_type: "pane.agent_status_changed".into(),
                         pane_id: pane_id.clone(),
                         agent: None,
                         status: Some(status.clone()),
@@ -203,7 +206,7 @@ pub fn ingress_to_loop_msg(event: &IngressEvent) -> Option<crate::durable::LoopM
                     pane_id,
                     herdr_name,
                 } => crate::durable::PollEvent {
-                    event_type: "pane_exited".into(),
+                    event_type: "pane.exited".into(),
                     pane_id: pane_id.clone(),
                     agent: Some(herdr_name.clone()),
                     status: None,
@@ -212,12 +215,17 @@ pub fn ingress_to_loop_msg(event: &IngressEvent) -> Option<crate::durable::LoopM
             };
             Some(crate::durable::LoopMsg::Herdr(pe))
         }
-        IngressEvent::LedgerFact { bead_id, .. } => Some(crate::durable::LoopMsg::BrClose {
+        // Only a CLOSED ledger fact is a BrClose. Claimed/Blocked/Reopened
+        // are NOT closes — mapping them here would corrupt per_bead_phase.
+        IngressEvent::LedgerFact {
+            bead_id,
+            event: LedgerEvent::Closed,
+        } => Some(crate::durable::LoopMsg::BrClose {
             bead_id: bead_id.clone(),
         }),
-        // Watch/Workflow/Cron/Fact map is intentionally None today — they fan
-        // into doorbell or fact journal, not LoopMsg::Tick. The seam exists so
-        // a future tick arm can be added without a second bus.
+        // Watch/Workflow/Cron/other facts map is intentionally None today —
+        // they fan into doorbell or fact journal, not LoopMsg. The seam
+        // exists so a future tick arm can be added without a second bus.
         _ => None,
     }
 }
@@ -503,18 +511,44 @@ mod tests {
 
     #[test]
     fn bd0or2_ingress_to_loop_msg_seam_exists_and_maps_herdr() {
+        // event_type strings MUST match apply_events_to_states consumers —
+        // an invented string would be a silent no-op downstream.
+        let status = IngressEvent::Herdr(HerdrEvent::PaneAgentStatusChanged {
+            pane_id: "w1:p1".into(),
+            status: "idle".into(),
+        });
+        match ingress_to_loop_msg(&status).expect("herdr must map") {
+            crate::durable::LoopMsg::Herdr(pe) => {
+                assert_eq!(pe.event_type, "pane.agent_status_changed");
+                assert_eq!(pe.status.as_deref(), Some("idle"));
+            }
+            other => panic!("expected LoopMsg::Herdr, got {other:?}"),
+        }
         let he = IngressEvent::Herdr(HerdrEvent::PaneExited {
             pane_id: "w1:p1".into(),
             herdr_name: "oc".into(),
         });
-        let lm = ingress_to_loop_msg(&he).expect("herdr must map to LoopMsg::Herdr");
-        assert!(matches!(lm, crate::durable::LoopMsg::Herdr(_)));
+        match ingress_to_loop_msg(&he).expect("herdr must map") {
+            crate::durable::LoopMsg::Herdr(pe) => {
+                assert_eq!(pe.event_type, "pane.exited");
+            }
+            other => panic!("expected LoopMsg::Herdr, got {other:?}"),
+        }
         let lf = IngressEvent::LedgerFact {
             bead_id: "bd-123".into(),
             event: LedgerEvent::Closed,
         };
-        let lm2 = ingress_to_loop_msg(&lf).expect("ledger fact maps to BrClose");
+        let lm2 = ingress_to_loop_msg(&lf).expect("closed ledger fact maps to BrClose");
         assert!(matches!(lm2, crate::durable::LoopMsg::BrClose { .. }));
+        // A claim is NOT a close — must not corrupt per_bead_phase.
+        let claim = IngressEvent::LedgerFact {
+            bead_id: "bd-123".into(),
+            event: LedgerEvent::Claimed,
+        };
+        assert!(
+            ingress_to_loop_msg(&claim).is_none(),
+            "claimed fact must not map to BrClose"
+        );
         let watch = IngressEvent::Watch(WatchHit {
             project: "flywheel".into(),
             kind: "9".into(),
@@ -523,6 +557,41 @@ mod tests {
         assert!(
             ingress_to_loop_msg(&watch).is_none(),
             "watch stays on doorbell, not loop"
+        );
+    }
+
+    #[test]
+    fn bd0or2_herdr_event_folds_into_tick_pending_and_drains_on_next_tick() {
+        use crate::durable::{AgentState, LoopModel, LoopMsg};
+        let mut model = LoopModel::default();
+        let pe = crate::durable::PollEvent {
+            event_type: "pane.agent_status_changed".into(),
+            pane_id: "w1:p1".into(),
+            agent: Some("a".into()),
+            status: Some("idle".into()),
+            seq: 1,
+        };
+        let (next, actions) = crate::durable::tick(&model, &LoopMsg::Herdr(pe));
+        assert!(actions.is_empty());
+        assert_eq!(next.pending_events.len(), 1, "Herdr buffers into model'");
+        let (next2, _) = crate::durable::tick(
+            &next,
+            &LoopMsg::Tick {
+                states: vec![AgentState {
+                    name: "a".into(),
+                    status: "working".into(),
+                    kind: String::new(),
+                    pane_id: "w1:p1".into(),
+                    mail_identity: None,
+                }],
+                digests: Default::default(),
+                nudge: None,
+                wake_suppressed: Default::default(),
+            },
+        );
+        assert!(
+            next2.pending_events.is_empty(),
+            "Tick drains buffered events"
         );
     }
 }

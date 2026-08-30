@@ -1022,11 +1022,17 @@ pub fn parse_watch_ndjson(line: &str, index: &SelfIndex) -> Option<(EventClass, 
             })
             .unwrap_or(false)
     });
+    // mail-delivered AND ack-sla-expired are mailbox wakes (kind 9 metadata
+    // rings for sealed NIP-17 mail) — both must pull the inbox, never
+    // `channel read` on a thread id.
     let toron_kind_mail_delivered = tags.iter().any(|t| {
         t.as_array()
             .map(|a| {
                 a.first().and_then(|x| x.as_str()) == Some("toron-kind")
-                    && a.get(1).and_then(|x| x.as_str()) == Some("mail-delivered")
+                    && matches!(
+                        a.get(1).and_then(|x| x.as_str()),
+                        Some("mail-delivered") | Some("ack-sla-expired")
+                    )
             })
             .unwrap_or(false)
     });

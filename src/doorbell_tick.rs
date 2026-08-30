@@ -1,19 +1,34 @@
 // governed-by: ADR-0025
 //! Doorbell Elm tick (GS-007 yw4s, GS-006 §10) — pure `tick(Model,Msg)->(Model,Actions)`
+//! The live dispatcher process (`cmd_internal_doorbell`) is the effect layer;
+//! this module is the functional core (no I/O, no &mut). Tests assert
+//! `same Msg log -> byte-identical Action sequence`. Classification reuses the
+//! already-pure `crate::doorbell::{classify, parse_watch_ndjson, parse_inbox_item}`
+//! — no second reducer.
 
 use std::collections::BTreeMap;
 
+/// One doorbell message. Every bus/inbox/status edge is a Msg; nothing
+/// happens outside `tick`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DoorbellMsg {
+    /// Plane-S watch NDJSON line (`{kind,id,tags,content}`).
     WatchNdjson { line: String },
+    /// Plane-P inbox rows for one pin (raw `fetch_inbox` JSON).
     InboxItems { raw: String, pin: String },
+    /// Herdr status change for one pin.
     HerdrStatus { pin: String, status: String },
+    /// Captain-bound fact (no alias info here — honest FactMiss).
     Fact { summary: String },
+    /// Periodic tick; drives the inbox fetch effect.
     AckSlaTick { now: u64 },
+    /// The watch child died; supervisor must restart (never exit).
     WatchDied,
-    BudgetReset { now: u64 },
 }
 
+/// What the effect layer should do. Prompt is the only delivery; FetchInbox /
+/// RestartWatch are effects whose results re-enter as Msgs; FactMiss and
+/// Audit are loud misses (journal + stderr), never silent Ok(()).
 #[derive(Debug, Clone, PartialEq)]
 pub enum DoorbellAction {
     Prompt {
@@ -36,19 +51,48 @@ pub enum DoorbellAction {
 
 #[derive(Debug, Clone, Default)]
 pub struct DoorbellModel {
+    /// LWW queues per pin (working panes hold their wake here).
     pub queues: BTreeMap<String, Vec<String>>,
+    /// Last-known herdr status per pin.
     pub statuses: BTreeMap<String, String>,
+    /// Pins (+npubs) this dispatcher owns.
+    pub index: crate::doorbell::SelfIndex,
 }
 
+/// Pure, total, deterministic: no I/O, no &mut, no herdr/toron calls.
 pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<DoorbellAction>) {
     let mut next = model.clone();
     let mut actions = Vec::new();
     match msg {
         DoorbellMsg::WatchNdjson { line } => {
-            let _ = line;
+            let Some((class, hint)) = crate::doorbell::parse_watch_ndjson(line, &next.index) else {
+                return (next, actions);
+            };
+            let line_out = crate::doorbell::doorbell_line(class, &hint);
+            for pin in crate::doorbell::watch_targets(line, &next.index) {
+                route_or_queue(&mut next, &mut actions, &pin, line_out.clone());
+            }
         }
-        DoorbellMsg::InboxItems { raw: _, pin } => {
-            let _ = pin;
+        DoorbellMsg::InboxItems { raw, pin } => {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+                actions.push(DoorbellAction::Audit {
+                    kind: "inbox_parse_failure".into(),
+                    pin: pin.clone(),
+                    detail: raw.clone(),
+                });
+                return (next, actions);
+            };
+            let items: Vec<&serde_json::Value> = match &v {
+                serde_json::Value::Array(arr) => arr.iter().collect(),
+                other => vec![other],
+            };
+            for item in items {
+                let Some((class, hint)) = crate::doorbell::parse_inbox_item(item) else {
+                    continue;
+                };
+                let line_out = crate::doorbell::doorbell_line(class, &hint);
+                route_or_queue(&mut next, &mut actions, pin, line_out);
+            }
         }
         DoorbellMsg::HerdrStatus { pin, status } => {
             let from = next
@@ -69,8 +113,10 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             next.statuses.insert(pin.clone(), status.clone());
         }
         DoorbellMsg::Fact { summary } => {
+            // The doorbell-side reducer has no captain alias — an alias-less
+            // fact is a LOUD miss (never registry.first()).
             actions.push(DoorbellAction::FactMiss {
-                why: format!("fact without alias: {}", summary),
+                why: format!("fact without captain alias: {}", summary),
             });
         }
         DoorbellMsg::AckSlaTick { .. } => {
@@ -79,29 +125,133 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             });
         }
         DoorbellMsg::WatchDied => {
+            // Never exit the dispatcher: restart is the only path (heal_tick is backup).
             actions.push(DoorbellAction::RestartWatch);
         }
-        DoorbellMsg::BudgetReset { .. } => {}
     }
     (next, actions)
+}
+
+/// Idle/done/blocked panes get a Prompt now; working panes queue (drained on
+/// the next working -> idle|done|blocked HerdrStatus).
+fn route_or_queue(
+    next: &mut DoorbellModel,
+    actions: &mut Vec<DoorbellAction>,
+    pin: &str,
+    line: String,
+) {
+    let status = next.statuses.get(pin).map(String::as_str).unwrap_or("idle");
+    if crate::doorbell::should_inject(status) {
+        actions.push(DoorbellAction::Prompt {
+            pin: pin.to_string(),
+            line,
+        });
+    } else {
+        next.queues.entry(pin.to_string()).or_default().push(line);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn model_with(pin: &str) -> DoorbellModel {
+        let mut m = DoorbellModel::default();
+        m.index.insert_pin(pin.to_string(), None);
+        m
+    }
+
     #[test]
     fn doorbell_tick_is_pure_and_deterministic() {
-        let model = DoorbellModel::default();
+        let model = model_with("BlueRidge");
         let msg = DoorbellMsg::WatchDied;
         let (m1, a1) = tick(&model, &msg);
         let (m2, a2) = tick(&model, &msg);
         assert_eq!(a1, a2);
         assert_eq!(m1.queues.len(), m2.queues.len());
     }
+
     #[test]
     fn doorbell_tick_watch_died_produces_restart() {
         let model = DoorbellModel::default();
         let (_, actions) = tick(&model, &DoorbellMsg::WatchDied);
         assert!(actions.contains(&DoorbellAction::RestartWatch));
+    }
+
+    #[test]
+    fn doorbell_tick_watch_line_prompts_idle_pin() {
+        let model = model_with("BlueRidge");
+        let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#;
+        let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            DoorbellAction::Prompt { pin, line } => {
+                assert_eq!(pin, "BlueRidge");
+                assert!(line.contains("[doorbell]"));
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+        assert!(next.queues.is_empty(), "idle pin must not queue");
+    }
+
+    #[test]
+    fn doorbell_tick_watch_line_queues_working_pin_then_drains() {
+        let mut model = model_with("BlueRidge");
+        model.statuses.insert("BlueRidge".into(), "working".into());
+        let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#;
+        let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
+        assert!(actions.is_empty(), "working pin must not prompt");
+        assert_eq!(next.queues.get("BlueRidge").map(Vec::len), Some(1));
+        let (next2, actions2) = tick(
+            &next,
+            &DoorbellMsg::HerdrStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        assert_eq!(actions2.len(), 1);
+        assert!(actions2[0].to_label().contains("BlueRidge"));
+        assert!(next2.queues.get("BlueRidge").is_none_or(|q| q.is_empty()));
+    }
+
+    #[test]
+    fn doorbell_tick_mail_delivered_pulls_inbox_not_channel() {
+        let model = model_with("BlueRidge");
+        let line = r#"{"kind":9,"id":"aa","tags":[["p","BlueRidge"],["toron-kind","mail-delivered"],["h","t-1"]],"content":"sealed"}"#;
+        let (_, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            DoorbellAction::Prompt { line, .. } => {
+                assert!(line.contains("inbox"), "mail wake must pull inbox: {line}");
+                assert!(
+                    !line.contains("channel read"),
+                    "mail wake must not channel read: {line}"
+                );
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doorbell_tick_room_chatter_is_silent() {
+        let mut model = model_with("BlueRidge");
+        model.index.insert_pin("LilacChapel".into(), None);
+        let line = r#"{"kind":9,"id":"cc","tags":[["h","ch-1"]],"content":"room talk"}"#;
+        let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
+        assert!(actions.is_empty(), "unaddressed chatter must not ring");
+        assert!(next.queues.is_empty());
+    }
+}
+
+impl DoorbellAction {
+    /// Test/debug label (also keeps the enum honest in logs).
+    pub fn to_label(&self) -> String {
+        match self {
+            DoorbellAction::Prompt { pin, .. } => format!("prompt {pin}"),
+            DoorbellAction::FetchInbox { since } => format!("fetch-inbox {since}"),
+            DoorbellAction::RestartWatch => "restart-watch".into(),
+            DoorbellAction::FactMiss { why } => format!("fact-miss {why}"),
+            DoorbellAction::Audit { kind, pin, .. } => format!("audit {kind} {pin}"),
+        }
     }
 }
