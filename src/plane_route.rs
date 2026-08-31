@@ -1,6 +1,8 @@
 // governed-by: ADR-0025
 #![allow(dead_code, clippy::all, unused)]
-// TODO: wire into main.rs send/mail/channel wrappers after S releases main.rs (deferred per file split)
+// Wired: `check_send_plane_tripwires` (cmd_send) + `check_job_tripwire`
+// direct call in cmd_mail Send (gift-wrap private must not carry job-assign).
+// Channel post is toron-owned (`toron channel post`) — no flywheel wrapper.
 //! Plane tripwire classifiers (Spec 5) — pure, no I/O, no Nostr kinds.
 //!
 //! Two tripwires, both fail-closed and audited:

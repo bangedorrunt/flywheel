@@ -20,15 +20,17 @@ pub enum DoorbellMsg {
     HerdrStatus { pin: String, status: String },
     /// Captain-bound fact (no alias info here — honest FactMiss).
     Fact { summary: String },
-    /// Periodic tick; drives the inbox fetch effect.
+    /// Periodic tick (60s cadence in the live dispatcher); drives the
+    /// Ack-SLA scan effect — the scan itself is `check_ack_sla_expired`,
+    /// NOT an inbox fetch (GS-009: naming lie fixed).
     AckSlaTick { now: u64 },
     /// The watch child died; supervisor must restart (never exit).
     WatchDied,
 }
 
 /// What the effect layer should do. Prompt is the only delivery; FetchInbox /
-/// RestartWatch are effects whose results re-enter as Msgs; FactMiss and
-/// Audit are loud misses (journal + stderr), never silent Ok(()).
+/// CheckAckSla / RestartWatch are effects whose results re-enter as Msgs;
+/// FactMiss and Audit are loud misses (journal + stderr), never silent Ok(()).
 #[derive(Debug, Clone, PartialEq)]
 pub enum DoorbellAction {
     Prompt {
@@ -38,6 +40,9 @@ pub enum DoorbellAction {
     FetchInbox {
         since: String,
     },
+    /// Effect: run `check_ack_sla_expired` for the project (toron mailbox).
+    /// Overdue wakes re-enter as WatchNdjson Msgs via plane S.
+    CheckAckSla,
     RestartWatch,
     FactMiss {
         why: String,
@@ -127,9 +132,9 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             });
         }
         DoorbellMsg::AckSlaTick { .. } => {
-            actions.push(DoorbellAction::FetchInbox {
-                since: "ack-sla".into(),
-            });
+            // The scan is check_ack_sla_expired (toron), not an inbox fetch.
+            // Overdue wakes arrive back as kind-9 ack-sla-expired WatchNdjson.
+            actions.push(DoorbellAction::CheckAckSla);
         }
         DoorbellMsg::WatchDied => {
             // Never exit the dispatcher: restart is the only path (heal_tick is backup).
@@ -289,6 +294,7 @@ impl DoorbellAction {
         match self {
             DoorbellAction::Prompt { pin, .. } => format!("prompt {pin}"),
             DoorbellAction::FetchInbox { since } => format!("fetch-inbox {since}"),
+            DoorbellAction::CheckAckSla => "check-ack-sla".into(),
             DoorbellAction::RestartWatch => "restart-watch".into(),
             DoorbellAction::FactMiss { why } => format!("fact-miss {why}"),
             DoorbellAction::Audit { kind, pin, .. } => format!("audit {kind} {pin}"),
