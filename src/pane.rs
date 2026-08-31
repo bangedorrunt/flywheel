@@ -1149,7 +1149,18 @@ pub fn start_approval_drainer(
                 .map_err(|e| anyhow!("approval drainer runtime: {e}"))?;
             rt.block_on(async {
                 let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                // bd-1ub5: the drainer is the RESOLVE path. Parked promises are
+                // resolved by scanning the project inbox for a captain decision
+                // mail (`approve:<promise_id>` / `reject:<promise_id>` subject
+                // token) — `flywheel workflow approve` sends exactly that. Mail
+                // scan runs every ~2s inside the 150ms drain loop (every 13th
+                // pass); mail unavailable degrades to the sink-only behavior.
+                let mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
+                    .ok()
+                    .flatten();
+                let mut pass: u32 = 0;
                 loop {
+                    pass = pass.wrapping_add(1);
                     let ids: Vec<String> = {
                         let mut sink = engine.approval_sink().lock().await;
                         let mut new_ids = Vec::new();
@@ -1164,13 +1175,67 @@ pub fn start_approval_drainer(
                         new_ids
                     };
                     for promise_id in ids {
-                        // Surface to captain: existing channel/DM pattern (eprintln + toron channel)
+                        // Surface to captain: the decision token they reply with.
                         eprintln!(
-                            "flywheel: approval parked: promise {} for project {} — awaiting captain decision (approve/reject via WorkflowEngine::resolve_approval)",
-                            promise_id, project
+                            "flywheel: approval parked: promise {promise_id} for project {project} — resolve with: flywheel workflow approve {run_tag} {promise_id} --decision approve|reject --project {project}",
+                            run_tag = format!("run-{}", &promise_id[..promise_id.len().min(8)])
                         );
-                        // For the test harness, the test will call resolve_approval/reject_approval directly.
-                        // In production, the captain's DM would trigger resolve via `flywheel workflow approve` CLI (future).
+                    }
+                    // Resolve pass: scan inbox for decision tokens on parked ids.
+                    if let Some(mail) = &mail {
+                        let parked: Vec<String> = {
+                            let sink = engine.approval_sink().lock().await;
+                            sink.iter().cloned().collect()
+                        };
+                        if !parked.is_empty() && pass % 13 == 0 {
+                            for promise_id in &parked {
+                                let token_a = format!("approve:{promise_id}");
+                                let token_r = format!("reject:{promise_id}");
+                                let Ok(inbox) = mail.inbox(&project, &mail.name, false, 25) else {
+                                    continue;
+                                };
+                                let Some(rows) = inbox.as_array() else {
+                                    continue;
+                                };
+                                for row in rows {
+                                    let subject =
+                                        row.get("subject").and_then(|s| s.as_str()).unwrap_or("");
+                                    let sender =
+                                        row.get("sender").and_then(|s| s.as_str()).unwrap_or("");
+                                    let decision = if subject.contains(&token_a) {
+                                        Some(toron_workflow::engine::Decision::approved(format!(
+                                            "via workflow approve (from {sender})"
+                                        )))
+                                    } else if subject.contains(&token_r) {
+                                        Some(toron_workflow::engine::Decision::rejected(format!(
+                                            "via workflow approve (from {sender})"
+                                        )))
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(decision) = decision {
+                                        let outcome = decision.outcome.clone();
+                                        match engine
+                                            .resolve_approval(promise_id, &decision)
+                                            .await
+                                        {
+                                            Ok(_) => {
+                                                eprintln!(
+                                                    "flywheel: approval resolved: promise {} -> {} (from {sender})",
+                                                    promise_id, outcome
+                                                );
+                                                seen.remove(promise_id);
+                                            }
+                                            Err(e) => eprintln!(
+                                                "flywheel: resolve_approval {} failed: {e:#}",
+                                                promise_id
+                                            ),
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                     if stop.load(Ordering::Relaxed) {
                         break;

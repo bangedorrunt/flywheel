@@ -2870,7 +2870,8 @@ enum WorkflowCmd {
         #[arg(long)]
         review_bead: Option<String>,
     },
-    /// Approve or reject a parked SIGNOFF promise (GS-007 bd-1ub5: ApprovalSink must resolve_approval not eprintln)
+    /// Approve or reject a parked SIGNOFF promise (bd-1ub5): sends the
+    /// decision mail the parked run's approval drainer resolves.
     Approve {
         /// run id that parked on approval
         run_id: String,
@@ -2882,6 +2883,9 @@ enum WorkflowCmd {
         /// optional reason
         #[arg(long)]
         reason: Option<String>,
+        /// the project whose parked run holds the promise (default flywheel)
+        #[arg(long, default_value = "flywheel")]
+        project: String,
     },
 }
 
@@ -22810,21 +22814,39 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             promise_id,
             decision,
             reason,
+            project,
         } => {
-            // GS-007 bd-1ub5: SIGNOFF park must resolve via engine resolve_approval,
-            // not a printed promise. The approval_sink lives IN the engine process
-            // that parked the promise (pane-mode `workflow run --execute` blocks on
-            // invoke with its drainer), so THIS CLI cannot reach it — returning Ok
-            // here would be a costume approval the engine never sees. Fail loud
-            // with the honest remedy until a durable resolve exists (kind-46011).
-            let reason_note = reason
-                .as_deref()
-                .map(|r| format!(" (reason: {r})"))
-                .unwrap_or_default();
-            bail!(
-                "workflow approve: cannot reach the engine holding promise {promise_id} (run {run_id}) — \
-                 the approval_sink is in-memory in the parked run's process; your {decision} was NOT applied{reason_note}"
+            // bd-1ub5: the approval_sink is in-memory in the parked run's
+            // process — but that process's drainer SCANS the project inbox for
+            // an `approve:<promise_id>` / `reject:<promise_id>` subject token
+            // and calls engine.resolve_approval itself (≤2s cadence). This CLI
+            // is the captain's half: send the decision mail.
+            let key = project_dir_str(cfg, &project)?;
+            let mail = mail_or_die(cfg)?;
+            mail.ensure_project(&key)?;
+            // The parked run scans the CONFIG identity's inbox (its own).
+            let target = mail.name.clone();
+            let subject = format!("{decision}:{promise_id}");
+            let body = format!(
+                "SIGNOFF decision for run {run_id}: {decision}{}",
+                reason
+                    .as_deref()
+                    .map(|r| format!("\nreason: {r}"))
+                    .unwrap_or_default()
             );
+            mail.send(
+                &key,
+                &[target.clone()],
+                &subject,
+                &body,
+                "high",
+                false,
+                None,
+            )?;
+            println!(
+                "workflow approve: decision mailed to {target} ({subject}) — the parked run's drainer resolves within ~2s (run {run_id})"
+            );
+            Ok(())
         }
     }
 }
