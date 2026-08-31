@@ -606,7 +606,7 @@ pub fn fanout_now(
 
 /// Pins this dispatcher owns. Live kind-9 `p` tags are **npub hex**, not
 /// the pin; jobs use `assignee=<pin>`. Resolve both to a pin.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct SelfIndex {
     pins: BTreeMap<String, String>,
     npubs: BTreeMap<String, String>,

@@ -53,6 +53,7 @@ mod toron_embed;
 mod verdict;
 mod work;
 mod workflow_catalog;
+mod workspace;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal;
