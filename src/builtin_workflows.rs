@@ -1170,7 +1170,7 @@ steps:
         "repair-until-verified",
         r##"
 name: repair-until-verified
-description: "Unrolled repair loop (ADR-0024 Spec 2): fresh-context repair → evaluate → VERIFY, bounded, ledger JSON, one writer. Runs --mode pane only."
+description: "Repair loop (ADR-0024 Spec 2): bounded fresh-context repair → evaluate → VERIFY (3 iterations, continue on verify failure so verify-1 can fail and verify-2 can still run; final verify gates the run). Runs --mode pane only."
 trigger:
   type: webhook
 crew: auto
@@ -1204,7 +1204,7 @@ graph:
       needs: [evaluate-1]
       action: verify
       command: "{{inputs.verify}}"
-      on_error: fail_run
+      on_error: continue
     repair-2:
       needs: [verify-1]
       action: dispatch_job
@@ -1227,7 +1227,7 @@ graph:
       needs: [evaluate-2]
       action: verify
       command: "{{inputs.verify}}"
-      on_error: fail_run
+      on_error: continue
     repair-3:
       needs: [verify-2]
       action: dispatch_job
@@ -2843,6 +2843,40 @@ mod tests {
         assert_eq!(
             inputs.get("max_iterations").and_then(|v| v.as_u64()),
             Some(3)
+        );
+    }
+
+    /// Repair loop is bounded and allows verify-1 failure to still reach
+    /// verify-2 (GS-009 / bd-s1yy: static fail_run would abort on first
+    /// verify failure, so c2 could never run after c1 failed).
+    #[test]
+    fn repair_unroll_allows_verify_1_failure_to_reach_verify_2() {
+        use toron_workflow::schema::StepOnError;
+        let wfs = builtin_workflows();
+        let repair = &wfs["repair-until-verified"];
+        let graph = repair.graph.as_ref().expect("repair is a graph");
+        assert_eq!(
+            graph.nodes["verify-1"].on_error,
+            StepOnError::Continue,
+            "verify-1 must continue so c2 can run after c1 failure (was fail_run, blocked c2)"
+        );
+        assert_eq!(
+            graph.nodes["verify-2"].on_error,
+            StepOnError::Continue,
+            "verify-2 must continue so c3 can run after c2 failure"
+        );
+        assert_eq!(
+            graph.nodes["verify-3"].on_error,
+            StepOnError::FailRun,
+            "final verify gates the run"
+        );
+        assert!(
+            repair
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .contains("continue on verify failure"),
+            "description must be honest (was Unrolled claim)"
         );
     }
 
