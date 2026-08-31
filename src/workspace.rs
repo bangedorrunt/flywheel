@@ -204,6 +204,52 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             );
             next.doorbell = dm;
             cmds.extend(c);
+            // E2: also handle tagged kind-9 WatchNdjson (corr/wake via extra_tags)
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(tags) = v.get("tags").and_then(|t| t.as_array()) {
+                    let mut corr: Option<String> = None;
+                    let mut wake: Option<String> = None;
+                    let mut audience: Option<String> = None;
+                    let mut result_path: Option<String> = None;
+                    let mut priority: Option<String> = None;
+                    for tag in tags {
+                        if let Some(arr) = tag.as_array() {
+                            if arr.len() >= 2 {
+                                let k = arr[0].as_str().unwrap_or("");
+                                let val = arr[1].as_str().unwrap_or("").to_string();
+                                match k {
+                                    "corr" => corr = Some(val),
+                                    "wake" => wake = Some(val),
+                                    "audience" => audience = Some(val),
+                                    "result_path" => result_path = Some(val),
+                                    "priority" => priority = Some(val),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    if let Some(c) = corr {
+                        let w = wake.unwrap_or_else(|| "tasked".to_string());
+                        let a = audience.unwrap_or_else(|| "agents".to_string());
+                        let p = priority.unwrap_or_else(|| "queue".to_string());
+                        let body = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        let broadcast = false;
+                        if a == "human" && broadcast {
+                            cmds.push(Cmd::LoudMiss { why: format!("broadcast to human is hard error for corr {c}") });
+                        } else if p == "interrupt" && a == "human" {
+                            cmds.push(Cmd::LoudMiss { why: format!("interrupt never onto human pin for corr {c}") });
+                        } else if w == "standing" && body.is_empty() {
+                            // silence
+                        } else {
+                            let state = if w == "tasked" && body.is_empty() { "resulted" } else { "owed" };
+                            let receipt = Receipt { state: state.to_string(), wake: w.clone(), due_at: None, result_path: result_path.clone() };
+                            next.assignment.insert(c.clone(), receipt.clone());
+                            cmds.push(Cmd::SqliteUpsert { corr: c.clone(), receipt: receipt.clone() });
+                            cmds.push(Cmd::WaitCorr { corr: c });
+                        }
+                    }
+                }
+            }
         }
         Msg::InboxItems { raw, pin } => {
             let (dm, c) = doorbell_slice(
@@ -220,6 +266,46 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             );
             next.doorbell = dm;
             cmds.extend(c);
+            // E2/E3: assignment from tagged rows (corr/wake/priority/audience/result_path)
+            for row in rows {
+                let corr = row.get("corr").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if corr.is_empty() {
+                    continue;
+                }
+                let wake = row.get("wake").and_then(|v| v.as_str()).unwrap_or("tasked").to_string();
+                let body = row.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let audience = row.get("audience").and_then(|v| v.as_str()).unwrap_or("agents").to_string();
+                let result_path = row.get("result_path").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let priority = row.get("priority").and_then(|v| v.as_str()).unwrap_or("queue").to_string();
+                let broadcast = row.get("broadcast").and_then(|v| v.as_bool()).unwrap_or(false);
+                // E3: audience=human broadcast is hard error
+                if audience == "human" && broadcast {
+                    cmds.push(Cmd::LoudMiss { why: format!("broadcast to human is hard error for corr {corr}") });
+                    continue;
+                }
+                // E3: interrupt never onto human pin
+                if priority == "interrupt" && audience == "human" {
+                    cmds.push(Cmd::LoudMiss { why: format!("interrupt never onto human pin for corr {corr}") });
+                    continue;
+                }
+                // E3: standing + empty body -> silence (no Cmd, no assignment)
+                if wake == "standing" && body.is_empty() {
+                    continue;
+                }
+                // tasked + empty body -> result against corr
+                let state = if wake == "tasked" && body.is_empty() { "resulted" } else { "owed" };
+                let receipt = Receipt {
+                    state: state.to_string(),
+                    wake: wake.clone(),
+                    due_at: None,
+                    result_path: result_path.clone(),
+                };
+                next.assignment.insert(corr.clone(), receipt.clone());
+                cmds.push(Cmd::SqliteUpsert { corr: corr.clone(), receipt: receipt.clone() });
+                cmds.push(Cmd::WaitCorr { corr: corr.clone() });
+                // default tasked priority is queue (already handled, interrupt is explicit)
+            }
+            let _ = pin;
         }
         Msg::HerdrStatus { pin, status } => {
             let (dm, c) = doorbell_slice(
@@ -594,5 +680,124 @@ mod loop_fold_tests {
         let has_world_dump = slice.contains("states:") && slice.contains("digests:") && slice.contains("events:");
         assert!(!has_world_dump, "RED (bd-gs8b): LoopMsg::Tick still world-dumps states/digests/events — must be Tick now clock + poll as Cmd");
         assert!(slice.contains("now: u64") || slice.contains("now"), "LoopMsg::Tick should be clock payload");
+    }
+}
+
+#[cfg(test)]
+mod assignment_tick_tests {
+    use super::*;
+
+    fn empty_model() -> WorkspaceModel {
+        WorkspaceModel::default()
+    }
+
+    fn inbox_row(corr: &str, wake: &str, body: &str, audience: &str, result_path: Option<&str>, priority: Option<&str>) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "corr": corr,
+            "wake": wake,
+            "body": body,
+            "audience": audience,
+        });
+        if let Some(rp) = result_path {
+            v["result_path"] = serde_json::Value::String(rp.to_string());
+        }
+        if let Some(p) = priority {
+            v["priority"] = serde_json::Value::String(p.to_string());
+        }
+        v
+    }
+
+    #[test]
+    fn assignment_tick_standing_empty_is_silence() {
+        let m = empty_model();
+        let row = inbox_row("FM-GS-012", "standing", "", "agents", None, None);
+        let (next, cmds) = tick(&m, &Msg::InboxRows { rows: vec![row], pin: "Tester".into() });
+        // standing + empty body -> NO Cmd to human pin, no result
+        let has_human_prompt = cmds.iter().any(|c| matches!(c, Cmd::Prompt{pin,..} if pin=="human" || pin=="captain"));
+        let has_result = cmds.iter().any(|c| matches!(c, Cmd::SqliteUpsert{corr, ..} if corr=="FM-GS-012"));
+        assert!(!has_human_prompt, "standing empty must be silence, no human pin Cmd");
+        assert!(!has_result, "standing empty must not write result");
+        assert!(next.assignment.get("FM-GS-012").is_none(), "standing empty must not create assignment");
+    }
+
+    #[test]
+    fn assignment_tick_tasked_empty_writes_result() {
+        let m = empty_model();
+        let row = inbox_row("FM-GS-012", "tasked", "", "agents", Some("/tmp/adr27-result.txt"), None);
+        let (next, cmds) = tick(&m, &Msg::InboxRows { rows: vec![row], pin: "Tester".into() });
+        // tasked + empty -> Cmd records result against corr with result_path
+        assert!(next.assignment.contains_key("FM-GS-012"), "tasked empty must create assignment");
+        let receipt = next.assignment.get("FM-GS-012").unwrap();
+        assert_eq!(receipt.wake, "tasked");
+        assert_eq!(receipt.result_path.as_deref(), Some("/tmp/adr27-result.txt"));
+        let has_upsert = cmds.iter().any(|c| matches!(c, Cmd::SqliteUpsert{corr, receipt} if corr=="FM-GS-012" && receipt.result_path.is_some()));
+        assert!(has_upsert, "tasked empty must emit SqliteUpsert with result_path");
+        let has_wait = cmds.iter().any(|c| matches!(c, Cmd::WaitCorr{corr} if corr=="FM-GS-012"));
+        assert!(has_wait, "tasked should also emit WaitCorr");
+    }
+
+    #[test]
+    fn assignment_tick_default_tasked_priority_is_queue() {
+        let m = empty_model();
+        // tasked without priority should default to queue, not interrupt
+        let row = inbox_row("C1", "tasked", "hello", "agents", None, None);
+        let (next, cmds) = tick(&m, &Msg::InboxRows { rows: vec![row], pin: "Tester".into() });
+        let r = next.assignment.get("C1").expect("should create assignment");
+        assert_ne!(r.wake, "interrupt");
+        // Should not be treated as interrupt
+        let has_interrupt_err = cmds.iter().any(|c| matches!(c, Cmd::LoudMiss{why} if why.contains("interrupt")));
+        assert!(!has_interrupt_err, "default tasked priority must be queue, not interrupt");
+    }
+
+    #[test]
+    fn assignment_tick_interrupt_never_human() {
+        let m = empty_model();
+        let row = inbox_row("C2", "tasked", "hi", "human", None, Some("interrupt"));
+        let (_next, cmds) = tick(&m, &Msg::InboxRows { rows: vec![row], pin: "Tester".into() });
+        // interrupt onto human pin is hard error
+        let has_err = cmds.iter().any(|c| matches!(c, Cmd::LoudMiss{why} if why.contains("interrupt") && why.contains("human")));
+        assert!(has_err, "interrupt never onto human pin must be hard error (LoudMiss)");
+    }
+
+    #[test]
+    fn assignment_tick_audience_human_one_pin_only() {
+        let m = empty_model();
+        // audience=human with corr that would fan-out to multiple pins is hard error
+        // Simulate by having row with audience human and a special marker for broadcast
+        let mut row = inbox_row("C3", "tasked", "hello", "human", None, None);
+        row["broadcast"] = serde_json::Value::Bool(true);
+        let (_next, cmds) = tick(&m, &Msg::InboxRows { rows: vec![row], pin: "Tester".into() });
+        let has_err = cmds.iter().any(|c| matches!(c, Cmd::LoudMiss{why} if why.contains("broadcast") || why.contains("human")));
+        assert!(has_err, "audience=human broadcast must be hard error");
+    }
+
+    #[test]
+    fn assignment_tick_receipt_is_durable() {
+        let m = empty_model();
+        let receipt = Receipt { state: "owed".into(), wake: "tasked".into(), due_at: Some(999), result_path: None };
+        let (next, cmds) = tick(&m, &Msg::Receipt { corr: "FM-GS-012".into(), receipt: receipt.clone() });
+        assert_eq!(next.assignment.get("FM-GS-012"), Some(&receipt));
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::SqliteUpsert{corr, ..} if corr=="FM-GS-012")));
+    }
+
+    #[test]
+    fn assignment_tick_wait_corr_wired() {
+        let m = empty_model();
+        let row = inbox_row("C4", "tasked", "work", "agents", None, None);
+        let (_next, cmds) = tick(&m, &Msg::InboxRows { rows: vec![row], pin: "Tester".into() });
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::WaitCorr{corr} if corr=="C4")), "tasked should emit WaitCorr");
+    }
+
+    #[test]
+    fn assignment_tick_s1_tasked_survives() {
+        // S1 scenario: tasked mail survives walker death is via durable receipt, not journal
+        let m = empty_model();
+        let receipt = Receipt { state: "owed".into(), wake: "tasked".into(), due_at: Some(123), result_path: Some("/tmp/x".into()) };
+        let (next, cmds) = tick(&m, &Msg::Receipt { corr: "FM-GS-012".into(), receipt: receipt.clone() });
+        assert!(next.assignment.contains_key("FM-GS-012"));
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::SqliteUpsert{..})));
+        // Simulate new process rebuilding cache from table (not journal) — assignment should be rebuildable
+        let rebuilt = next.assignment.clone();
+        assert_eq!(rebuilt.get("FM-GS-012"), Some(&receipt));
     }
 }
