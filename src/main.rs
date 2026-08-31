@@ -7500,7 +7500,23 @@ fn cmd_doorbell_why(cfg: &Config, project: &str, pin: &str, limit: usize) -> Res
             .and_then(|a| a.as_array())
             .map(|a| {
                 a.iter()
-                    .filter_map(|v| v.get("Prompt").map(|_| "prompt"))
+                    .map(|v| {
+                        if v.get("Prompt").is_some() {
+                            "prompt"
+                        } else if v.get("CheckAckSla").is_some() {
+                            "check-ack-sla"
+                        } else if v.get("RestartWatch").is_some() {
+                            "restart-watch"
+                        } else if v.get("FactMiss").is_some() {
+                            "fact-miss"
+                        } else if v.get("Audit").is_some() {
+                            "audit"
+                        } else if v.get("FetchInbox").is_some() {
+                            "fetch-inbox"
+                        } else {
+                            "unknown"
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(",")
             })
@@ -7727,7 +7743,8 @@ fn cmd_internal_doorbell(
     let mut herdr = Client::connect(Some(&cfg.socket_path())).ok();
     let mut status_by_pin: BTreeMap<String, String> = BTreeMap::new();
     let mut pane_to_pin: BTreeMap<String, String> = BTreeMap::new();
-    let mut queues: BTreeMap<String, doorbell::DoorbellQueue> = BTreeMap::new();
+    let mut _queues: BTreeMap<String, doorbell::DoorbellQueue> = BTreeMap::new();
+    let mut bell_model = doorbell_tick::DoorbellModel::default();
     let mut budgets: BTreeMap<String, doorbell::PinBudget> = BTreeMap::new();
     // bd-durable-doorbell-lngf: plane-P/S high-waters + the last-wake stamp
     // survive a crash — at-least-once redelivery with an idempotent line.
@@ -7753,7 +7770,7 @@ fn cmd_internal_doorbell(
         project,
         &mut status_by_pin,
         &mut pane_to_pin,
-        &mut queues,
+        &mut bell_model,
         &mut hear,
         &index,
         workspace,
@@ -8123,7 +8140,7 @@ fn cmd_internal_doorbell(
                         project,
                         &mut status_by_pin,
                         &mut pane_to_pin,
-                        &mut queues,
+                        &mut bell_model,
                         &mut hear,
                         &index,
                         workspace,
@@ -8391,7 +8408,7 @@ fn doorbell_refresh_status(
     project: &str,
     status_by_pin: &mut BTreeMap<String, String>,
     pane_to_pin: &mut BTreeMap<String, String>,
-    queues: &mut BTreeMap<String, doorbell::DoorbellQueue>,
+    bell_model: &mut doorbell_tick::DoorbellModel,
     hear: &mut doorbell::HearTracker,
     index: &doorbell::SelfIndex,
     workspace: &str,
@@ -8422,12 +8439,31 @@ fn doorbell_refresh_status(
             continue;
         };
         let to = a.agent_status.as_str().to_string();
-        let from = status_by_pin
-            .get(&pin)
-            .cloned()
-            .unwrap_or_else(|| to.clone());
         status_by_pin.insert(pin.clone(), to.clone());
-        injects.extend(doorbell::apply_status_change(&pin, &from, &to, queues));
+        // bd-a2vx: drain decision via tick (was apply_status_change on a separate queues map).
+        bell_model.statuses.insert(pin.clone(), to.clone());
+        bell_model.index = index.clone();
+        let msg = doorbell_tick::DoorbellMsg::HerdrStatus {
+            pin: pin.clone(),
+            status: to.clone(),
+        };
+        let (next_model, tick_actions) = doorbell_tick::tick(bell_model, &msg);
+        *bell_model = next_model;
+        let raw: Vec<(String, String)> = tick_actions
+            .iter()
+            .filter_map(|ac| match ac {
+                doorbell_tick::DoorbellAction::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                _ => None,
+            })
+            .collect();
+        doorbell::journal_append(
+            &config::state_dir(),
+            workspace,
+            &msg,
+            &tick_actions,
+            serde_json::json!({ "stage": "refresh_status", "pin": pin }),
+        );
+        injects.extend(raw);
     }
     doorbell_prompt_and_hear(
         Some(client),
@@ -28447,6 +28483,30 @@ mod integration_tests {
                     "{kind}/{name} heading"
                 );
             }
+        }
+    }
+
+    /// GS-010: playbook compose lines must be clap-parseable (not SPAWN substring) — the
+    /// agent must be able to run the pasted command, not just see English.
+    #[test]
+    fn playbook_compose_lines_are_clap_parseable() {
+        for tpl in ["swarm", "loop"] {
+            let path = format!("integrations/prompts/{tpl}.md.tpl");
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("read {path}"));
+            let mut found = 0;
+            for line in content.lines().filter(|l| l.contains("workflow compose")) {
+                found += 1;
+                assert!(
+                    line.contains("\"<objective>\"") || line.contains("<objective>"),
+                    "compose line must have positional <objective> in {tpl}: {line}"
+                );
+                assert!(
+                    !line.contains("--mode"),
+                    "compose line must not have --mode in {tpl}: {line}"
+                );
+            }
+            assert!(found > 0, "no workflow compose line found in {tpl}");
         }
     }
 

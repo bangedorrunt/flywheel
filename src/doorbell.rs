@@ -1253,7 +1253,7 @@ pub fn apply_watch_line(
         let status = status_by_pin
             .get(&pin)
             .map(String::as_str)
-            .unwrap_or("idle");
+            .unwrap_or("unknown");
         if should_inject(status) {
             inject.push((pin, msg.clone()));
         } else {
