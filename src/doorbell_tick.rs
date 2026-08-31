@@ -170,7 +170,7 @@ fn route_or_queue(
     pin: &str,
     line: String,
 ) {
-    let status = next.statuses.get(pin).map(String::as_str).unwrap_or("idle");
+    let status = next.statuses.get(pin).map(String::as_str).unwrap_or("unknown");
     if crate::doorbell::should_inject(status) {
         actions.push(DoorbellAction::Prompt {
             pin: pin.to_string(),
