@@ -10944,11 +10944,12 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
         }
         println!("{report}");
         println!(
-            "doorbell: {} last_wake={} pin={}",
+            "{} {} last_wake={} pin={}",
+            crate::output::accent("◆ doorbell:"),
             if dispatcher_alive {
-                "up"
+                crate::output::ok("up")
             } else {
-                "DOWN (healed)"
+                crate::output::warn("DOWN (healed)")
             },
             wake_state
                 .last_wake_unix
@@ -10957,7 +10958,8 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             wake_state.last_wake_pin.as_deref().unwrap_or("?")
         );
         println!(
-            "facts: {} last={}",
+            "{} {} last={}",
+            crate::output::accent("facts:"),
             facts_count,
             last_fact.as_deref().unwrap_or("none")
         );

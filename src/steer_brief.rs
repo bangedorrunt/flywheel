@@ -19,6 +19,8 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 
+use crate::output::{accent, accent_lav, dim, ok, warn};
+
 /// One role's model menu: the profile default plus every registered id that
 /// could serve the role's harness, with cost/caps so the operator chooses
 /// with numbers on screen.
@@ -82,29 +84,45 @@ pub fn run_briefing(
     } else {
         ctx.source.as_str()
     };
-    writeln!(out, "== captain briefing: {} {:?}", kind, ctx.workflow)?;
-    writeln!(out, "objective: {}", ctx.objective)?;
+    writeln!(
+        out,
+        "{}",
+        accent(&format!("== captain briefing: {} {:?}", kind, ctx.workflow))
+    )?;
+    writeln!(out, "  {} {}", dim("objective:"), accent(&ctx.objective))?;
 
     // (1) inferred crew plan with editable counts.
-    writeln!(out, "\n[1/4] inferred crew plan (Enter keeps the count):")?;
+    writeln!(
+        out,
+        "\n{} {}",
+        accent_lav("[1/4]"),
+        ok("inferred crew plan (Enter keeps the count):")
+    )?;
     for (role, count) in &ctx.crew_plan {
-        write!(out, "  {role} x{count} > ")?;
+        write!(out, "  {} {} > ", accent(role), dim(&format!("x{count}")))?;
         out.flush()?;
         let line = read_line(input)?;
         if let Ok(n) = line.trim().parse::<u32>()
             && n > 0
         {
-            writeln!(out, "  {role} -> x{n}")?;
+            writeln!(out, "  {} -> {}", dim(role), ok(&format!("x{n}")))?;
         }
     }
 
     // (2) per-role models with cost/caps + funded column (ADR-0026 Spec 2).
-    writeln!(out, "\n[2/4] per-role models (Enter keeps the default):")?;
+    writeln!(
+        out,
+        "\n{} {}",
+        accent_lav("[2/4]"),
+        ok("per-role models (Enter keeps the default):")
+    )?;
     for m in &ctx.models {
         writeln!(
             out,
             "  {} ({}): default {}",
-            m.role, m.harness, m.default_model
+            accent(&m.role),
+            dim(&m.harness),
+            ok(&m.default_model)
         )?;
         for (i, (id, cost, caps)) in m.alternatives.iter().enumerate() {
             let cost_s = if *cost > 0.0 {
@@ -117,52 +135,68 @@ pub fn run_briefing(
             } else {
                 format!(" caps={}", caps.join(","))
             };
-            writeln!(out, "    [{i}] {id} ({cost_s}{caps_s})")?;
+            writeln!(out, "    {} {} ({}{})", dim(&format!("[{i}]")), id, cost_s, caps_s)?;
         }
         if let Some(funded) = ctx.funded.get(&m.role) {
-            writeln!(out, "    funded: {funded}")?;
+            writeln!(out, "    {} {}", dim("funded:"), funded)?;
         }
-        write!(out, "  select > ")?;
+        write!(out, "  {} > ", dim("select"))?;
         out.flush()?;
         let line = read_line(input)?;
         if let Ok(i) = line.trim().parse::<usize>()
             && let Some((id, _, _)) = m.alternatives.get(i)
         {
-            writeln!(out, "  {} -> {id}", m.role)?;
+            writeln!(out, "  {} -> {}", dim(&m.role), accent(id))?;
         }
     }
 
     // (3) squad recommendation or explicit bare harness+model.
-    writeln!(out, "\n[3/4] fleet shape:")?;
+    writeln!(
+        out,
+        "\n{} {}",
+        accent_lav("[3/4]"),
+        ok("fleet shape:")
+    )?;
     match &ctx.squad_recommendation {
-        Some(squad) => writeln!(out, "  recommended squad: {squad}")?,
-        None => writeln!(out, "  recommended squad: none (per-role profiles)")?,
-    }
-    match &ctx.bare_override {
-        Some(bare) => writeln!(out, "  bare override accepted: {bare}")?,
+        Some(squad) => writeln!(out, "  {} {}", dim("recommended squad:"), accent(squad))?,
         None => writeln!(
             out,
-            "  bare harness+model: available via spawn --model/--provider"
+            "  {} none (per-role profiles)",
+            dim("recommended squad:")
+        )?,
+    }
+    match &ctx.bare_override {
+        Some(bare) => writeln!(out, "  {} {}", dim("bare override accepted:"), accent(bare))?,
+        None => writeln!(
+            out,
+            "  {}",
+            dim("bare harness+model: available via spawn --model/--provider")
         )?,
     }
 
     // (4) resolved stage-chain preview.
-    writeln!(out, "\n[4/4] stage chain for {:?}:", ctx.workflow)?;
+    writeln!(
+        out,
+        "\n{} {} {:?}:",
+        accent_lav("[4/4]"),
+        ok("stage chain for"),
+        ctx.workflow
+    )?;
     for stage in &ctx.stage_chain {
-        writeln!(out, "  - {stage}")?;
+        writeln!(out, "  {} {}", dim("-"), stage)?;
     }
 
-    // go/no-go.
-    write!(out, "\ndispatch? [Y/n] > ")?;
+    // go/no-go — amber gate per hacker-night warning slot
+    write!(out, "\n{} > ", warn("dispatch? [Y/n]"))?;
     out.flush()?;
     let verdict = read_line(input)?;
     match verdict.trim().to_ascii_lowercase().as_str() {
         "n" | "no" => {
-            writeln!(out, "aborted.")?;
+            writeln!(out, "{}", warn("aborted."))?;
             Ok(BriefingOutcome::Abort)
         }
         _ => {
-            writeln!(out, "dispatching.")?;
+            writeln!(out, "{}", ok("dispatching."))?;
             Ok(BriefingOutcome::Go)
         }
     }
