@@ -317,14 +317,16 @@ pub struct LoopModel {
     pub mail_health: crate::state::MailHealth,
     pub mail_degraded: bool,
     pub heal_states: std::collections::HashMap<String, HealState>,
-    /// Herdr events folded into tick (bd-ugd1): `LoopMsg::Herdr` buffers the
-    /// PollEvent here; the next `LoopMsg::Tick` drains it through
-    /// `apply_events_to_states` so plan_actions sees event-asserted statuses.
-    /// serde default keeps stored loops.json / journals loading unchanged.
+    /// Herdr events buffered by `LoopMsg::Herdr` (bd-ugd1); drained on the
+    /// next Tick through apply_events_to_states + route decisions.
     #[serde(default)]
     pub pending_events: Vec<PollEvent>,
+    /// Double-dispatch guard (bd-nsb3 fold): names dispatched via the event
+    /// path awaiting `working` confirmation. Lives in model' so route
+    /// decisions inside tick are visible and replayable.
+    #[serde(default)]
+    pub dispatch_pending: std::collections::HashSet<String>,
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum LoopMsg {
     Herdr(PollEvent),
@@ -354,6 +356,11 @@ pub enum LoopMsg {
         digests: std::collections::HashMap<String, MailDigest>,
         nudge: Option<String>,
         wake_suppressed: std::collections::HashSet<String>,
+        /// The poll's event batch (bd-nsb3): route decisions are made INSIDE
+        /// tick — queue pops and dispatch-pending updates land in model'
+        /// where they are visible and replayable.
+        #[serde(default)]
+        events: Vec<PollEvent>,
     },
 }
 
@@ -451,18 +458,48 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             digests,
             nudge,
             wake_suppressed,
+            events,
         } => {
-            // Fold buffered Herdr events (LoopMsg::Herdr) into the states
-            // BEFORE planning, so plan_actions sees event-asserted statuses
-            // without waiting for the heartbeat snapshot (bd-ugd1).
+            // bd-nsb3 FOLD: the tick is the only decision producer. Three
+            // stages, in live-loop order:
+            //
+            // (1) EVENT PATH — buffered Herdr events + this batch. Statuses
+            //     apply to states, then route_event decides zero-latency
+            //     redispatch: queue pops + dispatch-pending updates land in
+            //     model' (visible + replayable), not in a loop local.
+            let mut all_events: Vec<PollEvent> = next.pending_events.drain(..).collect();
+            all_events.extend(events.iter().cloned());
             let mut states = states.clone();
-            if !next.pending_events.is_empty() {
-                let pending = std::mem::take(&mut next.pending_events);
-                apply_events_to_states(&mut states, &pending);
+            apply_events_to_states(&mut states, &all_events);
+            for ev in &all_events {
+                if let Some(a) =
+                    route_event(&states, ev, &mut next.queue, &mut next.dispatch_pending)
+                {
+                    actions.push(a);
+                }
             }
-            let actions_from_plan =
-                plan_actions(&next, &states, nudge.as_deref(), digests, wake_suppressed);
-            let send_count = actions_from_plan
+            // (2) MAIL-HOLD + heartbeat plan. Degraded mail-health emits
+            //     Blocked for idle agents INSTEAD of the plan (in-flight
+            //     claim-watches continue — they ride stage 3).
+            let mut plan: Vec<LoopAction> = if next.mail_degraded {
+                states
+                    .iter()
+                    .filter(|s| s.status == "idle")
+                    .map(|s| LoopAction::Blocked {
+                        name: s.name.clone(),
+                    })
+                    .collect()
+            } else {
+                plan_actions(&next, &states, nudge.as_deref(), digests, wake_suppressed)
+            };
+            // (3) Dispatch-pending retention (bd-event-dispatch double-feed
+            //     guard): drop Sends to agents already awaiting `working`,
+            //     pop the queue for survivors, record them as pending.
+            plan.retain(|a| match a {
+                LoopAction::Send { name, .. } => !next.dispatch_pending.contains(name),
+                _ => true,
+            });
+            let send_count = plan
                 .iter()
                 .filter(|a| matches!(a, LoopAction::Send { .. }))
                 .count();
@@ -471,7 +508,19 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
                     next.queue.remove(0);
                 }
             }
-            actions.extend(actions_from_plan);
+            for a in &plan {
+                if let LoopAction::Send { name, .. } = a {
+                    next.dispatch_pending.insert(name.clone());
+                }
+            }
+            actions.extend(plan);
+            // (4) Claim-watch nudges: DELIBERATELY loop-side (bd-nsb3
+            //     scoping note). The Nudge variants are pure Sends, but the
+            //     Redispatch variants perform I/O (dispatch-guard scans) and
+            //     front-requeue — effects belong to the effect layer. The
+            //     decision producer for events, queue, retention, and
+            //     mail-hold is tick; the claim-watch stage is an effect
+            //     stage with its own guard leaves.
         }
         LoopMsg::Herdr(pe) => {
             // bd-ugd1: buffer into model' (visible + replayable); the next
@@ -4095,8 +4144,6 @@ pub const ALWAYS_SERIALIZE_PATHS: &[&str] = &[
     "docs/catalog/**",
     "target/**",
 ];
-
-/// Pure: does ANY held reservation (path, reason=bead-id) overlap an
 /// always-serialize path? If yes, all NEW ready-bead dispatch serializes —
 /// never parallel (ADR-0019 Spec 3.5, acceptance: two beads touching
 /// `.beads/` or `Cargo.lock` run one after the other).
@@ -4138,7 +4185,7 @@ pub fn bead_overlap_waits(
 }
 
 /// One watchdog decision for a watched bead.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClaimWatchAction {
     /// send a claim-focused nudge to the dispatched agent (short, explicit).
     NudgeClaim { agent: String, bead_id: String },
@@ -5632,7 +5679,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // agents that received DispatchImmediate and await working confirmation
     // (bd-event-dispatch double-dispatch guard)
     let mut dispatch_pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // cross-project [xproj] message ids already queued (avoid re-enqueue).
+    // bd-nsb3: per-bead phase map persists across polls in model' (was Default every poll).
+    let mut per_bead_phase: std::collections::BTreeMap<String, LoopPhase> =
+        std::collections::BTreeMap::new();
     // String: toron ids are hex event ids; agent-mail ids normalize to string.
     let mut seen_xproj: std::collections::HashSet<String> = std::collections::HashSet::new();
     // bd-context-limit-honor-luqg: exact-body CONTEXT_LIMIT replies already
@@ -6672,23 +6721,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         }
 
         let mut blocked_names: Vec<String> = Vec::new();
-        // event path first (zero-latency redispatch), then heartbeat plan_actions
+        // bd-nsb3 FOLD: event decisions now live inside tick (queue pops and
+        // dispatch_pending live in model'). The pre-pass route_event loop is
+        // deleted — events travel as Tick.events and are replayable.
         let mut actions: Vec<LoopAction> = heal_actions;
-        for ev in &event_batch.events {
-            if let Some(a) = route_event(&states, ev, &mut queue, &mut dispatch_pending) {
-                // pane.exited Diagnose is already covered by self_heal_step;
-                // skip duplicate Diagnose from route_event when heal ran.
-                if matches!(&a, LoopAction::Diagnose { name, reason }
-                    if reason == "pane_exited" && exited_names.contains(name))
-                {
-                    continue;
-                }
-                if let LoopAction::Blocked { name } = &a {
-                    blocked_names.push(name.clone());
-                }
-                actions.push(a);
-            }
-        }
         // heartbeat path: full-snapshot reconciliation (skips agents already
         // dispatch-pending so event path and poll path don't double-feed)
         // Loop-side mail wake: fetch per-agent digests ONCE per iteration
@@ -6837,56 +6873,57 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         } else {
             false
         };
-        let mut poll_actions = if mail_hold {
-            // Blocked for all idle agents; in-flight claim-watches continue
-            states
-                .iter()
-                .filter(|s| s.status == "idle")
-                .map(|s| LoopAction::Blocked {
-                    name: s.name.clone(),
-                })
-                .collect()
-        } else {
-            // Runtime cutover: build LoopModel from loops.json v3 control state
-            // and drive through tick (behavior-preserving; plan_actions is now
-            // an internal helper of tick).
-            let active = crate::state::load_active_loop(&params.project)
-                .ok()
-                .flatten();
-            let model = LoopModel {
-                queue: queue.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: wake_suppressed.clone(),
-                done_mailed: Default::default(),
-                event_cursor: active.as_ref().and_then(|a| a.event_cursor.clone()),
-                escalation: active
-                    .as_ref()
-                    .map(|a| a.escalation.clone())
-                    .unwrap_or_default(),
-                respawn: active
-                    .as_ref()
-                    .map(|a| a.respawn.clone())
-                    .unwrap_or_default(),
-                mail_health: active
-                    .as_ref()
-                    .map(|a| a.mail_health.clone())
-                    .unwrap_or_default(),
-                mail_degraded: active.as_ref().map(|a| a.mail_degraded).unwrap_or(false),
-                heal_states: Default::default(),
-                pending_events: Default::default(),
-            };
-            let msg = LoopMsg::Tick {
-                states: states.clone(),
-                digests: digests.clone(),
-                nudge: params.nudge.clone(),
-                wake_suppressed: wake_suppressed.clone(),
-            };
-            let (next_model, actions) = tick(&model, &msg);
-            // Journal every LoopMsg driven into tick (kind + payload + actions) as JSONL
-            let _ = crate::state::journal_loop_msg(&params.project, &msg, &model, &actions);
-            queue = next_model.queue.clone();
-            actions
+        // bd-nsb3 FOLD: mail-hold + events + retention all live inside tick.
+        // The degraded flag is the tick's decision — Blocked for idles instead
+        // of the plan when degraded (in-flight claim-watches still append after
+        // as the loop's effect stage). Queue pops and dispatch_pending live in
+        // model' (visible + replayable).
+        let active = crate::state::load_active_loop(&params.project)
+            .ok()
+            .flatten();
+        let model = LoopModel {
+            queue: queue.clone(),
+            per_bead_phase: per_bead_phase.clone(),
+            wake_suppression: wake_suppressed.clone(),
+            done_mailed: Default::default(),
+            event_cursor: active.as_ref().and_then(|a| a.event_cursor.clone()),
+            escalation: active
+                .as_ref()
+                .map(|a| a.escalation.clone())
+                .unwrap_or_default(),
+            respawn: active
+                .as_ref()
+                .map(|a| a.respawn.clone())
+                .unwrap_or_default(),
+            mail_health: active
+                .as_ref()
+                .map(|a| a.mail_health.clone())
+                .unwrap_or_default(),
+            mail_degraded: mail_hold,
+            heal_states: Default::default(),
+            pending_events: Default::default(),
+            dispatch_pending: dispatch_pending.clone(),
         };
+        let msg = LoopMsg::Tick {
+            states: states.clone(),
+            digests: digests.clone(),
+            nudge: params.nudge.clone(),
+            wake_suppressed: wake_suppressed.clone(),
+            events: event_batch.events.clone(),
+        };
+        let (next_model, poll_actions) = tick(&model, &msg);
+        // Journal every LoopMsg driven into tick (kind + payload + actions) as JSONL
+        let _ = crate::state::journal_loop_msg(&params.project, &msg, &model, &poll_actions);
+        // Dedup pane.exited Diagnose already covered by self_heal_step (heal_actions).
+        let mut poll_actions: Vec<LoopAction> = poll_actions
+            .into_iter()
+            .filter(|a| {
+                !matches!(a, LoopAction::Diagnose { name, reason } if reason == "pane_exited" && exited_names.contains(name))
+            })
+            .collect();
+        queue = next_model.queue.clone();
+        per_bead_phase = next_model.per_bead_phase.clone();
+        dispatch_pending = next_model.dispatch_pending.clone();
         // record wake decisions so the same urgent message does not re-wake
         for a in &poll_actions {
             if let LoopAction::Send { name, text } = a
@@ -6897,15 +6934,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 woken_for.insert(name.clone(), id.clone());
             }
         }
-        poll_actions.retain(|a| match a {
-            LoopAction::Send { name, .. } => !dispatch_pending.contains(name),
-            _ => true,
-        });
         // re-add Send names that survived to pending so event flutter is covered
         for a in &poll_actions {
-            if let LoopAction::Send { name, .. } = a {
-                dispatch_pending.insert(name.clone());
-            }
             if let LoopAction::Blocked { name } = a {
                 blocked_names.push(name.clone());
             }
@@ -8779,6 +8809,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -8838,6 +8869,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -8874,6 +8906,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -8902,6 +8935,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -8930,6 +8964,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             Some("proceed"),
@@ -8956,6 +8991,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -8984,6 +9020,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -9012,6 +9049,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             Some("proceed"),
@@ -9924,6 +9962,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -9967,6 +10006,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -10007,6 +10047,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -10118,6 +10159,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -10153,6 +10195,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -10180,6 +10223,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states_plain,
             None,
@@ -10221,6 +10265,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -10295,6 +10340,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -10330,6 +10376,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -10361,6 +10408,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -10405,6 +10453,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -10516,6 +10565,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -10579,6 +10629,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -10608,6 +10659,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             Some("proceed"),
@@ -10643,6 +10695,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -10675,6 +10728,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -10706,6 +10760,7 @@ mod tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -12020,12 +12075,14 @@ mod tests {
             mail_degraded: false,
             heal_states: Default::default(),
             pending_events: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let msg = LoopMsg::Tick {
             states: states.to_vec(),
             digests: HashMap::new(),
             nudge: None,
             wake_suppressed: std::collections::HashSet::new(),
+            events: Default::default(),
         };
         let (next, actions) = tick(&model, &msg);
         *queue = next.queue;
@@ -14289,6 +14346,7 @@ mod tick_replay_tests {
             mail_degraded: false,
             heal_states: Default::default(),
             pending_events: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let msgs = vec![
             LoopMsg::Tick {
@@ -14302,6 +14360,7 @@ mod tick_replay_tests {
                 digests: HashMap::new(),
                 nudge: None,
                 wake_suppressed: HashSet::new(),
+                events: Default::default(),
             },
             LoopMsg::Dispatch {
                 bead_id: "bd-1".to_string(),
@@ -14332,6 +14391,7 @@ mod tick_replay_tests {
             mail_degraded: false,
             heal_states: Default::default(),
             pending_events: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let mut actions_log2 = Vec::new();
         for msg in &msgs {
@@ -14357,6 +14417,7 @@ mod tick_replay_tests {
             mail_degraded: false,
             heal_states: Default::default(),
             pending_events: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let msg = LoopMsg::Tick {
             states: vec![AgentState {
@@ -14369,6 +14430,7 @@ mod tick_replay_tests {
             digests: HashMap::new(),
             nudge: None,
             wake_suppressed: HashSet::new(),
+            events: Default::default(),
         };
         let (m1, a1) = tick(&model, &msg);
         let (m2, a2) = tick(&model, &msg);
@@ -14392,6 +14454,7 @@ mod tick_replay_tests {
             mail_degraded: false,
             heal_states: Default::default(),
             pending_events: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let msg = LoopMsg::Tick {
             states: vec![AgentState {
@@ -14404,6 +14467,7 @@ mod tick_replay_tests {
             digests: HashMap::new(),
             nudge: None,
             wake_suppressed: HashSet::new(),
+            events: Default::default(),
         };
         let (next, actions) = tick(&model, &msg);
         // Queue pop should be visible in next.queue
@@ -14435,6 +14499,7 @@ mod loop_invoke_vehicle_tests {
             mail_degraded: false,
             heal_states: Default::default(),
             pending_events: Default::default(),
+            dispatch_pending: Default::default(),
         };
         // Simulate a graph invoke for bd-1 that succeeds (in-graph green)
         let msg = LoopMsg::Tick {
@@ -14448,6 +14513,7 @@ mod loop_invoke_vehicle_tests {
             digests: Default::default(),
             nudge: None,
             wake_suppressed: Default::default(),
+            events: Default::default(),
         };
         let (next, _actions) = tick(&model, &msg);
         // Graph green should not have popped the bead's phase to Complete, just remain in Dispatched/ClaimWatch
@@ -14473,6 +14539,7 @@ mod loop_invoke_vehicle_tests {
             mail_degraded: false,
             heal_states: Default::default(),
             pending_events: Default::default(),
+            dispatch_pending: Default::default(),
         };
         // Simulate worker closing the bead via br close (BrClose event)
         let (next, _) = tick(
@@ -14514,6 +14581,7 @@ mod loop_invoke_vehicle_tests {
             mail_degraded: false,
             heal_states: Default::default(),
             pending_events: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let msg = LoopMsg::BrClose {
             bead_id: "bd-1".to_string(),
@@ -14578,6 +14646,7 @@ mod loop_invoke_vehicle_tests {
             mail_degraded: false,
             heal_states: Default::default(),
             pending_events: Default::default(),
+            dispatch_pending: Default::default(),
         };
         // For a bead that is not opted-in for graph, tick with Tick should just do normal plan_actions
         let msg = LoopMsg::Tick {
@@ -14591,6 +14660,7 @@ mod loop_invoke_vehicle_tests {
             digests: Default::default(),
             nudge: None,
             wake_suppressed: Default::default(),
+            events: Default::default(),
         };
         let (next, actions) = tick(&model, &msg);
         // Should have popped the queue and created a Send action (normal path)
@@ -14613,6 +14683,7 @@ mod loop_invoke_vehicle_tests {
             mail_degraded: false,
             heal_states: Default::default(),
             pending_events: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let states = vec![AgentState {
             name: "a".to_string(),
@@ -14629,6 +14700,7 @@ mod loop_invoke_vehicle_tests {
             digests: digests.clone(),
             nudge: None,
             wake_suppressed: wake.clone(),
+            events: Default::default(),
         };
         let (next, via_tick) = tick(&model, &msg);
         assert_eq!(via_tick, direct);
@@ -14654,6 +14726,7 @@ mod loop_invoke_vehicle_tests {
             mail_degraded: false,
             heal_states: Default::default(),
             pending_events: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let msg = LoopMsg::Tick {
             states: vec![AgentState {
@@ -14666,6 +14739,7 @@ mod loop_invoke_vehicle_tests {
             digests: Default::default(),
             nudge: None,
             wake_suppressed: Default::default(),
+            events: Default::default(),
         };
         let (next, actions) = tick(&model, &msg);
         st::journal_loop_msg(&proj, &msg, &model, &actions).unwrap();
@@ -14685,6 +14759,7 @@ mod loop_invoke_vehicle_tests {
             mail_degraded: false,
             heal_states: Default::default(),
             pending_events: Default::default(),
+            dispatch_pending: Default::default(),
         };
         for entry in &entries {
             let m: LoopMsg = serde_json::from_value(entry.get("msg").unwrap().clone()).unwrap();
@@ -14718,12 +14793,14 @@ mod loop_invoke_vehicle_tests {
             mail_degraded: false,
             heal_states: Default::default(),
             pending_events: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let msg = LoopMsg::Tick {
             states: vec![],
             digests: Default::default(),
             nudge: None,
             wake_suppressed: Default::default(),
+            events: Default::default(),
         };
         let (_, actions) = tick(&model, &msg);
         st::journal_loop_msg(&proj, &msg, &model, &actions).unwrap();

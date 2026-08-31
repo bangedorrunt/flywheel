@@ -587,6 +587,7 @@ mod tests {
                 digests: Default::default(),
                 nudge: None,
                 wake_suppressed: Default::default(),
+                events: Default::default(),
             },
         );
         assert!(
