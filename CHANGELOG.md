@@ -5,11 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 2026-08-29/30 orchestration campaign (ADR-0024/0025/0026)
+## [Unreleased]
 
-### ✨ Added
+## [0.3.0] — 2026-08-31 Tick Law + doorbell bind (GS-005 → GS-009, 0.2.0 → 0.3.0)
 
-- **Engine kind-aware `fail_run` (ADR-0024 Spec 1)** — `rate_limit`/`timeout` retry the same
+
+### ✨ Added (0.3.0 — GS-005 → GS-009, Tick Law)
+
+- **Doorbell Elm tick bound + `doorbell why` (GS-006/007, bd-yw4s, `c96a7ae`)** — `doorbell_tick::tick` is now the live dispatcher's decider for Watch/Status/Died/AckSla (`WatchNdjson`/`HerdrStatus`/`WatchDied`/`AckSlaTick` → `Prompt`/`RestartWatch`/`CheckAckSla`); every tick journaled to `doorbell-journal-<ws>.jsonl`; `flywheel doorbell why <project> <pin>` replays it; `sc_d1` gate updated to tick contract.
+- **Loop `--workflow <name>` now `engine.invoke` with VerifySink (bd-i3lw, GS-009)** — `build_queue` no longer bails English; builtins run via `workflow run --execute --mode pane --project <proj>` subprocess with `make_verify_sink` (was `verify sink missing` on `compose --run` before `ecdb86f`).
+- **Repair loop honest (bd-s1yy, GS-009)** — `verify-1/2` → `on_error: continue` (was `fail_run`, blocked c2 after c1 failure); description no longer claims early-exit `Unrolled`; final `verify-3` still gates the run.
+- **Plane-P sweep via tick (bd-9hco, `4fe50e0`)** — `InboxRows {rows, pin}` through `tick` (pre-parsed `Vec<Value>`, no JSON round-trip); `bell_model` carries `queues`/`statuses`/`index` for the sweep; `watch/status` already via tick, now sweep too; `doorbell why` journals sweep rows.
+- **Hold loop tick — Tick Law wave-2+3 (bd-nsb3, `1ab0223`)** — `heal`/`route_event` (queue pops + `dispatch_pending`) + `mail-hold` (Blocked for idles when degraded) + retention + watch-sends Nudge all inside `tick`; `per_bead_phase` + `dispatch_pending` persist loop-local via `model'` and crash-safe via `ActiveLoop` file (was `Default` every poll); `events: Vec<PollEvent>` travels as `Tick.events` and is replayable; dedup for `pane_exited` Diagnose already covered by `self_heal`.
+- **Persist `per_bead_phase` + `dispatch_pending` via `ActiveLoop` file (bd-5fbv, `aaa86f5`)** — `ActiveLoop` gains `per_bead_phase: BTreeMap<String,String>` + `dispatch_pending: HashSet<String>` with `#[serde(default)]`; `swarm_loop` loads at start and saves after every `Tick` via `save_active_loop`; `loops.json` v3 additive.
+- **Loop graph vehicle typed `VehicleOutcome` (bd-nmk5, `118fb41`→`982094c` audit)** — `AlreadySpawned` is a distinct ok-arm (loud, typed — never silent `Ok(())`); caller keeps the bead vehicle-owned and never falls through to a normal brief (was double-dispatch regression).
+- **Watch supervisor never dead (bd-umto)** — `watch_retry_at` gate retries every 16s forever; `heal_tick` is backup, not the only life; `spawn_watch_child` helper centralizes kinds (`9,43001,30031,39002`).
+- **ApprovalSink real resolve (bd-1ub5, `21a3f44`)** — drainer scans inbox every ~2s for `approve:<id>`/`reject:<id>` and calls `engine.resolve_approval`; `workflow approve` sends that decision mail (was `bail!` admitting it could not reach the engine).
+- **Ingress seam typed (bd-0or2, `ecdb86f`→`982094c` audit)** — `ingress_to_loop_msg` with real `pane.agent_status_changed`/`pane.exited` strings (were invented `agent_status`/`pane_exited` that `apply_events_to_states` ignored); only `Closed` maps to `BrClose`.
+
+### ✨ Added (0.2.0 — 2026-08-29/30 orchestration campaign, ADR-0024/0025/0026)
+
   node with backoff (bounded by the enclosing `retry`, default 3) before escalating;
   `auth`/`blocked`/`cancelled` abort. R-E1/E2/E3 lint rules fire at compose time.
 - **RECIPE compose expansion keeps `graph`** — `--parts repair-until-verified` yields the full
@@ -52,7 +67,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **GitFact producer** — the strict pre-commit guard appends attributed commit facts to the
   flywheel fact journal (best-effort, never blocks).
 
-### 🔧 Fixed
+### 🔧 Fixed (0.3.0 — GS-006 → GS-009, operator doors + Tick Law)
+
+- **Doorbell delivery (GS-006, `ecdb86f`)** — kind-9 `mail-delivered` → `EventClass::PlanePUrgent` (`toron mail inbox --since`, not `channel read` on a thread id); `ack-sla-expired` also a mail wake; 39002 `join`/`leave` classified as Channel and subscribed in-process + CLI (`9,43001,30031,39002`); `watch_targets` `p`/`assignee` for any kind; `captain_fact_inject` loud `FactMiss` (was silent `Ok(())`, never `registry.first()`); `Ack-SLA` 60s production caller + pin-name `p` tags (was hex-only, toron `messaging.rs:713`).
+- **Watch supervisor never dead (GS-007, `118fb41`→`a86eb0c`)** — `watch_retry_at` gate retries every 16s forever; `heal_tick` is backup, not the only life; `spawn_watch_child` helper centralizes kinds.
+- **Spawn vehicle loud `AlreadySpawned` (bd-nmk5, `982094c`)** — typed `VehicleOutcome` (loud, distinct ok-arm) — caller keeps the bead vehicle-owned and never falls through to a normal brief (was double-dispatch regression where a `bail!` fell through to a brief every poll).
+- **Ingress seam typed (bd-0or2, `ecdb86f`→`982094c` audit)** — `ingress_to_loop_msg` with real `pane.agent_status_changed`/`pane.exited` strings (were invented strings `agent_status`/`pane_exited` that `apply_events_to_states` ignored); only `Closed` maps to `BrClose` (was Claimed → BrClose); journal snapshot + replay now include `queue` + `dispatch_pending`/`per_bead_phase`/`mail_degraded`.
+- **Tick arms real (bd-ugd1, `118fb41`→`982094c` audit)** — `Herdr` buffers into `pending_events` + drains at next `Tick` through `apply_events_to_states` + `route_event`; `WaveGate`/`CommandVerified` via `LoopEvent` state machine (were `let _ =` no-ops on live variants); `LoopModel` gains `dispatch_pending` + `pending_events`.
+- **Doorbell `InboxRows` + `doorbell why` journal + `AckSlaTick` lie fix (GS-009 cheap set, `24b5051`→`a86eb0c`)** — `InboxItems` wrapper `{"messages":[...]}` expanded; `AckSlaTick` → `CheckAckSla` (was `FetchInbox` lie); `swarm.md.tpl:48` legalized; dead `walk_action` flatten deleted; fact adapter `let _ =` → loud `FactMiss` at the seam.
+- **Repair loop honest (bd-s1yy, `e5f2477`)** — `verify-1/2` `continue` so c2 can run after c1 failure (was `fail_run`); description no longer claims early-exit `Unrolled`.
+- **Loop `--workflow` invoke (bd-i3lw, `e5f2477`)** — `build_queue` actually runs the builtin via `workflow run --execute --mode pane --project <proj>` subprocess with `VerifySink` (was bail English).
+- **Plane-P sweep via tick (bd-9hco, `4fe50e0`)** — `InboxRows {rows, pin}` through `tick`; `bell_model` carries `queues`/`statuses`/`index`; legacy queue for sweep removed; `doorbell why` journals sweep rows.
+- **Hold loop tick fold (bd-nsb3, `1ab0223`)** — `heal`/`route_event`/`mail-hold`/`dispatch_pending`/`queue`/`per_bead_phase` all inside `tick`; `events: Vec<PollEvent>` travels as `Tick.events`; `watch_sends` Nudge appended last; `ActiveLoop` file persists `per_bead_phase`/`dispatch_pending` crash-safe.
+
+### 🔧 Fixed (0.2.0 — 2026-08-29/30 orchestration campaign, ADR-0024/0025/0026)
 
 - **Non-vacuous VERIFY evidence** — receipt/loop paths parse test counts; a zero-match filter
   warns (and refuses in strict mode) instead of closing green on nothing.
