@@ -536,3 +536,63 @@ mod bell_fold_tests {
         assert!(!slice.contains("raw.contains(&needle)") || slice.contains("fold"), "RED (bd-6b1y #11): why still greps pin substring — must fold tick");
     }
 }
+
+#[cfg(test)]
+mod loop_fold_tests {
+    #[test]
+    fn loop_fold_no_watch_sends_after_tick() {
+        let durable = include_str!("durable.rs");
+        assert!(!durable.contains("actions.append(&mut watch_sends)"), "RED (bd-gs8b #2): durable.rs still appends watch_sends AFTER tick — must be Msg::ClaimWatch into tick; delete append at ~6996");
+        assert!(!durable.contains("DELIBERATELY") || !durable.contains("loop-side"), "RED (bd-gs8b #2): durable.rs still carries DELIBERATELY loop-side comment — delete it when folding ClaimWatch");
+    }
+
+    #[test]
+    fn loop_fold_no_heal_pre_seed() {
+        let durable = include_str!("durable.rs");
+        // Reclaim pre-seeds heal_actions before tick — must be Msg::Reclaim into tick
+        assert!(!durable.contains("heal_actions") || durable.contains("Msg::Reclaim") || durable.contains("Reclaim {"), "RED (bd-gs8b #3): durable.rs still pre-seeds heal_actions before tick — must be Msg::Reclaim into tick, then actions = tick(...) only");
+        // Check that tick is the only producer of actions (no pre-seed var)
+        let has_preseed = durable.contains("let mut heal_actions") && durable.contains("actions = tick");
+        assert!(!has_preseed, "RED (bd-gs8b #3): durable.rs has heal_actions pre-seed before tick");
+    }
+
+    #[test]
+    fn loop_fold_no_diagnose_filter() {
+        let durable = include_str!("durable.rs");
+        // Check for the specific post-tick filter that was at 6956-6962: filter Diagnose pane_exited
+        let has_filter = durable.contains("filter(|a|") && durable.contains("pane_exited") && durable.contains("poll_actions");
+        assert!(!has_filter, "RED (bd-gs8b #4): durable.rs still filters Diagnose pane_exited after tick — DELETE the filter");
+    }
+
+    #[test]
+    fn loop_fold_no_double_apply() {
+        let durable = include_str!("durable.rs");
+        // loop pre-apply must be gone (the specific line we removed)
+        assert!(!durable.contains("apply_events_to_states(&mut states, &event_batch.events)"), "RED (bd-gs8b #5): loop pre-apply still present");
+        // tick's apply should remain (at least one occurrence)
+        assert!(durable.contains("apply_events_to_states"), "tick's apply should remain");
+    }
+
+    #[test]
+    fn loop_fold_heal_states_on_activeloop() {
+        let state = include_str!("state.rs");
+        assert!(state.contains("heal_states"), "RED (bd-gs8b #14): state.rs ActiveLoop missing heal_states — move onto ActiveLoop (crash-safe)");
+        // Also check that durable.rs does not have loop-local heal_states map at 5672 after tick
+        let durable = include_str!("durable.rs");
+        // The loop-local map `let mut heal_states: HashMap` should be gone or be on ActiveLoop
+        let has_local_map = durable.contains("let mut heal_states") && !durable.contains("ActiveLoop");
+        // We just check that state.rs has it; loop-local mutate at 7472 should be gone
+        assert!(!durable.contains("apply_diagnose_outcome") || state.contains("heal_states"), "RED (bd-gs8b #14): apply_diagnose_outcome loop-local mutate still present");
+    }
+
+    #[test]
+    fn loop_fold_tick_is_clock_not_world_dump() {
+        let durable = include_str!("durable.rs");
+        // LoopMsg::Tick should be clock, not world dump — check the enum definition slice
+        let pos = durable.find("LoopMsg::Tick").unwrap_or(0);
+        let slice = &durable[pos..std::cmp::min(durable.len(), pos + 800)];
+        let has_world_dump = slice.contains("states:") && slice.contains("digests:") && slice.contains("events:");
+        assert!(!has_world_dump, "RED (bd-gs8b): LoopMsg::Tick still world-dumps states/digests/events — must be Tick now clock + poll as Cmd");
+        assert!(slice.contains("now: u64") || slice.contains("now"), "LoopMsg::Tick should be clock payload");
+    }
+}

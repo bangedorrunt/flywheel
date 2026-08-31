@@ -154,6 +154,15 @@ pub fn mail_health_escalate_at() -> u32 {
         .unwrap_or(3)
 }
 
+/// Heal state per agent (bd-gs8b #14) — moved onto ActiveLoop for crash-safe persistence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HealState {
+    pub unknown_count: u32,
+    pub diagnose_count: u32,
+    pub respawn_count: u32,
+    pub awaiting_clear: bool,
+}
+
 /// One active durable loop run: invocation id + params + v2/v3 control state.
 ///
 /// New fields use `#[serde(default)]` so a v1-shaped JSON still deserializes
@@ -185,6 +194,9 @@ pub struct ActiveLoop {
     /// Double-dispatch guard persists across polls (bd-5fbv).
     #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
     pub dispatch_pending: std::collections::HashSet<String>,
+    /// Heal state per agent persists across polls in model' (bd-gs8b #14, crash-safe via ActiveLoop file, was loop-local).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub heal_states: std::collections::BTreeMap<String, HealState>,
 }
 impl ActiveLoop {
     /// Construct a v3 entry with empty control fields (fresh loop start).
@@ -204,6 +216,7 @@ impl ActiveLoop {
             mail_degraded: false,
             per_bead_phase: BTreeMap::new(),
             dispatch_pending: std::collections::HashSet::new(),
+            heal_states: BTreeMap::new(),
         }
     }
 }
@@ -1661,6 +1674,7 @@ mod loops_schema_v2_tests {
             mail_degraded: false,
             per_bead_phase: Default::default(),
             dispatch_pending: Default::default(),
+            heal_states: Default::default(),
         };
         let mut map = BTreeMap::new();
         map.insert("/tmp/p".into(), al.clone());

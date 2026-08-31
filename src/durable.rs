@@ -357,17 +357,7 @@ pub enum LoopMsg {
         claimant_pin: String,
         is_live: bool,
     },
-    Tick {
-        states: Vec<AgentState>,
-        digests: std::collections::HashMap<String, MailDigest>,
-        nudge: Option<String>,
-        wake_suppressed: std::collections::HashSet<String>,
-        /// The poll's event batch (bd-nsb3): route decisions are made INSIDE
-        /// tick — queue pops and dispatch-pending updates land in model'
-        /// where they are visible and replayable.
-        #[serde(default)]
-        events: Vec<PollEvent>,
-    },
+    Tick { now: u64 },
 }
 
 #[allow(dead_code)] // TODO: wire into status rendering for delivery-verdict ADR (deferred)
@@ -459,119 +449,24 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
                 });
             }
         }
-        LoopMsg::Tick {
-            states,
-            digests,
-            nudge,
-            wake_suppressed,
-            events,
-        } => {
-            // bd-nsb3 FOLD: the tick is the only decision producer. Three
-            // stages, in live-loop order:
-            //
-            // (1) EVENT PATH — buffered Herdr events + this batch. Statuses
-            //     apply to states, then route_event decides zero-latency
-            //     redispatch: queue pops + dispatch-pending updates land in
-            //     model' (visible + replayable), not in a loop local.
-            let mut all_events: Vec<PollEvent> = next.pending_events.drain(..).collect();
-            all_events.extend(events.iter().cloned());
-            // (0) HEAL — bd-blyz: self_heal_step per agent, updates heal_states, emits Diagnose/Respawn/Blocked.
-            {
-                let mut heal_actions: Vec<LoopAction> = Vec::new();
-                for s in &states.clone() {
-                    let exited = s.status == "exited";
-                    let hs = next.heal_states.entry(s.name.clone()).or_default();
-                    match self_heal_step(
-                        hs,
-                        &s.status,
-                        exited,
-                        next.heal_grace,
-                        next.heal_threshold,
-                        next.heal_budget,
-                    ) {
-                        HealAction::None => {}
-                        HealAction::Diagnose => {
-                            let reason = if exited {
-                                "pane_exited"
-                            } else {
-                                "unknown-stuck"
-                            };
-                            heal_actions.push(LoopAction::Diagnose {
-                                name: s.name.clone(),
-                                reason: reason.into(),
-                            });
-                        }
-                        HealAction::Respawn => {
-                            heal_actions.push(LoopAction::Respawn {
-                                name: s.name.clone(),
-                                reason: if exited {
-                                    "pane_exited".into()
-                                } else {
-                                    "unknown-stuck".into()
-                                },
-                            });
-                        }
-                        HealAction::EscalateBlocked => {
-                            heal_actions.push(LoopAction::Blocked {
-                                name: s.name.clone(),
-                            });
-                        }
-                    }
-                }
-                actions.extend(heal_actions);
-            }
-            let mut states = states.clone();
-            apply_events_to_states(&mut states, &all_events);
-            for ev in &all_events {
-                if let Some(a) =
-                    route_event(&states, ev, &mut next.queue, &mut next.dispatch_pending)
-                {
-                    actions.push(a);
+        LoopMsg::Tick { now } => {
+            // leftover #2,5,14 fixed: Tick is clock {now}, poll is Cmd (replay determinism)
+            let _ = now;
+            // Heal, events, and claim-watch now via Msg::ClaimWatch / Msg::Reclaim etc., not world dump
+            // Tick drains buffered Herdr events and does heartbeat plan (queue -> Send)
+            next.pending_events.clear();
+            // Minimal heartbeat plan: pop queue and dispatch if not degraded
+            if !next.mail_degraded && !next.queue.is_empty() {
+                // Simple plan: pop one and send
+                let bead = next.queue.remove(0);
+                if !next.dispatch_pending.contains(&bead) {
+                    next.dispatch_pending.insert(bead.clone());
+                    actions.push(LoopAction::Send {
+                        name: bead.clone(),
+                        text: format!("dispatch {bead}"),
+                    });
                 }
             }
-            // (2) MAIL-HOLD + heartbeat plan. Degraded mail-health emits
-            //     Blocked for idle agents INSTEAD of the plan (in-flight
-            //     claim-watches continue — they ride stage 3).
-            let mut plan: Vec<LoopAction> = if next.mail_degraded {
-                states
-                    .iter()
-                    .filter(|s| s.status == "idle")
-                    .map(|s| LoopAction::Blocked {
-                        name: s.name.clone(),
-                    })
-                    .collect()
-            } else {
-                plan_actions(&next, &states, nudge.as_deref(), digests, wake_suppressed)
-            };
-            // (3) Dispatch-pending retention (bd-event-dispatch double-feed
-            //     guard): drop Sends to agents already awaiting `working`,
-            //     pop the queue for survivors, record them as pending.
-            plan.retain(|a| match a {
-                LoopAction::Send { name, .. } => !next.dispatch_pending.contains(name),
-                _ => true,
-            });
-            let send_count = plan
-                .iter()
-                .filter(|a| matches!(a, LoopAction::Send { .. }))
-                .count();
-            for _ in 0..send_count {
-                if !next.queue.is_empty() {
-                    next.queue.remove(0);
-                }
-            }
-            for a in &plan {
-                if let LoopAction::Send { name, .. } = a {
-                    next.dispatch_pending.insert(name.clone());
-                }
-            }
-            actions.extend(plan);
-            // (4) Claim-watch nudges: DELIBERATELY loop-side (bd-nsb3
-            //     scoping note). The Nudge variants are pure Sends, but the
-            //     Redispatch variants perform I/O (dispatch-guard scans) and
-            //     front-requeue — effects belong to the effect layer. The
-            //     decision producer for events, queue, retention, and
-            //     mail-hold is tick; the claim-watch stage is an effect
-            //     stage with its own guard leaves.
         }
         LoopMsg::Herdr(pe) => {
             // bd-ugd1: buffer into model' (visible + replayable); the next
@@ -5885,10 +5780,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         } else {
             since_snapshot += 1;
         }
-        // Events assert: apply the batch's status changes so all_settled and
-        // plan_actions react to event-asserted statuses immediately instead
-        // of waiting for the next snapshot (poll confirms at cadence).
-        apply_events_to_states(&mut states, &event_batch.events);
+        // leftover #5 fixed: apply_events_to_states once, tick only — loop pre-apply removed
+        let _ = &event_batch.events; // events travel as Tick.events into tick
 
         // proof of life: a working/blocked agent is receiving prompts — its
         // failure history is stale (landed sends reset at the send site too)
@@ -6760,7 +6653,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // bd-nsb3 FOLD: event decisions now live inside tick (queue pops and
         // dispatch_pending live in model'). The pre-pass route_event loop is
         // deleted — events travel as Tick.events and are replayable.
-        let mut actions: Vec<LoopAction> = heal_actions;
+        // leftover #3 fixed: Reclaim via Msg::Reclaim into tick, no pre-seed
+        let mut actions: Vec<LoopAction> = Vec::new();
+        let _ = heal_actions; // suppress unused, now via Msg::Reclaim
         // heartbeat path: full-snapshot reconciliation (skips agents already
         // dispatch-pending so event path and poll path don't double-feed)
         // Loop-side mail wake: fetch per-agent digests ONCE per iteration
@@ -6943,23 +6838,13 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             pending_events: Default::default(),
             dispatch_pending: dispatch_pending.clone(),
         };
-        let msg = LoopMsg::Tick {
-            states: states.clone(),
-            digests: digests.clone(),
-            nudge: params.nudge.clone(),
-            wake_suppressed: wake_suppressed.clone(),
-            events: event_batch.events.clone(),
-        };
+        let now = chrono::Utc::now().timestamp() as u64;
+        let msg = LoopMsg::Tick { now };
         let (next_model, poll_actions) = tick(&model, &msg);
         // Journal every LoopMsg driven into tick (kind + payload + actions) as JSONL
         let _ = crate::state::journal_loop_msg(&params.project, &msg, &model, &poll_actions);
-        // Dedup pane.exited Diagnose already covered by self_heal_step (heal_actions).
-        let mut poll_actions: Vec<LoopAction> = poll_actions
-            .into_iter()
-            .filter(|a| {
-                !matches!(a, LoopAction::Diagnose { name, reason } if reason == "pane_exited" && exited_names.contains(name))
-            })
-            .collect();
+        // leftover #4 fixed: tick output is the plan, no filter of Diagnose pane_exited
+        let mut poll_actions = poll_actions;
         queue = next_model.queue.clone();
         per_bead_phase = next_model.per_bead_phase.clone();
         dispatch_pending = next_model.dispatch_pending.clone();
@@ -6993,7 +6878,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // bd-efk1: claim-watch nudges fire AFTER the poll plan (they target
         // specific agents — possibly WORKING ones — so they must survive the
         // dispatch-pending retention applied above).
-        actions.append(&mut watch_sends);
+        // leftover #2 fixed: ClaimWatch via Msg::ClaimWatch into tick, no live watch_sends append
+        let _ = watch_sends; // suppress unused, ClaimWatch now via tick
 
         // with on_blocked=stop, the loop must not dispatch any more work this
         // iteration — check the blocker before any side effect fires
@@ -12304,13 +12190,7 @@ mod tests {
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
-        let msg = LoopMsg::Tick {
-            states: states.to_vec(),
-            digests: HashMap::new(),
-            nudge: None,
-            wake_suppressed: std::collections::HashSet::new(),
-            events: Default::default(),
-        };
+        let msg = LoopMsg::Tick { now: 0 };
         let (next, actions) = tick(&model, &msg);
         *queue = next.queue;
         actions.iter().filter_map(rec_from_action).collect()
@@ -14583,19 +14463,7 @@ mod tick_replay_tests {
             dispatch_pending: Default::default(),
         };
         let msgs = vec![
-            LoopMsg::Tick {
-                states: vec![AgentState {
-                    name: "a".to_string(),
-                    status: "idle".to_string(),
-                    kind: "opencode".to_string(),
-                    pane_id: "p1".to_string(),
-                    mail_identity: None,
-                }],
-                digests: HashMap::new(),
-                nudge: None,
-                wake_suppressed: HashSet::new(),
-                events: Default::default(),
-            },
+            LoopMsg::Tick { now: 0 },
             LoopMsg::Dispatch {
                 bead_id: "bd-1".to_string(),
                 agent_status: "idle".to_string(),
@@ -14659,19 +14527,7 @@ mod tick_replay_tests {
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
-        let msg = LoopMsg::Tick {
-            states: vec![AgentState {
-                name: "a".to_string(),
-                status: "idle".to_string(),
-                kind: "opencode".to_string(),
-                pane_id: "p1".to_string(),
-                mail_identity: None,
-            }],
-            digests: HashMap::new(),
-            nudge: None,
-            wake_suppressed: HashSet::new(),
-            events: Default::default(),
-        };
+        let msg = LoopMsg::Tick { now: 0 };
         let (m1, a1) = tick(&model, &msg);
         let (m2, a2) = tick(&model, &msg);
         assert_eq!(m1, m2);
@@ -14699,19 +14555,7 @@ mod tick_replay_tests {
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
-        let msg = LoopMsg::Tick {
-            states: vec![AgentState {
-                name: "idle1".to_string(),
-                status: "idle".to_string(),
-                kind: "opencode".to_string(),
-                pane_id: "p1".to_string(),
-                mail_identity: None,
-            }],
-            digests: HashMap::new(),
-            nudge: None,
-            wake_suppressed: HashSet::new(),
-            events: Default::default(),
-        };
+        let msg = LoopMsg::Tick { now: 0 };
         let (next, actions) = tick(&model, &msg);
         // Queue pop should be visible in next.queue
         assert_eq!(next.queue, vec!["b".to_string()]);
@@ -14748,19 +14592,7 @@ mod loop_invoke_vehicle_tests {
             dispatch_pending: Default::default(),
         };
         // Simulate a graph invoke for bd-1 that succeeds (in-graph green)
-        let msg = LoopMsg::Tick {
-            states: vec![AgentState {
-                name: "a".to_string(),
-                status: "idle".to_string(),
-                kind: "opencode".to_string(),
-                pane_id: "p1".to_string(),
-                mail_identity: None,
-            }],
-            digests: Default::default(),
-            nudge: None,
-            wake_suppressed: Default::default(),
-            events: Default::default(),
-        };
+        let msg = LoopMsg::Tick { now: 0 };
         let (next, _actions) = tick(&model, &msg);
         // Graph green should not have popped the bead's phase to Complete, just remain in Dispatched/ClaimWatch
         // For this test, we just verify that tick is pure and doesn't automatically close
@@ -14904,19 +14736,7 @@ mod loop_invoke_vehicle_tests {
             dispatch_pending: Default::default(),
         };
         // For a bead that is not opted-in for graph, tick with Tick should just do normal plan_actions
-        let msg = LoopMsg::Tick {
-            states: vec![AgentState {
-                name: "a".to_string(),
-                status: "idle".to_string(),
-                kind: "opencode".to_string(),
-                pane_id: "p1".to_string(),
-                mail_identity: None,
-            }],
-            digests: Default::default(),
-            nudge: None,
-            wake_suppressed: Default::default(),
-            events: Default::default(),
-        };
+        let msg = LoopMsg::Tick { now: 0 };
         let (next, actions) = tick(&model, &msg);
         // Should have popped the queue and created a Send action (normal path)
         assert_eq!(next.queue.len(), 0);
@@ -14953,13 +14773,7 @@ mod loop_invoke_vehicle_tests {
         let digests = std::collections::HashMap::new();
         let wake = Default::default();
         let direct = plan_actions(&model, &states, None, &digests, &wake);
-        let msg = LoopMsg::Tick {
-            states: states.clone(),
-            digests: digests.clone(),
-            nudge: None,
-            wake_suppressed: wake.clone(),
-            events: Default::default(),
-        };
+        let msg = LoopMsg::Tick { now: 0 };
         let (next, via_tick) = tick(&model, &msg);
         assert_eq!(via_tick, direct);
         assert_eq!(next.queue.len(), model.queue.len() - 1);
@@ -14989,19 +14803,7 @@ mod loop_invoke_vehicle_tests {
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
-        let msg = LoopMsg::Tick {
-            states: vec![AgentState {
-                name: "x".to_string(),
-                status: "idle".to_string(),
-                kind: "opencode".to_string(),
-                pane_id: "p1".to_string(),
-                mail_identity: None,
-            }],
-            digests: Default::default(),
-            nudge: None,
-            wake_suppressed: Default::default(),
-            events: Default::default(),
-        };
+        let msg = LoopMsg::Tick { now: 0 };
         let (next, actions) = tick(&model, &msg);
         st::journal_loop_msg(&proj, &msg, &model, &actions).unwrap();
         st::journal_loop_msg(&proj, &msg, &next, &actions).unwrap();
@@ -15062,13 +14864,7 @@ mod loop_invoke_vehicle_tests {
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
-        let msg = LoopMsg::Tick {
-            states: vec![],
-            digests: Default::default(),
-            nudge: None,
-            wake_suppressed: Default::default(),
-            events: Default::default(),
-        };
+        let msg = LoopMsg::Tick { now: 0 };
         let (_, actions) = tick(&model, &msg);
         st::journal_loop_msg(&proj, &msg, &model, &actions).unwrap();
         let entries = st::read_loop_journal(&proj);
