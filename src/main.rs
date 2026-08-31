@@ -7718,6 +7718,7 @@ fn cmd_internal_doorbell(
             Filter::new()
                 .kinds([
                     toron_kind(9),
+                    toron_kind(20001),
                     toron_kind(30013),
                     toron_kind(43001),
                     toron_kind(30031),
