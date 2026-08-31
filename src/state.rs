@@ -179,8 +179,13 @@ pub struct ActiveLoop {
     /// Whether the loop is in mail-degraded dispatch-hold (consecutive_failures >= N).
     #[serde(default)]
     pub mail_degraded: bool,
+    /// Per-bead phase map persists across polls in model' (bd-5fbv, crash-safe via ActiveLoop file, was loop-local).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub per_bead_phase: std::collections::BTreeMap<String, String>,
+    /// Double-dispatch guard persists across polls (bd-5fbv).
+    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
+    pub dispatch_pending: std::collections::HashSet<String>,
 }
-
 impl ActiveLoop {
     /// Construct a v3 entry with empty control fields (fresh loop start).
     pub fn new(
@@ -197,6 +202,8 @@ impl ActiveLoop {
             respawn: BTreeMap::new(),
             mail_health: MailHealth::default(),
             mail_degraded: false,
+            per_bead_phase: BTreeMap::new(),
+            dispatch_pending: std::collections::HashSet::new(),
         }
     }
 }
@@ -1652,6 +1659,8 @@ mod loops_schema_v2_tests {
                 last_ok_ts: 123,
             },
             mail_degraded: false,
+            per_bead_phase: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let mut map = BTreeMap::new();
         map.insert("/tmp/p".into(), al.clone());

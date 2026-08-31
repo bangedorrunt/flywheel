@@ -5677,11 +5677,38 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // the dispatch-pending retention applied to poll_actions).
     let mut watch_sends: Vec<LoopAction> = Vec::new();
     // agents that received DispatchImmediate and await working confirmation
-    // (bd-event-dispatch double-dispatch guard)
-    let mut dispatch_pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // bd-nsb3: per-bead phase map persists across polls in model' (was Default every poll).
-    let mut per_bead_phase: std::collections::BTreeMap<String, LoopPhase> =
-        std::collections::BTreeMap::new();
+    // (bd-event-dispatch double-dispatch guard) — crash-safe via ActiveLoop file (bd-5fbv).
+    let mut dispatch_pending: std::collections::HashSet<String> = {
+        if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
+            al.dispatch_pending.clone()
+        } else {
+            std::collections::HashSet::new()
+        }
+    };
+    // bd-nsb3: per-bead phase map persists across polls in model' (was Default every poll) — crash-safe.
+    let mut per_bead_phase: std::collections::BTreeMap<String, LoopPhase> = {
+        if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
+            al.per_bead_phase
+                .iter()
+                .filter_map(|(k, v)| {
+                    let phase = match v.as_str() {
+                        "Idle" => LoopPhase::Idle,
+                        "Dispatched" => LoopPhase::Dispatched,
+                        "ClaimWatch" => LoopPhase::ClaimWatch,
+                        "Verify" => LoopPhase::Verify,
+                        "Complete" => LoopPhase::Complete,
+                        "WaveHeld" => LoopPhase::WaveHeld,
+                        "Blocked" => LoopPhase::Blocked,
+                        "Reclaim" => LoopPhase::Reclaim,
+                        _ => return None,
+                    };
+                    Some((k.clone(), phase))
+                })
+                .collect()
+        } else {
+            std::collections::BTreeMap::new()
+        }
+    };
     // String: toron ids are hex event ids; agent-mail ids normalize to string.
     let mut seen_xproj: std::collections::HashSet<String> = std::collections::HashSet::new();
     // bd-context-limit-honor-luqg: exact-body CONTEXT_LIMIT replies already
@@ -6924,6 +6951,15 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         queue = next_model.queue.clone();
         per_bead_phase = next_model.per_bead_phase.clone();
         dispatch_pending = next_model.dispatch_pending.clone();
+        // bd-5fbv: crash-safe persistence via ActiveLoop file (was loop-local only).
+        if let Ok(Some(mut al)) = crate::state::load_active_loop(&params.project) {
+            al.per_bead_phase = per_bead_phase
+                .iter()
+                .map(|(k, v)| (k.clone(), format!("{v:?}")))
+                .collect();
+            al.dispatch_pending = dispatch_pending.clone();
+            let _ = crate::state::save_active_loop(&params.project, &al);
+        }
         // record wake decisions so the same urgent message does not re-wake
         for a in &poll_actions {
             if let LoopAction::Send { name, text } = a
