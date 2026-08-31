@@ -170,7 +170,11 @@ fn route_or_queue(
     pin: &str,
     line: String,
 ) {
-    let status = next.statuses.get(pin).map(String::as_str).unwrap_or("unknown");
+    let status = next
+        .statuses
+        .get(pin)
+        .map(String::as_str)
+        .unwrap_or("unknown");
     if crate::doorbell::should_inject(status) {
         actions.push(DoorbellAction::Prompt {
             pin: pin.to_string(),
@@ -188,6 +192,7 @@ mod tests {
     fn model_with(pin: &str) -> DoorbellModel {
         let mut m = DoorbellModel::default();
         m.index.insert_pin(pin.to_string(), None);
+        m.statuses.insert(pin.to_string(), "idle".into());
         m
     }
 
