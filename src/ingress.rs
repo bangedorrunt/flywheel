@@ -574,22 +574,7 @@ mod tests {
         let (next, actions) = crate::durable::tick(&model, &LoopMsg::Herdr(pe));
         assert!(actions.is_empty());
         assert_eq!(next.pending_events.len(), 1, "Herdr buffers into model'");
-        let (next2, _) = crate::durable::tick(
-            &next,
-            &LoopMsg::Tick {
-                states: vec![AgentState {
-                    name: "a".into(),
-                    status: "working".into(),
-                    kind: String::new(),
-                    pane_id: "w1:p1".into(),
-                    mail_identity: None,
-                }],
-                digests: Default::default(),
-                nudge: None,
-                wake_suppressed: Default::default(),
-                events: Default::default(),
-            },
-        );
+        let (next2, _) = crate::durable::tick(&next, &LoopMsg::Tick { now: 0 });
         assert!(
             next2.pending_events.is_empty(),
             "Tick drains buffered events"
