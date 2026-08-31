@@ -45,3 +45,4 @@
 {"id":44,"issue_id":"bd-yw4s","from_status":"open","to_status":"closed","status_revision":0,"gate":"unit-test-verified","provider":"cargo-check","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-30 08:53:44"}
 {"id":46,"issue_id":"bd-yw4s","from_status":"open","to_status":"closed","status_revision":1927,"gate":"unit-test-verified","provider":"cargo-test","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 04:09:29"}
 {"id":47,"issue_id":"bd-1ub5","from_status":"open","to_status":"closed","status_revision":1929,"gate":"unit-test-verified","provider":"cargo-test","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 04:09:44"}
+{"id":48,"issue_id":"bd-nsb3","from_status":"in_progress","to_status":"closed","status_revision":1937,"gate":"unit-test-verified","provider":"cargo-test","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 04:49:02"}
