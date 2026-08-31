@@ -10586,7 +10586,13 @@ pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
         workflow: Box::new(|t| eprintln!("ingress routing bug: workflow via fact seam: {t:?}")),
         cron: Box::new(|n| eprintln!("ingress routing bug: cron via fact seam: {n}")),
         fact: Box::new(move |ev: &ingress::IngressEvent| {
-            let _ = captain_fact_inject(&proj, ev);
+            // GS-009: the FactMiss bail must not vanish at the seam — the
+            // captain-facing eprintln lives INSIDE captain_fact_inject; here we
+            // make the swallow visible so handle_ingress cannot read as success
+            // when delivery failed.
+            if let Err(e) = captain_fact_inject(&proj, ev) {
+                eprintln!("flywheel: [FactMiss] fact dropped at ingress seam: {e:#}");
+            }
         }),
     }
 }
@@ -15673,46 +15679,11 @@ fn build_queue(queue: Option<&str>, workflow: Option<&str>) -> Result<Vec<String
                 }
             }
             if let Some(uwf) = all.get(wf) {
-                use toron_workflow::schema::Action;
-                fn spec_to_prompt(spec: &toron_workflow::schema::DispatchSpec) -> Option<String> {
-                    if let Some(t) = spec.task.as_deref().filter(|s| !s.trim().is_empty()) {
-                        return Some(t.to_string());
-                    }
-                    if let Some(pl) = spec.plan.as_deref().filter(|s| !s.trim().is_empty()) {
-                        return Some(pl.to_string());
-                    }
-                    if let Some(stage) = spec.stage.as_deref() {
-                        if let Ok(p) = stage_prompt(stage) {
-                            return Some(p);
-                        }
-                        return Some(stage.to_string());
-                    }
-                    spec.profile.clone()
-                }
-                fn walk_action(action: &Action, out: &mut Vec<String>) {
-                    match action {
-                        Action::DispatchJob { spec, .. } => {
-                            if let Some(p) = spec_to_prompt(spec) {
-                                out.push(p);
-                            }
-                        }
-                        Action::Parallel { each, .. } | Action::Foreach { each, .. } => {
-                            walk_action(&each.action, out)
-                        }
-                        Action::Retry { step, .. } => walk_action(&step.action, out),
-                        Action::Branch {
-                            then, else_steps, ..
-                        } => {
-                            for s in then.iter().chain(else_steps.iter()) {
-                                walk_action(&s.action, out);
-                            }
-                        }
-                        Action::CallWorkflow { workflow, .. } => {
-                            out.push(format!("call workflow {workflow}"));
-                        }
-                        _ => {}
-                    }
-                }
+                // Builtins run via the engine, not the queue. The old
+                // walk_action flatten (graph -> English prompt strings) is
+                // deleted — a flattened recipe is how a captain asks for a
+                // functor and gets a chatty agent instead of a closed verify.
+                let _ = uwf;
                 anyhow::bail!(
                     "workflow {0}: builtins run via the engine, not the queue — use                      'flywheel workflow run {0} --execute --mode pane --inputs \'{}\' --project <proj>'                      (or remove --workflow and use --work for beads)",
                     wf
