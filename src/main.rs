@@ -1401,6 +1401,16 @@ enum DoorbellCmd {
     /// re-inject the peer-aware handler + identity line into EXISTING panes
     /// (covers herdr pane-split additions and post-crash respawns).
     ReInject { project: String },
+    /// why did (or didn't) a pin get rung? Replays the doorbell journal —
+    /// GS-007 bd-yw4s: the trust surface, not log tailing.
+    Why {
+        project: String,
+        /// pin (adjective+noun) to explain
+        pin: String,
+        /// max entries to show (newest last)
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
 }
 
 /// Subcommands of `flywheel loop` (bd-fw-stale-loop-processes-gac
@@ -3791,6 +3801,11 @@ fn main() {
             DoorbellCmd::Start { project } => cmd_doorbell_start(&cfg, project),
             DoorbellCmd::Stop { project, workspace } => cmd_doorbell_stop(&cfg, project, workspace),
             DoorbellCmd::ReInject { project } => cmd_doorbell_re_inject(&cfg, project),
+            DoorbellCmd::Why {
+                project,
+                pin,
+                limit,
+            } => cmd_doorbell_why(&cfg, &project, &pin, *limit),
         },
         Some(Commands::LoopMode { cmd }) => match cmd {
             LoopCmd::Run {
@@ -7455,6 +7470,72 @@ fn cmd_doorbell_stop(_cfg: &Config, project: &str, workspace: &str) -> Result<()
     Ok(())
 }
 
+/// bd-yw4s: `doorbell why <pin>` — replay the doorbell journal and explain
+/// what the tick decided for this pin (prompted / queued / drained / died /
+/// sla). The trust surface; never log tailing.
+fn cmd_doorbell_why(cfg: &Config, project: &str, pin: &str, limit: usize) -> Result<()> {
+    let _ = cfg;
+    let entries = doorbell::journal_read_all(&config::state_dir());
+    let needle = format!("\"{pin}\"");
+    let mut shown = 0usize;
+    let mut matched = 0usize;
+    for (workspace, entry) in &entries {
+        let raw = entry.to_string();
+        if !raw.contains(&needle) {
+            continue;
+        }
+        matched += 1;
+        shown += 1;
+        if shown > limit {
+            continue;
+        }
+        let ts = entry.get("ts").and_then(|t| t.as_str()).unwrap_or("?");
+        let msg = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
+        let actions = entry
+            .get("actions")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.get("Prompt").map(|_| "prompt"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        let kind = match msg.get("WatchNdjson") {
+            Some(_) => "watch",
+            None => match msg.get("HerdrStatus") {
+                Some(_) => "status",
+                None => match msg.get("AckSlaTick") {
+                    Some(_) => "ack-sla",
+                    None => match msg.get("WatchDied") {
+                        Some(_) => "watch-died",
+                        None => "other",
+                    },
+                },
+            },
+        };
+        let status = msg
+            .get("HerdrStatus")
+            .and_then(|h| h.get("status"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        println!(
+            "{workspace} {ts} {kind}{} actions=[{actions}]",
+            if status.is_empty() {
+                String::new()
+            } else {
+                format!(" ->{status}")
+            }
+        );
+    }
+    if matched == 0 {
+        println!(
+            "no doorbell journal entries mention pin {pin} (unaddressed, filtered before classify, or journal empty)"
+        );
+    }
+    Ok(())
+}
+
 /// bd-durable-doorbell-lngf requirement 4: re-inject the peer-aware handler
 /// and identity line into EXISTING panes — covers herdr pane-split additions
 /// and post-crash respawns that never got the spawn-time injection.
@@ -7713,6 +7794,9 @@ fn cmd_internal_doorbell(
         }
     }
 
+    // bd-yw4s BIND: the tick's model — the decision layer the live loop feeds.
+    let mut bell_model = doorbell_tick::DoorbellModel::default();
+
     loop {
         if !path.exists() {
             break;
@@ -7724,9 +7808,23 @@ fn cmd_internal_doorbell(
         let now_s = doorbell_now_unix();
         if now_s.saturating_sub(last_ack_sla_check) >= ACK_SLA_CHECK_SECS {
             last_ack_sla_check = now_s;
-            if let Some(mb) = crate::mail_shim::try_mailbox() {
+            // bd-yw4s BIND: the scan decision comes from the tick.
+            let msg = doorbell_tick::DoorbellMsg::AckSlaTick { now: now_s };
+            let (next_model, tick_actions) = doorbell_tick::tick(&bell_model, &msg);
+            bell_model = next_model;
+            let scan = tick_actions
+                .iter()
+                .any(|a| matches!(a, doorbell_tick::DoorbellAction::CheckAckSla));
+            if scan && let Some(mb) = crate::mail_shim::try_mailbox() {
                 let _ = crate::mail_shim::block_on(mb.check_ack_sla_expired(project, None));
             }
+            doorbell::journal_append(
+                &config::state_dir(),
+                workspace,
+                &msg,
+                &tick_actions,
+                serde_json::json!({ "stage": "executed", "scanned": scan }),
+            );
         }
         // GS-007: a watch that died and exhausted its restart burst must not leave
         // the dispatcher permanently deaf — heal_tick will NOT heal a live pid.
@@ -7781,11 +7879,46 @@ fn cmd_internal_doorbell(
                 for pin in &pins {
                     index.insert_pin(pin.clone(), None);
                 }
-                let raw_injects =
-                    doorbell::apply_watch_line(&line, &index, &status_by_pin, &mut queues);
+                // bd-yw4s BIND: the tick is the decider (classify + queue-or-
+                // prompt); the live loop is the effect layer (budget gate,
+                // herdr prompt, hear, persist). Same rules, one producer.
+                bell_model.index = index.clone();
+                let msg = doorbell_tick::DoorbellMsg::WatchNdjson { line: line.clone() };
+                let (next_model, tick_actions) = doorbell_tick::tick(&bell_model, &msg);
+                bell_model = next_model;
+                let mut delivered = Vec::new();
+                let raw_injects: Vec<(String, String)> = tick_actions
+                    .iter()
+                    .filter_map(|a| match a {
+                        doorbell_tick::DoorbellAction::Prompt { pin, line } => {
+                            Some((pin.clone(), line.clone()))
+                        }
+                        other => {
+                            delivered.push(serde_json::to_value(other).unwrap_or_default());
+                            None
+                        }
+                    })
+                    .collect();
+                doorbell::journal_append(
+                    &config::state_dir(),
+                    workspace,
+                    &msg,
+                    &tick_actions,
+                    serde_json::json!({ "stage": "decided" }),
+                );
+                // Effect layer: budget gate on tick's prompts (drop is audited).
                 let budget_before = raw_injects.len();
                 let injects =
                     doorbell::take_allowed(raw_injects, &mut budgets, doorbell_now_unix());
+                if !delivered.is_empty() {
+                    doorbell::journal_append(
+                        &config::state_dir(),
+                        workspace,
+                        &msg,
+                        &tick_actions,
+                        serde_json::json!({ "stage": "executed", "delivered": delivered }),
+                    );
+                }
                 if budget_before != injects.len() {
                     doorbell::audit_append(
                         &config::state_dir(),
@@ -7845,8 +7978,35 @@ fn cmd_internal_doorbell(
                     .cloned()
                     .unwrap_or_else(|| "working".into());
                 status_by_pin.insert(pin.clone(), to.clone());
-                let injects = doorbell::apply_status_change(&pin, &from, &to, &mut queues);
-                let injects = doorbell::take_allowed(injects, &mut budgets, doorbell_now_unix());
+                // bd-yw4s BIND: drain decision comes from the tick, not
+                // apply_status_change. `from` is kept for the legacy sweep
+                // queue (wave-2 fold, bd-nsb3).
+                let _ = from;
+                bell_model.statuses.insert(pin.clone(), to.clone());
+                let msg = doorbell_tick::DoorbellMsg::HerdrStatus {
+                    pin: pin.clone(),
+                    status: to.clone(),
+                };
+                let (next_model, tick_actions) = doorbell_tick::tick(&bell_model, &msg);
+                bell_model = next_model;
+                let raw_injects: Vec<(String, String)> = tick_actions
+                    .iter()
+                    .filter_map(|a| match a {
+                        doorbell_tick::DoorbellAction::Prompt { pin, line } => {
+                            Some((pin.clone(), line.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                doorbell::journal_append(
+                    &config::state_dir(),
+                    workspace,
+                    &msg,
+                    &tick_actions,
+                    serde_json::json!({ "stage": "drain" }),
+                );
+                let injects =
+                    doorbell::take_allowed(raw_injects, &mut budgets, doorbell_now_unix());
                 let registry = state::load_spawn_registry(project);
                 doorbell_prompt_and_hear(
                     herdr.as_mut(),
@@ -7870,6 +8030,8 @@ fn cmd_internal_doorbell(
                 // coming from the 1s pass — heal_tick will NOT heal a live pid, so
                 // the dispatcher itself must never give up (GS-007 never-deaf rule).
                 eprintln!("flywheel doorbell: watch died, restarting with backoff");
+                let msg = doorbell_tick::DoorbellMsg::WatchDied;
+                let (_, tick_actions) = doorbell_tick::tick(&bell_model, &msg);
                 let mut backoff = 1u64;
                 let mut restarted = false;
                 for _ in 0..5 {
@@ -7901,8 +8063,22 @@ fn cmd_internal_doorbell(
                     backoff = (backoff * 2).min(16);
                 }
                 if restarted {
+                    doorbell::journal_append(
+                        &config::state_dir(),
+                        workspace,
+                        &msg,
+                        &tick_actions,
+                        serde_json::json!({ "stage": "executed", "restarted": true }),
+                    );
                     continue;
                 }
+                doorbell::journal_append(
+                    &config::state_dir(),
+                    workspace,
+                    &msg,
+                    &tick_actions,
+                    serde_json::json!({ "stage": "executed", "restarted": false, "retry_gate_secs": WATCH_RETRY_SECS }),
+                );
                 eprintln!(
                     "flywheel doorbell: watch restart burst exhausted — dispatcher stays alive, retry gate respawns every {WATCH_RETRY_SECS}s (never exit, never deaf)"
                 );

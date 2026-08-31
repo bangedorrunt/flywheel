@@ -1296,6 +1296,84 @@ pub fn once_json(stdin: &str, status_by_pin: &BTreeMap<String, String>) -> Strin
     serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
 }
 
+// ---- bd-yw4s: doorbell journal — the `doorbell why` trust surface --------
+
+/// One journaled tick: the Msg in, the Actions out, what the effect layer
+/// actually did. `doorbell why <pin>` replays this — never log tailing.
+pub fn journal_file(state_dir: &Path, workspace: &str) -> PathBuf {
+    state_dir
+        .join("journals")
+        .join(format!("doorbell-journal-{workspace}.jsonl"))
+}
+
+pub fn journal_append(
+    state_dir: &Path,
+    workspace: &str,
+    msg: &crate::doorbell_tick::DoorbellMsg,
+    actions: &[crate::doorbell_tick::DoorbellAction],
+    executed: serde_json::Value,
+) {
+    let path = journal_file(state_dir, workspace);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let entry = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "workspace": workspace,
+        "msg": msg,
+        "actions": actions,
+        "executed": executed,
+    });
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{entry}");
+    }
+}
+
+/// All journal entries across every workspace, oldest first. Missing or
+/// corrupt lines are skipped (a journal is a trust surface, not a WAL).
+pub fn journal_read_all(state_dir: &Path) -> Vec<(String, serde_json::Value)> {
+    let dir = state_dir.join("journals");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("doorbell-journal-") && n.ends_with(".jsonl"))
+                .unwrap_or(false)
+        })
+        .collect();
+    paths.sort();
+    let mut out = Vec::new();
+    for p in paths {
+        let workspace = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| {
+                n.trim_start_matches("doorbell-journal-")
+                    .trim_end_matches(".jsonl")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        if let Ok(raw) = std::fs::read_to_string(&p) {
+            for line in raw.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    out.push((workspace.clone(), v));
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1999,5 +2077,49 @@ mod tests {
             ),
             "39002 addressed should map to a wake class, got {class:?}"
         );
+    }
+
+    /// bd-yw4s: journal_append + journal_read_all roundtrip — `doorbell why`
+    /// replays this; corrupt lines are skipped, never fatal.
+    #[test]
+    fn doorbell_journal_roundtrip_and_corrupt_tolerant() {
+        let dir = std::env::temp_dir().join(format!("dbljrn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let msg = crate::doorbell_tick::DoorbellMsg::HerdrStatus {
+            pin: "BlueRidge".into(),
+            status: "idle".into(),
+        };
+        let actions = vec![crate::doorbell_tick::DoorbellAction::Prompt {
+            pin: "BlueRidge".into(),
+            line: "[doorbell] test".into(),
+        }];
+        journal_append(
+            &dir,
+            "w1",
+            &msg,
+            &actions,
+            serde_json::json!({"stage":"drain"}),
+        );
+        // corrupt line must be skipped, not fatal
+        let path = journal_file(&dir, "w1");
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "{{not json").unwrap();
+        journal_append(
+            &dir,
+            "w2",
+            &msg,
+            &actions,
+            serde_json::json!({"stage":"drain"}),
+        );
+        let all = journal_read_all(&dir);
+        assert_eq!(all.len(), 2, "two good entries survive the corrupt line");
+        assert_eq!(all[0].0, "w1");
+        assert_eq!(all[1].1["msg"]["HerdrStatus"]["pin"], "BlueRidge");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
