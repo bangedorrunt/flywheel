@@ -16325,6 +16325,7 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
         mail_degraded: false,
         heal_states: Default::default(),
         pending_events: Default::default(),
+        dispatch_pending: Default::default(),
     };
     for (idx, entry) in entries.iter().enumerate() {
         let Some(msg_val) = entry.get("msg") else {
@@ -16332,16 +16333,31 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
         };
         let msg: crate::durable::LoopMsg = serde_json::from_value(msg_val.clone())
             .with_context(|| format!("journal {idx} msg decode"))?;
-        // If journal has snapshot queue, restore it for this replay step (future journal entries have it)
-        if let Some(q) = entry
-            .get("model_snapshot")
-            .and_then(|m| m.get("queue"))
-            .and_then(|q| q.as_array())
-        {
-            model.queue = q
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
+        // If journal has snapshot queue/per_bead_phase/dispatch_pending, restore for replay.
+        if let Some(snap) = entry.get("model_snapshot") {
+            if let Some(q) = snap.get("queue").and_then(|q| q.as_array()) {
+                model.queue = q
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+            }
+            if let Some(dp) = snap.get("dispatch_pending").and_then(|v| v.as_array()) {
+                model.dispatch_pending = dp
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+            }
+            if let Some(pb) = snap.get("per_bead_phase") {
+                if let Ok(map) = serde_json::from_value::<
+                    std::collections::BTreeMap<String, crate::durable::LoopPhase>,
+                >(pb.clone())
+                {
+                    model.per_bead_phase = map;
+                }
+            }
+            if let Some(md) = snap.get("mail_degraded").and_then(|v| v.as_bool()) {
+                model.mail_degraded = md;
+            }
         }
         let (next, actions) = crate::durable::tick(&model, &msg);
         let recorded_actions = entry.get("actions").and_then(|v| v.as_array());
@@ -16746,6 +16762,7 @@ fn cmd_loop(
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &d_states,
             nudge,
@@ -18086,6 +18103,7 @@ mod loop_tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -18122,6 +18140,7 @@ mod loop_tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -18153,6 +18172,7 @@ mod loop_tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             Some("continue"),
@@ -18184,6 +18204,7 @@ mod loop_tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -18213,6 +18234,7 @@ mod loop_tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -18242,6 +18264,7 @@ mod loop_tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -18279,6 +18302,7 @@ mod loop_tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -18307,6 +18331,7 @@ mod loop_tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -18339,6 +18364,7 @@ mod loop_tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -18362,6 +18388,7 @@ mod loop_tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             Some("proceed"),
@@ -18391,6 +18418,7 @@ mod loop_tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             Some("proceed"),
@@ -18417,6 +18445,7 @@ mod loop_tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,
@@ -18443,6 +18472,7 @@ mod loop_tests {
                 mail_degraded: false,
                 heal_states: Default::default(),
                 pending_events: Default::default(),
+                dispatch_pending: Default::default(),
             },
             &states,
             None,

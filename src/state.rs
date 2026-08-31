@@ -749,6 +749,7 @@ pub fn journal_loop_msg(
             "queue": model.queue,
             "queue_len": model.queue.len(),
             "per_bead_phase": model.per_bead_phase,
+            "dispatch_pending": model.dispatch_pending,
             "mail_degraded": model.mail_degraded,
         },
         "actions": actions,
