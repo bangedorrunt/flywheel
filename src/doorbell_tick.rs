@@ -59,7 +59,7 @@ pub enum DoorbellAction {
     },
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct DoorbellModel {
     /// LWW queues per pin (working panes hold their wake here).
     pub queues: BTreeMap<String, Vec<String>>,
