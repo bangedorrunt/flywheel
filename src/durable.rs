@@ -317,9 +317,15 @@ pub struct LoopModel {
     pub mail_health: crate::state::MailHealth,
     pub mail_degraded: bool,
     pub heal_states: std::collections::HashMap<String, HealState>,
+    /// Heal thresholds from LoopParams (bd-blyz, effect-layer remainder → tick).
+    #[serde(default)]
+    pub heal_grace: u32,
+    #[serde(default)]
+    pub heal_threshold: u32,
+    #[serde(default)]
+    pub heal_budget: u32,
     /// Herdr events buffered by `LoopMsg::Herdr` (bd-ugd1); drained on the
     /// next Tick through apply_events_to_states + route decisions.
-    #[serde(default)]
     pub pending_events: Vec<PollEvent>,
     /// Double-dispatch guard (bd-nsb3 fold): names dispatched via the event
     /// path awaiting `working` confirmation. Lives in model' so route
@@ -469,6 +475,51 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             //     model' (visible + replayable), not in a loop local.
             let mut all_events: Vec<PollEvent> = next.pending_events.drain(..).collect();
             all_events.extend(events.iter().cloned());
+            // (0) HEAL — bd-blyz: self_heal_step per agent, updates heal_states, emits Diagnose/Respawn/Blocked.
+            {
+                let mut heal_actions: Vec<LoopAction> = Vec::new();
+                for s in &states.clone() {
+                    let exited = s.status == "exited";
+                    let hs = next.heal_states.entry(s.name.clone()).or_default();
+                    match self_heal_step(
+                        hs,
+                        &s.status,
+                        exited,
+                        next.heal_grace,
+                        next.heal_threshold,
+                        next.heal_budget,
+                    ) {
+                        HealAction::None => {}
+                        HealAction::Diagnose => {
+                            let reason = if exited {
+                                "pane_exited"
+                            } else {
+                                "unknown-stuck"
+                            };
+                            heal_actions.push(LoopAction::Diagnose {
+                                name: s.name.clone(),
+                                reason: reason.into(),
+                            });
+                        }
+                        HealAction::Respawn => {
+                            heal_actions.push(LoopAction::Respawn {
+                                name: s.name.clone(),
+                                reason: if exited {
+                                    "pane_exited".into()
+                                } else {
+                                    "unknown-stuck".into()
+                                },
+                            });
+                        }
+                        HealAction::EscalateBlocked => {
+                            heal_actions.push(LoopAction::Blocked {
+                                name: s.name.clone(),
+                            });
+                        }
+                    }
+                }
+                actions.extend(heal_actions);
+            }
             let mut states = states.clone();
             apply_events_to_states(&mut states, &all_events);
             for ev in &all_events {
@@ -6034,50 +6085,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             }
         }
         let mut heal_actions: Vec<LoopAction> = Vec::new();
-        for s in &states {
-            let exited = exited_names.contains(&s.name);
-            let hs = heal_states.entry(s.name.clone()).or_default();
-            match self_heal_step(
-                hs,
-                &s.status,
-                exited,
-                params.unknown_detect_grace_polls,
-                params.unknown_diagnose_threshold,
-                params.respawn_budget,
-            ) {
-                HealAction::None => {}
-                HealAction::Diagnose => {
-                    let reason = if exited {
-                        "pane_exited"
-                    } else {
-                        "unknown-stuck"
-                    };
-                    heal_actions.push(LoopAction::Diagnose {
-                        name: s.name.clone(),
-                        reason: reason.into(),
-                    });
-                }
-                HealAction::Respawn => {
-                    heal_actions.push(LoopAction::Respawn {
-                        name: s.name.clone(),
-                        reason: if exited {
-                            "pane_exited".into()
-                        } else {
-                            "unknown-stuck".into()
-                        },
-                    });
-                }
-                HealAction::EscalateBlocked => {
-                    heal_actions.push(LoopAction::Blocked {
-                        name: s.name.clone(),
-                    });
-                    eprintln!(
-                        "flywheel: WARN agent {} exceeded respawn budget ({}); escalating blocked",
-                        s.name, params.respawn_budget
-                    );
-                }
-            }
-        }
+        // bd-blyz: heal now inside tick (self_heal_step per agent, updates heal_states in model').
+        // The loop-side heal loop is deleted — tick is the only producer of Diagnose/Respawn.
 
         // bead-driven mode: refresh the instruction queue from the tracker each
         // poll; the assigned-set is deterministic across replays (derives from
@@ -6927,7 +6936,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 .map(|a| a.mail_health.clone())
                 .unwrap_or_default(),
             mail_degraded: mail_hold,
-            heal_states: Default::default(),
+            heal_states: heal_states.clone(),
+            heal_grace: params.unknown_detect_grace_polls,
+            heal_threshold: params.unknown_diagnose_threshold,
+            heal_budget: params.respawn_budget,
             pending_events: Default::default(),
             dispatch_pending: dispatch_pending.clone(),
         };
@@ -6951,6 +6963,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         queue = next_model.queue.clone();
         per_bead_phase = next_model.per_bead_phase.clone();
         dispatch_pending = next_model.dispatch_pending.clone();
+        heal_states = next_model.heal_states.clone();
         // bd-5fbv: crash-safe persistence via ActiveLoop file (was loop-local only).
         if let Ok(Some(mut al)) = crate::state::load_active_loop(&params.project) {
             al.per_bead_phase = per_bead_phase
@@ -8844,6 +8857,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -8904,6 +8924,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -8941,6 +8968,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -8970,6 +9004,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -8999,6 +9040,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -9026,6 +9074,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -9055,6 +9110,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -9084,6 +9146,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -9997,6 +10066,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -10041,6 +10117,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -10082,6 +10165,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -10194,6 +10284,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -10230,6 +10327,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -10258,6 +10362,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -10300,6 +10411,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -10375,6 +10493,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -10411,6 +10536,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -10443,6 +10575,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -10488,6 +10627,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -10600,6 +10746,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -10664,6 +10817,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -10694,6 +10854,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -10730,6 +10897,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -10763,6 +10937,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -10795,6 +10976,13 @@ mod tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -12110,6 +12298,9 @@ mod tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            heal_grace: Default::default(),
+            heal_threshold: Default::default(),
+            heal_budget: Default::default(),
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
@@ -12215,10 +12406,13 @@ mod tests {
             &mut q_ev,
             &mut pending,
         );
-        assert!(poll.is_empty(), "poll must not send to unknown: {poll:?}");
+        // bd-blyz: heal now inside tick — poll (tick) triggers Diagnose for unknown, event (route_event) does not.
+        assert_eq!(poll.len(), 1);
+        assert_eq!(poll[0].kind, "diagnose");
+        assert_eq!(poll[0].content, "unknown-stuck");
         assert!(
             event.is_empty(),
-            "event must not send to unknown: {event:?}"
+            "event path for unknown is still empty (heal is poll-only): {event:?}"
         );
         assert_eq!(q_poll, vec!["p1".to_string()]);
         assert_eq!(q_ev, vec!["p1".to_string()]);
@@ -12275,7 +12469,8 @@ mod tests {
         let states = vec![st_pane("a", "unknown", "%1")];
         let mut q = vec!["p1".into()];
         let poll = poll_dispatch(&states, &mut q);
-        assert!(poll.is_empty());
+        // bd-blyz: heal now inside tick — unknown with default thresholds (grace 0, threshold 0→1) triggers Diagnose on first call, not silent.
+        assert_eq!(poll[0].kind, "diagnose");
         assert_eq!(q, vec!["p1".to_string()]);
     }
 
@@ -14381,6 +14576,9 @@ mod tick_replay_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            heal_grace: Default::default(),
+            heal_threshold: Default::default(),
+            heal_budget: Default::default(),
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
@@ -14426,6 +14624,9 @@ mod tick_replay_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            heal_grace: Default::default(),
+            heal_threshold: Default::default(),
+            heal_budget: Default::default(),
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
@@ -14452,6 +14653,9 @@ mod tick_replay_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            heal_grace: Default::default(),
+            heal_threshold: Default::default(),
+            heal_budget: Default::default(),
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
@@ -14489,6 +14693,9 @@ mod tick_replay_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            heal_grace: Default::default(),
+            heal_threshold: Default::default(),
+            heal_budget: Default::default(),
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
@@ -14534,6 +14741,9 @@ mod loop_invoke_vehicle_tests {
             mail_health: MailHealth::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            heal_grace: Default::default(),
+            heal_threshold: Default::default(),
+            heal_budget: Default::default(),
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
@@ -14574,6 +14784,9 @@ mod loop_invoke_vehicle_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            heal_grace: Default::default(),
+            heal_threshold: Default::default(),
+            heal_budget: Default::default(),
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
@@ -14616,6 +14829,9 @@ mod loop_invoke_vehicle_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            heal_grace: Default::default(),
+            heal_threshold: Default::default(),
+            heal_budget: Default::default(),
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
@@ -14681,6 +14897,9 @@ mod loop_invoke_vehicle_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            heal_grace: Default::default(),
+            heal_threshold: Default::default(),
+            heal_budget: Default::default(),
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
@@ -14718,6 +14937,9 @@ mod loop_invoke_vehicle_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            heal_grace: Default::default(),
+            heal_threshold: Default::default(),
+            heal_budget: Default::default(),
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
@@ -14761,6 +14983,9 @@ mod loop_invoke_vehicle_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            heal_grace: Default::default(),
+            heal_threshold: Default::default(),
+            heal_budget: Default::default(),
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
@@ -14794,6 +15019,9 @@ mod loop_invoke_vehicle_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            heal_grace: Default::default(),
+            heal_threshold: Default::default(),
+            heal_budget: Default::default(),
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };
@@ -14828,6 +15056,9 @@ mod loop_invoke_vehicle_tests {
             mail_health: Default::default(),
             mail_degraded: false,
             heal_states: Default::default(),
+            heal_grace: Default::default(),
+            heal_threshold: Default::default(),
+            heal_budget: Default::default(),
             pending_events: Default::default(),
             dispatch_pending: Default::default(),
         };

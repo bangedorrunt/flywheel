@@ -8452,7 +8452,9 @@ fn doorbell_refresh_status(
         let raw: Vec<(String, String)> = tick_actions
             .iter()
             .filter_map(|ac| match ac {
-                doorbell_tick::DoorbellAction::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                doorbell_tick::DoorbellAction::Prompt { pin, line } => {
+                    Some((pin.clone(), line.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -16435,6 +16437,13 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
         mail_health: Default::default(),
         mail_degraded: false,
         heal_states: Default::default(),
+
+        heal_grace: Default::default(),
+
+        heal_threshold: Default::default(),
+
+        heal_budget: Default::default(),
+
         pending_events: Default::default(),
         dispatch_pending: Default::default(),
     };
@@ -16872,6 +16881,13 @@ fn cmd_loop(
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -18213,6 +18229,13 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -18250,6 +18273,13 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -18282,6 +18312,13 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -18314,6 +18351,13 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -18344,6 +18388,13 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -18374,6 +18425,13 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -18412,6 +18470,13 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -18441,6 +18506,13 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -18474,6 +18546,13 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -18498,6 +18577,13 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -18528,6 +18614,13 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -18555,6 +18648,13 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -18582,6 +18682,13 @@ mod loop_tests {
                 mail_health: Default::default(),
                 mail_degraded: false,
                 heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
                 pending_events: Default::default(),
                 dispatch_pending: Default::default(),
             },
@@ -28492,8 +28599,7 @@ mod integration_tests {
     fn playbook_compose_lines_are_clap_parseable() {
         for tpl in ["swarm", "loop"] {
             let path = format!("integrations/prompts/{tpl}.md.tpl");
-            let content = std::fs::read_to_string(&path)
-                .unwrap_or_else(|_| panic!("read {path}"));
+            let content = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("read {path}"));
             let mut found = 0;
             for line in content.lines().filter(|l| l.contains("workflow compose")) {
                 found += 1;
