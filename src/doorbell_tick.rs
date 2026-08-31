@@ -289,6 +289,27 @@ mod tests {
     }
 
     #[test]
+    fn doorbell_tick_inbox_rows_prompts_idle_pin() {
+        let model = model_with("BlueRidge");
+        let rows = vec![
+            serde_json::json!({"importance":"urgent"}),
+            serde_json::json!({"importance":"high"}),
+            serde_json::json!({"importance":"normal"}),
+        ];
+        let (_, actions) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows,
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert_eq!(actions.len(), 2, "urgent+high ring, normal stays quiet");
+        for a in &actions {
+            assert!(a.to_label().contains("BlueRidge"));
+        }
+    }
+
+    #[test]
     fn doorbell_tick_bad_inbox_json_is_loud_audit() {
         let model = model_with("BlueRidge");
         let (_, actions) = tick(

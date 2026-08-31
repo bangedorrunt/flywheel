@@ -8106,7 +8106,7 @@ fn cmd_internal_doorbell(
                     cfg,
                     project,
                     &status_by_pin,
-                    &mut queues,
+                    &mut bell_model,
                     &mut since_by_pin,
                     &mut budgets,
                     herdr.as_mut(),
@@ -8461,7 +8461,7 @@ fn doorbell_sweep_inbox(
     cfg: &Config,
     project: &str,
     status_by_pin: &BTreeMap<String, String>,
-    queues: &mut BTreeMap<String, doorbell::DoorbellQueue>,
+    bell_model: &mut doorbell_tick::DoorbellModel,
     since_by_pin: &mut BTreeMap<String, String>,
     budgets: &mut BTreeMap<String, doorbell::PinBudget>,
     herdr: Option<&mut Client>,
@@ -8477,15 +8477,18 @@ fn doorbell_sweep_inbox(
         let Some(pin) = e.mail_identity.as_deref() else {
             continue;
         };
-        // bd-durable-doorbell-lngf: NO persisted high-water (first run or
-        // pre-supervisor state) → look BACK a bounded window, not `now` —
-        // mail that arrived while the dispatcher was dead must still wake
-        // (at-least-once; the [doorbell] line + budget make replay safe).
         let since = since_by_pin.get(pin).cloned().unwrap_or_else(|| {
             (chrono::Utc::now()
                 - chrono::Duration::hours(doorbell::REDELIVERY_LOOKBACK_HOURS as i64))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         });
+        // Sync status into tick model for this pin.
+        let status = status_by_pin
+            .get(pin)
+            .cloned()
+            .unwrap_or_else(|| "idle".into());
+        bell_model.statuses.insert(pin.to_string(), status);
+        bell_model.index = index.clone();
         // Prefer in-process mailbox (zero fork) — fallback to CLI only if unavailable
         let in_process_ok = (|| -> Option<()> {
             let mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
@@ -8499,21 +8502,31 @@ fn doorbell_sweep_inbox(
             };
             let v = mail.inbox_filtered(project, pin, &filter).ok()?;
             let arr = v.as_array()?;
-            // Directly classify each returned row (no JSON string round-trip)
-            let status = status_by_pin.get(pin).map(String::as_str).unwrap_or("idle");
-            let mut local = Vec::new();
-            for item in arr {
-                if let Some((class, hint)) = doorbell::parse_inbox_item(item) {
-                    let msg = doorbell::doorbell_line(class, &hint);
-                    if doorbell::should_inject(status) {
-                        local.push((pin.to_string(), msg));
-                    } else {
-                        queues.entry(pin.to_string()).or_default().push(class, msg);
+            // Feed rows through the tick (bd-9hco: plane-P sweep via tick).
+            let rows: Vec<serde_json::Value> = arr.clone();
+            let msg = doorbell_tick::DoorbellMsg::InboxRows {
+                rows,
+                pin: pin.to_string(),
+            };
+            let (next_model, tick_actions) = doorbell_tick::tick(bell_model, &msg);
+            *bell_model = next_model;
+            let raw: Vec<(String, String)> = tick_actions
+                .iter()
+                .filter_map(|a| match a {
+                    doorbell_tick::DoorbellAction::Prompt { pin, line } => {
+                        Some((pin.clone(), line.clone()))
                     }
-                }
-            }
-            injects.extend(local);
-            // High-water from the returned rows (max created_ts)
+                    _ => None,
+                })
+                .collect();
+            doorbell::journal_append(
+                &config::state_dir(),
+                workspace,
+                &msg,
+                &tick_actions,
+                serde_json::json!({ "stage": "sweep_inbox", "pin": pin }),
+            );
+            injects.extend(raw);
             if let Some(hw) = arr
                 .iter()
                 .filter_map(|it| it.get("created_ts").and_then(|t| t.as_str()))
@@ -8522,7 +8535,6 @@ fn doorbell_sweep_inbox(
             {
                 since_by_pin.insert(pin.to_string(), hw);
             } else if arr.is_empty() {
-                // keep high-water unchanged
             } else {
                 since_by_pin.insert(pin.to_string(), now.clone());
             }
@@ -8575,13 +8587,48 @@ fn doorbell_sweep_inbox(
             continue;
         }
         let raw = String::from_utf8_lossy(&output.stdout);
-        injects.extend(doorbell::apply_inbox_json(&raw, pin, status_by_pin, queues));
+        // Parse CLI output into rows and feed through tick as well.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+        let rows: Vec<serde_json::Value> = match &parsed {
+            serde_json::Value::Array(arr) => arr.clone(),
+            v if v.get("messages").is_some() => v
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            other if other.is_object() => vec![other.clone()],
+            _ => vec![],
+        };
+        if !rows.is_empty() {
+            let msg = doorbell_tick::DoorbellMsg::InboxRows {
+                rows: rows.clone(),
+                pin: pin.to_string(),
+            };
+            let (next_model, tick_actions) = doorbell_tick::tick(bell_model, &msg);
+            *bell_model = next_model;
+            let raw_injects: Vec<(String, String)> = tick_actions
+                .iter()
+                .filter_map(|a| match a {
+                    doorbell_tick::DoorbellAction::Prompt { pin, line } => {
+                        Some((pin.clone(), line.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            doorbell::journal_append(
+                &config::state_dir(),
+                workspace,
+                &msg,
+                &tick_actions,
+                serde_json::json!({ "stage": "sweep_inbox_cli", "pin": pin }),
+            );
+            injects.extend(raw_injects);
+        }
         if let Some(hw) = doorbell::inbox_high_water(&raw) {
             since_by_pin.insert(pin.to_string(), hw);
         } else if raw.trim().is_empty() || raw.trim() == "[]" || raw.trim() == "{}" {
-            // No messages: keep high-water unchanged (never jump to now and skip future mail)
         } else {
-            // Valid blob but no parsable created_ts: advance to now to avoid spin
             since_by_pin.insert(pin.to_string(), now.clone());
         }
     }
