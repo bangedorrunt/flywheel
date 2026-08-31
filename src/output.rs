@@ -105,18 +105,18 @@ fn slot_256(slot: Slot) -> &'static str {
 /// 16 ANSI fallback — Ghostty maps these to hacker-night hues correctly.
 fn slot_ansi(slot: Slot) -> &'static str {
     match slot {
-        Slot::FgDefault => "37",   // white → #c8d0e8 via palette 7
-        Slot::FgMuted => "90",     // bright black → #565f89
-        Slot::FgEmphasis => "97",  // bright white
-        Slot::BgBase => "40",      // black bg — rarely used directly
+        Slot::FgDefault => "37",  // white → #c8d0e8 via palette 7
+        Slot::FgMuted => "90",    // bright black → #565f89
+        Slot::FgEmphasis => "97", // bright white
+        Slot::BgBase => "40",     // black bg — rarely used directly
         Slot::BgSurface => "40",
         Slot::BgOverlay => "48;5;236",
-        Slot::AccentCyan => "36",  // cyan → #0db9d7 via palette 6
-        Slot::AccentLav => "35",   // magenta → #bb9af7 via palette 5
-        Slot::Success => "32",     // green → #73daca via palette 2
-        Slot::Info => "96",        // bright cyan → #89ddff via palette 12
-        Slot::Warning => "33",     // yellow → #e0af68 via palette 3
-        Slot::Error => "91",       // bright red fallback for error
+        Slot::AccentCyan => "36", // cyan → #0db9d7 via palette 6
+        Slot::AccentLav => "35",  // magenta → #bb9af7 via palette 5
+        Slot::Success => "32",    // green → #73daca via palette 2
+        Slot::Info => "96",       // bright cyan → #89ddff via palette 12
+        Slot::Warning => "33",    // yellow → #e0af68 via palette 3
+        Slot::Error => "91",      // bright red fallback for error
     }
 }
 

@@ -135,7 +135,14 @@ pub fn run_briefing(
             } else {
                 format!(" caps={}", caps.join(","))
             };
-            writeln!(out, "    {} {} ({}{})", dim(&format!("[{i}]")), id, cost_s, caps_s)?;
+            writeln!(
+                out,
+                "    {} {} ({}{})",
+                dim(&format!("[{i}]")),
+                id,
+                cost_s,
+                caps_s
+            )?;
         }
         if let Some(funded) = ctx.funded.get(&m.role) {
             writeln!(out, "    {} {}", dim("funded:"), funded)?;
@@ -151,12 +158,7 @@ pub fn run_briefing(
     }
 
     // (3) squad recommendation or explicit bare harness+model.
-    writeln!(
-        out,
-        "\n{} {}",
-        accent_lav("[3/4]"),
-        ok("fleet shape:")
-    )?;
+    writeln!(out, "\n{} {}", accent_lav("[3/4]"), ok("fleet shape:"))?;
     match &ctx.squad_recommendation {
         Some(squad) => writeln!(out, "  {} {}", dim("recommended squad:"), accent(squad))?,
         None => writeln!(

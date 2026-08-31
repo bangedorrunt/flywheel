@@ -154,7 +154,9 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             // Overdue wakes arrive back as kind-9 ack-sla-expired WatchNdjson.
             actions.push(DoorbellAction::CheckAckSla);
             // leftover #13: FetchInbox is now a real Cmd whose rows re-enter as InboxRows
-            actions.push(DoorbellAction::FetchInbox { since: format!("{now}") });
+            actions.push(DoorbellAction::FetchInbox {
+                since: format!("{now}"),
+            });
         }
         DoorbellMsg::WatchDied => {
             // Never exit the dispatcher: restart is the only path (heal_tick is backup).

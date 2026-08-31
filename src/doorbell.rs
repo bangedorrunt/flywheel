@@ -1294,7 +1294,9 @@ pub fn once_json(stdin: &str, status_by_pin: &BTreeMap<String, String>) -> Strin
     };
     let mut rows = Vec::new();
     for line in stdin.lines() {
-        let msg = crate::doorbell_tick::DoorbellMsg::WatchNdjson { line: line.to_string() };
+        let msg = crate::doorbell_tick::DoorbellMsg::WatchNdjson {
+            line: line.to_string(),
+        };
         let (next, actions) = crate::doorbell_tick::tick(&model, &msg);
         model = next;
         for a in actions {

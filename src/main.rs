@@ -7508,7 +7508,10 @@ fn cmd_doorbell_why(
     let mut matched = 0usize;
     for (workspace, entry) in &entries {
         let msg_val = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
-        let actions_val = entry.get("actions").cloned().unwrap_or(serde_json::Value::Null);
+        let actions_val = entry
+            .get("actions")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         // Deserialize msg for replay
         if let Ok(msg) = serde_json::from_value::<doorbell_tick::DoorbellMsg>(msg_val.clone()) {
             let expected: Vec<doorbell_tick::DoorbellAction> =
@@ -10909,9 +10912,10 @@ pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
             // Live Fact path via tick (leftover #10) — no swallow into ()
             let summary = ingress::fact_doorbell_line(ev).unwrap_or_else(|| format!("{ev:?}"));
             let msg = crate::doorbell_tick::DoorbellMsg::Fact { summary };
-            let _ = crate::doorbell_tick::tick(&crate::doorbell_tick::DoorbellModel::default(), &msg);
+            let _ =
+                crate::doorbell_tick::tick(&crate::doorbell_tick::DoorbellModel::default(), &msg);
             match captain_fact_inject(&proj, ev) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => eprintln!("flywheel: [FactMiss] fact dropped at ingress seam: {e:#}"),
             }
         }),
