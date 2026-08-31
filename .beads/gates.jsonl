@@ -73,3 +73,4 @@
 {"id":73,"issue_id":"bd-blyz","from_status":"in_progress","to_status":"closed","status_revision":2033,"gate":"unit-test-verified","provider":"cargo-test","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 07:11:57"}
 {"id":74,"issue_id":"bd-peka","from_status":"in_progress","to_status":"closed","status_revision":2035,"gate":"unit-test-verified","provider":"cargo-test","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 07:11:58"}
 {"id":75,"issue_id":"bd-rd4d","from_status":"in_progress","to_status":"closed","status_revision":2034,"gate":"unit-test-verified","provider":"cargo-test","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 07:11:58"}
+{"id":76,"issue_id":"bd-rd4d","from_status":"in_progress","to_status":"closed","status_revision":2044,"gate":"unit-test-verified","provider":"cargo-test","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 08:04:41"}
