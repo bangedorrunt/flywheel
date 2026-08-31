@@ -1250,7 +1250,22 @@ graph:
       needs: [evaluate-3]
       action: verify
       command: "{{inputs.verify}}"
-      on_error: fail_run
+      on_error: continue
+    # Branch early-exit (bd-rd4d): if any verify succeeded, the run succeeds
+    # without needing to re-verify. The guard sees step outputs via
+    # steps_<name>_<key> (e.g. steps_verify_1_ok) after the engine now
+    # exposes step_outputs to Branch. This is the true unroll: fail c1 can
+    # still reach green c2 and the run succeeds, and success skips remaining
+    # re-verification via the Branch's then/else.
+    decide:
+      needs: [verify-3]
+      action: branch
+      if: "steps_verify_1_ok == 'true' || steps_verify_2_ok == 'true' || steps_verify_3_ok == 'true'"
+      then: []
+      else:
+        - action: verify
+          command: "false 'no verify succeeded — repair loop exhausted without a passing VERIFY'"
+          on_error: fail_run
 "##,
     ),
     // ---- ADR-0019 Spec 7.2 reflect (wave 6, bd-w6-reflect-8gp5) ----
@@ -2867,9 +2882,24 @@ mod tests {
         );
         assert_eq!(
             graph.nodes["verify-3"].on_error,
-            StepOnError::FailRun,
-            "final verify gates the run"
+            StepOnError::Continue,
+            "verify-3 now continue — Branch decide gates the run (was FailRun, now early-exit Branch handles final failure)"
         );
+        assert!(
+            graph.nodes.contains_key("decide"),
+            "repair must have decide Branch for early-exit"
+        );
+        let decide = &graph.nodes["decide"];
+        assert_eq!(decide.needs, vec!["verify-3".to_string()]);
+        match &decide.action {
+            toron_workflow::schema::Action::Branch { if_guard, .. } => {
+                assert!(
+                    if_guard.contains("steps_verify_1_ok"),
+                    "Branch guard must check step outputs, got: {if_guard}"
+                );
+            }
+            other => panic!("decide must be Branch, got {other:?}"),
+        }
         assert!(
             repair
                 .description
