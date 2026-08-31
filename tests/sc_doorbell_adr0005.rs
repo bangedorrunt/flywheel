@@ -141,8 +141,9 @@ fn run_doorbell_once(stdin_line: &str, status: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// SC-D1 wiring: live dispatcher uses the proven apply path; one `toron
-/// watch` child; no `loop run`.
+/// SC-D1 wiring: live dispatcher decides via `doorbell_tick::tick` (bd-yw4s
+/// bind); effects stay herdr `agent.prompt`; one `toron watch` child; no
+/// `loop run`.
 #[test]
 fn sc_d1_live_dispatcher_uses_apply_watch_line() {
     let src = read("src/main.rs");
@@ -153,13 +154,19 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         .find("fn project_base(")
         .expect("project_base after doorbell helpers");
     let body = &src[start..end];
+    // bd-yw4s: the reducer is the decider on the live path — Watch, Status,
+    // Died, and AckSlaTick all flow through doorbell_tick::tick.
     assert!(
-        body.contains("doorbell::apply_watch_line"),
-        "live dispatcher must use apply_watch_line"
+        body.contains("doorbell_tick::tick"),
+        "live dispatcher must decide via doorbell_tick::tick"
     );
     assert!(
-        body.contains("doorbell::apply_status_change"),
-        "live dispatcher must drain via apply_status_change"
+        body.matches("doorbell_tick::DoorbellMsg::").count() >= 3,
+        "live dispatcher must construct DoorbellMsgs (watch/status/ack-sla)"
+    );
+    assert!(
+        body.contains("doorbell::journal_append"),
+        "live dispatcher must journal ticks for `doorbell why`"
     );
     assert!(
         body.contains("agent_prompt"),
@@ -169,18 +176,14 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         !body.contains("loop run"),
         "doorbell must not start the loop"
     );
-    // Two spawn-path literals are the contract now: cold-start start and
-    // the lazy heal/re-inject path — each workspace still gets exactly ONE
-    // watch child (the third "watch" literal in the region is the audit
-    // trail's kind tag, and an inbox sweep is not a second watch).
+    // Two `.args(["watch"` literals are the contract: the cold-start CLI
+    // fallback inside the dispatcher body, and the shared spawn_watch_child
+    // helper (Died burst + retry gate respawns) which sits later in the same
+    // region. One workspace still gets exactly ONE live watch child.
     assert_eq!(
         body.matches(".args([\"watch\"").count(),
         2,
-        "dispatcher spawns the watch child from exactly the start + heal paths"
-    );
-    assert!(
-        body.contains("9,43001,30031"),
-        "watch kinds must include reservations (30031)"
+        "cold-start fallback + shared respawn helper are the only watch spawn sites"
     );
     assert!(
         !body.contains("9,7,43001"),

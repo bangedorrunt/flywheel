@@ -10,12 +10,17 @@ use std::collections::BTreeMap;
 
 /// One doorbell message. Every bus/inbox/status edge is a Msg; nothing
 /// happens outside `tick`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DoorbellMsg {
     /// Plane-S watch NDJSON line (`{kind,id,tags,content}`).
     WatchNdjson { line: String },
     /// Plane-P inbox rows for one pin (raw `fetch_inbox` JSON).
     InboxItems { raw: String, pin: String },
+    /// Plane-P sweep path: rows already parsed (no serde round-trip).
+    InboxRows {
+        rows: Vec<serde_json::Value>,
+        pin: String,
+    },
     /// Herdr status change for one pin.
     HerdrStatus { pin: String, status: String },
     /// Captain-bound fact (no alias info here — honest FactMiss).
@@ -31,7 +36,7 @@ pub enum DoorbellMsg {
 /// What the effect layer should do. Prompt is the only delivery; FetchInbox /
 /// CheckAckSla / RestartWatch are effects whose results re-enter as Msgs;
 /// FactMiss and Audit are loud misses (journal + stderr), never silent Ok(()).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DoorbellAction {
     Prompt {
         pin: String,
@@ -64,6 +69,20 @@ pub struct DoorbellModel {
     pub index: crate::doorbell::SelfIndex,
 }
 
+/// Expand an inbox JSON blob into row values: array, single object, or the
+/// `{"messages":[...]}` wrapper `fetch_inbox` emits.
+fn expand_inbox_rows(v: &serde_json::Value) -> Vec<&serde_json::Value> {
+    match v {
+        serde_json::Value::Array(arr) => arr.iter().collect(),
+        other if other.get("messages").is_some() => other
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|arr| arr.iter().collect())
+            .unwrap_or_default(),
+        other => vec![other],
+    }
+}
+
 /// Pure, total, deterministic: no I/O, no &mut, no herdr/toron calls.
 pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<DoorbellAction>) {
     let mut next = model.clone();
@@ -87,18 +106,17 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 });
                 return (next, actions);
             };
-            let items: Vec<&serde_json::Value> = match &v {
-                serde_json::Value::Array(arr) => arr.iter().collect(),
-                // `fetch_inbox` also emits a {"messages":[...]} wrapper —
-                // treat it as the row list, not a single unparseable item.
-                other if other.get("messages").is_some() => other
-                    .get("messages")
-                    .and_then(|m| m.as_array())
-                    .map(|arr| arr.iter().collect())
-                    .unwrap_or_default(),
-                other => vec![other],
-            };
-            for item in items {
+            for item in expand_inbox_rows(&v) {
+                let Some((class, hint)) = crate::doorbell::parse_inbox_item(item) else {
+                    continue;
+                };
+                let line_out = crate::doorbell::doorbell_line(class, &hint);
+                route_or_queue(&mut next, &mut actions, pin, line_out);
+            }
+        }
+        DoorbellMsg::InboxRows { rows, pin } => {
+            // Plane-P sweep path: rows already parsed (Values), no round-trip.
+            for item in rows {
                 let Some((class, hint)) = crate::doorbell::parse_inbox_item(item) else {
                     continue;
                 };
