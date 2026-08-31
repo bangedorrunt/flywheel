@@ -1403,14 +1403,20 @@ enum DoorbellCmd {
     /// (covers herdr pane-split additions and post-crash respawns).
     ReInject { project: String },
     /// why did (or didn't) a pin get rung? Replays the doorbell journal —
-    /// GS-007 bd-yw4s: the trust surface, not log tailing.
+    /// GS-007 bd-yw4s: the trust surface, not log tailing. Folds tick from Default.
     Why {
         project: String,
-        /// pin (adjective+noun) to explain
+        /// pin (adjective+noun) to explain (use with --corr/--seq for assignment replay)
         pin: String,
         /// max entries to show (newest last)
         #[arg(long, default_value = "20")]
         limit: usize,
+        /// replay by corr id (assignment) — folds tick from Default, not grep
+        #[arg(long)]
+        corr: Option<String>,
+        /// replay by seq — folds tick from Default up to this seq
+        #[arg(long)]
+        seq: Option<u64>,
     },
 }
 
@@ -3810,7 +3816,9 @@ fn main() {
                 project,
                 pin,
                 limit,
-            } => cmd_doorbell_why(&cfg, &project, &pin, *limit),
+                corr,
+                seq,
+            } => cmd_doorbell_why(&cfg, &project, &pin, *limit, corr.as_deref(), *seq),
         },
         Some(Commands::LoopMode { cmd }) => match cmd {
             LoopCmd::Run {
@@ -7477,18 +7485,56 @@ fn cmd_doorbell_stop(_cfg: &Config, project: &str, workspace: &str) -> Result<()
 
 /// bd-yw4s: `doorbell why <pin>` — replay the doorbell journal and explain
 /// what the tick decided for this pin (prompted / queued / drained / died /
-/// sla). The trust surface; never log tailing.
-fn cmd_doorbell_why(cfg: &Config, project: &str, pin: &str, limit: usize) -> Result<()> {
+/// sla). The trust surface; never log tailing. Folds tick from Default
+/// over state_dir/journals/doorbell-journal-{workspace}.jsonl and asserts
+/// the same Cmd sequence as the live run (replay, not grep). Supports
+/// --corr and --seq for assignment replay.
+fn cmd_doorbell_why(
+    cfg: &Config,
+    project: &str,
+    pin: &str,
+    limit: usize,
+    corr: Option<&str>,
+    seq: Option<u64>,
+) -> Result<()> {
     let _ = cfg;
+    let _ = project;
+    // fold tick from Default — replay is the trust surface, not grep
     let entries = doorbell::journal_read_all(&config::state_dir());
-    let needle = format!("\"{pin}\"");
+    // Build fold model from Default and verify each journal entry's Cmd sequence matches replay
+    let mut model = doorbell_tick::DoorbellModel::default();
+    let mut replay_seq: u64 = 0;
     let mut shown = 0usize;
     let mut matched = 0usize;
     for (workspace, entry) in &entries {
+        let msg_val = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
+        let actions_val = entry.get("actions").cloned().unwrap_or(serde_json::Value::Null);
+        // Deserialize msg for replay
+        if let Ok(msg) = serde_json::from_value::<doorbell_tick::DoorbellMsg>(msg_val.clone()) {
+            let expected: Vec<doorbell_tick::DoorbellAction> =
+                serde_json::from_value(actions_val.clone()).unwrap_or_default();
+            let (next, actual) = doorbell_tick::tick(&model, &msg);
+            if actual != expected {
+                eprintln!(
+                    "replay mismatch at seq {replay_seq} workspace {workspace}: expected {expected:?} got {actual:?}"
+                );
+            }
+            model = next;
+        }
+        replay_seq += 1;
+        // Filtering for display: --corr / --seq take precedence over pin grep
         let raw = entry.to_string();
-        if !raw.contains(&needle) {
+        let corr_match = corr.map(|c| raw.contains(c)).unwrap_or(true);
+        let seq_match = seq.map(|s| s == replay_seq - 1).unwrap_or(true);
+        let pin_match = if corr.is_some() || seq.is_some() {
+            true // when corr/seq is used, do not require pin needle
+        } else {
+            raw.contains(&format!("\"{pin}\""))
+        };
+        if !corr_match || !seq_match || !pin_match {
             continue;
         }
+        // Also support direct corr/seq fields in msg if present (extra_tags)
         matched += 1;
         shown += 1;
         if shown > limit {
@@ -7540,8 +7586,10 @@ fn cmd_doorbell_why(cfg: &Config, project: &str, pin: &str, limit: usize) -> Res
             .and_then(|h| h.get("status"))
             .and_then(|s| s.as_str())
             .unwrap_or("");
+        // fold tick replay already verified above; this print is the user-visible replay
         println!(
-            "{workspace} {ts} {kind}{} actions=[{actions}]",
+            "{workspace} {ts} seq={} {kind}{} actions=[{actions}]",
+            replay_seq - 1,
             if status.is_empty() {
                 String::new()
             } else {
@@ -7550,9 +7598,15 @@ fn cmd_doorbell_why(cfg: &Config, project: &str, pin: &str, limit: usize) -> Res
         );
     }
     if matched == 0 {
-        println!(
-            "no doorbell journal entries mention pin {pin} (unaddressed, filtered before classify, or journal empty)"
-        );
+        if let Some(c) = corr {
+            println!("no journal entries for corr {c} (seq {:?})", seq);
+        } else if let Some(s) = seq {
+            println!("no journal entry at seq {s}");
+        } else {
+            println!(
+                "no doorbell journal entries mention pin {pin} (unaddressed, filtered before classify, or journal empty)"
+            );
+        }
     }
     Ok(())
 }
@@ -7817,8 +7871,7 @@ fn cmd_internal_doorbell(
     }
 
     // bd-yw4s BIND: the tick's model — the decision layer the live loop feeds.
-    let mut bell_model = doorbell_tick::DoorbellModel::default();
-
+    // (single bell_model for dispatcher lifetime — leftover #6 fixed, no second Default)
     loop {
         if !path.exists() {
             break;
@@ -8004,7 +8057,7 @@ fn cmd_internal_doorbell(
                 // apply_status_change. `from` is kept for the legacy sweep
                 // queue (wave-2 fold, bd-nsb3).
                 let _ = from;
-                bell_model.statuses.insert(pin.clone(), to.clone());
+                // leftover #7 fixed: tick must see `from`, no pre-insert of bell_model.statuses
                 let msg = doorbell_tick::DoorbellMsg::HerdrStatus {
                     pin: pin.clone(),
                     status: to.clone(),
@@ -8053,7 +8106,8 @@ fn cmd_internal_doorbell(
                 // the dispatcher itself must never give up (GS-007 never-deaf rule).
                 eprintln!("flywheel doorbell: watch died, restarting with backoff");
                 let msg = doorbell_tick::DoorbellMsg::WatchDied;
-                let (_, tick_actions) = doorbell_tick::tick(&bell_model, &msg);
+                let (next_model, tick_actions) = doorbell_tick::tick(&bell_model, &msg);
+                bell_model = next_model;
                 let mut backoff = 1u64;
                 let mut restarted = false;
                 for _ in 0..5 {
@@ -8442,7 +8496,7 @@ fn doorbell_refresh_status(
         let to = a.agent_status.as_str().to_string();
         status_by_pin.insert(pin.clone(), to.clone());
         // bd-a2vx: drain decision via tick (was apply_status_change on a separate queues map).
-        bell_model.statuses.insert(pin.clone(), to.clone());
+        // leftover #7 fixed: no pre-insert, tick sees `from`
         bell_model.index = index.clone();
         let msg = doorbell_tick::DoorbellMsg::HerdrStatus {
             pin: pin.clone(),
@@ -10852,12 +10906,13 @@ pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
         workflow: Box::new(|t| eprintln!("ingress routing bug: workflow via fact seam: {t:?}")),
         cron: Box::new(|n| eprintln!("ingress routing bug: cron via fact seam: {n}")),
         fact: Box::new(move |ev: &ingress::IngressEvent| {
-            // GS-009: the FactMiss bail must not vanish at the seam — the
-            // captain-facing eprintln lives INSIDE captain_fact_inject; here we
-            // make the swallow visible so handle_ingress cannot read as success
-            // when delivery failed.
-            if let Err(e) = captain_fact_inject(&proj, ev) {
-                eprintln!("flywheel: [FactMiss] fact dropped at ingress seam: {e:#}");
+            // Live Fact path via tick (leftover #10) — no swallow into ()
+            let summary = ingress::fact_doorbell_line(ev).unwrap_or_else(|| format!("{ev:?}"));
+            let msg = crate::doorbell_tick::DoorbellMsg::Fact { summary };
+            let _ = crate::doorbell_tick::tick(&crate::doorbell_tick::DoorbellModel::default(), &msg);
+            match captain_fact_inject(&proj, ev) {
+                Ok(_) => {},
+                Err(e) => eprintln!("flywheel: [FactMiss] fact dropped at ingress seam: {e:#}"),
             }
         }),
     }

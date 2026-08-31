@@ -1264,6 +1264,7 @@ pub fn apply_watch_line(
 }
 
 /// Drain a pin's queue on working → idle|done. Empty if not a drain edge.
+/// Helper kept for tests only — live path uses tick(&WorkspaceModel, &Msg) (bd-6b1y #9, no second reducer).
 pub fn apply_status_change(
     pin: &str,
     from: &str,
@@ -1283,14 +1284,23 @@ pub fn apply_status_change(
     }
 }
 
-/// herdr-mock: stdin watch lines + pin statuses → JSON injects. No loop.
+/// herdr-mock: stdin watch lines + pin statuses → JSON injects via tick (no second reducer).
 pub fn once_json(stdin: &str, status_by_pin: &BTreeMap<String, String>) -> String {
     let index = SelfIndex::from_pins(status_by_pin.keys().cloned());
-    let mut queues = BTreeMap::new();
+    let mut model = crate::doorbell_tick::DoorbellModel {
+        statuses: status_by_pin.clone(),
+        index,
+        ..Default::default()
+    };
     let mut rows = Vec::new();
     for line in stdin.lines() {
-        for (pin, msg) in apply_watch_line(line, &index, status_by_pin, &mut queues) {
-            rows.push(serde_json::json!({"pin": pin, "line": msg}));
+        let msg = crate::doorbell_tick::DoorbellMsg::WatchNdjson { line: line.to_string() };
+        let (next, actions) = crate::doorbell_tick::tick(&model, &msg);
+        model = next;
+        for a in actions {
+            if let crate::doorbell_tick::DoorbellAction::Prompt { pin, line } = a {
+                rows.push(serde_json::json!({"pin": pin, "line": line}));
+            }
         }
     }
     serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())

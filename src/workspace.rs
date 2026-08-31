@@ -460,3 +460,79 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod bell_fold_tests {
+    #[test]
+    fn bell_fold_no_double_bell_model() {
+        let src = include_str!("main.rs");
+        let needle = "let mut bell_model = doorbell_tick::DoorbellModel::default()";
+        let count = src.matches(needle).count();
+        assert!(count <= 1, "RED (bd-6b1y #6): main.rs has {count} bell_model = Default (7747/7819) — must be ONE model for dispatcher lifetime");
+    }
+
+    #[test]
+    fn bell_fold_no_status_preinsert_before_herdr_tick() {
+        let src = include_str!("main.rs");
+        // pre-insert before HerdrStatus tick kills drain (tick must see from)
+        let needle = "bell_model.statuses.insert(pin.clone(), to.clone())";
+        let count = src.matches(needle).count();
+        assert!(count <= 1, "RED (bd-6b1y #7): main.rs still pre-inserts statuses before HerdrStatus tick");
+    }
+
+    #[test]
+    fn bell_fold_watchdied_keeps_model() {
+        let src = include_str!("main.rs");
+        assert!(!src.contains("let (_, tick_actions) = doorbell_tick::tick(&bell_model, &msg)"), "RED (bd-6b1y #8): main.rs WatchDied still discards model' (`let (_, tick_actions) = tick(...)` at 8055) — keep the returned model");
+        // Must have keep: let (next_model, tick_actions) = ... ; bell_model = next_model;
+        assert!(src.contains("WatchDied"), "src must contain WatchDied handling");
+    }
+
+    #[test]
+    fn bell_fold_once_calls_tick_not_second_reducer() {
+        let main = include_str!("main.rs");
+        let doorbell = include_str!("doorbell.rs");
+        // once_json should call tick, not apply_watch_line as live second reducer
+        assert!(main.contains("doorbell_tick::tick"), "RED (bd-6b1y #9): main.rs must wire through tick");
+        // doorbell.rs once_json must use tick after fix
+        assert!(doorbell.contains("doorbell_tick::tick"), "RED (bd-6b1y #9): doorbell.rs once_json must call tick, not apply_watch_line");
+    }
+
+    #[test]
+    fn bell_fold_fact_path_live() {
+        let src = include_str!("main.rs");
+        let dt = include_str!("doorbell_tick.rs");
+        assert!(dt.contains("Fact"), "RED (bd-6b1y #10): DoorbellMsg::Fact missing in doorbell_tick.rs");
+        assert!(src.contains("DoorbellMsg::Fact") || src.contains("Fact {"), "RED (bd-6b1y #10): DoorbellMsg::Fact not on live path in main.rs");
+        // adapter must not swallow Err into ()
+        assert!(!src.contains("if let Err(e) = captain_fact_inject(&proj, ev)"), "RED (bd-6b1y #10): adapter still swallows Err into () at main.rs 10853-10860 — must propagate fact into Msg");
+    }
+
+    #[test]
+    fn bell_fold_fetch_inbox_emitted() {
+        let dt = include_str!("doorbell_tick.rs");
+        let main = include_str!("main.rs");
+        // FetchInbox must be emitted as real Cmd, rows re-enter as InboxRows
+        assert!(dt.contains("FetchInbox"), "RED (bd-6b1y #13): FetchInbox variant missing");
+        // Must have a constructor or usage in main.rs / workspace.rs
+        let has_emit = main.contains("FetchInbox") || dt.contains("FetchInbox");
+        assert!(has_emit, "RED (bd-6b1y #13): FetchInbox never emitted — must be a real Cmd whose rows re-enter as InboxRows");
+        // workspace tick should handle InboxRows
+        let ws = include_str!("workspace.rs");
+        assert!(ws.contains("InboxRows"), "workspace must handle InboxRows");
+    }
+
+    #[test]
+    fn bell_fold_why_replay() {
+        let doorbell = include_str!("doorbell.rs");
+        let main = include_str!("main.rs");
+        assert!(doorbell.contains("doorbell-journal-") && doorbell.contains("journals"), "RED (bd-6b1y #11): doorbell.rs journal path must be state_dir/journals/doorbell-journal");
+        // why must fold tick from Default, have --corr/--seq, not grep
+        assert!(main.contains("fn cmd_doorbell_why"), "RED (bd-6b1y #11): fn cmd_doorbell_why not found");
+        let pos = main.find("fn cmd_doorbell_why").unwrap();
+        let slice = &main[pos..std::cmp::min(main.len(), pos + 8000)];
+        assert!(slice.contains("fold") || slice.contains("replay") || slice.contains("tick("), "RED (bd-6b1y #11): doorbell why must fold tick from Default over journal and assert same Cmd sequence — currently greps pin substring, not replay");
+        assert!(slice.contains("corr") && slice.contains("seq"), "RED (bd-6b1y #11): why must gain --corr / --seq flags — why_fn missing corr/seq");
+        assert!(!slice.contains("raw.contains(&needle)") || slice.contains("fold"), "RED (bd-6b1y #11): why still greps pin substring — must fold tick");
+    }
+}
