@@ -15839,7 +15839,11 @@ fn clamp_active_interval(v: u64) -> u64 {
     v.max(5)
 }
 
-fn build_queue(queue: Option<&str>, workflow: Option<&str>) -> Result<Vec<String>> {
+fn build_queue(
+    queue: Option<&str>,
+    workflow: Option<&str>,
+    project: Option<&str>,
+) -> Result<Vec<String>> {
     let mut items: Vec<String> = Vec::new();
     if let Some(wf) = workflow {
         // Resolve from the builtin catalog/all_workflows FIRST (38 builtins runnable),
@@ -15858,16 +15862,40 @@ fn build_queue(queue: Option<&str>, workflow: Option<&str>) -> Result<Vec<String
                     all.insert(name, wf);
                 }
             }
-            if let Some(uwf) = all.get(wf) {
-                // Builtins run via the engine, not the queue. The old
-                // walk_action flatten (graph -> English prompt strings) is
-                // deleted — a flattened recipe is how a captain asks for a
-                // functor and gets a chatty agent instead of a closed verify.
-                let _ = uwf;
-                anyhow::bail!(
-                    "workflow {0}: builtins run via the engine, not the queue — use                      'flywheel workflow run {0} --execute --mode pane --inputs \'{}\' --project <proj>'                      (or remove --workflow and use --work for beads)",
-                    wf
-                );
+            if let Some(_uwf) = all.get(wf) {
+                // Builtins run via the engine, not the queue. Formerly this
+                // bailed and told the operator to run `workflow run --execute`
+                // manually — now it actually runs the workflow via the engine
+                // (GS-007 invoke, bd-i3lw) so `loop --workflow <name>` is a
+                // real graph invocation, not English.
+                if let Some(proj) = project {
+                    let exe = std::env::current_exe()?;
+                    let output = std::process::Command::new(exe)
+                        .args([
+                            "workflow",
+                            "run",
+                            wf,
+                            "--execute",
+                            "--mode",
+                            "pane",
+                            "--project",
+                            proj,
+                            "--yes",
+                            "--json",
+                        ])
+                        .output()?;
+                    if !output.status.success() {
+                        anyhow::bail!(
+                            "workflow {wf} failed (engine invoke): {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    handled = true;
+                } else {
+                    anyhow::bail!(
+                        "workflow {wf} requires --project <proj> to run via the engine (use 'flywheel workflow run {wf} --execute --mode pane --project <proj>')"
+                    );
+                }
             }
         }
         if !handled {
@@ -16513,7 +16541,7 @@ fn cmd_loop(
             bail!("--wave-label must be `wave-<N>` (got `{label}`)");
         }
     }
-    let mut queue_items = build_queue(queue, workflow)?;
+    let mut queue_items = build_queue(queue, workflow, Some(project))?;
 
     // durable mode (default): run the loop as a Resonate workflow so it
     // survives crashes and restarts. --local / --once use the sync loop.
