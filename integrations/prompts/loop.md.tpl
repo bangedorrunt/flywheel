@@ -17,7 +17,7 @@ The solo agent is its own captain for reversible decisions. The human/captain
 objective and scope remain authoritative; peer-aware messages must not replace
 the primary objective.
 
-## The 6-step loop
+## The loop
 
 Before starting a new managed run, ask the operator to choose the profile and
 model routing for this role. Present the profile default plus compatible model

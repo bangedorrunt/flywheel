@@ -44,8 +44,8 @@ default, explicit provider/model overrides. Use consistently.
    with VERIFY tail, stage ONLY reserved paths (never git add -A),
    on [doorbell] pull then act, post to steer channel, blocked >10m mail
    captain, TIMEBOX 90m partial report. Use public mail identity.
-   prove-it-works.
-   Supervised wave execution: `flywheel workflow compose "<objective>" --parts wave-swarm --run` -- swarm-mode is the crew, wave-swarm is the recipe.
+   prove-it-works. Turn-based crews stall silently: when a claimed bead
+   shows no commits for ~2 polls, send a status+continue wake.
 
 6. CONFLICT: soft -> `toron reserve request-release` -> respond
    agreed|denied|deferred -> escalate on steer channel, captain LAST.
@@ -53,8 +53,11 @@ default, explicit provider/model overrides. Use consistently.
    interrogate/debate. Cross-sweep -> flag, victim re-commits.
    never-block-on-the-human.
 
-7. WAVE GATE: captain verifies epic checkboxes (suite+grep+fmt+install
-   --force), closes epic with evidence, then next wave.
+7. WAVE GATE: captain verifies with fresh eyes — suite+fmt+clippy AND the
+   actual wiring: a green suite can hide unwired producers/arms (the
+   ADR-0027 facade: source-scan guards passed while live paths never called
+   the new entry). Read the call sites; verify dropped-behavior lists (grep
+   `let _ =` on action vecs). Close the epic with evidence, then next wave.
 
 8. TEARDOWN: release reservations + slot, kill --force-working, br sync,
    commit .beads.
