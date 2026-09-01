@@ -1296,6 +1296,19 @@ pub fn journal_append(
     {
         let _ = writeln!(f, "{entry}");
     }
+    // Bounded retention: doorbell journal also grows without bound — same
+    // 5 MiB / 5k line cap as loop journal. Keep recent history for `why`.
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 5 * 1024 * 1024 {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                let lines: Vec<&str> = raw.lines().collect();
+                if lines.len() > 5000 {
+                    let keep = lines[lines.len() - 5000..].join("\n") + "\n";
+                    let _ = std::fs::write(&path, keep);
+                }
+            }
+        }
+    }
 }
 
 pub fn journal_append_workspace(
@@ -1323,6 +1336,18 @@ pub fn journal_append_workspace(
         .open(&path)
     {
         let _ = writeln!(f, "{entry}");
+    }
+    // Same 5 MiB / 5k line cap — workspace journal is the same file.
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 5 * 1024 * 1024 {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                let lines: Vec<&str> = raw.lines().collect();
+                if lines.len() > 5000 {
+                    let keep = lines[lines.len() - 5000..].join("\n") + "\n";
+                    let _ = std::fs::write(&path, keep);
+                }
+            }
+        }
     }
 }
 
