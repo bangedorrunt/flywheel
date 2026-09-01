@@ -332,6 +332,10 @@ pub struct LoopModel {
     /// decisions inside tick are visible and replayable.
     #[serde(default)]
     pub dispatch_pending: std::collections::HashSet<String>,
+    /// Agent states (bd-p1ds): the polled swarm snapshot lives in the Model,
+    /// not loop-local. Apply is single and inside the Tick arm.
+    #[serde(default)]
+    pub states: Vec<AgentState>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum LoopMsg {
@@ -522,11 +526,9 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
         LoopMsg::Tick { now } => {
             let _ = now;
             // Tick is the clock beat: heartbeat plan (queue -> Send). Heal and
-            // nudges are per-event Msgs (LoopMsg::Heal/ClaimNudge/CloseNudge);
-            // live poll events apply ONCE loop-side until Model.states lands.
-            // pending_events holds only Herdr-Msg-buffered events (test/replay
-            // seam); Tick drains them here. LIVE poll events never enter the
-            // model.
+            // nudges are per-event Msgs; Model.states lives in the Model and
+            // pending_events are drained and applied here (single-apply invariant, bd-p1ds).
+            apply_events_to_states(&mut next.states, &next.pending_events);
             next.pending_events.clear();
             if !next.mail_degraded && !next.queue.is_empty() {
                 // Simple plan: pop one and send
@@ -541,9 +543,8 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             }
         }
         LoopMsg::Herdr(pe) => {
-            // Live events apply ONCE, loop-side (see the poll region): states
-            // are loop-owned until the Model.states fold lands. The Herdr Msg
-            // buffers into model' for replay visibility only.
+            // Herdr events buffer into Model and are drained/applied on the
+            // next Tick (single-apply via Model.states, bd-p1ds).
             next.pending_events.push(pe.clone());
         }
         LoopMsg::WaveGate { bead_id } => {
@@ -5845,19 +5846,14 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         } else {
             since_snapshot += 1;
         }
-        // Events apply EXACTLY ONCE, here (fresh-eyes fix 2026-09-01): the
-        // previous "tick only" fold left ZERO appliers — the tick's Tick arm
-        // has no agent states, so buffered events were silently dropped and
-        // the loop degraded to snapshot-only polling. Single-apply is the
-        // leftover-#5 invariant; the loop-side location is a documented
-        // deviation until Model.states lands (bd-0027 remainder).
-        apply_events_to_states(&mut states, &event_batch.events);
+        // Events apply EXACTLY ONCE inside the Tick arm (bd-p1ds): Model.states
+        // lives in the Model (states: Vec<AgentState>) and pending_events are
+        // drained and applied there. No loop-side apply — single-apply invariant
+        // holds via tick.
 
-        // proof of life: a working/blocked agent is receiving prompts — its
-        // failure history is stale (landed sends reset at the send site too)
-        clear_live_failures(&mut send_failures, &states);
-        // learn agent kinds for the respawn path (idempotent, never removes)
-        learn_kinds(&mut agent_kinds, &states);
+        // proof of life and kind learning now use Model.states after the Tick;
+        // keep local states in sync with the Model after each iteration (see
+        // post-tick sync below).
 
         // ---- cross-project receive (bd-pattern-cross-project-swarm §9.5) ----
         // Scan orchestrator inbox for [xproj] requests. For each unseen item,
@@ -6919,8 +6915,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             heal_grace: params.unknown_detect_grace_polls,
             heal_threshold: params.unknown_diagnose_threshold,
             heal_budget: params.respawn_budget,
-            pending_events: Default::default(),
+            pending_events: event_batch.events.clone(),
             dispatch_pending: dispatch_pending.clone(),
+            states: states.clone(),
         };
         let now = chrono::Utc::now().timestamp() as u64;
         let msg = LoopMsg::Tick { now };
@@ -6947,6 +6944,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         per_bead_phase = next_model.per_bead_phase.clone();
         dispatch_pending = next_model.dispatch_pending.clone();
         heal_states = next_model.heal_states.clone();
+        states = next_model.states.clone();
+        // proof of life + kind learning use the Model's states after Tick (bd-p1ds)
+        clear_live_failures(&mut send_failures, &states);
+        learn_kinds(&mut agent_kinds, &states);
         // bd-5fbv: crash-safe persistence via ActiveLoop file (was loop-local only).
         if let Ok(Some(mut al)) = crate::state::load_active_loop(&params.project) {
             al.per_bead_phase = per_bead_phase
@@ -8864,6 +8865,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -8931,6 +8933,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -8975,6 +8978,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -9011,6 +9015,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -9047,6 +9052,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -9081,6 +9087,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -9117,6 +9124,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -9153,6 +9161,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -10073,6 +10082,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -10124,6 +10134,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -10172,6 +10183,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -10291,6 +10303,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -10334,6 +10347,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -10369,6 +10383,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states_plain,
@@ -10418,6 +10433,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -10500,6 +10516,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -10543,6 +10560,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -10582,6 +10600,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -10634,6 +10653,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -10753,6 +10773,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -10824,6 +10845,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -10861,6 +10883,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -10904,6 +10927,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -10944,6 +10968,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -10983,6 +11008,7 @@ mod tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -12283,7 +12309,8 @@ mod tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-            dispatch_pending: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (next, actions) = tick(&model, &msg);
@@ -14456,7 +14483,8 @@ mod tick_replay_tests {
             heal_threshold: 1,
             heal_budget: 2,
             pending_events: Default::default(),
-            dispatch_pending: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
         }
     }
 
@@ -14583,7 +14611,8 @@ mod tick_replay_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-            dispatch_pending: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
         };
         let msgs = vec![
             LoopMsg::Tick { now: 0 },
@@ -14619,7 +14648,8 @@ mod tick_replay_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-            dispatch_pending: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
         };
         let mut actions_log2 = Vec::new();
         for msg in &msgs {
@@ -14648,7 +14678,8 @@ mod tick_replay_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-            dispatch_pending: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (m1, a1) = tick(&model, &msg);
@@ -14676,7 +14707,8 @@ mod tick_replay_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-            dispatch_pending: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (next, actions) = tick(&model, &msg);
@@ -14712,7 +14744,8 @@ mod loop_invoke_vehicle_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-            dispatch_pending: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
         };
         // Simulate a graph invoke for bd-1 that succeeds (in-graph green)
         let msg = LoopMsg::Tick { now: 0 };
@@ -14743,7 +14776,8 @@ mod loop_invoke_vehicle_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-            dispatch_pending: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
         };
         // Simulate worker closing the bead via br close (BrClose event)
         let (next, _) = tick(
@@ -14788,7 +14822,8 @@ mod loop_invoke_vehicle_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-            dispatch_pending: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
         };
         let msg = LoopMsg::BrClose {
             bead_id: "bd-1".to_string(),
@@ -14856,7 +14891,8 @@ mod loop_invoke_vehicle_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-            dispatch_pending: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
         };
         // For a bead that is not opted-in for graph, tick with Tick should just do normal plan_actions
         let msg = LoopMsg::Tick { now: 0 };
@@ -14899,7 +14935,8 @@ mod loop_invoke_vehicle_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-            dispatch_pending: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (_, actions) = tick(&model, &msg);

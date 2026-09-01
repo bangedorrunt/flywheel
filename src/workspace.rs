@@ -1144,15 +1144,20 @@ mod loop_fold_tests {
     #[test]
     fn loop_fold_single_event_apply() {
         let durable = include_str!("durable.rs");
-        // Events apply EXACTLY ONCE. The 2026-08-31 fold left ZERO appliers
-        // (buffered events dropped, loop degraded to snapshot polling); the
-        // honest invariant is single application, currently loop-side until
-        // Model.states lands.
-        let call = "apply_events_to_states(&mut states, &event_batch.events)";
-        let count = durable.matches(call).count();
+        // Events apply EXACTLY ONCE inside the Tick arm (bd-p1ds): Model.states
+        // lives in the Model and pending_events are drained and applied there.
+        // No loop-side apply — single-apply invariant holds via tick.
+        let tick_call = "apply_events_to_states(&mut next.states, &next.pending_events)";
+        let loop_call = "apply_events_to_states(&mut states, &event_batch.events)";
+        let tick_count = durable.matches(tick_call).count();
+        let loop_count = durable.matches(loop_call).count();
         assert_eq!(
-            count, 1,
-            "event application must happen exactly once (found {count})"
+            tick_count, 1,
+            "event application must happen exactly once inside Tick arm (found {tick_count} tick calls)"
+        );
+        assert_eq!(
+            loop_count, 0,
+            "loop-side apply must be gone (found {loop_count} old loop calls)"
         );
     }
 

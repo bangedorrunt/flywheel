@@ -16549,7 +16549,8 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
         heal_budget: Default::default(),
 
         pending_events: Default::default(),
-        dispatch_pending: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
     };
     for (idx, entry) in entries.iter().enumerate() {
         let Some(msg_val) = entry.get("msg") else {
@@ -16993,6 +16994,7 @@ fn cmd_loop(
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &d_states,
@@ -18341,6 +18343,7 @@ mod loop_tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -18385,6 +18388,7 @@ mod loop_tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -18424,6 +18428,7 @@ mod loop_tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -18463,6 +18468,7 @@ mod loop_tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -18500,6 +18506,7 @@ mod loop_tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -18537,6 +18544,7 @@ mod loop_tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -18582,6 +18590,7 @@ mod loop_tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -18618,6 +18627,7 @@ mod loop_tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -18658,6 +18668,7 @@ mod loop_tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -18689,6 +18700,7 @@ mod loop_tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -18726,6 +18738,7 @@ mod loop_tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -18760,6 +18773,7 @@ mod loop_tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
@@ -18794,6 +18808,7 @@ mod loop_tests {
                 heal_budget: Default::default(),
 
                 pending_events: Default::default(),
+                states: Default::default(),
                 dispatch_pending: Default::default(),
             },
             &states,
