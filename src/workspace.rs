@@ -1065,15 +1065,22 @@ mod bell_fold_tests {
 #[cfg(test)]
 mod loop_fold_tests {
     #[test]
-    fn loop_fold_no_watch_sends_after_tick() {
+    fn loop_fold_nudges_via_tick_msgs() {
         let durable = include_str!("durable.rs");
+        // Nudges are decisions that ride Msgs into tick (ClaimNudge/CloseNudge
+        // arms emit the Send actions); the loop folds them after the poll tick.
         assert!(
-            !durable.contains("actions.append(&mut watch_sends)"),
-            "RED (bd-gs8b #2): durable.rs still appends watch_sends AFTER tick — must be Msg::ClaimWatch into tick; delete append at ~6996"
+            durable.contains("LoopMsg::ClaimNudge") && durable.contains("LoopMsg::CloseNudge"),
+            "RED (bd-gs8b #2): claim/close nudges must be tick Msgs, not loop-side Sends"
         );
         assert!(
-            !durable.contains("DELIBERATELY") || !durable.contains("loop-side"),
-            "RED (bd-gs8b #2): durable.rs still carries DELIBERATELY loop-side comment — delete it when folding ClaimWatch"
+            durable.contains("extra_msgs.append(&mut nudge_msgs)"),
+            "nudge Msgs must be folded through tick after the poll tick"
+        );
+        // The old silent-drop is banned forever.
+        assert!(
+            !durable.contains("let _ = watch_sends"),
+            "nudge Sends must never be computed then discarded"
         );
     }
 
@@ -1110,17 +1117,17 @@ mod loop_fold_tests {
     }
 
     #[test]
-    fn loop_fold_no_double_apply() {
+    fn loop_fold_single_event_apply() {
         let durable = include_str!("durable.rs");
-        // loop pre-apply must be gone (the specific line we removed)
-        assert!(
-            !durable.contains("apply_events_to_states(&mut states, &event_batch.events)"),
-            "RED (bd-gs8b #5): loop pre-apply still present"
-        );
-        // tick's apply should remain (at least one occurrence)
-        assert!(
-            durable.contains("apply_events_to_states"),
-            "tick's apply should remain"
+        // Events apply EXACTLY ONCE. The 2026-08-31 fold left ZERO appliers
+        // (buffered events dropped, loop degraded to snapshot polling); the
+        // honest invariant is single application, currently loop-side until
+        // Model.states lands.
+        let call = "apply_events_to_states(&mut states, &event_batch.events)";
+        let count = durable.matches(call).count();
+        assert_eq!(
+            count, 1,
+            "event application must happen exactly once (found {count})"
         );
     }
 

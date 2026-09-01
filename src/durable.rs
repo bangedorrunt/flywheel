@@ -357,6 +357,25 @@ pub enum LoopMsg {
         claimant_pin: String,
         is_live: bool,
     },
+    /// Per-agent heal decision input (ADR-0027 fold list: `Heal { name, status, exited }`).
+    /// tick owns the heal_state transition via `self_heal_step` and emits
+    /// Diagnose/Respawn/Blocked actions; the executor leaves run the I/O.
+    Heal {
+        name: String,
+        status: String,
+        exited: bool,
+    },
+    /// Claim-watch watchdog (bd-efk1): unclaimed-bead nudge for the dispatched agent.
+    ClaimNudge {
+        name: String,
+        bead_id: String,
+    },
+    /// Claim-watch watchdog: claimed-but-unclosed nudge for the idle assignee.
+    CloseNudge {
+        name: String,
+        bead_id: String,
+        title: String,
+    },
     Tick {
         now: u64,
     },
@@ -451,13 +470,64 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
                 });
             }
         }
+        LoopMsg::Heal {
+            name,
+            status,
+            exited,
+        } => {
+            // tick owns the heal transition (ADR-0027 fold: `Heal` is a Msg).
+            // Thresholds ride the model (heal_grace/threshold/budget), so the
+            // decision is pure and replayable; the executor leaves run the I/O.
+            let hs = next.heal_states.entry(name.clone()).or_default();
+            let action = self_heal_step(
+                hs,
+                status,
+                *exited,
+                next.heal_grace,
+                next.heal_threshold,
+                next.heal_budget,
+            );
+            let reason = if *exited { "pane_exited" } else { "unknown" };
+            match action {
+                HealAction::None => {}
+                HealAction::Diagnose => actions.push(LoopAction::Diagnose {
+                    name: name.clone(),
+                    reason: reason.into(),
+                }),
+                HealAction::Respawn => actions.push(LoopAction::Respawn {
+                    name: name.clone(),
+                    reason: reason.into(),
+                }),
+                HealAction::EscalateBlocked => {
+                    actions.push(LoopAction::Blocked { name: name.clone() })
+                }
+            }
+        }
+        LoopMsg::ClaimNudge { name, bead_id } => {
+            actions.push(LoopAction::Send {
+                name: name.clone(),
+                text: claim_nudge_prompt(bead_id),
+            });
+        }
+        LoopMsg::CloseNudge {
+            name,
+            bead_id,
+            title,
+        } => {
+            actions.push(LoopAction::Send {
+                name: name.clone(),
+                text: close_nudge_prompt(bead_id, title),
+            });
+        }
         LoopMsg::Tick { now } => {
-            // leftover #2,5,14 fixed: Tick is clock {now}, poll is Cmd (replay determinism)
             let _ = now;
-            // Heal, events, and claim-watch now via Msg::ClaimWatch / Msg::Reclaim etc., not world dump
-            // Tick drains buffered Herdr events and does heartbeat plan (queue -> Send)
+            // Tick is the clock beat: heartbeat plan (queue -> Send). Heal and
+            // nudges are per-event Msgs (LoopMsg::Heal/ClaimNudge/CloseNudge);
+            // live poll events apply ONCE loop-side until Model.states lands.
+            // pending_events holds only Herdr-Msg-buffered events (test/replay
+            // seam); Tick drains them here. LIVE poll events never enter the
+            // model.
             next.pending_events.clear();
-            // Minimal heartbeat plan: pop queue and dispatch if not degraded
             if !next.mail_degraded && !next.queue.is_empty() {
                 // Simple plan: pop one and send
                 let bead = next.queue.remove(0);
@@ -471,8 +541,9 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             }
         }
         LoopMsg::Herdr(pe) => {
-            // bd-ugd1: buffer into model' (visible + replayable); the next
-            // Tick drains it through apply_events_to_states.
+            // Live events apply ONCE, loop-side (see the poll region): states
+            // are loop-owned until the Model.states fold lands. The Herdr Msg
+            // buffers into model' for replay visibility only.
             next.pending_events.push(pe.clone());
         }
         LoopMsg::WaveGate { bead_id } => {
@@ -5231,16 +5302,6 @@ pub struct HealState {
     pub awaiting_clear: bool,
 }
 
-/// Record a diagnose outcome in the heal state (cg6.2): only a SUCCESSFUL
-/// diagnose advances the episode (increment count + set awaiting_clear); a
-/// failed diagnose leaves the state untouched so the next poll retries.
-fn apply_diagnose_outcome(hs: &mut HealState, ok: bool) {
-    if ok && !hs.awaiting_clear {
-        hs.diagnose_count = hs.diagnose_count.saturating_add(1);
-        hs.awaiting_clear = true;
-    }
-}
-
 /// Pure self-heal decision for one agent (table-driven tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealAction {
@@ -5619,11 +5680,13 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // the captain once per bead — the marker file is the durable dedup.
     let mut verifier_dispatched: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    // bd-efk1: claim-watch nudge sends collected during work-mode sourcing,
-    // merged into the action list AFTER plan_actions (they target specific
-    // agents — including WORKING ones — and must not be double-filtered by
-    // the dispatch-pending retention applied to poll_actions).
-    let mut watch_sends: Vec<LoopAction> = Vec::new();
+    // bd-efk1: claim-watch nudge DECISIONS collected as Msgs during work-mode
+    // sourcing and folded through `tick` after the main poll tick (ADR-0027:
+    // nudge text is a tick decision, not a loop-side append). They target
+    // specific agents — including WORKING ones — so they must not be
+    // double-filtered by the dispatch-pending retention applied to
+    // poll_actions.
+    let mut nudge_msgs: Vec<LoopMsg> = Vec::new();
     // agents that received DispatchImmediate and await working confirmation
     // (bd-event-dispatch double-dispatch guard) — crash-safe via ActiveLoop file (bd-5fbv).
     let mut dispatch_pending: std::collections::HashSet<String> = {
@@ -5782,8 +5845,13 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         } else {
             since_snapshot += 1;
         }
-        // leftover #5 fixed: apply_events_to_states once, tick only — loop pre-apply removed
-        let _ = &event_batch.events; // events travel as Tick.events into tick
+        // Events apply EXACTLY ONCE, here (fresh-eyes fix 2026-09-01): the
+        // previous "tick only" fold left ZERO appliers — the tick's Tick arm
+        // has no agent states, so buffered events were silently dropped and
+        // the loop degraded to snapshot-only polling. Single-apply is the
+        // leftover-#5 invariant; the loop-side location is a documented
+        // deviation until Model.states lands (bd-0027 remainder).
+        apply_events_to_states(&mut states, &event_batch.events);
 
         // proof of life: a working/blocked agent is receiving prompts — its
         // failure history is stale (landed sends reset at the send site too)
@@ -5979,9 +6047,24 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 }
             }
         }
-        let mut heal_actions: Vec<LoopAction> = Vec::new();
-        // bd-blyz: heal now inside tick (self_heal_step per agent, updates heal_states in model').
-        // The loop-side heal loop is deleted — tick is the only producer of Diagnose/Respawn.
+        // Stranded-bead RECLAIM collector (bd-627z.1) — planner actions from
+        // reclaim_on_pane_exited/plan_reclaim, merged into the poll plan below.
+        // (fresh-eyes fix: the previous "leftover #3 fixed" drop discarded
+        // these, so stranded beads were never reclaimed.)
+        let mut reclaim_actions: Vec<LoopAction> = Vec::new();
+        // Heal decisions ride Msgs into tick (fresh-eyes fix 2026-09-01): the
+        // previous fold deleted the loop-side heal loop without relocating the
+        // per-agent statuses, so NOBODY ran self_heal_step — dead agents were
+        // never diagnosed/respawned. tick owns the heal_states transition; the
+        // executor leaves still run the diagnose/respawn I/O.
+        let mut heal_msgs: Vec<LoopMsg> = states
+            .iter()
+            .map(|s| LoopMsg::Heal {
+                name: s.name.clone(),
+                status: s.status.clone(),
+                exited: exited_names.contains(&s.name),
+            })
+            .collect();
 
         // bead-driven mode: refresh the instruction queue from the tracker each
         // poll; the assigned-set is deterministic across replays (derives from
@@ -6166,14 +6249,14 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             if board.iter().any(|(_, reason)| reason == &bead.id) {
                                 continue;
                             }
-                            heal_actions.push(act);
+                            reclaim_actions.push(act);
                         }
                     }
                 }
                 let now_secs = chrono::Utc::now().timestamp();
                 let stale = plan_reclaim(now_secs, &inprog, &states, &board);
                 for act in stale {
-                    heal_actions.push(act);
+                    reclaim_actions.push(act);
                 }
             }
             // bd-eign.2: bead-creation flood guard — >3 NEW ready beads in
@@ -6344,9 +6427,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             for a in watch_actions {
                 match a {
                     ClaimWatchAction::NudgeClaim { agent, bead_id } => {
-                        watch_sends.push(LoopAction::Send {
+                        nudge_msgs.push(LoopMsg::ClaimNudge {
                             name: agent,
-                            text: claim_nudge_prompt(&bead_id),
+                            bead_id,
                         });
                     }
                     ClaimWatchAction::RedispatchBead { bead_id, title } => {
@@ -6382,9 +6465,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         bead_id,
                         title,
                     } => {
-                        watch_sends.push(LoopAction::Send {
+                        nudge_msgs.push(LoopMsg::CloseNudge {
                             name: agent,
-                            text: close_nudge_prompt(&bead_id, &title),
+                            bead_id,
+                            title,
                         });
                     }
                     ClaimWatchAction::RedispatchResume { bead_id, title } => {
@@ -6652,12 +6736,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         }
 
         let mut blocked_names: Vec<String> = Vec::new();
-        // bd-nsb3 FOLD: event decisions now live inside tick (queue pops and
-        // dispatch_pending live in model'). The pre-pass route_event loop is
-        // deleted — events travel as Tick.events and are replayable.
-        // leftover #3 fixed: Reclaim via Msg::Reclaim into tick, no pre-seed
+        // bd-nsb3 FOLD: dispatch decisions live in model'. Heal decisions ride
+        // Msg::Heal into tick (built above); reclaim runs via the phase machine
+        // (LoopMsg::Reclaim) — no loop-side pre-seed, no dropped sends.
         let mut actions: Vec<LoopAction> = Vec::new();
-        let _ = heal_actions; // suppress unused, now via Msg::Reclaim
         // heartbeat path: full-snapshot reconciliation (skips agents already
         // dispatch-pending so event path and poll path don't double-feed)
         // Loop-side mail wake: fetch per-agent digests ONCE per iteration
@@ -6842,11 +6924,25 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         };
         let now = chrono::Utc::now().timestamp() as u64;
         let msg = LoopMsg::Tick { now };
-        let (next_model, poll_actions) = tick(&model, &msg);
+        let (mut next_model, mut poll_actions) = tick(&model, &msg);
         // Journal every LoopMsg driven into tick (kind + payload + actions) as JSONL
         let _ = crate::state::journal_loop_msg(&params.project, &msg, &model, &poll_actions);
         // leftover #4 fixed: tick output is the plan, no filter of Diagnose pane_exited
-        let mut poll_actions = poll_actions;
+        // Fold heal + nudge Msgs through the SAME tick (fresh-eyes fix
+        // 2026-09-01): the previous "leftover #2/#3 fixed" drop discarded the
+        // claim/close nudges and orphaned self-heal entirely. Decisions are
+        // tick(Model, Msg) -> actions; heal transitions land in model'; the
+        // executor leaves run the I/O. Reclaim planner actions (bd-627z.1)
+        // merge here too — they were previously computed then dropped.
+        let mut extra_msgs = std::mem::take(&mut heal_msgs);
+        extra_msgs.append(&mut nudge_msgs);
+        for m in &extra_msgs {
+            let (m_next, m_actions) = tick(&next_model, m);
+            let _ = crate::state::journal_loop_msg(&params.project, m, &next_model, &m_actions);
+            poll_actions.extend(m_actions);
+            next_model = m_next;
+        }
+        poll_actions.extend(reclaim_actions);
         queue = next_model.queue.clone();
         per_bead_phase = next_model.per_bead_phase.clone();
         dispatch_pending = next_model.dispatch_pending.clone();
@@ -6858,6 +6954,22 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 .map(|(k, v)| (k.clone(), format!("{v:?}")))
                 .collect();
             al.dispatch_pending = dispatch_pending.clone();
+            // Persist heal counters (crash-safe; awaiting_clear is
+            // within-episode state and deliberately does not survive restart).
+            al.heal_states = heal_states
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        crate::state::HealState {
+                            diagnose_count: v.diagnose_count,
+                            respawn_count: v.respawn_count,
+                            unknown_count: v.unknown_count,
+                            awaiting_clear: false,
+                        },
+                    )
+                })
+                .collect();
             let _ = crate::state::save_active_loop(&params.project, &al);
         }
         // record wake decisions so the same urgent message does not re-wake
@@ -6877,11 +6989,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             }
         }
         actions.extend(poll_actions);
-        // bd-efk1: claim-watch nudges fire AFTER the poll plan (they target
-        // specific agents — possibly WORKING ones — so they must survive the
-        // dispatch-pending retention applied above).
-        // leftover #2 fixed: ClaimWatch via Msg::ClaimWatch into tick, no live watch_sends append
-        let _ = watch_sends; // suppress unused, ClaimWatch now via tick
+        // bd-efk1: claim-watch nudges and heal escalations ride the poll plan
+        // above (they target specific agents — possibly WORKING ones — so they
+        // survive the dispatch-pending retention applied to it).
 
         // with on_blocked=stop, the loop must not dispatch any more work this
         // iteration — check the blocker before any side effect fires
@@ -7360,15 +7470,16 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     let hs = heal_states.entry(name.clone()).or_default();
                     match diag {
                         Ok(_) => {
-                            // mark heal state awaiting_clear so next still-dead tick respawns
-                            apply_diagnose_outcome(hs, true);
+                            // awaiting_clear/diagnose_count advanced in tick's
+                            // model' (LoopMsg::Heal arm); nothing to mutate here.
                         }
                         Err(e) => {
-                            // cg6.2: a failed diagnose must not advance heal
-                            // state (herdr hiccup ≠ agent healed) — the next
-                            // poll retries the diagnose.
+                            // cg6.2: a failed diagnose must not advance the
+                            // episode — tick set awaiting_clear optimistically,
+                            // so revert it and let the next poll retry.
+                            hs.awaiting_clear = false;
                             eprintln!(
-                                "flywheel: diagnose_agent leaf failed for {name} (heal state untouched): {e}"
+                                "flywheel: diagnose_agent leaf failed for {name} (reverted awaiting_clear): {e}"
                             );
                         }
                     }
@@ -11933,24 +12044,6 @@ mod tests {
 
     // ---- bd-event-self-heal-unknown: self_heal_step state machine ----
 
-    /// cg6.2: only a SUCCESSFUL diagnose advances the heal episode — a failed
-    /// leaf must not inflate diagnose_count or pre-set awaiting_clear.
-    #[test]
-    fn apply_diagnose_outcome_only_advances_on_success() {
-        let mut hs = HealState::default();
-        // leaf failed: state untouched
-        apply_diagnose_outcome(&mut hs, false);
-        assert_eq!(hs.diagnose_count, 0);
-        assert!(!hs.awaiting_clear);
-        // success: episode advances
-        apply_diagnose_outcome(&mut hs, true);
-        assert_eq!(hs.diagnose_count, 1);
-        assert!(hs.awaiting_clear);
-        // second success with awaiting_clear already set: count unchanged
-        apply_diagnose_outcome(&mut hs, true);
-        assert_eq!(hs.diagnose_count, 1);
-    }
-
     #[test]
     fn self_heal_unknown_diagnose_then_respawn() {
         let mut hs = HealState::default();
@@ -14347,6 +14440,131 @@ mod tick_replay_tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
 
+    fn base_model() -> LoopModel {
+        LoopModel {
+            queue: vec![],
+            per_bead_phase: Default::default(),
+            wake_suppression: Default::default(),
+            done_mailed: Default::default(),
+            event_cursor: None,
+            escalation: Default::default(),
+            respawn: Default::default(),
+            mail_health: Default::default(),
+            mail_degraded: false,
+            heal_states: Default::default(),
+            heal_grace: 0,
+            heal_threshold: 1,
+            heal_budget: 2,
+            pending_events: Default::default(),
+            dispatch_pending: Default::default(),
+        }
+    }
+
+    #[test]
+    fn heal_msg_unknown_diagnoses_then_respawns() {
+        let mut m = base_model();
+        // First Heal for an unknown agent past grace: Diagnose
+        let (_, a1) = tick(
+            &m,
+            &LoopMsg::Heal {
+                name: "a".into(),
+                status: "unknown".into(),
+                exited: false,
+            },
+        );
+        assert!(matches!(
+            a1.last(),
+            Some(LoopAction::Diagnose { name, reason }) if name == "a" && reason == "unknown"
+        ));
+        m = tick(
+            &m,
+            &LoopMsg::Heal {
+                name: "a".into(),
+                status: "unknown".into(),
+                exited: false,
+            },
+        )
+        .0;
+        // Still awaiting_clear: same Diagnose is NOT re-emitted (cg6.2 state)
+        let (_, a2) = tick(
+            &m,
+            &LoopMsg::Heal {
+                name: "a".into(),
+                status: "unknown".into(),
+                exited: false,
+            },
+        );
+        assert!(
+            !a2.iter().any(|x| matches!(x, LoopAction::Diagnose { .. })),
+            "awaiting_clear suppresses repeat diagnose"
+        );
+        // Exited while awaiting_clear: escalates to Respawn within budget
+        let (_, a3) = tick(
+            &m,
+            &LoopMsg::Heal {
+                name: "a".into(),
+                status: "unknown".into(),
+                exited: true,
+            },
+        );
+        assert!(matches!(
+            a3.last(),
+            Some(LoopAction::Respawn { name, .. }) if name == "a"
+        ));
+        // Proof of life resets the episode
+        let m = tick(
+            &m,
+            &LoopMsg::Heal {
+                name: "a".into(),
+                status: "working".into(),
+                exited: false,
+            },
+        )
+        .0;
+        assert!(!m.heal_states.contains_key("a") || m.heal_states["a"].unknown_count == 0);
+    }
+
+    #[test]
+    fn claim_nudge_msg_emits_claim_prompt_send() {
+        let (_, actions) = tick(
+            &base_model(),
+            &LoopMsg::ClaimNudge {
+                name: "oc".into(),
+                bead_id: "bd-12".into(),
+            },
+        );
+        match actions.last() {
+            Some(LoopAction::Send { name, text }) => {
+                assert_eq!(name, "oc");
+                assert!(text.contains("CLAIM REQUIRED"), "{text}");
+                assert!(text.contains("bd-12"), "{text}");
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_nudge_msg_emits_close_prompt_send() {
+        let (_, actions) = tick(
+            &base_model(),
+            &LoopMsg::CloseNudge {
+                name: "oc".into(),
+                bead_id: "bd-12".into(),
+                title: "fix auth".into(),
+            },
+        );
+        match actions.last() {
+            Some(LoopAction::Send { name, text }) => {
+                assert_eq!(name, "oc");
+                assert!(text.contains("CLOSE REQUIRED"), "{text}");
+                assert!(
+                    text.contains("bd-12") && text.contains("fix auth"),
+                    "{text}"
+                );
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
     #[test]
     fn tick_replay_differential() {
         // Record a fact sequence and replay it, asserting identical actions
