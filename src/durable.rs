@@ -6961,6 +6961,40 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         dispatch_pending = next_model.dispatch_pending.clone();
         heal_states = next_model.heal_states.clone();
         states = next_model.states.clone();
+        // Bounded retention: prune maps that would otherwise grow with every
+        // bead/agent ever seen. Complete/WaveHeld beads older than the queue
+        // are dead weight; heal entries for gone agents are stale.
+        {
+            let live_agents: std::collections::HashSet<&String> =
+                states.iter().map(|s| &s.name).collect();
+            heal_states.retain(|k, _| live_agents.contains(k));
+            // per_bead_phase: keep only beads still in queue or recently active
+            // (last 200 entries). This caps the map even under high churn.
+            if per_bead_phase.len() > 500 {
+                let mut keys: Vec<String> = per_bead_phase.keys().cloned().collect();
+                keys.sort();
+                let to_remove = per_bead_phase.len() - 400;
+                for k in keys.into_iter().take(to_remove) {
+                    // Only prune terminal phases; keep non-terminal for correctness
+                    if matches!(
+                        per_bead_phase.get(&k),
+                        Some(LoopPhase::Complete) | Some(LoopPhase::WaveHeld)
+                    ) {
+                        per_bead_phase.remove(&k);
+                    } else if per_bead_phase.len() <= 400 {
+                        break;
+                    }
+                }
+            }
+            // dispatch_pending is naturally bounded by queue length; ensure it
+            // never retains names not in queue or states.
+            let live_beads: std::collections::HashSet<&String> =
+                queue.iter().collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .chain(states.iter().map(|s| &s.name))
+                    .collect();
+            dispatch_pending.retain(|k| live_beads.contains(k) || per_bead_phase.contains_key(k));
+        }
         // proof of life + kind learning use the Model's states after Tick (bd-p1ds)
         clear_live_failures(&mut send_failures, &states);
         learn_kinds(&mut agent_kinds, &states);

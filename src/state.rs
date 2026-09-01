@@ -780,6 +780,20 @@ pub fn journal_loop_msg(
         .append(true)
         .open(&path)?;
     writeln!(f, "{}", serde_json::to_string(&entry)?)?;
+    // Bounded retention: if the journal exceeds 5 MiB, keep the last 5k
+    // lines (approx 1 MiB of recent history). `loop why` needs history but
+    // not unbounded growth — a runaway loop must not fill the disk.
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 5 * 1024 * 1024 {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                let lines: Vec<&str> = raw.lines().collect();
+                if lines.len() > 5000 {
+                    let keep = lines[lines.len() - 5000..].join("\n") + "\n";
+                    let _ = std::fs::write(&path, keep);
+                }
+            }
+        }
+    }
     Ok(())
 }
 
