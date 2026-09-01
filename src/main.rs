@@ -7500,9 +7500,10 @@ fn cmd_doorbell_why(
     let _ = cfg;
     let _ = project;
     // fold tick from Default — replay is the trust surface, not grep
+    // WorkspaceModel is the single owner; journal entries may be DoorbellMsg (old) or workspace::Msg (new)
     let entries = doorbell::journal_read_all(&config::state_dir());
     // Build fold model from Default and verify each journal entry's Cmd sequence matches replay
-    let mut model = doorbell_tick::DoorbellModel::default();
+    let mut model = workspace::WorkspaceModel::default();
     let mut replay_seq: u64 = 0;
     let mut shown = 0usize;
     let mut matched = 0usize;
@@ -7512,11 +7513,39 @@ fn cmd_doorbell_why(
             .get("actions")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        // Deserialize msg for replay
-        if let Ok(msg) = serde_json::from_value::<doorbell_tick::DoorbellMsg>(msg_val.clone()) {
-            let expected: Vec<doorbell_tick::DoorbellAction> =
-                serde_json::from_value(actions_val.clone()).unwrap_or_default();
-            let (next, actual) = doorbell_tick::tick(&model, &msg);
+        // Deserialize msg for replay — prefer workspace::Msg, fallback to DoorbellMsg (legacy journal)
+        let replay_msg: Option<workspace::Msg> = if let Ok(m) = serde_json::from_value::<workspace::Msg>(msg_val.clone()) {
+            Some(m)
+        } else if let Ok(dm) = serde_json::from_value::<doorbell_tick::DoorbellMsg>(msg_val.clone()) {
+            Some(match dm {
+                doorbell_tick::DoorbellMsg::WatchNdjson { line } => workspace::Msg::WatchNdjson { line },
+                doorbell_tick::DoorbellMsg::InboxItems { raw, pin } => workspace::Msg::InboxItems { raw, pin },
+                doorbell_tick::DoorbellMsg::InboxRows { rows, pin } => workspace::Msg::InboxRows { rows, pin },
+                doorbell_tick::DoorbellMsg::HerdrStatus { pin, status } => workspace::Msg::HerdrStatus { pin, status },
+                doorbell_tick::DoorbellMsg::Fact { summary } => workspace::Msg::Fact { summary },
+                doorbell_tick::DoorbellMsg::AckSlaTick { now } => workspace::Msg::AckSlaTick { now },
+                doorbell_tick::DoorbellMsg::WatchDied => workspace::Msg::WatchDied,
+            })
+        } else {
+            None
+        };
+        if let Some(msg) = replay_msg {
+            // Expected may be workspace::Cmd or legacy DoorbellAction
+            let expected: Vec<workspace::Cmd> = if let Ok(v) = serde_json::from_value::<Vec<workspace::Cmd>>(actions_val.clone()) {
+                v
+            } else if let Ok(legacy) = serde_json::from_value::<Vec<doorbell_tick::DoorbellAction>>(actions_val.clone()) {
+                legacy.into_iter().map(|a| match a {
+                    doorbell_tick::DoorbellAction::Prompt { pin, line } => workspace::Cmd::Prompt { pin, line },
+                    doorbell_tick::DoorbellAction::FetchInbox { since } => workspace::Cmd::FetchInbox { since },
+                    doorbell_tick::DoorbellAction::CheckAckSla => workspace::Cmd::CheckAckSla,
+                    doorbell_tick::DoorbellAction::RestartWatch => workspace::Cmd::RestartWatch,
+                    doorbell_tick::DoorbellAction::FactMiss { why } => workspace::Cmd::FactMiss { why },
+                    doorbell_tick::DoorbellAction::Audit { kind, pin, detail } => workspace::Cmd::Audit { kind, pin, detail },
+                }).collect()
+            } else {
+                Vec::new()
+            };
+            let (next, actual) = workspace::tick(&model, &msg);
             if actual != expected {
                 eprintln!(
                     "replay mismatch at seq {replay_seq} workspace {workspace}: expected {expected:?} got {actual:?}"
@@ -7804,7 +7833,7 @@ fn cmd_internal_doorbell(
     let mut status_by_pin: BTreeMap<String, String> = BTreeMap::new();
     let mut pane_to_pin: BTreeMap<String, String> = BTreeMap::new();
     let mut _queues: BTreeMap<String, doorbell::DoorbellQueue> = BTreeMap::new();
-    let mut bell_model = doorbell_tick::DoorbellModel::default();
+    let mut workspace_model = workspace::WorkspaceModel::default();
     let mut budgets: BTreeMap<String, doorbell::PinBudget> = BTreeMap::new();
     // bd-durable-doorbell-lngf: plane-P/S high-waters + the last-wake stamp
     // survive a crash — at-least-once redelivery with an idempotent line.
@@ -7830,7 +7859,7 @@ fn cmd_internal_doorbell(
         project,
         &mut status_by_pin,
         &mut pane_to_pin,
-        &mut bell_model,
+        &mut workspace_model,
         &mut hear,
         &index,
         workspace,
@@ -7877,6 +7906,7 @@ fn cmd_internal_doorbell(
 
     // bd-yw4s BIND: the tick's model — the decision layer the live loop feeds.
     // (single bell_model for dispatcher lifetime — leftover #6 fixed, no second Default)
+    // ADR-0027: tick(&WorkspaceModel, &Msg) is the only state transition for the live dispatcher
     loop {
         if !path.exists() {
             break;
@@ -7889,20 +7919,22 @@ fn cmd_internal_doorbell(
         if now_s.saturating_sub(last_ack_sla_check) >= ACK_SLA_CHECK_SECS {
             last_ack_sla_check = now_s;
             // bd-yw4s BIND: the scan decision comes from the tick.
-            let msg = doorbell_tick::DoorbellMsg::AckSlaTick { now: now_s };
-            let (next_model, tick_actions) = doorbell_tick::tick(&bell_model, &msg);
-            bell_model = next_model;
-            let scan = tick_actions
+            let msg = workspace::Msg::AckSlaTick { now: now_s };
+            let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
+            workspace_model = next_model;
+            let scan = cmds
                 .iter()
-                .any(|a| matches!(a, doorbell_tick::DoorbellAction::CheckAckSla));
+                .any(|a| matches!(a, workspace::Cmd::CheckAckSla));
             if scan && let Some(mb) = crate::mail_shim::try_mailbox() {
                 let _ = crate::mail_shim::block_on(mb.check_ack_sla_expired(project, None));
             }
-            doorbell::journal_append(
+            // Journal via workspace model — keep file as doorbell journal for replay compatibility
+            // (legacy DoorbellMsg/Action entries still replay via workspace slice; new entries are workspace Msg/Cmd)
+            doorbell::journal_append_workspace(
                 &config::state_dir(),
                 workspace,
                 &msg,
-                &tick_actions,
+                &cmds,
                 serde_json::json!({ "stage": "executed", "scanned": scan }),
             );
         }
@@ -7962,15 +7994,15 @@ fn cmd_internal_doorbell(
                 // bd-yw4s BIND: the tick is the decider (classify + queue-or-
                 // prompt); the live loop is the effect layer (budget gate,
                 // herdr prompt, hear, persist). Same rules, one producer.
-                bell_model.index = index.clone();
-                let msg = doorbell_tick::DoorbellMsg::WatchNdjson { line: line.clone() };
-                let (next_model, tick_actions) = doorbell_tick::tick(&bell_model, &msg);
-                bell_model = next_model;
+                workspace_model.doorbell.index = index.clone();
+                let msg = workspace::Msg::WatchNdjson { line: line.clone() };
+                let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
+                workspace_model = next_model;
                 let mut delivered = Vec::new();
-                let raw_injects: Vec<(String, String)> = tick_actions
+                let raw_injects: Vec<(String, String)> = cmds
                     .iter()
                     .filter_map(|a| match a {
-                        doorbell_tick::DoorbellAction::Prompt { pin, line } => {
+                        workspace::Cmd::Prompt { pin, line } => {
                             Some((pin.clone(), line.clone()))
                         }
                         other => {
@@ -7979,11 +8011,11 @@ fn cmd_internal_doorbell(
                         }
                     })
                     .collect();
-                doorbell::journal_append(
+                doorbell::journal_append_workspace(
                     &config::state_dir(),
                     workspace,
                     &msg,
-                    &tick_actions,
+                    &cmds,
                     serde_json::json!({ "stage": "decided" }),
                 );
                 // Effect layer: budget gate on tick's prompts (drop is audited).
@@ -7991,11 +8023,11 @@ fn cmd_internal_doorbell(
                 let injects =
                     doorbell::take_allowed(raw_injects, &mut budgets, doorbell_now_unix());
                 if !delivered.is_empty() {
-                    doorbell::journal_append(
+                    doorbell::journal_append_workspace(
                         &config::state_dir(),
                         workspace,
                         &msg,
-                        &tick_actions,
+                        &cmds,
                         serde_json::json!({ "stage": "executed", "delivered": delivered }),
                     );
                 }
@@ -8062,27 +8094,27 @@ fn cmd_internal_doorbell(
                 // apply_status_change. `from` is kept for the legacy sweep
                 // queue (wave-2 fold, bd-nsb3).
                 let _ = from;
-                // leftover #7 fixed: tick must see `from`, no pre-insert of bell_model.statuses
-                let msg = doorbell_tick::DoorbellMsg::HerdrStatus {
+                // leftover #7 fixed: tick must see `from`, no pre-insert of workspace_model.doorbell.statuses
+                let msg = workspace::Msg::HerdrStatus {
                     pin: pin.clone(),
                     status: to.clone(),
                 };
-                let (next_model, tick_actions) = doorbell_tick::tick(&bell_model, &msg);
-                bell_model = next_model;
-                let raw_injects: Vec<(String, String)> = tick_actions
+                let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
+                workspace_model = next_model;
+                let raw_injects: Vec<(String, String)> = cmds
                     .iter()
                     .filter_map(|a| match a {
-                        doorbell_tick::DoorbellAction::Prompt { pin, line } => {
+                        workspace::Cmd::Prompt { pin, line } => {
                             Some((pin.clone(), line.clone()))
                         }
                         _ => None,
                     })
                     .collect();
-                doorbell::journal_append(
+                doorbell::journal_append_workspace(
                     &config::state_dir(),
                     workspace,
                     &msg,
-                    &tick_actions,
+                    &cmds,
                     serde_json::json!({ "stage": "drain" }),
                 );
                 let injects =
@@ -8110,9 +8142,9 @@ fn cmd_internal_doorbell(
                 // coming from the 1s pass — heal_tick will NOT heal a live pid, so
                 // the dispatcher itself must never give up (GS-007 never-deaf rule).
                 eprintln!("flywheel doorbell: watch died, restarting with backoff");
-                let msg = doorbell_tick::DoorbellMsg::WatchDied;
-                let (next_model, tick_actions) = doorbell_tick::tick(&bell_model, &msg);
-                bell_model = next_model;
+                let msg = workspace::Msg::WatchDied;
+                let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
+                workspace_model = next_model;
                 let mut backoff = 1u64;
                 let mut restarted = false;
                 for _ in 0..5 {
@@ -8144,20 +8176,20 @@ fn cmd_internal_doorbell(
                     backoff = (backoff * 2).min(16);
                 }
                 if restarted {
-                    doorbell::journal_append(
+                    doorbell::journal_append_workspace(
                         &config::state_dir(),
                         workspace,
                         &msg,
-                        &tick_actions,
+                        &cmds,
                         serde_json::json!({ "stage": "executed", "restarted": true }),
                     );
                     continue;
                 }
-                doorbell::journal_append(
+                doorbell::journal_append_workspace(
                     &config::state_dir(),
                     workspace,
                     &msg,
-                    &tick_actions,
+                    &cmds,
                     serde_json::json!({ "stage": "executed", "restarted": false, "retry_gate_secs": WATCH_RETRY_SECS }),
                 );
                 eprintln!(
@@ -8183,7 +8215,7 @@ fn cmd_internal_doorbell(
                     cfg,
                     project,
                     &status_by_pin,
-                    &mut bell_model,
+                    &mut workspace_model,
                     &mut since_by_pin,
                     &mut budgets,
                     herdr.as_mut(),
@@ -8200,7 +8232,7 @@ fn cmd_internal_doorbell(
                         project,
                         &mut status_by_pin,
                         &mut pane_to_pin,
-                        &mut bell_model,
+                        &mut workspace_model,
                         &mut hear,
                         &index,
                         workspace,
@@ -8468,7 +8500,7 @@ fn doorbell_refresh_status(
     project: &str,
     status_by_pin: &mut BTreeMap<String, String>,
     pane_to_pin: &mut BTreeMap<String, String>,
-    bell_model: &mut doorbell_tick::DoorbellModel,
+    workspace_model: &mut workspace::WorkspaceModel,
     hear: &mut doorbell::HearTracker,
     index: &doorbell::SelfIndex,
     workspace: &str,
@@ -8502,27 +8534,27 @@ fn doorbell_refresh_status(
         status_by_pin.insert(pin.clone(), to.clone());
         // bd-a2vx: drain decision via tick (was apply_status_change on a separate queues map).
         // leftover #7 fixed: no pre-insert, tick sees `from`
-        bell_model.index = index.clone();
-        let msg = doorbell_tick::DoorbellMsg::HerdrStatus {
+        workspace_model.doorbell.index = index.clone();
+        let msg = workspace::Msg::HerdrStatus {
             pin: pin.clone(),
             status: to.clone(),
         };
-        let (next_model, tick_actions) = doorbell_tick::tick(bell_model, &msg);
-        *bell_model = next_model;
-        let raw: Vec<(String, String)> = tick_actions
+        let (next_model, cmds) = workspace::tick(workspace_model, &msg);
+        *workspace_model = next_model;
+        let raw: Vec<(String, String)> = cmds
             .iter()
             .filter_map(|ac| match ac {
-                doorbell_tick::DoorbellAction::Prompt { pin, line } => {
+                workspace::Cmd::Prompt { pin, line } => {
                     Some((pin.clone(), line.clone()))
                 }
                 _ => None,
             })
             .collect();
-        doorbell::journal_append(
+        doorbell::journal_append_workspace(
             &config::state_dir(),
             workspace,
             &msg,
-            &tick_actions,
+            &cmds,
             serde_json::json!({ "stage": "refresh_status", "pin": pin }),
         );
         injects.extend(raw);
@@ -8559,7 +8591,7 @@ fn doorbell_sweep_inbox(
     cfg: &Config,
     project: &str,
     status_by_pin: &BTreeMap<String, String>,
-    bell_model: &mut doorbell_tick::DoorbellModel,
+    workspace_model: &mut workspace::WorkspaceModel,
     since_by_pin: &mut BTreeMap<String, String>,
     budgets: &mut BTreeMap<String, doorbell::PinBudget>,
     herdr: Option<&mut Client>,
@@ -8585,8 +8617,8 @@ fn doorbell_sweep_inbox(
             .get(pin)
             .cloned()
             .unwrap_or_else(|| "idle".into());
-        bell_model.statuses.insert(pin.to_string(), status);
-        bell_model.index = index.clone();
+        workspace_model.doorbell.statuses.insert(pin.to_string(), status);
+        workspace_model.doorbell.index = index.clone();
         // Prefer in-process mailbox (zero fork) — fallback to CLI only if unavailable
         let in_process_ok = (|| -> Option<()> {
             let mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
@@ -8602,26 +8634,26 @@ fn doorbell_sweep_inbox(
             let arr = v.as_array()?;
             // Feed rows through the tick (bd-9hco: plane-P sweep via tick).
             let rows: Vec<serde_json::Value> = arr.clone();
-            let msg = doorbell_tick::DoorbellMsg::InboxRows {
+            let msg = workspace::Msg::InboxRows {
                 rows,
                 pin: pin.to_string(),
             };
-            let (next_model, tick_actions) = doorbell_tick::tick(bell_model, &msg);
-            *bell_model = next_model;
-            let raw: Vec<(String, String)> = tick_actions
+            let (next_model, cmds) = workspace::tick(workspace_model, &msg);
+            *workspace_model = next_model;
+            let raw: Vec<(String, String)> = cmds
                 .iter()
                 .filter_map(|a| match a {
-                    doorbell_tick::DoorbellAction::Prompt { pin, line } => {
+                    workspace::Cmd::Prompt { pin, line } => {
                         Some((pin.clone(), line.clone()))
                     }
                     _ => None,
                 })
                 .collect();
-            doorbell::journal_append(
+            doorbell::journal_append_workspace(
                 &config::state_dir(),
                 workspace,
                 &msg,
-                &tick_actions,
+                &cmds,
                 serde_json::json!({ "stage": "sweep_inbox", "pin": pin }),
             );
             injects.extend(raw);
@@ -8699,26 +8731,26 @@ fn doorbell_sweep_inbox(
             _ => vec![],
         };
         if !rows.is_empty() {
-            let msg = doorbell_tick::DoorbellMsg::InboxRows {
+            let msg = workspace::Msg::InboxRows {
                 rows: rows.clone(),
                 pin: pin.to_string(),
             };
-            let (next_model, tick_actions) = doorbell_tick::tick(bell_model, &msg);
-            *bell_model = next_model;
-            let raw_injects: Vec<(String, String)> = tick_actions
+            let (next_model, cmds) = workspace::tick(workspace_model, &msg);
+            *workspace_model = next_model;
+            let raw_injects: Vec<(String, String)> = cmds
                 .iter()
                 .filter_map(|a| match a {
-                    doorbell_tick::DoorbellAction::Prompt { pin, line } => {
+                    workspace::Cmd::Prompt { pin, line } => {
                         Some((pin.clone(), line.clone()))
                     }
                     _ => None,
                 })
                 .collect();
-            doorbell::journal_append(
+            doorbell::journal_append_workspace(
                 &config::state_dir(),
                 workspace,
                 &msg,
-                &tick_actions,
+                &cmds,
                 serde_json::json!({ "stage": "sweep_inbox_cli", "pin": pin }),
             );
             injects.extend(raw_injects);
@@ -10911,11 +10943,19 @@ pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
         workflow: Box::new(|t| eprintln!("ingress routing bug: workflow via fact seam: {t:?}")),
         cron: Box::new(|n| eprintln!("ingress routing bug: cron via fact seam: {n}")),
         fact: Box::new(move |ev: &ingress::IngressEvent| {
-            // Live Fact path via tick (leftover #10) — no swallow into ()
+            // Live Fact path via workspace tick (leftover #10) — journal through the workspace model, not a discarded Default
             let summary = ingress::fact_doorbell_line(ev).unwrap_or_else(|| format!("{ev:?}"));
-            let msg = crate::doorbell_tick::DoorbellMsg::Fact { summary };
-            let _ =
-                crate::doorbell_tick::tick(&crate::doorbell_tick::DoorbellModel::default(), &msg);
+            let msg = crate::workspace::Msg::Fact { summary: summary.clone() };
+            let (next_model, cmds) = crate::workspace::tick(&crate::workspace::WorkspaceModel::default(), &msg);
+            // Journal the fact via workspace model (preserve for replay)
+            let _ = next_model; // model' is transient here; the durable journal is the seam's record
+            crate::doorbell::journal_append_workspace(
+                &crate::config::state_dir(),
+                &proj,
+                &msg,
+                &cmds,
+                serde_json::json!({ "stage": "fact_seam", "summary": summary }),
+            );
             match captain_fact_inject(&proj, ev) {
                 Ok(_) => {}
                 Err(e) => eprintln!("flywheel: [FactMiss] fact dropped at ingress seam: {e:#}"),

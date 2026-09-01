@@ -981,15 +981,23 @@ mod bell_fold_tests {
     fn bell_fold_once_calls_tick_not_second_reducer() {
         let main = include_str!("main.rs");
         let doorbell = include_str!("doorbell.rs");
-        // once_json should call tick, not apply_watch_line as live second reducer
+        // once_json should call workspace::tick, not apply_watch_line as live second reducer
         assert!(
-            main.contains("doorbell_tick::tick"),
-            "RED (bd-6b1y #9): main.rs must wire through tick"
+            main.contains("workspace::tick"),
+            "RED (bd-6b1y #9): main.rs must wire through workspace::tick"
         );
-        // doorbell.rs once_json must use tick after fix
+        // doorbell.rs once_json must use workspace::tick after fix (bd-3wzl)
         assert!(
-            doorbell.contains("doorbell_tick::tick"),
-            "RED (bd-6b1y #9): doorbell.rs once_json must call tick, not apply_watch_line"
+            doorbell.contains("workspace::tick"),
+            "RED (bd-6b1y #9): doorbell.rs once_json must call workspace::tick, not apply_watch_line"
+        );
+        assert!(
+            !doorbell.contains("fn apply_watch_line"),
+            "RED (bd-3wzl): doorbell.rs still has apply_watch_line second reducer — delete it"
+        );
+        assert!(
+            !doorbell.contains("fn apply_status_change"),
+            "RED (bd-3wzl): doorbell.rs still has apply_status_change second reducer — delete it"
         );
     }
 
@@ -1058,6 +1066,23 @@ mod bell_fold_tests {
         assert!(
             !slice.contains("raw.contains(&needle)") || slice.contains("fold"),
             "RED (bd-6b1y #11): why still greps pin substring — must fold tick"
+        );
+    }
+
+    #[test]
+    fn bell_fold_no_live_doorbell_tick_in_main() {
+        let src = include_str!("main.rs");
+        // LIVE dispatcher must route through workspace::tick, not direct doorbell_tick::tick
+        // Count occurrences of doorbell_tick::tick in main.rs live paths (exclude tests via #cfg)
+        // Simple scan: any occurrence is forbidden — workspace.rs is the only caller of slice ticks
+        let count = src.matches("doorbell_tick::tick").count();
+        assert_eq!(
+            count, 0,
+            "RED (bd-3wzl): main.rs still has {count} direct doorbell_tick::tick call(s) on live paths — must be 0, route through workspace::tick"
+        );
+        assert!(
+            src.contains("workspace::tick") || src.contains("WorkspaceModel"),
+            "RED (bd-3wzl): main.rs must hold WorkspaceModel and route via workspace::tick"
         );
     }
 }
