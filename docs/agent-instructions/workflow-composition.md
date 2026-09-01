@@ -20,6 +20,15 @@ Design doc: toron `docs/decisions/0022-phase-native-orchestration.md`.
 
 ## 1. The mental model (60 seconds)
 
+Four nouns, not interchangeable:
+
+- **stage** — one named prompt (`send --stage systematic-execute`). Catalog: `stage list`.
+- **workflow** — engine procedure (YAML steps or graph). A step *may* dispatch a stage to a `@role`. SIGNOFF is `request_approval`, not a stage.
+- **recipe** — compose token that expands to a workflow: `--parts wave-swarm` or `--parts repair-until-verified`. Other builtins are `workflow run <name> --execute`.
+- **profile** — role → harness + model + skills. `crew: auto` counts `@roles`. Not what makes a recipe.
+
+Loop / swarm / open are topologies (how work is supervised), not workflows.
+
 ```
 catalog + built-ins          your first stop — something already fits
         │  doesn't fit
@@ -55,7 +64,7 @@ arms and what they obligate you to do:
 | compose-parts | deterministic assembly suffices | compose with `--parts` |
 | compose-agent | the shape needs authoring | planner authors YAML; lint fail-stop |
 | steer | objective-driven, captain-free driving | `flywheel steer "<objective>"` |
-| loop-work | bead queue driving | `flywheel loop run <project> --work` |
+| loop-work | bead queue driving | `flywheel loop-mode run <project> --work` |
 | captain-audit | read-only audit of the captain session | run the audit workflow |
 
 Hard rules:

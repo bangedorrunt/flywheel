@@ -45,9 +45,15 @@ These are not interchangeable with workflow definitions:
   It may use `loop-mode --work` for bead supervision, but peer wake does not
   depend on the loop.
 
-A **workflow** is a reusable multi-step procedure. It can run inside a loop,
+A **workflow** is a reusable engine procedure. It can run inside a loop,
 inside a swarm, headlessly, or directly; it is not itself an execution
- topology.
+topology.
+
+A **stage** is one prompt (`send --stage`). A **recipe** is a compose token
+(`wave-swarm`, `repair-until-verified`) that expands to a workflow. A
+**profile** is role → harness/model; `crew: auto` counts `@roles`.
+`flywheel squad` / `recipes list` is a group of profiles (spawn shape), a
+different use of "recipe."
 
 ## Execution modes (ADR-0010)
 
