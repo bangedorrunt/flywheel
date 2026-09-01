@@ -1524,8 +1524,14 @@ mod tests {
     fn sc_d1_kind9_at_pin_injects_when_idle() {
         // Ported to workspace::tick per bd-3wzl — no second reducer
         let mut model = crate::workspace::WorkspaceModel::default();
-        model.doorbell.statuses.insert("BlueRidge".into(), "idle".into());
-        model.doorbell.statuses.insert("LilacChapel".into(), "idle".into());
+        model
+            .doorbell
+            .statuses
+            .insert("BlueRidge".into(), "idle".into());
+        model
+            .doorbell
+            .statuses
+            .insert("LilacChapel".into(), "idle".into());
         model.doorbell.index = SelfIndex::from_pins(["BlueRidge", "LilacChapel"]);
         let (next, cmds) = crate::workspace::tick(
             &model,
@@ -1564,7 +1570,10 @@ mod tests {
     fn sc_d3_working_queues_then_drains_on_idle() {
         // Ported to workspace::tick per bd-3wzl
         let mut model = crate::workspace::WorkspaceModel::default();
-        model.doorbell.statuses.insert("BlueRidge".into(), "working".into());
+        model
+            .doorbell
+            .statuses
+            .insert("BlueRidge".into(), "working".into());
         model.doorbell.index = SelfIndex::from_pins(["BlueRidge"]);
         let (next, cmds) = crate::workspace::tick(
             &model,
@@ -1598,7 +1607,13 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].0, "BlueRidge");
         assert!(drained[0].1.contains("[doorbell]"));
-        assert!(next2.doorbell.queues.get("BlueRidge").is_none_or(Vec::is_empty));
+        assert!(
+            next2
+                .doorbell
+                .queues
+                .get("BlueRidge")
+                .is_none_or(Vec::is_empty)
+        );
     }
 
     #[test]
@@ -1611,13 +1626,17 @@ mod tests {
         index.insert_pin("BlueRidge".into(), Some(npub.into()));
         index.insert_pin("LilacChapel".into(), None);
         let mut model = crate::workspace::WorkspaceModel::default();
-        model.doorbell.statuses.insert("BlueRidge".into(), "idle".into());
-        model.doorbell.statuses.insert("LilacChapel".into(), "idle".into());
+        model
+            .doorbell
+            .statuses
+            .insert("BlueRidge".into(), "idle".into());
+        model
+            .doorbell
+            .statuses
+            .insert("LilacChapel".into(), "idle".into());
         model.doorbell.index = index;
-        let (_, cmds) = crate::workspace::tick(
-            &model,
-            &crate::workspace::Msg::WatchNdjson { line },
-        );
+        let (_, cmds) =
+            crate::workspace::tick(&model, &crate::workspace::Msg::WatchNdjson { line });
         let prompts: Vec<_> = cmds
             .iter()
             .filter_map(|c| match c {
@@ -1625,7 +1644,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(prompts.len(), 1, "npub p-tag must resolve to pin, got {prompts:?}");
+        assert_eq!(
+            prompts.len(),
+            1,
+            "npub p-tag must resolve to pin, got {prompts:?}"
+        );
         assert_eq!(prompts[0].0, "BlueRidge");
         assert!(prompts[0].1.contains("[doorbell]"));
     }
@@ -1637,14 +1660,18 @@ mod tests {
             r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["h","steer-x"]],"content":"@BlueRidge take the repro"}}"#
         );
         let mut model = crate::workspace::WorkspaceModel::default();
-        model.doorbell.statuses.insert("BlueRidge".into(), "idle".into());
+        model
+            .doorbell
+            .statuses
+            .insert("BlueRidge".into(), "idle".into());
         model.doorbell.index = SelfIndex::from_pins(["BlueRidge"]);
         // also insert npub mapping so p-tag resolves but content also rings
-        model.doorbell.index.insert_pin("BlueRidge".into(), Some(npub.into()));
-        let (_, cmds) = crate::workspace::tick(
-            &model,
-            &crate::workspace::Msg::WatchNdjson { line },
-        );
+        model
+            .doorbell
+            .index
+            .insert_pin("BlueRidge".into(), Some(npub.into()));
+        let (_, cmds) =
+            crate::workspace::tick(&model, &crate::workspace::Msg::WatchNdjson { line });
         let prompts: Vec<_> = cmds
             .iter()
             .filter_map(|c| match c {
@@ -1652,7 +1679,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(prompts.len(), 1, "content @pin must ring even when p is npub");
+        assert_eq!(
+            prompts.len(),
+            1,
+            "content @pin must ring even when p is npub"
+        );
         assert_eq!(prompts[0].0, "BlueRidge");
     }
 
