@@ -7514,16 +7514,29 @@ fn cmd_doorbell_why(
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         // Deserialize msg for replay — prefer workspace::Msg, fallback to DoorbellMsg (legacy journal)
-        let replay_msg: Option<workspace::Msg> = if let Ok(m) = serde_json::from_value::<workspace::Msg>(msg_val.clone()) {
+        let replay_msg: Option<workspace::Msg> = if let Ok(m) =
+            serde_json::from_value::<workspace::Msg>(msg_val.clone())
+        {
             Some(m)
-        } else if let Ok(dm) = serde_json::from_value::<doorbell_tick::DoorbellMsg>(msg_val.clone()) {
+        } else if let Ok(dm) = serde_json::from_value::<doorbell_tick::DoorbellMsg>(msg_val.clone())
+        {
             Some(match dm {
-                doorbell_tick::DoorbellMsg::WatchNdjson { line } => workspace::Msg::WatchNdjson { line },
-                doorbell_tick::DoorbellMsg::InboxItems { raw, pin } => workspace::Msg::InboxItems { raw, pin },
-                doorbell_tick::DoorbellMsg::InboxRows { rows, pin } => workspace::Msg::InboxRows { rows, pin },
-                doorbell_tick::DoorbellMsg::HerdrStatus { pin, status } => workspace::Msg::HerdrStatus { pin, status },
+                doorbell_tick::DoorbellMsg::WatchNdjson { line } => {
+                    workspace::Msg::WatchNdjson { line }
+                }
+                doorbell_tick::DoorbellMsg::InboxItems { raw, pin } => {
+                    workspace::Msg::InboxItems { raw, pin }
+                }
+                doorbell_tick::DoorbellMsg::InboxRows { rows, pin } => {
+                    workspace::Msg::InboxRows { rows, pin }
+                }
+                doorbell_tick::DoorbellMsg::HerdrStatus { pin, status } => {
+                    workspace::Msg::HerdrStatus { pin, status }
+                }
                 doorbell_tick::DoorbellMsg::Fact { summary } => workspace::Msg::Fact { summary },
-                doorbell_tick::DoorbellMsg::AckSlaTick { now } => workspace::Msg::AckSlaTick { now },
+                doorbell_tick::DoorbellMsg::AckSlaTick { now } => {
+                    workspace::Msg::AckSlaTick { now }
+                }
                 doorbell_tick::DoorbellMsg::WatchDied => workspace::Msg::WatchDied,
             })
         } else {
@@ -7531,17 +7544,32 @@ fn cmd_doorbell_why(
         };
         if let Some(msg) = replay_msg {
             // Expected may be workspace::Cmd or legacy DoorbellAction
-            let expected: Vec<workspace::Cmd> = if let Ok(v) = serde_json::from_value::<Vec<workspace::Cmd>>(actions_val.clone()) {
+            let expected: Vec<workspace::Cmd> = if let Ok(v) =
+                serde_json::from_value::<Vec<workspace::Cmd>>(actions_val.clone())
+            {
                 v
-            } else if let Ok(legacy) = serde_json::from_value::<Vec<doorbell_tick::DoorbellAction>>(actions_val.clone()) {
-                legacy.into_iter().map(|a| match a {
-                    doorbell_tick::DoorbellAction::Prompt { pin, line } => workspace::Cmd::Prompt { pin, line },
-                    doorbell_tick::DoorbellAction::FetchInbox { since } => workspace::Cmd::FetchInbox { since },
-                    doorbell_tick::DoorbellAction::CheckAckSla => workspace::Cmd::CheckAckSla,
-                    doorbell_tick::DoorbellAction::RestartWatch => workspace::Cmd::RestartWatch,
-                    doorbell_tick::DoorbellAction::FactMiss { why } => workspace::Cmd::FactMiss { why },
-                    doorbell_tick::DoorbellAction::Audit { kind, pin, detail } => workspace::Cmd::Audit { kind, pin, detail },
-                }).collect()
+            } else if let Ok(legacy) =
+                serde_json::from_value::<Vec<doorbell_tick::DoorbellAction>>(actions_val.clone())
+            {
+                legacy
+                    .into_iter()
+                    .map(|a| match a {
+                        doorbell_tick::DoorbellAction::Prompt { pin, line } => {
+                            workspace::Cmd::Prompt { pin, line }
+                        }
+                        doorbell_tick::DoorbellAction::FetchInbox { since } => {
+                            workspace::Cmd::FetchInbox { since }
+                        }
+                        doorbell_tick::DoorbellAction::CheckAckSla => workspace::Cmd::CheckAckSla,
+                        doorbell_tick::DoorbellAction::RestartWatch => workspace::Cmd::RestartWatch,
+                        doorbell_tick::DoorbellAction::FactMiss { why } => {
+                            workspace::Cmd::FactMiss { why }
+                        }
+                        doorbell_tick::DoorbellAction::Audit { kind, pin, detail } => {
+                            workspace::Cmd::Audit { kind, pin, detail }
+                        }
+                    })
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -8006,9 +8034,7 @@ fn cmd_internal_doorbell(
                 let raw_injects: Vec<(String, String)> = cmds
                     .iter()
                     .filter_map(|a| match a {
-                        workspace::Cmd::Prompt { pin, line } => {
-                            Some((pin.clone(), line.clone()))
-                        }
+                        workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
                         other => {
                             delivered.push(serde_json::to_value(other).unwrap_or_default());
                             None
@@ -8109,9 +8135,7 @@ fn cmd_internal_doorbell(
                 let raw_injects: Vec<(String, String)> = cmds
                     .iter()
                     .filter_map(|a| match a {
-                        workspace::Cmd::Prompt { pin, line } => {
-                            Some((pin.clone(), line.clone()))
-                        }
+                        workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
                         _ => None,
                     })
                     .collect();
@@ -8608,9 +8632,7 @@ fn doorbell_refresh_status(
         let raw: Vec<(String, String)> = cmds
             .iter()
             .filter_map(|ac| match ac {
-                workspace::Cmd::Prompt { pin, line } => {
-                    Some((pin.clone(), line.clone()))
-                }
+                workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
                 _ => None,
             })
             .collect();
@@ -8681,7 +8703,10 @@ fn doorbell_sweep_inbox(
             .get(pin)
             .cloned()
             .unwrap_or_else(|| "idle".into());
-        workspace_model.doorbell.statuses.insert(pin.to_string(), status);
+        workspace_model
+            .doorbell
+            .statuses
+            .insert(pin.to_string(), status);
         workspace_model.doorbell.index = index.clone();
         // Prefer in-process mailbox (zero fork) — fallback to CLI only if unavailable
         let in_process_ok = (|| -> Option<()> {
@@ -8704,13 +8729,11 @@ fn doorbell_sweep_inbox(
             };
             let (next_model, cmds) = workspace::tick(workspace_model, &msg);
             *workspace_model = next_model;
-        handle_workspace_cmds(&cmds);
+            handle_workspace_cmds(&cmds);
             let raw: Vec<(String, String)> = cmds
                 .iter()
                 .filter_map(|a| match a {
-                    workspace::Cmd::Prompt { pin, line } => {
-                        Some((pin.clone(), line.clone()))
-                    }
+                    workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
                     _ => None,
                 })
                 .collect();
@@ -8806,9 +8829,7 @@ fn doorbell_sweep_inbox(
             let raw_injects: Vec<(String, String)> = cmds
                 .iter()
                 .filter_map(|a| match a {
-                    workspace::Cmd::Prompt { pin, line } => {
-                        Some((pin.clone(), line.clone()))
-                    }
+                    workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
                     _ => None,
                 })
                 .collect();
@@ -11011,8 +11032,11 @@ pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
         fact: Box::new(move |ev: &ingress::IngressEvent| {
             // Live Fact path via workspace tick (leftover #10) — journal through the workspace model, not a discarded Default
             let summary = ingress::fact_doorbell_line(ev).unwrap_or_else(|| format!("{ev:?}"));
-            let msg = crate::workspace::Msg::Fact { summary: summary.clone() };
-            let (next_model, cmds) = crate::workspace::tick(&crate::workspace::WorkspaceModel::default(), &msg);
+            let msg = crate::workspace::Msg::Fact {
+                summary: summary.clone(),
+            };
+            let (next_model, cmds) =
+                crate::workspace::tick(&crate::workspace::WorkspaceModel::default(), &msg);
             // Journal the fact via workspace model (preserve for replay)
             let _ = next_model; // model' is transient here; the durable journal is the seam's record
             crate::doorbell::journal_append_workspace(
@@ -16615,8 +16639,8 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
         heal_budget: Default::default(),
 
         pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
+        states: Default::default(),
+        dispatch_pending: Default::default(),
     };
     for (idx, entry) in entries.iter().enumerate() {
         let Some(msg_val) = entry.get("msg") else {

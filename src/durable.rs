@@ -5630,6 +5630,22 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // across replay via checkpointed leaf results that drive the same steps.
     let mut heal_states: std::collections::HashMap<String, HealState> =
         std::collections::HashMap::new();
+    // Crash-resume: restore heal counters from ActiveLoop file (crash-safe via
+    // bd-5fbv save at 6934; awaiting_clear is within-episode, always false on
+    // load so a fresh poll retries the diagnose).
+    if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
+        for (k, v) in al.heal_states {
+            heal_states.insert(
+                k,
+                HealState {
+                    unknown_count: v.unknown_count,
+                    diagnose_count: v.diagnose_count,
+                    respawn_count: v.respawn_count,
+                    awaiting_clear: false,
+                },
+            );
+        }
+    }
     // pane_exited names observed this iteration (event path feeds heal step)
     let mut exited_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     // bd-a7j: outstanding expected replies (agent → thread/head/reminder).
@@ -12309,8 +12325,8 @@ mod tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
+            states: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (next, actions) = tick(&model, &msg);
@@ -14483,8 +14499,8 @@ mod tick_replay_tests {
             heal_threshold: 1,
             heal_budget: 2,
             pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
+            states: Default::default(),
+            dispatch_pending: Default::default(),
         }
     }
 
@@ -14611,8 +14627,8 @@ mod tick_replay_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
+            states: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let msgs = vec![
             LoopMsg::Tick { now: 0 },
@@ -14648,8 +14664,8 @@ mod tick_replay_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
+            states: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let mut actions_log2 = Vec::new();
         for msg in &msgs {
@@ -14678,8 +14694,8 @@ mod tick_replay_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
+            states: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (m1, a1) = tick(&model, &msg);
@@ -14707,8 +14723,8 @@ mod tick_replay_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
+            states: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (next, actions) = tick(&model, &msg);
@@ -14744,8 +14760,8 @@ mod loop_invoke_vehicle_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
+            states: Default::default(),
+            dispatch_pending: Default::default(),
         };
         // Simulate a graph invoke for bd-1 that succeeds (in-graph green)
         let msg = LoopMsg::Tick { now: 0 };
@@ -14776,8 +14792,8 @@ mod loop_invoke_vehicle_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
+            states: Default::default(),
+            dispatch_pending: Default::default(),
         };
         // Simulate worker closing the bead via br close (BrClose event)
         let (next, _) = tick(
@@ -14822,8 +14838,8 @@ mod loop_invoke_vehicle_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
+            states: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let msg = LoopMsg::BrClose {
             bead_id: "bd-1".to_string(),
@@ -14891,8 +14907,8 @@ mod loop_invoke_vehicle_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
+            states: Default::default(),
+            dispatch_pending: Default::default(),
         };
         // For a bead that is not opted-in for graph, tick with Tick should just do normal plan_actions
         let msg = LoopMsg::Tick { now: 0 };
@@ -14935,8 +14951,8 @@ mod loop_invoke_vehicle_tests {
             heal_threshold: Default::default(),
             heal_budget: Default::default(),
             pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
+            states: Default::default(),
+            dispatch_pending: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (_, actions) = tick(&model, &msg);
