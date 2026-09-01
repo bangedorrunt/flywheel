@@ -5627,16 +5627,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // whose record has been dropped (the escalation path).
     let mut agent_kinds: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    // per-agent self-heal bookkeeping (bd-event-self-heal-unknown). Deterministic
-    // across replay via checkpointed leaf results that drive the same steps.
-    let mut heal_states: std::collections::HashMap<String, HealState> =
-        std::collections::HashMap::new();
-    // Crash-resume: restore heal counters from ActiveLoop file (crash-safe via
-    // bd-5fbv save at 6934; awaiting_clear is within-episode, always false on
-    // load so a fresh poll retries the diagnose).
+    // One heal map: LoopModel.heal_states. Crash-resume seeds it from
+    // ActiveLoop; tick is the only writer of awaiting_clear.
+    let mut heal_model = LoopModel::default();
     if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
         for (k, v) in al.heal_states {
-            heal_states.insert(
+            heal_model.heal_states.insert(
                 k,
                 HealState {
                     unknown_count: v.unknown_count,
@@ -6256,7 +6252,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             bead,
                             exited,
                             &states,
-                            heal_states.get(exited).unwrap_or(&HealState::default()),
+                            heal_model
+                                .heal_states
+                                .get(exited)
+                                .unwrap_or(&HealState::default()),
                             params.respawn_budget,
                         ) {
                             if board.iter().any(|(_, reason)| reason == &bead.id) {
@@ -6928,11 +6927,11 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 .map(|a| a.mail_health.clone())
                 .unwrap_or_default(),
             mail_degraded: mail_hold,
-            heal_states: heal_states.clone(),
+            heal_states: heal_model.heal_states.clone(),
             heal_grace: params.unknown_detect_grace_polls,
             heal_threshold: params.unknown_diagnose_threshold,
             heal_budget: params.respawn_budget,
-            pending_events: event_batch.events.clone(),
+            pending_events: Vec::new(),
             dispatch_pending: dispatch_pending.clone(),
             states: states.clone(),
         };
@@ -6952,11 +6951,19 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             *ws = next;
             acts
         };
-        let mut poll_actions = fold(
+        let mut poll_actions = Vec::new();
+        for pe in &event_batch.events {
+            poll_actions.extend(fold(
+                &mut ws,
+                crate::workspace::Msg::Herdr { event: pe.clone() },
+                LoopMsg::Herdr(pe.clone()),
+            ));
+        }
+        poll_actions.extend(fold(
             &mut ws,
             crate::workspace::Msg::Tick { now },
             LoopMsg::Tick { now },
-        );
+        ));
         // leftover #4 fixed: tick output is the plan, no filter of Diagnose pane_exited
         // Heal + nudge + reclaim all ride workspace::tick (one live entry).
         let mut extra_msgs = std::mem::take(&mut heal_msgs);
@@ -7025,7 +7032,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         queue = next_model.queue.clone();
         per_bead_phase = next_model.per_bead_phase.clone();
         dispatch_pending = next_model.dispatch_pending.clone();
-        heal_states = next_model.heal_states.clone();
+        heal_model.heal_states = next_model.heal_states.clone();
         states = next_model.states.clone();
         // Bounded retention: prune maps that would otherwise grow with every
         // bead/agent ever seen. Complete/WaveHeld beads older than the queue
@@ -7033,7 +7040,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         {
             let live_agents: std::collections::HashSet<&String> =
                 states.iter().map(|s| &s.name).collect();
-            heal_states.retain(|k, _| live_agents.contains(k));
+            heal_model
+                .heal_states
+                .retain(|k, _| live_agents.contains(k));
+            next_model.heal_states = heal_model.heal_states.clone();
             // per_bead_phase: keep only beads still in queue or recently active
             // (last 200 entries). This caps the map even under high churn.
             if per_bead_phase.len() > 500 {
@@ -7074,7 +7084,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             al.dispatch_pending = dispatch_pending.clone();
             // Persist heal counters (crash-safe; awaiting_clear is
             // within-episode state and deliberately does not survive restart).
-            al.heal_states = heal_states
+            al.heal_states = heal_model
+                .heal_states
                 .iter()
                 .map(|(k, v)| {
                     (
@@ -7602,7 +7613,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             );
                             let _ = extra;
                             next_model = next.swarm;
-                            heal_states = next_model.heal_states.clone();
+                            heal_model.heal_states = next_model.heal_states.clone();
                             eprintln!(
                                 "flywheel: diagnose_agent leaf failed for {name} (reverted awaiting_clear via tick): {e}"
                             );
@@ -7611,7 +7622,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     any_work = true;
                 }
                 LoopAction::Respawn { name, reason } => {
-                    let attempts = heal_states
+                    let attempts = heal_model
+                        .heal_states
                         .get(name)
                         .map(|h| u64::from(h.respawn_count))
                         .unwrap_or(1);
