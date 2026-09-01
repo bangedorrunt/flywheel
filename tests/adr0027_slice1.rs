@@ -38,27 +38,23 @@ fn flywheel_bin() -> String {
     option_env!("CARGO_BIN_EXE_flywheel")
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
-            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../target/debug/flywheel");
+            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/flywheel");
             if p.exists() {
                 return p.to_string_lossy().into_owned();
             }
             // also try workspace root target
-            let p2 = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target/debug/flywheel");
+            let p2 = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/flywheel");
             p2.to_string_lossy().into_owned()
         })
 }
 
 fn toron_bin() -> String {
     // Prefer built artifact, then PATH.
-    let cand = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../toron/target/debug/toron");
+    let cand = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../toron/target/debug/toron");
     if cand.exists() {
         return cand.to_string_lossy().into_owned();
     }
-    let cand2 = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../target/debug/toron");
+    let cand2 = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/toron");
     if cand2.exists() {
         return cand2.to_string_lossy().into_owned();
     }
@@ -75,8 +71,7 @@ fn toron_root() -> PathBuf {
 }
 
 fn read_file(path: &Path) -> String {
-    std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
 }
 
 fn contains(path: &Path, needle: &str) -> bool {
@@ -97,8 +92,7 @@ impl Scratch {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let base =
-            std::env::temp_dir().join(format!("fw-adr27-{tag}-{}-{ts}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("fw-adr27-{tag}-{}-{ts}", std::process::id()));
         let s = Scratch {
             dir: base.join("proj"),
             mailbox: base.join("mailbox"),
@@ -196,7 +190,13 @@ fn adr0027_s1_toron_send_flags_exist() {
     let content = read_file(&cli);
     // Flags are defined as `pub corr: Option<String>` with `#[arg(long)]` (field name -> flag name)
     // Check for field definitions, not just literal "--corr" strings
-    for field in ["pub corr:", "pub wake:", "pub priority:", "pub audience:", "pub result_path:"] {
+    for field in [
+        "pub corr:",
+        "pub wake:",
+        "pub priority:",
+        "pub audience:",
+        "pub result_path:",
+    ] {
         assert!(
             content.contains(field),
             "RED (bd-2u27): toron mail send missing field {field} — flags must ride SendMessage.extra_tags (E2). See bd-2u27 contract."
@@ -207,8 +207,15 @@ fn adr0027_s1_toron_send_flags_exist() {
         .args(["mail", "send", "--help"])
         .output()
         .expect("toron help");
-    let help = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
-    for flag in ["--corr", "--wake", "--priority", "--audience", "--result-path"] {
+    let help =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    for flag in [
+        "--corr",
+        "--wake",
+        "--priority",
+        "--audience",
+        "--result-path",
+    ] {
         assert!(
             help.contains(flag),
             "RED (bd-2u27): toron mail send --help missing {flag} — binary help must list it"
@@ -295,7 +302,9 @@ fn adr0027_s1_receipt_store_contract() {
         let has_wire = m.contains("receipt") || m.contains("Receipt");
         if !has_wire {
             // soft — cli definition is the minimum pin; wiring is second commit
-            eprintln!("warn: toron-cli main.rs does not yet wire receipt verbs (expected after bd-gokp)");
+            eprintln!(
+                "warn: toron-cli main.rs does not yet wire receipt verbs (expected after bd-gokp)"
+            );
         }
     }
 }
@@ -314,7 +323,10 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
         // try PATH fallback
         let out = Command::new(&fw).arg("--help").output();
         if out.is_err() || !out.unwrap().status.success() {
-            panic!("RED (bd-gmjo S1): flywheel binary not found at {} — build with cargo build --bin flywheel", fw);
+            panic!(
+                "RED (bd-gmjo S1): flywheel binary not found at {} — build with cargo build --bin flywheel",
+                fw
+            );
         }
     }
     let scratch = Scratch::new("s1-walker");
@@ -325,13 +337,37 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
         .output()
         .unwrap();
     // Register two pins: sender + recipient (use same style as e2e_loop_run_verify)
-    let out = scratch.run(&fw, &["mail", "register", scratch.dir.to_str().unwrap(), "--name", "adr27-sender"]);
+    let out = scratch.run(
+        &fw,
+        &[
+            "mail",
+            "register",
+            scratch.dir.to_str().unwrap(),
+            "--name",
+            "adr27-sender",
+        ],
+    );
     if !out.status.success() {
-        eprintln!("register sender stderr: {}", String::from_utf8_lossy(&out.stderr));
+        eprintln!(
+            "register sender stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
-    let out = scratch.run(&fw, &["mail", "register", scratch.dir.to_str().unwrap(), "--name", "adr27-recip"]);
+    let out = scratch.run(
+        &fw,
+        &[
+            "mail",
+            "register",
+            scratch.dir.to_str().unwrap(),
+            "--name",
+            "adr27-recip",
+        ],
+    );
     if !out.status.success() {
-        eprintln!("register recip stderr: {}", String::from_utf8_lossy(&out.stderr));
+        eprintln!(
+            "register recip stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     // Also register via toron directly to ensure project exists
     let proj = "adr27-s1";
@@ -340,20 +376,31 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
     // Try to send tasked mail with the new flags (bd-2u27). Before impl this will fail with unknown flag.
     let corr = "FM-GS-012";
     let send_args = [
-        "mail", "send",
-        "--project", proj,
-        "--as", "adr27-sender",
-        "--to", "adr27-recip",
-        "--subject", "tasked S1",
-        "--body", "standing vs tasked S1",
-        "--corr", corr,
-        "--wake", "tasked",
-        "--priority", "queue",
-        "--audience", "agents",
+        "mail",
+        "send",
+        "--project",
+        proj,
+        "--as",
+        "adr27-sender",
+        "--to",
+        "adr27-recip",
+        "--subject",
+        "tasked S1",
+        "--body",
+        "standing vs tasked S1",
+        "--corr",
+        corr,
+        "--wake",
+        "tasked",
+        "--priority",
+        "queue",
+        "--audience",
+        "agents",
     ];
     let out = scratch.run(&toron, &send_args);
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string()
+            + &String::from_utf8_lossy(&out.stdout);
         // If the flag is still unrecognized, that's the RED we care about (bd-2u27)
         if stderr.contains("unexpected argument") {
             panic!(
@@ -370,8 +417,13 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
         // The deeper flag+receipt contract is proven in toron-cli/tests and send_tags.rs.
         // We still verify the flag was recognized (not "unexpected argument") and continue
         // to the receipt store library check below.
-        if stderr.contains("unknown recipient") || stderr.contains("no local key") || stderr.contains("no operator key") {
-            eprintln!("warn: S1 CLI send skipped (harness setup): {stderr} — flag recognized, contract GREEN for bd-2u27");
+        if stderr.contains("unknown recipient")
+            || stderr.contains("no local key")
+            || stderr.contains("no operator key")
+        {
+            eprintln!(
+                "warn: S1 CLI send skipped (harness setup): {stderr} — flag recognized, contract GREEN for bd-2u27"
+            );
             // Verify receipt store directly via library instead of CLI send
             // (the durable store is the real S1 proof; CLI send is just one vehicle)
             let _ = std::fs::remove_dir_all(scratch.dir.parent().unwrap());
@@ -385,7 +437,10 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
         );
     }
     // Verify receipt exists via receipt get (bd-gokp) — durable sqlite, not HashMap
-    let out = scratch.run(&toron, &["receipt", "get", "--project", proj, "--corr", corr]);
+    let out = scratch.run(
+        &toron,
+        &["receipt", "get", "--project", proj, "--corr", corr],
+    );
     if !out.status.success() {
         panic!(
             "RED (bd-gmjo S1, bd-gokp): toron receipt get --corr {corr} failed after send\n\
@@ -396,7 +451,10 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
         );
     }
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
-        panic!("receipt get bad json: {e} stdout: {}", String::from_utf8_lossy(&out.stdout))
+        panic!(
+            "receipt get bad json: {e} stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
     });
     assert_eq!(
         v.get("corr").and_then(|x| x.as_str()).unwrap_or(""),
@@ -410,7 +468,10 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
         mailbox: scratch.mailbox.clone(),
         cfg: scratch.cfg.clone(),
     };
-    let out = scratch2.run(&toron, &["receipt", "get", "--project", proj, "--corr", corr]);
+    let out = scratch2.run(
+        &toron,
+        &["receipt", "get", "--project", proj, "--corr", corr],
+    );
     assert!(
         out.status.success(),
         "RED (bd-gmjo S1): new process must still see owed/acked for corr=FM-GS-012 (receipts store, not receipt_cache HashMap)\nstdout: {}\nstderr: {}",
@@ -422,17 +483,29 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
     // Empty tasked still writes a one-line result against corr (E3)
     // Send tasked empty body with --result-path and assert receipt state -> resulted
     let empty_corr = "FM-GS-012-empty";
-    let out = scratch2.run(&toron, &[
-        "mail", "send",
-        "--project", proj,
-        "--as", "adr27-sender",
-        "--to", "adr27-recip",
-        "--subject", "empty tasked",
-        "--body", "",
-        "--corr", empty_corr,
-        "--wake", "tasked",
-        "--result-path", "/tmp/adr27-result.txt",
-    ]);
+    let out = scratch2.run(
+        &toron,
+        &[
+            "mail",
+            "send",
+            "--project",
+            proj,
+            "--as",
+            "adr27-sender",
+            "--to",
+            "adr27-recip",
+            "--subject",
+            "empty tasked",
+            "--body",
+            "",
+            "--corr",
+            empty_corr,
+            "--wake",
+            "tasked",
+            "--result-path",
+            "/tmp/adr27-result.txt",
+        ],
+    );
     if !out.status.success() {
         panic!(
             "RED (bd-gmjo S1 empty tasked): empty tasked send failed\nstdout: {}\nstderr: {}",
@@ -442,7 +515,10 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
     }
     // After tick (assignment in Model), the empty tasked should have recorded a result
     // For now we just assert receipt exists and has result_path
-    let out = scratch2.run(&toron, &["receipt", "get", "--project", proj, "--corr", empty_corr]);
+    let out = scratch2.run(
+        &toron,
+        &["receipt", "get", "--project", proj, "--corr", empty_corr],
+    );
     assert!(
         out.status.success(),
         "RED (bd-gmjo S1): empty tasked must write result against corr\nstdout: {}\nstderr: {}",
@@ -459,7 +535,9 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
 fn adr0027_s1_standing_empty_silent_tasked_empty_result() {
     let ws = flywheel_manifest_dir().join("src/workspace.rs");
     if !ws.exists() {
-        panic!("RED (bd-gmjo S2, bd-7fat): src/workspace.rs missing — S2 pins standing/tasked in tick (E3)");
+        panic!(
+            "RED (bd-gmjo S2, bd-7fat): src/workspace.rs missing — S2 pins standing/tasked in tick (E3)"
+        );
     }
     let content = read_file(&ws);
     // S2 contract: standing + empty -> no Cmd to human pin; tasked + empty -> Cmd records result
@@ -468,12 +546,15 @@ fn adr0027_s1_standing_empty_silent_tasked_empty_result() {
         "RED (bd-gmjo S2, bd-dhm1): Workspace tick must distinguish wake=standing vs tasked (E3)"
     );
     assert!(
-        content.contains("result_path") || content.contains("result-path") || content.contains("result_path"),
+        content.contains("result_path")
+            || content.contains("result-path")
+            || content.contains("result_path"),
         "RED (bd-gmjo S2): tasked empty must carry result_path tag into tick"
     );
     // Default tasked priority is queue; interrupt is operator/user only, never onto human pin
     assert!(
-        content.contains("queue") && (content.contains("interrupt") || content.contains("Interrupt")),
+        content.contains("queue")
+            && (content.contains("interrupt") || content.contains("Interrupt")),
         "RED (bd-gmjo S2): tick must enforce default tasked priority=queue and interrupt never onto human pin (E3)"
     );
     // audience=human addresses one orchestrator pin; broadcast-to-human is hard error
@@ -485,9 +566,15 @@ fn adr0027_s1_standing_empty_silent_tasked_empty_result() {
     // standing empty must NOT produce Cmd::Publish to human pin (assert via code scan for Prompt guard)
     // We look for a conditional that returns early / no Prompt for standing empty.
     // This is a soft pin: we require the test to mention silence.
-    let has_silence = content.contains("standing") && (content.contains("no Cmd") || content.contains("silence") || content.contains("No Cmd") || content.contains("Prompt"));
+    let has_silence = content.contains("standing")
+        && (content.contains("no Cmd")
+            || content.contains("silence")
+            || content.contains("No Cmd")
+            || content.contains("Prompt"));
     if !has_silence {
-        eprintln!("warn: workspace.rs standing-empty silence not yet explicit — ensure tick emits no Cmd to human pin for wake=standing + empty");
+        eprintln!(
+            "warn: workspace.rs standing-empty silence not yet explicit — ensure tick emits no Cmd to human pin for wake=standing + empty"
+        );
     }
     // CLI-level S2: try to verify via toron receipt that standing empty has no prompt
     // We do not have a direct inject-assert without workspace tick, so we defer the full e2e to the integration test above.
@@ -518,7 +605,9 @@ fn adr0027_s1_guard_no_watch_sends_after_tick() {
         "RED (bd-gs8b #2): durable.rs still carries the DELIBERATELY loop-side comment — delete it when folding ClaimWatch"
     );
     assert!(
-        !content.contains("watch_sends.push") || content.contains("Msg::ClaimWatch") || content.contains("ClaimWatch"),
+        !content.contains("watch_sends.push")
+            || content.contains("Msg::ClaimWatch")
+            || content.contains("ClaimWatch"),
         "RED (bd-gs8b #2): watch_sends.push should be gone or replaced by Msg::ClaimWatch construction"
     );
 }
@@ -530,7 +619,9 @@ fn adr0027_s1_guard_no_diagnose_pane_exited_filter() {
     let content = read_file(&durable);
     // The filter that was at 6956-6962: `!matches!(a, LoopAction::Diagnose { reason: "pane_exited" } if exited_names.contains(name))`
     // Legitimate uses of "pane_exited" remain (e.g., reclaim_on_pane_exited at 4576, 5067). Check for the filter pattern.
-    let has_filter = content.contains("exited_names.contains") && content.contains("Diagnose") && content.contains("pane_exited");
+    let has_filter = content.contains("exited_names.contains")
+        && content.contains("Diagnose")
+        && content.contains("pane_exited");
     // Also check for the old comment that was at 6846 before fix — now it should say "leftover #4 fixed"
     let has_fixed_comment = content.contains("leftover #4 fixed");
     assert!(
@@ -550,7 +641,9 @@ fn adr0027_s1_guard_no_double_bell_model_and_no_status_preinsert_and_watchdied_k
     let main_rs = flywheel_manifest_dir().join("src/main.rs");
     let content = read_file(&main_rs);
     // 6. double bell_model = Default at 7747 then 7819 — one model for dispatcher lifetime
-    let count = content.matches("let mut bell_model = doorbell_tick::DoorbellModel::default()").count();
+    let count = content
+        .matches("let mut bell_model = doorbell_tick::DoorbellModel::default()")
+        .count();
     assert!(
         count <= 1,
         "RED (bd-6b1y #6): main.rs has {count} bell_model = Default (7747/7819) — must be ONE model for dispatcher lifetime"
@@ -567,10 +660,13 @@ fn adr0027_s1_guard_no_double_bell_model_and_no_status_preinsert_and_watchdied_k
         // allow at most 1-2 non-Herdr inserts, but the 2 Herdr inserts must be gone
         // We do a stricter check: look for the comment that was added to disambiguate
         // After fix, the lines 8006/8444 should be gone.
-        let has_live_insert = content.contains("// apply_status_change. `from` is kept") || content.contains("bell_model.statuses.insert(pin.clone(), to.clone())");
+        let has_live_insert = content.contains("// apply_status_change. `from` is kept")
+            || content.contains("bell_model.statuses.insert(pin.clone(), to.clone())");
         if has_live_insert {
             // still RED — count exact pattern
-            let specific = content.matches("bell_model.statuses.insert(pin.clone(), to.clone())").count();
+            let specific = content
+                .matches("bell_model.statuses.insert(pin.clone(), to.clone())")
+                .count();
             assert!(
                 specific <= 1,
                 "RED (bd-6b1y #7): main.rs still pre-inserts statuses before HerdrStatus tick (live 8006, refresh 8444) — stop; let tick see `from` (drain fires on working->idle/done/blocked)"
@@ -600,16 +696,17 @@ fn adr0027_s1_guard_once_calls_tick_not_second_reducer() {
         m_content.clone()
     };
     assert!(
-        !once_section.contains("apply_watch_line") || once_section.contains("doorbell_tick::tick"),
+        !once_section.contains("apply_watch_line") || once_section.contains("workspace::tick"),
         "RED (bd-6b1y #9): --once still uses apply_watch_line second reducer (doorbell.rs 1240/1267) — --once must call tick; helpers may call tick, never a second producer"
     );
     assert!(
         !d_content.contains("apply_status_change") || d_content.contains("tick(&WorkspaceModel"),
         "RED (bd-6b1y #9): doorbell.rs apply_status_change second reducer still present on live path"
     );
-    // More direct: ensure the `once` flag handling in main.rs invokes doorbell_tick::tick or Workspace tick
+    // More direct: ensure the `once` flag handling in main.rs invokes workspace::tick or legacy doorbell_tick::tick
     assert!(
-        m_content.contains("doorbell_tick::tick") && (m_content.contains("--once") || m_content.contains("once")),
+        (m_content.contains("workspace::tick") || m_content.contains("doorbell_tick::tick"))
+            && (m_content.contains("--once") || m_content.contains("once")),
         "RED (bd-6b1y #9): main.rs must wire --once through tick (not bypass)"
     );
 }
@@ -620,7 +717,13 @@ fn adr0027_s1_guard_every_live_event_constructs_msg() {
     let main_rs = flywheel_manifest_dir().join("src/main.rs");
     let content = read_file(&main_rs);
     // Live dispatcher binds at least: AckSlaTick, WatchNdjson, HerdrStatus, WatchDied, InboxRows sweep
-    for msg_variant in ["AckSlaTick", "WatchNdjson", "HerdrStatus", "WatchDied", "InboxRows"] {
+    for msg_variant in [
+        "AckSlaTick",
+        "WatchNdjson",
+        "HerdrStatus",
+        "WatchDied",
+        "InboxRows",
+    ] {
         assert!(
             content.contains(msg_variant),
             "RED (bd-6b1y/bd-gs8b E1): main.rs live dispatcher never constructs DoorbellMsg::{msg_variant} / Msg::{msg_variant} — every live edge must be a Msg into tick"
@@ -632,7 +735,8 @@ fn adr0027_s1_guard_every_live_event_constructs_msg() {
     // After fold they live only in doorbell_tick.rs / workspace.rs
     // For now we just assert tick is the only state transition
     assert!(
-        content.contains("doorbell_tick::tick(&bell_model, &msg)") || content.contains("tick(&WorkspaceModel"),
+        content.contains("doorbell_tick::tick(&bell_model, &msg)")
+            || content.contains("tick(&WorkspaceModel"),
         "RED (bd-6b1y E1): live dispatcher must call tick(Model, Msg) as the only state transition"
     );
 }
@@ -692,7 +796,10 @@ fn adr0027_s1_why_corr_seq_replays_tick() {
     if let Some(pos) = m.find("fn cmd_doorbell_why") {
         let why_fn = m[pos..std::cmp::min(m.len(), pos + 8000)].to_string();
         assert!(
-            why_fn.contains("fold") || why_fn.contains("replay") || why_fn.contains("WorkspaceModel::default") || why_fn.contains("tick("),
+            why_fn.contains("fold")
+                || why_fn.contains("replay")
+                || why_fn.contains("WorkspaceModel::default")
+                || why_fn.contains("tick("),
             "RED (bd-6b1y #11): doorbell why must fold tick from Default over journal and assert same Cmd sequence — currently greps pin substring (7480-7556), not replay. why_fn missing fold/replay/tick call"
         );
         assert!(
@@ -719,7 +826,10 @@ fn adr0027_s1_why_corr_seq_replays_tick() {
 fn adr0027_s1_receipt_cli_wired() {
     let toron_cli_main = toron_root().join("crates/toron-cli/src/main.rs");
     if !toron_cli_main.exists() {
-        eprintln!("skip: toron-cli main.rs not found at {}", toron_cli_main.display());
+        eprintln!(
+            "skip: toron-cli main.rs not found at {}",
+            toron_cli_main.display()
+        );
         return;
     }
     let m = read_file(&toron_cli_main);

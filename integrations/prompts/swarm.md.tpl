@@ -53,7 +53,7 @@ default, explicit provider/model overrides. Use consistently.
    interrogate/debate. Cross-sweep -> flag, victim re-commits.
    never-block-on-the-human.
 
-7. WAVE GATE: captain verifies with fresh eyes — suite+fmt+clippy AND the
+7. WAVE GATE: captain verifies with fresh eyes -- suite+fmt+clippy AND the
    actual wiring: a green suite can hide unwired producers/arms (the
    ADR-0027 facade: source-scan guards passed while live paths never called
    the new entry). Read the call sites; verify dropped-behavior lists (grep

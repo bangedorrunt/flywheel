@@ -155,14 +155,15 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         .expect("project_base after doorbell helpers");
     let body = &src[start..end];
     // bd-yw4s: the reducer is the decider on the live path — Watch, Status,
-    // Died, and AckSlaTick all flow through doorbell_tick::tick.
+    // Died, and AckSlaTick all flow through workspace::tick (via doorbell slice).
     assert!(
-        body.contains("doorbell_tick::tick"),
-        "live dispatcher must decide via doorbell_tick::tick"
+        body.contains("workspace::tick") || body.contains("doorbell_tick::tick"),
+        "live dispatcher must decide via workspace::tick (or legacy doorbell_tick::tick)"
     );
     assert!(
-        body.matches("doorbell_tick::DoorbellMsg::").count() >= 3,
-        "live dispatcher must construct DoorbellMsgs (watch/status/ack-sla)"
+        body.matches("workspace::Msg::").count() >= 3
+            || body.matches("doorbell_tick::DoorbellMsg::").count() >= 3,
+        "live dispatcher must construct Msgs (watch/status/ack-sla)"
     );
     assert!(
         body.contains("doorbell::journal_append"),

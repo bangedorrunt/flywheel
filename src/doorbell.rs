@@ -1234,73 +1234,25 @@ pub fn parse_status_pair(s: &str) -> Option<(String, String)> {
     Some((pin.to_string(), st.to_string()))
 }
 
-/// Classify one watch NDJSON line. Idle/done pins inject now; working pins
-/// queue (last-write-wins per class). Unmentioned pins stay quiet.
-/// Trust: line carries triggering event id for proof (gap 17).
-pub fn apply_watch_line(
-    line: &str,
-    index: &SelfIndex,
-    status_by_pin: &BTreeMap<String, String>,
-    queues: &mut BTreeMap<String, DoorbellQueue>,
-) -> Vec<(String, String)> {
-    let Some((class, hint)) = parse_watch_ndjson(line, index) else {
-        return Vec::new();
-    };
-    let id = watch_id(line).unwrap_or_default();
-    let msg = doorbell_line_with_event(class, &hint, &id);
-    let mut inject = Vec::new();
-    for pin in watch_targets(line, index) {
-        let status = status_by_pin
-            .get(&pin)
-            .map(String::as_str)
-            .unwrap_or("unknown");
-        if should_inject(status) {
-            inject.push((pin, msg.clone()));
-        } else {
-            queues.entry(pin).or_default().push(class, msg.clone());
-        }
-    }
-    inject
-}
-
-/// Drain a pin's queue on working → idle|done. Empty if not a drain edge.
-/// Helper kept for tests only — live path uses tick(&WorkspaceModel, &Msg) (bd-6b1y #9, no second reducer).
-pub fn apply_status_change(
-    pin: &str,
-    from: &str,
-    to: &str,
-    queues: &mut BTreeMap<String, DoorbellQueue>,
-) -> Vec<(String, String)> {
-    if !is_drain_transition(from, to) {
-        return Vec::new();
-    }
-    match queues.get_mut(pin) {
-        Some(q) => q
-            .drain()
-            .into_iter()
-            .map(|(_, line)| (pin.to_string(), line))
-            .collect(),
-        None => Vec::new(),
-    }
-}
+/// Second reducers deleted per bd-3wzl.
+/// Live dispatcher now routes every watch/status edge through `workspace::tick` (tick(&WorkspaceModel, &Msg)).
+/// Tests below port the same scenarios to `workspace::tick` (see `sc_d1_*`).
 
 /// herdr-mock: stdin watch lines + pin statuses → JSON injects via tick (no second reducer).
 pub fn once_json(stdin: &str, status_by_pin: &BTreeMap<String, String>) -> String {
     let index = SelfIndex::from_pins(status_by_pin.keys().cloned());
-    let mut model = crate::doorbell_tick::DoorbellModel {
-        statuses: status_by_pin.clone(),
-        index,
-        ..Default::default()
-    };
+    let mut model = crate::workspace::WorkspaceModel::default();
+    model.doorbell.statuses = status_by_pin.clone();
+    model.doorbell.index = index;
     let mut rows = Vec::new();
     for line in stdin.lines() {
-        let msg = crate::doorbell_tick::DoorbellMsg::WatchNdjson {
+        let msg = crate::workspace::Msg::WatchNdjson {
             line: line.to_string(),
         };
-        let (next, actions) = crate::doorbell_tick::tick(&model, &msg);
+        let (next, cmds) = crate::workspace::tick(&model, &msg);
         model = next;
-        for a in actions {
-            if let crate::doorbell_tick::DoorbellAction::Prompt { pin, line } = a {
+        for a in cmds {
+            if let crate::workspace::Cmd::Prompt { pin, line } = a {
                 rows.push(serde_json::json!({"pin": pin, "line": line}));
             }
         }
@@ -1334,6 +1286,34 @@ pub fn journal_append(
         "workspace": workspace,
         "msg": msg,
         "actions": actions,
+        "executed": executed,
+    });
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{entry}");
+    }
+}
+
+pub fn journal_append_workspace(
+    state_dir: &Path,
+    workspace: &str,
+    msg: &crate::workspace::Msg,
+    cmds: &[crate::workspace::Cmd],
+    executed: serde_json::Value,
+) {
+    let path = journal_file(state_dir, workspace);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let entry = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "workspace": workspace,
+        "msg": msg,
+        "actions": cmds,
         "executed": executed,
     });
     use std::io::Write;
@@ -1542,24 +1522,28 @@ mod tests {
 
     #[test]
     fn sc_d1_kind9_at_pin_injects_when_idle() {
-        let mut status = BTreeMap::new();
-        status.insert("BlueRidge".into(), "idle".into());
-        status.insert("LilacChapel".into(), "idle".into());
-        let mut queues = BTreeMap::new();
-        let out = apply_watch_line(
-            kind9_at_blueridge(),
-            &SelfIndex::from_pins(["BlueRidge", "LilacChapel"]),
-            &status,
-            &mut queues,
+        // Ported to workspace::tick per bd-3wzl — no second reducer
+        let mut model = crate::workspace::WorkspaceModel::default();
+        model.doorbell.statuses.insert("BlueRidge".into(), "idle".into());
+        model.doorbell.statuses.insert("LilacChapel".into(), "idle".into());
+        model.doorbell.index = SelfIndex::from_pins(["BlueRidge", "LilacChapel"]);
+        let (next, cmds) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::WatchNdjson {
+                line: kind9_at_blueridge().to_string(),
+            },
         );
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].0, "BlueRidge");
-        assert!(
-            out[0].1.contains("[doorbell]"),
-            "inject is a doorbell, got {}",
-            out[0].1
-        );
-        assert!(queues.is_empty(), "idle pin must not queue");
+        let prompts: Vec<_> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                crate::workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].0, "BlueRidge");
+        assert!(prompts[0].1.contains("[doorbell]"));
+        assert!(next.doorbell.queues.is_empty(), "idle pin must not queue");
     }
 
     #[test]
@@ -1578,26 +1562,43 @@ mod tests {
 
     #[test]
     fn sc_d3_working_queues_then_drains_on_idle() {
-        let mut status = BTreeMap::new();
-        status.insert("BlueRidge".into(), "working".into());
-        let mut queues = BTreeMap::new();
-        let inject = apply_watch_line(
-            kind9_at_blueridge(),
-            &SelfIndex::from_pins(["BlueRidge"]),
-            &status,
-            &mut queues,
+        // Ported to workspace::tick per bd-3wzl
+        let mut model = crate::workspace::WorkspaceModel::default();
+        model.doorbell.statuses.insert("BlueRidge".into(), "working".into());
+        model.doorbell.index = SelfIndex::from_pins(["BlueRidge"]);
+        let (next, cmds) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::WatchNdjson {
+                line: kind9_at_blueridge().to_string(),
+            },
         );
-        assert!(inject.is_empty(), "working pin must not inject");
-        assert_eq!(queues.get("BlueRidge").map(DoorbellQueue::len), Some(1));
-        let drained = apply_status_change("BlueRidge", "working", "idle", &mut queues);
+        let prompts: Vec<_> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                crate::workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(prompts.is_empty(), "working pin must not inject");
+        assert_eq!(next.doorbell.queues.get("BlueRidge").map(Vec::len), Some(1));
+        let (next2, cmds2) = crate::workspace::tick(
+            &next,
+            &crate::workspace::Msg::HerdrStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        let drained: Vec<_> = cmds2
+            .iter()
+            .filter_map(|c| match c {
+                crate::workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                _ => None,
+            })
+            .collect();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].0, "BlueRidge");
-        assert!(
-            drained[0].1.contains("[doorbell]"),
-            "drain is a doorbell, got {}",
-            drained[0].1
-        );
-        assert!(queues.get("BlueRidge").is_none_or(DoorbellQueue::is_empty));
+        assert!(drained[0].1.contains("[doorbell]"));
+        assert!(next2.doorbell.queues.get("BlueRidge").is_none_or(Vec::is_empty));
     }
 
     #[test]
@@ -1609,14 +1610,24 @@ mod tests {
         let mut index = SelfIndex::default();
         index.insert_pin("BlueRidge".into(), Some(npub.into()));
         index.insert_pin("LilacChapel".into(), None);
-        let mut status = BTreeMap::new();
-        status.insert("BlueRidge".into(), "idle".into());
-        status.insert("LilacChapel".into(), "idle".into());
-        let mut queues = BTreeMap::new();
-        let out = apply_watch_line(&line, &index, &status, &mut queues);
-        assert_eq!(out.len(), 1, "npub p-tag must resolve to pin, got {out:?}");
-        assert_eq!(out[0].0, "BlueRidge");
-        assert!(out[0].1.contains("[doorbell]"));
+        let mut model = crate::workspace::WorkspaceModel::default();
+        model.doorbell.statuses.insert("BlueRidge".into(), "idle".into());
+        model.doorbell.statuses.insert("LilacChapel".into(), "idle".into());
+        model.doorbell.index = index;
+        let (_, cmds) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::WatchNdjson { line },
+        );
+        let prompts: Vec<_> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                crate::workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prompts.len(), 1, "npub p-tag must resolve to pin, got {prompts:?}");
+        assert_eq!(prompts[0].0, "BlueRidge");
+        assert!(prompts[0].1.contains("[doorbell]"));
     }
 
     #[test]
@@ -1625,17 +1636,24 @@ mod tests {
         let line = format!(
             r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["h","steer-x"]],"content":"@BlueRidge take the repro"}}"#
         );
-        let mut status = BTreeMap::new();
-        status.insert("BlueRidge".into(), "idle".into());
-        let mut queues = BTreeMap::new();
-        let out = apply_watch_line(
-            &line,
-            &SelfIndex::from_pins(["BlueRidge"]),
-            &status,
-            &mut queues,
+        let mut model = crate::workspace::WorkspaceModel::default();
+        model.doorbell.statuses.insert("BlueRidge".into(), "idle".into());
+        model.doorbell.index = SelfIndex::from_pins(["BlueRidge"]);
+        // also insert npub mapping so p-tag resolves but content also rings
+        model.doorbell.index.insert_pin("BlueRidge".into(), Some(npub.into()));
+        let (_, cmds) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::WatchNdjson { line },
         );
-        assert_eq!(out.len(), 1, "content @pin must ring even when p is npub");
-        assert_eq!(out[0].0, "BlueRidge");
+        let prompts: Vec<_> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                crate::workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prompts.len(), 1, "content @pin must ring even when p is npub");
+        assert_eq!(prompts[0].0, "BlueRidge");
     }
 
     #[test]
