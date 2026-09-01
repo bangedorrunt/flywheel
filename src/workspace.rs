@@ -113,11 +113,26 @@ pub enum Msg {
         holder_pin: String,
         claimant_pin: String,
         is_live: bool,
+        #[serde(default)]
+        reason: String,
     },
     Heal {
         name: String,
         status: String,
         exited: bool,
+    },
+    ClaimNudge {
+        name: String,
+        bead_id: String,
+    },
+    CloseNudge {
+        name: String,
+        bead_id: String,
+        title: String,
+    },
+    /// Clock for plane-P fetch: effect runs FetchInbox; rows re-enter as InboxRows.
+    Sweep {
+        since: String,
     },
     Receipt {
         corr: String,
@@ -276,6 +291,96 @@ impl Cmd {
             crate::durable::LoopAction::Wait => Self::Wait,
         }
     }
+
+    /// Swarm executor still drains LoopAction; doorbell cmds stay None.
+    pub fn to_loop_action(&self) -> Option<crate::durable::LoopAction> {
+        match self {
+            Self::Send { name, text } => Some(crate::durable::LoopAction::Send {
+                name: name.clone(),
+                text: text.clone(),
+            }),
+            Self::PinStamp { bead_id, pin } => Some(crate::durable::LoopAction::PinStamp {
+                bead_id: bead_id.clone(),
+                pin: pin.clone(),
+            }),
+            Self::DispatchImmediate { name, text } => {
+                Some(crate::durable::LoopAction::DispatchImmediate {
+                    name: name.clone(),
+                    text: text.clone(),
+                })
+            }
+            Self::Blocked { name } => {
+                Some(crate::durable::LoopAction::Blocked { name: name.clone() })
+            }
+            Self::Nudge { name } => Some(crate::durable::LoopAction::Nudge { name: name.clone() }),
+            Self::Diagnose { name, reason } => Some(crate::durable::LoopAction::Diagnose {
+                name: name.clone(),
+                reason: reason.clone(),
+            }),
+            Self::Respawn { name, reason } => Some(crate::durable::LoopAction::Respawn {
+                name: name.clone(),
+                reason: reason.clone(),
+            }),
+            Self::Reclaim {
+                bead_id,
+                pin,
+                herdr_name,
+                reason,
+            } => Some(crate::durable::LoopAction::Reclaim {
+                bead_id: bead_id.clone(),
+                pin: pin.clone(),
+                herdr_name: herdr_name.clone(),
+                reason: reason.clone(),
+            }),
+            Self::Wait => Some(crate::durable::LoopAction::Wait),
+            _ => None,
+        }
+    }
+}
+
+fn prompt_allowed(model: &WorkspaceModel, pin: &str) -> bool {
+    match model.presence.get(pin) {
+        Some(Presence::Working) => false,
+        Some(Presence::Unknown) | None => crate::doorbell::should_inject(
+            model
+                .doorbell
+                .statuses
+                .get(pin)
+                .map(String::as_str)
+                .unwrap_or("unknown"),
+        ),
+        Some(p) => crate::doorbell::should_inject(p.as_str()),
+    }
+}
+
+fn filter_prompts(model: &WorkspaceModel, cmds: Vec<Cmd>) -> Vec<Cmd> {
+    cmds.into_iter()
+        .filter(|c| match c {
+            Cmd::Prompt { pin, .. } => prompt_allowed(model, pin),
+            _ => true,
+        })
+        .collect()
+}
+
+fn mint_human_question(next: &mut WorkspaceModel, cmds: &mut Vec<Cmd>, corr: &str, body: &str) {
+    if next.open_human.contains_key(corr) {
+        cmds.push(Cmd::LoudMiss {
+            why: format!("question already open for corr {corr}"),
+        });
+        return;
+    }
+    next.open_human.insert(
+        corr.to_string(),
+        Question {
+            corr: corr.to_string(),
+            body: body.to_string(),
+            created_at: 0,
+        },
+    );
+    cmds.push(Cmd::Publish {
+        kind: 14,
+        content: body.to_string(),
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +405,62 @@ fn swarm_slice(
     (next, cmds)
 }
 
+/// Replay / live-loop helper: every LoopMsg enters through workspace::tick.
+pub fn tick_from_loop_msg(
+    model: &crate::durable::LoopModel,
+    msg: &crate::durable::LoopMsg,
+) -> (crate::durable::LoopModel, Vec<crate::durable::LoopAction>) {
+    let ws_msg = match msg {
+        crate::durable::LoopMsg::Tick { now } => Msg::Tick { now: *now },
+        crate::durable::LoopMsg::Heal {
+            name,
+            status,
+            exited,
+        } => Msg::Heal {
+            name: name.clone(),
+            status: status.clone(),
+            exited: *exited,
+        },
+        crate::durable::LoopMsg::ClaimNudge { name, bead_id } => Msg::ClaimNudge {
+            name: name.clone(),
+            bead_id: bead_id.clone(),
+        },
+        crate::durable::LoopMsg::CloseNudge {
+            name,
+            bead_id,
+            title,
+        } => Msg::CloseNudge {
+            name: name.clone(),
+            bead_id: bead_id.clone(),
+            title: title.clone(),
+        },
+        crate::durable::LoopMsg::Reclaim {
+            bead_id,
+            holder_pin,
+            claimant_pin,
+            is_live,
+        } => Msg::Reclaim {
+            bead_id: bead_id.clone(),
+            holder_pin: holder_pin.clone(),
+            claimant_pin: claimant_pin.clone(),
+            is_live: *is_live,
+            reason: String::new(),
+        },
+        other => {
+            let (next, cmds) = swarm_slice(model, other.clone());
+            let acts = cmds.iter().filter_map(|c| c.to_loop_action()).collect();
+            return (next, acts);
+        }
+    };
+    let wm = WorkspaceModel {
+        swarm: model.clone(),
+        ..Default::default()
+    };
+    let (wm, cmds) = tick(&wm, &ws_msg);
+    let acts = cmds.iter().filter_map(|c| c.to_loop_action()).collect();
+    (wm.swarm, acts)
+}
+
 // ---------------------------------------------------------------------------
 // Entry: one tick
 // ---------------------------------------------------------------------------
@@ -318,8 +479,9 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 crate::doorbell_tick::DoorbellMsg::WatchNdjson { line: line.clone() },
             );
             next.doorbell = dm;
-            cmds.extend(c);
-            // E2/E4/E6: handle 30013 role=, 20001 presence, and kind-9 corr/wake
+            cmds.extend(filter_prompts(&next, c));
+            // E2/E4/E6: 30013 role=, 20001 presence. Kind-9 is the ring, not
+            // the assignment vehicle — corr/wake ride rumor 14 / InboxRows.
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 // 20001 presence
                 if v.get("kind").and_then(|k| k.as_u64()) == Some(20001) {
@@ -393,40 +555,48 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                             }
                         }
                     }
-                    if let Some(c) = corr {
-                        let w = wake.unwrap_or_else(|| "tasked".to_string());
-                        let a = audience.unwrap_or_else(|| "agents".to_string());
-                        let p = priority.unwrap_or_else(|| "queue".to_string());
-                        let body = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                        let broadcast = false;
-                        if a == "human" && broadcast {
-                            cmds.push(Cmd::LoudMiss {
-                                why: format!("broadcast to human is hard error for corr {c}"),
-                            });
-                        } else if p == "interrupt" && a == "human" {
-                            cmds.push(Cmd::LoudMiss {
-                                why: format!("interrupt never onto human pin for corr {c}"),
-                            });
-                        } else if w == "standing" && body.is_empty() {
-                            // silence
-                        } else {
-                            let state = if w == "tasked" && body.is_empty() {
-                                "resulted"
+                    // Kind-9 is the ring. Assignment enters from rumor 14 tags
+                    // (or InboxRows from FetchInbox). Never from mail-delivered.
+                    let kind = v.get("kind").and_then(|k| k.as_u64());
+                    if kind == Some(14) {
+                        if let Some(c) = corr {
+                            let w = wake.unwrap_or_else(|| "tasked".to_string());
+                            let a = audience.unwrap_or_else(|| "agents".to_string());
+                            let p = priority.unwrap_or_else(|| "queue".to_string());
+                            let body = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                            let broadcast = false;
+                            if a == "human" && broadcast {
+                                cmds.push(Cmd::LoudMiss {
+                                    why: format!("broadcast to human is hard error for corr {c}"),
+                                });
+                            } else if p == "interrupt" && a == "human" {
+                                cmds.push(Cmd::LoudMiss {
+                                    why: format!("interrupt never onto human pin for corr {c}"),
+                                });
+                            } else if w == "standing" && body.is_empty() {
+                                // silence
                             } else {
-                                "owed"
-                            };
-                            let receipt = Receipt {
-                                state: state.to_string(),
-                                wake: w.clone(),
-                                due_at: None,
-                                result_path: result_path.clone(),
-                            };
-                            next.assignment.insert(c.clone(), receipt.clone());
-                            cmds.push(Cmd::SqliteUpsert {
-                                corr: c.clone(),
-                                receipt: receipt.clone(),
-                            });
-                            cmds.push(Cmd::WaitCorr { corr: c });
+                                if a == "human" && !body.is_empty() {
+                                    mint_human_question(&mut next, &mut cmds, &c, body);
+                                }
+                                let state = if w == "tasked" && body.is_empty() {
+                                    "resulted"
+                                } else {
+                                    "owed"
+                                };
+                                let receipt = Receipt {
+                                    state: state.to_string(),
+                                    wake: w.clone(),
+                                    due_at: None,
+                                    result_path: result_path.clone(),
+                                };
+                                next.assignment.insert(c.clone(), receipt.clone());
+                                cmds.push(Cmd::SqliteUpsert {
+                                    corr: c.clone(),
+                                    receipt: receipt.clone(),
+                                });
+                                cmds.push(Cmd::WaitCorr { corr: c });
+                            }
                         }
                     }
                 }
@@ -441,7 +611,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 },
             );
             next.doorbell = dm;
-            cmds.extend(c);
+            cmds.extend(filter_prompts(&next, c));
         }
         Msg::InboxRows { rows, pin } => {
             let (dm, c) = doorbell_slice(
@@ -452,7 +622,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 },
             );
             next.doorbell = dm;
-            cmds.extend(c);
+            cmds.extend(filter_prompts(&next, c));
             // E2/E3: assignment from tagged rows (corr/wake/priority/audience/result_path)
             for row in rows {
                 let corr = row
@@ -509,6 +679,9 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 if wake == "standing" && body.is_empty() {
                     continue;
                 }
+                if audience == "human" && !body.is_empty() {
+                    mint_human_question(&mut next, &mut cmds, &corr, &body);
+                }
                 // tasked + empty body -> result against corr
                 let state = if wake == "tasked" && body.is_empty() {
                     "resulted"
@@ -540,7 +713,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 },
             );
             next.doorbell = dm;
-            cmds.extend(c);
+            cmds.extend(filter_prompts(&next, c));
         }
         Msg::Fact { summary } => {
             let (dm, c) = doorbell_slice(
@@ -550,7 +723,23 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 },
             );
             next.doorbell = dm;
-            cmds.extend(c);
+            if let Some(pin) = next
+                .roles
+                .get("captain")
+                .cloned()
+                .or_else(|| next.roles.get("wheelhouse").cloned())
+            {
+                if prompt_allowed(&next, &pin) {
+                    cmds.push(Cmd::Prompt {
+                        pin,
+                        line: format!("[doorbell] {summary}"),
+                    });
+                } else {
+                    cmds.extend(c);
+                }
+            } else {
+                cmds.extend(c);
+            }
         }
         Msg::AckSlaTick { now } => {
             let (dm, c) = doorbell_slice(
@@ -559,6 +748,11 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             );
             next.doorbell = dm;
             cmds.extend(c);
+        }
+        Msg::Sweep { since } => {
+            cmds.push(Cmd::FetchInbox {
+                since: since.clone(),
+            });
         }
         Msg::WatchDied => {
             let (dm, c) = doorbell_slice(
@@ -578,8 +772,9 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             holder_pin,
             claimant_pin,
             is_live,
+            reason,
         } => {
-            let (sm, c) = swarm_slice(
+            let (sm, mut c) = swarm_slice(
                 &model.swarm,
                 crate::durable::LoopMsg::Reclaim {
                     bead_id: bead_id.clone(),
@@ -589,6 +784,18 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 },
             );
             next.swarm = sm;
+            if !c.iter().any(|cmd| matches!(cmd, Cmd::Reclaim { .. })) {
+                c.push(Cmd::Reclaim {
+                    bead_id: bead_id.clone(),
+                    pin: holder_pin.clone(),
+                    herdr_name: claimant_pin.clone(),
+                    reason: if reason.is_empty() {
+                        "reclaim".into()
+                    } else {
+                        reason.clone()
+                    },
+                });
+            }
             cmds.extend(c);
         }
         Msg::Heal {
@@ -596,12 +803,43 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             status,
             exited,
         } => {
-            if *exited {
-                cmds.push(Cmd::Diagnose {
+            let (sm, c) = swarm_slice(
+                &model.swarm,
+                crate::durable::LoopMsg::Heal {
                     name: name.clone(),
-                    reason: format!("heal:{status}"),
-                });
-            }
+                    status: status.clone(),
+                    exited: *exited,
+                },
+            );
+            next.swarm = sm;
+            cmds.extend(c);
+        }
+        Msg::ClaimNudge { name, bead_id } => {
+            let (sm, c) = swarm_slice(
+                &model.swarm,
+                crate::durable::LoopMsg::ClaimNudge {
+                    name: name.clone(),
+                    bead_id: bead_id.clone(),
+                },
+            );
+            next.swarm = sm;
+            cmds.extend(c);
+        }
+        Msg::CloseNudge {
+            name,
+            bead_id,
+            title,
+        } => {
+            let (sm, c) = swarm_slice(
+                &model.swarm,
+                crate::durable::LoopMsg::CloseNudge {
+                    name: name.clone(),
+                    bead_id: bead_id.clone(),
+                    title: title.clone(),
+                },
+            );
+            next.swarm = sm;
+            cmds.extend(c);
         }
         Msg::Receipt { corr, receipt } => {
             next.assignment.insert(corr.clone(), receipt.clone());
@@ -631,7 +869,9 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             }
         }
         Msg::Tick { now } => {
-            let _ = now;
+            let (sm, c) = swarm_slice(&model.swarm, crate::durable::LoopMsg::Tick { now: *now });
+            next.swarm = sm;
+            cmds.extend(c);
         }
     }
 
@@ -664,6 +904,48 @@ mod tests {
         assert_eq!(m1.seq, 1);
         let (m2, _) = tick(&m1, &Msg::Tick { now: 42 });
         assert_eq!(m2.seq, 2);
+    }
+
+    #[test]
+    fn ws_model_herdr_status_is_inject_truth() {
+        let mut m = empty_model();
+        m.doorbell.index.insert_pin("BlueRidge".into(), None);
+        let (m, _) = tick(
+            &m,
+            &Msg::HerdrStatus {
+                pin: "BlueRidge".into(),
+                status: "working".into(),
+            },
+        );
+        assert_eq!(
+            m.doorbell.statuses.get("BlueRidge").map(String::as_str),
+            Some("working"),
+            "HerdrStatus tick is the only status write"
+        );
+        let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#;
+        let (m, cmds) = tick(&m, &Msg::WatchNdjson { line: line.into() });
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
+            "inject reads Model.doorbell.statuses, not a side map"
+        );
+        assert_eq!(m.doorbell.queues.get("BlueRidge").map(Vec::len), Some(1));
+        let (m2, cmds2) = tick(
+            &m,
+            &Msg::HerdrStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        assert!(
+            cmds2.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
+            "working->idle drain fires from Model, not a parallel map"
+        );
+        assert!(
+            m2.doorbell
+                .queues
+                .get("BlueRidge")
+                .is_none_or(|q| q.is_empty())
+        );
     }
 
     #[test]
@@ -874,9 +1156,128 @@ mod tests {
                 holder_pin: "A".into(),
                 claimant_pin: "B".into(),
                 is_live: false,
+                reason: "pane_exited".into(),
             },
         );
         assert_eq!(next.seq, 1);
+    }
+
+    #[test]
+    fn tick_clock_drives_swarm_queue() {
+        let mut m = empty_model();
+        m.swarm.queue.push("bd-1".into());
+        let (next, cmds) = tick(&m, &Msg::Tick { now: 1 });
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::Send { name, .. } if name == "bd-1")),
+            "Msg::Tick must run swarm_slice, not no-op"
+        );
+        assert!(next.swarm.queue.is_empty());
+        assert!(next.swarm.dispatch_pending.contains("bd-1"));
+    }
+
+    #[test]
+    fn tick_heal_runs_swarm_slice() {
+        let m = empty_model();
+        let (next, cmds) = tick(
+            &m,
+            &Msg::Heal {
+                name: "oc".into(),
+                status: "idle".into(),
+                exited: true,
+            },
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::Diagnose { name, .. } if name == "oc"))
+        );
+        assert!(
+            next.swarm.heal_states.contains_key("oc"),
+            "Msg::Heal must call swarm_slice so heal_states land in Model"
+        );
+    }
+
+    #[test]
+    fn tick_reclaim_always_emits_cmd() {
+        let m = empty_model();
+        let (_, cmds) = tick(
+            &m,
+            &Msg::Reclaim {
+                bead_id: "bd-9".into(),
+                holder_pin: "Holder".into(),
+                claimant_pin: "Holder".into(),
+                is_live: false,
+                reason: "pane_exited".into(),
+            },
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::Reclaim { bead_id, .. } if bead_id == "bd-9")),
+            "Reclaim Msg must emit Cmd even when LoopPhase transition is illegal"
+        );
+    }
+
+    #[test]
+    fn kind9_is_ring_not_assignment() {
+        let line = r#"{"kind":9,"tags":[["corr","C9"],["wake","tasked"]],"content":"hi"}"#;
+        let (next, cmds) = tick(&empty_model(), &Msg::WatchNdjson { line: line.into() });
+        assert!(
+            !next.assignment.contains_key("C9"),
+            "kind-9 mail-delivered is the ring; assignment enters from InboxRows / rumor 14"
+        );
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::SqliteUpsert { .. })));
+    }
+
+    #[test]
+    fn human_decision_mints_at_most_one_question() {
+        let row = serde_json::json!({
+            "corr": "FM-H",
+            "wake": "tasked",
+            "body": "approve this?",
+            "audience": "human"
+        });
+        let (m1, cmds1) = tick(
+            &empty_model(),
+            &Msg::InboxRows {
+                rows: vec![row.clone()],
+                pin: "Tester".into(),
+            },
+        );
+        assert!(m1.open_human.contains_key("FM-H"));
+        assert!(
+            cmds1
+                .iter()
+                .any(|c| matches!(c, Cmd::Publish { kind, .. } if *kind == 14))
+        );
+        let (m2, cmds2) = tick(
+            &m1,
+            &Msg::InboxRows {
+                rows: vec![row],
+                pin: "Tester".into(),
+            },
+        );
+        assert_eq!(m2.open_human.len(), 1);
+        assert!(
+            cmds2
+                .iter()
+                .any(|c| matches!(c, Cmd::LoudMiss { why } if why.contains("already open")))
+        );
+    }
+
+    #[test]
+    fn inject_skips_prompt_when_presence_working() {
+        let mut m = empty_model();
+        m.doorbell.index.insert_pin("BlueRidge".into(), None);
+        m.doorbell
+            .statuses
+            .insert("BlueRidge".into(), "idle".into());
+        m.presence.insert("BlueRidge".into(), Presence::Working);
+        let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#;
+        let (_, cmds) = tick(&m, &Msg::WatchNdjson { line: line.into() });
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
+            "inject reads Model.presence; working pin is not prompted"
+        );
     }
 
     #[test]
@@ -907,12 +1308,23 @@ mod tests {
                 holder_pin: "h".into(),
                 claimant_pin: "c".into(),
                 is_live: false,
+                reason: String::new(),
             },
             Msg::Heal {
                 name: "n".into(),
                 status: "s".into(),
                 exited: false,
             },
+            Msg::ClaimNudge {
+                name: "n".into(),
+                bead_id: "b".into(),
+            },
+            Msg::CloseNudge {
+                name: "n".into(),
+                bead_id: "b".into(),
+                title: "t".into(),
+            },
+            Msg::Sweep { since: "0".into() },
             Msg::Receipt {
                 corr: "c".into(),
                 receipt: Receipt::default(),
@@ -960,6 +1372,41 @@ mod bell_fold_tests {
         assert!(
             count <= 1,
             "RED (bd-6b1y #7): main.rs still pre-inserts statuses before HerdrStatus tick"
+        );
+        assert!(
+            !src.contains("status_by_pin.insert"),
+            "RED: dispatcher still writes a side map before HerdrStatus; tick owns Model.doorbell.statuses"
+        );
+    }
+
+    #[test]
+    fn bell_fold_no_status_by_pin_side_map() {
+        let src = include_str!("main.rs");
+        let start = src.find("fn cmd_internal_doorbell(").expect("dispatcher");
+        let refresh = src.find("fn doorbell_refresh_status(").expect("refresh");
+        let sweep = src.find("fn doorbell_sweep_inbox(").expect("sweep");
+        let dispatcher = &src[start..refresh];
+        assert!(
+            !dispatcher.contains("let mut status_by_pin"),
+            "RED: live dispatcher still owns status_by_pin; Model.doorbell.statuses is the only herdr-status map"
+        );
+        assert!(
+            !dispatcher.contains("status_by_pin"),
+            "RED: dispatcher still passes status_by_pin into sweep/refresh"
+        );
+        let refresh_fn = &src[refresh..sweep];
+        assert!(
+            !refresh_fn.contains("status_by_pin"),
+            "RED: doorbell_refresh_status still takes/writes status_by_pin; tick HerdrStatus writes Model"
+        );
+        let sweep_end = src[sweep..]
+            .find("\nfn ")
+            .map(|i| sweep + i)
+            .unwrap_or(src.len());
+        let sweep_fn = &src[sweep..sweep_end];
+        assert!(
+            !sweep_fn.contains("status_by_pin"),
+            "RED: doorbell_sweep_inbox still takes status_by_pin; inject reads Model after InboxRows tick"
         );
     }
 
@@ -1013,6 +1460,14 @@ mod bell_fold_tests {
             src.contains("DoorbellMsg::Fact") || src.contains("Fact {"),
             "RED (bd-6b1y #10): DoorbellMsg::Fact not on live path in main.rs"
         );
+        assert!(
+            !src.contains("WorkspaceModel::default(), &msg"),
+            "Fact must tick the live workspace_model, not Default"
+        );
+        assert!(
+            src.contains("drain_pending_facts") && src.contains("append_pending_fact"),
+            "ingress queues facts; dispatcher ticks them on the live model"
+        );
         // adapter must not swallow Err into ()
         assert!(
             !src.contains("if let Err(e) = captain_fact_inject(&proj, ev)"),
@@ -1064,8 +1519,29 @@ mod bell_fold_tests {
             "RED (bd-6b1y #11): why must gain --corr / --seq flags — why_fn missing corr/seq"
         );
         assert!(
-            !slice.contains("raw.contains(&needle)") || slice.contains("fold"),
-            "RED (bd-6b1y #11): why still greps pin substring — must fold tick"
+            !slice.contains("raw.contains(&format!") && !slice.contains("raw.contains(&needle)"),
+            "why display must filter from fold (cmds/model), not pin-substring grep"
+        );
+    }
+
+    #[test]
+    fn handle_workspace_cmds_waitcorr_ticks_receipt() {
+        let src = include_str!("main.rs");
+        let pos = src
+            .find("fn handle_workspace_cmds(")
+            .expect("handle_workspace_cmds");
+        let slice = &src[pos..src.len().min(pos + 2500)];
+        assert!(
+            slice.contains("Msg::Receipt") && slice.contains("workspace::tick"),
+            "WaitCorr must re-enter Receipt through tick, not discard the store row"
+        );
+        assert!(
+            !slice.contains("let _ = r"),
+            "WaitCorr must not peek-and-drop the receipt"
+        );
+        assert!(
+            !src.contains("subscribe cmd {filter}"),
+            "Subscribe must not eprintln; live bus already subscribed"
         );
     }
 
@@ -1090,6 +1566,24 @@ mod bell_fold_tests {
 #[cfg(test)]
 mod loop_fold_tests {
     #[test]
+    fn loop_fold_live_entry_is_workspace_tick() {
+        let durable = include_str!("durable.rs");
+        assert!(
+            durable.contains("crate::workspace::tick"),
+            "swarm_loop must call workspace::tick, not durable::tick as the live entry"
+        );
+        let main = include_str!("main.rs");
+        assert!(
+            !main.contains("crate::durable::tick(&model, &msg)"),
+            "loop replay must fold workspace::tick, not durable::tick"
+        );
+        assert!(
+            !durable.contains("poll_actions.extend(reclaim_actions)"),
+            "reclaim must not bypass tick"
+        );
+    }
+
+    #[test]
     fn loop_fold_nudges_via_tick_msgs() {
         let durable = include_str!("durable.rs");
         // Nudges are decisions that ride Msgs into tick (ClaimNudge/CloseNudge
@@ -1099,8 +1593,9 @@ mod loop_fold_tests {
             "RED (bd-gs8b #2): claim/close nudges must be tick Msgs, not loop-side Sends"
         );
         assert!(
-            durable.contains("extra_msgs.append(&mut nudge_msgs)"),
-            "nudge Msgs must be folded through tick after the poll tick"
+            durable.contains("extra_msgs.append(&mut nudge_msgs)")
+                && durable.contains("crate::workspace::tick"),
+            "nudge Msgs must be folded through workspace::tick after the poll tick"
         );
         // The old silent-drop is banned forever.
         assert!(
@@ -1112,12 +1607,14 @@ mod loop_fold_tests {
     #[test]
     fn loop_fold_no_heal_pre_seed() {
         let durable = include_str!("durable.rs");
-        // Reclaim pre-seeds heal_actions before tick — must be Msg::Reclaim into tick
+        // Reclaim is a Msg the live producer ticks; never extend after.
         assert!(
-            !durable.contains("heal_actions")
-                || durable.contains("Msg::Reclaim")
-                || durable.contains("Reclaim {"),
-            "RED (bd-gs8b #3): durable.rs still pre-seeds heal_actions before tick — must be Msg::Reclaim into tick, then actions = tick(...) only"
+            !durable.contains("poll_actions.extend(reclaim_actions)"),
+            "RED (bd-gs8b #3): reclaim still bypasses tick via poll_actions.extend(reclaim_actions)"
+        );
+        assert!(
+            durable.contains("crate::workspace::Msg::Reclaim") || durable.contains("Msg::Reclaim"),
+            "live producer must construct Msg::Reclaim"
         );
         // Check that tick is the only producer of actions (no pre-seed var)
         let has_preseed =

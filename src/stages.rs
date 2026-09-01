@@ -271,7 +271,7 @@ impl StageLibrary {
             (
                 "wave-dispatch",
                 "",
-                "Wave dispatch (ADR-0006 D3/D1/D4). FIRST read the gate artifact `.flywheel/wave/<wave-label>-ready.json` (bd-wave-swarm-graduation-fix-98io — you dispatch ONLY beads the GATE wrote there; if the file is missing or \"held\": true, post `[dispatch] held` and STOP). For EACH bead in ready[] emit ONE payload to the crew's coder pane (find it: `herdr agent list`, this workspace, profile coder): `flywheel send --to <coder-pane-name> --stage p1 --param bead=<id> --param scope=<owned globs> --param exit=<the bead's VERIFY command from the artifact> --param channel=<steer-channel> --param pin=<coder-pin> --param report_file=/tmp/<id>-report-<epoch>.md`. Every payload NAMES its bead id and carries the CLAIM/CLOSE CONTRACT — also post it once on the steer channel: claim before work (`br update <id> --status=in_progress --assignee <pin>`), reserve files before editing, commit BEFORE close with the bead id in the message, close only with VERIFY tail + principles citations. Full reports go to report_file; the steer channel gets a <=700-char summary plus the file path.",
+                "Wave dispatch (ADR-0006 D3/D1/D4). FIRST read the gate artifact `.flywheel/wave/<wave-label>-ready.json` (bd-wave-swarm-graduation-fix-98io — you dispatch ONLY beads the GATE wrote there; if the file is missing or \"held\": true, post `[dispatch] held` and STOP). For EACH bead in ready[] emit ONE payload to the crew's coder pane (find it: `herdr agent list`, this workspace, profile coder): `flywheel send --to <coder-pane-name> --stage systematic-execute --param bead=<id> --param scope=<owned globs> --param exit=<the bead's VERIFY command from the artifact> --param channel=<steer-channel> --param pin=<coder-pin> --param report_file=/tmp/<id>-report-<epoch>.md`. p1/fresh-eyes-explore is scout-only; coder execution is systematic-execute (p6). Every payload NAMES its bead id and carries the CLAIM/CLOSE CONTRACT — also post it once on the steer channel: claim before work (`br update <id> --status=in_progress --assignee <pin>`), reserve files before editing, commit BEFORE close with the bead id in the message, close only with VERIFY tail + principles citations. Full reports go to report_file; the steer channel gets a <=700-char summary plus the file path.",
             ),
             (
                 "wave-observe",
@@ -965,6 +965,23 @@ mod tests {
     }
 
     /// ADR-0006 D3: the wave-swarm recipe's compiled-in stages resolve.
+    #[test]
+    fn wave_dispatch_briefs_systematic_execute_not_p1() {
+        let lib = StageLibrary::compiled_in();
+        let prompt = &lib
+            .get_stage("wave-dispatch")
+            .expect("wave-dispatch seed")
+            .prompt;
+        assert!(
+            prompt.contains("--stage systematic-execute"),
+            "DISPATCH must brief the coder stage, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("--stage p1"),
+            "p1 is fresh-eyes-explore (scout); coder execution is systematic-execute/p6"
+        );
+    }
+
     #[test]
     fn wave_swarm_stages_resolve_compiled_in() {
         let lib = StageLibrary::compiled_in();

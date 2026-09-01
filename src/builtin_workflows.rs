@@ -1104,7 +1104,7 @@ steps:
         "wave-swarm",
         r##"
 name: wave-swarm
-description: "ADR-0006 D3: the composed wave swarm. GATE scopes br ready to one wave label and holds on any open lower wave; DISPATCH emits send --stage p1 --param payloads (bead/scope/exit/channel/pin/report_file); OBSERVE escalates to the captain and never adjudicates; VERIFY checks receipts at committed HEAD + close-reason VERIFY tails + decision-naming principles citations; SIGNOFF suspends for captain-only approval."
+description: "ADR-0006 D3: the composed wave swarm. GATE scopes br ready to one wave label and holds on any open lower wave; DISPATCH emits send --stage systematic-execute --param payloads (bead/scope/exit/channel/pin/report_file); OBSERVE escalates to the captain and never adjudicates; VERIFY checks receipts at committed HEAD + close-reason VERIFY tails + decision-naming principles citations; SIGNOFF suspends for captain-only approval."
 trigger:
   type: webhook
 crew: auto
@@ -1129,14 +1129,16 @@ steps:
       stage: wave-gate
       task: 'Gate the wave {{inputs.wave_label}}: preflight + scope `br ready` to the label; write .flywheel/wave/{{inputs.wave_label}}-ready.json (the DISPATCH binding artifact); a lower open wave holds. Objective: {{inputs.objective}}'
     on_error: fail_run
+    error_kinds: [timeout, rate_limit, unknown]
   - name: dispatch
     action: dispatch_job
     assignee: x
     spec:
       profile: "@planner"
       stage: wave-dispatch
-      task: 'Dispatch ONLY the beads in .flywheel/wave/{{inputs.wave_label}}-ready.json — one send --stage p1 --param payload per bead, each naming its bead id + the claim/close contract; onto {{inputs.steer_channel}}. The crew escalates to orchestrator pin {{inputs.captain_pin}}. Objective: {{inputs.objective}}'
+      task: 'Dispatch ONLY the beads in .flywheel/wave/{{inputs.wave_label}}-ready.json — one send --stage systematic-execute --param payload per bead, each naming its bead id + the claim/close contract; onto {{inputs.steer_channel}}. The crew escalates to orchestrator pin {{inputs.captain_pin}}. Objective: {{inputs.objective}}'
     on_error: fail_run
+    error_kinds: [timeout, rate_limit, unknown]
   - name: execute
     action: dispatch_job
     assignee: x
@@ -1145,6 +1147,7 @@ steps:
       stage: systematic-execute
       task: 'Execute the wave beads listed in .flywheel/wave/{{inputs.wave_label}}-ready.json (claim -> run each bead''s VERIFY -> commit before close -> ledger-legal close with VERIFY tail + principles citations). Objective: {{inputs.objective}}'
     on_error: fail_run
+    error_kinds: [timeout, rate_limit, unknown]
   - name: observe
     action: dispatch_job
     assignee: x
@@ -1161,6 +1164,7 @@ steps:
       stage: wave-verify
       task: 'Verify every close claim: receipt at committed HEAD + VERIFY tail + principles citations. Objective: {{inputs.objective}}'
     on_error: fail_run
+    error_kinds: [timeout, rate_limit, unknown]
   - name: signoff
     action: request_approval
     message: "Wave signoff (captain-only) for {{inputs.objective}} [{{inputs.wave_label}}]: review the VERIFY receipts and the steer-channel summary; approve closes the wave gate, reject reopens."

@@ -4,8 +4,8 @@
 Run /swarm-mode: captain-led multi-crew execution.
 
 Args: objective, scope, crew shape, flags. The captain steers crews via
-current harness/profile per role. Parallel counterpart to /loop (solo).
-Swarm for lanes and waves; loop for one objective in one pane.
+current harness/profile per role. Parallel counterpart to /loop-mode (solo).
+Swarm for lanes and waves; loop-mode for one objective in one pane.
 
 One captain, up to 5 crews; lanes run parallel when files don't overlap.
 Keep objective authoritative, each lane verifiable.
@@ -16,8 +16,12 @@ Ask operator for model routing per profile (planner/coder/reviewer/scout)
 before spawn/dispatch. Show default + registry alternatives; blank keeps
 default, explicit provider/model overrides. Use consistently.
 
-1. CLASSIFY: `flywheel decide "<target>" --json --ready-beads N`.
-   Follow primitive (sequence-verifiable-units).
+1. RUN: `flywheel workflow compose "<objective>" --parts wave-swarm --run --inputs
+   '{"objective": "<target>"}'`. Slash /swarm-mode pins this recipe. Do not
+   re-run `flywheel decide` — that can divert to loop-work or steer.
+   GATE->DISPATCH->EXECUTE->OBSERVE->VERIFY->SIGNOFF. The run parks at
+   SIGNOFF: resolve via `flywheel workflow approve`. DISPATCH briefs
+   `--stage systematic-execute` (p6) onto coder panes, never p1.
 
 2. GATE PREP: `br sync --flush-only`; clear stale assignees; commit tracker.
    Map bead graph (deps, waves). Waves ONE AT A TIME; epics are gates.
@@ -28,15 +32,10 @@ default, explicit provider/model overrides. Use consistently.
    posts VERIFIED/FAILED). guard-the-context-window: bulk to subagents,
    summaries in main thread.
 
-4. WAVES + SPAWN (waves are the default for supervised multi-lane
-   work; spawn is the manual escape): run the wave as a recipe:
-   `flywheel workflow compose "<objective>" --parts wave-swarm --run --inputs
-   '{"objective": "<target>"}'` -- GATE->DISPATCH->OBSERVE->VERIFY->
-   SIGNOFF; swarm-mode is the crew, wave-swarm is the recipe. The run
-   parks at SIGNOFF: you resolve the approval (flywheel runs list).
-   MANUAL ESCAPE (un-waved ad-hoc lanes): `flywheel spawn <proj>
-   --profile <role> --count N`; explicit provider/model only on
-   override. Keep wake separate from supervision.
+4. ESCAPE (un-waved ad-hoc lanes only): `flywheel spawn <proj>
+   --profile <role> --count N --escape`; kind/count + --model/--provider
+   without --escape warns. `/swarm-mode peer-aware=off` maps to spawn
+   `--no-peer-aware`. Keep wake separate from supervision.
 
 5. BRIEF: lane dispatch authoritative. Peer wakes are signals, not tasks.
    Bead ids, files, pin, claim (br update in_progress), reserve (toron
@@ -54,10 +53,10 @@ default, explicit provider/model overrides. Use consistently.
    never-block-on-the-human.
 
 7. WAVE GATE: captain verifies with fresh eyes -- suite+fmt+clippy AND the
-   actual wiring: a green suite can hide unwired producers/arms (the
-   ADR-0027 facade: source-scan guards passed while live paths never called
-   the new entry). Read the call sites; verify dropped-behavior lists (grep
-   `let _ =` on action vecs). Close the epic with evidence, then next wave.
+   actual wiring. Live doorbell and swarm_loop must call workspace::tick
+   (slice reducers stay private). Read the call sites; verify dropped-behavior
+   lists (grep `let _ =` on action vecs). Close the epic with evidence, then
+   next wave.
 
 8. TEARDOWN: release reservations + slot, kill --force-working, br sync,
    commit .beads.

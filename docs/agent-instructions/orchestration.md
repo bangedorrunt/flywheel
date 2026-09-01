@@ -15,7 +15,7 @@ ADR-0005 + 0010 + 0011 + 0012. Authoring: [docs/workflow-authoring.md](../workfl
 | open mode | `/open-mode`: direct work in the current pane; no crew, durable loop, or swarm lifecycle |
 | loop mode | `/loop-mode` / `flywheel loop-mode run`: durable solo execution in one current harness; `--work` opts into tracked work |
 | swarm mode | `/swarm-mode`: captain-led multi-crew execution with parallel lanes; loop supervision is optional |
-| doorbell | workspace `__doorbell` (ADR-0005 Layer 0). Spawn starts it. `flywheel kill` stops it. `/peer-aware` attaches. Shared by loop and swarm when enabled. |
+| doorbell | workspace `__doorbell` (ADR-0005 Layer 0). Spawn starts it. `flywheel kill` stops it. `/peer-aware-mode` attaches. Shared by loop-mode and swarm-mode when enabled. |
 
 ## Captain selector
 
@@ -31,7 +31,7 @@ Run `flywheel decide "<target>" --json` (pure classifier in `src/decide.rs`). Ru
 | spawn-send | `spawn --profile` (never `add --oc`) |
 | cron-start | `cron start` |
 
-`workflow run` without `--execute` is a no-op. `--mode` default is **headless**. `steer` always `--execute --mode pane`.
+`workflow run` without `--execute` records control-flow only (no pane dispatch). Real work needs `--execute`. `--mode` default is **headless**. `steer` always `--execute --mode pane`. `/swarm-mode` pins `compose --parts wave-swarm --run` (do not re-run decide). `/loop-mode` pins `loop-mode run <project> --work`.
 
 ## Operating topologies
 

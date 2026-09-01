@@ -648,6 +648,10 @@ fn adr0027_s1_guard_no_double_bell_model_and_no_status_preinsert_and_watchdied_k
         count <= 1,
         "RED (bd-6b1y #6): main.rs has {count} bell_model = Default (7747/7819) — must be ONE model for dispatcher lifetime"
     );
+    assert!(
+        !content.contains("let mut status_by_pin"),
+        "RED: live dispatcher still owns status_by_pin; Model.doorbell.statuses is the only herdr-status map"
+    );
     // 7. statuses.insert(to) before HerdrStatus tick (8006 live, 8444 refresh) -> drain dead
     // Check for the pre-insert pattern immediately before tick for HerdrStatus
     // We scan for the two-insert sites; after fix they must not appear before doorbell_tick::tick for HerdrStatus

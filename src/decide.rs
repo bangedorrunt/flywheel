@@ -30,6 +30,20 @@ fn has(t: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| t.contains(n))
 }
 
+/// Pull a `--parts` value out of free text (`parts: a,b`). Empty / missing
+/// yields the angle-bracket slot so clap never sees a bare `--parts`.
+fn compose_parts_value(target: &str) -> String {
+    const MARK: &str = "parts:";
+    let lower = target.to_ascii_lowercase();
+    if let Some(idx) = lower.find(MARK) {
+        let rest = target[idx + MARK.len()..].trim();
+        if !rest.is_empty() {
+            return rest.to_string();
+        }
+    }
+    "<role:stage,...>".to_string()
+}
+
 fn dec(primitive: &'static str, reason: &str, argv: &[&str]) -> Decision {
     Decision {
         primitive,
@@ -58,7 +72,7 @@ fn dec(primitive: &'static str, reason: &str, argv: &[&str]) -> Decision {
 ///  15 ready beads + empty|work|loop|beads (not implement/fix) → loop-work
 ///  16 implement/fix + beads|tracker|gate (not "no tracker") → steer
 ///  17 implement/fix + no tracker|direct → steer-direct
-///  18 compose|catalog miss|parts: → compose-parts
+///  18 compose|catalog miss|parts: → compose-parts (`--parts` always has a value)
 ///  19 shape unknown|improvise|author workflow → compose-agent
 ///  20 contention|coalition|shared-file (target or snap) → coalition-form
 ///  21 one pane|watch me|single agent → spawn-send
@@ -449,8 +463,12 @@ pub fn decide(target: &str, snap: &Snapshot) -> Decision {
             ],
         );
     }
-    // 24. wave-swarm -> wave-swarm (ADR-0006 D3 composed wave swarm).
-    if has(&t, &["wave-swarm", "wave swarm"]) {
+    // 24. wave-swarm -> compose --parts wave-swarm (ADR-0006 D3).
+    // Do not require the recipe name in the objective (GS-013: kill the easter egg).
+    let wave_shaped = has(&t, &["wave-swarm", "wave swarm", "lanes", "waves"])
+        || t.split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+            .any(|w| w.starts_with("wave-") && w.len() > 5);
+    if wave_shaped {
         return dec(
             "wave-swarm",
             "wave-swarm — composed wave swarm (GATE -> DISPATCH -> OBSERVE -> VERIFY -> SIGNOFF)",
@@ -465,6 +483,22 @@ pub fn decide(target: &str, snap: &Snapshot) -> Decision {
             ],
         );
     }
+    // 24b. repair-until-verified recipe (not the bug-fix wrapper).
+    if has(&t, &["repair-until-verified", "repair until verified"]) {
+        return dec(
+            "repair-until-verified",
+            "repair-until-verified — compose --parts repair-until-verified --run",
+            &[
+                "flywheel",
+                "workflow",
+                "compose",
+                target,
+                "--parts",
+                "repair-until-verified",
+                "--run",
+            ],
+        );
+    }
     // 25. Ready beads + work-ish intent → run the loop, not hand-rolled sends.
     if snap.ready_bead_count > 0
         && !implement
@@ -472,8 +506,11 @@ pub fn decide(target: &str, snap: &Snapshot) -> Decision {
     {
         return dec(
             "loop-work",
-            &format!("{} ready beads — loop run --work", snap.ready_bead_count),
-            &["flywheel", "loop", "run", "--work"],
+            &format!(
+                "{} ready beads — loop-mode run <project> --work",
+                snap.ready_bead_count
+            ),
+            &["flywheel", "loop-mode", "run", "<project>", "--work"],
         );
     }
     // 3. Implement/fix with a tracker/gate → steer (plan gate).
@@ -494,10 +531,11 @@ pub fn decide(target: &str, snap: &Snapshot) -> Decision {
     }
     // 5. Catalog cannot express it → compose --parts.
     if has(&t, &["compose", "catalog miss", "parts:"]) {
+        let parts = compose_parts_value(target);
         return dec(
             "compose-parts",
             "catalog cannot express the named parts — compose --parts",
-            &["flywheel", "workflow", "compose", target, "--parts"],
+            &["flywheel", "workflow", "compose", target, "--parts", &parts],
         );
     }
     // 6. Shape unknown → planner arm (lint is the gate).
@@ -584,6 +622,7 @@ pub fn decide_trigger_for(workflow: &str) -> Option<&'static str> {
         "awareness-digest" => Some("awareness-digest"),
         "onboard" => Some("onboard"),
         "wave-swarm" => Some("wave-swarm"),
+        "repair-until-verified" => Some("repair-until-verified"),
         _ => None,
     }
 }
@@ -816,8 +855,13 @@ mod tests {
             let d = decide(t, &with_beads(3));
             assert_eq!(d.primitive, "loop-work", "target: {t:?}");
             assert!(
-                d.argv.windows(2).any(|w| w == ["loop", "run"]),
+                d.argv.windows(2).any(|w| w == ["loop-mode", "run"]),
                 "argv: {:?}",
+                d.argv
+            );
+            assert!(
+                d.argv.contains(&"<project>".to_string()),
+                "loop-work argv must name the project slot: {:?}",
                 d.argv
             );
             assert!(d.argv.contains(&"--work".to_string()));
@@ -842,6 +886,20 @@ mod tests {
             d.argv
                 .contains(&"implement the parser with a plan gate".to_string())
         );
+    }
+
+    #[test]
+    fn wave_label_routes_to_wave_swarm_without_recipe_token() {
+        let d = decide("implement the parser for wave-1", &with_beads(3));
+        assert_eq!(d.primitive, "wave-swarm");
+        assert!(d.argv.contains(&"compose".to_string()));
+        assert!(d.argv.contains(&"wave-swarm".to_string()));
+    }
+
+    #[test]
+    fn lanes_keyword_routes_to_wave_swarm() {
+        let d = decide("run the lanes", &snap());
+        assert_eq!(d.primitive, "wave-swarm");
     }
 
     // Row 4 — implement/fix + no tracker|direct → steer-direct.
@@ -873,6 +931,38 @@ mod tests {
                 "argv: {:?}",
                 d.argv
             );
+            let parts_idx = d.argv.iter().position(|a| a == "--parts").expect("--parts");
+            let value = d.argv.get(parts_idx + 1).expect("--parts needs a value");
+            assert!(
+                !value.is_empty() && value != "--parts",
+                "bare --parts is unrunnable clap: {:?}",
+                d.argv
+            );
+        }
+        let extracted = decide(
+            "compose parts: scout:fresh-eyes-explore,coder:systematic-execute",
+            &snap(),
+        );
+        assert_eq!(extracted.primitive, "compose-parts");
+        let idx = extracted.argv.iter().position(|a| a == "--parts").unwrap();
+        assert_eq!(
+            extracted.argv.get(idx + 1).map(String::as_str),
+            Some("scout:fresh-eyes-explore,coder:systematic-execute")
+        );
+    }
+
+    #[test]
+    fn repair_until_verified_routes_to_recipe() {
+        for t in ["repair until verified", "repair-until-verified the panic"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "repair-until-verified", "target: {t}");
+            assert!(
+                d.argv.contains(&"compose".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
+            assert!(d.argv.contains(&"repair-until-verified".to_string()));
+            assert!(d.argv.contains(&"--run".to_string()));
         }
     }
 
@@ -1372,7 +1462,10 @@ mod tests {
         assert_eq!(decide_trigger_for("phase-resolve"), None);
         assert_eq!(decide_trigger_for("ship"), None);
         assert_eq!(decide_trigger_for("wave-swarm"), Some("wave-swarm"));
-        assert_eq!(decide_trigger_for("repair-until-verified"), None);
+        assert_eq!(
+            decide_trigger_for("repair-until-verified"),
+            Some("repair-until-verified")
+        );
     }
 
     // Existing rows still win where they should (regression anchors).

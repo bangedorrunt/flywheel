@@ -84,7 +84,10 @@ fn expand_inbox_rows(v: &serde_json::Value) -> Vec<&serde_json::Value> {
 }
 
 /// Pure, total, deterministic: no I/O, no &mut, no herdr/toron calls.
-pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<DoorbellAction>) {
+pub(crate) fn tick(
+    model: &DoorbellModel,
+    msg: &DoorbellMsg,
+) -> (DoorbellModel, Vec<DoorbellAction>) {
     let mut next = model.clone();
     let mut actions = Vec::new();
     match msg {
