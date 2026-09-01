@@ -1,6 +1,7 @@
 // governed-by: ADR-0024
 // governed-by: ADR-0025
 // governed-by: ADR-0026
+// governed-by: ADR-0027
 //! Durable swarm loop — the monitoring orchestrator as a Resonate workflow.
 //!
 //! Design (resonate-philosophy): the loop is sequential happy-path code with
@@ -406,7 +407,7 @@ impl LoopSnapshot {
     }
 }
 
-pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
+pub(crate) fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
     let mut next = model.clone();
     let mut actions = Vec::new();
     // Pure, total, deterministic: no I/O, no &mut, no br/herdr calls
@@ -6748,9 +6749,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         }
 
         let mut blocked_names: Vec<String> = Vec::new();
-        // bd-nsb3 FOLD: dispatch decisions live in model'. Heal decisions ride
-        // Msg::Heal into tick (built above); reclaim runs via the phase machine
-        // (LoopMsg::Reclaim) — no loop-side pre-seed, no dropped sends.
+        // ADR-0027: live swarm is workspace::tick. Slice durable::tick is
+        // private. Reclaim is a Msg the producer constructs — never extend
+        // after tick.
         let mut actions: Vec<LoopAction> = Vec::new();
         // heartbeat path: full-snapshot reconciliation (skips agents already
         // dispatch-pending so event path and poll path don't double-feed)
@@ -6936,26 +6937,97 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             states: states.clone(),
         };
         let now = chrono::Utc::now().timestamp() as u64;
-        let msg = LoopMsg::Tick { now };
-        let (mut next_model, mut poll_actions) = tick(&model, &msg);
-        // Journal every LoopMsg driven into tick (kind + payload + actions) as JSONL
-        let _ = crate::state::journal_loop_msg(&params.project, &msg, &model, &poll_actions);
+        let mut ws = crate::workspace::WorkspaceModel {
+            swarm: model.clone(),
+            ..Default::default()
+        };
+        let fold = |ws: &mut crate::workspace::WorkspaceModel,
+                    ws_msg: crate::workspace::Msg,
+                    journal: LoopMsg|
+         -> Vec<LoopAction> {
+            let before = ws.swarm.clone();
+            let (next, cmds) = crate::workspace::tick(ws, &ws_msg);
+            let acts: Vec<LoopAction> = cmds.iter().filter_map(|c| c.to_loop_action()).collect();
+            let _ = crate::state::journal_loop_msg(&params.project, &journal, &before, &acts);
+            *ws = next;
+            acts
+        };
+        let mut poll_actions = fold(
+            &mut ws,
+            crate::workspace::Msg::Tick { now },
+            LoopMsg::Tick { now },
+        );
         // leftover #4 fixed: tick output is the plan, no filter of Diagnose pane_exited
-        // Fold heal + nudge Msgs through the SAME tick (fresh-eyes fix
-        // 2026-09-01): the previous "leftover #2/#3 fixed" drop discarded the
-        // claim/close nudges and orphaned self-heal entirely. Decisions are
-        // tick(Model, Msg) -> actions; heal transitions land in model'; the
-        // executor leaves run the I/O. Reclaim planner actions (bd-627z.1)
-        // merge here too — they were previously computed then dropped.
+        // Heal + nudge + reclaim all ride workspace::tick (one live entry).
         let mut extra_msgs = std::mem::take(&mut heal_msgs);
         extra_msgs.append(&mut nudge_msgs);
-        for m in &extra_msgs {
-            let (m_next, m_actions) = tick(&next_model, m);
-            let _ = crate::state::journal_loop_msg(&params.project, m, &next_model, &m_actions);
-            poll_actions.extend(m_actions);
-            next_model = m_next;
+        for m in extra_msgs {
+            let ws_msg = match &m {
+                LoopMsg::Heal {
+                    name,
+                    status,
+                    exited,
+                } => crate::workspace::Msg::Heal {
+                    name: name.clone(),
+                    status: status.clone(),
+                    exited: *exited,
+                },
+                LoopMsg::ClaimNudge { name, bead_id } => crate::workspace::Msg::ClaimNudge {
+                    name: name.clone(),
+                    bead_id: bead_id.clone(),
+                },
+                LoopMsg::CloseNudge {
+                    name,
+                    bead_id,
+                    title,
+                } => crate::workspace::Msg::CloseNudge {
+                    name: name.clone(),
+                    bead_id: bead_id.clone(),
+                    title: title.clone(),
+                },
+                other => {
+                    let (m_next, m_actions) = tick(&ws.swarm, other);
+                    let _ = crate::state::journal_loop_msg(
+                        &params.project,
+                        other,
+                        &ws.swarm,
+                        &m_actions,
+                    );
+                    poll_actions.extend(m_actions);
+                    ws.swarm = m_next;
+                    continue;
+                }
+            };
+            poll_actions.extend(fold(&mut ws, ws_msg, m));
         }
-        poll_actions.extend(reclaim_actions);
+        for act in reclaim_actions {
+            if let LoopAction::Reclaim {
+                bead_id,
+                pin,
+                herdr_name,
+                reason,
+            } = act
+            {
+                let journal = LoopMsg::Reclaim {
+                    bead_id: bead_id.clone(),
+                    holder_pin: pin.clone(),
+                    claimant_pin: pin.clone(),
+                    is_live: false,
+                };
+                poll_actions.extend(fold(
+                    &mut ws,
+                    crate::workspace::Msg::Reclaim {
+                        bead_id,
+                        holder_pin: pin.clone(),
+                        claimant_pin: herdr_name,
+                        is_live: false,
+                        reason,
+                    },
+                    journal,
+                ));
+            }
+        }
+        let mut next_model = ws.swarm;
         queue = next_model.queue.clone();
         per_bead_phase = next_model.per_bead_phase.clone();
         dispatch_pending = next_model.dispatch_pending.clone();
@@ -6988,11 +7060,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             }
             // dispatch_pending is naturally bounded by queue length; ensure it
             // never retains names not in queue or states.
-            let live_beads: std::collections::HashSet<&String> =
-                queue.iter().collect::<std::collections::HashSet<_>>()
-                    .into_iter()
-                    .chain(states.iter().map(|s| &s.name))
-                    .collect();
+            let live_beads: std::collections::HashSet<&String> = queue
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .chain(states.iter().map(|s| &s.name))
+                .collect();
             dispatch_pending.retain(|k| live_beads.contains(k) || per_bead_phase.contains_key(k));
         }
         // proof of life + kind learning use the Model's states after Tick (bd-p1ds)

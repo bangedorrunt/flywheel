@@ -314,11 +314,11 @@ Headless run logs (`runs/*.jsonl`) feed this view; pane runs feed from the proje
 | run one agent on one task, watch it | `flywheel profile run <role>` or `flywheel send` |
 | run one objective durably in one current harness | `flywheel loop-mode run <project>` |
 | run bead-backed solo work durably | `flywheel loop-mode run <project> --work` |
-| run a fixed daily stage sequence on a live swarm | use `/swarm` and optionally supervise beads with `flywheel loop-mode run <project> --work` |
-| perform one immediate task without orchestration | `/open` or work directly in the current pane |
+| run a fixed daily stage sequence on a live swarm | use `/swarm-mode` and optionally supervise beads with `flywheel loop-mode run <project> --work` |
+| perform one immediate task without orchestration | `/open-mode` or work directly in the current pane |
 | run a reusable multi-step procedure once | `flywheel workflow run <name> --execute` |
-| run a procedure in solo durable mode | `/loop` / `flywheel loop-mode run <project>` |
-| run a procedure in captain-led multi-crew mode | `/swarm` / `flywheel steer ...` |
+| run a procedure in solo durable mode | `/loop-mode` / `flywheel loop-mode run <project>` |
+| run a procedure in captain-led multi-crew mode | `/swarm-mode` / `flywheel steer ...` |
 | run that procedure on a schedule, unattended | `flywheel cron add ...` + `flywheel cron start` |
 | spawn a fixed team shape repeatedly | define a recipe/squad → `flywheel squad spawn <name>` |
 | fan out N agents on one step | `parallel over: "@crew.<role>"` in a workflow |

@@ -208,11 +208,13 @@ findings." No single catalog workflow does both in sequence.
 ## 5. Steering from inside a pane (slash commands)
 
 SHIPPED (2026-08-21 fix — the commands were previously dead in opencode; if
-`/swarm` does not expand, run `flywheel integration opencode` to regenerate
+`/swarm-mode` does not expand, run `flywheel integration opencode` to regenerate
 into `~/.config/opencode/commands/` — plural):
 
-- `/swarm` — spawn/steer a crew
-- `/loop` — start/inspect the durable loop
+- `/swarm-mode` — captain-led multi-crew (`workflow compose --parts wave-swarm --run`)
+- `/loop-mode` — start/inspect the durable solo loop
+- `/open-mode` — current-pane work, no lifecycle
+- `/peer-aware-mode` — attach a running pane to the doorbell
 - `/workflow-*` — brainstorm, plan, plan-review, debate, triage, onboard,
   captain-audit
 - `/beads-*` — triage, execute, review, commit, create

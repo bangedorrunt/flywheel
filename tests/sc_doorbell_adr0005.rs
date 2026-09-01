@@ -40,7 +40,7 @@ fn sc_d9_swarm_playbook_loop_optional_for_peer_wake() {
     );
 }
 
-/// SC-D10: `/loop` must not teach a 5-min inbox timer as the driver.
+/// SC-D10: `/loop-mode` must not teach a 5-min inbox timer as the driver.
 #[test]
 fn sc_d10_loop_playbook_is_not_a_five_min_poll() {
     let tpl = read("integrations/prompts/loop.md.tpl");
@@ -253,7 +253,7 @@ fn sc_d7_no_peer_aware_keeps_identity_opts_out_of_handler() {
     );
 }
 
-/// SC-D4: /peer-aware attaches (same lock), never forks.
+/// SC-D4: /peer-aware-mode attaches (same lock), never forks.
 #[test]
 fn sc_d4_peer_aware_command_attaches() {
     let tpl = read("integrations/prompts/peer-aware.md.tpl");
@@ -299,18 +299,46 @@ fn sc_d7_spawn_identity_without_dispatcher() {
     assert!(body.contains("doorbell::ensure_running"));
 }
 
-/// `/swarm peer-aware=off` maps to `--no-peer-aware`.
+/// `/swarm-mode` pins wave-swarm; it must not re-run `decide` (that diverts).
+#[test]
+fn swarm_mode_pins_wave_swarm_without_reclassify() {
+    let tpl = read("integrations/prompts/swarm.md.tpl");
+    assert!(
+        tpl.contains("--parts wave-swarm"),
+        "swarm-mode must pin compose --parts wave-swarm"
+    );
+    assert!(
+        !tpl.contains("1. CLASSIFY:"),
+        "slash /swarm-mode must not re-run decide as step 1"
+    );
+}
+
+/// `/loop-mode` pins `loop-mode run --work`; it must not re-run `decide`.
+#[test]
+fn loop_mode_pins_loop_run_without_reclassify() {
+    let tpl = read("integrations/prompts/loop.md.tpl");
+    assert!(
+        tpl.contains("loop-mode run") && tpl.contains("--work"),
+        "loop-mode must pin flywheel loop-mode run <project> --work"
+    );
+    assert!(
+        !tpl.contains("1. CLASSIFY:"),
+        "slash /loop-mode must not re-run decide as step 1"
+    );
+}
+
+/// `/swarm-mode peer-aware=off` maps to `--no-peer-aware`.
 #[test]
 fn swarm_and_loop_modes_are_distinct() {
     let swarm = read("integrations/prompts/swarm.md.tpl");
     let loop_tpl = read("integrations/prompts/loop.md.tpl");
     assert!(swarm.contains("multi-crew") && swarm.contains("captain-led"));
     assert!(loop_tpl.contains("solo mode") && loop_tpl.contains("current harness"));
-    assert!(loop_tpl.contains("opposite of /swarm"));
+    assert!(loop_tpl.contains("opposite of /swarm-mode"));
 }
 
-/// `/swarm peer-aware=off` maps to `--no-peer-aware`.
-#[allow(dead_code)]
+/// `/swarm-mode peer-aware=off` maps to `--no-peer-aware`.
+#[test]
 fn swarm_peer_aware_off_maps_to_flag() {
     let tpl = read("integrations/prompts/swarm.md.tpl");
     assert!(

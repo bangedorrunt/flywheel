@@ -291,6 +291,28 @@ impl ProfileCatalog {
         self.profiles.get(name)
     }
 
+    /// Overlay compose `--role-model ROLE=PROVIDER/MODEL` onto catalog profiles.
+    /// Fails loud on unknown role or malformed spec (never silent drop).
+    pub fn apply_role_models(&mut self, specs: &[String]) -> anyhow::Result<()> {
+        for spec in specs {
+            let (role, rest) = spec.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--role-model needs ROLE=PROVIDER/MODEL (or ROLE=MODEL), got {spec:?}"
+                )
+            })?;
+            let p = self.profiles.get_mut(role).ok_or_else(|| {
+                anyhow::anyhow!("--role-model unknown role {role:?} (flywheel profile list)")
+            })?;
+            if let Some((prov, model)) = rest.split_once('/') {
+                p.provider = prov.to_string();
+                p.model = model.to_string();
+            } else {
+                p.model = rest.to_string();
+            }
+        }
+        Ok(())
+    }
+
     /// Look up a harness spawn recipe.
     pub fn harness(&self, name: &str) -> Option<&HarnessConfig> {
         self.harnesses.get(name)

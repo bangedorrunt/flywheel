@@ -456,6 +456,7 @@ fn build_part_step(
             // must fail the run visibly, not sail through as Continue
             // (first-prompt trust; builtins already carry their own).
             on_error: StepOnError::FailRun,
+            error_kinds: vec!["timeout".into(), "rate_limit".into(), "unknown".into()],
             build_slot: false,
             action,
         };
@@ -520,6 +521,7 @@ fn build_part_step(
         name: Some(format!("part-{ordinal}")),
         guard: None,
         on_error: StepOnError::Continue,
+        error_kinds: Vec::new(),
         build_slot: false,
         action,
     };
@@ -1677,6 +1679,7 @@ steps:
             name: Some("leaf".into()),
             guard: None,
             on_error: toron_workflow::schema::StepOnError::Continue,
+            error_kinds: Vec::new(),
             build_slot: false,
             action: Action::SendDm {
                 to: "x".into(),
@@ -1690,6 +1693,7 @@ steps:
                 name: Some("wrap".into()),
                 guard: None,
                 on_error: toron_workflow::schema::StepOnError::Continue,
+                error_kinds: Vec::new(),
                 build_slot: false,
                 action: Action::Retry {
                     max_attempts: 2,
@@ -2050,6 +2054,7 @@ steps:
             name: None,
             guard: None,
             on_error: StepOnError::Continue,
+            error_kinds: Vec::new(),
             build_slot: false,
             action: Action::DispatchJob {
                 assignee: "x".into(),
@@ -2081,6 +2086,7 @@ steps:
                 name: Some("outer-branch".into()),
                 guard: None,
                 on_error: StepOnError::Continue,
+                error_kinds: Vec::new(),
                 build_slot: false,
                 action: Action::Branch {
                     if_guard: "true".into(),
@@ -2097,6 +2103,7 @@ steps:
                     name: Some("loop".into()),
                     guard: None,
                     on_error: StepOnError::Continue,
+                    error_kinds: Vec::new(),
                     build_slot: false,
                     action: Action::Foreach {
                         over: "items".into(),
@@ -2107,6 +2114,7 @@ steps:
                     name: Some("retry".into()),
                     guard: None,
                     on_error: StepOnError::Continue,
+                    error_kinds: Vec::new(),
                     build_slot: false,
                     action: Action::Retry {
                         max_attempts: 3,
@@ -2289,6 +2297,7 @@ steps:
             name: Some("verify-1".into()),
             guard: None,
             on_error: StepOnError::FailRun,
+            error_kinds: vec!["timeout".into(), "rate_limit".into(), "unknown".into()],
             build_slot: false,
             action: Action::Verify {
                 command: "cargo test --lib".into(),
@@ -2367,6 +2376,7 @@ steps:
             name: Some("verify-1".into()),
             guard: None,
             on_error: StepOnError::FailRun,
+            error_kinds: vec!["timeout".into(), "rate_limit".into(), "unknown".into()],
             build_slot: false,
             action: Action::Verify {
                 command: "cargo test --lib".into(),

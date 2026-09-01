@@ -96,7 +96,8 @@ fn decide_ready_beads_is_loop_work() {
     let v = stdout_json(&out);
     assert_eq!(v["primitive"], "loop-work");
     let argv = v["argv"].as_array().expect("argv is array");
-    assert!(argv.windows(2).any(|w| w == ["loop", "run"]));
+    assert!(argv.windows(2).any(|w| w == ["loop-mode", "run"]));
+    assert!(argv.iter().any(|a| a == "<project>"));
     assert!(argv.iter().any(|a| a == "--work"));
 }
 

@@ -1,6 +1,7 @@
 // governed-by: ADR-0024
 // governed-by: ADR-0025
 // governed-by: ADR-0026
+// governed-by: ADR-0027
 //! flywheel — multi-agent swarm orchestrator on the herdr backend.
 //!
 //! NTM-parity daily loop for opencode/pi/grok: spawn swarms, dispatch work,
@@ -402,7 +403,8 @@ struct Cli {
 enum Commands {
     /// Scaffold a project (ensure dir + .beads) without spawning
     Init { project: String },
-    /// Spawn a swarm: herdr workspace + agent panes
+    /// Spawn a swarm (escape hatch). Default multi-lane is
+    /// `workflow compose --parts wave-swarm --run`.
     Spawn {
         project: String,
         #[command(flatten)]
@@ -476,6 +478,10 @@ enum Commands {
         /// provider pin for --model's composite registry key
         #[arg(long, requires = "model")]
         provider: Option<String>,
+        /// Label this spawn as an escape from `workflow compose --parts wave-swarm`.
+        /// Kind/count + --model/--provider without --escape prints a warning.
+        #[arg(long)]
+        escape: bool,
     },
     /// Extend a running swarm with more agent panes
     Add {
@@ -541,7 +547,7 @@ enum Commands {
         /// matches EXACTLY one agent)
         #[arg(long, default_value = "all")]
         to: String,
-        /// daily-driver stage name: p1|p2|p4|p5|p6|p8
+        /// stage name or p-code alias (`flywheel stage list`)
         #[arg(long)]
         stage: Option<String>,
         /// ADR-0006 D1: payload param k=v substituted into the stage
@@ -2192,11 +2198,14 @@ enum AssetCmd {
 /// layered stage registry surface.
 #[derive(Subcommand)]
 enum StageCmd {
-    /// List stages (default: authored tiers repo/user/project; --all adds seed)
+    /// List stages (seed + authored; `--all` kept as an alias)
     List {
-        /// include the compiled seed tier too
+        /// include seed (default: true; flag kept so old `--all` scripts still parse)
         #[arg(long)]
         all: bool,
+        /// JSON rows (agent flag parity; list is JSON when this is set)
+        #[arg(long)]
+        json: bool,
     },
     /// Show one stage: prompt body + metadata + tier
     Show {
@@ -2725,7 +2734,11 @@ enum RunsCmd {
 #[derive(Subcommand)]
 enum WorkflowCmd {
     /// List catalog + built-in workflows (name, source, trigger, crew)
-    List,
+    List {
+        /// accepted: list is always JSON (agent `--json` parity)
+        #[arg(long)]
+        json: bool,
+    },
     /// Show one workflow's definition
     Show {
         /// workflow name (built-in or catalog)
@@ -2840,6 +2853,11 @@ enum WorkflowCmd {
         /// ADR-0025 W5: stable idempotency key for compose --run (project, bead_id|run_id, profile) — second run with same key returns existing run
         #[arg(long)]
         idempotency_key: Option<String>,
+        /// Per-role model routing for compose --run (repeatable).
+        /// `coder=opencode-go/muse-spark-1.2-contributor` uses the same
+        /// registry pin as `spawn --profile`.
+        #[arg(long = "role-model", value_name = "ROLE=PROVIDER/MODEL")]
+        role_model: Vec<String>,
         /// JSON output
         #[arg(long)]
         json: bool,
@@ -3705,6 +3723,7 @@ fn main() {
             count,
             model,
             provider,
+            escape,
         }) => cmd_spawn(
             &cfg,
             project,
@@ -3728,6 +3747,7 @@ fn main() {
                 bare_model: model.clone().unwrap_or_default(),
                 bare_provider: provider.clone().unwrap_or_default(),
                 idempotency_key: None,
+                escape: *escape,
             },
         ),
         Some(Commands::Add {
@@ -6560,6 +6580,8 @@ struct SpawnOpts {
     bare_provider: String,
     /// ADR-0025 W5: stable idempotency key for spawn (project, run_id|bead_id, profile)
     idempotency_key: Option<String>,
+    /// Operator labeled this spawn as an escape from compose/wave-swarm.
+    escape: bool,
 }
 
 impl Default for SpawnOpts {
@@ -6584,6 +6606,7 @@ impl Default for SpawnOpts {
             bare_model: String::new(),
             bare_provider: String::new(),
             idempotency_key: None,
+            escape: false,
         }
     }
 }
@@ -6730,6 +6753,15 @@ projects available: {}",
             }
         }
         bail!("{msg}");
+    }
+    let kind_count_escape =
+        opts.counts.oc.unwrap_or(0) + opts.counts.pi.unwrap_or(0) + opts.counts.gk.unwrap_or(0) > 0
+            || !opts.kinds.is_empty()
+            || !opts.bare_model.is_empty();
+    if kind_count_escape && !opts.escape {
+        eprintln!(
+            "flywheel: spawn with --oc/--model/--provider is the escape hatch; default multi-lane is `workflow compose --parts wave-swarm --run`. Pass --escape to silence."
+        );
     }
     // bd-eign.13 fix: a PROFILE-ONLY spawn must not die in recipe_counts'
     // "nothing to spawn" guard — the profile plan is the spawn plan.
@@ -7580,82 +7612,90 @@ fn cmd_doorbell_why(
                 );
             }
             model = next;
-        }
-        replay_seq += 1;
-        // Filtering for display: --corr / --seq take precedence over pin grep
-        let raw = entry.to_string();
-        let corr_match = corr.map(|c| raw.contains(c)).unwrap_or(true);
-        let seq_match = seq.map(|s| s == replay_seq - 1).unwrap_or(true);
-        let pin_match = if corr.is_some() || seq.is_some() {
-            true // when corr/seq is used, do not require pin needle
-        } else {
-            raw.contains(&format!("\"{pin}\""))
-        };
-        if !corr_match || !seq_match || !pin_match {
-            continue;
-        }
-        // Also support direct corr/seq fields in msg if present (extra_tags)
-        matched += 1;
-        shown += 1;
-        if shown > limit {
-            continue;
-        }
-        let ts = entry.get("ts").and_then(|t| t.as_str()).unwrap_or("?");
-        let msg = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
-        let actions = entry
-            .get("actions")
-            .and_then(|a| a.as_array())
-            .map(|a| {
-                a.iter()
-                    .map(|v| {
-                        if v.get("Prompt").is_some() {
-                            "prompt"
-                        } else if v.get("CheckAckSla").is_some() {
-                            "check-ack-sla"
-                        } else if v.get("RestartWatch").is_some() {
-                            "restart-watch"
-                        } else if v.get("FactMiss").is_some() {
-                            "fact-miss"
-                        } else if v.get("Audit").is_some() {
-                            "audit"
-                        } else if v.get("FetchInbox").is_some() {
-                            "fetch-inbox"
-                        } else {
-                            "unknown"
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",")
-            })
-            .unwrap_or_default();
-        let kind = match msg.get("WatchNdjson") {
-            Some(_) => "watch",
-            None => match msg.get("HerdrStatus") {
-                Some(_) => "status",
-                None => match msg.get("AckSlaTick") {
-                    Some(_) => "ack-sla",
-                    None => match msg.get("WatchDied") {
-                        Some(_) => "watch-died",
-                        None => "other",
+            replay_seq += 1;
+            let seq_match = seq.map(|s| s == replay_seq - 1).unwrap_or(true);
+            let corr_match = match corr {
+                Some(c) => {
+                    model.assignment.contains_key(c)
+                        || actual.iter().any(|cmd| match cmd {
+                            workspace::Cmd::WaitCorr { corr } => corr == c,
+                            workspace::Cmd::SqliteUpsert { corr, .. } => corr == c,
+                            _ => false,
+                        })
+                }
+                None => true,
+            };
+            let pin_match = if corr.is_some() || seq.is_some() {
+                true
+            } else {
+                why_entry_mentions_pin(pin, &msg, &actual)
+            };
+            if !corr_match || !seq_match || !pin_match {
+                continue;
+            }
+            // Also support direct corr/seq fields in msg if present (extra_tags)
+            matched += 1;
+            shown += 1;
+            if shown > limit {
+                continue;
+            }
+            let ts = entry.get("ts").and_then(|t| t.as_str()).unwrap_or("?");
+            let msg = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
+            let actions = entry
+                .get("actions")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|v| {
+                            if v.get("Prompt").is_some() {
+                                "prompt"
+                            } else if v.get("CheckAckSla").is_some() {
+                                "check-ack-sla"
+                            } else if v.get("RestartWatch").is_some() {
+                                "restart-watch"
+                            } else if v.get("FactMiss").is_some() {
+                                "fact-miss"
+                            } else if v.get("Audit").is_some() {
+                                "audit"
+                            } else if v.get("FetchInbox").is_some() {
+                                "fetch-inbox"
+                            } else {
+                                "unknown"
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let kind = match msg.get("WatchNdjson") {
+                Some(_) => "watch",
+                None => match msg.get("HerdrStatus") {
+                    Some(_) => "status",
+                    None => match msg.get("AckSlaTick") {
+                        Some(_) => "ack-sla",
+                        None => match msg.get("WatchDied") {
+                            Some(_) => "watch-died",
+                            None => "other",
+                        },
                     },
                 },
-            },
-        };
-        let status = msg
-            .get("HerdrStatus")
-            .and_then(|h| h.get("status"))
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
-        // fold tick replay already verified above; this print is the user-visible replay
-        println!(
-            "{workspace} {ts} seq={} {kind}{} actions=[{actions}]",
-            replay_seq - 1,
-            if status.is_empty() {
-                String::new()
-            } else {
-                format!(" ->{status}")
-            }
-        );
+            };
+            let status = msg
+                .get("HerdrStatus")
+                .and_then(|h| h.get("status"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            // fold tick replay already verified above; this print is the user-visible replay
+            println!(
+                "{workspace} {ts} seq={} {kind}{} actions=[{actions}]",
+                replay_seq - 1,
+                if status.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ->{status}")
+                }
+            );
+        }
     }
     if matched == 0 {
         if let Some(c) = corr {
@@ -7669,6 +7709,24 @@ fn cmd_doorbell_why(
         }
     }
     Ok(())
+}
+
+fn why_entry_mentions_pin(pin: &str, msg: &workspace::Msg, cmds: &[workspace::Cmd]) -> bool {
+    let cmd_hit = cmds.iter().any(|c| match c {
+        workspace::Cmd::Prompt { pin: p, .. } => p == pin,
+        workspace::Cmd::Audit { pin: p, .. } => p == pin,
+        _ => false,
+    });
+    if cmd_hit {
+        return true;
+    }
+    match msg {
+        workspace::Msg::InboxItems { pin: p, .. }
+        | workspace::Msg::InboxRows { pin: p, .. }
+        | workspace::Msg::HerdrStatus { pin: p, .. } => p == pin,
+        workspace::Msg::WatchNdjson { line } => line.contains(pin),
+        _ => false,
+    }
 }
 
 /// bd-durable-doorbell-lngf requirement 4: re-inject the peer-aware handler
@@ -7817,7 +7875,7 @@ fn cmd_internal_doorbell(
         Some(())
     })();
     if in_process_ok.is_none() {
-        let kinds = "9,43001,30031,39002";
+        let kinds = "9,20001,30013,43001,30031,39002";
         let mut child = match Command::new("toron")
             .args(["watch", "--project", project, "--kinds", kinds])
             .stdout(Stdio::piped())
@@ -7858,10 +7916,12 @@ fn cmd_internal_doorbell(
     }
 
     let mut herdr = Client::connect(Some(&cfg.socket_path())).ok();
-    let mut status_by_pin: BTreeMap<String, String> = BTreeMap::new();
     let mut pane_to_pin: BTreeMap<String, String> = BTreeMap::new();
     let mut _queues: BTreeMap<String, doorbell::DoorbellQueue> = BTreeMap::new();
     let mut workspace_model = workspace::WorkspaceModel::default();
+    if let Some(pin) = state::load_captain_alias(project) {
+        workspace_model.roles.insert("captain".into(), pin);
+    }
     // bd-7xsf: rebuild assignment from receipts table at dispatcher startup (durable)
     rebuild_assignment_from_receipts(&mut workspace_model);
     let mut budgets: BTreeMap<String, doorbell::PinBudget> = BTreeMap::new();
@@ -7887,7 +7947,6 @@ fn cmd_internal_doorbell(
     doorbell_refresh_status(
         herdr.as_mut(),
         project,
-        &mut status_by_pin,
         &mut pane_to_pin,
         &mut workspace_model,
         &mut hear,
@@ -7941,6 +8000,38 @@ fn cmd_internal_doorbell(
         if !path.exists() {
             break;
         }
+        for summary in drain_pending_facts(project) {
+            let msg = workspace::Msg::Fact {
+                summary: summary.clone(),
+            };
+            let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
+            workspace_model = next_model;
+            let _ = handle_workspace_cmds(&mut workspace_model, &cmds);
+            let injects: Vec<(String, String)> = cmds
+                .iter()
+                .filter_map(|c| match c {
+                    workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                    _ => None,
+                })
+                .collect();
+            if !injects.is_empty() {
+                doorbell_prompt(
+                    herdr.as_mut(),
+                    &state::load_spawn_registry(project),
+                    &injects,
+                    generation.as_ref(),
+                    project,
+                    workspace,
+                );
+            }
+            doorbell::journal_append_workspace(
+                &config::state_dir(),
+                workspace,
+                &msg,
+                &cmds,
+                serde_json::json!({ "stage": "fact_live", "summary": summary }),
+            );
+        }
         // GS-006 bug 3: Ack-SLA was test-only (0 production callers). The dispatcher
         // tick is the live caller, gated to once per 60s (30-min SLA needs no 1 Hz SQL
         // scan). Runs at loop top so heavy watch traffic cannot starve it (a Timeout-
@@ -7952,7 +8043,21 @@ fn cmd_internal_doorbell(
             let msg = workspace::Msg::AckSlaTick { now: now_s };
             let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
             workspace_model = next_model;
-            handle_workspace_cmds(&cmds);
+            let need_fetch = handle_workspace_cmds(&mut workspace_model, &cmds);
+            if need_fetch {
+                doorbell_sweep_inbox(
+                    cfg,
+                    project,
+                    &mut workspace_model,
+                    &mut since_by_pin,
+                    &mut budgets,
+                    herdr.as_mut(),
+                    &mut hear,
+                    &index,
+                    workspace,
+                    generation.as_ref(),
+                );
+            }
             let scan = cmds
                 .iter()
                 .any(|a| matches!(a, workspace::Cmd::CheckAckSla));
@@ -8029,7 +8134,7 @@ fn cmd_internal_doorbell(
                 let msg = workspace::Msg::WatchNdjson { line: line.clone() };
                 let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
                 workspace_model = next_model;
-                handle_workspace_cmds(&cmds);
+                handle_workspace_cmds(&mut workspace_model, &cmds);
                 let mut delivered = Vec::new();
                 let raw_injects: Vec<(String, String)> = cmds
                     .iter()
@@ -8115,23 +8220,14 @@ fn cmd_internal_doorbell(
                 let Some(pin) = pane_to_pin.get(&pane_id).cloned() else {
                     continue;
                 };
-                let from = status_by_pin
-                    .get(&pin)
-                    .cloned()
-                    .unwrap_or_else(|| "working".into());
-                status_by_pin.insert(pin.clone(), to.clone());
-                // bd-yw4s BIND: drain decision comes from the tick, not
-                // apply_status_change. `from` is kept for the legacy sweep
-                // queue (wave-2 fold, bd-nsb3).
-                let _ = from;
-                // leftover #7 fixed: tick must see `from`, no pre-insert of workspace_model.doorbell.statuses
+                // Model.doorbell.statuses is truth. Tick sees `from`; do not pre-insert.
                 let msg = workspace::Msg::HerdrStatus {
                     pin: pin.clone(),
                     status: to.clone(),
                 };
                 let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
                 workspace_model = next_model;
-                handle_workspace_cmds(&cmds);
+                handle_workspace_cmds(&mut workspace_model, &cmds);
                 let raw_injects: Vec<(String, String)> = cmds
                     .iter()
                     .filter_map(|a| match a {
@@ -8174,7 +8270,7 @@ fn cmd_internal_doorbell(
                 let msg = workspace::Msg::WatchDied;
                 let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
                 workspace_model = next_model;
-                handle_workspace_cmds(&cmds);
+                handle_workspace_cmds(&mut workspace_model, &cmds);
                 let mut backoff = 1u64;
                 let mut restarted = false;
                 for _ in 0..5 {
@@ -8241,18 +8337,30 @@ fn cmd_internal_doorbell(
                     );
                     break;
                 }
-                doorbell_sweep_inbox(
-                    cfg,
-                    project,
-                    &status_by_pin,
-                    &mut workspace_model,
-                    &mut since_by_pin,
-                    &mut budgets,
-                    herdr.as_mut(),
-                    &mut hear,
-                    &index,
+                let since = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                let msg = workspace::Msg::Sweep { since };
+                let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
+                workspace_model = next_model;
+                if handle_workspace_cmds(&mut workspace_model, &cmds) {
+                    doorbell_sweep_inbox(
+                        cfg,
+                        project,
+                        &mut workspace_model,
+                        &mut since_by_pin,
+                        &mut budgets,
+                        herdr.as_mut(),
+                        &mut hear,
+                        &index,
+                        workspace,
+                        generation.as_ref(),
+                    );
+                }
+                doorbell::journal_append_workspace(
+                    &config::state_dir(),
                     workspace,
-                    generation.as_ref(),
+                    &msg,
+                    &cmds,
+                    serde_json::json!({ "stage": "sweep" }),
                 );
                 // ADR-0005: subscribe is the drain signal. Poll herdr only
                 // when the event spine is down.
@@ -8260,7 +8368,6 @@ fn cmd_internal_doorbell(
                     doorbell_refresh_status(
                         herdr.as_mut(),
                         project,
-                        &mut status_by_pin,
                         &mut pane_to_pin,
                         &mut workspace_model,
                         &mut hear,
@@ -8423,39 +8530,91 @@ fn doorbell_persist_wake_with_plane_s(
     let _ = doorbell::save_wake_state(&path, &st);
 }
 
-fn handle_workspace_cmds(cmds: &[crate::workspace::Cmd]) {
+fn upsert_workspace_receipt(corr: &str, receipt: &workspace::Receipt) {
+    let state = match receipt.state.as_str() {
+        "owed" => toron_core::mailbox::receipts::ReceiptState::Owed,
+        "acked" => toron_core::mailbox::receipts::ReceiptState::Acked,
+        "resulted" => toron_core::mailbox::receipts::ReceiptState::Resulted,
+        _ => return,
+    };
+    let wake = match receipt.wake.as_str() {
+        "standing" => Some(toron_core::mailbox::send_tags::Wake::Standing),
+        "tasked" => Some(toron_core::mailbox::send_tags::Wake::Tasked),
+        _ => None,
+    };
+    let r = toron_core::mailbox::receipts::Receipt {
+        corr: corr.to_string(),
+        state,
+        wake,
+        due_at: receipt.due_at.map(|v| v as i64),
+        result_path: receipt.result_path.clone(),
+        updated_at: chrono::Utc::now().timestamp_millis(),
+    };
+    let _ = crate::mail_shim::block_on(async {
+        if let Some(mb) = crate::mail_shim::try_mailbox() {
+            if let Ok(store) = mb.receipt_store() {
+                let _ = store.upsert(&r).await;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+}
+
+fn handle_workspace_cmds(
+    workspace_model: &mut workspace::WorkspaceModel,
+    cmds: &[workspace::Cmd],
+) -> bool {
+    let mut fetch_inbox = false;
     for cmd in cmds {
-        if let crate::workspace::Cmd::SqliteUpsert { corr, receipt } = cmd {
-            let state = match receipt.state.as_str() {
-                "owed" => toron_core::mailbox::receipts::ReceiptState::Owed,
-                "acked" => toron_core::mailbox::receipts::ReceiptState::Acked,
-                "resulted" => toron_core::mailbox::receipts::ReceiptState::Resulted,
-                _ => continue,
-            };
-            let wake = match receipt.wake.as_str() {
-                "standing" => Some(toron_core::mailbox::send_tags::Wake::Standing),
-                "tasked" => Some(toron_core::mailbox::send_tags::Wake::Tasked),
-                _ => None,
-            };
-            let due_at = receipt.due_at.map(|v| v as i64);
-            let r = toron_core::mailbox::receipts::Receipt {
-                corr: corr.clone(),
-                state,
-                wake,
-                due_at,
-                result_path: receipt.result_path.clone(),
-                updated_at: chrono::Utc::now().timestamp_millis(),
-            };
-            let _ = crate::mail_shim::block_on(async {
+        match cmd {
+            workspace::Cmd::SqliteUpsert { corr, receipt } => {
+                upsert_workspace_receipt(corr, receipt);
+            }
+            workspace::Cmd::FetchInbox { .. } => {
+                fetch_inbox = true;
+            }
+            workspace::Cmd::WaitCorr { corr } => {
                 if let Some(mb) = crate::mail_shim::try_mailbox() {
                     if let Ok(store) = mb.receipt_store() {
-                        let _ = store.upsert(&r).await;
+                        if let Ok(Some(r)) = crate::mail_shim::block_on(store.get(corr)) {
+                            let rec = workspace::Receipt {
+                                state: r.state.as_str().to_string(),
+                                wake: r
+                                    .wake
+                                    .map(|w| w.as_str().to_string())
+                                    .unwrap_or_else(|| "tasked".into()),
+                                due_at: r.due_at.map(|v| v as u64),
+                                result_path: r.result_path.clone(),
+                            };
+                            let msg = workspace::Msg::Receipt {
+                                corr: corr.clone(),
+                                receipt: rec,
+                            };
+                            let (next, extra) = workspace::tick(workspace_model, &msg);
+                            *workspace_model = next;
+                            for c in extra {
+                                if let workspace::Cmd::SqliteUpsert { corr, receipt } = c {
+                                    upsert_workspace_receipt(&corr, &receipt);
+                                }
+                            }
+                        }
                     }
                 }
-                Ok::<(), anyhow::Error>(())
-            });
+            }
+            workspace::Cmd::Subscribe { .. } => {
+                // Live dispatcher already holds subscribe_trusted. Claim-watch
+                // Subscribe Cmds belong to swarm_loop. No second bus.
+            }
+            workspace::Cmd::FactMiss { why } => {
+                eprintln!("flywheel: [FactMiss] {why}");
+            }
+            workspace::Cmd::LoudMiss { why } => {
+                eprintln!("flywheel: [LoudMiss] {why}");
+            }
+            _ => {}
         }
     }
+    fetch_inbox
 }
 
 fn rebuild_assignment_from_receipts(workspace_model: &mut crate::workspace::WorkspaceModel) {
@@ -8581,11 +8740,11 @@ fn doorbell_prompt_and_hear(
 }
 
 /// Seed / poll pane status. Drain queues on working → idle|done.
+/// Status writes go through `Msg::HerdrStatus` so Model.doorbell.statuses is truth.
 #[allow(clippy::too_many_arguments)]
 fn doorbell_refresh_status(
     herdr: Option<&mut Client>,
     project: &str,
-    status_by_pin: &mut BTreeMap<String, String>,
     pane_to_pin: &mut BTreeMap<String, String>,
     workspace_model: &mut workspace::WorkspaceModel,
     hear: &mut doorbell::HearTracker,
@@ -8618,9 +8777,7 @@ fn doorbell_refresh_status(
             continue;
         };
         let to = a.agent_status.as_str().to_string();
-        status_by_pin.insert(pin.clone(), to.clone());
-        // bd-a2vx: drain decision via tick (was apply_status_change on a separate queues map).
-        // leftover #7 fixed: no pre-insert, tick sees `from`
+        // bd-a2vx: drain decision via tick. No side map; tick sees `from` on Model.
         workspace_model.doorbell.index = index.clone();
         let msg = workspace::Msg::HerdrStatus {
             pin: pin.clone(),
@@ -8628,7 +8785,7 @@ fn doorbell_refresh_status(
         };
         let (next_model, cmds) = workspace::tick(workspace_model, &msg);
         *workspace_model = next_model;
-        handle_workspace_cmds(&cmds);
+        handle_workspace_cmds(workspace_model, &cmds);
         let raw: Vec<(String, String)> = cmds
             .iter()
             .filter_map(|ac| match ac {
@@ -8676,7 +8833,6 @@ fn doorbell_refresh_pins(project: &str, pane_to_pin: &mut BTreeMap<String, Strin
 fn doorbell_sweep_inbox(
     cfg: &Config,
     project: &str,
-    status_by_pin: &BTreeMap<String, String>,
     workspace_model: &mut workspace::WorkspaceModel,
     since_by_pin: &mut BTreeMap<String, String>,
     budgets: &mut BTreeMap<String, doorbell::PinBudget>,
@@ -8698,15 +8854,7 @@ fn doorbell_sweep_inbox(
                 - chrono::Duration::hours(doorbell::REDELIVERY_LOOKBACK_HOURS as i64))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         });
-        // Sync status into tick model for this pin.
-        let status = status_by_pin
-            .get(pin)
-            .cloned()
-            .unwrap_or_else(|| "idle".into());
-        workspace_model
-            .doorbell
-            .statuses
-            .insert(pin.to_string(), status);
+        // Status enters via HerdrStatus ticks, never pre-insert before InboxRows.
         workspace_model.doorbell.index = index.clone();
         // Prefer in-process mailbox (zero fork) — fallback to CLI only if unavailable
         let in_process_ok = (|| -> Option<()> {
@@ -8729,7 +8877,7 @@ fn doorbell_sweep_inbox(
             };
             let (next_model, cmds) = workspace::tick(workspace_model, &msg);
             *workspace_model = next_model;
-            handle_workspace_cmds(&cmds);
+            handle_workspace_cmds(workspace_model, &cmds);
             let raw: Vec<(String, String)> = cmds
                 .iter()
                 .filter_map(|a| match a {
@@ -8825,7 +8973,7 @@ fn doorbell_sweep_inbox(
             };
             let (next_model, cmds) = workspace::tick(workspace_model, &msg);
             *workspace_model = next_model;
-            handle_workspace_cmds(&cmds);
+            handle_workspace_cmds(workspace_model, &cmds);
             let raw_injects: Vec<(String, String)> = cmds
                 .iter()
                 .filter_map(|a| match a {
@@ -10913,6 +11061,37 @@ pub fn facts_journal_path(project: &str) -> std::path::PathBuf {
         .join(format!("{}.jsonl", state::state_key(project)))
 }
 
+fn pending_facts_path(project: &str) -> std::path::PathBuf {
+    config::state_dir()
+        .join("facts")
+        .join(format!("{}-pending.jsonl", state::state_key(project)))
+}
+
+fn append_pending_fact(project: &str, summary: &str) -> Result<()> {
+    let path = pending_facts_path(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(f, "{}", serde_json::to_string(summary)?)?;
+    Ok(())
+}
+
+fn drain_pending_facts(project: &str) -> Vec<String> {
+    let path = pending_facts_path(project);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let _ = std::fs::remove_file(&path);
+    raw.lines()
+        .filter_map(|l| serde_json::from_str(l.trim()).ok())
+        .collect()
+}
+
 pub fn append_fact(project: &str, event: &ingress::IngressEvent) -> Result<()> {
     if !ingress::is_fact(event) {
         return Ok(());
@@ -11030,25 +11209,22 @@ pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
         workflow: Box::new(|t| eprintln!("ingress routing bug: workflow via fact seam: {t:?}")),
         cron: Box::new(|n| eprintln!("ingress routing bug: cron via fact seam: {n}")),
         fact: Box::new(move |ev: &ingress::IngressEvent| {
-            // Live Fact path via workspace tick (leftover #10) — journal through the workspace model, not a discarded Default
+            // Live Fact path: journal a pending Msg. The doorbell dispatcher
+            // ticks it on the live WorkspaceModel (never Default, never
+            // herdr-inject that bypasses tick).
             let summary = ingress::fact_doorbell_line(ev).unwrap_or_else(|| format!("{ev:?}"));
             let msg = crate::workspace::Msg::Fact {
                 summary: summary.clone(),
             };
-            let (next_model, cmds) =
-                crate::workspace::tick(&crate::workspace::WorkspaceModel::default(), &msg);
-            // Journal the fact via workspace model (preserve for replay)
-            let _ = next_model; // model' is transient here; the durable journal is the seam's record
             crate::doorbell::journal_append_workspace(
                 &crate::config::state_dir(),
                 &proj,
                 &msg,
-                &cmds,
-                serde_json::json!({ "stage": "fact_seam", "summary": summary }),
+                &[],
+                serde_json::json!({ "stage": "fact_pending", "summary": summary }),
             );
-            match captain_fact_inject(&proj, ev) {
-                Ok(_) => {}
-                Err(e) => eprintln!("flywheel: [FactMiss] fact dropped at ingress seam: {e:#}"),
+            if let Err(e) = append_pending_fact(&proj, &summary) {
+                eprintln!("flywheel: [FactMiss] could not queue fact for dispatcher: {e:#}");
             }
         }),
     }
@@ -15780,13 +15956,18 @@ fn cmd_stage(cfg: &Config, cmd: &StageCmd) -> Result<()> {
     // `workflow compose` defaults to.
     let project_stages = project_dir(cfg, "flywheel").join(".flywheel/stages.toml");
     match cmd {
-        StageCmd::List { all } => {
+        StageCmd::List {
+            all: _,
+            json: as_json,
+        } => {
             let lib = stages::StageLibrary::load_layered(Some(&project_stages))?;
+            let rows: Vec<stages::StageRow> = lib.list_tiered();
+            if *as_json {
+                print_json(&json!({ "stages": rows }));
+                return Ok(());
+            }
             println!("stages (semantic name <-> p-code alias, tier, role, phase):");
-            for row in lib.list_tiered() {
-                if row.tier == stages::Tier::Seed && !*all {
-                    continue;
-                }
+            for row in &rows {
                 println!(
                     "  {:<28} {:<4} [{:<7}] role={} phase={}",
                     row.name,
@@ -16674,7 +16855,7 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
                 model.mail_degraded = md;
             }
         }
-        let (next, actions) = crate::durable::tick(&model, &msg);
+        let (next, actions) = crate::workspace::tick_from_loop_msg(&model, &msg);
         let recorded_actions = entry.get("actions").and_then(|v| v.as_array());
         let replayed_val = serde_json::to_value(&actions).unwrap_or(serde_json::Value::Null);
         let replayed_arr = replayed_val.as_array();
@@ -22264,7 +22445,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
     }
 
     match cmd {
-        WorkflowCmd::List => {
+        WorkflowCmd::List { json: _ } => {
             let all = all_workflows()?;
             if all.is_empty() {
                 println!("no workflows defined");
@@ -22308,6 +22489,16 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     format!("{n}: {}", s.action.type_name())
                 })
                 .collect();
+            let graph_labels: Vec<String> = wf
+                .graph
+                .as_ref()
+                .map(|g| {
+                    g.nodes
+                        .iter()
+                        .map(|(n, node)| format!("{n}: {}", node.action.type_name()))
+                        .collect()
+                })
+                .unwrap_or_default();
             print_json(&json!({
                 "name": wf.name,
                 "source": source,
@@ -22317,6 +22508,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 "crew": crew,
                 "inputs": wf.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(),
                 "steps": step_labels,
+                "graph": graph_labels,
                 "graph_nodes": wf.graph.as_ref().map(|g| g.nodes.len()),
             }));
             Ok(())
@@ -22731,6 +22923,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             project,
             inputs,
             idempotency_key,
+            role_model,
             json,
         } => {
             // W6: --keep is a graduation of a RUN — without --run there is no
@@ -22915,7 +23108,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // steer/workflow run — lint passed, spawn the inferred crew +
             // dispatch each step via __send, reap on end. The composed struct
             // is invoked directly (the engine takes ANY Workflow).
-            let catalog = profile::ProfileCatalog::load()?;
+            let mut catalog = profile::ProfileCatalog::load()?;
+            catalog.apply_role_models(role_model)?;
             let ctx = pane::pre_spawn_crew(
                 cfg,
                 project_name,
@@ -28731,25 +28925,28 @@ mod integration_tests {
         );
         let (name, description, template) = ORCHESTRATION_COMMANDS[0];
         assert_eq!(name, "open-mode");
-        assert!(!description.is_empty(), "/open has a description");
+        assert!(!description.is_empty(), "/open-mode has a description");
         assert!(template.ends_with(".tpl"), "template file referenced");
         let (name, description, template) = ORCHESTRATION_COMMANDS[1];
         assert_eq!(name, "swarm-mode");
-        assert!(!description.is_empty(), "/swarm has a description");
+        assert!(!description.is_empty(), "/swarm-mode has a description");
         assert!(template.ends_with(".tpl"), "template file referenced");
         let (name, description, template) = ORCHESTRATION_COMMANDS[2];
         assert_eq!(
             name, "loop-mode",
             "loop mode avoids harness command collisions"
         );
-        assert!(!description.is_empty(), "/loop has a description");
+        assert!(!description.is_empty(), "/loop-mode has a description");
         assert!(template.ends_with(".tpl"), "template file referenced");
         let (name, description, template) = ORCHESTRATION_COMMANDS[3];
         assert_eq!(
             name, "peer-aware-mode",
             "peer-aware mode avoids harness command collisions"
         );
-        assert!(!description.is_empty(), "/peer-aware has a description");
+        assert!(
+            !description.is_empty(),
+            "/peer-aware-mode has a description"
+        );
         assert!(template.ends_with(".tpl"), "template file referenced");
     }
 

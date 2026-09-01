@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-09-01 workflow/stage seam
+
+### Fixed
+- **Wave-dispatch briefs `systematic-execute` (p6), not p1.** p1 is scout `fresh-eyes-explore`; coder execution is p6. Recipe YAML + stage body + slash `/swarm-mode` agree.
+- **`decide` argv is runnable.** `loop-work` is `loop-mode run <project> --work`. `compose-parts` always has a `--parts` value (`parts: a,b` extracted, else `<role:stage,...>`). `repair until verified` maps to `compose --parts repair-until-verified --run`.
+- **`stage list` shows seed by default.** `--json` accepted on `stage list` and `workflow list`. `workflow show` prints graph node labels (was `steps: []` on graph workflows).
+- **Slash pins the primitive.** `/swarm-mode` does not re-run `decide`. `/loop-mode` pins `loop-mode run --work`.
+- **`send --stage` help** names any stage / p-code (`stage list`), not only p1–p8.
+
+### Added
+- **`error_kinds` on workflow steps/graph nodes** (toron-workflow 1.3.1). R-E2 warns only when `fail_run` has no kinds. `wave-swarm` fail_run steps classify `[timeout, rate_limit, unknown]`.
+
 ## [0.3.0] — 2026-08-31 Tick Law + doorbell bind (GS-005 → GS-009, 0.2.0 → 0.3.0)
 
 

@@ -9,7 +9,7 @@ objective end-to-end. It is a durable execution loop implemented with workflow
 runtime machinery, but it is not the same thing as a reusable workflow
  definition. Beads are optional: `--work` selects bead-backed execution;
 without `--work`, the loop may drive an objective, queue, or workflow. It is
-the opposite of /swarm: no parallel crew lanes and no wave fan-out. A reviewer
+the opposite of /swarm-mode: no parallel crew lanes and no wave fan-out. A reviewer
 may be summoned at checkpoints, but that reviewer is an exception, not a
 second execution crew.
 
@@ -25,13 +25,15 @@ registry alternatives and their known cost/capabilities. Blank input keeps the
 default; an explicit provider/model selection overrides it. Use the selected
 profile/model for the run and record the choice in the launch/report summary.
 
-1. SETUP: one pane via `flywheel spawn <proj> --profile <role>` (or run
-   in-place if already pane'd). The selected/current harness is the execution
-   harness for the whole solo run. Write the objective as a brief with GOAL / SCOPE / CONTEXT / ACCEPTANCE / VERIFY /
-   TIMEBOX / FORBIDDEN / REPORT. Keep it specific enough to execute and verify. Reserve files before
-   edit   (toron reserve acquire; renew 4min); build slot for cargo. Wake is
-   the workspace doorbell: show you heard it, then pull the relevant inbox,
-   channel, or job. Do not start a self-managed polling timer.
+1. SETUP: `flywheel loop-mode run <project> --work`. Slash /loop-mode pins
+   this. Do not re-run `flywheel decide`. One pane via `flywheel spawn <proj>
+   --profile <role>` (or run in-place if already pane'd). The selected/current
+   harness is the execution harness for the whole solo run. Write the objective
+   as a brief with GOAL / SCOPE / CONTEXT / ACCEPTANCE / VERIFY / TIMEBOX /
+   FORBIDDEN / REPORT. Keep it specific enough to execute and verify. Reserve
+   files before edit (toron reserve acquire; renew 4min); build slot for cargo.
+   Wake is the workspace doorbell: show you heard it, then pull the relevant
+   inbox, channel, or job. Do not start a self-managed polling timer.
 
 2. EXECUTE: TDD red-green per unit (RED test first, GREEN minimal code,
    REFACTOR while green). Stage ONLY reserved paths (never git add -A --

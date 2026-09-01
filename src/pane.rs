@@ -1,4 +1,5 @@
 // governed-by: ADR-0024
+// governed-by: ADR-0027
 //! Pane runner (ADR-0010 Spec A pane row, P10.3, bd-ghcj.1): real herdr
 //! PANE execution for interactive workflows — a crew pre-spawned from the
 //! workflow's `crew` plan, then each `dispatch_job` step sent to the running
@@ -380,17 +381,16 @@ fn spawn_crew_into(
                         split.pane_id
                     }
                 };
-                // AGENT_ARG = per-harness model flag (headless.rs model_args)
-                // + the omp role models (--smol/--slow/--plan, bd-gsvn.2).
-                let mut agent_args: Vec<String> = if profile.model.is_empty() {
-                    vec![]
-                } else {
-                    headless::model_args(
-                        harness,
-                        &profile.model,
-                        (!profile.effort.is_empty()).then_some(profile.effort.as_str()),
-                    )
-                };
+                // AGENT_ARG must honor Profile.provider via the same
+                // registry pin as cmd_spawn / spawn_launch_plan. Raw
+                // profile.model drops the provider half (ADR-0027 compose gap).
+                let mut agent_args: Vec<String> =
+                    if profile.model.is_empty() && profile.provider.is_empty() {
+                        vec![]
+                    } else {
+                        crate::profile_launch_args(harness, profile, None)
+                            .map_err(|e| anyhow!("pane crew @{role} model routing: {e}"))?
+                    };
                 agent_args.extend(headless::role_model_args(
                     harness,
                     &profile.smol,
@@ -1320,6 +1320,19 @@ mod tests {
         ));
         assert!(!is_transient_dispatch_reason("unknown profile @nope"));
         assert!(!is_transient_dispatch_reason(""));
+    }
+
+    #[test]
+    fn spawn_crew_into_uses_profile_launch_args() {
+        let src = include_str!("pane.rs");
+        let start = src
+            .find("fn spawn_crew_into(")
+            .expect("spawn_crew_into present");
+        let slice = &src[start..start.saturating_add(12000)];
+        assert!(
+            slice.contains("profile_launch_args(harness, profile, None)"),
+            "compose pre-spawn must honor Profile.provider via profile_launch_args"
+        );
     }
 
     /// P10.3: `@role` resolves via the registry PROFILE column; a bare name
