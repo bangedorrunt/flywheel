@@ -191,6 +191,14 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         "watch filter stays tight: reactions (kind 7) are not wake-worthy (bd-qsed.4)"
     );
     assert!(
+        body.contains("20001") && body.contains("30013"),
+        "fallback + respawn watch must include presence 20001 and profile 30013"
+    );
+    assert!(
+        !body.contains("let kinds = \"9,43001,30031,39002\""),
+        "spawn_watch_child must not drop 20001/30013"
+    );
+    assert!(
         body.contains("mail") && body.contains("inbox"),
         "plane P sweep is fetch_inbox / toron mail inbox --since"
     );

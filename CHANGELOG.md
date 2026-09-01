@@ -7,8 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-09-02 GS-014 Tick Law leftovers
+
+### Fixed
+- Doorbell CLI fallback watch kinds match in-process: `9,20001,30013,43001,30031,39002` (respawn child no longer dropped presence/profile).
+- Swarm fold no longer calls `durable::tick` on unmapped LoopMsg.
+- Diagnose I/O failure reverts `awaiting_clear` via `Msg::DiagnoseFailed` (tick), not a post-tick HashMap mutate.
+- `WaitCorr` keeps pending corrs and re-peeks; `Publish` kind-14 sends a rumor (audience=human).
+
 ### Docs
-- Vocabulary: stage vs workflow vs recipe vs profile (README, orchestration, composition guide). Squad `recipes list` called out as a different word.
+- ADR-0027 Tick Law sentence: live path is held.
 
 ## [0.3.1] — 2026-09-01 workflow/stage seam
 

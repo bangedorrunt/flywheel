@@ -7875,7 +7875,7 @@ fn cmd_internal_doorbell(
         Some(())
     })();
     if in_process_ok.is_none() {
-        let kinds = "9,20001,30013,43001,30031,39002";
+        let kinds = DOORBELL_WATCH_KINDS;
         let mut child = match Command::new("toron")
             .args(["watch", "--project", project, "--kinds", kinds])
             .stdout(Stdio::piped())
@@ -8006,7 +8006,7 @@ fn cmd_internal_doorbell(
             };
             let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
             workspace_model = next_model;
-            let _ = handle_workspace_cmds(&mut workspace_model, &cmds);
+            let _ = handle_workspace_cmds(&mut workspace_model, &cmds, project);
             let injects: Vec<(String, String)> = cmds
                 .iter()
                 .filter_map(|c| match c {
@@ -8043,7 +8043,7 @@ fn cmd_internal_doorbell(
             let msg = workspace::Msg::AckSlaTick { now: now_s };
             let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
             workspace_model = next_model;
-            let need_fetch = handle_workspace_cmds(&mut workspace_model, &cmds);
+            let need_fetch = handle_workspace_cmds(&mut workspace_model, &cmds, project);
             if need_fetch {
                 doorbell_sweep_inbox(
                     cfg,
@@ -8134,7 +8134,7 @@ fn cmd_internal_doorbell(
                 let msg = workspace::Msg::WatchNdjson { line: line.clone() };
                 let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
                 workspace_model = next_model;
-                handle_workspace_cmds(&mut workspace_model, &cmds);
+                handle_workspace_cmds(&mut workspace_model, &cmds, project);
                 let mut delivered = Vec::new();
                 let raw_injects: Vec<(String, String)> = cmds
                     .iter()
@@ -8227,7 +8227,7 @@ fn cmd_internal_doorbell(
                 };
                 let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
                 workspace_model = next_model;
-                handle_workspace_cmds(&mut workspace_model, &cmds);
+                handle_workspace_cmds(&mut workspace_model, &cmds, project);
                 let raw_injects: Vec<(String, String)> = cmds
                     .iter()
                     .filter_map(|a| match a {
@@ -8270,7 +8270,7 @@ fn cmd_internal_doorbell(
                 let msg = workspace::Msg::WatchDied;
                 let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
                 workspace_model = next_model;
-                handle_workspace_cmds(&mut workspace_model, &cmds);
+                handle_workspace_cmds(&mut workspace_model, &cmds, project);
                 let mut backoff = 1u64;
                 let mut restarted = false;
                 for _ in 0..5 {
@@ -8341,7 +8341,7 @@ fn cmd_internal_doorbell(
                 let msg = workspace::Msg::Sweep { since };
                 let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
                 workspace_model = next_model;
-                if handle_workspace_cmds(&mut workspace_model, &cmds) {
+                if handle_workspace_cmds(&mut workspace_model, &cmds, project) {
                     doorbell_sweep_inbox(
                         cfg,
                         project,
@@ -8436,12 +8436,14 @@ fn cmd_internal_doorbell(
 /// Spawn the CLI `toron watch` plane-S child + its NDJSON reader thread.
 /// Shared by the initial fallback and both respawn paths (Died burst +
 /// 1s retry gate) so every restart uses the SAME kinds and wiring.
-/// Kinds MUST match the in-process filter (9, 43001, 30031, 39002).
+/// Kinds MUST match the in-process filter (presence 20001 + profile 30013).
+const DOORBELL_WATCH_KINDS: &str = "9,20001,30013,43001,30031,39002";
+
 fn spawn_watch_child<F>(project: &str, on_event: F) -> Option<std::process::Child>
 where
     F: Fn(Option<String>) + Send + 'static,
 {
-    let kinds = "9,43001,30031,39002";
+    let kinds = DOORBELL_WATCH_KINDS;
     let mut child = Command::new("toron")
         .args(["watch", "--project", project, "--kinds", kinds])
         .stdout(Stdio::piped())
@@ -8563,6 +8565,7 @@ fn upsert_workspace_receipt(corr: &str, receipt: &workspace::Receipt) {
 fn handle_workspace_cmds(
     workspace_model: &mut workspace::WorkspaceModel,
     cmds: &[workspace::Cmd],
+    project: &str,
 ) -> bool {
     let mut fetch_inbox = false;
     for cmd in cmds {
@@ -8574,36 +8577,15 @@ fn handle_workspace_cmds(
                 fetch_inbox = true;
             }
             workspace::Cmd::WaitCorr { corr } => {
-                if let Some(mb) = crate::mail_shim::try_mailbox() {
-                    if let Ok(store) = mb.receipt_store() {
-                        if let Ok(Some(r)) = crate::mail_shim::block_on(store.get(corr)) {
-                            let rec = workspace::Receipt {
-                                state: r.state.as_str().to_string(),
-                                wake: r
-                                    .wake
-                                    .map(|w| w.as_str().to_string())
-                                    .unwrap_or_else(|| "tasked".into()),
-                                due_at: r.due_at.map(|v| v as u64),
-                                result_path: r.result_path.clone(),
-                            };
-                            let msg = workspace::Msg::Receipt {
-                                corr: corr.clone(),
-                                receipt: rec,
-                            };
-                            let (next, extra) = workspace::tick(workspace_model, &msg);
-                            *workspace_model = next;
-                            for c in extra {
-                                if let workspace::Cmd::SqliteUpsert { corr, receipt } = c {
-                                    upsert_workspace_receipt(&corr, &receipt);
-                                }
-                            }
-                        }
-                    }
-                }
+                workspace_model.pending_wait.insert(corr.clone());
+            }
+            workspace::Cmd::Publish { kind, content } => {
+                publish_human_question(project, *kind, content);
             }
             workspace::Cmd::Subscribe { .. } => {
-                // Live dispatcher already holds subscribe_trusted. Claim-watch
-                // Subscribe Cmds belong to swarm_loop. No second bus.
+                // Live dispatcher already holds subscribe_trusted (kinds
+                // DOORBELL_WATCH_KINDS). Claim-watch Subscribe belongs to
+                // swarm_loop. No second bus.
             }
             workspace::Cmd::FactMiss { why } => {
                 eprintln!("flywheel: [FactMiss] {why}");
@@ -8611,10 +8593,86 @@ fn handle_workspace_cmds(
             workspace::Cmd::LoudMiss { why } => {
                 eprintln!("flywheel: [LoudMiss] {why}");
             }
+            workspace::Cmd::Invoke { workflow, input } => {
+                eprintln!("flywheel: [LoudMiss] Invoke not wired: {workflow} {input}");
+            }
+            workspace::Cmd::WriteNcryptsec { pin, .. } => {
+                eprintln!("flywheel: [LoudMiss] WriteNcryptsec denied for pin {pin}");
+            }
             _ => {}
         }
     }
+    drain_pending_wait_corrs(workspace_model);
     fetch_inbox
+}
+
+fn drain_pending_wait_corrs(workspace_model: &mut workspace::WorkspaceModel) {
+    let pending: Vec<String> = workspace_model.pending_wait.iter().cloned().collect();
+    for corr in pending {
+        if try_tick_receipt(workspace_model, &corr) {
+            workspace_model.pending_wait.remove(&corr);
+        }
+    }
+}
+
+fn try_tick_receipt(workspace_model: &mut workspace::WorkspaceModel, corr: &str) -> bool {
+    let Some(mb) = crate::mail_shim::try_mailbox() else {
+        return false;
+    };
+    let Ok(store) = mb.receipt_store() else {
+        return false;
+    };
+    let Ok(Some(r)) = crate::mail_shim::block_on(store.get(corr)) else {
+        return false;
+    };
+    let rec = workspace::Receipt {
+        state: r.state.as_str().to_string(),
+        wake: r
+            .wake
+            .map(|w| w.as_str().to_string())
+            .unwrap_or_else(|| "tasked".into()),
+        due_at: r.due_at.map(|v| v as u64),
+        result_path: r.result_path.clone(),
+    };
+    let msg = workspace::Msg::Receipt {
+        corr: corr.to_string(),
+        receipt: rec,
+    };
+    let (next, extra) = workspace::tick(workspace_model, &msg);
+    *workspace_model = next;
+    for c in extra {
+        if let workspace::Cmd::SqliteUpsert { corr, receipt } = c {
+            upsert_workspace_receipt(&corr, &receipt);
+        }
+    }
+    true
+}
+
+fn publish_human_question(project: &str, kind: u64, content: &str) {
+    eprintln!(
+        "flywheel: [Publish kind={kind}] {}",
+        content.chars().take(120).collect::<String>()
+    );
+    if kind != 14 {
+        return;
+    }
+    let Some(mb) = crate::mail_shim::try_mailbox() else {
+        return;
+    };
+    let tag = match toron_core::nostr::Tag::parse(["audience", "human"]) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let args = toron_core::mailbox::messaging::SendMessage {
+        project_slug: project.to_string(),
+        sender_name: "captain".into(),
+        to: vec!["captain".into()],
+        subject: "[human] question".into(),
+        body_md: content.to_string(),
+        extra_tags: vec![tag],
+        ..Default::default()
+    };
+    let _ = crate::mail_shim::block_on(mb.send_message(&args));
 }
 
 fn rebuild_assignment_from_receipts(workspace_model: &mut crate::workspace::WorkspaceModel) {
@@ -8785,7 +8843,7 @@ fn doorbell_refresh_status(
         };
         let (next_model, cmds) = workspace::tick(workspace_model, &msg);
         *workspace_model = next_model;
-        handle_workspace_cmds(workspace_model, &cmds);
+        handle_workspace_cmds(workspace_model, &cmds, project);
         let raw: Vec<(String, String)> = cmds
             .iter()
             .filter_map(|ac| match ac {
@@ -8877,7 +8935,7 @@ fn doorbell_sweep_inbox(
             };
             let (next_model, cmds) = workspace::tick(workspace_model, &msg);
             *workspace_model = next_model;
-            handle_workspace_cmds(workspace_model, &cmds);
+            handle_workspace_cmds(workspace_model, &cmds, project);
             let raw: Vec<(String, String)> = cmds
                 .iter()
                 .filter_map(|a| match a {
@@ -8973,7 +9031,7 @@ fn doorbell_sweep_inbox(
             };
             let (next_model, cmds) = workspace::tick(workspace_model, &msg);
             *workspace_model = next_model;
-            handle_workspace_cmds(workspace_model, &cmds);
+            handle_workspace_cmds(workspace_model, &cmds, project);
             let raw_injects: Vec<(String, String)> = cmds
                 .iter()
                 .filter_map(|a| match a {

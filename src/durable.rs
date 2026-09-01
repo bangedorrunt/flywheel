@@ -6986,15 +6986,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     title: title.clone(),
                 },
                 other => {
-                    let (m_next, m_actions) = tick(&ws.swarm, other);
-                    let _ = crate::state::journal_loop_msg(
-                        &params.project,
-                        other,
-                        &ws.swarm,
-                        &m_actions,
+                    eprintln!(
+                        "flywheel: unmapped LoopMsg in workspace fold (skipped, no durable::tick): {other:?}"
                     );
-                    poll_actions.extend(m_actions);
-                    ws.swarm = m_next;
                     continue;
                 }
             };
@@ -7591,19 +7585,26 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             },
                         )
                         .await;
-                    let hs = heal_states.entry(name.clone()).or_default();
                     match diag {
                         Ok(_) => {
                             // awaiting_clear/diagnose_count advanced in tick's
                             // model' (LoopMsg::Heal arm); nothing to mutate here.
                         }
                         Err(e) => {
-                            // cg6.2: a failed diagnose must not advance the
-                            // episode — tick set awaiting_clear optimistically,
-                            // so revert it and let the next poll retry.
-                            hs.awaiting_clear = false;
+                            // Revert optimistic awaiting_clear inside tick.
+                            let tmp = crate::workspace::WorkspaceModel {
+                                swarm: next_model.clone(),
+                                ..Default::default()
+                            };
+                            let (next, extra) = crate::workspace::tick(
+                                &tmp,
+                                &crate::workspace::Msg::DiagnoseFailed { name: name.clone() },
+                            );
+                            let _ = extra;
+                            next_model = next.swarm;
+                            heal_states = next_model.heal_states.clone();
                             eprintln!(
-                                "flywheel: diagnose_agent leaf failed for {name} (reverted awaiting_clear): {e}"
+                                "flywheel: diagnose_agent leaf failed for {name} (reverted awaiting_clear via tick): {e}"
                             );
                         }
                     }

@@ -75,6 +75,8 @@ pub struct WorkspaceModel {
     pub presence: BTreeMap<String, Presence>,
     pub open_human: BTreeMap<String, Question>,
     pub seq: u64,
+    /// WaitCorr corrs whose receipt has not landed yet (re-peek on Sweep).
+    pub pending_wait: std::collections::BTreeSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +155,10 @@ pub enum Msg {
     /// Clock discipline: wall-clock enters tick ONLY as this payload (E1).
     Tick {
         now: u64,
+    },
+    /// Diagnose I/O failed: revert optimistic awaiting_clear inside tick.
+    DiagnoseFailed {
+        name: String,
     },
 }
 
@@ -873,6 +879,11 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             next.swarm = sm;
             cmds.extend(c);
         }
+        Msg::DiagnoseFailed { name } => {
+            if let Some(hs) = next.swarm.heal_states.get_mut(name) {
+                hs.awaiting_clear = false;
+            }
+        }
     }
 
     (next, cmds)
@@ -884,6 +895,28 @@ mod tests {
 
     fn empty_model() -> WorkspaceModel {
         WorkspaceModel::default()
+    }
+
+    #[test]
+    fn ws_diagnose_failed_clears_awaiting_clear() {
+        let mut m = empty_model();
+        m.swarm.heal_states.insert(
+            "oc".into(),
+            crate::durable::HealState {
+                awaiting_clear: true,
+                ..Default::default()
+            },
+        );
+        let (next, cmds) = tick(&m, &Msg::DiagnoseFailed { name: "oc".into() });
+        assert!(
+            !next
+                .swarm
+                .heal_states
+                .get("oc")
+                .expect("kept")
+                .awaiting_clear
+        );
+        assert!(cmds.is_empty());
     }
 
     #[test]
@@ -1342,6 +1375,7 @@ mod tests {
                 verdict: "v".into(),
             },
             Msg::Tick { now: 123 },
+            Msg::DiagnoseFailed { name: "n".into() },
         ];
         for msg in msgs {
             let (next, _) = tick(&m, &msg);
@@ -1532,8 +1566,10 @@ mod bell_fold_tests {
             .expect("handle_workspace_cmds");
         let slice = &src[pos..src.len().min(pos + 2500)];
         assert!(
-            slice.contains("Msg::Receipt") && slice.contains("workspace::tick"),
-            "WaitCorr must re-enter Receipt through tick, not discard the store row"
+            src.contains("fn try_tick_receipt")
+                && src.contains("Msg::Receipt")
+                && src.contains("pending_wait"),
+            "WaitCorr must re-enter Receipt through tick (pending re-peek), not discard the store row"
         );
         assert!(
             !slice.contains("let _ = r"),
@@ -1674,6 +1710,14 @@ mod loop_fold_tests {
         assert!(
             !durable.contains("apply_diagnose_outcome") || state.contains("heal_states"),
             "RED (bd-gs8b #14): apply_diagnose_outcome loop-local mutate still present"
+        );
+        assert!(
+            durable.contains("Msg::DiagnoseFailed"),
+            "diagnose I/O failure must re-enter tick as Msg::DiagnoseFailed"
+        );
+        assert!(
+            !durable.contains("tick(&ws.swarm, other)"),
+            "fold other must not call durable::tick; map LoopMsg or skip"
         );
     }
 
