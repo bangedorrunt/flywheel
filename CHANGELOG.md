@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-09-02 swarm WorkspaceModel lifetime
+
+### Fixed
+- `swarm_loop` keeps one `WorkspaceModel` for the run (same as the doorbell dispatcher). No more `..Default` wipe each poll. DiagnoseFailed ticks that live model.
+
 ## [0.3.3] — 2026-09-02 GS-014 leftover finish
 
 ### Fixed

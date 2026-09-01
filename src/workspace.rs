@@ -1762,6 +1762,14 @@ mod loop_fold_tests {
             !durable.contains("pending_events: event_batch.events.clone()"),
             "do not world-dump poll events into the model before Tick; fold Msg::Herdr"
         );
+        assert!(
+            !durable.contains("swarm: model.clone()"),
+            "swarm_loop must not wipe WorkspaceModel from Default each poll"
+        );
+        assert!(
+            !durable.contains("swarm: next_model.clone()"),
+            "DiagnoseFailed must tick the live WorkspaceModel, not a Default-wrapped copy"
+        );
     }
 
     #[test]
