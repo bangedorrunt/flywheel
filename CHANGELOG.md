@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs
+- Vocabulary: stage vs workflow vs recipe vs profile (README, orchestration, composition guide). Squad `recipes list` called out as a different word.
+
 ## [0.3.1] — 2026-09-01 workflow/stage seam
 
 ### Fixed

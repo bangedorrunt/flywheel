@@ -11,11 +11,24 @@ Three operating modes, one engine:
 |------|----------|--------------|
 | **open-mode** | Direct. Current pane. No crew, no loop, no graph. | Your harness tools. If the task needs durability or lanes, stop and name loop or swarm. |
 | **loop-mode** | Durable solo execution. Crash-resume. | `--work`: beads from `br ready`. A bead may name a workflow (`## WORKFLOW <builtin>`), which the loop runs through the engine. |
-| **swarm-mode** | Captain + crews + waves. | `flywheel workflow compose --parts wave-swarm --run --mode pane` — the playbook *is* the recipe (GATE→DISPATCH→OBSERVE→VERIFY→SIGNOFF). Manual `spawn` + `send` lanes are the escape. |
+| **swarm-mode** | Captain + crews + waves. | `flywheel workflow compose --parts wave-swarm --run --mode pane` — the playbook *is* the recipe (GATE→DISPATCH→EXECUTE→OBSERVE→VERIFY→SIGNOFF). Manual `spawn` + `send` lanes are the escape. |
 
 `flywheel decide "<target>"` classifies a target and prints the exact argv.
 37 built-in workflows, 24 seed stages, and the compose grammar
 (`--parts`, `--from-yaml`, `--agent`) are reachable from every door.
+
+## Vocabulary
+
+These four nouns are not interchangeable.
+
+| Noun | What it is | What it is not |
+|------|------------|----------------|
+| **stage** | One named prompt. `flywheel send --to <pin> --stage systematic-execute`. Catalog: `stage list`. | Not a runner. p-codes (`p6`) are aliases for semantic names. |
+| **workflow** | An engine procedure (YAML steps or graph). A step *may* dispatch a stage to a role (`dispatch_job` + `@coder` + `systematic-execute`). Other steps are not stages: `request_approval`, `retry`, `call_workflow`, mail. | Not a topology. Loop, swarm, and open are how work is supervised. |
+| **recipe** | A compose token that expands to a workflow: `--parts wave-swarm` or `--parts repair-until-verified`. | Not every builtin. `captain-audit` / `bug-fix` / `plan` are `workflow run <name> --execute`. |
+| **profile** | A role template: harness + model + behavior + skills. `spawn --profile coder`. `crew: auto` counts the `@roles` the workflow named. | Not what makes a recipe. N panes = how many roles were named, each with that profile's default harness. |
+
+`flywheel squad` / `recipes list` is a group of profiles (spawn shape). That is a different use of the word recipe.
 
 ## Install
 
