@@ -160,6 +160,10 @@ pub enum Msg {
     DiagnoseFailed {
         name: String,
     },
+    /// Herdr pane event. Enters as Msg (not a world-dump into pending_events).
+    Herdr {
+        event: crate::durable::PollEvent,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +372,90 @@ fn filter_prompts(model: &WorkspaceModel, cmds: Vec<Cmd>) -> Vec<Cmd> {
         .collect()
 }
 
+fn parse_verdict(raw: &str) -> Option<String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "approve" | "approved" | "yes" | "ack" => Some("approve".into()),
+        "deny" | "denied" | "no" | "reject" | "rejected" => Some("deny".into()),
+        _ => None,
+    }
+}
+
+fn apply_human_decision(next: &mut WorkspaceModel, cmds: &mut Vec<Cmd>, corr: &str, verdict: &str) {
+    if next.open_human.remove(corr).is_some() {
+        cmds.push(Cmd::Audit {
+            kind: "human_decision".into(),
+            pin: corr.to_string(),
+            detail: verdict.to_string(),
+        });
+    } else {
+        cmds.push(Cmd::LoudMiss {
+            why: format!("HumanDecision for unknown corr {corr}: {verdict}"),
+        });
+    }
+}
+
+fn apply_assignment(
+    next: &mut WorkspaceModel,
+    cmds: &mut Vec<Cmd>,
+    corr: String,
+    wake: String,
+    body: &str,
+    audience: String,
+    priority: String,
+    broadcast: bool,
+    result_path: Option<String>,
+    verdict: Option<String>,
+) {
+    if corr.is_empty() {
+        return;
+    }
+    let from_tag = verdict.as_deref().and_then(parse_verdict);
+    let from_body = if next.open_human.contains_key(&corr) {
+        parse_verdict(body)
+    } else {
+        None
+    };
+    if let Some(v) = from_tag.or(from_body) {
+        apply_human_decision(next, cmds, &corr, &v);
+        return;
+    }
+    if audience == "human" && broadcast {
+        cmds.push(Cmd::LoudMiss {
+            why: format!("broadcast to human is hard error for corr {corr}"),
+        });
+        return;
+    }
+    if priority == "interrupt" && audience == "human" {
+        cmds.push(Cmd::LoudMiss {
+            why: format!("interrupt never onto human pin for corr {corr}"),
+        });
+        return;
+    }
+    if wake == "standing" && body.is_empty() {
+        return;
+    }
+    if audience == "human" && !body.is_empty() {
+        mint_human_question(next, cmds, &corr, body);
+    }
+    let state = if wake == "tasked" && body.is_empty() {
+        "resulted"
+    } else {
+        "owed"
+    };
+    let receipt = Receipt {
+        state: state.to_string(),
+        wake: wake.clone(),
+        due_at: None,
+        result_path,
+    };
+    next.assignment.insert(corr.clone(), receipt.clone());
+    cmds.push(Cmd::SqliteUpsert {
+        corr: corr.clone(),
+        receipt,
+    });
+    cmds.push(Cmd::WaitCorr { corr });
+}
+
 fn mint_human_question(next: &mut WorkspaceModel, cmds: &mut Vec<Cmd>, corr: &str, body: &str) {
     if next.open_human.contains_key(corr) {
         cmds.push(Cmd::LoudMiss {
@@ -545,6 +633,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     let mut audience: Option<String> = None;
                     let mut result_path: Option<String> = None;
                     let mut priority: Option<String> = None;
+                    let mut verdict: Option<String> = None;
                     for tag in tags {
                         if let Some(arr) = tag.as_array() {
                             if arr.len() >= 2 {
@@ -556,6 +645,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                                     "audience" => audience = Some(val),
                                     "result_path" => result_path = Some(val),
                                     "priority" => priority = Some(val),
+                                    "verdict" => verdict = Some(val),
                                     _ => {}
                                 }
                             }
@@ -564,46 +654,22 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     // Kind-9 is the ring. Assignment enters from rumor 14 tags
                     // (or InboxRows from FetchInbox). Never from mail-delivered.
                     let kind = v.get("kind").and_then(|k| k.as_u64());
-                    if kind == Some(14) {
-                        if let Some(c) = corr {
-                            let w = wake.unwrap_or_else(|| "tasked".to_string());
-                            let a = audience.unwrap_or_else(|| "agents".to_string());
-                            let p = priority.unwrap_or_else(|| "queue".to_string());
-                            let body = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                            let broadcast = false;
-                            if a == "human" && broadcast {
-                                cmds.push(Cmd::LoudMiss {
-                                    why: format!("broadcast to human is hard error for corr {c}"),
-                                });
-                            } else if p == "interrupt" && a == "human" {
-                                cmds.push(Cmd::LoudMiss {
-                                    why: format!("interrupt never onto human pin for corr {c}"),
-                                });
-                            } else if w == "standing" && body.is_empty() {
-                                // silence
-                            } else {
-                                if a == "human" && !body.is_empty() {
-                                    mint_human_question(&mut next, &mut cmds, &c, body);
-                                }
-                                let state = if w == "tasked" && body.is_empty() {
-                                    "resulted"
-                                } else {
-                                    "owed"
-                                };
-                                let receipt = Receipt {
-                                    state: state.to_string(),
-                                    wake: w.clone(),
-                                    due_at: None,
-                                    result_path: result_path.clone(),
-                                };
-                                next.assignment.insert(c.clone(), receipt.clone());
-                                cmds.push(Cmd::SqliteUpsert {
-                                    corr: c.clone(),
-                                    receipt: receipt.clone(),
-                                });
-                                cmds.push(Cmd::WaitCorr { corr: c });
-                            }
-                        }
+                    if kind == Some(14)
+                        && let Some(c) = corr
+                    {
+                        let body = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        apply_assignment(
+                            &mut next,
+                            &mut cmds,
+                            c,
+                            wake.unwrap_or_else(|| "tasked".to_string()),
+                            body,
+                            audience.unwrap_or_else(|| "agents".to_string()),
+                            priority.unwrap_or_else(|| "queue".to_string()),
+                            false,
+                            result_path,
+                            verdict,
+                        );
                     }
                 }
             }
@@ -636,77 +702,40 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                if corr.is_empty() {
-                    continue;
-                }
-                let wake = row
-                    .get("wake")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("tasked")
-                    .to_string();
                 let body = row
                     .get("body")
+                    .or_else(|| row.get("body_md"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let audience = row
-                    .get("audience")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("agents")
-                    .to_string();
-                let result_path = row
-                    .get("result_path")
+                    .unwrap_or("");
+                let verdict = row
+                    .get("verdict")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                let priority = row
-                    .get("priority")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("queue")
-                    .to_string();
-                let broadcast = row
-                    .get("broadcast")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                // E3: audience=human broadcast is hard error
-                if audience == "human" && broadcast {
-                    cmds.push(Cmd::LoudMiss {
-                        why: format!("broadcast to human is hard error for corr {corr}"),
-                    });
-                    continue;
-                }
-                // E3: interrupt never onto human pin
-                if priority == "interrupt" && audience == "human" {
-                    cmds.push(Cmd::LoudMiss {
-                        why: format!("interrupt never onto human pin for corr {corr}"),
-                    });
-                    continue;
-                }
-                // E3: standing + empty body -> silence (no Cmd, no assignment)
-                if wake == "standing" && body.is_empty() {
-                    continue;
-                }
-                if audience == "human" && !body.is_empty() {
-                    mint_human_question(&mut next, &mut cmds, &corr, &body);
-                }
-                // tasked + empty body -> result against corr
-                let state = if wake == "tasked" && body.is_empty() {
-                    "resulted"
-                } else {
-                    "owed"
-                };
-                let receipt = Receipt {
-                    state: state.to_string(),
-                    wake: wake.clone(),
-                    due_at: None,
-                    result_path: result_path.clone(),
-                };
-                next.assignment.insert(corr.clone(), receipt.clone());
-                cmds.push(Cmd::SqliteUpsert {
-                    corr: corr.clone(),
-                    receipt: receipt.clone(),
-                });
-                cmds.push(Cmd::WaitCorr { corr: corr.clone() });
-                // default tasked priority is queue (already handled, interrupt is explicit)
+                apply_assignment(
+                    &mut next,
+                    &mut cmds,
+                    corr,
+                    row.get("wake")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tasked")
+                        .to_string(),
+                    body,
+                    row.get("audience")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("agents")
+                        .to_string(),
+                    row.get("priority")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("queue")
+                        .to_string(),
+                    row.get("broadcast")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    row.get("result_path")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    verdict,
+                );
             }
             let _ = pin;
         }
@@ -861,18 +890,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             next.presence.insert(pin.clone(), Presence::from_str(state));
         }
         Msg::HumanDecision { corr, verdict } => {
-            if let Some(q) = next.open_human.remove(corr) {
-                let _ = q;
-                cmds.push(Cmd::Audit {
-                    kind: "human_decision".into(),
-                    pin: corr.clone(),
-                    detail: verdict.clone(),
-                });
-            } else {
-                cmds.push(Cmd::LoudMiss {
-                    why: format!("HumanDecision for unknown corr {corr}: {verdict}"),
-                });
-            }
+            apply_human_decision(&mut next, &mut cmds, corr, verdict);
         }
         Msg::Tick { now } => {
             let (sm, c) = swarm_slice(&model.swarm, crate::durable::LoopMsg::Tick { now: *now });
@@ -883,6 +901,11 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             if let Some(hs) = next.swarm.heal_states.get_mut(name) {
                 hs.awaiting_clear = false;
             }
+        }
+        Msg::Herdr { event } => {
+            let (sm, c) = swarm_slice(&model.swarm, crate::durable::LoopMsg::Herdr(event.clone()));
+            next.swarm = sm;
+            cmds.extend(c);
         }
     }
 
@@ -1502,6 +1525,18 @@ mod bell_fold_tests {
             src.contains("drain_pending_facts") && src.contains("append_pending_fact"),
             "ingress queues facts; dispatcher ticks them on the live model"
         );
+        let fact_fn = src
+            .find("pub fn captain_fact_inject")
+            .expect("captain_fact_inject");
+        let slice = &src[fact_fn..src.len().min(fact_fn + 1800)];
+        assert!(
+            slice.contains("append_pending_fact"),
+            "captain_fact_inject must queue for workspace::tick"
+        );
+        assert!(
+            !slice.contains("agent_prompt") && !slice.contains("Client::connect"),
+            "captain_fact_inject must not herdr-inject (Tick Law)"
+        );
         // adapter must not swallow Err into ()
         assert!(
             !src.contains("if let Err(e) = captain_fact_inject(&proj, ev)"),
@@ -1718,6 +1753,14 @@ mod loop_fold_tests {
         assert!(
             !durable.contains("tick(&ws.swarm, other)"),
             "fold other must not call durable::tick; map LoopMsg or skip"
+        );
+        assert!(
+            !durable.contains("let mut heal_states: std::collections::HashMap"),
+            "loop-local heal_states HashMap must be gone; LoopModel.heal_states is the only map"
+        );
+        assert!(
+            !durable.contains("pending_events: event_batch.events.clone()"),
+            "do not world-dump poll events into the model before Tick; fold Msg::Herdr"
         );
     }
 
@@ -2371,6 +2414,71 @@ mod human_decision_tests {
         assert!(
             !src.contains(&bad) && !src.contains(&bad2),
             "mailbox mints no UI token/card"
+        );
+    }
+
+    #[test]
+    fn human_decision_from_inbox_verdict_closes_open_question() {
+        let mut m = empty_model();
+        m.open_human.insert(
+            "C-LIVE".into(),
+            Question {
+                corr: "C-LIVE".into(),
+                body: "ship?".into(),
+                created_at: 1,
+            },
+        );
+        let row = serde_json::json!({
+            "corr": "C-LIVE",
+            "body_md": "approve",
+            "wake": "tasked",
+            "audience": "human",
+        });
+        let (next, cmds) = tick(
+            &m,
+            &Msg::InboxRows {
+                rows: vec![row],
+                pin: "Captain".into(),
+            },
+        );
+        assert!(
+            !next.open_human.contains_key("C-LIVE"),
+            "mailbox verdict must close the open question"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::Audit { kind, detail, .. } if kind == "human_decision" && detail == "approve")),
+            "live producer is InboxRows, not a UI token"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Publish { .. })),
+            "a verdict must not mint another question"
+        );
+    }
+
+    #[test]
+    fn assignment_reads_body_md_from_live_inbox_json() {
+        let m = empty_model();
+        let row = serde_json::json!({
+            "corr": "FM-LIVE",
+            "body_md": "do the work",
+            "wake": "tasked",
+            "audience": "agents",
+        });
+        let (next, cmds) = tick(
+            &m,
+            &Msg::InboxRows {
+                rows: vec![row],
+                pin: "Recv".into(),
+            },
+        );
+        assert!(
+            next.assignment.contains_key("FM-LIVE"),
+            "live fetch_inbox JSON uses body_md, not body"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::WaitCorr { corr } if corr == "FM-LIVE"))
         );
     }
 }

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-09-02 GS-014 leftover finish
+
+### Fixed
+- One heal map: `LoopModel.heal_states` (no loop-local HashMap). Diagnose still re-enters as `Msg::DiagnoseFailed`.
+- Poll events enter as `Msg::Herdr`, not a world-dump into `pending_events` before clock Tick.
+- `captain_fact_inject` queues for `workspace::tick` (no herdr-direct inject).
+- HumanDecision live producer: InboxRows / rumor-14 `verdict=` or approve/deny body on an open corr.
+- Watch kinds include rumor 14. `handle_workspace_cmds` is exhaustive.
+
 ## [0.3.2] — 2026-09-02 GS-014 Tick Law leftovers
 
 ### Fixed

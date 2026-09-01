@@ -191,8 +191,8 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         "watch filter stays tight: reactions (kind 7) are not wake-worthy (bd-qsed.4)"
     );
     assert!(
-        body.contains("20001") && body.contains("30013"),
-        "fallback + respawn watch must include presence 20001 and profile 30013"
+        body.contains("20001") && body.contains("30013") && body.contains(",14,"),
+        "fallback + respawn watch must include presence 20001, profile 30013, and rumor 14"
     );
     assert!(
         !body.contains("let kinds = \"9,43001,30031,39002\""),

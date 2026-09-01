@@ -7833,6 +7833,7 @@ fn cmd_internal_doorbell(
             Filter::new()
                 .kinds([
                     toron_kind(9),
+                    toron_kind(14),
                     toron_kind(20001),
                     toron_kind(30013),
                     toron_kind(43001),
@@ -8437,7 +8438,7 @@ fn cmd_internal_doorbell(
 /// Shared by the initial fallback and both respawn paths (Died burst +
 /// 1s retry gate) so every restart uses the SAME kinds and wiring.
 /// Kinds MUST match the in-process filter (presence 20001 + profile 30013).
-const DOORBELL_WATCH_KINDS: &str = "9,20001,30013,43001,30031,39002";
+const DOORBELL_WATCH_KINDS: &str = "9,14,20001,30013,43001,30031,39002";
 
 fn spawn_watch_child<F>(project: &str, on_event: F) -> Option<std::process::Child>
 where
@@ -8599,7 +8600,26 @@ fn handle_workspace_cmds(
             workspace::Cmd::WriteNcryptsec { pin, .. } => {
                 eprintln!("flywheel: [LoudMiss] WriteNcryptsec denied for pin {pin}");
             }
-            _ => {}
+            workspace::Cmd::Prompt { .. }
+            | workspace::Cmd::CheckAckSla
+            | workspace::Cmd::RestartWatch => {
+                // Applied by the dispatcher caller (doorbell_prompt / AckSla
+                // scan / Died restart). Not I/O here.
+            }
+            workspace::Cmd::Audit { kind, pin, detail } => {
+                eprintln!("flywheel: [Audit {kind}] {pin}: {detail}");
+            }
+            workspace::Cmd::Send { .. }
+            | workspace::Cmd::PinStamp { .. }
+            | workspace::Cmd::DispatchImmediate { .. }
+            | workspace::Cmd::Blocked { .. }
+            | workspace::Cmd::Nudge { .. }
+            | workspace::Cmd::Diagnose { .. }
+            | workspace::Cmd::Respawn { .. }
+            | workspace::Cmd::Reclaim { .. }
+            | workspace::Cmd::Wait => {
+                // Swarm I/O is applied in swarm_loop via Cmd::to_loop_action.
+            }
         }
     }
     drain_pending_wait_corrs(workspace_model);
@@ -11197,61 +11217,16 @@ pub fn captain_fact_inject(project: &str, event: &ingress::IngressEvent) -> Resu
     let Some(line) = ingress::fact_doorbell_line(event) else {
         return Ok(());
     };
-    // persist for status (facts ride the journal/watch line, ADR-0014 intact)
     let _ = append_fact(project, event);
-    // GS-006: alias is the ONLY captain route; empty after Continue/Adopt means nowhere loud.
-    let Some(pin) = state::load_captain_alias(project) else {
+    if state::load_captain_alias(project).is_none() {
         eprintln!(
             "flywheel: [FactMiss] no captain alias for project {project}: fact not injected (loud)"
         );
         anyhow::bail!("captain fact miss: no alias for project {project}");
-    };
-    // reuse doorbell_prompt path (herdr inject, pane fallback)
-    let registry = state::load_spawn_registry(project);
-    let entry = registry
-        .iter()
-        .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()));
-    let Some(entry) = entry else {
-        eprintln!(
-            "flywheel: [FactMiss] captain alias {pin} not in registry for {project}: fact not injected (loud)"
-        );
-        anyhow::bail!("captain fact miss: alias {pin} not in registry for {project}");
-    };
-    // best-effort herdr connect; loud if herdr down (facts still journaled)
-    let mut client = Client::connect(Some(
-        &config::Config::load().unwrap_or_default().socket_path(),
-    ))
-    .context("captain fact miss: herdr unavailable")?;
-    match client.agent_prompt(&entry.name, &line, None) {
-        Ok(_) => {}
-        Err(e) if is_agent_not_ready(&e.code) => {
-            let pane = entry.pane_id.clone();
-            match try_send_text_delivery(&mut client, project, &entry.name, &pane, &line) {
-                Ok(true) => {}
-                ok_failed => {
-                    eprintln!(
-                        "flywheel: [FactMiss] send_text delivery failed for {} (pane {}): {:?}",
-                        entry.name, pane, ok_failed
-                    );
-                    anyhow::bail!(
-                        "captain fact miss: send_text delivery failed for {}",
-                        entry.name
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!(
-                "flywheel: captain fact inject failed for {}: {e:#}",
-                entry.name
-            );
-            anyhow::bail!(
-                "captain fact miss: herdr inject failed for {}: {e:#}",
-                entry.name
-            );
-        }
     }
-    Ok(())
+    // Queue for the live dispatcher. workspace::tick owns Prompt/FactMiss.
+    // Never herdr-inject here (Tick Law).
+    append_pending_fact(project, &line)
 }
 
 /// Adapter wiring for `handle_ingress`: facts → journal + captain doorbell.
