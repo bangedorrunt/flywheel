@@ -8008,13 +8008,8 @@ fn cmd_internal_doorbell(
             let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
             workspace_model = next_model;
             let _ = handle_workspace_cmds(&mut workspace_model, &cmds, project);
-            let injects: Vec<(String, String)> = cmds
-                .iter()
-                .filter_map(|c| match c {
-                    workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
-                    _ => None,
-                })
-                .collect();
+            let injects =
+                doorbell::take_allowed(prompt_injects(&cmds), &mut budgets, doorbell_now_unix());
             if !injects.is_empty() {
                 doorbell_prompt(
                     herdr.as_mut(),
@@ -8137,16 +8132,12 @@ fn cmd_internal_doorbell(
                 workspace_model = next_model;
                 handle_workspace_cmds(&mut workspace_model, &cmds, project);
                 let mut delivered = Vec::new();
-                let raw_injects: Vec<(String, String)> = cmds
-                    .iter()
-                    .filter_map(|a| match a {
-                        workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
-                        other => {
-                            delivered.push(serde_json::to_value(other).unwrap_or_default());
-                            None
-                        }
-                    })
-                    .collect();
+                for a in &cmds {
+                    if !matches!(a, workspace::Cmd::Prompt { .. }) {
+                        delivered.push(serde_json::to_value(a).unwrap_or_default());
+                    }
+                }
+                let raw_injects = prompt_injects(&cmds);
                 doorbell::journal_append_workspace(
                     &config::state_dir(),
                     workspace,
@@ -8229,13 +8220,7 @@ fn cmd_internal_doorbell(
                 let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
                 workspace_model = next_model;
                 handle_workspace_cmds(&mut workspace_model, &cmds, project);
-                let raw_injects: Vec<(String, String)> = cmds
-                    .iter()
-                    .filter_map(|a| match a {
-                        workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
-                        _ => None,
-                    })
-                    .collect();
+                let raw_injects = prompt_injects(&cmds);
                 doorbell::journal_append_workspace(
                     &config::state_dir(),
                     workspace,
@@ -8563,6 +8548,15 @@ fn upsert_workspace_receipt(corr: &str, receipt: &workspace::Receipt) {
     });
 }
 
+fn prompt_injects(cmds: &[workspace::Cmd]) -> Vec<(String, String)> {
+    cmds.iter()
+        .filter_map(|c| match c {
+            workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 fn handle_workspace_cmds(
     workspace_model: &mut workspace::WorkspaceModel,
     cmds: &[workspace::Cmd],
@@ -8692,7 +8686,9 @@ fn publish_human_question(project: &str, kind: u64, content: &str) {
         extra_tags: vec![tag],
         ..Default::default()
     };
-    let _ = crate::mail_shim::block_on(mb.send_message(&args));
+    if let Err(e) = crate::mail_shim::block_on(mb.send_message(&args)) {
+        eprintln!("flywheel: [Publish kind=14] send failed: {e:#}");
+    }
 }
 
 fn rebuild_assignment_from_receipts(workspace_model: &mut crate::workspace::WorkspaceModel) {
@@ -8864,13 +8860,7 @@ fn doorbell_refresh_status(
         let (next_model, cmds) = workspace::tick(workspace_model, &msg);
         *workspace_model = next_model;
         handle_workspace_cmds(workspace_model, &cmds, project);
-        let raw: Vec<(String, String)> = cmds
-            .iter()
-            .filter_map(|ac| match ac {
-                workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
-                _ => None,
-            })
-            .collect();
+        let raw = prompt_injects(&cmds);
         doorbell::journal_append_workspace(
             &config::state_dir(),
             workspace,
@@ -8956,13 +8946,7 @@ fn doorbell_sweep_inbox(
             let (next_model, cmds) = workspace::tick(workspace_model, &msg);
             *workspace_model = next_model;
             handle_workspace_cmds(workspace_model, &cmds, project);
-            let raw: Vec<(String, String)> = cmds
-                .iter()
-                .filter_map(|a| match a {
-                    workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
-                    _ => None,
-                })
-                .collect();
+            let raw = prompt_injects(&cmds);
             doorbell::journal_append_workspace(
                 &config::state_dir(),
                 workspace,
@@ -8971,12 +8955,7 @@ fn doorbell_sweep_inbox(
                 serde_json::json!({ "stage": "sweep_inbox", "pin": pin }),
             );
             injects.extend(raw);
-            if let Some(hw) = arr
-                .iter()
-                .filter_map(|it| it.get("created_ts").and_then(|t| t.as_str()))
-                .max()
-                .map(|s| s.to_string())
-            {
+            if let Some(hw) = doorbell::inbox_high_water_from_values(arr.iter().collect()) {
                 since_by_pin.insert(pin.to_string(), hw);
             } else if arr.is_empty() {
             } else {
@@ -9052,13 +9031,7 @@ fn doorbell_sweep_inbox(
             let (next_model, cmds) = workspace::tick(workspace_model, &msg);
             *workspace_model = next_model;
             handle_workspace_cmds(workspace_model, &cmds, project);
-            let raw_injects: Vec<(String, String)> = cmds
-                .iter()
-                .filter_map(|a| match a {
-                    workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
-                    _ => None,
-                })
-                .collect();
+            let raw_injects = prompt_injects(&cmds);
             doorbell::journal_append_workspace(
                 &config::state_dir(),
                 workspace,

@@ -1132,65 +1132,74 @@ pub fn apply_inbox_json(
     inject
 }
 
-/// Newest `created_ts` in an inbox blob (RFC3339), for the high-water.
-/// Gap 9 fix: parses to micros and compares numerically — lexicographic string
-/// max is wrong when formats differ (fractional, Z vs +00:00).
-pub fn inbox_high_water(raw: &str) -> Option<String> {
-    let _us = inbox_high_water_micros(raw)?;
-    // Re-parse to find the string that produced the max micros (canonical return).
-    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let items: Vec<&serde_json::Value> = if let Some(arr) = v.as_array() {
-        arr.iter().collect()
-    } else if let Some(arr) = v.get("messages").and_then(|m| m.as_array()) {
-        arr.iter().collect()
-    } else if v.is_object() {
-        vec![&v]
-    } else {
-        return None;
-    };
-    let mut best: Option<(i64, String)> = None;
-    for i in &items {
-        if let Some(ts) = i.get("created_ts").and_then(|t| t.as_str())
-            && let Ok(us_item) = parse_rfc3339_micros(ts)
-            && best.as_ref().map(|(u, _)| us_item > *u).unwrap_or(true)
-        {
-            best = Some((us_item, ts.to_string()));
+/// Rumor-time of one inbox JSON row: live ToJson uses `created_ts_us` (i64
+/// micros); CLI/legacy blobs may still carry `created_ts` RFC3339.
+pub fn row_created_us(v: &serde_json::Value) -> Option<i64> {
+    if let Some(n) = v.get("created_ts_us") {
+        if let Some(i) = n.as_i64() {
+            return Some(i);
+        }
+        if let Some(u) = n.as_u64() {
+            return Some(u as i64);
+        }
+        if let Some(s) = n.as_str() {
+            return s.parse().ok();
         }
     }
-    if let Some((_, s)) = best {
-        return Some(s);
-    }
-    // Fallback: if parsing failed, use string max (old behavior).
-    items
-        .into_iter()
-        .filter_map(|i| {
-            i.get("created_ts")
-                .and_then(|t| t.as_str())
-                .map(str::to_string)
-        })
-        .max()
+    v.get("created_ts")
+        .and_then(|t| t.as_str())
+        .and_then(|s| parse_rfc3339_micros(s).ok())
 }
 
-/// Numeric high-water for inbox blobs (micros since epoch).
-pub fn inbox_high_water_micros(raw: &str) -> Option<i64> {
-    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let items: Vec<&serde_json::Value> = if let Some(arr) = v.as_array() {
+fn us_to_rfc3339(us: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_micros(us)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+}
+
+fn inbox_items(v: &serde_json::Value) -> Vec<&serde_json::Value> {
+    if let Some(arr) = v.as_array() {
         arr.iter().collect()
     } else if let Some(arr) = v.get("messages").and_then(|m| m.as_array()) {
         arr.iter().collect()
     } else if v.is_object() {
-        vec![&v]
+        vec![v]
     } else {
-        return None;
-    };
-    items
-        .into_iter()
-        .filter_map(|i| {
-            i.get("created_ts")
-                .and_then(|t| t.as_str())
-                .and_then(|s| parse_rfc3339_micros(s).ok())
-        })
-        .max()
+        Vec::new()
+    }
+}
+
+pub fn inbox_high_water_from_values(items: Vec<&serde_json::Value>) -> Option<String> {
+    let mut best: Option<(i64, String)> = None;
+    for i in items {
+        let Some(us) = row_created_us(i) else {
+            continue;
+        };
+        let label = i
+            .get("created_ts")
+            .and_then(|t| t.as_str())
+            .map(str::to_string)
+            .or_else(|| us_to_rfc3339(us));
+        let Some(label) = label else {
+            continue;
+        };
+        if best.as_ref().map(|(u, _)| us > *u).unwrap_or(true) {
+            best = Some((us, label));
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+/// Newest created time in an inbox blob as RFC3339, for the high-water.
+/// Compares numerically (micros). Live JSON is `created_ts_us`.
+pub fn inbox_high_water(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    inbox_high_water_from_values(inbox_items(&v))
+}
+
+/// Newest created time as unix-micros (None if unparseable).
+pub fn inbox_high_water_micros(raw: &str) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    inbox_items(&v).into_iter().filter_map(row_created_us).max()
 }
 
 pub fn parse_rfc3339_micros(ts: &str) -> Result<i64, chrono::ParseError> {
@@ -1740,6 +1749,20 @@ mod tests {
             inbox_high_water(raw).as_deref(),
             Some("2026-08-20T00:00:02Z")
         );
+    }
+
+    #[test]
+    fn inbox_high_water_reads_created_ts_us_from_live_json() {
+        // Live ToJson emits created_ts_us (i64 micros), not created_ts RFC3339.
+        let us = chrono::DateTime::parse_from_rfc3339("2026-08-20T00:00:02Z")
+            .unwrap()
+            .timestamp_micros();
+        let raw = format!(
+            r#"{{"messages":[{{"importance":"urgent","created_ts_us":{us},"body_md":"hi"}}]}}"#
+        );
+        let hw = inbox_high_water(&raw).expect("high-water from created_ts_us");
+        let got = parse_rfc3339_micros(&hw).expect("hw is RFC3339");
+        assert_eq!(got, us, "cursor must follow rumor time, not wall-clock now");
     }
 
     #[test]

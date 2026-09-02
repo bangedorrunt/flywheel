@@ -1525,6 +1525,14 @@ mod bell_fold_tests {
             src.contains("drain_pending_facts") && src.contains("append_pending_fact"),
             "ingress queues facts; dispatcher ticks them on the live model"
         );
+        let fact_loop = src
+            .find("for summary in drain_pending_facts")
+            .expect("fact drain");
+        let slice = &src[fact_loop..src.len().min(fact_loop + 1400)];
+        assert!(
+            slice.contains("take_allowed"),
+            "Fact injects must honor 5/30/3 — Watch/Status/Sweep already do"
+        );
         let fact_fn = src
             .find("pub fn captain_fact_inject")
             .expect("captain_fact_inject");
