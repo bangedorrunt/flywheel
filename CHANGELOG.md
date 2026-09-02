@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5] — 2026-09-02 inbox cursor + fact budget
+
+### Fixed
+- Inbox high-water reads live `created_ts_us` (ToJson), not only legacy `created_ts` RFC3339. In-process sweep was jumping to wall-clock `now`.
+- Fact doorbell injects go through `take_allowed` (5/30/3). Watch/Status/Sweep already did; Fact did not.
+- Prompt extract is one helper (`prompt_injects`). Publish kind-14 send errors are loud.
+
 ## [0.3.4] — 2026-09-02 swarm WorkspaceModel lifetime
 
 ### Fixed
