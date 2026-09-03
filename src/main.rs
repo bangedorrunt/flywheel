@@ -7536,6 +7536,19 @@ fn cmd_doorbell_why(
     let entries = doorbell::journal_read_all(&config::state_dir());
     // Build fold model from Default and verify each journal entry's Cmd sequence matches replay
     let mut model = workspace::WorkspaceModel::default();
+    // bd-adr0027-proven-leftovers-55nx.1: crash-resume seed — the same
+    // durable caches the live dispatcher reloads at start (receipts sqlite
+    // → assignment; presence.jsonl snapshot → presence). Journal Msgs fold
+    // on top. Never the live dispatcher's RAM, never a second store.
+    rebuild_assignment_from_receipts(&mut model);
+    if let Ok(body) =
+        std::fs::read_to_string(crate::mail_shim::mailbox_roots().0.join("presence.jsonl"))
+    {
+        seed_why_presence(
+            &mut model,
+            timeout_presence_rows(&body, doorbell_now_unix()),
+        );
+    }
     let mut replay_seq: u64 = 0;
     let mut shown = 0usize;
     let mut matched = 0usize;
@@ -7605,7 +7618,18 @@ fn cmd_doorbell_why(
             } else {
                 Vec::new()
             };
-            let (next, actual) = workspace::tick(&model, &msg);
+            let (next, actual) = {
+                // bd-z54w honesty contract: restore the journaled pin set into
+                // the fold index so classification reproduces deterministically.
+                // Entries lacking pins (pre-field journals) keep the empty
+                // Default index: Unknown-presence semantics, never invent idle.
+                if let Some(pins) = entry.get("pins").and_then(|p| p.as_array()) {
+                    for pin in pins.iter().filter_map(|v| v.as_str()) {
+                        model.doorbell.index.insert_pin(pin.to_string(), None);
+                    }
+                }
+                workspace::tick(&model, &msg)
+            };
             if actual != expected {
                 eprintln!(
                     "replay mismatch at seq {replay_seq} workspace {workspace}: expected {expected:?} got {actual:?}"
@@ -8149,6 +8173,12 @@ fn cmd_internal_doorbell(
                     "summary": summary,
                     "effect": budget_effect(&prompt_injects(&cmds), &injects),
                 }),
+                Some(
+                    &prompt_injects(&cmds)
+                        .iter()
+                        .map(|(p, _)| p.clone())
+                        .collect::<Vec<_>>(),
+                ),
             );
         }
         // GS-006 bug 3: Ack-SLA was test-only (0 production callers). The dispatcher
@@ -8191,6 +8221,7 @@ fn cmd_internal_doorbell(
                 &msg,
                 &cmds,
                 serde_json::json!({ "stage": "executed", "scanned": scan }),
+                Some(&journal_pins(&workspace_model)),
             );
         }
         // GS-007: a watch that died and exhausted its restart burst must not leave
@@ -8267,12 +8298,14 @@ fn cmd_internal_doorbell(
                 let injects =
                     doorbell::take_allowed(raw_injects.clone(), &mut budgets, doorbell_now_unix());
                 let effect = budget_effect(&raw_injects, &injects);
+                let pins: Vec<String> = raw_injects.iter().map(|(p, _)| p.clone()).collect();
                 doorbell::journal_append_workspace(
                     &config::state_dir(),
                     workspace,
                     &msg,
                     &cmds,
                     serde_json::json!({ "stage": "decided", "effect": effect }),
+                    Some(&pins),
                 );
                 if !delivered.is_empty() {
                     doorbell::journal_append_workspace(
@@ -8281,6 +8314,7 @@ fn cmd_internal_doorbell(
                         &msg,
                         &cmds,
                         serde_json::json!({ "stage": "executed", "delivered": delivered }),
+                        Some(&journal_pins(&workspace_model)),
                     );
                 }
                 if budget_before != injects.len() {
@@ -8351,12 +8385,14 @@ fn cmd_internal_doorbell(
                 let injects =
                     doorbell::take_allowed(raw_injects.clone(), &mut budgets, doorbell_now_unix());
                 let effect = budget_effect(&raw_injects, &injects);
+                let pins: Vec<String> = raw_injects.iter().map(|(p, _)| p.clone()).collect();
                 doorbell::journal_append_workspace(
                     &config::state_dir(),
                     workspace,
                     &msg,
                     &cmds,
                     serde_json::json!({ "stage": "drain", "effect": effect }),
+                    Some(&pins),
                 );
                 let registry = state::load_spawn_registry(project);
                 doorbell_prompt_and_hear(
@@ -8422,6 +8458,7 @@ fn cmd_internal_doorbell(
                         &msg,
                         &cmds,
                         serde_json::json!({ "stage": "executed", "restarted": true }),
+                        Some(&journal_pins(&workspace_model)),
                     );
                     continue;
                 }
@@ -8431,6 +8468,7 @@ fn cmd_internal_doorbell(
                     &msg,
                     &cmds,
                     serde_json::json!({ "stage": "executed", "restarted": false, "retry_gate_secs": WATCH_RETRY_SECS }),
+                    Some(&journal_pins(&workspace_model)),
                 );
                 eprintln!(
                     "flywheel doorbell: watch restart burst exhausted — dispatcher stays alive, retry gate respawns every {WATCH_RETRY_SECS}s (never exit, never deaf)"
@@ -8475,6 +8513,7 @@ fn cmd_internal_doorbell(
                     &msg,
                     &cmds,
                     serde_json::json!({ "stage": "sweep" }),
+                    Some(&journal_pins(&workspace_model)),
                 );
                 // ADR-0005: subscribe is the drain signal. Poll herdr only
                 // when the event spine is down.
@@ -8685,6 +8724,19 @@ fn prompt_injects(cmds: &[workspace::Cmd]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Pin-set snapshot for the why-fold honesty contract (bd-z54w): journal
+/// callers pass `Some(&journal_pins(model))` so the fold restores the
+/// SelfIndex and classification reproduces deterministically. Paths without a
+/// live model pass `None` — those entries fold with Unknown semantics.
+fn journal_pins(model: &workspace::WorkspaceModel) -> Vec<String> {
+    model
+        .doorbell
+        .index
+        .pin_names()
+        .map(str::to_string)
+        .collect()
+}
+
 /// bd-adr0027-proven-leftovers-55nx.9: budget-gate outcome as journal data.
 /// `raw` is tick's complete Prompt injects, `allowed` is take_allowed's
 /// survivors (an order-preserving subsequence); the difference is the drop
@@ -8758,9 +8810,6 @@ fn handle_workspace_cmds(
             }
             workspace::Cmd::LoudMiss { why } => {
                 eprintln!("flywheel: [LoudMiss] {why}");
-            }
-            workspace::Cmd::Invoke { workflow, input } => {
-                eprintln!("flywheel: [LoudMiss] Invoke not wired: {workflow} {input}");
             }
             workspace::Cmd::Prompt { .. }
             | workspace::Cmd::CheckAckSla
@@ -8870,6 +8919,110 @@ mod waitcorr_doorbell_only_tests {
     }
 }
 
+#[cfg(test)]
+mod s_proof_tests {
+    // bd-adr-0028-implementation-zfnx.9: S-slice baselines run against live
+    // HEADs and record red/green honestly. Green here is the expected record
+    // (proof, not defect); any failure files a bead, never weakens the assert.
+    #[test]
+    fn s1_rebuild_reads_sqlite_into_assignment() {
+        // S1: tasked corr survives walker death via sqlite rebuild.
+        let src = include_str!("main.rs");
+        let pos = src
+            .find("fn rebuild_assignment_from_receipts(")
+            .expect("rebuild");
+        let end = src[pos..]
+            .find("\nfn doorbell_prompt(")
+            .map(|i| pos + i)
+            .unwrap_or(src.len());
+        let slice = &src[pos..end];
+        assert!(
+            slice.contains("receipt_store") && slice.contains(".list("),
+            "S1: rebuild must read the receipts sqlite store (receipt_store list)"
+        );
+        assert!(
+            slice.contains("assignment.insert"),
+            "S1: every listed receipt must land in Model.assignment (no drop filter)"
+        );
+    }
+
+    #[test]
+    fn s1_receipt_tick_writes_assignment_and_upsert() {
+        // Post-rebuild half, pure tick: Receipt -> assignment + SqliteUpsert.
+        let (next, cmds) = crate::workspace::tick(
+            &crate::workspace::WorkspaceModel::default(),
+            &crate::workspace::Msg::Receipt {
+                corr: "FM-S1".into(),
+                receipt: crate::workspace::Receipt {
+                    state: "owed".into(),
+                    wake: "tasked".into(),
+                    due_at: None,
+                    result_path: None,
+                },
+            },
+        );
+        assert!(
+            next.assignment.contains_key("FM-S1"),
+            "S1: Receipt tick must record the corr in assignment"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                crate::workspace::Cmd::SqliteUpsert { corr, .. } if corr == "FM-S1"
+            )),
+            "S1: Receipt tick must emit SqliteUpsert, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn s2_standing_empty_silence() {
+        // S2: with no rings and no assignment, tick emits no Cmd and writes
+        // nothing — standing-empty stays silent.
+        let (next, cmds) = crate::workspace::tick(
+            &crate::workspace::WorkspaceModel::default(),
+            &crate::workspace::Msg::WatchNdjson {
+                line: "not json, no ring".into(),
+            },
+        );
+        assert!(
+            cmds.is_empty(),
+            "S2: unrung line must emit no Cmds, got {cmds:?}"
+        );
+        assert!(
+            next.assignment.is_empty(),
+            "S2: unrung line must not write assignment"
+        );
+    }
+
+    #[test]
+    fn why_fold_has_corr_seq_filters_from_default() {
+        // why producer contract, consumer half: corr/seq filter bound + fold
+        // tick from Default (pin-substring grep never truth).
+        let src = include_str!("main.rs");
+        let pos = src.find("fn cmd_doorbell_why(").expect("why");
+        let end = src[pos..]
+            .find("\nfn cmd_loop_why(")
+            .map(|i| pos + i)
+            .unwrap_or(src.len());
+        let slice = &src[pos..end];
+        assert!(
+            slice.contains("WorkspaceModel::default()"),
+            "why must fold tick from Default"
+        );
+        assert!(
+            slice.contains("workspace::tick(&model, &msg)")
+                || slice.contains("workspace::tick(&model, &msg,"),
+            "why must reproduce Cmds by folding tick"
+        );
+        for needle in ["corr", "seq"] {
+            assert!(
+                slice.contains(needle),
+                "why must carry a {needle} filter bound, not pin-substring grep"
+            );
+        }
+    }
+}
+
 fn publish_human_question(project: &str, kind: u64, content: &str) {
     eprintln!(
         "flywheel: [Publish kind={kind}] {}",
@@ -8896,6 +9049,21 @@ fn publish_human_question(project: &str, kind: u64, content: &str) {
     };
     if let Err(e) = crate::mail_shim::block_on(mb.send_message(&args)) {
         eprintln!("flywheel: [Publish kind=14] send failed: {e:#}");
+    }
+}
+
+/// bd-adr0027-proven-leftovers-55nx.1: crash-resume presence seed for `why`.
+/// Applies fresh presence.jsonl rows (parsed by timeout_presence_rows:
+/// latest row per pin, <30s old) as Model.presence. Unparseable states
+/// become Unknown via Presence::from_str — never defaulted idle.
+fn seed_why_presence(
+    workspace_model: &mut crate::workspace::WorkspaceModel,
+    rows: Vec<(String, String)>,
+) {
+    for (pin, state) in rows {
+        workspace_model
+            .presence
+            .insert(pin, crate::workspace::Presence::from_str(&state));
     }
 }
 
@@ -9075,6 +9243,7 @@ fn doorbell_refresh_status(
             &msg,
             &cmds,
             serde_json::json!({ "stage": "refresh_status", "pin": pin }),
+            Some(&journal_pins(workspace_model)),
         );
         injects.extend(raw);
     }
@@ -9257,12 +9426,14 @@ fn doorbell_sweep_inbox(
             let allowed_p: Vec<(String, String)> =
                 injects.iter().filter(|(p, _)| p == pin).cloned().collect();
             let effect = budget_effect(&raw_p, &allowed_p);
+            let pins = [pin.clone()];
             doorbell::journal_append_workspace(
                 &config::state_dir(),
                 workspace,
                 msg,
                 cmds,
                 serde_json::json!({ "stage": stage, "pin": pin, "effect": effect }),
+                Some(&pins),
             );
         }
     }
@@ -11444,6 +11615,7 @@ pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
                 &msg,
                 &[],
                 serde_json::json!({ "stage": "fact_pending", "summary": summary }),
+                None,
             );
             if let Err(e) = append_pending_fact(&proj, &summary) {
                 eprintln!("flywheel: [FactMiss] could not queue fact for dispatcher: {e:#}");
@@ -31683,6 +31855,54 @@ mod journal_effect_tests {
         assert!(
             slice.contains("effect") && slice.contains("dropped"),
             "RED (55nx.9): why never reads the journal effect — dropped Prompts replay as injected"
+        );
+    }
+}
+
+#[cfg(test)]
+mod why_resume_tests {
+    // bd-adr0027-proven-leftovers-55nx.1: `why` must fold from crash-resume
+    // caches (receipts sqlite + presence snapshot), never bare Default —
+    // otherwise replay shows Prompts the live gate would have suppressed.
+    use super::*;
+
+    #[test]
+    fn why_resume_seed_applies_presence_rows() {
+        let mut model = workspace::WorkspaceModel::default();
+        seed_why_presence(
+            &mut model,
+            vec![
+                ("A".to_string(), "working".to_string()),
+                ("B".to_string(), "weird".to_string()),
+            ],
+        );
+        assert_eq!(model.presence.get("A"), Some(&workspace::Presence::Working));
+        assert_eq!(
+            model.presence.get("B"),
+            Some(&workspace::Presence::Unknown),
+            "unparseable state seeds Unknown, never idle"
+        );
+    }
+
+    #[test]
+    fn why_seeds_assignment_before_fold() {
+        let src = include_str!("main.rs");
+        let pos = src.find("fn cmd_doorbell_why(").expect("cmd_doorbell_why");
+        let slice = &src[pos..std::cmp::min(src.len(), pos + 6000)];
+        assert!(
+            slice.contains("rebuild_assignment_from_receipts"),
+            "RED (55nx.1): why folds from Default without the receipts seed — tasked corrs vanish from replay"
+        );
+    }
+
+    #[test]
+    fn why_seeds_presence_snapshot() {
+        let src = include_str!("main.rs");
+        let pos = src.find("fn cmd_doorbell_why(").expect("cmd_doorbell_why");
+        let slice = &src[pos..std::cmp::min(src.len(), pos + 6000)];
+        assert!(
+            slice.contains("seed_why_presence") || slice.contains("presence.jsonl"),
+            "RED (55nx.1): why folds without a presence seed — working pins replay Prompts live would suppress"
         );
     }
 }
