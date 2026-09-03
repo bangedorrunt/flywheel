@@ -1251,8 +1251,17 @@ pub fn parse_status_pair(s: &str) -> Option<(String, String)> {
 pub fn once_json(stdin: &str, status_by_pin: &BTreeMap<String, String>) -> String {
     let index = SelfIndex::from_pins(status_by_pin.keys().cloned());
     let mut model = crate::workspace::WorkspaceModel::default();
-    model.doorbell.statuses = status_by_pin.clone();
     model.doorbell.index = index;
+    for (pin, status) in status_by_pin {
+        let (next, _) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::HerdrStatus {
+                pin: pin.clone(),
+                status: status.clone(),
+            },
+        );
+        model = next;
+    }
     let mut rows = Vec::new();
     for line in stdin.lines() {
         let msg = crate::workspace::Msg::WatchNdjson {
@@ -1598,6 +1607,28 @@ mod tests {
             !json.contains("LilacChapel"),
             "unmentioned pin stays quiet: {json}"
         );
+    }
+
+    #[test]
+    fn once_json_seeds_statuses_via_herdr_tick() {
+        // bd-adr0027-proven-leftovers-55nx.10 RED: statuses must enter via
+        // Msg::HerdrStatus ticks, never via direct map assign. (Needle is
+        // split so this source-scan does not match its own literal.)
+        let src = include_str!("doorbell.rs");
+        let needle = ["model.doorbell.statuses ", "= status_by_pin"].concat();
+        assert!(
+            !src.contains(&needle),
+            "RED: once_json still map-assigns statuses; tick Msg::HerdrStatus instead"
+        );
+        // Behavioral: working pin must queue (no prompt), idle must inject.
+        let mut working = BTreeMap::new();
+        working.insert("BlueRidge".into(), "working".into());
+        let json = once_json(kind9_at_blueridge(), &working);
+        assert_eq!(json, "[]", "working pin must not inject: {json}");
+        let mut idle = BTreeMap::new();
+        idle.insert("BlueRidge".into(), "idle".into());
+        let json = once_json(kind9_at_blueridge(), &idle);
+        assert!(json.contains("BlueRidge"), "idle pin rings: {json}");
     }
 
     #[test]
