@@ -697,6 +697,11 @@ enum Commands {
         /// jobs routinely exceed 15m — a plain --force used to reap them)
         #[arg(long)]
         force_working: bool,
+        /// graceful two-phase stop (ADR-0028 zfnx.10): ask working agents to
+        /// finish their VERIFY fence instead of reaping; the loop enforces
+        /// the grace polls and force-stops past grace. Skips the close.
+        #[arg(long)]
+        drain: bool,
         /// unconditional override: kill captain + all crews regardless of
         /// on_captain_death (ADR-0025 Spec 4)
         #[arg(long)]
@@ -3923,8 +3928,9 @@ fn main() {
             project,
             force,
             force_working,
+            drain,
             reap_crews,
-        }) => cmd_kill(&cfg, project, *force, *force_working, *reap_crews),
+        }) => cmd_kill(&cfg, project, *force, *force_working, *drain, *reap_crews),
         Some(Commands::Ledger { cmd }) => cmd_ledger(&cfg, cmd),
         Some(Commands::Principles { cmd }) => cmd_principles(cmd),
         Some(Commands::StandingOrders { cmd }) => cmd_standing_orders(cmd),
@@ -11647,6 +11653,27 @@ pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
                 serde_json::json!({ "stage": "fact_pending", "summary": summary }),
                 None,
             );
+            // Durable facts ledger (bd-cy0s captain surface): load_facts and
+            // facts_count_and_last read this file — the pending queue below is
+            // only the wake. Dropping this writer orphaned the surface (empty
+            // reads; facts_close/lapsed tests red). Append, never wake-only.
+            let ledger = facts_journal_path(&proj);
+            let wrote = match ledger.parent() {
+                Some(dir) => std::fs::create_dir_all(dir).and_then(|_| {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&ledger)
+                        .and_then(|mut f| {
+                            use std::io::Write;
+                            writeln!(f, "{}", serde_json::to_string(ev).unwrap_or_default())
+                        })
+                }),
+                None => Ok(()),
+            };
+            if let Err(e) = wrote {
+                eprintln!("flywheel: [FactMiss] could not append facts ledger: {e:#}");
+            }
             if let Err(e) = append_pending_fact(&proj, &summary) {
                 eprintln!("flywheel: [FactMiss] could not queue fact for dispatcher: {e:#}");
             }
@@ -13492,6 +13519,7 @@ fn cmd_kill(
     project: &str,
     force: bool,
     force_working: bool,
+    drain: bool,
     reap_crews: bool,
 ) -> Result<()> {
     if !force {
@@ -13511,7 +13539,6 @@ fn cmd_kill(
     }
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
-    // the panes die with the workspace — capture their ids first so the
     // pane-identity bridge files can be cleared (no stale lookups after
     // pane_exited, bd-mail-pane-identity-bridge)
     let agents: Vec<AgentInfo> = c
@@ -13538,9 +13565,43 @@ fn cmd_kill(
     } else {
         working.clone()
     };
+    if !blocked.is_empty() && drain {
+        // ADR-0028 zfnx.10 producer: phase 1 of the two-phase stop. Ask
+        // each working agent to finish its VERIFY fence, record the drain
+        // on ActiveLoop (the swarm poll seeds ws.swarm.drain_pending from
+        // it and the tick enforces grace), and SKIP the close. Phase 2 is
+        // the loop's past-grace force or an explicit --force-working.
+        let mut al = match state::load_active_loop(project)? {
+            Some(al) => al,
+            None => state::ActiveLoop::new(project, serde_json::json!({}), "drain"),
+        };
+        let dispatched: Vec<String> = al
+            .per_bead_phase
+            .iter()
+            .filter(|(_, p)| p.starts_with("dispatch"))
+            .map(|(b, _)| b.clone())
+            .collect();
+        for name in &blocked {
+            if al.drain_pending.contains_key(name) {
+                continue;
+            }
+            let bead = dispatched.first().cloned().unwrap_or_else(|| name.clone());
+            al.drain_pending.insert(name.clone(), bead.clone());
+            if let Some(a) = agents.iter().find(|a| a.name.as_deref() == Some(name)) {
+                let _ = c.agent_prompt(&a.pane_id, &crate::durable::drain_prompt(&bead), None);
+            }
+        }
+        state::save_active_loop(project, &al)?;
+        println!(
+            "drain: asked {} working agent(s) to finish their VERIFY fence; grace is {} polls. Re-run kill --force --force-working once they report, or let the loop force-stop past grace.",
+            blocked.len(),
+            durable::DRAIN_GRACE_POLLS
+        );
+        return Ok(());
+    }
     if !blocked.is_empty() && !force_working {
         bail!(
-            "refuse kill: {} agent(s) still working ({}). Long jobs (cargo test) often exceed 15m. Pass --force-working to reap anyway.",
+            "refuse kill: {} agent(s) still working ({}). Long jobs (cargo test) often exceed 15m. Pass --force-working to reap anyway, or --drain for a graceful two-phase stop.",
             blocked.len(),
             blocked.join(", ")
         );
