@@ -8490,7 +8490,8 @@ fn cmd_internal_doorbell(
                     break;
                 }
                 let since = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                let msg = workspace::Msg::Sweep { since };
+                let now = chrono::Utc::now().timestamp() as u64;
+                let msg = workspace::Msg::Sweep { since, now };
                 let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
                 workspace_model = next_model;
                 if handle_workspace_cmds(&mut workspace_model, &cmds, project) {
@@ -8800,7 +8801,14 @@ fn handle_workspace_cmds(
                 // tick below, including the 1s sweep timeout wake, so a miss
                 // survives and a later Receipt tick completes it. The swarm fold
                 // (durable.rs) never produces or drains WaitCorr — doorbell-only.
-                workspace_model.pending_wait.insert(corr.clone());
+                // bd-zfnx.6: the park is bounded — deadline TTL stamped here,
+                // expiry/cap-eviction decided in the Sweep arm (tick), each
+                // with an Audit wait-timeout record. Never silent drop.
+                let now = chrono::Utc::now().timestamp() as u64;
+                workspace_model.pending_wait.insert(
+                    corr.clone(),
+                    now.saturating_add(workspace::PENDING_WAIT_TTL_SECS),
+                );
             }
             workspace::Cmd::Publish {
                 kind,
@@ -8843,7 +8851,7 @@ fn handle_workspace_cmds(
 }
 
 fn drain_pending_wait_corrs(workspace_model: &mut workspace::WorkspaceModel) {
-    let pending: Vec<String> = workspace_model.pending_wait.iter().cloned().collect();
+    let pending: Vec<String> = workspace_model.pending_wait.keys().cloned().collect();
     for corr in pending {
         if try_tick_receipt(workspace_model, &corr) {
             workspace_model.pending_wait.remove(&corr);
