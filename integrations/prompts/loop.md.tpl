@@ -4,26 +4,24 @@
 Run the /loop-mode slash command: solo mode.
 
 Arguments are supplied by the harness adapter above. Treat the supplied text as
-the objective, scope, and any mode flags for this invocation. ONE current harness/pane drives ONE
-objective end-to-end. It is a durable execution loop implemented with workflow
-runtime machinery, but it is not the same thing as a reusable workflow
- definition. Beads are optional: `--work` selects bead-backed execution;
-without `--work`, the loop may drive an objective, queue, or workflow. It is
-the opposite of /swarm-mode: no parallel crew lanes and no wave fan-out. A reviewer
-may be summoned at checkpoints, but that reviewer is an exception, not a
-second execution crew.
+the objective, scope, and any mode flags for this invocation. ONE current harness/pane
+drives ONE objective end-to-end. It uses workflow runtime
+machinery but is not a reusable workflow definition. Beads are optional:
+`--work` selects bead-backed execution; without it, the loop may drive an
+objective, queue, or workflow. It is the opposite of /swarm-mode: no parallel
+crew lanes and no wave fan-out. A reviewer may be summoned at checkpoints,
+but that reviewer is an exception, not a second execution crew.
 
-The solo agent is its own captain for reversible decisions. The human/captain
-objective and scope remain authoritative; peer-aware messages must not replace
-the primary objective.
+The solo agent is its own captain for reversible decisions; the human
+objective and scope stay authoritative, and peer-aware messages never replace
+them.
 
 ## The loop
 
-Before starting a new managed run, ask the operator to choose the profile and
-model routing for this role. Present the profile default plus compatible model
-registry alternatives and their known cost/capabilities. Blank input keeps the
-default; an explicit provider/model selection overrides it. Use the selected
-profile/model for the run and record the choice in the launch/report summary.
+Before each managed run, ask the operator to choose the profile and model
+routing. Present the profile default plus compatible registry alternatives
+with known cost/capabilities. Blank keeps the default; an explicit
+provider/model overrides it. Record the choice in the launch/report summary.
 
 1. SETUP: `flywheel loop-mode run <project> --work`. Slash /loop-mode pins
    this. Do not re-run `flywheel decide`. One pane via `flywheel spawn <proj>
