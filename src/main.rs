@@ -8572,6 +8572,16 @@ fn handle_workspace_cmds(
                 fetch_inbox = true;
             }
             workspace::Cmd::WaitCorr { corr } => {
+                // bd-adr0027-proven-leftovers-55nx.6: doorbell drain-on-every-event
+                // IS the WaitCorr implementation (same bus as watch). Toron CLI
+                // equivalent is `wait_for_corr` (toron-cli/src/plane.rs): it
+                // subscribes to kinds 9/14/1059/43001/43004 and unparks on bus
+                // event or deadline, then re-checks receipts sqlite — no sleep
+                // poll. Here the corr parks in pending_wait and
+                // drain_pending_wait_corrs re-peeks sqlite after EVERY doorbell
+                // tick below, including the 1s sweep timeout wake, so a miss
+                // survives and a later Receipt tick completes it. The swarm fold
+                // (durable.rs) never produces or drains WaitCorr — doorbell-only.
                 workspace_model.pending_wait.insert(corr.clone());
             }
             workspace::Cmd::Publish { kind, content } => {
@@ -8660,6 +8670,46 @@ fn try_tick_receipt(workspace_model: &mut workspace::WorkspaceModel, corr: &str)
         }
     }
     true
+}
+
+#[cfg(test)]
+mod waitcorr_doorbell_only_tests {
+    // bd-adr0027-proven-leftovers-55nx.6 RED: WaitCorr drain is doorbell-only.
+    #[test]
+    fn waitcorr_arm_names_cli_equivalent_and_sweep_wake() {
+        let src = include_str!("main.rs");
+        let pos = src.find("fn handle_workspace_cmds(").expect("handler");
+        let end = src[pos..]
+            .find("\nfn drain_pending_wait_corrs")
+            .map(|i| pos + i)
+            .unwrap_or(src.len());
+        let slice = &src[pos..end];
+        assert!(
+            slice.contains("wait_for_corr"),
+            "RED (55nx.6): WaitCorr arm must name the toron CLI equivalent (wait_for_corr)"
+        );
+        assert!(
+            slice.contains("sweep"),
+            "RED (55nx.6): WaitCorr arm must name the 1s sweep wake"
+        );
+        assert!(
+            slice.contains("drain_pending_wait_corrs"),
+            "drain must run on every handle_workspace_cmds call"
+        );
+    }
+
+    #[test]
+    fn waitcorr_never_drains_on_swarm_fold() {
+        let durable = include_str!("durable.rs");
+        assert!(
+            !durable.contains("WaitCorr"),
+            "swarm fold must not produce/drain WaitCorr; doorbell owns pending_wait"
+        );
+        assert!(
+            !durable.contains("pending_wait"),
+            "pending_wait lives on the doorbell path only"
+        );
+    }
 }
 
 fn publish_human_question(project: &str, kind: u64, content: &str) {
