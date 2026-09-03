@@ -8103,6 +8103,7 @@ fn cmd_internal_doorbell(
         &index,
         workspace,
         generation.as_ref(),
+        cfg,
     );
 
     // Ack-SLA scanner cadence: the SLA is 30-min granularity — a 1 Hz SQL
@@ -8156,7 +8157,7 @@ fn cmd_internal_doorbell(
             };
             let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
             workspace_model = next_model;
-            let _ = handle_workspace_cmds(&mut workspace_model, &cmds, project);
+            let _ = handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, false);
             let injects =
                 doorbell::take_allowed(prompt_injects(&cmds), &mut budgets, doorbell_now_unix());
             if !injects.is_empty() {
@@ -8198,7 +8199,8 @@ fn cmd_internal_doorbell(
             let msg = workspace::Msg::AckSlaTick { now: now_s };
             let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
             workspace_model = next_model;
-            let need_fetch = handle_workspace_cmds(&mut workspace_model, &cmds, project);
+            let need_fetch =
+                handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, false);
             if need_fetch {
                 doorbell_sweep_inbox(
                     cfg,
@@ -8290,7 +8292,7 @@ fn cmd_internal_doorbell(
                 let msg = workspace::Msg::WatchNdjson { line: line.clone() };
                 let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
                 workspace_model = next_model;
-                handle_workspace_cmds(&mut workspace_model, &cmds, project);
+                handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, true);
                 let mut delivered = Vec::new();
                 for a in &cmds {
                     if !matches!(a, workspace::Cmd::Prompt { .. }) {
@@ -8384,7 +8386,7 @@ fn cmd_internal_doorbell(
                 };
                 let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
                 workspace_model = next_model;
-                handle_workspace_cmds(&mut workspace_model, &cmds, project);
+                handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, false);
                 let raw_injects = prompt_injects(&cmds);
                 // Budget gate BEFORE the drain journal so the line carries
                 // the gate outcome (55nx.9) — gate is pure.
@@ -8426,7 +8428,7 @@ fn cmd_internal_doorbell(
                 let msg = workspace::Msg::WatchDied;
                 let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
                 workspace_model = next_model;
-                handle_workspace_cmds(&mut workspace_model, &cmds, project);
+                handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, false);
                 let mut backoff = 1u64;
                 let mut restarted = false;
                 for _ in 0..5 {
@@ -8500,7 +8502,7 @@ fn cmd_internal_doorbell(
                 let msg = workspace::Msg::Sweep { since, now };
                 let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
                 workspace_model = next_model;
-                if handle_workspace_cmds(&mut workspace_model, &cmds, project) {
+                if handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, false) {
                     doorbell_sweep_inbox(
                         cfg,
                         project,
@@ -8534,6 +8536,7 @@ fn cmd_internal_doorbell(
                         &index,
                         workspace,
                         generation.as_ref(),
+                        cfg,
                     );
                 } else {
                     doorbell_refresh_pins(project, &mut pane_to_pin);
@@ -8577,7 +8580,8 @@ fn cmd_internal_doorbell(
                             },
                         );
                         workspace_model = next_model;
-                        let _ = handle_workspace_cmds(&mut workspace_model, &cmds, project);
+                        let _ =
+                            handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, false);
                         if workspace_model.presence.contains_key(&pin) {
                             hear.note_heard_pin(&pin);
                         }
@@ -8786,7 +8790,14 @@ fn handle_workspace_cmds(
     workspace_model: &mut workspace::WorkspaceModel,
     cmds: &[workspace::Cmd],
     project: &str,
+    cfg: &Config,
+    drain_waits: bool,
 ) -> bool {
+    // drain_waits (ADR-0028 E2): the pending_wait sqlite peek is the
+    // fast path AFTER a genuine wake (WatchNdjson batch — kind-9 ring,
+    // kind-14 assignment, InboxRows), never the wake itself. Sweep,
+    // Fact, AckSla, HerdrStatus and Died batches pass false so the 1s
+    // cadence cannot become a poll.
     let mut fetch_inbox = false;
     for cmd in cmds {
         match cmd {
@@ -8797,16 +8808,18 @@ fn handle_workspace_cmds(
                 fetch_inbox = true;
             }
             workspace::Cmd::WaitCorr { corr } => {
-                // bd-adr0027-proven-leftovers-55nx.6: doorbell drain-on-every-event
+                // bd-adr0027-proven-leftovers-55nx.6: doorbell drain-on-wake
                 // IS the WaitCorr implementation (same bus as watch). Toron CLI
                 // equivalent is `wait_for_corr` (toron-cli/src/plane.rs): it
                 // subscribes to kinds 9/14/1059/43001/43004 and unparks on bus
                 // event or deadline, then re-checks receipts sqlite — no sleep
                 // poll. Here the corr parks in pending_wait and
-                // drain_pending_wait_corrs re-peeks sqlite after EVERY doorbell
-                // tick below, including the 1s sweep timeout wake, so a miss
-                // survives and a later Receipt tick completes it. The swarm fold
-                // (durable.rs) never produces or drains WaitCorr — doorbell-only.
+                // drain_pending_wait_corrs re-peeks sqlite after WATCH batches
+                // only (drain_waits=true; GS-016: the 1s sweep/Fact/AckSla
+                // batches pass false — the peek is a post-wake fast path,
+                // never the wake). A missed receipt still expires via the
+                // Sweep-arm TTL with an Audit wait-timeout record. The swarm
+                // fold (durable.rs) never produces or drains WaitCorr.
                 // bd-zfnx.6: the park is bounded — deadline TTL stamped here,
                 // expiry/cap-eviction decided in the Sweep arm (tick), each
                 // with an Audit wait-timeout record. Never silent drop.
@@ -8830,6 +8843,41 @@ fn handle_workspace_cmds(
             workspace::Cmd::LoudMiss { why } => {
                 eprintln!("flywheel: [LoudMiss] {why}");
             }
+            workspace::Cmd::Invoke {
+                workflow,
+                input,
+                corr,
+            } => {
+                // ADR-0028 E1 (zfnx.5 rewired, GS-016): hand the invocation
+                // to the durable Run machinery — playbook lint + workflow
+                // resolution gate inside cmd_workflow, engine.invoke +
+                // VerifySink downstream. corr rides the inputs so the run
+                // is attributable; failure is LoudMiss, never silent.
+                let mut inputs = input.clone();
+                if let Some(obj) = inputs.as_object_mut() {
+                    obj.insert("corr".into(), serde_json::json!(corr));
+                }
+                let run = WorkflowCmd::Run {
+                    name: workflow.clone(),
+                    inputs: Some(inputs.to_string()),
+                    crew: None,
+                    execute: true,
+                    mode: "pane".to_string(),
+                    project: Some(project.to_string()),
+                    reuse: None,
+                    retain: false,
+                    retire_orphans: false,
+                    json: true,
+                    yes: true,
+                    allow_worktree: false,
+                };
+                if let Err(e) = cmd_workflow(cfg, &run) {
+                    eprintln!("flywheel: [LoudMiss] invoke {corr} ({workflow}): {e:#}");
+                }
+            }
+            workspace::Cmd::FactMiss { why } => {
+                eprintln!("flywheel: [FactMiss] {why}");
+            }
             workspace::Cmd::Prompt { .. }
             | workspace::Cmd::CheckAckSla
             | workspace::Cmd::RestartWatch => {
@@ -8852,7 +8900,9 @@ fn handle_workspace_cmds(
             }
         }
     }
-    drain_pending_wait_corrs(workspace_model);
+    if drain_waits {
+        drain_pending_wait_corrs(workspace_model);
+    }
     fetch_inbox
 }
 
@@ -8919,8 +8969,42 @@ mod waitcorr_doorbell_only_tests {
             "RED (55nx.6): WaitCorr arm must name the 1s sweep wake"
         );
         assert!(
-            slice.contains("drain_pending_wait_corrs"),
-            "drain must run on every handle_workspace_cmds call"
+            slice.contains("drain_pending_wait_corrs(workspace_model)"),
+            "drain fast-path must live in the handler"
+        );
+        assert!(
+            slice.contains("drain_waits"),
+            "E2 (GS-016): the peek is gated to genuine wake batches, never the 1s sweep"
+        );
+    }
+
+    #[test]
+    fn invoke_arm_hands_off_to_durable_run_gate() {
+        // GS-016 zfnx.5 rewire: the Invoke arm routes through cmd_workflow
+        // (playbook lint + resolution gate, engine.invoke + VerifySink
+        // downstream), corr rides the inputs, failure is LoudMiss.
+        let src = include_str!("main.rs");
+        let pos = src.find("fn handle_workspace_cmds(").expect("handler");
+        let end = src[pos..]
+            .find("\nfn drain_pending_wait_corrs")
+            .map(|i| pos + i)
+            .unwrap_or(src.len());
+        let slice = &src[pos..end];
+        assert!(
+            slice.contains("Cmd::Invoke"),
+            "Invoke arm must be applied in the handler"
+        );
+        assert!(
+            slice.contains("cmd_workflow(cfg, &run)"),
+            "Invoke must route through cmd_workflow (the durable Run gate)"
+        );
+        assert!(
+            slice.contains("\"corr\".into(), serde_json::json!(corr)"),
+            "Invoke inputs must carry the corr for attribution"
+        );
+        assert!(
+            slice.contains("[LoudMiss] invoke"),
+            "Invoke failure must be LoudMiss, never silent"
         );
     }
 
@@ -9237,6 +9321,7 @@ fn doorbell_refresh_status(
     index: &doorbell::SelfIndex,
     workspace: &str,
     generation: Option<&doorbell::WatcherGen>,
+    cfg: &Config,
 ) {
     let registry = state::load_spawn_registry(project);
     pane_to_pin.clear();
@@ -9271,7 +9356,7 @@ fn doorbell_refresh_status(
         };
         let (next_model, cmds) = workspace::tick(workspace_model, &msg);
         *workspace_model = next_model;
-        handle_workspace_cmds(workspace_model, &cmds, project);
+        handle_workspace_cmds(workspace_model, &cmds, project, cfg, false);
         let raw = prompt_injects(&cmds);
         doorbell::journal_append_workspace(
             &config::state_dir(),
@@ -9362,7 +9447,7 @@ fn doorbell_sweep_inbox(
             };
             let (next_model, cmds) = workspace::tick(workspace_model, &msg);
             *workspace_model = next_model;
-            handle_workspace_cmds(workspace_model, &cmds, project);
+            handle_workspace_cmds(workspace_model, &cmds, project, cfg, true);
             let raw = prompt_injects(&cmds);
             pending.push((pin.to_string(), msg, cmds, "sweep_inbox"));
             injects.extend(raw);
@@ -9441,7 +9526,7 @@ fn doorbell_sweep_inbox(
             };
             let (next_model, cmds) = workspace::tick(workspace_model, &msg);
             *workspace_model = next_model;
-            handle_workspace_cmds(workspace_model, &cmds, project);
+            handle_workspace_cmds(workspace_model, &cmds, project, cfg, true);
             let raw_injects = prompt_injects(&cmds);
             pending.push((pin.to_string(), msg, cmds, "sweep_inbox_cli"));
             injects.extend(raw_injects);

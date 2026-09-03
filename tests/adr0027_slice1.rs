@@ -1,11 +1,10 @@
 // governed-by: ADR-0027
 //! ADR-0027 Slice 1 — acceptance S1/S2 + source-scan guards (bd-gmjo).
 //!
-//! DRAFT-RED discipline: these tests pin the contracts in ADR §7 Slice 1
-//! and §10 S1/S2. Implementations do not exist yet (wave-1 beads
-//! bd-7fat bd-6b1y bd-gs8b bd-2u27 bd-gokp bd-dhm1 are OPEN). Every test
-//! here is EXPECTED to fail (or be unavailable) until those beads close.
-//! That is the RED state. Green is `cargo test adr0027_s1` passing after
+//! Status 2026-09-04 (GS-016): wave-1 beads closed; these tests are GREEN
+//! on the live path (originally DRAFT-RED: contracts pinned in ADR §7
+//! Slice 1 and §10 S1/S2 before wave-1 beads bd-7fat bd-6b1y bd-gs8b
+//! bd-2u27 bd-gokp bd-dhm1 landed). Green is `cargo test adr0027_s1`.
 //! wave-1 lands.
 //!
 //! Surface: flywheel/tests/** (primary) + toron-cli/tests later. We own
