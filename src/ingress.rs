@@ -562,22 +562,45 @@ mod tests {
 
     #[test]
     fn bd0or2_herdr_event_folds_into_tick_pending_and_drains_on_next_tick() {
-        use crate::durable::{AgentState, LoopModel, LoopMsg};
-        let mut model = LoopModel::default();
-        let pe = crate::durable::PollEvent {
+        // bd-55nx.11: exercise the LIVE entry (workspace tick), not the
+        // slice reducer — a green slice with a broken live entry must fail.
+        use crate::durable::{LoopModel, PollEvent};
+        use crate::workspace::{Msg as WsMsg, WorkspaceModel, tick as ws_tick};
+        let ws = WorkspaceModel {
+            swarm: LoopModel::default(),
+            ..Default::default()
+        };
+        let pe = PollEvent {
             event_type: "pane.agent_status_changed".into(),
             pane_id: "w1:p1".into(),
             agent: Some("a".into()),
             status: Some("idle".into()),
             seq: 1,
         };
-        let (next, actions) = crate::durable::tick(&model, &LoopMsg::Herdr(pe));
-        assert!(actions.is_empty());
-        assert_eq!(next.pending_events.len(), 1, "Herdr buffers into model'");
-        let (next2, _) = crate::durable::tick(&next, &LoopMsg::Tick { now: 0 });
+        let (next, cmds) = ws_tick(&ws, &WsMsg::Herdr { event: pe });
+        assert!(cmds.is_empty());
+        assert_eq!(
+            next.swarm.pending_events.len(),
+            1,
+            "Herdr buffers into model'"
+        );
+        let (next2, _) = ws_tick(&next, &WsMsg::Tick { now: 0 });
         assert!(
-            next2.pending_events.is_empty(),
+            next2.swarm.pending_events.is_empty(),
             "Tick drains buffered events"
+        );
+    }
+
+    #[test]
+    fn ingress_tests_use_live_entry_not_slice() {
+        // bd-55nx.11 RED: tests must exercise the live entry
+        // (workspace tick), never the slice reducer directly.
+        // (needle split so this self-scan does not match its own source)
+        let needle = ["durable", "::tick"].concat();
+        let src = include_str!("ingress.rs");
+        assert!(
+            !src.contains(&needle),
+            "RED (55nx.11): ingress.rs still calls the slice reducer; port tests to the live entry"
         );
     }
 }
