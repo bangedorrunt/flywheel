@@ -88,8 +88,9 @@ pub struct WorkspaceModel {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Msg {
-    /// Untrusted wire bytes. Routed via watch_route priority table; a Miss
-    /// emits FactMiss (never silent, never panics on unparseable input).
+    /// Untrusted wire bytes. Per-kind folds (20001 presence with the E5
+    /// trust rule, 30013 roles, corr-tagged 14 assignment); kind-9 is the
+    /// doorbell-slice ring. Never panics on unparseable input.
     WatchNdjson {
         line: String,
     },
@@ -522,123 +523,6 @@ fn mint_human_question(next: &mut WorkspaceModel, cmds: &mut Vec<Cmd>, corr: &st
 }
 
 // ---------------------------------------------------------------------------
-// Compiled signal router (ADR-0028 C fold-in): kind→handler table for the
-// WatchNdjson edge. Tag-pattern priority:
-// corr-tagged 14 > p-mention 9 > channel 9 > presence 20001 > profile 30013.
-// Kinds owned by the doorbell slice ring path (43001 job, 30031
-// reservation, 39002 member) route as Ring — never miss. Anything else
-// (corr-less 14, unknown kind, unparseable bytes) is Miss and the arm emits
-// a structured FactMiss (kind/tag summary) so the miss rate is observable
-// in the journal audit instead of a silent skip. Cost per event is
-// constant: one kind match + one tag scan. No CloudEvents, no new kinds.
-// ---------------------------------------------------------------------------
-
-/// Where one watch event goes. Total: every input maps to exactly one arm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WatchRoute {
-    /// Rumor-14 carrying a non-empty corr: the assignment vehicle.
-    Assignment14,
-    /// Kind-9 addressing a known pin (p tag or @pin): the ring.
-    Mention9,
-    /// Kind-9 room traffic with no pin address: the ring.
-    Channel9,
-    /// Kind-20001: presence fold (E5 trust rule applies at the fold).
-    Presence20001,
-    /// Kind-30013: role fold.
-    Profile30013,
-    /// Doorbell-slice-owned wake kinds (43001/30031/39002): routed, silent here.
-    Ring(u16),
-    /// Nothing owns this event: emit FactMiss, never silent skip.
-    Miss,
-}
-
-fn tag_keys(v: &serde_json::Value) -> Vec<String> {
-    v.get("tags")
-        .and_then(|t| t.as_array())
-        .map(|tags| {
-            tags.iter()
-                .filter_map(|t| t.as_array()?.first()?.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn is_pin_mentioned(v: &serde_json::Value, index: &crate::doorbell::SelfIndex) -> bool {
-    if let Some(tags) = v.get("tags").and_then(|t| t.as_array()) {
-        for t in tags {
-            let Some(a) = t.as_array() else { continue };
-            if a.first().and_then(|x| x.as_str()) != Some("p") {
-                continue;
-            }
-            if let Some(val) = a.get(1).and_then(|x| x.as_str())
-                && index.resolve(val).is_some()
-            {
-                return true;
-            }
-        }
-    }
-    if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
-        for pin in index.pin_names() {
-            if content.contains(&format!("@{pin}")) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn has_nonempty_corr(v: &serde_json::Value) -> bool {
-    v.get("tags")
-        .and_then(|t| t.as_array())
-        .is_some_and(|tags| {
-            tags.iter().any(|t| {
-                t.as_array().is_some_and(|a| {
-                    a.first().and_then(|x| x.as_str()) == Some("corr")
-                        && a.get(1)
-                            .and_then(|x| x.as_str())
-                            .is_some_and(|s| !s.is_empty())
-                })
-            })
-        })
-}
-
-/// Pure route for one parsed watch event. Total over all inputs.
-pub fn watch_route(v: &serde_json::Value, index: &crate::doorbell::SelfIndex) -> WatchRoute {
-    match v.get("kind").and_then(|k| k.as_u64()) {
-        Some(14) if has_nonempty_corr(v) => WatchRoute::Assignment14,
-        Some(14) => WatchRoute::Miss,
-        Some(9) if is_pin_mentioned(v, index) => WatchRoute::Mention9,
-        Some(9) => WatchRoute::Channel9,
-        Some(20001) => WatchRoute::Presence20001,
-        Some(30013) => WatchRoute::Profile30013,
-        Some(k) if matches!(k, 43001 | 30031 | 39002) => WatchRoute::Ring(k as u16),
-        _ => WatchRoute::Miss,
-    }
-}
-
-/// Route for bytes that may not parse: unparseable is Miss, never a panic.
-pub fn watch_route_unparseable(line: &str, index: &crate::doorbell::SelfIndex) -> WatchRoute {
-    match serde_json::from_str::<serde_json::Value>(line) {
-        Ok(v) => watch_route(&v, index),
-        Err(_) => WatchRoute::Miss,
-    }
-}
-
-/// One-line audit summary for a route-miss (FactMiss payload).
-fn route_miss_summary(v: Option<&serde_json::Value>) -> String {
-    match v {
-        None => "route-miss unparseable".into(),
-        Some(v) => {
-            let kind = v
-                .get("kind")
-                .map(|k| k.to_string())
-                .unwrap_or_else(|| "?".into());
-            format!("route-miss kind={kind} tags=[{}]", tag_keys(v).join(","))
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Private slice reducers — the only place the two old ticks are called.
 // ---------------------------------------------------------------------------
 
@@ -737,22 +621,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             cmds.extend(filter_prompts(&next, c));
             // E2/E4/E6: 30013 role=, 20001 presence. Kind-9 is the ring, not
             // the assignment vehicle — corr/wake ride rumor 14 / InboxRows.
-            // Route first (ADR-0028 C): a Miss emits FactMiss here so no
-            // watch event ever slips silent; the per-kind folds below are
-            // no-ops on miss shapes.
-            let parsed: Option<serde_json::Value> = serde_json::from_str(line).ok();
-            match parsed.as_ref() {
-                None => cmds.push(Cmd::FactMiss {
-                    why: route_miss_summary(None),
-                }),
-                Some(v) => match watch_route(v, &model.doorbell.index) {
-                    WatchRoute::Miss => cmds.push(Cmd::FactMiss {
-                        why: route_miss_summary(Some(v)),
-                    }),
-                    _ => {}
-                },
-            }
-            if let Some(v) = parsed {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 // 20001 presence — ADR-0028 E5 trust rule: inject truth is
                 // the pin itself (line `pubkey` == pin's npub in
                 // `doorbell.index`) or the trusted `Msg::Presence` edge
@@ -2891,96 +2760,5 @@ mod cmd_schema_tests {
         let raw = serde_json::to_value(&cmd).expect("Cmd is serde");
         let back: Cmd = serde_json::from_value(raw).expect("Cmd round-trips");
         assert_eq!(back, cmd, "Invoke shape survives the journal");
-    }
-
-    #[test]
-    fn router_golden_vectors() {
-        let index = crate::doorbell::SelfIndex::from_pins(["BlueRidge".to_string()]);
-        let cases: &[(&str, WatchRoute)] = &[
-            // corr-tagged 14 wins over everything
-            (
-                r#"{"kind":14,"tags":[["corr","C1"],["wake","tasked"]],"content":"w"}"#,
-                WatchRoute::Assignment14,
-            ),
-            // p-mention 9
-            (
-                r#"{"kind":9,"tags":[["p","BlueRidge"]],"content":"@BlueRidge hi"}"#,
-                WatchRoute::Mention9,
-            ),
-            // plain channel 9
-            (
-                r#"{"kind":9,"tags":[["h","ch"]],"content":"hello room"}"#,
-                WatchRoute::Channel9,
-            ),
-            // presence + profile
-            (
-                r#"{"kind":20001,"tags":[["p","BlueRidge"]],"content":"idle"}"#,
-                WatchRoute::Presence20001,
-            ),
-            (
-                r#"{"kind":30013,"tags":[["d","pin:BlueRidge"],["role","coder"]],"content":""}"#,
-                WatchRoute::Profile30013,
-            ),
-            // doorbell-slice ring kinds are routed, never miss
-            (
-                r#"{"kind":43001,"tags":[],"content":""}"#,
-                WatchRoute::Ring(43001),
-            ),
-            (
-                r#"{"kind":30031,"tags":[],"content":""}"#,
-                WatchRoute::Ring(30031),
-            ),
-            (
-                r#"{"kind":39002,"tags":[],"content":""}"#,
-                WatchRoute::Ring(39002),
-            ),
-            // miss: 14 without corr, unknown kind, garbage
-            (
-                r#"{"kind":14,"tags":[],"content":"no corr"}"#,
-                WatchRoute::Miss,
-            ),
-            (r#"{"kind":7,"tags":[],"content":"+"}"#, WatchRoute::Miss),
-        ];
-        for (line, want) in cases {
-            let v: serde_json::Value = serde_json::from_str(line).expect("vector parses");
-            assert_eq!(&watch_route(&v, &index), want, "route for {line}");
-        }
-        assert_eq!(
-            watch_route_unparseable("not json{{", &index),
-            WatchRoute::Miss
-        );
-    }
-
-    #[test]
-    fn router_miss_emits_factmiss_not_silence() {
-        let m = empty_model();
-        let line = r#"{"kind":7,"id":"r1","tags":[["p","x"]],"content":"+"}"#;
-        let (next, cmds) = tick(&m, &Msg::WatchNdjson { line: line.into() });
-        assert!(
-            cmds.iter()
-                .any(|c| matches!(c, Cmd::FactMiss { why } if why.contains("kind=7"))),
-            "route-miss must be observable FactMiss, got {cmds:?}"
-        );
-        assert!(next.presence.is_empty() && next.roles.is_empty() && next.assignment.is_empty());
-        // corr-less 14 is malformed assignment vehicle, also miss
-        let line = r#"{"kind":14,"id":"r2","tags":[],"content":"no corr"}"#;
-        let (_, cmds) = tick(&m, &Msg::WatchNdjson { line: line.into() });
-        assert!(
-            cmds.iter().any(|c| matches!(c, Cmd::FactMiss { .. })),
-            "corr-less 14 must not slip silent, got {cmds:?}"
-        );
-    }
-
-    #[test]
-    fn router_ring_kinds_stay_silent_in_workspace_fold() {
-        let m = empty_model();
-        for kind in [43001u64, 30031, 39002] {
-            let line = format!(r#"{{"kind":{kind},"id":"k","tags":[],"content":""}}"#);
-            let (_, cmds) = tick(&m, &Msg::WatchNdjson { line });
-            assert!(
-                !cmds.iter().any(|c| matches!(c, Cmd::FactMiss { .. })),
-                "ring kind {kind} is doorbell-slice-owned, no workspace FactMiss"
-            );
-        }
     }
 }
