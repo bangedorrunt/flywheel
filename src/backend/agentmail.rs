@@ -563,6 +563,9 @@ impl MailSurface for AgentMailBackend {
                                         .map(|d| d.timestamp_micros())
                                 },
                             ),
+                            // zfnx.11 epoch rides lease content, not the wire
+                            // shape — absent here reads as genesis 0.
+                            epoch: g.get("epoch").and_then(Value::as_u64).unwrap_or(0),
                         })
                     })
                     .collect::<Result<Vec<_>, MailError>>()
@@ -688,6 +691,9 @@ impl MailSurface for AgentMailBackend {
                                     .map(|d| d.timestamp_micros())
                             },
                         ),
+                        // zfnx.11 epoch rides lease content, not the wire
+                        // shape — absent here reads as genesis 0.
+                        epoch: r.get("epoch").and_then(Value::as_u64).unwrap_or(0),
                     })
                     .collect()
             })
