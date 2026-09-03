@@ -7770,6 +7770,98 @@ fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod timeout_presence_tests {
+    // bd-adr0027-proven-leftovers-55nx.5 RED: timeout must tick Msg::Presence.
+    #[test]
+    fn timeout_arm_ticks_presence_not_only_hear() {
+        let src = include_str!("main.rs");
+        let pos = src.find("fn cmd_internal_doorbell(").expect("dispatcher");
+        let end = src[pos..]
+            .find("\nfn spawn_watch_child")
+            .map(|i| pos + i)
+            .unwrap_or(src.len());
+        let slice = &src[pos..end];
+        assert!(
+            slice.contains("Msg::Presence"),
+            "RED (55nx.5): timeout arm reads presence.jsonl into HearTracker only; tick Msg::Presence"
+        );
+    }
+
+    #[test]
+    fn presence_rows_keep_fresh_states_latest_wins() {
+        let now = 1_000_000u64;
+        let body = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({"name": "BlueRidge", "state": "idle", "ts": now - 100}),
+            serde_json::json!({"name": "BlueRidge", "state": "working", "ts": now - 5}),
+            serde_json::json!({"name": "LilacChapel", "state": "working", "ts": now - 500}),
+        );
+        let rows = super::timeout_presence_rows(&body, now);
+        assert_eq!(
+            rows,
+            vec![("BlueRidge".to_string(), "working".to_string())],
+            "latest fresh row wins; stale rows drop: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn presence_tick_working_blocks_prompt_without_20001() {
+        // No WatchNdjson 20001 is ever seen here: the jsonl row alone, via
+        // Msg::Presence, must land in Model.presence as Working.
+        let (next, _) = crate::workspace::tick(
+            &crate::workspace::WorkspaceModel::default(),
+            &crate::workspace::Msg::Presence {
+                pin: "BlueRidge".into(),
+                state: "working".into(),
+            },
+        );
+        assert_eq!(
+            next.presence.get("BlueRidge"),
+            Some(&crate::workspace::Presence::Working),
+            "jsonl working must enter Model.presence even with no 20001 seen"
+        );
+    }
+}
+
+/// Parse presence.jsonl body into fresh (pin, state) rows for the timeout path.
+/// Latest row per name wins; only rows <30s old are fresh. State comes from the
+/// row's `state` field (the Kind 20001 projection); rows without one default to
+/// `unknown`, which never prompts.
+fn timeout_presence_rows(body: &str, now: u64) -> Vec<(String, String)> {
+    let mut latest: std::collections::HashMap<String, (u64, String)> =
+        std::collections::HashMap::new();
+    for line in body.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let (Some(name), Some(ts)) = (
+            v.get("name").and_then(|n| n.as_str()),
+            v.get("ts").and_then(|t| t.as_u64()),
+        ) else {
+            continue;
+        };
+        let state = v
+            .get("state")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        latest
+            .entry(name.to_string())
+            .and_modify(|e| {
+                if ts > e.0 {
+                    *e = (ts, state.clone());
+                }
+            })
+            .or_insert((ts, state));
+    }
+    latest
+        .into_iter()
+        .filter(|(_, (ts, _))| now.saturating_sub(*ts) < 30)
+        .map(|(pin, (_, state))| (pin, state))
+        .collect()
+}
+
 fn cmd_internal_doorbell(
     cfg: &Config,
     project: &str,
@@ -8383,29 +8475,29 @@ fn cmd_internal_doorbell(
                 // Gap 2: presence hear — presence.jsonl is the real projection for
                 // ephemeral 20001 (bus never stores it). A recent presence (<30s)
                 // means the agent heard, even if no channel post arrived.
+                // bd-adr0027-proven-leftovers-55nx.5: inject truth is
+                // Model.presence, so each fresh row ticks Msg::Presence (the
+                // trusted internal edge — no author check, dispatcher is the
+                // trust root). Hear derives from Model after tick; jsonl is
+                // never a second oracle. Kind 20001 remains the wire.
                 let presence_path = crate::mail_shim::mailbox_roots().0.join("presence.jsonl");
                 if let Ok(body) = std::fs::read_to_string(&presence_path) {
                     let now = doorbell_now_unix();
-                    let mut latest_by_pin: std::collections::HashMap<String, u64> =
-                        std::collections::HashMap::new();
-                    for line in body.lines() {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
-                            && let (Some(name), Some(ts)) = (
-                                v.get("name").and_then(|n| n.as_str()),
-                                v.get("ts").and_then(|t| t.as_u64()),
-                            )
-                        {
-                            latest_by_pin
-                                .entry(name.to_string())
-                                .and_modify(|e| *e = (*e).max(ts))
-                                .or_insert(ts);
+                    for (pin, state) in timeout_presence_rows(&body, now) {
+                        if !pins.contains(&pin) {
+                            continue;
                         }
-                    }
-                    for pin in &pins {
-                        if let Some(ts) = latest_by_pin.get(pin)
-                            && now.saturating_sub(*ts) < 30
-                        {
-                            hear.note_heard_pin(pin);
+                        let (next_model, cmds) = workspace::tick(
+                            &workspace_model,
+                            &workspace::Msg::Presence {
+                                pin: pin.clone(),
+                                state,
+                            },
+                        );
+                        workspace_model = next_model;
+                        let _ = handle_workspace_cmds(&mut workspace_model, &cmds, project);
+                        if workspace_model.presence.contains_key(&pin) {
+                            hear.note_heard_pin(&pin);
                         }
                     }
                     doorbell_persist_hear(workspace, &hear);
@@ -16878,6 +16970,7 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
         pending_events: Default::default(),
         states: Default::default(),
         dispatch_pending: Default::default(),
+        drain_pending: Default::default(),
     };
     for (idx, entry) in entries.iter().enumerate() {
         let Some(msg_val) = entry.get("msg") else {
@@ -17323,6 +17416,7 @@ fn cmd_loop(
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &d_states,
             nudge,
@@ -18672,6 +18766,7 @@ mod loop_tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -18717,6 +18812,7 @@ mod loop_tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -18757,6 +18853,7 @@ mod loop_tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             Some("continue"),
@@ -18797,6 +18894,7 @@ mod loop_tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -18835,6 +18933,7 @@ mod loop_tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -18873,6 +18972,7 @@ mod loop_tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -18919,6 +19019,7 @@ mod loop_tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -18956,6 +19057,7 @@ mod loop_tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -18997,6 +19099,7 @@ mod loop_tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -19029,6 +19132,7 @@ mod loop_tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             Some("proceed"),
@@ -19067,6 +19171,7 @@ mod loop_tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             Some("proceed"),
@@ -19102,6 +19207,7 @@ mod loop_tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -19137,6 +19243,7 @@ mod loop_tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,

@@ -337,7 +337,29 @@ pub struct LoopModel {
     /// not loop-local. Apply is single and inside the Tick arm.
     #[serde(default)]
     pub states: Vec<AgentState>,
+    /// Graceful drain-stop (bd-zfnx.10): agents asked to finish their
+    /// VERIFY fence before a kill, keyed by herdr name. Tick owns the
+    /// countdown; Heal-exit fulfills; Tick-expiry force-stops.
+    #[serde(default)]
+    pub drain_pending: std::collections::BTreeMap<String, DrainState>,
 }
+
+/// One drain in flight (bd-zfnx.10). Crash-safe via ActiveLoop (name →
+/// bead id; grace restarts fresh on resume — a crash must never
+/// force-kill immediately).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct DrainState {
+    pub bead_id: String,
+    pub grace_polls: u32,
+}
+
+/// THE grace bound (bd-zfnx.10): a drained pane gets this many polls to
+/// finish its VERIFY fence and report before the loop force-kills.
+/// Working agents need an explicit reason to skip the drain
+/// (`--force-working` / `--force` kill keys bypass it deliberately —
+/// see the kill safety rules); the force path always records a LoudMiss
+/// with the bead id so the receipt is recoverable, never silent.
+pub const DRAIN_GRACE_POLLS: u32 = 3;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum LoopMsg {
     Herdr(PollEvent),
@@ -380,6 +402,15 @@ pub enum LoopMsg {
         name: String,
         bead_id: String,
         title: String,
+    },
+    /// Graceful drain-stop ask (bd-zfnx.10): the pane finishes its current
+    /// VERIFY fence and reports instead of being killed mid-fence (which
+    /// orphans the receipt). Tick records drain_pending + emits the drain
+    /// prompt as Send; Heal-exit fulfills; Tick-expiry force-stops with
+    /// the bead id on the record.
+    DrainRequest {
+        name: String,
+        bead_id: String,
     },
     Tick {
         now: u64,
@@ -493,6 +524,12 @@ pub(crate) fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopActi
                 next.heal_budget,
             );
             let reason = if *exited { "pane_exited" } else { "unknown" };
+            if *exited {
+                // bd-zfnx.10: exit fulfills an open drain — the pane left
+                // (finished or died); the receipt path (close-check) owns
+                // what follows, never a force-stop.
+                next.drain_pending.remove(name);
+            }
             match action {
                 HealAction::None => {}
                 HealAction::Diagnose => actions.push(LoopAction::Diagnose {
@@ -524,6 +561,22 @@ pub(crate) fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopActi
                 text: close_nudge_prompt(bead_id, title),
             });
         }
+        LoopMsg::DrainRequest { name, bead_id } => {
+            // bd-zfnx.10 two-phase stop: ask the pane to finish its VERIFY
+            // fence and report. First ask opens the grace window; a repeat
+            // ask re-prompts without extending it. Exit via Heal fulfills;
+            // Tick past grace force-stops with the bead id on the record.
+            next.drain_pending
+                .entry(name.clone())
+                .or_insert(DrainState {
+                    bead_id: bead_id.clone(),
+                    grace_polls: DRAIN_GRACE_POLLS,
+                });
+            actions.push(LoopAction::Send {
+                name: name.clone(),
+                text: drain_prompt(bead_id),
+            });
+        }
         LoopMsg::Tick { now } => {
             let _ = now;
             // Tick is the clock beat: heartbeat plan (queue -> Send). Heal and
@@ -531,6 +584,25 @@ pub(crate) fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopActi
             // pending_events are drained and applied here (single-apply invariant, bd-p1ds).
             apply_events_to_states(&mut next.states, &next.pending_events);
             next.pending_events.clear();
+            // bd-zfnx.10: drain grace countdown. A drain inside grace only
+            // waits; the first Tick AT zero force-stops with the bead id on
+            // the record (executor kills + LoudMiss). Exit via Heal fulfills
+            // first (arm above), so a finished pane is never force-stopped.
+            let mut expired: Vec<(String, String)> = Vec::new();
+            for (name, ds) in next.drain_pending.iter_mut() {
+                if ds.grace_polls == 0 {
+                    expired.push((name.clone(), ds.bead_id.clone()));
+                } else {
+                    ds.grace_polls -= 1;
+                }
+            }
+            for (name, bead_id) in expired {
+                next.drain_pending.remove(&name);
+                actions.push(LoopAction::Respawn {
+                    name: name.clone(),
+                    reason: format!("drain_expired bead {bead_id}"),
+                });
+            }
             if !next.mail_degraded && !next.queue.is_empty() {
                 // Simple plan: pop one and send
                 let bead = next.queue.remove(0);
@@ -4278,6 +4350,17 @@ pub fn close_nudge_prompt(bead_id: &str, title: &str) -> String {
     )
 }
 
+/// bd-zfnx.10: the drain ask — finish the current VERIFY fence and
+/// report, instead of being killed mid-fence (which orphans the
+/// receipt). Emitted as Send (existing variant); the `[drain-stop]`
+/// marker keeps the ask observable in journals and transcripts.
+pub fn drain_prompt(bead_id: &str) -> String {
+    format!(
+        "[drain-stop] Finish your current VERIFY fence for {bead_id} and report on its thread now; \
+         do not start new work. You are being drained, not re-tasked."
+    )
+}
+
 /// One claim-watch reconcile step (pure — the unit surface). Mutates
 /// `watch` and returns the actions the loop must take this poll.
 ///
@@ -5645,6 +5728,22 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         }
         // bd-55nx.8: done-mail dedup is crash-safe Model state, not a per-poll wipe.
         ws.swarm.done_mailed = al.done_mailed.clone();
+        // bd-zfnx.10: open drains resume with fresh grace (never force-kill
+        // immediately after a crash); the prompt re-sends via DrainRequest
+        // replay and send dedup protects against doubles.
+        ws.swarm.drain_pending = al
+            .drain_pending
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    DrainState {
+                        bead_id: v.clone(),
+                        grace_polls: DRAIN_GRACE_POLLS,
+                    },
+                )
+            })
+            .collect();
     }
     // pane_exited names observed this iteration (event path feeds heal step)
     let mut exited_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -7084,6 +7183,14 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             al.dispatch_pending = dispatch_pending.clone();
             // bd-55nx.8: done-mail dedup is crash-safe Model state.
             al.done_mailed = ws.swarm.done_mailed.clone();
+            // bd-zfnx.10: open drains are crash-safe Model state (name →
+            // bead id; grace restarts fresh on resume).
+            al.drain_pending = ws
+                .swarm
+                .drain_pending
+                .iter()
+                .map(|(k, v)| (k.clone(), v.bead_id.clone()))
+                .collect();
             // Persist heal counters (crash-safe; awaiting_clear is
             // within-episode state and deliberately does not survive restart).
             al.heal_states = next_model
@@ -7627,6 +7734,16 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         .get(name)
                         .map(|h| u64::from(h.respawn_count))
                         .unwrap_or(1);
+                    if let Some(bead) = reason.strip_prefix("drain_expired bead ") {
+                        // bd-zfnx.10: grace ran out without exit — the force
+                        // path. Recorded as LoudMiss WITH the bead id so the
+                        // orphaned VERIFY receipt is recoverable via
+                        // close-check, never silent. Skipping the drain needs
+                        // an explicit reason (--force-working / kill keys).
+                        eprintln!(
+                            "flywheel: LoudMiss drain-stop grace expired for {name} (bead {bead}) — force-respawned"
+                        );
+                    }
                     respawn_and_requeue(
                         ctx,
                         &params,
@@ -9003,6 +9120,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -9071,6 +9189,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -9116,6 +9235,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -9153,6 +9273,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -9190,6 +9311,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             Some("proceed"),
@@ -9225,6 +9347,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -9262,6 +9385,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -9299,6 +9423,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             Some("proceed"),
@@ -10220,6 +10345,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -10272,6 +10398,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -10321,6 +10448,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -10441,6 +10569,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -10485,6 +10614,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -10521,6 +10651,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states_plain,
             None,
@@ -10571,6 +10702,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -10654,6 +10786,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -10698,6 +10831,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -10738,6 +10872,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -10791,6 +10926,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -10911,6 +11047,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -10983,6 +11120,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -11021,6 +11159,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             Some("proceed"),
@@ -11065,6 +11204,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -11106,6 +11246,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -11146,6 +11287,7 @@ mod tests {
                 pending_events: Default::default(),
                 states: Default::default(),
                 dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
             },
             &states,
             None,
@@ -12447,6 +12589,7 @@ mod tests {
             pending_events: Default::default(),
             states: Default::default(),
             dispatch_pending: Default::default(),
+            drain_pending: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (next, actions) = tick(&model, &msg);
@@ -14621,6 +14764,7 @@ mod tick_replay_tests {
             pending_events: Default::default(),
             states: Default::default(),
             dispatch_pending: Default::default(),
+            drain_pending: Default::default(),
         }
     }
 
@@ -14749,6 +14893,7 @@ mod tick_replay_tests {
             pending_events: Default::default(),
             states: Default::default(),
             dispatch_pending: Default::default(),
+            drain_pending: Default::default(),
         };
         let msgs = vec![
             LoopMsg::Tick { now: 0 },
@@ -14786,6 +14931,7 @@ mod tick_replay_tests {
             pending_events: Default::default(),
             states: Default::default(),
             dispatch_pending: Default::default(),
+            drain_pending: Default::default(),
         };
         let mut actions_log2 = Vec::new();
         for msg in &msgs {
@@ -14816,6 +14962,7 @@ mod tick_replay_tests {
             pending_events: Default::default(),
             states: Default::default(),
             dispatch_pending: Default::default(),
+            drain_pending: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (m1, a1) = tick(&model, &msg);
@@ -14845,6 +14992,7 @@ mod tick_replay_tests {
             pending_events: Default::default(),
             states: Default::default(),
             dispatch_pending: Default::default(),
+            drain_pending: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (next, actions) = tick(&model, &msg);
@@ -14882,6 +15030,7 @@ mod loop_invoke_vehicle_tests {
             pending_events: Default::default(),
             states: Default::default(),
             dispatch_pending: Default::default(),
+            drain_pending: Default::default(),
         };
         // Simulate a graph invoke for bd-1 that succeeds (in-graph green)
         let msg = LoopMsg::Tick { now: 0 };
@@ -14914,6 +15063,7 @@ mod loop_invoke_vehicle_tests {
             pending_events: Default::default(),
             states: Default::default(),
             dispatch_pending: Default::default(),
+            drain_pending: Default::default(),
         };
         // Simulate worker closing the bead via br close (BrClose event)
         let (next, _) = tick(
@@ -14960,6 +15110,7 @@ mod loop_invoke_vehicle_tests {
             pending_events: Default::default(),
             states: Default::default(),
             dispatch_pending: Default::default(),
+            drain_pending: Default::default(),
         };
         let msg = LoopMsg::BrClose {
             bead_id: "bd-1".to_string(),
@@ -15029,6 +15180,7 @@ mod loop_invoke_vehicle_tests {
             pending_events: Default::default(),
             states: Default::default(),
             dispatch_pending: Default::default(),
+            drain_pending: Default::default(),
         };
         // For a bead that is not opted-in for graph, tick with Tick should just do normal plan_actions
         let msg = LoopMsg::Tick { now: 0 };
@@ -15073,6 +15225,7 @@ mod loop_invoke_vehicle_tests {
             pending_events: Default::default(),
             states: Default::default(),
             dispatch_pending: Default::default(),
+            drain_pending: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (_, actions) = tick(&model, &msg);
@@ -15112,6 +15265,85 @@ mod loop_invoke_vehicle_tests {
         assert!(
             !src.contains(&needle),
             "RED (55nx.4): loop-local done_mailed HashSet still exists; ws.swarm.done_mailed is the only owner"
+        );
+    }
+
+    #[test]
+    fn drain_stop_two_phase_before_force() {
+        // bd-zfnx.10 RED: two-phase stop. DrainRequest asks the pane to
+        // finish its VERIFY fence (Send with drain prompt); the pane keeps
+        // `grace` polls; exit via Heal fulfills the drain (no force);
+        // past-grace expiry force-stops with the bead id on the record.
+        let model = LoopModel::default();
+        let (m1, a1) = tick(
+            &model,
+            &LoopMsg::DrainRequest {
+                name: "oc".into(),
+                bead_id: "bd-1".into(),
+            },
+        );
+        assert!(
+            a1.iter()
+                .any(|a| matches!(a, LoopAction::Send { name, text }
+                if name == "oc" && text.contains("bd-1"))),
+            "drain ask sends the finish-and-report prompt: {a1:?}"
+        );
+        assert_eq!(
+            m1.drain_pending.get("oc").map(|d| d.bead_id.as_str()),
+            Some("bd-1"),
+            "drain tracked on the Model"
+        );
+        // Slow fence: ticks inside grace never force.
+        let mut m = m1;
+        for _ in 0..DRAIN_GRACE_POLLS {
+            let (next, acts) = tick(&m, &LoopMsg::Tick { now: 0 });
+            assert!(
+                !acts.iter().any(|a| matches!(a, LoopAction::Respawn { .. })),
+                "no force inside grace"
+            );
+            m = next;
+        }
+        // Exit observed via Heal: drain fulfilled, receipt path intact.
+        let (m3, a3) = tick(
+            &m,
+            &LoopMsg::Heal {
+                name: "oc".into(),
+                status: "done".into(),
+                exited: true,
+            },
+        );
+        assert!(
+            !m3.drain_pending.contains_key("oc"),
+            "exit fulfills the drain"
+        );
+        assert!(
+            !a3.iter().any(|a| matches!(a, LoopAction::Respawn { .. })),
+            "fulfilled drain never force-stops"
+        );
+        // Past grace with no exit: force-stop carries the bead id.
+        let (mut m4, _) = tick(
+            &model,
+            &LoopMsg::DrainRequest {
+                name: "oc".into(),
+                bead_id: "bd-1".into(),
+            },
+        );
+        let mut force = Vec::new();
+        for _ in 0..=DRAIN_GRACE_POLLS {
+            let (next, acts) = tick(&m4, &LoopMsg::Tick { now: 0 });
+            force.extend(acts);
+            m4 = next;
+        }
+        assert!(
+            force
+                .iter()
+                .any(|a| matches!(a, LoopAction::Respawn { name, reason }
+                if name == "oc" && reason.contains("bd-1"))),
+            "grace expiry force-stops with the bead id: {force:?}"
+        );
+        assert!(
+            !m4.drain_pending.contains_key("oc"),
+            "expired drain leaves no pending entry"
         );
     }
 }
