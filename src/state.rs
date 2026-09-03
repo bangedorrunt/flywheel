@@ -197,6 +197,10 @@ pub struct ActiveLoop {
     /// Heal state per agent persists across polls in model' (bd-gs8b #14, crash-safe via ActiveLoop file, was loop-local).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub heal_states: std::collections::BTreeMap<String, HealState>,
+    /// Programmatic done-mail dedup persists across polls (bd-55nx.8,
+    /// crash-safe via ActiveLoop file, was a per-poll Default wipe + loop-local).
+    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
+    pub done_mailed: std::collections::HashSet<String>,
 }
 impl ActiveLoop {
     /// Construct a v3 entry with empty control fields (fresh loop start).
@@ -217,6 +221,7 @@ impl ActiveLoop {
             per_bead_phase: BTreeMap::new(),
             dispatch_pending: std::collections::HashSet::new(),
             heal_states: BTreeMap::new(),
+            done_mailed: std::collections::HashSet::new(),
         }
     }
 }
@@ -1689,6 +1694,7 @@ mod loops_schema_v2_tests {
             per_bead_phase: Default::default(),
             dispatch_pending: Default::default(),
             heal_states: Default::default(),
+            done_mailed: Default::default(),
         };
         let mut map = BTreeMap::new();
         map.insert("/tmp/p".into(), al.clone());

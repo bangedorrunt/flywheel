@@ -5632,9 +5632,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // survive polls. Tick is the only writer of awaiting_clear.
     let mut ws = crate::workspace::WorkspaceModel::default();
     if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
-        for (k, v) in al.heal_states {
+        for (k, v) in &al.heal_states {
             ws.swarm.heal_states.insert(
-                k,
+                k.clone(),
                 HealState {
                     unknown_count: v.unknown_count,
                     diagnose_count: v.diagnose_count,
@@ -5643,6 +5643,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 },
             );
         }
+        // bd-55nx.8: done-mail dedup is crash-safe Model state, not a per-poll wipe.
+        ws.swarm.done_mailed = al.done_mailed.clone();
     }
     // pane_exited names observed this iteration (event path feeds heal step)
     let mut exited_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -5687,9 +5689,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // leaf results, so a crash converges next tick.
     let mut close_grace_ticks: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
-    // programmatic done-mail (2026-08-18): one captain done-mail per closed
-    // bead per invocation.
-    let mut done_mailed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // bd-55nx.8: programmatic done-mail dedup lives on ws.swarm.done_mailed
+    // (crash-safe via ActiveLoop), not a loop-local HashSet.
     // ADR-0019 Spec 4 (bd-w1-verifier-degrade-a6fk): closed beads whose
     // verifier-dispatch decision already ran this invocation. Degrade mails
     // the captain once per bead — the marker file is the durable dedup.
@@ -6542,8 +6543,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                         // the loop is the reporter of record —
                                         // mail the captain the close-reason
                                         // REPORT on the bead thread. Best-effort
-                                        // + once per bead per invocation.
-                                        if done_mailed.insert(bead_id.clone()) {
+                                        // + once per bead (bd-55nx.8: dedup on
+                                        // ws.swarm.done_mailed, crash-safe).
+                                        if ws.swarm.done_mailed.insert(bead_id.clone()) {
                                             let md = MailDoneArgs {
                                                 project: params.project.clone(),
                                                 bead_id: bead_id.clone(),
@@ -6909,35 +6911,36 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         let active = crate::state::load_active_loop(&params.project)
             .ok()
             .flatten();
-        let model = LoopModel {
-            queue: queue.clone(),
-            per_bead_phase: per_bead_phase.clone(),
-            wake_suppression: wake_suppressed.clone(),
-            done_mailed: Default::default(),
-            event_cursor: active.as_ref().and_then(|a| a.event_cursor.clone()),
-            escalation: active
-                .as_ref()
-                .map(|a| a.escalation.clone())
-                .unwrap_or_default(),
-            respawn: active
-                .as_ref()
-                .map(|a| a.respawn.clone())
-                .unwrap_or_default(),
-            mail_health: active
-                .as_ref()
-                .map(|a| a.mail_health.clone())
-                .unwrap_or_default(),
-            mail_degraded: mail_hold,
-            heal_states: ws.swarm.heal_states.clone(),
-            heal_grace: params.unknown_detect_grace_polls,
-            heal_threshold: params.unknown_diagnose_threshold,
-            heal_budget: params.respawn_budget,
-            pending_events: Vec::new(),
-            dispatch_pending: dispatch_pending.clone(),
-            states: states.clone(),
-        };
+        // bd-55nx.8: ws.swarm is the only RAM for queue / per_bead_phase /
+        // dispatch_pending / heal_states / done_mailed. Assign poll inputs in
+        // place — never replace the whole struct (a throwaway LoopModel with
+        // `done_mailed: Default` wiped the dedup every poll).
+        ws.swarm.queue = queue.clone();
+        ws.swarm.per_bead_phase = per_bead_phase.clone();
+        ws.swarm.wake_suppression = wake_suppressed.clone();
+        ws.swarm.event_cursor = active.as_ref().and_then(|a| a.event_cursor.clone());
+        ws.swarm.escalation = active
+            .as_ref()
+            .map(|a| a.escalation.clone())
+            .unwrap_or_default();
+        ws.swarm.respawn = active
+            .as_ref()
+            .map(|a| a.respawn.clone())
+            .unwrap_or_default();
+        ws.swarm.mail_health = active
+            .as_ref()
+            .map(|a| a.mail_health.clone())
+            .unwrap_or_default();
+        ws.swarm.mail_degraded = mail_hold;
+        ws.swarm.heal_grace = params.unknown_detect_grace_polls;
+        ws.swarm.heal_threshold = params.unknown_diagnose_threshold;
+        ws.swarm.heal_budget = params.respawn_budget;
+        ws.swarm.pending_events = Vec::new();
+        ws.swarm.dispatch_pending = dispatch_pending.clone();
+        ws.swarm.states = states.clone();
+        // done_mailed + heal_states deliberately untouched: they persist on
+        // ws.swarm across polls (seeded from ActiveLoop at startup).
         let now = chrono::Utc::now().timestamp() as u64;
-        ws.swarm = model;
         let fold = |ws: &mut crate::workspace::WorkspaceModel,
                     ws_msg: crate::workspace::Msg,
                     journal: LoopMsg|
@@ -7079,6 +7082,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 .map(|(k, v)| (k.clone(), format!("{v:?}")))
                 .collect();
             al.dispatch_pending = dispatch_pending.clone();
+            // bd-55nx.8: done-mail dedup is crash-safe Model state.
+            al.done_mailed = ws.swarm.done_mailed.clone();
             // Persist heal counters (crash-safe; awaiting_clear is
             // within-episode state and deliberately does not survive restart).
             al.heal_states = next_model
@@ -15078,5 +15083,28 @@ mod loop_invoke_vehicle_tests {
         assert!(entries[0].get("model_snapshot").is_some());
         assert!(entries[0].get("actions").is_some());
         let _ = std::fs::remove_file(st::loop_journal_file(&proj));
+    }
+
+    #[test]
+    fn loop_fold_done_mailed_persists_on_activeloop() {
+        // bd-adr0027-proven-leftovers-55nx.8 RED: done_mailed must survive
+        // polls via ActiveLoop (crash-safe), not a per-poll Default wipe.
+        let mut al =
+            crate::state::ActiveLoop::new("test", serde_json::json!({}), "2026-09-03T00:00:00Z");
+        al.done_mailed.insert("bd-1".to_string());
+        let raw = serde_json::to_value(&al).unwrap();
+        let back: crate::state::ActiveLoop = serde_json::from_value(raw).unwrap();
+        assert!(
+            back.done_mailed.contains("bd-1"),
+            "done_mailed must round-trip through ActiveLoop"
+        );
+        // Live poll must seed ws.swarm.done_mailed from ActiveLoop, never wipe.
+        let src = include_str!("durable.rs");
+        let live_wipe =
+            src.contains("done_mailed: Default::default(),\n            event_cursor: active");
+        assert!(
+            !live_wipe,
+            "RED (55nx.8): live per-poll LoopModel still wipes done_mailed with Default"
+        );
     }
 }
