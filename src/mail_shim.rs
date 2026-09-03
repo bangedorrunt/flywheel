@@ -581,6 +581,10 @@ impl Mail {
             .transpose()?;
         match &self.backend {
             BackendKind::InProcess => {
+                // bd-55nx.12: since_ts is applied ONCE by the toron
+                // projection (fetch_inbox strict-newer, equal-ts excluded).
+                // No second retain here — two RFC3339 parsers can diverge
+                // on fractional seconds / offsets at the boundary.
                 let msgs = block_on(mailbox().fetch_inbox(&FetchInbox {
                     project_slug: project_key.to_string(),
                     agent_name: agent_name.to_string(),
@@ -594,10 +598,6 @@ impl Mail {
                 let rows = msgs
                     .iter()
                     .filter(|m| !filter.urgent_only || is_urgent(&m.importance))
-                    .filter(|m| match since_us {
-                        Some(s) => m.created_ts_us > s,
-                        None => true,
-                    })
                     .map(ToJson::to_json)
                     .collect();
                 Ok(Value::Array(rows))
@@ -2764,6 +2764,82 @@ mod tests {
         assert!(
             err.to_string().contains("RFC3339"),
             "names the parse failure: {err}"
+        );
+    }
+
+    #[test]
+    fn inbox_filtered_since_applied_once_by_toron() {
+        // bd-55nx.12 RED: the InProcess arm must not re-filter since_ts —
+        // toron's fetch_inbox already applies it (strict-newer). Two
+        // RFC3339 parsers can diverge at the boundary.
+        // (needle split so this self-scan does not match its own source)
+        let needle = ["created_ts_us >", " s"].concat();
+        let src = include_str!("mail_shim.rs");
+        assert!(
+            !src.contains(&needle),
+            "RED (55nx.12): duplicate since_ts retain still in inbox_filtered"
+        );
+    }
+
+    #[test]
+    fn inbox_filtered_since_boundary_equal_ts_excluded() {
+        // bd-55nx.12: a row stamped exactly at the bound is excluded once
+        // (toron uses strict-newer), never twice-wrong.
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let project = format!("since-bound-{}", std::process::id());
+        mail.ensure_project(&project).expect("project");
+        mail.register_agent(&project, "BoundSender", "opencode", "test", "seed")
+            .expect("sender registered");
+        mail.register_agent(&project, "BoundRecv", "opencode", "test", "seed")
+            .expect("recipient registered");
+        mail.register_agent(&project, &mail.name, "opencode", "test", "seed")
+            .expect("facade identity registered");
+        mail.send(
+            &project,
+            &["BoundRecv".to_string()],
+            "bound-note",
+            "body",
+            "normal",
+            false,
+            None,
+        )
+        .expect("send ok");
+        let all = mail
+            .inbox_filtered(
+                &project,
+                "BoundRecv",
+                &MailInboxFilter {
+                    include_bodies: false,
+                    limit: 100,
+                    ..Default::default()
+                },
+            )
+            .expect("unfiltered inbox");
+        let rows = all.as_array().expect("array");
+        assert_eq!(rows.len(), 1, "one row sent: {rows:?}");
+        let us = rows[0]
+            .get("created_ts_us")
+            .and_then(serde_json::Value::as_i64)
+            .expect("row carries created_ts_us micros");
+        let bound = chrono::DateTime::from_timestamp_micros(us)
+            .expect("valid micros")
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let got = mail
+            .inbox_filtered(
+                &project,
+                "BoundRecv",
+                &MailInboxFilter {
+                    since_ts: Some(bound),
+                    include_bodies: false,
+                    limit: 100,
+                    ..Default::default()
+                },
+            )
+            .expect("bound-filtered inbox");
+        assert_eq!(
+            got.as_array().expect("array").len(),
+            0,
+            "equal-ts row excluded exactly once"
         );
     }
 
