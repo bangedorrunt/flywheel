@@ -198,7 +198,7 @@ pub enum Msg {
 // Per-arm contract (ADR-0028 C): Prompt gated by prompt_allowed; every
 // arm is applied by exactly one executor (dispatcher or swarm_loop) or
 // carries a bead deleting it. Content shapes: Publish is rumor-14,
-// WaitCorr carries a non-empty corr, Invoke carries workflow + JSON input.
+// WaitCorr carries a non-empty corr.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -259,10 +259,10 @@ pub enum Cmd {
     /// (empty corr is standing-empty silence, never a Wait). Bounding
     /// (TTL + cap) is the executor's job (.6); tick registers, never drops.
     WaitCorr { corr: String },
-    /// Engine invocation vehicle. Workflow names the playbook, input is a
-    /// JSON object string, and attribution needs the corr once wired (.5).
-    /// Tick never emits this arm today; the executor LoudMisses it (E1).
-    Invoke { workflow: String, input: String },
+    // DELETED by zfnx.5: the Invoke Cmd is gone — no playbook gates it
+    // and tick never emitted it (the executor only LoudMissed it). Wire
+    // engine.invoke + VerifySink behind a playbook gate to bring back an
+    // invocation vehicle; never as a second tick entry.
     // DELETED by zfnx.4 (E1): WriteNcryptsec is gone — flywheel never
     // writes ncryptsec secrets (keys belong to toron); a secret-writing
     // Cmd beside rumor-14 would be an exfil path. Likewise the Subscribe
@@ -1473,6 +1473,7 @@ mod bell_fold_tests {
         let wn = ["WriteNcryptsec", " {"].concat();
         let sub = ["Cmd::Sub", "scribe"].concat();
         let cw = ["Msg::Claim", "Watch"].concat();
+        let inv = ["Inv", "oke {"].concat();
         assert!(
             !src.contains(&wn),
             "RED (zfnx.4): WriteNcryptsec arm still present — delete it, flywheel never writes ncryptsec"
@@ -1484,6 +1485,10 @@ mod bell_fold_tests {
         assert!(
             !src.contains(&cw),
             "RED (zfnx.4): the producer-less ClaimWatch Msg still present — delete it"
+        );
+        assert!(
+            !src.contains(&inv),
+            "RED (zfnx.5): the unwired Invoke arm still present — wire it or delete it"
         );
         let main = include_str!("main.rs");
         assert!(
@@ -2745,24 +2750,5 @@ mod cmd_schema_tests {
                 "malformed tags must not write assignment"
             );
         }
-    }
-
-    #[test]
-    fn schema_invoke_shape_workflow_plus_json_input() {
-        let cmd = Cmd::Invoke {
-            workflow: "bug-fix".into(),
-            input: r#"{"bead":"bd-1"}"#.into(),
-        };
-        match &cmd {
-            Cmd::Invoke { workflow, input } => {
-                assert!(!workflow.is_empty(), "Invoke names a playbook workflow");
-                serde_json::from_str::<serde_json::Value>(input)
-                    .expect("Invoke input is JSON for engine.invoke");
-            }
-            _ => unreachable!(),
-        }
-        let raw = serde_json::to_value(&cmd).expect("Cmd is serde");
-        let back: Cmd = serde_json::from_value(raw).expect("Cmd round-trips");
-        assert_eq!(back, cmd, "Invoke shape survives the journal");
     }
 }
