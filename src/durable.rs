@@ -15346,4 +15346,28 @@ mod loop_invoke_vehicle_tests {
             "expired drain leaves no pending entry"
         );
     }
+
+    #[test]
+    fn swarm_holds_no_assignment_cache() {
+        // bd-55nx.3 cut A: the assignment cache is doorbell-only (seeded
+        // once at dispatcher start in main.rs); receipts sqlite is the
+        // shared truth. No swarm code path may read
+        // WorkspaceModel.assignment — this scan fails the build if one appears.
+        // (needle split so this self-scan does not match its own source)
+        let needle = [".assign", "ment"].concat();
+        let src = include_str!("durable.rs");
+        let reads: Vec<&str> = src
+            .lines()
+            .filter(|l| l.contains(&needle))
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        assert!(
+            reads.is_empty(),
+            "RED (55nx.3): swarm reads the assignment cache: {reads:?}"
+        );
+        assert!(
+            !src.contains(&["rebuild_assignment", "_from_receipts"].concat()),
+            "RED (55nx.3): swarm references the doorbell-only seed"
+        );
+    }
 }
