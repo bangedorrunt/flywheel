@@ -75,9 +75,20 @@ pub struct WorkspaceModel {
     pub presence: BTreeMap<String, Presence>,
     pub open_human: BTreeMap<String, Question>,
     pub seq: u64,
-    /// WaitCorr corrs whose receipt has not landed yet (re-peek on Sweep).
-    pub pending_wait: std::collections::BTreeSet<String>,
+    /// WaitCorr corrs whose receipt has not landed yet (re-peek on Sweep),
+    /// with deadline unix secs (bd-zfnx.6: bounded — TTL + cap, never an
+    /// unbounded set). The doorbell dispatcher owns this cache; swarm
+    /// never reads it. Expiry/cap-eviction happens in the Sweep arm and
+    /// always records Cmd::Audit wait-timeout (never silent drop).
+    pub pending_wait: std::collections::BTreeMap<String, u64>,
 }
+
+/// bd-zfnx.6: a parked corr lives at most this long before the Sweep arm
+/// times it out (deadline path removes + Audit wait-timeout record).
+pub const PENDING_WAIT_TTL_SECS: u64 = 3600;
+/// bd-zfnx.6: hard cap on parked corrs. Over-cap inserts evict the
+/// earliest deadline first, each with an Audit wait-timeout record.
+pub const PENDING_WAIT_CAP: usize = 512;
 
 // ---------------------------------------------------------------------------
 // Msg — one union covering mail / watch / status / heal / reclaim / receipt / role / human / presence
@@ -149,8 +160,10 @@ pub enum Msg {
     },
     /// Clock for plane-P fetch: effect runs FetchInbox; rows re-enter as InboxRows.
     /// Emits exactly one FetchInbox{since}; never performs the fetch itself.
+    /// Carries `now` so the same beat expires bounded waits (bd-zfnx.6).
     Sweep {
         since: String,
+        now: u64,
     },
     /// Write-through of one durable receipt: inserts the assignment cache
     /// AND emits SqliteUpsert for the same corr (never one without the other).
@@ -872,10 +885,44 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             next.doorbell = dm;
             cmds.extend(c);
         }
-        Msg::Sweep { since } => {
+        Msg::Sweep { since, now } => {
             cmds.push(Cmd::FetchInbox {
                 since: since.clone(),
             });
+            // bd-zfnx.6: bound the wait cache on every sweep beat. Expired
+            // deadlines and over-cap earliest entries leave WITH an Audit
+            // wait-timeout record each — a timeout is observable, never a
+            // silent drop. Receipt arrival still wins via try_tick_receipt
+            // (effect side) before the next sweep.
+            let mut gone: Vec<(String, &'static str)> = Vec::new();
+            for (corr, deadline) in next.pending_wait.iter() {
+                if *deadline <= *now {
+                    gone.push((corr.clone(), "expired"));
+                }
+            }
+            for (corr, _) in &gone {
+                next.pending_wait.remove(corr);
+            }
+            while next.pending_wait.len() > PENDING_WAIT_CAP {
+                if let Some((corr, _)) = next
+                    .pending_wait
+                    .iter()
+                    .min_by_key(|(_, d)| *d)
+                    .map(|(c, _)| (c.clone(), ()))
+                {
+                    next.pending_wait.remove(&corr);
+                    gone.push((corr, "over-cap"));
+                } else {
+                    break;
+                }
+            }
+            for (corr, why) in gone {
+                cmds.push(Cmd::Audit {
+                    kind: "wait-timeout".into(),
+                    pin: corr,
+                    detail: format!("pending_wait {why}"),
+                });
+            }
         }
         Msg::WatchDied => {
             let (dm, c) = doorbell_slice(
@@ -1448,7 +1495,10 @@ mod tests {
                 bead_id: "b".into(),
                 title: "t".into(),
             },
-            Msg::Sweep { since: "0".into() },
+            Msg::Sweep {
+                since: "0".into(),
+                now: 0,
+            },
             Msg::Receipt {
                 corr: "c".into(),
                 receipt: Receipt::default(),
@@ -1472,6 +1522,60 @@ mod tests {
             let (next, _) = tick(&m, &msg);
             assert_eq!(next.seq, 1, "seq must increment for {:?}", msg);
         }
+    }
+
+    #[test]
+    fn pending_wait_sweep_expires_and_caps_with_timeout_record() {
+        // bd-zfnx.6 RED: pending_wait is bounded (TTL + cap). Expiry and
+        // cap-eviction REMOVE entries and record a timeout — never silent.
+        let mut m = empty_model();
+        let now = 1_000_000u64;
+        m.pending_wait.insert("expired".into(), now - 1);
+        m.pending_wait.insert("live".into(), now + 100_000);
+        for i in 0..PENDING_WAIT_CAP + 2 {
+            m.pending_wait
+                .insert(format!("filler-{i:04}"), now + 20_000 + i as u64);
+        }
+        let (next, cmds) = tick(
+            &m,
+            &Msg::Sweep {
+                since: "0".into(),
+                now,
+            },
+        );
+        assert!(
+            !next.pending_wait.contains_key("expired"),
+            "expired waits drain on Sweep"
+        );
+        assert!(
+            next.pending_wait.contains_key("live"),
+            "live waits survive Sweep"
+        );
+        assert!(
+            next.pending_wait.len() <= PENDING_WAIT_CAP as usize,
+            "cap holds: {}",
+            next.pending_wait.len()
+        );
+        let timeouts: Vec<&str> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::Audit { kind, pin, .. } if kind == "wait-timeout" => Some(pin.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            timeouts.contains(&"expired"),
+            "expired corr gets a timeout record: {cmds:?}"
+        );
+        assert!(
+            !timeouts.contains(&"live"),
+            "live corr gets no timeout record"
+        );
+        assert!(
+            timeouts.len() >= 1 + 2,
+            "over-cap evictions recorded too ({} timeouts)",
+            timeouts.len()
+        );
     }
 }
 
