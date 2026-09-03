@@ -15106,5 +15106,12 @@ mod loop_invoke_vehicle_tests {
             !live_wipe,
             "RED (55nx.8): live per-poll LoopModel still wipes done_mailed with Default"
         );
+        // bd-55nx.4 one owner: no loop-local done_mailed HashSet remains.
+        // (needle split so this self-scan does not match its own source)
+        let needle = ["let mut done", "_mailed"].concat();
+        assert!(
+            !src.contains(&needle),
+            "RED (55nx.4): loop-local done_mailed HashSet still exists; ws.swarm.done_mailed is the only owner"
+        );
     }
 }
