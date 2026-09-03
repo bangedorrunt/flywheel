@@ -201,6 +201,12 @@ pub struct ActiveLoop {
     /// crash-safe via ActiveLoop file, was a per-poll Default wipe + loop-local).
     #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
     pub done_mailed: std::collections::HashSet<String>,
+    /// Graceful drain-stop asks persist across polls (bd-zfnx.10,
+    /// crash-safe via ActiveLoop file). Name → bead id only; grace
+    /// restarts fresh on resume — a crash must never force-kill
+    /// immediately, and the drain prompt re-sends (send dedup protects).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub drain_pending: std::collections::BTreeMap<String, String>,
 }
 impl ActiveLoop {
     /// Construct a v3 entry with empty control fields (fresh loop start).
@@ -222,6 +228,7 @@ impl ActiveLoop {
             dispatch_pending: std::collections::HashSet::new(),
             heal_states: BTreeMap::new(),
             done_mailed: std::collections::HashSet::new(),
+            drain_pending: BTreeMap::new(),
         }
     }
 }
@@ -1695,6 +1702,7 @@ mod loops_schema_v2_tests {
             dispatch_pending: Default::default(),
             heal_states: Default::default(),
             done_mailed: Default::default(),
+            drain_pending: Default::default(),
         };
         let mut map = BTreeMap::new();
         map.insert("/tmp/p".into(), al.clone());
