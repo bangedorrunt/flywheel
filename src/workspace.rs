@@ -348,6 +348,10 @@ impl Cmd {
     }
 }
 
+/// ADR-0028 E5 inject gate: Working never prompts; Unknown (missing key
+/// or unparseable state) never prompts on presence alone — it falls back
+/// to herdr status, defaulting to "unknown" (never idle), which
+/// should_inject rejects. Explicit Idle/Blocked/Done consult presence.
 fn prompt_allowed(model: &WorkspaceModel, pin: &str) -> bool {
     match model.presence.get(pin) {
         Some(Presence::Working) => false,
@@ -577,17 +581,53 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             // E2/E4/E6: 30013 role=, 20001 presence. Kind-9 is the ring, not
             // the assignment vehicle — corr/wake ride rumor 14 / InboxRows.
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                // 20001 presence
+                // 20001 presence — ADR-0028 E5 trust rule: inject truth is
+                // the pin itself (line `pubkey` == pin's npub in
+                // `doorbell.index`) or the trusted `Msg::Presence` edge
+                // (dispatcher-internal, e.g. jsonl timeout path below).
+                // A 20001 line whose author is provably not the claimed pin
+                // is a forge: LoudMiss (+Audit), presence unchanged.
+                // Verification needs BOTH a known npub mapping AND a line
+                // pubkey; when either is absent forgery is unprovable so the
+                // claim is accepted (bootstrap + pre-npub tests). Missing
+                // key = Unknown; Unknown never prompts (see prompt_allowed).
                 if v.get("kind").and_then(|k| k.as_u64()) == Some(20001) {
                     if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
                         // content is like "idle" or JSON with pin/state? For test, content is state, tags contain p tag for pin
                         let state = content.to_string();
+                        let author = v
+                            .get("pubkey")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("")
+                            .to_lowercase();
                         if let Some(tags) = v.get("tags").and_then(|t| t.as_array()) {
                             for tag in tags {
                                 if let Some(arr) = tag.as_array() {
                                     if arr.len() >= 2 && arr[0].as_str() == Some("p") {
                                         let pin = arr[1].as_str().unwrap_or("").to_string();
                                         if !pin.is_empty() {
+                                            let expected = next
+                                                .doorbell
+                                                .index
+                                                .npub(&pin)
+                                                .unwrap_or("")
+                                                .to_lowercase();
+                                            if !expected.is_empty()
+                                                && !author.is_empty()
+                                                && author != expected
+                                            {
+                                                cmds.push(Cmd::LoudMiss {
+                                                    why: format!(
+                                                        "forged 20001 for {pin}: author is not the pin"
+                                                    ),
+                                                });
+                                                cmds.push(Cmd::Audit {
+                                                    kind: "presence_forge".into(),
+                                                    pin: pin.clone(),
+                                                    detail: "20001 author != pin npub".into(),
+                                                });
+                                                continue;
+                                            }
                                             next.presence
                                                 .insert(pin.clone(), Presence::from_str(&state));
                                         }
@@ -887,6 +927,8 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             next.roles.insert(role.clone(), pin.clone());
         }
         Msg::Presence { pin, state } => {
+            // Trusted internal edge (dispatcher jsonl timeout path):
+            // no author check — the dispatcher is the trust root here.
             next.presence.insert(pin.clone(), Presence::from_str(state));
         }
         Msg::HumanDecision { corr, verdict } => {
@@ -2282,6 +2324,66 @@ mod presence_model_tests {
         assert!(
             src.contains("30013") && src.contains("20001"),
             "watch filter must include 30013 and 20001"
+        );
+    }
+
+    // ADR-0028 E5: 20001 trust rule — inject truth is the pin itself
+    // (line pubkey == pin's npub) or the trusted Msg::Presence edge.
+    // A 20001 line whose author is not the claimed pin is a forge:
+    // LoudMiss (+Audit), presence unchanged. Missing key = Unknown;
+    // Unknown never prompts (prompt_allowed falls back to herdr
+    // "unknown" which should_inject rejects).
+    #[test]
+    fn presence_20001_forge_fails_loud() {
+        let mut m = empty_model();
+        let npub_self = "a".repeat(64);
+        let npub_forge = "b".repeat(64);
+        m.doorbell
+            .index
+            .insert_pin("BlueRidge".into(), Some(npub_self));
+        let line = format!(
+            r#"{{"kind":20001,"id":"e1","pubkey":"{npub_forge}","tags":[["p","BlueRidge"]],"content":"idle"}}"#
+        );
+        let (next, cmds) = tick(&m, &Msg::WatchNdjson { line });
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::LoudMiss { .. })),
+            "forged 20001 must fail loud, got {cmds:?}"
+        );
+        assert!(
+            next.presence.get("BlueRidge").is_none(),
+            "forged 20001 must not write presence"
+        );
+    }
+
+    #[test]
+    fn presence_20001_self_report_accepted() {
+        let mut m = empty_model();
+        let npub_self = "a".repeat(64);
+        m.doorbell
+            .index
+            .insert_pin("BlueRidge".into(), Some(npub_self.clone()));
+        let line = format!(
+            r#"{{"kind":20001,"id":"e2","pubkey":"{npub_self}","tags":[["p","BlueRidge"]],"content":"idle"}}"#
+        );
+        let (next, cmds) = tick(&m, &Msg::WatchNdjson { line });
+        assert_eq!(next.presence.get("BlueRidge"), Some(&Presence::Idle));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::LoudMiss { .. })),
+            "self-reported 20001 must not LoudMiss, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn presence_unknown_pin_gets_no_prompt() {
+        let mut m = empty_model();
+        m.doorbell.index.insert_pin("GhostPin".into(), None);
+        // No presence entry (Unknown) and no herdr status (unknown):
+        // a kind-9 mention must not prompt.
+        let line = r#"{"kind":9,"id":"ab","tags":[["p","GhostPin"],["h","ch-1"]],"content":"@GhostPin hi"}"#;
+        let (_, cmds) = tick(&m, &Msg::WatchNdjson { line: line.into() });
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
+            "Unknown pin must get no Prompt, got {cmds:?}"
         );
     }
 }
