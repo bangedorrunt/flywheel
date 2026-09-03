@@ -149,6 +149,9 @@ fn renew_result_from(v: Value) -> Result<RenewResult, MailError> {
                         .get("new_expires_ts")
                         .and_then(Value::as_str)
                         .and_then(|s| s.parse().ok()),
+                    // zfnx.11 epoch rides lease content, not the wire
+                    // shape — absent here reads as genesis 0.
+                    epoch: r.get("epoch").and_then(Value::as_u64).unwrap_or(0),
                 })
                 .collect()
         })
