@@ -123,11 +123,6 @@ pub enum Msg {
     },
     /// Transport death. Slice restarts the watch; model queues survive.
     WatchDied,
-    /// Emits Subscribe with filter claim-watch:<name> (documented non-bus;
-    /// swarm owns claim-watch). Filter shape is part of the contract.
-    ClaimWatch {
-        name: String,
-    },
     /// Delegates to the swarm slice; guarantees a Cmd::Reclaim when the
     /// slice emits none (reason defaults to "reclaim").
     Reclaim {
@@ -260,9 +255,6 @@ pub enum Cmd {
     /// Rumor-14 shape: kind is always 14, content non-empty. (Corr
     /// plumbing rides this arm in .8; until then content-only questions.)
     Publish { kind: u64, content: String },
-    /// Documented non-bus (live subscribe_trusted already held). Filter is
-    /// always claim-watch:<name>; any other filter is a contract breach.
-    Subscribe { filter: String },
     /// Registers interest in one receipt. Corr is always non-empty
     /// (empty corr is standing-empty silence, never a Wait). Bounding
     /// (TTL + cap) is the executor's job (.6); tick registers, never drops.
@@ -271,9 +263,10 @@ pub enum Cmd {
     /// JSON object string, and attribution needs the corr once wired (.5).
     /// Tick never emits this arm today; the executor LoudMisses it (E1).
     Invoke { workflow: String, input: String },
-    /// DELETED by .4 (E1): flywheel never writes ncryptsec secrets. Never
-    /// constructed by tick; the arm exists only until the deletion bead.
-    WriteNcryptsec { pin: String, secret: String },
+    // DELETED by zfnx.4 (E1): WriteNcryptsec is gone — flywheel never
+    // writes ncryptsec secrets (keys belong to toron); a secret-writing
+    // Cmd beside rumor-14 would be an exfil path. Likewise the Subscribe
+    // Cmd is gone (55nx.7): claim-watch lives in swarm_loop, no second bus.
     /// Tick's hard-error signal. Why is always non-empty and names the
     /// contract broken (forge, malformed tags, unknown corr).
     LoudMiss { why: String },
@@ -878,11 +871,6 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             next.doorbell = dm;
             cmds.extend(c);
         }
-        Msg::ClaimWatch { name } => {
-            cmds.push(Cmd::Subscribe {
-                filter: format!("claim-watch:{name}"),
-            });
-        }
         Msg::Reclaim {
             bead_id,
             holder_pin,
@@ -1244,22 +1232,6 @@ mod tests {
     }
 
     #[test]
-    fn ws_model_claim_watch_emits_subscribe_not_loop_append() {
-        let m = empty_model();
-        let (next, cmds) = tick(
-            &m,
-            &Msg::ClaimWatch {
-                name: "my-bead".into(),
-            },
-        );
-        assert!(
-            cmds.iter()
-                .any(|c| matches!(c, Cmd::Subscribe { filter } if filter.contains("my-bead")))
-        );
-        assert_eq!(next.swarm.queue.len(), m.swarm.queue.len());
-    }
-
-    #[test]
     fn ws_model_heal_exited_emits_diagnose() {
         let m = empty_model();
         let (_, cmds) = tick(
@@ -1441,7 +1413,6 @@ mod tests {
             },
             Msg::AckSlaTick { now: 0 },
             Msg::WatchDied,
-            Msg::ClaimWatch { name: "x".into() },
             Msg::Reclaim {
                 bead_id: "b".into(),
                 holder_pin: "h".into(),
@@ -1492,6 +1463,39 @@ mod tests {
 
 #[cfg(test)]
 mod bell_fold_tests {
+    #[test]
+    fn bell_fold_no_dead_secret_or_subscribe_arms() {
+        // bd-zfnx.4 + bd-55nx.7 RED: no secret-writing arm, no dead
+        // Subscribe Cmd, no producer-less ClaimWatch. A deletion comment
+        // naming the removal is allowed; an arm (brace form) is not.
+        // (needles split so this self-scan does not match its own source)
+        let src = include_str!("workspace.rs");
+        let wn = ["WriteNcryptsec", " {"].concat();
+        let sub = ["Cmd::Sub", "scribe"].concat();
+        let cw = ["Msg::Claim", "Watch"].concat();
+        assert!(
+            !src.contains(&wn),
+            "RED (zfnx.4): WriteNcryptsec arm still present — delete it, flywheel never writes ncryptsec"
+        );
+        assert!(
+            !src.contains(&sub),
+            "RED (55nx.7): the dead Subscribe Cmd still present — delete it, swarm owns claim-watch"
+        );
+        assert!(
+            !src.contains(&cw),
+            "RED (zfnx.4): the producer-less ClaimWatch Msg still present — delete it"
+        );
+        let main = include_str!("main.rs");
+        assert!(
+            !main.contains(&sub),
+            "RED (55nx.7): main.rs still matches the dead Subscribe Cmd — delete the no-op arm"
+        );
+        assert!(
+            !main.contains(&wn),
+            "RED (zfnx.4): main.rs still matches WriteNcryptsec — delete the exfil-path arm"
+        );
+    }
+
     #[test]
     fn bell_fold_no_double_bell_model() {
         let src = include_str!("main.rs");

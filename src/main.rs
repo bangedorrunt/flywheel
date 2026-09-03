@@ -8753,11 +8753,6 @@ fn handle_workspace_cmds(
             workspace::Cmd::Publish { kind, content } => {
                 publish_human_question(project, *kind, content);
             }
-            workspace::Cmd::Subscribe { .. } => {
-                // Live dispatcher already holds subscribe_trusted (kinds
-                // DOORBELL_WATCH_KINDS). Claim-watch Subscribe belongs to
-                // swarm_loop. No second bus.
-            }
             workspace::Cmd::FactMiss { why } => {
                 eprintln!("flywheel: [FactMiss] {why}");
             }
@@ -8766,9 +8761,6 @@ fn handle_workspace_cmds(
             }
             workspace::Cmd::Invoke { workflow, input } => {
                 eprintln!("flywheel: [LoudMiss] Invoke not wired: {workflow} {input}");
-            }
-            workspace::Cmd::WriteNcryptsec { pin, .. } => {
-                eprintln!("flywheel: [LoudMiss] WriteNcryptsec denied for pin {pin}");
             }
             workspace::Cmd::Prompt { .. }
             | workspace::Cmd::CheckAckSla
