@@ -81,35 +81,54 @@ pub struct WorkspaceModel {
 
 // ---------------------------------------------------------------------------
 // Msg — one union covering mail / watch / status / heal / reclaim / receipt / role / human / presence
+//
+// Per-arm contract (ADR-0028 C): every variant states what it writes and
+// what it emits. Clock enters ONLY as a payload (Tick/AckSlaTick/Sweep).
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Msg {
+    /// Untrusted wire bytes. Routed via watch_route priority table; a Miss
+    /// emits FactMiss (never silent, never panics on unparseable input).
     WatchNdjson {
         line: String,
     },
+    /// Opaque fetch blob for one pin. Forwarded to the doorbell slice only;
+    /// assignment enters only after re-entering as InboxRows.
     InboxItems {
         raw: String,
         pin: String,
     },
+    /// Trusted projection rows. Each row needs a non-empty corr (empty corr
+    /// is standing-empty silence); vocab validated in apply_assignment.
     InboxRows {
         rows: Vec<serde_json::Value>,
         pin: String,
     },
+    /// Sole writer of doorbell.statuses. Working pins queue; the
+    /// working→idle transition drains the queue into Prompt.
     HerdrStatus {
         pin: String,
         status: String,
     },
+    /// Captain/operator injection. Prompts the captain-role pin iff
+    /// prompt_allowed, else falls through to the doorbell slice.
     Fact {
         summary: String,
     },
+    /// Clock payload for the ack-SLA slice. Carries time, never reads it.
     AckSlaTick {
         now: u64,
     },
+    /// Transport death. Slice restarts the watch; model queues survive.
     WatchDied,
+    /// Emits Subscribe with filter claim-watch:<name> (documented non-bus;
+    /// swarm owns claim-watch). Filter shape is part of the contract.
     ClaimWatch {
         name: String,
     },
+    /// Delegates to the swarm slice; guarantees a Cmd::Reclaim when the
+    /// slice emits none (reason defaults to "reclaim").
     Reclaim {
         bead_id: String,
         holder_pin: String,
@@ -133,34 +152,45 @@ pub enum Msg {
         title: String,
     },
     /// Clock for plane-P fetch: effect runs FetchInbox; rows re-enter as InboxRows.
+    /// Emits exactly one FetchInbox{since}; never performs the fetch itself.
     Sweep {
         since: String,
     },
+    /// Write-through of one durable receipt: inserts the assignment cache
+    /// AND emits SqliteUpsert for the same corr (never one without the other).
     Receipt {
         corr: String,
         receipt: Receipt,
     },
+    /// Upserts the roles map (role → pin). Last writer wins; no Cmd emitted.
     RoleBound {
         role: String,
         pin: String,
     },
+    /// Trusted internal presence edge (dispatcher jsonl path). Inserts
+    /// Presence::from_str(state); unknown strings become Unknown. See E5.
     Presence {
         pin: String,
         state: String,
     },
+    /// Closes at most one open question per corr. Unknown or duplicate corr
+    /// emits LoudMiss; exactly one Audit per close.
     HumanDecision {
         corr: String,
         verdict: String,
     },
     /// Clock discipline: wall-clock enters tick ONLY as this payload (E1).
+    /// Drives the swarm slice; deterministic in (model, now).
     Tick {
         now: u64,
     },
     /// Diagnose I/O failed: revert optimistic awaiting_clear inside tick.
+    /// Clears the flag, emits nothing.
     DiagnoseFailed {
         name: String,
     },
     /// Herdr pane event. Enters as Msg (not a world-dump into pending_events).
+    /// Delegates to the swarm slice.
     Herdr {
         event: crate::durable::PollEvent,
     },
@@ -168,23 +198,29 @@ pub enum Msg {
 
 // ---------------------------------------------------------------------------
 // Cmd — effects as data (DoorbellAction + LoopAction collapse into this)
+//
+// Per-arm contract (ADR-0028 C): Prompt gated by prompt_allowed; every
+// arm is applied by exactly one executor (dispatcher or swarm_loop) or
+// carries a bead deleting it. Content shapes: Publish is rumor-14,
+// WaitCorr carries a non-empty corr, Invoke carries workflow + JSON input.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Cmd {
     // doorbell slice — data equivalents of DoorbellAction
-    Prompt {
-        pin: String,
-        line: String,
-    },
-    FetchInbox {
-        since: String,
-    },
+    /// Inject iff prompt_allowed (E5 gate). Line always starts "[doorbell]".
+    Prompt { pin: String, line: String },
+    /// Effect runs the fetch; rows re-enter tick as InboxRows. Since is an
+    /// opaque cursor, never a filter.
+    FetchInbox { since: String },
+    /// Caller-applied dispatcher effects (no tick-side content).
     CheckAckSla,
+    /// Caller-applied dispatcher effects (no tick-side content).
     RestartWatch,
-    FactMiss {
-        why: String,
-    },
+    /// Structured route-miss: why carries "route-miss kind=<k> tags=[...]".
+    /// Journal-observable; the miss rate is the audit signal.
+    FactMiss { why: String },
+    /// Observation only (kind/pin/detail). Never gates dispatch.
     Audit {
         kind: String,
         pin: String,
@@ -192,66 +228,54 @@ pub enum Cmd {
     },
 
     // swarm slice — data equivalents of LoopAction
-    Send {
-        name: String,
-        text: String,
-    },
-    PinStamp {
-        bead_id: String,
-        pin: String,
-    },
-    DispatchImmediate {
-        name: String,
-        text: String,
-    },
-    Blocked {
-        name: String,
-    },
-    Nudge {
-        name: String,
-    },
-    Diagnose {
-        name: String,
-        reason: String,
-    },
-    Respawn {
-        name: String,
-        reason: String,
-    },
+    /// Swarm send. Name is the herdr pane, text the full prompt.
+    Send { name: String, text: String },
+    /// Swarm send. Records bead→pin binding for the spawn registry.
+    PinStamp { bead_id: String, pin: String },
+    /// Swarm send. Immediate dispatch bypassing the queue.
+    DispatchImmediate { name: String, text: String },
+    /// Swarm send. Marks the pane blocked (await-signal, not dead).
+    Blocked { name: String },
+    /// Swarm send. Claim/close nudge for one bead.
+    Nudge { name: String },
+    /// Swarm send. Diagnose with reason; may precede Respawn.
+    Diagnose { name: String, reason: String },
+    /// Swarm send. Respawn with reason; budgeted by the executor.
+    Respawn { name: String, reason: String },
+    /// Swarm send. Reclaim carries bead + pin + herdr name + reason.
     Reclaim {
         bead_id: String,
         pin: String,
         herdr_name: String,
         reason: String,
     },
+    /// Swarm send. Cooperative yield; no content.
     Wait,
 
     // E2/E3 assignment + receipts
-    SqliteUpsert {
-        corr: String,
-        receipt: Receipt,
-    },
-    Publish {
-        kind: u64,
-        content: String,
-    },
-    Subscribe {
-        filter: String,
-    },
-    WaitCorr {
-        corr: String,
-    },
-    Invoke {
-        workflow: String,
-        input: String,
-    },
-    WriteNcryptsec {
-        pin: String,
-        secret: String,
-    },
-    LoudMiss {
-        why: String,
-    },
+    /// Write-through of the assignment cache. Corr is always non-empty;
+    /// receipt mirrors the Model row exactly.
+    SqliteUpsert { corr: String, receipt: Receipt },
+    /// Rumor-14 shape: kind is always 14, content non-empty. (Corr
+    /// plumbing rides this arm in .8; until then content-only questions.)
+    Publish { kind: u64, content: String },
+    /// Documented non-bus (live subscribe_trusted already held). Filter is
+    /// always claim-watch:<name>; any other filter is a contract breach.
+    Subscribe { filter: String },
+    /// Registers interest in one receipt. Corr is always non-empty
+    /// (empty corr is standing-empty silence, never a Wait). Bounding
+    /// (TTL + cap) is the executor's job (.6); tick registers, never drops.
+    WaitCorr { corr: String },
+    /// Engine invocation vehicle. Workflow names the playbook, input is a
+    /// JSON object string, and attribution needs the corr once wired (.5).
+    /// Tick never emits this arm today; the executor LoudMisses it (E1).
+    Invoke { workflow: String, input: String },
+    /// DELETED by .4 (E1): flywheel never writes ncryptsec secrets. Never
+    /// constructed by tick; the arm exists only until the deletion bead.
+    WriteNcryptsec { pin: String, secret: String },
+    /// Tick's hard-error signal. Why is always non-empty and names the
+    /// contract broken (forge, malformed tags, unknown corr).
+    LoudMiss { why: String },
 }
 
 impl Cmd {
@@ -413,6 +437,22 @@ fn apply_assignment(
     if corr.is_empty() {
         return;
     }
+    // ADR-0028 C: tag vocabulary is wake ∈ {tasked,standing}, audience ∈
+    // {human,agents}, priority ∈ {queue,interrupt} — mirrors the
+    // SendTags::parse hard-error on the send path. Absent tags arrive
+    // pre-defaulted to valid members; a present-but-unknown value is a
+    // malformed assignment → LoudMiss (tick's hard-error), no model write.
+    if !matches!(wake.as_str(), "tasked" | "standing")
+        || !matches!(audience.as_str(), "human" | "agents")
+        || !matches!(priority.as_str(), "queue" | "interrupt")
+    {
+        cmds.push(Cmd::LoudMiss {
+            why: format!(
+                "malformed assignment tags for corr {corr}: wake={wake} audience={audience} priority={priority}"
+            ),
+        });
+        return;
+    }
     let from_tag = verdict.as_deref().and_then(parse_verdict);
     let from_body = if next.open_human.contains_key(&corr) {
         parse_verdict(body)
@@ -479,6 +519,123 @@ fn mint_human_question(next: &mut WorkspaceModel, cmds: &mut Vec<Cmd>, corr: &st
         kind: 14,
         content: body.to_string(),
     });
+}
+
+// ---------------------------------------------------------------------------
+// Compiled signal router (ADR-0028 C fold-in): kind→handler table for the
+// WatchNdjson edge. Tag-pattern priority:
+// corr-tagged 14 > p-mention 9 > channel 9 > presence 20001 > profile 30013.
+// Kinds owned by the doorbell slice ring path (43001 job, 30031
+// reservation, 39002 member) route as Ring — never miss. Anything else
+// (corr-less 14, unknown kind, unparseable bytes) is Miss and the arm emits
+// a structured FactMiss (kind/tag summary) so the miss rate is observable
+// in the journal audit instead of a silent skip. Cost per event is
+// constant: one kind match + one tag scan. No CloudEvents, no new kinds.
+// ---------------------------------------------------------------------------
+
+/// Where one watch event goes. Total: every input maps to exactly one arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchRoute {
+    /// Rumor-14 carrying a non-empty corr: the assignment vehicle.
+    Assignment14,
+    /// Kind-9 addressing a known pin (p tag or @pin): the ring.
+    Mention9,
+    /// Kind-9 room traffic with no pin address: the ring.
+    Channel9,
+    /// Kind-20001: presence fold (E5 trust rule applies at the fold).
+    Presence20001,
+    /// Kind-30013: role fold.
+    Profile30013,
+    /// Doorbell-slice-owned wake kinds (43001/30031/39002): routed, silent here.
+    Ring(u16),
+    /// Nothing owns this event: emit FactMiss, never silent skip.
+    Miss,
+}
+
+fn tag_keys(v: &serde_json::Value) -> Vec<String> {
+    v.get("tags")
+        .and_then(|t| t.as_array())
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|t| t.as_array()?.first()?.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_pin_mentioned(v: &serde_json::Value, index: &crate::doorbell::SelfIndex) -> bool {
+    if let Some(tags) = v.get("tags").and_then(|t| t.as_array()) {
+        for t in tags {
+            let Some(a) = t.as_array() else { continue };
+            if a.first().and_then(|x| x.as_str()) != Some("p") {
+                continue;
+            }
+            if let Some(val) = a.get(1).and_then(|x| x.as_str())
+                && index.resolve(val).is_some()
+            {
+                return true;
+            }
+        }
+    }
+    if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
+        for pin in index.pin_names() {
+            if content.contains(&format!("@{pin}")) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn has_nonempty_corr(v: &serde_json::Value) -> bool {
+    v.get("tags")
+        .and_then(|t| t.as_array())
+        .is_some_and(|tags| {
+            tags.iter().any(|t| {
+                t.as_array().is_some_and(|a| {
+                    a.first().and_then(|x| x.as_str()) == Some("corr")
+                        && a.get(1)
+                            .and_then(|x| x.as_str())
+                            .is_some_and(|s| !s.is_empty())
+                })
+            })
+        })
+}
+
+/// Pure route for one parsed watch event. Total over all inputs.
+pub fn watch_route(v: &serde_json::Value, index: &crate::doorbell::SelfIndex) -> WatchRoute {
+    match v.get("kind").and_then(|k| k.as_u64()) {
+        Some(14) if has_nonempty_corr(v) => WatchRoute::Assignment14,
+        Some(14) => WatchRoute::Miss,
+        Some(9) if is_pin_mentioned(v, index) => WatchRoute::Mention9,
+        Some(9) => WatchRoute::Channel9,
+        Some(20001) => WatchRoute::Presence20001,
+        Some(30013) => WatchRoute::Profile30013,
+        Some(k) if matches!(k, 43001 | 30031 | 39002) => WatchRoute::Ring(k as u16),
+        _ => WatchRoute::Miss,
+    }
+}
+
+/// Route for bytes that may not parse: unparseable is Miss, never a panic.
+pub fn watch_route_unparseable(line: &str, index: &crate::doorbell::SelfIndex) -> WatchRoute {
+    match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(v) => watch_route(&v, index),
+        Err(_) => WatchRoute::Miss,
+    }
+}
+
+/// One-line audit summary for a route-miss (FactMiss payload).
+fn route_miss_summary(v: Option<&serde_json::Value>) -> String {
+    match v {
+        None => "route-miss unparseable".into(),
+        Some(v) => {
+            let kind = v
+                .get("kind")
+                .map(|k| k.to_string())
+                .unwrap_or_else(|| "?".into());
+            format!("route-miss kind={kind} tags=[{}]", tag_keys(v).join(","))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -580,7 +737,22 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             cmds.extend(filter_prompts(&next, c));
             // E2/E4/E6: 30013 role=, 20001 presence. Kind-9 is the ring, not
             // the assignment vehicle — corr/wake ride rumor 14 / InboxRows.
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            // Route first (ADR-0028 C): a Miss emits FactMiss here so no
+            // watch event ever slips silent; the per-kind folds below are
+            // no-ops on miss shapes.
+            let parsed: Option<serde_json::Value> = serde_json::from_str(line).ok();
+            match parsed.as_ref() {
+                None => cmds.push(Cmd::FactMiss {
+                    why: route_miss_summary(None),
+                }),
+                Some(v) => match watch_route(v, &model.doorbell.index) {
+                    WatchRoute::Miss => cmds.push(Cmd::FactMiss {
+                        why: route_miss_summary(Some(v)),
+                    }),
+                    _ => {}
+                },
+            }
+            if let Some(v) = parsed {
                 // 20001 presence — ADR-0028 E5 trust rule: inject truth is
                 // the pin itself (line `pubkey` == pin's npub in
                 // `doorbell.index`) or the trusted `Msg::Presence` edge
@@ -2598,5 +2770,217 @@ mod human_decision_tests {
             cmds.iter()
                 .any(|c| matches!(c, Cmd::WaitCorr { corr } if corr == "FM-LIVE"))
         );
+    }
+}
+
+#[cfg(test)]
+mod cmd_schema_tests {
+    // ADR-0028 C: action-schema discipline at the Cmd/Msg boundary.
+    use super::*;
+
+    fn empty_model() -> WorkspaceModel {
+        WorkspaceModel::default()
+    }
+
+    fn row(
+        corr: &str,
+        wake: &str,
+        audience: &str,
+        priority: &str,
+        body: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "corr": corr, "wake": wake, "audience": audience,
+            "priority": priority, "body": body,
+        })
+    }
+
+    #[test]
+    fn schema_publish_shape_kind14_nonempty_content() {
+        let m = empty_model();
+        let (_, cmds) = tick(
+            &m,
+            &Msg::InboxRows {
+                rows: vec![row("C-PUB", "tasked", "human", "queue", "approve?")],
+                pin: "Recv".into(),
+            },
+        );
+        let pub_ = cmds
+            .iter()
+            .find_map(|c| match c {
+                Cmd::Publish { kind, content } => Some((*kind, content.clone())),
+                _ => None,
+            })
+            .expect("human audience must mint Publish, got {cmds:?}");
+        assert_eq!(pub_.0, 14, "Publish is rumor-14, never kind-9");
+        assert!(!pub_.1.is_empty(), "Publish content carries the question");
+    }
+
+    #[test]
+    fn schema_waitcorr_registers_only_nonempty_corr() {
+        let m = empty_model();
+        let (_, cmds) = tick(
+            &m,
+            &Msg::InboxRows {
+                rows: vec![row("", "tasked", "agents", "queue", "work")],
+                pin: "Recv".into(),
+            },
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::WaitCorr { .. })),
+            "empty corr registers no WaitCorr, got {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SqliteUpsert { .. })),
+            "empty corr writes no receipt, got {cmds:?}"
+        );
+        let (_, cmds) = tick(
+            &m,
+            &Msg::InboxRows {
+                rows: vec![row("C-W", "tasked", "agents", "queue", "work")],
+                pin: "Recv".into(),
+            },
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::WaitCorr { corr } if corr == "C-W")),
+            "non-empty corr registers WaitCorr with the same corr"
+        );
+    }
+
+    #[test]
+    fn schema_malformed_vocab_fails_loud() {
+        for (wake, audience, priority) in [
+            ("bogus", "agents", "queue"),
+            ("tasked", "everyone", "queue"),
+            ("tasked", "agents", "later"),
+        ] {
+            let m = empty_model();
+            let (next, cmds) = tick(
+                &m,
+                &Msg::InboxRows {
+                    rows: vec![row("C-M", wake, audience, priority, "work")],
+                    pin: "Recv".into(),
+                },
+            );
+            assert!(
+                cmds.iter().any(|c| matches!(c, Cmd::LoudMiss { .. })),
+                "unknown vocab ({wake}/{audience}/{priority}) must fail loud"
+            );
+            assert!(
+                !next.assignment.contains_key("C-M"),
+                "malformed tags must not write assignment"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_invoke_shape_workflow_plus_json_input() {
+        let cmd = Cmd::Invoke {
+            workflow: "bug-fix".into(),
+            input: r#"{"bead":"bd-1"}"#.into(),
+        };
+        match &cmd {
+            Cmd::Invoke { workflow, input } => {
+                assert!(!workflow.is_empty(), "Invoke names a playbook workflow");
+                serde_json::from_str::<serde_json::Value>(input)
+                    .expect("Invoke input is JSON for engine.invoke");
+            }
+            _ => unreachable!(),
+        }
+        let raw = serde_json::to_value(&cmd).expect("Cmd is serde");
+        let back: Cmd = serde_json::from_value(raw).expect("Cmd round-trips");
+        assert_eq!(back, cmd, "Invoke shape survives the journal");
+    }
+
+    #[test]
+    fn router_golden_vectors() {
+        let index = crate::doorbell::SelfIndex::from_pins(["BlueRidge".to_string()]);
+        let cases: &[(&str, WatchRoute)] = &[
+            // corr-tagged 14 wins over everything
+            (
+                r#"{"kind":14,"tags":[["corr","C1"],["wake","tasked"]],"content":"w"}"#,
+                WatchRoute::Assignment14,
+            ),
+            // p-mention 9
+            (
+                r#"{"kind":9,"tags":[["p","BlueRidge"]],"content":"@BlueRidge hi"}"#,
+                WatchRoute::Mention9,
+            ),
+            // plain channel 9
+            (
+                r#"{"kind":9,"tags":[["h","ch"]],"content":"hello room"}"#,
+                WatchRoute::Channel9,
+            ),
+            // presence + profile
+            (
+                r#"{"kind":20001,"tags":[["p","BlueRidge"]],"content":"idle"}"#,
+                WatchRoute::Presence20001,
+            ),
+            (
+                r#"{"kind":30013,"tags":[["d","pin:BlueRidge"],["role","coder"]],"content":""}"#,
+                WatchRoute::Profile30013,
+            ),
+            // doorbell-slice ring kinds are routed, never miss
+            (
+                r#"{"kind":43001,"tags":[],"content":""}"#,
+                WatchRoute::Ring(43001),
+            ),
+            (
+                r#"{"kind":30031,"tags":[],"content":""}"#,
+                WatchRoute::Ring(30031),
+            ),
+            (
+                r#"{"kind":39002,"tags":[],"content":""}"#,
+                WatchRoute::Ring(39002),
+            ),
+            // miss: 14 without corr, unknown kind, garbage
+            (
+                r#"{"kind":14,"tags":[],"content":"no corr"}"#,
+                WatchRoute::Miss,
+            ),
+            (r#"{"kind":7,"tags":[],"content":"+"}"#, WatchRoute::Miss),
+        ];
+        for (line, want) in cases {
+            let v: serde_json::Value = serde_json::from_str(line).expect("vector parses");
+            assert_eq!(&watch_route(&v, &index), want, "route for {line}");
+        }
+        assert_eq!(
+            watch_route_unparseable("not json{{", &index),
+            WatchRoute::Miss
+        );
+    }
+
+    #[test]
+    fn router_miss_emits_factmiss_not_silence() {
+        let m = empty_model();
+        let line = r#"{"kind":7,"id":"r1","tags":[["p","x"]],"content":"+"}"#;
+        let (next, cmds) = tick(&m, &Msg::WatchNdjson { line: line.into() });
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::FactMiss { why } if why.contains("kind=7"))),
+            "route-miss must be observable FactMiss, got {cmds:?}"
+        );
+        assert!(next.presence.is_empty() && next.roles.is_empty() && next.assignment.is_empty());
+        // corr-less 14 is malformed assignment vehicle, also miss
+        let line = r#"{"kind":14,"id":"r2","tags":[],"content":"no corr"}"#;
+        let (_, cmds) = tick(&m, &Msg::WatchNdjson { line: line.into() });
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::FactMiss { .. })),
+            "corr-less 14 must not slip silent, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn router_ring_kinds_stay_silent_in_workspace_fold() {
+        let m = empty_model();
+        for kind in [43001u64, 30031, 39002] {
+            let line = format!(r#"{{"kind":{kind},"id":"k","tags":[],"content":""}}"#);
+            let (_, cmds) = tick(&m, &Msg::WatchNdjson { line });
+            assert!(
+                !cmds.iter().any(|c| matches!(c, Cmd::FactMiss { .. })),
+                "ring kind {kind} is doorbell-slice-owned, no workspace FactMiss"
+            );
+        }
     }
 }
