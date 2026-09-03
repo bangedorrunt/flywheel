@@ -7613,6 +7613,10 @@ fn cmd_doorbell_why(
             }
             model = next;
             replay_seq += 1;
+            // 55nx.9: the journal line carries the budget-gate outcome
+            // (effect); dropped-pin Prompts replayed below are the EFFECTIVE
+            // injects, never the pre-gate cmds.
+            let dropped = why_dropped_pins(entry);
             let seq_match = seq.map(|s| s == replay_seq - 1).unwrap_or(true);
             let corr_match = match corr {
                 Some(c) => {
@@ -7628,7 +7632,15 @@ fn cmd_doorbell_why(
             let pin_match = if corr.is_some() || seq.is_some() {
                 true
             } else {
-                why_entry_mentions_pin(pin, &msg, &actual)
+                let effective: Vec<workspace::Cmd> = actual
+                    .iter()
+                    .filter(|c| match c {
+                        workspace::Cmd::Prompt { pin: p, .. } => !dropped.contains(p),
+                        _ => true,
+                    })
+                    .cloned()
+                    .collect();
+                why_entry_mentions_pin(pin, &msg, &effective)
             };
             if !corr_match || !seq_match || !pin_match {
                 continue;
@@ -7646,8 +7658,18 @@ fn cmd_doorbell_why(
                 .and_then(|a| a.as_array())
                 .map(|a| {
                     a.iter()
-                        .map(|v| {
-                            if v.get("Prompt").is_some() {
+                        .filter_map(|v| {
+                            // 55nx.9: a journaled Prompt the budget dropped
+                            // was never injected — skip it in the replay.
+                            if let Some(p) = v
+                                .get("Prompt")
+                                .and_then(|p| p.get("pin"))
+                                .and_then(|p| p.as_str())
+                                && dropped.iter().any(|d| d == p)
+                            {
+                                return None;
+                            }
+                            Some(if v.get("Prompt").is_some() {
                                 "prompt"
                             } else if v.get("CheckAckSla").is_some() {
                                 "check-ack-sla"
@@ -7661,7 +7683,7 @@ fn cmd_doorbell_why(
                                 "fetch-inbox"
                             } else {
                                 "unknown"
-                            }
+                            })
                         })
                         .collect::<Vec<_>>()
                         .join(",")
@@ -7687,13 +7709,18 @@ fn cmd_doorbell_why(
                 .unwrap_or("");
             // fold tick replay already verified above; this print is the user-visible replay
             println!(
-                "{workspace} {ts} seq={} {kind}{} actions=[{actions}]",
+                "{workspace} {ts} seq={} {kind}{} actions=[{actions}]{}",
                 replay_seq - 1,
                 if status.is_empty() {
                     String::new()
                 } else {
                     format!(" ->{status}")
-                }
+                },
+                if dropped.is_empty() {
+                    String::new()
+                } else {
+                    format!(" dropped=[{}]", dropped.join(","))
+                },
             );
         }
     }
@@ -8117,7 +8144,11 @@ fn cmd_internal_doorbell(
                 workspace,
                 &msg,
                 &cmds,
-                serde_json::json!({ "stage": "fact_live", "summary": summary }),
+                serde_json::json!({
+                    "stage": "fact_live",
+                    "summary": summary,
+                    "effect": budget_effect(&prompt_injects(&cmds), &injects),
+                }),
             );
         }
         // GS-006 bug 3: Ack-SLA was test-only (0 production callers). The dispatcher
@@ -8230,17 +8261,19 @@ fn cmd_internal_doorbell(
                     }
                 }
                 let raw_injects = prompt_injects(&cmds);
+                let budget_before = raw_injects.len();
+                // Effect layer: budget gate BEFORE the decided journal so the
+                // line carries the gate outcome (55nx.9) — gate is pure.
+                let injects =
+                    doorbell::take_allowed(raw_injects.clone(), &mut budgets, doorbell_now_unix());
+                let effect = budget_effect(&raw_injects, &injects);
                 doorbell::journal_append_workspace(
                     &config::state_dir(),
                     workspace,
                     &msg,
                     &cmds,
-                    serde_json::json!({ "stage": "decided" }),
+                    serde_json::json!({ "stage": "decided", "effect": effect }),
                 );
-                // Effect layer: budget gate on tick's prompts (drop is audited).
-                let budget_before = raw_injects.len();
-                let injects =
-                    doorbell::take_allowed(raw_injects, &mut budgets, doorbell_now_unix());
                 if !delivered.is_empty() {
                     doorbell::journal_append_workspace(
                         &config::state_dir(),
@@ -8313,15 +8346,18 @@ fn cmd_internal_doorbell(
                 workspace_model = next_model;
                 handle_workspace_cmds(&mut workspace_model, &cmds, project);
                 let raw_injects = prompt_injects(&cmds);
+                // Budget gate BEFORE the drain journal so the line carries
+                // the gate outcome (55nx.9) — gate is pure.
+                let injects =
+                    doorbell::take_allowed(raw_injects.clone(), &mut budgets, doorbell_now_unix());
+                let effect = budget_effect(&raw_injects, &injects);
                 doorbell::journal_append_workspace(
                     &config::state_dir(),
                     workspace,
                     &msg,
                     &cmds,
-                    serde_json::json!({ "stage": "drain" }),
+                    serde_json::json!({ "stage": "drain", "effect": effect }),
                 );
-                let injects =
-                    doorbell::take_allowed(raw_injects, &mut budgets, doorbell_now_unix());
                 let registry = state::load_spawn_registry(project);
                 doorbell_prompt_and_hear(
                     herdr.as_mut(),
@@ -8647,6 +8683,44 @@ fn prompt_injects(cmds: &[workspace::Cmd]) -> Vec<(String, String)> {
             _ => None,
         })
         .collect()
+}
+
+/// bd-adr0027-proven-leftovers-55nx.9: budget-gate outcome as journal data.
+/// `raw` is tick's complete Prompt injects, `allowed` is take_allowed's
+/// survivors (an order-preserving subsequence); the difference is the drop
+/// set `why` must not replay as injected. Tick output stays complete —
+/// effect rides the `executed` JSON beside cmds, never inside tick.
+fn budget_effect(raw: &[(String, String)], allowed: &[(String, String)]) -> serde_json::Value {
+    let mut remaining: Vec<(String, String)> = allowed.to_vec();
+    let mut injected: Vec<String> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for (pin, line) in raw {
+        if let Some(pos) = remaining.iter().position(|(p, l)| p == pin && l == line) {
+            remaining.remove(pos);
+            if !injected.contains(pin) {
+                injected.push(pin.clone());
+            }
+        } else if !dropped.contains(pin) {
+            dropped.push(pin.clone());
+        }
+    }
+    serde_json::json!({ "injected": injected, "dropped": dropped })
+}
+
+/// Pins the journal effect marks dropped for one entry (`executed.effect`).
+/// Absent effect (legacy lines, unbudgeted paths) means no drops.
+fn why_dropped_pins(entry: &serde_json::Value) -> Vec<String> {
+    entry
+        .get("executed")
+        .and_then(|e| e.get("effect"))
+        .and_then(|f| f.get("dropped"))
+        .and_then(|d| d.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| p.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn handle_workspace_cmds(
@@ -9055,6 +9129,10 @@ fn doorbell_sweep_inbox(
     let registry = state::load_spawn_registry(project);
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let mut injects = Vec::new();
+    // 55nx.9: per-pin journal payloads, written AFTER the batch budget gate
+    // below so each line carries its gate outcome (effect). High-water
+    // updates stay inline — they are independent of the gate.
+    let mut pending: Vec<(String, workspace::Msg, Vec<workspace::Cmd>, &'static str)> = Vec::new();
     for e in &registry {
         let Some(pin) = e.mail_identity.as_deref() else {
             continue;
@@ -9089,13 +9167,7 @@ fn doorbell_sweep_inbox(
             *workspace_model = next_model;
             handle_workspace_cmds(workspace_model, &cmds, project);
             let raw = prompt_injects(&cmds);
-            doorbell::journal_append_workspace(
-                &config::state_dir(),
-                workspace,
-                &msg,
-                &cmds,
-                serde_json::json!({ "stage": "sweep_inbox", "pin": pin }),
-            );
+            pending.push((pin.to_string(), msg, cmds, "sweep_inbox"));
             injects.extend(raw);
             if let Some(hw) = doorbell::inbox_high_water_from_values(arr.iter().collect()) {
                 since_by_pin.insert(pin.to_string(), hw);
@@ -9174,13 +9246,7 @@ fn doorbell_sweep_inbox(
             *workspace_model = next_model;
             handle_workspace_cmds(workspace_model, &cmds, project);
             let raw_injects = prompt_injects(&cmds);
-            doorbell::journal_append_workspace(
-                &config::state_dir(),
-                workspace,
-                &msg,
-                &cmds,
-                serde_json::json!({ "stage": "sweep_inbox_cli", "pin": pin }),
-            );
+            pending.push((pin.to_string(), msg, cmds, "sweep_inbox_cli"));
             injects.extend(raw_injects);
         }
         if let Some(hw) = doorbell::inbox_high_water(&raw) {
@@ -9192,6 +9258,22 @@ fn doorbell_sweep_inbox(
     }
     let took = injects.len();
     let injects = doorbell::take_allowed(injects, budgets, doorbell_now_unix());
+    // 55nx.9: journal each pin's line AFTER the batch gate with its outcome.
+    {
+        for (pin, msg, cmds, stage) in &pending {
+            let raw_p = prompt_injects(cmds);
+            let allowed_p: Vec<(String, String)> =
+                injects.iter().filter(|(p, _)| p == pin).cloned().collect();
+            let effect = budget_effect(&raw_p, &allowed_p);
+            doorbell::journal_append_workspace(
+                &config::state_dir(),
+                workspace,
+                msg,
+                cmds,
+                serde_json::json!({ "stage": stage, "pin": pin, "effect": effect }),
+            );
+        }
+    }
     if took != injects.len() {
         doorbell::audit_append(
             &config::state_dir(),
@@ -31538,5 +31620,77 @@ mod ingress_wiring_tests {
         crate::append_fact(&proj, &non).unwrap();
         let (c2, _) = crate::facts_count_and_last(&proj);
         assert_eq!(c2, 1, "non-fact must not be journaled");
+    }
+}
+
+#[cfg(test)]
+mod journal_effect_tests {
+    // bd-adr0027-proven-leftovers-55nx.9: the journal must record the budget
+    // gate outcome (effect: injected vs dropped pins) next to tick's complete
+    // cmds, and `why` must read it — otherwise why replays dropped Prompts
+    // as if they were injected.
+    use super::*;
+
+    #[test]
+    fn budget_effect_splits_pins() {
+        let raw = vec![
+            ("A".to_string(), "l1".to_string()),
+            ("B".to_string(), "l2".to_string()),
+        ];
+        let allowed = vec![("A".to_string(), "l1".to_string())];
+        let effect = budget_effect(&raw, &allowed);
+        assert_eq!(
+            effect
+                .get("injected")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(1),
+            "one pin injected, got {effect}"
+        );
+        let dropped = effect
+            .get("dropped")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            dropped.iter().any(|p| p.as_str() == Some("B")),
+            "B was dropped by budget, got {effect}"
+        );
+        assert!(
+            !dropped.iter().any(|p| p.as_str() == Some("A")),
+            "A was injected, never dropped, got {effect}"
+        );
+    }
+
+    #[test]
+    fn journal_decided_lines_carry_effect() {
+        let src = include_str!("main.rs");
+        for stage in ["decided", "drain", "fact_live", "sweep_inbox"] {
+            let mut found_effect = false;
+            let mut search = src;
+            while let Some(pos) = search.find(stage) {
+                let slice = &search[pos..std::cmp::min(search.len(), pos + 600)];
+                if slice.contains("\"effect\"") || slice.contains("effect") {
+                    found_effect = true;
+                    break;
+                }
+                search = &search[pos + stage.len()..];
+            }
+            assert!(
+                found_effect,
+                "RED (55nx.9): journal stage {stage} carries no effect field — why overclaims dropped Prompts"
+            );
+        }
+    }
+
+    #[test]
+    fn why_reads_effect_before_claiming_inject() {
+        let src = include_str!("main.rs");
+        let pos = src.find("fn cmd_doorbell_why(").expect("cmd_doorbell_why");
+        let slice = &src[pos..std::cmp::min(src.len(), pos + 12000)];
+        assert!(
+            slice.contains("effect") && slice.contains("dropped"),
+            "RED (55nx.9): why never reads the journal effect — dropped Prompts replay as injected"
+        );
     }
 }
