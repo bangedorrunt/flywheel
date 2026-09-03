@@ -252,9 +252,15 @@ pub enum Cmd {
     /// Write-through of the assignment cache. Corr is always non-empty;
     /// receipt mirrors the Model row exactly.
     SqliteUpsert { corr: String, receipt: Receipt },
-    /// Rumor-14 shape: kind is always 14, content non-empty. (Corr
-    /// plumbing rides this arm in .8; until then content-only questions.)
-    Publish { kind: u64, content: String },
+    /// Rumor-14 shape: kind is always 14, content non-empty, corr is the
+    /// assignment key the answer returns (E4: no uncorrelated Publish),
+    /// result_path rides where known (executor tags both onto the rumor).
+    Publish {
+        kind: u64,
+        content: String,
+        corr: String,
+        result_path: Option<String>,
+    },
     /// Registers interest in one receipt. Corr is always non-empty
     /// (empty corr is standing-empty silence, never a Wait). Bounding
     /// (TTL + cap) is the executor's job (.6); tick registers, never drops.
@@ -473,7 +479,7 @@ fn apply_assignment(
         return;
     }
     if audience == "human" && !body.is_empty() {
-        mint_human_question(next, cmds, &corr, body);
+        mint_human_question(next, cmds, &corr, body, result_path.clone());
     }
     let state = if wake == "tasked" && body.is_empty() {
         "resulted"
@@ -494,7 +500,13 @@ fn apply_assignment(
     cmds.push(Cmd::WaitCorr { corr });
 }
 
-fn mint_human_question(next: &mut WorkspaceModel, cmds: &mut Vec<Cmd>, corr: &str, body: &str) {
+fn mint_human_question(
+    next: &mut WorkspaceModel,
+    cmds: &mut Vec<Cmd>,
+    corr: &str,
+    body: &str,
+    result_path: Option<String>,
+) {
     if next.open_human.contains_key(corr) {
         cmds.push(Cmd::LoudMiss {
             why: format!("question already open for corr {corr}"),
@@ -512,6 +524,8 @@ fn mint_human_question(next: &mut WorkspaceModel, cmds: &mut Vec<Cmd>, corr: &st
     cmds.push(Cmd::Publish {
         kind: 14,
         content: body.to_string(),
+        corr: corr.to_string(),
+        result_path,
     });
 }
 
@@ -2516,6 +2530,139 @@ mod human_decision_tests {
         assert!(!next.open_human.contains_key("C1"));
     }
 
+    // ADR-0028 E4: Publish carries corr (+ result_path) so the answer can
+    // return exactly that corr. No pre-seeded Model on this path — the
+    // question opens from a live InboxRows mint.
+    #[test]
+    fn human_decision_publish_carries_corr() {
+        let m = empty_model();
+        let row = serde_json::json!({
+            "corr": "C-PUB", "wake": "tasked", "audience": "human",
+            "priority": "queue", "body": "approve?",
+            "result_path": "beads/br-1",
+        });
+        let (next, cmds) = tick(
+            &m,
+            &Msg::InboxRows {
+                rows: vec![row],
+                pin: "Recv".into(),
+            },
+        );
+        assert!(next.open_human.contains_key("C-PUB"));
+        let (kind, corr, rp) = cmds
+            .iter()
+            .find_map(|c| match c {
+                Cmd::Publish {
+                    kind,
+                    content,
+                    corr,
+                    result_path,
+                } if !content.is_empty() => Some((*kind, corr.clone(), result_path.clone())),
+                _ => None,
+            })
+            .expect("human audience must mint Publish, got {cmds:?}");
+        assert_eq!(kind, 14, "Publish is rumor-14");
+        assert_eq!(corr, "C-PUB", "Publish carries the corr");
+        assert_eq!(rp.as_deref(), Some("beads/br-1"));
+    }
+
+    // E4 happy path over live-shaped rows, zero pre-seed: mint → tagged
+    // answer closes exactly one question → duplicate answer LoudMiss.
+    #[test]
+    fn human_decision_live_path_no_preseed() {
+        let m = empty_model();
+        let mint = serde_json::json!({
+            "corr": "C-LIVE", "wake": "tasked", "audience": "human",
+            "priority": "queue", "body": "ship it?",
+        });
+        let (m1, _) = tick(
+            &m,
+            &Msg::InboxRows {
+                rows: vec![mint],
+                pin: "Recv".into(),
+            },
+        );
+        assert!(
+            m1.open_human.contains_key("C-LIVE"),
+            "mint opens the question"
+        );
+        let answer = serde_json::json!({
+            "corr": "C-LIVE", "wake": "tasked", "audience": "agents",
+            "priority": "queue", "body": "", "verdict": "approve",
+        });
+        let (m2, cmds) = tick(
+            &m1,
+            &Msg::InboxRows {
+                rows: vec![answer],
+                pin: "Recv".into(),
+            },
+        );
+        assert!(
+            !m2.open_human.contains_key("C-LIVE"),
+            "tagged answer closes it"
+        );
+        assert!(
+            cmds.iter().any(
+                |c| matches!(c, Cmd::Audit { kind, detail, .. } if kind == "human_decision" && detail == "approve")
+            ),
+            "exactly one close Audit, got {cmds:?}"
+        );
+        let (m3, cmds3) = tick(
+            &m2,
+            &Msg::InboxRows {
+                rows: vec![serde_json::json!({
+                    "corr": "C-LIVE", "wake": "tasked", "audience": "agents",
+                    "priority": "queue", "body": "", "verdict": "approve",
+                })],
+                pin: "Recv".into(),
+            },
+        );
+        assert!(
+            cmds3.iter().any(|c| matches!(c, Cmd::LoudMiss { .. })),
+            "duplicate answer fails loud, got {cmds3:?}"
+        );
+        assert!(m3.open_human.is_empty());
+    }
+
+    // Migration fallback (one release): a tag-less human mail whose body
+    // carries the verdict still closes while open_human holds the corr.
+    #[test]
+    fn human_decision_body_fallback_while_open() {
+        let m = empty_model();
+        let mint = serde_json::json!({
+            "corr": "C-FB", "wake": "tasked", "audience": "human",
+            "priority": "queue", "body": "go?",
+        });
+        let (m1, _) = tick(
+            &m,
+            &Msg::InboxRows {
+                rows: vec![mint],
+                pin: "Recv".into(),
+            },
+        );
+        let answer = serde_json::json!({
+            "corr": "C-FB", "wake": "tasked", "audience": "agents",
+            "priority": "queue", "body": "deny",
+        });
+        let (m2, cmds) = tick(
+            &m1,
+            &Msg::InboxRows {
+                rows: vec![answer],
+                pin: "Recv".into(),
+            },
+        );
+        assert!(
+            !m2.open_human.contains_key("C-FB"),
+            "body verdict closes it"
+        );
+        assert!(
+            cmds.iter().any(
+                |c| matches!(c, Cmd::Audit { kind, detail, .. } if kind == "human_decision" && detail == "deny")
+            ),
+            "got {cmds:?}"
+        );
+    }
+
     #[test]
     fn human_decision_question_publish() {
         // Question should be published as Cmd::Publish with audience human, one rumor
@@ -2686,12 +2833,19 @@ mod cmd_schema_tests {
         let pub_ = cmds
             .iter()
             .find_map(|c| match c {
-                Cmd::Publish { kind, content } => Some((*kind, content.clone())),
+                Cmd::Publish {
+                    kind,
+                    content,
+                    corr,
+                    result_path,
+                } => Some((*kind, content.clone(), corr.clone(), result_path.clone())),
                 _ => None,
             })
             .expect("human audience must mint Publish, got {cmds:?}");
         assert_eq!(pub_.0, 14, "Publish is rumor-14, never kind-9");
         assert!(!pub_.1.is_empty(), "Publish content carries the question");
+        assert_eq!(pub_.2, "C-PUB", "Publish carries the corr (E4)");
+        assert!(pub_.3.is_none(), "no result_path on this row");
     }
 
     #[test]

@@ -8802,8 +8802,13 @@ fn handle_workspace_cmds(
                 // (durable.rs) never produces or drains WaitCorr — doorbell-only.
                 workspace_model.pending_wait.insert(corr.clone());
             }
-            workspace::Cmd::Publish { kind, content } => {
-                publish_human_question(project, *kind, content);
+            workspace::Cmd::Publish {
+                kind,
+                content,
+                corr,
+                result_path,
+            } => {
+                publish_human_question(project, *kind, content, corr, result_path.as_deref());
             }
             workspace::Cmd::FactMiss { why } => {
                 eprintln!("flywheel: [FactMiss] {why}");
@@ -9023,28 +9028,45 @@ mod s_proof_tests {
     }
 }
 
-fn publish_human_question(project: &str, kind: u64, content: &str) {
+/// E4 live producer: the rumor carries corr (+ result_path) so the human
+/// answer returns exactly that corr via --corr/--verdict (or body fallback).
+fn publish_human_question(
+    project: &str,
+    kind: u64,
+    content: &str,
+    corr: &str,
+    result_path: Option<&str>,
+) {
     eprintln!(
-        "flywheel: [Publish kind={kind}] {}",
+        "flywheel: [Publish kind={kind} corr={corr}] {}",
         content.chars().take(120).collect::<String>()
     );
-    if kind != 14 {
+    if kind != 14 || corr.is_empty() {
         return;
     }
     let Some(mb) = crate::mail_shim::try_mailbox() else {
         return;
     };
-    let tag = match toron_core::nostr::Tag::parse(["audience", "human"]) {
-        Ok(t) => t,
-        Err(_) => return,
-    };
+    let mut extra_tags = Vec::new();
+    for pair in [("audience", "human"), ("corr", corr)] {
+        match toron_core::nostr::Tag::parse([pair.0, pair.1]) {
+            Ok(t) => extra_tags.push(t),
+            Err(_) => return,
+        }
+    }
+    if let Some(rp) = result_path.filter(|s| !s.is_empty()) {
+        match toron_core::nostr::Tag::parse(["result_path", rp]) {
+            Ok(t) => extra_tags.push(t),
+            Err(_) => return,
+        }
+    }
     let args = toron_core::mailbox::messaging::SendMessage {
         project_slug: project.to_string(),
         sender_name: "captain".into(),
         to: vec!["captain".into()],
         subject: "[human] question".into(),
         body_md: content.to_string(),
-        extra_tags: vec![tag],
+        extra_tags,
         ..Default::default()
     };
     if let Err(e) = crate::mail_shim::block_on(mb.send_message(&args)) {
