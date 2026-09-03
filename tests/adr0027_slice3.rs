@@ -53,9 +53,12 @@ fn adr0027_s3_invariant10_tripwire_denied() {
     // Invariant 10: secrets never in a rumor — tripwire result shape is denied (or LoudMiss as denied)
     let ws = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/workspace.rs");
     let content = std::fs::read_to_string(&ws).expect("read workspace.rs");
+    // GS-016: the WriteNcryptsec arm is DELETED (zfnx.4) — the honest
+    // tripwire asserts the arm's absence (no secret-writing Cmd beside
+    // rumor-14), not a comment substring. Denied/LoudMiss shape stays.
     assert!(
-        content.contains("WriteNcryptsec") || content.contains("ncryptsec"),
-        "S4: secrets must be Cmd::WriteNcryptsec, never rumor"
+        !content.contains("Cmd::WriteNcryptsec"),
+        "S4: no secret-writing Cmd may exist beside rumor-14 (zfnx.4 deletion is contract)"
     );
     assert!(
         content.contains("denied") || content.contains("Denied") || content.contains("LoudMiss"),

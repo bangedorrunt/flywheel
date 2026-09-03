@@ -278,10 +278,18 @@ pub enum Cmd {
     /// (empty corr is standing-empty silence, never a Wait). Bounding
     /// (TTL + cap) is the executor's job (.6); tick registers, never drops.
     WaitCorr { corr: String },
-    // DELETED by zfnx.5: the Invoke Cmd is gone — no playbook gates it
-    // and tick never emitted it (the executor only LoudMissed it). Wire
-    // engine.invoke + VerifySink behind a playbook gate to bring back an
-    // invocation vehicle; never as a second tick entry.
+    /// Playbook invocation vehicle (zfnx.5 rewired per GS-016): effect-layer
+    /// door to `engine.invoke` + `VerifySink` through the durable Run
+    /// machinery. The gate is inside `cmd_workflow` — playbook lint first,
+    /// unknown workflow fails loud naming it. Caller-applied (like Prompt):
+    /// tick never emits Invoke; the composing caller does. `workflow` is a
+    /// built-in or catalog name; `input` must be a JSON object (`{{inputs.x}}`);
+    /// `corr` is always non-empty and attributes the run.
+    Invoke {
+        workflow: String,
+        input: serde_json::Value,
+        corr: String,
+    },
     // DELETED by zfnx.4 (E1): WriteNcryptsec is gone — flywheel never
     // writes ncryptsec secrets (keys belong to toron); a secret-writing
     // Cmd beside rumor-14 would be an exfil path. Likewise the Subscribe
@@ -1604,9 +1612,14 @@ mod bell_fold_tests {
             !src.contains(&cw),
             "RED (zfnx.4): the producer-less ClaimWatch Msg still present — delete it"
         );
+        // zfnx.5 superseded (GS-016): Invoke is back as the WIRED playbook
+        // vehicle — caller-applied, executor routes through cmd_workflow
+        // (playbook lint + resolution gate, engine.invoke + VerifySink
+        // downstream). Guards: schema_invoke_is_caller_applied (tick never
+        // emits) + main.rs invoke_arm_hands_off_to_durable_run_gate.
         assert!(
-            !src.contains(&inv),
-            "RED (zfnx.5): the unwired Invoke arm still present — wire it or delete it"
+            src.contains("Invoke {"),
+            "the wired Invoke vehicle must exist (GS-016 rewire)"
         );
         let main = include_str!("main.rs");
         assert!(
@@ -2839,13 +2852,25 @@ mod human_decision_tests {
     #[test]
     fn human_decision_from_inbox_verdict_closes_open_question() {
         let mut m = empty_model();
-        m.open_human.insert(
-            "C-LIVE".into(),
-            Question {
-                corr: "C-LIVE".into(),
-                body: "ship?".into(),
-                created_at: 1,
+        // E4: happy path needs no test-only pre-seed — the question is
+        // minted by the live Publish path (audience=human InboxRow), then
+        // the correlated answer closes it.
+        let ask = serde_json::json!({
+            "corr": "C-LIVE",
+            "body_md": "ship?",
+            "wake": "standing",
+            "audience": "human",
+        });
+        let (m, _mint_cmds) = tick(
+            &m,
+            &Msg::InboxRows {
+                rows: vec![ask],
+                pin: "Captain".into(),
             },
+        );
+        assert!(
+            m.open_human.contains_key("C-LIVE"),
+            "audience=human ask must mint the open question"
         );
         let row = serde_json::json!({
             "corr": "C-LIVE",
@@ -2950,6 +2975,24 @@ mod cmd_schema_tests {
         assert!(!pub_.1.is_empty(), "Publish content carries the question");
         assert_eq!(pub_.2, "C-PUB", "Publish carries the corr (E4)");
         assert!(pub_.3.is_none(), "no result_path on this row");
+    }
+
+    #[test]
+    fn schema_invoke_is_caller_applied_tick_never_emits() {
+        // ADR-0028 E1: Invoke is a caller-applied effect (like Prompt) —
+        // tick never emits it; the composing caller does (GS-016 rewire).
+        let m = empty_model();
+        let (_, cmds) = tick(
+            &m,
+            &Msg::InboxRows {
+                rows: vec![row("C-INV", "tasked", "agents", "queue", "run bug-fix")],
+                pin: "Recv".into(),
+            },
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Invoke { .. })),
+            "tick must never emit Invoke (caller-applied), got {cmds:?}"
+        );
     }
 
     #[test]
