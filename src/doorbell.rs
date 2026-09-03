@@ -1099,39 +1099,6 @@ pub fn parse_inbox_item(v: &serde_json::Value) -> Option<(EventClass, String)> {
     Some((class, pull_hint(class, None)))
 }
 
-/// Walk a `toron mail inbox` JSON blob; return injects for this pin.
-pub fn apply_inbox_json(
-    raw: &str,
-    pin: &str,
-    status_by_pin: &BTreeMap<String, String>,
-    queues: &mut BTreeMap<String, DoorbellQueue>,
-) -> Vec<(String, String)> {
-    let v: serde_json::Value = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
-    let items: Vec<&serde_json::Value> = if let Some(arr) = v.as_array() {
-        arr.iter().collect()
-    } else if let Some(arr) = v.get("messages").and_then(|m| m.as_array()) {
-        arr.iter().collect()
-    } else if v.is_object() {
-        vec![&v]
-    } else {
-        return Vec::new();
-    };
-    let mut inject = Vec::new();
-    let status = status_by_pin.get(pin).map(String::as_str).unwrap_or("idle");
-    for item in items {
-        let Some((class, hint)) = parse_inbox_item(item) else {
-            continue;
-        };
-        let msg = doorbell_line(class, &hint);
-        if should_inject(status) {
-            inject.push((pin.to_string(), msg));
-        } else {
-            queues.entry(pin.to_string()).or_default().push(class, msg);
-        }
-    }
-    inject
-}
-
 /// Rumor-time of one inbox JSON row: live ToJson uses `created_ts_us` (i64
 /// micros); CLI/legacy blobs may still carry `created_ts` RFC3339.
 pub fn row_created_us(v: &serde_json::Value) -> Option<i64> {
@@ -1768,14 +1735,42 @@ mod tests {
 
     #[test]
     fn plane_p_urgent_injects_when_idle() {
+        // bd-adr0027-proven-leftovers-55nx.2: ported from the deleted
+        // apply_inbox_json second reducer to the live path —
+        // workspace::tick + Msg::InboxRows. Statuses enter as HerdrStatus
+        // Msgs, never a side map.
+        use crate::workspace::{Msg, WorkspaceModel};
+        let mut model = WorkspaceModel::default();
+        model.doorbell.index.insert_pin("BlueRidge".into(), None);
+        let (model, _) = crate::workspace::tick(
+            &model,
+            &Msg::HerdrStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        let row = serde_json::json!({
+            "importance": "urgent",
+            "created_ts": "2026-08-20T00:00:02Z",
+        });
+        let (_, cmds) = crate::workspace::tick(
+            &model,
+            &Msg::InboxRows {
+                rows: vec![row],
+                pin: "BlueRidge".into(),
+            },
+        );
+        let prompts: Vec<_> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                crate::workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].1.contains("[doorbell]"));
+        assert!(prompts[0].1.contains("inbox --since"));
         let raw = r#"{"messages":[{"importance":"urgent","created_ts":"2026-08-20T00:00:02Z"}]}"#;
-        let mut status = BTreeMap::new();
-        status.insert("BlueRidge".into(), "idle".into());
-        let mut queues = BTreeMap::new();
-        let out = apply_inbox_json(raw, "BlueRidge", &status, &mut queues);
-        assert_eq!(out.len(), 1);
-        assert!(out[0].1.contains("[doorbell]"));
-        assert!(out[0].1.contains("inbox --since"));
         assert_eq!(
             inbox_high_water(raw).as_deref(),
             Some("2026-08-20T00:00:02Z")
