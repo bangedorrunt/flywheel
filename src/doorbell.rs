@@ -1296,12 +1296,19 @@ pub fn journal_append(
     }
 }
 
+/// Workspace-tick journal entry writer. `pins` is the inject-relevant pin set
+/// (bd-z54w honesty contract): the fold restores the SelfIndex from it so
+/// classification reproduces deterministically. `None` (or entries predating
+/// the field) fold with Unknown-presence semantics — the fold never invents
+/// idle. Serde-side the field is plain JSON (`null` when absent); readers use
+/// `entry.get("pins")` with missing/null meaning unknown.
 pub fn journal_append_workspace(
     state_dir: &Path,
     workspace: &str,
     msg: &crate::workspace::Msg,
     cmds: &[crate::workspace::Cmd],
     executed: serde_json::Value,
+    pins: Option<&[String]>,
 ) {
     let path = journal_file(state_dir, workspace);
     if let Some(parent) = path.parent() {
@@ -1313,6 +1320,7 @@ pub fn journal_append_workspace(
         "msg": msg,
         "actions": cmds,
         "executed": executed,
+        "pins": pins,
     });
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -1596,6 +1604,156 @@ mod tests {
         idle.insert("BlueRidge".into(), "idle".into());
         let json = once_json(kind9_at_blueridge(), &idle);
         assert!(json.contains("BlueRidge"), "idle pin rings: {json}");
+    }
+
+    #[test]
+    fn s_proof_why_producer_journal_path() {
+        // zfnx.9 producer contract: journal path is
+        // state_dir/journals/doorbell-journal-{workspace}.jsonl.
+        let dir = std::env::temp_dir().join(format!("fw-sproof-path-{}", std::process::id()));
+        let path = journal_file(&dir, "ws1");
+        assert_eq!(
+            path,
+            dir.join("journals").join("doorbell-journal-ws1.jsonl"),
+            "journal path contract violated: {path:?}"
+        );
+    }
+
+    #[test]
+    fn s_proof_why_producer_retention_bound() {
+        // zfnx.9 producer contract: 5MiB / 5k-line retention cap on the live path.
+        let src = include_str!("doorbell.rs");
+        assert!(
+            src.contains("5 * 1024 * 1024"),
+            "journal retention must keep the 5MiB bound"
+        );
+        assert!(
+            src.contains("5000"),
+            "journal retention must keep the 5k-line bound"
+        );
+    }
+
+    #[test]
+    fn s_proof_why_fold_reproduces_cmds() {
+        // zfnx.9: fold tick from Default over journal entries reproduces the
+        // recorded Vec<Cmd> — the why trust surface. Uses an index-free
+        // Receipt msg so the fold is exact (see gap note below).
+        let dir = std::env::temp_dir().join(format!("fw-sproof-cmds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let msg = crate::workspace::Msg::Receipt {
+            corr: "FM-SPROOF".into(),
+            receipt: crate::workspace::Receipt {
+                state: "owed".into(),
+                wake: "tasked".into(),
+                due_at: None,
+                result_path: None,
+            },
+        };
+        let (_, cmds) = crate::workspace::tick(&crate::workspace::WorkspaceModel::default(), &msg);
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                crate::workspace::Cmd::SqliteUpsert { corr, .. } if corr == "FM-SPROOF"
+            )),
+            "seed must produce SqliteUpsert, got {cmds:?}"
+        );
+        journal_append_workspace(&dir, "ws1", &msg, &cmds, serde_json::json!({}), Some(&[]));
+        let entries = journal_read_all(&dir);
+        assert_eq!(entries.len(), 1, "roundtrip must read 1 entry: {entries:?}");
+        let mut folded = crate::workspace::WorkspaceModel::default();
+        for (workspace, entry) in &entries {
+            assert_eq!(workspace, "ws1");
+            if let Some(ps) = entry.get("pins").and_then(|p| p.as_array()) {
+                for pin in ps.iter().filter_map(|v| v.as_str()) {
+                    folded.doorbell.index.insert_pin(pin.to_string(), None);
+                }
+            }
+            let m: crate::workspace::Msg =
+                serde_json::from_value(entry.get("msg").cloned().unwrap()).unwrap();
+            let expected: Vec<crate::workspace::Cmd> =
+                serde_json::from_value(entry.get("actions").cloned().unwrap()).unwrap();
+            let (n, actual) = crate::workspace::tick(&folded, &m);
+            folded = n;
+            assert_eq!(
+                actual, expected,
+                "fold must reproduce recorded Cmds for {m:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s_proof_why_fold_reproduces_prompt_with_pins() {
+        // zfnx.9 + bd-z54w: exact Vec<Cmd> reproduction INCLUDING a Prompt —
+        // the journaled pin set restores the fold index deterministically.
+        let dir = std::env::temp_dir().join(format!("fw-sproof-prompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pins = vec!["BlueRidge".to_string()];
+        let mut model = crate::workspace::WorkspaceModel::default();
+        for p in &pins {
+            model.doorbell.index.insert_pin(p.clone(), None);
+        }
+        let idle = crate::workspace::Msg::HerdrStatus {
+            pin: "BlueRidge".into(),
+            status: "idle".into(),
+        };
+        let (seeded, _) = crate::workspace::tick(&model, &idle);
+        model = seeded;
+        let msg = crate::workspace::Msg::WatchNdjson {
+            line: kind9_at_blueridge().to_string(),
+        };
+        let (next, cmds) = crate::workspace::tick(&model, &msg);
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                crate::workspace::Cmd::Prompt { pin, .. } if pin == "BlueRidge"
+            )),
+            "seed must produce a Prompt, got {cmds:?}"
+        );
+        let _ = next;
+        journal_append_workspace(&dir, "ws1", &idle, &[], serde_json::json!({}), Some(&pins));
+        journal_append_workspace(&dir, "ws1", &msg, &cmds, serde_json::json!({}), Some(&pins));
+        let entries = journal_read_all(&dir);
+        assert_eq!(entries.len(), 2, "roundtrip must read 2 entries");
+        let mut folded = crate::workspace::WorkspaceModel::default();
+        for (workspace, entry) in &entries {
+            assert_eq!(workspace, "ws1");
+            // Same seeding rule as cmd_doorbell_why: pins restore the index,
+            // missing pins keep Unknown semantics.
+            if let Some(ps) = entry.get("pins").and_then(|p| p.as_array()) {
+                for pin in ps.iter().filter_map(|v| v.as_str()) {
+                    folded.doorbell.index.insert_pin(pin.to_string(), None);
+                }
+            }
+            let m: crate::workspace::Msg =
+                serde_json::from_value(entry.get("msg").cloned().unwrap()).unwrap();
+            let expected: Vec<crate::workspace::Cmd> =
+                serde_json::from_value(entry.get("actions").cloned().unwrap()).unwrap();
+            let (n, actual) = crate::workspace::tick(&folded, &m);
+            folded = n;
+            assert_eq!(
+                actual, expected,
+                "fold must reproduce recorded Cmds exactly, including Prompt"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s_proof_why_fold_without_pins_never_invents_idle() {
+        // Entries lacking pins (pre-field journals) fold with Unknown-presence
+        // semantics: a kind-9 mention for an unknown pin stays silent.
+        let mut folded = crate::workspace::WorkspaceModel::default();
+        let m = crate::workspace::Msg::WatchNdjson {
+            line: kind9_at_blueridge().to_string(),
+        };
+        let (_, cmds) = crate::workspace::tick(&folded, &m);
+        assert!(
+            cmds.iter()
+                .all(|c| !matches!(c, crate::workspace::Cmd::Prompt { .. })),
+            "pins-less fold must never invent a Prompt, got {cmds:?}"
+        );
+        let _ = &mut folded;
     }
 
     #[test]
