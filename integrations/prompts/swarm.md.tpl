@@ -3,26 +3,22 @@
 
 Run /swarm-mode: captain-led multi-crew execution.
 
-Args: objective, scope, crew shape, flags. The captain steers crews via
-current harness/profile per role. Parallel counterpart to /loop-mode (solo).
-Swarm for lanes and waves; loop-mode for one objective in one pane.
-
-One captain, up to 5 crews; lanes run parallel when files don't overlap.
-Keep objective authoritative, each lane verifiable.
+Args: objective, scope, crew shape, flags. Parallel counterpart to
+/loop-mode (solo). One captain, up to 5 crews; lanes run parallel when
+files don't overlap. Keep objective authoritative, each lane verifiable.
 
 ## Playbook
 
-Before dispatch, CLASSIFY once if the primitive is unclear:
-`flywheel decide "<target>" --json --ready-beads N` (sequence-verifiable-units).
-/swarm-mode itself pins wave-swarm, never re-run decide after compose.
+CLASSIFY once if unclear (`flywheel decide "<target>" --json
+--ready-beads N`; sequence-verifiable-units); /swarm-mode pins
+wave-swarm, never re-run decide after compose.
 
 `decide` returning steer on a multi-lane target is NOT an escape: run wave-swarm. Cross-repo lanes are a brief concern:
 register the pin on both projects, one repo owner per lane (tested in
 the 08-29 and 09-03 swarms).
 
-Ask operator for model routing per profile (planner/coder/reviewer/scout)
-before spawn/dispatch. Show default + registry alternatives; blank keeps
-default, explicit provider/model overrides. Use consistently.
+Ask operator for model routing per profile before spawn/dispatch; show
+default + registry alternatives; blank keeps default, selection overrides.
 
 1. RUN: `flywheel workflow compose "<objective>" --parts wave-swarm --run --inputs
    '{"objective": "<target>"}'`. Slash /swarm-mode pins this recipe.
@@ -51,10 +47,13 @@ default, explicit provider/model overrides. Use consistently.
    reserve acquire 4min), build slot, TDD (RED first), commit-before-close
    with VERIFY tail, stage ONLY reserved paths (never git add -A),
    on [doorbell] pull then act, blocked >10m mail captain, TIMEBOX 90m
-   partial report. Use public mail identity. prove-it-works. Coder
-   execution dispatches --stage systematic-execute (p6), never raw p1;
-   --raw is for nudges/wakes only. Join the steer channel at spawn
-   (--join-channel) so "post to steer channel" is real. Turn-based crews
+   partial report. Use public mail identity. prove-it-works. Every
+   dispatch ANNOUNCES its stage/workflow (stage name, recipe, or "none:
+   raw") in the brief's first line; crews restate it in their report
+   (status, sha, verify, deviations, stage). Coder execution dispatches
+   --stage systematic-execute (p6), never raw p1; --raw is for
+   nudges/wakes only. Join the steer channel at spawn (--join-channel)
+   so "post to steer channel" is real. Turn-based crews
    stall silently: when a claimed bead shows no commits for ~2 polls,
    send a status+continue wake; third contact = finish or release.
 
@@ -66,9 +65,8 @@ default, explicit provider/model overrides. Use consistently.
 
 8. WAVE GATE: captain verifies with fresh eyes -- suite+fmt+clippy AND the
    actual wiring. Live doorbell and swarm_loop must call workspace::tick
-   (slice reducers stay private). Read the call sites; verify dropped-behavior
-   lists (grep `let _ =` on action vecs). Close the epic with evidence, then
-   next wave.
+   (slice reducers stay private). Verify dropped-behavior lists (grep
+   `let _ =` on action vecs). Close the epic with evidence, then next wave.
 
 9. TEARDOWN: release reservations + slot, kill --force-working, br sync,
    commit .beads.
