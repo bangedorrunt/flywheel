@@ -61,14 +61,24 @@ jobs:
           # Split invocations + a 6 GiB address-space cap turn a silent OOM
           # into a visible allocation failure; markers show how far it gets.
           ulimit -v 6291456 || true
-          echo "=== bin suite ==="
-          cargo test --bin flywheel
+          echo "=== markers ==="
+          free -g | head -2; df -h /home/runner/work | tail -1
+          echo "=== shard A: durable ==="
+          timeout 15m cargo test --bin flywheel -- durable::
+          echo "=== shard B: tick/doorbell/wait family ==="
+          timeout 15m cargo test --bin flywheel -- workspace:: doorbell:: doorbell_tick:: state:: herdr_shim:: mail_shim:: wake_identity_tests:: timeout_presence_tests:: waitcorr_doorbell_only_tests:: s_proof_tests:: renew_sweep_tests:: journal_effect_tests::
+          echo "=== shard C: engine/loop/strategy family ==="
+          timeout 15m cargo test --bin flywheel -- integration_tests:: builtin_workflows:: decide:: loop_tests:: verdict:: models:: crew:: cron:: config:: headless:: backend:: failure:: stages:: profile:: pane:: preflight:: plane_route:: coalition::
+          echo "=== shard D: remainder ==="
+          timeout 15m cargo test --bin flywheel -- --skip durable:: --skip workspace:: --skip doorbell:: --skip doorbell_tick:: --skip state:: --skip herdr_shim:: --skip mail_shim:: --skip wake_identity_tests:: --skip timeout_presence_tests:: --skip waitcorr_doorbell_only_tests:: --skip s_proof_tests:: --skip renew_sweep_tests:: --skip journal_effect_tests:: --skip integration_tests:: --skip builtin_workflows:: --skip decide:: --skip loop_tests:: --skip verdict:: --skip models:: --skip crew:: --skip cron:: --skip config:: --skip headless:: --skip backend:: --skip failure:: --skip stages:: --skip profile:: --skip pane:: --skip preflight:: --skip plane_route:: --skip coalition::
+          echo "=== markers ==="
+          free -g | head -2; df -h /home/runner/work | tail -1
           echo "=== slice1 ==="
-          cargo test --test adr0027_slice1
+          timeout 10m cargo test --test adr0027_slice1
           echo "=== slice3 ==="
-          cargo test --test adr0027_slice3
+          timeout 10m cargo test --test adr0027_slice3
           echo "=== sc_doorbell ==="
-          cargo test --test sc_doorbell_adr0005
+          timeout 10m cargo test --test sc_doorbell_adr0005
           echo "=== ALL GREEN ==="
       - name: cargo clippy
         working-directory: flywheel
