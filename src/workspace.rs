@@ -75,8 +75,9 @@ pub struct WorkspaceModel {
     pub presence: BTreeMap<String, Presence>,
     pub open_human: BTreeMap<String, Question>,
     pub seq: u64,
-    /// WaitCorr corrs whose receipt has not landed yet (re-peek on Sweep),
-    /// with deadline unix secs (bd-zfnx.6: bounded — TTL + cap, never an
+    /// WaitCorr corrs whose receipt has not landed yet (fast-path re-peek
+    /// on WATCH batches only, GS-016: never the 1s sweep), with deadline
+    /// unix secs (bd-zfnx.6: bounded — TTL + cap, never an
     /// unbounded set). The doorbell dispatcher owns this cache; swarm
     /// never reads it. Expiry/cap-eviction happens in the Sweep arm and
     /// always records Cmd::Audit wait-timeout (never silent drop).
