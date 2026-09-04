@@ -48,9 +48,9 @@ jobs:
       - name: cargo check
         working-directory: flywheel
         run: cargo check --workspace
-      - name: cargo test (bin -- hermetic)
+      - name: cargo test (bin + hermetic integration suites -- S1-S4 contracts)
         working-directory: flywheel
-        run: cargo test --bin flywheel
+        run: cargo test --bin flywheel && cargo test --test adr0027_slice1 --test adr0027_slice3 --test sc_doorbell_adr0005
       - name: cargo clippy
         working-directory: flywheel
         run: cargo clippy --all-targets -- -D warnings
