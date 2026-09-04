@@ -45,6 +45,13 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          # Explicit: overrides rust-toolchain.toml (nightly pin) via
+          # RUSTUP_TOOLCHAIN so every step uses stable + components.
+          # GS-019: without this, cargo resolved nightly WITHOUT clippy
+          # ("cargo-clippy is not installed") and the gate failed.
+          toolchain: stable
+          components: rustfmt, clippy
+        with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -84,6 +91,13 @@ jobs:
           token: ${{ secrets.CI_TORON_TOKEN }}
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # Explicit: overrides rust-toolchain.toml (nightly pin) via
+          # RUSTUP_TOOLCHAIN so every step uses stable + components.
+          # GS-019: without this, cargo resolved nightly WITHOUT clippy
+          # ("cargo-clippy is not installed") and the gate failed.
+          toolchain: stable
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
