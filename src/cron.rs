@@ -2291,6 +2291,7 @@ mod kind_classify_tests {
                 caps: vec![],
                 fallback: Some("cron/fallback".to_string()),
                 effort: None,
+                tier: None,
             },
         );
         registry.models.insert(
@@ -2301,6 +2302,7 @@ mod kind_classify_tests {
                 caps: vec![],
                 fallback: None,
                 effort: None,
+                tier: None,
             },
         );
         let fb = registry

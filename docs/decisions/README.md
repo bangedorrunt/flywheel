@@ -10,6 +10,7 @@ This directory contains records of the major architectural decisions made for th
 | [0004](0004-flywheel-web-presence.md) | flywheel Web Presence — Orchestration-Layer Presentation | **Accepted** (2026-08-13; flywheel = section of toron.dev per toron ADR-0013 D5; layer-ownership table, Orchestration pillar, 3 diagrams E/W/CO, docs sections, spin-out path to flywheel.dev) |
 | [0005](0005-always-on-collab-baseline-and-command-surface.md) | Always-On Collaboration Baseline + Composable Markdown Command Surface | **Accepted** (2026-08-20; D5 captain ±loop; §9 SC-D1–D10; `verify-0005.sh`) |
 | [0006](0006-parameterized-stage-payloads-and-wave-scoped-dispatch.md) | Parameterized Stage Payloads + Wave-Scoped Dispatch (the unattended wave swarm) | **Accepted** (2026-08-22; D1–D4; `verify-0006.sh` 9/9; graduation GREEN 2026-08-23 — composed wave-swarm closed fixture bead grad-fw-43424-9da via legal close, kept to catalog) |
+| [0007](0007-catalog-slots-and-agent-native-cli.md) | Catalog slots + agent-native catalog CLI | **Accepted** (2026-09-05; D1 slots=harness+model, D2 six job profiles, D3 compiled-in squads, D4 catalog CLI+TUI; Wave 7 catalog-only; `verify-0007.sh` 14/14) |
 
 ## Related toron ADRs
 

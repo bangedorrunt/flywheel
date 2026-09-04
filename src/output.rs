@@ -67,7 +67,7 @@ pub enum Slot {
     Error,
 }
 
-fn slot_rgb(slot: Slot) -> (u8, u8, u8) {
+pub fn slot_rgb(slot: Slot) -> (u8, u8, u8) {
     match slot {
         Slot::FgDefault => (0xc8, 0xd0, 0xe8),
         Slot::FgMuted => (0x56, 0x5f, 0x89),
