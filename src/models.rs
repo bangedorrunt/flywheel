@@ -390,6 +390,110 @@ impl ModelRegistry {
         Ok((harness.to_string(), model.to_string()))
     }
 
+    /// ADR-0007 D1 FULL resolve ladder: profile pin → slot (harness+model)
+    /// → `model_fallback[]` → slot `fallback_harness` + a caps-compatible
+    /// model → registry `ModelEntry.fallback` (caps-checked). Returns
+    /// `(harness, model_id)` plus the route step taken so callers can log
+    /// or report the hop. The 429 retry paths keep their own step-5 hop;
+    /// this helper is the pre-flight route.
+    ///
+    /// `model_fallback` and `fallback_harness` are consulted ONLY when the
+    /// primary id cannot run on the resolved harness (caps whitelist miss)
+    /// or is absent from the registry — a healthy primary route never
+    /// detours through them.
+    pub fn resolve_profile_route_full(
+        &self,
+        harness: &str,
+        model: &str,
+        model_fallback: &[String],
+    ) -> Result<(String, String, &'static str)> {
+        let (h, primary) = self.resolve_profile_route(harness, model)?;
+        let primary_ok = self
+            .models
+            .get(&primary)
+            .map(|e| e.caps.is_empty() || e.caps.iter().any(|c| c == &h))
+            // Unknown ids stay lenient here (ad-hoc operator strings pass
+            // through; strictness is resolve_strict's job at spawn time).
+            .unwrap_or(true);
+        if primary_ok {
+            return Ok((h, primary, "primary"));
+        }
+        // Step 3: profile-ordered model_fallback ids on the same harness.
+        for id in model_fallback {
+            let caps_ok = self
+                .models
+                .get(id)
+                .map(|e| e.caps.is_empty() || e.caps.iter().any(|c| c == &h))
+                .unwrap_or(false);
+            if caps_ok {
+                return Ok((h, id.clone(), "model_fallback"));
+            }
+        }
+        // Step 4: the slot's fallback_harness + a routable model. Grok is
+        // closed-source with its own proprietary model (operator note
+        // 2026-09-05): a grok hop is MODEL-OPAQUE — no caps check, no model
+        // pick; the harness runs its own model (bare id flag form).
+        let slot = slot_alias(model).and_then(|n| self.slots.get(n));
+        if let Some(slot) = slot
+            && let Some(fh) = &slot.fallback_harness
+        {
+            if fh == "grok" {
+                let bare = slot.model.rsplit('/').next().unwrap_or(&slot.model);
+                return Ok((fh.clone(), bare.to_string(), "fallback_harness"));
+            }
+            let slot_model_caps_ok = self
+                .models
+                .get(&slot.model)
+                .map(|e| e.caps.is_empty() || e.caps.iter().any(|c| c == fh))
+                .unwrap_or(false);
+            if slot_model_caps_ok {
+                return Ok((fh.clone(), slot.model.clone(), "fallback_harness"));
+            }
+            let candidate = self
+                .models
+                .iter()
+                .find(|(_, e)| e.caps.iter().any(|c| c == fh))
+                .map(|(id, _)| id.clone());
+            if let Some(id) = candidate {
+                return Ok((fh.clone(), id, "fallback_harness"));
+            }
+        }
+        // Step 5: registry fallback of the primary id. A grok-family
+        // fallback is model-opaque (closed-source proprietary model): the
+        // bare id rides as the flag, no caps check. Other families keep
+        // the caps check.
+        if let Some(fb) = self
+            .models
+            .get(&primary)
+            .and_then(|e| e.fallback.clone())
+        {
+            let fb_h = if self.family_of(&fb) == "grok" {
+                "grok".to_string()
+            } else {
+                h.clone()
+            };
+            let caps_ok = fb_h != "grok"
+                && self
+                    .models
+                    .get(&fb)
+                    .map(|e| e.caps.is_empty() || e.caps.iter().any(|c| c == &fb_h))
+                    .unwrap_or(false);
+            if fb_h == "grok" || caps_ok {
+                if fb_h == "grok" {
+                    let bare = fb.rsplit('/').next().unwrap_or(&fb).to_string();
+                    return Ok((fb_h, bare, "registry_fallback"));
+                }
+                return Ok((fb_h, fb, "registry_fallback"));
+            }
+        }
+        // Loud failure naming every rung tried (ADR D1: no silent hop).
+        anyhow::bail!(
+            "no routable model: primary {primary:?} cannot run on harness {h:?} \
+             (caps), model_fallback {model_fallback:?} has no caps-compatible id, \
+             slot fallback_harness unroutable, and registry fallback absent/incompatible"
+        )
+    }
+
     /// Implicit kind→slot: a bare-harness spawn with no profile uses this
     /// slot's model (ADR-0007 D1). Unknown kind → None.
     pub fn implied_slot_for_harness(&self, kind: &str) -> Option<&SlotSpec> {
@@ -1246,15 +1350,79 @@ mod tests {
             .expect("cheap inherit");
         assert_eq!(h, "opencode");
         assert_eq!(m, "opencode/big-pickle");
-        let (h, m) = reg
-            .resolve_profile_route("", "@standard")
-            .expect("standard inherit");
-        assert_eq!(h, "pi");
-        assert_eq!(m, "opencode-go/deepseek-v4-flash");
-        let (h, m) = reg
-            .resolve_profile_route("jcode", "@standard")
-            .expect("explicit harness wins");
-        assert_eq!(h, "jcode");
+    }
+
+    #[test]
+    fn full_ladder_primary_route_when_caps_compatible() {
+        let _g = with_config_dir();
+        let reg = ModelRegistry::load_routing().expect("routing");
+        // big-pickle caps=[opencode], routed on opencode → primary, no detour.
+        let (h, m, route) = reg
+            .resolve_profile_route_full("", "@cheap", &[])
+            .expect("primary");
+        assert_eq!((h.as_str(), m.as_str(), route), ("opencode", "opencode/big-pickle", "primary"));
+    }
+
+    #[test]
+    fn full_ladder_caps_block_detours_to_model_fallback_then_slot_harness() {
+        let _g = with_config_dir();
+        let mut reg = ModelRegistry::load_routing().expect("routing");
+        // Block the primary: big-pickle may NOT run on opencode anymore.
+        if let Some(e) = reg.models.get_mut("opencode/big-pickle") {
+            e.caps = vec!["omp".into()];
+        }
+        // Step 3 first: a caps-compatible model_fallback id wins.
+        let (h, m, route) = reg
+            .resolve_profile_route_full(
+                "",
+                "@cheap",
+                &["opencode-go/deepseek-v4-flash".to_string()],
+            )
+            .expect("model_fallback rung");
+        assert_eq!(route, "model_fallback", "ordered list wins before harness swap");
+        assert_eq!(h, "opencode");
+
+        // Step 4: empty model_fallback → premium's fallback_harness=grok…
+        // but cheap's slot has NO fallback_harness; big-pickle is
+        // caps-blocked and the registry has no other opencode-capped model
+        // nor a fallback → loud failure naming the rungs (no silent hop).
+        let err = reg
+            .resolve_profile_route_full("", "@cheap", &[])
+            .expect_err("loud failure");
+        assert!(
+            err.to_string().contains("no routable model"),
+            "names the failure: {err}"
+        );
+
+        // Step 4 positive case: cap glm-5.2 to a NON-omp harness so the
+        // omp slot route is caps-blocked; fallback_harness=grok is
+        // model-opaque so no grok registry row is needed.
+        if let Some(e) = reg.models.get_mut("zai/glm-5.2") {
+            e.caps = vec!["pi".into()];
+        }
+        let (h, m, route) = reg
+            .resolve_profile_route_full("", "@premium", &[])
+            .expect("fallback_harness rung");
+        assert_eq!(route, "fallback_harness");
+        assert_eq!(h, "grok", "slot fallback_harness swaps the harness");
+        assert_eq!(m, "glm-5.2", "grok hop is model-opaque: bare id as flag, no registry pick");
+    }
+
+    #[test]
+    fn full_ladder_registry_fallback_rung_when_slot_has_no_fallback_harness() {
+        let _g = with_config_dir();
+        let mut reg = ModelRegistry::load_routing().expect("routing");
+        // cheap slot has no fallback_harness; give big-pickle a registry
+        // fallback to a caps-compatible id and block the primary caps.
+        if let Some(e) = reg.models.get_mut("opencode/big-pickle") {
+            e.caps = vec!["omp".into()];
+            e.fallback = Some("opencode-go/deepseek-v4-flash".into());
+        }
+        let (h, m, route) = reg
+            .resolve_profile_route_full("", "@cheap", &[])
+            .expect("registry_fallback rung");
+        assert_eq!(route, "registry_fallback");
+        assert_eq!(h, "opencode", "non-grok fallback keeps the harness");
         assert_eq!(m, "opencode-go/deepseek-v4-flash");
     }
 
