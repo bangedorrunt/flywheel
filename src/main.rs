@@ -23,6 +23,7 @@ mod coalition;
 mod config;
 mod crew;
 mod cron;
+mod daemon;
 mod decide;
 mod doorbell;
 mod doorbell_tick;
@@ -1020,6 +1021,13 @@ enum Commands {
     Upgrade,
     /// Interactive walkthrough
     Tutorial,
+    /// Daemon lifecycle (toron-parity): start|stop|restart|status over the
+    /// `serve` HTTP surface. macOS launchd / Linux systemd user unit /
+    /// pidfile fallback. `restart` VERIFIES the new daemon answers.
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCmd,
+    },
     /// Local REST + SSE server (feature: serve)
     Serve {
         #[arg(long, default_value = "7337")]
@@ -3828,6 +3836,7 @@ fn main() {
             ],
             "tracker": "br/bv (CLI, no MCP)",
             "coordination": "toron mail",
+            "daemon": "flywheel daemon start|stop|restart|status — supervised serve lifecycle (launchd/systemd/pidfile); restart verifies the new daemon answers; stop/refuse unmanaged port holders without --force",
             "stages": ["p1", "p2", "p4", "p5", "p6", "p8"],
             "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
             "catalog": {
@@ -4253,6 +4262,7 @@ fn main() {
         ),
         Some(Commands::Upgrade) => cmd_upgrade(),
         Some(Commands::Tutorial) => cmd_tutorial(),
+        Some(Commands::Daemon { cmd }) => cmd_daemon(cmd),
         Some(Commands::Serve { port }) => cmd_serve(&cfg, *port),
         Some(Commands::Toron { cmd }) => cmd_toron(&cfg, cmd),
         Some(Commands::Preflight {
@@ -20112,9 +20122,13 @@ fn save_policy(path: &std::path::Path, policy: &config::Policy) -> Result<()> {
 
 // ---- deps / config / upgrade / tutorial ----
 pub(crate) fn resonate_health(cfg: &Config) -> Result<()> {
+    // 127.0.0.1, NOT localhost: localhost resolves ::1-first while the
+    // resonate serve binds IPv4 — a naive probe reports DOWN against a
+    // healthy server (same live failure pane.rs::cli_engine_store_url
+    // documents for the engine seam).
     let url = cfg
         .resonate_url()
-        .unwrap_or_else(|| "http://localhost:8001".to_string());
+        .unwrap_or_else(|| "http://127.0.0.1:8001".to_string());
     let resp = ureq::get(&format!("{url}/health"))
         .call()
         .map_err(|e| anyhow!("resonate server unreachable at {url}: {e}"))?;
@@ -29834,6 +29848,49 @@ fn load_closed_bead_ids(cfg: &Config, project: &str) -> Result<std::collections:
 // ---- serve (feature: serve) ----
 
 #[cfg(feature = "serve")]
+/// Daemon lifecycle subcommands (toron-parity, `src/daemon.rs`).
+#[derive(Subcommand)]
+enum DaemonCmd {
+    /// Ensure the daemon is running (install-if-absent; pidfile fallback).
+    Start {
+        /// serve port (default 8787)
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+    },
+    /// Stop the daemon. Idempotent; refuses unmanaged holders without --force.
+    Stop {
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+        /// kill an unmanaged port holder (a stray manual `flywheel serve`)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Stop then start, VERIFYING the new daemon answers before exit 0.
+    Restart {
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print how the daemon is currently supervised / running.
+    Status {
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+    },
+}
+
+fn cmd_daemon(cmd: &DaemonCmd) -> Result<()> {
+    let state = daemon::default_state_dir();
+    std::fs::create_dir_all(&state)?;
+    let addr = |port: u16| format!("127.0.0.1:{port}");
+    match cmd {
+        DaemonCmd::Start { port } => daemon::start(&state, &addr(*port)),
+        DaemonCmd::Stop { port, force } => daemon::stop(&state, &addr(*port), *force),
+        DaemonCmd::Restart { port, force } => daemon::restart(&state, &addr(*port), *force),
+        DaemonCmd::Status { port } => daemon::status(&state, &addr(*port)),
+    }
+}
+
 fn cmd_serve(cfg: &Config, port: u16) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(serve_async(cfg.clone(), port))

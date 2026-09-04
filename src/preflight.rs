@@ -152,14 +152,20 @@ impl Mode {
 pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
     let mut checks = Vec::new();
 
-    // 1. herdr socket alive (cheapest meaningful check)
-    checks.push(check_herdr(cfg));
+    // 1. herdr socket alive (cheapest meaningful check) — skipped for modes
+    //    that never touch panes (cron is store-side only).
+    if mode.needs_project || mode.needs_beads || mode.needs_mail {
+        checks.push(check_herdr(cfg));
+    }
 
     // 2. resonate server reachable
     checks.push(check_resonate(cfg));
 
-    // 3. br binary on PATH
-    checks.push(check_br());
+    // 3. br binary on PATH — only bead-driven modes (matches the Mode doc:
+    //    "Cron (headless): needs resonate only")
+    if mode.needs_beads {
+        checks.push(check_br());
+    }
 
     // 4. project directory exists
     if mode.needs_project {
