@@ -807,7 +807,7 @@ enum Commands {
     },
     /// Aggregate counters over the event log
     Analytics { project: String },
-    /// Named spawn recipes
+    /// Spawn squads (legacy name: recipes) — prefer `flywheel squad`
     Recipes {
         #[command(subcommand)]
         cmd: AssetCmd,
@@ -822,7 +822,7 @@ enum Commands {
         #[command(subcommand)]
         cmd: AssetCmd,
     },
-    /// Templates (alias of recipes)
+    /// Templates (legacy alias of the squad surface)
     Template {
         #[command(subcommand)]
         cmd: AssetCmd,
@@ -832,7 +832,7 @@ enum Commands {
         #[command(subcommand)]
         cmd: StageCmd,
     },
-    /// Recipe + workflow in one launch
+    /// Squad (--recipe takes a squad name) + workflow in one launch
     Ensemble {
         project: String,
         #[arg(long)]
@@ -882,7 +882,10 @@ enum Commands {
         #[command(subcommand)]
         cmd: ProfileCmd,
     },
-    /// Squads (ADR-0005 P6) — named groups of profiles; recipes are aliases
+    /// Squads (ADR-0005 P6) — named groups of profiles = spawn shapes.
+    /// Vocabulary: say "squad" here; "recipe" means a compose token
+    /// (builtin workflow spliced into `workflow compose --parts`).
+    /// `recipes`/`template` stay as legacy aliases of this surface.
     Squad {
         #[command(subcommand)]
         cmd: SquadCmd,
