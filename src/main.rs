@@ -22324,8 +22324,18 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
             let cat = ProfileCatalog::load()?;
             let recipes = config::Recipes::load()?.recipes;
             let mut rows: Vec<Value> = Vec::new();
-            // Compiled-in squads are derived from the built-in profile set;
+            // Compiled-in squads (ADR-0007 D3: default/plan/review/recon);
             // user-authored recipes.toml entries surface as squads (aliases).
+            let compiled = profile::compiled_in_squads();
+            for (name, squad) in &compiled {
+                if !recipes.contains_key(name) {
+                    rows.push(json!({
+                        "name": name,
+                        "members": squad.counts,
+                        "source": "compiled-in",
+                    }));
+                }
+            }
             for (name, r) in &recipes {
                 let squad = Squad::from_recipe(r);
                 rows.push(json!({
@@ -22336,7 +22346,7 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
             // Built-in profile singles are listed as 1-member squads so a
             // fresh install still has squad surface with zero config.
             for name in cat.names() {
-                if !recipes.contains_key(&name) {
+                if !recipes.contains_key(&name) && !compiled.contains_key(&name) {
                     rows.push(json!({
                         "name": name,
                         "members": { name: 1 },
@@ -22358,8 +22368,10 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
         SquadCmd::Show { name } => {
             let cat = ProfileCatalog::load()?;
             let recipes = config::Recipes::load()?.recipes;
+            let compiled = profile::compiled_in_squads();
             let squad = match recipes.get(name) {
                 Some(r) => Squad::from_recipe(r),
+                None if compiled.contains_key(name) => compiled[name].clone(),
                 None if cat.get(name).is_some() => {
                     let mut counts = std::collections::BTreeMap::new();
                     counts.insert(name.clone(), 1u32);
