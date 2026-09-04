@@ -71,3 +71,14 @@ Interactive TTY `steer`, `workflow run --execute`, and managed mode commands pro
 ## Hidden leaves
 
 Never invoke `__*` except documented `__wait-output`.
+
+## Which noun when (strategy surface, ADR-0028 E7)
+
+| noun | is | choose it when | trail |
+| --- | --- | --- | --- |
+| **stage** | a payload unit (prompt + role/phase affinity) dispatched by `send --stage` | the INSTRUCTIONS are the value; one step, one crew member | `flywheel timeline` shows `stage=` per send |
+| **workflow** | an execution procedure (steps/branches/verify) run by `workflow run/compose` | the CONTROL FLOW is the value: gates, retries, parallel arms, SIGNOFF | compose runs write artifacts |
+| **recipe** | a spawn shape (squad alias: profile counts) used by `spawn --recipe` | the CREW COMPOSITION is the value and repeats across swarms | spawn registry entry |
+| **profile** | role conditioning (harness/model/effort/behavior) referenced by all three | always — model routing is strict; recipes/stages name profiles | model registry |
+
+Announce the vehicle on every dispatch (stage / workflow / recipe / `none: raw`) — crews restate it in reports (2026-09-04 contract).
