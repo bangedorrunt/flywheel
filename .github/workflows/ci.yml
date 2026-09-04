@@ -56,7 +56,20 @@ jobs:
         run: cargo check --workspace
       - name: cargo test (bin + hermetic integration suites -- S1-S4 contracts)
         working-directory: flywheel
-        run: cargo test --bin flywheel && cargo test --test adr0027_slice1 --test adr0027_slice3 --test sc_doorbell_adr0005
+        run: |
+          # GS-019: two hosted runners died ~52m into this step with no log tail.
+          # Split invocations + a 6 GiB address-space cap turn a silent OOM
+          # into a visible allocation failure; markers show how far it gets.
+          ulimit -v 6291456 || true
+          echo "=== bin suite ==="
+          cargo test --bin flywheel
+          echo "=== slice1 ==="
+          cargo test --test adr0027_slice1
+          echo "=== slice3 ==="
+          cargo test --test adr0027_slice3
+          echo "=== sc_doorbell ==="
+          cargo test --test sc_doorbell_adr0005
+          echo "=== ALL GREEN ==="
       - name: cargo clippy
         working-directory: flywheel
         run: cargo clippy --all-targets -- -D warnings
