@@ -33,6 +33,10 @@ toron-workflow = { path = "../toron/crates/toron-workflow" }
 async-trait = "0.1"
 cron = "0.17.0"
 chrono = "0.4.45"
+# ADR-0007 D4: catalog ratatui hub + TTY multi-select.
+ratatui = "0.29"
+crossterm = "0.28"
+dialoguer = "0.11"
 
 [features]
 # Default build: the `serve` HTTP surface + herdr multiplexer + BOTH mail

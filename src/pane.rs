@@ -1845,6 +1845,7 @@ mod kind_classify_tests {
                 caps: vec![],
                 fallback: Some("test/fallback".to_string()),
                 effort: None,
+                tier: None,
             },
         );
         registry.models.insert(
@@ -1855,6 +1856,7 @@ mod kind_classify_tests {
                 caps: vec![],
                 fallback: None,
                 effort: None,
+                tier: None,
             },
         );
         // First 429 on primary should find fallback

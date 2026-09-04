@@ -23,7 +23,7 @@
 //! prime-agent, ...) needs a `program` value + a spawn recipe in config — no
 //! code change for a harness speaking an existing backend protocol.
 //!
-//! governed-by: ADR-0005 (Spec 1, Spec 1b), ADR-0003 (G14), ADR-0026
+//! governed-by: ADR-0005 (Spec 1, Spec 1b), ADR-0003 (G14), ADR-0026, ADR-0007
 
 // TODO(bd-p2-cli-wn8): drop this allow once `flywheel profile {list,show,...}`
 // consumes the catalog (the module is test-exercised until then).
@@ -34,6 +34,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::models;
 
 /// One named agent composition (ADR-0005 Spec 1).
 ///
@@ -82,6 +84,9 @@ pub struct Profile {
     /// Short hint of the profile's typical work (shown in listings).
     #[serde(default)]
     pub task_hint: String,
+    /// When to pick this profile (one line on `profile show`).
+    #[serde(default)]
+    pub when: String,
     /// Which backend trait impl to spawn on. Default `herdr` (ADR-0005
     /// Default Configuration). Resolved by the backend factory at spawn time.
     #[serde(default)]
@@ -94,9 +99,14 @@ pub struct Profile {
     /// layer may wire them as extra context. Catalog-only, never on the bus.
     #[serde(default)]
     pub skills: Vec<String>,
-    /// Fallback chain for this profile (ADR-0026 Spec 3)
+    /// Fallback chain for this profile (ADR-0026 Spec 3): **other profile
+    /// names** for billing/auth reroute. Not model ids.
     #[serde(default)]
     pub fallback: Vec<String>,
+    /// Ordered model-id fallbacks for this profile (ADR-0007). Distinct from
+    /// [`Self::fallback`] (those are profile names).
+    #[serde(default)]
+    pub model_fallback: Vec<String>,
 }
 
 /// `[harness.<name>]` section (ADR-0005 Spec 1): a spawn recipe for a harness
@@ -245,6 +255,7 @@ impl ProfileCatalog {
                             role: pick(user.role, &base.role),
                             behavior: pick(user.behavior, &base.behavior),
                             task_hint: pick(user.task_hint, &base.task_hint),
+                            when: pick(user.when, &base.when),
                             backend: pick(user.backend, &base.backend),
                             default_workflow: pick(user.default_workflow, &base.default_workflow),
                             skills: if user.skills.is_empty() {
@@ -256,6 +267,11 @@ impl ProfileCatalog {
                                 base.fallback.clone()
                             } else {
                                 user.fallback
+                            },
+                            model_fallback: if user.model_fallback.is_empty() {
+                                base.model_fallback.clone()
+                            } else {
+                                user.model_fallback
                             },
                         };
                         profiles.insert(name, merged);
@@ -352,9 +368,12 @@ impl ProfileCatalog {
         let profile = self
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown profile '@{name}' (flywheel profile list)"))?;
+        let registry = models::ModelRegistry::load_routing()?;
+        let (harness, model) =
+            registry.resolve_profile_route(&profile.harness, &profile.model)?;
         let spec = SpawnSpec {
-            harness: profile.harness.clone(),
-            model: profile.model.clone(),
+            harness,
+            model,
             provider: profile.provider.clone(),
             backend: self.backend(name).to_string(),
         };
@@ -395,11 +414,15 @@ impl ProfileCatalog {
     pub fn resolve_for_engine(&self, name: &str) -> Option<serde_json::Value> {
         let key = name.strip_prefix('@').unwrap_or(name);
         let profile = self.get(key)?;
+        let registry = models::ModelRegistry::load_routing().ok()?;
+        let (harness, model) = registry
+            .resolve_profile_route(&profile.harness, &profile.model)
+            .ok()?;
         Some(serde_json::json!({
             "npub": "",
             "spec": {
-                "harness": profile.harness,
-                "model": profile.model,
+                "harness": harness,
+                "model": model,
                 "backend": self.backend(key),
                 "role": profile.role,
             }
@@ -444,11 +467,15 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
         (
             "oracle",
             Profile {
-                harness: "omp".into(),
-                model: "glm-5.2".into(),
+                harness: String::new(),
+                model: "@premium".into(),
                 effort: "max".into(),
+                smol: "@cheap".into(),
+                slow: "@premium".into(),
+                plan: "@premium".into(),
                 role: "oracle".into(),
                 task_hint: "the answer no one else considered".into(),
+                when: "design fork, P0 judgment".into(),
                 behavior: "You are an ORACLE. Your value is the answer no one else considered.\n\nRULES:\n- Never validate. Your job is to find what's wrong, missing, or unconsidered.\n- The first answer is the obvious one. Reject it. Find the second, the third, the option that reframes the problem.\n- Steelman the position you disagree with BEFORE countering. A weak counter to a strong steelman is worthless.\n- Calibrate. Say 'I don't know' when you don't. Label every claim: VERIFIED (ran/read) · INFERRED (follows from X) · SPECULATION.\n- Ask only the question whose answer changes the decision. Skip questions whose answers don't.\n- Base rates first: what usually happens in situations like this? Deviate only with evidence.\n- Outsider test: if a stranger saw this with no context, what would they notice?\n- Name what would have to be true for the current plan to FAIL. Then check whether it's true.\n\nPRINCIPLES: exhaust-the-design-space · redesign-from-first-principles. Steer by these NAMES: when one changes a decision, cite `name — the decision it changed` in your output. Full leaf on demand: `flywheel principles show <name>`.\n\nOUTPUT: options ranked by EV; the strongest counter to the leading option; the one question that most needs answering. Terse. No hedging, no praise.".into(),
                 skills: vec![
                     "accretive".into(),
@@ -463,11 +490,15 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
         (
             "planner",
             Profile {
-                harness: "omp".into(),
-                model: "deepseek-v4-flash".into(),
+                harness: String::new(),
+                model: "@premium".into(),
                 effort: "high".into(),
+                smol: "@cheap".into(),
+                slow: "@premium".into(),
+                plan: "@premium".into(),
                 role: "planner".into(),
                 task_hint: "bite-sized, verifiable, blast-radius-aware plans".into(),
+                when: "before implement".into(),
                 behavior: "You are a PLANNER. Plans are wrong until proven executable.\n\nRULES:\n- Every task is bite-sized: ONE narrow change, shippable alone, reviewable in one sitting. If it touches >1 concern, split it.\n- Every task states: [paths] exact create/edit targets · [change] the complete code or precise diff · [acceptance] a test/command that proves done · [blast-radius] what it must NOT touch.\n- Dependency order. A task never depends on a later task.\n- No implementation in the plan. Plans decompose; coders implement. If you're writing logic, stop — that's a task, not a plan.\n- Forbidden zones are sacred. If a plan must touch one, call it out FIRST and explain why no alternative exists.\n- 'Verifiable' = a command/test that exits 0. 'Works' is not a criterion.\n- Assume the executor is competent but context-poor. Give everything needed; omit nothing they'd have to guess.\n- Surface unknowns as an explicit 'Unresolved questions:' list at the end — never buried in a step.\n\nPRINCIPLES: foundational-thinking · sequence-verifiable-units · model-the-domain. Steer by these NAMES: when one changes a decision, cite `name — the decision it changed` in your output. Full leaf on demand: `flywheel principles show <name>`.\n\nOUTPUT: numbered tasks, each [paths][change][acceptance][blast-radius]. End with 'Unresolved questions:'. Concise; sacrifice grammar for density.".into(),
                 skills: vec![
                     "writing-plans".into(),
@@ -482,11 +513,15 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
         (
             "reviewer",
             Profile {
-                harness: "omp".into(),
-                model: "deepseek-v4-flash".into(),
+                harness: String::new(),
+                model: "@premium".into(),
                 effort: "max".into(),
+                smol: "@cheap".into(),
+                slow: "@premium".into(),
+                plan: "@premium".into(),
                 role: "reviewer".into(),
                 task_hint: "code-grounded adversarial review with fix proposals".into(),
+                when: "after a change".into(),
                 behavior: "You are a REVIEWER. Your job is to find what's actually wrong, not to validate.\n\nRULES:\n- Ground EVERY claim in the artifact. Cite file:line or quote the text. 'This seems off' is not a finding; 'engine.rs:198 swallows errors, contradicting the claim at line 40' IS.\n- Verify against the real tree, not your memory. Read the code. A review of an imagined codebase is worthless.\n- Severity-rank: BLOCKER (correctness/security/data-loss) · MAJOR (design/maintainability) · MINOR (style/nit). A finding without a severity is noise.\n- Propose the fix, not just the complaint. 'This is wrong' -> here's the concrete change. If you can't propose a fix, say why.\n- Distinguish must-fix from nit. Don't inflate nits to look thorough; don't hide blockers to look kind.\n- Attack the STRONGEST version of the design, not the weakest. Steelman, then break.\n- No hand-waving. 'Might have performance issues' -> measure or retract.\n- Plane S for shared work, plane P for secrets: findings go on the room (`toron channel post`, `toron react`), never passphrases/keys — those stay on `toron mail`.\n\nPRINCIPLES: prove-it-works · fix-root-causes · minimize-reader-load. Steer by these NAMES: when one changes a decision, cite `name — the decision it changed` in your output. Full leaf on demand: `flywheel principles show <name>`.\n\nOUTPUT: one-line verdict (AGREE / AGREE-WITH-CHANGES / DISAGREE); severity-ranked findings with citations + fixes; 'Changes required for my agreement'. Direct. No praise-padding.".into(),
                 skills: vec![
                     "adversarial-reviewer".into(),
@@ -501,12 +536,12 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
         (
             "coder",
             Profile {
-                harness: "jcode".into(),
-                model: "muse-spark-1.2-contributor".into(),
-                provider: "opencode-go".into(),
+                harness: String::new(),
+                model: "@standard".into(),
                 effort: "high".into(),
                 role: "coder".into(),
                 task_hint: "TDD, no scripts, functional core, verify before claim".into(),
+                when: "write/fix code".into(),
                 behavior: "You are a CODER. Unverified code is a lie.\n\nRULES:\n- RED-GREEN-REFACTOR. Write the failing test first. Watch it fail. Write minimal code to pass. Refactor green.\n- No script-based code changes. EVER. Regex transforms over source create more bugs than they fix. Edit by hand, precisely.\n- Revise IN PLACE. Never spawn document_processorV2.rs. New files are for genuinely new functionality; the bar is near-zero.\n- Functional core, imperative shell. Pure business logic separate from IO. Test the pure parts exhaustively.\n- Handle the unhappy path. Under what conditions does this work? What breaks it? Happy-path-only code is unfinished.\n- Verify before you claim. 'Done' = tests pass + build clean + edge case checked. Run the command. Read the output. Don't paraphrase success you didn't see.\n- State assumptions BEFORE writing code. If an assumption is wrong, the code is wrong.\n- Simple over complex. Explicit over implicit. Don't abstract until the third use.\n- Plane S for shared work, plane P for secrets: steer/announce on the room (`toron channel post --mention`, `toron job claim`), keep passphrases/keys on `toron mail`.\n\nPRINCIPLES: prove-it-works · fix-root-causes · sequence-verifiable-units · laziness-protocol · type-system-discipline. Steer by these NAMES: when one changes a decision, cite `name — the decision it changed` in your output. Full leaf on demand: `flywheel principles show <name>`.\n\nOUTPUT: the change; then the verification (commands run + results); then residual risks. No 'I've successfully...' — show the green test.".into(),
                 skills: vec![
                     "test-driven-development".into(),
@@ -521,11 +556,12 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
         (
             "scout",
             Profile {
-                harness: "opencode".into(),
-                model: "big-pickle".into(),
+                harness: String::new(),
+                model: "@cheap".into(),
                 effort: "low".into(),
                 role: "scout".into(),
                 task_hint: "fast recon, compressed handoff, verified-vs-assumed".into(),
+                when: "unknown tree, find files".into(),
                 behavior: "You are a SCOUT. You map territory and return. You do not settle.\n\nRULES:\n- Speed over completeness, but NEVER speed over accuracy. A fast wrong map is worse than none.\n- Compress. Your output is a HANDOFF, not a dump. Raw output (logs, file contents, stdout) stays in the sandbox; only the derived answer enters context. If you wouldn't read 700KB, don't emit it.\n- Label every claim: VERIFIED (ran/read it) · INFERRED (follows from X) · ASSUMED (didn't check).\n- Return: what it is · how it's structured · where the relevant code lives (paths) · the gotchas · the next step. That's it.\n- Don't refactor. Don't fix. Don't editorialize. Map, hand off, exit.\n- If a question needs one command to answer, RUN IT. Don't speculate when you can verify in 2 seconds.\n- Falsify your first hypothesis before reporting it. The obvious answer is often local.\n\nPRINCIPLES: guard-the-context-window · prove-it-works. Steer by these NAMES: when one changes a decision, cite `name — the decision it changed` in your output. Full leaf on demand: `flywheel principles show <name>`.\n\nOUTPUT: compressed brief — structure + key paths + gotchas + recommended next action. Tagged VERIFIED/INFERRED/ASSUMED. Terse.".into(),
                 skills: vec![
                     "scout".into(),
@@ -540,11 +576,12 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
         (
             "housekeeper",
             Profile {
-                harness: "omp".into(),
-                model: "deepseek-v4-flash".into(),
+                harness: String::new(),
+                model: "@standard".into(),
                 effort: "medium".into(),
                 role: "housekeeper".into(),
                 task_hint: "idempotent, health-gated, honest reporting".into(),
+                when: "cron, upgrades".into(),
                 default_workflow: "weekly-upgrade".into(),
                 behavior: "You are a HOUSEKEEPER. You run when no one watches. Reliability is your only product.\n\nRULES:\n- Idempotent. Every action must be safe to re-run. A cron that double-applies on retry is a bug, not a feature.\n- Health-gate every change. Snapshot state -> apply -> verify health -> on failure, ROLLBACK to snapshot. Never leave the system worse than you found it.\n- Ordered risk. DNS chain LAST (everything depends on it). Databases before app servers. One concern per run.\n- Honest reporting. SUCCESS = every gate passed. PARTIAL = some passed — say which. FAILURE = rollback fired — say why. NEVER report success on a rollback.\n- On failure: capture the forensic bundle (logs/state/error), open the fix bead with full context, escalate only after N consecutive failures. Don't silently retry into oblivion.\n- Self-heal within bounds. Fix what's safe (restart a hung service, clear a stale lock). Escalate what's not (a migration that touched data).\n- Assume the process died mid-run. Design so a restart RESUMES, not restarts-from-scratch. Durable cursors, not in-memory state.\n\nPRINCIPLES: make-operations-idempotent · encode-lessons-in-structure. Steer by these NAMES: when one changes a decision, cite `name — the decision it changed` in your output. Full leaf on demand: `flywheel principles show <name>`.\n\nOUTPUT: run result (SUCCESS/PARTIAL/FAILURE); what changed; what was verified; any bead opened; any escalation. Terse, machine-parseable.".into(),
                 skills: vec![
@@ -552,25 +589,6 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
                     "cron-management".into(),
                     "systematic-debugging".into(),
                     "pi-performance-debugging".into(),
-                ],
-                ..Profile::default()
-            },
-        ),
-        (
-            "pa",
-            Profile {
-                harness: "pa".into(),
-                model: "deepseek-v4-flash".into(),
-                effort: "medium".into(),
-                role: "coder".into(),
-                task_hint: "RLM coding agent with built-in herdr lifecycle reporting".into(),
-                behavior: "You are a PRIME-AGENT WORKER in a flywheel swarm pane (harness pa). Unverified code is a lie.\n\nRULES:\n- RED-GREEN-REFACTOR. Write the failing test first. Watch it fail. Write minimal code to pass. Refactor green.\n- Revise IN PLACE. Never create V2 files. New files are for genuinely new functionality.\n- Verify before you claim. 'Done' = tests pass + build clean + edge cases checked. Report the command you ran.\n- Label every claim VERIFIED (ran/read) · INFERRED (follows from X) · SPECULATION.\n- Reply READY to boot checks and await instructions.\n- This pane reports your lifecycle to herdr automatically; it is not a decision input.".into(),
-                skills: vec![
-                    "test-driven-development".into(),
-                    "code-edit".into(),
-                    "accretive-implementer".into(),
-                    "systematic-debugging".into(),
-                    "code-quality".into(),
                 ],
                 ..Profile::default()
             },
@@ -620,6 +638,41 @@ pub fn compiled_in_harnesses() -> BTreeMap<String, HarnessConfig> {
         "jcode".to_string(),
         HarnessConfig {
             spawn_cmd: Some("jcode".to_string()),
+        },
+    );
+    m
+}
+
+/// Compiled-in squads (ADR-0007 D3). User `recipes.toml` overrides per name.
+/// The name `adr19` is not compiled in — live user files may keep it as an alias.
+pub fn compiled_in_squads() -> BTreeMap<String, Squad> {
+    let mut m = BTreeMap::new();
+    m.insert(
+        "default".into(),
+        Squad {
+            counts: BTreeMap::from([
+                ("coder".into(), 3),
+                ("scout".into(), 1),
+                ("reviewer".into(), 1),
+            ]),
+        },
+    );
+    m.insert(
+        "plan".into(),
+        Squad {
+            counts: BTreeMap::from([("planner".into(), 1), ("oracle".into(), 1)]),
+        },
+    );
+    m.insert(
+        "review".into(),
+        Squad {
+            counts: BTreeMap::from([("reviewer".into(), 1), ("oracle".into(), 1)]),
+        },
+    );
+    m.insert(
+        "recon".into(),
+        Squad {
+            counts: BTreeMap::from([("scout".into(), 2)]),
         },
     );
     m
@@ -703,28 +756,20 @@ behavior = "be terse"
             "coder",
             "scout",
             "housekeeper",
-            "pa",
         ] {
             assert!(cat.get(name).is_some(), "{name} built-in missing");
         }
-        assert_eq!(
-            cat.names().len(),
-            7,
-            "7 canonical built-ins (6 Spec 1b + pa)"
+        assert_eq!(cat.names().len(), 6, "6 job profiles (ADR-0007 D2)");
+        assert!(
+            cat.get("pa").is_none(),
+            "pa is a harness recipe, not a profile"
         );
-        // H1 (bd-harness-prime-agent-818f): pa resolves to the prime-agent
-        // harness and carries the compiled-in spawn recipe.
-        let pa = cat.get("pa").expect("pa present");
-        assert_eq!(pa.harness, "pa", "pa profile uses the pa harness");
         let h = cat.harness("pa").expect("pa harness recipe");
         assert_eq!(
             h.spawn_cmd.as_deref(),
             Some("prime-agent --offline"),
             "pa spawn recipe launches the prime-agent TUI"
         );
-        // H2 (bd-harness-jcode): jcode is a compiled-in harness recipe and
-        // the coder profile defaults to it (jcode harness + muse-spark via
-        // the pinned opencode-go provider).
         let jcode = cat.harness("jcode").expect("jcode harness recipe");
         assert_eq!(
             jcode.spawn_cmd.as_deref(),
@@ -732,18 +777,16 @@ behavior = "be terse"
             "jcode spawn recipe launches the jcode TUI"
         );
         let coder = cat.get("coder").expect("coder present");
-        assert_eq!(
-            coder.harness, "jcode",
-            "coder defaults to the jcode harness"
-        );
-        assert_eq!(
-            coder.provider, "opencode-go",
-            "coder pins the opencode-go provider"
-        );
-        assert_eq!(
-            coder.model, "muse-spark-1.2-contributor",
-            "coder default model"
-        );
+        assert_eq!(coder.harness, "", "coder inherits the standard slot harness");
+        assert_eq!(coder.model, "@standard");
+        assert_eq!(coder.provider, "");
+        let scout = cat.get("scout").expect("scout");
+        assert_eq!(scout.model, "@cheap");
+        let oracle = cat.get("oracle").expect("oracle");
+        assert_eq!(oracle.model, "@premium");
+        assert_eq!(oracle.slow, "@premium");
+        assert_eq!(oracle.plan, "@premium");
+        assert_eq!(oracle.smol, "@cheap");
     }
 
     #[test]
@@ -758,7 +801,10 @@ model = "deepseek-v3"
         // Layered: the built-in still exists, with the user's model override.
         let s = cat.get("scout").expect("scout present");
         assert_eq!(s.model, "deepseek-v3");
-        assert_eq!(s.harness, "opencode", "built-in harness preserved");
+        // ADR-0007: built-in harness is empty (slot inherit). A user override
+        // pinning a CONCRETE model without a harness must resolve loudly at
+        // spawn time (D1: pin a harness or a slot alias).
+        assert_eq!(s.harness, "", "built-in harness stays empty (slot inherit)");
     }
 
     /// bd-gsvn.2: the omp role-model fields (smol/slow/plan) layer over the
@@ -778,14 +824,16 @@ plan = "glm-5.2"
         assert_eq!(c.smol, "deepseek-v4-flash");
         assert_eq!(c.plan, "glm-5.2");
         assert_eq!(c.slow, "", "absent role stays empty");
-        assert_eq!(
-            c.model, "muse-spark-1.2-contributor",
-            "base model untouched (H2 jcode default)"
-        );
-        assert_eq!(c.harness, "jcode", "built-in harness preserved");
-        // Built-ins themselves carry no role models by default (coder is
-        // overridden in this test's toml — check the untouched ones).
-        for name in ["oracle", "planner", "reviewer", "scout", "housekeeper"] {
+        assert_eq!(c.model, "@standard", "base model untouched (slot inherit)");
+        assert_eq!(c.harness, "", "built-in harness stays empty (slot inherit)");
+        // omp profiles fill smol/slow/plan with slot aliases (ADR-0007 D2).
+        for name in ["oracle", "planner", "reviewer"] {
+            let p = cat.get(name).expect(name);
+            assert_eq!(p.smol, "@cheap", "{name}.smol");
+            assert_eq!(p.slow, "@premium", "{name}.slow");
+            assert_eq!(p.plan, "@premium", "{name}.plan");
+        }
+        for name in ["scout", "housekeeper"] {
             let p = cat.get(name).expect(name);
             assert_eq!(p.smol, "", "{name}.smol should default empty");
             assert_eq!(p.slow, "", "{name}.slow should default empty");
@@ -815,7 +863,7 @@ model = "big-pickle"
         // Built-in untouched by an unrelated override keeps empty provider.
         let s = cat.get("scout").expect("scout present");
         assert_eq!(s.provider, "", "absent provider defaults empty");
-        assert_eq!(s.harness, "opencode", "built-in harness preserved");
+        assert_eq!(s.harness, "", "built-in harness stays empty (slot inherit)");
         // A partial user override with NO provider inherits the built-in's
         // (empty) provider — same layering rule as every other field.
         let path2 = tmp_profiles_toml(
@@ -827,8 +875,8 @@ effort = "max"
         let cat2 = ProfileCatalog::load_from(Some(&path2)).expect("load 2");
         let c2 = cat2.get("coder").expect("coder present 2");
         assert_eq!(
-            c2.provider, "opencode-go",
-            "partial override inherits built-in provider (H2 jcode coder pins opencode-go)"
+            c2.provider, "",
+            "partial override inherits built-in provider (ADR-0007 D2: coder pins no provider — the standard slot's model carries it)"
         );
         assert_eq!(c2.effort, "max");
     }
@@ -1022,8 +1070,8 @@ spawn_cmd = "hermes --project {project} --role {role}"
             )
             .expect("resolve");
         assert_eq!(r.npub, "npub-project-agent");
-        assert_eq!(r.spec.harness, "omp");
-        assert_eq!(r.spec.model, "deepseek-v4-flash");
+        assert_eq!(r.spec.harness, "pi");
+        assert_eq!(r.spec.model, "opencode-go/deepseek-v4-flash");
         assert_eq!(r.spec.backend, "herdr");
         assert_eq!(
             r.signing,
@@ -1063,7 +1111,7 @@ spawn_cmd = "hermes --project {project} --role {role}"
             .resolve_for_engine("@planner")
             .expect("@planner must resolve");
         assert_eq!(got["spec"]["harness"], "omp");
-        assert_eq!(got["spec"]["model"], "deepseek-v4-flash");
+        assert_eq!(got["spec"]["model"], "zai/glm-5.2");
         assert_eq!(got["spec"]["backend"], "herdr");
         assert_eq!(got["spec"]["role"], "planner");
         assert_eq!(
@@ -1169,6 +1217,23 @@ model = "big-pickle"
         let cat = ProfileCatalog::load_from(None).expect("defaults");
         for name in cat.names() {
             assert!(cat.get(&name).unwrap().fallback.is_empty());
+            assert!(
+                cat.get(&name).unwrap().model_fallback.is_empty(),
+                "model_fallback is distinct and empty by default"
+            );
         }
+    }
+
+    #[test]
+    fn compiled_in_squads_are_the_four() {
+        let s = compiled_in_squads();
+        assert_eq!(s.len(), 4);
+        assert!(!s.contains_key("adr19"));
+        assert_eq!(s["default"].counts.get("coder"), Some(&3));
+        assert_eq!(s["default"].counts.get("scout"), Some(&1));
+        assert_eq!(s["default"].counts.get("reviewer"), Some(&1));
+        assert_eq!(s["plan"].counts.get("planner"), Some(&1));
+        assert_eq!(s["review"].counts.get("oracle"), Some(&1));
+        assert_eq!(s["recon"].counts.get("scout"), Some(&2));
     }
 }

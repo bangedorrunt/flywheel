@@ -38,6 +38,7 @@ mod mcp_http;
 mod models;
 mod output;
 mod pane;
+mod catalog_tui;
 mod phase_chain;
 mod phase_contracts;
 mod plane_route;
@@ -957,6 +958,19 @@ enum Commands {
     Model {
         #[command(subcommand)]
         cmd: ModelCmd,
+    },
+    /// Routing slots (ADR-0007 D1) — cheap/standard/premium = harness+model.
+    Slot {
+        #[command(subcommand)]
+        cmd: SlotCmd,
+    },
+    /// Catalog hub (ADR-0007 D4) — ratatui multi-panel over slots/models/
+    /// profiles/squads. Refuses on non-TTY / NO_COLOR / TERM=dumb and names
+    /// the CLI verbs.
+    Catalog {
+        /// JSON snapshot instead of the TUI (agent drivers)
+        #[arg(long)]
+        json: bool,
     },
     /// Smart-cron surface (ADR-0005 Spec 3 / P4.6) — the flywheel half of
     /// cron: registered schedules + schedule-triggered workflows, pause/
@@ -2391,6 +2405,49 @@ enum ProfileCmd {
         /// profile name
         name: String,
     },
+    /// Set routing fields on a profile (ADR-0007 D4 — the missing verb).
+    /// Persists the merged profile to the user profiles.toml (bd-2dao rule:
+    /// write the RAW user file merged over the built-in, never the catalog
+    /// rebuild).
+    Set {
+        /// profile name (built-in or local)
+        name: String,
+        /// model id or slot alias (@cheap/@standard/@premium)
+        #[arg(long)]
+        model: Option<String>,
+        /// provider prefix for a concrete model id
+        #[arg(long)]
+        provider: Option<String>,
+        /// slot alias override for model (same as --model @slot)
+        #[arg(long)]
+        slot: Option<String>,
+        /// ordered model-id fallbacks (comma-separated; NOT Profile.fallback —
+        /// those are other profile names, ADR-0026)
+        #[arg(long = "model-fallback", value_delimiter = ',')]
+        model_fallback: Vec<String>,
+        /// harness / program (empty on a slot-aliased profile inherits the
+        /// slot's harness)
+        #[arg(long)]
+        harness: Option<String>,
+        /// thinking/effort level: minimal|low|medium|high|xhigh|max
+        #[arg(long)]
+        effort: Option<String>,
+        /// omp --smol= role model (id or @slot)
+        #[arg(long)]
+        smol: Option<String>,
+        /// omp --slow= role model (id or @slot)
+        #[arg(long)]
+        slow: Option<String>,
+        /// omp --plan= role model (id or @slot)
+        #[arg(long)]
+        plan: Option<String>,
+        /// comma-separated skills list (catalog only)
+        #[arg(long, value_delimiter = ',')]
+        skills: Vec<String>,
+        /// print the resulting user-file entry without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Squad commands (ADR-0005 P6): a squad is a named group of profile counts —
@@ -2420,6 +2477,18 @@ enum SquadCmd {
     Remove {
         /// squad / recipe name
         name: String,
+    },
+    /// Create/overwrite a squad in ~/.config/flywheel/recipes.toml
+    /// (ADR-0007 D3: user file overrides compiled-in squads per name).
+    Create {
+        /// squad name
+        name: String,
+        /// member counts: --profile coder=3 (repeatable)
+        #[arg(long = "profile", value_name = "PROFILE=COUNT", value_parser = parse_kind_count)]
+        members: Vec<(String, u32)>,
+        /// print the resulting user-file entry without writing
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -2962,11 +3031,79 @@ enum ModelCmd {
         /// high|xhigh|max (bd-42fs)
         #[arg(long)]
         effort: Option<String>,
+        /// cost tier (ADR-0007): cheap | standard | premium
+        #[arg(long)]
+        tier: Option<String>,
     },
-    /// Remove a registry entry
+    /// Remove registry entries. Bare ids resolve via the default provider.
+    /// Compiled-in ids are refused unless --shadow (writes a user shadow).
+    /// TTY with no ids → dialoguer MultiSelect. Requires --force to delete.
     Remove {
-        /// model id
-        id: String,
+        /// model ids (bare or provider/model; repeatable)
+        ids: Vec<String>,
+        /// resolve bare ids against the default provider (default: on)
+        #[arg(long, default_value_t = true)]
+        resolve: bool,
+        /// remove compiled-in ids by writing nothing — they cannot be
+        /// deleted; this flag is accepted so scripts do not break
+        #[arg(long)]
+        shadow: bool,
+        /// actually delete (skip the confirm)
+        #[arg(long)]
+        force: bool,
+        /// never prompt (non-interactive)
+        #[arg(long)]
+        no_input: bool,
+    },
+}
+
+/// Routing slot subcommands (ADR-0007 D1/D4). A slot is harness + model
+/// (+ fallbacks) for a cost band: cheap | standard | premium.
+#[derive(Subcommand)]
+enum SlotCmd {
+    /// List slots with source (compiled-in vs user overlay)
+    List {
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one slot (harness, model, fallbacks, source)
+    Show {
+        /// slot name or alias (cheap/free/smol, standard/default, premium/slow/plan)
+        name: String,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set slot fields in the USER models.toml (whole-Spec overlay; the
+    /// compiled-in defaults are never baked into the file — ADR-0007 D1).
+    Set {
+        /// slot name: cheap | standard | premium (never "default" — that is
+        /// the compiled-in squad)
+        name: String,
+        /// harness / program (opencode | pi | omp | grok | ...)
+        #[arg(long)]
+        harness: Option<String>,
+        /// concrete model id (provider/model or bare; NOT @alias)
+        #[arg(long)]
+        model: Option<String>,
+        /// fallback harness when the primary is unavailable
+        #[arg(long)]
+        fallback_harness: Option<String>,
+        /// ordered model-id fallbacks (comma-separated)
+        #[arg(long = "model-fallback", value_delimiter = ',')]
+        model_fallback: Vec<String>,
+        /// print the resulting user-file entry without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove the USER overlay for a slot (restores the compiled-in spec)
+    Remove {
+        /// slot name
+        name: String,
+        /// skip the confirm
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -3662,7 +3799,7 @@ fn main() {
             "loop-mode (alias: loop) run/status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts",
             "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
             "doorbell status/start/stop/re-inject (supervised pane-wake layer: lazy-heal + persisted wake state)",
-                "coalition debate plan-review profile squad model runs",
+                "coalition debate plan-review profile squad model slot catalog runs",
                 "workflow cron recipes workflows pipeline template stage ensemble",
                 "checkpoint timeline audit history changes resume analytics",
                 "backend safety guards policy deps integration config upgrade tutorial serve preflight"
@@ -3671,6 +3808,13 @@ fn main() {
             "coordination": "toron mail",
             "stages": ["p1", "p2", "p4", "p5", "p6", "p8"],
             "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
+            "catalog": {
+                "slots": "flywheel slot list/show/set/remove — cheap/standard/premium = harness+model; profiles alias @cheap/@standard/@premium (ADR-0007 D1)",
+                "models": "flywheel model list/show/add/remove — registry ids are provider/model with tier cheap|standard|premium; compiled-ins are permanent",
+                "profiles": "flywheel profile list/show/create/edit/set/run/remove — `set` is the routing-field verb (--model/@slot/--model-fallback; model_fallback ≠ fallback)",
+                "squads": "flywheel squad list/show/spawn/create/remove — compiled-ins: default/plan/review/recon; user recipes.toml overrides per name (ADR-0007 D3)",
+                "hub": "flywheel catalog [--json] — ratatui multi-panel; refuses non-TTY/NO_COLOR/TERM=dumb naming the CLI (ADR-0007 D4)"
+            },
             "wave_dispatch": "loop run --work --wave-label wave-N scopes the ready set to that label and holds (naming blockers) while any lower wave-M (M<N) is open/in_progress; default --work unchanged; label-based transitional until beads ADR-0001 schema-18 (ADR-0006 D2)",
             "wave_swarm_recipe": "workflow compose \"<objective>\" --parts wave-swarm expands GATE/DISPATCH/OBSERVE/VERIFY/SIGNOFF over the compiled-in wave-* stages; SIGNOFF is request_approval — the run suspends for captain-only sign-off; bounded by FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
             "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error" }
@@ -4050,6 +4194,8 @@ fn main() {
             pf.and_then(|_| cmd_workflow(&cfg, cmd))
         }
         Some(Commands::Model { cmd }) => cmd_models(cmd),
+        Some(Commands::Slot { cmd }) => cmd_slot(cmd),
+        Some(Commands::Catalog { json }) => catalog_tui::run(*json),
         Some(Commands::Cron { cmd }) => cmd_cron(&cfg, cmd),
         Some(Commands::Debate {
             proposition,
@@ -4549,6 +4695,24 @@ fn spawn_items_from_plan(
     items
 }
 
+fn spawn_item_kind(
+    cfg: &Config,
+    item: &SpawnItem,
+    catalog: &profile::ProfileCatalog,
+    registry: &models::ModelRegistry,
+) -> Result<String> {
+    match (&item.kind, &item.profile) {
+        (Some(k), Some(name)) if k.is_empty() => {
+            let p = catalog.get(name).ok_or_else(|| {
+                anyhow!("unknown profile '@{name}' (flywheel profile list)")
+            })?;
+            Ok(registry.resolve_profile_route(&p.harness, &p.model)?.0)
+        }
+        (Some(k), _) if !k.is_empty() => Ok(k.clone()),
+        _ => Ok(cfg.resolve_kind(&item.short)),
+    }
+}
+
 /// Model + role-model launch args for a profiled spawn (bd-eign.9): the
 /// per-harness `-m <model>` / `--model=<model>` flag (headless.rs) plus the
 /// omp role flags (`--smol`/`--slow`/`--plan`, bd-gsvn.2). Order matters —
@@ -4590,34 +4754,73 @@ fn bare_model_launch_args(harness: &str, model: &str, provider: &str) -> Result<
     ))
 }
 
+fn expand_slot_model(registry: &models::ModelRegistry, id: &str) -> Result<String> {
+    if id.is_empty() {
+        return Ok(String::new());
+    }
+    if let Some(name) = models::slot_alias(id) {
+        let slot = registry.slot(name).ok_or_else(|| {
+            anyhow!("slot '{name}' is not configured — `flywheel slot set {name} --model <id>`")
+        })?;
+        if slot.model.is_empty() {
+            anyhow::bail!("slot '{name}' has no model — `flywheel slot set {name} --model <id>`");
+        }
+        return Ok(slot.model.clone());
+    }
+    Ok(id.to_string())
+}
+
+/// Role-flag ids (`smol`/`slow`/`plan`): slot aliases that are not routable
+/// on this harness omit the flag (cheap/big-pickle is opencode-capped).
+fn resolve_role_flag(
+    registry: &models::ModelRegistry,
+    raw: &str,
+    harness: &str,
+) -> Result<String> {
+    if raw.is_empty() {
+        return Ok(String::new());
+    }
+    let from_slot = models::slot_alias(raw).is_some();
+    let id = expand_slot_model(registry, raw)?;
+    match registry.resolve_strict(&id, harness) {
+        Ok(s) => Ok(s),
+        Err(_) if from_slot => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
 pub(crate) fn profile_launch_args(
     harness: &str,
     p: &profile::Profile,
     phase: Option<&str>,
 ) -> Result<Vec<String>> {
     let registry = models::ModelRegistry::load_routing()?;
+    let (harness, slot_model) = registry.resolve_profile_route(harness, &p.model)?;
     // bd-62ke: an explicit profile provider pins the provider half of the
     // composite registry key (bd-1t3j) — it overrides the default-provider
     // fallback for a bare id, and an unknown provider pair fails loudly.
-    let lookup = if p.provider.is_empty() {
+    // Slot aliases already expanded to a concrete registry id; ignore provider.
+    let lookup = if models::slot_alias(&p.model).is_some() {
+        slot_model
+    } else if p.provider.is_empty() {
         p.model.clone()
     } else {
         format!("{}/{}", p.provider, p.model)
     };
-    let model = registry.resolve_strict(&lookup, harness)?;
+    let model = registry.resolve_strict(&lookup, &harness)?;
     let mut args = headless::model_args(
-        harness,
+        &harness,
         &model,
         (!p.effort.is_empty()).then_some(p.effort.as_str()),
     );
     args.extend(headless::role_model_args(
-        harness,
-        &registry.resolve_strict(&p.smol, harness)?,
-        &registry.resolve_strict(&p.slow, harness)?,
-        &registry.resolve_strict(&p.plan, harness)?,
+        &harness,
+        &resolve_role_flag(&registry, &p.smol, &harness)?,
+        &resolve_role_flag(&registry, &p.slow, &harness)?,
+        &resolve_role_flag(&registry, &p.plan, &harness)?,
     ));
     if let Some(phase) = phase.filter(|ph| !ph.is_empty()) {
-        let (extra, degraded) = headless::phase_launch_args(harness, phase);
+        let (extra, degraded) = headless::phase_launch_args(&harness, phase);
         if degraded {
             eprintln!(
                 "flywheel: phase {phase:?} has no native mechanic on harness {harness:?} — degrading to prompt mode"
@@ -6782,6 +6985,7 @@ projects available: {}",
     // bd-eign.13: merge an optional profile-driven plan (harness kind +
     // count) with the recipe/count/kind plan for mixed crews.
     let catalog = profile::ProfileCatalog::load()?;
+    let model_reg = models::ModelRegistry::load_routing()?;
     let profile_plan = match opts.profile_name.as_deref() {
         Some(p) => {
             let profile = catalog
@@ -6957,10 +7161,7 @@ projects available: {}",
     // BEFORE create to ride along as AGENT_NAME/FLYWHEEL_MAIL_AS. Every
     // later agent draws its pin before its own pane.split (the loop below).
     let first_pin = items.first().and_then(|item| {
-        let kind = item
-            .kind
-            .clone()
-            .unwrap_or_else(|| cfg.resolve_kind(&item.short));
+        let kind = spawn_item_kind(cfg, item, &catalog, &model_reg).ok()?;
         pinned_mail_identity(cfg, project, &agent_name_n(project, &item.short, 1), &kind)
     });
     let herdr_env = herdr_shim::herdr_integration_env(cfg, first_pin.as_deref());
@@ -7013,10 +7214,7 @@ projects available: {}",
     let integration_statuses = read_integration_statuses();
     let mut preflighted_kinds: HashSet<String> = HashSet::new();
     for item in &items {
-        let kind = item
-            .kind
-            .clone()
-            .unwrap_or_else(|| cfg.resolve_kind(&item.short));
+        let kind = spawn_item_kind(cfg, item, &catalog, &model_reg)?;
         if preflighted_kinds.insert(kind.clone()) {
             preflight_kind_integration(&mut c, &kind, &integration_statuses);
         }
@@ -21311,9 +21509,16 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 skills: base.skills,
                 provider: base.provider,
                 fallback: base.fallback,
+                when: base.when,
+                model_fallback: base.model_fallback,
             };
-            if merged.harness.is_empty() || merged.model.is_empty() {
-                bail!("profile {name} needs at least --harness and --model");
+            if merged.model.is_empty() {
+                bail!("profile {name} needs --model (id or @cheap/@standard/@premium)");
+            }
+            if merged.harness.is_empty() && models::slot_alias(&merged.model).is_none() {
+                bail!(
+                    "profile {name} needs --harness, or a slot alias (@cheap/@standard/@premium)"
+                );
             }
             // bd-2dao: persist from the RAW user file — the merged catalog
             // rebuild dropped user overrides of built-in profile names.
@@ -21422,6 +21627,75 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 std::fs::write(&path, raw)?;
             }
             println!("removed profile {name}");
+        }
+        ProfileCmd::Set {
+            name,
+            model,
+            provider,
+            slot,
+            model_fallback,
+            harness,
+            effort,
+            smol,
+            slow,
+            plan,
+            skills,
+            dry_run,
+        } => {
+            use models::slot_alias;
+            let path = config::config_dir().join("profiles.toml");
+            let cat = ProfileCatalog::load()?;
+            if cat.get(name).is_none() {
+                bail!("no profile named {name:?} (flywheel profile list)");
+            }
+            let base = cat.get(name).cloned().unwrap_or_default();
+            // --slot is an explicit alias form of --model @slot.
+            let model = match slot {
+                Some(s) => Some(format!("@{}", s.trim_start_matches('@'))),
+                None => model.clone(),
+            };
+            let merged = Profile {
+                model: model.unwrap_or(base.model),
+                provider: provider.clone().unwrap_or(base.provider),
+                model_fallback: if model_fallback.is_empty() {
+                    base.model_fallback
+                } else {
+                    model_fallback.clone()
+                },
+                harness: harness.clone().unwrap_or(base.harness),
+                effort: effort.clone().unwrap_or(base.effort),
+                smol: smol.clone().unwrap_or(base.smol),
+                slow: slow.clone().unwrap_or(base.slow),
+                plan: plan.clone().unwrap_or(base.plan),
+                skills: if skills.is_empty() {
+                    base.skills
+                } else {
+                    skills.clone()
+                },
+                ..base
+            };
+            if merged.model.is_empty() {
+                bail!("profile {name} needs --model (id or @cheap/@standard/@premium)");
+            }
+            if merged.harness.is_empty() && slot_alias(&merged.model).is_none() {
+                bail!(
+                    "profile {name} needs --harness, or a slot alias (@cheap/@standard/@premium)"
+                );
+            }
+            // bd-2dao: persist from the RAW user file, merged entry on top.
+            let mut on_disk: BTreeMap<String, profile::Profile> =
+                profile::ProfileCatalog::load_user_file(Some(&path));
+            on_disk.insert(name.clone(), merged.clone());
+            if *dry_run {
+                print_json(&serde_json::to_value(&merged)?);
+                return Ok(());
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let raw = toml::to_string_pretty(&ProfilesFile { profiles: on_disk })?;
+            std::fs::write(&path, raw)?;
+            println!("wrote {} [profiles.{name}]", path.display());
         }
     }
     Ok(())
@@ -22182,6 +22456,36 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
             println!("removed squad/recipe {name}");
             Ok(())
         }
+        SquadCmd::Create {
+            name,
+            members,
+            dry_run,
+        } => {
+            if members.is_empty() {
+                bail!("squad create {name}: pass at least one --profile <profile>=<count>");
+            }
+            let mut recipes = config::Recipes::load()?;
+            let mut recipe = config::Recipe::default();
+            let cat = ProfileCatalog::load()?;
+            for (profile, count) in members {
+                if cat.get(profile).is_none() {
+                    bail!("unknown profile @{profile} (flywheel profile list)");
+                }
+                recipe.extra.insert(profile.clone(), *count);
+            }
+            if *dry_run {
+                print_json(&json!({ "name": name, "members": recipe.extra }));
+                return Ok(());
+            }
+            recipes.recipes.insert(name.clone(), recipe);
+            let path = config::config_dir().join("recipes.toml");
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, toml::to_string_pretty(&recipes)?)?;
+            println!("wrote squad {name} → {}", path.display());
+            Ok(())
+        }
     }
 }
 
@@ -22596,6 +22900,7 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
             caps,
             fallback,
             effort,
+            tier,
         } => {
             if id.trim().is_empty() {
                 bail!("model id cannot be empty");
@@ -22619,6 +22924,13 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                 bail!("--provider is required (registry keys are provider/model)");
             }
             let key = format!("{provider}/{id}");
+            let tier_val = match tier.as_deref().map(str::trim) {
+                Some("cheap") => Some(models::Tier::Cheap),
+                Some("standard") => Some(models::Tier::Standard),
+                Some("premium") => Some(models::Tier::Premium),
+                Some(other) => bail!("unknown tier {other:?} (cheap | standard | premium)"),
+                None => None,
+            };
             reg.models.insert(
                 key.clone(),
                 models::ModelEntry {
@@ -22627,19 +22939,287 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                     caps: caps_list,
                     fallback: fallback.clone(),
                     effort: effort.clone(),
+                    tier: tier_val,
                 },
             );
             reg.save()?;
             println!("registered model {key}");
             Ok(())
         }
-        ModelCmd::Remove { id } => {
+        ModelCmd::Remove {
+            ids,
+            resolve,
+            shadow: _,
+            force,
+            no_input,
+        } => {
+            let mut picked_ids: Vec<String> = ids.clone();
+            if picked_ids.is_empty() {
+                if *no_input || !std::io::stdin().is_terminal() {
+                    bail!("model remove: pass at least one id (flywheel model list)");
+                }
+                // TTY + no ids → dialoguer MultiSelect over USER models only
+                // (compiled-in ids are never deletable — D4).
+                let user = models::ModelRegistry::load()?;
+                if user.models.is_empty() {
+                    bail!("no user models to remove (compiled-in ids are not deletable)");
+                }
+                let keys: Vec<&String> = user.models.keys().collect();
+                let picked = dialoguer::MultiSelect::new()
+                    .with_prompt("models to remove (Space=select, Enter=confirm)")
+                    .items(&keys)
+                    .interact()?;
+                picked_ids.extend(picked.into_iter().map(|i| keys[i].clone()));
+            }
+            if picked_ids.is_empty() {
+                bail!("model remove: nothing selected");
+            }
             let mut reg = models::ModelRegistry::load()?;
-            if reg.models.remove(id).is_none() {
-                bail!("no model named {id:?} (flywheel model list)");
+            let compiled = models::compiled_in_models();
+            let mut removed: Vec<String> = Vec::new();
+            let mut skipped: Vec<String> = Vec::new();
+            for raw in &picked_ids {
+                // Bare id → composite via the routing layer's default-provider
+                // resolution; provider/model keys pass through verbatim.
+                let key = if raw.contains('/') || !*resolve {
+                    raw.clone()
+                } else {
+                    let routing = models::ModelRegistry::load_routing()?;
+                    let p = routing.provider_of(&raw);
+                    if p.is_empty() {
+                        raw.clone()
+                    } else {
+                        format!("{p}/{raw}")
+                    }
+                };
+                if compiled.contains_key(&key) && reg.models.get(&key).is_none() {
+                    skipped.push(key);
+                    continue;
+                }
+                if reg.models.remove(&key).is_some() {
+                    removed.push(key);
+                } else {
+                    skipped.push(key);
+                }
+            }
+            if removed.is_empty() {
+                bail!(
+                    "no deletable models among {skipped:?} — compiled-in ids are never removed"
+                );
+            }
+            if !*force && std::io::stdin().is_terminal() {
+                let ok = dialoguer::Confirm::new()
+                    .with_prompt(format!("remove {} model(s)?", removed.len()))
+                    .default(false)
+                    .interact()?;
+                if !ok {
+                    bail!("model remove: aborted");
+                }
             }
             reg.save()?;
-            println!("removed model {id}");
+            for k in &removed {
+                println!("removed model {k}");
+            }
+            for k in &skipped {
+                eprintln!("skipped {k} (not in the user file; compiled-ins are permanent)");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `flywheel catalog --json` — one agent-discoverable snapshot over all four
+/// catalog nouns (ADR-0007 D4).
+fn catalog_snapshot_json() -> Result<()> {
+    let reg = models::ModelRegistry::load_routing()?;
+    let cat = profile::ProfileCatalog::load()?;
+    let squads = profile::compiled_in_squads();
+    print_json(&json!({
+        "slots": reg.slots,
+        "models": reg.models.iter().map(|(id, e)| {
+            json!({
+                "id": id,
+                "tier": e.tier.map(|t| t.as_str()),
+                "caps": e.caps,
+                "fallback": e.fallback,
+                "effort": e.effort,
+                "cost_in_per_mtok": e.cost_in_per_mtok,
+                "cost_out_per_mtok": e.cost_out_per_mtok,
+            })
+        }).collect::<Vec<_>>(),
+        "profiles": cat.names().into_iter().filter_map(|name| {
+            let p = cat.get(&name)?;
+            Some(json!({
+                "name": name,
+                "harness": p.harness,
+                "model": p.model,
+                "effort": p.effort,
+                "role": p.role,
+                "when": p.when,
+                "builtin": is_builtin_profile(&name),
+            }))
+        }).collect::<Vec<_>>(),
+        "squads": squads.iter().map(|(name, s)| json!({
+            "name": name,
+            "members": s.counts,
+        })).collect::<Vec<_>>(),
+    }));
+    Ok(())
+}
+
+/// `flywheel slot` — the three routing slots (ADR-0007 D1/D4).
+fn cmd_slot(cmd: &SlotCmd) -> Result<()> {
+    match cmd {
+        SlotCmd::List { json } => {
+            let reg = models::ModelRegistry::load_routing()?;
+            let user = models::ModelRegistry::load()?;
+            let rows: Vec<Value> = reg
+                .slots
+                .iter()
+                .map(|(name, s)| {
+                    json!({
+                        "name": name,
+                        "harness": s.harness,
+                        "model": s.model,
+                        "fallback_harness": s.fallback_harness,
+                        "model_fallback": s.model_fallback,
+                        "source": if user.slots.contains_key(name) { "user" } else { "compiled-in" },
+                    })
+                })
+                .collect();
+            if *json {
+                print_json(&json!({ "slots": rows }));
+            } else if rows.is_empty() {
+                println!("no slots configured (flywheel slot set <name> --harness <h> --model <id>)");
+            } else {
+                for r in &rows {
+                    println!(
+                        "{name:10} {harness:10} {model:36} fb_harness={fbh} source={src}",
+                        name = r["name"].as_str().unwrap_or(""),
+                        harness = r["harness"].as_str().unwrap_or(""),
+                        model = r["model"].as_str().unwrap_or(""),
+                        fbh = r["fallback_harness"].as_str().unwrap_or("-"),
+                        src = r["source"].as_str().unwrap_or(""),
+                    );
+                }
+            }
+            Ok(())
+        }
+        SlotCmd::Show { name, json } => {
+            let reg = models::ModelRegistry::load_routing()?;
+            match reg.slot(name) {
+                Some(s) => {
+                    let canonical = models::slot_alias(name)
+                        .or(match name.as_str() {
+                            "free" | "smol" => Some(models::SLOT_CHEAP),
+                            "standard" => Some(models::SLOT_STANDARD),
+                            "slow" | "plan" | "default" => Some(models::SLOT_PREMIUM),
+                            _ => None,
+                        })
+                        .unwrap_or(name.as_str());
+                    let spec = json!({
+                        "name": canonical,
+                        "harness": s.harness,
+                        "model": s.model,
+                        "fallback_harness": s.fallback_harness,
+                        "model_fallback": s.model_fallback,
+                    });
+                    if *json {
+                        print_json(&spec);
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&spec)?);
+                    }
+                    Ok(())
+                }
+                None => bail!(
+                    "unknown slot {name:?} (cheap | standard | premium — aliases: free/smol, default, slow/plan)"
+                ),
+            }
+        }
+        SlotCmd::Set {
+            name,
+            harness,
+            model,
+            fallback_harness,
+            model_fallback,
+            dry_run,
+        } => {
+            let canonical = match name.as_str() {
+                models::SLOT_CHEAP | "free" | "smol" => models::SLOT_CHEAP,
+                models::SLOT_STANDARD | "default" => models::SLOT_STANDARD,
+                models::SLOT_PREMIUM | "slow" | "plan" => models::SLOT_PREMIUM,
+                other => bail!(
+                    "unknown slot {other:?} — slot names are cheap | standard | premium \
+                     (aliases resolve on read; never write one). 'default' is a SQUAD name."
+                ),
+            };
+            // Start from the ROUTING layer (compiled-in + user) so a partial
+            // `slot set` keeps the other fields, then write the WHOLE spec as
+            // the user overlay (D1: per-name whole-Spec).
+            let routing = models::ModelRegistry::load_routing()?;
+            let mut spec = routing.slot(canonical).cloned().unwrap_or_default();
+            if let Some(h) = harness {
+                spec.harness = h.clone();
+            }
+            if let Some(m) = model {
+                if m.starts_with('@') {
+                    bail!("slot model must be a concrete id — slots cannot alias other slots");
+                }
+                spec.model = m.clone();
+            }
+            if let Some(fh) = fallback_harness {
+                spec.fallback_harness = (!fh.is_empty()).then(|| fh.clone());
+            }
+            if !model_fallback.is_empty() {
+                spec.model_fallback = model_fallback.clone();
+            }
+            if spec.harness.is_empty() || spec.model.is_empty() {
+                bail!(
+                    "slot {canonical} needs both --harness and --model (currently: harness={:?} model={:?})",
+                    spec.harness,
+                    spec.model
+                );
+            }
+            let mut user = models::ModelRegistry::load()?;
+            user.slots.insert(canonical.to_string(), spec.clone());
+            if *dry_run {
+                print_json(&json!({
+                    "name": canonical,
+                    "spec": serde_json::to_value(&spec)?,
+                    "note": "dry-run — nothing written",
+                }));
+                return Ok(());
+            }
+            user.save()?;
+            println!(
+                "wrote [slots.{canonical}] harness={} model={}",
+                spec.harness, spec.model
+            );
+            Ok(())
+        }
+        SlotCmd::Remove { name, force } => {
+            let canonical = match name.as_str() {
+                models::SLOT_CHEAP | "free" | "smol" => models::SLOT_CHEAP,
+                models::SLOT_STANDARD | "default" => models::SLOT_STANDARD,
+                models::SLOT_PREMIUM | "slow" | "plan" => models::SLOT_PREMIUM,
+                other => bail!("unknown slot {other:?}"),
+            };
+            let mut user = models::ModelRegistry::load()?;
+            if user.slots.remove(canonical).is_none() {
+                println!("no user overlay for slot {canonical} (compiled-in default active)");
+                return Ok(());
+            }
+            if !*force && std::io::stdin().is_terminal() {
+                let ok = dialoguer::Confirm::new()
+                    .with_prompt(format!("remove the user overlay for slot {canonical}?"))
+                    .default(false)
+                    .interact()?;
+                if !ok {
+                    bail!("slot remove: aborted");
+                }
+            }
+            user.save()?;
+            println!("removed user overlay for slot {canonical} (compiled-in default restored)");
             Ok(())
         }
     }
@@ -26545,14 +27125,16 @@ fn cmd_internal_run_headless(
     let profile = catalog
         .get(profile_name)
         .ok_or_else(|| anyhow!("unknown profile @{profile_name} (flywheel profile list)"))?;
-    if profile.harness.is_empty() && harness_override.is_none() {
+    let registry = models::ModelRegistry::load_routing()?;
+    let inherited = registry.resolve_profile_route(&profile.harness, &profile.model)?;
+    if inherited.0.is_empty() && harness_override.is_none() {
         bail!("profile @{profile_name} has no harness — cannot run headless");
     }
     // bd-42fs step 5: a per-step harness override (spec.harness) wins over
     // the profile's default harness — for THIS step only.
     let harness = harness_override
         .filter(|h| !h.is_empty())
-        .unwrap_or(profile.harness.as_str());
+        .unwrap_or(inherited.0.as_str());
     if !matches!(harness, "pi" | "omp" | "opencode" | "grok") {
         bail!("unsupported harness for headless run: {harness} (pi | omp | opencode | grok)");
     }
@@ -26561,11 +27143,10 @@ fn cmd_internal_run_headless(
     // STRICT split: a PROFILE-sourced id must be a registry entry (nothing
     // bypasses the registry); an EXPLICIT --model override is an ad-hoc
     // operator string and keeps the lenient warn + passthrough.
-    let model_id = model_override
-        .or_else(|| (!profile.model.is_empty()).then_some(profile.model.as_str()))
-        .unwrap_or("")
-        .to_string();
-    let registry = models::ModelRegistry::load_routing()?;
+    let model_id = match model_override {
+        Some(over) => over.to_string(),
+        None => inherited.1.clone(),
+    };
     let model = if model_id.is_empty() {
         String::new()
     } else if model_override.is_some() {
@@ -26582,10 +27163,11 @@ fn cmd_internal_run_headless(
     // bd-gsvn.2: the omp role models (--smol/--slow/--plan) resolve through
     // the registry the same way as `model` (provider/id form for omp) —
     // profile-sourced, so STRICT: an unknown role id fails the run naming
-    // the fix (no silent verbatim passthrough).
-    let role_smol = registry.resolve_strict(&profile.smol, harness)?;
-    let role_slow = registry.resolve_strict(&profile.slow, harness)?;
-    let role_plan = registry.resolve_strict(&profile.plan, harness)?;
+    // the fix (no silent verbatim passthrough). Slot aliases that are not
+    // routable on this harness omit the flag (ADR-0007).
+    let role_smol = resolve_role_flag(&registry, &profile.smol, harness)?;
+    let role_slow = resolve_role_flag(&registry, &profile.slow, harness)?;
+    let role_plan = resolve_role_flag(&registry, &profile.plan, harness)?;
 
     // bd-42fs retry-on-429: a rate-limited run (HTTP 429 in the harness
     // error stream or stderr) retries ONCE with the model's registry
@@ -29854,6 +30436,7 @@ mod headless_retry_tests {
                 caps: vec![],
                 fallback: Some("grok/grok-4.5".into()),
                 effort: Some("max".into()),
+                tier: None,
             },
         );
         reg.models.insert(
@@ -29864,6 +30447,7 @@ mod headless_retry_tests {
                 caps: vec![],
                 fallback: None,
                 effort: Some("max".into()),
+                tier: None,
             },
         );
         let fb = reg
@@ -30385,8 +30969,8 @@ mod profile_cli_tests {
     #[test]
     fn is_builtin_profile_tracks_compiled_in_defaults() {
         assert!(
-            is_builtin_profile("pa"),
-            "pa is a compiled-in profile — must classify as builtin"
+            !is_builtin_profile("pa"),
+            "pa is a harness recipe, not a compiled-in profile (ADR-0007 D2)"
         );
         for name in profile::compiled_in_defaults().keys() {
             assert!(
@@ -30397,9 +30981,9 @@ mod profile_cli_tests {
     }
 
     #[test]
-    fn profile_catalog_lists_seven_builtins() {
+    fn profile_catalog_lists_six_builtins() {
         let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
-        assert_eq!(cat.names().len(), 7);
+        assert_eq!(cat.names().len(), 6, "6 job profiles (ADR-0007 D2)");
         for name in [
             "oracle",
             "planner",
@@ -30458,8 +31042,8 @@ mod profile_cli_tests {
         let r = cat
             .resolve("housekeeper", None, "npub-op", &|_, _| None)
             .expect("resolve");
-        assert_eq!(r.spec.harness, "omp");
-        assert_eq!(r.spec.model, "deepseek-v4-flash");
+        assert_eq!(r.spec.harness, "pi");
+        assert_eq!(r.spec.model, "opencode-go/deepseek-v4-flash");
         assert_eq!(r.spec.backend, "herdr");
         assert_eq!(
             r.signing,
@@ -30496,7 +31080,7 @@ mod profile_cli_tests {
                 "no user recipe named {name} in a fresh install"
             );
         }
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 6, "6 job profiles (ADR-0007 D2)");
     }
 
     #[test]
@@ -31303,6 +31887,7 @@ mod kind_classify_headless_tests {
                 caps: vec![],
                 fallback: Some("headless/fallback".to_string()),
                 effort: None,
+                tier: None,
             },
         );
         registry.models.insert(
@@ -31313,6 +31898,7 @@ mod kind_classify_headless_tests {
                 caps: vec![],
                 fallback: None,
                 effort: None,
+                tier: None,
             },
         );
         let fb = registry

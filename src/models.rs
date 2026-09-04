@@ -1,17 +1,18 @@
-//! Model registry (ADR-0010 Spec D, P10.2): `~/.config/flywheel/models.toml`
-//! with `[models.ID]` entries (provider, per-mtok cost, caps, fallback).
+//! Model registry (ADR-0010 Spec D, P10.2 + ADR-0007): `~/.config/flywheel/models.toml`
+//! with `[models.ID]` entries (provider, per-mtok cost, caps, fallback, tier)
+//! and `[slots.<cheap|standard|premium>]` (harness + model + fallbacks).
 //! Profile.model strings resolve against the registry so the per-harness
 //! injection is REAL: the registry knows how each harness wants its model
 //! flag (`omp --model=ID`, `opencode -m provider/ID`, `pi --model pattern`,
-//! `grok -m ID`).
+//! `grok -m ID`). Slot aliases (`@cheap`) inherit the slot's harness+model.
 //!
 //! Resolution is never a blocker: an unknown model id warns and passes
-//! through untouched.
+//! through untouched. Profile-sourced ids use `resolve_strict`.
 //!
 //! Functional core / imperative shell: parsing + resolution are pure
 //! (unit-tested); the `models.toml` read/write is the thin IO shell.
 //!
-//! governed-by: ADR-0010 (Spec D)
+//! governed-by: ADR-0010 (Spec D), ADR-0007
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -72,6 +73,57 @@ fn validate_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Cost / purpose band (ADR-0007). Discovery + recommendation, not auto-dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    Cheap,
+    Standard,
+    Premium,
+}
+
+impl Tier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cheap => "cheap",
+            Self::Standard => "standard",
+            Self::Premium => "premium",
+        }
+    }
+}
+
+/// One routing slot: default harness + model for a cost band (ADR-0007 D1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotSpec {
+    #[serde(default)]
+    pub harness: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_fallback: Vec<String>,
+}
+
+/// Canonical slot names. `default` is a *squad* name, never a slot.
+pub const SLOT_CHEAP: &str = "cheap";
+pub const SLOT_STANDARD: &str = "standard";
+pub const SLOT_PREMIUM: &str = "premium";
+
+/// Map `@cheap` / `free` / `smol` / … onto a canonical slot name.
+/// Requires the `@` prefix on profile.model so a model id `cheap` is not stolen.
+pub fn slot_alias(model: &str) -> Option<&'static str> {
+    let rest = model.strip_prefix('@')?;
+    match rest {
+        "cheap" | "free" | "smol" => Some(SLOT_CHEAP),
+        "standard" => Some(SLOT_STANDARD),
+        "premium" | "slow" | "plan" => Some(SLOT_PREMIUM),
+        // omp `default` role → standard slot. Not the `default` squad.
+        "default" => Some(SLOT_STANDARD),
+        _ => None,
+    }
+}
+
 /// One registry entry (`[models."provider/id"]`). The provider prefix is
 /// part of the KEY, not a field (bd-1j3t composite keying).
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -95,6 +147,9 @@ pub struct ModelEntry {
     /// absent = harness default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Cost/purpose band (ADR-0007). Absent = unclassified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<Tier>,
 }
 
 impl ModelEntry {
@@ -115,12 +170,15 @@ impl ModelEntry {
 pub struct ModelsFile {
     #[serde(default)]
     pub models: BTreeMap<String, ModelEntry>,
+    #[serde(default)]
+    pub slots: BTreeMap<String, SlotSpec>,
 }
 
 /// The registry: parsed `models.toml` entries keyed by `provider/model`.
 #[derive(Debug, Default)]
 pub struct ModelRegistry {
     pub models: BTreeMap<String, ModelEntry>,
+    pub slots: BTreeMap<String, SlotSpec>,
     /// Keys sourced from the USER file in [`ModelRegistry::load_routing`]
     /// (vs compiled-in defaults). The bare-id default-provider fallback
     /// prefers these, so a user override wins even when its provider name
@@ -141,6 +199,7 @@ impl ModelRegistry {
     /// a legacy bare id fails LOUDLY naming the rewrite (bd-1t3j).
     pub fn load_from(path: Option<&Path>) -> Result<Self> {
         let mut models = BTreeMap::new();
+        let mut slots = BTreeMap::new();
         if let Some(path) = path
             && path.exists()
         {
@@ -152,9 +211,11 @@ impl ModelRegistry {
                 validate_key(key).with_context(|| format!("parse {}", path.display()))?;
             }
             models = file.models;
+            slots = file.slots;
         }
         Ok(Self {
             models,
+            slots,
             user_keys: Default::default(),
         })
     }
@@ -166,6 +227,7 @@ impl ModelRegistry {
     pub fn load_routing() -> Result<Self> {
         let path = crate::config::config_dir().join("models.toml");
         let mut models = compiled_in_models();
+        let mut slots = compiled_in_slots();
         // A missing file is fine (zero-config); a PRESENT but unparseable
         // file is a loud error — silently skipping it would quietly drop
         // the user's routing entries (a bypass).
@@ -174,7 +236,14 @@ impl ModelRegistry {
         if !user.models.is_empty() {
             models.extend(user.models);
         }
-        Ok(Self { models, user_keys })
+        for (name, spec) in user.slots {
+            slots.insert(name, spec);
+        }
+        Ok(Self {
+            models,
+            slots,
+            user_keys,
+        })
     }
 
     /// Resolve a lookup id to its registry KEY. A full `provider/model`
@@ -269,6 +338,68 @@ impl ModelRegistry {
                  (profile models route ONLY through the registry)"
             ),
         }
+    }
+
+    /// Canonical slot spec after alias normalization (`@cheap` / `free` / …).
+    pub fn slot(&self, name: &str) -> Option<&SlotSpec> {
+        let key = slot_alias(name).or_else(|| {
+            // slot set / [slots.cheap] use the bare name, not `@cheap`.
+            match name {
+                SLOT_CHEAP | "free" | "smol" => Some(SLOT_CHEAP),
+                SLOT_STANDARD => Some(SLOT_STANDARD),
+                SLOT_PREMIUM | "slow" | "plan" => Some(SLOT_PREMIUM),
+                "default" => Some(SLOT_STANDARD),
+                _ => None,
+            }
+        })?;
+        self.slots.get(key)
+    }
+
+    /// Inherit harness + model from a slot when `model` is `@cheap` etc.
+    /// Concrete model + empty harness is an error (must pin a harness or a slot).
+    pub fn resolve_profile_route(&self, harness: &str, model: &str) -> Result<(String, String)> {
+        if let Some(name) = slot_alias(model) {
+            let slot = self.slots.get(name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "slot '{name}' is not configured — `flywheel slot set {name} --harness <h> --model <id>`"
+                )
+            })?;
+            if slot.model.is_empty() {
+                anyhow::bail!(
+                    "slot '{name}' has no model — `flywheel slot set {name} --model <id>`"
+                );
+            }
+            let h = if harness.is_empty() {
+                if slot.harness.is_empty() {
+                    anyhow::bail!(
+                        "slot '{name}' has no harness — `flywheel slot set {name} --harness <h>`"
+                    );
+                }
+                slot.harness.clone()
+            } else {
+                harness.to_string()
+            };
+            return Ok((h, slot.model.clone()));
+        }
+        if harness.is_empty() {
+            anyhow::bail!(
+                "profile has no harness and model {model:?} is not a slot alias \
+                 (@cheap/@standard/@premium)"
+            );
+        }
+        Ok((harness.to_string(), model.to_string()))
+    }
+
+    /// Implicit kind→slot: a bare-harness spawn with no profile uses this
+    /// slot's model (ADR-0007 D1). Unknown kind → None.
+    pub fn implied_slot_for_harness(&self, kind: &str) -> Option<&SlotSpec> {
+        let name = match kind {
+            "opencode" | "oc" => SLOT_CHEAP,
+            "pi" => SLOT_STANDARD,
+            "grok" | "gk" => SLOT_PREMIUM,
+            _ => return None,
+        };
+        self.slots.get(name)
     }
 
     /// Save the full file to `~/.config/flywheel/models.toml` (the `add`/
@@ -366,6 +497,7 @@ impl ModelRegistry {
         }
         let raw = toml::to_string_pretty(&ModelsFile {
             models: self.models.clone(),
+            slots: self.slots.clone(),
         })?;
         std::fs::write(path, raw).with_context(|| format!("write {}", path.display()))?;
         Ok(())
@@ -385,24 +517,65 @@ pub fn compiled_in_models() -> BTreeMap<String, ModelEntry> {
     let mut m = BTreeMap::new();
     m.insert(
         "opencode-go/deepseek-v4-flash".to_string(),
-        ModelEntry::default(),
+        ModelEntry {
+            tier: Some(Tier::Standard),
+            ..ModelEntry::default()
+        },
     );
     m.insert(
         "opencode/big-pickle".to_string(),
         ModelEntry {
             caps: vec!["opencode".into()],
+            tier: Some(Tier::Cheap),
             ..ModelEntry::default()
         },
     );
-    m.insert("zai/glm-5.2".to_string(), ModelEntry::default());
-    // H2 (bd-harness-jcode): coder's default model on the jcode harness.
-    // `opencode-go` is a native jcode provider (`-p opencode-go`), so the
-    // composite key routes through resolve_strict for harness `jcode`
-    // (empty caps = routable everywhere) and `model_args` splits it into
-    // `-p opencode-go -m muse-spark-1.2-contributor`.
+    m.insert(
+        "zai/glm-5.2".to_string(),
+        ModelEntry {
+            tier: Some(Tier::Premium),
+            ..ModelEntry::default()
+        },
+    );
+    // Kept in the registry for explicit `--harness jcode` (bare harness).
+    // Coder no longer defaults here (ADR-0007 D2: coder inherits @standard/pi).
     m.insert(
         "opencode-go/muse-spark-1.2-contributor".to_string(),
-        ModelEntry::default(),
+        ModelEntry {
+            tier: Some(Tier::Standard),
+            ..ModelEntry::default()
+        },
+    );
+    m
+}
+
+/// Compiled-in routing slots (ADR-0007 D1). Layered under user `[slots.*]`.
+pub fn compiled_in_slots() -> BTreeMap<String, SlotSpec> {
+    let mut m = BTreeMap::new();
+    m.insert(
+        SLOT_CHEAP.to_string(),
+        SlotSpec {
+            harness: "opencode".into(),
+            model: "opencode/big-pickle".into(),
+            ..SlotSpec::default()
+        },
+    );
+    m.insert(
+        SLOT_STANDARD.to_string(),
+        SlotSpec {
+            harness: "pi".into(),
+            model: "opencode-go/deepseek-v4-flash".into(),
+            ..SlotSpec::default()
+        },
+    );
+    m.insert(
+        SLOT_PREMIUM.to_string(),
+        SlotSpec {
+            harness: "omp".into(),
+            model: "zai/glm-5.2".into(),
+            fallback_harness: Some("grok".into()),
+            ..SlotSpec::default()
+        },
     );
     m
 }
@@ -429,6 +602,7 @@ mod tests {
             caps: vec![],
             fallback: None,
             effort: None,
+            tier: None,
         }
     }
 
@@ -485,6 +659,7 @@ mod tests {
             caps: vec![],
             fallback: Some("grok/grok-4.5".into()),
             effort: Some("high".into()),
+            tier: None,
         };
         assert_eq!(e.effort.as_deref(), Some("high"));
         assert_eq!(e.fallback.as_deref(), Some("grok/grok-4.5"));
@@ -532,6 +707,7 @@ mod tests {
                 caps: vec!["opencode".into()],
                 fallback: Some("anthropic/claude-opus-4".into()),
                 effort: None,
+                tier: None,
             },
         );
         reg.models.insert(
@@ -542,6 +718,7 @@ mod tests {
                 caps: vec![],
                 fallback: None,
                 effort: None,
+                tier: None,
             },
         );
         assert_eq!(
@@ -569,6 +746,7 @@ mod tests {
                 caps: vec!["omp".into()],
                 fallback: None,
                 effort: None,
+                tier: None,
             },
         );
         assert_eq!(
@@ -617,6 +795,7 @@ mod tests {
                 .iter()
                 .map(|k| ((*k).to_string(), ModelEntry::default()))
                 .collect(),
+            slots: Default::default(),
             user_keys: Default::default(),
         }
     }
@@ -1012,5 +1191,138 @@ mod tests {
             format!("{err:#}").contains("must be provider/model"),
             "routing layer is loud too: {err:#}"
         );
+    }
+
+    // ---- ADR-0007: slots + tiers
+
+    #[test]
+    fn slot_alias_requires_at_and_maps_omp_names() {
+        assert_eq!(slot_alias("@cheap"), Some(SLOT_CHEAP));
+        assert_eq!(slot_alias("@free"), Some(SLOT_CHEAP));
+        assert_eq!(slot_alias("@smol"), Some(SLOT_CHEAP));
+        assert_eq!(slot_alias("@standard"), Some(SLOT_STANDARD));
+        assert_eq!(slot_alias("@default"), Some(SLOT_STANDARD));
+        assert_eq!(slot_alias("@premium"), Some(SLOT_PREMIUM));
+        assert_eq!(slot_alias("@slow"), Some(SLOT_PREMIUM));
+        assert_eq!(slot_alias("@plan"), Some(SLOT_PREMIUM));
+        assert_eq!(slot_alias("cheap"), None, "bare name is not a profile.model alias");
+        assert_eq!(slot_alias("opencode/big-pickle"), None);
+    }
+
+    #[test]
+    fn compiled_in_slots_and_tiers_on_zero_config() {
+        let _g = with_config_dir();
+        let reg = ModelRegistry::load_routing().expect("routing");
+        let cheap = reg.slot("cheap").expect("cheap");
+        assert_eq!(cheap.harness, "opencode");
+        assert_eq!(cheap.model, "opencode/big-pickle");
+        let standard = reg.slot("@standard").expect("standard via alias");
+        assert_eq!(standard.harness, "pi");
+        assert_eq!(standard.model, "opencode-go/deepseek-v4-flash");
+        let premium = reg.slot("premium").expect("premium");
+        assert_eq!(premium.harness, "omp");
+        assert_eq!(premium.fallback_harness.as_deref(), Some("grok"));
+        assert_eq!(
+            reg.get("opencode/big-pickle").and_then(|e| e.tier),
+            Some(Tier::Cheap)
+        );
+        assert_eq!(
+            reg.get("opencode-go/deepseek-v4-flash")
+                .and_then(|e| e.tier),
+            Some(Tier::Standard)
+        );
+        assert_eq!(
+            reg.get("zai/glm-5.2").and_then(|e| e.tier),
+            Some(Tier::Premium)
+        );
+    }
+
+    #[test]
+    fn resolve_profile_route_inherits_slot_harness() {
+        let _g = with_config_dir();
+        let reg = ModelRegistry::load_routing().expect("routing");
+        let (h, m) = reg
+            .resolve_profile_route("", "@cheap")
+            .expect("cheap inherit");
+        assert_eq!(h, "opencode");
+        assert_eq!(m, "opencode/big-pickle");
+        let (h, m) = reg
+            .resolve_profile_route("", "@standard")
+            .expect("standard inherit");
+        assert_eq!(h, "pi");
+        assert_eq!(m, "opencode-go/deepseek-v4-flash");
+        let (h, m) = reg
+            .resolve_profile_route("jcode", "@standard")
+            .expect("explicit harness wins");
+        assert_eq!(h, "jcode");
+        assert_eq!(m, "opencode-go/deepseek-v4-flash");
+    }
+
+    #[test]
+    fn user_slot_overlay_wins_and_save_does_not_bake_compiled_ins() {
+        let _g = with_config_dir();
+        let path = crate::config::config_dir().join("models.toml");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
+        fs::write(
+            &path,
+            r#"
+[slots.cheap]
+harness = "opencode"
+model = "opencode/big-pickle"
+"#,
+        )
+        .expect("write overlay");
+        let routing = ModelRegistry::load_routing().expect("routing");
+        assert_eq!(
+            routing.slot("cheap").map(|s| s.model.as_str()),
+            Some("opencode/big-pickle")
+        );
+        assert!(
+            routing.slot("standard").is_some(),
+            "compiled-in standard survives a cheap-only overlay"
+        );
+        let user = ModelRegistry::load().expect("user file");
+        assert!(
+            !user.slots.contains_key(SLOT_STANDARD),
+            "user file must not contain baked compiled-in slots"
+        );
+        assert_eq!(user.slots.len(), 1);
+        user.save().expect("save user-only");
+        let raw = fs::read_to_string(&path).expect("reread");
+        assert!(
+            !raw.contains("[slots.standard]"),
+            "save must not bake compiled-in standard: {raw}"
+        );
+    }
+
+    #[test]
+    fn implied_slot_for_bare_harness() {
+        let _g = with_config_dir();
+        let reg = ModelRegistry::load_routing().expect("routing");
+        assert_eq!(
+            reg.implied_slot_for_harness("opencode")
+                .map(|s| s.model.as_str()),
+            Some("opencode/big-pickle")
+        );
+        assert_eq!(
+            reg.implied_slot_for_harness("pi").map(|s| s.harness.as_str()),
+            Some("pi")
+        );
+        assert_eq!(
+            reg.implied_slot_for_harness("grok")
+                .and_then(|s| s.fallback_harness.as_deref()),
+            Some("grok"),
+            "grok implies premium, whose fallback_harness is grok"
+        );
+        assert!(reg.implied_slot_for_harness("omp").is_none());
+    }
+
+    #[test]
+    fn resolve_profile_route_rejects_empty_harness_without_slot() {
+        let reg = ModelRegistry::default();
+        let err = reg
+            .resolve_profile_route("", "zai/glm-5.2")
+            .expect_err("must pin harness or slot");
+        assert!(err.to_string().contains("@cheap"));
     }
 }
