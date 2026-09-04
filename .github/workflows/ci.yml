@@ -30,6 +30,12 @@ jobs:
         with:
           repository: bangedorrunt/toron
           path: toron
+          # Both repos are private: the default GITHUB_TOKEN is scoped to
+          # THIS repo only. The operator must set CI_TORON_TOKEN (fine-
+          # grained PAT, Contents:read on bangedorrunt/toron). Until then
+          # this step fails loud — do not make it optional, unverifiable
+          # green is the failure GS-018 called out.
+          token: ${{ secrets.CI_TORON_TOKEN }}
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
