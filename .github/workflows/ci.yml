@@ -18,6 +18,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # 2-core hosted runners OOM linking the giant flywheel binary under
+  # default parallelism (GS-019: runner lost communication at 52m).
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   gates:
