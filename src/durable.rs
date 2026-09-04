@@ -7911,7 +7911,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
 pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::Result<String> {
     let url = cfg
         .resonate_url()
-        .unwrap_or_else(|| "http://localhost:8001".to_string());
+        .unwrap_or_else(|| "http://127.0.0.1:8001".to_string());
     // bd-fw-durable-worker-errors-65a: a worker polls its GROUP anycast —
     // the default group accumulates STALE pending invocations (killed runs
     // from previous days), and a fresh worker would execute every one of
@@ -8229,7 +8229,7 @@ fn loop_verdict(state: Option<&PromiseState>, process_alive: bool) -> &'static s
 pub async fn loop_status(cfg: &Config, project: &str) -> anyhow::Result<serde_json::Value> {
     let url = cfg
         .resonate_url()
-        .unwrap_or_else(|| "http://localhost:8001".to_string());
+        .unwrap_or_else(|| "http://127.0.0.1:8001".to_string());
     let resonate = Resonate::new(ResonateConfig {
         url: Some(url),
         ..Default::default()
@@ -8292,7 +8292,7 @@ fn is_loop_invocation(id: &str) -> bool {
 pub async fn loop_doctor(cfg: &Config, fix: bool) -> anyhow::Result<serde_json::Value> {
     let url = cfg
         .resonate_url()
-        .unwrap_or_else(|| "http://localhost:8001".to_string());
+        .unwrap_or_else(|| "http://127.0.0.1:8001".to_string());
     let resonate = Resonate::new(ResonateConfig {
         url: Some(url.clone()),
         ..Default::default()
