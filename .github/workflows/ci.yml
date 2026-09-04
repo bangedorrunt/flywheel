@@ -54,35 +54,58 @@ jobs:
       - name: cargo check
         working-directory: flywheel
         run: cargo check --workspace
-      - name: cargo test (bin + hermetic integration suites -- S1-S4 contracts)
+      - name: cargo test (bin shards cover -- see test-shards matrix)
         working-directory: flywheel
-        run: |
-          # GS-019: two hosted runners died ~52m into this step with no log tail.
-          # Split invocations + a 6 GiB address-space cap turn a silent OOM
-          # into a visible allocation failure; markers show how far it gets.
-          ulimit -v 6291456 || true
-          echo "=== markers ==="
-          free -g | head -2; df -h /home/runner/work | tail -1
-          echo "=== shard A: durable ==="
-          timeout 15m cargo test --bin flywheel -- durable::
-          echo "=== shard B: tick/doorbell/wait family ==="
-          timeout 15m cargo test --bin flywheel -- workspace:: doorbell:: doorbell_tick:: state:: herdr_shim:: mail_shim:: wake_identity_tests:: timeout_presence_tests:: waitcorr_doorbell_only_tests:: s_proof_tests:: renew_sweep_tests:: journal_effect_tests::
-          echo "=== shard C: engine/loop/strategy family ==="
-          timeout 15m cargo test --bin flywheel -- integration_tests:: builtin_workflows:: decide:: loop_tests:: verdict:: models:: crew:: cron:: config:: headless:: backend:: failure:: stages:: profile:: pane:: preflight:: plane_route:: coalition::
-          echo "=== shard D: remainder ==="
-          timeout 15m cargo test --bin flywheel -- --skip durable:: --skip workspace:: --skip doorbell:: --skip doorbell_tick:: --skip state:: --skip herdr_shim:: --skip mail_shim:: --skip wake_identity_tests:: --skip timeout_presence_tests:: --skip waitcorr_doorbell_only_tests:: --skip s_proof_tests:: --skip renew_sweep_tests:: --skip journal_effect_tests:: --skip integration_tests:: --skip builtin_workflows:: --skip decide:: --skip loop_tests:: --skip verdict:: --skip models:: --skip crew:: --skip cron:: --skip config:: --skip headless:: --skip backend:: --skip failure:: --skip stages:: --skip profile:: --skip pane:: --skip preflight:: --skip plane_route:: --skip coalition::
-          echo "=== markers ==="
-          free -g | head -2; df -h /home/runner/work | tail -1
-          echo "=== slice1 ==="
-          timeout 10m cargo test --test adr0027_slice1
-          echo "=== slice3 ==="
-          timeout 10m cargo test --test adr0027_slice3
-          echo "=== sc_doorbell ==="
-          timeout 10m cargo test --test sc_doorbell_adr0005
-          echo "=== ALL GREEN ==="
+        run: echo "bin suite runs in the test-shards matrix below"
       - name: cargo clippy
         working-directory: flywheel
         run: cargo clippy --all-targets -- -D warnings
       - name: cargo fmt --check
         working-directory: flywheel
         run: cargo fmt --check
+
+  test-shards:
+    name: bin suite shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [durable, tick-family, engine-family, rest, slices]
+    steps:
+      - name: Checkout flywheel
+        uses: actions/checkout@v4
+        with:
+          path: flywheel
+      - name: Checkout sibling toron (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: bangedorrunt/toron
+          path: toron
+          token: ${{ secrets.CI_TORON_TOKEN }}
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            flywheel
+            toron
+      - name: run shard
+        working-directory: flywheel
+        run: |
+          ulimit -v 6291456 || true
+          free -g | head -2; df -h /home/runner/work | tail -1
+          case "${{ matrix.shard }}" in
+            durable)
+              timeout 20m cargo test --bin flywheel -- durable:: ;;
+            tick-family)
+              timeout 20m cargo test --bin flywheel -- workspace:: doorbell:: doorbell_tick:: state:: herdr_shim:: mail_shim:: wake_identity_tests:: timeout_presence_tests:: waitcorr_doorbell_only_tests:: s_proof_tests:: renew_sweep_tests:: journal_effect_tests:: ;;
+            engine-family)
+              timeout 20m cargo test --bin flywheel -- integration_tests:: builtin_workflows:: decide:: loop_tests:: verdict:: models:: crew:: cron:: config:: headless:: backend:: failure:: stages:: profile:: pane:: preflight:: plane_route:: coalition:: ;;
+            rest)
+              timeout 20m cargo test --bin flywheel -- --skip durable:: --skip workspace:: --skip doorbell:: --skip doorbell_tick:: --skip state:: --skip herdr_shim:: --skip mail_shim:: --skip wake_identity_tests:: --skip timeout_presence_tests:: --skip waitcorr_doorbell_only_tests:: --skip s_proof_tests:: --skip renew_sweep_tests:: --skip journal_effect_tests:: --skip integration_tests:: --skip builtin_workflows:: --skip decide:: --skip loop_tests:: --skip verdict:: --skip models:: --skip crew:: --skip cron:: --skip config:: --skip headless:: --skip backend:: --skip failure:: --skip stages:: --skip profile:: --skip pane:: --skip preflight:: --skip plane_route:: --skip coalition:: ;;
+            slices)
+              timeout 10m cargo test --test adr0027_slice1
+              timeout 10m cargo test --test adr0027_slice3
+              timeout 10m cargo test --test sc_doorbell_adr0005 ;;
+          esac
+          echo "=== SHARD ${{ matrix.shard }} DONE ==="
