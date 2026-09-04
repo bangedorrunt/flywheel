@@ -250,7 +250,7 @@ impl ModelRegistry {
     /// id must hit exactly; a bare model id falls back to the DEFAULT
     /// provider for that id — a user-sourced entry if one exists, else
     /// the alphabetically-first registry key carrying it (deterministic).
-    fn key_for(&self, id: &str) -> Option<String> {
+    pub fn key_for(&self, id: &str) -> Option<String> {
         if self.models.contains_key(id) {
             return Some(id.to_string());
         }
