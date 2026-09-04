@@ -48,8 +48,9 @@ default + registry alternatives; blank keeps default, selection overrides.
    with VERIFY tail, stage ONLY reserved paths (never git add -A),
    on [doorbell] pull then act, blocked >10m mail captain, TIMEBOX 90m
    partial report. Use public mail identity. prove-it-works. Every
-   dispatch ANNOUNCES its stage/workflow (stage name, recipe, or "none:
-   raw") in the brief's first line; crews restate it in their report
+   dispatch ANNOUNCES its vehicle (stage name, compose token such as
+   wave-swarm, or "none: raw") in the brief's first line; crews restate
+   it in their report
    (status, sha, verify, deviations, stage). Coder execution dispatches
    --stage systematic-execute (p6), never raw p1; --raw is for
    nudges/wakes only. Join the steer channel at spawn (--join-channel)
