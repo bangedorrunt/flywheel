@@ -1023,6 +1023,10 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             });
         }
         Msg::RoleBound { role, pin } => {
+            // E4 open-corr inheritance is LATE BINDING: assignment receipts
+            // are keyed by corr with no pin field, so every later Prompt
+            // resolves through `roles` at dispatch time — rebinding the role
+            // re-targets all open corrs by construction. Nothing to copy.
             next.roles.insert(role.clone(), pin.clone());
         }
         Msg::Presence { pin, state } => {
