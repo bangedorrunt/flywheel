@@ -4738,12 +4738,20 @@ fn spawn_item_kind(
 /// stays profile-only: the operator named this pair explicitly, so there is
 /// no profile indirection to protect. Empty model -> no flags.
 fn bare_model_launch_args(harness: &str, model: &str, provider: &str) -> Result<Vec<String>> {
-    if model.is_empty() {
-        return Ok(vec![]);
-    }
     let registry = models::ModelRegistry::load_routing()?;
-    let lookup = if provider.is_empty() {
+    // ADR-0007 D1 (implicit): a bare kind/count spawn with NO --model uses
+    // the harness's implied slot's model (opencode→cheap, pi→standard,
+    // grok→premium). Unknown kind / unconfigured slot → no model flag.
+    let model = if model.is_empty() {
+        match registry.implied_slot_for_harness(harness) {
+            Some(slot) if !slot.model.is_empty() => slot.model.clone(),
+            _ => return Ok(vec![]),
+        }
+    } else {
         model.to_string()
+    };
+    let lookup = if provider.is_empty() {
+        model
     } else {
         format!("{provider}/{model}")
     };
@@ -5212,10 +5220,40 @@ mod spawn_profile_plan_tests {
         assert_eq!(args, vec!["--model=ghost-model"]);
         let args = bare_model_launch_args("omp", "ghost-model", "qqq").expect("pair passthrough");
         assert_eq!(args, vec!["--model=qqq/ghost-model"]);
-        // Empty model: no flags at all.
+        // Empty model: no flags at all — omp has no implied slot.
         assert!(
             bare_model_launch_args("omp", "", "")
                 .expect("empty model")
+                .is_empty()
+        );
+    }
+
+    /// ADR-0007 D1 (implicit): a bare kind/count spawn with NO --model rides
+    /// the harness's implied slot (opencode→cheap, pi→standard, grok→premium).
+    #[test]
+    fn bare_spawn_without_model_uses_implied_slot() {
+        let _g = lock_env();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let cfg_home = dir.path().join("config");
+        std::fs::create_dir_all(cfg_home.join("flywheel")).expect("config dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
+        // Zero-config: compiled-in slots carry the implied models.
+        let args = bare_model_launch_args("opencode", "", "").expect("cheap implied");
+        assert_eq!(
+            args,
+            vec!["-m", "opencode/big-pickle"],
+            "opencode spawn without --model uses the cheap slot: {args:?}"
+        );
+        let args = bare_model_launch_args("pi", "", "").expect("standard implied");
+        assert_eq!(
+            args,
+            vec!["--model", "opencode-go/deepseek-v4-flash"],
+            "pi spawn without --model uses the standard slot: {args:?}"
+        );
+        // Unknown kind: no implied slot → no flags (unchanged).
+        assert!(
+            bare_model_launch_args("omp", "", "")
+                .expect("omp has no implied slot")
                 .is_empty()
         );
     }
