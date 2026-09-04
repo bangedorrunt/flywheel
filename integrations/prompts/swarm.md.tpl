@@ -16,6 +16,10 @@ Before dispatch, CLASSIFY once if the primitive is unclear:
 `flywheel decide "<target>" --json --ready-beads N` (sequence-verifiable-units).
 /swarm-mode itself pins wave-swarm, never re-run decide after compose.
 
+`decide` returning steer on a multi-lane target is NOT an escape: run wave-swarm. Cross-repo lanes are a brief concern:
+register the pin on both projects, one repo owner per lane (tested in
+the 08-29 and 09-03 swarms).
+
 Ask operator for model routing per profile (planner/coder/reviewer/scout)
 before spawn/dispatch. Show default + registry alternatives; blank keeps
 default, explicit provider/model overrides. Use consistently.
@@ -38,16 +42,21 @@ default, explicit provider/model overrides. Use consistently.
 5. SPAWN (escape; un-waved ad-hoc lanes only): `flywheel spawn <proj>
    --profile <role> --count N --escape`; kind/count + --model/--provider
    without --escape warns. `/swarm-mode peer-aware=off` maps to spawn
-   `--no-peer-aware`. Keep wake separate from supervision.
+   `--no-peer-aware`. Keep wake separate from supervision. Escape
+   forfeits SIGNOFF + artifacts: write the trail (timeline/beads) or it
+   does not exist.
 
 6. BRIEF: lane dispatch authoritative. Peer wakes are signals, not tasks.
    Bead ids, files, pin, claim (br update in_progress), reserve (toron
    reserve acquire 4min), build slot, TDD (RED first), commit-before-close
    with VERIFY tail, stage ONLY reserved paths (never git add -A),
-   on [doorbell] pull then act, post to steer channel, blocked >10m mail
-   captain, TIMEBOX 90m partial report. Use public mail identity.
-   prove-it-works. Turn-based crews stall silently: when a claimed bead
-   shows no commits for ~2 polls, send a status+continue wake.
+   on [doorbell] pull then act, blocked >10m mail captain, TIMEBOX 90m
+   partial report. Use public mail identity. prove-it-works. Coder
+   execution dispatches --stage systematic-execute (p6), never raw p1;
+   --raw is for nudges/wakes only. Join the steer channel at spawn
+   (--join-channel) so "post to steer channel" is real. Turn-based crews
+   stall silently: when a claimed bead shows no commits for ~2 polls,
+   send a status+continue wake; third contact = finish or release.
 
 7. CONFLICT: soft -> `toron reserve request-release` -> respond
    agreed|denied|deferred -> escalate on steer channel, captain LAST.
