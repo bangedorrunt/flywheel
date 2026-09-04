@@ -324,10 +324,14 @@ fn spawn_crew_into(
         let profile = catalog
             .get(role)
             .ok_or_else(|| anyhow!("pane crew: unknown profile @{role} (flywheel profile list)"))?;
-        let harness = &profile.harness;
-        if harness.is_empty() {
-            bail!("pane crew: profile @{role} has no harness (set --harness)");
-        }
+        // ADR-0007 D1: resolve the slot ladder first — a slot-aliased profile
+        // (@cheap/@standard/@premium) inherits the slot's harness. The raw
+        // profile.harness is empty by design on those profiles.
+        let model_reg = ModelRegistry::load_routing()
+            .map_err(|e| anyhow!("pane crew: model registry: {e}"))?;
+        let (harness_resolved, _slot_model) =
+            model_reg.resolve_profile_route(&profile.harness, &profile.model)?;
+        let harness = &harness_resolved;
         for _i in 0..*count {
             let ordinal = {
                 let n = ordinals.entry(role.clone()).or_insert(0);
@@ -514,7 +518,12 @@ pub fn is_transient_dispatch_reason(reason: &str) -> bool {
 /// the override surface. Pure + unit-tested.
 pub fn harness_override_conflicts(profile_harness: &str, spec_harness: Option<&str>) -> bool {
     match spec_harness {
-        Some(h) if !h.trim().is_empty() => h != profile_harness,
+        // An EMPTY profile harness (ADR-0007 slot-inherit) never conflicts:
+        // the profile resolves its harness from the slot at spawn time, so
+        // any explicit override is simply authoritative for the step.
+        Some(h) if !h.trim().is_empty() => {
+            !profile_harness.is_empty() && h != profile_harness
+        }
         _ => false,
     }
 }
@@ -1456,6 +1465,12 @@ mod tests {
         assert!(!harness_override_conflicts("omp", None));
         assert!(!harness_override_conflicts("omp", Some("")));
         assert!(!harness_override_conflicts("opencode", Some("opencode")));
+        // ADR-0007: slot-aliased profiles carry an EMPTY harness — the
+        // override is authoritative for the step, never a conflict.
+        assert!(
+            !harness_override_conflicts("", Some("pi")),
+            "empty (slot-inherit) harness must not conflict"
+        );
     }
 
     /// P10.3: an empty crew plan refuses pane mode (fail-fast, clear error).
