@@ -23437,10 +23437,18 @@ fn briefing_context_inner(
         .keys()
         .map(|role| {
             let profile = cat_profiles.get(role);
-            let harness = profile
-                .map(|p| p.harness.clone())
-                .unwrap_or_else(|| cfg_resolve_kind_default(role));
-            let default_model = profile.map(|p| p.model.clone()).unwrap_or_default();
+            let (harness, default_model) = match profile {
+                // ADR-0007 D1: slot-aliased profiles carry an empty raw
+                // harness; the briefing menu must reflect the SLOT's
+                // harness + model, not an empty raw pair.
+                Some(p) => {
+                    let (h, m) = registry
+                        .resolve_profile_route(&p.harness, &p.model)
+                        .unwrap_or_else(|_| (p.harness.clone(), p.model.clone()));
+                    (h, m)
+                }
+                None => (cfg_resolve_kind_default(role), String::new()),
+            };
             let mut alternatives: Vec<(String, f64, Vec<String>)> = registry
                 .models
                 .iter()
