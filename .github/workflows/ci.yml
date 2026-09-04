@@ -51,8 +51,6 @@ jobs:
           # ("cargo-clippy is not installed") and the gate failed.
           toolchain: stable
           components: rustfmt, clippy
-        with:
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
