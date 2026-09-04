@@ -3039,6 +3039,24 @@ enum ModelCmd {
         #[arg(long)]
         tier: Option<String>,
     },
+    /// Set which slot a model serves as the DEFAULT for (ADR-0007 D1:
+    /// "select default model from CLI"). Writes the whole SlotSpec to the
+    /// user models.toml overlay — never bakes compiled-ins.
+    Set {
+        /// model id (provider/model or bare; bare resolves via the
+        /// default provider; must be a registered id)
+        id: String,
+        /// target slot: cheap | standard | premium (TTY without --slot
+        /// prompts; grok is closed-source — it has no slot)
+        #[arg(long)]
+        slot: Option<String>,
+        /// never prompt (non-interactive)
+        #[arg(long)]
+        no_input: bool,
+        /// show what would change without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Remove registry entries. Bare ids resolve via the default provider.
     /// Compiled-in ids are refused unless --shadow (writes a user shadow).
     /// TTY with no ids → dialoguer MultiSelect. Requires --force to delete.
@@ -3814,7 +3832,7 @@ fn main() {
             "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
             "catalog": {
                 "slots": "flywheel slot list/show/set/remove — cheap/standard/premium = harness+model; profiles alias @cheap/@standard/@premium (ADR-0007 D1)",
-                "models": "flywheel model list/show/add/remove — registry ids are provider/model with tier cheap|standard|premium; compiled-ins are permanent",
+                "models": "flywheel model list/show/add/set/remove — `set <id> --slot <s>` selects a model as a slot DEFAULT; registry ids are provider/model with tier cheap|standard|premium; compiled-ins are permanent",
                 "profiles": "flywheel profile list/show/create/edit/set/run/remove — `set` is the routing-field verb (--model/@slot/--model-fallback; model_fallback ≠ fallback)",
                 "squads": "flywheel squad list/show/spawn/create/remove — compiled-ins: default/plan/review/recon; user recipes.toml overrides per name (ADR-0007 D3)",
                 "hub": "flywheel catalog [--json] — ratatui multi-panel; refuses non-TTY/NO_COLOR/TERM=dumb naming the CLI (ADR-0007 D4)"
@@ -23030,6 +23048,75 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
             );
             reg.save()?;
             println!("registered model {key}");
+            Ok(())
+        }
+        ModelCmd::Set {
+            id,
+            slot,
+            no_input,
+            dry_run,
+        } => {
+            // Resolve the id first (bare → composite via default provider).
+            let reg = models::ModelRegistry::load_routing()?;
+            let key = reg
+                .key_for(id)
+                .ok_or_else(|| anyhow!("unknown model {id:?} — register it first: flywheel model add {id} --provider <p>"))?;
+            let entry = reg.models.get(&key).cloned();
+            let entry = entry.ok_or_else(|| anyhow!("unknown model {id:?}"))?;
+            // Grok is closed-source with its own proprietary model: it is
+            // not a slot target and a grok-caps-only model cannot serve a
+            // slot default (operator decision 2026-09-05).
+            if entry.caps.len() == 1 && entry.caps[0] == "grok" {
+                bail!("model {key} is grok-only — grok is closed-source with its own proprietary model and cannot serve as a slot default");
+            }
+            // Target slot: flag, else TTY select, else error.
+            let slot_name = match slot.as_deref().map(str::trim) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => {
+                    if *no_input || !std::io::stdin().is_terminal() {
+                        bail!("model set: pass --slot cheap|standard|premium (or run on a TTY)");
+                    }
+                    let idx = dialoguer::Select::new()
+                        .with_prompt(format!("slot for {key}"))
+                        .items(&["cheap", "standard", "premium"])
+                        .interact()?;
+                    ["cheap", "standard", "premium"][idx].to_string()
+                }
+            };
+            if !matches!(slot_name.as_str(), "cheap" | "standard" | "premium") {
+                bail!("unknown slot {slot_name:?} (cheap | standard | premium; never \"default\" — that is the compiled-in squad)");
+            }
+            let mut reg = models::ModelRegistry::load_routing()?;
+            let current = reg.slot(&slot_name).cloned().unwrap_or_default();
+            // Loud warn (not refusal — the operator may know something the
+            // registry does not): a caps whitelist that excludes the slot's
+            // harness means every spawn detours through the fallback ladder.
+            if let Some(h) = (!current.harness.is_empty()).then_some(current.harness.as_str())
+                && !entry.caps.is_empty()
+                && !entry.caps.iter().any(|c| c == h)
+            {
+                eprintln!(
+                    "flywheel: WARNING — model {key} caps={:?} excludes the {slot_name} slot's harness {h:?}; \
+                     spawns will detour through the fallback ladder (flywheel model show {key})",
+                    entry.caps
+                );
+            }
+            let next = models::SlotSpec {
+                model: key.clone(),
+                ..current.clone()
+            };
+            if *dry_run {
+                print_json(&json!({
+                    "dry_run": true,
+                    "slot": slot_name,
+                    "from": { "harness": current.harness, "model": current.model },
+                    "to": { "harness": next.harness, "model": next.model },
+                }));
+                return Ok(());
+            }
+            reg.slots.insert(slot_name.clone(), next);
+            reg.save()?;
+            println!("slot {slot_name} default model → {key}");
             Ok(())
         }
         ModelCmd::Remove {
