@@ -24,7 +24,10 @@ jobs:
     name: check / test(bin) / clippy / fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout flywheel
+        uses: actions/checkout@v4
+        with:
+          path: flywheel
       - name: Checkout sibling toron (path dependency)
         uses: actions/checkout@v4
         with:
