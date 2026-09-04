@@ -78,6 +78,17 @@ if "$BIN" profile show coder 2>/dev/null | grep -q '"model": "@standard"'; then
 else
   bad "profile show coder is not slot-routed"
 fi
+
+# 15. ADR-0007 D1 full resolve ladder exposed via profile show --json
+# (resolved route: slot-inherited harness/model; primary unless caps-blocked)
+RESOLVED_H=$("$BIN" profile show coder --json 2>/dev/null | grep -o '"harness": "pi"' | head -1)
+RESOLVED_M=$("$BIN" profile show coder --json 2>/dev/null | grep -o '"model": "opencode-go/deepseek-v4-flash"' | head -1)
+RESOLVED_R=$("$BIN" profile show coder --json 2>/dev/null | grep -o '"route": "primary"' | head -1)
+if [ -n "$RESOLVED_H" ] && [ -n "$RESOLVED_M" ] && [ -n "$RESOLVED_R" ]; then
+  ok "profile show --json exposes the D1 resolved route (pi + deepseek-v4-flash, primary)"
+else
+  bad "profile show --json missing or wrong resolved route"
+fi
 refusal="$(NO_COLOR=1 "$BIN" catalog 2>&1 || true)"
 if echo "$refusal" | grep -q "slot list"; then
   ok "NO_COLOR catalog refuses the TUI and names the CLI"

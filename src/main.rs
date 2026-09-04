@@ -2308,6 +2308,10 @@ enum ProfileCmd {
     Show {
         /// profile name (e.g. housekeeper, or a local [profiles.foo])
         name: String,
+        /// machine output with the ADR-0007 D1 resolved route
+        /// (harness/model after slot-inherit + fallback ladder)
+        #[arg(long)]
+        json: bool,
     },
     /// Add or update a profile in ~/.config/flywheel/profiles.toml
     Create {
@@ -4803,7 +4807,10 @@ pub(crate) fn profile_launch_args(
     phase: Option<&str>,
 ) -> Result<Vec<String>> {
     let registry = models::ModelRegistry::load_routing()?;
-    let (harness, slot_model) = registry.resolve_profile_route(harness, &p.model)?;
+    // ADR-0007 D1 full ladder: rungs 3-5 (model_fallback / fallback_harness /
+    // registry fallback) only detour when the primary route is caps-blocked.
+    let (harness, slot_model, _route) =
+        registry.resolve_profile_route_full(harness, &p.model, &p.model_fallback)?;
     // bd-62ke: an explicit profile provider pins the provider half of the
     // composite registry key (bd-1t3j) — it overrides the default-provider
     // fallback for a bare id, and an unknown provider pair fails loudly.
@@ -21480,11 +21487,40 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             }
             print_json(&json!({ "profiles": rows }));
         }
-        ProfileCmd::Show { name } => {
+        ProfileCmd::Show { name, json } => {
             let cat = ProfileCatalog::load()?;
             let p = cat
                 .get(name)
                 .ok_or_else(|| anyhow!("unknown profile '@{name}' (flywheel profile list)"))?;
+            if *json {
+                // ADR-0007 D1: resolved route after slot-inherit + the
+                // fallback ladder (primary unless caps-blocked).
+                let resolved = models::ModelRegistry::load_routing().ok().and_then(|r| {
+                    r.resolve_profile_route_full(&p.harness, &p.model, &p.model_fallback)
+                        .ok()
+                        .map(|(h, m, route)| json!({
+                            "harness": h, "model": m, "route": route,
+                        }))
+                });
+                print_json(&json!({
+                    "name": name,
+                    "harness": p.harness,
+                    "model": p.model,
+                    "model_fallback": p.model_fallback,
+                    "resolved": resolved,
+                    "effort": p.effort,
+                    "smol": p.smol,
+                    "slow": p.slow,
+                    "plan": p.plan,
+                    "role": p.role,
+                    "backend": cat.backend(name),
+                    "default_workflow": p.default_workflow,
+                    "behavior": p.behavior,
+                    "task_hint": p.task_hint,
+                    "skills": p.skills,
+                }));
+                return Ok(());
+            }
             print_json(&json!({
                 "name": name,
                 "harness": p.harness,
