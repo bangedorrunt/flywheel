@@ -24,12 +24,12 @@ resonate-sdk = "0.6.0"
 # embeds toron-core's mailbox + toron-mcp's server surface with zero IPC.
 # se2.3: deps re-pointed from the stale toron-head snapshot to the live
 # workspace — the MailSurface extension (R1 + se2.3) lives on main.
-toron-core = { path = "/Users/bangedorrunt/workspace/toron/crates/toron-core" }
-toron-mcp = { path = "/Users/bangedorrunt/workspace/toron/crates/toron-mcp" }
+toron-core = { path = "../toron/crates/toron-core" }
+toron-mcp = { path = "../toron/crates/toron-mcp" }
 # The unified durable workflow engine (ADR-0005 Spec 2, P3.1): flywheel routes
 # ALL workflow execution through toron-workflow's WorkflowEngine. This is the
 # cargo edge the tier diagram always implied but no Cargo.toml wired.
-toron-workflow = { path = "/Users/bangedorrunt/workspace/toron/crates/toron-workflow" }
+toron-workflow = { path = "../toron/crates/toron-workflow" }
 async-trait = "0.1"
 cron = "0.17.0"
 chrono = "0.4.45"
@@ -73,7 +73,7 @@ serde_json = "1"
 tempfile = "3.27.0"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-toron-core = { path = "/Users/bangedorrunt/workspace/toron/crates/toron-core" }
+toron-core = { path = "../toron/crates/toron-core" }
 
 [profile.release]
 strip = true

@@ -1,4 +1,14 @@
-# governed-by: ADR-0027 (independent verification of captain green claims, GS-018)
+# Independent verification of captain green claims (GS-018: flywheel had no
+# Actions; every local "suite green" claim was unverifiable remotely).
+#
+# Scope: bin tests + check/clippy/fmt are hermetic and run here. The five
+# integration files that shell out to herdr/br/toron-daemon
+# (e2e_serialize_worktree, e2e_verdict_reopen, event_poll_parity,
+# collab_patterns_e2e, chain_unblock_conformance) are env-dependent and run
+# on dev machines with the full stack adjacent; clippy --all-targets still
+# compiles them so they cannot rot silently.
+#
+# The toron checkout is required: flywheel path-depends on ../toron/crates/*.
 name: CI
 
 on:
@@ -11,20 +21,33 @@ env:
 
 jobs:
   gates:
-    name: cargo check/test/clippy/fmt
+    name: check / test(bin) / clippy / fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout sibling toron (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: bangedorrunt/toron
+          path: toron
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            flywheel
+            toron
       - name: cargo check
-        run: cargo check --offline || cargo check
-      - name: cargo test
-        run: cargo test --offline || cargo test
+        working-directory: flywheel
+        run: cargo check --workspace
+      - name: cargo test (bin -- hermetic)
+        working-directory: flywheel
+        run: cargo test --bin flywheel
       - name: cargo clippy
+        working-directory: flywheel
         run: cargo clippy --all-targets -- -D warnings
       - name: cargo fmt --check
+        working-directory: flywheel
         run: cargo fmt --check
