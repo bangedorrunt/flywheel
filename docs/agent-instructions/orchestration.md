@@ -54,6 +54,16 @@ A **stage** is one prompt (`send --stage`). A **recipe** is a compose token
 **profile** is role → harness/model; `crew: auto` counts `@roles`.
 `flywheel squad` / `recipes list` is a group of profiles (spawn shape), a
 different use of "recipe."
+When steering, "recipe" always means the compose token; for the
+spawn shape say "squad."
+
+**What a compose token is:** a bare name in `workflow compose --parts`
+that expands to a compiled-in workflow's steps, inline, at that
+position - one engine run, one artifact trail. Token forms: builtin
+workflow name (`wave-swarm`, `repair-until-verified`), bare stage
+name, `role:stage`, `phase:stage`, `workflow:name`, and the grammar
+forms (`each:`, `when:`, `retry(n):`, `parallel:`). Stages referenced
+by spliced steps resolve from the stage catalog (`stage list`).
 
 ## Execution modes (ADR-0010)
 
@@ -78,7 +88,7 @@ Never invoke `__*` except documented `__wait-output`.
 | --- | --- | --- | --- |
 | **stage** | a payload unit (prompt + role/phase affinity) dispatched by `send --stage` | the INSTRUCTIONS are the value; one step, one crew member | `flywheel timeline` shows `stage=` per send |
 | **workflow** | an execution procedure (steps/branches/verify) run by `workflow run/compose` | the CONTROL FLOW is the value: gates, retries, parallel arms, SIGNOFF | compose runs write artifacts |
-| **recipe** | a spawn shape (squad alias: profile counts) used by `spawn --recipe` | the CREW COMPOSITION is the value and repeats across swarms | spawn registry entry |
+| **recipe** | a compose token (builtin workflow name: `wave-swarm`, `repair-until-verified`) spliced into `--parts`; expands inline to that workflow's steps in one engine run | the CONTROL FLOW is the value and repeats across objectives | the composed run's artifacts |
 | **profile** | role conditioning (harness/model/effort/behavior) referenced by all three | always — model routing is strict; recipes/stages name profiles | model registry |
 
 Announce the vehicle on every dispatch (stage / workflow / recipe / `none: raw`) — crews restate it in reports (2026-09-04 contract).
