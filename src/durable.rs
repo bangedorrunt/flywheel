@@ -344,13 +344,15 @@ pub struct LoopModel {
     pub drain_pending: std::collections::BTreeMap<String, DrainState>,
 }
 
-/// GS-030 slice 2 (one-owner lever, bd-gs030-seed-helper-6m7e): seed a
-/// LoopModel's crash-resume state from the persisted ActiveLoop snapshot.
-/// Pure — the single seed any owner of swarm resume state calls, so two
-/// owners can never diverge on resume semantics: heal counters carry over
-/// with `awaiting_clear` reset (within-episode), done-mail dedup carries
-/// verbatim, drains restart with fresh grace (a crash must never force-kill
-/// immediately; the prompt re-sends and send dedup protects).
+/// GS-030/GS-033 (NEW-L2): seed a LoopModel's crash-resume state from the
+/// persisted ActiveLoop snapshot. Pure — the single seed **any** owner of
+/// swarm resume state calls (doorbell `WorkspaceModel.swarm` via
+/// [`seed_workspace_from_active_loop`], loop-local `LoopModel`, shared
+/// Model path). Two call sites must never diverge on resume semantics:
+/// heal counters carry over with `awaiting_clear` reset (within-episode),
+/// done-mail dedup carries verbatim, drains restart with fresh grace (a
+/// crash must never force-kill immediately; the prompt re-sends and send
+/// dedup protects).
 pub(crate) fn seed_swarm_resume(
     model: &mut LoopModel,
     heal_states: &std::collections::BTreeMap<String, crate::state::HealState>,
@@ -385,6 +387,53 @@ pub(crate) fn seed_swarm_resume(
             )
         })
         .collect();
+}
+
+/// GS-033 (NEW-L2 / B1): seed the one WorkspaceModel's swarm slice from
+/// ActiveLoop. Shared Model path — doorbell (the RAM owner) calls this
+/// at start; tests / why-replay may too. Loop-only callers keep
+/// [`seed_swarm_resume`] on a `LoopModel`.
+pub(crate) fn seed_workspace_from_active_loop(
+    ws: &mut crate::workspace::WorkspaceModel,
+    project: &str,
+) -> anyhow::Result<()> {
+    // GS-033 fail-loud: I/O / parse Err must not collapse into Ok(None).
+    match crate::state::load_active_loop(project) {
+        Ok(Some(al)) => {
+            seed_swarm_resume(
+                &mut ws.swarm,
+                &al.heal_states,
+                &al.done_mailed,
+                &al.drain_pending,
+            );
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(e) => Err(anyhow::anyhow!(
+            "seed_workspace_from_active_loop({project}): load_active_loop failed (refusing silent skip): {e:#}"
+        )),
+    }
+}
+
+/// Throwaway WorkspaceModel around a LoopModel so swarm-slice Msgs still
+/// enter through workspace::tick (the one entry). Not a live owner —
+/// doorbell holds the RAM WorkspaceModel. Process split may remain.
+///
+/// The `..Default::default()` wrap is a transitional throwaway fold (GS-033
+/// Option A honesty): it must not be read as a second live WorkspaceModel.
+/// Tripwires allow this pattern only inside this helper.
+fn tick_loop_owner(
+    swarm: &mut LoopModel,
+    msg: &crate::workspace::Msg,
+) -> Vec<crate::workspace::Cmd> {
+    // throwaway fold — not a live second WorkspaceModel owner
+    let wm = crate::workspace::WorkspaceModel {
+        swarm: swarm.clone(),
+        ..Default::default()
+    };
+    let (next, cmds) = crate::workspace::tick(&wm, msg);
+    *swarm = next.swarm;
+    cmds
 }
 
 /// One drain in flight (bd-zfnx.10). Crash-safe via ActiveLoop (name →
@@ -5758,17 +5807,27 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // whose record has been dropped (the escalation path).
     let mut agent_kinds: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    // One WorkspaceModel for the swarm_loop lifetime (doorbell already does
-    // this). Crash-resume seeds heal onto it; assignment/roles/presence
-    // survive polls. Tick is the only writer of awaiting_clear.
-    let mut ws = crate::workspace::WorkspaceModel::default();
-    if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
-        seed_swarm_resume(
-            &mut ws.swarm,
-            &al.heal_states,
-            &al.done_mailed,
-            &al.drain_pending,
-        );
+    // GS-033 B1: loop holds LoopModel only — not a second WorkspaceModel.
+    // Crash-resume seeds via seed_swarm_resume (same resume semantics as
+    // doorbell's seed_workspace_from_active_loop). I/O Err is fail-loud —
+    // never swallow into empty resume while claiming a seeded restart.
+    let mut swarm = LoopModel::default();
+    match crate::state::load_active_loop(&params.project) {
+        Ok(Some(al)) => {
+            seed_swarm_resume(
+                &mut swarm,
+                &al.heal_states,
+                &al.done_mailed,
+                &al.drain_pending,
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Err(map_err(anyhow::anyhow!(
+                "swarm_loop ActiveLoop seed failed for '{}': {e:#} (refusing silent empty resume)",
+                params.project
+            )));
+        }
     }
     // pane_exited names observed this iteration (event path feeds heal step)
     let mut exited_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -5813,7 +5872,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // leaf results, so a crash converges next tick.
     let mut close_grace_ticks: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
-    // bd-55nx.8: programmatic done-mail dedup lives on ws.swarm.done_mailed
+    // bd-55nx.8: programmatic done-mail dedup lives on swarm.done_mailed
     // (crash-safe via ActiveLoop), not a loop-local HashSet.
     // ADR-0019 Spec 4 (bd-w1-verifier-degrade-a6fk): closed beads whose
     // verifier-dispatch decision already ran this invocation. Degrade mails
@@ -6372,7 +6431,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             bead,
                             exited,
                             &states,
-                            ws.swarm
+                            swarm
                                 .heal_states
                                 .get(exited)
                                 .unwrap_or(&HealState::default()),
@@ -6662,8 +6721,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                         // mail the captain the close-reason
                                         // REPORT on the bead thread. Best-effort
                                         // + once per bead (bd-55nx.8: dedup on
-                                        // ws.swarm.done_mailed, crash-safe).
-                                        if ws.swarm.done_mailed.insert(bead_id.clone()) {
+                                        // swarm.done_mailed, crash-safe).
+                                        if swarm.done_mailed.insert(bead_id.clone()) {
                                             let md = MailDoneArgs {
                                                 project: params.project.clone(),
                                                 bead_id: bead_id.clone(),
@@ -6997,57 +7056,56 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         let active = crate::state::load_active_loop(&params.project)
             .ok()
             .flatten();
-        // bd-55nx.8: ws.swarm is the only RAM for queue / per_bead_phase /
+        // bd-55nx.8: swarm is the only RAM for queue / per_bead_phase /
         // dispatch_pending / heal_states / done_mailed. Assign poll inputs in
         // place — never replace the whole struct (a throwaway LoopModel with
         // `done_mailed: Default` wiped the dedup every poll).
-        ws.swarm.queue = queue.clone();
-        ws.swarm.per_bead_phase = per_bead_phase.clone();
-        ws.swarm.wake_suppression = wake_suppressed.clone();
-        ws.swarm.event_cursor = active.as_ref().and_then(|a| a.event_cursor.clone());
-        ws.swarm.escalation = active
+        swarm.queue = queue.clone();
+        swarm.per_bead_phase = per_bead_phase.clone();
+        swarm.wake_suppression = wake_suppressed.clone();
+        swarm.event_cursor = active.as_ref().and_then(|a| a.event_cursor.clone());
+        swarm.escalation = active
             .as_ref()
             .map(|a| a.escalation.clone())
             .unwrap_or_default();
-        ws.swarm.respawn = active
+        swarm.respawn = active
             .as_ref()
             .map(|a| a.respawn.clone())
             .unwrap_or_default();
-        ws.swarm.mail_health = active
+        swarm.mail_health = active
             .as_ref()
             .map(|a| a.mail_health.clone())
             .unwrap_or_default();
-        ws.swarm.mail_degraded = mail_hold;
-        ws.swarm.heal_grace = params.unknown_detect_grace_polls;
-        ws.swarm.heal_threshold = params.unknown_diagnose_threshold;
-        ws.swarm.heal_budget = params.respawn_budget;
-        ws.swarm.pending_events = Vec::new();
-        ws.swarm.dispatch_pending = dispatch_pending.clone();
-        ws.swarm.states = states.clone();
+        swarm.mail_degraded = mail_hold;
+        swarm.heal_grace = params.unknown_detect_grace_polls;
+        swarm.heal_threshold = params.unknown_diagnose_threshold;
+        swarm.heal_budget = params.respawn_budget;
+        swarm.pending_events = Vec::new();
+        swarm.dispatch_pending = dispatch_pending.clone();
+        swarm.states = states.clone();
         // done_mailed + heal_states deliberately untouched: they persist on
-        // ws.swarm across polls (seeded from ActiveLoop at startup).
+        // swarm across polls (seeded from ActiveLoop at startup).
         let now = chrono::Utc::now().timestamp() as u64;
-        let fold = |ws: &mut crate::workspace::WorkspaceModel,
+        let fold = |swarm: &mut LoopModel,
                     ws_msg: crate::workspace::Msg,
                     journal: LoopMsg|
          -> Vec<LoopAction> {
-            let before = ws.swarm.clone();
-            let (next, cmds) = crate::workspace::tick(ws, &ws_msg);
+            let before = swarm.clone();
+            let cmds = tick_loop_owner(swarm, &ws_msg);
             let acts: Vec<LoopAction> = cmds.iter().filter_map(|c| c.to_loop_action()).collect();
             let _ = crate::state::journal_loop_msg(&params.project, &journal, &before, &acts);
-            *ws = next;
             acts
         };
         let mut poll_actions = Vec::new();
         for pe in &event_batch.events {
             poll_actions.extend(fold(
-                &mut ws,
+                &mut swarm,
                 crate::workspace::Msg::Herdr { event: pe.clone() },
                 LoopMsg::Herdr(pe.clone()),
             ));
         }
         poll_actions.extend(fold(
-            &mut ws,
+            &mut swarm,
             crate::workspace::Msg::Tick { now },
             LoopMsg::Tick { now },
         ));
@@ -7086,7 +7144,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     continue;
                 }
             };
-            poll_actions.extend(fold(&mut ws, ws_msg, m));
+            poll_actions.extend(fold(&mut swarm, ws_msg, m));
         }
         for act in reclaim_actions {
             if let LoopAction::Reclaim {
@@ -7103,7 +7161,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     is_live: false,
                 };
                 poll_actions.extend(fold(
-                    &mut ws,
+                    &mut swarm,
                     crate::workspace::Msg::Reclaim {
                         bead_id,
                         holder_pin: pin.clone(),
@@ -7115,7 +7173,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 ));
             }
         }
-        let mut next_model = ws.swarm.clone();
+        let mut next_model = swarm.clone();
         queue = next_model.queue.clone();
         per_bead_phase = next_model.per_bead_phase.clone();
         dispatch_pending = next_model.dispatch_pending.clone();
@@ -7129,7 +7187,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             next_model
                 .heal_states
                 .retain(|k, _| live_agents.contains(k));
-            ws.swarm.heal_states = next_model.heal_states.clone();
+            swarm.heal_states = next_model.heal_states.clone();
             // per_bead_phase: keep only beads still in queue or recently active
             // (last 200 entries). This caps the map even under high churn.
             if per_bead_phase.len() > 500 {
@@ -7169,11 +7227,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 .collect();
             al.dispatch_pending = dispatch_pending.clone();
             // bd-55nx.8: done-mail dedup is crash-safe Model state.
-            al.done_mailed = ws.swarm.done_mailed.clone();
+            al.done_mailed = swarm.done_mailed.clone();
             // bd-zfnx.10: open drains are crash-safe Model state (name →
             // bead id; grace restarts fresh on resume).
-            al.drain_pending = ws
-                .swarm
+            al.drain_pending = swarm
                 .drain_pending
                 .iter()
                 .map(|(k, v)| (k.clone(), v.bead_id.clone()))
@@ -7689,14 +7746,13 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         }
                         Err(e) => {
                             // Revert optimistic awaiting_clear inside tick
-                            // on the live WorkspaceModel (not a Default copy).
-                            let (next, extra) = crate::workspace::tick(
-                                &ws,
+                            // on the loop LoopModel (throwaway fold, not a second owner).
+                            let extra = tick_loop_owner(
+                                &mut swarm,
                                 &crate::workspace::Msg::DiagnoseFailed { name: name.clone() },
                             );
                             let _ = extra;
-                            ws = next;
-                            next_model = ws.swarm.clone();
+                            next_model = swarm.clone();
                             eprintln!(
                                 "flywheel: diagnose_agent leaf failed for {name} (reverted awaiting_clear via tick): {e}"
                             );
@@ -7705,8 +7761,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     any_work = true;
                 }
                 LoopAction::Respawn { name, reason } => {
-                    let attempts = ws
-                        .swarm
+                    let attempts = swarm
                         .heal_states
                         .get(name)
                         .map(|h| u64::from(h.respawn_count))
@@ -15313,6 +15368,19 @@ mod loop_invoke_vehicle_tests {
             d.grace_polls, DRAIN_GRACE_POLLS,
             "drains restart with fresh grace"
         );
+        // NEW-L2: the same helper seeds a WorkspaceModel swarm slice
+        // (doorbell / shared Model path), not loop-only.
+        let mut owned = crate::workspace::WorkspaceModel::default();
+        seed_swarm_resume(&mut owned.swarm, &heal, &done, &drain);
+        assert_eq!(
+            owned.swarm.heal_states.get("oc").map(|h| h.unknown_count),
+            Some(2),
+            "shared Model path seeds ws.swarm"
+        );
+        assert!(
+            include_str!("durable.rs").contains("fn seed_workspace_from_active_loop"),
+            "NEW-L2: workspace wrapper must exist for the doorbell owner"
+        );
     }
 
     #[test]
@@ -15449,13 +15517,82 @@ mod loop_invoke_vehicle_tests {
     }
 }
 
-/// GS-030 single-writer-per-slice tripwires (bd-gs030-single-writer-ciqu):
-/// the loop owns `swarm` and nothing else. Any construction of a
-/// doorbell-slice Msg, or any direct write to a non-swarm slice, fails the
-/// build. (Needles split so these self-scans do not match their own source;
-/// same idiom as the 55nx.3 assignment scan above.)
+/// GS-033 Option A tripwires: the live loop must not construct a second
+/// WorkspaceModel (B1). Doorbell-slice Msgs still stay off the loop (the
+/// loop is the effect runner, not a second doorbell). Needles split so
+/// these self-scans do not match their own source.
 #[cfg(test)]
 mod single_writer_tests {
+    #[test]
+    fn option_a_loop_constructs_no_workspace_model_default() {
+        let src = include_str!("durable.rs");
+        let live = [
+            "let mut ws = crate::workspace::Workspace",
+            "Model::default()",
+        ]
+        .concat();
+        assert!(
+            !src.contains(&live),
+            "Option A: swarm_loop must not construct WorkspaceModel::default() — doorbell is the one RAM owner"
+        );
+        // Broaden Default-wrapped detection: `WorkspaceModel { swarm, ..Default::default() }`
+        // is honest only as the transitional throwaway fold inside tick_loop_owner
+        // (not invent-green by pretending no Default wrap exists).
+        let wrap_ty = ["crate::workspace::Workspace", "Model {"].concat();
+        let mut wrap_sites: Vec<usize> = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find(&wrap_ty) {
+            let abs = from + rel;
+            let window = &src[abs..src.len().min(abs + 220)];
+            if window.contains("..Default::default()") {
+                wrap_sites.push(abs);
+            }
+            from = abs + wrap_ty.len();
+        }
+        assert!(
+            !wrap_sites.is_empty(),
+            "Option A honesty: tick_loop_owner throwaway Default wrap must remain visible"
+        );
+        for abs in wrap_sites {
+            let before = &src[..abs];
+            let helper = before
+                .rfind("fn tick_loop_owner(")
+                .expect("Option A: WorkspaceModel Default wrap only inside tick_loop_owner");
+            let helper_body = &src[helper..abs];
+            assert!(
+                helper_body.contains("Throwaway") || helper_body.contains("throwaway"),
+                "Option A: tick_loop_owner must stay labeled throwaway (not a live second owner)"
+            );
+        }
+        let start = src.find("async fn swarm_loop(").expect("swarm_loop");
+        let body = &src[start..src.len().min(start + 4000)];
+        assert!(
+            body.contains("seed_swarm_resume"),
+            "Option A: swarm_loop must seed LoopModel via the shared seed helper"
+        );
+        assert!(
+            body.contains("refusing silent empty resume")
+                && body.contains("match crate::state::load_active_loop"),
+            "GS-033: swarm_loop ActiveLoop seed must fail-loud on I/O Err (not if-let-Ok swallow)"
+        );
+        // Seed block must not use if-let-Ok swallow (the later dispatch_pending
+        // loads may still use if-let; only the seed path is gated here).
+        let seed_at = body.find("let mut swarm = LoopModel::default()").expect("swarm default");
+        let seed_slice = &body[seed_at..body.len().min(seed_at + 900)];
+        assert!(
+            !seed_slice.contains("if let Ok(Some(al))"),
+            "GS-033: swarm_loop must not swallow ActiveLoop seed Err into empty resume"
+        );
+        assert!(
+            body.contains("LoopModel::default()"),
+            "Option A: swarm_loop holds LoopModel, not a second WorkspaceModel"
+        );
+        assert!(
+            !body.contains("..Default::default()"),
+            "Option A: swarm_loop body must not Default-wrap a WorkspaceModel"
+        );
+    }
+
     /// Doorbell-slice Msgs the loop must never construct (watch / inbox /
     /// status / role / presence / receipt / sweep / watch-died / fact /
     /// ack-sla / human-decision).
@@ -15479,27 +15616,7 @@ mod single_writer_tests {
         for needle in &variants {
             assert!(
                 !src.contains(needle.as_str()),
-                "single-writer: swarm_loop must not construct {needle} (doorbell slice)"
-            );
-        }
-    }
-
-    /// Direct writes outside tick: the loop body may only assign `ws.swarm`
-    /// fields (sanctioned poll-input assigns); any other model slice fails.
-    #[test]
-    fn single_writer_loop_writes_swarm_slice_only() {
-        let src = include_str!("durable.rs");
-        for slice in [
-            ["ws.door", "bell"].concat(),
-            ["ws.pres", "ence"].concat(),
-            ["ws.ro", "les"].concat(),
-            ["ws.assign", "ment"].concat(),
-            ["ws.pending", "_wait"].concat(),
-            ["ws.open_", "human"].concat(),
-        ] {
-            assert!(
-                !src.contains(slice.as_str()),
-                "single-writer: swarm_loop must not touch {slice} (doorbell slice)"
+                "Option A: swarm_loop must not construct {needle} (doorbell slice)"
             );
         }
     }

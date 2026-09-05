@@ -6481,6 +6481,24 @@ mod workspace_origin_tests {
     }
 }
 
+
+#[cfg(test)]
+mod tripwire {
+    /// Locate a column-0 `fn name(` definition in `src`.
+    ///
+    /// Tripwires often quote the same needle in string literals
+    /// (`src.find("fn cmd_spawn(")`). Those quotes are not at column 0, so
+    /// searching for `\nfn name(` finds the real definition and never the
+    /// test's own literal — bare `find`/`rfind` invent-green or false-red
+    /// when other tests also quote the needle.
+    pub fn find_fn(src: &str, name: &str) -> usize {
+        let needle = format!("\nfn {name}(");
+        src.find(&needle)
+            .map(|i| i + 1)
+            .unwrap_or_else(|| panic!("expected toplevel `fn {name}(`"))
+    }
+}
+
 #[cfg(test)]
 mod spawn_boot_reliability_tests {
     use super::*;
@@ -6497,14 +6515,10 @@ mod spawn_boot_reliability_tests {
     #[test]
     fn spawn_verifies_live_process_and_recovers_or_fails() {
         let src = include_str!("main.rs");
-        // rfind: the gate's own source contains the same string literals —
-        // the LAST occurrence is the real definition (the test module sits
-        // above the functions it gates).
-        let spawn = src.rfind("fn cmd_spawn(").expect("cmd_spawn present");
+        // Column-0 search: bare rfind/find hit tripwire string literals.
+        let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
         let spawn_body = &src[spawn..];
-        let helper = src
-            .rfind("fn verify_or_respawn_pane(")
-            .expect("helper present");
+        let helper = crate::tripwire::find_fn(src, "verify_or_respawn_pane");
         let helper_body = &src[helper..];
 
         // (a) the post-boot verify runs after the prime, inside cmd_spawn
@@ -6551,17 +6565,14 @@ mod spawn_boot_reliability_tests {
     #[test]
     fn spawn_starts_doorbell_dispatcher() {
         let src = include_str!("main.rs");
-        let spawn = src.rfind("fn cmd_spawn(").expect("cmd_spawn");
-        let spawn_end = src[spawn + 1..]
-            .find("\nfn cmd_internal_doorbell")
-            .map(|i| spawn + 1 + i)
-            .unwrap_or(src.len());
+        let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
+        let spawn_end = crate::tripwire::find_fn(src, "cmd_internal_doorbell");
         let body = &src[spawn..spawn_end];
         assert!(
             body.contains("doorbell::ensure_running"),
             "cmd_spawn must start/attach the ADR-0005 doorbell dispatcher"
         );
-        let kill = src.rfind("fn cmd_kill(").expect("cmd_kill");
+        let kill = crate::tripwire::find_fn(src, "cmd_kill");
         let kbody = &src[kill..];
         assert!(
             kbody.contains("doorbell::stop"),
@@ -6572,11 +6583,8 @@ mod spawn_boot_reliability_tests {
     #[test]
     fn spawn_no_peer_aware_keeps_identity_skips_dispatcher() {
         let src = include_str!("main.rs");
-        let spawn = src.rfind("fn cmd_spawn(").expect("cmd_spawn");
-        let spawn_end = src[spawn + 1..]
-            .find("\nfn cmd_internal_doorbell")
-            .map(|i| spawn + 1 + i)
-            .unwrap_or(src.len());
+        let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
+        let spawn_end = crate::tripwire::find_fn(src, "cmd_internal_doorbell");
         let body = &src[spawn..spawn_end];
         assert!(
             body.contains("doorbell::identity_prime"),
@@ -6604,13 +6612,13 @@ mod spawn_boot_reliability_tests {
         ] {
             assert!(src.contains(needle), "{needle} wired into the surface");
         }
-        let recover = src.rfind("fn cmd_recover(").expect("cmd_recover");
+        let recover = crate::tripwire::find_fn(src, "cmd_recover");
         let recover_body = &src[recover..recover + 6000];
         assert!(
             recover_body.contains("doorbell::ensure_running"),
             "recover must heal dead dispatchers"
         );
-        let status = src.rfind("fn cmd_status(").expect("cmd_status");
+        let status = crate::tripwire::find_fn(src, "cmd_status");
         let status_body = &src[status..status + 5000];
         assert!(
             status_body.contains("doorbell::ensure_running") && status_body.contains("wake_state"),
@@ -6620,7 +6628,7 @@ mod spawn_boot_reliability_tests {
             src.contains("doorbell_persist_wake"),
             "dispatcher persists wake state (at-least-once redelivery)"
         );
-        let internal = src.rfind("fn cmd_internal_doorbell(").expect("internal");
+        let internal = crate::tripwire::find_fn(src, "cmd_internal_doorbell");
         let internal_body = &src[internal..internal + 9000];
         assert!(
             internal_body.contains("doorbell::load_wake_state"),
@@ -7307,8 +7315,16 @@ projects available: {}",
             // S9 (ADR-0018 D1a) + bd-pin-public-plane-s-easy.2: draw the
             // adj+noun PIN BEFORE the pane exists so the pane env carries
             // AGENT_NAME/FLYWHEEL_MAIL_AS (herdr injects env only at
-            // split/create). Best-effort (failures never fail the spawn).
+            // split/create). GS-033: refuse_unpinned BEFORE agent_start
+            // (add/profile/squad style) — never leave a dark orphan pane.
             let mail_identity = pinned_mail_identity(cfg, project, &name, &kind);
+            if mail_identity.is_none() {
+                refuse_unpinned_spawn(
+                    &name,
+                    item.profile.as_deref(),
+                    backend::mail_backend(cfg).is_ok(),
+                )?;
+            }
             let identity = mail_identity.as_deref().unwrap_or(&name);
             let pane_env = herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
             let pane_id = if first {
@@ -7473,7 +7489,9 @@ projects available: {}",
                 item.profile.as_deref(),
                 &item.short,
                 mail_identity.as_deref(),
-            );
+            )?;
+            // Fail-closed already ran BEFORE agent_start; remaining None-pin
+            // cases are legacy+warn only (mail not configured).
             let entry = match (&item.profile, &mail_identity) {
                 (Some(p), Some(mid)) => state::SpawnEntry::profiled(
                     agent.pane_id.clone(),
@@ -7482,18 +7500,6 @@ projects available: {}",
                     kind.clone(),
                     Some(mid.clone()),
                 ),
-                // GS-030 slice 4: profiled spawn with no pin — fail closed
-                // when mail is configured (a pin should exist; a dark
-                // profiled pane is a failure, not a shape), legacy+warn
-                // when mail is not configured at all.
-                (Some(p), None)
-                    if unpinned_spawn_fate(backend::mail_backend(cfg).is_ok())
-                        == UnpinnedFate::FailClosed =>
-                {
-                    anyhow::bail!(
-                        "spawn {name} (profile {p}) drew no mail identity while mail is configured — refusing a dark pane (fix mail, then re-run; never operates unpinned)"
-                    )
-                }
                 (Some(p), None) => {
                     eprintln!(
                         "flywheel: warn: spawned {name} ({}) profile {p} with no mail identity (mail not configured); doorbell sweep skips unpinned panes",
@@ -7512,16 +7518,6 @@ projects available: {}",
                     name.clone(),
                     mid.clone(),
                 ),
-                // GS-030 slice 4: same fail-closed rule for bare spawns —
-                // a configured backend that yields no pin is a failure.
-                (None, None)
-                    if unpinned_spawn_fate(backend::mail_backend(cfg).is_ok())
-                        == UnpinnedFate::FailClosed =>
-                {
-                    anyhow::bail!(
-                        "spawn {name} drew no mail identity while mail is configured — refusing a dark pane (fix mail, then re-run; never operates unpinned)"
-                    )
-                }
                 (None, None) => {
                     // bd-unpinned-loud-1mlt: a legacy entry with no mail
                     // identity is invisible to the doorbell sweep — say so at
@@ -8168,7 +8164,7 @@ mod timeout_presence_tests {
     #[test]
     fn timeout_arm_ticks_presence_not_only_hear() {
         let src = include_str!("main.rs");
-        let pos = src.find("fn cmd_internal_doorbell(").expect("dispatcher");
+        let pos = crate::tripwire::find_fn(src, "cmd_internal_doorbell");
         let end = src[pos..]
             .find("\nfn spawn_watch_child")
             .map(|i| pos + i)
@@ -8407,6 +8403,13 @@ fn cmd_internal_doorbell(
     if let Some(pin) = state::load_captain_alias(project) {
         workspace_model.roles.insert("captain".into(), pin);
     }
+    // GS-033 B1 / NEW-L2: seed swarm onto the one RAM owner from ActiveLoop
+    // (same helper the loop uses). Two-process topology may remain; two
+    // WorkspaceModel::default()s may not. Fail-loud on I/O (not silent skip).
+    crate::durable::seed_workspace_from_active_loop(&mut workspace_model, project)?;
+    // GS-033 B8: seed crew roles from the spawn-time RoleBound snapshot
+    // so inject/Prompt resolution does not wait on 30013 watch.
+    seed_roles_from_binds(&mut workspace_model, project)?;
     // bd-7xsf: rebuild assignment from receipts table at dispatcher startup (durable)
     rebuild_assignment_from_receipts(&mut workspace_model);
     let mut budgets: BTreeMap<String, doorbell::PinBudget> = BTreeMap::new();
@@ -8485,6 +8488,33 @@ fn cmd_internal_doorbell(
     loop {
         if !path.exists() {
             break;
+        }
+        let pending_bounds = match drain_pending_role_bounds(project) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "flywheel doorbell: drain_pending_role_bounds failed (refusing silent skip): {e:#}"
+                );
+                Vec::new()
+            }
+        };
+        for (role, pin) in pending_bounds {
+            let msg = workspace::Msg::RoleBound {
+                role: role.clone(),
+                pin: pin.clone(),
+            };
+            let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
+            workspace_model = next_model;
+            let _ = handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, false);
+            let pins = [pin.clone()];
+            doorbell::journal_append_workspace(
+                &config::state_dir(),
+                workspace,
+                &msg,
+                &cmds,
+                serde_json::json!({ "stage": "role_bound_live", "role": role, "pin": pin }),
+                Some(pins.as_slice()),
+            );
         }
         for summary in drain_pending_facts(project) {
             let msg = workspace::Msg::Fact {
@@ -11876,6 +11906,11 @@ fn cmd_add(
             // bd-pin-public-plane-s-easy.2: draw the pin BEFORE the split so
             // the pane env carries AGENT_NAME/FLYWHEEL_MAIL_AS.
             let mail_identity = pinned_mail_identity(cfg, project, &name, &kind);
+            // GS-033: add-path fail-closed when mail is configured (same
+            // fate as cmd_spawn). Sweep loud-skip stays for true legacy rows.
+            if mail_identity.is_none() {
+                refuse_unpinned_spawn(&name, None, backend::mail_backend(cfg).is_ok())?;
+            }
             let pane_env = herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
             let p = herdr_shim::pane_split(
                 &mut c,
@@ -11949,7 +11984,7 @@ fn cmd_add(
             );
             // GS-030 slice 3: auto-bind the kind role to the pin (add path
             // carries no profile — the kind short is the role noun).
-            bind_spawn_role(cfg, project, None, short, mail_identity.as_deref());
+            bind_spawn_role(cfg, project, None, short, mail_identity.as_deref())?;
             println!("  {} {}", kind_paint(&kind), agent.pane_id);
             spawned
                 .push(json!({ "name": agent.name, "kind": agent.agent, "pane_id": agent.pane_id }));
@@ -16058,9 +16093,11 @@ pub(crate) fn spawn_role_noun(profile: Option<&str>, short: &str) -> Option<Stri
     Some(noun.to_string())
 }
 
-/// GS-030 slice 3 (bd-gs030-rolebind-02mi): best-effort spawn-time role
-/// bind (alias table + signed 30013 `role=` charter via the Mail facade).
-/// Warns loud on failure; never fails the spawn/add. No pin or no role
+/// GS-033 B8: spawn-time role bind. After `set_role_pin`, fold immediate
+/// `Msg::RoleBound` onto the one Model via the pending/snapshot path
+/// (not watch-racy 30013). Remote / pin failure is fail-loud (NEW-L7).
+/// If `emit_role_bound` fails after the mail pin, the alias is cleared
+/// (compensate) so mail pin and RoleBound stay paired. No pin or no role
 /// noun (captain/empty) → silent no-op.
 fn bind_spawn_role(
     cfg: &Config,
@@ -16068,23 +16105,173 @@ fn bind_spawn_role(
     profile: Option<&str>,
     short: &str,
     pin: Option<&str>,
-) {
+) -> anyhow::Result<()> {
     let Some(pin) = pin.filter(|p| !p.is_empty()) else {
-        return;
+        return Ok(());
     };
     let Some(role) = spawn_role_noun(profile, short) else {
-        return;
+        return Ok(());
     };
-    match mail_shim::Mail::from_config(Some(&cfg.toron_mail_config())) {
-        Ok(Some(facade)) => {
-            if let Err(e) = facade.pin_role_alias(project, &role, pin) {
-                eprintln!("flywheel: mail role pin failed for role {role} -> {pin}: {e:#}");
+    let facade = mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
+        .map_err(|e| {
+            anyhow::anyhow!("mail role pin failed for role {role} -> {pin}: {e:#}")
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "mail role pin failed for role {role} -> {pin}: mailbox facade unavailable (refusing a silent skip)"
+            )
+        })?;
+    facade
+        .pin_role_alias(project, &role, pin)
+        .map_err(|e| anyhow::anyhow!("mail role pin failed for role {role} -> {pin}: {e:#}"))?;
+    // GS-033: if RoleBound emit fails after the mail pin lands, unpin so we
+    // never leave a mail alias without a matching RoleBound.
+    if let Err(e) = emit_role_bound(project, &role, pin) {
+        match facade.clear_role_alias(project, &role) {
+            Ok(_) => anyhow::bail!(
+                "role bind emit failed for role {role} -> {pin}: {e:#} (mail role alias cleared)"
+            ),
+            Err(rb) => anyhow::bail!(
+                "role bind emit failed for role {role} -> {pin}: {e:#}; also failed to clear mail role alias: {rb:#}"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Persist + queue `Msg::RoleBound` so the doorbell owner ticks it
+/// immediately (pending drain) and on crash-resume (role_binds snapshot).
+/// Upsert + pending append are compensated: on append Err the snapshot is
+/// rolled back so the pair stays atomic (GS-033).
+fn emit_role_bound(project: &str, role: &str, pin: &str) -> anyhow::Result<()> {
+    let prior = state::load_role_binds(project).map_err(|e| {
+        anyhow::anyhow!("role bind snapshot load failed for role {role} -> {pin}: {e:#}")
+    })?;
+    state::upsert_role_bind(project, role, pin).map_err(|e| {
+        anyhow::anyhow!("role bind snapshot failed for role {role} -> {pin}: {e:#}")
+    })?;
+    if let Err(e) = append_pending_role_bound(project, role, pin) {
+        if let Err(rb) = state::save_role_binds(project, &prior) {
+            anyhow::bail!(
+                "role bind pending append failed for role {role} -> {pin}: {e:#}; also failed to roll back snapshot: {rb:#}"
+            );
+        }
+        anyhow::bail!(
+            "role bind pending append failed for role {role} -> {pin}: {e:#} (snapshot rolled back)"
+        );
+    }
+    Ok(())
+}
+
+fn seed_roles_from_binds(
+    workspace_model: &mut workspace::WorkspaceModel,
+    project: &str,
+) -> anyhow::Result<()> {
+    let binds = state::load_role_binds(project).map_err(|e| {
+        anyhow::anyhow!("seed_roles_from_binds({project}): load_role_binds failed: {e:#}")
+    })?;
+    for (role, pin) in binds {
+        let (next, _) = workspace::tick(workspace_model, &workspace::Msg::RoleBound { role, pin });
+        *workspace_model = next;
+    }
+    Ok(())
+}
+
+fn pending_role_bounds_path(project: &str) -> std::path::PathBuf {
+    config::state_dir()
+        .join("roles")
+        .join(format!("{}-pending.jsonl", state::state_key(project)))
+}
+
+fn append_pending_role_bound(project: &str, role: &str, pin: &str) -> anyhow::Result<()> {
+    let path = pending_role_bounds_path(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(f, "{}", serde_json::json!({ "role": role, "pin": pin }))?;
+    Ok(())
+}
+
+/// Drain pending RoleBound lines. Missing file → empty. Read I/O Err is
+/// fail-loud (never silent empty). Validate/parse before `remove_file` so a
+/// crash mid-drain cannot lose RoleBound rows; corrupt lines warn loudly
+/// instead of being dropped without a trace (GS-033).
+fn drain_pending_role_bounds(project: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let path = pending_role_bounds_path(project);
+    let raw = match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!(
+                "pending role bounds read failed at {}: refusing silent empty",
+                path.display()
+            )));
+        }
+        Ok(raw) => raw,
+    };
+    let mut out = Vec::new();
+    for (idx, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(v) => match (
+                v.get("role").and_then(|r| r.as_str()),
+                v.get("pin").and_then(|p| p.as_str()),
+            ) {
+                (Some(role), Some(pin)) if !role.is_empty() && !pin.is_empty() => {
+                    out.push((role.to_string(), pin.to_string()));
+                }
+                _ => {
+                    eprintln!(
+                        "flywheel: warn: pending role bound line {} in {} missing role/pin — skipping corrupt row (RoleBound not applied)",
+                        idx + 1,
+                        path.display()
+                    );
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "flywheel: warn: pending role bound line {} in {} is corrupt JSON ({e}) — skipping (RoleBound not applied)",
+                    idx + 1,
+                    path.display()
+                );
             }
         }
-        Ok(None) => {}
-        Err(e) => {
-            eprintln!("flywheel: mail role pin skipped (mail unavailable): {e:#}");
-        }
+    }
+    // Remove only after validate/parse — never delete-before-read of RoleBound.
+    if let Err(e) = std::fs::remove_file(&path) {
+        eprintln!(
+            "flywheel: warn: could not remove drained pending role bounds {}: {e}",
+            path.display()
+        );
+    }
+    Ok(out)
+}
+
+/// GS-033: fail-closed when mail is configured and a spawn/add/profile/squad
+/// path drew no pin. Same fate as cmd_spawn. Returns Ok for legacy+warn
+/// (caller still writes the loud leftover).
+fn refuse_unpinned_spawn(
+    name: &str,
+    profile: Option<&str>,
+    mail_configured: bool,
+) -> anyhow::Result<()> {
+    if unpinned_spawn_fate(mail_configured) != UnpinnedFate::FailClosed {
+        return Ok(());
+    }
+    match profile {
+        Some(p) => anyhow::bail!(
+            "spawn {name} (profile {p}) drew no mail identity while mail is configured — refusing a dark pane (fix mail, then re-run; never operates unpinned)"
+        ),
+        None => anyhow::bail!(
+            "spawn {name} drew no mail identity while mail is configured — refusing a dark pane (fix mail, then re-run; never operates unpinned)"
+        ),
     }
 }
 
@@ -16193,6 +16380,143 @@ mod wake_identity_tests {
         assert_eq!(spawn_role_noun(Some(""), "oc"), Some("oc".to_string()));
         assert_eq!(spawn_role_noun(None, ""), None);
         assert_eq!(spawn_role_noun(None, "captain"), None);
+    }
+
+    /// GS-033 B8: bind constructs RoleBound (not watch-only) and is wired
+    /// on profile/squad as well as spawn/add. Remote is fail-loud.
+    #[test]
+    fn spawn_role_bind_emits_role_bound_on_all_paths() {
+        let src = include_str!("main.rs");
+        let bind = src.find("fn bind_spawn_role(").expect("bind_spawn_role");
+        let bind_fn = &src[bind..src.len().min(bind + 2500)];
+        assert!(
+            bind_fn.contains("emit_role_bound") && bind_fn.contains("pin_role_alias"),
+            "B8: bind must pin then emit RoleBound"
+        );
+        assert!(
+            bind_fn.contains("clear_role_alias")
+                && (bind_fn.contains("mail role alias cleared")
+                    || bind_fn.contains("failed to clear mail role alias")),
+            "B8: bind must compensate (unpin) if emit_role_bound fails after pin"
+        );
+        assert!(
+            bind_fn.contains("anyhow::Result"),
+            "B8 / NEW-L7: bind is fail-loud, not warn-and-skip"
+        );
+        let emit = src.find("fn emit_role_bound(").expect("emit_role_bound");
+        let emit_fn = &src[emit..src.len().min(emit + 1600)];
+        assert!(
+            emit_fn.contains("upsert_role_bind") && emit_fn.contains("append_pending_role_bound"),
+            "B8: RoleBound must persist snapshot + pending drain"
+        );
+        assert!(
+            emit_fn.contains("save_role_binds") && emit_fn.contains("rolled back"),
+            "B8: emit must compensate (rollback snapshot) on append Err"
+        );
+        assert!(
+            src.contains("drain_pending_role_bounds")
+                && src.contains("role_bound_live")
+                && src.contains("Msg::RoleBound"),
+            "B8: doorbell must tick pending RoleBound on the one Model"
+        );
+        let drain = src
+            .find("fn drain_pending_role_bounds(")
+            .expect("drain_pending_role_bounds");
+        let drain_fn = &src[drain..src.len().min(drain + 2500)];
+        assert!(
+            drain_fn.contains("anyhow::Result")
+                && drain_fn.contains("refusing silent empty")
+                && drain_fn.contains("NotFound"),
+            "B8: drain must fail-loud on read Err (NotFound → empty)"
+        );
+        assert!(
+            drain_fn.contains("corrupt") || drain_fn.contains("skipping corrupt"),
+            "B8: drain must warn on corrupt lines (never silent drop)"
+        );
+        // remove_file must come after parse/validate, not before.
+        let parse_mark = drain_fn
+            .find("serde_json::from_str")
+            .expect("drain parses JSON");
+        let remove_mark = drain_fn
+            .find("remove_file")
+            .expect("drain removes after validate");
+        assert!(
+            parse_mark < remove_mark,
+            "B8: drain must validate/parse BEFORE remove_file (never lose RoleBound)"
+        );
+        assert!(
+            src.contains("refuse_unpinned_spawn(&name, None,")
+                && src.contains("bind_spawn_role(cfg, project, None, short,"),
+            "NEW-L8: add path fail-closed + bind"
+        );
+        assert!(
+            src.contains("refuse_unpinned_spawn(&agent_name, Some(name),"),
+            "NEW-L8: profile spawn must bind + fail-closed"
+        );
+        // Profile/squad: refuse BEFORE agent_start (never leave a dark pane).
+        let profile_mark = src
+            .find("let agent_name = format!(\"profile-{name}\")")
+            .expect("profile agent_name");
+        let profile_slice = &src[profile_mark..src.len().min(profile_mark + 1200)];
+        let p_refuse = profile_slice
+            .find("refuse_unpinned_spawn")
+            .expect("profile refuse");
+        let p_start = profile_slice
+            .find("backend.agent_start")
+            .expect("profile agent_start");
+        assert!(
+            p_refuse < p_start,
+            "NEW-L8: profile refuse_unpinned must run BEFORE agent_start"
+        );
+        let squad_mark = src
+            .find("let agent_name = format!(\"squad-{name}-{profile_name}-{}\"")
+            .expect("squad agent_name");
+        let squad_slice = &src[squad_mark..src.len().min(squad_mark + 1400)];
+        let s_refuse = squad_slice
+            .find("refuse_unpinned_spawn")
+            .expect("squad refuse");
+        let s_start = squad_slice
+            .find("backend.agent_start")
+            .expect("squad agent_start");
+        assert!(
+            s_refuse < s_start,
+            "NEW-L8: squad refuse_unpinned must run BEFORE agent_start"
+        );
+        // cmd_spawn: same refuse-before-start contract (no dark orphan panes).
+        let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
+        let spawn_fn = &src[spawn..src.len().min(spawn + 55_000)];
+        let sp_refuse = spawn_fn
+            .find("refuse_unpinned_spawn")
+            .expect("cmd_spawn refuse_unpinned");
+        let sp_start = spawn_fn
+            .find("start_agent_with_retry_profile")
+            .expect("cmd_spawn start_agent");
+        assert!(
+            sp_refuse < sp_start,
+            "NEW-L8: cmd_spawn refuse_unpinned must run BEFORE agent_start"
+        );
+        assert!(
+            src.contains("Some(profile_name)"),
+            "NEW-L8: squad spawn must bind"
+        );
+        let shim = include_str!("mail_shim.rs");
+        assert!(
+            shim.contains("refusing a silent skip"),
+            "NEW-L7: remote role-pin must fail-loud"
+        );
+    }
+
+    #[test]
+    fn refuse_unpinned_fail_closed_matches_cmd_spawn() {
+        assert!(
+            refuse_unpinned_spawn("flywheel-demo-oc", None, true).is_err(),
+            "mail configured + no pin = fail"
+        );
+        assert!(refuse_unpinned_spawn("flywheel-demo-oc", Some("coder"), true).is_err());
+        assert!(
+            refuse_unpinned_spawn("flywheel-demo-oc", None, false).is_ok(),
+            "mail unconfigured = legacy warn path (caller warns)"
+        );
     }
 
     /// S8.1: the wake identity is the registry pin, else the canonical name
@@ -21955,6 +22279,16 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             let args = profile_launch_args(&spec.harness, profile, None)?;
             // Find a pane in the default project workspace, or create one.
             let workspace = resolved_spec_workspace(cfg, backend.as_ref(), &spec.harness)?;
+            // bd-l2ky: host project for registry (host-scope spawn, debate
+            // convention) so `__send --profile` / conditioning resolve.
+            let host_project = "flywheel";
+            // GS-033: fail-closed BEFORE agent_start (add-path style) —
+            // never leave a dark pane when mail is configured.
+            let mail_identity =
+                pinned_mail_identity(cfg, host_project, &agent_name, &spec.harness);
+            if mail_identity.is_none() {
+                refuse_unpinned_spawn(&agent_name, Some(name), backend::mail_backend(cfg).is_ok())?;
+            }
             let info = backend.agent_start(&agent_name, &spec.harness, &workspace, &args)?;
             println!(
                 "profile {name} spawned: agent={} pane={} backend={}",
@@ -21962,17 +22296,22 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 info.pane_id,
                 spec.backend
             );
-            // bd-l2ky: record the profiled entry under the orchestrator's
-            // host project (host-scope spawn, debate convention) so the
-            // loop's `__send --profile` / conditioning resolves this agent.
-            let host_project = "flywheel";
-            let mail_identity = register_spawned_agent(
+            if let Some(ref pin) = mail_identity {
+                bind_pane_mail_identity(
+                    cfg,
+                    host_project,
+                    &agent_name,
+                    &info.pane_id,
+                    Some(pin),
+                );
+            }
+            bind_spawn_role(
                 cfg,
                 host_project,
-                &agent_name,
-                &spec.harness,
-                &info.pane_id,
-            );
+                Some(name),
+                name,
+                mail_identity.as_deref(),
+            )?;
             record_spawn_entry(
                 cfg,
                 host_project,
@@ -22800,17 +23139,36 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
                     let agent_name = format!("squad-{name}-{profile_name}-{}", i + 1);
                     let workspace = resolved_spec_workspace(cfg, backend.as_ref(), &spec.harness)?;
                     let args = profile_launch_args(&spec.harness, profile, None)?;
+                    // GS-033: fail-closed BEFORE agent_start (add-path style) —
+                    // never leave a dark pane when mail is configured.
+                    let mail_identity =
+                        pinned_mail_identity(cfg, project_key, &agent_name, &spec.harness);
+                    if mail_identity.is_none() {
+                        refuse_unpinned_spawn(
+                            &agent_name,
+                            Some(profile_name),
+                            backend::mail_backend(cfg).is_ok(),
+                        )?;
+                    }
                     let info =
                         backend.agent_start(&agent_name, &spec.harness, &workspace, &args)?;
-                    // bd-l2ky: record the profiled entry so __send --profile
-                    // and loop conditioning resolve this member.
-                    let mail_identity = register_spawned_agent(
+                    // bd-l2ky: bind pane so __send --profile / conditioning resolve.
+                    if let Some(ref pin) = mail_identity {
+                        bind_pane_mail_identity(
+                            cfg,
+                            project_key,
+                            &agent_name,
+                            &info.pane_id,
+                            Some(pin),
+                        );
+                    }
+                    bind_spawn_role(
                         cfg,
                         project_key,
-                        &agent_name,
-                        &spec.harness,
-                        &info.pane_id,
-                    );
+                        Some(profile_name),
+                        profile_name,
+                        mail_identity.as_deref(),
+                    )?;
                     record_spawn_entry(
                         cfg,
                         project_key,
@@ -33220,47 +33578,44 @@ mod why_resume_tests {
     }
 }
 
-/// GS-030 single-writer-per-slice tripwires (bd-gs030-single-writer-ciqu):
-/// the dispatcher owns every slice except `swarm` and never constructs a
-/// swarm-slice Msg. Any violation fails the build. (Needles split so these
-/// self-scans do not match their own source.)
+/// GS-033 Option A tripwires: doorbell is the one RAM owner and must seed
+/// swarm resume. Dual-as-end-state speech is forbidden. Needles split so
+/// these self-scans do not match their own source.
 #[cfg(test)]
 mod single_writer_tests {
-    /// Swarm-slice Msgs the dispatcher must never construct (tick / herdr /
-    /// heal / nudges / reclaim / diagnose-failed).
     #[test]
-    fn single_writer_doorbell_constructs_no_swarm_slice_msgs() {
+    fn option_a_doorbell_seeds_swarm_resume() {
         let src = include_str!("main.rs");
-        let variants = [
-            ["Msg::Ti", "ck {"].concat(),
-            ["Msg::Her", "dr {"].concat(),
-            ["Msg::He", "al {"].concat(),
-            ["Msg::ClaimNu", "dge {"].concat(),
-            ["Msg::CloseNu", "dge {"].concat(),
-            ["Msg::Recl", "aim {"].concat(),
-            ["Msg::DiagnoseFa", "iled {"].concat(),
-        ];
-        for needle in &variants {
-            assert!(
-                !src.contains(needle.as_str()),
-                "single-writer: dispatcher must not construct {needle} (swarm slice)"
-            );
-        }
+        let start = crate::tripwire::find_fn(src, "cmd_internal_doorbell");
+        let slice = &src[start..src.len().min(start + 25000)];
+        assert!(
+            slice.contains("seed_workspace_from_active_loop"),
+            "Option A: doorbell must seed swarm from ActiveLoop onto the one Model"
+        );
+        assert!(
+            slice.contains("seed_roles_from_binds"),
+            "Option A / B8: doorbell must seed roles from the RoleBound snapshot"
+        );
+        assert!(
+            slice.contains("WorkspaceModel::default()"),
+            "doorbell remains the one live WorkspaceModel::default()"
+        );
     }
 
-    /// State touches: the dispatcher must never read or write swarm state —
-    /// no live owner besides the loop holds it.
     #[test]
-    fn single_writer_doorbell_touches_no_swarm_state() {
-        let src = include_str!("main.rs");
-        for needle in [
-            ["workspace_model.sw", "arm"].concat(),
-            ["model.sw", "arm"].concat(),
-        ] {
-            assert!(
-                !src.contains(needle.as_str()),
-                "single-writer: dispatcher must not touch {needle}"
-            );
-        }
+    fn option_a_speech_rejects_dual_as_end_state() {
+        let ws = include_str!("workspace.rs");
+        assert!(
+            !ws.contains("This is the end-state, not a halfway merge"),
+            "Option A: Dual-as-end-state speech must not remain"
+        );
+        assert!(
+            !ws.contains("One RAM is impossible"),
+            "Option A: 'One RAM is impossible' contradicts ADR-0027"
+        );
+        assert!(
+            ws.contains("The end-state is one RAM owner"),
+            "Option A: speech must name one RAM owner as the end-state"
+        );
     }
 }
