@@ -344,6 +344,49 @@ pub struct LoopModel {
     pub drain_pending: std::collections::BTreeMap<String, DrainState>,
 }
 
+/// GS-030 slice 2 (one-owner lever, bd-gs030-seed-helper-6m7e): seed a
+/// LoopModel's crash-resume state from the persisted ActiveLoop snapshot.
+/// Pure — the single seed any owner of swarm resume state calls, so two
+/// owners can never diverge on resume semantics: heal counters carry over
+/// with `awaiting_clear` reset (within-episode), done-mail dedup carries
+/// verbatim, drains restart with fresh grace (a crash must never force-kill
+/// immediately; the prompt re-sends and send dedup protects).
+pub(crate) fn seed_swarm_resume(
+    model: &mut LoopModel,
+    heal_states: &std::collections::BTreeMap<String, crate::state::HealState>,
+    done_mailed: &std::collections::HashSet<String>,
+    drain_pending: &std::collections::BTreeMap<String, String>,
+) {
+    for (k, v) in heal_states {
+        model.heal_states.insert(
+            k.clone(),
+            HealState {
+                unknown_count: v.unknown_count,
+                diagnose_count: v.diagnose_count,
+                respawn_count: v.respawn_count,
+                awaiting_clear: false,
+            },
+        );
+    }
+    // bd-55nx.8: done-mail dedup is crash-safe Model state, not a per-poll wipe.
+    model.done_mailed = done_mailed.clone();
+    // bd-zfnx.10: open drains resume with fresh grace (never force-kill
+    // immediately after a crash); the prompt re-sends via DrainRequest
+    // replay and send dedup protects against doubles.
+    model.drain_pending = drain_pending
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                DrainState {
+                    bead_id: v.clone(),
+                    grace_polls: DRAIN_GRACE_POLLS,
+                },
+            )
+        })
+        .collect();
+}
+
 /// One drain in flight (bd-zfnx.10). Crash-safe via ActiveLoop (name →
 /// bead id; grace restarts fresh on resume — a crash must never
 /// force-kill immediately).
@@ -3345,10 +3388,11 @@ async fn dispatch_guard_scan(args: DispatchGuardArgs) -> Result<Value> {
     }
 }
 
-/// Fetch one mail digest per agent (loop-side wake signal). Runs `__mail-
-/// digest` once per agent; a failing or empty digest yields a zeroed entry —
-/// a mail hiccup must not stall dispatch. Checkpointed: on replay the same
-/// digests are replayed, so prompt text stays deterministic.
+/// Fetch one mail digest per agent (debug surface only — GS-030 slice 1:
+/// NOT on the live loop path; the doorbell is the single wake producer).
+/// Runs `__mail-digest` once per agent; a failing or empty digest yields a
+/// zeroed entry — a mail hiccup must not stall dispatch. Checkpointed: on
+/// replay the same digests are replayed, so prompt text stays deterministic.
 #[function]
 async fn poll_mail_digests(args: MailDigestArgs) -> Result<Vec<MailDigest>> {
     let exe = self_exe().map_err(map_err)?;
@@ -5719,35 +5763,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // survive polls. Tick is the only writer of awaiting_clear.
     let mut ws = crate::workspace::WorkspaceModel::default();
     if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
-        for (k, v) in &al.heal_states {
-            ws.swarm.heal_states.insert(
-                k.clone(),
-                HealState {
-                    unknown_count: v.unknown_count,
-                    diagnose_count: v.diagnose_count,
-                    respawn_count: v.respawn_count,
-                    awaiting_clear: false,
-                },
-            );
-        }
-        // bd-55nx.8: done-mail dedup is crash-safe Model state, not a per-poll wipe.
-        ws.swarm.done_mailed = al.done_mailed.clone();
-        // bd-zfnx.10: open drains resume with fresh grace (never force-kill
-        // immediately after a crash); the prompt re-sends via DrainRequest
-        // replay and send dedup protects against doubles.
-        ws.swarm.drain_pending = al
-            .drain_pending
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.clone(),
-                    DrainState {
-                        bead_id: v.clone(),
-                        grace_polls: DRAIN_GRACE_POLLS,
-                    },
-                )
-            })
-            .collect();
+        seed_swarm_resume(
+            &mut ws.swarm,
+            &al.heal_states,
+            &al.done_mailed,
+            &al.drain_pending,
+        );
     }
     // pane_exited names observed this iteration (event path feeds heal step)
     let mut exited_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -5849,12 +5870,6 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // into wake_suppressed so no MAIL WAKE banner lands on the saturated
     // pane between the signal and the fresh boot.
     let mut ctx_suppressed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // mail-wake dedup: agent herdr name → last urgent message id it was woken
-    // for. An agent is woken ONCE per message id; a still-unreplied urgent
-    // message does not re-prompt every iteration (the reply changes the
-    // thread, and the NEXT urgent message id wakes again). Deterministic on
-    // replay: rebuilt from the checkpointed digest leaf results.
-    let mut woken_for: HashMap<String, String> = HashMap::new();
     // bd-w4-events-primary-gt0e: the agent.list snapshot is DEMOTED to the
     // heartbeat cadence. `states` persists across iterations; between
     // snapshots the event stream asserts status changes
@@ -6858,51 +6873,19 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // private. Reclaim is a Msg the producer constructs — never extend
         // after tick.
         let mut actions: Vec<LoopAction> = Vec::new();
-        // heartbeat path: full-snapshot reconciliation (skips agents already
-        // dispatch-pending so event path and poll path don't double-feed)
-        // Loop-side mail wake: fetch per-agent digests ONCE per iteration
-        // (checkpointed leaf). Idle agents with recent mail get the digest
-        // prefixed to their next prompt; idle agents with URGENT mail and an
-        // empty queue get woken directly. This replaces per-agent peer-poll
-        // templates — agents hold no standing polling instructions.
-        let idle_names: Vec<String> = states
-            .iter()
-            .filter(|s| matches!(s.status.as_str(), "idle" | "done"))
-            .map(|s| s.name.clone())
-            .collect();
-        let digests: HashMap<String, MailDigest> = if idle_names.is_empty() {
-            HashMap::new()
-        } else {
-            ctx.run(
-                poll_mail_digests,
-                MailDigestArgs {
-                    project: params.project.clone(),
-                    agents: idle_names,
-                },
-            )
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|d| (d.agent.clone(), d))
-            .collect()
-        };
-        // Wake dedup: an agent already woken for the CURRENT urgent message
-        // id is not re-woken (its digest still prefixes prompts — the agent
-        // may yet reply — but the urgent>0 wake trigger is suppressed).
-        let wake_suppressed: std::collections::HashSet<String> = digests
-            .iter()
-            .filter(|(name, d)| {
-                d.urgent > 0
-                    && match &d.last_id {
-                        Some(id) => woken_for.get(*name).map(|w| w == id).unwrap_or(false),
-                        None => true, // no id to key on — suppress the loop
-                    }
-            })
-            .map(|(k, _)| k.clone())
-            // bd-context-limit-honor-luqg: a pane being respawned for a
-            // saturation signal this cycle never gets a wake banner.
-            .chain(ctx_suppressed.iter().cloned())
-            .collect();
+        // GS-030 slice 1 (one wake, bd-gs030-one-wake-k8m3): the loop NO
+        // LONGER polls mail digests — the doorbell is the single wake
+        // producer (WatchNdjson ring + InboxRows urgent/high Prompt for idle
+        // pins). No digest map is constructed on the live path at all:
+        // plan_actions (legacy planner, tests/debug only) keeps its digest
+        // parameter, but no live caller passes mail in. The `__mail-digest`
+        // leaf + MailDigest helpers stay as a debug surface (manual ctx.run
+        // / tests), never a wake. Wake dedup below degrades to the
+        // context-limit suppression set only.
+        // Wake dedup: context-limit respawns suppress banners (the digest
+        // keyed per-message-id dedup left with the loop-side wake).
+        let wake_suppressed: std::collections::HashSet<String> =
+            ctx_suppressed.iter().cloned().collect();
         clear_stale_landed_for_idle(&params.project, &params.invocation, &states);
         // bd-bd79: lease renewal BEFORE dispatch — renew active leases whose reason
         // matches an in_progress bead with a live assignee. Near-expiry check
@@ -7213,16 +7196,6 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 })
                 .collect();
             let _ = crate::state::save_active_loop(&params.project, &al);
-        }
-        // record wake decisions so the same urgent message does not re-wake
-        for a in &poll_actions {
-            if let LoopAction::Send { name, text } = a
-                && text.starts_with("MAIL WAKE:")
-                && let Some(d) = digests.get(name)
-                && let Some(id) = &d.last_id
-            {
-                woken_for.insert(name.clone(), id.clone());
-            }
         }
         // re-add Send names that survived to pending so event flutter is covered
         for a in &poll_actions {
@@ -10896,6 +10869,64 @@ mod tests {
             }
             other => panic!("expected wake Send, got {other:?}"),
         }
+    }
+
+    /// GS-030 slice 1 (one wake, bd-gs030-one-wake-k8m3): the live loop must
+    /// not run the digest leaf — the doorbell is the single wake producer
+    /// (WatchNdjson ring + InboxRows urgent/high Prompt). A re-added live
+    /// call fails this test. The fn definition plus register call remain as
+    /// the debug surface. (Shape note: the assertion matches the loop-body
+    /// call indentation, so this test's own source never matches itself.)
+    #[test]
+    fn loop_live_path_one_wake_no_digest_producer() {
+        let src = include_str!("durable.rs");
+        assert!(
+            !src.contains("\n                poll_mail_digests,"),
+            "live loop must not ctx.run the digest leaf: the doorbell owns wake"
+        );
+    }
+
+    /// GS-030 slice 1: with the live empty digest map, an idle agent with an
+    /// empty queue Waits — no loop-side MAIL WAKE exists. Urgent wake arrives
+    /// via the doorbell (InboxRows Prompt for idle pins), never the loop.
+    #[test]
+    fn plan_actions_one_wake_empty_digests_wait() {
+        let queue: Vec<String> = Vec::new();
+        let states = vec![st("flywheel-proj-oc", "idle")];
+        let empty: HashMap<String, MailDigest> = HashMap::new();
+        let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
+                pending_events: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
+            },
+            &states,
+            None,
+            &empty,
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            actions.iter().all(|a| matches!(a, LoopAction::Wait)),
+            "live empty digests must Wait (doorbell owns wake), got {actions:?}"
+        );
     }
 
     /// bd-context-limit-honor-luqg: a pane being respawned for a saturation
@@ -15240,6 +15271,48 @@ mod loop_invoke_vehicle_tests {
         assert!(entries[0].get("model_snapshot").is_some());
         assert!(entries[0].get("actions").is_some());
         let _ = std::fs::remove_file(st::loop_journal_file(&proj));
+    }
+
+    /// GS-030 slice 2 (bd-gs030-seed-helper-6m7e): the crash-resume seed
+    /// carries heal counters (awaiting_clear reset), done-mail dedup
+    /// verbatim, and drains with FRESH grace.
+    #[test]
+    fn seed_swarm_resume_carries_heal_done_and_fresh_drain() {
+        use std::collections::{BTreeMap, HashSet};
+        let mut heal = BTreeMap::new();
+        heal.insert(
+            "oc".to_string(),
+            crate::state::HealState {
+                unknown_count: 2,
+                diagnose_count: 1,
+                respawn_count: 0,
+                awaiting_clear: true, // must reset: within-episode only
+            },
+        );
+        let mut done = HashSet::new();
+        done.insert("bd-1".to_string());
+        let mut drain = BTreeMap::new();
+        drain.insert("pi".to_string(), "bd-9".to_string());
+        let mut model = LoopModel::default();
+        model.done_mailed.insert("stale".to_string());
+        seed_swarm_resume(&mut model, &heal, &done, &drain);
+        let h = model.heal_states.get("oc").expect("heal seeded");
+        assert_eq!(
+            (h.unknown_count, h.diagnose_count, h.respawn_count),
+            (2, 1, 0),
+            "heal counters carry over"
+        );
+        assert!(!h.awaiting_clear, "awaiting_clear resets on resume");
+        assert_eq!(
+            model.done_mailed, done,
+            "done-mail dedup verbatim (stale gone)"
+        );
+        let d = model.drain_pending.get("pi").expect("drain seeded");
+        assert_eq!(d.bead_id, "bd-9");
+        assert_eq!(
+            d.grace_polls, DRAIN_GRACE_POLLS,
+            "drains restart with fresh grace"
+        );
     }
 
     #[test]
