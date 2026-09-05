@@ -7307,8 +7307,16 @@ projects available: {}",
             // S9 (ADR-0018 D1a) + bd-pin-public-plane-s-easy.2: draw the
             // adj+noun PIN BEFORE the pane exists so the pane env carries
             // AGENT_NAME/FLYWHEEL_MAIL_AS (herdr injects env only at
-            // split/create). Best-effort (failures never fail the spawn).
+            // split/create). GS-033: refuse_unpinned BEFORE agent_start
+            // (add/profile/squad style) — never leave a dark orphan pane.
             let mail_identity = pinned_mail_identity(cfg, project, &name, &kind);
+            if mail_identity.is_none() {
+                refuse_unpinned_spawn(
+                    &name,
+                    item.profile.as_deref(),
+                    backend::mail_backend(cfg).is_ok(),
+                )?;
+            }
             let identity = mail_identity.as_deref().unwrap_or(&name);
             let pane_env = herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
             let pane_id = if first {
@@ -7474,6 +7482,8 @@ projects available: {}",
                 &item.short,
                 mail_identity.as_deref(),
             )?;
+            // Fail-closed already ran BEFORE agent_start; remaining None-pin
+            // cases are legacy+warn only (mail not configured).
             let entry = match (&item.profile, &mail_identity) {
                 (Some(p), Some(mid)) => state::SpawnEntry::profiled(
                     agent.pane_id.clone(),
@@ -7482,18 +7492,6 @@ projects available: {}",
                     kind.clone(),
                     Some(mid.clone()),
                 ),
-                // GS-030 slice 4: profiled spawn with no pin — fail closed
-                // when mail is configured (a pin should exist; a dark
-                // profiled pane is a failure, not a shape), legacy+warn
-                // when mail is not configured at all.
-                (Some(p), None)
-                    if unpinned_spawn_fate(backend::mail_backend(cfg).is_ok())
-                        == UnpinnedFate::FailClosed =>
-                {
-                    anyhow::bail!(
-                        "spawn {name} (profile {p}) drew no mail identity while mail is configured — refusing a dark pane (fix mail, then re-run; never operates unpinned)"
-                    )
-                }
                 (Some(p), None) => {
                     eprintln!(
                         "flywheel: warn: spawned {name} ({}) profile {p} with no mail identity (mail not configured); doorbell sweep skips unpinned panes",
@@ -7512,16 +7510,6 @@ projects available: {}",
                     name.clone(),
                     mid.clone(),
                 ),
-                // GS-030 slice 4: same fail-closed rule for bare spawns —
-                // a configured backend that yields no pin is a failure.
-                (None, None)
-                    if unpinned_spawn_fate(backend::mail_backend(cfg).is_ok())
-                        == UnpinnedFate::FailClosed =>
-                {
-                    anyhow::bail!(
-                        "spawn {name} drew no mail identity while mail is configured — refusing a dark pane (fix mail, then re-run; never operates unpinned)"
-                    )
-                }
                 (None, None) => {
                     // bd-unpinned-loud-1mlt: a legacy entry with no mail
                     // identity is invisible to the doorbell sweep — say so at
@@ -8493,7 +8481,16 @@ fn cmd_internal_doorbell(
         if !path.exists() {
             break;
         }
-        for (role, pin) in drain_pending_role_bounds(project) {
+        let pending_bounds = match drain_pending_role_bounds(project) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "flywheel doorbell: drain_pending_role_bounds failed (refusing silent skip): {e:#}"
+                );
+                Vec::new()
+            }
+        };
+        for (role, pin) in pending_bounds {
             let msg = workspace::Msg::RoleBound {
                 role: role.clone(),
                 pin: pin.clone(),
@@ -16091,7 +16088,9 @@ pub(crate) fn spawn_role_noun(profile: Option<&str>, short: &str) -> Option<Stri
 /// GS-033 B8: spawn-time role bind. After `set_role_pin`, fold immediate
 /// `Msg::RoleBound` onto the one Model via the pending/snapshot path
 /// (not watch-racy 30013). Remote / pin failure is fail-loud (NEW-L7).
-/// No pin or no role noun (captain/empty) → silent no-op.
+/// If `emit_role_bound` fails after the mail pin, the alias is cleared
+/// (compensate) so mail pin and RoleBound stay paired. No pin or no role
+/// noun (captain/empty) → silent no-op.
 fn bind_spawn_role(
     cfg: &Config,
     project: &str,
@@ -16117,7 +16116,18 @@ fn bind_spawn_role(
     facade
         .pin_role_alias(project, &role, pin)
         .map_err(|e| anyhow::anyhow!("mail role pin failed for role {role} -> {pin}: {e:#}"))?;
-    emit_role_bound(project, &role, pin)?;
+    // GS-033: if RoleBound emit fails after the mail pin lands, unpin so we
+    // never leave a mail alias without a matching RoleBound.
+    if let Err(e) = emit_role_bound(project, &role, pin) {
+        match facade.clear_role_alias(project, &role) {
+            Ok(_) => anyhow::bail!(
+                "role bind emit failed for role {role} -> {pin}: {e:#} (mail role alias cleared)"
+            ),
+            Err(rb) => anyhow::bail!(
+                "role bind emit failed for role {role} -> {pin}: {e:#}; also failed to clear mail role alias: {rb:#}"
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -16179,21 +16189,61 @@ fn append_pending_role_bound(project: &str, role: &str, pin: &str) -> anyhow::Re
     Ok(())
 }
 
-fn drain_pending_role_bounds(project: &str) -> Vec<(String, String)> {
+/// Drain pending RoleBound lines. Missing file → empty. Read I/O Err is
+/// fail-loud (never silent empty). Validate/parse before `remove_file` so a
+/// crash mid-drain cannot lose RoleBound rows; corrupt lines warn loudly
+/// instead of being dropped without a trace (GS-033).
+fn drain_pending_role_bounds(project: &str) -> anyhow::Result<Vec<(String, String)>> {
     let path = pending_role_bounds_path(project);
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return Vec::new();
+    let raw = match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!(
+                "pending role bounds read failed at {}: refusing silent empty",
+                path.display()
+            )));
+        }
+        Ok(raw) => raw,
     };
-    let _ = std::fs::remove_file(&path);
-    raw.lines()
-        .filter_map(|l| {
-            let v: serde_json::Value = serde_json::from_str(l.trim()).ok()?;
-            Some((
-                v.get("role")?.as_str()?.to_string(),
-                v.get("pin")?.as_str()?.to_string(),
-            ))
-        })
-        .collect()
+    let mut out = Vec::new();
+    for (idx, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(v) => match (
+                v.get("role").and_then(|r| r.as_str()),
+                v.get("pin").and_then(|p| p.as_str()),
+            ) {
+                (Some(role), Some(pin)) if !role.is_empty() && !pin.is_empty() => {
+                    out.push((role.to_string(), pin.to_string()));
+                }
+                _ => {
+                    eprintln!(
+                        "flywheel: warn: pending role bound line {} in {} missing role/pin — skipping corrupt row (RoleBound not applied)",
+                        idx + 1,
+                        path.display()
+                    );
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "flywheel: warn: pending role bound line {} in {} is corrupt JSON ({e}) — skipping (RoleBound not applied)",
+                    idx + 1,
+                    path.display()
+                );
+            }
+        }
+    }
+    // Remove only after validate/parse — never delete-before-read of RoleBound.
+    if let Err(e) = std::fs::remove_file(&path) {
+        eprintln!(
+            "flywheel: warn: could not remove drained pending role bounds {}: {e}",
+            path.display()
+        );
+    }
+    Ok(out)
 }
 
 /// GS-033: fail-closed when mail is configured and a spawn/add/profile/squad
@@ -16336,6 +16386,12 @@ mod wake_identity_tests {
             "B8: bind must pin then emit RoleBound"
         );
         assert!(
+            bind_fn.contains("clear_role_alias")
+                && (bind_fn.contains("mail role alias cleared")
+                    || bind_fn.contains("failed to clear mail role alias")),
+            "B8: bind must compensate (unpin) if emit_role_bound fails after pin"
+        );
+        assert!(
             bind_fn.contains("anyhow::Result"),
             "B8 / NEW-L7: bind is fail-loud, not warn-and-skip"
         );
@@ -16354,6 +16410,31 @@ mod wake_identity_tests {
                 && src.contains("role_bound_live")
                 && src.contains("Msg::RoleBound"),
             "B8: doorbell must tick pending RoleBound on the one Model"
+        );
+        let drain = src
+            .find("fn drain_pending_role_bounds(")
+            .expect("drain_pending_role_bounds");
+        let drain_fn = &src[drain..src.len().min(drain + 2500)];
+        assert!(
+            drain_fn.contains("anyhow::Result")
+                && drain_fn.contains("refusing silent empty")
+                && drain_fn.contains("NotFound"),
+            "B8: drain must fail-loud on read Err (NotFound → empty)"
+        );
+        assert!(
+            drain_fn.contains("corrupt") || drain_fn.contains("skipping corrupt"),
+            "B8: drain must warn on corrupt lines (never silent drop)"
+        );
+        // remove_file must come after parse/validate, not before.
+        let parse_mark = drain_fn
+            .find("serde_json::from_str")
+            .expect("drain parses JSON");
+        let remove_mark = drain_fn
+            .find("remove_file")
+            .expect("drain removes after validate");
+        assert!(
+            parse_mark < remove_mark,
+            "B8: drain must validate/parse BEFORE remove_file (never lose RoleBound)"
         );
         assert!(
             src.contains("refuse_unpinned_spawn(&name, None,")
@@ -16392,6 +16473,19 @@ mod wake_identity_tests {
         assert!(
             s_refuse < s_start,
             "NEW-L8: squad refuse_unpinned must run BEFORE agent_start"
+        );
+        // cmd_spawn: same refuse-before-start contract (no dark orphan panes).
+        let spawn = src.rfind("fn cmd_spawn(").expect("cmd_spawn");
+        let spawn_fn = &src[spawn..src.len().min(spawn + 55_000)];
+        let sp_refuse = spawn_fn
+            .find("refuse_unpinned_spawn")
+            .expect("cmd_spawn refuse_unpinned");
+        let sp_start = spawn_fn
+            .find("start_agent_with_retry_profile")
+            .expect("cmd_spawn start_agent");
+        assert!(
+            sp_refuse < sp_start,
+            "NEW-L8: cmd_spawn refuse_unpinned must run BEFORE agent_start"
         );
         assert!(
             src.contains("Some(profile_name)"),
