@@ -1279,10 +1279,12 @@ graph:
     // ---- ADR-0008 §6.7 beads-lifecycle compose token (bd-adr0008-token-yaml-kimg) ------
     // The beads authoring lifecycle: grill → create → review1 → review2 →
     // integrate → implement → verify → outer SIGNOFF. inputs.until
-    // early-exits SUCCESS after any phase (ordinal Branch guards on the
-    // string value — no deep else nesting); gate_before_implement adds one
-    // OUTER approval between integrate and implement (the Branch names the
-    // gate point; the runner performs it — never a nested request_approval).
+    // early-exits SUCCESS after any phase (GraphNode guard: fields on
+    // trigger_until — run_branch evaluates ONLY trigger_*/steps_*
+    // variables, so `{{inputs.*}}` templates in guards degrade to '0' and
+    // never fire; bd-adr0008-guard-fix-16fl); gate_before_implement adds
+    // one OUTER approval between integrate and implement (a guarded
+    // request_approval node — never a nested one).
     // Nests ordinary builtins via call_workflow; hands off to wave-swarm
     // for execution, never merges it.
     (
@@ -1316,26 +1318,16 @@ graph:
         profile: "@planner"
         task: 'Grill the objective for {{inputs.objective}} (project {{inputs.project}}): sharpen scope, emit ADR/goal JSON to {{inputs.steer_channel}}. Escalate to {{inputs.captain_pin}} on ambiguity.'
       on_error: fail_run
-    exit-grill:
-      needs: [grill]
-      action: branch
-      if: "'{{inputs.until}}' == 'grill'"
-      then: []
-      else: []
     create:
-      needs: [exit-grill]
+      needs: [grill]
+      guard: 'trigger_until != "grill"'
       action: call_workflow
       workflow: phase-plan
       inputs: { goal: "{{inputs.objective}}" }
       on_error: fail_run
-    exit-create:
-      needs: [create]
-      action: branch
-      if: "'{{inputs.until}}' == 'grill' || '{{inputs.until}}' == 'create'"
-      then: []
-      else: []
     review1:
-      needs: [exit-create]
+      needs: [create]
+      guard: 'trigger_until != "grill" && trigger_until != "create"'
       action: dispatch_job
       assignee: x
       spec:
@@ -1343,14 +1335,9 @@ graph:
         stage: plan-review
         task: 'Bead-graph pass A for {{inputs.objective}}: review the plan from {{steps.create}}; return findings JSON + verdict to {{inputs.steer_channel}}.'
       on_error: fail_run
-    exit-review1:
-      needs: [review1]
-      action: branch
-      if: "'{{inputs.until}}' == 'grill' || '{{inputs.until}}' == 'create' || '{{inputs.until}}' == 'review1'"
-      then: []
-      else: []
     review2:
-      needs: [exit-review1]
+      needs: [review1]
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1"'
       action: dispatch_job
       assignee: x
       spec:
@@ -1358,34 +1345,27 @@ graph:
         stage: judge-arms
         task: 'Bead-graph pass B for {{inputs.objective}}: second review of the plan from {{steps.create}} against the pass-A findings in {{steps.review1}}; return findings JSON + verdict.'
       on_error: fail_run
-    exit-review2:
-      needs: [review2]
-      action: branch
-      if: "'{{inputs.until}}' == 'grill' || '{{inputs.until}}' == 'create' || '{{inputs.until}}' == 'review1' || '{{inputs.until}}' == 'review2'"
-      then: []
-      else: []
     integrate:
-      needs: [exit-review2]
+      needs: [review2]
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2"'
       action: dispatch_job
       assignee: x
       spec:
         profile: "@planner"
         task: 'Integrate for {{inputs.objective}}: fold AGREE-WITH-CHANGES from {{steps.review1}} + {{steps.review2}}; re-check bead cycles are zero; write the buildable bead set to {{inputs.steer_channel}}.'
       on_error: fail_run
-    exit-integrate:
-      needs: [integrate]
-      action: branch
-      if: "'{{inputs.until}}' == 'grill' || '{{inputs.until}}' == 'create' || '{{inputs.until}}' == 'review1' || '{{inputs.until}}' == 'review2' || '{{inputs.until}}' == 'integrate'"
-      then: []
-      else: []
+    # bd-adr0008-guard-fix-16fl: the optional outer gate — a guarded
+    # request_approval node (skipped unless gate_before_implement and the
+    # run has not early-exited at or before integrate). Outer-only: the
+    # engine parks the ONE durable run; no nested approvals exist.
     gate-before-implement:
-      needs: [exit-integrate]
-      action: branch
-      if: "'{{inputs.gate_before_implement}}' == 'true'"
-      then: []
-      else: []
+      needs: [integrate]
+      guard: 'trigger_gate_before_implement == "true" && trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_until != "integrate"'
+      action: request_approval
+      message: "Beads lifecycle gate (captain-only) for {{inputs.objective}} [{{inputs.project}}]: approve to let implement proceed, reject to stop here."
     implement:
       needs: [gate-before-implement]
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_until != "integrate"'
       action: dispatch_job
       assignee: x
       spec:
@@ -1393,14 +1373,9 @@ graph:
         stage: systematic-execute
         task: 'Implement the integrated bead set for {{inputs.objective}} from {{steps.integrate}} (project {{inputs.project}}): claim, VERIFY, commit before close, ledger-legal close. For wave execution hand off to wave-swarm instead of merging it.'
       on_error: fail_run
-    exit-implement:
-      needs: [implement]
-      action: branch
-      if: "'{{inputs.until}}' == 'grill' || '{{inputs.until}}' == 'create' || '{{inputs.until}}' == 'review1' || '{{inputs.until}}' == 'review2' || '{{inputs.until}}' == 'integrate' || '{{inputs.until}}' == 'implement'"
-      then: []
-      else: []
     verify:
-      needs: [exit-implement]
+      needs: [implement]
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_until != "integrate" && trigger_until != "implement"'
       action: dispatch_job
       assignee: x
       spec:
@@ -1408,14 +1383,9 @@ graph:
         stage: prove-verify
         task: 'Verify every close claim for {{inputs.objective}}: receipt at committed HEAD + VERIFY tail + principles citations. Evidence over status.'
       on_error: fail_run
-    exit-verify:
-      needs: [verify]
-      action: branch
-      if: "'{{inputs.until}}' == 'grill' || '{{inputs.until}}' == 'create' || '{{inputs.until}}' == 'review1' || '{{inputs.until}}' == 'review2' || '{{inputs.until}}' == 'integrate' || '{{inputs.until}}' == 'implement' || '{{inputs.until}}' == 'verify'"
-      then: []
-      else: []
     signoff:
-      needs: [exit-verify]
+      needs: [verify]
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_until != "integrate" && trigger_until != "implement" && trigger_until != "verify"'
       action: request_approval
       message: "Beads lifecycle signoff (captain-only) for {{inputs.objective}} [{{inputs.project}}]: review the verify evidence on {{inputs.steer_channel}}; approve closes, reject reopens."
 "##,
@@ -1513,7 +1483,10 @@ pub fn builtin_workflows() -> BTreeMap<String, Workflow> {
 /// ordinary builtins (e.g. captain-audit, beads) stay on
 /// `workflow run <name> --execute`.
 pub fn is_compose_token(name: &str) -> bool {
-    matches!(name, "wave-swarm" | "repair-until-verified" | "beads-lifecycle")
+    matches!(
+        name,
+        "wave-swarm" | "repair-until-verified" | "beads-lifecycle"
+    )
 }
 
 /// ADR-0006 D3: a compose token's parsed workflow for compose expansion
@@ -3405,7 +3378,11 @@ mod tests {
             report.issues
         );
         // until input declared with default signoff.
-        let until = wf.inputs.iter().find(|i| i.name == "until").expect("until input");
+        let until = wf
+            .inputs
+            .iter()
+            .find(|i| i.name == "until")
+            .expect("until input");
         assert_eq!(
             until.default,
             Some(serde_json::Value::String("signoff".to_string())),
@@ -3413,19 +3390,31 @@ mod tests {
         );
         // Phase nodes in ordinal order grill → signoff.
         let graph = wf.graph.as_ref().expect("beads-lifecycle is a graph");
-        let phase_order = ["grill", "create", "review1", "review2", "integrate", "implement", "verify", "signoff"];
+        let phase_order = [
+            "grill",
+            "create",
+            "review1",
+            "review2",
+            "integrate",
+            "implement",
+            "verify",
+            "signoff",
+        ];
         for phase in phase_order {
             assert!(
                 graph.nodes.contains_key(phase),
                 "phase node {phase} present"
             );
         }
-        // Exactly one RequestApproval action in the whole workflow
-        // (signoff outer-only; the gate_before_implement Branch carries no
-        // nested approval).
+        // Two RequestApproval actions max: signoff (unconditional, outer)
+        // + the OPTIONAL gate_before_implement outer gate (a guarded node,
+        // skipped unless enabled). Never a NESTED approval.
         fn count_approvals(action: &Action) -> usize {
             let mut n = usize::from(matches!(action, Action::RequestApproval { .. }));
-            if let Action::Branch { then, else_steps, .. } = action {
+            if let Action::Branch {
+                then, else_steps, ..
+            } = action
+            {
                 for s in then.iter().chain(else_steps.iter()) {
                     n += count_approvals(&s.action);
                 }
@@ -3440,8 +3429,156 @@ mod tests {
             approvals += count_approvals(&node.action);
         }
         assert_eq!(
-            approvals, 1,
-            "exactly one request_approval (signoff outer-only)"
+            approvals, 2,
+            "signoff + the OPTIONAL gate_before_implement outer gate (guarded node; skipped unless enabled) — still no NESTED approvals"
         );
+    }
+
+    /// bd-adr0008-guard-fix-16fl: Branch guards never render `{{inputs.*}}`
+    /// (run_branch evaluates only `trigger_*` / `steps_*` variables; lint
+    /// degrades the template to `'0'`, making the until early-exit inert).
+    /// The exit mechanism must be GraphNode `guard:` fields comparing
+    /// `trigger_until` (the invoke path flattens inputs onto the trigger),
+    /// with no inert empty-then/empty-else branch semaphores.
+    #[test]
+    fn beads_lifecycle_guards_use_engine_variables_not_templates() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let wf = &wfs["beads-lifecycle"];
+        let graph = wf.graph.as_ref().expect("graph form");
+        let expected_nodes = [
+            "grill",
+            "create",
+            "review1",
+            "review2",
+            "integrate",
+            "gate-before-implement",
+            "implement",
+            "verify",
+            "signoff",
+        ];
+        let mut seen: Vec<&str> = graph.nodes.keys().map(String::as_str).collect();
+        seen.sort_unstable();
+        let mut want: Vec<&str> = expected_nodes.to_vec();
+        want.sort_unstable();
+        assert_eq!(seen, want, "graph is exactly the 8 phases + outer gate");
+        for (name, node) in &graph.nodes {
+            if name == "grill" {
+                assert!(
+                    node.guard.is_none(),
+                    "grill always runs; until=grill exits by skipping everything AFTER it"
+                );
+                continue;
+            }
+            let guard = node
+                .guard
+                .as_deref()
+                .unwrap_or_else(|| panic!("node {name} must carry an exit guard"));
+            assert!(
+                !guard.contains("{{"),
+                "node {name} guard must be a plain expression, not a template: {guard}"
+            );
+            assert!(
+                guard.contains("trigger_until") || guard.contains("trigger_gate_before_implement"),
+                "node {name} guard must reference engine variables: {guard}"
+            );
+        }
+        // No inert branch semaphores: a Branch with empty then AND empty
+        // else cannot exit anything downstream of a needs edge.
+        fn has_empty_branch(action: &Action) -> bool {
+            match action {
+                Action::Branch {
+                    then, else_steps, ..
+                } => {
+                    (then.is_empty() && else_steps.is_empty())
+                        || then.iter().any(|s| has_empty_branch(&s.action))
+                        || else_steps.iter().any(|s| has_empty_branch(&s.action))
+                }
+                Action::Retry { step, .. } => has_empty_branch(&step.action),
+                _ => false,
+            }
+        }
+        for node in graph.nodes.values() {
+            assert!(
+                !has_empty_branch(&node.action),
+                "inert empty branch semaphore present: {:?}",
+                node.action.type_name()
+            );
+        }
+    }
+    /// bd-adr0008-guard-fix-16fl: the exit logic is a truth table — for
+    /// each `until` value the RUN SET is exactly grill + the phases at or
+    /// below its ordinal. Evaluates the YAML's own guard strings through
+    /// the engine's guard evaluator (the run_branch contract: Bool(false)
+    /// skips the node, EvalError also skips — so every guard must DECIDE).
+    #[tokio::test]
+    async fn beads_lifecycle_until_truth_table() {
+        use toron_workflow::guard::{GuardOutcome, evaluate_guard_default};
+        let wfs = builtin_workflows();
+        let wf = &wfs["beads-lifecycle"];
+        let graph = wf.graph.as_ref().expect("graph form");
+        let phases = [
+            "grill",
+            "create",
+            "review1",
+            "review2",
+            "integrate",
+            "implement",
+            "verify",
+            "signoff",
+        ];
+        let ord = |p: &str| phases.iter().position(|x| *x == p).unwrap();
+        for u in phases {
+            let mut vars = std::collections::HashMap::new();
+            vars.insert("trigger_until".to_string(), evalexpr::Value::from(u));
+            vars.insert(
+                "trigger_gate_before_implement".to_string(),
+                evalexpr::Value::from("false"),
+            );
+            let mut ran: Vec<&str> = vec![];
+            for p in phases {
+                let node = &graph.nodes[p];
+                match &node.guard {
+                    None => ran.push(p),
+                    Some(g) => {
+                        let outcome = evaluate_guard_default(Some(g), &vars).await;
+                        assert!(
+                            matches!(outcome, GuardOutcome::Bool(_)),
+                            "phase {p} guard must DECIDE for until={u} (no eval error): {outcome:?}"
+                        );
+                        if outcome.proceeds() {
+                            ran.push(p);
+                        }
+                    }
+                }
+            }
+            let want: Vec<&str> = phases[..=ord(u)].to_vec();
+            assert_eq!(ran, want, "until={u} runs exactly grill..={u}");
+        }
+        // The optional outer gate fires only when enabled AND the run has
+        // not early-exited at or before integrate.
+        let gate = &graph.nodes["gate-before-implement"];
+        let g = gate.guard.as_deref().expect("gate guard");
+        for (u, gate_in, expect) in [
+            ("grill", "true", false),
+            ("create", "true", false),
+            ("integrate", "true", false),
+            ("implement", "true", true),
+            ("signoff", "true", true),
+            ("signoff", "false", false),
+        ] {
+            let mut vars = std::collections::HashMap::new();
+            vars.insert("trigger_until".to_string(), evalexpr::Value::from(u));
+            vars.insert(
+                "trigger_gate_before_implement".to_string(),
+                evalexpr::Value::from(gate_in),
+            );
+            let outcome = evaluate_guard_default(Some(g), &vars).await;
+            assert_eq!(
+                outcome.proceeds(),
+                expect,
+                "gate fires for until={u} gate_in={gate_in}"
+            );
+        }
     }
 }

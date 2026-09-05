@@ -1139,6 +1139,7 @@ dependencies = [
  "dialoguer",
  "dirs",
  "dotenvy",
+ "evalexpr",
  "futures-core",
  "hex",
  "ratatui",

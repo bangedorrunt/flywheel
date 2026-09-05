@@ -1038,6 +1038,25 @@ fn infer_auto(
 
     CrewPlan { members: counts }
 }
+/// bd-adr0008-guard-fix-16fl: bind declared input defaults onto the caller's
+/// inputs before invoke. `InputDecl.default` documents "the engine binds a
+/// provided value over this default at invoke time", but no engine path
+/// applies it — so `{{inputs.x}}` templates and `trigger_x` guard variables
+/// go unresolved (guards eval-error to skip) whenever the caller omits a
+/// defaulted input. Fill ONLY missing keys; an explicit value always wins;
+/// a non-object inputs value passes through untouched. Pure.
+pub fn apply_input_defaults(workflow: &Workflow, inputs: &mut serde_json::Value) {
+    let Some(map) = inputs.as_object_mut() else {
+        return;
+    };
+    for decl in &workflow.inputs {
+        if let Some(default) = &decl.default
+            && !map.contains_key(&decl.name)
+        {
+            map.insert(decl.name.clone(), default.clone());
+        }
+    }
+}
 
 /// §3.6 safety envelope #3, wall-clock half (ADR-0022): a composed run is
 /// bounded in time. The bound errors THIS process attempt only — the
@@ -1048,9 +1067,10 @@ pub async fn bounded_invoke(
     engine: &toron_workflow::WorkflowEngine,
     run_id: &str,
     wf: Workflow,
-    inputs: serde_json::Value,
+    mut inputs: serde_json::Value,
     max_seconds: u64,
 ) -> Result<serde_json::Value> {
+    apply_input_defaults(&wf, &mut inputs);
     match tokio::time::timeout(
         std::time::Duration::from_secs(max_seconds),
         engine.invoke(run_id, wf, inputs),
@@ -1671,10 +1691,6 @@ steps:
     #[test]
     fn beads_lifecycle_compose_token_parses_and_expands_graph_lint_clean() {
         use toron_workflow::schema::Action;
-        assert!(
-            crate::builtin_workflows::is_compose_token("beads-lifecycle"),
-            "third token (match arm landed in 84fbfb7)"
-        );
         let part = parse_compose_part("beads-lifecycle").expect("token parses");
         assert_eq!(
             part,
@@ -1686,13 +1702,15 @@ steps:
         let lib = crate::stages::StageLibrary::compiled_in();
         let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
         let wf =
-            compose_workflow_with("composed-lifecycle", "obj", None, &[part], &affinity)
-                .unwrap();
-        let graph = wf.graph.as_ref().expect("graph-form token expands to graph");
+            compose_workflow_with("composed-lifecycle", "obj", None, &[part], &affinity).unwrap();
+        let graph = wf
+            .graph
+            .as_ref()
+            .expect("graph-form token expands to graph");
         assert_eq!(
             graph.nodes.len(),
-            16,
-            "8 phases + 7 until-guards + 1 implement gate: {:?}",
+            9,
+            "8 phases + outer implement gate (guards ride ON the nodes): {:?}",
             graph.nodes.keys().collect::<Vec<_>>()
         );
         assert!(
@@ -1704,7 +1722,10 @@ steps:
             .values()
             .filter(|n| matches!(&n.action, Action::RequestApproval { .. }))
             .count();
-        assert_eq!(approvals, 1, "single RequestApproval in the expansion");
+        assert_eq!(
+            approvals, 2,
+            "signoff + the gate_before_implement outer gate (the gate node's guard skips it unless enabled)"
+        );
         assert!(
             matches!(
                 &graph.nodes["signoff"].action,
@@ -1713,9 +1734,13 @@ steps:
             "signoff last (terminal approval)"
         );
         assert!(
-            !graph.nodes.values().any(|n| n.needs.contains(&"signoff".to_string())),
+            !graph
+                .nodes
+                .values()
+                .any(|n| n.needs.contains(&"signoff".to_string())),
             "nothing runs after signoff"
         );
+
         assert!(
             wf.inputs.iter().any(|i| i.name == "until"
                 && i.default == Some(serde_json::Value::String("signoff".to_string()))),
@@ -1729,6 +1754,48 @@ steps:
             report.issues
         );
         enforce_budget_caps(&wf).expect("7 dispatches, depth 1: within caps");
+    }
+    /// bd-adr0008-guard-fix-16fl: declared defaults bind onto missing keys
+    /// at the invoke door; explicit values always win; non-object inputs
+    /// pass through.
+    #[test]
+    fn apply_input_defaults_fills_missing_preserves_explicit() {
+        use toron_workflow::schema::{InputDecl, Workflow};
+        let wf = Workflow {
+            name: "t".into(),
+            description: None,
+            trigger: None,
+            policy: None,
+            guard: None,
+            steps: vec![],
+            graph: None,
+            inputs: vec![
+                InputDecl {
+                    name: "objective".into(),
+                    default: None,
+                },
+                InputDecl {
+                    name: "until".into(),
+                    default: Some(serde_json::Value::String("signoff".into())),
+                },
+                InputDecl {
+                    name: "gate_before_implement".into(),
+                    default: Some(serde_json::Value::Bool(false)),
+                },
+            ],
+            crew: None,
+            principles: vec![],
+        };
+        let mut inputs = serde_json::json!({ "objective": "x", "until": "create" });
+        apply_input_defaults(&wf, &mut inputs);
+        assert_eq!(inputs["until"], "create", "explicit value wins");
+        assert_eq!(
+            inputs["gate_before_implement"], false,
+            "missing default binds"
+        );
+        let mut null = serde_json::Value::Null;
+        apply_input_defaults(&wf, &mut null);
+        assert!(null.is_null(), "non-object inputs untouched");
     }
 
     /// A graph-form token mixes with ordinary parts (token nodes land in
@@ -1746,8 +1813,8 @@ steps:
         assert_eq!(wf.steps.len(), 1, "the plain part lands in steps");
         assert_eq!(
             wf.graph.as_ref().expect("graph").nodes.len(),
-            16,
-            "the token lands in the graph"
+            9,
+            "the token lands in the graph (8 phases + outer gate)"
         );
         let err = compose_workflow_with(
             "bad",
