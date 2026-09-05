@@ -327,8 +327,8 @@ fn spawn_crew_into(
         // ADR-0007 D1: resolve the slot ladder first — a slot-aliased profile
         // (@cheap/@standard/@premium) inherits the slot's harness. The raw
         // profile.harness is empty by design on those profiles.
-        let model_reg = ModelRegistry::load_routing()
-            .map_err(|e| anyhow!("pane crew: model registry: {e}"))?;
+        let model_reg =
+            ModelRegistry::load_routing().map_err(|e| anyhow!("pane crew: model registry: {e}"))?;
         let (harness_resolved, _slot_model) =
             model_reg.resolve_profile_route(&profile.harness, &profile.model)?;
         let harness = &harness_resolved;
@@ -521,9 +521,7 @@ pub fn harness_override_conflicts(profile_harness: &str, spec_harness: Option<&s
         // An EMPTY profile harness (ADR-0007 slot-inherit) never conflicts:
         // the profile resolves its harness from the slot at spawn time, so
         // any explicit override is simply authoritative for the step.
-        Some(h) if !h.trim().is_empty() => {
-            !profile_harness.is_empty() && h != profile_harness
-        }
+        Some(h) if !h.trim().is_empty() => !profile_harness.is_empty() && h != profile_harness,
         _ => false,
     }
 }

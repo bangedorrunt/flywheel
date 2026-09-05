@@ -19,6 +19,7 @@ mod agentstate;
 mod artifact;
 mod backend;
 mod builtin_workflows;
+mod catalog_tui;
 mod coalition;
 mod config;
 mod crew;
@@ -39,7 +40,6 @@ mod mcp_http;
 mod models;
 mod output;
 mod pane;
-mod catalog_tui;
 mod phase_chain;
 mod phase_contracts;
 mod plane_route;
@@ -4735,9 +4735,9 @@ fn spawn_item_kind(
 ) -> Result<String> {
     match (&item.kind, &item.profile) {
         (Some(k), Some(name)) if k.is_empty() => {
-            let p = catalog.get(name).ok_or_else(|| {
-                anyhow!("unknown profile '@{name}' (flywheel profile list)")
-            })?;
+            let p = catalog
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown profile '@{name}' (flywheel profile list)"))?;
             Ok(registry.resolve_profile_route(&p.harness, &p.model)?.0)
         }
         (Some(k), _) if !k.is_empty() => Ok(k.clone()),
@@ -4812,11 +4812,7 @@ fn expand_slot_model(registry: &models::ModelRegistry, id: &str) -> Result<Strin
 
 /// Role-flag ids (`smol`/`slow`/`plan`): slot aliases that are not routable
 /// on this harness omit the flag (cheap/big-pickle is opencode-capped).
-fn resolve_role_flag(
-    registry: &models::ModelRegistry,
-    raw: &str,
-    harness: &str,
-) -> Result<String> {
+fn resolve_role_flag(registry: &models::ModelRegistry, raw: &str, harness: &str) -> Result<String> {
     if raw.is_empty() {
         return Ok(String::new());
     }
@@ -21530,9 +21526,11 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 let resolved = models::ModelRegistry::load_routing().ok().and_then(|r| {
                     r.resolve_profile_route_full(&p.harness, &p.model, &p.model_fallback)
                         .ok()
-                        .map(|(h, m, route)| json!({
-                            "harness": h, "model": m, "route": route,
-                        }))
+                        .map(|(h, m, route)| {
+                            json!({
+                                "harness": h, "model": m, "route": route,
+                            })
+                        })
                 });
                 print_json(&json!({
                     "name": name,
@@ -23081,7 +23079,9 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
             // not a slot target and a grok-caps-only model cannot serve a
             // slot default (operator decision 2026-09-05).
             if entry.caps.len() == 1 && entry.caps[0] == "grok" {
-                bail!("model {key} is grok-only — grok is closed-source with its own proprietary model and cannot serve as a slot default");
+                bail!(
+                    "model {key} is grok-only — grok is closed-source with its own proprietary model and cannot serve as a slot default"
+                );
             }
             // Target slot: flag, else TTY select, else error.
             let slot_name = match slot.as_deref().map(str::trim) {
@@ -23098,7 +23098,9 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                 }
             };
             if !matches!(slot_name.as_str(), "cheap" | "standard" | "premium") {
-                bail!("unknown slot {slot_name:?} (cheap | standard | premium; never \"default\" — that is the compiled-in squad)");
+                bail!(
+                    "unknown slot {slot_name:?} (cheap | standard | premium; never \"default\" — that is the compiled-in squad)"
+                );
             }
             let mut reg = models::ModelRegistry::load_routing()?;
             let current = reg.slot(&slot_name).cloned().unwrap_or_default();
@@ -23190,9 +23192,7 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                 }
             }
             if removed.is_empty() {
-                bail!(
-                    "no deletable models among {skipped:?} — compiled-in ids are never removed"
-                );
+                bail!("no deletable models among {skipped:?} — compiled-in ids are never removed");
             }
             if !*force && std::io::stdin().is_terminal() {
                 let ok = dialoguer::Confirm::new()
@@ -23277,7 +23277,9 @@ fn cmd_slot(cmd: &SlotCmd) -> Result<()> {
             if *json {
                 print_json(&json!({ "slots": rows }));
             } else if rows.is_empty() {
-                println!("no slots configured (flywheel slot set <name> --harness <h> --model <id>)");
+                println!(
+                    "no slots configured (flywheel slot set <name> --harness <h> --model <id>)"
+                );
             } else {
                 for r in &rows {
                     println!(

@@ -23,7 +23,10 @@ pub fn default_state_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME")
         && !home.is_empty()
     {
-        return PathBuf::from(home).join(".local").join("state").join("flywheel");
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("flywheel");
     }
     PathBuf::from("flywheel-state")
 }
@@ -356,7 +359,10 @@ pub fn install(state: &Path, port: u16) -> anyhow::Result<()> {
                 anyhow::bail!("launchctl bootstrap failed: {stderr}");
             }
         }
-        println!("installed + started {DAEMON_LABEL} (plist {})", plist.display());
+        println!(
+            "installed + started {DAEMON_LABEL} (plist {})",
+            plist.display()
+        );
         Ok(())
     }
     #[cfg(target_os = "linux")]
@@ -371,7 +377,9 @@ pub fn install(state: &Path, port: u16) -> anyhow::Result<()> {
                 binary.display()
             ),
         )?;
-        let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).output();
+        let _ = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output();
         let out = Command::new("systemctl")
             .args(["--user", "enable", "--now", DAEMON_LABEL])
             .output()?;
@@ -381,13 +389,18 @@ pub fn install(state: &Path, port: u16) -> anyhow::Result<()> {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        println!("installed + started {DAEMON_LABEL} (unit {})", unit.display());
+        println!(
+            "installed + started {DAEMON_LABEL} (unit {})",
+            unit.display()
+        );
         Ok(())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (state, port, binary);
-        anyhow::bail!("daemon install: unsupported host — use `flywheel daemon start` (pidfile mode)")
+        anyhow::bail!(
+            "daemon install: unsupported host — use `flywheel daemon start` (pidfile mode)"
+        )
     }
 }
 
@@ -446,7 +459,9 @@ pub fn stop(state: &Path, addr: &str, force: bool) -> anyhow::Result<()> {
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
                 if addr_alive(addr) {
-                    anyhow::bail!("unmanaged pid {p} still holds {addr} after SIGTERM — kill it manually");
+                    anyhow::bail!(
+                        "unmanaged pid {p} still holds {addr} after SIGTERM — kill it manually"
+                    );
                 }
                 println!("stopped unmanaged instance (pid {p})");
                 return Ok(());

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-05 ADR-0007 catalog slots + daemon lifecycle
+
+### Added
+- Catalog slots (ADR-0007 D1): cheap/standard/premium = harness+model; profiles alias `@cheap/@standard/@premium` and inherit the slot's harness on read. Six compiled-in job profiles (no `pa`), four compiled-in squads (default/plan/review/recon).
+- Full D1 resolve ladder: `resolve_profile_route_full` walks pin → slot → `model_fallback[]` → slot `fallback_harness` → registry fallback, returns the route taken, fails loud naming the rungs. Grok hops are model-opaque (closed-source proprietary model — no caps check, bare-id flag).
+- CLI: `slot {list,show,set,remove}`, `model {list,show,add,set,remove}` (`set <id> --slot <s>` selects a slot default), `profile set` (routing fields) + `profile show --json` (resolved route), `squad create`, `catalog` ratatui hub (refuses non-TTY/NO_COLOR naming the CLI), `model remove` N-ids + TTY multi-select.
+- `daemon {start,stop,restart,status}` (toron-parity): launchd/systemd/pidfile supervision of `serve`; start/restart verify the daemon answers; stop refuses unmanaged holders without `--force`.
+- Agent-native discovery: `--robot-capabilities` carries the catalog + daemon objects; flywheel skill §5 synced.
+
+### Fixed
+- Slot ladder wired into pane crews and the captain briefing (previously bailed/rendered empty on slot-aliased profiles); respawn argv verified to route through the same ladder.
+- Preflight: herdr/br checks no longer run for cron mode ("needs resonate only"); resonate URL fallbacks `localhost` → `127.0.0.1` (::1-first resolution false-DOWNed healthy servers).
+
+### Changed
+- Live `~/.config/flywheel/profiles.toml` migrated off ox-alpha-free/jcode pins (backup: `profiles.toml.bak-adr0007`).
+
 ## [0.3.5] — 2026-09-02 inbox cursor + fact budget
 
 ### Fixed

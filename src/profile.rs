@@ -369,8 +369,7 @@ impl ProfileCatalog {
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown profile '@{name}' (flywheel profile list)"))?;
         let registry = models::ModelRegistry::load_routing()?;
-        let (harness, model) =
-            registry.resolve_profile_route(&profile.harness, &profile.model)?;
+        let (harness, model) = registry.resolve_profile_route(&profile.harness, &profile.model)?;
         let spec = SpawnSpec {
             harness,
             model,
@@ -777,7 +776,10 @@ behavior = "be terse"
             "jcode spawn recipe launches the jcode TUI"
         );
         let coder = cat.get("coder").expect("coder present");
-        assert_eq!(coder.harness, "", "coder inherits the standard slot harness");
+        assert_eq!(
+            coder.harness, "",
+            "coder inherits the standard slot harness"
+        );
         assert_eq!(coder.model, "@standard");
         assert_eq!(coder.provider, "");
         let scout = cat.get("scout").expect("scout");
