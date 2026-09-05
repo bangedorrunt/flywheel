@@ -171,8 +171,9 @@ pub enum ComposePart {
         over: String,
         inner: Box<ComposePart>,
     },
-    /// ADR-0006 D3: a compose token (`wave-swarm`, `repair-until-verified`) →
-    /// its compiled-in multi-phase steps, expanded where the token sits.
+    /// ADR-0006 D3 + ADR-0008 §6.7: a compose token (`wave-swarm`,
+    /// `repair-until-verified`, `beads-lifecycle`) → its compiled-in
+    /// multi-phase steps, expanded where the token sits.
     Recipe { name: String },
 }
 
@@ -182,8 +183,8 @@ pub enum ComposePart {
 pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
     let t = token.trim();
     let Some((kind, value)) = t.split_once(':') else {
-        // ADR-0006 D3: a compose token (`wave-swarm`, `repair-until-verified`)
-        // is checked BEFORE the stage-first fallback — a compose-token name
+        // ADR-0006 D3 + ADR-0008 §6.7: a compose token (`wave-swarm`,
+        // `repair-until-verified`, `beads-lifecycle`) is checked BEFORE the — a compose-token name
         // shadows any stage literally named the same (tokens are crate-reserved).
         if t.split(':').count() == 1 && crate::builtin_workflows::is_compose_token(t) {
             return Ok(ComposePart::Recipe {
@@ -358,15 +359,15 @@ pub fn compose_workflow_with(
     let mut extra_inputs: Vec<InputDecl> = Vec::new();
     let mut ordinal = 0u32;
     for part in parts {
-        // ADR-0006 D3: a compose token expands to its compiled-in
-        // steps right where it sits; its declared inputs merge into the
+        // ADR-0006 D3 + ADR-0008 §6.7: a compose token expands to its
+        // compiled-in steps (or graph nodes) right where it sits; its declared inputs merge into the
         // composed workflow so the token's template refs lint clean.
         // The builtin's own on_error (e.g. bug-fix fail_run) is preserved
         // verbatim; bare non-token parts are FailRun via build_part_step (bd-gs005).
         if let ComposePart::Recipe { name } = part {
             let expanded = crate::builtin_workflows::builtin_recipe(name).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "compose part {name:?}: unknown compose token (known: wave-swarm, repair-until-verified)"
+                    "compose part {name:?}: unknown compose token (known: wave-swarm, repair-until-verified, beads-lifecycle)"
                 )
             })?;
             for input in expanded.inputs {
@@ -1661,6 +1662,126 @@ steps:
             .collect();
         let wf = compose_workflow_with("mixed", "obj", None, &parts, &affinity).unwrap();
         assert_eq!(wf.steps.len(), 7, "1 plain + 6 compose-token steps");
+    }
+
+    // ---- ADR-0008 §10.C (bd-adr0008-expand-tests-7ui6) ----
+    // beads-lifecycle expand-path coverage: graph-form token parses,
+    // expands to its 16-node graph lint-clean, mixes with plain parts,
+    // stays within budget caps; thin `beads` stays ordinary.
+    #[test]
+    fn beads_lifecycle_compose_token_parses_and_expands_graph_lint_clean() {
+        use toron_workflow::schema::Action;
+        assert!(
+            crate::builtin_workflows::is_compose_token("beads-lifecycle"),
+            "third token (match arm landed in 84fbfb7)"
+        );
+        let part = parse_compose_part("beads-lifecycle").expect("token parses");
+        assert_eq!(
+            part,
+            ComposePart::Recipe {
+                name: "beads-lifecycle".to_string()
+            },
+            "bare token name routes before the stage-first fallback"
+        );
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
+        let wf =
+            compose_workflow_with("composed-lifecycle", "obj", None, &[part], &affinity)
+                .unwrap();
+        let graph = wf.graph.as_ref().expect("graph-form token expands to graph");
+        assert_eq!(
+            graph.nodes.len(),
+            16,
+            "8 phases + 7 until-guards + 1 implement gate: {:?}",
+            graph.nodes.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            graph.nodes["grill"].needs.is_empty(),
+            "grill first (no needs)"
+        );
+        let approvals = graph
+            .nodes
+            .values()
+            .filter(|n| matches!(&n.action, Action::RequestApproval { .. }))
+            .count();
+        assert_eq!(approvals, 1, "single RequestApproval in the expansion");
+        assert!(
+            matches!(
+                &graph.nodes["signoff"].action,
+                Action::RequestApproval { .. }
+            ),
+            "signoff last (terminal approval)"
+        );
+        assert!(
+            !graph.nodes.values().any(|n| n.needs.contains(&"signoff".to_string())),
+            "nothing runs after signoff"
+        );
+        assert!(
+            wf.inputs.iter().any(|i| i.name == "until"
+                && i.default == Some(serde_json::Value::String("signoff".to_string()))),
+            "token inputs merge (until defaults to signoff): {:?}",
+            wf.inputs.iter().map(|i| &i.name).collect::<Vec<_>>()
+        );
+        let report = toron_workflow::lint_workflow(&wf);
+        assert!(
+            report.is_clean(),
+            "beads-lifecycle expansion must lint clean: {:?}",
+            report.issues
+        );
+        enforce_budget_caps(&wf).expect("7 dispatches, depth 1: within caps");
+    }
+
+    /// A graph-form token mixes with ordinary parts (token nodes land in
+    /// the graph; the plain part lands in steps); the unknown-token error
+    /// names all three tokens.
+    #[test]
+    fn beads_lifecycle_compose_token_mixes_with_plain_parts() {
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
+        let parts: Vec<ComposePart> = ["scout:fresh-eyes-explore", "beads-lifecycle"]
+            .iter()
+            .map(|t| parse_compose_part(t).unwrap())
+            .collect();
+        let wf = compose_workflow_with("mixed", "obj", None, &parts, &affinity).unwrap();
+        assert_eq!(wf.steps.len(), 1, "the plain part lands in steps");
+        assert_eq!(
+            wf.graph.as_ref().expect("graph").nodes.len(),
+            16,
+            "the token lands in the graph"
+        );
+        let err = compose_workflow_with(
+            "bad",
+            "obj",
+            None,
+            &[ComposePart::Recipe {
+                name: "nope".to_string(),
+            }],
+            &affinity,
+        )
+        .expect_err("unknown token refuses");
+        for token in ["wave-swarm", "repair-until-verified", "beads-lifecycle"] {
+            assert!(
+                err.to_string().contains(token),
+                "error names {token}: {err}"
+            );
+        }
+    }
+
+    /// Thin `beads` is an ordinary builtin: not a compose token, parses as
+    /// a stage-first part (never bare `--parts` expansion).
+    #[test]
+    fn thin_beads_is_not_a_compose_token() {
+        assert!(
+            !crate::builtin_workflows::is_compose_token("beads"),
+            "thin beads stays ordinary"
+        );
+        assert_eq!(
+            parse_compose_part("beads").unwrap(),
+            ComposePart::StageFirst {
+                stage: "beads".to_string()
+            },
+            "bare beads falls through to stage-first, not Recipe"
+        );
     }
 
     /// §3.6 envelope #3: budget caps fail closed at the compose gate.
