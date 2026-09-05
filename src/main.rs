@@ -32169,19 +32169,24 @@ mod verify_sink_tests {
 
     #[test]
     fn verify_sink_returns_ok_on_success() {
+        // GS-025: absolute scratch project — Config::default() resolves
+        // ~/workspace/flywheel which does not exist on CI runners.
+        let dir = std::env::temp_dir().join(format!("fw-vs-ok-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
         let cfg = Config::default();
-        let sink = make_verify_sink(cfg, "flywheel".to_string());
+        let sink = make_verify_sink(cfg, dir.to_string_lossy().to_string());
         let req = VerifyRequest {
             command: "echo ok".to_string(),
         };
         let guard = sink.0.lock().unwrap();
         if let Some(f) = guard.as_ref() {
             let res = f(&req).expect("verify sink ok");
-            assert!(res.ok);
+            assert!(res.ok, "error={:?}", res.error);
             assert!(res.stdout_path.is_some() || res.error.is_none());
         } else {
             assert!(guard.is_none());
         }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -32246,8 +32251,11 @@ graph:
 
     #[test]
     fn verify_sink_exec_failing_command_returns_false_with_exit() {
+        // GS-025: absolute scratch project (see verify_sink_returns_ok_on_success).
+        let dir = std::env::temp_dir().join(format!("fw-vs-fail-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
         let cfg = Config::default();
-        let sink = make_verify_sink(cfg, "flywheel".to_string());
+        let sink = make_verify_sink(cfg, dir.to_string_lossy().to_string());
         let req = VerifyRequest {
             command: "false".to_string(),
         };
@@ -32258,19 +32266,23 @@ graph:
         assert!(res.exit != 0);
         assert!(res.stdout_path.is_none());
         assert!(res.error.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn verify_sink_exec_writes_workflow_receipt_on_success() {
+        // GS-025: absolute scratch project (see verify_sink_returns_ok_on_success).
+        let dir = std::env::temp_dir().join(format!("fw-vs-rcpt-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
         let cfg = Config::default();
-        let sink = make_verify_sink(cfg, "flywheel".to_string());
+        let sink = make_verify_sink(cfg, dir.to_string_lossy().to_string());
         let req = VerifyRequest {
             command: "echo workflow-ok".to_string(),
         };
         let guard = sink.0.lock().unwrap();
         let f = guard.as_ref().expect("sink");
         let res = f(&req).expect("verify sink");
-        assert!(res.ok);
+        assert!(res.ok, "error={:?}", res.error);
         assert_eq!(res.exit, 0);
         let path = res.stdout_path.expect("receipt path");
         assert!(path.contains("verify-sink"));
@@ -32279,14 +32291,17 @@ graph:
         // receipt file exists and contains output
         let content = std::fs::read_to_string(&path).expect("receipt file");
         assert!(content.contains("workflow-ok") || content.contains("verify ok"));
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn verify_sink_exec_slot_acquisition_still_happens() {
         // cargo command should go through slot path (acquire/release) without panic
+        // GS-025: absolute scratch project (see verify_sink_returns_ok_on_success).
+        let dir = std::env::temp_dir().join(format!("fw-vs-slot-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
         let cfg = Config::default();
-        let sink = make_verify_sink(cfg, "flywheel".to_string());
+        let sink = make_verify_sink(cfg, dir.to_string_lossy().to_string());
         let req = VerifyRequest {
             command: "cargo --version".to_string(),
         };
@@ -32294,9 +32309,10 @@ graph:
         let f = guard.as_ref().expect("sink");
         let res = f(&req).expect("verify sink");
         // cargo --version succeeds, so ok true
-        assert!(res.ok);
+        assert!(res.ok, "error={:?}", res.error);
         assert_eq!(res.exit, 0);
         assert!(res.stdout_path.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
