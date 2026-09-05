@@ -9,6 +9,7 @@
 # compiles them so they cannot rot silently.
 #
 # The toron checkout is required: flywheel path-depends on ../toron/crates/*.
+# GS-025: beads + toron CLIs must be on PATH (br init / toron help).
 name: CI
 
 on:
@@ -28,11 +29,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout flywheel
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: flywheel
       - name: Checkout sibling toron (path dependency)
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: bangedorrunt/toron
           path: toron
@@ -42,15 +43,29 @@ jobs:
           # this step fails loud — do not make it optional, unverifiable
           # green is the failure GS-018 called out.
           token: ${{ secrets.CI_TORON_TOKEN }}
+      - name: Checkout beads (public — br CLI)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bangedorrunt/beads
+          path: beads
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             flywheel
             toron
+            beads
+      - name: Build br + toron CLIs onto PATH (GS-025)
+        run: |
+          cargo build -p beads --bin br --manifest-path beads/Cargo.toml
+          cargo build -p toron-cli --bin toron --manifest-path toron/Cargo.toml
+          echo "$GITHUB_WORKSPACE/beads/target/debug" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/toron/target/debug" >> "$GITHUB_PATH"
+      - name: Verify br and toron on PATH
+        run: which br toron
       - name: cargo check
         working-directory: flywheel
         run: cargo check --workspace
@@ -73,15 +88,20 @@ jobs:
         shard: [durable, tick-family, engine-family, rest, slices]
     steps:
       - name: Checkout flywheel
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: flywheel
       - name: Checkout sibling toron (path dependency)
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: bangedorrunt/toron
           path: toron
           token: ${{ secrets.CI_TORON_TOKEN }}
+      - name: Checkout beads (public — br CLI)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bangedorrunt/beads
+          path: beads
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -91,11 +111,20 @@ jobs:
           # ("cargo-clippy is not installed") and the gate failed.
           toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             flywheel
             toron
+            beads
+      - name: Build br + toron CLIs onto PATH (GS-025)
+        run: |
+          cargo build -p beads --bin br --manifest-path beads/Cargo.toml
+          cargo build -p toron-cli --bin toron --manifest-path toron/Cargo.toml
+          echo "$GITHUB_WORKSPACE/beads/target/debug" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/toron/target/debug" >> "$GITHUB_PATH"
+      - name: Verify br and toron on PATH
+        run: which br toron
       - name: run shard
         working-directory: flywheel
         run: |
