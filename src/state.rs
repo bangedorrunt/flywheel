@@ -740,6 +740,37 @@ pub fn is_captain_alias_cleared(project: &str) -> bool {
     load_captain_alias(project).is_none()
 }
 
+/// GS-033 B8: last-writer-wins crew role → pin snapshot so the doorbell
+/// owner can seed `WorkspaceModel.roles` without waiting on watch.
+/// File: `state_dir/role_binds/<key>.json` (`{"coder":"DustySparrow",...}`).
+pub fn role_binds_file(project: &str) -> PathBuf {
+    state_dir()
+        .join("role_binds")
+        .join(format!("{}.json", state_key(project)))
+}
+
+pub fn load_role_binds(project: &str) -> BTreeMap<String, String> {
+    let path = role_binds_file(project);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return BTreeMap::new();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+pub fn upsert_role_bind(project: &str, role: &str, pin: &str) -> Result<()> {
+    let path = role_binds_file(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut map = load_role_binds(project);
+    map.insert(role.to_string(), pin.to_string());
+    let body = serde_json::to_string_pretty(&map)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 /// Resolve `captain` target for `mail send --to captain`.
 ///
 /// When alias is cleared (continue left it), fail loud with named remedy
