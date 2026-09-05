@@ -14101,7 +14101,7 @@ fn cmd_kill(
     if !blocked.is_empty() && drain {
         // ADR-0028 zfnx.10 producer: phase 1 of the two-phase stop. Ask
         // each working agent to finish its VERIFY fence, record the drain
-        // on ActiveLoop (the swarm poll seeds ws.swarm.drain_pending from
+        // on ActiveLoop (the swarm poll seeds the loop drain map from
         // it and the tick enforces grace), and SKIP the close. Phase 2 is
         // the loop's past-grace force or an explicit --force-working.
         let mut al = match state::load_active_loop(project)? {
@@ -33217,5 +33217,50 @@ mod why_resume_tests {
             slice.contains("seed_why_presence") || slice.contains("presence.jsonl"),
             "RED (55nx.1): why folds without a presence seed — working pins replay Prompts live would suppress"
         );
+    }
+}
+
+/// GS-030 single-writer-per-slice tripwires (bd-gs030-single-writer-ciqu):
+/// the dispatcher owns every slice except `swarm` and never constructs a
+/// swarm-slice Msg. Any violation fails the build. (Needles split so these
+/// self-scans do not match their own source.)
+#[cfg(test)]
+mod single_writer_tests {
+    /// Swarm-slice Msgs the dispatcher must never construct (tick / herdr /
+    /// heal / nudges / reclaim / diagnose-failed).
+    #[test]
+    fn single_writer_doorbell_constructs_no_swarm_slice_msgs() {
+        let src = include_str!("main.rs");
+        let variants = [
+            ["Msg::Ti", "ck {"].concat(),
+            ["Msg::Her", "dr {"].concat(),
+            ["Msg::He", "al {"].concat(),
+            ["Msg::ClaimNu", "dge {"].concat(),
+            ["Msg::CloseNu", "dge {"].concat(),
+            ["Msg::Recl", "aim {"].concat(),
+            ["Msg::DiagnoseFa", "iled {"].concat(),
+        ];
+        for needle in &variants {
+            assert!(
+                !src.contains(needle.as_str()),
+                "single-writer: dispatcher must not construct {needle} (swarm slice)"
+            );
+        }
+    }
+
+    /// State touches: the dispatcher must never read or write swarm state —
+    /// no live owner besides the loop holds it.
+    #[test]
+    fn single_writer_doorbell_touches_no_swarm_state() {
+        let src = include_str!("main.rs");
+        for needle in [
+            ["workspace_model.sw", "arm"].concat(),
+            ["model.sw", "arm"].concat(),
+        ] {
+            assert!(
+                !src.contains(needle.as_str()),
+                "single-writer: dispatcher must not touch {needle}"
+            );
+        }
     }
 }
