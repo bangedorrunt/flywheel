@@ -16,7 +16,6 @@ echo "== ADR-0008 verification =="
 grep -qE '^status: accepted' "$ADR" && ok "frontmatter status: accepted" || bad "status not accepted"
 grep -q '2026-09-05' "$ADR" && ok "date 2026-09-05 present" || bad "date missing"
 grep -q 'beads-lifecycle' "$ADR" && ok "beads-lifecycle design section present" || bad "beads-lifecycle missing from ADR"
-grep -qi 'implement pending' "$ADR" && ok "implement pending honesty present" || bad "missing implement-pending honesty"
 
 grep -q '0008-workflow-compose-topology-agent-optimal-mental-model.md' docs/decisions/README.md \
   && ok "README indexes 0008" || bad "README missing 0008"
@@ -31,7 +30,8 @@ else
   bad "is_compose_token missing expected live tokens"
 fi
 
-# If beads-lifecycle appears in is_compose_token, ADR must no longer say implement pending
+# Honesty vs live token: require "implement pending" only while beads-lifecycle
+# is NOT yet in is_compose_token; once it is gated, that phrase must be absent.
 if grep -n 'pub fn is_compose_token' -A6 src/builtin_workflows.rs | grep -q 'beads-lifecycle'; then
   if grep -qi 'implement pending' "$ADR"; then
     bad "beads-lifecycle in is_compose_token but ADR still says implement pending (update ADR speech)"
@@ -39,7 +39,11 @@ if grep -n 'pub fn is_compose_token' -A6 src/builtin_workflows.rs | grep -q 'bea
     ok "is_compose_token includes beads-lifecycle and ADR no longer says implement pending"
   fi
 else
-  ok "beads-lifecycle NOT in is_compose_token (implement pending — honest)"
+  if grep -qi 'implement pending' "$ADR"; then
+    ok "implement pending honesty present (beads-lifecycle NOT in is_compose_token)"
+  else
+    bad "missing implement-pending honesty (beads-lifecycle not yet in is_compose_token)"
+  fi
 fi
 
 # Broken local flywheel 0027 path must not appear as if local
