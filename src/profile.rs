@@ -1073,7 +1073,7 @@ spawn_cmd = "hermes --project {project} --role {role}"
             .expect("resolve");
         assert_eq!(r.npub, "npub-project-agent");
         assert_eq!(r.spec.harness, "pi");
-        assert_eq!(r.spec.model, "opencode-go/deepseek-v4-flash");
+        assert_eq!(r.spec.model, "opencode-go/muse-spark-1.3-contributor");
         assert_eq!(r.spec.backend, "herdr");
         assert_eq!(
             r.signing,
@@ -1113,7 +1113,7 @@ spawn_cmd = "hermes --project {project} --role {role}"
             .resolve_for_engine("@planner")
             .expect("@planner must resolve");
         assert_eq!(got["spec"]["harness"], "omp");
-        assert_eq!(got["spec"]["model"], "zai/glm-5.2");
+        assert_eq!(got["spec"]["model"], "zai/glm-5.3");
         assert_eq!(got["spec"]["backend"], "herdr");
         assert_eq!(got["spec"]["role"], "planner");
         assert_eq!(

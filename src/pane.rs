@@ -1489,7 +1489,7 @@ mod tests {
                 "housekeeper".into(),
                 crate::profile::Profile {
                     harness: "pi".into(),
-                    model: "glm-5.2".into(),
+                    model: "glm-5.3".into(),
                     effort: "max".into(),
                     ..Default::default()
                 },
@@ -1503,7 +1503,7 @@ mod tests {
             if name == "@housekeeper" {
                 Some(json!({
                     "npub": "",
-                    "spec": { "harness": "pi", "model": "glm-5.2", "backend": "herdr", "role": "housekeeper" },
+                    "spec": { "harness": "pi", "model": "glm-5.3", "backend": "herdr", "role": "housekeeper" },
                 }))
             } else {
                 None
@@ -1521,7 +1521,7 @@ mod tests {
         let spec = json!({
             "profile": "@housekeeper",
             "workflow": "weekly-upgrade",
-            "resolved": { "npub": "", "spec": { "harness": "pi", "model": "glm-5.2", "backend": "herdr", "role": "housekeeper" } },
+            "resolved": { "npub": "", "spec": { "harness": "pi", "model": "glm-5.3", "backend": "herdr", "role": "housekeeper" } },
             "await": true,
         });
         let plan = spawn_launch_plan("prom-1", &spec, &test_catalog()).expect("plan");
@@ -1538,7 +1538,7 @@ mod tests {
             "model/effort args must reach agent_start"
         );
         assert!(
-            plan.args.iter().any(|a| a.contains("glm-5.2")),
+            plan.args.iter().any(|a| a.contains("glm-5.3")),
             "model flag present: {:?}",
             plan.args
         );
@@ -1637,7 +1637,7 @@ steps:
         assert!(
             receipts[0]["args"].as_array().is_some_and(|a| a
                 .iter()
-                .any(|s| s.as_str().is_some_and(|x| x.contains("glm-5.2")))),
+                .any(|s| s.as_str().is_some_and(|x| x.contains("glm-5.3")))),
             "launch args carried: {:?}",
             receipts[0]["args"]
         );
