@@ -31,10 +31,13 @@ else
   bad "is_compose_token missing expected live tokens"
 fi
 
-# Must NOT claim beads-lifecycle in the match arms yet (WARN→FAIL if present without ADR update)
+# If beads-lifecycle appears in is_compose_token, ADR must no longer say implement pending
 if grep -n 'pub fn is_compose_token' -A6 src/builtin_workflows.rs | grep -q 'beads-lifecycle'; then
-  # If code landed, ADR verification section should still be consistent — soft ok with note
-  ok "is_compose_token includes beads-lifecycle (10.C landed — ensure docs speech updated)"
+  if grep -qi 'implement pending' "$ADR"; then
+    bad "beads-lifecycle in is_compose_token but ADR still says implement pending (update ADR speech)"
+  else
+    ok "is_compose_token includes beads-lifecycle and ADR no longer says implement pending"
+  fi
 else
   ok "beads-lifecycle NOT in is_compose_token (implement pending — honest)"
 fi

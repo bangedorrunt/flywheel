@@ -293,6 +293,12 @@ Lock nouns and doors; publish compose-token vs ordinary-builtin throughout; Acce
 - **Nested captain+crew** via `call_workflow` / `dispatch_job` spend crew attention under budget caps — they do **not** open a second captain SIGNOFF / nested `request_approval`.
 - **Topology** (`loop-mode`) may host long-lived supervision beside or around runs; it does not become a Workflow subclass and does not absorb `request_approval` semantics.
 
+### 6.6 Toron touchpoints (category hygiene)
+
+- `WorkflowEngine::invoke` + `VerifySink` remain the graph verify door.
+- `run_branch` stays workflow-engine control flow — **not** flywheel tick ([toron ADR-0027](../../toron/docs/decisions/0027-one-workspace-tick-control-plane.md) leftover hygiene).
+- Dep direction unchanged: flywheel → toron-workflow.
+
 ### 6.7 Counsel → Accepted addendum — `beads-lifecycle` (GS-022 / GS-023 / GS-024)
 
 Fold of GS-022. **Design Accepted.** **Implement pending** — do **not** land YAML / match arm / tests in this Accept ship.
@@ -406,11 +412,6 @@ flowchart LR
   ws -.->|on verify fail optional| ruv
 ```
 
-### 6.6 Toron touchpoints (category hygiene)
-
-- `WorkflowEngine::invoke` + `VerifySink` remain the graph verify door.
-- `run_branch` stays workflow-engine control flow — **not** flywheel tick ([toron ADR-0027](../../toron/docs/decisions/0027-one-workspace-tick-control-plane.md) leftover hygiene).
-- Dep direction unchanged: flywheel → toron-workflow.
 
 ---
 
@@ -469,7 +470,7 @@ flowchart LR
 
 ## 10. Implementation Plan
 
-Agent-readiness: an implementer can start from this section without tribal knowledge. **This Accept ship** lands the ADR + README only. Code follow-ups are sequenced below.
+Agent-readiness: an implementer can start from this section without tribal knowledge. **This Accept ship** lands the ADR + README + optional `verify-0008.sh`. Code follow-ups are sequenced below.
 
 ### 10.A — This ship (GS-024 Accept land)
 
