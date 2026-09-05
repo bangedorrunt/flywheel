@@ -1093,7 +1093,7 @@ steps:
     on_error: fail_run
 "##,
     ),
-    // ---- ADR-0006 D3 wave-swarm recipe (bd-wave-swarm-recipe-wsot) ------
+    // ---- ADR-0006 D3 wave-swarm compose token (bd-wave-swarm-recipe-wsot) ------
     // The composed unattended wave swarm: GATE (D2 filter + preflight) ->
     // DISPATCH (D1 --param payloads per ready bead, D4 report_file contract)
     // -> OBSERVE (escalate, never adjudicate) -> VERIFY (receipt at HEAD +
@@ -1357,17 +1357,17 @@ pub fn builtin_workflows() -> BTreeMap<String, Workflow> {
     map
 }
 
-/// ADR-0006 D3 (bd-wave-swarm-recipe-wsot): is `name` a builtin RECIPE — a
-/// composed multi-phase workflow addressable as a single `--parts` token?
-/// Deliberately NOT every builtin: only the composed recipes (today:
-/// wave-swarm) expand on the compose grammar; phase/playbook builtins keep
-/// their own routing (`decide`, cron templates).
-pub fn is_builtin_recipe(name: &str) -> bool {
+/// ADR-0006 D3 (bd-wave-swarm-recipe-wsot): is `name` a compose token — a
+/// composed multi-phase workflow legal as a bare `--parts` token?
+/// Deliberately NOT every builtin: only compose tokens (today: wave-swarm,
+/// repair-until-verified) expand on the compose grammar; ordinary builtins
+/// (e.g. captain-audit) stay on `workflow run <name> --execute`.
+pub fn is_compose_token(name: &str) -> bool {
     matches!(name, "wave-swarm" | "repair-until-verified")
 }
 
-/// ADR-0006 D3: a builtin RECIPE's parsed workflow for compose expansion
-/// (a recipe token expands where it sits; its `inputs:` declarations merge
+/// ADR-0006 D3: a compose token's parsed workflow for compose expansion
+/// (the token expands where it sits; its `inputs:` declarations merge
 /// into the composed workflow so template refs lint clean). Pure.
 pub fn builtin_recipe(name: &str) -> Option<Workflow> {
     builtin_workflows().remove(name)

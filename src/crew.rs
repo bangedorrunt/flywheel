@@ -171,8 +171,8 @@ pub enum ComposePart {
         over: String,
         inner: Box<ComposePart>,
     },
-    /// ADR-0006 D3: a builtin recipe token (`wave-swarm`) → its compiled-in
-    /// multi-phase steps, expanded where the token sits.
+    /// ADR-0006 D3: a compose token (`wave-swarm`, `repair-until-verified`) →
+    /// its compiled-in multi-phase steps, expanded where the token sits.
     Recipe { name: String },
 }
 
@@ -182,10 +182,10 @@ pub enum ComposePart {
 pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
     let t = token.trim();
     let Some((kind, value)) = t.split_once(':') else {
-        // ADR-0006 D3: a builtin recipe token (`wave-swarm`) is checked
-        // BEFORE the stage-first fallback — a recipe name shadows any stage
-        // literally named the same (recipes are crate-reserved words).
-        if t.split(':').count() == 1 && crate::builtin_workflows::is_builtin_recipe(t) {
+        // ADR-0006 D3: a compose token (`wave-swarm`, `repair-until-verified`)
+        // is checked BEFORE the stage-first fallback — a compose-token name
+        // shadows any stage literally named the same (tokens are crate-reserved).
+        if t.split(':').count() == 1 && crate::builtin_workflows::is_compose_token(t) {
             return Ok(ComposePart::Recipe {
                 name: t.to_string(),
             });
@@ -358,15 +358,15 @@ pub fn compose_workflow_with(
     let mut extra_inputs: Vec<InputDecl> = Vec::new();
     let mut ordinal = 0u32;
     for part in parts {
-        // ADR-0006 D3: a builtin recipe token expands to its compiled-in
+        // ADR-0006 D3: a compose token expands to its compiled-in
         // steps right where it sits; its declared inputs merge into the
-        // composed workflow so the recipe's template refs lint clean.
+        // composed workflow so the token's template refs lint clean.
         // The builtin's own on_error (e.g. bug-fix fail_run) is preserved
-        // verbatim; bare non-recipe parts are FailRun via build_part_step (bd-gs005).
+        // verbatim; bare non-token parts are FailRun via build_part_step (bd-gs005).
         if let ComposePart::Recipe { name } = part {
             let expanded = crate::builtin_workflows::builtin_recipe(name).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "compose part {name:?}: unknown builtin recipe (known: wave-swarm, repair-until-verified)"
+                    "compose part {name:?}: unknown compose token (known: wave-swarm, repair-until-verified)"
                 )
             })?;
             for input in expanded.inputs {
@@ -422,7 +422,7 @@ pub fn compose_workflow_with(
     })
 }
 
-/// Does `inputs` already declare `name`? (recipe-input merge dedup)
+/// Does `inputs` already declare `name`? (compose-token input merge dedup)
 fn steps_has_input(inputs: &[InputDecl], name: &str) -> bool {
     inputs.iter().any(|i| i.name == name)
 }
@@ -547,10 +547,10 @@ fn build_part_step(
             backoff_secs: 0,
             step: Box::new(leaf(inner, ordinal, objective, affinity)?),
         })),
-        // ADR-0006 D3: a recipe is multi-step — it never reaches the
+        // ADR-0006 D3: a compose token is multi-step — it never reaches the
         // one-step builder; compose_workflow_with expands it inline.
         ComposePart::Recipe { name } => {
-            anyhow::bail!("compose part: recipe `{name}` must expand in the assemble loop")
+            anyhow::bail!("compose part: compose token `{name}` must expand in the assemble loop")
         }
         leaf_part @ (ComposePart::Dispatch { .. }
         | ComposePart::StageFirst { .. }
@@ -1593,15 +1593,15 @@ steps:
         enforce_budget_caps(&wf).expect("within caps");
     }
 
-    /// ADR-0006 D3: the `wave-swarm` builtin recipe token expands to the
-    /// five-phase workflow — GATE → DISPATCH → OBSERVE → VERIFY → SIGNOFF —
+    /// ADR-0006 D3: the `wave-swarm` compose token expands to the
+    /// six-step workflow — GATE → DISPATCH → EXECUTE → OBSERVE → VERIFY → SIGNOFF —
     /// and the expansion lints clean.
     #[test]
-    fn wave_swarm_recipe_expands_five_phases_and_lints_clean() {
+    fn wave_swarm_compose_token_expands_six_steps_and_lints_clean() {
         use toron_workflow::schema::Action;
         let lib = crate::stages::StageLibrary::compiled_in();
         let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
-        let part = parse_compose_part("wave-swarm").expect("builtin recipe token parses");
+        let part = parse_compose_part("wave-swarm").expect("compose token parses");
         let wf = compose_workflow_with("composed-wave", "obj", None, &[part], &affinity).unwrap();
         assert_eq!(wf.steps.len(), 6, "{:?}", wf.steps.iter().map(|s| &s.name));
         assert!(
@@ -1648,11 +1648,11 @@ steps:
         );
     }
 
-    /// ADR-0006 D3: a recipe token mixes with ordinary parts (recipe steps
-    /// land where the token sits); unknown recipe-looking tokens stay plain
+    /// ADR-0006 D3: a compose token mixes with ordinary parts (token steps
+    /// land where the token sits); unknown token-looking names stay plain
     /// role parts (the role fallback is untouched).
     #[test]
-    fn wave_swarm_recipe_mixes_with_plain_parts() {
+    fn wave_swarm_compose_token_mixes_with_plain_parts() {
         let lib = crate::stages::StageLibrary::compiled_in();
         let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
         let parts: Vec<ComposePart> = ["scout:fresh-eyes-explore", "wave-swarm"]
@@ -1660,7 +1660,7 @@ steps:
             .map(|t| parse_compose_part(t).unwrap())
             .collect();
         let wf = compose_workflow_with("mixed", "obj", None, &parts, &affinity).unwrap();
-        assert_eq!(wf.steps.len(), 7, "1 plain + 6 recipe");
+        assert_eq!(wf.steps.len(), 7, "1 plain + 6 compose-token steps");
     }
 
     /// §3.6 envelope #3: budget caps fail closed at the compose gate.

@@ -31,7 +31,7 @@ fi
 
 echo "-- D3 wave-swarm recipe (bd-wave-swarm-recipe-wsot) --"
 if cargo test --offline wave_swarm >/dev/null 2>&1; then
-  ok "D3 recipe expands GATE/DISPATCH/OBSERVE/VERIFY/SIGNOFF and lints clean"
+  ok "D3 compose token expands GATE/DISPATCH/EXECUTE/OBSERVE/VERIFY/SIGNOFF and lints clean"
 else
   bad "D3 wave_swarm tests fail"
 fi
@@ -66,7 +66,7 @@ echo "  CAPTAIN-GATE: run manually — flywheel workflow compose \"<fixture obje
 
 echo "-- Skill Sync Contract (Commands enum compiles = ground truth; surfaces here) --"
 if grep -q 'stage_params' src/main.rs && grep -q 'wave_dispatch' src/main.rs \
-   && grep -q 'wave_swarm_recipe' src/main.rs; then
+   && grep -q 'wave_swarm_compose_token' src/main.rs; then
   ok "robot_capabilities carries D1+D2+D3 entries"
 else
   bad "robot_capabilities missing D1/D2/D3 entries in src/main.rs"

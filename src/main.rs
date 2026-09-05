@@ -885,8 +885,9 @@ enum Commands {
         cmd: ProfileCmd,
     },
     /// Squads (ADR-0005 P6) — named groups of profiles = spawn shapes.
-    /// Vocabulary: say "squad" here; "recipe" means a compose token
-    /// (builtin workflow spliced into `workflow compose --parts`).
+    /// Vocabulary: say "squad" here. A compose token (`wave-swarm`,
+    /// `repair-until-verified`) is a bare `--parts` name on
+    /// `workflow compose … --parts <token> --run` — not a squad.
     /// `recipes`/`template` stay as legacy aliases of this surface.
     Squad {
         #[command(subcommand)]
@@ -2839,11 +2840,15 @@ enum WorkflowCmd {
         /// lint only this workflow (name), else all
         name: Option<String>,
     },
-    /// Run a workflow by name through the unified engine (lint gate first)
-    /// Interactive TTY briefing when `--execute` (bd-nmzk): same skip
-    /// matrix as `steer` — shared prompt module (`source = workflow`).
+    /// Run a workflow by name through the unified engine (lint gate first).
+    /// Ordinary builtins (e.g. captain-audit): `workflow run <name> --execute`.
+    /// Compose tokens (`wave-swarm`, `repair-until-verified`): prefer
+    /// `workflow compose … --parts <token> --run`; `workflow run <token>
+    /// --execute` is the legacy alias. Do NOT pass ordinary builtins as bare
+    /// `--parts`. Interactive TTY briefing when `--execute` (bd-nmzk): same
+    /// skip matrix as `steer` — shared prompt module (`source = workflow`).
     Run {
-        /// workflow name (built-in or catalog)
+        /// workflow name (built-in or catalog); compose tokens accepted as legacy alias
         name: String,
         /// JSON inputs for the invoke path ({{inputs.x}})
         #[arg(long)]
@@ -2908,7 +2913,9 @@ enum WorkflowCmd {
         /// optional base workflow whose steps seed the composition
         #[arg(long)]
         base: Option<String>,
-        /// parts spec: comma-separated `role:stage` or `workflow:name`
+        /// parts: comma-separated `role:stage`, `workflow:name`, bare stage,
+        /// or compose token (`wave-swarm` / `repair-until-verified`). Preferred
+        /// door for compose tokens: `compose … --parts <token> --run`.
         #[arg(long, value_delimiter = ',')]
         parts: Vec<String>,
         /// planner arm: an agent authors the workflow from the target
@@ -2936,7 +2943,7 @@ enum WorkflowCmd {
         project: Option<String>,
         /// bd-wave-swarm-graduation-fix-98io: run inputs as a JSON object
         /// (merged over {"objective": target}) — e.g. the orchestrator pin
-        /// the recipe escalates to: --inputs '{"captain_pin":"<pin>"}'
+        /// the compose run escalates to: --inputs '{"captain_pin":"<pin>"}'
         #[arg(long)]
         inputs: Option<String>,
         /// ADR-0025 W5: stable idempotency key for compose --run (project, bead_id|run_id, profile) — second run with same key returns existing run
@@ -3847,7 +3854,7 @@ fn main() {
                 "hub": "flywheel catalog [--json] — ratatui multi-panel; refuses non-TTY/NO_COLOR/TERM=dumb naming the CLI (ADR-0007 D4)"
             },
             "wave_dispatch": "loop run --work --wave-label wave-N scopes the ready set to that label and holds (naming blockers) while any lower wave-M (M<N) is open/in_progress; default --work unchanged; label-based transitional until beads ADR-0001 schema-18 (ADR-0006 D2)",
-            "wave_swarm_recipe": "workflow compose \"<objective>\" --parts wave-swarm expands GATE/DISPATCH/OBSERVE/VERIFY/SIGNOFF over the compiled-in wave-* stages; SIGNOFF is request_approval — the run suspends for captain-only sign-off; bounded by FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
+            "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/VERIFY/SIGNOFF; SIGNOFF=request_approval (captain-only). Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Bounded by FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
             "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error" }
         }));
         return;
@@ -32305,7 +32312,7 @@ mod repair_recipe_tests {
 
     #[test]
     fn repair_recipe_is_registered_and_has_graph_nodes() {
-        assert!(crate::builtin_workflows::is_builtin_recipe(
+        assert!(crate::builtin_workflows::is_compose_token(
             "repair-until-verified"
         ));
         let wf = crate::builtin_workflows::builtin_recipe("repair-until-verified")
