@@ -271,7 +271,7 @@ impl StageLibrary {
             (
                 "wave-dispatch",
                 "",
-                "Wave dispatch (ADR-0006 D3/D1/D4). FIRST read the gate artifact `.flywheel/wave/<wave-label>-ready.json` (bd-wave-swarm-graduation-fix-98io — you dispatch ONLY beads the GATE wrote there; if the file is missing or \"held\": true, post `[dispatch] held` and STOP). For EACH bead in ready[] emit ONE payload to the crew's coder pane (find it: `herdr agent list`, this workspace, profile coder): `flywheel send --to <coder-pane-name> --stage systematic-execute --param bead=<id> --param scope=<owned globs> --param exit=<the bead's VERIFY command from the artifact> --param channel=<steer-channel> --param pin=<coder-pin> --param report_file=/tmp/<id>-report-<epoch>.md`. p1/fresh-eyes-explore is scout-only; coder execution is systematic-execute (p6). Every payload NAMES its bead id and carries the CLAIM/CLOSE CONTRACT — also post it once on the steer channel: claim before work (`br update <id> --status=in_progress --assignee <pin>`), reserve files before editing, commit BEFORE close with the bead id in the message, close only with VERIFY tail + principles citations. Full reports go to report_file; the steer channel gets a <=700-char summary plus the file path.",
+                "Wave dispatch (ADR-0006 D3/D1/D4). FIRST read the gate artifact `.flywheel/wave/<wave-label>-ready.json` (bd-wave-swarm-graduation-fix-98io — you dispatch ONLY beads the GATE wrote there; if the file is missing or \"held\": true, post `[dispatch] held` and STOP). For EACH bead in ready[] emit ONE payload to the crew's coder pane (find it: `herdr agent list`, this workspace, profile coder): `flywheel send --to <coder-pane-name> --stage systematic-execute --param bead=<id> --param scope=<owned globs> --param exit=<the bead's VERIFY command from the artifact> --param channel=<steer-channel> --param pin=<coder-pin> --param report_file=/tmp/<id>-report-<epoch>.md`. p1/fresh-eyes-explore is scout-only; coder execution is systematic-execute (p6). Every payload NAMES its bead id and carries the CLAIM/CLOSE CONTRACT — also post it once on the steer channel: claim before work (`br update <id> --status=in_progress --assignee <herdr-name>` — the herdr slug, e.g. flywheel-toron-coder, never a pin), reserve files before editing, commit BEFORE close with the bead id in the message, gate the completion (`br gate report <id> --gate <verdict> --provider <pin> --status pass --to closed`) then close with the commit sha (`br close <id> --commit-sha <sha>`) carrying the VERIFY tail + principles citations. Full reports go to report_file; the steer channel gets a <=700-char summary plus the file path.",
             ),
             (
                 "wave-observe",
@@ -729,6 +729,49 @@ mod tests {
         for code in ["p1", "p2", "p4", "p5", "p6", "p8"] {
             assert!(lib.has(code), "compiled-in stage {code} resolves");
         }
+    }
+
+    /// bd-close-ceremony-gate-sha-68ms (GS-028 B13-B15+B3): the taught close
+    /// contract is gate → commit → sha-carrying close, and the claim assignee
+    /// is a herdr slug, never a pin. Both the wave-dispatch stage and the
+    /// /beads-commit template carry it — ceremony drift fails the build.
+    #[test]
+    fn close_ceremony_contract_names_gate_sha_and_herdr_assignee() {
+        let lib = StageLibrary::compiled_in();
+        let dispatch = lib
+            .resolve("wave-dispatch")
+            .expect("wave-dispatch resolves");
+        for needle in [
+            "gate report",
+            "--commit-sha",
+            "--assignee <herdr-name>",
+            "commit BEFORE close",
+        ] {
+            assert!(
+                dispatch.contains(needle),
+                "wave-dispatch must teach {needle:?}"
+            );
+        }
+        assert!(
+            !dispatch.contains("--assignee <pin>"),
+            "wave-dispatch must not teach pin assignees (br takes a herdr slug)"
+        );
+
+        let tpl = include_str!("../integrations/prompts/beads-commit.md.tpl");
+        for needle in [
+            "gate report",
+            "--commit-sha",
+            "Commit BEFORE close",
+            "VERIFY tail",
+        ] {
+            assert!(tpl.contains(needle), "/beads-commit must teach {needle:?}");
+        }
+        let commit_pos = tpl.find("Commit BEFORE close").expect("order anchor");
+        let close_pos = tpl.find("br close").expect("close anchor");
+        assert!(
+            commit_pos < close_pos,
+            "/beads-commit must order commit before close"
+        );
     }
 
     /// bd-oj9o #2: the onboard + triage-deep workflows resolve their stages.

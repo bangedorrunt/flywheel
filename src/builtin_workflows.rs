@@ -399,7 +399,7 @@ description: "Triage inbound messages — the canonical reactive workflow (auto 
 trigger:
   type: message_posted
   channel: "#support"
-guard: "trigger.channel == '#support'"
+guard: "trigger.channel == \"#support\""
 steps:
   - name: ack
     action: send_dm
@@ -1268,7 +1268,7 @@ graph:
     decide:
       needs: [verify-3]
       action: branch
-      if: "steps_verify_1_ok == 'true' || steps_verify_2_ok == 'true' || steps_verify_3_ok == 'true'"
+      if: "steps_verify_1_ok == \"true\" || steps_verify_2_ok == \"true\" || steps_verify_3_ok == \"true\""
       then: []
       else:
         - action: verify
@@ -3034,6 +3034,47 @@ mod tests {
                 .unwrap_or("")
                 .contains("continue on verify failure"),
             "description must be honest (was Unrolled claim)"
+        );
+    }
+
+    /// bd-repair-quotes-double-z9vv (GS-028 NEW-3): the repair decide guard
+    /// must use DOUBLE-quoted string literals — evalexpr accepts only `"..."`,
+    /// so single-quoted `'true'` eval-errors to false and the run always takes
+    /// else. The compiled guard is also linted clean (toron lint rejects
+    /// single quotes at the authoring boundary).
+    #[test]
+    fn repair_decide_double_quotes() {
+        let wfs = builtin_workflows();
+        let repair = &wfs["repair-until-verified"];
+        let graph = repair.graph.as_ref().expect("repair is a graph");
+        let decide = &graph.nodes["decide"];
+        match &decide.action {
+            toron_workflow::schema::Action::Branch { if_guard, .. } => {
+                assert!(
+                    !if_guard.contains('\''),
+                    "decide guard must not contain single quotes, got: {if_guard}"
+                );
+                for step in [
+                    "steps_verify_1_ok",
+                    "steps_verify_2_ok",
+                    "steps_verify_3_ok",
+                ] {
+                    assert!(
+                        if_guard.contains(&format!("{step} == \"true\"")),
+                        "decide guard must compare {step} to double-quoted \"true\", got: {if_guard}"
+                    );
+                }
+            }
+            other => panic!("decide must be Branch, got {other:?}"),
+        }
+        let report = toron_workflow::lint_workflow(repair);
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|i| !matches!(i.level, toron_workflow::Level::Error)),
+            "repair workflow must lint with no errors: {:?}",
+            report.issues
         );
     }
 
