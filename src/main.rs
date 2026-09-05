@@ -7466,19 +7466,62 @@ projects available: {}",
                 &agent.pane_id,
                 mail_identity.as_deref(),
             );
+            // GS-030 slice 3: auto-bind the crew role to the pin.
+            bind_spawn_role(
+                cfg,
+                project,
+                item.profile.as_deref(),
+                &item.short,
+                mail_identity.as_deref(),
+            );
             let entry = match (&item.profile, &mail_identity) {
-                (Some(p), mid) => state::SpawnEntry::profiled(
+                (Some(p), Some(mid)) => state::SpawnEntry::profiled(
                     agent.pane_id.clone(),
                     name.clone(),
                     p.clone(),
                     kind.clone(),
-                    mid.clone(),
+                    Some(mid.clone()),
                 ),
+                // GS-030 slice 4: profiled spawn with no pin — fail closed
+                // when mail is configured (a pin should exist; a dark
+                // profiled pane is a failure, not a shape), legacy+warn
+                // when mail is not configured at all.
+                (Some(p), None)
+                    if unpinned_spawn_fate(backend::mail_backend(cfg).is_ok())
+                        == UnpinnedFate::FailClosed =>
+                {
+                    anyhow::bail!(
+                        "spawn {name} (profile {p}) drew no mail identity while mail is configured — refusing a dark pane (fix mail, then re-run; never operates unpinned)"
+                    )
+                }
+                (Some(p), None) => {
+                    eprintln!(
+                        "flywheel: warn: spawned {name} ({}) profile {p} with no mail identity (mail not configured); doorbell sweep skips unpinned panes",
+                        agent.pane_id
+                    );
+                    state::SpawnEntry::profiled(
+                        agent.pane_id.clone(),
+                        name.clone(),
+                        p.clone(),
+                        kind.clone(),
+                        None,
+                    )
+                }
                 (None, Some(mid)) => state::SpawnEntry::with_mail_identity(
                     agent.pane_id.clone(),
                     name.clone(),
                     mid.clone(),
                 ),
+                // GS-030 slice 4: same fail-closed rule for bare spawns —
+                // a configured backend that yields no pin is a failure.
+                (None, None)
+                    if unpinned_spawn_fate(backend::mail_backend(cfg).is_ok())
+                        == UnpinnedFate::FailClosed =>
+                {
+                    anyhow::bail!(
+                        "spawn {name} drew no mail identity while mail is configured — refusing a dark pane (fix mail, then re-run; never operates unpinned)"
+                    )
+                }
                 (None, None) => {
                     // bd-unpinned-loud-1mlt: a legacy entry with no mail
                     // identity is invisible to the doorbell sweep — say so at
@@ -9696,6 +9739,30 @@ fn unpinned_registry_names(registry: &[state::SpawnEntry]) -> Vec<String> {
         .collect()
 }
 
+/// GS-030 slice 4 (bd-gs030-failclosed-m1x0): fate of a spawn that drew no
+/// pin. Pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnpinnedFate {
+    /// Mail is configured so a pin should exist: fail naming the pane
+    /// instead of writing a dark row the sweep will skip.
+    FailClosed,
+    /// Mail is not configured (bare experiments, offline): proceed with the
+    /// legacy/unpinned entry and warn loud (current behavior preserved).
+    LegacyWarn,
+}
+
+/// Decide [`UnpinnedFate`] from whether mail is configured
+/// (`backend::mail_backend(cfg).is_ok()` — the same signal the pin draw
+/// gates on). A configured backend that yields no pin is a failure, not a
+/// shape; an unconfigured backend is an experiment, not an error.
+pub(crate) fn unpinned_spawn_fate(mail_configured: bool) -> UnpinnedFate {
+    if mail_configured {
+        UnpinnedFate::FailClosed
+    } else {
+        UnpinnedFate::LegacyWarn
+    }
+}
+
 /// Plane P: one `toron mail inbox --since` per pin, batched on the 1s tick.
 /// Gap 13: prefers in-process `Mailbox::fetch_inbox` (zero fork) and falls back
 /// to `toron mail inbox` CLI only when the in-process mailbox is unavailable.
@@ -11880,6 +11947,9 @@ fn cmd_add(
                 &agent.pane_id,
                 mail_identity.as_deref(),
             );
+            // GS-030 slice 3: auto-bind the kind role to the pin (add path
+            // carries no profile — the kind short is the role noun).
+            bind_spawn_role(cfg, project, None, short, mail_identity.as_deref());
             println!("  {} {}", kind_paint(&kind), agent.pane_id);
             spawned
                 .push(json!({ "name": agent.name, "kind": agent.agent, "pane_id": agent.pane_id }));
@@ -15971,6 +16041,53 @@ fn thread_has_reply(
     })
 }
 
+/// GS-030 slice 3 (bd-gs030-rolebind-02mi): the role noun a spawn auto-binds
+/// to its pin via `toron role pin` charter (30013 `role=` → `Msg::RoleBound`
+/// → `WorkspaceModel.roles`). Profile name when profile-driven, else the
+/// kind short. `None` for captain (reserved — `identity.rs:375`; captain
+/// stays `toron contact captain`) and for empty nouns. Pure.
+pub(crate) fn spawn_role_noun(profile: Option<&str>, short: &str) -> Option<String> {
+    let raw = profile
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| short.trim());
+    let noun = raw.strip_prefix('@').unwrap_or(raw).trim();
+    if noun.is_empty() || noun == "captain" {
+        return None;
+    }
+    Some(noun.to_string())
+}
+
+/// GS-030 slice 3 (bd-gs030-rolebind-02mi): best-effort spawn-time role
+/// bind (alias table + signed 30013 `role=` charter via the Mail facade).
+/// Warns loud on failure; never fails the spawn/add. No pin or no role
+/// noun (captain/empty) → silent no-op.
+fn bind_spawn_role(
+    cfg: &Config,
+    project: &str,
+    profile: Option<&str>,
+    short: &str,
+    pin: Option<&str>,
+) {
+    let Some(pin) = pin.filter(|p| !p.is_empty()) else {
+        return;
+    };
+    let Some(role) = spawn_role_noun(profile, short) else {
+        return;
+    };
+    match mail_shim::Mail::from_config(Some(&cfg.toron_mail_config())) {
+        Ok(Some(facade)) => {
+            if let Err(e) = facade.pin_role_alias(project, &role, pin) {
+                eprintln!("flywheel: mail role pin failed for role {role} -> {pin}: {e:#}");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("flywheel: mail role pin skipped (mail unavailable): {e:#}");
+        }
+    }
+}
+
 /// S8.3/S8.4: the mail profile a spawn registers — the CANONICAL herdr name
 /// as the identity (the random npub stays underneath; toron accepts any
 /// name, the legacy agent-mail adjective+noun whitelist does not apply),
@@ -16039,6 +16156,43 @@ mod wake_identity_tests {
             unpinned_registry_names(&pinned).is_empty(),
             "fully-pinned registry is clean"
         );
+    }
+
+    /// GS-030 slice 4 (bd-gs030-failclosed-m1x0): the fate matrix — a
+    /// configured backend that yields no pin fails closed (profiled and
+    /// bare alike: a pin should exist); an unconfigured backend proceeds
+    /// legacy+warn (bare experiments unaffected).
+    #[test]
+    fn unpinned_fail_closed_matrix() {
+        assert_eq!(
+            unpinned_spawn_fate(true),
+            UnpinnedFate::FailClosed,
+            "configured backend + no pin = fail"
+        );
+        assert_eq!(
+            unpinned_spawn_fate(false),
+            UnpinnedFate::LegacyWarn,
+            "unconfigured backend + no pin = legacy warn"
+        );
+    }
+
+    /// GS-030 slice 3 (bd-gs030-rolebind-02mi): role noun is profile-first,
+    /// `@`-stripped, short fallback; captain and empty never bind.
+    #[test]
+    fn spawn_role_noun_role_bind_profile_first_captain_refused() {
+        assert_eq!(
+            spawn_role_noun(Some("coder"), "oc"),
+            Some("coder".to_string())
+        );
+        assert_eq!(
+            spawn_role_noun(Some("@reviewer"), "oc"),
+            Some("reviewer".to_string())
+        );
+        assert_eq!(spawn_role_noun(None, "oc"), Some("oc".to_string()));
+        assert_eq!(spawn_role_noun(Some("captain"), "oc"), None);
+        assert_eq!(spawn_role_noun(Some(""), "oc"), Some("oc".to_string()));
+        assert_eq!(spawn_role_noun(None, ""), None);
+        assert_eq!(spawn_role_noun(None, "captain"), None);
     }
 
     /// S8.1: the wake identity is the registry pin, else the canonical name
