@@ -20,14 +20,32 @@ Design doc: toron `docs/decisions/0022-phase-native-orchestration.md`.
 
 ## 1. The mental model (60 seconds)
 
-Four nouns, not interchangeable:
+Five nouns, not interchangeable:
 
-- **stage** — one named prompt (`send --stage systematic-execute`). Catalog: `stage list`.
-- **workflow** — engine procedure (YAML steps or graph). A step *may* dispatch a stage to a `@role`. SIGNOFF is `request_approval`, not a stage.
-- **compose token** — bare name legal as `--parts`: `wave-swarm` or `repair-until-verified`. Preferred door: `workflow compose … --parts <token> --run`. Legacy alias: `workflow run <token> --execute`. Ordinary builtins (e.g. captain-audit): `workflow run <name> --execute`, NOT bare `--parts`.
-- **profile** — role → harness + model + skills. `crew: auto` counts `@roles`. Not what makes a compose token.
+| Noun | What it is | What it is not |
+| :--- | :--- | :--- |
+| **stage** | one named prompt (`send --stage systematic-execute`). Catalog: `stage list`. | a runner. |
+| **workflow** | engine procedure (YAML steps or graph). A step *may* dispatch a stage to a `@role`. SIGNOFF is `request_approval`, not a stage. | a topology. |
+| **profile** | role → harness + model + skills. `crew: auto` counts `@roles`. | what makes a compose token. |
+| **topology** | how work is supervised: loop / swarm / open. | Workflow YAML. "Loop workflow" is forbidden speech. |
+| **compose** (verb) | assembling a Workflow from parts (`--parts`, `--from-yaml`, `--agent`). | starting anything. |
+| **compose token** | bare name legal as `--parts`: `wave-swarm` or `repair-until-verified`. Preferred door: `workflow compose … --parts <token> --run`. Legacy alias: `workflow run <token> --execute`. | a recipe / squad. |
+| **ordinary builtin** | the same Workflow type, not a `--parts` token (e.g. captain-audit). | a compose token. |
 
-Loop / swarm / open are topologies (how work is supervised), not workflows.
+Door map (one door per intent):
+
+| Intent | Door | Not |
+| :--- | :--- | :--- |
+| Assemble a NEW Workflow from parts | `workflow compose … --parts …` | spawn kind/count |
+| Preview assembled graph + crew | compose **without** `--run` | claiming "started" |
+| Start a compose-token durable run | **`workflow compose … --parts <token> --run`** (**preferred**) | treating `workflow run <token> --execute` as primary |
+| Legacy alias for compose token | `workflow run <token> --execute` (**legacy alias**, not preferred) | teaching it as the door |
+| Run a named ordinary builtin | `workflow run <name> --execute` | bare `--parts captain-audit` |
+| Inline a compose token inside parts | `--parts wave-swarm` / `repair-until-verified` | calling it a "recipe" / squad |
+| Supervise a solo durable lane | topology `loop-mode` | "run the loop workflow" |
+| Human gate on outer wave | SIGNOFF = `request_approval` on **outer** run only | nested crew inventing signoff |
+
+Invariants (each stated once): **preview ≠ started** — compose without `--run` only lints + previews the crew. **SIGNOFF outer-only** — nested captain+crew via `call_workflow` / `dispatch_job` never open a second `request_approval`. Ordinary builtins enter via `workflow run <name> --execute` — never bare `--parts`.
 
 ```
 catalog + built-ins          your first stop — something already fits
