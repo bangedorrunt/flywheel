@@ -34,6 +34,10 @@
 //!   instrument or read the artifact; the deliverable is the DIAGNOSIS. NO
 //!   fix step (lint-enforced); a fix is a separate bug-fix.
 //! - `figure-it-out` — decide-only, no builtin YAML (bd-w2-review-s6ij): `figure it out` → `workflow compose --agent` (planner authors YAML, lint is the gate; the captain executes via --execute).
+//! - `beads-lifecycle` — compose token (ADR-0008 §6.7, bd-adr0008-token-yaml-kimg):
+//!   grill → create → review1 → review2 → integrate → implement → verify →
+//!   outer SIGNOFF; `inputs.until` early-exit + `gate_before_implement` outer
+//!   gate; nests ordinary builtins via call_workflow, never bare `--parts`.
 //! - `babysit-bead` / `ship-beads` / `autonomous-work` / `pickup` / `pause`
 //!   — the operations playbooks (ADR-0019 Spec 7.2, bd-w2-ops-szky):
 //!   babysit drives ONE bead to a legal ledger row; ship-beads gates on the
@@ -1272,6 +1276,150 @@ graph:
           on_error: fail_run
 "##,
     ),
+    // ---- ADR-0008 §6.7 beads-lifecycle compose token (bd-adr0008-token-yaml-kimg) ------
+    // The beads authoring lifecycle: grill → create → review1 → review2 →
+    // integrate → implement → verify → outer SIGNOFF. inputs.until
+    // early-exits SUCCESS after any phase (ordinal Branch guards on the
+    // string value — no deep else nesting); gate_before_implement adds one
+    // OUTER approval between integrate and implement (the Branch names the
+    // gate point; the runner performs it — never a nested request_approval).
+    // Nests ordinary builtins via call_workflow; hands off to wave-swarm
+    // for execution, never merges it.
+    (
+        "beads-lifecycle",
+        r##"
+name: beads-lifecycle
+description: "ADR-0008 §6.7: the beads authoring lifecycle. grill sharpens the objective (ADR/goal JSON); create nests phase-plan via call_workflow; review1 (@reviewer plan-review) + review2 (@oracle judge-arms) are two bead-graph passes; integrate folds AGREE-WITH-CHANGES and re-checks cycles; implement runs systematic-execute (or hands off to wave-swarm); verify proves with evidence; signoff suspends for captain-only approval. inputs.until early-exits SUCCESS after any phase; gate_before_implement adds one outer approval between integrate and implement."
+trigger:
+  type: webhook
+crew: auto
+principles:
+  - sequence-verifiable-units
+  - prove-it-works
+inputs:
+  - name: objective
+  - name: until
+    default: "signoff"
+  - name: gate_before_implement
+    default: false
+  - name: project
+  - name: captain_pin
+    default: ""
+  - name: steer_channel
+    default: "adr0008-steer"
+graph:
+  nodes:
+    grill:
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@planner"
+        task: 'Grill the objective for {{inputs.objective}} (project {{inputs.project}}): sharpen scope, emit ADR/goal JSON to {{inputs.steer_channel}}. Escalate to {{inputs.captain_pin}} on ambiguity.'
+      on_error: fail_run
+    exit-grill:
+      needs: [grill]
+      action: branch
+      if: "'{{inputs.until}}' == 'grill'"
+      then: []
+      else: []
+    create:
+      needs: [exit-grill]
+      action: call_workflow
+      workflow: phase-plan
+      inputs: { goal: "{{inputs.objective}}" }
+      on_error: fail_run
+    exit-create:
+      needs: [create]
+      action: branch
+      if: "'{{inputs.until}}' == 'grill' || '{{inputs.until}}' == 'create'"
+      then: []
+      else: []
+    review1:
+      needs: [exit-create]
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@reviewer"
+        stage: plan-review
+        task: 'Bead-graph pass A for {{inputs.objective}}: review the plan from {{steps.create}}; return findings JSON + verdict to {{inputs.steer_channel}}.'
+      on_error: fail_run
+    exit-review1:
+      needs: [review1]
+      action: branch
+      if: "'{{inputs.until}}' == 'grill' || '{{inputs.until}}' == 'create' || '{{inputs.until}}' == 'review1'"
+      then: []
+      else: []
+    review2:
+      needs: [exit-review1]
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@oracle"
+        stage: judge-arms
+        task: 'Bead-graph pass B for {{inputs.objective}}: second review of the plan from {{steps.create}} against the pass-A findings in {{steps.review1}}; return findings JSON + verdict.'
+      on_error: fail_run
+    exit-review2:
+      needs: [review2]
+      action: branch
+      if: "'{{inputs.until}}' == 'grill' || '{{inputs.until}}' == 'create' || '{{inputs.until}}' == 'review1' || '{{inputs.until}}' == 'review2'"
+      then: []
+      else: []
+    integrate:
+      needs: [exit-review2]
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@planner"
+        task: 'Integrate for {{inputs.objective}}: fold AGREE-WITH-CHANGES from {{steps.review1}} + {{steps.review2}}; re-check bead cycles are zero; write the buildable bead set to {{inputs.steer_channel}}.'
+      on_error: fail_run
+    exit-integrate:
+      needs: [integrate]
+      action: branch
+      if: "'{{inputs.until}}' == 'grill' || '{{inputs.until}}' == 'create' || '{{inputs.until}}' == 'review1' || '{{inputs.until}}' == 'review2' || '{{inputs.until}}' == 'integrate'"
+      then: []
+      else: []
+    gate-before-implement:
+      needs: [exit-integrate]
+      action: branch
+      if: "'{{inputs.gate_before_implement}}' == 'true'"
+      then: []
+      else: []
+    implement:
+      needs: [gate-before-implement]
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@coder"
+        stage: systematic-execute
+        task: 'Implement the integrated bead set for {{inputs.objective}} from {{steps.integrate}} (project {{inputs.project}}): claim, VERIFY, commit before close, ledger-legal close. For wave execution hand off to wave-swarm instead of merging it.'
+      on_error: fail_run
+    exit-implement:
+      needs: [implement]
+      action: branch
+      if: "'{{inputs.until}}' == 'grill' || '{{inputs.until}}' == 'create' || '{{inputs.until}}' == 'review1' || '{{inputs.until}}' == 'review2' || '{{inputs.until}}' == 'integrate' || '{{inputs.until}}' == 'implement'"
+      then: []
+      else: []
+    verify:
+      needs: [exit-implement]
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@reviewer"
+        stage: prove-verify
+        task: 'Verify every close claim for {{inputs.objective}}: receipt at committed HEAD + VERIFY tail + principles citations. Evidence over status.'
+      on_error: fail_run
+    exit-verify:
+      needs: [verify]
+      action: branch
+      if: "'{{inputs.until}}' == 'grill' || '{{inputs.until}}' == 'create' || '{{inputs.until}}' == 'review1' || '{{inputs.until}}' == 'review2' || '{{inputs.until}}' == 'integrate' || '{{inputs.until}}' == 'implement' || '{{inputs.until}}' == 'verify'"
+      then: []
+      else: []
+    signoff:
+      needs: [exit-verify]
+      action: request_approval
+      message: "Beads lifecycle signoff (captain-only) for {{inputs.objective}} [{{inputs.project}}]: review the verify evidence on {{inputs.steer_channel}}; approve closes, reject reopens."
+"##,
+    ),
     // ---- ADR-0019 Spec 7.2 reflect (wave 6, bd-w6-reflect-8gp5) ----
     (
         "reflect",
@@ -1357,13 +1505,15 @@ pub fn builtin_workflows() -> BTreeMap<String, Workflow> {
     map
 }
 
-/// ADR-0006 D3 (bd-wave-swarm-recipe-wsot): is `name` a compose token — a
+/// ADR-0006 D3 (bd-wave-swarm-recipe-wsot) + ADR-0008 §6.7
+/// (bd-adr0008-token-yaml-kimg): is `name` a compose token — a
 /// composed multi-phase workflow legal as a bare `--parts` token?
 /// Deliberately NOT every builtin: only compose tokens (today: wave-swarm,
-/// repair-until-verified) expand on the compose grammar; ordinary builtins
-/// (e.g. captain-audit) stay on `workflow run <name> --execute`.
+/// repair-until-verified, beads-lifecycle) expand on the compose grammar;
+/// ordinary builtins (e.g. captain-audit, beads) stay on
+/// `workflow run <name> --execute`.
 pub fn is_compose_token(name: &str) -> bool {
-    matches!(name, "wave-swarm" | "repair-until-verified")
+    matches!(name, "wave-swarm" | "repair-until-verified" | "beads-lifecycle")
 }
 
 /// ADR-0006 D3: a compose token's parsed workflow for compose expansion
@@ -3222,6 +3372,76 @@ mod tests {
         assert!(
             yaml.contains("#     action: call_workflow"),
             "edge is commented out"
+        );
+    }
+
+    // ---- ADR-0008 §10.C (bd-adr0008-token-yaml-kimg): beads-lifecycle ----
+    // The third compose token: grill → signoff beads lifecycle with
+    // inputs.until early-exit + gate_before_implement outer gate.
+    #[test]
+    fn beads_lifecycle_is_compose_token_and_beads_is_not() {
+        assert!(
+            is_compose_token("beads-lifecycle"),
+            "beads-lifecycle is the third compose token"
+        );
+        assert!(
+            !is_compose_token("beads"),
+            "thin beads stays an ordinary builtin, never bare --parts"
+        );
+    }
+
+    /// beads-lifecycle is compiled-in, parses, and lints clean; phases run
+    /// grill → signoff in order; exactly one outer request_approval
+    /// (signoff); until defaults to signoff.
+    #[test]
+    fn beads_lifecycle_yaml_parses_lints_clean_with_eight_phases() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let wf = &wfs["beads-lifecycle"];
+        let report = toron_workflow::lint_workflow(wf);
+        assert!(
+            report.is_clean(),
+            "beads-lifecycle must lint clean: {:?}",
+            report.issues
+        );
+        // until input declared with default signoff.
+        let until = wf.inputs.iter().find(|i| i.name == "until").expect("until input");
+        assert_eq!(
+            until.default,
+            Some(serde_json::Value::String("signoff".to_string())),
+            "until defaults to signoff"
+        );
+        // Phase nodes in ordinal order grill → signoff.
+        let graph = wf.graph.as_ref().expect("beads-lifecycle is a graph");
+        let phase_order = ["grill", "create", "review1", "review2", "integrate", "implement", "verify", "signoff"];
+        for phase in phase_order {
+            assert!(
+                graph.nodes.contains_key(phase),
+                "phase node {phase} present"
+            );
+        }
+        // Exactly one RequestApproval action in the whole workflow
+        // (signoff outer-only; the gate_before_implement Branch carries no
+        // nested approval).
+        fn count_approvals(action: &Action) -> usize {
+            let mut n = usize::from(matches!(action, Action::RequestApproval { .. }));
+            if let Action::Branch { then, else_steps, .. } = action {
+                for s in then.iter().chain(else_steps.iter()) {
+                    n += count_approvals(&s.action);
+                }
+            }
+            n
+        }
+        let mut approvals = 0;
+        for s in &wf.steps {
+            approvals += count_approvals(&s.action);
+        }
+        for node in graph.nodes.values() {
+            approvals += count_approvals(&node.action);
+        }
+        assert_eq!(
+            approvals, 1,
+            "exactly one request_approval (signoff outer-only)"
         );
     }
 }

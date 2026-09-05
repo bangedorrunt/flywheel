@@ -91,3 +91,4 @@
 {"id":91,"issue_id":"bd-ut8l","from_status":"open","to_status":"closed","status_revision":0,"gate":"unit-test-verified","provider":"TealDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-03 17:29:45"}
 {"id":92,"issue_id":"bd-z18m","from_status":"open","to_status":"closed","status_revision":0,"gate":"unit-test-verified","provider":"TealDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-03 21:47:33"}
 {"id":93,"issue_id":"bd-pabh","from_status":"open","to_status":"closed","status_revision":0,"gate":"unit-test-verified","provider":"TealDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-04 18:18:58"}
+{"id":94,"issue_id":"bd-adr0008-token-yaml-kimg","from_status":"in_progress","to_status":"closed","status_revision":2191,"gate":"unit-test-verified","provider":"crew-composed-2026090-coder","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-05 04:59:44"}
