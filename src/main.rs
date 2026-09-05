@@ -8409,11 +8409,11 @@ fn cmd_internal_doorbell(
     }
     // GS-033 B1 / NEW-L2: seed swarm onto the one RAM owner from ActiveLoop
     // (same helper the loop uses). Two-process topology may remain; two
-    // WorkspaceModel::default()s may not.
-    crate::durable::seed_workspace_from_active_loop(&mut workspace_model, project);
+    // WorkspaceModel::default()s may not. Fail-loud on I/O (not silent skip).
+    crate::durable::seed_workspace_from_active_loop(&mut workspace_model, project)?;
     // GS-033 B8: seed crew roles from the spawn-time RoleBound snapshot
     // so inject/Prompt resolution does not wait on 30013 watch.
-    seed_roles_from_binds(&mut workspace_model, project);
+    seed_roles_from_binds(&mut workspace_model, project)?;
     // bd-7xsf: rebuild assignment from receipts table at dispatcher startup (durable)
     rebuild_assignment_from_receipts(&mut workspace_model);
     let mut budgets: BTreeMap<String, doorbell::PinBudget> = BTreeMap::new();
@@ -16123,18 +16123,40 @@ fn bind_spawn_role(
 
 /// Persist + queue `Msg::RoleBound` so the doorbell owner ticks it
 /// immediately (pending drain) and on crash-resume (role_binds snapshot).
+/// Upsert + pending append are compensated: on append Err the snapshot is
+/// rolled back so the pair stays atomic (GS-033).
 fn emit_role_bound(project: &str, role: &str, pin: &str) -> anyhow::Result<()> {
-    if let Err(e) = state::upsert_role_bind(project, role, pin) {
-        anyhow::bail!("role bind snapshot failed for role {role} -> {pin}: {e:#}");
+    let prior = state::load_role_binds(project).map_err(|e| {
+        anyhow::anyhow!("role bind snapshot load failed for role {role} -> {pin}: {e:#}")
+    })?;
+    state::upsert_role_bind(project, role, pin).map_err(|e| {
+        anyhow::anyhow!("role bind snapshot failed for role {role} -> {pin}: {e:#}")
+    })?;
+    if let Err(e) = append_pending_role_bound(project, role, pin) {
+        if let Err(rb) = state::save_role_binds(project, &prior) {
+            anyhow::bail!(
+                "role bind pending append failed for role {role} -> {pin}: {e:#}; also failed to roll back snapshot: {rb:#}"
+            );
+        }
+        anyhow::bail!(
+            "role bind pending append failed for role {role} -> {pin}: {e:#} (snapshot rolled back)"
+        );
     }
-    append_pending_role_bound(project, role, pin)
+    Ok(())
 }
 
-fn seed_roles_from_binds(workspace_model: &mut workspace::WorkspaceModel, project: &str) {
-    for (role, pin) in state::load_role_binds(project) {
+fn seed_roles_from_binds(
+    workspace_model: &mut workspace::WorkspaceModel,
+    project: &str,
+) -> anyhow::Result<()> {
+    let binds = state::load_role_binds(project).map_err(|e| {
+        anyhow::anyhow!("seed_roles_from_binds({project}): load_role_binds failed: {e:#}")
+    })?;
+    for (role, pin) in binds {
         let (next, _) = workspace::tick(workspace_model, &workspace::Msg::RoleBound { role, pin });
         *workspace_model = next;
     }
+    Ok(())
 }
 
 fn pending_role_bounds_path(project: &str) -> std::path::PathBuf {
@@ -16318,10 +16340,14 @@ mod wake_identity_tests {
             "B8 / NEW-L7: bind is fail-loud, not warn-and-skip"
         );
         let emit = src.find("fn emit_role_bound(").expect("emit_role_bound");
-        let emit_fn = &src[emit..src.len().min(emit + 800)];
+        let emit_fn = &src[emit..src.len().min(emit + 1600)];
         assert!(
             emit_fn.contains("upsert_role_bind") && emit_fn.contains("append_pending_role_bound"),
             "B8: RoleBound must persist snapshot + pending drain"
+        );
+        assert!(
+            emit_fn.contains("save_role_binds") && emit_fn.contains("rolled back"),
+            "B8: emit must compensate (rollback snapshot) on append Err"
         );
         assert!(
             src.contains("drain_pending_role_bounds")
@@ -16337,6 +16363,35 @@ mod wake_identity_tests {
         assert!(
             src.contains("refuse_unpinned_spawn(&agent_name, Some(name),"),
             "NEW-L8: profile spawn must bind + fail-closed"
+        );
+        // Profile/squad: refuse BEFORE agent_start (never leave a dark pane).
+        let profile_mark = src
+            .find("let agent_name = format!(\"profile-{name}\")")
+            .expect("profile agent_name");
+        let profile_slice = &src[profile_mark..src.len().min(profile_mark + 1200)];
+        let p_refuse = profile_slice
+            .find("refuse_unpinned_spawn")
+            .expect("profile refuse");
+        let p_start = profile_slice
+            .find("backend.agent_start")
+            .expect("profile agent_start");
+        assert!(
+            p_refuse < p_start,
+            "NEW-L8: profile refuse_unpinned must run BEFORE agent_start"
+        );
+        let squad_mark = src
+            .find("let agent_name = format!(\"squad-{name}-{profile_name}-{}\"")
+            .expect("squad agent_name");
+        let squad_slice = &src[squad_mark..src.len().min(squad_mark + 1400)];
+        let s_refuse = squad_slice
+            .find("refuse_unpinned_spawn")
+            .expect("squad refuse");
+        let s_start = squad_slice
+            .find("backend.agent_start")
+            .expect("squad agent_start");
+        assert!(
+            s_refuse < s_start,
+            "NEW-L8: squad refuse_unpinned must run BEFORE agent_start"
         );
         assert!(
             src.contains("Some(profile_name)"),
@@ -22122,6 +22177,16 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             let args = profile_launch_args(&spec.harness, profile, None)?;
             // Find a pane in the default project workspace, or create one.
             let workspace = resolved_spec_workspace(cfg, backend.as_ref(), &spec.harness)?;
+            // bd-l2ky: host project for registry (host-scope spawn, debate
+            // convention) so `__send --profile` / conditioning resolve.
+            let host_project = "flywheel";
+            // GS-033: fail-closed BEFORE agent_start (add-path style) —
+            // never leave a dark pane when mail is configured.
+            let mail_identity =
+                pinned_mail_identity(cfg, host_project, &agent_name, &spec.harness);
+            if mail_identity.is_none() {
+                refuse_unpinned_spawn(&agent_name, Some(name), backend::mail_backend(cfg).is_ok())?;
+            }
             let info = backend.agent_start(&agent_name, &spec.harness, &workspace, &args)?;
             println!(
                 "profile {name} spawned: agent={} pane={} backend={}",
@@ -22129,19 +22194,14 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 info.pane_id,
                 spec.backend
             );
-            // bd-l2ky: record the profiled entry under the orchestrator's
-            // host project (host-scope spawn, debate convention) so the
-            // loop's `__send --profile` / conditioning resolves this agent.
-            let host_project = "flywheel";
-            let mail_identity = register_spawned_agent(
-                cfg,
-                host_project,
-                &agent_name,
-                &spec.harness,
-                &info.pane_id,
-            );
-            if mail_identity.is_none() {
-                refuse_unpinned_spawn(&agent_name, Some(name), backend::mail_backend(cfg).is_ok())?;
+            if let Some(ref pin) = mail_identity {
+                bind_pane_mail_identity(
+                    cfg,
+                    host_project,
+                    &agent_name,
+                    &info.pane_id,
+                    Some(pin),
+                );
             }
             bind_spawn_role(
                 cfg,
@@ -22977,23 +23037,28 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
                     let agent_name = format!("squad-{name}-{profile_name}-{}", i + 1);
                     let workspace = resolved_spec_workspace(cfg, backend.as_ref(), &spec.harness)?;
                     let args = profile_launch_args(&spec.harness, profile, None)?;
-                    let info =
-                        backend.agent_start(&agent_name, &spec.harness, &workspace, &args)?;
-                    // bd-l2ky: record the profiled entry so __send --profile
-                    // and loop conditioning resolve this member.
-                    let mail_identity = register_spawned_agent(
-                        cfg,
-                        project_key,
-                        &agent_name,
-                        &spec.harness,
-                        &info.pane_id,
-                    );
+                    // GS-033: fail-closed BEFORE agent_start (add-path style) —
+                    // never leave a dark pane when mail is configured.
+                    let mail_identity =
+                        pinned_mail_identity(cfg, project_key, &agent_name, &spec.harness);
                     if mail_identity.is_none() {
                         refuse_unpinned_spawn(
                             &agent_name,
                             Some(profile_name),
                             backend::mail_backend(cfg).is_ok(),
                         )?;
+                    }
+                    let info =
+                        backend.agent_start(&agent_name, &spec.harness, &workspace, &args)?;
+                    // bd-l2ky: bind pane so __send --profile / conditioning resolve.
+                    if let Some(ref pin) = mail_identity {
+                        bind_pane_mail_identity(
+                            cfg,
+                            project_key,
+                            &agent_name,
+                            &info.pane_id,
+                            Some(pin),
+                        );
                     }
                     bind_spawn_role(
                         cfg,

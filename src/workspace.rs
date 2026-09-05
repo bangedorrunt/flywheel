@@ -75,13 +75,17 @@ pub struct Question {
 /// process split may remain (remote-resonate / durable replay), but two
 /// RAM WorkspaceModels is Dual, not the end-state. The loop holds only
 /// `LoopModel` (effect runner + crash-resume slice) and folds swarm-slice
-/// Msgs through `tick` via a throwaway composition, not a live owner.
+/// Msgs through `tick` via a throwaway composition (`WorkspaceModel {
+/// swarm, ..Default::default() }` inside `tick_loop_owner` only), not a
+/// live owner. That Default wrap is transitional throwaway fold — never
+/// invent-green as "no Default".
 ///
 /// Tripwires enforce Option A: the live loop body contains no
-/// `WorkspaceModel::default()`; the dispatcher seeds swarm resume.
-/// Two-process + one-RAM + seed-from-receipts is a slice toward one
-/// Model. The end-state is one RAM owner. `seq` is a per-process
-/// diagnostic counter, not shared truth.
+/// `WorkspaceModel::default()` and no Default-wrapped WorkspaceModel;
+/// throwaway Default wrap is allowed only in `tick_loop_owner`. The
+/// dispatcher seeds swarm resume. Two-process + one-RAM +
+/// seed-from-receipts is a slice toward one Model. The end-state is one RAM owner.
+/// `seq` is a per-process diagnostic counter, not shared truth.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorkspaceModel {
     pub doorbell: crate::doorbell_tick::DoorbellModel,
