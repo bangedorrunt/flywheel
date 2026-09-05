@@ -49,21 +49,23 @@ A **workflow** is a reusable engine procedure. It can run inside a loop,
 inside a swarm, headlessly, or directly; it is not itself an execution
 topology.
 
-A **stage** is one prompt (`send --stage`). A **recipe** is a compose token
-(`wave-swarm`, `repair-until-verified`) that expands to a workflow. A
-**profile** is role → harness/model; `crew: auto` counts `@roles`.
-`flywheel squad` / `recipes list` is a group of profiles (spawn shape), a
-different use of "recipe."
-When steering, "recipe" always means the compose token; for the
-spawn shape say "squad."
+A **stage** is one prompt (`send --stage`). A **compose token**
+(`wave-swarm`, `repair-until-verified`) expands to a compiled-in
+workflow when used as a bare `--parts` name. A **profile** is role →
+harness/model; `crew: auto` counts `@roles`. `flywheel squad` /
+`recipes list` is a group of profiles (spawn shape) — say "squad," not
+"compose token."
 
-**What a compose token is:** a bare name in `workflow compose --parts`
-that expands to a compiled-in workflow's steps, inline, at that
-position - one engine run, one artifact trail. Token forms: builtin
-workflow name (`wave-swarm`, `repair-until-verified`), bare stage
-name, `role:stage`, `phase:stage`, `workflow:name`, and the grammar
-forms (`each:`, `when:`, `retry(n):`, `parallel:`). Stages referenced
-by spliced steps resolve from the stage catalog (`stage list`).
+**What a compose token is:** a bare name legal in
+`workflow compose … --parts <token> --run` that expands to a compiled-in
+workflow's steps, inline, at that position — one engine run, one artifact
+trail. Preferred door: `workflow compose … --parts <token> --run`.
+Legacy alias for compose tokens only: `workflow run <token> --execute`.
+Ordinary builtins (e.g. captain-audit): `workflow run <name> --execute`,
+NOT bare `--parts`. Other `--parts` forms: bare stage name, `role:stage`,
+`phase:stage`, `workflow:name`, and the grammar forms (`each:`, `when:`,
+`retry(n):`, `parallel:`). Stages referenced by spliced steps resolve
+from the stage catalog (`stage list`).
 
 ## Execution modes (ADR-0010)
 
@@ -88,7 +90,7 @@ Never invoke `__*` except documented `__wait-output`.
 | --- | --- | --- | --- |
 | **stage** | a payload unit (prompt + role/phase affinity) dispatched by `send --stage` | the INSTRUCTIONS are the value; one step, one crew member | `flywheel timeline` shows `stage=` per send |
 | **workflow** | an execution procedure (steps/branches/verify) run by `workflow run/compose` | the CONTROL FLOW is the value: gates, retries, parallel arms, SIGNOFF | compose runs write artifacts |
-| **recipe** | a compose token (builtin workflow name: `wave-swarm`, `repair-until-verified`) spliced into `--parts`; expands inline to that workflow's steps in one engine run | the CONTROL FLOW is the value and repeats across objectives | the composed run's artifacts |
-| **profile** | role conditioning (harness/model/effort/behavior) referenced by all three | always — model routing is strict; recipes/stages name profiles | model registry |
+| **compose token** | bare `--parts` name (`wave-swarm`, `repair-until-verified`); preferred `workflow compose … --parts <token> --run`; legacy `workflow run <token> --execute` | the CONTROL FLOW is the value and repeats across objectives | the composed run's artifacts |
+| **profile** | role conditioning (harness/model/effort/behavior) referenced by stage/workflow/compose-token | always — model routing is strict; compose tokens/stages name profiles | model registry |
 
-Announce the vehicle on every dispatch (stage / workflow / recipe / `none: raw`) — crews restate it in reports (2026-09-04 contract).
+Announce the vehicle on every dispatch (stage / workflow / compose token / `none: raw`) — crews restate it in reports (2026-09-04 contract).
