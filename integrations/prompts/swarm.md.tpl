@@ -17,11 +17,10 @@ wave-swarm, never re-run decide after compose.
 wave-swarm. Cross-repo lanes: register the pin on both projects, one
 repo owner per lane (08-29/09-03 swarms).
 
-Ask operator for model routing per profile before spawn/dispatch; show
-default + registry alternatives; blank keeps default, selection overrides.
+Ask operator for model routing per profile before dispatch; blank keeps default.
 
 1. RUN: `flywheel workflow compose "<objective>" --parts wave-swarm --run --inputs
-   '{"objective": "<target>"}'`. Slash /swarm-mode pins this compose token.
+   '{"objective": "<target>"}'`. Slash /swarm-mode pins this compose token. Beads-lifecycle hands off here after integrate (`until=integrate`).
    GATE->DISPATCH->EXECUTE->OBSERVE->VERIFY->SIGNOFF. The run parks at
    SIGNOFF: resolve via `flywheel workflow approve`. DISPATCH briefs
    `--stage systematic-execute` (p6) onto coder panes, never p1. Legacy
@@ -29,7 +28,7 @@ default + registry alternatives; blank keeps default, selection overrides.
    supervision topology, never "swarm workflow".
 
 3. GATE PREP: `br sync --flush-only`; clear stale assignees; commit tracker.
-   Map bead graph (deps, waves). Waves ONE AT A TIME; epics are gates.
+   Map bead graph. Waves ONE AT A TIME; epics are gates.
 
 4. LANES: single-writer file ownership from bead SCOPE. builtins/main.rs/
    one-file-at-a-time = handoff chain; disjoint files = parallel. Max 5
@@ -76,7 +75,6 @@ default + registry alternatives; blank keeps default, selection overrides.
    - `flywheel mail slot release <project> --slot cargo --as <pin>`
    - `flywheel kill <project> --force --force-working`
 
-10. REPORT: each crew posts concise report on lane thread: status, commit,
-   verify result, deviations.
+10. REPORT: each crew posts status/commit/verify/deviations on lane thread.
 
 {{VERSION}} {{GENERATED}}

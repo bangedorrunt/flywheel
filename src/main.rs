@@ -886,7 +886,7 @@ enum Commands {
     },
     /// Squads (ADR-0005 P6) — named groups of profiles = spawn shapes.
     /// Vocabulary: say "squad" here. A compose token (`wave-swarm`,
-    /// `repair-until-verified`) is a bare `--parts` name on
+    /// `repair-until-verified`, `beads-lifecycle`) is a bare `--parts` name on
     /// `workflow compose … --parts <token> --run` — not a squad.
     /// `recipes`/`template` stay as legacy aliases of this surface.
     Squad {
@@ -2842,7 +2842,8 @@ enum WorkflowCmd {
     },
     /// Run a workflow by name through the unified engine (lint gate first).
     /// Ordinary builtins (e.g. captain-audit): `workflow run <name> --execute`.
-    /// Compose tokens (`wave-swarm`, `repair-until-verified`): prefer
+    /// Compose tokens (`wave-swarm`, `repair-until-verified`,
+    /// `beads-lifecycle`): prefer
     /// `workflow compose … --parts <token> --run`; `workflow run <token>
     /// --execute` is the legacy alias. Do NOT pass ordinary builtins as bare
     /// `--parts`. Interactive TTY briefing when `--execute` (bd-nmzk): same
@@ -2914,7 +2915,8 @@ enum WorkflowCmd {
         #[arg(long)]
         base: Option<String>,
         /// parts: comma-separated `role:stage`, `workflow:name`, bare stage,
-        /// or compose token (`wave-swarm` / `repair-until-verified`). Preferred
+        /// or compose token (`wave-swarm` / `repair-until-verified` /
+        /// `beads-lifecycle`). Preferred
         /// door for compose tokens: `compose … --parts <token> --run`.
         #[arg(long, value_delimiter = ',')]
         parts: Vec<String>,
@@ -3855,6 +3857,7 @@ fn main() {
             },
             "wave_dispatch": "loop run --work --wave-label wave-N scopes the ready set to that label and holds (naming blockers) while any lower wave-M (M<N) is open/in_progress; default --work unchanged; label-based transitional until beads ADR-0001 schema-18 (ADR-0006 D2)",
             "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/VERIFY/SIGNOFF; SIGNOFF=request_approval (captain-only). Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Bounded by FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
+            "beads_lifecycle_compose_token": "preferred: workflow compose \"<objective>\" --parts beads-lifecycle --run --project <p> (compose token); legacy alias: workflow run beads-lifecycle --execute. grill/create/review1/review2/integrate/implement/verify outer SIGNOFF; nests ordinary builtins (phase-plan/beads/plan-review/phase-implement/phase-verify) via call_workflow; inputs.until early-exits SUCCESS after any phase; SIGNOFF outer-only; after integrate hand off to wave-swarm (until=integrate), never merge (ADR-0008 6.7)",
             "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error" }
         }));
         return;
