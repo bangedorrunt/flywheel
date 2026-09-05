@@ -23962,15 +23962,16 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             if blocking > 0 {
                 bail!("workflow {name:?} has {blocking} blocking lint issue(s) — refusing to run");
             }
-            let inputs_value: Value = match inputs {
+            let mut inputs_value: Value = match inputs {
                 Some(s) if !s.trim().is_empty() => {
                     serde_json::from_str(s).map_err(|e| anyhow!("--inputs must be JSON: {e}"))?
                 }
                 _ => json!({}),
             };
-            // Crew resolution: auto → infer from the workflow (recursing into
-            // call_workflow sub-workflows — bd-t86p: the composed fleet);
-            // <squad> → explicit role:count. Used for the preview + the
+            // bd-adr0008-guard-fix-16fl: bind declared input defaults so
+            // `{{inputs.x}}` templates and `trigger_x` guard variables
+            // resolve when the caller omits a defaulted input.
+            crew::apply_input_defaults(&wf, &mut inputs_value);
             // engine invoke.
             let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(|sub: &str| {
                 let cat = workflow_catalog::WorkflowCatalog::load().ok()?;
