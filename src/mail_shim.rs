@@ -480,11 +480,11 @@ impl Mail {
         }
     }
 
-    /// GS-030 slice 3 (bd-gs030-rolebind-02mi): bind a crew role to its spawn
-    /// pin (alias table + signed 30013 `role=` charter). In-process writes
-    /// through `Mailbox::set_role_pin` (the same function as `toron role
-    /// pin`); remote has no role-pin MCP op (ADR-0027 CLI-only surface) and
-    /// fails naming the CLI — the spawn caller warns loud, never fails.
+    /// GS-030/GS-033 B8: bind a crew role to its spawn pin (alias table +
+    /// signed 30013 `role=` charter). In-process writes through
+    /// `Mailbox::set_role_pin` (the same function as `toron role pin`).
+    /// Remote has no role-pin MCP op (ADR-0027 CLI-only surface) and
+    /// **fails loud** naming the CLI — no silent skip (NEW-L7).
     pub fn pin_role_alias(&self, project_key: &str, role: &str, pin: &str) -> Result<String> {
         match &self.backend {
             BackendKind::InProcess => {
@@ -492,7 +492,23 @@ impl Mail {
                 Ok(name)
             }
             BackendKind::Remote(_) => anyhow::bail!(
-                "role bind needs the mailbox charter: run `toron role pin {role} {pin} --project {project_key}` (no remote role-pin MCP op per ADR-0027)"
+                "role bind failed (remote mailbox): run `toron role pin {role} {pin} --project {project_key}` (no remote role-pin MCP op per ADR-0027; refusing a silent skip)"
+            ),
+        }
+    }
+
+    /// Undo [`Self::pin_role_alias`] (GS-033 compensate path when
+    /// `emit_role_bound` fails after the mail pin landed). In-process
+    /// clears via `Mailbox::clear_role_pin`; remote has no role-unpin MCP
+    /// op and fails loud naming the CLI.
+    pub fn clear_role_alias(&self, project_key: &str, role: &str) -> Result<Option<String>> {
+        match &self.backend {
+            BackendKind::InProcess => {
+                let prior = block_on(mailbox().clear_role_pin(project_key, role))?;
+                Ok(prior)
+            }
+            BackendKind::Remote(_) => anyhow::bail!(
+                "role unpin failed (remote mailbox): run `toron role unpin {role} --project {project_key}` (no remote role-unpin MCP op per ADR-0027; refusing a silent skip)"
             ),
         }
     }

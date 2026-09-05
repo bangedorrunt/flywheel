@@ -21,6 +21,16 @@ fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
 }
 
+
+/// Column-0 `fn name(` — skips tripwire string literals that quote the needle.
+fn find_toplevel_fn(src: &str, name: &str) -> usize {
+    let needle = format!("\nfn {name}(");
+    src.find(&needle)
+        .map(|i| i + 1)
+        .unwrap_or_else(|| panic!("expected toplevel `fn {name}(`"))
+}
+
+
 /// SC-D9: `/swarm-mode` must not require loop supervision for peer wake.
 #[test]
 fn sc_d9_swarm_playbook_loop_optional_for_peer_wake() {
@@ -147,12 +157,8 @@ fn run_doorbell_once(stdin_line: &str, status: &[&str]) -> String {
 #[test]
 fn sc_d1_live_dispatcher_uses_apply_watch_line() {
     let src = read("src/main.rs");
-    let start = src
-        .find("fn cmd_internal_doorbell(")
-        .expect("cmd_internal_doorbell");
-    let end = src
-        .find("fn project_base(")
-        .expect("project_base after doorbell helpers");
+    let start = find_toplevel_fn(&src, "cmd_internal_doorbell");
+    let end = find_toplevel_fn(&src, "project_base");
     let body = &src[start..end];
     // bd-yw4s: the reducer is the decider on the live path — Watch, Status,
     // Died, and AckSlaTick all flow through workspace::tick (via doorbell slice).
@@ -296,11 +302,8 @@ fn sc_d6_digest_needs_no_loop() {
 #[test]
 fn sc_d7_spawn_identity_without_dispatcher() {
     let src = read("src/main.rs");
-    let start = src.rfind("fn cmd_spawn(").expect("cmd_spawn");
-    let end = src[start + 1..]
-        .find("\nfn cmd_internal_doorbell")
-        .map(|i| start + 1 + i)
-        .unwrap_or(src.len());
+    let start = find_toplevel_fn(&src, "cmd_spawn");
+    let end = find_toplevel_fn(&src, "cmd_internal_doorbell");
     let body = &src[start..end];
     assert!(body.contains("doorbell::identity_prime"));
     assert!(body.contains("if peer_aware"));
@@ -383,7 +386,7 @@ fn integration_writes_orchestration_commands() {
 #[test]
 fn sc_kill_stops_doorbell() {
     let src = read("src/main.rs");
-    let start = src.rfind("fn cmd_kill(").expect("cmd_kill");
+    let start = find_toplevel_fn(&src, "cmd_kill");
     // cmd_kill now carries the ADR-0025 parent-death policy (stop/continue/
     // adopt + --reap-crews) before the doorbell teardown — window wide
     // enough for the policy block plus the stop call.
