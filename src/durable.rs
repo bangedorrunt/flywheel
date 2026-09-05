@@ -396,24 +396,37 @@ pub(crate) fn seed_swarm_resume(
 pub(crate) fn seed_workspace_from_active_loop(
     ws: &mut crate::workspace::WorkspaceModel,
     project: &str,
-) {
-    if let Ok(Some(al)) = crate::state::load_active_loop(project) {
-        seed_swarm_resume(
-            &mut ws.swarm,
-            &al.heal_states,
-            &al.done_mailed,
-            &al.drain_pending,
-        );
+) -> anyhow::Result<()> {
+    // GS-033 fail-loud: I/O / parse Err must not collapse into Ok(None).
+    match crate::state::load_active_loop(project) {
+        Ok(Some(al)) => {
+            seed_swarm_resume(
+                &mut ws.swarm,
+                &al.heal_states,
+                &al.done_mailed,
+                &al.drain_pending,
+            );
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(e) => Err(anyhow::anyhow!(
+            "seed_workspace_from_active_loop({project}): load_active_loop failed (refusing silent skip): {e:#}"
+        )),
     }
 }
 
 /// Throwaway WorkspaceModel around a LoopModel so swarm-slice Msgs still
 /// enter through workspace::tick (the one entry). Not a live owner —
 /// doorbell holds the RAM WorkspaceModel. Process split may remain.
+///
+/// The `..Default::default()` wrap is a transitional throwaway fold (GS-033
+/// Option A honesty): it must not be read as a second live WorkspaceModel.
+/// Tripwires allow this pattern only inside this helper.
 fn tick_loop_owner(
     swarm: &mut LoopModel,
     msg: &crate::workspace::Msg,
 ) -> Vec<crate::workspace::Cmd> {
+    // throwaway fold — not a live second WorkspaceModel owner
     let wm = crate::workspace::WorkspaceModel {
         swarm: swarm.clone(),
         ..Default::default()
@@ -15511,6 +15524,35 @@ mod single_writer_tests {
             !src.contains(&live),
             "Option A: swarm_loop must not construct WorkspaceModel::default() — doorbell is the one RAM owner"
         );
+        // Broaden Default-wrapped detection: `WorkspaceModel { swarm, ..Default::default() }`
+        // is honest only as the transitional throwaway fold inside tick_loop_owner
+        // (not invent-green by pretending no Default wrap exists).
+        let wrap_ty = ["crate::workspace::Workspace", "Model {"].concat();
+        let mut wrap_sites: Vec<usize> = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find(&wrap_ty) {
+            let abs = from + rel;
+            let window = &src[abs..src.len().min(abs + 220)];
+            if window.contains("..Default::default()") {
+                wrap_sites.push(abs);
+            }
+            from = abs + wrap_ty.len();
+        }
+        assert!(
+            !wrap_sites.is_empty(),
+            "Option A honesty: tick_loop_owner throwaway Default wrap must remain visible"
+        );
+        for abs in wrap_sites {
+            let before = &src[..abs];
+            let helper = before
+                .rfind("fn tick_loop_owner(")
+                .expect("Option A: WorkspaceModel Default wrap only inside tick_loop_owner");
+            let helper_body = &src[helper..abs];
+            assert!(
+                helper_body.contains("Throwaway") || helper_body.contains("throwaway"),
+                "Option A: tick_loop_owner must stay labeled throwaway (not a live second owner)"
+            );
+        }
         let start = src.find("async fn swarm_loop(").expect("swarm_loop");
         let body = &src[start..src.len().min(start + 4000)];
         assert!(
@@ -15520,6 +15562,10 @@ mod single_writer_tests {
         assert!(
             body.contains("LoopModel::default()"),
             "Option A: swarm_loop holds LoopModel, not a second WorkspaceModel"
+        );
+        assert!(
+            !body.contains("..Default::default()"),
+            "Option A: swarm_loop body must not Default-wrap a WorkspaceModel"
         );
     }
 

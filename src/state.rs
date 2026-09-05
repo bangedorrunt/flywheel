@@ -749,26 +749,42 @@ pub fn role_binds_file(project: &str) -> PathBuf {
         .join(format!("{}.json", state_key(project)))
 }
 
-pub fn load_role_binds(project: &str) -> BTreeMap<String, String> {
+/// Load role→pin snapshot. Missing file → empty map. I/O or corrupt JSON
+/// → Err (GS-033 fail-loud: never `unwrap_or_default` a corrupt snapshot).
+pub fn load_role_binds(project: &str) -> Result<BTreeMap<String, String>> {
     let path = role_binds_file(project);
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return BTreeMap::new();
-    };
-    serde_json::from_str(&raw).unwrap_or_default()
+    match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!(
+            "role_binds read failed at {}: refusing silent empty",
+            path.display()
+        ))),
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| {
+            anyhow::anyhow!(
+                "corrupt role_binds at {}: {e:#} (refusing silent default — fix or delete the file)",
+                path.display()
+            )
+        }),
+    }
 }
 
-pub fn upsert_role_bind(project: &str, role: &str, pin: &str) -> Result<()> {
+/// Atomic write of the role→pin snapshot (temp + rename).
+pub fn save_role_binds(project: &str, map: &BTreeMap<String, String>) -> Result<()> {
     let path = role_binds_file(project);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut map = load_role_binds(project);
-    map.insert(role.to_string(), pin.to_string());
-    let body = serde_json::to_string_pretty(&map)?;
+    let body = serde_json::to_string_pretty(map)?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+pub fn upsert_role_bind(project: &str, role: &str, pin: &str) -> Result<()> {
+    let mut map = load_role_binds(project)?;
+    map.insert(role.to_string(), pin.to_string());
+    save_role_binds(project, &map)
 }
 
 /// Resolve `captain` target for `mail send --to captain`.
