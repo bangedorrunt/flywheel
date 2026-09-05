@@ -15448,3 +15448,59 @@ mod loop_invoke_vehicle_tests {
         );
     }
 }
+
+/// GS-030 single-writer-per-slice tripwires (bd-gs030-single-writer-ciqu):
+/// the loop owns `swarm` and nothing else. Any construction of a
+/// doorbell-slice Msg, or any direct write to a non-swarm slice, fails the
+/// build. (Needles split so these self-scans do not match their own source;
+/// same idiom as the 55nx.3 assignment scan above.)
+#[cfg(test)]
+mod single_writer_tests {
+    /// Doorbell-slice Msgs the loop must never construct (watch / inbox /
+    /// status / role / presence / receipt / sweep / watch-died / fact /
+    /// ack-sla / human-decision).
+    #[test]
+    fn single_writer_loop_constructs_no_doorbell_slice_msgs() {
+        let src = include_str!("durable.rs");
+        let variants = [
+            ["Msg::Watch", "Ndjson {"].concat(),
+            ["Msg::Inbox", "Rows {"].concat(),
+            ["Msg::Inbox", "Items {"].concat(),
+            ["Msg::Herdr", "Status {"].concat(),
+            ["Msg::Role", "Bound {"].concat(),
+            ["Msg::Pres", "ence {"].concat(),
+            ["Msg::Rece", "ipt {"].concat(),
+            ["Msg::Swe", "ep {"].concat(),
+            ["Msg::Watch", "Died"].concat(),
+            ["Msg::Fa", "ct {"].concat(),
+            ["Msg::AckSla", "Tick {"].concat(),
+            ["Msg::HumanDec", "ision"].concat(),
+        ];
+        for needle in &variants {
+            assert!(
+                !src.contains(needle.as_str()),
+                "single-writer: swarm_loop must not construct {needle} (doorbell slice)"
+            );
+        }
+    }
+
+    /// Direct writes outside tick: the loop body may only assign `ws.swarm`
+    /// fields (sanctioned poll-input assigns); any other model slice fails.
+    #[test]
+    fn single_writer_loop_writes_swarm_slice_only() {
+        let src = include_str!("durable.rs");
+        for slice in [
+            ["ws.door", "bell"].concat(),
+            ["ws.pres", "ence"].concat(),
+            ["ws.ro", "les"].concat(),
+            ["ws.assign", "ment"].concat(),
+            ["ws.pending", "_wait"].concat(),
+            ["ws.open_", "human"].concat(),
+        ] {
+            assert!(
+                !src.contains(slice.as_str()),
+                "single-writer: swarm_loop must not touch {slice} (doorbell slice)"
+            );
+        }
+    }
+}
