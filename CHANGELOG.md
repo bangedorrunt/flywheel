@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.0] — 2026-09-05 ADR-0007 catalog slots + daemon lifecycle
 
 ### Added
-- Catalog slots (ADR-0007 D1): cheap/standard/premium = harness+model; profiles alias `@cheap/@standard/@premium` and inherit the slot's harness on read. Six compiled-in job profiles (no `pa`), four compiled-in squads (default/plan/review/recon).
+- Catalog slots (ADR-0007 D1): cheap/standard/premium = harness+model; profiles alias `@cheap/@standard/@premium` and inherit the slot's harness on read. Compiled-ins: cheap=opencode/big-pickle, standard=pi/muse-spark-1.3-contributor (model_fallback zai/glm-5.3-flash), premium=omp/zai/glm-5.3 (fallback_harness grok). Six compiled-in job profiles (no `pa`), four compiled-in squads (default/plan/review/recon).
+- Slot semantics corrected (operator 2026-09-05): the grok HARNESS accepts only its own proprietary model (grok hop = model-opaque, bare id, no caps check); grok MODELS are available on pi/omp/opencode and route normally.
 - Full D1 resolve ladder: `resolve_profile_route_full` walks pin → slot → `model_fallback[]` → slot `fallback_harness` → registry fallback, returns the route taken, fails loud naming the rungs. Grok hops are model-opaque (closed-source proprietary model — no caps check, bare-id flag).
 - CLI: `slot {list,show,set,remove}`, `model {list,show,add,set,remove}` (`set <id> --slot <s>` selects a slot default), `profile set` (routing fields) + `profile show --json` (resolved route), `squad create`, `catalog` ratatui hub (refuses non-TTY/NO_COLOR naming the CLI), `model remove` N-ids + TTY multi-select.
 - `daemon {start,stop,restart,status}` (toron-parity): launchd/systemd/pidfile supervision of `serve`; start/restart verify the daemon answers; stop refuses unmanaged holders without `--force`.

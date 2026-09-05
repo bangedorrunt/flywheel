@@ -429,10 +429,11 @@ impl ModelRegistry {
                 return Ok((h, id.clone(), "model_fallback"));
             }
         }
-        // Step 4: the slot's fallback_harness + a routable model. Grok is
-        // closed-source with its own proprietary model (operator note
-        // 2026-09-05): a grok hop is MODEL-OPAQUE — no caps check, no model
-        // pick; the harness runs its own model (bare id flag form).
+        // Step 4: the slot's fallback_harness + a routable model. The
+        // grok HARNESS only accepts its own proprietary model (operator
+        // note 2026-09-05 — grok MODELS are available on pi/omp/opencode,
+        // but the grok harness runs no other model): a grok hop is
+        // MODEL-OPAQUE — no caps check, no model pick; bare id flag form.
         let slot = slot_alias(model).and_then(|n| self.slots.get(n));
         if let Some(slot) = slot
             && let Some(fh) = &slot.fallback_harness
@@ -459,9 +460,9 @@ impl ModelRegistry {
             }
         }
         // Step 5: registry fallback of the primary id. A grok-family
-        // fallback is model-opaque (closed-source proprietary model): the
-        // bare id rides as the flag, no caps check. Other families keep
-        // the caps check.
+        // fallback is model-opaque (the grok harness runs only its own
+        // proprietary model): the bare id rides as the flag, no caps
+        // check. Other families keep the caps check.
         if let Some(fb) = self.models.get(&primary).and_then(|e| e.fallback.clone()) {
             let fb_h = if self.family_of(&fb) == "grok" {
                 "grok".to_string()
@@ -631,16 +632,30 @@ pub fn compiled_in_models() -> BTreeMap<String, ModelEntry> {
         },
     );
     m.insert(
-        "zai/glm-5.2".to_string(),
+        "zai/glm-5.3".to_string(),
         ModelEntry {
             tier: Some(Tier::Premium),
             ..ModelEntry::default()
         },
     );
+    m.insert(
+        "zai/glm-5.3-flash".to_string(),
+        ModelEntry {
+            tier: Some(Tier::Standard),
+            ..ModelEntry::default()
+        },
+    );
     // Kept in the registry for explicit `--harness jcode` (bare harness).
-    // Coder no longer defaults here (ADR-0007 D2: coder inherits @standard/pi).
+    // Coder no longer defaults here (ADR-0007 D2: coder inherits @standard).
     m.insert(
         "opencode-go/muse-spark-1.2-contributor".to_string(),
+        ModelEntry {
+            tier: Some(Tier::Standard),
+            ..ModelEntry::default()
+        },
+    );
+    m.insert(
+        "opencode-go/muse-spark-1.3-contributor".to_string(),
         ModelEntry {
             tier: Some(Tier::Standard),
             ..ModelEntry::default()
@@ -664,7 +679,8 @@ pub fn compiled_in_slots() -> BTreeMap<String, SlotSpec> {
         SLOT_STANDARD.to_string(),
         SlotSpec {
             harness: "pi".into(),
-            model: "opencode-go/deepseek-v4-flash".into(),
+            model: "opencode-go/muse-spark-1.3-contributor".into(),
+            model_fallback: vec!["zai/glm-5.3-flash".into()],
             ..SlotSpec::default()
         },
     );
@@ -672,7 +688,7 @@ pub fn compiled_in_slots() -> BTreeMap<String, SlotSpec> {
         SLOT_PREMIUM.to_string(),
         SlotSpec {
             harness: "omp".into(),
-            model: "zai/glm-5.2".into(),
+            model: "zai/glm-5.3".into(),
             fallback_harness: Some("grok".into()),
             ..SlotSpec::default()
         },
@@ -1132,7 +1148,7 @@ mod tests {
             "opencode-go/deepseek-v4-flash",
             "bare id falls back to the compiled-in default provider"
         );
-        assert_eq!(reg.resolve("glm-5.2", "omp"), "zai/glm-5.2");
+        assert_eq!(reg.resolve("glm-5.3", "omp"), "zai/glm-5.3");
         // big-pickle is free ONLY on the opencode harness (caps whitelist).
         assert_eq!(reg.resolve("big-pickle", "opencode"), "opencode/big-pickle");
         std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
@@ -1146,15 +1162,15 @@ mod tests {
             "user entry wins over compiled-in"
         );
         assert_eq!(
-            reg.resolve("glm-5.2", "omp"),
-            "zai/glm-5.2",
+            reg.resolve("glm-5.3", "omp"),
+            "zai/glm-5.3",
             "other default intact"
         );
 
         // load() (the CLI write path) must NOT see compiled-ins.
         let user = ModelRegistry::load().expect("user file");
         assert!(
-            user.get("glm-5.2").is_none(),
+            user.get("glm-5.3").is_none(),
             "load() reads the user file only — save() must not persist defaults"
         );
     }
@@ -1201,7 +1217,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
         fs::write(
             &path,
-            "[models.\"p/flagship\"]\ncaps = [\"omp\"]\nfallback = \"zai/glm-5.2\"\n",
+            "[models.\"p/flagship\"]\ncaps = [\"omp\"]\nfallback = \"zai/glm-5.3\"\n",
         )
         .expect("write");
         let reg = ModelRegistry::load_routing().expect("reg");
@@ -1212,7 +1228,7 @@ mod tests {
         assert_eq!(
             reg.resolve_strict("flagship", "opencode")
                 .expect("fallback"),
-            "zai/glm-5.2",
+            "zai/glm-5.3",
             "caps-excluded -> compiled-in fallback routes strictly (bare id too)"
         );
         // A fallback pointing at an unknown id stays an error (no bypass).
@@ -1322,7 +1338,8 @@ mod tests {
         assert_eq!(cheap.model, "opencode/big-pickle");
         let standard = reg.slot("@standard").expect("standard via alias");
         assert_eq!(standard.harness, "pi");
-        assert_eq!(standard.model, "opencode-go/deepseek-v4-flash");
+        assert_eq!(standard.model, "opencode-go/muse-spark-1.3-contributor");
+        assert_eq!(standard.model_fallback, vec!["zai/glm-5.3-flash"]);
         let premium = reg.slot("premium").expect("premium");
         assert_eq!(premium.harness, "omp");
         assert_eq!(premium.fallback_harness.as_deref(), Some("grok"));
@@ -1336,8 +1353,17 @@ mod tests {
             Some(Tier::Standard)
         );
         assert_eq!(
-            reg.get("zai/glm-5.2").and_then(|e| e.tier),
+            reg.get("zai/glm-5.3").and_then(|e| e.tier),
             Some(Tier::Premium)
+        );
+        assert_eq!(
+            reg.get("zai/glm-5.3-flash").and_then(|e| e.tier),
+            Some(Tier::Standard)
+        );
+        assert_eq!(
+            reg.get("opencode-go/muse-spark-1.3-contributor")
+                .and_then(|e| e.tier),
+            Some(Tier::Standard)
         );
     }
 
@@ -1400,10 +1426,10 @@ mod tests {
             "names the failure: {err}"
         );
 
-        // Step 4 positive case: cap glm-5.2 to a NON-omp harness so the
+        // Step 4 positive case: cap glm-5.3 to a NON-omp harness so the
         // omp slot route is caps-blocked; fallback_harness=grok is
         // model-opaque so no grok registry row is needed.
-        if let Some(e) = reg.models.get_mut("zai/glm-5.2") {
+        if let Some(e) = reg.models.get_mut("zai/glm-5.3") {
             e.caps = vec!["pi".into()];
         }
         let (h, m, route) = reg
@@ -1412,7 +1438,7 @@ mod tests {
         assert_eq!(route, "fallback_harness");
         assert_eq!(h, "grok", "slot fallback_harness swaps the harness");
         assert_eq!(
-            m, "glm-5.2",
+            m, "glm-5.3",
             "grok hop is model-opaque: bare id as flag, no registry pick"
         );
     }

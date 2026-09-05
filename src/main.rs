@@ -5127,24 +5127,24 @@ mod spawn_profile_plan_tests {
             profile_launch_args("opencode", &p, None).expect("opencode"),
             vec!["-m", "opencode-go/deepseek-v4-flash"]
         );
-        let pi = profile("pi", "glm-5.2");
+        let pi = profile("pi", "glm-5.3");
         assert_eq!(
             profile_launch_args("pi", &pi, None).expect("pi"),
-            vec!["--model", "zai/glm-5.2"]
+            vec!["--model", "zai/glm-5.3"]
         );
-        let mut omp = profile("omp", "glm-5.2");
+        let mut omp = profile("omp", "glm-5.3");
         omp.effort = "max".into();
         omp.smol = "deepseek-v4-flash".into();
         assert_eq!(
             profile_launch_args("omp", &omp, None).expect("omp"),
             vec![
-                "--model=zai/glm-5.2",
+                "--model=zai/glm-5.3",
                 "--thinking=max",
                 "--smol=opencode-go/deepseek-v4-flash"
             ]
         );
         // Unknown harness injects nothing — but the model must still ROUTE.
-        let mut unknown = profile("hermes", "glm-5.2");
+        let mut unknown = profile("hermes", "glm-5.3");
         unknown.effort = "max".into();
         assert!(
             profile_launch_args("hermes", &unknown, None)
@@ -5278,7 +5278,7 @@ mod spawn_profile_plan_tests {
         let args = bare_model_launch_args("pi", "", "").expect("standard implied");
         assert_eq!(
             args,
-            vec!["--model", "opencode-go/deepseek-v4-flash"],
+            vec!["--model", "opencode-go/muse-spark-1.3-contributor"],
             "pi spawn without --model uses the standard slot: {args:?}"
         );
         // Unknown kind: no implied slot → no flags (unchanged).
@@ -5405,7 +5405,7 @@ mod profile_run_spawn_tests {
         // bare key there is a loud parse error by design (bd-1t3j AC 1).
         let dir = tempfile::TempDir::new().expect("temp dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
-        let mut coder = profile("omp", "glm-5.2");
+        let mut coder = profile("omp", "glm-5.3");
         coder.effort = "max".into();
         let args = profile_launch_args("omp", &coder, None).expect("launch args");
         assert!(
@@ -5413,7 +5413,7 @@ mod profile_run_spawn_tests {
             "known profile must inject model/effort args"
         );
         assert!(
-            args.iter().any(|a| a.contains("glm-5.2")),
+            args.iter().any(|a| a.contains("glm-5.3")),
             "model flag present: {args:?}"
         );
         assert!(
@@ -5619,7 +5619,7 @@ mod internal_respawn_tests {
     fn write_profiles_toml(dir: &tempfile::TempDir) {
         std::fs::write(
             dir.path().join("config/flywheel/profiles.toml"),
-            "[profiles.omp-coder]\nharness = \"omp\"\nmodel = \"glm-5.2\"\neffort = \"max\"\nsmol = \"glm-4.5-air\"\n",
+            "[profiles.omp-coder]\nharness = \"omp\"\nmodel = \"glm-5.3\"\neffort = \"max\"\nsmol = \"glm-4.5-air\"\n",
         )
         .expect("profiles.toml");
         // The role model is a USER registry entry (layered over the
@@ -5814,7 +5814,7 @@ mod internal_respawn_tests {
         assert_eq!(pane_id, "wA:p1", "omp restarts in the SAME pane");
         assert!(!args.is_empty(), "omp respawn argv must be non-empty");
         assert!(
-            args.iter().any(|a| a.contains("glm-5.2")),
+            args.iter().any(|a| a.contains("glm-5.3")),
             "omp model flag present: {args:?}"
         );
     }
@@ -5874,7 +5874,7 @@ mod internal_respawn_tests {
         let omp = respawn_launch_args(&cfg, "demo", "profile-coder", "omp");
         assert!(!omp.is_empty(), "profiled agent re-injects its launch args");
         assert!(
-            omp.iter().any(|a| a.contains("glm-5.2")),
+            omp.iter().any(|a| a.contains("glm-5.3")),
             "model flag: {omp:?}"
         );
 
@@ -31283,7 +31283,7 @@ mod profile_cli_tests {
             .resolve("housekeeper", None, "npub-op", &|_, _| None)
             .expect("resolve");
         assert_eq!(r.spec.harness, "pi");
-        assert_eq!(r.spec.model, "opencode-go/deepseek-v4-flash");
+        assert_eq!(r.spec.model, "opencode-go/muse-spark-1.3-contributor");
         assert_eq!(r.spec.backend, "herdr");
         assert_eq!(
             r.signing,
