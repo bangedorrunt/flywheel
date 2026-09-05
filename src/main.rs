@@ -6481,6 +6481,24 @@ mod workspace_origin_tests {
     }
 }
 
+
+#[cfg(test)]
+mod tripwire {
+    /// Locate a column-0 `fn name(` definition in `src`.
+    ///
+    /// Tripwires often quote the same needle in string literals
+    /// (`src.find("fn cmd_spawn(")`). Those quotes are not at column 0, so
+    /// searching for `\nfn name(` finds the real definition and never the
+    /// test's own literal — bare `find`/`rfind` invent-green or false-red
+    /// when other tests also quote the needle.
+    pub fn find_fn(src: &str, name: &str) -> usize {
+        let needle = format!("\nfn {name}(");
+        src.find(&needle)
+            .map(|i| i + 1)
+            .unwrap_or_else(|| panic!("expected toplevel `fn {name}(`"))
+    }
+}
+
 #[cfg(test)]
 mod spawn_boot_reliability_tests {
     use super::*;
@@ -6497,14 +6515,10 @@ mod spawn_boot_reliability_tests {
     #[test]
     fn spawn_verifies_live_process_and_recovers_or_fails() {
         let src = include_str!("main.rs");
-        // rfind: the gate's own source contains the same string literals —
-        // the LAST occurrence is the real definition (the test module sits
-        // above the functions it gates).
-        let spawn = src.rfind("fn cmd_spawn(").expect("cmd_spawn present");
+        // Column-0 search: bare rfind/find hit tripwire string literals.
+        let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
         let spawn_body = &src[spawn..];
-        let helper = src
-            .rfind("fn verify_or_respawn_pane(")
-            .expect("helper present");
+        let helper = crate::tripwire::find_fn(src, "verify_or_respawn_pane");
         let helper_body = &src[helper..];
 
         // (a) the post-boot verify runs after the prime, inside cmd_spawn
@@ -6551,17 +6565,14 @@ mod spawn_boot_reliability_tests {
     #[test]
     fn spawn_starts_doorbell_dispatcher() {
         let src = include_str!("main.rs");
-        let spawn = src.rfind("fn cmd_spawn(").expect("cmd_spawn");
-        let spawn_end = src[spawn + 1..]
-            .find("\nfn cmd_internal_doorbell")
-            .map(|i| spawn + 1 + i)
-            .unwrap_or(src.len());
+        let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
+        let spawn_end = crate::tripwire::find_fn(src, "cmd_internal_doorbell");
         let body = &src[spawn..spawn_end];
         assert!(
             body.contains("doorbell::ensure_running"),
             "cmd_spawn must start/attach the ADR-0005 doorbell dispatcher"
         );
-        let kill = src.rfind("fn cmd_kill(").expect("cmd_kill");
+        let kill = crate::tripwire::find_fn(src, "cmd_kill");
         let kbody = &src[kill..];
         assert!(
             kbody.contains("doorbell::stop"),
@@ -6572,11 +6583,8 @@ mod spawn_boot_reliability_tests {
     #[test]
     fn spawn_no_peer_aware_keeps_identity_skips_dispatcher() {
         let src = include_str!("main.rs");
-        let spawn = src.rfind("fn cmd_spawn(").expect("cmd_spawn");
-        let spawn_end = src[spawn + 1..]
-            .find("\nfn cmd_internal_doorbell")
-            .map(|i| spawn + 1 + i)
-            .unwrap_or(src.len());
+        let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
+        let spawn_end = crate::tripwire::find_fn(src, "cmd_internal_doorbell");
         let body = &src[spawn..spawn_end];
         assert!(
             body.contains("doorbell::identity_prime"),
@@ -6604,13 +6612,13 @@ mod spawn_boot_reliability_tests {
         ] {
             assert!(src.contains(needle), "{needle} wired into the surface");
         }
-        let recover = src.rfind("fn cmd_recover(").expect("cmd_recover");
+        let recover = crate::tripwire::find_fn(src, "cmd_recover");
         let recover_body = &src[recover..recover + 6000];
         assert!(
             recover_body.contains("doorbell::ensure_running"),
             "recover must heal dead dispatchers"
         );
-        let status = src.rfind("fn cmd_status(").expect("cmd_status");
+        let status = crate::tripwire::find_fn(src, "cmd_status");
         let status_body = &src[status..status + 5000];
         assert!(
             status_body.contains("doorbell::ensure_running") && status_body.contains("wake_state"),
@@ -6620,7 +6628,7 @@ mod spawn_boot_reliability_tests {
             src.contains("doorbell_persist_wake"),
             "dispatcher persists wake state (at-least-once redelivery)"
         );
-        let internal = src.rfind("fn cmd_internal_doorbell(").expect("internal");
+        let internal = crate::tripwire::find_fn(src, "cmd_internal_doorbell");
         let internal_body = &src[internal..internal + 9000];
         assert!(
             internal_body.contains("doorbell::load_wake_state"),
@@ -8156,7 +8164,7 @@ mod timeout_presence_tests {
     #[test]
     fn timeout_arm_ticks_presence_not_only_hear() {
         let src = include_str!("main.rs");
-        let pos = src.find("fn cmd_internal_doorbell(").expect("dispatcher");
+        let pos = crate::tripwire::find_fn(src, "cmd_internal_doorbell");
         let end = src[pos..]
             .find("\nfn spawn_watch_child")
             .map(|i| pos + i)
@@ -16475,7 +16483,7 @@ mod wake_identity_tests {
             "NEW-L8: squad refuse_unpinned must run BEFORE agent_start"
         );
         // cmd_spawn: same refuse-before-start contract (no dark orphan panes).
-        let spawn = src.rfind("fn cmd_spawn(").expect("cmd_spawn");
+        let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
         let spawn_fn = &src[spawn..src.len().min(spawn + 55_000)];
         let sp_refuse = spawn_fn
             .find("refuse_unpinned_spawn")
@@ -33578,9 +33586,7 @@ mod single_writer_tests {
     #[test]
     fn option_a_doorbell_seeds_swarm_resume() {
         let src = include_str!("main.rs");
-        let start = src
-            .rfind("fn cmd_internal_doorbell(")
-            .expect("cmd_internal_doorbell");
+        let start = crate::tripwire::find_fn(src, "cmd_internal_doorbell");
         let slice = &src[start..src.len().min(start + 25000)];
         assert!(
             slice.contains("seed_workspace_from_active_loop"),
