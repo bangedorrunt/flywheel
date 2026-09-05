@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# verify-0029.sh — thin compliance gate for ADR-0029 (GS-024 Accept)
+# verify-0008.sh — thin compliance gate for ADR-0008 (GS-024 Accept)
 # Honesty: live is_compose_token = wave-swarm | repair-until-verified ONLY
 # until beads-lifecycle follow-up lands.
-# governed-by: ADR-0029
+# governed-by: ADR-0008
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 pass=0; fail=0
 ok(){ echo "  [OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "  [FAIL] $1"; fail=$((fail+1)); }
 
-ADR=docs/decisions/0029-workflow-compose-topology-agent-optimal-mental-model.md
-echo "== ADR-0029 verification =="
+ADR=docs/decisions/0008-workflow-compose-topology-agent-optimal-mental-model.md
+echo "== ADR-0008 verification =="
 
 [[ -f "$ADR" ]] && ok "ADR file exists" || bad "ADR file missing"
 grep -qE '^status: accepted' "$ADR" && ok "frontmatter status: accepted" || bad "status not accepted"
@@ -18,10 +18,10 @@ grep -q '2026-09-05' "$ADR" && ok "date 2026-09-05 present" || bad "date missing
 grep -q 'beads-lifecycle' "$ADR" && ok "beads-lifecycle design section present" || bad "beads-lifecycle missing from ADR"
 grep -qi 'implement pending' "$ADR" && ok "implement pending honesty present" || bad "missing implement-pending honesty"
 
-grep -q '0029-workflow-compose-topology-agent-optimal-mental-model.md' docs/decisions/README.md \
-  && ok "README indexes 0029" || bad "README missing 0029"
-grep -E '0029.*Accepted|\*\*Accepted\*\*.*0029|0029.*\*\*Accepted\*\*' docs/decisions/README.md >/dev/null \
-  && ok "README marks 0029 Accepted" || bad "README does not mark 0029 Accepted"
+grep -q '0008-workflow-compose-topology-agent-optimal-mental-model.md' docs/decisions/README.md \
+  && ok "README indexes 0008" || bad "README missing 0008"
+grep -E '0008.*Accepted|\*\*Accepted\*\*.*0008|0008.*\*\*Accepted\*\*' docs/decisions/README.md >/dev/null \
+  && ok "README marks 0008 Accepted" || bad "README does not mark 0008 Accepted"
 
 # Live gate honesty — two tokens only until follow-up
 if grep -n 'pub fn is_compose_token' -A3 src/builtin_workflows.rs | grep -q 'wave-swarm' \
