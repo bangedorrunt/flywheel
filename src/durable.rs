@@ -1828,10 +1828,14 @@ async fn run_leaf_cmd_bounded(
                 Ok(Some(st)) => break st,
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
+                        // GS-025: `kill -9 -<pgid>` is unreliable across
+                        // procps on GHA (watchdog tests saw full 30s sleep).
+                        // Prefer `kill -s KILL -- -<pgid>` + direct child.kill.
                         let pgid = child.id() as i64;
                         let _ = std::process::Command::new("kill")
-                            .args(["-9", &format!("-{pgid}")])
+                            .args(["-s", "KILL", "--", &format!("-{pgid}")])
                             .status();
+                        let _ = child.kill();
                         let _ = child.wait();
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
