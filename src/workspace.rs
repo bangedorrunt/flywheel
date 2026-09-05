@@ -67,22 +67,21 @@ pub struct Question {
 
 /// One workspace model — honest composition, not a god object.
 ///
-/// OWNERSHIP (GS-030, bd-gs030-single-writer-ciqu): the two live processes
-/// own DISJOINT slices, one writer per slice, enforced by the
-/// `single_writer_*` tripwire tests (durable.rs / main.rs). This is the
-/// end-state, not a halfway merge:
+/// OWNERSHIP (GS-033 / ADR-0027 Option A): one live RAM owner.
+/// `cmd_internal_doorbell` constructs the single `WorkspaceModel` for the
+/// workspace lifetime and seeds `swarm` from ActiveLoop (same
+/// `seed_swarm_resume` the loop uses) plus assignment from receipts.
+/// `swarm_loop` must not construct a second `WorkspaceModel::default()` —
+/// process split may remain (remote-resonate / durable replay), but two
+/// RAM WorkspaceModels is Dual, not the end-state. The loop holds only
+/// `LoopModel` (effect runner + crash-resume slice) and folds swarm-slice
+/// Msgs through `tick` via a throwaway composition, not a live owner.
 ///
-/// | slice | owner | sends these Msgs |
-/// |---|---|---|
-/// | `swarm` | `swarm_loop` (resonate worker) | Tick, Herdr, Heal, ClaimNudge, CloseNudge, Reclaim, DiagnoseFailed |
-/// | `doorbell`, `presence`, `roles`, `assignment`, `pending_wait`, `open_human` | `__doorbell` dispatcher | WatchNdjson, InboxRows(/Items), HerdrStatus, RoleBound, Presence, Receipt, Sweep, WatchDied, Fact, AckSlaTick, HumanDecision |
-///
-/// One shared entry (`tick`), one shared journal shape, one wake
-/// (doorbell). One RAM is impossible: the loop may run on another machine
-/// (remote-resonate topology) and threads/subprocesses cannot live inside
-/// replayed durable fns — so the two `Default()`s are per-process initial
-/// states of disjointly-owned slices, and any cross-slice write fails the
-/// build. `seq` is a per-process diagnostic counter, not shared truth.
+/// Tripwires enforce Option A: the live loop body contains no
+/// `WorkspaceModel::default()`; the dispatcher seeds swarm resume.
+/// Two-process + one-RAM + seed-from-receipts is a slice toward one
+/// Model. The end-state is one RAM owner. `seq` is a per-process
+/// diagnostic counter, not shared truth.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorkspaceModel {
     pub doorbell: crate::doorbell_tick::DoorbellModel,
