@@ -24,7 +24,9 @@ default + registry alternatives; blank keeps default, selection overrides.
    '{"objective": "<target>"}'`. Slash /swarm-mode pins this compose token.
    GATE->DISPATCH->EXECUTE->OBSERVE->VERIFY->SIGNOFF. The run parks at
    SIGNOFF: resolve via `flywheel workflow approve`. DISPATCH briefs
-   `--stage systematic-execute` (p6) onto coder panes, never p1.
+   `--stage systematic-execute` (p6) onto coder panes, never p1. Legacy alias
+   `workflow run wave-swarm --execute` (not preferred). Swarm is supervision,
+   not a Workflow — never "swarm workflow".
 
 3. GATE PREP: `br sync --flush-only`; clear stale assignees; commit tracker.
    Map bead graph (deps, waves). Waves ONE AT A TIME; epics are gates.

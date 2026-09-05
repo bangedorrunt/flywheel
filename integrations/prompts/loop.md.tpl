@@ -46,7 +46,8 @@ provider/model overrides it. Record the choice in the launch/report summary.
    (blocks for reply; reviewer profile = different model family). Forks
    with 2+ viable options -> `flywheel workflow run prototype --execute
    --mode pane` (n>=2 sketch arms), oracle judges. Red-verify:
-   `flywheel workflow compose "<objective>" --parts repair-until-verified --run`.
+   `flywheel workflow compose "<objective>" --parts repair-until-verified --run`
+   (legacy alias: `workflow run repair-until-verified --execute`).
    NEVER block on the
    captain for reversible calls: if a fact is observable by running
    something, run it; peers substitute (never-block-on-the-human).
