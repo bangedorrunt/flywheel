@@ -7,7 +7,7 @@ consulted: GS-020 as-is SHA256 7ea25cd998967b59d72dd1d72dbc0b2541e2369b112a5f39a
 informed: flywheel × toron × beads maintainers; Wheelhouse; captain AND crew harness agents
 ---
 
-# ADR-0029: Workflow / Compose / Topology — Agent-Optimal Mental Model
+# ADR-0008: Workflow / Compose / Topology — Agent-Optimal Mental Model
 
 | Field | Value |
 |-------|-------|
@@ -19,7 +19,7 @@ informed: flywheel × toron × beads maintainers; Wheelhouse; captain AND crew h
 | **Governs (speech + doors now; code follow-ups)** | Compose-token mental model; preferred doors; SIGNOFF outer-only; topology ≠ Workflow; docs/skills speech. Live gate: `src/builtin_workflows.rs` `is_compose_token`. |
 | **Honesty @ Accepted** | Live `main` (`c60c3e55`): `is_compose_token` = `wave-swarm` \| `repair-until-verified` **ONLY**. Third token **`beads-lifecycle`** is **design Accepted**; **YAML / match arm / expand tests = implement pending** (follow-up tasks). Do **not** claim code has `beads-lifecycle` yet. |
 | **Tracker** | beads. Never pull requests as the log. |
-| **Verification** | § Implementation Plan → Verification; optional `docs/decisions/_scripts/verify-0029.sh` |
+| **Verification** | § Implementation Plan → Verification; optional `docs/decisions/_scripts/verify-0008.sh` |
 
 > **Scope:** one agent-optimal mental model for **captain AND crew**: five nouns (drop recipe speech); **compose tokens** via **`is_compose_token`** vs ordinary builtins — design set = `wave-swarm` \| `repair-until-verified` \| **`beads-lifecycle`**; live code today gates the first two only; preferred door `workflow compose … --parts <token> --run` with `workflow run <token> --execute` as **legacy alias**; ordinary builtins `workflow run --execute` only; outer durable runs nest captain+crew with **SIGNOFF outer-only**; topology off Workflow. Encode grill locks + beads-lifecycle graph/`inputs.until` as Accepted design; land third-token code in follow-up.
 
@@ -475,9 +475,9 @@ Agent-readiness: an implementer can start from this section without tribal knowl
 
 | Step | Action | Paths |
 | :--- | :--- | :--- |
-| 1 | Land Accepted ADR | `docs/decisions/0029-workflow-compose-topology-agent-optimal-mental-model.md` |
+| 1 | Land Accepted ADR | `docs/decisions/0008-workflow-compose-topology-agent-optimal-mental-model.md` |
 | 2 | Index row **Accepted** | `docs/decisions/README.md` |
-| 3 | Optional thin verify | `docs/decisions/_scripts/verify-0029.sh` — assert ADR status + README + live two-token gate honesty |
+| 3 | Optional thin verify | `docs/decisions/_scripts/verify-0008.sh` — assert ADR status + README + live two-token gate honesty |
 | 4 | **Do not** add `beads-lifecycle` YAML or match arm in this ship | — |
 
 ### 10.B — Follow-up: speech / docs / skills (may partially already be on main post GS-021)
@@ -529,7 +529,7 @@ Checkboxes are testable. **At Accept land (GS-024):** speech/design criteria app
 ### At Accept (this ship)
 
 - [x] ADR file landed under `docs/decisions/` with `status: accepted` and date `2026-09-05`.
-- [x] `docs/decisions/README.md` lists **0029** as **Accepted**.
+- [x] `docs/decisions/README.md` lists **0008** as **Accepted**.
 - [x] Self-contained: mermaid as-is/to-be, noun model, compose_token design set, preferred doors, SIGNOFF, efficiency catalog, beads-lifecycle § with **implement pending**.
 - [x] Links: flywheel ADRs local; toron ADRs via `../../toron/docs/decisions/…` — **no** fake local flywheel `0027-…` path.
 - [x] Does **not** rewrite [toron ADR-0027](../../toron/docs/decisions/0027-one-workspace-tick-control-plane.md) body.
@@ -562,7 +562,7 @@ Checkboxes are testable. **At Accept land (GS-024):** speech/design criteria app
 - [ ] Ordinary `beads` remains **not** a compose token.
 - [ ] `inputs.until` early-exit documented + lint-covered.
 - [ ] Docs/skills compose-token set lists three **after** code lands.
-- [ ] Optional: `docs/decisions/_scripts/verify-0029.sh` green for post-implement checks.
+- [ ] Optional: `docs/decisions/_scripts/verify-0008.sh` green for post-implement checks.
 
 ### Never (non-goals gates)
 
@@ -586,5 +586,5 @@ Checkboxes are testable. **At Accept land (GS-024):** speech/design criteria app
 - GS-022 source proposal SHA256 `351c3f3afd56be1943d979fe078ad500dc8406cadf0bd98b723e6d5d3e6a9d75`
 - GS-021/GS-023 Proposed counsel → **GS-024 Accepted** into **flywheel** (not toron)
 - Live main at Accept: flywheel `c60c3e55` (`is_compose_token` = two tokens only)
-- ADR number: **0029** (flywheel decisions previously through **0007**; higher numbers live primarily in toron — this record is flywheel-owned)
+- ADR number: **0008** (flywheel decisions previously through **0007**; next free slot — this record is flywheel-owned)
 - Cloud Agents: skipped (Pro-unavailable); clone path authorized
