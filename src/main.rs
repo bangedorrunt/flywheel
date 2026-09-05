@@ -3604,7 +3604,7 @@ fn resolve_agents_dyn(
 /// A normalized `--to` token: the concrete agent name to match against, plus
 /// whether the token was a BARE kind short (`oc`/`pi`/`gk`) that may broaden
 /// to all numbered agents of that kind. Concrete names (`flywheel-<base>-oc`,
-/// `flywheel-<base>-oc2`), numbered shorts (`oc2`), pane ids, and mail
+/// `flywheel-<base>-oc2`, `crew-<workflow>-<role>[N]`), numbered shorts (`oc2`), pane ids, and mail
 /// identities match EXACTLY — a full name never silently drags in oc2/oc3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WantToken {
@@ -3621,7 +3621,10 @@ struct WantToken {
 
 fn to_want_token(project: &str, token: &str) -> WantToken {
     let t = token.trim();
-    if t.is_empty() || t.starts_with("flywheel-") || t.contains(':') {
+    // bd-send-crew-addressable-7sjo: composed crew panes are concrete names
+    // (`crew-<workflow>-<role>[N]`, pane.rs crew_agent_name) — pass them
+    // through exactly like `flywheel-` names, never wrap them.
+    if t.is_empty() || t.starts_with("flywheel-") || t.starts_with("crew-") || t.contains(':') {
         WantToken {
             name: t.to_string(),
             broaden: false,
@@ -7476,7 +7479,16 @@ projects available: {}",
                     name.clone(),
                     mid.clone(),
                 ),
-                (None, None) => state::SpawnEntry::legacy(agent.pane_id.clone(), name.clone()),
+                (None, None) => {
+                    // bd-unpinned-loud-1mlt: a legacy entry with no mail
+                    // identity is invisible to the doorbell sweep — say so at
+                    // creation instead of going silently dark later.
+                    eprintln!(
+                        "flywheel: warn: spawned {name} ({}) with no mail identity (unpinned legacy entry); doorbell sweep skips unpinned panes — re-register with a mail identity to restore inbox checks",
+                        agent.pane_id
+                    );
+                    state::SpawnEntry::legacy(agent.pane_id.clone(), name.clone())
+                }
             };
             registry.push(entry);
             println!(
@@ -9672,6 +9684,18 @@ fn doorbell_refresh_pins(project: &str, pane_to_pin: &mut BTreeMap<String, Strin
     }
 }
 
+/// bd-unpinned-loud-1mlt (GS-028 B6+B7): names of registry entries with no
+/// pinned mail identity. Pure — shared by the spawn-site warning and the
+/// sweep skip counter so both agree on what "unpinned" means. An empty
+/// identity counts as unpinned (same rows the sweep skips).
+fn unpinned_registry_names(registry: &[state::SpawnEntry]) -> Vec<String> {
+    registry
+        .iter()
+        .filter(|e| !e.mail_identity.as_deref().is_some_and(|s| !s.is_empty()))
+        .map(|e| e.name.clone())
+        .collect()
+}
+
 /// Plane P: one `toron mail inbox --since` per pin, batched on the 1s tick.
 /// Gap 13: prefers in-process `Mailbox::fetch_inbox` (zero fork) and falls back
 /// to `toron mail inbox` CLI only when the in-process mailbox is unavailable.
@@ -9695,6 +9719,16 @@ fn doorbell_sweep_inbox(
     // below so each line carries its gate outcome (effect). High-water
     // updates stay inline — they are independent of the gate.
     let mut pending: Vec<(String, workspace::Msg, Vec<workspace::Cmd>, &'static str)> = Vec::new();
+    // bd-unpinned-loud-1mlt: legacy rows without a pin are skipped by the
+    // sweep below — count them loudly (once per sweep) instead of silently.
+    let unpinned = unpinned_registry_names(&registry);
+    if !unpinned.is_empty() {
+        eprintln!(
+            "flywheel: warn: doorbell sweep skipping {} unpinned pane(s) with no mail identity ({}); re-register with a mail identity to restore inbox checks",
+            unpinned.len(),
+            unpinned.join(", ")
+        );
+    }
     for e in &registry {
         let Some(pin) = e.mail_identity.as_deref() else {
             continue;
@@ -11005,14 +11039,17 @@ const NOUNS: [&str; 132] = [
 ];
 
 /// Resolve a mail-recipient specifier to a registered agent-mail identity
-/// name. A herdr agent name (`flywheel-<base>-<kind>[N]`) maps
-/// deterministically to its adjective+noun identity — registration uses the
-/// same mapping (bd-odc), so the identity exists. Anything else passes
+/// name. A herdr agent name (`flywheel-<base>-<kind>[N]`, `crew-<wf>-<role>[N]`)
+/// maps deterministically to its adjective+noun identity — registration uses
+/// the same mapping (bd-odc), so the identity exists. Anything else passes
 /// through unchanged: it is either an already-valid identity (the mapping is
 /// idempotent for those) or a recipient the server will reject honestly.
 /// Pure — no registry round trips.
 pub(crate) fn resolve_mail_target(target: &str) -> String {
-    if target.contains('-') {
+    // bd-mail-hyphen-loud-3r20: hash ONLY herdr-shaped names. The old
+    // `contains('-')` rule hashed channel-shaped input (`steer-<ch>`) and
+    // typos into a random adjective+noun pin — a misroute, never a mapping.
+    if target.starts_with("flywheel-") || target.starts_with("crew-") {
         agent_mail_name(target)
     } else {
         target.to_string()
@@ -11415,6 +11452,32 @@ mod agent_mail_name_tests {
         assert_eq!(resolve_mail_target(""), "");
     }
 
+    /// bd-mail-hyphen-loud-3r20 (GS-028 NEW-2): ONLY herdr-shaped names hash.
+    /// Channel-shaped input (`steer-<ch>`) and hyphenated typos pass through
+    /// so the server rejects them honestly instead of misrouting to a random
+    /// adjective+noun pin. Crew pane names still map.
+    #[test]
+    fn resolve_mail_target_hyphen_only_herdr_shapes_hash() {
+        // channel-shaped: pass through, never hashed
+        assert_eq!(resolve_mail_target("steer-abc123"), "steer-abc123");
+        assert_eq!(resolve_mail_target("my-channel"), "my-channel");
+        assert_eq!(
+            resolve_mail_target("not-a-herdr-name-at-all"),
+            "not-a-herdr-name-at-all"
+        );
+        // herdr-shaped: still maps (flywheel- and crew- prefixes)
+        assert_eq!(
+            resolve_mail_target("flywheel-toron-oc"),
+            agent_mail_name("flywheel-toron-oc")
+        );
+        assert_eq!(
+            resolve_mail_target("crew-plan-coder"),
+            agent_mail_name("crew-plan-coder")
+        );
+        // already-valid identities stay idempotent
+        assert_eq!(resolve_mail_target("TopazOx"), "TopazOx");
+    }
+
     /// bd-627z.4 GATE: the spawn-registry pin wins over the pure hash —
     /// two resolves of the SAME agent return the SAME identity, the pin
     /// survives a reload (daemon-restart equivalent), and an unpinned agent
@@ -11639,6 +11702,41 @@ mod agent_mail_name_tests {
             to_want_token("toron", ""),
             WantToken {
                 name: "".into(),
+                broaden: false,
+                short: None,
+                ordinal: 1,
+            }
+        );
+    }
+
+    /// bd-send-crew-addressable-7sjo (GS-028 NEW-1): composed crew pane names
+    /// (`crew-<workflow>-<role>[N]`) are concrete — they pass through exact
+    /// with no broadening, never wrapped to `flywheel-<base>-crew-...`.
+    #[test]
+    fn to_want_token_send_crew_names_pass_through() {
+        assert_eq!(
+            to_want_token("toron", "crew-plan-coder"),
+            WantToken {
+                name: "crew-plan-coder".into(),
+                broaden: false,
+                short: None,
+                ordinal: 1,
+            }
+        );
+        assert_eq!(
+            to_want_token("toron", "crew-wave-swarm-coder2"),
+            WantToken {
+                name: "crew-wave-swarm-coder2".into(),
+                broaden: false,
+                short: None,
+                ordinal: 1,
+            }
+        );
+        // whitespace-trimmed crew names still pass through
+        assert_eq!(
+            to_want_token("toron", "  crew-plan-coder  "),
+            WantToken {
+                name: "crew-plan-coder".into(),
                 broaden: false,
                 short: None,
                 ordinal: 1,
@@ -15912,6 +16010,35 @@ mod wake_identity_tests {
             "created_ts_us": created_us,
             "read_ts_us": read.then(|| created_us + 1),
         })
+    }
+
+    /// bd-unpinned-loud-1mlt (GS-028 B6+B7): the helper lists exactly the
+    /// rows the sweep skips — legacy entries with no (or empty) pin.
+    #[test]
+    fn unpinned_loud_lists_legacy_rows_only() {
+        assert_eq!(
+            unpinned_registry_names(&[]),
+            Vec::<String>::new(),
+            "empty registry is clean"
+        );
+        let reg = vec![
+            entry("flywheel-toron-oc", Some("DustySparrow")),
+            entry("flywheel-toron-pi", None),
+            entry("crew-plan-coder", None),
+        ];
+        assert_eq!(
+            unpinned_registry_names(&reg),
+            vec![
+                "flywheel-toron-pi".to_string(),
+                "crew-plan-coder".to_string()
+            ],
+            "legacy rows listed, pinned excluded"
+        );
+        let pinned = vec![entry("flywheel-toron-oc", Some("DustySparrow"))];
+        assert!(
+            unpinned_registry_names(&pinned).is_empty(),
+            "fully-pinned registry is clean"
+        );
     }
 
     /// S8.1: the wake identity is the registry pin, else the canonical name
