@@ -21,7 +21,7 @@ Ask operator for model routing per profile before spawn/dispatch; show
 default + registry alternatives; blank keeps default, selection overrides.
 
 1. RUN: `flywheel workflow compose "<objective>" --parts wave-swarm --run --inputs
-   '{"objective": "<target>"}'`. Slash /swarm-mode pins this recipe.
+   '{"objective": "<target>"}'`. Slash /swarm-mode pins this compose token.
    GATE->DISPATCH->EXECUTE->OBSERVE->VERIFY->SIGNOFF. The run parks at
    SIGNOFF: resolve via `flywheel workflow approve`. DISPATCH briefs
    `--stage systematic-execute` (p6) onto coder panes, never p1.
