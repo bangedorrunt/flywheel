@@ -11,6 +11,7 @@ This directory contains records of the major architectural decisions made for th
 | [0005](0005-always-on-collab-baseline-and-command-surface.md) | Always-On Collaboration Baseline + Composable Markdown Command Surface | **Accepted** (2026-08-20; D5 captain ±loop; §9 SC-D1–D10; `verify-0005.sh`) |
 | [0006](0006-parameterized-stage-payloads-and-wave-scoped-dispatch.md) | Parameterized Stage Payloads + Wave-Scoped Dispatch (the unattended wave swarm) | **Accepted** (2026-08-22; D1–D4; `verify-0006.sh` 9/9; graduation GREEN 2026-08-23 — composed wave-swarm closed fixture bead grad-fw-43424-9da via legal close, kept to catalog) |
 | [0007](0007-catalog-slots-and-agent-native-cli.md) | Catalog slots + agent-native catalog CLI | **Accepted** (2026-09-05; D1 slots=harness+model, D2 six job profiles, D3 compiled-in squads, D4 catalog CLI+TUI; Wave 7 catalog-only; `verify-0007.sh` 14/14) |
+| [0029](0029-workflow-compose-topology-agent-optimal-mental-model.md) | Workflow / Compose / Topology — Agent-Optimal Mental Model | **Accepted** (2026-09-05; GS-024; design set wave-swarm\|repair-until-verified\|beads-lifecycle; live `is_compose_token` two tokens only; beads-lifecycle implement pending; `verify-0029.sh`) |
 
 ## Related toron ADRs
 
@@ -23,4 +24,5 @@ flywheel is tightly coupled to toron (toron carries; flywheel drives). Key cross
 - **toron [ADR-0019](../../toron/docs/decisions/0019-bead-verified-execution-and-principle-playbooks.md)** — bead-verified execution, baked poteto principles, playbook workflows (proposed 2026-08-15). Wave 1 lives in flywheel (`ledger.rs`, loop reopen, briefs). Wave 4 is this repo's ADR-0001 A2 leftover.
 - **toron [ADR-0020](../../toron/docs/decisions/0020-nostr-two-plane-cli-and-crew-steering.md)** — CLI-first Nostr rooms/jobs/presence/watch so crews steer without flywheel `send`. No new flywheel subcommands in wave 1.
 - **toron [ADR-0024](../../toron/docs/decisions/0024-graph-first-repair-loops-bead-workflow.md)** — graph-canonical workflow engine, typed runtime failure, unrolled repair (Accepted in toron; VerifySink is the live compose/graph door — status corrected 2026-09-04, GS-016).
+- **flywheel [ADR-0029](0029-workflow-compose-topology-agent-optimal-mental-model.md)** — workflow/compose/topology agent-optimal mental model (Accepted 2026-09-05). Does not amend toron ADR-0027. Live `is_compose_token` = wave-swarm | repair-until-verified; beads-lifecycle design Accepted, implement pending.
 - **toron [ADR-0025](../../toron/docs/decisions/0025-adopt-graph-dispatch-artifact-reduce-pin-supervision.md)** — overlay: lease reclaim, typed artifacts, pin supervision, plane routing table, ingress + launch idempotency. Extends this repo's ADR-0001 `LoopAction`. Direct spawn-send stays cheap.
