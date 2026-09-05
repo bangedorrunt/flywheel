@@ -1687,9 +1687,9 @@ mod bell_fold_tests {
     #[test]
     fn bell_fold_no_status_by_pin_side_map() {
         let src = include_str!("main.rs");
-        let start = src.find("fn cmd_internal_doorbell(").expect("dispatcher");
-        let refresh = src.find("fn doorbell_refresh_status(").expect("refresh");
-        let sweep = src.find("fn doorbell_sweep_inbox(").expect("sweep");
+        let start = crate::tripwire::find_fn(src, "cmd_internal_doorbell");
+        let refresh = crate::tripwire::find_fn(src, "doorbell_refresh_status");
+        let sweep = crate::tripwire::find_fn(src, "doorbell_sweep_inbox");
         let dispatcher = &src[start..refresh];
         assert!(
             !dispatcher.contains("let mut status_by_pin"),
