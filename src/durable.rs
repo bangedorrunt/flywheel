@@ -5808,15 +5808,26 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     let mut agent_kinds: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     // GS-033 B1: loop holds LoopModel only — not a second WorkspaceModel.
-    // Crash-resume uses the same seed helper as the doorbell owner.
+    // Crash-resume seeds via seed_swarm_resume (same resume semantics as
+    // doorbell's seed_workspace_from_active_loop). I/O Err is fail-loud —
+    // never swallow into empty resume while claiming a seeded restart.
     let mut swarm = LoopModel::default();
-    if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
-        seed_swarm_resume(
-            &mut swarm,
-            &al.heal_states,
-            &al.done_mailed,
-            &al.drain_pending,
-        );
+    match crate::state::load_active_loop(&params.project) {
+        Ok(Some(al)) => {
+            seed_swarm_resume(
+                &mut swarm,
+                &al.heal_states,
+                &al.done_mailed,
+                &al.drain_pending,
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Err(map_err(anyhow::anyhow!(
+                "swarm_loop ActiveLoop seed failed for '{}': {e:#} (refusing silent empty resume)",
+                params.project
+            )));
+        }
     }
     // pane_exited names observed this iteration (event path feeds heal step)
     let mut exited_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -15558,6 +15569,19 @@ mod single_writer_tests {
         assert!(
             body.contains("seed_swarm_resume"),
             "Option A: swarm_loop must seed LoopModel via the shared seed helper"
+        );
+        assert!(
+            body.contains("refusing silent empty resume")
+                && body.contains("match crate::state::load_active_loop"),
+            "GS-033: swarm_loop ActiveLoop seed must fail-loud on I/O Err (not if-let-Ok swallow)"
+        );
+        // Seed block must not use if-let-Ok swallow (the later dispatch_pending
+        // loads may still use if-let; only the seed path is gated here).
+        let seed_at = body.find("let mut swarm = LoopModel::default()").expect("swarm default");
+        let seed_slice = &body[seed_at..body.len().min(seed_at + 900)];
+        assert!(
+            !seed_slice.contains("if let Ok(Some(al))"),
+            "GS-033: swarm_loop must not swallow ActiveLoop seed Err into empty resume"
         );
         assert!(
             body.contains("LoopModel::default()"),

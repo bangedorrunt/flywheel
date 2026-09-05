@@ -497,6 +497,22 @@ impl Mail {
         }
     }
 
+    /// Undo [`Self::pin_role_alias`] (GS-033 compensate path when
+    /// `emit_role_bound` fails after the mail pin landed). In-process
+    /// clears via `Mailbox::clear_role_pin`; remote has no role-unpin MCP
+    /// op and fails loud naming the CLI.
+    pub fn clear_role_alias(&self, project_key: &str, role: &str) -> Result<Option<String>> {
+        match &self.backend {
+            BackendKind::InProcess => {
+                let prior = block_on(mailbox().clear_role_pin(project_key, role))?;
+                Ok(prior)
+            }
+            BackendKind::Remote(_) => anyhow::bail!(
+                "role unpin failed (remote mailbox): run `toron role unpin {role} --project {project_key}` (no remote role-unpin MCP op per ADR-0027; refusing a silent skip)"
+            ),
+        }
+    }
+
     /// `register_agent` (upsert on the agent's key).
     pub fn register_agent(
         &self,
