@@ -31,7 +31,7 @@ fi
 
 echo "-- D3 wave-swarm recipe (bd-wave-swarm-recipe-wsot) --"
 if cargo test --offline wave_swarm >/dev/null 2>&1; then
-  ok "D3 recipe expands GATE/DISPATCH/OBSERVE/VERIFY/SIGNOFF and lints clean"
+  ok "D3 compose token expands GATE/DISPATCH/EXECUTE/OBSERVE/VERIFY/SIGNOFF and lints clean"
 else
   bad "D3 wave_swarm tests fail"
 fi
