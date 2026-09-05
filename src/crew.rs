@@ -1594,10 +1594,10 @@ steps:
     }
 
     /// ADR-0006 D3: the `wave-swarm` compose token expands to the
-    /// five-phase workflow — GATE → DISPATCH → OBSERVE → VERIFY → SIGNOFF —
+    /// six-step workflow — GATE → DISPATCH → EXECUTE → OBSERVE → VERIFY → SIGNOFF —
     /// and the expansion lints clean.
     #[test]
-    fn wave_swarm_compose_token_expands_five_phases_and_lints_clean() {
+    fn wave_swarm_compose_token_expands_six_steps_and_lints_clean() {
         use toron_workflow::schema::Action;
         let lib = crate::stages::StageLibrary::compiled_in();
         let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());

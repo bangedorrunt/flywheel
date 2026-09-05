@@ -3854,7 +3854,7 @@ fn main() {
                 "hub": "flywheel catalog [--json] — ratatui multi-panel; refuses non-TTY/NO_COLOR/TERM=dumb naming the CLI (ADR-0007 D4)"
             },
             "wave_dispatch": "loop run --work --wave-label wave-N scopes the ready set to that label and holds (naming blockers) while any lower wave-M (M<N) is open/in_progress; default --work unchanged; label-based transitional until beads ADR-0001 schema-18 (ADR-0006 D2)",
-            "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/OBSERVE/VERIFY/SIGNOFF; SIGNOFF=request_approval (captain-only). Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Bounded by FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
+            "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/VERIFY/SIGNOFF; SIGNOFF=request_approval (captain-only). Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Bounded by FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
             "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error" }
         }));
         return;
