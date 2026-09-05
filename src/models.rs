@@ -462,11 +462,7 @@ impl ModelRegistry {
         // fallback is model-opaque (closed-source proprietary model): the
         // bare id rides as the flag, no caps check. Other families keep
         // the caps check.
-        if let Some(fb) = self
-            .models
-            .get(&primary)
-            .and_then(|e| e.fallback.clone())
-        {
+        if let Some(fb) = self.models.get(&primary).and_then(|e| e.fallback.clone()) {
             let fb_h = if self.family_of(&fb) == "grok" {
                 "grok".to_string()
             } else {
@@ -1309,7 +1305,11 @@ mod tests {
         assert_eq!(slot_alias("@premium"), Some(SLOT_PREMIUM));
         assert_eq!(slot_alias("@slow"), Some(SLOT_PREMIUM));
         assert_eq!(slot_alias("@plan"), Some(SLOT_PREMIUM));
-        assert_eq!(slot_alias("cheap"), None, "bare name is not a profile.model alias");
+        assert_eq!(
+            slot_alias("cheap"),
+            None,
+            "bare name is not a profile.model alias"
+        );
         assert_eq!(slot_alias("opencode/big-pickle"), None);
     }
 
@@ -1360,7 +1360,10 @@ mod tests {
         let (h, m, route) = reg
             .resolve_profile_route_full("", "@cheap", &[])
             .expect("primary");
-        assert_eq!((h.as_str(), m.as_str(), route), ("opencode", "opencode/big-pickle", "primary"));
+        assert_eq!(
+            (h.as_str(), m.as_str(), route),
+            ("opencode", "opencode/big-pickle", "primary")
+        );
     }
 
     #[test]
@@ -1379,7 +1382,10 @@ mod tests {
                 &["opencode-go/deepseek-v4-flash".to_string()],
             )
             .expect("model_fallback rung");
-        assert_eq!(route, "model_fallback", "ordered list wins before harness swap");
+        assert_eq!(
+            route, "model_fallback",
+            "ordered list wins before harness swap"
+        );
         assert_eq!(h, "opencode");
 
         // Step 4: empty model_fallback → premium's fallback_harness=grok…
@@ -1405,7 +1411,10 @@ mod tests {
             .expect("fallback_harness rung");
         assert_eq!(route, "fallback_harness");
         assert_eq!(h, "grok", "slot fallback_harness swaps the harness");
-        assert_eq!(m, "glm-5.2", "grok hop is model-opaque: bare id as flag, no registry pick");
+        assert_eq!(
+            m, "glm-5.2",
+            "grok hop is model-opaque: bare id as flag, no registry pick"
+        );
     }
 
     #[test]
@@ -1473,7 +1482,8 @@ model = "opencode/big-pickle"
             Some("opencode/big-pickle")
         );
         assert_eq!(
-            reg.implied_slot_for_harness("pi").map(|s| s.harness.as_str()),
+            reg.implied_slot_for_harness("pi")
+                .map(|s| s.harness.as_str()),
             Some("pi")
         );
         assert_eq!(

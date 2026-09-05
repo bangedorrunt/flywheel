@@ -14,16 +14,16 @@
 use crate::models::{self, ModelRegistry};
 use crate::output::Slot;
 use crate::profile::{self, ProfileCatalog};
-use anyhow::{bail, Result};
-use std::io::IsTerminal;
+use anyhow::{Result, bail};
 use ratatui::{
+    Frame,
     crossterm::event::{self, Event, KeyCode, KeyEventKind},
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
-    Frame,
 };
+use std::io::IsTerminal;
 
 /// The three focusable panels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,7 +197,14 @@ fn panel_block(title: &'static str, focused: bool) -> Block<'static> {
         .title(title_span)
 }
 
-fn render_panel(f: &mut Frame, area: Rect, title: &'static str, rows: &[CatalogRow], state: &mut ListState, focused: bool) {
+fn render_panel(
+    f: &mut Frame,
+    area: Rect,
+    title: &'static str,
+    rows: &[CatalogRow],
+    state: &mut ListState,
+    focused: bool,
+) {
     let items: Vec<ListItem> = rows
         .iter()
         .map(|r| {
@@ -218,7 +225,10 @@ fn render_panel(f: &mut Frame, area: Rect, title: &'static str, rows: &[CatalogR
                         Modifier::BOLD
                     }),
                 ),
-                Span::styled(format!("{detail}{builtin_mark}", detail = r.detail), slot_style(Slot::FgMuted)),
+                Span::styled(
+                    format!("{detail}{builtin_mark}", detail = r.detail),
+                    slot_style(Slot::FgMuted),
+                ),
             ]))
         })
         .collect();
@@ -348,4 +358,3 @@ fn run_loop() -> Result<()> {
     ratatui::restore();
     result
 }
-
