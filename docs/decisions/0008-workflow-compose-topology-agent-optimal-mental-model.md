@@ -17,7 +17,7 @@ informed: flywheel × toron × beads maintainers; Wheelhouse; captain AND crew h
 | **Extends** | [ADR-0005](0005-always-on-collab-baseline-and-command-surface.md) (workflow/squad/profile surfaces), [ADR-0006](0006-parameterized-stage-payloads-and-wave-scoped-dispatch.md) (wave-swarm compose token), [toron ADR-0010](../../toron/docs/decisions/0010-execution-wiring-model-registry-headless.md) (`--execute` / mode), [toron ADR-0015](../../toron/docs/decisions/0015-flywheel-toron-integration-contract.md) (one-way flywheel→toron), [toron ADR-0019](../../toron/docs/decisions/0019-bead-verified-execution-and-principle-playbooks.md) (playbook shapes), [toron ADR-0022](../../toron/docs/decisions/0022-phase-native-orchestration.md) (compose grammar), [toron ADR-0024](../../toron/docs/decisions/0024-graph-first-repair-loops-bead-workflow.md) (`VerifySink` / repair), [toron ADR-0025](../../toron/docs/decisions/0025-adopt-graph-dispatch-artifact-reduce-pin-supervision.md), [toron ADR-0026](../../toron/docs/decisions/0026-failure-taxonomy-funded-preflight-fallback-chains-mail-health-escalation.md) |
 | **Does not amend / does not rewrite** | [toron ADR-0027](../../toron/docs/decisions/0027-one-workspace-tick-control-plane.md) — Tick Law, doorbell, kind 30013, factory.db, two captains untouched. ADR-0028 stays as landed. This record does not open GS-011. |
 | **Governs (speech + doors now; code follow-ups)** | Compose-token mental model; preferred doors; SIGNOFF outer-only; topology ≠ Workflow; docs/skills speech. Live gate: `src/builtin_workflows.rs` `is_compose_token`. |
-| **Honesty @ Accepted** | Live `main` (`c60c3e55`): `is_compose_token` = `wave-swarm` \| `repair-until-verified` **ONLY**. Third token **`beads-lifecycle`** is **design Accepted**; **YAML / match arm / expand tests = implement pending** (follow-up tasks). Do **not** claim code has `beads-lifecycle` yet. |
+| **Honesty @ Accepted** | At Accept (`c60c3e55`) `is_compose_token` held **only** `wave-swarm` \| `repair-until-verified`; the third token was design Accepted with code pending. **IMPLEMENTED 2026-09-05** (match arm 84fbfb7, expand tests c751690, guard-fix 2010d78): live gate holds all three. Accept snapshot preserved in Dump & method. |
 | **Tracker** | beads. Never pull requests as the log. |
 | **Verification** | § Implementation Plan → Verification; optional `docs/decisions/_scripts/verify-0008.sh` |
 
@@ -34,7 +34,7 @@ Grounded at live `main` (2026-09-05 Melbourne / UTC): flywheel `c60c3e55` (GS-02
 **Grill locks (Accepted speech + design):**
 
 1. **Drop recipe speech.** Five load-bearing nouns only: **stage**, **workflow**, **profile**, **topology**, **compose** (verb).
-2. **Compose token** = `wave-swarm` \| `repair-until-verified` \| **`beads-lifecycle`** (design set), gated by **`is_compose_token`** (was `is_builtin_recipe`). Teach the new name. **Live code @ `c60c3e55`:** only the first two match arms. Third token = **implement pending**.
+2. **Compose token** = `wave-swarm` \| `repair-until-verified` \| **`beads-lifecycle`** (design set → **live set**), gated by **`is_compose_token`** (was `is_builtin_recipe`). **Live: all three match arms.**
 3. **Preferred door** for compose tokens: `workflow compose … --parts <token> --run`.
 4. **`workflow run <token> --execute`** = **legacy alias** for compose tokens (not the preferred door).
 5. **Ordinary builtins** (e.g. `captain-audit`): `workflow run <name> --execute` — **NOT** bare `--parts`.
@@ -150,7 +150,7 @@ flowchart LR
 | Claim | Evidence |
 | :--- | :--- |
 | Four-noun doc teaches compose token doors | `docs/agent-instructions/workflow-composition.md` (post GS-021 speech) |
-| Compose token gate is **`is_compose_token`** | `builtin_workflows.rs` — live only `wave-swarm` \| `repair-until-verified`; design adds **`beads-lifecycle`** (implement pending) |
+| Compose token gate is **`is_compose_token`** | `builtin_workflows.rs` — live `wave-swarm` \| `repair-until-verified` \| **`beads-lifecycle`** (three arms since 84fbfb7) |
 | Token check **before** stage-first | `crew.rs` `parse_compose_part` |
 | `ComposePart::Recipe` expands inline | `crew.rs` expand + `builtin_recipe` |
 | 37 builtins, same `Workflow` type | `BUILTIN_WORKFLOWS_YAML` — 37 unique names |
@@ -281,7 +281,7 @@ Lock nouns and doors; publish compose-token vs ordinary-builtin throughout; Acce
 | Action | Names / rule |
 | :--- | :--- |
 | **keep (compose_token) — live** | `wave-swarm`, `repair-until-verified` — **`is_compose_token`** set @ `c60c3e55` |
-| **promote compose_token — design Accepted; implement pending** | **`beads-lifecycle`** — third token; follow-up needs match arm + YAML stages + expand tests + docs/skills checklist. **Not claimed in code at Accept.** |
+| **promote compose_token — design Accepted → IMPLEMENTED 2026-09-05** | **`beads-lifecycle`** — third token; landed match arm (84fbfb7) + YAML stages + expand tests (c751690) + guard-fix (2010d78) + docs/skills checklist. |
 | **keep (ordinary builtin)** | `captain-audit`, `weekly-review`, phase-* (`phase-resolve`…`phase-verify`), playbook shapes (`bug-fix`, `feature`, `refactoring`, `perf`, `hillclimb`, `prototype`, `arena`, `interrogate`, `forensics`), ops (`onboard`, `triage`, `triage-deep`, `pickup`, `pause`, `babysit-bead`, `ship-beads`, `autonomous-work`, `ship`, `reflect`, `awareness-digest`); thin `beads` / `plan` / `plan-review` / `goal*` stay ordinary — **nested by** `beads-lifecycle` when implemented, never bare `--parts` |
 | **merge candidates** | `goal` / `goal-direct`; `plan` / `plan-direct` / `plan-review` (workflow side) — merge only after purpose-CLI story for plan-review is settled |
 | **retire (speech first)** | Calling any ordinary builtin a "recipe"; dual docs that teach `--parts` for non-tokens |
@@ -301,7 +301,7 @@ Lock nouns and doors; publish compose-token vs ordinary-builtin throughout; Acce
 
 ### 6.7 Counsel → Accepted addendum — `beads-lifecycle` (GS-022 / GS-023 / GS-024)
 
-Fold of GS-022. **Design Accepted.** **Implement pending** — do **not** land YAML / match arm / tests in this Accept ship.
+Fold of GS-022. **Design Accepted → IMPLEMENTED 2026-09-05** (landed YAML + match arm + tests in the Accept ship's follow-ups; the Accept-ship restraint below is history).
 
 #### Name + doors
 
@@ -335,7 +335,7 @@ Arc speech: **grill/ADR → create → review1 → review2 → integrate → imp
 | Mechanism | Rule |
 | :--- | :--- |
 | **`inputs.until`** | ∈ `grill\|create\|review1\|review2\|integrate\|implement\|verify\|signoff` (default `signoff`) |
-| **Branch ordinal guard** | After each phase, early-exit success when `phase_ord >= until_ord` (toron `run_branch` / graph Branch — **not** tick) |
+| **Per-node `guard:` on `trigger_until`** | Each phase node carries a `guard:` field comparing `trigger_until` against double-quoted literals (e.g. create runs unless `trigger_until == "grill"`); guards that fail (or error) skip the node, so the run set is grill..=until. Template `{{inputs.*}}` in guards is INERT (engine evaluates only `trigger_*`/`steps_*` vars — the kimg Branch design never fired; guard-fix 2010d78). Defaults bind at the flywheel invoke doors (`crew::apply_input_defaults` in `bounded_invoke` + `workflow run`); the engine honors node guards via the `run_graph_node` check (toron `engine/control_flow.rs`, UNCOMMITTED — pending review, not claimed landed). |
 | **Preview** | Compose without `--run` lint-previews graph through `until` — preview ≠ started |
 | **Optional** | `gate_before_implement: true` → one **outer** `request_approval` between integrate and implement |
 | **Not** | Per-phase nested approvals; killing panes as "stop" |
@@ -363,7 +363,7 @@ flowchart TB
     v["phase-verify / repair-until-verified"]
     folk --> p --> b --> r1 --> imp --> v
   end
-  subgraph tobeBL["to-be — beads-lifecycle compose token (implement pending)"]
+  subgraph tobeBL["to-be — beads-lifecycle compose token (implemented 2026-09-05)"]
     direction TB
     door["PREFERRED: compose --parts beads-lifecycle --run"]
     g["grill / ADR"]
@@ -432,7 +432,7 @@ flowchart LR
 - Code may still say `Recipe` / `builtin_recipe` / spawn `--recipe` until a rename wave — **teach `is_compose_token`**; speech discipline required.
 - Execute polarity unify needs a careful clap/help migration so scripts do not break.
 - Purpose CLIs (Debate, Plan-review) continue to dual with builtins until alias strategy lands.
-- **`beads-lifecycle` implement pending** — agents must not invent the token as live until follow-up lands YAML + match arm + tests.
+- **`beads-lifecycle` live since 2026-09-05** — the token is implemented (match arm + YAML + expand tests + guard-fix); agents may compose it.
 
 ### Neutral
 
@@ -491,7 +491,7 @@ Agent-readiness: an implementer can start from this section without tribal knowl
 | 4 | Teach preferred door + legacy alias + ordinary-builtin door | same docs |
 | 5 | Preview ≠ started + SIGNOFF outer-only + topology ≠ Workflow | agent instructions + decide hints |
 
-### 10.C — Follow-up: `beads-lifecycle` code (implement pending)
+### 10.C — Follow-up: `beads-lifecycle` code (implemented 2026-09-05)
 
 | Step | Action | Paths / patterns |
 | :--- | :--- | :--- |
@@ -531,39 +531,39 @@ Checkboxes are testable. **At Accept land (GS-024):** speech/design criteria app
 
 - [x] ADR file landed under `docs/decisions/` with `status: accepted` and date `2026-09-05`.
 - [x] `docs/decisions/README.md` lists **0008** as **Accepted**.
-- [x] Self-contained: mermaid as-is/to-be, noun model, compose_token design set, preferred doors, SIGNOFF, efficiency catalog, beads-lifecycle § with **implement pending**.
+- [x] Self-contained: mermaid as-is/to-be, noun model, compose_token design set, preferred doors, SIGNOFF, efficiency catalog, beads-lifecycle § (design at Accept, code landed in follow-ups).
 - [x] Links: flywheel ADRs local; toron ADRs via `../../toron/docs/decisions/…` — **no** fake local flywheel `0027-…` path.
 - [x] Does **not** rewrite [toron ADR-0027](../../toron/docs/decisions/0027-one-workspace-tick-control-plane.md) body.
 - [x] Honesty: live `is_compose_token` names documented as `wave-swarm` \| `repair-until-verified` **only**.
 - [x] `beads-lifecycle` **NOT** claimed present in code.
 
-### Live code honesty (must stay true until 10.C lands)
+### Live code honesty (post-implement truth — updated 2026-09-05)
 
-- [ ] `rg 'is_compose_token' -n src/builtin_workflows.rs` — function exists.
-- [ ] `is_compose_token` match arms == `wave-swarm` \| `repair-until-verified` **until** follow-up adds third.
-- [ ] `rg 'beads-lifecycle' src/` returns **no** compose-token match arm / builtin YAML name **until** 10.C.
-- [ ] Docs speech: `workflow-composition.md` / `AGENTS.md` teach preferred compose door + legacy alias; do not teach bare `--parts` for ordinary builtins.
+- [x] `rg 'is_compose_token' -n src/builtin_workflows.rs` — function exists.
+- [x] `is_compose_token` match arms == `wave-swarm` \| `repair-until-verified` \| `beads-lifecycle` (third arm landed 84fbfb7).
+- [x] `rg 'beads-lifecycle' src/` returns the compose-token match arm + builtin YAML name + expand tests (10.C landed).
+- [x] Docs speech: `workflow-composition.md` / `AGENTS.md` teach preferred compose door + legacy alias; do not teach bare `--parts` for ordinary builtins.
 
 ### After speech follow-up (10.B)
 
-- [ ] Noun table taught without the word recipe (five nouns only) in AGENTS + workflow-composition.
-- [ ] Preferred door `workflow compose … --parts <token> --run` taught; `workflow run <token> --execute` marked **legacy alias**.
-- [ ] Ordinary builtin door == `workflow run --execute` only — **NOT** bare `--parts`.
-- [ ] Docs/skills checklist updated: AGENTS.md, workflow-composition.md, skills/flywheel (+toron if needed), slash swarm prompts, clap help.
-- [ ] Preview ≠ started enforced in agent instructions.
-- [ ] SIGNOFF outer-only + captain+crew nesting stated.
-- [ ] Topology ≠ Workflow in AGENTS.
+- [x] Noun table taught without the word recipe (five nouns only) in AGENTS + workflow-composition.
+- [x] Preferred door `workflow compose … --parts <token> --run` taught; `workflow run <token> --execute` marked **legacy alias**.
+- [x] Ordinary builtin door == `workflow run --execute` only — **NOT** bare `--parts`.
+- [x] Docs/skills checklist updated: AGENTS.md, workflow-composition.md, skills/flywheel (+toron if needed), slash swarm prompts, clap help.
+- [x] Preview ≠ started enforced in agent instructions.
+- [x] SIGNOFF outer-only + captain+crew nesting stated.
+- [x] Topology ≠ Workflow in AGENTS.
 
 ### After `beads-lifecycle` implement (10.C)
 
-- [ ] `is_compose_token("beads-lifecycle") == true`.
-- [ ] Builtin YAML name `beads-lifecycle` present; stages grill→…→signoff; outer SIGNOFF only.
-- [ ] `workflow compose … --parts beads-lifecycle` expands (preview) without claiming started.
-- [ ] Compose `--run` / legacy `workflow run beads-lifecycle --execute` invoke path works in tests.
-- [ ] Ordinary `beads` remains **not** a compose token.
-- [ ] `inputs.until` early-exit documented + lint-covered.
-- [ ] Docs/skills compose-token set lists three **after** code lands.
-- [ ] Optional: `docs/decisions/_scripts/verify-0008.sh` green for post-implement checks.
+- [x] `is_compose_token("beads-lifecycle") == true`.
+- [x] Builtin YAML name `beads-lifecycle` present; phases grill→…→signoff in order; approvals outer-only (unconditional signoff + one conditional pre-implement gate; no nested `request_approval`).
+- [x] `workflow compose … --parts beads-lifecycle` expands (preview) without claiming started.
+- [ ] Compose `--run` / legacy `workflow run beads-lifecycle --execute` invoke path works in tests (preview + guard-eval + defaults covered; full durable `--run` e2e open).
+- [x] Ordinary `beads` remains **not** a compose token.
+- [x] `inputs.until` early-exit documented + lint-covered (per-node guards + truth-table test).
+- [x] Docs/skills compose-token set lists three **after** code lands.
+- [x] Optional: `docs/decisions/_scripts/verify-0008.sh` green for post-implement checks.
 
 ### Never (non-goals gates)
 
@@ -576,7 +576,7 @@ Checkboxes are testable. **At Accept land (GS-024):** speech/design criteria app
 
 1. Prefer `--execute` as the single compose execute flag with `--run` alias, or the reverse?
 2. How long should `workflow run <token> --execute` remain as a **legacy alias** before redirecting compose tokens to compose-only?
-3. Schedule for 10.C `beads-lifecycle` YAML + match arm (bead id TBD).
+3. Landed 2026-09-05 via bd-adr0008-token-yaml-kimg (match arm + YAML) + bd-adr0008-expand-tests-7ui6 (expand tests) + bd-adr0008-guard-fix-16fl (working guards) + wave-1/wave-2 speech beads.
 4. Plan-review purpose CLI: keep forever, or alias to `workflow run plan-review` after one release of warnings?
 
 ---
@@ -587,5 +587,6 @@ Checkboxes are testable. **At Accept land (GS-024):** speech/design criteria app
 - GS-022 source proposal SHA256 `351c3f3afd56be1943d979fe078ad500dc8406cadf0bd98b723e6d5d3e6a9d75`
 - GS-021/GS-023 Proposed counsel → **GS-024 Accepted** into **flywheel** (not toron)
 - Live main at Accept: flywheel `c60c3e55` (`is_compose_token` = two tokens only)
+- Implemented 2026-09-05: match arm 84fbfb7 → expand tests c751690 → guard-fix 2010d78 (per-node `guard:` on `trigger_until`; kimg Branch design inert — see §6.7) → speech flip wwpd+q8mk
 - ADR number: **0008** (flywheel decisions previously through **0007**; next free slot — this record is flywheel-owned)
 - Cloud Agents: skipped (Pro-unavailable); clone path authorized
