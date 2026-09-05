@@ -13,9 +13,9 @@ CLASSIFY once if unclear (`flywheel decide "<target>" --json
 --ready-beads N`; sequence-verifiable-units); /swarm-mode pins
 wave-swarm, never re-run decide after compose.
 
-`decide` returning steer on a multi-lane target is NOT an escape: run wave-swarm. Cross-repo lanes are a brief concern:
-register the pin on both projects, one repo owner per lane (tested in
-the 08-29 and 09-03 swarms).
+`decide` returning steer on a multi-lane target is NOT an escape: run
+wave-swarm. Cross-repo lanes: register the pin on both projects, one
+repo owner per lane (08-29/09-03 swarms).
 
 Ask operator for model routing per profile before spawn/dispatch; show
 default + registry alternatives; blank keeps default, selection overrides.
@@ -24,9 +24,9 @@ default + registry alternatives; blank keeps default, selection overrides.
    '{"objective": "<target>"}'`. Slash /swarm-mode pins this compose token.
    GATE->DISPATCH->EXECUTE->OBSERVE->VERIFY->SIGNOFF. The run parks at
    SIGNOFF: resolve via `flywheel workflow approve`. DISPATCH briefs
-   `--stage systematic-execute` (p6) onto coder panes, never p1. Legacy alias
-   `workflow run wave-swarm --execute` (not preferred). Swarm is supervision,
-   not a Workflow — never "swarm workflow".
+   `--stage systematic-execute` (p6) onto coder panes, never p1. Legacy
+   alias: `workflow run wave-swarm --execute` (not preferred). Swarm =
+   supervision topology, never "swarm workflow".
 
 3. GATE PREP: `br sync --flush-only`; clear stale assignees; commit tracker.
    Map bead graph (deps, waves). Waves ONE AT A TIME; epics are gates.
@@ -40,9 +40,8 @@ default + registry alternatives; blank keeps default, selection overrides.
 5. SPAWN (escape; un-waved ad-hoc lanes only): `flywheel spawn <proj>
    --profile <role> --count N --escape`; kind/count + --model/--provider
    without --escape warns. `/swarm-mode peer-aware=off` maps to spawn
-   `--no-peer-aware`. Keep wake separate from supervision. Escape
-   forfeits SIGNOFF + artifacts: write the trail (timeline/beads) or it
-   does not exist.
+   `--no-peer-aware`. Escape forfeits SIGNOFF + artifacts: write the
+   trail (timeline/beads) or it does not exist.
 
 6. BRIEF: lane dispatch authoritative. Peer wakes are signals, not tasks.
    Bead ids, files, pin, claim (br update in_progress), reserve (toron
@@ -52,8 +51,8 @@ default + registry alternatives; blank keeps default, selection overrides.
    partial report. Use public mail identity. prove-it-works. Every
    dispatch ANNOUNCES its vehicle (stage name, compose token such as
    wave-swarm, or "none: raw") in the brief's first line; crews restate
-   it in their report
-   (status, sha, verify, deviations, stage). Coder execution dispatches
+   it in their report (status, sha, verify, deviations, stage). Coder
+   execution dispatches
    --stage systematic-execute (p6), never raw p1; --raw is for
    nudges/wakes only. Join the steer channel at spawn (--join-channel)
    so "post to steer channel" is real. Turn-based crews
