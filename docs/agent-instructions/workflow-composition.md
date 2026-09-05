@@ -24,8 +24,8 @@ Four nouns, not interchangeable:
 
 - **stage** — one named prompt (`send --stage systematic-execute`). Catalog: `stage list`.
 - **workflow** — engine procedure (YAML steps or graph). A step *may* dispatch a stage to a `@role`. SIGNOFF is `request_approval`, not a stage.
-- **recipe** — compose token that expands to a workflow: `--parts wave-swarm` or `--parts repair-until-verified`. Other builtins are `workflow run <name> --execute`.
-- **profile** — role → harness + model + skills. `crew: auto` counts `@roles`. Not what makes a recipe.
+- **compose token** — bare name legal as `--parts`: `wave-swarm` or `repair-until-verified`. Preferred door: `workflow compose … --parts <token> --run`. Legacy alias: `workflow run <token> --execute`. Ordinary builtins (e.g. captain-audit): `workflow run <name> --execute`, NOT bare `--parts`.
+- **profile** — role → harness + model + skills. `crew: auto` counts `@roles`. Not what makes a compose token.
 
 Loop / swarm / open are topologies (how work is supervised), not workflows.
 

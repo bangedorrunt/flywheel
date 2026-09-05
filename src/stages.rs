@@ -261,7 +261,7 @@ impl StageLibrary {
                 "",
                 "Session pickup (ADR-0019): read .flywheel/agent-state/, `br list --status in_progress --json` for stranded beads, ledger gaps, and the last-sent registry; respawn context-exhausted panes; resume briefs for stranded in_progress beads. Idempotent: a done pickup finds nothing to do. Keep SUMMARIES in your report, not raw dumps (guard-the-context-window).",
             ),
-            // ---- ADR-0006 D3 wave-swarm recipe stages (bd-wave-swarm-recipe-
+            // ---- ADR-0006 D3 wave-swarm compose-token stages (bd-wave-swarm-recipe-
             // wsot): one stage per composed phase. p-code-free: alias empty.
             (
                 "wave-gate",
@@ -964,7 +964,7 @@ mod tests {
         assert!(check_repo_evidence(2, true));
     }
 
-    /// ADR-0006 D3: the wave-swarm recipe's compiled-in stages resolve.
+    /// ADR-0006 D3: the wave-swarm compose token's compiled-in stages resolve.
     #[test]
     fn wave_dispatch_briefs_systematic_execute_not_p1() {
         let lib = StageLibrary::compiled_in();
