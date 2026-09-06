@@ -576,6 +576,10 @@ enum Commands {
         /// for nudges and mail wakes that must not carry role behavior.
         #[arg(long)]
         raw: bool,
+        /// GS-037 P0-A: allow exit 0 without land/wake receipt. Default
+        /// without `--wait` is fail-loud (no invent green on dispatched).
+        #[arg(long = "fire-and-forget")]
+        fire_and_forget: bool,
         /// ADR-0025 Spec 5: explicit plane override. Private by default
         /// (pane prompt + gift-wrap completion mail); `--plane s` is the
         /// explicit public act (kind-9 / channel). Classifier never flips
@@ -2956,6 +2960,15 @@ enum WorkflowCmd {
         /// registry pin as `spawn --profile`.
         #[arg(long = "role-model", value_name = "ROLE=PROVIDER/MODEL")]
         role_model: Vec<String>,
+        /// GS-037 P1: pane-mode stale-workspace protection — DEFAULT ON
+        /// (restore prior always-retire; do not silently stop retiring).
+        /// Pass `--no-retire-orphans` to keep stale workspaces (dangerous).
+        #[arg(long = "retire-orphans", default_value_t = true, action = clap::ArgAction::SetTrue)]
+        #[arg(long = "no-retire-orphans", action = clap::ArgAction::SetFalse)]
+        retire_orphans: bool,
+        /// pane mode: bind an existing workspace id instead of spawning fresh
+        #[arg(long)]
+        reuse: Option<String>,
         /// JSON output
         #[arg(long)]
         json: bool,
@@ -3982,6 +3995,7 @@ fn main() {
             force,
             respawn_on_stall,
             raw,
+            fire_and_forget,
             plane,
             unsafe_plane,
         }) => cmd_send(
@@ -3996,6 +4010,7 @@ fn main() {
             *force,
             *respawn_on_stall,
             *raw,
+            *fire_and_forget,
             plane.as_deref(),
             *unsafe_plane,
         ),
@@ -6560,6 +6575,83 @@ mod spawn_boot_reliability_tests {
             helper_body.contains("pane_send_input(pane_id, &[\"CTRL_C\"])"),
             "verify_or_respawn_pane must cancel a partial command before re-typing the launch"
         );
+        // GS-037 P0-1: dead-shell path must bail (nonzero exit via die), never
+        // fall through to "swarm ready".
+        assert!(
+            spawn_body.contains("GS-037 P0-1")
+                && spawn_body.contains("no live agent process after spawn + recovery"),
+            "dead-shell must bail with GS-037 P0-1 marker (nonzero exit)"
+        );
+        // GS-037 P0-3: agent_name_taken fail-fast / rename-clear, not ~120s burn.
+        assert!(
+            helper_body.contains("agent_name_taken")
+                && helper_body.contains("rename-clear"),
+            "verify_or_respawn_pane must rename-clear / fail-fast on agent_name_taken"
+        );
+    }
+
+    /// GS-037: send receipt honesty + wake observe-only + presence + compose retire.
+    #[test]
+    fn gs037_send_wake_presence_folds_present() {
+        let src = include_str!("main.rs");
+        let send = crate::tripwire::find_fn(src, "cmd_send");
+        let send_end = crate::tripwire::find_fn(src, "stall_step");
+        let send_body = &src[send..send_end];
+        assert!(
+            send_body.contains("fire_and_forget")
+                && send_body.contains("refuse invent-green exit 0")
+                && send_body.contains("produced no landed:true receipt"),
+            "cmd_send must fail-loud without --wait/--fire-and-forget AND on --wait with no landed"
+        );
+        // Behavior: observe independent wake — must NOT call doorbell_persist_wake
+        // from cmd_send (self-stamp invent-green).
+        assert!(
+            !send_body.contains("doorbell_persist_wake("),
+            "cmd_send must NOT self-mint last_wake via doorbell_persist_wake (GS-037 P0-C)"
+        );
+        assert!(
+            send_body.contains("wake_before_unix")
+                && send_body.contains("independent wake receipt missing"),
+            "cmd_send --wait landed must require independent wake advance"
+        );
+        assert!(
+            send_body.contains("best-effort pane send-text")
+                && send_body.contains("stall_giveup_error"),
+            "StallStep::GiveUp must fail-loud after best-effort pane send-text"
+        );
+        // GiveUp arm must return Err — not break into landed:true invent-green.
+        let giveup_marker = "best-effort pane send-text (not a wait receipt";
+        let gi = send_body
+            .find(giveup_marker)
+            .expect("GiveUp honesty marker");
+        let giveup_slice = &send_body[gi..gi + 600];
+        assert!(
+            giveup_slice.contains("return Err(stall_giveup_error")
+                && !giveup_slice.contains("break agent"),
+            "GiveUp must return Err(stall_giveup_error), never break agent into landed"
+        );
+        let persist = crate::tripwire::find_fn(src, "doorbell_persist_wake");
+        let persist_body = &src[persist..persist + 800];
+        assert!(
+            persist_body.contains("-> Result<()>")
+                && persist_body.contains("save_wake_state")
+                && !persist_body.contains("let _ = doorbell::save_wake_state"),
+            "doorbell_persist_wake must fail-loud on save (no let _ =)"
+        );
+        let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
+        let spawn_body = &src[spawn..spawn + 40000];
+        assert!(
+            spawn_body.contains("presence_project")
+                && spawn_body.contains("GS-037 P0-D"),
+            "presence publish must use absolute project key (register-before-presence)"
+        );
+        // Compose: default_value_t = true for retire_orphans (safe default).
+        assert!(
+            src.contains("no-retire-orphans")
+                && src.contains("default_value_t = true")
+                && src.contains("retire_orphans: bool"),
+            "compose --retire-orphans must default true (prior always-retire)"
+        );
     }
 
     #[test]
@@ -6990,9 +7082,42 @@ fn verify_or_respawn_pane(
         match c.agent_start(name, kind, pane_id, 45_000, args) {
             Ok(_) => {}
             Err(e) => {
+                let msg = format!("{e:#}");
                 eprintln!(
-                    "flywheel: re-launch of {name} ({pane_id}) attempt {attempts} failed: {e:#}"
+                    "flywheel: re-launch of {name} ({pane_id}) attempt {attempts} failed: {msg}"
                 );
+                // GS-037 P0-3: agent_name_taken burns ~120s if we keep retrying
+                // the same taken name. Rename-clear once, then fail-fast if
+                // still taken — never invent green by spinning the budget.
+                if msg.contains("agent_name_taken") {
+                    let stale = format!("{name}-stale-{attempts}");
+                    match c.agent_rename(pane_id, &stale) {
+                        Ok(_) => {
+                            eprintln!(
+                                "flywheel: freed name {name} by renaming dead binding to {stale} — retrying start once"
+                            );
+                            match c.agent_start(name, kind, pane_id, 45_000, args) {
+                                Ok(_) => {}
+                                Err(e2) => {
+                                    let m2 = format!("{e2:#}");
+                                    eprintln!(
+                                        "flywheel: re-launch after rename-clear still failed: {m2}"
+                                    );
+                                    if m2.contains("agent_name_taken") {
+                                        bail!(
+                                            "{name} ({pane_id}) agent_name_taken after rename-clear — refusing to burn the recovery budget. Close the workspace (flywheel kill <project> --force) or `herdr agent rename` the stale binding, then re-spawn."
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(re) => {
+                            bail!(
+                                "{name} ({pane_id}) agent_name_taken and rename-clear failed ({re:#}) — fail-fast (GS-037 P0-3), not a ~120s burn. Close the workspace or release the name, then re-spawn."
+                            );
+                        }
+                    }
+                }
             }
         }
         // bd-eign.6 L1: readiness gate again (the TUI owns the foreground
@@ -7463,6 +7588,8 @@ projects available: {}",
                     Duration::from_secs(120),
                 )?;
                 if !live {
+                    // GS-037 P0-1: dead-shell MUST exit nonzero (bail → die → 1).
+                    // Never print "swarm ready" after this path.
                     bail!(
                         "{name} ({pane_id}) has no live agent process after spawn + recovery — the pane is a dead shell. Inspect it (herdr pane read {pane_id}), then recover manually (flywheel recover {project} {name}) or kill + re-spawn."
                     );
@@ -7632,6 +7759,13 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
     // liveness on the presence surface, not by polling mail. Best-effort:
     // the existing CLI (`toron presence publish --as <pin>`); no new MCP
     // tool, a presence failure never fails the spawn.
+    // GS-037 P0-D: register-before-presence — pins were registered earlier
+    // under the ABSOLUTE project key (`project_dir`); presence must use the
+    // same key or toron reports `unknown agent name` (GS-034/035/036 race).
+    let presence_project = project_dir(cfg, project)
+        .to_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| project.to_string());
     for e in &registry {
         if let Some(pin) = &e.mail_identity {
             let status = Command::new("toron")
@@ -7643,7 +7777,7 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
                     "--state",
                     "working",
                     "--project",
-                    project,
+                    &presence_project,
                 ])
                 .output();
             match status {
@@ -8640,7 +8774,12 @@ fn cmd_internal_doorbell(
                     let path = doorbell::wake_state_file(&config::state_dir(), workspace);
                     let mut st = doorbell::load_wake_state(&path);
                     st.plane_s_cursor_us = plane_s_cursor_us;
-                    let _ = doorbell::save_wake_state(&path, &st);
+                    doorbell::save_wake_state(&path, &st).with_context(|| {
+                        format!(
+                            "doorbell plane-S cursor save failed at {} — refuse silent drop (GS-037 P0-C)",
+                            path.display()
+                        )
+                    })?;
                 }
                 let registry = state::load_spawn_registry(project);
                 let pins: Vec<String> = registry
@@ -8738,7 +8877,7 @@ fn cmd_internal_doorbell(
                     workspace,
                     &since_by_pin,
                     injects.first().map(|(pin, _)| pin.as_str()),
-                );
+                )?;
             }
             Ok(Bell::Status { pane_id, to }) => {
                 let Some(pin) = pane_to_pin.get(&pane_id).cloned() else {
@@ -8782,7 +8921,7 @@ fn cmd_internal_doorbell(
                     workspace,
                     &since_by_pin,
                     injects.first().map(|(pin, _)| pin.as_str()),
-                );
+                )?;
             }
             Ok(Bell::Died) => {
                 // Gap 3 fix: watch self-restart with backoff instead of deaf break.
@@ -8913,7 +9052,7 @@ fn cmd_internal_doorbell(
                     &since_by_pin,
                     plane_s_cursor_us,
                     None,
-                );
+                )?;
                 let pins: Vec<String> = state::load_spawn_registry(project)
                     .iter()
                     .filter_map(|e| e.mail_identity.clone())
@@ -9033,14 +9172,21 @@ fn doorbell_persist_wake(
     workspace: &str,
     since_by_pin: &BTreeMap<String, String>,
     woke_pin: Option<&str>,
-) {
+) -> Result<()> {
     let path = doorbell::wake_state_file(&config::state_dir(), workspace);
     let mut st = doorbell::load_wake_state(&path);
     st.since_by_pin = since_by_pin.clone();
     if let Some(pin) = woke_pin {
         doorbell::note_wake(&mut st, pin, doorbell_now_unix());
     }
-    let _ = doorbell::save_wake_state(&path, &st);
+    // GS-037 P0-C save-fail-silent: never discard save errors.
+    doorbell::save_wake_state(&path, &st).with_context(|| {
+        format!(
+            "doorbell wake state save failed at {} — refuse silent drop (GS-037 P0-C)",
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn doorbell_persist_wake_with_plane_s(
@@ -9048,7 +9194,7 @@ fn doorbell_persist_wake_with_plane_s(
     since_by_pin: &BTreeMap<String, String>,
     plane_s_cursor_us: Option<i64>,
     woke_pin: Option<&str>,
-) {
+) -> Result<()> {
     let path = doorbell::wake_state_file(&config::state_dir(), workspace);
     let mut st = doorbell::load_wake_state(&path);
     st.since_by_pin = since_by_pin.clone();
@@ -9058,7 +9204,13 @@ fn doorbell_persist_wake_with_plane_s(
     if let Some(pin) = woke_pin {
         doorbell::note_wake(&mut st, pin, doorbell_now_unix());
     }
-    let _ = doorbell::save_wake_state(&path, &st);
+    doorbell::save_wake_state(&path, &st).with_context(|| {
+        format!(
+            "doorbell wake state save failed at {} — refuse silent drop (GS-037 P0-C)",
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn upsert_workspace_receipt(corr: &str, receipt: &workspace::Receipt) {
@@ -12020,12 +12172,15 @@ fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
             .iter()
             .filter(|a| a.workspace_id == ws.workspace_id)
             .map(|a| {
+                // GS-037 P0-2: clear stale launch_pending when herdr already
+                // reports idle/interactive_ready (is_still_booting=false).
+                let pending = is_still_booting(a);
                 json!({
                     "name": a.name, "kind": a.agent,
                     // bd-4pxy: a launch_pending agent is NOT idle — it is
                     // still booting (the status must never mask the boot).
-                    "status": status_label(a.launch_pending, a.agent_status.as_str()),
-                    "launch_pending": a.launch_pending,
+                    "status": status_label(pending, a.agent_status.as_str()),
+                    "launch_pending": pending,
                 })
             })
             .collect();
@@ -12266,12 +12421,14 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     let rows: Vec<Value> = agents
         .iter()
         .map(|a| {
+            // GS-037 P0-2: clear stale launch_pending when herdr reports idle.
+            let pending = is_still_booting(a);
             json!({
                 "name": a.name, "kind": a.agent,
                 // bd-4pxy: a launch_pending agent is NOT idle — still booting.
-                "status": status_label(a.launch_pending, a.agent_status.as_str()),
+                "status": status_label(pending, a.agent_status.as_str()),
                 "pane_id": a.pane_id, "cwd": a.cwd, "workspace_id": ws_id,
-                "launch_pending": a.launch_pending,
+                "launch_pending": pending,
             })
         })
         .collect();
@@ -12787,6 +12944,7 @@ fn cmd_send(
     force: bool,
     respawn_on_stall: bool,
     raw: bool,
+    fire_and_forget: bool,
     plane: Option<&str>,
     unsafe_plane: bool,
 ) -> Result<()> {
@@ -12887,6 +13045,18 @@ fn cmd_send(
     let catalog = profile::ProfileCatalog::load();
     let mut registry_dirty = false;
     let mut results: Vec<Value> = Vec::new();
+    // GS-037 P0-C: snapshot wake BEFORE send so a later landed check can
+    // require an independent doorbell/agent advance (never self-mint here).
+    let wake_before_unix = if wait {
+        let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+        doorbell::load_wake_state(&doorbell::wake_state_file(
+            &config::state_dir(),
+            &ws_label,
+        ))
+        .last_wake_unix
+    } else {
+        None
+    };
     for a in &targets {
         // --wait means "settle": idle, done, or blocked. An empty `until` array
         // was sent before, which herdr cannot wait on meaningfully.
@@ -12952,10 +13122,16 @@ fn cmd_send(
                         None => {
                             if try_send_text_delivery(&mut c, project, &name, &target, &send_text)?
                             {
-                                // Deliverable confirmation: resolve the
-                                // agent from the registry so the normal
-                                // result row (dispatched/prior_status) is
-                                // emitted for this target.
+                                // Pane send-text delivered bytes — that is
+                                // NOT herdr settled-wait. With --wait, refuse
+                                // invent-green landed/receipt (GS-037).
+                                if wait {
+                                    bail!(
+                                        "send --wait: recipe-harness pane delivery for {name} succeeded but no settled wait observation — refuse invent-green landed (GS-037 prompt-wait-invent-landed)"
+                                    );
+                                }
+                                // Fire-and-forget / non-wait: emit dispatched
+                                // row without landed (P0-A gate handles exit).
                                 if let Some(agent) = c.agent_list().ok().and_then(|list| {
                                     list.iter()
                                         .find(|ag| {
@@ -13032,6 +13208,20 @@ fn cmd_send(
                             stalls_seen += 1;
                         }
                         Some(StallStep::GiveUp) => {
+                            // GS-037 prompt-wait-invent-landed: pane send-text
+                            // is NOT a settled wait observation. Best-effort
+                            // delivery may help the operator, but must NOT
+                            // break into landed:true/receipt:true invent-green.
+                            eprintln!(
+                                "flywheel: {target} agent_prompt_stalled after retries — best-effort pane send-text (not a wait receipt; GS-037 prompt --wait honesty)"
+                            );
+                            let _ = try_send_text_delivery(
+                                &mut c,
+                                project,
+                                &name,
+                                &a.pane_id,
+                                &send_text,
+                            );
                             return Err(stall_giveup_error(&target, project));
                         }
                     }
@@ -13072,11 +13262,64 @@ fn cmd_send(
         EventKind::Send,
         json!({
             "to": to, "stage": stage, "text_len": text.len(), "wait": wait,
-            "raw": raw, "results": results
+            "raw": raw, "fire_and_forget": fire_and_forget, "results": results
         }),
     );
     if !std::io::stdout().is_terminal() {
         print_json(&json!({ "results": results }));
+    }
+
+    // GS-037 P0-A / P0-C: receipt honesty.
+    // --wait with no landed must not exit 0 invent-green (P0-A wait-empty).
+    // On landed:true, last_wake must advance from an INDEPENDENT
+    // doorbell/agent wake observation — cmd_send must NOT self-mint the stamp
+    // then check it (P0-C self-stamp invent-green).
+    let any_landed = results.iter().any(|r| r.get("landed") == Some(&json!(true)));
+    if wait && !any_landed {
+        bail!(
+            "send --wait produced no landed:true receipt — refuse invent-green exit 0 (GS-037 P0-A). Re-run when the agent can settle, or pass --fire-and-forget to acknowledge no receipt."
+        );
+    }
+    if wait && any_landed {
+        let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+        let after = doorbell::load_wake_state(&doorbell::wake_state_file(
+            &config::state_dir(),
+            &ws_label,
+        ));
+        let before_unix = wake_before_unix;
+        if after.last_wake_unix.is_none() {
+            bail!(
+                "send --wait reported landed:true but doorbell last_wake did not advance (still never) — independent wake receipt missing (GS-037 P0-C). Wake stamp must come from doorbell/agent wake observation, not cmd_send. Inspect `flywheel doorbell status` / wake state under the workspace label."
+            );
+        }
+        match (before_unix, after.last_wake_unix) {
+            (None, Some(_)) => { /* advanced from never — independent stamp observed */ }
+            (Some(b), Some(a)) if a > b => { /* advanced */ }
+            (Some(b), Some(a)) if a == b => {
+                bail!(
+                    "send --wait landed:true but doorbell last_wake did not advance (still {a}) — independent wake receipt missing (GS-037 P0-C). Wake stamp must come from doorbell/agent wake observation, not cmd_send."
+                );
+            }
+            (Some(b), Some(a)) => {
+                bail!(
+                    "send --wait landed but doorbell last_wake went backwards ({b} → {a}) — wake state corrupt (GS-037 P0-C)"
+                );
+            }
+            _ => {
+                bail!(
+                    "send --wait landed:true but doorbell last_wake did not advance — independent wake receipt missing (GS-037 P0-C)"
+                );
+            }
+        }
+    }
+
+    // GS-037 P0-A: fire-and-forget must not invent green (dispatched:true
+    // exit 0 without land/wake receipt). Require --wait or explicit
+    // --fire-and-forget.
+    if !wait && !fire_and_forget {
+        bail!(
+            "send dispatched without land/wake receipt — refuse invent-green exit 0 (GS-037 P0-A). Re-run with --wait (receipt-backed) or pass --fire-and-forget to acknowledge no receipt."
+        );
     }
     Ok(())
 }
@@ -13114,11 +13357,11 @@ fn mint_task_id() -> String {
     format!("task-{}", &h[..8])
 }
 
-/// One send-result row. `dispatched: true` is the fire-and-forget success
-/// signal; `prior_status` names the herdr status at target time (never a
-/// bare `status` a captain parses as a miss when the agent was idle at
-/// dispatch). `landed` + `settled_status` appear ONLY after --wait/--confirm
-/// observed the prompt land (agent reached a settled state).
+/// One send-result row. `dispatched: true` means the prompt was handed to
+/// herdr; it is NOT a receipt. GS-037 P0-A: fire-and-forget must not invent
+/// green — `receipt:false` without --wait, and cmd_send exits nonzero unless
+/// `--fire-and-forget` (or wait landed + wake). `landed` + `settled_status`
+/// appear ONLY after --wait/--confirm observed the prompt land.
 fn send_result_row(
     target: &str,
     prior_status: &str,
@@ -13129,6 +13372,7 @@ fn send_result_row(
     let mut v = json!({
         "target": target,
         "dispatched": true,
+        "receipt": settled.is_some(),
         "prior_status": prior_status,
         "pane_id": pane_id,
         "profile": profile,
@@ -13136,6 +13380,8 @@ fn send_result_row(
     if let Some(s) = settled {
         v["landed"] = json!(true);
         v["settled_status"] = json!(s);
+    } else {
+        v["landed"] = json!(false);
     }
     v
 }
@@ -13198,7 +13444,7 @@ fn stall_step(
 /// commands instead of silently dropping the prompt.
 fn stall_giveup_error(target: &str, project: &str) -> anyhow::Error {
     anyhow!(
-        "agent {target} produced no observed state change twice (agent_prompt_stalled) — the agent is not responding. {}\nAlternatively re-run with --respawn-on-stall to respawn {target} under the same name and re-send automatically.",
+        "agent {target} produced no observed state change twice (agent_prompt_stalled) — refusing invent-green landed (GS-037 prompt --wait honesty). The agent is not responding. {}\nAlternatively re-run with --respawn-on-stall to respawn {target} under the same name and re-send automatically.",
         stall_recovery_hint(project),
     )
 }
@@ -24939,6 +25185,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             inputs,
             idempotency_key,
             role_model,
+            retire_orphans,
+            reuse,
             json,
         } => {
             // W6: --keep is a graduation of a RUN — without --run there is no
@@ -25131,9 +25379,9 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 &wf_name,
                 &crew_plan,
                 &catalog,
-                None,
+                reuse.as_deref(),
                 false,
-                true,
+                *retire_orphans,
             )?;
             let entries = ctx.entries.clone();
             let project_c = project_name.to_string();
@@ -32382,16 +32630,14 @@ mod send_result_row_tests {
     fn fire_and_forget_row_is_dispatched_not_landed() {
         let row = send_result_row("flywheel-toron-coder", "idle", "w1:p1", Some("coder"), None);
         assert_eq!(row["target"], "flywheel-toron-coder");
-        assert_eq!(row["dispatched"], true, "dispatch is the success signal");
+        assert_eq!(row["dispatched"], true, "dispatch is recorded");
+        assert_eq!(row["receipt"], false, "GS-037 P0-A: no receipt without --wait");
         assert_eq!(row["prior_status"], "idle", "names the status as prior");
         assert!(
             row.get("status").is_none(),
             "no bare status field to misread as a miss"
         );
-        assert!(
-            row.get("landed").is_none(),
-            "landing only after --wait/--confirm"
-        );
+        assert_eq!(row["landed"], false, "landing only after --wait/--confirm");
     }
 
     /// bd-pin-public-plane-s-easy.9: --wait/--confirm adds `landed: true` +
@@ -32401,6 +32647,7 @@ mod send_result_row_tests {
     fn wait_row_reports_landed_with_settled_status() {
         let row = send_result_row("flywheel-toron-coder", "idle", "w1:p1", None, Some("done"));
         assert_eq!(row["dispatched"], true);
+        assert_eq!(row["receipt"], true);
         assert_eq!(row["prior_status"], "idle");
         assert_eq!(row["landed"], true, "--wait observed landing");
         assert_eq!(row["settled_status"], "done");
