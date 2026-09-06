@@ -556,6 +556,29 @@ fn check_mail(cfg: &Config) -> Check {
     }
 }
 pub fn check_provider_funded(provider: &str, profile: &str) -> Check {
+    // GS-037 P0-4: louder provider preflight for opencode-go — name the env
+    // vars (never values). Fail-closed only when FLYWHEEL_FUNDED_BALANCE_* set
+    // and empty/zero; otherwise warn via skip message when neither API key
+    // name is present for opencode-go.
+    if provider.eq_ignore_ascii_case("opencode-go")
+        || provider.eq_ignore_ascii_case("opencode")
+    {
+        let api = std::env::var_os("OPENCODE_API_KEY").is_some();
+        let go = std::env::var_os("OPENCODE_GO_API_KEY").is_some();
+        if !api && !go {
+            return Check::skip(
+                "provider-funded",
+                "opencode-go/opencode: neither OPENCODE_API_KEY nor OPENCODE_GO_API_KEY is set in this process — pane spawn may fall through to Big Pickle; export one (or both; flywheel aliases GO→API into pane env)",
+            );
+        }
+        if go && !api {
+            // Informative skip — alias will wire pane env at spawn.
+            return Check::skip(
+                "provider-funded",
+                "OPENCODE_GO_API_KEY set; OPENCODE_API_KEY unset — flywheel aliases GO→API into pane env at spawn (GS-037 P0-4)",
+            );
+        }
+    }
     let env_key = format!("FLYWHEEL_FUNDED_BALANCE_{}", provider.to_ascii_uppercase());
     if let Ok(val) = std::env::var(&env_key) {
         let lower = val.to_ascii_lowercase();
