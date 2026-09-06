@@ -78,7 +78,9 @@ control. A grant is a lease transfer, never commit-on-behalf.
 On `[doorbell]` (the dispatcher injects this line; do not start a watch
 timer):
   0. JOIN first (above) if you have not already -- posting without
-     membership is a refused write.
+     membership is a refused write. Better: JOIN and publish
+     `presence --state idle` at BOOT, not at first doorbell -- an arrived
+     crew is discoverable by roster and presence from minute one.
   1. FIRST, show you heard (120s or you are unanswered): `toron presence
      publish --as {mail_identity} --state working` OR one kind-9 line.
   2. Pull: `toron channel read` / `toron job list` / `toron mail inbox
@@ -139,6 +141,10 @@ prompt existing peers, never create them.
   the file path (prefer toron `attachment_paths`). File-first is also the
   silent-failure recovery path -- redeliver from the file, never from
   scrollback.
+- **Address pins by exact identity, never by roster name-similarity.**
+  Roster entries can be stale session artifacts; an unknown pin gets a
+  `whois` + recency check before it is addressed. The `captain` alias, when
+  bound, is the only title-based address.
 - **Plane S is the room, plane P is the whisper.**
 - **`[doorbell]` is the wake.** A 5-minute self-watch loop is not the
   driver.

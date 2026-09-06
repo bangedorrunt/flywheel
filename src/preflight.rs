@@ -1078,7 +1078,9 @@ mod tests {
         );
         // Also reject the chained form used before the fix.
         assert!(
-            !body.contains("load_routing()\n                    .ok()\n                    .and_then"),
+            !body.contains(
+                "load_routing()\n                    .ok()\n                    .and_then"
+            ),
             "no chained load_routing().ok().and_then swallow"
         );
         assert!(

@@ -49,6 +49,7 @@ A **workflow** is a reusable engine procedure. It can run inside a loop,
 inside a swarm, headlessly, or directly; it is not itself an execution
 topology.
 
+
 A **stage** is one prompt (`send --stage`). A **compose token**
 (`wave-swarm`, `repair-until-verified`) expands to a compiled-in
 workflow when used as a bare `--parts` name. A **profile** is role →
@@ -71,6 +72,30 @@ from the stage catalog (`stage list`).
 
 - **pane**: pre-spawn crew, `__send --confirm`, bus-auditable. `dispatch_job` live. `action: spawn` drains `SpawnSink` into `agent_start`.
 - **headless**: `__run-headless` one-shot, logs `runs/<id>.jsonl`. Spawn must not fake 43001/43004.
+## Collaboration bootstrap (empty-fleet edge)
+
+Any mode whose agent holds a registered mail identity but has no live
+dispatcher (open mode especially, first agent on a task especially) must
+bootstrap its own coordination, or the human becomes the mail relay:
+
+1. **Arrive loudly** — check the roster (with recency; stale session
+   identities are the same rot class as dead panes), then publish presence
+   so the next agent discovers you.
+2. **Captain ladder** — try the `captain` alias; unbound means the operator
+   in the pane IS the captain channel (report in chat; mail is for peers).
+   Never address a pin chosen by roster name-similarity.
+3. **Arm an inbox watch** — `toron watch --live` or `mail inbox --since
+   last` after each work unit; a write-only mailbox taxes the human.
+4. **Mail discipline** — mint `corr` per thread, reply file-first, ack every
+   `ack_required` message you acted on.
+
+Canonical text lives in `integrations/prompts/open.md.tpl` (bootstrap
+section) and `integrations/peer-aware.md.tpl` (boot-time arrival +
+roster-recency invariants). Pending beads (2026-09-07 retrospective):
+`bd-de9c` auto-bind `captain`; `bd-c29i` roster recency/prune;
+`bd-fhf0` mail-surface honesty (read receipt, contact-request render,
+corr re-use); `bd-jrlr` pin bootstrap templates; `bd-p0ed` verify-0005
+drift.
 
 ## Profiles
 

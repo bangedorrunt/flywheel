@@ -13,6 +13,7 @@ This directory contains records of the major architectural decisions made for th
 | [0007](0007-catalog-slots-and-agent-native-cli.md) | Catalog slots + agent-native catalog CLI | **Accepted** (2026-09-05; D1 slots=harness+model, D2 six job profiles, D3 compiled-in squads, D4 catalog CLI+TUI; Wave 7 catalog-only; `verify-0007.sh` 14/14) |
 | [0008](0008-workflow-compose-topology-agent-optimal-mental-model.md) | Workflow / Compose / Topology — Agent-Optimal Mental Model | **Accepted** (2026-09-05; GS-024; design set wave-swarm\|repair-until-verified\|beads-lifecycle; live `is_compose_token` three tokens since 84fbfb7; beads-lifecycle implemented (guard-fix 2010d78); `verify-0008.sh`) |
 | [0009](0009-compound-spine-ce-vocabulary-and-learnings-corpus.md) | Compound Spine — ce- Vocabulary, Compounded wave-swarm (8 phases), Learnings Corpus | **Accepted** (2026-09-06; bd-4el4; ce- loop stages, p-codes retired, REVIEW+COMPOUND in the token, docs/learnings/ + ce-compound/ce-sweep, toron ADR-0022 phase addendum; `verify-0009.sh` 13/13; flywheel bin 1449/0) |
+| [0010](0010-delivery-semantics-attention-triage-decision-lifecycle.md) | Adopt delivery semantics, attention triage, and a keyed decision lifecycle | **Accepted** (2026-09-07; captain; D0–D15; HarborPilot + KeenAuditor agreed on `adr-0010-peer-review`) |
 
 ## Related toron ADRs
 

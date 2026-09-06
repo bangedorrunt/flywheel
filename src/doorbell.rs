@@ -913,6 +913,10 @@ pub fn dead_dispatchers(state_dir: &Path) -> Vec<(String, String)> {
 
 /// The durable supervisor leaf: heal every dead dispatcher. Checkpointed —
 /// a replay returns the stored result and never double-spawns a child.
+// resonate_sdk::function requires an args parameter; heal takes no input.
+// Item-level expect/allow cannot cover it: the macro regenerates the
+// function, so the lint fires on the emitted copy, not this node (see the
+// `no_effect_underscore_binding` allow in [lints.clippy]).
 #[resonate_sdk::function]
 async fn heal_tick(_args: ()) -> Result<Vec<String>> {
     let state_dir = crate::config::state_dir();

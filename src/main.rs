@@ -547,7 +547,7 @@ enum Commands {
         project: String,
         /// prompt text (or --stage for the daily-driver stages)
         msg: Option<String>,
-        /// target agents: comma-separated shorts (oc,pi,gk), full names, or "all"
+        /// target agents: comma-separated shorts (oc,pi,gk), full names, raw pane ids (w6:p2), raw agent kinds (grok), or "all"
         /// (bare shorts reach the whole crew of a kind — oc hits oc,oc2,oc3;
         /// a full name like flywheel-flywheel-oc or a numbered short like oc2
         /// matches EXACTLY one agent)
@@ -3508,9 +3508,10 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
     // falls back to the ordinal-th agent of that kind.
     let idx = match_indices(&in_ws, &want);
     if idx.is_empty() {
+        let display: Vec<String> = in_ws.iter().map(|a| agent_display(a)).collect();
         bail!(
-            "no agents match --to {to} in {project} (available: {})",
-            avail.join(", ")
+            "no agents match --to {to} in {project} (available: {}; raw panes address by agent kind or pane id)",
+            display.join(", ")
         );
     }
     let matched: Vec<AgentInfo> = idx.iter().map(|&i| in_ws[i].clone()).collect();
@@ -3619,9 +3620,10 @@ fn resolve_agents_dyn(
     // falls back to the ordinal-th agent of that kind.
     let idx = match_indices(&in_ws, &want);
     if idx.is_empty() {
+        let display: Vec<String> = in_ws.iter().map(|a| agent_display(a)).collect();
         bail!(
-            "no agents match --to {to} in {project} (available: {})",
-            avail.join(", ")
+            "no agents match --to {to} in {project} (available: {}; raw panes address by agent kind or pane id)",
+            display.join(", ")
         );
     }
     let matched: Vec<AgentInfo> = idx.iter().map(|&i| in_ws[i].clone()).collect();
@@ -3775,6 +3777,22 @@ fn match_indices(agents: &[AgentInfo], wants: &[WantToken]) -> Vec<usize> {
 
 fn agent_target(a: &AgentInfo) -> &str {
     a.name.as_deref().unwrap_or(a.pane_id.as_str())
+}
+
+/// Render an agent for the `--to` failure hint (raw-pane addressing,
+/// 2026-09-07): registry name when present, else the raw herdr agent kind
+/// with its pane id (`grok (w6:p2)`), else the bare pane id. Raw panes (no
+/// spawn-registry entry) are addressable by kind (`--to grok`) or pane id
+/// (`--to w6:p2`); the error must name them instead of degrading to empty
+/// strings, which left the operator with no actionable target.
+fn agent_display(a: &AgentInfo) -> String {
+    if let Some(n) = a.name.as_deref().filter(|n| !n.is_empty()) {
+        return n.to_string();
+    }
+    if let Some(kind) = a.agent.as_deref().filter(|k| !k.is_empty()) {
+        return format!("{kind} ({})", a.pane_id);
+    }
+    a.pane_id.clone()
 }
 
 /// bd-a2bw / ADR-0018: herdr omp panes drop names (bd-w17). Fill null
@@ -6788,15 +6806,11 @@ mod spawn_boot_reliability_tests {
                 );
 
                 let parse = |args: &[&str]| -> bool {
-                    let cli = Cli::try_parse_from(args).unwrap_or_else(|e| {
-                        panic!("parse {:?} failed: {e}", args)
-                    });
+                    let cli = Cli::try_parse_from(args)
+                        .unwrap_or_else(|e| panic!("parse {:?} failed: {e}", args));
                     match cli.command {
                         Some(Commands::Workflow {
-                            cmd:
-                                WorkflowCmd::Compose {
-                                    retire_orphans, ..
-                                },
+                            cmd: WorkflowCmd::Compose { retire_orphans, .. },
                         }) => retire_orphans,
                         _ => panic!("expected workflow compose"),
                     }
@@ -6806,13 +6820,7 @@ mod spawn_boot_reliability_tests {
                     "bare default retire_orphans=false"
                 );
                 assert!(
-                    parse(&[
-                        "flywheel",
-                        "workflow",
-                        "compose",
-                        "t",
-                        "--retire-orphans"
-                    ]),
+                    parse(&["flywheel", "workflow", "compose", "t", "--retire-orphans"]),
                     "--retire-orphans => true"
                 );
                 assert!(
@@ -6871,7 +6879,10 @@ mod spawn_boot_reliability_tests {
             "has no messages yet\");\n",
             "                    std::process::exit(1);"
         );
-        assert!(!src.contains(bad), "mail_watch must not early-exit(1) on empty thread");
+        assert!(
+            !src.contains(bad),
+            "mail_watch must not early-exit(1) on empty thread"
+        );
     }
 
     #[test]
@@ -6960,8 +6971,7 @@ mod spawn_boot_reliability_tests {
         );
         // P0-2: raw AUTHORITATIVE framing
         assert!(
-            src.contains("AUTHORITATIVE OPERATOR OBJECTIVE")
-                && src.contains("GS-039 P0-2"),
+            src.contains("AUTHORITATIVE OPERATOR OBJECTIVE") && src.contains("GS-039 P0-2"),
             "open-mode/--raw must frame AUTHORITATIVE operator objective"
         );
         // P0-3: retire default false + allow-crew-expand gate + robot hard-bail
@@ -14260,6 +14270,49 @@ mod bd_4pxy_tests {
             match_indices(&agents, &[to_want_token("flywheel", "omp")]),
             vec![0]
         );
+    }
+
+    #[test]
+    fn match_indices_raw_kind_hits_nameless_pane() {
+        // 2026-09-07 raw-pane addressing: a herdr pane with NO registry
+        // name (a raw harness agent, e.g. grok) is reachable by its agent
+        // kind. Witness: `flywheel send --to KeenAuditor` failed against a
+        // workspace whose only peers were raw omp/grok panes; `--to grok`
+        // must hit the kind fallback even when name is None.
+        let mut grok = agent(Some("grok"), None, "w6", false, AgentStatus::Idle);
+        grok.pane_id = "w6:p2".into();
+        let mut omp = agent(Some("omp"), None, "w6", false, AgentStatus::Working);
+        omp.pane_id = "w6:p1".into();
+        let agents = vec![omp, grok];
+        assert_eq!(
+            match_indices(&agents, &[to_want_token("flywheel", "grok")]),
+            vec![1]
+        );
+        // a toron pin with no registry row still misses — the error (not
+        // the matcher) is what teaches the raw-pane ladder
+        assert!(match_indices(&agents, &[to_want_token("flywheel", "KeenAuditor")]).is_empty());
+    }
+
+    #[test]
+    fn agent_display_names_raw_panes_actionably() {
+        let named = agent(
+            Some("oc"),
+            Some("flywheel-flywheel-oc"),
+            "w1",
+            false,
+            AgentStatus::Idle,
+        );
+        assert_eq!(agent_display(&named), "flywheel-flywheel-oc");
+        let mut raw = agent(Some("grok"), None, "w6", false, AgentStatus::Idle);
+        raw.pane_id = "w6:p2".into();
+        assert_eq!(agent_display(&raw), "grok (w6:p2)");
+        let mut bare = agent(None, None, "w6", false, AgentStatus::Idle);
+        bare.pane_id = "w6:p3".into();
+        assert_eq!(agent_display(&bare), "w6:p3");
+        // empty-string names (registry overlay miss) degrade to kind, not ""
+        let mut blank = agent(Some("omp"), Some(""), "w6", false, AgentStatus::Idle);
+        blank.pane_id = "w6:p1".into();
+        assert_eq!(agent_display(&blank), "omp (w6:p1)");
     }
 
     #[test]
@@ -25982,7 +26035,9 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     "flywheel: compose would spawn multi-crew ({crew_total} agents: {:?}) — recommended default is the inferred plan. Pass --allow-crew-expand to confirm, or reduce the recipe.",
                     crew_plan.members
                 );
-                eprint!("  proceed with this crew? [y/N] (profiles use default model opencode-go/muse-spark-1.3-contributor unless --role-model overrides): ");
+                eprint!(
+                    "  proceed with this crew? [y/N] (profiles use default model opencode-go/muse-spark-1.3-contributor unless --role-model overrides): "
+                );
                 let _ = std::io::Write::flush(&mut std::io::stderr());
                 let mut line = String::new();
                 std::io::stdin().read_line(&mut line)?;

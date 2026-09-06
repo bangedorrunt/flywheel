@@ -885,7 +885,7 @@ mod tests {
     }
 
     /// Cost fields are advisory and default to 0 (no requirement to set).
-    #[test]
+    #[expect(clippy::float_cmp, reason = "default-cost contract is exact zero")]
     fn cost_defaults_to_zero() {
         let _g = with_config_dir();
         let toml = r#"
