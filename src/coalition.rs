@@ -1427,7 +1427,7 @@ fn channel_tag(event: &toron_core::nostr::Event) -> Option<String> {
         .tags
         .iter()
         .find(|t| t.as_slice().first().map(|s| s == "h").unwrap_or(false))
-        .and_then(|t| t.as_slice().get(1).map(|s| s.to_string()))
+        .and_then(|t| t.as_slice().get(1).map(std::clone::Clone::clone))
 }
 
 /// Best-effort `br show <id>` status probe per tracked bead. `br` absent

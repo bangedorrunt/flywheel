@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 /// One doorbell message. Every bus/inbox/status edge is a Msg; nothing
 /// happens outside `tick`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DoorbellMsg {
     /// Plane-S watch NDJSON line (`{kind,id,tags,content}`).
     WatchNdjson { line: String },
@@ -36,7 +36,7 @@ pub enum DoorbellMsg {
 /// What the effect layer should do. Prompt is the only delivery; FetchInbox /
 /// CheckAckSla / RestartWatch are effects whose results re-enter as Msgs;
 /// FactMiss and Audit are loud misses (journal + stderr), never silent Ok(()).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DoorbellAction {
     Prompt {
         pin: String,
@@ -59,7 +59,7 @@ pub enum DoorbellAction {
     },
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DoorbellModel {
     /// LWW queues per pin (working panes hold their wake here).
     pub queues: BTreeMap<String, Vec<String>>,
@@ -84,10 +84,7 @@ fn expand_inbox_rows(v: &serde_json::Value) -> Vec<&serde_json::Value> {
 }
 
 /// Pure, total, deterministic: no I/O, no &mut, no herdr/toron calls.
-pub(crate) fn tick(
-    model: &DoorbellModel,
-    msg: &DoorbellMsg,
-) -> (DoorbellModel, Vec<DoorbellAction>) {
+pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<DoorbellAction>) {
     let mut next = model.clone();
     let mut actions = Vec::new();
     match msg {
@@ -253,7 +250,12 @@ mod tests {
         );
         assert_eq!(actions2.len(), 1);
         assert!(actions2[0].to_label().contains("BlueRidge"));
-        assert!(next2.queues.get("BlueRidge").is_none_or(|q| q.is_empty()));
+        assert!(
+            next2
+                .queues
+                .get("BlueRidge")
+                .is_none_or(std::vec::Vec::is_empty)
+        );
     }
 
     #[test]
@@ -343,12 +345,12 @@ impl DoorbellAction {
     /// Test/debug label (also keeps the enum honest in logs).
     pub fn to_label(&self) -> String {
         match self {
-            DoorbellAction::Prompt { pin, .. } => format!("prompt {pin}"),
-            DoorbellAction::FetchInbox { since } => format!("fetch-inbox {since}"),
-            DoorbellAction::CheckAckSla => "check-ack-sla".into(),
-            DoorbellAction::RestartWatch => "restart-watch".into(),
-            DoorbellAction::FactMiss { why } => format!("fact-miss {why}"),
-            DoorbellAction::Audit { kind, pin, .. } => format!("audit {kind} {pin}"),
+            Self::Prompt { pin, .. } => format!("prompt {pin}"),
+            Self::FetchInbox { since } => format!("fetch-inbox {since}"),
+            Self::CheckAckSla => "check-ack-sla".into(),
+            Self::RestartWatch => "restart-watch".into(),
+            Self::FactMiss { why } => format!("fact-miss {why}"),
+            Self::Audit { kind, pin, .. } => format!("audit {kind} {pin}"),
         }
     }
 }

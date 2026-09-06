@@ -86,7 +86,7 @@ pub struct Question {
 /// dispatcher seeds swarm resume. Two-process + one-RAM +
 /// seed-from-receipts is a slice toward one Model. The end-state is one RAM owner.
 /// `seq` is a per-process diagnostic counter, not shared truth.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkspaceModel {
     pub doorbell: crate::doorbell_tick::DoorbellModel,
     pub swarm: crate::durable::LoopModel,
@@ -118,7 +118,7 @@ pub const PENDING_WAIT_CAP: usize = 512;
 // what it emits. Clock enters ONLY as a payload (Tick/AckSlaTick/Sweep).
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Msg {
     /// Untrusted wire bytes. Per-kind folds (20001 presence with the E5
     /// trust rule, 30013 roles, corr-tagged 14 assignment); kind-9 is the
@@ -235,7 +235,7 @@ pub enum Msg {
 // WaitCorr carries a non-empty corr.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Cmd {
     // doorbell slice — data equivalents of DoorbellAction
     /// Inject iff prompt_allowed (E5 gate). Line always starts "[doorbell]".
@@ -636,7 +636,7 @@ pub fn tick_from_loop_msg(
         },
         other => {
             let (next, cmds) = swarm_slice(model, other.clone());
-            let acts = cmds.iter().filter_map(|c| c.to_loop_action()).collect();
+            let acts = cmds.iter().filter_map(Cmd::to_loop_action).collect();
             return (next, acts);
         }
     };
@@ -645,7 +645,7 @@ pub fn tick_from_loop_msg(
         ..Default::default()
     };
     let (wm, cmds) = tick(&wm, &ws_msg);
-    let acts = cmds.iter().filter_map(|c| c.to_loop_action()).collect();
+    let acts = cmds.iter().filter_map(Cmd::to_loop_action).collect();
     (wm.swarm, acts)
 }
 
@@ -681,7 +681,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 // pubkey; when either is absent forgery is unprovable so the
                 // claim is accepted (bootstrap + pre-npub tests). Missing
                 // key = Unknown; Unknown never prompts (see prompt_allowed).
-                if v.get("kind").and_then(|k| k.as_u64()) == Some(20001) {
+                if v.get("kind").and_then(serde_json::Value::as_u64) == Some(20001) {
                     if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
                         // content is like "idle" or JSON with pin/state? For test, content is state, tags contain p tag for pin
                         let state = content.to_string();
@@ -732,7 +732,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     }
                 }
                 // 30013 role binding
-                if v.get("kind").and_then(|k| k.as_u64()) == Some(30013) {
+                if v.get("kind").and_then(serde_json::Value::as_u64) == Some(30013) {
                     if let Some(tags) = v.get("tags").and_then(|t| t.as_array()) {
                         let mut pin: Option<String> = None;
                         let mut roles: Vec<String> = Vec::new();
@@ -783,7 +783,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     }
                     // Kind-9 is the ring. Assignment enters from rumor 14 tags
                     // (or InboxRows from FetchInbox). Never from mail-delivered.
-                    let kind = v.get("kind").and_then(|k| k.as_u64());
+                    let kind = v.get("kind").and_then(serde_json::Value::as_u64);
                     if kind == Some(14)
                         && let Some(c) = corr
                     {
@@ -840,7 +840,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 let verdict = row
                     .get("verdict")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+                    .map(std::string::ToString::to_string);
                 apply_assignment(
                     &mut next,
                     &mut cmds,
@@ -859,11 +859,11 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                         .unwrap_or("queue")
                         .to_string(),
                     row.get("broadcast")
-                        .and_then(|v| v.as_bool())
+                        .and_then(serde_json::Value::as_bool)
                         .unwrap_or(false),
                     row.get("result_path")
                         .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
+                        .map(std::string::ToString::to_string),
                     verdict,
                 );
             }
@@ -924,7 +924,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             // silent drop. Receipt arrival still wins via try_tick_receipt
             // (effect side) before the next sweep.
             let mut gone: Vec<(String, &'static str)> = Vec::new();
-            for (corr, deadline) in next.pending_wait.iter() {
+            for (corr, deadline) in &next.pending_wait {
                 if *deadline <= *now {
                     gone.push((corr.clone(), "expired"));
                 }
@@ -933,7 +933,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 next.pending_wait.remove(corr);
             }
             while next.pending_wait.len() > PENDING_WAIT_CAP {
-                if let Some((corr, _)) = next
+                if let Some((corr, ())) = next
                     .pending_wait
                     .iter()
                     .min_by_key(|(_, d)| *d)
@@ -1165,7 +1165,7 @@ mod tests {
             m2.doorbell
                 .queues
                 .get("BlueRidge")
-                .is_none_or(|q| q.is_empty())
+                .is_none_or(std::vec::Vec::is_empty)
         );
     }
 

@@ -98,13 +98,13 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new(tag: &str) -> Scratch {
+    fn new(tag: &str) -> Self {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let base = std::env::temp_dir().join(format!("fw-zord-{tag}-{}-{ts}", std::process::id()));
-        let s = Scratch {
+        let s = Self {
             dir: base.join("proj"),
             mailbox: base.join("mailbox"),
             cfg: base.join("cfg/flywheel"),

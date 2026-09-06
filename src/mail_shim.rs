@@ -84,7 +84,7 @@ fn init_mailbox() -> Result<()> {
 /// The shared in-process mailbox. Only reachable after a successful
 /// `init_mailbox` (via `Mail::from_config`) — an unreachable panic here means
 /// a call path skipped construction, which is a programming error.
-pub(crate) fn mailbox() -> &'static toron_core::mailbox::Mailbox {
+pub fn mailbox() -> &'static toron_core::mailbox::Mailbox {
     match MAILBOX.get() {
         Some(Ok(mb)) => mb,
         Some(Err(e)) => {
@@ -95,7 +95,7 @@ pub(crate) fn mailbox() -> &'static toron_core::mailbox::Mailbox {
 }
 
 /// Non-panicking mailbox access for background ticks (GS-006 Ack-SLA).
-pub(crate) fn try_mailbox() -> Option<&'static toron_core::mailbox::Mailbox> {
+pub fn try_mailbox() -> Option<&'static toron_core::mailbox::Mailbox> {
     match MAILBOX.get() {
         Some(Ok(mb)) => Some(mb),
         _ => None,
@@ -109,7 +109,7 @@ pub(crate) fn try_mailbox() -> Option<&'static toron_core::mailbox::Mailbox> {
 /// > invocations share one durable mailbox. The `TORON_MCP_DATA_DIR` alias
 /// > stays as the explicit demo/test isolation override. The SQLite index
 /// > lives at the root. Returns (data_dir, sqlite db path).
-pub(crate) fn mailbox_roots() -> (PathBuf, PathBuf) {
+pub fn mailbox_roots() -> (PathBuf, PathBuf) {
     // `TORON_DATA_DIR` wins (blank counts as unset — flywheel's old trim
     // semantics); `TORON_MCP_DATA_DIR` is the demo/test isolation alias;
     // otherwise the durable D3 default via resolve_data_root.
@@ -148,7 +148,7 @@ fn env_non_empty_os(name: &str) -> Option<PathBuf> {
 /// unwrap stops projecting (deliveries report count=N, inboxes stay empty).
 /// Pin a per-process temp root unless the test explicitly set one.
 #[cfg(test)]
-pub(crate) fn pin_test_mail_root_once() {
+pub fn pin_test_mail_root_once() {
     static PINNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     if PINNED.get().is_some() {
         return;
@@ -197,7 +197,7 @@ async fn build_mailbox() -> anyhow::Result<toron_core::mailbox::Mailbox> {
 /// main.rs dispatch is sync; each op is a short-lived, sequential block_on).
 /// The runtime is pre-built by `Mail::from_config` — the expect below is
 /// unreachable post-init (c3b.1: no `Runtime::new` per op).
-pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
+pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
     runtime()
         .expect("runtime initialized by Mail::from_config before any op")
         .block_on(f)
@@ -314,7 +314,7 @@ impl Mail {
                 // mailbox construction failure, and every op reuses the one
                 // pre-built runtime.
                 init_mailbox()?;
-                Ok(Some(Mail {
+                Ok(Some(Self {
                     name: cfg
                         .and_then(|c| c.name.clone())
                         .unwrap_or_else(|| "flywheel".to_string()),
@@ -340,7 +340,7 @@ impl Mail {
             ServerKind::Toron, // this facade IS the toron transport (ADR-0003 V1)
         )
         .map_err(|e| anyhow::anyhow!("agent-mail remote daemon {url}: {e:#}"))?;
-        Ok(Some(Mail {
+        Ok(Some(Self {
             name,
             backend: BackendKind::Remote(client),
         }))
@@ -1863,7 +1863,7 @@ pub fn canonical_identity_path(project_key: &str, pane_id: &str) -> PathBuf {
 
 /// Write the identity file atomically (temp + rename), mirroring agent-mail
 /// core's `write_identity_file` (0600, overwrite-only, no symlink).
-pub(crate) fn write_identity_file(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_identity_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("rename onto {}", path.display()))?;
@@ -1874,11 +1874,7 @@ pub(crate) fn write_identity_file(path: &Path, bytes: &[u8]) -> Result<()> {
 /// name refusal, symlink refusal). Shared by the toron `Mail` facade and the
 /// real agent-mail backend (ADR-0003 V3) — both write the SAME file the
 /// agent-mail server reads.
-pub(crate) fn write_identity_for(
-    project_key: &str,
-    pane_id: &str,
-    agent_name: &str,
-) -> Result<PathBuf> {
+pub fn write_identity_for(project_key: &str, pane_id: &str, agent_name: &str) -> Result<PathBuf> {
     let name = agent_name.trim();
     if name.is_empty() {
         bail!("refusing to write empty pane identity for {pane_id}");
@@ -1899,7 +1895,7 @@ pub(crate) fn write_identity_for(
 
 /// Remove a per-pane identity file (no-op when absent). Shared by the toron
 /// `Mail` facade and the real agent-mail backend.
-pub(crate) fn clear_identity_for(project_key: &str, pane_id: &str) -> Result<PathBuf> {
+pub fn clear_identity_for(project_key: &str, pane_id: &str) -> Result<PathBuf> {
     let path = canonical_identity_path(project_key, pane_id);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(path),
@@ -1911,7 +1907,7 @@ pub(crate) fn clear_identity_for(project_key: &str, pane_id: &str) -> Result<Pat
 /// One renewed reservation, as reported by `renew_file_reservations`.
 /// The id is a String: toron reservation ids are hex event ids, agent-mail's
 /// are decimal — both pass through without numeric coercion (se2.2).
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RenewedReservation {
     pub id: String,
     pub path_pattern: String,
@@ -1982,7 +1978,7 @@ pub fn inbox_json_rows(v: &serde_json::Value) -> serde_json::Value {
     };
     let ts = |r: &serde_json::Value, k: &str| {
         r.get(k)
-            .and_then(|x| x.as_i64())
+            .and_then(serde_json::Value::as_i64)
             .map(|n| json!(n))
             .unwrap_or(json!(null))
     };

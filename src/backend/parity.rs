@@ -178,14 +178,14 @@ mod tests {
     impl ParityKind {
         fn name(self) -> &'static str {
             match self {
-                ParityKind::Agentmail => "agentmail",
-                ParityKind::Toron => "toron",
+                Self::Agentmail => "agentmail",
+                Self::Toron => "toron",
             }
         }
         fn base_url(self) -> &'static str {
             match self {
-                ParityKind::Agentmail => "http://127.0.0.1:8765",
-                ParityKind::Toron => "http://127.0.0.1:18080",
+                Self::Agentmail => "http://127.0.0.1:8765",
+                Self::Toron => "http://127.0.0.1:18080",
             }
         }
     }
@@ -378,7 +378,7 @@ mod tests {
             kinds.iter().map(|k| (*k, live_backend(*k))).collect();
 
         // health: both must report a status-ish field (allowlist-normalized).
-        for (kind, b) in backends.iter_mut() {
+        for (kind, b) in &mut backends {
             let h = run_mail(b.health()).unwrap_or_else(|e| panic!("{} health: {e}", kind.name()));
             let status = serde_json::to_value(&h).unwrap_or_default();
             assert!(
@@ -390,7 +390,7 @@ mod tests {
 
         // ensure_project: same normalized key shape (slug/human_key/…).
         let mut ensured = Vec::new();
-        for (kind, b) in backends.iter_mut() {
+        for (kind, b) in &mut backends {
             let s = run_mail(b.ensure_project(project)).expect("ensure_project");
             ensured.push((*kind, serde_json::to_value(&s).unwrap_or_default()));
         }
@@ -407,7 +407,7 @@ mod tests {
         // toron returns the crypto identity envelope (npub/key_path/…). The
         // documented shared semantic field is `name` (the identity). Assert
         // both echo the same identity; the shape divergence is allowlisted.
-        for (kind, b) in backends.iter_mut() {
+        for (kind, b) in &mut backends {
             let profile = crate::backend::AgentProfile {
                 name: agent.to_string(),
                 program: Some("opencode".into()),
@@ -427,14 +427,14 @@ mod tests {
 
         // list_agents: both array of agent objects with same semantic keys.
         let mut agents = Vec::new();
-        for (kind, b) in backends.iter_mut() {
+        for (kind, b) in &mut backends {
             let a = run_mail(b.list_agents(project, None)).expect("list_agents");
             agents.push((*kind, serde_json::to_value(&a).unwrap_or_default()));
         }
         assert_shape_parity("list_agents", &agents[0].1, &agents[1].1, &[], true);
 
         // send + inbox round-trip: send to self, then fetch the inbox.
-        for (_kind, b) in backends.iter_mut() {
+        for (_kind, b) in &mut backends {
             let _ = run_mail(b.send(&crate::backend::SendMail {
                 project: project.to_string(),
                 sender: agent.to_string(),
@@ -448,7 +448,7 @@ mod tests {
             .expect("send");
         }
         let mut inboxes = Vec::new();
-        for (kind, b) in backends.iter_mut() {
+        for (kind, b) in &mut backends {
             let items = run_mail(b.inbox(&InboxQuery {
                 project: project.to_string(),
                 agent: agent.to_string(),
@@ -481,7 +481,7 @@ mod tests {
                 (*kind, items)
             })
             .collect();
-        for (kind, b) in backends.iter_mut() {
+        for (kind, b) in &mut backends {
             let (_, items) = reply_targets
                 .iter()
                 .find(|(k, _)| *k == *kind)
@@ -499,7 +499,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("{} reply: {e}", kind.name()));
         }
         // both replies visible in the inbox (subject prefixed `Re: `).
-        for (kind, b) in backends.iter_mut() {
+        for (kind, b) in &mut backends {
             let items = run_mail(b.inbox(&InboxQuery {
                 project: project.to_string(),
                 agent: agent.to_string(),
@@ -524,7 +524,7 @@ mod tests {
         // result is non-empty before comparing shapes (bounded, 10s). The
         // message element shape is already proven by the inbox parity above.
         let mut searches = Vec::new();
-        for (kind, b) in backends.iter_mut() {
+        for (kind, b) in &mut backends {
             let mut last = run_mail(b.search(&crate::backend::SearchQuery {
                 project: project.to_string(),
                 query: "parity".into(),

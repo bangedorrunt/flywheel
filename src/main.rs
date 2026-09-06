@@ -152,7 +152,7 @@ fn check_send_plane_tripwires(
         plane_route::check_secret_tripwire(text, None, false, &[], plane, unsafe_plane, raw)
             .map_err(|e| anyhow!(e))?;
     }
-    let is_gift_wrap = !is_public && !matches!(plane, Some("j") | Some("job"));
+    let is_gift_wrap = !is_public && !matches!(plane, Some("j" | "job"));
     if is_gift_wrap {
         let has_mention = text.contains('@');
         let has_p = has_mention;
@@ -337,16 +337,18 @@ model = "fallback-model"
 
 pub(crate) fn stage_prompt(name: &str) -> Result<String> {
     let lib = stages::StageLibrary::load()?;
-    lib.resolve(name).map(|p| p.to_string()).ok_or_else(|| {
-        anyhow!(
-            "unknown stage: {name} (known: {})",
-            lib.list()
-                .iter()
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })
+    lib.resolve(name)
+        .map(std::string::ToString::to_string)
+        .ok_or_else(|| {
+            anyhow!(
+                "unknown stage: {name} (known: {})",
+                lib.list()
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
 }
 
 /// ADR-0006 D1: resolve a stage and render its payload params. Missing
@@ -359,7 +361,7 @@ pub(crate) fn stage_prompt_with_params(name: &str, raw_params: &[String]) -> Res
             "unknown stage: {name} (known: {})",
             lib.list()
                 .iter()
-                .map(|n| n.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -4092,7 +4094,7 @@ fn main() {
                     );
                 }
                 preflight_gate(&cfg, cli.skip_preflight, pf_mode, Some(project.as_str())).and_then(
-                    |_| {
+                    |()| {
                         cmd_loop(
                             &cfg,
                             project,
@@ -4215,7 +4217,7 @@ fn main() {
             preflight::Mode::steer(),
             project.as_deref(),
         )
-        .and_then(|_| {
+        .and_then(|()| {
             cmd_steer(
                 &cfg,
                 objective,
@@ -4253,7 +4255,7 @@ fn main() {
             } else {
                 Ok(())
             };
-            pf.and_then(|_| cmd_workflow(&cfg, cmd))
+            pf.and_then(|()| cmd_workflow(&cfg, cmd))
         }
         Some(Commands::Model { cmd }) => cmd_models(cmd),
         Some(Commands::Slot { cmd }) => cmd_slot(cmd),
@@ -6886,7 +6888,7 @@ fn preflight_kind_integration(
             );
         }
         Err(e) => {
-            warn_integration_install_failed(kind, LIFECYCLE_AUTHORITY_KINDS.contains(&kind), &e)
+            warn_integration_install_failed(kind, LIFECYCLE_AUTHORITY_KINDS.contains(&kind), &e);
         }
     }
 }
@@ -7168,7 +7170,7 @@ fn cmd_spawn(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
             && let Ok(rd) = std::fs::read_dir(parent)
         {
             let mut names: Vec<String> = rd
-                .filter_map(|e| e.ok())
+                .filter_map(std::result::Result::ok)
                 .filter(|e| e.path().is_dir())
                 .filter_map(|e| e.file_name().to_str().map(String::from))
                 .filter(|n| !n.starts_with('.'))
@@ -8367,7 +8369,7 @@ fn timeout_presence_rows(body: &str, now: u64) -> Vec<(String, String)> {
         };
         let (Some(name), Some(ts)) = (
             v.get("name").and_then(|n| n.as_str()),
-            v.get("ts").and_then(|t| t.as_u64()),
+            v.get("ts").and_then(serde_json::Value::as_u64),
         ) else {
             continue;
         };
@@ -9779,22 +9781,24 @@ fn doorbell_prompt(
             // back to the pane primitives, then count the wake as delivered.
             Err(e) if is_agent_not_ready(&e.code) => {
                 let pane = entry.pane_id.clone();
-                match try_send_text_delivery(client, project, &entry.name, &pane, &msg) {
-                    Ok(true) => ok.push(pin.clone()),
-                    _ => {
-                        eprintln!("flywheel doorbell: prompt {} failed: {e:#}", entry.name);
-                        doorbell::audit_append(
-                            &config::state_dir(),
-                            workspace,
-                            serde_json::json!({
-                                "ts": chrono::Utc::now().to_rfc3339(),
-                                "workspace": workspace,
-                                "kind": "prompt_failure",
-                                "pin": pin,
-                                "error": e.to_string(),
-                            }),
-                        );
-                    }
+                if matches!(
+                    try_send_text_delivery(client, project, &entry.name, &pane, &msg),
+                    Ok(true)
+                ) {
+                    ok.push(pin.clone())
+                } else {
+                    eprintln!("flywheel doorbell: prompt {} failed: {e:#}", entry.name);
+                    doorbell::audit_append(
+                        &config::state_dir(),
+                        workspace,
+                        serde_json::json!({
+                            "ts": chrono::Utc::now().to_rfc3339(),
+                            "workspace": workspace,
+                            "kind": "prompt_failure",
+                            "pin": pin,
+                            "error": e.to_string(),
+                        }),
+                    );
                 }
             }
             Err(e) => {
@@ -9924,7 +9928,7 @@ fn doorbell_refresh_pins(project: &str, pane_to_pin: &mut BTreeMap<String, Strin
 fn unpinned_registry_names(registry: &[state::SpawnEntry]) -> Vec<String> {
     registry
         .iter()
-        .filter(|e| !e.mail_identity.as_deref().is_some_and(|s| !s.is_empty()))
+        .filter(|e| e.mail_identity.as_deref().is_none_or(str::is_empty))
         .map(|e| e.name.clone())
         .collect()
 }
@@ -10314,7 +10318,7 @@ pub(crate) fn start_agent_with_retry_profile(
     // ADR-0026 Spec 3 pane fallback: track one hop per reroute_eligible class.
     let mut current_kind = kind.to_string();
     let mut current_args = args.to_vec();
-    let mut current_profile = profile_name.map(|s| s.to_string());
+    let mut current_profile = profile_name.map(std::string::ToString::to_string);
     let mut attempted_profiles: Vec<String> = current_profile.clone().into_iter().collect();
     let mut already_rerouted = false;
     for attempt in 0..30 {
@@ -10477,7 +10481,7 @@ fn start_agent_with_retry_dyn_profile(
     let mut recipe_launched = false;
     let mut current_kind = kind.to_string();
     let mut current_args = args.to_vec();
-    let mut current_profile = profile_name.map(|s| s.to_string());
+    let mut current_profile = profile_name.map(std::string::ToString::to_string);
     let mut attempted_profiles: Vec<String> = current_profile.clone().into_iter().collect();
     let mut already_rerouted = false;
     for attempt in 0..30 {
@@ -10900,7 +10904,7 @@ pub(crate) fn pinned_mail_identity(
                     taken.extend(agents.into_iter().map(|a| a.name));
                 }
                 Err(e) => {
-                    eprintln!("flywheel: mail list_agents failed during pin draw for {name}: {e}")
+                    eprintln!("flywheel: mail list_agents failed during pin draw for {name}: {e}");
                 }
             }
             unique_adjnoun_pin(&taken, state::fnv1a64(name))
@@ -11958,7 +11962,7 @@ mod agent_mail_name_tests {
         assert_eq!(
             to_want_token("toron", ""),
             WantToken {
-                name: "".into(),
+                name: String::new(),
                 broaden: false,
                 short: None,
                 ordinal: 1,
@@ -12260,6 +12264,7 @@ fn cmd_decide(
 
 // ---- bd-cy0s: event-driven facts (captain surface) ----
 
+#[must_use]
 pub fn facts_journal_path(project: &str) -> std::path::PathBuf {
     config::state_dir()
         .join("facts")
@@ -12315,6 +12320,7 @@ pub fn append_fact(project: &str, event: &ingress::IngressEvent) -> Result<()> {
     Ok(())
 }
 
+#[must_use]
 pub fn load_facts(project: &str) -> Vec<ingress::IngressEvent> {
     let path = facts_journal_path(project);
     let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -12357,6 +12363,7 @@ pub fn captain_fact_inject(project: &str, event: &ingress::IngressEvent) -> Resu
 }
 
 /// Adapter wiring for `handle_ingress`: facts → journal + captain doorbell.
+#[must_use]
 pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
     let proj = project.to_string();
     ingress::IngressAdapters {
@@ -12390,7 +12397,7 @@ pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
             // reads; facts_close/lapsed tests red). Append, never wake-only.
             let ledger = facts_journal_path(&proj);
             let wrote = match ledger.parent() {
-                Some(dir) => std::fs::create_dir_all(dir).and_then(|_| {
+                Some(dir) => std::fs::create_dir_all(dir).and_then(|()| {
                     std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
@@ -12994,7 +13001,7 @@ fn cmd_send(
         // its pane lost its name binding — restore from the spawn registry
         // (best-effort) and re-resolve before reporting the miss.
         let backend = backend::multiplexer_backend(cfg)?;
-        for tok in to.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        for tok in to.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let _ = rebind_from_registry(&*backend, project, tok, &ws_id);
         }
         // bd-a2bw: also rebind every nameless pane in the workspace — a
@@ -13085,7 +13092,7 @@ fn cmd_send(
             Ok(c) => condition_send_target(entry, c, &text, raw),
             Err(e) => {
                 eprintln!("flywheel: profile catalog unavailable ({e:#}) — sending raw");
-                (text.to_string(), None, false)
+                (text.clone(), None, false)
             }
         };
         if skills_injected {
@@ -14047,7 +14054,7 @@ fn cmd_interrupt(
     let keys: Vec<&str> = if keys.is_empty() {
         vec!["Escape"]
     } else {
-        keys.iter().map(|s| s.as_str()).collect()
+        keys.iter().map(std::string::String::as_str).collect()
     };
     if !force && let Some(k) = kill_key(&keys) {
         bail!(
@@ -14211,8 +14218,8 @@ fn cmd_watch(
         } else if let Some(s) = stream.as_mut() {
             s.set_read_timeout(None)?;
         }
-        match stream.as_mut() {
-            Some(s) => match s.read_event() {
+        if let Some(s) = stream.as_mut() {
+            match s.read_event() {
                 Ok(Some(ev)) => {
                     // typed: the subscription push (and the equivalent server
                     // event) both land here with a fully parsed payload.
@@ -14246,14 +14253,13 @@ fn cmd_watch(
                         return Ok(());
                     }
                 }
-            },
-            None => {
-                // no subscription (empty workspace or rejected request):
-                // poll state until the deadline
-                std::thread::sleep(Duration::from_millis(1000));
-                if watch_poll(&mut c, &watch_names, until_status)? {
-                    return Ok(());
-                }
+            }
+        } else {
+            // no subscription (empty workspace or rejected request):
+            // poll state until the deadline
+            std::thread::sleep(Duration::from_millis(1000));
+            if watch_poll(&mut c, &watch_names, until_status)? {
+                return Ok(());
             }
         }
     }
@@ -14494,14 +14500,13 @@ fn cmd_principles(cmd: &PrinciplesCmd) -> Result<()> {
             }
             Ok(())
         }
-        PrinciplesCmd::Show { name } => match crate::principles::show(name) {
-            Some(p) => {
+        PrinciplesCmd::Show { name } => {
+            if let Some(p) = crate::principles::show(name) {
                 println!("{}", p.name);
                 println!("WHEN {}", p.when);
                 println!("RULE {}", p.rule);
                 Ok(())
-            }
-            None => {
+            } else {
                 let suggestion = crate::principles::suggest(name)
                     .map(|s| format!(" — did you mean `{s}`?"))
                     .unwrap_or_default();
@@ -14509,7 +14514,7 @@ fn cmd_principles(cmd: &PrinciplesCmd) -> Result<()> {
                     "unknown principle `{name}`{suggestion} (see `flywheel principles list`)"
                 );
             }
-        },
+        }
     }
 }
 
@@ -14659,7 +14664,7 @@ mod verify_gate_tests {
     fn verify_gate_matched_count_string() {
         let msg = format!("VERIFY matched {} tests, all passed", 5);
         assert!(msg.contains("matched"));
-        assert!(msg.contains("5"));
+        assert!(msg.contains('5'));
         assert!(msg.contains("passed"));
     }
 
@@ -15189,6 +15194,7 @@ where
 }
 
 /// Build the worker queue prompt for a cross-project request.
+#[must_use]
 pub fn xproj_queue_prompt(item: &XprojInboxItem, req: &XprojRequest) -> String {
     format!(
         "CROSS-PROJECT SWARM REQUEST (message_id={}, thread={}, from={}).\n\
@@ -15211,6 +15217,7 @@ pub fn xproj_queue_prompt(item: &XprojInboxItem, req: &XprojRequest) -> String {
 
 /// Extract `[xproj]` items from a `fetch_inbox` JSON value (pure, unit-tested).
 /// Accepts either a bare array or `{messages:[...]}` / `{result:[...]}`.
+#[must_use]
 pub fn extract_xproj_from_inbox(v: &serde_json::Value) -> Vec<XprojInboxItem> {
     let arr = v
         .as_array()
@@ -15264,6 +15271,7 @@ pub fn extract_xproj_from_inbox(v: &serde_json::Value) -> Vec<XprojInboxItem> {
 }
 
 /// Filter unseen xproj items and produce (message_id, queue_prompt) pairs.
+#[must_use]
 pub fn xproj_prompts_for_unseen(
     items: &[XprojInboxItem],
     seen: &std::collections::HashSet<String>,
@@ -15288,6 +15296,7 @@ pub fn xproj_prompts_for_unseen(
 /// contract says reply EXACTLY that). Same envelope tolerance as the xproj
 /// scan (bare array / `{messages}` / `{result}`); carries id/thread/from so
 /// the loop can dedup + map the sender to a pane.
+#[must_use]
 pub fn extract_context_limit_from_inbox(v: &serde_json::Value) -> Vec<XprojInboxItem> {
     const MARKER: &str = "CONTEXT_LIMIT";
     let arr = v
@@ -15340,6 +15349,7 @@ pub fn extract_context_limit_from_inbox(v: &serde_json::Value) -> Vec<XprojInbox
 ///
 /// Accepts lines like `recipe=backtest-5m`, `workers=4`, `product=trading-research`,
 /// free-form remainder as params. Subject may be `[xproj] run … recipe=foo`.
+#[must_use]
 pub fn parse_xproj_request(text: &str) -> Option<XprojRequest> {
     let t = text.trim();
     if t.is_empty() {
@@ -15457,7 +15467,7 @@ fn cmd_xproj(cfg: &Config, cmd: &XprojCmd) -> Result<()> {
                         p.display()
                     );
                 }
-                Some(to_project.to_string())
+                Some(to_project.clone())
             };
             let body_md = format!(
                 "recipe={recipe}\nworkers={workers}\nproduct={product}\n{}\n\n{body}\n\n\
@@ -16195,7 +16205,11 @@ pub(crate) fn newest_urgent<'a>(
     urgent
         .iter()
         .copied()
-        .max_by_key(|m| m.get("created_ts_us").and_then(|t| t.as_u64()).unwrap_or(0))
+        .max_by_key(|m| {
+            m.get("created_ts_us")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        })
         .or(fallback)
 }
 
@@ -16305,7 +16319,7 @@ fn thread_has_reply(
     let Some(tid) = m.get("thread_id").and_then(|t| t.as_str()) else {
         return false;
     };
-    let Some(ts) = m.get("created_ts_us").and_then(|t| t.as_i64()) else {
+    let Some(ts) = m.get("created_ts_us").and_then(serde_json::Value::as_i64) else {
         return false;
     };
     rows.iter().any(|r| {
@@ -16317,7 +16331,7 @@ fn thread_has_reply(
                 .unwrap_or(false)
             && r.get("thread_id").and_then(|t| t.as_str()) == Some(tid)
             && r.get("created_ts_us")
-                .and_then(|t| t.as_i64())
+                .and_then(serde_json::Value::as_i64)
                 .map(|t| t > ts)
                 .unwrap_or(false)
     })
@@ -18137,7 +18151,7 @@ fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
             priority: b
                 .get("priority")
                 .and_then(Value::as_u64)
-                .map(|p| p.min(u8::MAX as u64) as u8)
+                .map(|p| p.min(u64::from(u8::MAX)) as u8)
                 .unwrap_or(3),
             principles: durable::principles_typed_field(&b),
             updated_at: None,
@@ -18198,7 +18212,7 @@ fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
             priority: b
                 .get("priority")
                 .and_then(Value::as_u64)
-                .map(|p| p.min(u8::MAX as u64) as u8)
+                .map(|p| p.min(u64::from(u8::MAX)) as u8)
                 .unwrap_or(3),
             principles: durable::principles_typed_field(b),
             updated_at: None,
@@ -18464,11 +18478,11 @@ fn cmd_loop_doctor(cfg: &Config, fix: bool, json: bool) -> Result<()> {
     if fix {
         let rejected = report["fixed"]["rejected"]
             .as_array()
-            .map(|a| a.len())
+            .map(std::vec::Vec::len)
             .unwrap_or(0);
         let pruned = report["fixed"]["pruned"]
             .as_array()
-            .map(|a| a.len())
+            .map(std::vec::Vec::len)
             .unwrap_or(0);
         println!(
             "Fixed: rejected {} stale invocation(s), pruned {} orphaned pid(s)",
@@ -18545,7 +18559,10 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
                     model.per_bead_phase = map;
                 }
             }
-            if let Some(md) = snap.get("mail_degraded").and_then(|v| v.as_bool()) {
+            if let Some(md) = snap
+                .get("mail_degraded")
+                .and_then(serde_json::Value::as_bool)
+            {
                 model.mail_degraded = md;
             }
         }
@@ -19828,7 +19845,9 @@ mod loop_tests {
             .find(|m| m.subject.contains("NOT ready"))
             .expect("planner received the not-ready mail");
         assert_eq!(
-            m.thread_id.as_ref().map(|t| t.as_str()),
+            m.thread_id
+                .as_ref()
+                .map(toron_core::mailbox::ids::MessageId::as_str),
             Some("bd-fence-missing"),
             "mail rides the bead's thread (ADR-0019 Spec 0)"
         );
@@ -19889,7 +19908,9 @@ mod loop_tests {
             .find(|m| m.subject == "[bd-done-probe] done")
             .expect("captain received the done mail");
         assert_eq!(
-            m.thread_id.as_ref().map(|t| t.as_str()),
+            m.thread_id
+                .as_ref()
+                .map(toron_core::mailbox::ids::MessageId::as_str),
             Some("bd-done-probe"),
             "done mail rides the bead's thread"
         );
@@ -19936,7 +19957,9 @@ mod loop_tests {
             .find(|m| m.subject.contains("unverified close reopened"))
             .expect("planner received the unverified-close mail");
         assert_eq!(
-            m.thread_id.as_ref().map(|t| t.as_str()),
+            m.thread_id
+                .as_ref()
+                .map(toron_core::mailbox::ids::MessageId::as_str),
             Some("bd-sha-missing"),
             "mail rides the bead's thread (ADR-0019 Spec 0)"
         );
@@ -20120,7 +20143,10 @@ mod loop_tests {
                     "exactly one mail per (bead, sha): {items:?}"
                 );
                 assert_eq!(
-                    mails[0].thread_id.as_ref().map(|t| t.as_str()),
+                    mails[0]
+                        .thread_id
+                        .as_ref()
+                        .map(toron_core::mailbox::ids::MessageId::as_str),
                     Some(bead_id.as_str()),
                     "on the bead's thread"
                 );
@@ -20886,12 +20912,11 @@ fn cmd_safety(cfg: &Config) -> Result<()> {
     for p in &policy.deny {
         println!("  {}", dim(p));
     }
-    let mut c = match Client::connect(Some(&cfg.socket_path())) {
-        Ok(c) => c,
-        Err(_) => {
-            println!("herdr: {}", error("unreachable"));
-            return Ok(());
-        }
+    let mut c = if let Ok(c) = Client::connect(Some(&cfg.socket_path())) {
+        c
+    } else {
+        println!("herdr: {}", error("unreachable"));
+        return Ok(());
     };
     println!("herdr: {}", status_paint(AgentStatus::Idle));
     if c.ping().is_ok() {
@@ -21246,6 +21271,7 @@ fn prompt_orchestration_template(name: &str) -> Option<&'static str> {
 
 /// The prompts directory for one agent kind (the dir the generated
 /// commands are written into). Purely conventional per tool.
+#[must_use]
 pub fn prompts_dir(kind: &str) -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
     let home = std::path::Path::new(&home);
@@ -21676,42 +21702,39 @@ fn upsert_grok_toron(path: &std::path::Path, url: &str, dry: bool) -> Result<Str
             break;
         }
     }
-    match idx {
-        Some(i) => {
-            // already present: replace the section body's url/enabled lines
-            // up to the next `[section]` header.
-            let mut j = i + 1;
-            let mut found_url = false;
-            while j < lines.len() && !lines[j].trim_start().starts_with('[') {
-                let t = lines[j].trim();
-                if t.starts_with("url =") {
-                    lines[j] = format!("url = \"{url}\"");
-                    found_url = true;
-                }
-                j += 1;
+    if let Some(i) = idx {
+        // already present: replace the section body's url/enabled lines
+        // up to the next `[section]` header.
+        let mut j = i + 1;
+        let mut found_url = false;
+        while j < lines.len() && !lines[j].trim_start().starts_with('[') {
+            let t = lines[j].trim();
+            if t.starts_with("url =") {
+                lines[j] = format!("url = \"{url}\"");
+                found_url = true;
             }
-            if !found_url {
-                // ensure an url line right after the header, before the next header
-                lines.insert(i + 1, format!("url = \"{url}\""));
-            }
-            let act = if found_url { "updated" } else { "added url" };
-            if dry {
-                return Ok(format!("grok {act} ({})", pretty_path(path)));
-            }
-            std::fs::write(path, lines.join("\n") + "\n")?;
-            Ok(format!("grok {act}"))
+            j += 1;
         }
-        None => {
-            if dry {
-                return Ok(format!("grok added ({})", pretty_path(path)));
-            }
-            lines.push(String::from("[mcp_servers.toron]"));
-            lines.push(format!("url = \"{url}\""));
-            lines.push(String::from("enabled = true"));
-            lines.push(String::new());
-            std::fs::write(path, lines.join("\n") + "\n")?;
-            Ok("grok added".to_string())
+        if !found_url {
+            // ensure an url line right after the header, before the next header
+            lines.insert(i + 1, format!("url = \"{url}\""));
         }
+        let act = if found_url { "updated" } else { "added url" };
+        if dry {
+            return Ok(format!("grok {act} ({})", pretty_path(path)));
+        }
+        std::fs::write(path, lines.join("\n") + "\n")?;
+        Ok(format!("grok {act}"))
+    } else {
+        if dry {
+            return Ok(format!("grok added ({})", pretty_path(path)));
+        }
+        lines.push(String::from("[mcp_servers.toron]"));
+        lines.push(format!("url = \"{url}\""));
+        lines.push(String::from("enabled = true"));
+        lines.push(String::new());
+        std::fs::write(path, lines.join("\n") + "\n")?;
+        Ok("grok added".to_string())
     }
 }
 
@@ -21811,14 +21834,13 @@ fn setup_flywheel_backend(url: &str, dry: bool) -> Result<String> {
             lines[i] = format!("url = \"{url}\"");
             "updated".to_string()
         }
-        None => match section_idx {
-            Some(i) => {
+        None => {
+            if let Some(i) = section_idx {
                 // mail.toron section present but no url line — insert right after
                 // the section header.
                 lines.insert(i + 1, format!("url = \"{url}\""));
                 "added url".to_string()
-            }
-            None => {
+            } else {
                 // no [mail.toron] at all — append fresh blocks (identity first).
                 lines.push(String::from("[agent_mail]"));
                 lines.push(String::from("name = \"flywheel\""));
@@ -21828,7 +21850,7 @@ fn setup_flywheel_backend(url: &str, dry: bool) -> Result<String> {
                 lines.push(String::new());
                 "added section".to_string()
             }
-        },
+        }
     };
 
     if dry {
@@ -22023,14 +22045,14 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
     // by design — this is the signal that triggers a bd-protocol-v2X-bump
     // bead later), live < pin is ERROR + exit 1 (server too old — the safety
     // net, per ADR-0001 gap A1).
-    match std::process::Command::new("herdr")
+    if let Some(p) = std::process::Command::new("herdr")
         .args(["api", "schema", "--json"])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| herdr_shim::parse_protocol(&String::from_utf8_lossy(&o.stdout)))
     {
-        Some(p) => match protocol_check(p, herdr_shim::HDR_PROTOCOL) {
+        match protocol_check(p, herdr_shim::HDR_PROTOCOL) {
             ProtocolCheck::Match => println!(
                 "herdr protocol: {} (verified {})",
                 paint_ok(&p.to_string()),
@@ -22059,17 +22081,14 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
                     herdr_shim::HDR_PROTOCOL
                 );
             }
-        },
-        None => {
-            println!(
-                "herdr protocol: {} (verified {})",
-                crate::output::warn("unknown"),
-                herdr_shim::HDR_PROTOCOL
-            );
-            eprintln!(
-                "flywheel: WARNING cannot read herdr protocol (herdr api schema --json failed)"
-            );
         }
+    } else {
+        println!(
+            "herdr protocol: {} (verified {})",
+            crate::output::warn("unknown"),
+            herdr_shim::HDR_PROTOCOL
+        );
+        eprintln!("flywheel: WARNING cannot read herdr protocol (herdr api schema --json failed)");
     }
 
     // H3 (bd-harness-integration-preflight): per-kind integration state
@@ -22127,7 +22146,7 @@ fn cmd_deps(cfg: &Config) -> Result<()> {
     }
 
     match resonate_health(cfg) {
-        Ok(_) => println!("resonate server: {}", status_paint(AgentStatus::Idle)),
+        Ok(()) => println!("resonate server: {}", status_paint(AgentStatus::Idle)),
         Err(e) => {
             ok = false;
             println!("resonate server: {} ({e:#})", error("FAIL"));
@@ -22201,10 +22220,10 @@ fn cmd_config(cfg: &Config, cmd: &ConfigCmd) -> Result<()> {
                 "workspace_root" => cfg.workspace_root = Some(value.clone()),
                 "default_timeout_ms" => cfg.default_timeout_ms = Some(value.parse()?),
                 "backend.multiplexer" => {
-                    cfg.backend.get_or_insert_with(Default::default).multiplexer = value.clone()
+                    cfg.backend.get_or_insert_with(Default::default).multiplexer = value.clone();
                 }
                 "backend.mail" => {
-                    cfg.backend.get_or_insert_with(Default::default).mail = value.clone()
+                    cfg.backend.get_or_insert_with(Default::default).mail = value.clone();
                 }
                 _ => bail!(
                     "unknown key: {key} (socket_path|workspace_root|default_timeout_ms|backend.multiplexer|backend.mail)"
@@ -24112,7 +24131,7 @@ fn catalog_snapshot_json() -> Result<()> {
         "models": reg.models.iter().map(|(id, e)| {
             json!({
                 "id": id,
-                "tier": e.tier.map(|t| t.as_str()),
+                "tier": e.tier.map(models::Tier::as_str),
                 "caps": e.caps,
                 "fallback": e.fallback,
                 "effort": e.effort,
@@ -24719,7 +24738,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     "run": run,
                     "compose_token": token,
                     "source": source,
-                    "trigger": wf.trigger.as_ref().map(|t| t.type_name()),
+                    "trigger": wf.trigger.as_ref().map(toron_workflow::Trigger::type_name),
                     "crew": match &wf.crew {
                         Some(CrewSpec::Auto) => "auto",
                         Some(CrewSpec::Explicit(_)) => "explicit",
@@ -24774,7 +24793,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 "description": wf.description,
                 "run": run,
                 "compose_token": token,
-                "trigger": wf.trigger.as_ref().map(|t| t.type_name()),
+                "trigger": wf.trigger.as_ref().map(toron_workflow::Trigger::type_name),
                 "guard": wf.guard,
                 "crew": crew,
                 "inputs": wf.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(),
@@ -24786,28 +24805,25 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
         }
         WorkflowCmd::Lint { name } => {
             let all = all_workflows()?;
-            match name {
-                Some(n) => {
-                    let (wf, _) = all.get(n).ok_or_else(|| {
-                        anyhow!("unknown workflow {n:?} (flywheel workflow list)")
-                    })?;
-                    let blocking = lint_one(n, wf);
-                    if blocking > 0 {
-                        std::process::exit(1);
-                    }
-                    Ok(())
+            if let Some(n) = name {
+                let (wf, _) = all
+                    .get(n)
+                    .ok_or_else(|| anyhow!("unknown workflow {n:?} (flywheel workflow list)"))?;
+                let blocking = lint_one(n, wf);
+                if blocking > 0 {
+                    std::process::exit(1);
                 }
-                None => {
-                    let mut blocking_total = 0;
-                    for (n, (wf, _)) in &all {
-                        blocking_total += lint_one(n, wf);
-                    }
-                    if blocking_total > 0 {
-                        std::process::exit(1);
-                    }
-                    println!("lint clean: {} workflow(s)", all.len());
-                    Ok(())
+                Ok(())
+            } else {
+                let mut blocking_total = 0;
+                for (n, (wf, _)) in &all {
+                    blocking_total += lint_one(n, wf);
                 }
+                if blocking_total > 0 {
+                    std::process::exit(1);
+                }
+                println!("lint clean: {} workflow(s)", all.len());
+                Ok(())
             }
         }
         WorkflowCmd::Run {
@@ -24975,113 +24991,108 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // when the job finishes. The crew workspace stays open until the
             // drainer joins (closing it would kill in-flight spawn panes).
             let mut spawn_receipts: Vec<Value> = vec![];
-            let output = match pane_ctx.as_ref() {
-                Some(pane_ctx) => {
-                    let engine = std::sync::Arc::new({
-                        let eng = pane::local_engine(
-                            &rt,
-                            runner,
-                            profile_resolver,
-                            workflow_resolver.clone(),
-                        )?;
-                        let sink = make_verify_sink(
-                            cfg.clone(),
-                            project.as_deref().unwrap_or("flywheel").to_string(),
-                        );
-                        *eng.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
-                        eng
-                    });
-                    let approval_stop =
-                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let approval_drainer = pane::start_approval_drainer(
+            let output = if let Some(pane_ctx) = pane_ctx.as_ref() {
+                let engine = std::sync::Arc::new({
+                    let eng = pane::local_engine(
+                        &rt,
+                        runner,
+                        profile_resolver,
+                        workflow_resolver.clone(),
+                    )?;
+                    let sink = make_verify_sink(
                         cfg.clone(),
                         project.as_deref().unwrap_or("flywheel").to_string(),
-                        engine.clone(),
-                        approval_stop.clone(),
+                    );
+                    *eng.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
+                    eng
+                });
+                let approval_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let approval_drainer = pane::start_approval_drainer(
+                    cfg.clone(),
+                    project.as_deref().unwrap_or("flywheel").to_string(),
+                    engine.clone(),
+                    approval_stop.clone(),
+                )?;
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let drainer = pane::start_spawn_drainer(
+                    cfg.clone(),
+                    project.as_deref().unwrap_or("flywheel").to_string(),
+                    name.clone(),
+                    pane_ctx.workspace_id.clone(),
+                    engine.clone(),
+                    stop.clone(),
+                )?;
+                let out = rt.block_on(async {
+                    // bd-cvv9: the ship chain routes through the gated
+                    // runner — same engine rail, §4.5 contracts between
+                    // links (warn-first; block after the W5 flip).
+                    phase_chain::invoke_or_ship_chain(
+                        &engine,
+                        &workflow_resolver,
+                        &project_dir(cfg, project.as_deref().unwrap_or("flywheel")),
+                        project.as_deref().unwrap_or("flywheel"),
+                        &run_id,
+                        name,
+                        &invoke_wf,
+                        inputs_value.clone(),
+                    )
+                    .await
+                });
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                approval_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                spawn_receipts = drainer
+                    .join()
+                    .map_err(|_| anyhow!("spawn drainer thread panicked"))??;
+                let _ = approval_drainer
+                    .join()
+                    .map_err(|_| anyhow!("approval drainer thread panicked"));
+                out
+            } else {
+                // bd-adr22-local-resonate-tx8q: ONE engine rail — the
+                // headless/record arm uses the same durable store
+                // selection as pane mode (pane::local_engine), so a
+                // kill -9 mid-run resumes on restart regardless of
+                // --execute mode.
+                let engine = std::sync::Arc::new({
+                    let eng = pane::local_engine(
+                        &rt,
+                        runner,
+                        profile_resolver,
+                        workflow_resolver.clone(),
                     )?;
-                    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let drainer = pane::start_spawn_drainer(
+                    let sink = make_verify_sink(
                         cfg.clone(),
                         project.as_deref().unwrap_or("flywheel").to_string(),
-                        name.clone(),
-                        pane_ctx.workspace_id.clone(),
-                        engine.clone(),
-                        stop.clone(),
-                    )?;
-                    let out = rt.block_on(async {
-                        // bd-cvv9: the ship chain routes through the gated
-                        // runner — same engine rail, §4.5 contracts between
-                        // links (warn-first; block after the W5 flip).
-                        phase_chain::invoke_or_ship_chain(
-                            &engine,
-                            &workflow_resolver,
-                            &project_dir(cfg, project.as_deref().unwrap_or("flywheel")),
-                            project.as_deref().unwrap_or("flywheel"),
-                            &run_id,
-                            name,
-                            &invoke_wf,
-                            inputs_value.clone(),
-                        )
-                        .await
-                    });
-                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                    approval_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                    spawn_receipts = drainer
-                        .join()
-                        .map_err(|_| anyhow!("spawn drainer thread panicked"))??;
-                    let _ = approval_drainer
-                        .join()
-                        .map_err(|_| anyhow!("approval drainer thread panicked"));
-                    out
-                }
-                None => {
-                    // bd-adr22-local-resonate-tx8q: ONE engine rail — the
-                    // headless/record arm uses the same durable store
-                    // selection as pane mode (pane::local_engine), so a
-                    // kill -9 mid-run resumes on restart regardless of
-                    // --execute mode.
-                    let engine = std::sync::Arc::new({
-                        let eng = pane::local_engine(
-                            &rt,
-                            runner,
-                            profile_resolver,
-                            workflow_resolver.clone(),
-                        )?;
-                        let sink = make_verify_sink(
-                            cfg.clone(),
-                            project.as_deref().unwrap_or("flywheel").to_string(),
-                        );
-                        *eng.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
-                        eng
-                    });
-                    let approval_stop =
-                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let approval_drainer = pane::start_approval_drainer(
-                        cfg.clone(),
-                        project.as_deref().unwrap_or("flywheel").to_string(),
-                        engine.clone(),
-                        approval_stop.clone(),
-                    )?;
-                    let out = rt.block_on(async {
-                        // bd-cvv9: ship runs gated on the same rail headless.
-                        phase_chain::invoke_or_ship_chain(
-                            &engine,
-                            &workflow_resolver,
-                            &project_dir(cfg, project.as_deref().unwrap_or("flywheel")),
-                            project.as_deref().unwrap_or("flywheel"),
-                            &run_id,
-                            name,
-                            &invoke_wf,
-                            inputs_value.clone(),
-                        )
-                        .await
-                    });
-                    approval_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let _ = approval_drainer
-                        .join()
-                        .map_err(|_| anyhow!("approval drainer thread panicked"));
-                    out
-                }
+                    );
+                    *eng.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
+                    eng
+                });
+                let approval_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let approval_drainer = pane::start_approval_drainer(
+                    cfg.clone(),
+                    project.as_deref().unwrap_or("flywheel").to_string(),
+                    engine.clone(),
+                    approval_stop.clone(),
+                )?;
+                let out = rt.block_on(async {
+                    // bd-cvv9: ship runs gated on the same rail headless.
+                    phase_chain::invoke_or_ship_chain(
+                        &engine,
+                        &workflow_resolver,
+                        &project_dir(cfg, project.as_deref().unwrap_or("flywheel")),
+                        project.as_deref().unwrap_or("flywheel"),
+                        &run_id,
+                        name,
+                        &invoke_wf,
+                        inputs_value.clone(),
+                    )
+                    .await
+                });
+                approval_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = approval_drainer
+                    .join()
+                    .map_err(|_| anyhow!("approval drainer thread panicked"));
+                out
             }?;
             // P10.3 lifecycle: ephemeral default — reap the crew workspace
             // (close it + its panes) at run end unless --retain (keep) or
@@ -25921,27 +25932,24 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
         }
         CronCmd::Lint { name, project } => {
             let rows = cron::load_crons(cfg, project.as_deref())?;
-            match name {
-                Some(n) => {
-                    let row = resolve(&rows, n)?;
-                    let blocking = lint_one(n, &row.spec);
-                    if blocking > 0 {
-                        std::process::exit(1);
-                    }
-                    println!("cron {n} lints clean (source {})", row.source_label());
-                    Ok(())
+            if let Some(n) = name {
+                let row = resolve(&rows, n)?;
+                let blocking = lint_one(n, &row.spec);
+                if blocking > 0 {
+                    std::process::exit(1);
                 }
-                None => {
-                    let mut blocking_total = 0;
-                    for row in &rows {
-                        blocking_total += lint_one(row.name(), &row.spec);
-                    }
-                    if blocking_total > 0 {
-                        std::process::exit(1);
-                    }
-                    println!("lint clean: {} cron(s)", rows.len());
-                    Ok(())
+                println!("cron {n} lints clean (source {})", row.source_label());
+                Ok(())
+            } else {
+                let mut blocking_total = 0;
+                for row in &rows {
+                    blocking_total += lint_one(row.name(), &row.spec);
                 }
+                if blocking_total > 0 {
+                    std::process::exit(1);
+                }
+                println!("lint clean: {} cron(s)", rows.len());
+                Ok(())
             }
         }
         CronCmd::Run {
@@ -26230,7 +26238,7 @@ fn lint_flywheel_tier(name: &str, wf: &toron_workflow::schema::Workflow) -> usiz
         if bare.is_empty() {
             return;
         }
-        if !profiles.get(bare).is_some() {
+        if profiles.get(bare).is_none() {
             let msg = format!(
                 "profile {profile:?} does not resolve (known: {})",
                 profiles.names().join(", ")
@@ -26432,7 +26440,7 @@ fn cmd_debate(
     // `[a-zA-Z0-9._-]` only, no `:`. Replace hyphens AND colons AND the trailing
     // Z so the id is e.g. `debate-20260806T130548`.
     let iso = crate::state::now_iso().replacen('-', "", 10);
-    let ts: String = iso.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let ts: String = iso.chars().filter(char::is_ascii_alphanumeric).collect();
     let thread = format!("debate-{ts}");
 
     // scope the debate to the project dir (the proposition may be a project
@@ -26456,7 +26464,7 @@ fn cmd_debate(
     let mux = backend::multiplexer_backend(cfg)?;
     backend::run_mail(mail.ensure_project(&key))?;
 
-    let mail_target = |agent: &str| resolve_mail_target_registry(&project, agent).to_string();
+    let mail_target = |agent: &str| resolve_mail_target_registry(&project, agent).clone();
 
     // opening: A argues FOR
     let opening = format!(
@@ -26604,6 +26612,7 @@ pub enum PriAction {
 }
 
 /// Initial planner prompt (writes plan file + replies with path).
+#[must_use]
 pub fn pri_planner_prompt(feature: &str, plan_path: &str) -> String {
     format!(
         "You are the PLANNER for this feature (paper-first gate).\n\n\
@@ -26620,6 +26629,7 @@ pub fn pri_planner_prompt(feature: &str, plan_path: &str) -> String {
 /// Returns (next_phase, action, updated_change_rounds).
 /// `change_rounds` counts completed CHANGES loops; escalate when the next
 /// CHANGES would exceed `max_change_rounds`.
+#[must_use]
 pub fn pri_route(
     phase: PriPhase,
     token: &ReviewToken,
@@ -26705,6 +26715,7 @@ pub fn pri_route(
 }
 
 /// After implementer settles: send verify prompt to reviewer.
+#[must_use]
 pub fn pri_after_implement(plan_path: &str) -> (PriPhase, PriAction) {
     (
         PriPhase::AwaitingVerify,
@@ -26720,6 +26731,7 @@ pub fn pri_after_implement(plan_path: &str) -> (PriPhase, PriAction) {
 }
 
 /// After planner settles with a plan path: send review prompt.
+#[must_use]
 pub fn pri_after_plan(plan_path: &str) -> (PriPhase, PriAction) {
     (
         PriPhase::AwaitingPlanReview,
@@ -26735,6 +26747,7 @@ pub fn pri_after_plan(plan_path: &str) -> (PriPhase, PriAction) {
 }
 
 /// Extract `PLAN: <path>` from planner reply (best-effort).
+#[must_use]
 pub fn extract_plan_path(text: &str, fallback: &str) -> String {
     for line in text.lines() {
         let t = line.trim();
@@ -27068,7 +27081,12 @@ fn newest_in_thread<'a>(
 ) -> Option<&'a backend::MailItem> {
     items
         .iter()
-        .filter(|m| m.thread_id.as_ref().map(|t| t.as_str()) == Some(thread))
+        .filter(|m| {
+            m.thread_id
+                .as_ref()
+                .map(toron_core::mailbox::ids::MessageId::as_str)
+                == Some(thread)
+        })
         .filter(|m| m.sender == sender || (!sender_npub.is_empty() && m.sender == sender_npub))
         .max_by_key(|m| m.created_ts_us)
 }
@@ -27140,7 +27158,7 @@ fn harvest_latest(
 fn cmd_upgrade() -> Result<()> {
     let source = std::env::var("FLYWHEEL_SOURCE").unwrap_or_else(|_| "~/workspace/flywheel".into());
     let expanded = source.replacen(
-        "~",
+        '~',
         &dirs::home_dir().unwrap_or_default().display().to_string(),
         1,
     );
@@ -27342,7 +27360,7 @@ fn summarize_status_event(
     ev: &toron_core::backend::BackendEvent,
     seq: &mut u64,
 ) -> Option<StatusEventItem> {
-    use toron_core::backend::BackendEvent::*;
+    use toron_core::backend::BackendEvent::{AgentDetected, AgentStatusChanged, PaneExited, Raw};
     let (event_type, pane_id, agent, status) = match ev {
         AgentStatusChanged {
             pane,
@@ -27500,20 +27518,19 @@ fn cmd_internal_send(
     let profile_obj = match profile_name {
         Some(p) => {
             let catalog = profile::ProfileCatalog::load()?;
-            match catalog.get(p) {
-                Some(pr) => Some((
+            if let Some(pr) = catalog.get(p) {
+                Some((
                     p.to_string(),
                     pr.harness.clone(),
                     pr.model.clone(),
                     pr.behavior.clone(),
                     pr.skills.clone(),
-                )),
-                None => {
-                    eprintln!(
-                        "flywheel: __send --profile {p} unknown (flywheel profile list) — sending raw"
-                    );
-                    None
-                }
+                ))
+            } else {
+                eprintln!(
+                    "flywheel: __send --profile {p} unknown (flywheel profile list) — sending raw"
+                );
+                None
             }
         }
         None => None,
@@ -27753,7 +27770,7 @@ fn log_engine_dispatch(
         tokens_in: 0,
         tokens_out: 0,
         duration_ms: started.elapsed().as_millis() as u64,
-        exit_code: if landed { 0 } else { 1 },
+        exit_code: i32::from(!landed),
         error: None,
         phase: None,
         phase_degraded: false,
@@ -28363,7 +28380,9 @@ fn cmd_internal_run_headless(
                             retried_fallback = true;
                         }
                         Err(e) => {
-                            eprintln!("flywheel: profile fallback run {next_profile} failed: {e:#}")
+                            eprintln!(
+                                "flywheel: profile fallback run {next_profile} failed: {e:#}"
+                            );
                         }
                     }
                 }
@@ -28680,7 +28699,7 @@ mod spawn_drain_gate_tests {
     #[test]
     fn headless_spawn_gate_rejects_flat_spawn_step() {
         let wf = parse(
-            r##"
+            r#"
 name: gate-flat
 trigger:
   type: webhook
@@ -28689,7 +28708,7 @@ steps:
     action: spawn
     profile: "@housekeeper"
     await: false
-"##,
+"#,
         );
         let err = headless_spawn_gate(&wf).unwrap_err();
         assert!(err.to_string().contains("job"), "{err}");
@@ -28704,7 +28723,7 @@ steps:
     #[test]
     fn headless_spawn_gate_walks_nested_steps() {
         let wf = parse(
-            r##"
+            r#"
 name: gate-nested
 trigger:
   type: webhook
@@ -28717,7 +28736,7 @@ steps:
         action: spawn
         profile: "@coder"
         await: true
-"##,
+"#,
         );
         let err = headless_spawn_gate(&wf).unwrap_err();
         assert!(err.to_string().contains("inner-job"), "{err}");
@@ -28727,7 +28746,7 @@ steps:
     #[test]
     fn headless_spawn_gate_passes_spawn_free_workflow() {
         let wf = parse(
-            r##"
+            r#"
 name: gate-clean
 trigger:
   type: webhook
@@ -28736,7 +28755,7 @@ steps:
     action: send_dm
     to: operator
     body: "hi"
-"##,
+"#,
         );
         headless_spawn_gate(&wf).expect("no spawn -> pass");
     }
@@ -28782,12 +28801,11 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
         "agent": key_name, "mail_identity": identity, "unread": 0, "urgent": 0,
         "last_from": null, "last_subject": null, "thread_id": null,
     });
-    let mail = match backend::mail_backend(cfg) {
-        Ok(m) => m,
-        Err(_) => {
-            print_json(&zero);
-            return Ok(());
-        }
+    let mail = if let Ok(m) = backend::mail_backend(cfg) {
+        m
+    } else {
+        print_json(&zero);
+        return Ok(());
     };
     let key = project_dir_str(cfg, project)?;
     if backend::run_mail(mail.ensure_project(&key)).is_err() {
@@ -28816,7 +28834,7 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
     // (limit 10) with bodies (the S8.2 dedup keys on body) and report
     // `recent` + the wake-filtered `urgent` (importance high|urgent; read
     // rows and executed assigns filtered — bd-dbre).
-    let v = match backend::run_mail(mail.inbox(&backend::InboxQuery {
+    let v = if let Ok(v) = backend::run_mail(mail.inbox(&backend::InboxQuery {
         project: key,
         agent: identity.clone(),
         unread_only: false,
@@ -28826,11 +28844,10 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
         since_ts: None,
         thread_id: None,
     })) {
-        Ok(v) => v,
-        Err(_) => {
-            print_json(&zero);
-            return Ok(());
-        }
+        v
+    } else {
+        print_json(&zero);
+        return Ok(());
     };
     let v_json = serde_json::to_value(&v).unwrap_or_default();
     let arr = v_json.as_array().cloned().unwrap_or_default();
@@ -28895,7 +28912,7 @@ fn plane_s_open_jobs_for(project: &str, identity: &str) -> usize {
     };
     serde_json::from_slice::<serde_json::Value>(&out.stdout)
         .ok()
-        .and_then(|v| v.as_array().map(|a| a.len()))
+        .and_then(|v| v.as_array().map(std::vec::Vec::len))
         .unwrap_or(0)
 }
 
@@ -29002,12 +29019,11 @@ fn cmd_internal_dispatch_guard(cfg: &Config, project: &str, bead: &str) -> Resul
 /// digest leaf's resilience: verification failures degrade, never abort.
 fn cmd_internal_check_reply(cfg: &Config, project: &str, name: &str, thread: &str) -> Result<()> {
     let zero = json!({ "newest_id": null, "author": null });
-    let mail = match backend::mail_backend(cfg) {
-        Ok(m) => m,
-        Err(_) => {
-            print_json(&zero);
-            return Ok(());
-        }
+    let mail = if let Ok(m) = backend::mail_backend(cfg) {
+        m
+    } else {
+        print_json(&zero);
+        return Ok(());
     };
     let key = project_dir_str(cfg, project)?;
     if backend::run_mail(mail.ensure_project(&key)).is_err() {
@@ -29083,6 +29099,7 @@ fn cmd_internal_remind_reply(
 /// Extract `[compose-request]` items from a `fetch_inbox` JSON value
 /// (ADR-0022 §3.7 T4, W7) — same envelope as xproj items, subject-prefix
 /// filter `[compose-request]`. Pure + unit-tested.
+#[must_use]
 pub fn extract_compose_requests_from_inbox(v: &serde_json::Value) -> Vec<XprojInboxItem> {
     let arr = v
         .as_array()
@@ -29140,6 +29157,7 @@ pub fn extract_compose_requests_from_inbox(v: &serde_json::Value) -> Vec<XprojIn
 /// allowlist.toml` — `senders = ["Pin", ...]`. Missing file = empty list =
 /// every request denied (deny is the default; the gate never dispatches on
 /// an unconfigured project).
+#[must_use]
 pub fn load_compose_allowlist(project_root: &Path) -> Vec<String> {
     #[derive(Deserialize)]
     struct Allowlist {
@@ -29157,12 +29175,11 @@ pub fn load_compose_allowlist(project_root: &Path) -> Vec<String> {
 fn cmd_internal_compose_inbox(cfg: &Config, project: &str, limit: u32) -> Result<()> {
     // W7 leaf: [compose-request] rows + the allowlist, resolved in the
     // subprocess (checkpoint-safe); the loop applies the pure gates.
-    let mail = match backend::mail_backend(cfg) {
-        Ok(m) => m,
-        Err(_) => {
-            print_json(&json!({ "items": [], "allowlist": [] }));
-            return Ok(());
-        }
+    let mail = if let Ok(m) = backend::mail_backend(cfg) {
+        m
+    } else {
+        print_json(&json!({ "items": [], "allowlist": [] }));
+        return Ok(());
     };
     let key = project_dir_str(cfg, project)?;
     if backend::run_mail(mail.ensure_project(&key)).is_err() {
@@ -29196,12 +29213,11 @@ fn cmd_internal_compose_inbox(cfg: &Config, project: &str, limit: u32) -> Result
 
 fn cmd_internal_xproj_inbox(cfg: &Config, project: &str, limit: u32) -> Result<()> {
     // review-fix F6: the xproj-inbox leaf routes through the backend factory.
-    let mail = match backend::mail_backend(cfg) {
-        Ok(m) => m,
-        Err(_) => {
-            print_json(&json!({ "items": [] }));
-            return Ok(());
-        }
+    let mail = if let Ok(m) = backend::mail_backend(cfg) {
+        m
+    } else {
+        print_json(&json!({ "items": [] }));
+        return Ok(());
     };
     let key = project_dir_str(cfg, project)?;
     if backend::run_mail(mail.ensure_project(&key)).is_err() {
@@ -29237,12 +29253,11 @@ fn cmd_internal_xproj_inbox(cfg: &Config, project: &str, limit: u32) -> Result<(
 /// xproj scan — bodies included, orchestrator's own identity — filtered to
 /// the exact saturation marker by [`extract_context_limit_from_inbox`].
 fn cmd_internal_context_inbox(cfg: &Config, project: &str, limit: u32) -> Result<()> {
-    let mail = match backend::mail_backend(cfg) {
-        Ok(m) => m,
-        Err(_) => {
-            print_json(&json!({ "items": [] }));
-            return Ok(());
-        }
+    let mail = if let Ok(m) = backend::mail_backend(cfg) {
+        m
+    } else {
+        print_json(&json!({ "items": [] }));
+        return Ok(());
     };
     let key = project_dir_str(cfg, project)?;
     if backend::run_mail(mail.ensure_project(&key)).is_err() {
@@ -29315,7 +29330,7 @@ fn cmd_internal_xproj_spawn(
     let spawned_ok = outcome.is_ok();
     // reply in the request thread (best-effort; mail down must not kill the loop)
     let reply = match outcome {
-        Ok(_) => format!(
+        Ok(()) => format!(
             "[xproj] swarm started: recipe={recipe}, {workers} worker(s) in project {project} (msg {message_id}). Reply thread: {thread_id}."
         ),
         Err(e) => format!(
@@ -29592,19 +29607,16 @@ fn cmd_internal_mail_done(cfg: &Config, project: &str, bead_id: &str) -> Result<
     // project (the "bangedorrunt" class is a username, not a pin).
     let captain = if mail_whois_ok(&*mail, &key, &created_by) {
         created_by
+    } else if let Some(name) = registered_orchestrator(&*mail, &key) {
+        name
     } else {
-        match registered_orchestrator(&*mail, &key) {
-            Some(name) => name,
-            None => {
-                print_json(&json!({
-                    "ok": false,
-                    "bead_id": bead_id,
-                    "notified": created_by,
-                    "error": format!("no routable captain identity for {key} (created_by {created_by} unregistered)")
-                }));
-                return Ok(());
-            }
-        }
+        print_json(&json!({
+            "ok": false,
+            "bead_id": bead_id,
+            "notified": created_by,
+            "error": format!("no routable captain identity for {key} (created_by {created_by} unregistered)")
+        }));
+        return Ok(());
     };
     let out = (|| -> Result<backend::SendReceipt> {
         backend::run_mail(mail.ensure_project(&key)).map_err(|e| anyhow!("{e}"))?;
@@ -29796,7 +29808,7 @@ fn cmd_internal_verify_dispatch(
     opts: VerifyDispatchOpts,
 ) -> Result<()> {
     let key = match opts.dir {
-        Some(ref p) => p.to_path_buf(),
+        Some(ref p) => p.clone(),
         None => PathBuf::from(project_dir_str(cfg, project)?),
     };
     let mut bead = match verdict::bead_from_br_show(&key, bead_id) {
@@ -30713,6 +30725,7 @@ fn cmd_internal_release_bead_locks(cfg: &Config, project: &str, bead_id: &str) -
 /// Reasons are the bead id verbatim (`bd-oj9o`) or free text; only
 /// `bd-<id>`-shaped reasons are treated as bead refs (bd-evqs — the sweep
 /// must never guess that an arbitrary reason is a bead).
+#[must_use]
 pub fn bead_id_from_reason(reason: &str) -> Option<&str> {
     let t = reason.trim();
     let id = t.split_whitespace().next().unwrap_or(t);
@@ -31600,7 +31613,7 @@ mod headless_retry_tests {
             },
             model: String::new(),
             duration_ms: 0,
-            exit_code: if err.is_some() { 1 } else { 0 },
+            exit_code: i32::from(err.is_some()),
             error: err.map(str::to_string),
         }
     }
@@ -32319,7 +32332,7 @@ mod workflow_cli_lint_tests {
     #[test]
     fn lint_rejects_unresolved_profile() {
         let wf = parse_workflow(
-            r##"
+            r#"
 name: t
 trigger:
   type: webhook
@@ -32330,7 +32343,7 @@ steps:
     action: dispatch_job
     assignee: x
     spec: { profile: "@doesnotexist" }
-"##,
+"#,
         )
         .expect("parse");
         let blocking = lint_flywheel_tier("t", &wf);
@@ -32341,7 +32354,7 @@ steps:
     #[test]
     fn lint_rejects_unresolved_stage() {
         let wf = parse_workflow(
-            r##"
+            r#"
 name: t
 trigger:
   type: webhook
@@ -32352,7 +32365,7 @@ steps:
     action: dispatch_job
     assignee: x
     spec: { profile: "@planner", stage: "not-a-real-stage" }
-"##,
+"#,
         )
         .expect("parse");
         let blocking = lint_flywheel_tier("t", &wf);
@@ -32363,7 +32376,7 @@ steps:
     #[test]
     fn lint_rejects_undeclared_input_ref() {
         let wf = parse_workflow(
-            r##"
+            r#"
 name: t
 trigger:
   type: webhook
@@ -32374,7 +32387,7 @@ steps:
     action: send_dm
     to: x
     body: "{{inputs.ghost}}"
-"##,
+"#,
         )
         .expect("parse");
         let blocking = lint_flywheel_tier("t", &wf);
@@ -32390,7 +32403,7 @@ steps:
     #[test]
     fn lint_accepts_nested_ref_into_declared_object_input() {
         let wf = parse_workflow(
-            r##"
+            r#"
 name: t
 trigger:
   type: webhook
@@ -32401,7 +32414,7 @@ steps:
     action: send_dm
     to: x
     body: "{{inputs.bundle.run_id}} {{inputs.bundle.workflow}}"
-"##,
+"#,
         )
         .expect("parse");
         let blocking = lint_flywheel_tier("t", &wf);
@@ -32412,7 +32425,7 @@ steps:
     #[test]
     fn lint_clean_workflow_passes() {
         let wf = parse_workflow(
-            r##"
+            r#"
 name: t
 trigger:
   type: webhook
@@ -32423,7 +32436,7 @@ steps:
     action: dispatch_job
     assignee: x
     spec: { profile: "@planner", stage: "ce-execute" }
-"##,
+"#,
         )
         .expect("parse");
         let blocking = lint_flywheel_tier("t", &wf);
@@ -33385,9 +33398,7 @@ steps:
                 if let Some(id) = ids.first().cloned() {
                     break id;
                 }
-                if tries > 20 {
-                    panic!("approval promise never appeared");
-                }
+                assert!(tries <= 20, "approval promise never appeared");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 tries += 1;
             }
@@ -33428,9 +33439,7 @@ steps:
                 if let Some(id) = ids.first().cloned() {
                     break id;
                 }
-                if tries > 20 {
-                    panic!("approval promise never appeared");
-                }
+                assert!(tries <= 20, "approval promise never appeared");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 tries += 1;
             }
@@ -33797,7 +33806,7 @@ mod journal_effect_tests {
             effect
                 .get("injected")
                 .and_then(|v| v.as_array())
-                .map(|a| a.len()),
+                .map(std::vec::Vec::len),
             Some(1),
             "one pin injected, got {effect}"
         );

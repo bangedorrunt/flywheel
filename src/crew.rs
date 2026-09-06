@@ -149,28 +149,16 @@ pub enum ComposePart {
     CallWorkflow { name: String },
     /// `each:<over>:<part>` → foreach sub-runs, one per list item
     /// (`over` is a template ref to the list). ADR-0022 §3.6 T1.
-    Each {
-        over: String,
-        inner: Box<ComposePart>,
-    },
+    Each { over: String, inner: Box<Self> },
     /// `when:<guard>:<part>` → a branch running the part as the single
     /// `then` step when the guard holds. ADR-0022 §3.6 T1.
-    When {
-        guard: String,
-        inner: Box<ComposePart>,
-    },
+    When { guard: String, inner: Box<Self> },
     /// `retry(n):<part>` → bounded retries (n ≥ 1) around the part.
     /// ADR-0022 §3.6 T1.
-    Retry {
-        max_attempts: u32,
-        inner: Box<ComposePart>,
-    },
+    Retry { max_attempts: u32, inner: Box<Self> },
     /// `parallel:<over>:<part>` → elastic fan-out across N copies or a
     /// crew role (`@crew.<role>`). ADR-0022 §3.6 T1.
-    Parallel {
-        over: String,
-        inner: Box<ComposePart>,
-    },
+    Parallel { over: String, inner: Box<Self> },
     /// ADR-0006 D3 + ADR-0008 §6.7: a compose token (`wave-swarm`,
     /// `repair-until-verified`, `beads-lifecycle`) → its compiled-in
     /// multi-phase steps, expanded where the token sits.
@@ -575,7 +563,7 @@ pub fn enforce_budget_caps(workflow: &Workflow) -> Result<()> {
         match action {
             Action::DispatchJob { .. } | Action::CallWorkflow { .. } => *dispatches += 1,
             Action::Parallel { each, .. } | Action::Foreach { each, .. } => {
-                walk(&each.action, depth + 1, dispatches, max_depth)
+                walk(&each.action, depth + 1, dispatches, max_depth);
             }
             Action::Retry { step, .. } => walk(&step.action, depth + 1, dispatches, max_depth),
             Action::Branch {
@@ -758,7 +746,7 @@ pub fn render_dry_run(
                     resolver,
                     depth,
                     out,
-                )
+                );
             }
             Action::Foreach { over, each } => {
                 let f = fanout_of(over, plan);
@@ -772,7 +760,7 @@ pub fn render_dry_run(
                     resolver,
                     depth,
                     out,
-                )
+                );
             }
             Action::Retry { step, .. } => collect_action(
                 name,
@@ -1132,7 +1120,7 @@ mod tests {
     #[test]
     fn crew_auto_infers_from_profile_refs() {
         let wf = parse_workflow(
-            r##"
+            r#"
 name: debate
 trigger:
   type: webhook
@@ -1150,7 +1138,7 @@ steps:
     action: dispatch_job
     assignee: x
     spec: { profile: "@oracle" }
-"##,
+"#,
         )
         .expect("parse");
         let plan = plan_crew(&wf);
@@ -1166,7 +1154,7 @@ steps:
     #[test]
     fn crew_auto_recurses_into_call_workflow_targets() {
         let wf = parse_workflow(
-            r##"
+            r#"
 name: goal-direct
 trigger:
   type: webhook
@@ -1179,13 +1167,13 @@ steps:
     action: dispatch_job
     assignee: x
     spec: { profile: "@coder" }
-"##,
+"#,
         )
         .expect("parse");
         let resolve = |sub: &str| match sub {
             "brainstorm" => Some(
                 parse_workflow(
-                    r##"
+                    r#"
 name: brainstorm
 trigger: { type: webhook }
 crew: auto
@@ -1198,7 +1186,7 @@ steps:
     action: dispatch_job
     assignee: x
     spec: { profile: "@planner" }
-"##,
+"#,
                 )
                 .expect("sub"),
             ),
@@ -1225,7 +1213,7 @@ steps:
     #[test]
     fn crew_auto_cycle_guard_terminates() {
         let wf = parse_workflow(
-            r##"
+            r"
 name: a
 trigger: { type: webhook }
 crew: auto
@@ -1233,11 +1221,11 @@ steps:
   - name: self
     action: call_workflow
     workflow: b
-"##,
+",
         )
         .expect("parse");
         let b = parse_workflow(
-            r##"
+            r#"
 name: b
 trigger: { type: webhook }
 crew: auto
@@ -1249,7 +1237,7 @@ steps:
     action: dispatch_job
     assignee: x
     spec: { profile: "@coder" }
-"##,
+"#,
         )
         .expect("b");
         let resolve = |sub: &str| match sub {
@@ -1419,7 +1407,7 @@ steps:
     fn compose_workflow_seeds_from_base() {
         use toron_workflow::schema::Action;
         let base = parse_workflow(
-            r##"
+            r#"
 name: triage
 trigger: { type: webhook }
 crew: auto
@@ -1428,7 +1416,7 @@ steps:
     action: send_dm
     to: operator
     body: "start"
-"##,
+"#,
         )
         .expect("base");
         let parts = vec![ComposePart::Dispatch {
@@ -1598,7 +1586,7 @@ steps:
             );
             match &step.action {
                 Action::Foreach { each, .. } | Action::Parallel { each, .. } => {
-                    assert_eq!(each.on_error, StepOnError::FailRun)
+                    assert_eq!(each.on_error, StepOnError::FailRun);
                 }
                 Action::Branch { then, .. } => assert_eq!(then[0].on_error, StepOnError::FailRun),
                 Action::Retry { step, .. } => assert_eq!(step.on_error, StepOnError::FailRun),
@@ -1869,7 +1857,7 @@ steps:
     fn budget_caps_fail_closed() {
         use toron_workflow::schema::{Action, Step};
         // Over-cap dispatch leaves refuse.
-        let parts: Vec<ComposePart> = (0..MAX_COMPOSED_DISPATCHES as u32 + 1)
+        let parts: Vec<ComposePart> = (0..=(MAX_COMPOSED_DISPATCHES as u32))
             .map(|i| parse_compose_part(&format!("r{i}:stage{i}")).unwrap())
             .collect();
         let wf = compose_workflow("composed-cap", "obj", None, &parts).unwrap();
@@ -1924,7 +1912,7 @@ steps:
     #[test]
     fn dry_run_renders_fanouts_and_phase_tags() {
         let wf = parse_workflow(
-            r##"
+            r#"
 name: ship
 trigger: { type: webhook }
 crew: { coder: 3 }
@@ -1936,7 +1924,7 @@ steps:
       action: dispatch_job
       assignee: x
       spec: { profile: "@coder", stage: systematic-execute, phase: implement }
-"##,
+"#,
         )
         .expect("parse");
         let rendered = render_dry_run(&wf, &|_| None);
@@ -1950,7 +1938,7 @@ steps:
     #[test]
     fn dry_run_keeps_flat_leaf_for_unresolvable_link() {
         let wf = parse_workflow(
-            r##"
+            r"
 name: chain
 trigger: { type: webhook }
 crew: auto
@@ -1958,7 +1946,7 @@ steps:
   - name: hop
     action: call_workflow
     workflow: not-anywhere
-"##,
+",
         )
         .expect("parse");
         let rendered = render_dry_run(&wf, &|_| None);
@@ -1971,7 +1959,7 @@ steps:
     /// empty-bodied workflow refuses (fail closed).
     #[test]
     fn from_yaml_round_trip_full_workflow() {
-        let src = r##"
+        let src = r#"
 name: authored
 description: captain-authored
 trigger: { type: webhook }
@@ -1984,7 +1972,7 @@ steps:
     action: parallel
     over: "@crew.coder"
     each: { action: send_dm, to: x, body: y }
-"##;
+"#;
         let wf = workflow_from_yaml(src).expect("round trip");
         assert_eq!(wf.name, "authored");
         assert_eq!(wf.steps.len(), 2);
@@ -2002,7 +1990,7 @@ steps:
     #[test]
     fn crew_explicit_squad() {
         let wf = parse_workflow(
-            r##"
+            r"
 name: ship
 trigger:
   type: webhook
@@ -2012,7 +2000,7 @@ steps:
     action: send_dm
     to: x
     body: y
-"##,
+",
         )
         .expect("parse");
         let plan = plan_crew(&wf);
@@ -2025,7 +2013,7 @@ steps:
     #[test]
     fn crew_fanout_count_resolves() {
         let wf = parse_workflow(
-            r##"
+            r#"
 name: ship
 trigger:
   type: webhook
@@ -2035,7 +2023,7 @@ steps:
     action: parallel
     over: "@crew.coder"
     each: { action: send_dm, to: x, body: y }
-"##,
+"#,
         )
         .expect("parse");
         let plan = plan_crew(&wf);
@@ -2057,7 +2045,7 @@ steps:
     fn resolve_crew_fanouts_substitutes_crew_refs() {
         use toron_workflow::schema::Action;
         let wf = parse_workflow(
-            r##"
+            r#"
 name: ship
 trigger:
   type: webhook
@@ -2093,7 +2081,7 @@ steps:
         action: parallel
         over: "@crew.ghost"
         each: { action: send_dm, to: x, body: y }
-"##,
+"#,
         )
         .expect("parse");
         let plan = plan_crew(&wf);
@@ -2145,7 +2133,7 @@ steps:
     fn resolve_crew_fanouts_applies_to_graph_nodes() {
         use toron_workflow::schema::Action;
         let wf = parse_workflow(
-            r##"
+            r#"
 name: ship
 trigger:
   type: webhook
@@ -2161,7 +2149,7 @@ graph:
       to: x
       body: done
       needs: [build]
-"##,
+"#,
         )
         .expect("parse");
         let plan = plan_crew(&wf);
@@ -2173,7 +2161,7 @@ graph:
         }
         // A graph WITHOUT the fan-out ref resolves to the same shape.
         let bare = parse_workflow(
-            r##"
+            r#"
 name: ship
 trigger:
   type: webhook
@@ -2184,7 +2172,7 @@ graph:
       action: parallel
       over: "2"
       each: { action: send_dm, to: x, body: y }
-"##,
+"#,
         )
         .expect("parse");
         let r2 = resolve_crew_fanouts(&bare, &plan_crew(&bare));
@@ -2198,7 +2186,7 @@ graph:
     #[test]
     fn no_crew_empty_plan() {
         let wf = parse_workflow(
-            r##"
+            r"
 name: plain
 trigger:
   type: webhook
@@ -2207,7 +2195,7 @@ steps:
     action: send_dm
     to: x
     body: y
-"##,
+",
         )
         .expect("parse");
         let plan = plan_crew(&wf);
@@ -2221,7 +2209,7 @@ steps:
     #[test]
     fn omitted_crew_with_profile_refs_stays_standalone() {
         let wf = parse_workflow(
-            r##"
+            r#"
 name: plain-with-refs
 trigger:
   type: webhook
@@ -2234,7 +2222,7 @@ steps:
     action: dispatch_job
     assignee: x
     spec: { profile: "@oracle" }
-"##,
+"#,
         )
         .expect("parse");
         assert!(wf.crew.is_none(), "fixture has no crew");

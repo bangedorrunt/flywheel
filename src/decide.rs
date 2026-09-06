@@ -819,11 +819,11 @@ impl Archetype {
     /// The tag surfaced in candidate rendering.
     pub fn tag(self) -> &'static str {
         match self {
-            Archetype::ScoutFanout => "scout-fanout",
-            Archetype::VerifyFence => "verify-fence",
-            Archetype::Debate => "debate",
-            Archetype::Hillclimb => "hillclimb",
-            Archetype::Review => "review",
+            Self::ScoutFanout => "scout-fanout",
+            Self::VerifyFence => "verify-fence",
+            Self::Debate => "debate",
+            Self::Hillclimb => "hillclimb",
+            Self::Review => "review",
         }
     }
 
@@ -831,11 +831,11 @@ impl Archetype {
     /// W6's affinity resolution dispatches each to its default role).
     pub fn default_parts(self) -> &'static [&'static str] {
         match self {
-            Archetype::ScoutFanout => &["fresh-eyes-explore"],
-            Archetype::VerifyFence => &["repro-baseline", "tdd-red", "minimal-fix", "prove-verify"],
-            Archetype::Debate => &["judge-arms"],
-            Archetype::Hillclimb => &["baseline-measure", "measure-keep-or-discard"],
-            Archetype::Review => &["code-review"],
+            Self::ScoutFanout => &["fresh-eyes-explore"],
+            Self::VerifyFence => &["repro-baseline", "tdd-red", "minimal-fix", "prove-verify"],
+            Self::Debate => &["judge-arms"],
+            Self::Hillclimb => &["baseline-measure", "measure-keep-or-discard"],
+            Self::Review => &["code-review"],
         }
     }
 
@@ -851,12 +851,12 @@ impl Archetype {
                 "two approaches",
             ],
         ) {
-            Archetype::Debate
+            Self::Debate
         } else if has(
             &t,
             &["hillclimb", "keep-or-discard", "measure against baseline"],
         ) {
-            Archetype::Hillclimb
+            Self::Hillclimb
         } else if has(
             &t,
             &[
@@ -869,11 +869,11 @@ impl Archetype {
                 "failing test",
             ],
         ) {
-            Archetype::VerifyFence
+            Self::VerifyFence
         } else if has(&t, &["review", "audit", "fresh eyes", "code check"]) {
-            Archetype::Review
+            Self::Review
         } else {
-            Archetype::ScoutFanout
+            Self::ScoutFanout
         }
     }
 }
@@ -936,7 +936,7 @@ pub fn coverage_report(goal: &str, catalog: &[CatalogEntry]) -> CoverageReport {
                 archetype
                     .default_parts()
                     .iter()
-                    .map(|s| s.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect(),
             )
         },

@@ -606,7 +606,7 @@ pub fn fanout_now(
 
 /// Pins this dispatcher owns. Live kind-9 `p` tags are **npub hex**, not
 /// the pin; jobs use `assignee=<pin>`. Resolve both to a pin.
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SelfIndex {
     pins: BTreeMap<String, String>,
     npubs: BTreeMap<String, String>,
@@ -794,20 +794,22 @@ pub fn watch_pubkey(line: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     v.get("pubkey")
         .and_then(|p| p.as_str())
-        .map(|s| s.to_lowercase())
+        .map(str::to_lowercase)
 }
 
 /// Event id on a watch NDJSON line (gap 17 trust: hint carries proof).
 pub fn watch_id(line: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    v.get("id").and_then(|p| p.as_str()).map(|s| s.to_string())
+    v.get("id")
+        .and_then(|p| p.as_str())
+        .map(std::string::ToString::to_string)
 }
 
 /// `created_at` unix secs on a watch NDJSON line (gap 1 fix: plane-S cursor).
 #[allow(dead_code)]
 pub fn watch_created_at(line: &str) -> Option<u64> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    v.get("created_at").and_then(|c| c.as_u64())
+    v.get("created_at").and_then(serde_json::Value::as_u64)
 }
 
 /// `dispatcher: up|down` plus watcher generation (bd-stale-doorbell-wake-0fic)
@@ -996,7 +998,7 @@ pub fn watch_targets(line: &str, index: &SelfIndex) -> Vec<String> {
             }
         }
     }
-    if v.get("kind").and_then(|k| k.as_u64()) == Some(9)
+    if v.get("kind").and_then(serde_json::Value::as_u64) == Some(9)
         && let Some(content) = v.get("content").and_then(|c| c.as_str())
     {
         for pin in index.pin_names() {
@@ -1031,7 +1033,7 @@ pub fn parse_watch_ndjson(line: &str, index: &SelfIndex) -> Option<(EventClass, 
                 a.first().and_then(|x| x.as_str()) == Some("toron-kind")
                     && matches!(
                         a.get(1).and_then(|x| x.as_str()),
-                        Some("mail-delivered") | Some("ack-sla-expired")
+                        Some("mail-delivered" | "ack-sla-expired")
                     )
             })
             .unwrap_or(false)
@@ -1072,7 +1074,10 @@ fn pull_hint(class: EventClass, channel: Option<&str>) -> String {
 
 /// Classify one `fetch_inbox` row (plane P). Inbox is already pin-scoped.
 pub fn parse_inbox_item(v: &serde_json::Value) -> Option<(EventClass, String)> {
-    if v.get("ack_only").and_then(|x| x.as_bool()).unwrap_or(false) {
+    if v.get("ack_only")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
         return None;
     }
     let tags = v.get("tags").and_then(|t| t.as_array());
@@ -1352,7 +1357,7 @@ pub fn journal_read_all(state_dir: &Path) -> Vec<(String, serde_json::Value)> {
         return Vec::new();
     };
     let mut paths: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.path())
         .filter(|p| {
             p.file_name()

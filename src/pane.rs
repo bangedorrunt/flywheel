@@ -77,7 +77,7 @@ fn write_dispatch_artifact(
         crate::artifact::GroundingStatus::Cited,
         crate::artifact::ClaimSupportStatus::WorkerAsserted,
         None,
-        bead_id.map(|s| s.to_string()),
+        bead_id.map(std::string::ToString::to_string),
         run_id.to_string(),
         Some(node_id.to_string()),
         pin.to_string(),
@@ -781,7 +781,9 @@ pub fn spawn_launch_plan(
         Some(ph) => headless::phase_launch_args(&harness, ph).1,
         None => false,
     };
-    let context = spec["context"].as_str().map(|s| s.to_string());
+    let context = spec["context"]
+        .as_str()
+        .map(std::string::ToString::to_string);
     Ok(SpawnJobLaunch {
         promise_id: promise_id.to_string(),
         profile,
@@ -1105,7 +1107,7 @@ pub fn local_engine(
 /// 127.0.0.1, NOT localhost: the host serve binds IPv4 while `localhost`
 /// resolves ::1-first here, so a naive probe silently demotes every run to
 /// the embedded in-memory store (observed live).
-pub(crate) fn cli_engine_store_url() -> Option<String> {
+pub fn cli_engine_store_url() -> Option<String> {
     if let Ok(pin) = std::env::var("RESONATE_URL")
         && !pin.trim().is_empty()
     {
@@ -1226,7 +1228,7 @@ pub fn start_approval_drainer(
                                             .resolve_approval(promise_id, &decision)
                                             .await
                                         {
-                                            Ok(_) => {
+                                            Ok(()) => {
                                                 eprintln!(
                                                     "flywheel: approval resolved: promise {} -> {} (from {sender})",
                                                     promise_id, outcome
@@ -1562,7 +1564,7 @@ mod tests {
 
     fn spawn_workflow(await_job: bool) -> toron_workflow::Workflow {
         toron_workflow::parse_workflow(&format!(
-            r##"
+            r#"
 name: spawn-drain-test
 trigger:
   type: webhook
@@ -1572,7 +1574,7 @@ steps:
     profile: "@housekeeper"
     workflow: weekly-upgrade
     await: {await_job}
-"##
+"#
         ))
         .expect("parse spawn workflow")
     }

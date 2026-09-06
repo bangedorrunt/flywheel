@@ -36,15 +36,15 @@ impl fmt::Display for FailureKind {
 
 #[allow(dead_code)]
 impl FailureKind {
-    pub const ALL: [FailureKind; 8] = [
-        FailureKind::Auth,
-        FailureKind::RateLimit,
-        FailureKind::Timeout,
-        FailureKind::Blocked,
-        FailureKind::Provider,
-        FailureKind::Cancelled,
-        FailureKind::Unknown,
-        FailureKind::Billing,
+    pub const ALL: [Self; 8] = [
+        Self::Auth,
+        Self::RateLimit,
+        Self::Timeout,
+        Self::Blocked,
+        Self::Provider,
+        Self::Cancelled,
+        Self::Unknown,
+        Self::Billing,
     ];
     pub fn variant_name(&self) -> &'static str {
         match self {
@@ -196,7 +196,10 @@ mod tests {
     use super::*;
     #[test]
     fn failure_kind_variant_spelling_frozen() {
-        let names: Vec<&str> = FailureKind::ALL.iter().map(|k| k.variant_name()).collect();
+        let names: Vec<&str> = FailureKind::ALL
+            .iter()
+            .map(super::FailureKind::variant_name)
+            .collect();
         assert_eq!(
             names,
             vec![

@@ -15,7 +15,7 @@
 /// One contract evaluation: phase, pass/fail, and the named evidence
 /// (what was checked and what was missing — one line, citable in gate
 /// events and the runs board).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhaseContractReport {
     pub phase: &'static str,
     pub ok: bool,

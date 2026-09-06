@@ -393,7 +393,7 @@ impl MailSurface for ToronMailBackend {
 
     async fn health(&self) -> Result<toron_core::mailbox::infra::HealthReport, MailError> {
         let mail = self.mail.clone();
-        let v = run_facade(mail, |m| m.health()).await?;
+        let v = run_facade(mail, super::super::mail_shim::Mail::health).await?;
         into_typed(v, "health")
     }
 

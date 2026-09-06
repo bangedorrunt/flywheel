@@ -48,7 +48,7 @@ pub use toron_core::backend::types::AgentStatus;
 /// agent's mail PIN (`AGENT_NAME` + `FLYWHEEL_MAIL_AS`) so a spawned agent
 /// boots knowing the identity it is addressed by — same pin the peer
 /// template injects and the loop's `{AGENT_NAME}` substitutes.
-pub(crate) fn herdr_integration_env(
+pub fn herdr_integration_env(
     cfg: &crate::config::Config,
     pin: Option<&str>,
 ) -> std::collections::BTreeMap<String, String> {
@@ -70,9 +70,7 @@ pub(crate) fn herdr_integration_env(
 /// GS-037 P0-4: if `OPENCODE_GO_API_KEY` is set in the process env and
 /// `OPENCODE_API_KEY` is unset (process + pane map), copy the bytes under the
 /// API name into the pane env so opencode-go models authenticate.
-pub(crate) fn apply_opencode_go_api_key_alias(
-    env: &mut std::collections::BTreeMap<String, String>,
-) {
+pub fn apply_opencode_go_api_key_alias(env: &mut std::collections::BTreeMap<String, String>) {
     if env.contains_key("OPENCODE_API_KEY") {
         return;
     }
@@ -95,7 +93,7 @@ pub(crate) fn apply_opencode_go_api_key_alias(
 /// GS-037 P1: herdr `integration.install` fails when parent config dirs are
 /// missing (pi/omp/opencode). Create the documented parent dirs before install
 /// so zero-touch spawn works on a cold box.
-pub(crate) fn ensure_integration_parent_dirs(kind: &str) {
+pub fn ensure_integration_parent_dirs(kind: &str) {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let home = std::path::PathBuf::from(home);
     let dirs: &[&str] = match kind {
@@ -466,7 +464,14 @@ impl HerdrEventKind {
     /// Parse a wire event name. Accepts both namespaces: the 26 snake_case
     /// server events and the 3 dotted subscription events.
     pub fn parse(s: &str) -> Result<Self> {
-        use HerdrEventKind::*;
+        use HerdrEventKind::{
+            LayoutUpdated, PaneAgentDetected, PaneAgentStatusChanged, PaneAgentStatusChangedSub,
+            PaneClosed, PaneCreated, PaneExited, PaneFocused, PaneMoved, PaneOutputChanged,
+            PaneOutputMatched, PaneScrollChanged, PaneUpdated, TabClosed, TabCreated, TabFocused,
+            TabMoved, TabRenamed, WorkspaceClosed, WorkspaceCreated, WorkspaceFocused,
+            WorkspaceMetadataUpdated, WorkspaceMoved, WorkspaceRenamed, WorkspaceReordered,
+            WorkspaceUpdated, WorktreeCreated, WorktreeOpened, WorktreeRemoved,
+        };
         let kind = match s {
             "workspace_created" => WorkspaceCreated,
             "workspace_updated" => WorkspaceUpdated,
@@ -836,40 +841,45 @@ pub enum HerdrEventData {
 impl HerdrEventData {
     /// Deserialize the payload `data` for the given `kind`.
     pub fn from_kind(kind: HerdrEventKind, data: Value) -> Result<Self> {
-        use HerdrEventKind::*;
+        use HerdrEventKind::{
+            LayoutUpdated, PaneAgentDetected, PaneAgentStatusChanged, PaneAgentStatusChangedSub,
+            PaneClosed, PaneCreated, PaneExited, PaneFocused, PaneMoved, PaneOutputChanged,
+            PaneOutputMatched, PaneScrollChanged, PaneUpdated, TabClosed, TabCreated, TabFocused,
+            TabMoved, TabRenamed, WorkspaceClosed, WorkspaceCreated, WorkspaceFocused,
+            WorkspaceMetadataUpdated, WorkspaceMoved, WorkspaceRenamed, WorkspaceReordered,
+            WorkspaceUpdated, WorktreeCreated, WorktreeOpened, WorktreeRemoved,
+        };
         use serde_json::from_value;
         Ok(match kind {
-            WorkspaceCreated => HerdrEventData::WorkspaceCreated(from_value(data)?),
-            WorkspaceUpdated => HerdrEventData::WorkspaceUpdated(from_value(data)?),
-            WorkspaceMetadataUpdated => HerdrEventData::WorkspaceMetadataUpdated(from_value(data)?),
-            WorkspaceClosed => HerdrEventData::WorkspaceClosed(from_value(data)?),
-            WorkspaceRenamed => HerdrEventData::WorkspaceRenamed(from_value(data)?),
-            WorkspaceMoved => HerdrEventData::WorkspaceMoved(from_value(data)?),
-            WorkspaceReordered => HerdrEventData::WorkspaceReordered(from_value(data)?),
-            WorkspaceFocused => HerdrEventData::WorkspaceFocused(from_value(data)?),
-            WorktreeCreated => HerdrEventData::WorktreeCreated(from_value(data)?),
-            WorktreeOpened => HerdrEventData::WorktreeOpened(from_value(data)?),
-            WorktreeRemoved => HerdrEventData::WorktreeRemoved(from_value(data)?),
-            TabCreated => HerdrEventData::TabCreated(from_value(data)?),
-            TabClosed => HerdrEventData::TabClosed(from_value(data)?),
-            TabRenamed => HerdrEventData::TabRenamed(from_value(data)?),
-            TabMoved => HerdrEventData::TabMoved(from_value(data)?),
-            TabFocused => HerdrEventData::TabFocused(from_value(data)?),
-            PaneCreated => HerdrEventData::PaneCreated(from_value(data)?),
-            PaneClosed => HerdrEventData::PaneClosed(from_value(data)?),
-            PaneUpdated => HerdrEventData::PaneUpdated(from_value(data)?),
-            PaneFocused => HerdrEventData::PaneFocused(from_value(data)?),
-            PaneMoved => HerdrEventData::PaneMoved(from_value(data)?),
-            PaneOutputChanged => HerdrEventData::PaneOutputChanged(from_value(data)?),
-            PaneExited => HerdrEventData::PaneExited(from_value(data)?),
-            PaneAgentDetected => HerdrEventData::PaneAgentDetected(from_value(data)?),
-            PaneAgentStatusChanged => HerdrEventData::PaneAgentStatusChanged(from_value(data)?),
-            LayoutUpdated => HerdrEventData::LayoutUpdated(from_value(data)?),
-            PaneAgentStatusChangedSub => {
-                HerdrEventData::PaneAgentStatusChangedSub(from_value(data)?)
-            }
-            PaneOutputMatched => HerdrEventData::PaneOutputMatched(from_value(data)?),
-            PaneScrollChanged => HerdrEventData::PaneScrollChanged(from_value(data)?),
+            WorkspaceCreated => Self::WorkspaceCreated(from_value(data)?),
+            WorkspaceUpdated => Self::WorkspaceUpdated(from_value(data)?),
+            WorkspaceMetadataUpdated => Self::WorkspaceMetadataUpdated(from_value(data)?),
+            WorkspaceClosed => Self::WorkspaceClosed(from_value(data)?),
+            WorkspaceRenamed => Self::WorkspaceRenamed(from_value(data)?),
+            WorkspaceMoved => Self::WorkspaceMoved(from_value(data)?),
+            WorkspaceReordered => Self::WorkspaceReordered(from_value(data)?),
+            WorkspaceFocused => Self::WorkspaceFocused(from_value(data)?),
+            WorktreeCreated => Self::WorktreeCreated(from_value(data)?),
+            WorktreeOpened => Self::WorktreeOpened(from_value(data)?),
+            WorktreeRemoved => Self::WorktreeRemoved(from_value(data)?),
+            TabCreated => Self::TabCreated(from_value(data)?),
+            TabClosed => Self::TabClosed(from_value(data)?),
+            TabRenamed => Self::TabRenamed(from_value(data)?),
+            TabMoved => Self::TabMoved(from_value(data)?),
+            TabFocused => Self::TabFocused(from_value(data)?),
+            PaneCreated => Self::PaneCreated(from_value(data)?),
+            PaneClosed => Self::PaneClosed(from_value(data)?),
+            PaneUpdated => Self::PaneUpdated(from_value(data)?),
+            PaneFocused => Self::PaneFocused(from_value(data)?),
+            PaneMoved => Self::PaneMoved(from_value(data)?),
+            PaneOutputChanged => Self::PaneOutputChanged(from_value(data)?),
+            PaneExited => Self::PaneExited(from_value(data)?),
+            PaneAgentDetected => Self::PaneAgentDetected(from_value(data)?),
+            PaneAgentStatusChanged => Self::PaneAgentStatusChanged(from_value(data)?),
+            LayoutUpdated => Self::LayoutUpdated(from_value(data)?),
+            PaneAgentStatusChangedSub => Self::PaneAgentStatusChangedSub(from_value(data)?),
+            PaneOutputMatched => Self::PaneOutputMatched(from_value(data)?),
+            PaneScrollChanged => Self::PaneScrollChanged(from_value(data)?),
         })
     }
 }
@@ -1902,41 +1912,38 @@ pub fn read_session_log(
             db.display()
         );
     }
-    let (sid, meta): (String, Value) = match session_id {
-        Some(sid) => {
-            let rows = sqlite_json(
-                &db,
-                &format!(
-                    "SELECT id, title, agent, model, time_updated FROM session WHERE id='{}'",
-                    sq(sid)
-                ),
-            )?;
-            let arr = rows.as_array().cloned().unwrap_or_default();
-            if arr.is_empty() {
-                bail!("no opencode session {sid}");
-            }
-            (sid.to_string(), Value::Array(arr))
+    let (sid, meta): (String, Value) = if let Some(sid) = session_id {
+        let rows = sqlite_json(
+            &db,
+            &format!(
+                "SELECT id, title, agent, model, time_updated FROM session WHERE id='{}'",
+                sq(sid)
+            ),
+        )?;
+        let arr = rows.as_array().cloned().unwrap_or_default();
+        if arr.is_empty() {
+            bail!("no opencode session {sid}");
         }
-        None => {
-            let agent_clause = role
-                .map(|r| format!(" AND agent='{}'", sq(r)))
-                .unwrap_or_default();
-            let sql = format!(
-                "SELECT id, title, agent, model, time_updated FROM session \
-                 WHERE directory='{}'{agent_clause} ORDER BY time_updated DESC LIMIT 1",
-                sq(project_dir)
+        (sid.to_string(), Value::Array(arr))
+    } else {
+        let agent_clause = role
+            .map(|r| format!(" AND agent='{}'", sq(r)))
+            .unwrap_or_default();
+        let sql = format!(
+            "SELECT id, title, agent, model, time_updated FROM session \
+             WHERE directory='{}'{agent_clause} ORDER BY time_updated DESC LIMIT 1",
+            sq(project_dir)
+        );
+        let rows = sqlite_json(&db, &sql)?;
+        let arr = rows.as_array().cloned().unwrap_or_default();
+        if arr.is_empty() {
+            bail!(
+                "no opencode session for directory {project_dir}{} — run opencode there first",
+                role.map(|r| format!(" (agent {r})")).unwrap_or_default()
             );
-            let rows = sqlite_json(&db, &sql)?;
-            let arr = rows.as_array().cloned().unwrap_or_default();
-            if arr.is_empty() {
-                bail!(
-                    "no opencode session for directory {project_dir}{} — run opencode there first",
-                    role.map(|r| format!(" (agent {r})")).unwrap_or_default()
-                );
-            }
-            let sid = arr[0]["id"].as_str().unwrap_or_default().to_string();
-            (sid, Value::Array(arr))
         }
+        let sid = arr[0]["id"].as_str().unwrap_or_default().to_string();
+        (sid, Value::Array(arr))
     };
     let parts_sql = format!(
         "SELECT data FROM part WHERE session_id='{}' ORDER BY time_created, id LIMIT {}",

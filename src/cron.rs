@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use toron_workflow::schema::{CronScope, CronSpec, Workflow};
 
 /// One registered cron: a schedule bound to a workflow template.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CronEntry {
     /// unique cron name (identifier used by pause/resume/history/status)
     pub name: String,
@@ -91,7 +91,7 @@ impl Crons {
     /// Load from an explicit path (tests use temp dirs).
     pub fn load_from(path: &Path) -> Result<Self> {
         if !path.exists() {
-            return Ok(Crons::default());
+            return Ok(Self::default());
         }
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
@@ -208,9 +208,9 @@ impl CronSource {
     /// The `cron list` source label.
     pub fn label(self) -> &'static str {
         match self {
-            CronSource::Builtin => "builtin",
-            CronSource::Global => "global",
-            CronSource::Project => "project",
+            Self::Builtin => "builtin",
+            Self::Global => "global",
+            Self::Project => "project",
         }
     }
 }
@@ -463,7 +463,10 @@ pub fn next_due(cron_expr: &str, from_ts: i64) -> Option<i64> {
 ///    through too — the parse fails downstream in `next_due`/`upsert`.
 fn normalize_cron(expr: &str) -> String {
     let trimmed = expr.trim();
-    let mut fields: Vec<String> = trimmed.split_whitespace().map(|s| s.to_string()).collect();
+    let mut fields: Vec<String> = trimmed
+        .split_whitespace()
+        .map(std::string::ToString::to_string)
+        .collect();
     if fields.len() == 5 {
         fields.insert(0, "0".to_string());
     }
@@ -1043,7 +1046,7 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
     let manager = RegistryCronManager::load()?;
     let registrations = manager.registrations()?;
     let rows = load_crons(cfg, project)?;
-    if registrations.is_empty() && !rows.iter().any(|r| r.enabled()) {
+    if registrations.is_empty() && !rows.iter().any(CronRow::enabled) {
         bail!("no enabled crons defined (flywheel cron list)");
     }
 
@@ -1196,7 +1199,7 @@ impl CronManager for RegistryCronManager {
             );
         }
         let profiles = crate::profile::ProfileCatalog::load().unwrap_or_default();
-        if !profiles.get(&entry.owner).is_some() {
+        if profiles.get(&entry.owner).is_none() {
             bail!(
                 "owner profile {:?} does not resolve (known: {})",
                 entry.owner,
@@ -1549,7 +1552,7 @@ owner = "housekeeper"
         let pid_tmp = format!(".crons.toml.tmp-{}", std::process::id());
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n == &pid_tmp)
             .collect();
@@ -2091,16 +2094,16 @@ owner = "housekeeper"
         // All five up → pass. The probe surface is the recording runner
         // (dry-run); pane mode dispatches (bd-5qls).
         let engine = toron_workflow::WorkflowEngine::local(recording_runner()).unwrap();
-        let all_up: Vec<u16> = ports.to_vec();
+        let all_up: Vec<u16> = ports.clone();
         let out = engine
             .invoke("gate-all-up", gate_wf(&all_up), json!({}))
             .await
             .expect("gate runs");
         assert!(
-            !out.as_object()
+            out.as_object()
                 .and_then(|o| o.get("status"))
                 .and_then(Value::as_str)
-                .is_some_and(|s| s == "failed"),
+                .is_none_or(|s| s != "failed"),
             "all services up => gate passes: {out}"
         );
 

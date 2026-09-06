@@ -17,7 +17,7 @@
 pub const DESIGN_WORKFLOWS: &[(&str, &str)] = &[
     (
         "docker-upgrade",
-        r##"
+        r#"
 name: docker-upgrade
 description: "Weekly health-gated Docker image upgrade with auto-rollback (saga replacement, ADR-0005 Spec 3)."
 trigger:
@@ -66,11 +66,11 @@ steps:
         action: send_dm
         to: housekeeper
         body: "docker-upgrade FAILED — rolled back to snapshot"
-"##,
+"#,
     ),
     (
         "agent-reach-upgrade",
-        r##"
+        r#"
 name: agent-reach-upgrade
 description: "Weekly agent-reach CLI upgrade + verify (saga replacement, ADR-0005 Spec 3)."
 trigger:
@@ -110,11 +110,11 @@ steps:
         action: call_webhook
         url: "http://127.0.0.1:9/none"
         on_error: fail_run
-"##,
+"#,
     ),
     (
         "housekeeper-diagnose",
-        r##"
+        r#"
 name: housekeeper-diagnose
 description: "Defined fixer (ADR-0005 Spec 3): reads a failure bead bundle and proposes a patch."
 trigger:
@@ -142,7 +142,7 @@ steps:
         action: send_dm
         to: housekeeper
         body: "housekeeper-diagnose could not propose a patch for {{inputs.bundle.workflow}} — human-in-the-loop"
-"##,
+"#,
     ),
 ];
 

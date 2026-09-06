@@ -48,9 +48,13 @@ jobs:
         with:
           repository: bangedorrunt/beads
           path: beads
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned nightly toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
+          # Shared pin with siblings beads + toron (bd-14ea). The action
+          # reads rust-toolchain.toml when `toolchain` is omitted, but the
+          # pin is spelled out so CI breaks loud if the file drifts.
+          toolchain: nightly-2026-08-20
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -102,14 +106,13 @@ jobs:
         with:
           repository: bangedorrunt/beads
           path: beads
-      - name: Install stable toolchain
+      - name: Install pinned nightly toolchain (rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Explicit: overrides rust-toolchain.toml (nightly pin) via
-          # RUSTUP_TOOLCHAIN so every step uses stable + components.
-          # GS-019: without this, cargo resolved nightly WITHOUT clippy
-          # ("cargo-clippy is not installed") and the gate failed.
-          toolchain: stable
+          # Shared pin with siblings beads + toron (bd-14ea). GS-019's
+          # stable-override is retired: the pinned nightly ships rustfmt +
+          # clippy, so the toolchain file resolves directly.
+          toolchain: nightly-2026-08-20
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:

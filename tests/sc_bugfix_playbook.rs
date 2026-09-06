@@ -66,7 +66,9 @@ fn bug_fix_control_flow_orders_repro_tdd_fix_prove() {
             assert_eq!(workflow, "repair-until-verified");
             assert!(inputs.get("verify").is_some(), "verify input");
             assert_eq!(
-                inputs.get("max_iterations").and_then(|v| v.as_u64()),
+                inputs
+                    .get("max_iterations")
+                    .and_then(serde_json::Value::as_u64),
                 Some(3)
             );
         }
@@ -91,7 +93,7 @@ fn bug_fix_lint_gate_rejects_broken_repro_edge() {
 
     // Broken: fix -> tdd, but tdd -> (nothing); repro is a detached node.
     let broken = toron_workflow::schema::parse_workflow(
-        r##"
+        r#"
 name: bug-fix
 description: "broken edge"
 trigger:
@@ -114,7 +116,7 @@ graph:
       assignee: x
       spec: { profile: "@coder", task: "fix" }
       needs: [tdd]
-"##,
+"#,
     )
     .expect("broken parses");
     let report = lint_workflow(&broken);

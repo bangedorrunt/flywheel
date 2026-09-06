@@ -59,7 +59,7 @@ use toron_workflow::schema::{Workflow, parse_workflow};
 pub const BUILTIN_WORKFLOWS_YAML: &[(&str, &str)] = &[
     (
         "phase-resolve",
-        r##"
+        r#"
 name: phase-resolve
 description: "ADR-0022 §3.3 phase built-in (resolve): reduce ambiguity to a goal statement. The resolver posts the statement to the project thread (plane P) and replies with the machine-checkable §4.5 report: target, non_goals, blast_radius, open_questions."
 trigger:
@@ -76,11 +76,11 @@ steps:
       phase: resolve
       task: 'Resolve the objective into a goal statement. 1) Post the statement to the project thread (toron mail, plane P) with subject [resolve]. 2) Reply with ONLY a JSON object: {"target": "<one sentence>", "non_goals": ["..."], "blast_radius": "<files/areas>", "open_questions": []} — every field present; open_questions may be an empty array. Objective: {{inputs.objective}}'
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "phase-plan",
-        r##"
+        r#"
 name: phase-plan
 description: "ADR-0022 §3.3 phase built-in (plan): decompose into verifiable beads. §4.5 contract: ≥1 bead with non-empty acceptance, br-verified dep_cycles=0 (the chain runner injects it; do not self-report)."
 trigger:
@@ -98,11 +98,11 @@ steps:
       phase: plan
       task: 'Decompose the goal into beads (br create) in this repo: every bead carries a non-empty acceptance criteria with a runnable VERIFY command and explicit dependencies; run `br dep cycles --json` and confirm count stays 0. Reply with ONLY a JSON object: {"beads": [{"id": "bd-xxxx", "acceptance": "<command>"}], "dep_cycles_note": "runner verifies"}. Goal: {{inputs.goal}}. Data shape (what exists to work with): {{inputs.data_shape}}'
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "phase-implement",
-        r##"
+        r#"
 name: phase-implement
 description: "ADR-0022 §3.3 phase built-in (implement): build against a bead. §4.5 contract: a commit whose message cites the bead id + the bead's acceptance gate exit 0 with output recorded."
 trigger:
@@ -123,11 +123,11 @@ steps:
       plan: "{{inputs.plan}}"
       task: 'Implement the plan against your bead: commit BEFORE closing with the bead id IN the commit message, then run the bead''s acceptance command. Reply with ONLY a JSON object: {"commit_sha": "<sha>", "commit_message": "<full message>", "gate": {"command": "<acceptance cmd>", "exit": <code>, "output": "<tail>"}}. Goal: {{inputs.goal}}'
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "phase-review",
-        r##"
+        r#"
 name: phase-review
 description: "ADR-0022 §3.3 phase built-in (review): adversarial falsification, n=2 fanout (R-P3). §4.5 contract: findings posted + verdict ∈ {AGREE, AGREE-WITH-CHANGES, REJECT}."
 trigger:
@@ -151,11 +151,11 @@ steps:
         plan: "{{inputs.artifact}}"
         task: 'Adversarially review the artifact for the target: hunt material defects (soundness, complexity, preservation), NOT style. Reply with ONLY a JSON object: {"findings": ["<finding>"], "verdict": "AGREE|AGREE-WITH-CHANGES|REJECT"}. Target: {{inputs.target}}'
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "phase-verify",
-        r##"
+        r#"
 name: phase-verify
 description: "ADR-0022 §3.3 phase built-in (verify): prove the contract by running the named gate. §4.5 contract: gate exit 0 with output recorded."
 trigger:
@@ -173,11 +173,11 @@ steps:
       phase: verify
       task: 'Run the named gate command and record its outcome verbatim. Reply with ONLY a JSON object: {"gate": {"command": "<cmd>", "exit": <code>, "output": "<last lines>"}}. Gate: {{inputs.gate}}. Goal: {{inputs.goal}}'
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "ship",
-        r##"
+        r#"
 name: ship
 description: "ADR-0022 §3.3 chain built-in: resolve → plan → implement → review → verify with the §4.5 completion-contract gates between links. `flywheel workflow run ship --execute` routes through the gated chain runner (phase_chain::run_ship_chain); a plain engine invoke runs the links without gates. crew: auto."
 trigger:
@@ -208,11 +208,11 @@ steps:
     action: call_workflow
     workflow: phase-verify
     inputs: { goal: "{{inputs.objective}}", gate: "{{inputs.gate}}" }
-"##,
+"#,
     ),
     (
         "ce-brainstorm",
-        r##"
+        r#"
 name: ce-brainstorm
 description: "Requirements-first divergent ideation (ADR-0009) — fan out oracles, the planner reduces to a requirements-only artifact via the ce-brainstorm stage."
 trigger:
@@ -232,11 +232,11 @@ graph:
       spec: { profile: "@planner", stage: "ce-brainstorm", task: "Reduce these oracle outputs into ranked options for: {{inputs.question}}\n\nOracle outputs: {{steps.diverge}}" }
       needs: [diverge]
       on_error: fail_run
-"##,
+"#,
     ),
     (
         "ce-plan",
-        r##"
+        r#"
 name: ce-plan
 description: "Goal → bead-ready plan via the ce-plan stage, with an optional approval gate."
 trigger:
@@ -253,11 +253,11 @@ steps:
   - name: gate
     action: request_approval
     message: "Approve plan for {{inputs.goal}}?"
-"##,
+"#,
     ),
     (
         "beads",
-        r##"
+        r#"
 name: beads
 description: Plan → tracker. The planner runs the ce-execute stage.
 trigger:
@@ -271,11 +271,11 @@ steps:
     assignee: x
     spec: { profile: "@planner", stage: "ce-execute", plan: "{{inputs.plan}}" }
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "debate",
-        r##"
+        r#"
 name: debate
 description: Adversarial synthesis — reviewers brief, an oracle decides.
 trigger:
@@ -295,11 +295,11 @@ graph:
       spec: { profile: "@oracle", task: "Adjudicate the briefs and decide on: {{inputs.proposal}}\n\nReviewer briefs: {{steps.briefs}}" }
       needs: [briefs]
       on_error: fail_run
-"##,
+"#,
     ),
     (
         "goal",
-        r##"
+        r#"
 name: goal
 description: The meta-workflow — ce-brainstorm → plan → beads → build → review → ship.
 trigger:
@@ -335,11 +335,11 @@ steps:
     assignee: x
     spec: { profile: "@housekeeper", stage: "commit-and-push", plan: "{{steps.build}}" }
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "goal-direct",
-        r##"
+        r#"
 name: goal-direct
 description: "Captain-free DIRECT arm of goal (bd-t86p) — ce-brainstorm → plan → build → review → ship with NO bead tracking and NO plan approval gate: non-bead targets flow straight to the coder. `flywheel steer \"<target>\" --direct` runs this."
 trigger:
@@ -371,11 +371,11 @@ steps:
     assignee: x
     spec: { profile: "@housekeeper", stage: "commit-and-push", plan: "{{steps.build}}" }
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "plan-direct",
-        r##"
+        r#"
 name: plan-direct
 description: "Goal → execution plan WITHOUT the approval gate (bd-t86p): the captain-free companion to `ce-plan`. The plan gate is the one interactive checkpoint; a steer --direct run must not park on it — the captain already stated the target."
 trigger:
@@ -389,7 +389,7 @@ steps:
     assignee: x
     spec: { profile: "@planner", task: "Decompose this goal into an execution plan (tasks, subtasks, dependency structure) — direct mode, no tracker, no approval: {{inputs.goal}}" }
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "triage",
@@ -413,7 +413,7 @@ steps:
     ),
     (
         "ce-plan-review",
-        r##"
+        r#"
 name: ce-plan-review
 description: Review a plan bead-by-bead before implementation — the ce-plan-review stage.
 trigger:
@@ -427,11 +427,11 @@ steps:
     assignee: x
     spec: { profile: "@reviewer", harness: "opencode", stage: "ce-plan-review", plan: "{{inputs.plan}}" }
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "onboard",
-        r##"
+        r#"
 name: onboard
 description: Cold-start a newcomer — map the repo, seed context, propose the first task.
 trigger:
@@ -450,11 +450,11 @@ steps:
     assignee: x
     spec: { profile: "@planner", stage: "seed-first-task", plan: "{{steps.map}}", project: "{{inputs.project}}" }
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "triage-deep",
-        r##"
+        r#"
 name: triage-deep
 description: "Deep backlog triage — bv robot-triage, prioritize + assign, spawn the crew. NOTE: /triage -> triage-deep is intentional (triage = auto #support trigger; triage-deep = interactive)."
 trigger:
@@ -478,11 +478,11 @@ steps:
     assignee: x
     spec: { profile: "@housekeeper", stage: "spawn-crew", plan: "{{steps.prioritize}}", project: "{{inputs.project}}" }
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "captain-audit",
-        r##"
+        r#"
 name: captain-audit
 description: "Captain audit (bd-wsui) — read-only analysis of a topic within a scope: scout gathers evidence, oracle synthesizes, reviewer challenges. ANALYSIS ONLY: no beads, no repo edits; the final report is written to report_path."
 trigger:
@@ -517,12 +517,12 @@ graph:
         task: "ANALYSIS ONLY — no beads, no repo edits. Challenge the synthesized report: {{steps.synthesize}}. Audit topic: {{inputs.topic}}. Check evidence, gaps, and overclaiming; append your adversarial verdict section to the report at: {{inputs.report_path}}."
       needs: [synthesize]
       on_error: fail_run
-"##,
+"#,
     ),
     // ---- ADR-0009 compound-engineering workflows ----
     (
         "ce-compound",
-        r##"
+        r#"
 name: ce-compound
 description: "ADR-0009 standalone compound gate: capture the durable learning from a verified bead/wave/session into docs/learnings/ — usable from ANY topology (open/loop/swarm). One learning per run; clean_skip is a success."
 trigger:
@@ -545,11 +545,11 @@ steps:
       stage: ce-compound
       task: 'Run the compound gate (ADR-0009) over: bead {{inputs.bead}} {{inputs.source}}. Ground in the commit at HEAD, the steer-channel lessons (lesson: lines), and the receipts under .flywheel/receipts/. Reply with ONLY the terminal JSON. One learning per run.'
     on_error: continue
-"##,
+"#,
     ),
     (
         "ce-sweep",
-        r##"
+        r#"
 name: ce-sweep
 description: "ADR-0009 learnings maintenance sweep (compound-refresh): Keep / Update / Consolidate / Replace / Delete over docs/learnings/ — a learning contradicting standing-orders or AGENTS.md guidance outranks ordinary staleness; resolve by which side the code follows. Cron-able."
 trigger:
@@ -568,11 +568,11 @@ steps:
       profile: "@housekeeper"
       task: 'SWEEP docs/learnings/ (ADR-0009): for EACH entry, classify Keep / Update / Consolidate / Replace / Delete. Evidence per verdict: cited paths still exist, cited SHAs still reachable, guidance-layer contradictions (standing-orders / AGENTS.md / skill) named explicitly — a contradiction resolves by which side current code follows, and a wrong guidance FILE is reported, never edited here. High-overlap pairs become ONE canonical doc (oldest path wins, last_updated stamped). Output a JSON array [{path, verdict, evidence}] and apply the Deletes/Consolidates directly in git (one commit, message cites ce-sweep).'
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "weekly-review",
-        r##"
+        r#"
 name: weekly-review
 description: "Weekly repo review — scout fan-out, oracle synthesis, exactly ONE follow-up bead (bd-m7ac)."
 trigger:
@@ -615,12 +615,12 @@ graph:
     #     inputs: { project: "{{trigger.project}}", run_id: "{{trigger.id}}" }
     #     needs: [oracle]
       needs: [scout-fanout]
-"##,
+"#,
     ),
     // ---- ADR-0019 Spec 7.2 fix-path playbooks (bd-w2-fix-path-7gd5) ----
     (
         "bug-fix",
-        r##"
+        r#"
 name: bug-fix
 description: "Fix-path playbook (ADR-0019 Spec 7.2): repro → repair-until-verified fix loop → independent proof. No fix node without a repro predecessor (lint). ADR-0024 Scenario B: fix path via repair-until-verified."
 trigger:
@@ -660,11 +660,11 @@ graph:
         task: "Independently prove the fix for {{inputs.symptom}} (different model family, ADR-0019 Spec 4). VERIFY from the bead: test green + repro gone. Record unit-test-verified. Do not re-fix."
       needs: [fix]
       on_error: fail_run
-"##,
+"#,
     ),
     (
         "feature",
-        r##"
+        r#"
 name: feature
 description: "Feature playbook (ADR-0019 Spec 7.2): shape the domain type/state machine → TDD build → independent proof. data_shape is REQUIRED."
 trigger:
@@ -701,11 +701,11 @@ steps:
       stage: "prove-verify"
       plan: "Objective: {{inputs.objective}}"
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "refactoring",
-        r##"
+        r#"
 name: refactoring
 description: "Refactoring playbook (ADR-0019 Spec 7.2): baseline invariant → delete first → behavior-preserving reshape → invariant still green, no *V2* files."
 trigger:
@@ -750,12 +750,12 @@ steps:
       stage: "prove-verify"
       plan: "Refactoring of {{inputs.target}}: invariant `{{inputs.invariant_cmd}}` still green AND no *V2*/*_improved*/*_enhanced* files added."
     on_error: fail_run
-"##,
+"#,
     ),
     // ---- ADR-0019 Spec 7.2 measured-improvement playbooks (bd-w2-perf-to27) ----
     (
         "perf",
-        r##"
+        r#"
 name: perf
 description: "Measured-improvement playbook (ADR-0019 Spec 7.2): baseline → ONE change → same-command measure → KEEP (commit) or DISCARD (a revert, never a leftover) via an explicit control-flow branch."
 trigger:
@@ -812,11 +812,11 @@ steps:
           profile: "@scout"
           task: "DISCARD the change: {{inputs.metric}} did not improve (or the budget was missed). DISCARD IS A REVERT — restore the baseline exactly, no leftover."
         on_error: fail_run
-"##,
+"#,
     ),
     (
         "hillclimb",
-        r##"
+        r#"
 name: hillclimb
 description: "Sustained measured-improvement loop (ADR-0019 Spec 7.2): capped retry — each attempt hypothesizes -> applies the smallest change -> measures -> KEEPS (ledger row + ONE commit per accepted win) or DISCARDS (a revert) and retries with a new hypothesis. The retry max_attempts is the iteration cap (max_iters)."
 trigger:
@@ -843,11 +843,11 @@ steps:
         profile: "@coder"
         stage: "measure-keep-or-discard"
         plan: "HILLCLIMB ITERATION (budget {{inputs.max_iters}} attempts; target {{inputs.target}} for {{inputs.metric}}): hypothesize -> apply the SMALLEST change -> measure with the same command. If improved: KEEP — record the ledger row (flywheel ledger / br gate, sha of this iteration's commit) + ONE commit per accepted win, return ok. If NOT improved: DISCARD — discard IS a revert, restore the baseline exactly, then return an ERROR so the loop retries with a new hypothesis. No unrelated work."
-"##,
+"#,
     ),
     (
         "prototype",
-        r##"
+        r#"
 name: prototype
 description: "Exhaust-the-design-space (ADR-0019 Spec 7.2, as amended 2026-08-15 — no /tmp crate-copy): n arms (2-3) prototype the question, an @oracle judge picks ONE. Sketch mode (default): arms run PARALLEL and write NON-COMPILING design sketches — API shapes, state machines, tradeoff table — TEXT ONLY to /tmp/flywheel-proto-<run>-<arm>/; no crate copy, no br, no tracker writes. Compile mode: arms run SEQUENTIALLY (one at a time) in the primary tree on a scratch git ref under the build slot; arm N+1 starts only after arm N is measured and reset. Judge compares on named criteria, picks one, discards the rest; no merge of a bit-of-each unless the oracle writes a graft bead. Principles: exhaust-the-design-space, separate-before-serializing-shared-state."
 trigger:
@@ -893,11 +893,11 @@ graph:
       spec: { profile: "@oracle", harness: "opencode", stage: "judge-arms", plan: "Prototype arms for: {{inputs.question}}" }
       needs: [arms]
       on_error: fail_run
-"##,
+"#,
     ),
     (
         "arena",
-        r##"
+        r#"
 name: arena
 description: "Model race (ADR-0019 Spec 7.2 arena): same shape as prototype but the arms may run the SAME brief on DIFFERENT models — the race is in the models, not the tree. Selection rule declared UP FRONT via the `selection` input: first-pass (pick the first arm that clears the bar) | rank-all (rank every arm) | best-of (pick the best). Sketch arms: parallel, text-only under /tmp/flywheel-proto-<run>-<arm>/; compile arms: SEQUENTIAL on the build slot, one arm at a time on a scratch ref, measure + reset between arms. The @oracle judge keeps the comparison TABLE, not raw dumps (guard-the-context-window). Principles: exhaust-the-design-space, guard-the-context-window."
 trigger:
@@ -944,11 +944,11 @@ graph:
       spec: { profile: "@oracle", harness: "opencode", stage: "judge-arms", plan: "Arena arms for: {{inputs.question}}. SELECTION RULE (declared up front): {{inputs.selection}} — first-pass: pick the first arm that clears the bar; rank-all: rank every arm; best-of: pick the best. Output the comparison TABLE (model per arm, verdict per criterion) — the table, not raw dumps." }
       needs: [arms]
       on_error: fail_run
-"##,
+"#,
     ),
     (
         "interrogate",
-        r##"
+        r#"
 name: interrogate
 description: "Adversarial N-model review (extends debate — 2-brief synthesis vs N-model rubric; both live): N reviewers on DIFFERENT model families, same rubric, READONLY; the parent synthesizes Act-on / Consider / Noted / Dismissed. Does not apply fixes — a follow-up bug-fix or refactoring consumes Act-on."
 trigger:
@@ -982,11 +982,11 @@ graph:
         task: "Synthesize the N reviewer briefs for: {{inputs.target}}. Group every finding into Act-on / Consider / Noted / Dismissed with the supporting evidence. Do not apply changes — the parent routes Act-on into a follow-up playbook. Reviewer briefs: {{steps.briefs}}"
       needs: [briefs]
       on_error: fail_run
-"##,
+"#,
     ),
     (
         "forensics",
-        r##"
+        r#"
 name: forensics
 description: "Diagnosis-only playbook (merged from runtime-forensics + trace-forensics): instrument the live surface or read the artifact; the deliverable is the DIAGNOSIS. Follow-up work is a separate playbook after the captain accepts the diagnosis."
 trigger:
@@ -1007,11 +1007,11 @@ graph:
         profile: "@scout"
         stage: "diagnose-only"
         plan: "Symptom: {{inputs.symptom}}. Artifact: {{inputs.artifact}}"
-"##,
+"#,
     ),
     (
         "babysit-bead",
-        r##"
+        r#"
 name: babysit-bead
 description: "Drive ONE bead to a legal ledger row (ADR-0019 Spec 7.2, pstack babysit without PRs): claim-watch nudge, reservation renew, T0-T3 mail, verifier spawn when required. NEVER starts new beads. Principles: never-block-on-the-human, prove-it-works."
 trigger:
@@ -1031,11 +1031,11 @@ steps:
       harness: "opencode"
       task: "BABYSIT ONE BEAD {{inputs.bead_id}} to a legal ledger row (ADR-0019): (1) `br show {{inputs.bead_id}} --json` — status in_progress / blocked / unverified-closed; (2) claim-watch: if the dispatched agent never claimed, nudge it (loop claim-watch); if it is unclaimed and free, claim it; (3) RENEW its file reservations (reason={{inputs.bead_id}}, toron renew_file_reservations) before the TTL lapses; (4) if blocked: drive the T0-T3 escalation mail through the loop machinery — never fabricate a verdict; (5) if closed but unverified: `flywheel ledger check {{inputs.bead_id}}` — missing/illegal verdict → the LOOP reopens it (never force-unlock a peer); if a verifier is required (P0/P1/judgment AC), spawn the reviewer dispatch on a different model family. NEVER start new beads; NEVER write a verdict yourself — only the loop records gate rows. Report: status before/after, what you drove, the legal ledger row."
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "ship-beads",
-        r##"
+        r#"
 name: ship-beads
 description: "Ship beads (ADR-0019 Spec 7.2, pstack shipping without merge-when-ready): predicate = no ready beads AND claim-watch empty AND every newly closed bead legal on the ledger -> @housekeeper commit-and-push. Principles: prove-it-works, sequence-verifiable-units."
 trigger:
@@ -1064,11 +1064,11 @@ steps:
       stage: "commit-and-push"
       task: "Predicate verified ({{steps.verify-predicate}}). Commit all changed files in logically connected groups with detailed messages (bead ids IN the messages), then push. Do not edit code; do not commit obviously ephemeral files. This is pstack shipping without merge-when-ready — the ledger is the proof."
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "autonomous-work",
-        r##"
+        r#"
 name: autonomous-work
 description: "Autonomous overnight work (ADR-0019 Spec 7.2): runs `flywheel loop run --work --on-blocked mail` — the REAL loop, this workflow does NOT reimplement it — then a terminal ship-beads check (predicate default = ship-beads). Documented so decide can point at it. Principles: never-block-on-the-human, make-operations-idempotent."
 trigger:
@@ -1094,11 +1094,11 @@ steps:
     action: call_workflow
     workflow: ship-beads
     inputs: { project: "{{inputs.project}}" }
-"##,
+"#,
     ),
     (
         "pickup",
-        r##"
+        r#"
 name: pickup
 description: "Session pickup (ADR-0019 Spec 7.2): read .flywheel/agent-state/, br list --status in_progress, ledger gaps, and the last-sent registry; respawn context-exhausted panes; resume briefs for stranded in_progress beads. Principles: make-operations-idempotent, guard-the-context-window."
 trigger:
@@ -1119,11 +1119,11 @@ steps:
       stage: "resume-pickup"
       plan: "Project: {{inputs.project}}"
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "pause",
-        r##"
+        r#"
 name: pause
 description: "Pause safely (ADR-0019 Spec 7.2): `flywheel checkpoint save` + standing handoff (what is in flight, ledger gaps, the EXACT resume command). Kills nothing that is working unless --force-working is explicit. Principles: make-operations-idempotent, never-block-on-the-human."
 trigger:
@@ -1146,7 +1146,7 @@ steps:
       harness: "opencode"
       task: "PAUSE {{inputs.project}} (ADR-0019): (1) `flywheel checkpoint save --project {{inputs.project}}` — durable state snapshot; (2) write the STANDING HANDOFF: what is in flight (in_progress beads + held reservations), ledger gaps (closed-but-unverified beads), and the EXACT resume command (e.g. `flywheel loop run --work --on-blocked mail --project {{inputs.project}}` or the pickup workflow); (3) kill NOTHING that is working unless force_working={{inputs.force_working}} was explicit — a working agent keeps running through the pause. Operator message: {{inputs.msg}}. Report: checkpoint id, handoff path, what stayed alive."
     on_error: fail_run
-"##,
+"#,
     ),
     // ---- ADR-0006 D3 wave-swarm compose token (bd-wave-swarm-recipe-wsot),
     // compounded by ADR-0009: REVIEW (ce-review — evidence-gated findings
@@ -1154,7 +1154,7 @@ steps:
     // continue, after VERIFY). Bounded by FLYWHEEL_COMPOSE_MAX_SECONDS.
     (
         "wave-swarm",
-        r##"
+        r#"
 name: wave-swarm
 description: "ADR-0006 D3 + ADR-0009: the compounded wave swarm. GATE scopes br ready to one wave label (grounding-reads docs/learnings/), holds on any open lower wave; DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to docs/learnings/ (never blocks); SIGNOFF suspends for captain-only approval."
 trigger:
@@ -1239,11 +1239,11 @@ steps:
   - name: signoff
     action: request_approval
     message: "Wave signoff (captain-only) for {{inputs.objective}} [{{inputs.wave_label}}]: review the VERIFY receipts, the REVIEW findings, and the COMPOUND learnings summary; approve closes the wave gate, reject reopens."
-"##,
+"#,
     ),
     (
         "repair-until-verified",
-        r##"
+        r#"
 name: repair-until-verified
 description: "Repair loop (ADR-0024 Spec 2): bounded fresh-context repair → evaluate → VERIFY (3 iterations, continue on verify failure so verify-1 can fail and verify-2 can still run; final verify gates the run). Runs --mode pane only."
 trigger:
@@ -1341,7 +1341,7 @@ graph:
         - action: verify
           command: "false 'no verify succeeded — repair loop exhausted without a passing VERIFY'"
           on_error: fail_run
-"##,
+"#,
     ),
     // ---- ADR-0008 §6.7 beads-lifecycle compose token (bd-adr0008-token-yaml-kimg) ------
     // The beads authoring lifecycle: grill → create → review1 → review2 →
@@ -1356,7 +1356,7 @@ graph:
     // for execution, never merges it.
     (
         "beads-lifecycle",
-        r##"
+        r#"
 name: beads-lifecycle
 description: "ADR-0008 §6.7: the beads authoring lifecycle. grill (ce-brainstorm) sharpens the objective (ADR/goal JSON); create nests phase-plan via call_workflow; review1 (@reviewer ce-plan-review) + review2 (@oracle judge-arms) are two bead-graph passes; integrate folds AGREE-WITH-CHANGES and re-checks cycles; implement runs ce-execute (or hands off to wave-swarm); verify proves with evidence; signoff suspends for captain-only approval. inputs.until early-exits SUCCESS after any phase; gate_before_implement adds one outer approval between integrate and implement."
 trigger:
@@ -1456,12 +1456,12 @@ graph:
       guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_until != "integrate" && trigger_until != "implement" && trigger_until != "verify"'
       action: request_approval
       message: "Beads lifecycle signoff (captain-only) for {{inputs.objective}} [{{inputs.project}}]: review the verify evidence on {{inputs.steer_channel}}; approve closes, reject reopens."
-"##,
+"#,
     ),
     // ---- ADR-0019 Spec 7.2 reflect (wave 6, bd-w6-reflect-8gp5) ----
     (
         "reflect",
-        r##"
+        r#"
 name: reflect
 description: "Corrections become structure (ADR-0019 Spec 7.2 reflect, wave 6): scan standing orders + ledger + mail threads; the SAME instruction twice -> emit ONE hook-adding bead (a lint, a preflight, or a principle-registry line) + delete the superseded lines from the PROJECT standing orders (the global regenerates from the registry). The output is a hook bead, NEVER an AGENTS.md paragraph. Principles: encode-lessons-in-structure."
 trigger:
@@ -1495,11 +1495,11 @@ steps:
       profile: "@coder"
       task: "Delete the superseded standing-order lines from {{steps.scan}} in the PROJECT layer ONLY ({{inputs.project}}/.flywheel/standing-orders.md). NEVER edit the global (~/.config/flywheel/standing-orders.md) — it regenerates from the principle registry."
     on_error: fail_run
-"##,
+"#,
     ),
     (
         "awareness-digest",
-        r##"
+        r#"
 name: awareness-digest
 description: "ADR-0005 captain digest (no loop): presence + reservations + expired request-release + guard denials. First line MUST be dispatcher: up|down <since>. Post kind 9 on the steer channel; DM captain on conflict only."
 trigger:
@@ -1521,7 +1521,7 @@ steps:
       harness: "opencode"
       task: "AWARENESS DIGEST for {{inputs.project}} (ADR-0005 D1.4, no loop run). First lines MUST be `flywheel status {{inputs.project}}` JSON `dispatcher` + `unanswered` (or `flywheel __doorbell --project {{inputs.project}} --workspace <label> --report`): `dispatcher: up|down …` then `doorbell: ok` or `doorbell: unanswered pin=…`. Then snapshot: presence list, active reservations, expired request-release, guard denials. Post the digest as one kind-9 on the project steer channel. DM the captain on conflict: dispatcher down, unanswered doorbell (deaf pane), hard reservation overlap, unanswered request-release. No beads, no repo edits. Per-project cron YAML lives at {{inputs.project}}/.flywheel/crons/ (builtin is the default)."
     on_error: fail_run
-"##,
+"#,
     ),
 ];
 
@@ -1657,7 +1657,10 @@ mod tests {
         match &fan.action {
             Action::DispatchJob { spec, .. } => {
                 assert_eq!(spec.phase.as_deref(), Some("review"));
-                assert_eq!(spec.extra.get("n").and_then(|n| n.as_u64()), Some(2));
+                assert_eq!(
+                    spec.extra.get("n").and_then(serde_json::Value::as_u64),
+                    Some(2)
+                );
             }
             other => panic!("review fanout leaf is a dispatch, got {other:?}"),
         }
@@ -2285,7 +2288,9 @@ mod tests {
                 assert_eq!(workflow, "repair-until-verified");
                 assert!(inputs.get("verify").is_some(), "verify input present");
                 assert_eq!(
-                    inputs.get("max_iterations").and_then(|v| v.as_u64()),
+                    inputs
+                        .get("max_iterations")
+                        .and_then(serde_json::Value::as_u64),
                     Some(3)
                 );
                 let verify = inputs.get("verify").and_then(|v| v.as_str()).unwrap();
@@ -3054,7 +3059,9 @@ mod tests {
         assert_eq!(workflow, "repair-until-verified");
         assert!(inputs.get("verify").is_some());
         assert_eq!(
-            inputs.get("max_iterations").and_then(|v| v.as_u64()),
+            inputs
+                .get("max_iterations")
+                .and_then(serde_json::Value::as_u64),
             Some(3)
         );
     }
