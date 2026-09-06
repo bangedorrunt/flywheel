@@ -6677,6 +6677,20 @@ mod spawn_boot_reliability_tests {
 
     /// GS-039: CoS-honest folds — real wake observation, open-mode authority,
     /// solo compose sizing, name-bind fail-closed, no invent-green.
+
+    #[test]
+    fn gs040_compose_wf_name_includes_project_tag() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("GS-040: crew_agent_name keeps only 16"),
+            "compose wf_name must include project tag (avoid truncated-ISO collisions)"
+        );
+        assert!(
+            src.contains("chrono::Utc::now().format("%H%M%S")"),
+            "compose wf_name must use HHMMSS not truncated composed-ISO"
+        );
+    }
+
     #[test]
     fn gs040_collab_watch_waits_empty_thread() {
         // GS-040: mail watch must NOT process::exit(1) on an empty thread
@@ -25619,7 +25633,25 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let project_root = project_dir(cfg, project_name);
             let project_stages = project_root.join(".flywheel/stages.toml");
             let all = all_workflows_layered(Some(&project_root))?;
-            let wf_name = format!("composed-{}", state::now_iso().replace([':', '-', '.'], ""));
+            // GS-040: crew_agent_name keeps only 16 chars of the wf slug.
+            // `composed-{ISO}` truncated to `composed-2026090` collided across
+            // concurrent projects in the same hour. Encode project tag +
+            // HHMMSS + pid nibble so names stay unique within herdr's 32-char
+            // agent-name budget (`crew-{slug}-{role}`).
+            let proj_tag: String = std::path::Path::new(project_name)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("p")
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .take(4)
+                .collect();
+            let wf_name = format!(
+                "{}{}{:x}",
+                proj_tag,
+                chrono::Utc::now().format("%H%M%S"),
+                std::process::id() % 256
+            );
             let composed = if let Some(src) = from_yaml {
                 // §3.6 T2 author-from-scratch arm: the FULL Workflow comes
                 // verbatim from the captain (stdin or file); it rides the
