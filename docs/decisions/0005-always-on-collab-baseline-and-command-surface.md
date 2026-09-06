@@ -253,7 +253,7 @@ identity mode is for direct mailbox use and passes registered names through;
 it does not imply a captain, crew, bead graph, or durable loop. This ADR
 clarifies the execution modes but does not change Toron's identity rules.
 
-### D5 — Execution topology and captain operation (binding)
+### D5 — Captain with and without a loop (binding)
 
 The captain has two live modes. They compose; neither is a fallback
 hack.
