@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Compound Engineering × flywheel — Integration Plan</title>
+<style>
+  /* Design system: flywheel's own hacker-night palette (src/output.rs Slot theme) */
+  :root {
+    --void: #08080e; --panel: #101018; --panel2: #14141f; --line: #23233a;
+    --fg: #c8d0e8; --dim: #7a80a0; --cyan: #0db9d7; --lav: #bb9af7;
+    --mint: #73daca; --amber: #e0af68; --red: #f7768e; --ice: #89ddff;
+    --sel: #1a1a3e;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html { background: var(--void); }
+  body {
+    margin: 0; color: var(--fg); background: var(--void);
+    font: 15px/1.6 ui-sans-serif, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1160px; margin: 0 auto; padding: 28px 20px 80px; }
+  code, .mono { font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 0.88em; }
+  code { background: var(--sel); color: var(--ice); padding: 1px 5px; border-radius: 4px; word-break: break-word; }
+  h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: 0.5px; }
+  h1 .accent { color: var(--cyan); }
+  h2 { font-size: 18px; margin: 42px 0 6px; color: var(--ice); border-bottom: 1px solid var(--line); padding-bottom: 8px; letter-spacing: 0.4px; }
+  h2 .n { color: var(--lav); margin-right: 8px; }
+  h3 { font-size: 15px; margin: 22px 0 8px; color: var(--mint); }
+  p { margin: 8px 0; } .dim { color: var(--dim); }
+  .lede { color: var(--dim); margin: 2px 0 0; font-size: 15px; }
+
+  .verdict { background: linear-gradient(135deg, #101022, #0d1a20); border: 1px solid var(--cyan); border-radius: 10px; padding: 18px 20px; margin: 22px 0 6px; }
+  .verdict .big { font-size: 17px; color: var(--fg); }
+  .verdict .big b { color: var(--cyan); }
+
+  .badges { margin: 10px 0 0; display: flex; flex-wrap: wrap; gap: 8px; }
+  .badge { font-size: 12px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); background: var(--panel); white-space: nowrap; }
+  .badge.p0 { border-color: var(--mint); color: var(--mint); }
+  .badge.p1 { border-color: var(--cyan); color: var(--cyan); }
+  .badge.p2 { border-color: var(--lav); color: var(--lav); }
+  .badge.rej { border-color: var(--red); color: var(--red); }
+
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr)); gap: 14px; margin-top: 12px; }
+  .grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); gap: 14px; margin-top: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+  .card h4 { margin: 0 0 6px; font-size: 14px; color: var(--ice); }
+  .card .tag { float: right; font-size: 11px; padding: 1px 8px; border-radius: 999px; }
+  .have { border-left: 3px solid var(--mint); } .have .tag { background: rgba(115,218,202,.12); color: var(--mint); }
+  .gap  { border-left: 3px solid var(--amber); } .gap .tag { background: rgba(224,175,104,.12); color: var(--amber); }
+  .new  { border-left: 3px solid var(--cyan); } .new .tag { background: rgba(13,185,215,.12); color: var(--cyan); }
+  .rej  { border-left: 3px solid var(--red); } .rej .tag { background: rgba(247,118,142,.12); color: var(--red); }
+  .card p { margin: 4px 0; font-size: 13.5px; }
+  .card p b { color: var(--fg); }
+
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 13.5px; background: var(--panel); border-radius: 10px; overflow: hidden; }
+  th { text-align: left; padding: 9px 12px; background: var(--panel2); color: var(--ice); font-size: 12.5px; letter-spacing: .4px; border-bottom: 1px solid var(--line); }
+  td { padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; min-width: 0; }
+  tr:last-child td { border-bottom: none; }
+  td.ce { color: var(--lav); font-weight: 600; }
+  td code { white-space: normal; }
+  .tier-p0 { color: var(--mint); font-weight: 700; } .tier-p1 { color: var(--cyan); font-weight: 700; } .tier-p2 { color: var(--lav); font-weight: 700; } .tier-rej { color: var(--red); font-weight: 700; }
+  .tablewrap { overflow-x: auto; border-radius: 10px; }
+
+  .phase { display: flex; gap: 14px; align-items: flex-start; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-top: 12px; }
+  .phase .step { min-width: 64px; text-align: center; font-size: 20px; font-weight: 800; padding: 8px 0; border-radius: 8px; }
+  .phase .body { min-width: 0; flex: 1; }
+  .phase h3 { margin: 4px 0 4px; }
+  .phase ul { margin: 6px 0 0; padding-left: 18px; } .phase li { margin: 4px 0; font-size: 13.5px; }
+  .s0 { background: rgba(115,218,202,.12); color: var(--mint); border: 1px solid var(--mint); }
+  .s1 { background: rgba(13,185,215,.12); color: var(--cyan); border: 1px solid var(--cyan); }
+  .s2 { background: rgba(187,154,247,.12); color: var(--lav); border: 1px solid var(--lav); }
+
+  pre { background: #0b0b14; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; overflow-x: auto; font-size: 12.5px; line-height: 1.55; color: var(--fg); }
+  pre .c { color: var(--dim); } pre .k { color: var(--lav); } pre .s { color: var(--mint); } pre .a { color: var(--amber); }
+
+  .fig { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-top: 14px; }
+  .fig svg { width: 100%; height: auto; display: block; }
+  .figcap { text-align: center; color: var(--dim); font-size: 12.5px; margin-top: 8px; }
+
+  .openq { background: var(--panel2); border: 1px dashed var(--amber); border-radius: 10px; padding: 14px 18px; margin-top: 12px; }
+  .openq ol { margin: 6px 0 0; padding-left: 20px; } .openq li { margin: 6px 0; font-size: 13.5px; }
+  .openq li b { color: var(--amber); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1><span class="accent">Compound Engineering</span> × flywheel / toron / beads</h1>
+<p class="lede">Every's CE plugin (33 skills, MIT) studied against our compose-token / stage / playbook stack — what maps, what's missing, what to port, what to refuse. Sources: <code>EveryInc/compound-engineering-plugin</code> (README, CONCEPTS.md, skill guides) × <code>src/stages.rs</code>, <code>src/builtin_workflows.rs</code>, <code>src/crew.rs</code>, ADR-0006/0008/0027/0028.</p>
+
+<div class="verdict">
+  <div class="big"><b>Verdict:</b> we already have CE's <b>discipline half</b> — contracts, gates, bounded repair, evidence receipts, human signoff (in places stronger than CE, via durable mail + beads two-step close). We are missing CE's <b>compounding half</b>: the learning <b>return arrow</b> (nothing reads past lessons at dispatch; lessons are hand-curated into AGENTS.md/skills by the captain) and a <b>true adversarial review</b> (wave-VERIFY audits receipts and close-reason tails, not the artifact itself — the exact hole the torondev "garbage stub catalog claimed as real" lane fell through).</div>
+  <div class="badges">
+    <span class="badge p0">P0 — zero-code, project tier, works today</span>
+    <span class="badge p1">P1 — one small Rust PR</span>
+    <span class="badge p2">P2 — ADR-0029 tier</span>
+    <span class="badge rej">4 concepts deliberately rejected</span>
+  </div>
+</div>
+
+<h2><span class="n">1</span>Loop vs loop — where CE's six steps already live in our tokens</h2>
+<div class="grid3">
+  <div class="card have"><h4>ce-brainstorm → <code>beads-lifecycle: grill</code> <span class="tag">HAVE</span></h4><p>Grill sharpens the objective against ADR/goal JSON before bead creation — same shape as CE's requirements-only artifact.</p></div>
+  <div class="card have"><h4>ce-plan → <code>create → review1 → review2 → integrate</code> <span class="tag">HAVE</span></h4><p>Two bead-graph review passes (@reviewer plan-review + @oracle judge-arms) ≈ CE's doc-review personas. Missing only CE's <b>readiness levels</b> (requirements-only vs implementation-ready).</p></div>
+  <div class="card have"><h4>ce-work → <code>wave-swarm: DISPATCH→EXECUTE</code> <span class="tag">HAVE</span></h4><p>systematic-execute brief (GOAL/SCOPE/CONTEXT/ACCEPTANCE/VERIFY/TIMEBOX/FORBIDDEN/REPORT/PRINCIPLES/STANDING) <b>is</b> CE's "outcome spine" — result, done-bar, safe-failure direction — already enforced.</p></div>
+  <div class="card gap"><h4>ce-simplify-code → <span class="tag">GAP (minor)</span></h4><p>No behavior-preserving refinement pass between EXECUTE and review. Cheap to fold into systematic-execute ("simplify as you go") — CE itself demoted it to mid-work.</p></div>
+  <div class="card gap"><h4>ce-code-review → <span class="tag">GAP (major)</span></h4><p>No persona-panel diff review anywhere in wave-swarm. VERIFY = receipt-at-HEAD + tail + principles citations = <b>audits the claim, never the code</b>.</p></div>
+  <div class="card gap"><h4>ce-compound → <span class="tag">GAP (the point)</span></h4><p>Nothing writes learnings at wave end. <code>PHASES = [resolve, plan, implement, review, verify]</code> — no <b>compound</b> phase exists in the vocabulary. weekly-review produces ONE follow-up bead, not a corpus.</p></div>
+</div>
+
+<div class="fig">
+  <svg viewBox="0 0 1140 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Current wave-swarm loop versus proposed compound loop">
+    <defs>
+      <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7a80a0"/></marker>
+      <marker id="arc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#e0af68"/></marker>
+    </defs>
+    <style>
+      .lbl { font: 600 13px ui-monospace, Menlo, monospace; fill: #c8d0e8; }
+      .sub { font: 11px ui-sans-serif; fill: #7a80a0; }
+      .box { fill: #14141f; stroke: #23233a; stroke-width: 1.4; rx: 8; }
+      .havebox { stroke: #0db9d7; } .newbox { stroke: #73daca; stroke-dasharray: 5 4; }
+      .lane { font: 700 12px ui-monospace, monospace; fill: #89ddff; letter-spacing: 1px; }
+    </style>
+    <text x="10" y="26" class="lane">TODAY — wave-swarm (6 steps, dead-ends at SIGNOFF)</text>
+    <g>
+      <rect class="box" x="10"  y="44" width="150" height="58" rx="8"/><text class="lbl" x="85" y="68" text-anchor="middle">GATE</text><text class="sub" x="85" y="86" text-anchor="middle">preflight + br ready</text>
+      <rect class="box" x="196" y="44" width="150" height="58" rx="8"/><text class="lbl" x="271" y="68" text-anchor="middle">DISPATCH</text><text class="sub" x="271" y="86" text-anchor="middle">--param payloads</text>
+      <rect class="box" x="382" y="44" width="150" height="58" rx="8"/><text class="lbl" x="457" y="68" text-anchor="middle">EXECUTE</text><text class="sub" x="457" y="86" text-anchor="middle">systematic-execute</text>
+      <rect class="box" x="568" y="44" width="150" height="58" rx="8"/><text class="lbl" x="643" y="68" text-anchor="middle">OBSERVE</text><text class="sub" x="643" y="86" text-anchor="middle">escalate, never judge</text>
+      <rect class="box" x="754" y="44" width="150" height="58" rx="8"/><text class="lbl" x="829" y="68" text-anchor="middle">VERIFY</text><text class="sub" x="829" y="86" text-anchor="middle">receipts + tails</text>
+      <rect class="box" x="940" y="44" width="180" height="58" rx="8"/><text class="lbl" x="1030" y="68" text-anchor="middle">SIGNOFF</text><text class="sub" x="1030" y="86" text-anchor="middle">captain approval</text>
+      <line x1="160" y1="73" x2="192" y2="73" stroke="#7a80a0" stroke-width="1.6" marker-end="url(#ar)"/>
+      <line x1="346" y1="73" x2="378" y2="73" stroke="#7a80a0" stroke-width="1.6" marker-end="url(#ar)"/>
+      <line x1="532" y1="73" x2="564" y2="73" stroke="#7a80a0" stroke-width="1.6" marker-end="url(#ar)"/>
+      <line x1="718" y1="73" x2="750" y2="73" stroke="#7a80a0" stroke-width="1.6" marker-end="url(#ar)"/>
+      <line x1="904" y1="73" x2="936" y2="73" stroke="#7a80a0" stroke-width="1.6" marker-end="url(#ar)"/>
+    </g>
+
+    <text x="10" y="180" class="lane">PROPOSED — compound wave-swarm (8 steps + the return arrow)</text>
+    <g>
+      <rect class="box havebox" x="10" y="198" width="128" height="58" rx="8"/><text class="lbl" x="74" y="222" text-anchor="middle">GATE</text><text class="sub" x="74" y="240" text-anchor="middle">+ reads learnings</text>
+      <rect class="box havebox" x="164" y="198" width="128" height="58" rx="8"/><text class="lbl" x="228" y="222" text-anchor="middle">DISPATCH</text><text class="sub" x="228" y="240" text-anchor="middle">brief + matches</text>
+      <rect class="box havebox" x="318" y="198" width="128" height="58" rx="8"/><text class="lbl" x="382" y="222" text-anchor="middle">EXECUTE</text><text class="sub" x="382" y="240" text-anchor="middle">report contract</text>
+      <rect class="box havebox" x="472" y="198" width="128" height="58" rx="8"/><text class="lbl" x="536" y="222" text-anchor="middle">OBSERVE</text><text class="sub" x="536" y="240" text-anchor="middle">attention set</text>
+      <rect class="box newbox" x="626" y="198" width="140" height="58" rx="8"/><text class="lbl" x="696" y="222" text-anchor="middle" fill="#73daca">REVIEW</text><text class="sub" x="696" y="240" text-anchor="middle">personas + evidence</text>
+      <rect class="box havebox" x="792" y="198" width="128" height="58" rx="8"/><text class="lbl" x="856" y="222" text-anchor="middle">VERIFY</text><text class="sub" x="856" y="240" text-anchor="middle">+ residual gate</text>
+      <rect class="box newbox" x="946" y="198" width="174" height="58" rx="8"/><text class="lbl" x="1033" y="222" text-anchor="middle" fill="#73daca">SIGNOFF</text><text class="sub" x="1033" y="240" text-anchor="middle">learnings: N in report</text>
+      <line x1="138" y1="227" x2="160" y2="227" stroke="#7a80a0" stroke-width="1.6" marker-end="url(#ar)"/>
+      <line x1="292" y1="227" x2="314" y2="227" stroke="#7a80a0" stroke-width="1.6" marker-end="url(#ar)"/>
+      <line x1="446" y1="227" x2="468" y2="227" stroke="#7a80a0" stroke-width="1.6" marker-end="url(#ar)"/>
+      <line x1="600" y1="227" x2="622" y2="227" stroke="#7a80a0" stroke-width="1.6" marker-end="url(#ar)"/>
+      <line x1="766" y1="227" x2="788" y2="227" stroke="#7a80a0" stroke-width="1.6" marker-end="url(#ar)"/>
+      <line x1="920" y1="227" x2="942" y2="227" stroke="#7a80a0" stroke-width="1.6" marker-end="url(#ar)"/>
+    </g>
+    <g>
+      <rect class="box newbox" x="792" y="316" width="128" height="58" rx="8"/><text class="lbl" x="856" y="340" text-anchor="middle" fill="#73daca">COMPOUND</text><text class="sub" x="856" y="358" text-anchor="middle">gated capture</text>
+      <line x1="856" y1="256" x2="856" y2="312" stroke="#7a80a0" stroke-width="1.6" marker-end="url(#ar)"/>
+      <line x1="920" y1="345" x2="942" y2="345" stroke="#7a80a0" stroke-width="1.6" marker-end="url(#ar)"/>
+      <text class="sub" x="1033" y="350" text-anchor="middle">(then SIGNOFF)</text>
+      <rect x="140" y="326" width="380" height="40" rx="8" fill="#0b0b14" stroke="#e0af68" stroke-width="1.4"/>
+      <text class="lbl" x="330" y="342" text-anchor="middle" fill="#e0af68">docs/learnings/  (bug track · knowledge track)</text>
+      <text class="sub" x="330" y="358" text-anchor="middle">frontmatter: track / module / tags / problem_type — rg-able</text>
+      <path d="M 522 346 C 620 346, 700 330, 788 300" fill="none" stroke="#e0af68" stroke-width="1.6" marker-end="url(#arc)"/>
+      <path d="M 330 326 C 330 160, 200 130, 90 118" fill="none" stroke="#e0af68" stroke-width="2" stroke-dasharray="7 5" marker-end="url(#arc)"/>
+      <text x="150" y="152" fill="#e0af68" font-size="12.5" font-weight="700">THE RETURN ARROW — next GATE / grill / brief reads the corpus</text>
+      <text x="600" y="318" fill="#e0af68" font-size="11.5">writes</text>
+    </g>
+    <text class="sub" x="10" y="440">Solid cyan = existing steps. Dashed mint = new (REVIEW, COMPOUND). Amber = the compounding loop CE is named after — the only thing CE has that we structurally lack.</text>
+  </svg>
+  <div class="figcap">wave-swarm today vs the compound wave. New steps are ordinary stages — the compose grammar already chains them (<code>--parts wave-swarm,reviewer:wave-review</code> is legal today).</div>
+</div>
+
+<h2><span class="n">2</span>Concept-by-concept map — port / have / reject</h2>
+<p class="dim">CE concept → what flywheel has today → the integration. Tier: <span class="tier-p0">P0</span> prompt-only (project-tier stages.toml / standing-orders, zero Rust) · <span class="tier-p1">P1</span> small Rust PR · <span class="tier-p2">P2</span> needs ADR · <span class="tier-rej">REJ</span> deliberately not ported.</p>
+<div class="tablewrap">
+<table>
+  <tr><th style="width:19%">CE concept</th><th style="width:26%">flywheel today</th><th style="width:41%">Integration</th><th style="width:14%">Tier</th></tr>
+  <tr><td class="ce">Learning / ce-compound</td><td>Nothing automatic. Captain hand-curates lessons into AGENTS.md / SKILL.md (the torondev swarm lessons were folded in manually, days later).</td><td><b>The flagship port.</b> <code>docs/learnings/</code> corpus + new <code>wave-compound</code> stage after VERIFY. Gate = CE's three-part test verbatim (non-obvious ∧ durable ∧ material — "if the doc vanished, would the next crew redo the investigation?"). One learning per run. Track bug vs knowledge decides sections.</td><td class="tier-p1">P1 (capture now via P0 convention)</td></tr>
+  <tr><td class="ce">The return arrow (grounding reads)</td><td>GATE reads br ready + preflight only. Brief CONTEXT is authored fresh each time.</td><td>GATE + grill + DISPATCH get one line: <code>rg -l "&lt;scope keywords&gt;" docs/learnings/</code> → matching entries ride the dispatch payload as brief CONTEXT. Grep-able frontmatter, no vector store — dumb on purpose.</td><td class="tier-p0">P0</td></tr>
+  <tr><td class="ce">Reviewer persona · detection condition · confidence anchor · evidence guard</td><td>review1/review2 review <b>plans</b> (beads-lifecycle). Nothing reviews the executed diff in wave-swarm.</td><td><b>Second flagship.</b> New <code>wave-review</code> stage: @reviewer (cross-harness, opencode) reviews each closed bead's diff against the brief's ACCEPTANCE. A finding exists only under a stated observable condition; high confidence requires quoted <code>file:line</code> occurrences. Output JSON: severity P0–P3, autofix class, evidence, confidence.</td><td class="tier-p1">P1</td></tr>
+  <tr><td class="ce">Independence ("two lenses in one context = one perspective, not two witnesses")</td><td>Implicit: reviewer already runs on opencode for cross-harness independence, but nobody states the rule.</td><td>Codify in wave-review + debate prompts: corroboration / confidence promotion only across separately-dispatched panes; inline agreement is coverage, not confirmation. One sentence, pure doctrine.</td><td class="tier-p0">P0</td></tr>
+  <tr><td class="ce">Residual ("accepted finding must reach a durable sink before done")</td><td>VERIFY fails on missing receipt/tail. But an accepted-but-unfixed finding lives only in the session.</td><td><b>Residual gate:</b> VERIFY refuses a wave whose review findings aren't each either fixed or filed as a <code>br create</code> bead id cited in the close. Maps 1:1 onto our two-step close — the bead id IS the durable sink.</td><td class="tier-p1">P1</td></tr>
+  <tr><td class="ce">Repo-owned review criteria (CODING_STANDARDS.md)</td><td>principles registry (21 names) + repo AGENTS.md.</td><td>Same function, existing home: project-tier <code>.flywheel/</code> verify-checklist that wave-review findings must cite ("violates <em>rule-name</em>"), so review strictness compounds per project without growing AGENTS.md. Do NOT add a third conventions file.</td><td class="tier-p0">P0</td></tr>
+  <tr><td class="ce">Clean skip vs crash</td><td>Missing report_file is ambiguous; OBSERVE can't distinguish "gate judged N/A" from "pane died".</td><td>Terminal-state vocabulary in the D4 report contract: <code>terminal: done | clean_skip | blocked | failed</code>. clean_skip is a SUCCESS outcome; absent report stays unknown. Also added to repair-until-verified's evaluate JSON.</td><td class="tier-p1">P1</td></tr>
+  <tr><td class="ce">Model identity receipt</td><td>Strict registry + resolve ladder + presence-20001 self-report — but nothing records <b>served</b> vs <b>requested</b> per dispatch.</td><td>Report contract gains <code>served_model</code> (from presence/kind-9). OBSERVE diffs requested vs served; mismatch = digest line. Cross-model debate may claim "independent" only on verified-different families.</td><td class="tier-p2">P2</td></tr>
+  <tr><td class="ce">Session-settled decisions</td><td>Captain briefing go/no-go + crew/model choices live in --inputs, unlabeled.</td><td>Label them <code>settled:</code> in inputs; wave-review routes "I'd have done it differently" findings to report-only (<code>settled_conflict</code>) while real defects keep severity. Stops crews re-litigating captain decisions.</td><td class="tier-p0">P0</td></tr>
+  <tr><td class="ce">Idempotent re-entry</td><td>systematic-execute starts from the bead; nothing checks "already satisfied at HEAD".</td><td>Brief rule: before starting, run the bead's VERIFY at HEAD; green → mark complete, skip reimplementation. Protects resumed waves from redoing shipped work (a real torondev failure mode).</td><td class="tier-p0">P0</td></tr>
+  <tr><td class="ce">Evidence dossier</td><td>scout fan-outs return inline text (weekly-review).</td><td>Scout writes verbatim quotes + <code>path:line</code> pointers to a scratch file, returns a gist. Directly serves the <code>guard-the-context-window</code> principle we already cite.</td><td class="tier-p0">P0</td></tr>
+  <tr><td class="ce">Attention set / settle window / liveness marker</td><td>Doorbell sweep + claim-watch + pending_wait TTL — same family, already strong.</td><td>Doctrinal alignment only: "observing never marks handled; items leave the set only on confirmed action or removed-by-truth". Liveness markers (kind-9 presence) never count as progress evidence.</td><td class="tier-p0">P0</td></tr>
+  <tr><td class="ce">Host prompt budget · load stub · phase-loaded kernel</td><td>Stages are single bodies, 20k cap. beads-body.md.tpl alone is 14.8KB.</td><td>P1: authoring rule — first block of every stage = outcome spine + stop classes (what must survive truncation). P2: <code>Stage.refs: Vec&lt;Path&gt;</code> loaded at the acting step, body becomes the kernel. Also adopt CE's prompt anti-patterns (below) in the authoring guide.</td><td class="tier-p2">P2</td></tr>
+  <tr><td class="ce">Proxy rule · case accretion · subordinated shape</td><td>Nothing; our prompts accumulate case lists (AGENTS.md crit grows exactly this way).</td><td>Adopt as stage-authoring doctrine + a lint heuristic: a block that grew twice from "also handle this" must state the deciding condition or split by confidence. These three concepts explain prompt drift better than anything we have.</td><td class="tier-p2">P2 (doctrine now)</td></tr>
+  <tr><td class="ce">Outcome spine</td><td><b>Already ours</b> — the systematic-execute brief (GOAL/…/FORBIDDEN/REPORT/STANDING) is a stricter outcome spine than CE's.</td><td>Nothing to port. Cite it as the pattern name when authoring new stages.</td><td class="tier-p0">HAVE</td></tr>
+  <tr><td class="ce">Detached job · headless mode · model tiers · bounded repair</td><td><b>Already ours, stronger:</b> Resonate durable loop + doorbell, non-TTY byte-identical dispatch, catalog slots cheap/standard/premium, repair-until-verified (3× fresh-context repair→evaluate→verify).</td><td>Nothing to port. CE's detached job is a weaker resonate promise.</td><td class="tier-p0">HAVE</td></tr>
+  <tr><td class="ce">Skill-eval cell ("score surviving artifacts, not essays")</td><td>Stage repo-evidence bar: 2 distinct objective greens + review bead; wave-verify receipt-at-HEAD; mutation-test gates.</td><td>Same doctrine, keep extending it: VERIFY/REVIEW always re-derive the artifact, never grade the crew's prose. This is the anti-"done-claims-are-marketing" rule.</td><td class="tier-p0">HAVE (name it)</td></tr>
+  <tr><td class="ce">Transport commit / terminalize (host builds the commit, workers never commit)</td><td>Commit-before-close is load-bearing: <code>br close --commit-sha</code> requires the CREW's commit citing the bead.</td><td><b>Rejected.</b> CE's model would invert the two-step close and beads' SHA-bound ledger. We keep crew-commits + move the counterweight earlier (REVIEW inspects the diff pre-VERIFY instead of trusting the claim post-close).</td><td class="tier-rej">REJ</td></tr>
+  <tr><td class="ce">Wave contract (shared dir, exclusive write surfaces)</td><td>toron file reservations (kind-30031) + strict guard — same goal, cryptographic instead of contractual.</td><td>Keep ours. Steal one line for dispatch prompts: a worker aborts loudly on any write outside its reserved globs (the strict guard already enforces; the prompt should say so).</td><td class="tier-rej">REJ (keep ours)</td></tr>
+  <tr><td class="ce">Plugin/converter/marketplace, visual probes, live annotation, PR/CI babysit</td><td>—</td><td>Not applicable: single binary + skill-sync contract; we don't do product-design prototyping; babysit-bead / ship-beads already exist.</td><td class="tier-rej">REJ</td></tr>
+</table>
+</div>
+
+<h2><span class="n">3</span>Phased plan</h2>
+
+<div class="phase">
+  <div class="step s0">P0</div>
+  <div class="body">
+    <h3>Zero-code, project tier — works with today's binary</h3>
+    <ul>
+      <li>Create <code>docs/learnings/</code> + convention (schema below) + one discoverability line in AGENTS.md.</li>
+      <li>Project-tier <code>.flywheel/stages.toml</code>: add <code>wave-review</code> (phase <code>review</code> — legal vocabulary today) with persona + detection-condition + evidence-quote + independence doctrine.</li>
+      <li>Override <code>wave-verify</code> prompt: + residual gate (unfixed finding ⇒ bead id or it fails), + artifact-not-essay rule.</li>
+      <li>standing-orders additions: terminal-state vocabulary in reports, idempotent re-entry rule, <code>settled:</code> labels, scout evidence-dossier habit.</li>
+      <li>Chain it today: <code>flywheel workflow compose "&lt;obj&gt;" --parts wave-swarm,reviewer:wave-review --run</code> — the grammar already supports token + part.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="step s1">P1</div>
+  <div class="body">
+    <h3>One small Rust PR — the compound spine lands properly</h3>
+    <ul>
+      <li><code>PHASES += "compound"</code> (src/stages.rs, one line + lint vocabulary).</li>
+      <li>Compiled-in seed stages <code>wave-review</code> + <code>wave-compound</code>; wave-swarm YAML 6 → 8 steps (REVIEW after OBSERVE, COMPOUND after VERIFY with <code>on_error: continue</code> — a failed capture never blocks signoff; SIGNOFF message reports "learnings: N captured / M deferred").</li>
+      <li>Report contract (D4) + evaluate JSON: <code>terminal</code> + <code>clean_skip</code>.</li>
+      <li>Skill Sync Contract, all four surfaces: Commands enum docs, robot_capabilities, AGENTS.md, skill §5 + CHANGELOG. Tests: 8-step expansion lints clean, compound phase valid, clean_skip parses.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="step s2">P2</div>
+  <div class="body">
+    <h3>ADR-0029 "compound spine" — the structural pieces</h3>
+    <ul>
+      <li><code>Stage.refs</code> (phase-loaded kernel; body = spine + stop classes, mechanics in reference files loaded at the acting step).</li>
+      <li>Model identity receipt wiring (presence/report diff → observe digest).</li>
+      <li><code>compound-sweep</code> cron builtin: Keep/Update/Consolidate/Replace/Delete over the corpus + CE's guidance-layer rule (a learning contradicting standing-orders/AGENTS.md outranks ordinary staleness; resolve by which side the code follows). Extends weekly-review's family.</li>
+      <li>Principles candidates (registry ADR needed): <code>score-artifacts-not-essays</code>, <code>state-the-condition-not-the-cases</code>.</li>
+      <li>GATE readiness check: a bead without VERIFY+scope is held as not-execution-ready (CE's requirements-only vs implementation-ready).</li>
+    </ul>
+  </div>
+</div>
+
+<h3>Learning doc schema (P0 convention)</h3>
+<pre><span class="c">---</span>
+<span class="k">track:</span> <span class="s">bug</span>          <span class="c"># bug | knowledge — decides sections below</span>
+<span class="k">module:</span> crew.rs       <span class="c"># open vocabulary, reused from corpus</span>
+<span class="k">problem_type:</span> <span class="s">integration_issue</span>  <span class="c"># closed enum</span>
+<span class="k">tags:</span> [dispatch, boot-race]
+<span class="k">bead:</span> bd-wave-swarm-graduation-fix-98io   <span class="c"># provenance</span>
+<span class="k">created:</span> 2026-09-06
+<span class="c"># knowledge track instead: Context / Guidance / Why This Matters / When to Apply</span></pre>
+
+<div class="openq">
+  <ol>
+    <li><b>COMPOUND placement:</b> <span style="color:var(--mint)">after VERIFY</span>, <code>on_error: continue</code>, SIGNOFF message reports the learnings summary. ✅ shipped in the 8-phase token.</li>
+    <li><b>Failure-path capture:</b> OBSERVE's escalation digest carries a <code>lesson:</code> line (my recommendation — linear YAML stays). ✅</li>
+    <li><b>Corpus home:</b> per-project <code>docs/learnings/</code>. ✅ seeded (README + the torondev done-claims lesson).</li>
+    <li><b>ADR:</b> flywheel ADR-0009 + toron ADR-0022 addendum (Phase += compound). ✅ both written.</li>
+    <li><b>ce- vocabulary:</b> ce-brainstorm/ce-plan/ce-plan-review/ce-execute/ce-simplify/ce-review/ce-compound; builtins brainstorm/plan/plan-review renamed; <b>p-code aliases retired</b>. ✅</li>
+    <li><b>Token compounded:</b> REVIEW + COMPOUND are inside <code>--parts wave-swarm</code> — no manual chaining. ✅ 8 steps, lints clean.</li>
+    <li><b>Other topologies:</b> loop-mode via the beads-body brief (grounding read + compound gate); open-mode via standing orders + <code>workflow run ce-compound --execute</code>; decide routes the capture phrases. ✅</li>
+  </ol>
+</div>
+
+<p class="dim" style="margin-top:34px">Grounded in: EveryInc/compound-engineering-plugin README + CONCEPTS.md + ce-compound / ce-code-review / ce-work guides · flywheel src/stages.rs (PHASES, tier precedence, 20k cap, repo-evidence bar) · src/builtin_workflows.rs (wave-swarm, repair-until-verified, beads-lifecycle, weekly-review YAML) · src/crew.rs compose grammar (token + part chaining) · src/decide.rs · toron AGENTS.md (receipts, corr authority, reservations) · beads two-step close. 2026-09-06.</p>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TUI Review — flywheel × toron × beads · hacker-night</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700;800&display=swap');
+  :root{
+    --void:#08080e;
+    --void2:#0f0f1e;
+    --surface:#1a1a2e;
+    --surface2:#1a1a3e;
+    --border:#24243a;
+    --fg:#c8d0e8;
+    --muted:#565f89;
+    --cyan:#0db9d7;
+    --cyan2:#2ac3de;
+    --ice:#89ddff;
+    --blue:#7aa2f7;
+    --lav:#bb9af7;
+    --pink:#ff007c;
+    --mint:#73daca;
+    --green:#9ece6a;
+    --amber:#e0af68;
+    --orange:#ff9e64;
+    --red:#f7768e;
+  }
+  *{font-family:Inter,sans-serif}
+  .mono{font-family:'JetBrains Mono',monospace}
+  .void{background:var(--void)}
+  .card{background:rgba(26,26,46,0.85);border:1px solid var(--border)}
+  .glow{box-shadow:0 0 32px rgba(13,185,215,0.12), 0 0 64px rgba(187,154,247,0.06)}
+  .term{font-family:'JetBrains Mono',monospace;background:#0a0a14;border:1px solid #1e1e3a;border-radius:10px;overflow:hidden}
+  .term-bar{background:#12122a;border-bottom:1px solid #1e1e3a}
+  ::-webkit-scrollbar{width:6px;height:6px}
+  ::-webkit-scrollbar-thumb{background:#24243a;border-radius:99px}
+</style>
+</head>
+<body class="void text-[var(--fg)] antialiased">
+<!-- HEADER -->
+<header class="sticky top-0 z-40 backdrop-blur-xl" style="background:rgba(8,8,14,0.88);border-bottom:1px solid #1a1a2e">
+  <div class="max-w-[1280px] mx-auto px-6 py-4 flex items-center justify-between gap-6">
+    <div class="flex items-center gap-4">
+      <div class="w-9 h-9 rounded-lg flex items-center justify-center font-black mono text-xs" style="background:var(--cyan);color:var(--void)">HN</div>
+      <div>
+        <div class="text-[11px] tracking-[0.18em] font-bold" style="color:var(--cyan)">HACKER-NIGHT × TUI DESIGN REVIEW</div>
+        <div class="text-lg font-extrabold leading-none tracking-tight">flywheel <span style="color:var(--muted)">×</span> toron <span style="color:var(--muted)">×</span> beads</div>
+      </div>
+    </div>
+    <div class="hidden md:flex items-center gap-3">
+      <span class="mono text-[11px] px-2.5 py-1 rounded-full" style="background:#1a1a2e;border:1px solid #24243a;color:var(--muted)">skill: tui-design</span>
+      <span class="mono text-[11px] px-2.5 py-1 rounded-full" style="background:rgba(13,185,215,0.12);border:1px solid rgba(13,185,215,0.35);color:var(--cyan)">palette: Ghostty v2 neon-on-void</span>
+      <span class="mono text-[11px] px-2.5 py-1 rounded-full" style="background:rgba(255,0,124,0.12);border:1px solid rgba(255,0,124,0.35);color:var(--pink)">2 surfaces · 1 viewer · 1 TUI</span>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-[1280px] mx-auto px-6 py-8 space-y-8">
+
+<!-- TL;DR -->
+<section class="card glow rounded-2xl p-6 md:p-7">
+  <div class="flex flex-wrap gap-2 mb-4">
+    <span class="mono text-[10px] tracking-widest font-bold px-2 py-1 rounded" style="background:var(--cyan);color:var(--void)">BOTTOM LINE</span>
+    <span class="mono text-xs" style="color:var(--muted)">read this and you have the answer — rest is pullable detail</span>
+  </div>
+  <h1 class="text-[22px] md:text-[28px] font-extrabold leading-tight tracking-tight">
+    Your stack is <span style="color:var(--cyan)">CLI-first, not TUI-first</span> — and that's correct. The only true TUI is <span class="mono text-[18px] md:text-[22px]" style="color:var(--lav)">toron tui</span> (ratatui + crossterm). flywheel's "viewer" is ANSI-painted status lines with no theme system. <span style="color:var(--amber)">Hacker-night maps cleanly</span>, but you have no semantic slots, no responsive gate, and no help tier — fix those and the neon-on-void sings.
+  </h1>
+  <div class="grid md:grid-cols-3 gap-3 mt-6">
+    <div class="rounded-xl p-4" style="background:#0a0a14;border:1px solid #1e1e3a">
+      <div class="mono text-[10px] tracking-widest font-bold" style="color:var(--cyan)">WHAT'S REAL</div>
+      <div class="text-sm mt-1 leading-relaxed"><b>flywheel</b> has <b>zero</b> ratatui deps. Its TUI is <span class="mono text-xs px-1 rounded" style="background:#1a1a3e">output.rs</span> + <span class="mono text-xs px-1 rounded" style="background:#1a1a3e">view/watch/status</span> + <span class="mono text-xs px-1 rounded" style="background:#1a1a3e">steer_brief</span> prompts. <b>toron-cli</b> <i>does</i> ship a ratatui dashboard (3 tabs, demo mailbox).</div>
+    </div>
+    <div class="rounded-xl p-4" style="background:#0a0a14;border:1px solid #1e1e3a">
+      <div class="mono text-[10px] tracking-widest font-bold" style="color:var(--mint)">HACKER-NIGHT FIT</div>
+      <div class="text-sm mt-1 leading-relaxed">Void <span class="mono" style="color:var(--ice)">#08080e</span> → <b>bg.base</b>. Electric lavender + vivid cyan give you a 2-accent system (not 6). Palette already passes WCAG on void — but your hardcoded ANSI <span class="mono text-xs">\x1b[32m</span> etc. ignore it.</div>
+    </div>
+    <div class="rounded-xl p-4" style="background:#0a0a14;border:1px solid #1e1e3a">
+      <div class="mono text-[10px] tracking-widest font-bold" style="color:var(--pink)">BIGGEST RISKS</div>
+      <div class="text-sm mt-1 leading-relaxed"><b>No theme layer</b> — colors hardcoded, no TrueColor fallback, no <span class="mono text-xs">NO_COLOR</span> respect in tui.rs. <b>No min-size gate</b> — 80×24 will truncate tabs. <b>No ? help</b> — discoverability fails skill tier 1.</div>
+    </div>
+  </div>
+  <div class="flex flex-wrap gap-2 mt-5">
+    <span class="mono text-[11px] px-3 py-1.5 rounded-full font-bold" style="background:var(--cyan);color:var(--void)">→ Do: add theme.rs with semantic slots → wire to both crates</span>
+    <span class="mono text-[11px] px-3 py-1.5 rounded-full" style="border:1px solid #24243a;color:var(--muted)">→ Then: responsive gate + help overlay + spinner polish</span>
+  </div>
+</section>
+
+<!-- 2 COL: Inventory + Palette Map -->
+<section class="grid lg:grid-cols-[1.15fr_0.85fr] gap-6">
+
+<!-- LEFT: Inventory -->
+<div class="card rounded-2xl p-6">
+  <div class="flex items-center gap-2 mb-1">
+    <div class="w-1.5 h-1.5 rounded-full" style="background:var(--cyan)"></div>
+    <h2 class="font-extrabold tracking-tight">1 — Inventory · what you actually have</h2>
+  </div>
+  <p class="mono text-xs mb-4" style="color:var(--muted)">classified per TUI Design §1 Layout Paradigm Selector · inspected: src/output.rs:1, tui.rs, steer_brief.rs, main.rs view/watch</p>
+
+  <div class="space-y-3">
+    <div class="rounded-xl p-4" style="background:#0a0a14;border:1px solid #1e1e3a">
+      <div class="flex items-start justify-between gap-3">
+        <div>
+          <div class="mono text-[11px] font-bold tracking-widest" style="color:var(--cyan)">TORON TUI</div>
+          <div class="text-sm font-bold">toron-cli/src/tui.rs:1 — ratatui 0.29 + crossterm 0.28</div>
+          <div class="mono text-xs mt-1" style="color:var(--muted)">366 lines · Tabs=Inbox/Agents/Search · demo mailbox (demo/TestAgent)</div>
+        </div>
+        <span class="mono text-[10px] px-2 py-1 rounded-full font-bold shrink-0" style="background:rgba(115,218,202,0.15);color:var(--mint);border:1px solid rgba(115,218,202,0.3)">REAL TUI</span>
+      </div>
+      <div class="mono text-xs mt-3 leading-relaxed" style="color:var(--fg)">
+        Layout: <b>Header(1) + Tabs(1) + Body(min) + Footer(1)</b> vertical stack — effectively <i>Drill-Down Stack inside Tabs</i>, not Persistent Multi-Panel.<br>
+        <span style="color:var(--muted)">Paradigm fit:</span> OK for a 3-view operator dashboard. Wrong if you later add reservations/threads — then switch to Persistent Multi-Panel (Inbox left, detail right, footer).
+      </div>
+      <div class="flex flex-wrap gap-1.5 mt-3">
+        <span class="mono text-[10px] px-2 py-1 rounded" style="background:#1a1a2e;color:var(--muted)">TTY gate: stdout+stdin ✓</span>
+        <span class="mono text-[10px] px-2 py-1 rounded" style="background:#1a1a2e;color:var(--muted)">refresh_ms poll ✓</span>
+        <span class="mono text-[10px] px-2 py-1 rounded" style="background:rgba(255,158,100,0.12);color:var(--orange);border:1px solid rgba(255,158,100,0.25)">no theme</span>
+        <span class="mono text-[10px] px-2 py-1 rounded" style="background:rgba(255,0,124,0.12);color:var(--pink);border:1px solid rgba(255,0,124,0.25)">no resize gate</span>
+      </div>
+    </div>
+
+    <div class="rounded-xl p-4" style="background:#0a0a14;border:1px solid #1e1e3a">
+      <div class="flex items-start justify-between gap-3">
+        <div>
+          <div class="mono text-[11px] font-bold tracking-widest" style="color:var(--lav)">FLYWHEEL VIEWER</div>
+          <div class="text-sm font-bold">src/main.rs:12469 view + 12514 watch + output.rs</div>
+          <div class="mono text-xs mt-1" style="color:var(--muted)">CLI human/JSON dual-mode · TTY-aware · alt-screen sanitized view</div>
+        </div>
+        <span class="mono text-[10px] px-2 py-1 rounded-full font-bold shrink-0" style="background:rgba(187,154,247,0.15);color:var(--lav);border:1px solid rgba(187,154,247,0.3)">CLI VIEWER</span>
+      </div>
+      <div class="mono text-xs mt-3 leading-relaxed" style="color:var(--fg)">
+        <b>view</b>: alt_screen_read_ladder via <span class="mono">recent_unwrapped</span> → <span class="mono">sanitize_pane_text</span> (strips ANSI/OSC + box chrome) — correct per TUI anti-pattern #5.<br>
+        <b>watch</b>: per-pane <span class="mono">agent_status_changed</span> subscription + poll fallback · deadline-aware read timeout — correct async pattern (skill §7.4).<br>
+        <b>status/list</b>: stdout.is_terminal() → human paint vs JSON — correct clig.dev discipline.<br>
+        <span style="color:var(--amber)">But:</span> <span class="mono">steer_brief.rs:79</span> is 4× <span class="mono">writeln! + read_line</span> with no color, no box-drawing, no footer hints. Falls below skill §3 progressive disclosure.
+      </div>
+    </div>
+
+    <div class="rounded-xl p-4" style="background:rgba(255,0,124,0.06);border:1px solid rgba(255,0,124,0.22)">
+      <div class="mono text-[11px] font-bold tracking-widest" style="color:var(--pink)">BEADS</div>
+      <div class="text-sm font-bold">br / bv — not a TUI surface inside flywheel</div>
+      <div class="mono text-xs mt-1 leading-relaxed" style="color:var(--muted)">Beads is invoked via <span class="mono">br ready --json</span> etc. No <span class="mono">bv</span> embedding. If you add an interactive beads viewer, that's the Persistent Multi-Panel slot — don't cram it into toron tui's tabs.</div>
+    </div>
+  </div>
+</div>
+
+<!-- RIGHT: Palette Map -->
+<div class="card rounded-2xl p-6">
+  <div class="flex items-center gap-2 mb-1">
+    <div class="w-1.5 h-1.5 rounded-full" style="background:var(--lav)"></div>
+    <h2 class="font-extrabold tracking-tight">2 — Hacker-night → semantic slots</h2>
+  </div>
+  <p class="mono text-xs mb-4" style="color:var(--muted)">Ghostty v2 is already near-perfect for TUI semantics — map, don't invent</p>
+
+  <!-- Swatches -->
+  <div class="grid grid-cols-8 gap-1.5 mb-4">
+    <div class="text-center"><div class="h-8 rounded-lg" style="background:#08080e;border:1px solid #1e1e3a"></div><div class="mono text-[9px] mt-1" style="color:var(--muted)">0 void</div></div>
+    <div class="text-center"><div class="h-8 rounded-lg" style="background:#f7768e"></div><div class="mono text-[9px] mt-1" style="color:var(--muted)">1 red</div></div>
+    <div class="text-center"><div class="h-8 rounded-lg" style="background:#73daca"></div><div class="mono text-[9px] mt-1" style="color:var(--muted)">2 mint</div></div>
+    <div class="text-center"><div class="h-8 rounded-lg" style="background:#e0af68"></div><div class="mono text-[9px] mt-1" style="color:var(--muted)">3 amber</div></div>
+    <div class="text-center"><div class="h-8 rounded-lg" style="background:#7aa2f7"></div><div class="mono text-[9px] mt-1" style="color:var(--muted)">4 blue</div></div>
+    <div class="text-center"><div class="h-8 rounded-lg" style="background:#bb9af7"></div><div class="mono text-[9px] mt-1" style="color:var(--muted)">5 lav</div></div>
+    <div class="text-center"><div class="h-8 rounded-lg" style="background:#0db9d7"></div><div class="mono text-[9px] mt-1" style="color:var(--muted)">6 cyan</div></div>
+    <div class="text-center"><div class="h-8 rounded-lg" style="background:#c8d0e8"></div><div class="mono text-[9px] mt-1" style="color:var(--muted)">7 fg</div></div>
+    <div class="text-center"><div class="h-8 rounded-lg" style="background:#565f89"></div><div class="mono text-[9px] mt-1" style="color:var(--muted)">8 dim</div></div>
+    <div class="text-center"><div class="h-8 rounded-lg" style="background:#ff007c"></div><div class="mono text-[9px] mt-1" style="color:var(--muted)">9 hpink</div></div>
+    <div class="text-center"><div class="h-8 rounded-lg" style="background:#9ece6a"></div><div class="mono text-[9px] mt-1" style="color:var(--muted)">10 green</div></div>
+    <div class="text-center"><div class="h-8 rounded-lg" style="background:#ff9e64"></div><div class="mono text-[9px] mt-1" style="color:var(--muted)">11 orange</div></div>
+    <div class="text-center"><div class="h-8 rounded-lg" style="background:#89ddff"></div><div class="mono text-[9px] mt-1" style="color:var(--muted)">12 ice</div></div>
+    <div class="text-center"><div class="h-8 rounded-lg" style="background:#ff007c"></div><div class="mono text-[9px] mt-1" style="color:var(--muted)">13 pink</div></div>
+    <div class="text-center"><div class="h-8 rounded-lg" style="background:#2ac3de"></div><div class="mono text-[9px] mt-1" style="color:var(--muted)">14 e-cyan</div></div>
+    <div class="text-center"><div class="h-8 rounded-lg" style="background:#ededed"></div><div class="mono text-[9px] mt-1" style="color:var(--muted)">15 white</div></div>
+  </div>
+  <div class="flex gap-2 mb-4 mono text-[10px]">
+    <span class="px-2 py-1 rounded" style="background:#0db9d7;color:#08080e;font-weight:800">cursor #0db9d7</span>
+    <span class="px-2 py-1 rounded" style="background:#1a1a3e;color:#c8d0e8;border:1px solid #24243a">selection #1a1a3e</span>
+    <span class="px-2 py-1 rounded" style="background:#08080e;color:#c8d0e8;border:1px solid #24243a">bg #08080e</span>
+  </div>
+
+  <div class="overflow-hidden rounded-xl" style="border:1px solid #1e1e3a">
+    <table class="w-full mono text-xs">
+      <thead><tr style="background:#12122a;color:var(--muted)"><th class="text-left px-3 py-2 font-bold">Slot</th><th class="text-left px-3 py-2 font-bold">Hacker-night</th><th class="text-left px-3 py-2 font-bold">Use</th></tr></thead>
+      <tbody class="divide-y divide-[#1e1e3a]">
+        <tr><td class="px-3 py-2 font-bold" style="color:var(--fg)">bg.base</td><td class="px-3 py-2"><span class="inline-block w-3 h-3 rounded-sm align-middle mr-1" style="background:#08080e;border:1px solid #2a2a4a"></span>#08080e void</td><td class="px-3 py-2" style="color:var(--muted)">terminal void</td></tr>
+        <tr><td class="px-3 py-2 font-bold" style="color:var(--fg)">bg.surface</td><td class="px-3 py-2"><span class="inline-block w-3 h-3 rounded-sm align-middle mr-1" style="background:#12122a"></span>#12122a</td><td class="px-3 py-2" style="color:var(--muted)">panels — +~6% lighter</td></tr>
+        <tr><td class="px-3 py-2 font-bold" style="color:var(--fg)">bg.overlay</td><td class="px-3 py-2"><span class="inline-block w-3 h-3 rounded-sm align-middle mr-1" style="background:#1a1a3e"></span>#1a1a3e selection</td><td class="px-3 py-2" style="color:var(--muted)">popups / help</td></tr>
+        <tr><td class="px-3 py-2 font-bold" style="color:var(--fg)">bg.selection</td><td class="px-3 py-2"><span class="inline-block w-3 h-3 rounded-sm align-middle mr-1" style="background:#24243f;border:1px solid #0db9d7"></span>#24243f + cyan ring</td><td class="px-3 py-2" style="color:var(--muted)">list highlight</td></tr>
+        <tr><td class="px-3 py-2 font-bold" style="color:var(--fg)">fg.default</td><td class="px-3 py-2"><span class="inline-block w-3 h-3 rounded-sm align-middle mr-1" style="background:#c8d0e8"></span>#c8d0e8</td><td class="px-3 py-2" style="color:var(--muted)">body</td></tr>
+        <tr><td class="px-3 py-2 font-bold" style="color:var(--fg)">fg.muted</td><td class="px-3 py-2"><span class="inline-block w-3 h-3 rounded-sm align-middle mr-1" style="background:#565f89"></span>#565f89</td><td class="px-3 py-2" style="color:var(--muted)">timestamps, meta</td></tr>
+        <tr><td class="px-3 py-2 font-bold" style="color:var(--fg)">fg.emphasis</td><td class="px-3 py-2"><span class="inline-block w-3 h-3 rounded-sm align-middle mr-1" style="background:#ededed"></span>#ededed</td><td class="px-3 py-2" style="color:var(--muted)">headers, bold</td></tr>
+        <tr><td class="px-3 py-2 font-bold" style="color:var(--cyan)">accent.primary</td><td class="px-3 py-2"><span class="inline-block w-3 h-3 rounded-sm align-middle mr-1" style="background:#0db9d7"></span>#0db9d7 vivid cyan</td><td class="px-3 py-2" style="color:var(--muted)">focus, cursor, tabs</td></tr>
+        <tr><td class="px-3 py-2 font-bold" style="color:var(--lav)">accent.secondary</td><td class="px-3 py-2"><span class="inline-block w-3 h-3 rounded-sm align-middle mr-1" style="background:#bb9af7"></span>#bb9af7 lav</td><td class="px-3 py-2" style="color:var(--muted)">secondary accents</td></tr>
+        <tr><td class="px-3 py-2 font-bold" style="color:var(--red)">status.error</td><td class="px-3 py-2"><span class="inline-block w-3 h-3 rounded-sm align-middle mr-1" style="background:#f7768e"></span>#f7768e → #ff007c bright</td><td class="px-3 py-2" style="color:var(--muted)">blocked, error</td></tr>
+        <tr><td class="px-3 py-2 font-bold" style="color:var(--amber)">status.warning</td><td class="px-3 py-2"><span class="inline-block w-3 h-3 rounded-sm align-middle mr-1" style="background:#e0af68"></span>#e0af68 / #ff9e64</td><td class="px-3 py-2" style="color:var(--muted)">warn, pending</td></tr>
+        <tr><td class="px-3 py-2 font-bold" style="color:var(--mint)">status.success</td><td class="px-3 py-2"><span class="inline-block w-3 h-3 rounded-sm align-middle mr-1" style="background:#73daca"></span>#73daca / #9ece6a</td><td class="px-3 py-2" style="color:var(--muted)">idle, done</td></tr>
+        <tr><td class="px-3 py-2 font-bold" style="color:var(--ice)">status.info</td><td class="px-3 py-2"><span class="inline-block w-3 h-3 rounded-sm align-middle mr-1" style="background:#89ddff"></span>#89ddff ice</td><td class="px-3 py-2" style="color:var(--muted)">working, info</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="mono text-[11px] mt-3 p-3 rounded-lg" style="background:#0a0a14;border:1px solid #1e1e3a;color:var(--muted)">
+    <b style="color:var(--amber)">Rule from skill §4:</b> never hardcode hex in widget code — reference these slots. Map to <span class="mono" style="color:var(--cyan)">Color::Rgb(r,g,b)</span> in TrueColor, <span class="mono" style="color:var(--lav)">ANSI 256</span> fallback, <span class="mono">16 ANSI</span> foundation. Detect via <span class="mono">COLORTERM=truecolor → 256 → NO_COLOR</span>.
+  </div>
+</div>
+</section>
+
+<!-- AUDIT TABLE -->
+<section class="card rounded-2xl p-6">
+  <div class="flex items-center gap-2 mb-1">
+    <div class="w-1.5 h-1.5 rounded-full" style="background:var(--pink)"></div>
+    <h2 class="font-extrabold tracking-tight">3 — Audit · skill principles + anti-patterns against your code</h2>
+  </div>
+  <p class="mono text-xs mb-4" style="color:var(--muted)">Severity: <span style="color:var(--red)">■ fix now</span> · <span style="color:var(--amber)">■ next</span> · <span style="color:var(--muted)">■ polish</span> · citations are file:line so you can jump</p>
+  <div class="overflow-x-auto rounded-xl" style="border:1px solid #1e1e3a">
+    <table class="w-full text-sm">
+      <thead><tr class="mono text-[11px] tracking-widest" style="background:#12122a;color:var(--muted)"><th class="text-left px-4 py-3">Area</th><th class="text-left px-4 py-3">Finding</th><th class="text-left px-4 py-3">Where</th><th class="text-left px-4 py-3">Fix</th></tr></thead>
+      <tbody class="divide-y divide-[#1e1e3a]">
+        <tr>
+          <td class="px-4 py-3 font-bold" style="color:var(--red)">Color system</td>
+          <td class="px-4 py-3 leading-relaxed"><b>Hardcoded ANSI in flywheel</b> — <span class="mono text-xs">output.rs:29 "32" idle / "36" working / "31;1" blocked / "90" done</span> ignores hacker-night. No semantic slots, no TrueColor. toron tui uses <span class="mono text-xs">Color::Red</span> raw + default style — no theme at all.</td>
+          <td class="px-4 py-3 mono text-xs" style="color:var(--muted)">output.rs:26<br>tui.rs:356<br>tui.rs:227</td>
+          <td class="px-4 py-3"><span class="mono text-xs px-2 py-1 rounded font-bold" style="background:rgba(255,0,124,0.15);color:var(--pink)">P0</span><div class="mono text-xs mt-1" style="color:var(--fg)">Create <span class="mono">theme.rs</span> with semantic slots → 3-tier degrade (§4). Wire both crates.</div></td>
+        </tr>
+        <tr>
+          <td class="px-4 py-3 font-bold" style="color:var(--red)">Responsive</td>
+          <td class="px-4 py-3 leading-relaxed"><b>No minimum-size gate.</b> <span class="mono text-xs">tui.rs:208</span> splits 1+1+min+1 without checking area. At 80×24 the body is ~20 rows — works — but at &lt;60 cols the header/tab truncate silently. No <span class="mono text-xs">"terminal too small"</span> message per skill §2.</td>
+          <td class="px-4 py-3 mono text-xs" style="color:var(--muted)">tui.rs:207<br>skill §2</td>
+          <td class="px-4 py-3"><span class="mono text-xs px-2 py-1 rounded font-bold" style="background:rgba(255,0,124,0.15);color:var(--pink)">P0</span><div class="mono text-xs mt-1" style="color:var(--fg)">Gate <span class="mono">80×12</span> → centered "resize" card; else proportional split holds.</div></td>
+        </tr>
+        <tr>
+          <td class="px-4 py-3 font-bold" style="color:var(--red)">Discoverability</td>
+          <td class="px-4 py-3 leading-relaxed"><b>No ? help overlay</b> and <b>footer lies by omission</b>. Footer repeats <span class="mono text-xs">"q: quit / Tab: next"</span> per tab but never mentions <span class="mono text-xs">↑↓ navigate, Enter search, Esc quit, j/k</span>. Fails skill §3 three-tier help. steer_brief has no footer at all.</td>
+          <td class="px-4 py-3 mono text-xs" style="color:var(--muted)">tui.rs:360<br>tui.rs:236<br>steer_brief.rs:79</td>
+          <td class="px-4 py-3"><span class="mono text-xs px-2 py-1 rounded font-bold" style="background:rgba(255,0,124,0.15);color:var(--pink)">P0</span><div class="mono text-xs mt-1" style="color:var(--fg)">Footer = <span class="mono">[q]uit [Tab]tab [↑↓]nav [?]help [Enter]search</span> + <span class="mono">?</span> overlay.</div></td>
+        </tr>
+        <tr>
+          <td class="px-4 py-3 font-bold" style="color:var(--amber)">Keyboard</td>
+          <td class="px-4 py-3 leading-relaxed">Only <span class="mono text-xs">Tab/BackTab, ↑↓, q, Esc, Ctrl-C</span>. Missing vim <span class="mono text-xs">j/k, g/G, /, ?</span> lingua franca (skill §3). Search tab does char-push but has <b>no Esc to clear</b> and no <span class="mono text-xs">n/N</span> next-match.</td>
+          <td class="px-4 py-3 mono text-xs" style="color:var(--muted)">tui.rs:89</td>
+          <td class="px-4 py-3"><span class="mono text-xs px-2 py-1 rounded font-bold" style="background:rgba(224,175,104,0.15);color:var(--amber)">P1</span><div class="mono text-xs mt-1" style="color:var(--muted)">Add j/k aliases, Esc clears search_input, / focuses search.</div></td>
+        </tr>
+        <tr>
+          <td class="px-4 py-3 font-bold" style="color:var(--amber)">Visual hierarchy</td>
+          <td class="px-4 py-3 leading-relaxed">All List items use same style + only <b>Bold</b> for selection. No <b>muted</b> for secondary (subject vs sender), no dim for <span class="mono text-xs">[ack]</span>. No zebra, no symbols (●/○). Header <span class="mono text-xs">tui.rs:218</span> is unstyled Paragraph — should be <span class="mono text-xs">fg.muted + BOLD</span> per skill §4 recipe (80% default, bold emphasis, dim meta).</td>
+          <td class="px-4 py-3 mono text-xs" style="color:var(--muted)">tui.rs:250<br>tui.rs:218</td>
+          <td class="px-4 py-3"><span class="mono text-xs px-2 py-1 rounded font-bold" style="background:rgba(224,175,104,0.15);color:var(--amber)">P1</span><div class="mono text-xs mt-1" style="color:var(--muted)">Style inbox rows: sender BOLD fg.emphasis, subject fg.default, ack in amber, importance dot.</div></td>
+        </tr>
+        <tr>
+          <td class="px-4 py-3 font-bold" style="color:var(--amber)">Focus & borders</td>
+          <td class="px-4 py-3 leading-relaxed">Blocks use <span class="mono text-xs">Block::bordered()</span> (light) everywhere — no <b>heavy border on focus</b> (skill visual-catalog mixed style). No dim on unfocused, no background layering.</td>
+          <td class="px-4 py-3 mono text-xs" style="color:var(--muted)">tui.rs:261<br>visual-catalog §Mixed</td>
+          <td class="px-4 py-3"><span class="mono text-xs px-2 py-1 rounded font-bold" style="background:rgba(224,175,104,0.15);color:var(--amber)">P1</span><div class="mono text-xs mt-1" style="color:var(--muted)">Active panel: heavy <span class="mono">┏━</span> + cyan; inactive: light <span class="mono">┌─</span> + muted.</div></td>
+        </tr>
+        <tr>
+          <td class="px-4 py-3 font-bold" style="color:var(--muted)">Accessibility</td>
+          <td class="px-4 py-3 leading-relaxed"><b>NO_COLOR ignored in tui.rs</b> (only checked in output.rs). Error uses <span class="mono text-xs">fg(Color::Red)</span> alone — no symbol prefix. No contrast check on void: red #f7768e on #08080e is 5.1:1 (passes AA) but bright #ff007c on void is 4.3:1 (fails small text). Skill §4.8 violated.</td>
+          <td class="px-4 py-3 mono text-xs" style="color:var(--muted)">tui.rs:356<br>output.rs:8</td>
+          <td class="px-4 py-3"><span class="mono text-xs px-2 py-1 rounded" style="background:#1a1a2e;color:var(--muted)">P2</span><div class="mono text-xs mt-1" style="color:var(--muted)">Gate tui colors on <span class="mono">NO_COLOR</span>; prefix errors with <span class="mono">✗</span>; pick #f7768e not #ff007c for text.</div></td>
+        </tr>
+        <tr>
+          <td class="px-4 py-3 font-bold" style="color:var(--muted)">Animation</td>
+          <td class="px-4 py-3 leading-relaxed">Refresh does full <span class="mono text-xs">refresh()</span> on every poll timeout — no spinner, no 200ms delay, no empty-state skeleton. Ratatui handles double-buffer but no synchronized output wrapper was verified.</td>
+          <td class="px-4 py-3 mono text-xs" style="color:var(--muted)">tui.rs:71<br>skill §6</td>
+          <td class="px-4 py-3"><span class="mono text-xs px-2 py-1 rounded" style="background:#1a1a2e;color:var(--muted)">P2</span><div class="mono text-xs mt-1" style="color:var(--muted)">Braille spinner <span class="mono">⠋⠙⠹</span> after 200ms; <span class="mono">CSI ? 2026 h</span> around draw (ratatui does batched writes).</div></td>
+        </tr>
+        <tr>
+          <td class="px-4 py-3 font-bold" style="color:var(--muted)">flywheel viewer</td>
+          <td class="px-4 py-3 leading-relaxed">view sanitizer is <b>good</b> (skill §5 pass). watch's per-pane subscription pattern is <b>good</b>. But <span class="mono text-xs">status_paint</span> hardcodes ANSI with no truecolor — on Ghostty this renders as the correct hacker-night hues <i>by accident</i> (palette 2/6 etc.). Document this as <b>16 ANSI foundation</b> intentionally.</td>
+          <td class="px-4 py-3 mono text-xs" style="color:var(--muted)">output.rs:26<br>main.rs:12513</td>
+          <td class="px-4 py-3"><span class="mono text-xs px-2 py-1 rounded" style="background:rgba(115,218,202,0.12);color:var(--mint);border:1px solid rgba(115,218,202,0.25)">KEEP</span><div class="mono text-xs mt-1" style="color:var(--muted)">Keep ANSI foundation; add <span class="mono">COLORTERM</span> truecolor branch for hacker-night exacts.</div></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- SPECIMENS -->
+<section class="grid lg:grid-cols-2 gap-6">
+
+<div class="card rounded-2xl p-6">
+  <h3 class="font-extrabold tracking-tight flex items-center gap-2"><span class="w-2 h-2 rounded-full" style="background:var(--muted)"></span> Before — current toron tui</h3>
+  <p class="mono text-xs mt-1" style="color:var(--muted)">tui.rs:207 ui() — 4-row vertical stack, no theming, default ratatui colors</p>
+  <div class="term mt-4">
+    <div class="term-bar flex items-center gap-1.5 px-3 py-2">
+      <span class="w-3 h-3 rounded-full" style="background:#ff5f56"></span><span class="w-3 h-3 rounded-full" style="background:#ffbd2e"></span><span class="w-3 h-3 rounded-full" style="background:#27c93f"></span>
+      <span class="mono text-xs ml-2" style="color:var(--muted)">toron tui — 80×24</span>
+    </div>
+    <div class="p-3 mono text-[12px] leading-5" style="color:#c8d0e8">
+      <div style="color:#565f89">toron tui — operator dashboard    view: 1 / 3    q: quit / Tab: next</div>
+      <div class="mt-1"><span style="text-decoration:underline;font-weight:700">Inbox</span>  <span style="color:#565f89">Agents</span>  <span style="color:#565f89">Search</span></div>
+      <div class="mt-2" style="border:1px solid #565f89;padding:6px">
+        <div style="color:#c8d0e8">┌ Inbox ──────────────────────────────┐</div>
+        <div>&gt; alice@example.com — [br-12] done (high) [ack]</div>
+        <div style="color:#565f89">  bob@example.com — deploy ping (low)</div>
+        <div style="color:#565f89">  carol@example.com — review ready</div>
+        <div style="color:#565f89">└─────────────────────────────────────┘</div>
+      </div>
+      <div class="mt-2" style="color:#565f89">inbox: refreshed every tick — q: quit / Tab: next</div>
+    </div>
+  </div>
+  <ul class="mono text-xs mt-3 space-y-1" style="color:var(--muted)">
+    <li>→ header/tab unstyled — no fg.muted/BOLD</li>
+    <li>→ selection only Bold — no bg.layering or symbol</li>
+    <li>→ light border everywhere — no heavy focus</li>
+    <li>→ footer repeats without [?] hint</li>
+  </ul>
+</div>
+
+<div class="card rounded-2xl p-6" style="border-color:rgba(13,185,215,0.35)">
+  <h3 class="font-extrabold tracking-tight flex items-center gap-2"><span class="w-2 h-2 rounded-full" style="background:var(--cyan)"></span> After — hacker-night themed</h3>
+  <p class="mono text-xs mt-1" style="color:var(--cyan)">with theme.rs semantic slots · heavy focus · 3-tier color · ? overlay</p>
+  <div class="term mt-4" style="border-color:rgba(13,185,215,0.25)">
+    <div class="term-bar flex items-center gap-1.5 px-3 py-2">
+      <span class="w-3 h-3 rounded-full" style="background:#ff5f56"></span><span class="w-3 h-3 rounded-full" style="background:#ffbd2e"></span><span class="w-3 h-3 rounded-full" style="background:#27c93f"></span>
+      <span class="mono text-xs ml-2" style="color:#0db9d7">toron tui — hacker-night</span>
+      <span class="ml-auto mono text-[10px] px-2 py-0.5 rounded-full" style="background:#0db9d7;color:#08080e;font-weight:800">TRUECOLOR</span>
+    </div>
+    <div class="p-3 mono text-[12px] leading-5" style="background:#08080e;color:#c8d0e8">
+      <div><span style="color:#565f89">toron</span> <span style="color:#0db9d7">◆</span> <span style="color:#ededed;font-weight:700">operator dashboard</span> <span style="color:#565f89">·</span> <span style="color:#bb9af7">demo/TestAgent</span> <span style="color:#565f89">· view 1/3</span> <span class="float-right" style="color:#73daca">● live</span></div>
+      <div class="mt-1 flex gap-3">
+        <span style="background:#0db9d7;color:#08080e;padding:1px 8px;border-radius:4px;font-weight:700">Inbox</span>
+        <span style="color:#565f89">Agents</span>
+        <span style="color:#565f89">Search</span>
+      </div>
+      <div class="mt-2" style="border:1px solid #0db9d7;padding:6px;background:#12122a">
+        <div style="color:#0db9d7;font-weight:700">┏ Inbox ━━━━━━━━━━━━━━━━━━━━━━━━━━━┓</div>
+        <div style="background:#24243f;padding:2px 6px"><span style="color:#0db9d7">▶</span> <span style="color:#ededed;font-weight:700">alice@example.com</span> <span style="color:#c8d0e8">— [br-12] done</span> <span style="background:#e0af68;color:#08080e;padding:0 4px;border-radius:3px;font-size:10px">HIGH</span> <span style="color:#e0af68">◉ ack</span></div>
+        <div style="color:#c8d0e8;padding:2px 6px">  bob@example.com <span style="color:#565f89">— deploy ping</span> <span style="background:#1a1a3e;color:#565f89;padding:0 4px;border-radius:3px;font-size:10px">LOW</span></div>
+        <div style="color:#c8d0e8;padding:2px 6px">  carol@example.com <span style="color:#565f89">— review ready</span></div>
+        <div style="color:#0db9d7">┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛</div>
+      </div>
+      <div class="mt-2 flex justify-between" style="color:#565f89;border-top:1px solid #1a1a3e;padding-top:6px">
+        <span><span style="color:#c8d0e8">[q]</span> quit <span style="color:#c8d0e8">[Tab]</span> tab <span style="color:#c8d0e8">[↑↓/jk]</span> nav <span style="color:#0db9d7">[?]</span> help</span>
+        <span style="color:#73daca">⠋ tick 12 · 2 agents</span>
+      </div>
+    </div>
+  </div>
+  <ul class="mono text-xs mt-3 space-y-1" style="color:var(--fg)">
+    <li><span style="color:var(--mint)">→</span> heavy cyan border = focus (visual-catalog mixed)</li>
+    <li><span style="color:var(--mint)">→</span> selection = bg.selection #24243f + ▶ + bold sender</li>
+    <li><span style="color:var(--mint)">→</span> importance as colored badge + ack as amber ◉</li>
+    <li><span style="color:var(--mint)">→</span> footer = 5 hints + live spinner, ? opens overlay</li>
+  </ul>
+</div>
+</section>
+
+<!-- More specimens: flywheel status + steer_brief -->
+<section class="grid lg:grid-cols-2 gap-6">
+<div class="card rounded-2xl p-6">
+  <h3 class="font-extrabold">flywheel status — before vs hacker-night</h3>
+  <p class="mono text-xs mt-1" style="color:var(--muted)">output.rs:26 status_paint · hardcoded 16 ANSI</p>
+  <div class="grid grid-cols-2 gap-3 mt-4 mono text-xs">
+    <div class="term p-3">
+      <div style="color:var(--muted)">before (ANSI 16)</div>
+      <div class="mt-2 space-y-1">
+        <div><span style="color:#565f89">opencode</span> <span style="color:#ff00ff">flywheel-flywheel-oc</span> <span style="color:#00ffff">working</span></div>
+        <div><span style="color:#565f89">pi</span> <span style="color:#ff00ff">flywheel-flywheel-pi</span> <span style="color:#00ff00">idle</span></div>
+        <div><span style="color:#565f89">grok</span> <span style="color:#ff00ff">flywheel-flywheel-gk</span> <span style="color:#ff0000;font-weight:700">blocked</span></div>
+        <div style="color:#565f89">doorbell: up last_wake=never pin=?</div>
+      </div>
+    </div>
+    <div class="term p-3" style="border-color:rgba(13,185,215,0.25)">
+      <div style="color:var(--cyan)">after (hacker-night, truecolor + ANSI fallback)</div>
+      <div class="mt-2 space-y-1">
+        <div><span style="color:#565f89">opencode</span> <span style="color:#e0af68">flywheel-flywheel-oc</span> <span style="color:#89ddff">● working</span></div>
+        <div><span style="color:#565f89">pi</span> <span style="color:#e0af68">flywheel-flywheel-pi</span> <span style="color:#73daca">● idle</span></div>
+        <div><span style="color:#565f89">grok</span> <span style="color:#e0af68">flywheel-flywheel-gk</span> <span style="color:#f7768e">● blocked</span><span style="color:#565f89"> ⚠</span></div>
+        <div><span style="color:#0db9d7">◆ doorbell</span> <span style="color:#73daca">up</span> <span style="color:#565f89">· last_wake never · pin ?</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="mono text-xs mt-3 p-2 rounded" style="background:#0a0a14;border:1px solid #1e1e3a;color:var(--muted)">16 ANSI stays as foundation — Ghostty palette already maps 32→#73daca etc. Truecolor branch emits <span class="mono" style="color:var(--cyan)">\x1b[38;2;13;185;215m</span> for cyan so non-Ghostty terms also get neon-on-void, not terminal lottery.</div>
+</div>
+
+<div class="card rounded-2xl p-6">
+  <h3 class="font-extrabold">steer_brief — before vs hacker-night</h3>
+  <p class="mono text-xs mt-1" style="color:var(--muted)">steer_brief.rs:79 — pure text prompts today</p>
+  <div class="term mt-4 p-3 mono text-[12px] leading-5">
+    <div style="color:#0db9d7;font-weight:700">┏ captain briefing: steer "implement auth" ━━━━━━━━━━━━━━┓</div>
+    <div style="color:#565f89">┃ objective: implement the auth refactor               ┃</div>
+    <div style="color:#1a1a3e">┃                                                      ┃</div>
+    <div><span style="color:#bb9af7">┃ [1/4]</span> <span style="color:#ededed;font-weight:700">inferred crew plan</span> <span style="color:#565f89">(Enter keeps)</span>              <span style="color:#565f89">┃</span></div>
+    <div><span style="color:#c8d0e8">┃   planner x1</span> <span style="color:#73daca">● funded</span>                         <span style="color:#565f89">┃</span></div>
+    <div><span style="color:#c8d0e8">┃   coder   x2</span> <span style="color:#73daca">● funded</span>                         <span style="color:#565f89">┃</span></div>
+    <div><span style="color:#bb9af7">┃ [2/4]</span> <span style="color:#ededed;font-weight:700">per-role models</span> <span style="color:#565f89">Enter keeps default</span>              <span style="color:#565f89">┃</span></div>
+    <div><span style="color:#c8d0e8">┃   coder (omp):</span> <span style="color:#0db9d7">deepseek-v4-flash</span> <span style="color:#565f89">$0.001/mtok</span> <span style="color:#565f89">┃</span></div>
+    <div><span style="color:#565f89">┃     [0] opencode-go/deepseek-v4-flash  [1] zai/glm-5.2  ┃</span></div>
+    <div><span style="color:#e0af68">┃ ⚠  dispatch? [Y/n] &gt; █</span>                                  <span style="color:#565f89">┃</span></div>
+    <div style="color:#0db9d7;font-weight:700">┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛</div>
+    <div class="mt-2" style="color:#565f89">[Enter] keep  [n] abort  [?] help</div>
+  </div>
+  <div class="mono text-xs mt-3" style="color:var(--muted)">Use heavy header + numbered sections + bold defaults + amber dispatch gate — progressive disclosure without changing the pure-function contract (still injected stdin/stdout).</div>
+</div>
+</section>
+
+<!-- CODE -->
+<section class="card rounded-2xl p-6">
+  <div class="flex items-center gap-2 mb-4">
+    <div class="w-1.5 h-1.5 rounded-full" style="background:var(--amber)"></div>
+    <h2 class="font-extrabold tracking-tight">4 — Patch spec · copy-pasteable theme layer</h2>
+    <span class="ml-auto mono text-[10px] px-2 py-1 rounded-full" style="background:#1a1a2e;color:var(--muted)">never hardcode hex in widget code — reference slots</span>
+  </div>
+
+  <div class="grid lg:grid-cols-2 gap-4">
+    <div>
+      <div class="mono text-xs font-bold mb-2" style="color:var(--cyan)">A — flywheel: output.rs → hacker-night truecolor (3-tier degrade)</div>
+      <div class="term p-3 overflow-x-auto">
+<pre class="mono text-[11px] leading-5" style="color:#c8d0e8"><span style="color:#565f89">// theme: semantic slot → (truecolor RGB, 256 idx, 16 ANSI code)</span>
+<span style="color:#bb9af7">pub enum Slot</span> { BgBase, BgSurface, FgDefault, FgMuted,
+  FgEmphasis, AccentCyan, AccentLav, Error, Warn, Success, Info }
+
+<span style="color:#565f89">// hacker-night exacts</span>
+<span style="color:#bb9af7">fn rgb</span>(s: Slot) -&gt; (u8,u8,u8) {
+  <span style="color:#bb9af7">match</span> s {
+    BgBase =&gt; (0x08,0x08,0x0e), <span style="color:#565f89">// void</span>
+    FgMuted =&gt; (0x56,0x5f,0x89),
+    AccentCyan =&gt; (0x0d,0xb9,0xd7), <span style="color:#565f89">// vivid cyan</span>
+    AccentLav =&gt; (0xbb,0x9a,0xf7),
+    Error =&gt; (0xf7,0x76,0x8e),   <span style="color:#565f89">// NOT #ff007c for text (contrast)</span>
+    Success =&gt; (0x73,0xda,0xca),
+    Info =&gt; (0x89,0xdd,0xff),
+    Warn =&gt; (0xe0,0xaf,0x68),
+    <span style="color:#565f89">// …</span>
+  }
+}
+<span style="color:#bb9af7">fn paint_slot</span>(s: &amp;str, slot: Slot) -&gt; String {
+  <span style="color:#bb9af7">if</span> no_color() { <span style="color:#bb9af7">return</span> s.into() }
+  <span style="color:#bb9af7">if</span> truecolor() { <span style="color:#565f89">// COLORTERM=truecolor|24bit</span>
+    <span style="color:#bb9af7">let</span> (r,g,b)=rgb(slot);
+    <span style="color:#bb9af7">return format!</span>(<span style="color:#9ece6a">"\x1b[38;2;{r};{g};{b}m{s}\x1b[0m"</span>)
+  }
+  <span style="color:#565f89">// 256 fallback: map to nearest 38;5;N, else 16 ANSI foundation</span>
+  <span style="color:#bb9af7">let</span> code = ansi256(slot); <span style="color:#565f89">// e.g. cyan → 38;5;44</span>
+  <span style="color:#bb9af7">format!</span>(<span style="color:#9ece6a">"\x1b[{code}m{s}\x1b[0m"</span>)
+}
+<span style="color:#565f89">// status_paint then becomes:</span>
+Idle =&gt; paint_slot(s, Slot::Success),     <span style="color:#565f89">// mint #73daca</span>
+Working =&gt; paint_slot(s, Slot::Info),     <span style="color:#565f89">// ice #89ddff (was 36 cyan)</span>
+Blocked =&gt; paint_slot(s, Slot::Error),    <span style="color:#565f89">// #f7768e bold</span>
+Done =&gt; paint_slot(s, Slot::FgMuted),</pre>
+      </div>
+      <div class="mono text-[11px] mt-2 p-2 rounded" style="background:rgba(224,175,104,0.08);border:1px solid rgba(224,175,104,0.2);color:var(--amber)">Keep 16 ANSI as foundation: Ghostty maps palette 2/6/4 correctly — but truecolor branch guarantees neon-on-void on *any* terminal (skill §4 Detection hierarchy).</div>
+    </div>
+
+    <div>
+      <div class="mono text-xs font-bold mb-2" style="color:var(--lav)">B — toron tui: theme.rs for ratatui Style</div>
+      <div class="term p-3 overflow-x-auto">
+<pre class="mono text-[11px] leading-5" style="color:#c8d0e8"><span style="color:#565f89">// crates/toron-cli/src/theme.rs — single source of truth</span>
+<span style="color:#bb9af7">pub struct HackerNight</span>;
+<span style="color:#bb9af7">impl HackerNight</span> {
+  <span style="color:#bb9af7">pub const VOID</span>: Color = Color::Rgb(0x08,0x08,0x0e);
+  <span style="color:#bb9af7">pub const FG</span>: Color = Color::Rgb(0xc8,0xd0,0xe8);
+  <span style="color:#bb9af7">pub const MUTED</span>: Color = Color::Rgb(0x56,0x5f,0x89);
+  <span style="color:#bb9af7">pub const CYAN</span>: Color = Color::Rgb(0x0d,0xb9,0xd7);
+  <span style="color:#bb9af7">pub const LAV</span>: Color = Color::Rgb(0xbb,0x9a,0xf7);
+  <span style="color:#bb9af7">pub const MINT</span>: Color = Color::Rgb(0x73,0xda,0xca);
+  <span style="color:#bb9af7">pub const AMBER</span>: Color = Color::Rgb(0xe0,0xaf,0x68);
+  <span style="color:#bb9af7">pub const RED</span>: Color = Color::Rgb(0xf7,0x76,0x8e);
+  <span style="color:#bb9af7">pub const ICE</span>: Color = Color::Rgb(0x89,0xdd,0xff);
+  <span style="color:#565f89">// semantic Styles</span>
+  <span style="color:#bb9af7">pub fn header</span>() -&gt; Style {
+    Style::default().fg(Self::FG).bg(Self::VOID)
+      .add_modifier(Modifier::BOLD)
+  }
+  <span style="color:#bb9af7">pub fn selection</span>() -&gt; Style {
+    Style::default().fg(Self::FG).bg(Color::Rgb(0x24,0x24,0x3f))
+      .add_modifier(Modifier::BOLD)
+  }
+  <span style="color:#bb9af7">pub fn muted</span>() -&gt; Style {
+    Style::default().fg(Self::MUTED)
+      .add_modifier(Modifier::DIM)
+  }
+  <span style="color:#bb9af7">pub fn error</span>() -&gt; Style {
+    Style::default().fg(Self::RED)
+      .add_modifier(Modifier::BOLD)
+  }
+}
+<span style="color:#565f89">// usage in tui.rs:</span>
+<span style="color:#bb9af7">let</span> tabs = Tabs::new(TABS).select(state.tab)
+  .style(HackerNight::muted())
+  .highlight_style(HackerNight::header()
+    .fg(HackerNight::CYAN)
+    .add_modifier(Modifier::UNDERLINED));
+<span style="color:#565f89">// respect NO_COLOR at startup:</span>
+<span style="color:#bb9af7">if</span> std::env::var_os(<span style="color:#9ece6a">"NO_COLOR"</span>).is_some() {
+  <span style="color:#565f89">// downgrade every Style to .fg(Color::Reset)</span>
+}</pre>
+      </div>
+      <div class="mono text-[11px] mt-2 p-2 rounded" style="background:rgba(13,185,215,0.08);border:1px solid rgba(13,185,215,0.2);color:var(--cyan)">Ship dark hacker-night by default. Light variant = swap bg.base/fg.default; detect via OSC query or terminal-light crate — but don't block on it.</div>
+    </div>
+  </div>
+
+  <div class="grid lg:grid-cols-3 gap-3 mt-4 mono text-xs">
+    <div class="rounded-xl p-3" style="background:#0a0a14;border:1px solid #1e1e3a">
+      <div class="font-bold" style="color:var(--cyan)">C — Responsive gate (P0)</div>
+      <div class="mt-1" style="color:var(--muted)">At top of <span class="mono">ui()</span>:</div>
+      <div class="mono text-[11px] mt-1 p-2 rounded" style="background:#08080e;border:1px solid #1e1e3a;color:#c8d0e8">if area.width &lt; 80 || area.height &lt; 12 {<br>&nbsp;&nbsp;render_resize_card(f, area); return;<br>}</div>
+      <div class="mt-1" style="color:var(--muted)">Proportional split holds otherwise; below 100 cols hide search preview first (§2 Priority collapse).</div>
+    </div>
+    <div class="rounded-xl p-3" style="background:#0a0a14;border:1px solid #1e1e3a">
+      <div class="font-bold" style="color:var(--lav)">D — Help overlay (P0)</div>
+      <div class="mt-1 mono text-[11px] leading-relaxed" style="color:var(--muted)">Footer: <span class="mono" style="color:var(--fg)">[q] quit [Tab] tab [↑↓/jk] nav [?] help [Enter] search</span><br>On <span class="mono">?</span>: centered <span class="mono">Clear</span> popup on dimmed bg.overlay listing all bindings + NO_COLOR note.</div>
+    </div>
+    <div class="rounded-xl p-3" style="background:#0a0a14;border:1px solid #1e1e3a">
+      <div class="font-bold" style="color:var(--amber)">E — Polish (P1/P2)</div>
+      <div class="mt-1 mono text-[11px] leading-relaxed" style="color:var(--muted)">j/k aliases, Esc clears search, g/G top/bottom, spinner <span class="mono">⠋</span> after 200ms, heavy ┏━ focus border, error prefix <span class="mono">✗</span> (never color alone).</div>
+    </div>
+  </div>
+</section>
+
+<!-- CHECKLIST -->
+<section class="card rounded-2xl p-6">
+  <h2 class="font-extrabold tracking-tight">5 — Ship checklist (skill §9) · what's passing, what's not</h2>
+  <div class="grid md:grid-cols-3 gap-3 mt-4 mono text-xs">
+    <div class="space-y-2">
+      <div class="font-bold tracking-widest" style="color:var(--mint)">PASSING ✓</div>
+      <div class="flex gap-2"><span style="color:var(--mint)">✓</span><span>TTY gate (stdout+stdin) in toron tui — no hang on pipe</span></div>
+      <div class="flex gap-2"><span style="color:var(--mint)">✓</span><span>NO_COLOR respected in flywheel output.rs</span></div>
+      <div class="flex gap-2"><span style="color:var(--mint)">✓</span><span>view sanitizes TUI chrome (alternate-screen ladder)</span></div>
+      <div class="flex gap-2"><span style="color:var(--mint)">✓</span><span>watch per-pane subscription + poll fallback</span></div>
+      <div class="flex gap-2"><span style="color:var(--mint)">✓</span><span>stdout is data, stderr is messages (clig.dev)</span></div>
+      <div class="flex gap-2"><span style="color:var(--mint)">✓</span><span>Keyboard-only (no mouse assumption)</span></div>
+    </div>
+    <div class="space-y-2">
+      <div class="font-bold tracking-widest" style="color:var(--red)">FAILING ✗ (P0)</div>
+      <div class="flex gap-2"><span style="color:var(--red)">✗</span><span>No theme layer — hardcoded colors in both crates</span></div>
+      <div class="flex gap-2"><span style="color:var(--red)">✗</span><span>No min-size gate (80×24)</span></div>
+      <div class="flex gap-2"><span style="color:var(--red)">✗</span><span>No ? help overlay (tier 2)</span></div>
+      <div class="flex gap-2"><span style="color:var(--red)">✗</span><span>Footer not context-sensitive (same text every tab)</span></div>
+      <div class="flex gap-2"><span style="color:var(--red)">✗</span><span>NO_COLOR ignored in tui.rs</span></div>
+      <div class="flex gap-2"><span style="color:var(--red)">✗</span><span>No focus indicator (heavy vs light border)</span></div>
+    </div>
+    <div class="space-y-2">
+      <div class="font-bold tracking-widest" style="color:var(--amber)">NEXT (P1/P2)</div>
+      <div class="flex gap-2"><span style="color:var(--amber)">○</span><span>Vim j/k, g/G, /, Esc-clear</span></div>
+      <div class="flex gap-2"><span style="color:var(--amber)">○</span><span>Zebra / muted secondary text</span></div>
+      <div class="flex gap-2"><span style="color:var(--amber)">○</span><span>Braille spinner after 200ms</span></div>
+      <div class="flex gap-2"><span style="color:var(--amber)">○</span><span>Never color-alone (✗ prefix)</span></div>
+      <div class="flex gap-2"><span style="color:var(--amber)">○</span><span>steer_brief box-drawing + color</span></div>
+      <div class="flex gap-2"><span style="color:var(--amber)">○</span><span>Test in Ghostty + WezTerm + tmux</span></div>
+    </div>
+  </div>
+  <div class="mono text-xs mt-4 p-3 rounded-xl flex flex-wrap gap-2" style="background:#0a0a14;border:1px solid #1e1e3a">
+    <span class="px-2.5 py-1 rounded-full font-bold" style="background:var(--cyan);color:var(--void)">Next step</span>
+    <span style="color:var(--fg)">Land <b>theme.rs</b> in both crates (this review's §4 A+B) → wire <b>responsive gate + ? overlay</b> → then polish. I can patch <span class="mono">toron-cli/src/theme.rs</span> + <span class="mono">flywheel/src/output.rs</span> now if you want — say the word.</span>
+  </div>
+</section>
+
+<footer class="mono text-xs text-center py-6" style="color:var(--muted)">
+  hacker-night neon-on-void · Ghostty v2 · tui-design skill §1-§9 · flywheel 0.3.0 · toron-cli ratatui 0.29<br>
+  Bottom line stays at top. Everything else was pullable — that was the point.
+</footer>
+
+</main>
+</body>
+</html>
