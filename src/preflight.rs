@@ -560,9 +560,7 @@ pub fn check_provider_funded(provider: &str, profile: &str) -> Check {
     // vars (never values). Fail-closed only when FLYWHEEL_FUNDED_BALANCE_* set
     // and empty/zero; otherwise warn via skip message when neither API key
     // name is present for opencode-go.
-    if provider.eq_ignore_ascii_case("opencode-go")
-        || provider.eq_ignore_ascii_case("opencode")
-    {
+    if provider.eq_ignore_ascii_case("opencode-go") || provider.eq_ignore_ascii_case("opencode") {
         let api = std::env::var_os("OPENCODE_API_KEY").is_some();
         let go = std::env::var_os("OPENCODE_GO_API_KEY").is_some();
         if !api && !go {

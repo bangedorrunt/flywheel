@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Terminal states (`done|clean_skip|blocked|failed`) + `settled:` decision labels + independence doctrine, in stage contracts.
 - toron ADR-0022 addendum: `Phase` enum gains `compound` (six-value closed vocabulary, deserialize-gated as before).
 - **Agent-native workflow selection (ADR-0009 addon):** every `workflow list --json` row now carries `description` + `run` (exact invocation) + `compose_token` + `decide_trigger` — select from `list` like a skill catalog. `decide` routes five previously-unpickable intents: debate, brainstorm→ce-brainstorm, bead-ready plan→ce-plan, ship the chain→ship, convert to beads→beads (+ trigger phrases). `robot_capabilities` gains the `workflows` discovery object.
+- **Compound `init` (bd-bhri):** `flywheel init <project>` now scaffolds the project-scope compound spine — `.flywheel/stages.toml` (project tier template), `.flywheel/standing-orders.md` (fence + compound orders), `docs/learnings/README.md` (corpus convention). Re-runnable, never overwrites; prints the AGENTS.md discoverability pointer instead of editing it.
 
 ### Changed — ADR-0009
 - Builtins renamed where they ARE CE concepts: `brainstorm`→`ce-brainstorm`, `plan`→`ce-plan`, `plan-review`→`ce-plan-review` (slash short-forms `/plan` `/plan-review` `/brainstorm` keep their names, retargeted). `goal`/`goal-direct`/`beads`/`beads-lifecycle` stage refs updated to ce- names. `stage list` drops the alias column; robot_capabilities `stages` carries the ce- loop.

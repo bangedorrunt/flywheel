@@ -34,6 +34,7 @@ mod fs_util;
 mod headless;
 mod herdr_shim;
 mod ingress;
+mod init_scaffold;
 mod intent;
 mod mail_shim;
 mod mcp_http;
@@ -402,7 +403,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Scaffold a project (ensure dir + .beads) without spawning
+    /// Scaffold a project (ensure dir + .beads + the project-scope compound
+    /// spine: .flywheel/stages.toml, .flywheel/standing-orders.md,
+    /// docs/learnings/) without spawning
     Init { project: String },
     /// Spawn a swarm (escape hatch). Default multi-lane is
     /// `workflow compose --parts wave-swarm --run`.
@@ -4642,9 +4645,6 @@ fn snapshot_runs() -> Vec<Value> {
 fn chrono_like_ts() -> String {
     state::now_iso()
 }
-
-// ---- init ----
-
 fn cmd_init(cfg: &Config, project: &str) -> Result<()> {
     let dir = project_dir(cfg, project);
     if !dir.exists() {
@@ -4665,6 +4665,17 @@ fn cmd_init(cfg: &Config, project: &str) -> Result<()> {
             bail!("br init failed: {}", String::from_utf8_lossy(&out.stderr));
         }
     }
+    // Project-scope compound spine (ADR-0009, bd-bhri): re-runnable, never
+    // overwrites authored files.
+    let (created, kept) = crate::init_scaffold::scaffold(&dir)?;
+    for path in &created {
+        println!("created {}", path.display());
+    }
+    for path in &kept {
+        println!("kept {}", path.display());
+    }
+    println!("AGENTS.md pointer (add so future agents find the corpus):");
+    println!("  {}", crate::init_scaffold::AGENTS_POINTER);
     Ok(())
 }
 
@@ -6583,8 +6594,7 @@ mod spawn_boot_reliability_tests {
         );
         // GS-037 P0-3: agent_name_taken fail-fast / rename-clear, not ~120s burn.
         assert!(
-            helper_body.contains("agent_name_taken")
-                && helper_body.contains("rename-clear"),
+            helper_body.contains("agent_name_taken") && helper_body.contains("rename-clear"),
             "verify_or_respawn_pane must rename-clear / fail-fast on agent_name_taken"
         );
     }
@@ -6640,8 +6650,7 @@ mod spawn_boot_reliability_tests {
         let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
         let spawn_body = &src[spawn..spawn + 40000];
         assert!(
-            spawn_body.contains("presence_project")
-                && spawn_body.contains("GS-037 P0-D"),
+            spawn_body.contains("presence_project") && spawn_body.contains("GS-037 P0-D"),
             "presence publish must use absolute project key (register-before-presence)"
         );
         // Compose: default_value_t = true for retire_orphans (safe default).
@@ -13048,11 +13057,8 @@ fn cmd_send(
     // require an independent doorbell/agent advance (never self-mint here).
     let wake_before_unix = if wait {
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
-        doorbell::load_wake_state(&doorbell::wake_state_file(
-            &config::state_dir(),
-            &ws_label,
-        ))
-        .last_wake_unix
+        doorbell::load_wake_state(&doorbell::wake_state_file(&config::state_dir(), &ws_label))
+            .last_wake_unix
     } else {
         None
     };
@@ -13215,11 +13221,7 @@ fn cmd_send(
                                 "flywheel: {target} agent_prompt_stalled after retries — best-effort pane send-text (not a wait receipt; GS-037 prompt --wait honesty)"
                             );
                             let _ = try_send_text_delivery(
-                                &mut c,
-                                project,
-                                &name,
-                                &a.pane_id,
-                                &send_text,
+                                &mut c, project, &name, &a.pane_id, &send_text,
                             );
                             return Err(stall_giveup_error(&target, project));
                         }
@@ -13273,7 +13275,9 @@ fn cmd_send(
     // On landed:true, last_wake must advance from an INDEPENDENT
     // doorbell/agent wake observation — cmd_send must NOT self-mint the stamp
     // then check it (P0-C self-stamp invent-green).
-    let any_landed = results.iter().any(|r| r.get("landed") == Some(&json!(true)));
+    let any_landed = results
+        .iter()
+        .any(|r| r.get("landed") == Some(&json!(true)));
     if wait && !any_landed {
         bail!(
             "send --wait produced no landed:true receipt — refuse invent-green exit 0 (GS-037 P0-A). Re-run when the agent can settle, or pass --fire-and-forget to acknowledge no receipt."
@@ -13281,10 +13285,8 @@ fn cmd_send(
     }
     if wait && any_landed {
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
-        let after = doorbell::load_wake_state(&doorbell::wake_state_file(
-            &config::state_dir(),
-            &ws_label,
-        ));
+        let after =
+            doorbell::load_wake_state(&doorbell::wake_state_file(&config::state_dir(), &ws_label));
         let before_unix = wake_before_unix;
         if after.last_wake_unix.is_none() {
             bail!(
@@ -32671,7 +32673,10 @@ mod send_result_row_tests {
         let row = send_result_row("flywheel-toron-coder", "idle", "w1:p1", Some("coder"), None);
         assert_eq!(row["target"], "flywheel-toron-coder");
         assert_eq!(row["dispatched"], true, "dispatch is recorded");
-        assert_eq!(row["receipt"], false, "GS-037 P0-A: no receipt without --wait");
+        assert_eq!(
+            row["receipt"], false,
+            "GS-037 P0-A: no receipt without --wait"
+        );
         assert_eq!(row["prior_status"], "idle", "names the status as prior");
         assert!(
             row.get("status").is_none(),
