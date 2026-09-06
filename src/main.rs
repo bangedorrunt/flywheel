@@ -1405,6 +1405,18 @@ enum Commands {
     /// Pure decision lives in durable::eval_dispatch_guard.
     #[command(name = "__dispatch-guard", hide = true)]
     __DispatchGuard { project: String, bead: String },
+    /// internal: ADR-0010 D14 captain-facing turn-end guard (harness-hook
+    /// adapter). Vendor Stop/idle hooks on the captain/steer pane call
+    /// `flywheel __turn-guard <project> [--role captain|crew]`; exit 0 =
+    /// turn may end, exit 3 = blocked (JSON names reason + follow_up
+    /// recover turn). Crew panes pass --role crew and are always allowed.
+    #[command(name = "__turn-guard", hide = true)]
+    __TurnGuard {
+        project: String,
+        /// captain (default) or crew. Crew is exempt, always allow.
+        #[arg(long)]
+        role: Option<String>,
+    },
     /// internal: the project's expected-reply entries (checkpointed leaf —
     /// collab may have written new ones while the loop runs)
     #[command(name = "__expected-replies", hide = true)]
@@ -4575,6 +4587,9 @@ fn main() {
         }) => cmd_internal_check_reply(&cfg, project, name, thread),
         Some(Commands::__DispatchGuard { project, bead }) => {
             cmd_internal_dispatch_guard(&cfg, project, bead)
+        }
+        Some(Commands::__TurnGuard { project, role }) => {
+            cmd_turn_guard(&cfg, project, role.as_deref())
         }
         Some(Commands::__ReplySettled {
             project,
@@ -29788,6 +29803,203 @@ fn thread_head(
 /// go/hold decision is durable::eval_dispatch_guard (pure, unit-tested).
 /// Mail failures print an empty-facts shape (fail-open at the collector;
 /// the leaf logs loudly so a dead daemon never silently gates dispatches).
+/// ADR-0010 D14 — captain-facing turn-end guard (harness-hook adapter).
+///
+/// Predicate: if beads are in_progress OR a dispatcher is required, and
+/// the wake-owner beacon (doorbell wake_state) is stale past
+/// `FLYWHEEL_GUARD_GRACE_SECS` (default 300s), the captain-facing
+/// Stop/idle path blocks with a follow_up recover turn. Crew panes are
+/// exempt. A D5 AFK daemon with a fresh identity-matched beacon satisfies
+/// the predicate (wired false until D5 lands). Structural backstop, not
+/// permission to omit the live cycle.
+///
+/// Hook contract: exit 0 + `{"decision":"allow"}` = turn may end;
+/// exit 3 + `{"decision":"block","reason":..,"follow_up":..}` =
+/// turn-end blocked, run the follow_up (`flywheel recover <project>`).
+/// Unknown in-flight count (br unreadable) fails closed to Block.
+pub(crate) const GUARD_GRACE_DEFAULT_SECS: u64 = 300;
+
+/// D14 decision: allow the turn to end, or block it naming the recover turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TurnDecision {
+    Allow,
+    Block { reason: String, follow_up: String },
+}
+
+/// Pure D14 predicate.
+///
+/// | input | decision |
+/// |-------|----------|
+/// | crew pane | Allow (exempt) |
+/// | AFK satisfied | Allow (D5 daemon, fresh identity-matched beacon) |
+/// | in-flight unknown | Block (fail closed — never ends blind) |
+/// | no work (0 in-flight, no dispatcher) | Allow |
+/// | beacon fresh (age <= grace) | Allow |
+/// | work + stale/missing beacon | Block + follow_up recover |
+pub(crate) fn turn_end_guard(
+    in_flight: Option<u64>,
+    dispatcher_required: bool,
+    beacon_age_secs: Option<u64>,
+    is_crew: bool,
+    afk_satisfied: bool,
+    grace_secs: u64,
+    project: &str,
+) -> TurnDecision {
+    if is_crew {
+        return TurnDecision::Allow;
+    }
+    if afk_satisfied {
+        return TurnDecision::Allow;
+    }
+    let in_flight = match in_flight {
+        Some(n) => n,
+        None => {
+            return TurnDecision::Block {
+                reason: "cannot determine in-flight beads (br unreadable) — failing closed".into(),
+                follow_up: format!("flywheel recover {project}"),
+            };
+        }
+    };
+    if in_flight == 0 && !dispatcher_required {
+        return TurnDecision::Allow;
+    }
+    match beacon_age_secs {
+        Some(age) if age <= grace_secs => TurnDecision::Allow,
+        _ => TurnDecision::Block {
+            reason: format!(
+                "{in_flight} bead(s) in flight (dispatcher_required={dispatcher_required}) with wake-owner beacon stale past {grace_secs}s"
+            ),
+            follow_up: format!("flywheel recover {project}"),
+        },
+    }
+}
+
+/// Live in-flight count from the work ledger. None when br is unreadable
+/// (D14 fails closed on None — the turn blocks naming br, never ends blind).
+fn in_flight_count(project_root: &std::path::Path) -> Option<u64> {
+    let out = std::process::Command::new("br")
+        .args(["list", "--status", "in_progress", "--json"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    v.get("issues")?.as_array().map(|a| a.len() as u64)
+}
+
+fn cmd_turn_guard(cfg: &Config, project: &str, role: Option<&str>) -> Result<()> {
+    let is_crew = matches!(role.map(str::to_ascii_lowercase).as_deref(), Some("crew"));
+    let grace_secs: u64 = std::env::var("FLYWHEEL_GUARD_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(GUARD_GRACE_DEFAULT_SECS);
+    let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+    let state_dir = config::state_dir();
+    let ws = doorbell::load_wake_state(&doorbell::wake_state_file(&state_dir, &ws_label));
+    let now = doorbell_now_unix();
+    let beacon_age_secs = ws.last_wake_unix.map(|t| now.saturating_sub(t));
+    let dispatcher_required = doorbell::read_pid(&doorbell::pid_file(&state_dir, &ws_label))
+        .is_some_and(doorbell::pid_alive);
+    let root = project_dir(cfg, project);
+    let in_flight = in_flight_count(&root);
+    // NOTE (bd-qpub): D5 AFK surface does not exist yet; the predicate arm
+    // is implemented + tested, the CLI wires false until D5 lands.
+    match turn_end_guard(
+        in_flight,
+        dispatcher_required,
+        beacon_age_secs,
+        is_crew,
+        false,
+        grace_secs,
+        project,
+    ) {
+        TurnDecision::Allow => {
+            print_json(&json!({
+                "decision": "allow",
+                "in_flight": in_flight,
+                "dispatcher_required": dispatcher_required,
+                "beacon_age_secs": beacon_age_secs,
+            }));
+            Ok(())
+        }
+        TurnDecision::Block { reason, follow_up } => {
+            print_json(&json!({
+                "decision": "block",
+                "reason": reason,
+                "follow_up": follow_up,
+            }));
+            std::process::exit(3);
+        }
+    }
+}
+
+#[cfg(test)]
+mod turn_guard_tests {
+    use super::*;
+
+    const P: &str = "flywheel";
+
+    #[test]
+    fn d14_in_flight_stale_beacon_blocks_with_follow_up() {
+        let d = turn_end_guard(Some(2), false, Some(301), false, false, 300, P);
+        match d {
+            TurnDecision::Block { reason, follow_up } => {
+                assert!(reason.contains('2'), "names in-flight count: {reason}");
+                assert!(reason.contains("300"), "names grace: {reason}");
+                assert_eq!(follow_up, "flywheel recover flywheel");
+            }
+            TurnDecision::Allow => panic!("in-flight + stale beacon must block"),
+        }
+        // Missing beacon with work is also stale.
+        assert!(matches!(
+            turn_end_guard(Some(1), false, None, false, false, 300, P),
+            TurnDecision::Block { .. }
+        ));
+        // Dispatcher-required with zero beads still guards.
+        assert!(matches!(
+            turn_end_guard(Some(0), true, Some(9999), false, false, 300, P),
+            TurnDecision::Block { .. }
+        ));
+    }
+
+    #[test]
+    fn d14_crew_exempt_afk_satisfies() {
+        // Crew pane under identical conditions: no block.
+        assert_eq!(
+            turn_end_guard(Some(2), true, Some(9999), true, false, 300, P),
+            TurnDecision::Allow
+        );
+        // D5 AFK daemon live with identity-matched fresh beacon: satisfied.
+        assert_eq!(
+            turn_end_guard(Some(2), true, Some(9999), false, true, 300, P),
+            TurnDecision::Allow
+        );
+    }
+
+    #[test]
+    fn d14_fresh_or_idle_allows_unknown_fails_closed() {
+        assert_eq!(
+            turn_end_guard(Some(2), false, Some(300), false, false, 300, P),
+            TurnDecision::Allow
+        );
+        assert_eq!(
+            turn_end_guard(Some(0), false, Some(9999), false, false, 300, P),
+            TurnDecision::Allow
+        );
+        assert_eq!(
+            turn_end_guard(Some(0), false, None, false, false, 300, P),
+            TurnDecision::Allow
+        );
+        // Unknown in-flight fails closed even with a fresh beacon.
+        assert!(matches!(
+            turn_end_guard(None, false, Some(0), false, false, 300, P),
+            TurnDecision::Block { .. }
+        ));
+    }
+}
+
 fn cmd_internal_dispatch_guard(cfg: &Config, project: &str, bead: &str) -> Result<()> {
     let mut facts = json!({ "signals": [], "receipts_fresh_us": null });
     if let Ok(mail) = backend::mail_backend(cfg) {
