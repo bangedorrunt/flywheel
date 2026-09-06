@@ -829,8 +829,10 @@ impl Mail {
                         "mail --wake must be standing|tasked (got {w:?}) — refuse inventing a free-string wake (GS-039 P0-1)"
                     );
                 }
-                vec![toron_core::nostr::Tag::parse(["wake", w.as_str()])
-                    .map_err(|e| anyhow!("wake tag: {e}"))?]
+                vec![
+                    toron_core::nostr::Tag::parse(["wake", w.as_str()])
+                        .map_err(|e| anyhow!("wake tag: {e}"))?,
+                ]
             }
             _ => Vec::new(),
         };

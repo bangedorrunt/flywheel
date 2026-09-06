@@ -48,12 +48,36 @@ unless the operator requests a change.
 - If the task requires durable solo execution or crash-resume behavior, stop
   and recommend `/loop-mode`.
 
-## Identity and project mode
+## Identity and collaboration bootstrap
 
 Open mode may operate with a direct registered mailbox identity, but it does
 not imply the project's Toron identity mode is `swarm`. Use the public mail
 identity supplied by the environment for `toron`, presence, reservations, and
 mail. Do not invent a pin or use an internal pane slug as a public identity.
+
+If you register a mail identity for a collaboration task, bootstrap it — the
+mailbox is write-only until you do, and the human must never become the relay:
+
+- **Arrive loudly.** Check the roster first (`toron` list agents — note each
+  entry's recency), then publish presence
+  (`toron presence publish --state working`) so the next agent discovers you
+  instead of being surprised by your mail. Roster entries can be stale
+  session artifacts; treat an identity with no recent activity as absent,
+  never address it.
+- **Resolve the captain channel by ladder, never by guessing.** Try the
+  `captain` alias; if it is unbound, the operator in THIS pane is the
+  captain channel — report outcomes in chat and keep mail for peers only.
+  Do not pick a captain-looking pin from the roster (name-similarity mailed
+  a 9-day-dead session once; that failure is why this ladder exists).
+- **Arm an inbox watch.** No dispatcher will ring you in open mode. Run
+  `toron watch --live` in the background, or pull
+  `toron mail inbox --since last` after each work unit — a peer's message
+  must reach you without the human relaying it.
+- **Mail discipline.** Mint a `corr` per collaboration thread and keep the
+  `thread_id` across rounds; reply file-first (findings over ~20 lines go to
+  a durable file, the mail carries summary + path); `acknowledge_message`
+  every `ack_required` message you have acted on — the ack is the delivery
+  contract, not the send.
 
 ## When to choose another mode
 

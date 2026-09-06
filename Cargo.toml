@@ -101,7 +101,6 @@ uninlined_format_args = { level = "allow", priority = 1 }
 useless_let_if_seq = { level = "allow", priority = 1 }
 format_push_string = { level = "allow", priority = 1 }
 # Stylistic nursery/pedantic lints that don't reflect real defects
-assert_is_empty = { level = "allow", priority = 1 }
 option_if_let_else = { level = "allow", priority = 1 }
 map_unwrap_or = { level = "allow", priority = 1 }
 similar_names = { level = "allow", priority = 1 }
@@ -110,7 +109,11 @@ missing_errors_doc = { level = "allow", priority = 1 }
 redundant_clone = { level = "allow", priority = 1 }
 struct_excessive_bools = { level = "allow", priority = 1 }
 if_not_else = { level = "allow", priority = 1 }
-# bd-14ea wave 2: mechanical churn across the single-binary codebase.
+# no_effect_underscore_binding is allowed crate-wide for exactly one shape:
+# `#[resonate_sdk::function]` regenerates the item, so item-level
+# expect/allow cannot reach the emitted copy; the sole zero-arg leaf is
+# heal_tick (doorbell.rs), whose `_args: ()` is inert by contract.
+no_effect_underscore_binding = { level = "allow", priority = 1 }
 # `clippy --fix` cleared ~800 sites; the rest are allowed, not fixed, to
 # keep this alignment commit reviewable. Tighten one lint at a time later.
 default_trait_access = { level = "allow", priority = 1 }
