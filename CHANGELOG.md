@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed — GS-039 CoS-honest-5 (hold merge)
-- **P0-1 Wake:** doorbell advances `last_wake` only from real herdr Status (working/idle/done/blocked) or **successfully delivered** prompt pins — never from planned injects on delivery miss (no `or_else(injects.first())` invent-green). Poll/sweep observed-wake saves loud-warn (no `let _ =`). Mail send defaults `--wake tasked`. Robot never-wake after meaningful dispatch stays hard-fail. `cmd_send` still must not self-mint wake.
+- **P0-1 Wake (reprobe):** stamp `last_wake` from REAL observations — herdr Status / poll `working|idle|done|blocked`, successfully delivered prompts, **and** `send --wait` landed+settled status (covers idle→idle when Status push has no transition). Never from planned injects / `doorbell_persist_wake` invent-green. Observed-wake always advances past a prior stamp. Robot never-wake after meaningful dispatch stays hard-fail.
+- **P0-3 Solo dry-run (reprobe):** compose `--parts repair-until-verified` preserves recipe Explicit crew `coder:1`+`reviewer:1` (no Auto-infer balloon to 3+3 over repair/evaluate nodes).
+- **P0-1 Wake (prior):** Mail send defaults `--wake tasked`. Poll/sweep observed-wake saves loud-warn (no `let _ =`).
 - **P0-2 Open-mode:** operator/`--raw` framed AUTHORITATIVE; open.md.tpl + peer-aware carve-out so create-file tasks are not chatter.
 - **P0-3 Solo compose:** `--retire-orphans` defaults **off**. Multi-crew requires `--allow-crew-expand`; robot/CI/`--json`/`FLYWHEEL_ROBOT`/non-interactive **hard-bail** (no `read_line`); interactive TTY y/N ask is humans only. `repair-until-verified` crew is `coder:1` + `reviewer:1`.
 - **P0-4 Name-binding:** post-settle rename + fail spawn if any pane missing, empty-named, **or wrong-named** (fail closed under verify).

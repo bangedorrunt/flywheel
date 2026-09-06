@@ -6713,14 +6713,23 @@ mod spawn_boot_reliability_tests {
             pah_body.contains("-> Vec<String>"),
             "doorbell_prompt_and_hear must return delivered pins for wake stamp"
         );
-        // cmd_send still must NOT self-mint last_wake
+        // cmd_send must NOT invent via doorbell_persist_wake / injects.
+        // It MAY stamp via doorbell_note_observed_wake when --wait OBSERVED
+        // herdr settled_status working|idle|done|blocked after land (GS-039).
         let send = crate::tripwire::find_fn(src, "cmd_send");
         let send_end = crate::tripwire::find_fn(src, "stall_step");
         let send_body = &src[send..send_end];
         assert!(
-            !send_body.contains("doorbell_persist_wake(")
-                && !send_body.contains("doorbell_note_observed_wake("),
-            "cmd_send must not invent-green last_wake (observe via doorbell only)"
+            !send_body.contains("doorbell_persist_wake("),
+            "cmd_send must not invent-green last_wake via doorbell_persist_wake"
+        );
+        assert!(
+            send_body.contains("doorbell_note_observed_wake(")
+                && send_body.contains("settled_status")
+                && send_body.contains("status_l != \"working\"")
+                && send_body.contains("\"idle\"")
+                && send_body.contains("\"blocked\""),
+            "cmd_send --wait must stamp last_wake from observed settled status (GS-039 P0-1)"
         );
         // Poll/sweep: loud warn on observed-wake save Err (no let _ = swallow).
         // Split needle so this tripwire cannot false-red on its own literal.
@@ -9412,10 +9421,17 @@ fn doorbell_persist_wake_with_plane_s(
 
 /// GS-039 P0-1: stamp last_wake from a REAL observation without clobbering
 /// plane-P/S high-waters (refresh/sweep callers lack the live since map).
+/// Always advances past a prior stamp (same-second observations still move
+/// `last_wake` forward so send --wait fail-closed can see the receipt).
 fn doorbell_note_observed_wake(workspace: &str, pin: &str) -> Result<()> {
     let path = doorbell::wake_state_file(&config::state_dir(), workspace);
     let mut st = doorbell::load_wake_state(&path);
-    doorbell::note_wake(&mut st, pin, doorbell_now_unix());
+    let now = doorbell_now_unix();
+    let at = match st.last_wake_unix {
+        Some(prev) if now <= prev => prev.saturating_add(1),
+        _ => now,
+    };
+    doorbell::note_wake(&mut st, pin, at);
     doorbell::save_wake_state(&path, &st).with_context(|| {
         format!(
             "doorbell observed-wake save failed at {} — refuse silent drop (GS-039 P0-1)",
@@ -10073,6 +10089,9 @@ fn doorbell_refresh_status(
         return;
     };
     let mut injects = Vec::new();
+    // GS-039 P0-1: poll mirrors Status-arm — herdr working|idle|done|blocked
+    // is a REAL observation (not planned injects).
+    let mut observed_status_pins: Vec<String> = Vec::new();
     for a in agents {
         let pin = registry
             .iter()
@@ -10082,6 +10101,14 @@ fn doorbell_refresh_status(
             continue;
         };
         let to = a.agent_status.as_str().to_string();
+        let status_l = to.to_ascii_lowercase();
+        if status_l == "working"
+            || status_l == "idle"
+            || status_l == "done"
+            || status_l == "blocked"
+        {
+            observed_status_pins.push(pin.clone());
+        }
         // bd-a2vx: drain decision via tick. No side map; tick sees `from` on Model.
         workspace_model.doorbell.index = index.clone();
         let msg = workspace::Msg::HerdrStatus {
@@ -10112,10 +10139,13 @@ fn doorbell_refresh_status(
         workspace,
         generation,
     );
-    // GS-039 P0-1: poll-path wake stamp from successful prompt delivery.
-    // Refuse silent drop — loud warn (dispatcher must not invent-green by
-    // discarding wake-persist errors).
-    if let Some(pin) = delivered.first() {
+    // GS-039 P0-1: poll-path wake stamp from observed herdr status OR
+    // successful prompt delivery. Refuse silent drop — loud warn.
+    let woke = delivered
+        .first()
+        .map(String::as_str)
+        .or_else(|| observed_status_pins.first().map(String::as_str));
+    if let Some(pin) = woke {
         if let Err(e) = doorbell_note_observed_wake(workspace, pin) {
             eprintln!(
                 "flywheel doorbell: observed-wake stamp FAILED on poll for pin={pin}: {e:#} — refuse silent drop (GS-039)"
@@ -13281,8 +13311,9 @@ fn cmd_send(
     let catalog = profile::ProfileCatalog::load();
     let mut registry_dirty = false;
     let mut results: Vec<Value> = Vec::new();
-    // GS-037 P0-C: snapshot wake BEFORE send so a later landed check can
-    // require an independent doorbell/agent advance (never self-mint here).
+    // GS-037 P0-C / GS-039 P0-1: snapshot wake BEFORE send so a later landed
+    // check can require an observed advance (Status/poll/delivery, or
+    // herdr settled_status after --wait land — never invent from injects).
     let wake_before_unix = if wait {
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
         doorbell::load_wake_state(&doorbell::wake_state_file(&config::state_dir(), &ws_label))
@@ -13500,9 +13531,9 @@ fn cmd_send(
 
     // GS-037 P0-A / P0-C: receipt honesty.
     // --wait with no landed must not exit 0 invent-green (P0-A wait-empty).
-    // On landed:true, last_wake must advance from an INDEPENDENT
-    // doorbell/agent wake observation — cmd_send must NOT self-mint the stamp
-    // then check it (P0-C self-stamp invent-green).
+    // On landed:true, last_wake must advance from a REAL observation
+    // (herdr settled status working|idle|done|blocked after send lands, or
+    // doorbell Status/delivery). Never invent from planned injects.
     let any_landed = results
         .iter()
         .any(|r| r.get("landed") == Some(&json!(true)));
@@ -13513,6 +13544,53 @@ fn cmd_send(
     }
     if wait && any_landed {
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+        // GS-039 P0-1: when send --wait OBSERVES herdr settle (landed +
+        // settled_status in working|idle|done|blocked), stamp last_wake from
+        // that observation. Covers idle→idle fast-path where doorbell Status
+        // push may not fire a transition. Not invent-green: gated on herdr
+        // wait receipt, not planned injects / doorbell_persist_wake.
+        for r in &results {
+            if r.get("landed") != Some(&json!(true)) {
+                continue;
+            }
+            let settled = r
+                .get("settled_status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let status_l = settled.to_ascii_lowercase();
+            if status_l != "working"
+                && status_l != "idle"
+                && status_l != "done"
+                && status_l != "blocked"
+            {
+                continue;
+            }
+            let target = r.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            let pane_id = r.get("pane_id").and_then(|v| v.as_str()).unwrap_or("");
+            let pin = registry
+                .iter()
+                .find(|e| {
+                    e.name == target
+                        || e.pane_id == pane_id
+                        || e.pane_id == target
+                        || e.mail_identity.as_deref() == Some(target)
+                })
+                .and_then(|e| e.mail_identity.clone())
+                .or_else(|| {
+                    if target.is_empty() {
+                        None
+                    } else {
+                        Some(target.to_string())
+                    }
+                });
+            if let Some(pin) = pin {
+                if let Err(e) = doorbell_note_observed_wake(&ws_label, &pin) {
+                    eprintln!(
+                        "flywheel: observed-wake stamp FAILED after send --wait land for pin={pin}: {e:#} — refuse silent drop (GS-039 P0-1)"
+                    );
+                }
+            }
+        }
         let after =
             doorbell::load_wake_state(&doorbell::wake_state_file(&config::state_dir(), &ws_label));
         let before_unix = wake_before_unix;
