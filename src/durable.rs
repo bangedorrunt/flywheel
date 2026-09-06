@@ -383,6 +383,7 @@ pub fn seed_swarm_resume(
                 DrainState {
                     bead_id: v.clone(),
                     grace_polls: DRAIN_GRACE_POLLS,
+                    defers: 0,
                 },
             )
         })
@@ -443,6 +444,10 @@ fn tick_loop_owner(
 pub struct DrainState {
     pub bead_id: String,
     pub grace_polls: u32,
+    /// D4 (bd-8j7m): consecutive write-evidence defers. Crash-resets to
+    /// 0 via the resume seed (fresh grace, never force-kill immediately).
+    #[serde(default)]
+    pub defers: u32,
 }
 
 /// THE grace bound (bd-zfnx.10): a drained pane gets this many polls to
@@ -663,6 +668,7 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
                 .or_insert(DrainState {
                     bead_id: bead_id.clone(),
                     grace_polls: DRAIN_GRACE_POLLS,
+                    defers: 0,
                 });
             actions.push(LoopAction::Send {
                 name: name.clone(),
@@ -680,19 +686,19 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             // waits; the first Tick AT zero force-stops with the bead id on
             // the record (executor kills + LoudMiss). Exit via Heal fulfills
             // first (arm above), so a finished pane is never force-stopped.
-            let mut expired: Vec<(String, String)> = Vec::new();
+            let mut expired: Vec<(String, String, u32)> = Vec::new();
             for (name, ds) in &mut next.drain_pending {
                 if ds.grace_polls == 0 {
-                    expired.push((name.clone(), ds.bead_id.clone()));
+                    expired.push((name.clone(), ds.bead_id.clone(), ds.defers));
                 } else {
                     ds.grace_polls -= 1;
                 }
             }
-            for (name, bead_id) in expired {
+            for (name, bead_id, defers) in expired {
                 next.drain_pending.remove(&name);
                 actions.push(LoopAction::Respawn {
                     name: name.clone(),
-                    reason: format!("drain_expired bead {bead_id}"),
+                    reason: format!("drain_expired bead {bead_id} defer {defers}"),
                 });
             }
             if !next.mail_degraded && !next.queue.is_empty() {
@@ -7723,15 +7729,90 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         .get(name)
                         .map(|h| u64::from(h.respawn_count))
                         .unwrap_or(1);
-                    if let Some(bead) = reason.strip_prefix("drain_expired bead ") {
-                        // bd-zfnx.10: grace ran out without exit — the force
-                        // path. Recorded as LoudMiss WITH the bead id so the
-                        // orphaned VERIFY receipt is recoverable via
-                        // close-check, never silent. Skipping the drain needs
-                        // an explicit reason (--force-working / kill keys).
-                        eprintln!(
-                            "flywheel: LoudMiss drain-stop grace expired for {name} (bead {bead}) — force-respawned"
-                        );
+                    // D4 (bd-8j7m): drain-expiry carries
+                    // "drain_expired bead {id} defer {n}". Before the force
+                    // path, walk the bead's reservation globs: a file newer
+                    // than the quiet window defers (skip kill, re-arm grace,
+                    // write-evidence digest); quiet/failed walks and beads
+                    // with no reservations respawn as before. Heal-path
+                    // respawns (pane_exited/unknown) bypass the walk: no bead.
+                    let mut deferred = false;
+                    if let Some(rest) = reason.strip_prefix("drain_expired bead ") {
+                        let mut toks = rest.split_whitespace();
+                        if let Some(bead) = toks.next() {
+                            let prior: u32 = match (toks.next(), toks.next()) {
+                                (Some("defer"), Some(n)) => n.parse().unwrap_or(0),
+                                _ => 0,
+                            };
+                            let board = ctx
+                                .run(
+                                    reservation_board,
+                                    ReservationBoardArgs {
+                                        project: params.project.clone(),
+                                    },
+                                )
+                                .await
+                                .unwrap_or_default();
+                            let globs: Vec<String> = board
+                                .into_iter()
+                                .filter(|(_, r)| r == bead)
+                                .map(|(p, _)| p)
+                                .collect();
+                            if !globs.is_empty() {
+                                let opts = crate::write_liveness::WalkOpts::from_env();
+                                let root =
+                                    crate::write_liveness::resolve_project_root(&params.project);
+                                match crate::write_liveness::walk(&root, &globs, &opts) {
+                                    crate::write_liveness::WalkOutcome::Fresh {
+                                        path,
+                                        age_secs,
+                                    } => {
+                                        let defers = prior.saturating_add(1);
+                                        next_model.drain_pending.insert(
+                                            name.clone(),
+                                            DrainState {
+                                                bead_id: bead.to_string(),
+                                                grace_polls: DRAIN_GRACE_POLLS,
+                                                defers,
+                                            },
+                                        );
+                                        eprintln!(
+                                            "{}",
+                                            crate::write_liveness::defer_digest(
+                                                name, bead, &path, age_secs, defers, &opts
+                                            )
+                                        );
+                                        any_work = true;
+                                        deferred = true;
+                                    }
+                                    outcome => {
+                                        // NOTE (bd-8j7m): no busy-since clock
+                                        // exists in LoopModel, so exact_busy
+                                        // reads false here; the busy-turn arm
+                                        // of inspect_due is test-covered for
+                                        // the lane that tracks busy-since.
+                                        let verdict =
+                                            crate::write_liveness::decide(&outcome, false, &opts);
+                                        if let crate::write_liveness::LivenessVerdict::Respawn {
+                                            inspect: true,
+                                        } = verdict
+                                        {
+                                            eprintln!(
+                                                "flywheel: D4 inspect recommended for {name} (bead {bead}): quiet + not-writing — look before next drain"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if !deferred {
+                                eprintln!(
+                                    "flywheel: LoudMiss drain-stop grace expired for {name} (bead {bead}) — force-respawned"
+                                );
+                            }
+                        }
+                    }
+                    if deferred {
+                        continue;
                     }
                     respawn_and_requeue(
                         ctx,
