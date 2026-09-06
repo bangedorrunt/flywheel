@@ -6674,8 +6674,6 @@ mod spawn_boot_reliability_tests {
         );
     }
 
-    #[test]
-
     /// GS-039: CoS-honest folds — real wake observation, open-mode authority,
     /// solo compose sizing, name-bind fail-closed, no invent-green.
     #[test]
@@ -6683,11 +6681,27 @@ mod spawn_boot_reliability_tests {
         let src = include_str!("main.rs");
         // P0-1: real observation path (Status working/idle stamps wake;
         // prompt_and_hear returns delivered pins; note_observed_wake exists).
+        // Never invent-green last_wake from planned injects on delivery miss.
         assert!(
             src.contains("GS-039 P0-1 REAL observation")
                 && src.contains("doorbell_note_observed_wake")
                 && src.contains("fn doorbell_prompt_and_hear"),
             "GS-039 P0-1 wake observation path must be present"
+        );
+        // Split needles so this assert body cannot invent-green-match itself.
+        let invent_a = format!("{}{}{}", "or_else(", "|", "| injects.first()");
+        let invent_b = format!("{}{}", ".or_else(", invent_a.trim_start_matches("or_else("));
+        assert!(
+            !src.contains(&invent_a) && !src.contains(&invent_b),
+            "P0-1 must NOT stamp last_wake from planned injects (no invent-green or_else+injects.first)"
+        );
+        // Also: Status arm must not fall back to injects.first() for wake.
+        let status_fn = "GS-039 P0-1 REAL observation";
+        let status_idx = src.find(status_fn).expect("status observation marker");
+        let status_chunk = &src[status_idx..status_idx + 900];
+        assert!(
+            !status_chunk.contains("injects.first().map"),
+            "Status wake arm must not fall back to injects.first() (invent-green)"
         );
         let pah = crate::tripwire::find_fn(src, "doorbell_prompt_and_hear");
         let pah_body = &src[pah..pah + 600];
@@ -6736,6 +6750,7 @@ mod spawn_boot_reliability_tests {
         );
     }
 
+    #[test]
     fn spawn_starts_doorbell_dispatcher() {
         let src = include_str!("main.rs");
         let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
@@ -7811,20 +7826,32 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
             }
         }
         let agents_after = c.agent_list()?;
+        // Fail-closed under verify: empty OR wrong-name counts as unbound
+        // (GS-039 P0-4) — not only name:null/empty.
         let still_unbound: Vec<String> = registry
             .iter()
             .filter(|e| !e.pane_id.is_empty())
             .filter(|e| {
-                agents_after.iter().any(|a| {
-                    a.pane_id == e.pane_id
-                        && a.name.as_deref().is_none_or(|n| n.is_empty())
-                })
+                match agents_after.iter().find(|a| a.pane_id == e.pane_id) {
+                    None => true, // pane vanished — unbound
+                    Some(a) => {
+                        a.name.as_deref().is_none_or(|n| n.is_empty())
+                            || a.name.as_deref() != Some(e.name.as_str())
+                    }
+                }
             })
-            .map(|e| format!("{} ({})", e.name, e.pane_id))
+            .map(|e| {
+                let seen = agents_after
+                    .iter()
+                    .find(|a| a.pane_id == e.pane_id)
+                    .and_then(|a| a.name.clone())
+                    .unwrap_or_else(|| "<missing>".into());
+                format!("{} ({}) saw={seen}", e.name, e.pane_id)
+            })
             .collect();
         if !still_unbound.is_empty() {
             bail!(
-                "spawn name-binding failed after settle (GS-039 P0-4): panes still unbound: {}. Refusing swarm ready — rebind manually (flywheel rebind {project}) or re-spawn.",
+                "spawn name-binding failed after settle (GS-039 P0-4): panes still unbound/wrong-name: {}. Refusing swarm ready — rebind manually (flywheel rebind {project}) or re-spawn.",
                 still_unbound.join(", ")
             );
         }
@@ -9016,13 +9043,10 @@ fn cmd_internal_doorbell(
                     workspace,
                     generation.as_ref(),
                 );
-                // GS-039 P0-1: stamp last_wake from successful prompt delivery
-                // (real observation), else from planned inject, else from
-                // watch pubkey→pin resolve when the event was heard.
-                let woke = delivered_pins
-                    .first()
-                    .map(String::as_str)
-                    .or_else(|| injects.first().map(|(p, _)| p.as_str()));
+                // GS-039 P0-1: stamp last_wake ONLY from successfully
+                // delivered pins — never from planned injects when delivery
+                // fails/empty (no invent-green or_else injects.first()).
+                let woke = delivered_pins.first().map(String::as_str);
                 doorbell_persist_wake(workspace, &since_by_pin, woke)?;
             }
             Ok(Bell::Status { pane_id, to }) => {
@@ -9053,7 +9077,7 @@ fn cmd_internal_doorbell(
                     Some(&pins),
                 );
                 let registry = state::load_spawn_registry(project);
-                let _delivered = doorbell_prompt_and_hear(
+                let delivered = doorbell_prompt_and_hear(
                     herdr.as_mut(),
                     &registry,
                     &injects,
@@ -9065,8 +9089,9 @@ fn cmd_internal_doorbell(
                 );
                 // GS-039 P0-1 REAL observation: herdr status transitions that
                 // show the agent woke (working) or settled after work
-                // (idle/done) advance last_wake — independent of Prompt
-                // injects. Never invent-green from cmd_send; observe here.
+                // (idle/done/blocked) advance last_wake — OR a pin that
+                // actually delivered. Never invent-green from planned
+                // injects when delivery failed / status not observed.
                 let status_l = to.to_ascii_lowercase();
                 let observed = status_l == "working"
                     || status_l == "idle"
@@ -9075,7 +9100,7 @@ fn cmd_internal_doorbell(
                 let woke = if observed {
                     Some(pin.as_str())
                 } else {
-                    injects.first().map(|(p, _)| p.as_str())
+                    delivered.first().map(String::as_str)
                 };
                 doorbell_persist_wake(workspace, &since_by_pin, woke)?;
             }
@@ -10072,8 +10097,14 @@ fn doorbell_refresh_status(
         generation,
     );
     // GS-039 P0-1: poll-path wake stamp from successful prompt delivery.
+    // Refuse silent drop — loud warn (dispatcher must not invent-green by
+    // discarding wake-persist errors).
     if let Some(pin) = delivered.first() {
-        let _ = doorbell_note_observed_wake(workspace, pin);
+        if let Err(e) = doorbell_note_observed_wake(workspace, pin) {
+            eprintln!(
+                "flywheel doorbell: observed-wake stamp FAILED on poll for pin={pin}: {e:#} — refuse silent drop (GS-039)"
+            );
+        }
     }
 }
 
@@ -10318,8 +10349,13 @@ fn doorbell_sweep_inbox(
         herdr, &registry, &injects, hear, index, project, workspace, generation,
     );
     // GS-039 P0-1: inbox sweep wake stamp from successful delivery.
+    // Refuse silent drop — loud warn (no let _ = invent-quiet).
     if let Some(pin) = delivered.first() {
-        let _ = doorbell_note_observed_wake(workspace, pin);
+        if let Err(e) = doorbell_note_observed_wake(workspace, pin) {
+            eprintln!(
+                "flywheel doorbell: observed-wake stamp FAILED on inbox sweep for pin={pin}: {e:#} — refuse silent drop (GS-039)"
+            );
+        }
     }
 }
 
@@ -25568,30 +25604,34 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let mut catalog = profile::ProfileCatalog::load()?;
             catalog.apply_role_models(role_model)?;
             // GS-039 P0-3 + UX: multi-crew compose must not silently N.
-            // Ask on TTY (recommended default = inferred plan); otherwise
-            // require --allow-crew-expand when total crew > 1.
+            // Interactive TTY ask ONLY for humans. Robot/CI/--json/
+            // FLYWHEEL_ROBOT/non-interactive MUST hard-bail requiring
+            // --allow-crew-expand (never read_line — hangs robots).
             let crew_total: u32 = crew_plan.members.values().copied().sum();
-            if crew_total > 1 {
-                let tty = std::io::stdin().is_terminal() && !*json;
-                if tty && !*allow_crew_expand {
-                    eprintln!(
-                        "flywheel: compose would spawn multi-crew ({crew_total} agents: {:?}) — recommended default is the inferred plan. Pass --allow-crew-expand to confirm, or reduce the recipe.",
+            if crew_total > 1 && !*allow_crew_expand {
+                let robotish = *json
+                    || std::env::var_os("FLYWHEEL_ROBOT").is_some()
+                    || std::env::var_os("CI").is_some()
+                    || !std::io::stdin().is_terminal();
+                if robotish {
+                    bail!(
+                        "compose would spawn multi-crew ({crew_total} agents: {:?}) without --allow-crew-expand (GS-039 P0-3). Robot/CI/--json/FLYWHEEL_ROBOT/non-interactive paths hard-bail (no read_line); pass --allow-crew-expand to confirm, or set an explicit crew of 1.",
                         crew_plan.members
                     );
-                    eprint!("  proceed with this crew? [y/N] (profiles use default model opencode-go/muse-spark-1.3-contributor unless --role-model overrides): ");
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
-                    let mut line = String::new();
-                    std::io::stdin().read_line(&mut line)?;
-                    let ans = line.trim().to_ascii_lowercase();
-                    if ans != "y" && ans != "yes" {
-                        bail!(
-                            "compose multi-crew refused (GS-039 P0-3 / UX) — re-run with --allow-crew-expand after confirming crew count, or use a solo-shaped recipe"
-                        );
-                    }
-                } else if !*allow_crew_expand {
+                }
+                // Interactive human TTY only.
+                eprintln!(
+                    "flywheel: compose would spawn multi-crew ({crew_total} agents: {:?}) — recommended default is the inferred plan. Pass --allow-crew-expand to confirm, or reduce the recipe.",
+                    crew_plan.members
+                );
+                eprint!("  proceed with this crew? [y/N] (profiles use default model opencode-go/muse-spark-1.3-contributor unless --role-model overrides): ");
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                let ans = line.trim().to_ascii_lowercase();
+                if ans != "y" && ans != "yes" {
                     bail!(
-                        "compose would spawn multi-crew ({crew_total} agents: {:?}) without --allow-crew-expand (GS-039 P0-3). Loop/open solo paths must not silently balloon; pass --allow-crew-expand to confirm, or set an explicit crew of 1.",
-                        crew_plan.members
+                        "compose multi-crew refused (GS-039 P0-3 / UX) — re-run with --allow-crew-expand after confirming crew count, or use a solo-shaped recipe"
                     );
                 }
             }
