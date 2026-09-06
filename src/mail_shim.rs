@@ -790,11 +790,50 @@ impl Mail {
         ack: bool,
         thread_id: Option<&str>,
     ) -> Result<Value> {
+        self.send_with_wake(
+            project_key,
+            to,
+            subject,
+            body,
+            importance,
+            ack,
+            thread_id,
+            Some("tasked"),
+        )
+    }
+
+    /// GS-039 P0-1: mail send with an explicit wake tag (default tasked) so
+    /// deliveries are not wake:null theater. Pass None to omit the tag.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_with_wake(
+        &self,
+        project_key: &str,
+        to: &[String],
+        subject: &str,
+        body: &str,
+        importance: &str,
+        ack: bool,
+        thread_id: Option<&str>,
+        wake: Option<&str>,
+    ) -> Result<Value> {
         // bd-pncn: `all` (the broadcast token) is expanded to the project's
         // registered roster BEFORE the backend call — the toron surfaces
         // (in-process mailbox + daemon tool) reject a literal "all"
         // recipient. Zero registered agents is a clear error.
         let targets = self.expand_broadcast(project_key, to)?;
+        let extra_tags = match wake {
+            Some(w) if !w.is_empty() => {
+                let w = w.trim().to_ascii_lowercase();
+                if w != "standing" && w != "tasked" {
+                    bail!(
+                        "mail --wake must be standing|tasked (got {w:?}) — refuse inventing a free-string wake (GS-039 P0-1)"
+                    );
+                }
+                vec![toron_core::nostr::Tag::parse(["wake", w.as_str()])
+                    .map_err(|e| anyhow!("wake tag: {e}"))?]
+            }
+            _ => Vec::new(),
+        };
         match &self.backend {
             BackendKind::InProcess => {
                 let result = block_on(mailbox().send_message(&SendMessage {
@@ -806,12 +845,20 @@ impl Mail {
                     importance: Some(importance.to_string()),
                     ack_required: ack,
                     thread_id: thread_id.map(String::from),
+                    extra_tags,
                     ..Default::default()
                 }))?;
-                Ok(result.to_json())
+                // Echo wake in the JSON receipt so operators see non-null.
+                let mut v = result.to_json();
+                if let Some(w) = wake.filter(|s| !s.is_empty()) {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("wake".into(), serde_json::json!(w));
+                    }
+                }
+                Ok(v)
             }
             BackendKind::Remote(_) => {
-                let args = crate::backend::wire::send_args(
+                let mut args = crate::backend::wire::send_args(
                     project_key,
                     &self.name,
                     &targets,
@@ -821,6 +868,9 @@ impl Mail {
                     ack,
                     thread_id,
                 );
+                if let Some(w) = wake.filter(|s| !s.is_empty()) {
+                    args["wake"] = serde_json::json!(w);
+                }
                 self.call_remote("send_message", args)
             }
         }

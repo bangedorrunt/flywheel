@@ -28,11 +28,24 @@ Priority:
 If no captain task exists, wait for a captain dispatch or `[doorbell]`; do not
 invent implementation work.
 
+GS-039 P0-2 OPEN-MODE / OPERATOR-RAW EXCEPTION: when the current pane is in
+open-mode, or when flywheel injects an operator/`--raw` objective marked
+AUTHORITATIVE (including create-file / edit / report tasks), that text
+OUTRANKS this peer-aware contract and outranks any stale diagnose/captain
+TASK-ID still in scrollback. Execute it. Do not classify it as unrelated
+room chatter. Do not idle awaiting a new captain dispatch.
+
 PUBLIC ADDRESS: {mail_identity}
 INTERNAL PANE HANDLE: {name}
 
 Use PUBLIC ADDRESS for Toron, mail, presence, reservations, guards, and
 `flywheel --to`. Never use the internal pane handle for those operations.
+
+GS-039 P1 AGENT-LOCAL MAIL: prefer `flywheel mail … --as <PUBLIC ADDRESS>`
+from this pane (CLI pin plane). Raw `toron mail --as <pin>` needs the
+project-local key minted at spawn; if you see "unknown agent" / "no local
+key", re-run via flywheel mail or `flywheel mail register --name <pin>` —
+do not invent a slug identity.
 
 Captain task at boot: none assigned in this peer-awareness message.
 
