@@ -58,6 +58,7 @@ mod verdict;
 mod work;
 mod workflow_catalog;
 mod workspace;
+mod write_liveness;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal;
