@@ -2970,9 +2970,10 @@ enum WorkflowCmd {
         role_model: Vec<String>,
         /// GS-039 P0-3: NEVER silent-reap desks. Default OFF — pass
         /// `--retire-orphans` explicitly to close pre-existing workspaces.
-        /// (`--no-retire-orphans` kept as an explicit alias of the default.)
-        #[arg(long = "retire-orphans", default_value_t = false, action = clap::ArgAction::SetTrue)]
-        #[arg(long = "no-retire-orphans", action = clap::ArgAction::SetFalse)]
+        // GS-040: clap dual-#[arg] previously dropped `--retire-orphans`
+        // (only `--no-retire-orphans` survived). Single SetTrue long flag;
+        // default false = never silent-reap.
+        #[arg(long = "retire-orphans", default_value_t = false)]
         retire_orphans: bool,
         /// GS-039 P0-3: refuse multi-crew expansion unless explicitly allowed
         /// (repair/loop must not silently balloon; wave-swarm needs this or a
@@ -6666,11 +6667,11 @@ mod spawn_boot_reliability_tests {
         );
         // GS-039 P0-3: retire_orphans defaults FALSE (never silent-reap).
         assert!(
-            src.contains("no-retire-orphans")
+            src.contains("retire-orphans")
                 && src.contains("GS-039 P0-3")
                 && src.contains("allow-crew-expand")
                 && src.contains("retire_orphans: bool"),
-            "compose must default retire_orphans false + expose --allow-crew-expand (GS-039 P0-3)"
+            "compose must default retire_orphans false + expose --allow-crew-expand / --retire-orphans (GS-039/040)"
         );
     }
 
