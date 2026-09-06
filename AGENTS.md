@@ -58,7 +58,12 @@ Live ignored tests need herdr + mail. `mbx +nightly-aarch64-apple-darwin test --
 - **Stage payloads (ADR-0006 D1):** `send --stage <name> --param k=v` (repeatable) substitutes
   `{{k}}` slots in the stage template; reserved slots `{{bead}}/{{scope}}/{{exit}}/{{channel}}/{{pin}}/{{report_file}}`.
   A stage's declared required params missing → non-zero exit naming the slot. Zero `--param`
-  renders byte-identical to the unparameterized prompt.
+  renders byte-identical to the unparameterized prompt. Explicit message text alongside `--stage`
+  appends after the rendered stage (never dropped). A `--param` with no matching slot warns
+  loudly and is ignored (`task_id` exempt, consumed by thread routing). Every send carries a
+  header naming the bound bead (`BEAD: <id>`) or stating none is bound (do not act on the
+  TASK-ID: routing metadata only, never `br show` it). Project tier `.flywheel/stages.toml`
+  resolves in CLI sends.
 - **Wave-scoped dispatch (ADR-0006 D2):** `loop-mode run --work --wave-label wave-N` = ready ∩ exact
   label, held with named blockers while any open/in_progress bead carries wave-M (M<N). Default
   `--work` unchanged. Label-based hold is transitional (TODO → beads ADR-0001 schema-18 typed field).

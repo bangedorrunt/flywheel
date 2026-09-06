@@ -426,10 +426,15 @@ impl Mail {
                 )?;
                 Ok(Value::Array(agents.iter().map(ToJson::to_json).collect()))
             }
-            BackendKind::Remote(_) => self.call_remote(
-                "list_agents",
-                crate::backend::wire::list_agents_args(project_key, active_within_days),
-            ),
+            BackendKind::Remote(_) => {
+                // Daemon envelope onto the in-process bare-array shape; loud
+                // on unrecognized shape (never a silent empty roster).
+                let v = self.call_remote(
+                    "list_agents",
+                    crate::backend::wire::list_agents_args(project_key, active_within_days),
+                )?;
+                remotes_to_agents(v)
+            }
         }
     }
 
@@ -3086,5 +3091,40 @@ mod locks_list_tests {
         let empty = remotes_to_board("x", json!({}));
         assert_eq!(empty["count"], 0);
         assert!(empty["reservations"].as_array().expect("rows").is_empty());
+    }
+}
+/// Map the daemon `list_agents` envelope (`{"agents": [...]}`) onto the
+/// in-process bare-array shape so pin draw + roster read byte-identical at
+/// both ends of the seam. Bare-array passthrough for forward-compat;
+/// anything else is a loud error (the caller warns + draws without a
+/// collision check — never a silent empty roster).
+fn remotes_to_agents(v: Value) -> anyhow::Result<Value> {
+    if v.is_array() {
+        return Ok(v);
+    }
+    match v.get("agents").and_then(Value::as_array) {
+        Some(arr) => Ok(Value::Array(arr.clone())),
+        None => anyhow::bail!(
+            "list_agents remote shape mismatch: expected [..] or {{\"agents\": [..]}}, got {v}"
+        ),
+    }
+}
+
+/// bare-array shape, same precedent as `remotes_to_board`).
+#[cfg(test)]
+mod agents_list_tests {
+    use super::*;
+
+    #[test]
+    fn list_agents_remote_envelope_unwraps_to_array() {
+        let envelope = json!({"agents": [{"name": "BlueLake", "npub": "abc"}]});
+        let arr = remotes_to_agents(envelope).expect("envelope unwraps");
+        assert_eq!(arr.as_array().expect("array").len(), 1);
+        // bare-array passthrough (in-process shape / newer daemon)
+        let bare = json!([{"name": "BlueLake"}]);
+        assert!(remotes_to_agents(bare).expect("passthrough").is_array());
+        // degenerate: loud error, never silent empty
+        assert!(remotes_to_agents(json!({})).is_err());
+        assert!(remotes_to_agents(json!({"agents": "nope"})).is_err());
     }
 }
