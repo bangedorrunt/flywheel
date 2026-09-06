@@ -21,7 +21,6 @@ fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
 }
 
-
 /// Column-0 `fn name(` — skips tripwire string literals that quote the needle.
 fn find_toplevel_fn(src: &str, name: &str) -> usize {
     let needle = format!("\nfn {name}(");
@@ -29,7 +28,6 @@ fn find_toplevel_fn(src: &str, name: &str) -> usize {
         .map(|i| i + 1)
         .unwrap_or_else(|| panic!("expected toplevel `fn {name}(`"))
 }
-
 
 /// SC-D9: `/swarm-mode` must not require loop supervision for peer wake.
 #[test]

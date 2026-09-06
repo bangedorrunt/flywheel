@@ -547,7 +547,7 @@ timeout_ms = 500
             r#"[[daily]]
 type = "send"
 to = "oc"
-stage = "p1"
+stage = "fresh-eyes-explore"
 msg = "hello"
 
 [[daily]]
@@ -567,7 +567,7 @@ timeout_ms = 500
                     spec.extra.get("to").and_then(serde_json::Value::as_str),
                     Some("oc")
                 );
-                assert_eq!(spec.stage.as_deref(), Some("p1"));
+                assert_eq!(spec.stage.as_deref(), Some("fresh-eyes-explore"));
                 assert_eq!(
                     spec.extra.get("msg").and_then(serde_json::Value::as_str),
                     Some("hello")

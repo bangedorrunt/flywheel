@@ -327,13 +327,12 @@ model = "fallback-model"
     }
 }
 
-// ---- stage prompts (ADR-0005 Spec 2a / P3.3) ----
+// ---- stage prompts (ADR-0005 Spec 2a / P3.3; ADR-0009 ce- vocabulary) ----
 //
-// Resolved through the `stages` library: compiled-in defaults (the former
-// STAGES const, verbatim) under semantic names + p-code aliases, overridable
-// by ~/.config/flywheel/stages.toml. A `--stage` name may be a semantic name
-// (`systematic-execute`) OR a p-code alias (`p6`) — both resolve to the same
-// prompt (the stage_alias contract).
+// Resolved through the `stages` library: compiled-in defaults under semantic
+// names, overridable by ~/.config/flywheel/stages.toml and the project tier
+// `.flywheel/stages.toml`. A `--stage` name is the semantic name
+// (`ce-execute`); the p-code aliases are retired (ADR-0009).
 
 pub(crate) fn stage_prompt(name: &str) -> Result<String> {
     let lib = stages::StageLibrary::load()?;
@@ -342,7 +341,7 @@ pub(crate) fn stage_prompt(name: &str) -> Result<String> {
             "unknown stage: {name} (known: {})",
             lib.list()
                 .iter()
-                .map(|(n, a)| format!("{n} ({a})"))
+                .map(|n| n.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -359,7 +358,7 @@ pub(crate) fn stage_prompt_with_params(name: &str, raw_params: &[String]) -> Res
             "unknown stage: {name} (known: {})",
             lib.list()
                 .iter()
-                .map(|(n, a)| format!("{n} ({a})"))
+                .map(|n| n.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -549,7 +548,7 @@ enum Commands {
         /// matches EXACTLY one agent)
         #[arg(long, default_value = "all")]
         to: String,
-        /// stage name or p-code alias (`flywheel stage list`)
+        /// stage name (`flywheel stage list`; ADR-0009 — p-codes retired)
         #[arg(long)]
         stage: Option<String>,
         /// ADR-0006 D1: payload param k=v substituted into the stage
@@ -3862,7 +3861,7 @@ fn main() {
             "tracker": "br/bv (CLI, no MCP)",
             "coordination": "toron mail",
             "daemon": "flywheel daemon start|stop|restart|status — supervised serve lifecycle (launchd/systemd/pidfile); restart verifies the new daemon answers; stop/refuse unmanaged port holders without --force",
-            "stages": ["p1", "p2", "p4", "p5", "p6", "p8"],
+            "stages": ["ce-brainstorm", "ce-plan", "ce-plan-review", "ce-execute", "ce-simplify", "ce-review", "ce-compound", "commit-and-push"],
             "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
             "catalog": {
                 "slots": "flywheel slot list/show/set/remove — cheap/standard/premium = harness+model; profiles alias @cheap/@standard/@premium (ADR-0007 D1)",
@@ -4531,7 +4530,7 @@ fn print_concise_help() {
         "flywheel — herdr swarm orchestrator (v{VERSION})\n\n\
          Examples:\n\
          \x20 flywheel spawn notetoself --oc=1 --pi=1 --gk=1\n\
-         \x20 flywheel send notetoself --to all --stage p1 --wait\n\
+         \x20 flywheel send notetoself --to all --stage fresh-eyes-explore --wait\n\
          \x20 flywheel status notetoself\n\
          \x20 flywheel work triage\n\
          \x20 flywheel checkpoint save notetoself --msg \"before auth refactor\"\n\
@@ -6495,7 +6494,6 @@ mod workspace_origin_tests {
         );
     }
 }
-
 
 #[cfg(test)]
 mod tripwire {
@@ -17667,25 +17665,19 @@ fn cmd_stage(cfg: &Config, cmd: &StageCmd) -> Result<()> {
                 print_json(&json!({ "stages": rows }));
                 return Ok(());
             }
-            println!("stages (semantic name <-> p-code alias, tier, role, phase):");
+            println!("stages (name, tier, role, phase):");
             for row in &rows {
                 println!(
-                    "  {:<28} {:<4} [{:<7}] role={} phase={}",
+                    "  {:<28} [{:<7}] role={} phase={}",
                     row.name,
-                    if row.alias.is_empty() {
-                        "-"
-                    } else {
-                        &row.alias
-                    },
                     row.tier.tag(),
                     row.role.as_deref().unwrap_or("-"),
                     row.phase.as_deref().unwrap_or("-"),
                 );
             }
-            println!("semantic alias table (Spec 2a):");
-            for (semantic, code) in lib.semantic_aliases() {
-                println!("  {semantic} = {code}");
-            }
+            println!(
+                "ce- loop (ADR-0009): ce-brainstorm -> ce-plan -> ce-plan-review -> ce-execute -> ce-simplify -> ce-review -> verify -> ce-compound"
+            );
             println!("user override: {}", override_display());
             println!("project tier: {}", project_stages.display());
             Ok(())
@@ -17697,9 +17689,6 @@ fn cmd_stage(cfg: &Config, cmd: &StageCmd) -> Result<()> {
                 .ok_or_else(|| anyhow!("unknown stage {name:?} (flywheel stage list --all)"))?;
             let tier = lib.tier_of(name).unwrap_or(stages::Tier::Seed);
             println!("name:     {}", stage.name);
-            if !stage.alias.is_empty() {
-                println!("alias:    {}", stage.alias);
-            }
             println!("tier:     {}", tier.tag());
             if let Some(role) = &stage.role {
                 println!("role:     {role}");
@@ -21153,18 +21142,18 @@ const PROMPT_WORKFLOWS: &[(&str, &str, &str)] = &[
     ),
     (
         "plan",
-        "plan",
-        "Run the plan workflow — goal → bead-ready plan via the planner.",
+        "ce-plan",
+        "Run the ce-plan workflow — goal → bead-ready plan via the planner.",
     ),
     (
         "plan-review",
-        "plan-review",
-        "Run the plan-review workflow — review a plan bead-by-bead before implementation.",
+        "ce-plan-review",
+        "Run the ce-plan-review workflow — review a plan bead-by-bead before implementation.",
     ),
     (
         "brainstorm",
-        "brainstorm",
-        "Run the brainstorm workflow — divergent ideation: oracles fan out, a planner reduces.",
+        "ce-brainstorm",
+        "Run the ce-brainstorm workflow — requirements-first ideation: oracles fan out, a planner reduces.",
     ),
     (
         "onboard",
@@ -22530,8 +22519,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             let host_project = "flywheel";
             // GS-033: fail-closed BEFORE agent_start (add-path style) —
             // never leave a dark pane when mail is configured.
-            let mail_identity =
-                pinned_mail_identity(cfg, host_project, &agent_name, &spec.harness);
+            let mail_identity = pinned_mail_identity(cfg, host_project, &agent_name, &spec.harness);
             if mail_identity.is_none() {
                 refuse_unpinned_spawn(&agent_name, Some(name), backend::mail_backend(cfg).is_ok())?;
             }
@@ -22543,13 +22531,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 spec.backend
             );
             if let Some(ref pin) = mail_identity {
-                bind_pane_mail_identity(
-                    cfg,
-                    host_project,
-                    &agent_name,
-                    &info.pane_id,
-                    Some(pin),
-                );
+                bind_pane_mail_identity(cfg, host_project, &agent_name, &info.pane_id, Some(pin));
             }
             bind_spawn_role(
                 cfg,
@@ -32353,7 +32335,7 @@ steps:
   - name: a
     action: dispatch_job
     assignee: x
-    spec: { profile: "@planner", stage: "systematic-execute" }
+    spec: { profile: "@planner", stage: "ce-execute" }
 "##,
         )
         .expect("parse");

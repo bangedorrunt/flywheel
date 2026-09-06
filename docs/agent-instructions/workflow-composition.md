@@ -24,7 +24,7 @@ Five nouns, not interchangeable:
 
 | Noun | What it is | What it is not |
 | :--- | :--- | :--- |
-| **stage** | one named prompt (`send --stage systematic-execute`). Catalog: `stage list`. | a runner. |
+| **stage** | one named prompt (`send --stage ce-execute`). Catalog: `stage list`. | a runner. |
 | **workflow** | engine procedure (YAML steps or graph). A step *may* dispatch a stage to a `@role`. SIGNOFF is `request_approval`, not a stage. | a topology. |
 | **profile** | role → harness + model + skills. `crew: auto` counts `@roles`. | what makes a compose token. |
 | **topology** | how work is supervised: loop / swarm / open. | Workflow YAML. "Loop workflow" is forbidden speech. |
@@ -47,7 +47,7 @@ Door map (one door per intent):
 
 Invariants (each stated once): **preview ≠ started** — compose without `--run` only lints + previews the crew. **SIGNOFF outer-only** — nested captain+crew via `call_workflow` / `dispatch_job` never open a second `request_approval`. Ordinary builtins enter via `workflow run <name> --execute` — never bare `--parts`.
 
-**beads-lifecycle** (third token): preferred `workflow compose "<objective>" --parts beads-lifecycle --run --project <p>`; legacy alias `workflow run beads-lifecycle --execute`. Nests ordinary builtins (phase-plan, beads, plan-review, phase-implement, phase-verify) via `call_workflow`; `inputs.until` early-exits SUCCESS after any phase; SIGNOFF outer-only. Sibling of wave-swarm: after integrate, hand off with `until=integrate`, never merge.
+**beads-lifecycle** (third token): preferred `workflow compose "<objective>" --parts beads-lifecycle --run --project <p>`; legacy alias `workflow run beads-lifecycle --execute`. Nests ordinary builtins (phase-plan, beads, ce-plan-review, phase-implement, phase-verify) via call_workflow; `inputs.until` early-exits SUCCESS after any phase; SIGNOFF outer-only. Sibling of wave-swarm: after integrate, hand off with `until=integrate`, never merge.
 
 ```
 catalog + built-ins          your first stop — something already fits
@@ -135,10 +135,10 @@ spawning fresh. Use it for repeat work on a live swarm.
 
 ```bash
 # parts only: lint + preview the inferred crew (no run)
-flywheel workflow compose "<target>" --parts "scout:fresh-eyes-explore,coder:systematic-execute"
+flywheel workflow compose "<target>" --parts "scout:fresh-eyes-explore,coder:ce-execute"
 
 # seed from an existing workflow, then extend
-flywheel workflow compose "<target>" --base triage --parts "coder:systematic-execute"
+flywheel workflow compose "<target>" --base triage --parts "coder:ce-execute"
 
 # chain a catalog workflow as one part of something bigger
 flywheel workflow compose "<target>" --parts "workflow:weekly-review"
@@ -215,7 +215,7 @@ findings." No single catalog workflow does both in sequence.
 
 1. `flywheel decide` → compose-parts.
 2. Compose + preview:
-   `flywheel workflow compose "explore then fix module X" --parts "scout:fresh-eyes-explore,coder:systematic-execute"`
+   `flywheel workflow compose "explore then fix module X" --parts "scout:fresh-eyes-explore,coder:ce-execute"`
    → read the lint output and the crew preview.
 3. Lint issues? Fix the parts (wrong stage name, wrong role) — never the gate.
 4. Run: append `--run --project <p>`.
@@ -245,7 +245,8 @@ into `~/.config/opencode/commands/` — plural):
 - `/open-mode` — current-pane work, no lifecycle
 - `/peer-aware-mode` — attach a running pane to the doorbell
 - `/workflow-*` — brainstorm, plan, plan-review, debate, triage, onboard,
-  captain-audit
+  captain-audit (slash short-forms; the plan/plan-review/brainstorm ones
+  target the renamed `ce-*` builtins — ADR-0009)
 - `/beads-*` — triage, execute, review, commit, create
 
 Mail steering (any harness): crews ack, read, and reply through the toron

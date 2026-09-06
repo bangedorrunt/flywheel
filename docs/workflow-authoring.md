@@ -162,7 +162,7 @@ steps:
   - name: scope
     action: spawn
     profile: "@scout"
-    stage: fresh-eyes-explore        # named stage (Spec 2a) — reuses the p1 prompt
+    stage: fresh-eyes-explore        # named stage (Spec 2a; ADR-0009 — semantic names only)
     await: true                      # block until the scout finishes
   - name: plan
     action: spawn
@@ -172,7 +172,7 @@ steps:
   - name: build
     action: parallel
     over: "@crew.coder"              # fan out across the 2 coders
-    each: { action: spawn, stage: systematic-execute, await: true }
+    each: { action: spawn, stage: ce-execute, await: true }
   - name: review
     action: spawn
     profile: "@reviewer"
@@ -224,10 +224,11 @@ Guards are `evalexpr` expressions (100ms timeout).
 
 ### 3e. Built-in library + slash commands
 
-**Built-in workflows (2026-08-10):** `brainstorm` · `plan` · `beads` · `debate` · `goal` ·
+**Built-in workflows (2026-09-06, ADR-0009):** `ce-brainstorm` · `ce-plan` · `beads` · `debate` · `goal` ·
 `triage` + **`onboard`** (cold-start: read AGENTS.md + map structure + seed context + first task) +
 **`triage-deep`** (bv robot-triage → prioritize → assign → spawn) + **`weekly-review`** (the weekly
-self-improvement cron: scout-fanout → oracle → ONE follow-up bead; see §4). Zero-config:
+self-improvement cron: scout-fanout → oracle → ONE follow-up bead; see §4) + **`ce-compound`** +
+**`ce-sweep`** (ADR-0009 learnings capture + corpus maintenance — any topology). Zero-config:
 `flywheel workflow run debate --inputs '{"proposal":"..."}'` works on a fresh install.
 
 **Slash commands (2026-08-10):** the bead-workflow lifecycle is delivered as slash commands —
