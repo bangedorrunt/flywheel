@@ -2970,10 +2970,23 @@ enum WorkflowCmd {
         role_model: Vec<String>,
         /// GS-039 P0-3: NEVER silent-reap desks. Default OFF — pass
         /// `--retire-orphans` explicitly to close pre-existing workspaces.
-        /// (`--no-retire-orphans` kept as an explicit alias of the default.)
-        #[arg(long = "retire-orphans", default_value_t = false, action = clap::ArgAction::SetTrue)]
-        #[arg(long = "no-retire-orphans", action = clap::ArgAction::SetFalse)]
+        // GS-040 B2: hidden `--no-retire-orphans` is a SEPARATE field linked
+        // via overrides_with — NOT dual-#[arg] on the same field (that
+        // dropped the positive flag; only --no-retire-orphans survived).
+        #[arg(
+            long = "retire-orphans",
+            action = clap::ArgAction::SetTrue,
+            overrides_with = "_no_retire_orphans"
+        )]
         retire_orphans: bool,
+        /// Hidden SetFalse alias for script compat (GS-040 B2).
+        #[arg(
+            long = "no-retire-orphans",
+            action = clap::ArgAction::SetFalse,
+            overrides_with = "retire_orphans",
+            hide = true
+        )]
+        _no_retire_orphans: bool,
         /// GS-039 P0-3: refuse multi-crew expansion unless explicitly allowed
         /// (repair/loop must not silently balloon; wave-swarm needs this or a
         /// TTY crew-count ask).
@@ -6664,18 +6677,203 @@ mod spawn_boot_reliability_tests {
             spawn_body.contains("presence_project") && spawn_body.contains("GS-037 P0-D"),
             "presence publish must use absolute project key (register-before-presence)"
         );
-        // GS-039 P0-3: retire_orphans defaults FALSE (never silent-reap).
+        // GS-039 P0-3 / GS-040 B2: retire_orphans defaults FALSE; positive
+        // flag visible; hidden --no-retire-orphans via SEPARATE field.
         assert!(
-            src.contains("no-retire-orphans")
+            src.contains("retire-orphans")
                 && src.contains("GS-039 P0-3")
                 && src.contains("allow-crew-expand")
-                && src.contains("retire_orphans: bool"),
-            "compose must default retire_orphans false + expose --allow-crew-expand (GS-039 P0-3)"
+                && src.contains("retire_orphans: bool")
+                && src.contains("long = \"retire-orphans\"")
+                && src.contains("long = \"no-retire-orphans\"")
+                && src.contains("overrides_with")
+                && src.contains("hide = true"),
+            "compose must default retire_orphans false + visible --retire-orphans + hidden --no-retire-orphans via overrides_with (GS-039/040 B2)"
         );
     }
 
     /// GS-039: CoS-honest folds — real wake observation, open-mode authority,
     /// solo compose sizing, name-bind fail-closed, no invent-green.
+
+    #[test]
+    fn gs040_compose_wf_name_includes_project_tag() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("GS-040: crew_agent_name keeps only 16"),
+            "compose wf_name must include project tag (avoid truncated-ISO collisions)"
+        );
+        assert!(
+            src.contains("chrono::Utc::now().format(") && src.contains("%m%d%H%M%S"),
+            "compose wf_name must use date-bearing %m%d%H%M%S (unique across days in 16-char slug)"
+        );
+    }
+
+    #[test]
+    fn gs040_retire_orphans_single_arg_no_dual() {
+        // GS-040 B2 tripwire: dual #[arg] on the SAME field dropped
+        // --retire-orphans (only --no-retire-orphans survived). Hidden
+        // SetFalse alias MUST be a separate field linked via overrides_with.
+        let src = include_str!("main.rs");
+        let compose_marker = "Runtime workflow composition (bd-8xca)";
+        let start = src.find(compose_marker).expect("Compose docs");
+        let window = &src[start..start + 12000];
+        let needle = "long = \"retire-orphans\"";
+        let hits: Vec<_> = window.match_indices(needle).collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "Compose must declare long = \"retire-orphans\" exactly once"
+        );
+        // Positive flag binds retire_orphans: bool before any no- alias.
+        let after_pos = &window[hits[0].0..hits[0].0 + 220];
+        assert!(
+            after_pos.contains("retire_orphans: bool"),
+            "retire-orphans arg must bind retire_orphans: bool"
+        );
+        assert!(
+            !after_pos.contains("long = \"no-retire-orphans\""),
+            "must not dual-#[arg] long=no-retire-orphans on same field (clap drop bug)"
+        );
+        assert!(
+            after_pos.contains("ArgAction::SetTrue") || after_pos.contains("overrides_with"),
+            "positive --retire-orphans must SetTrue / link via overrides_with"
+        );
+        // Separate hidden SetFalse field (not stacked #[arg] on retire_orphans).
+        assert!(
+            window.contains("long = \"no-retire-orphans\"")
+                && window.contains("ArgAction::SetFalse")
+                && window.contains("hide = true")
+                && window.contains("_no_retire_orphans: bool"),
+            "hidden --no-retire-orphans SetFalse must be a separate field"
+        );
+        // Dual-#[arg] regression: two #[arg] attrs with no field between them
+        // immediately before retire_orphans: bool.
+        let dual_bug = "#[arg(long = \"retire-orphans\"";
+        let dual_bug2 = "#[arg(long = \"no-retire-orphans\"";
+        if let (Some(a), Some(b)) = (window.find(dual_bug), window.find(dual_bug2)) {
+            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+            let between = &window[lo..hi];
+            assert!(
+                between.contains(": bool"),
+                "no-retire-orphans #[arg] must not stack on same field as retire-orphans"
+            );
+        }
+    }
+
+    #[test]
+    fn gs040_retire_orphans_clap_help_and_parse() {
+        // Behavioral (not invent-green): help lists --retire-orphans; parse
+        // covers default / positive / hidden negative / overrides last-wins.
+        use clap::CommandFactory;
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let cmd = Cli::command();
+                let wf = cmd
+                    .find_subcommand("workflow")
+                    .expect("workflow subcommand");
+                let compose = wf
+                    .find_subcommand("compose")
+                    .expect("workflow compose subcommand");
+                let mut help = Vec::new();
+                compose.clone().write_long_help(&mut help).expect("help");
+                let help_s = String::from_utf8(help).expect("utf8");
+                assert!(
+                    help_s.contains("--retire-orphans"),
+                    "compose help must list --retire-orphans"
+                );
+                assert!(
+                    !help_s.contains("--no-retire-orphans"),
+                    "compose help must hide --no-retire-orphans"
+                );
+
+                let parse = |args: &[&str]| -> bool {
+                    let cli = Cli::try_parse_from(args).unwrap_or_else(|e| {
+                        panic!("parse {:?} failed: {e}", args)
+                    });
+                    match cli.command {
+                        Some(Commands::Workflow {
+                            cmd:
+                                WorkflowCmd::Compose {
+                                    retire_orphans, ..
+                                },
+                        }) => retire_orphans,
+                        _ => panic!("expected workflow compose"),
+                    }
+                };
+                assert!(
+                    !parse(&["flywheel", "workflow", "compose", "t"]),
+                    "bare default retire_orphans=false"
+                );
+                assert!(
+                    parse(&[
+                        "flywheel",
+                        "workflow",
+                        "compose",
+                        "t",
+                        "--retire-orphans"
+                    ]),
+                    "--retire-orphans => true"
+                );
+                assert!(
+                    !parse(&[
+                        "flywheel",
+                        "workflow",
+                        "compose",
+                        "t",
+                        "--no-retire-orphans"
+                    ]),
+                    "--no-retire-orphans => false"
+                );
+                assert!(
+                    !parse(&[
+                        "flywheel",
+                        "workflow",
+                        "compose",
+                        "t",
+                        "--retire-orphans",
+                        "--no-retire-orphans"
+                    ]),
+                    "--retire-orphans then --no-retire-orphans => false (overrides_with)"
+                );
+                assert!(
+                    parse(&[
+                        "flywheel",
+                        "workflow",
+                        "compose",
+                        "t",
+                        "--no-retire-orphans",
+                        "--retire-orphans"
+                    ]),
+                    "--no-retire-orphans then --retire-orphans => true (overrides_with)"
+                );
+            })
+            .expect("spawn clap probe");
+        handle.join().expect("clap probe thread");
+    }
+
+    #[test]
+    fn gs040_collab_watch_waits_empty_thread() {
+        // GS-040: mail watch must NOT process::exit(1) on an empty thread
+        // mid-wait (collab asker outbound is invisible in inbox). Source
+        // tripwire — keep polling until timeout.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("waiting for reply"),
+            "mail_watch must wait on empty thread (GS-040 collab)"
+        );
+        assert!(
+            src.contains("empty_noted"),
+            "mail_watch must rate-limit empty-thread note via empty_noted"
+        );
+        // Old early-exit pattern must be gone (invent-fail on empty thread).
+        let bad = concat!(
+            "has no messages yet\");\n",
+            "                    std::process::exit(1);"
+        );
+        assert!(!src.contains(bad), "mail_watch must not early-exit(1) on empty thread");
+    }
+
     #[test]
     fn gs039_cos_honest_folds_present() {
         let src = include_str!("main.rs");
@@ -17595,6 +17793,7 @@ fn cmd_mail_watch(
     let start = std::time::Instant::now();
     let seen: Option<String> =
         latest(&mail)?.and_then(|m| m.get("id").and_then(|i| i.as_str()).map(String::from));
+    let mut empty_noted = false;
     eprintln!(
         "flywheel: watching thread {thread_id} (latest {}); Ctrl-C to abort",
         seen.as_deref().unwrap_or("<none>")
@@ -17614,9 +17813,15 @@ fn cmd_mail_watch(
                 }
             }
             None => {
-                if seen.is_none() {
-                    eprintln!("flywheel: thread {thread_id} has no messages yet");
-                    std::process::exit(1);
+                // GS-040: empty thread is normal while waiting for the first
+                // reply — the asker's OUTBOUND collab ask does not appear in
+                // their inbox projection, so `seen` starts None. Keep polling
+                // until timeout (no invent-fail / early exit).
+                if seen.is_none() && !empty_noted {
+                    eprintln!(
+                        "flywheel: thread {thread_id} has no messages yet (waiting for reply…)"
+                    );
+                    empty_noted = true;
                 }
             }
         }
@@ -25548,6 +25753,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             idempotency_key,
             role_model,
             retire_orphans,
+            _no_retire_orphans: _,
             allow_crew_expand,
             reuse,
             json,
@@ -25589,7 +25795,26 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let project_root = project_dir(cfg, project_name);
             let project_stages = project_root.join(".flywheel/stages.toml");
             let all = all_workflows_layered(Some(&project_root))?;
-            let wf_name = format!("composed-{}", state::now_iso().replace([':', '-', '.'], ""));
+            // GS-040: crew_agent_name keeps only 16 chars of the wf slug.
+            // `composed-{ISO}` truncated to `composed-2026090` collided across
+            // concurrent projects / days. Encode project tag (4) + date-bearing
+            // compact stamp %m%d%H%M%S (10) + pid nibble (2 hex) = 16 chars so
+            // uniqueness holds across days within the 16-char crew slug budget
+            // (`crew-{slug}-{role}` still fits herdr's 32-char agent-name).
+            let proj_tag: String = std::path::Path::new(project_name)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("p")
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .take(4)
+                .collect();
+            let wf_name = format!(
+                "{}{}{:02x}",
+                proj_tag,
+                chrono::Utc::now().format("%m%d%H%M%S"),
+                std::process::id() % 256
+            );
             let composed = if let Some(src) = from_yaml {
                 // §3.6 T2 author-from-scratch arm: the FULL Workflow comes
                 // verbatim from the captain (stdin or file); it rides the
