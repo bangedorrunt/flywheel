@@ -1799,13 +1799,6 @@ pub struct MailDigest {
     pub thread_id: Option<String>,
 }
 
-/// Args for the mail-digest leaf: which agents' mail to summarize.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MailDigestArgs {
-    pub project: String,
-    pub agents: Vec<String>,
-}
-
 /// Args for the dispatch-dedupe guard leaf (bd-dispatch-dedupe-2zlz):
 /// which bead's thread to scan before a GOAL dispatch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3434,40 +3427,6 @@ async fn dispatch_guard_scan(args: DispatchGuardArgs) -> Result<Value> {
         Ok(()) => Ok(json!({ "bead": args.bead, "dispatch": true, "reason": null })),
         Err(reason) => Ok(json!({ "bead": args.bead, "dispatch": false, "reason": reason })),
     }
-}
-
-/// Fetch one mail digest per agent (debug surface only — GS-030 slice 1:
-/// NOT on the live loop path; the doorbell is the single wake producer).
-/// Runs `__mail-digest` once per agent; a failing or empty digest yields a
-/// zeroed entry — a mail hiccup must not stall dispatch. Checkpointed: on
-/// replay the same digests are replayed, so prompt text stays deterministic.
-#[function]
-async fn poll_mail_digests(args: MailDigestArgs) -> Result<Vec<MailDigest>> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut digests = Vec::with_capacity(args.agents.len());
-    for agent in &args.agents {
-        let mut cmd = Command::new(&exe);
-        cmd.args(["__mail-digest", &args.project, agent]);
-        let out = if let Ok(o) = run_leaf_cmd(cmd, "__mail-digest").await {
-            o
-        } else {
-            digests.push(MailDigest {
-                agent: agent.clone(),
-                ..Default::default()
-            });
-            continue;
-        };
-        let raw = String::from_utf8_lossy(&out.stdout);
-        let mut d: MailDigest = serde_json::from_str(raw.trim()).unwrap_or_else(|_| MailDigest {
-            agent: agent.clone(),
-            ..Default::default()
-        });
-        if d.agent.is_empty() {
-            d.agent = agent.clone();
-        }
-        digests.push(d);
-    }
-    Ok(digests)
 }
 
 /// Spawn the swarm for a parsed `[xproj]` request (full loop branch).
@@ -7977,9 +7936,6 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     resonate
         .register(poll_xproj_inbox)
         .map_err(|e| anyhow::anyhow!("register poll_xproj_inbox: {e}"))?;
-    resonate
-        .register(poll_mail_digests)
-        .map_err(|e| anyhow::anyhow!("register poll_mail_digests: {e}"))?;
     resonate
         .register(spawn_xproj)
         .map_err(|e| anyhow::anyhow!("register spawn_xproj: {e}"))?;
