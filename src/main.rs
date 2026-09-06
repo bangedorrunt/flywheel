@@ -6679,14 +6679,26 @@ mod spawn_boot_reliability_tests {
     #[test]
     fn gs039_cos_honest_folds_present() {
         let src = include_str!("main.rs");
-        // P0-1: real observation path (Status working/idle stamps wake;
-        // prompt_and_hear returns delivered pins; note_observed_wake exists).
-        // Never invent-green last_wake from planned injects on delivery miss.
+        // P0-1: aim at the PRODUCTION Status comment via rfind — never the
+        // tripwire's own src.contains / string literals (TW-STATUS-AIM).
+        // Full production comment (leading // + trailing :) — rfind lands on
+        // the Status arm, not this tripwire's earlier string literal.
+        let status_marker = "// GS-039 P0-1 REAL observation:";
+        let status_idx = src
+            .rfind(status_marker)
+            .expect("production Status REAL observation marker");
+        let status_chunk = &src[status_idx..status_idx + 900];
         assert!(
-            src.contains("GS-039 P0-1 REAL observation")
-                && src.contains("doorbell_note_observed_wake")
+            status_chunk.contains("status_l == \"working\"")
+                && status_chunk.contains("doorbell_persist_wake")
+                && !status_chunk.contains("injects.first().map")
+                && !status_chunk.contains("or_else"),
+            "Status wake arm must observe herdr status / delivered pins — no invent-green injects.first"
+        );
+        assert!(
+            src.contains("doorbell_note_observed_wake")
                 && src.contains("fn doorbell_prompt_and_hear"),
-            "GS-039 P0-1 wake observation path must be present"
+            "GS-039 P0-1 wake observation helpers must be present"
         );
         // Split needles so this assert body cannot invent-green-match itself.
         let invent_a = format!("{}{}{}", "or_else(", "|", "| injects.first()");
@@ -6694,14 +6706,6 @@ mod spawn_boot_reliability_tests {
         assert!(
             !src.contains(&invent_a) && !src.contains(&invent_b),
             "P0-1 must NOT stamp last_wake from planned injects (no invent-green or_else+injects.first)"
-        );
-        // Also: Status arm must not fall back to injects.first() for wake.
-        let status_fn = "GS-039 P0-1 REAL observation";
-        let status_idx = src.find(status_fn).expect("status observation marker");
-        let status_chunk = &src[status_idx..status_idx + 900];
-        assert!(
-            !status_chunk.contains("injects.first().map"),
-            "Status wake arm must not fall back to injects.first() (invent-green)"
         );
         let pah = crate::tripwire::find_fn(src, "doorbell_prompt_and_hear");
         let pah_body = &src[pah..pah + 600];
@@ -6718,24 +6722,36 @@ mod spawn_boot_reliability_tests {
                 && !send_body.contains("doorbell_note_observed_wake("),
             "cmd_send must not invent-green last_wake (observe via doorbell only)"
         );
+        // Poll/sweep: loud warn on observed-wake save Err (no let _ = swallow).
+        // Split needle so this tripwire cannot false-red on its own literal.
+        let silent = format!("{}{}", "let _ = ", "doorbell_note_observed_wake");
+        assert!(
+            src.contains("observed-wake stamp FAILED on poll")
+                && src.contains("observed-wake stamp FAILED on inbox sweep")
+                && !src.contains(&silent),
+            "poll/sweep must loud-warn on observed-wake save failure (no silent let _ =)"
+        );
         // P0-2: raw AUTHORITATIVE framing
         assert!(
             src.contains("AUTHORITATIVE OPERATOR OBJECTIVE")
                 && src.contains("GS-039 P0-2"),
             "open-mode/--raw must frame AUTHORITATIVE operator objective"
         );
-        // P0-3: retire default false + allow-crew-expand gate
+        // P0-3: retire default false + allow-crew-expand gate + robot hard-bail
         assert!(
             src.contains("allow-crew-expand")
                 && src.contains("GS-039 P0-3")
-                && src.contains("compose would spawn multi-crew"),
-            "compose must gate multi-crew behind --allow-crew-expand"
+                && src.contains("compose would spawn multi-crew")
+                && src.contains("hard-bail (no read_line)")
+                && src.contains("FLYWHEEL_ROBOT"),
+            "compose must gate multi-crew + robot/CI hard-bail (no read_line)"
         );
-        // P0-4: name-bind fail-closed
+        // P0-4: name-bind fail-closed (empty OR wrong-name)
         assert!(
             src.contains("GS-039 P0-4")
-                && src.contains("panes still unbound"),
-            "spawn must fail if panes unbound after settle"
+                && src.contains("panes still unbound/wrong-name")
+                && src.contains("Fail-closed under verify: empty OR wrong-name"),
+            "spawn must fail if panes unbound or wrong-named after settle"
         );
         // P2: no p1 ghost on ready banner
         assert!(
