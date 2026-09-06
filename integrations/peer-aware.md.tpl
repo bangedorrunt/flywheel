@@ -90,6 +90,15 @@ timer):
        - do the work, or escalate via kind 9 / captain mail
   4. acknowledge_message on each ack_required message you have acted on
 
+ACK-DUTY (the delivery contract): the toron message IS the delivery, the
+`[doorbell]` line is only the wake. On doorbell: `fetch_inbox` (or
+`toron mail inbox --since last`), process in rumor order, act, then
+`acknowledge_message` / `mark_message_read`. The ack is the handling
+fact: an unacked corr re-rings on the ladder (one ring per grace
+window, then Dead->respawn / Unknown->digest). A duplicate ring is the
+same delivery, never second work. `--fire-and-forget <delivery-id>`
+opts out of the ladder; re-enqueue under the same id is idempotent.
+
 Verify-after-send: after any load-bearing post, confirm
 delivery ONCE -- `toron channel post ... --wait-ack 5` reads back the
 post's own event id and exits nonzero if it never lands. One read-back,
