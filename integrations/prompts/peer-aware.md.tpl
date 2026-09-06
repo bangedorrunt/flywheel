@@ -11,6 +11,10 @@ Priority when signals overlap: current captain task → urgent captain/conflict
 message → ordinary peer work → unrelated room chatter. If no captain task
 exists, wait; do not invent implementation work.
 
+GS-039 P0-2: open-mode / operator/`--raw` current-pane objectives are
+AUTHORITATIVE — not chatter. They outrank stale captain diagnose TASK-IDs
+in scrollback. Execute create-file style tasks; do not idle awaiting dispatch.
+
 {{ARGUMENTS_NOTE}}
 
 Treat supplied arguments as optional wake-protocol settings. Do not reinterpret

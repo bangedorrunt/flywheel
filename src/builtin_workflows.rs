@@ -1245,10 +1245,12 @@ steps:
         "repair-until-verified",
         r#"
 name: repair-until-verified
-description: "Repair loop (ADR-0024 Spec 2): bounded fresh-context repair → evaluate → VERIFY (3 iterations, continue on verify failure so verify-1 can fail and verify-2 can still run; final verify gates the run). Runs --mode pane only."
+description: "Repair loop (ADR-0024 Spec 2): bounded fresh-context repair → evaluate → VERIFY (3 iterations, continue on verify failure so verify-1 can fail and verify-2 can still run; final verify gates the run). Runs --mode pane only. GS-039 P0-3: explicit crew coder:1 reviewer:1 — never auto-balloon to 3+3; multi-crew expand still requires --allow-crew-expand."
 trigger:
   type: webhook
-crew: auto
+crew:
+  coder: 1
+  reviewer: 1
 inputs:
   - name: bead_id
   - name: verify
@@ -1266,6 +1268,7 @@ graph:
         context: fresh
         task: "Repair iteration 1 for {{inputs.bead_id}}: remaining work from ledger {{inputs.ledger_path}} (read the file, do not trust prompt). VERIFY: {{inputs.verify}}"
       on_error: fail_run
+      error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
     evaluate-1:
       needs: [repair-1]
       action: dispatch_job
@@ -1275,6 +1278,7 @@ graph:
         context: fresh
         task: "Evaluate iteration 1 for {{inputs.bead_id}} against VERIFY {{inputs.verify}} and ledger {{inputs.ledger_path}}. Return JSON {done, remaining_work, failures, validation_evidence}."
       on_error: fail_run
+      error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
     verify-1:
       needs: [evaluate-1]
       action: verify
@@ -1289,6 +1293,7 @@ graph:
         context: fresh
         task: "Repair iteration 2 for {{inputs.bead_id}}: remaining work from ledger {{inputs.ledger_path}}."
       on_error: fail_run
+      error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
     evaluate-2:
       needs: [repair-2]
       action: dispatch_job
@@ -1298,6 +1303,7 @@ graph:
         context: fresh
         task: "Evaluate iteration 2 for {{inputs.bead_id}}."
       on_error: fail_run
+      error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
     verify-2:
       needs: [evaluate-2]
       action: verify
@@ -1312,6 +1318,7 @@ graph:
         context: fresh
         task: "Repair iteration 3 for {{inputs.bead_id}}."
       on_error: fail_run
+      error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
     evaluate-3:
       needs: [repair-3]
       action: dispatch_job
@@ -1321,6 +1328,7 @@ graph:
         context: fresh
         task: "Evaluate iteration 3 for {{inputs.bead_id}}."
       on_error: fail_run
+      error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
     verify-3:
       needs: [evaluate-3]
       action: verify
@@ -1341,6 +1349,7 @@ graph:
         - action: verify
           command: "false 'no verify succeeded — repair loop exhausted without a passing VERIFY'"
           on_error: fail_run
+      error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
 "#,
     ),
     // ---- ADR-0008 §6.7 beads-lifecycle compose token (bd-adr0008-token-yaml-kimg) ------
