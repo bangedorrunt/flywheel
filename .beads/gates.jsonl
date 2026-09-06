@@ -111,3 +111,4 @@
 {"id":109,"issue_id":"bd-gs030-seed-helper-6m7e","from_status":"in_progress","to_status":"closed","status_revision":2269,"gate":"unit-test-verified","provider":"BlueLake","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-05 20:36:56"}
 {"id":112,"issue_id":"bd-gs030-single-writer-ciqu","from_status":"in_progress","to_status":"closed","status_revision":2284,"gate":"unit-test-verified","provider":"BlueLake","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-05 20:50:11"}
 {"id":113,"issue_id":"bd-4el4","from_status":"open","to_status":"closed","status_revision":0,"gate":"unit-test-verified","provider":"bangedorrunt","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-06 04:21:59"}
+{"id":114,"issue_id":"bd-ajwi","from_status":"open","to_status":"closed","status_revision":0,"gate":"unit-test-verified","provider":"assistant","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-06 04:32:50"}
