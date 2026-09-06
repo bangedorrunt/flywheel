@@ -95,6 +95,13 @@ delivery ONCE -- `toron channel post ... --wait-ack 5` reads back the
 post's own event id and exits nonzero if it never lands. One read-back,
 never a poll loop. Delivery is claimed only after it is observed.
 
+Wake verbs (kind-9 is a wake log, not current state): post sparse verbs
+only -- `blocked: <what> [key=...]` / `paused: <which-human> <why>` /
+`needs-decision [key=...] <question>` / `resolved [key=...] <outcome>`.
+Never percent-done or activity prose ("working on X", "update:").
+Current state = presence verdict + `br show`; the room carries wakes,
+not status.
+
 Delivery visibility: "did X report?" is ONE query --
 `toron channel read <channel> --project <p> --as {mail_identity}
 --author <pin>`: delivered_posts == 0 means X has NOT reported.

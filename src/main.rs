@@ -8879,7 +8879,7 @@ mod timeout_presence_tests {
         );
         assert_eq!(
             next.presence.get("BlueRidge"),
-            Some(&crate::workspace::Presence::Working),
+            Some(&crate::workspace::Presence::from_str("working")),
             "jsonl working must enter Model.presence even with no 20001 seen"
         );
     }
@@ -13045,10 +13045,17 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
         .map(|a| {
             // GS-037 P0-2: clear stale launch_pending when herdr reports idle.
             let pending = is_still_booting(a);
+            // ADR-0010 D3: status prints verdict+source per pin. No live
+            // Model in this render path, so resolve from herdr evidence:
+            // native busy is evidence (labeled), native idle never trusted.
+            let herdr_status = a.agent_status.as_str();
+            let verdict = crate::workspace::verdict_for(None, herdr_status, herdr_status != "dead")
+                .status_token();
             json!({
                 "name": a.name, "kind": a.agent,
                 // bd-4pxy: a launch_pending agent is NOT idle — still booting.
-                "status": status_label(pending, a.agent_status.as_str()),
+                "status": status_label(pending, herdr_status),
+                "verdict": verdict,
                 "pane_id": a.pane_id, "cwd": a.cwd, "workspace_id": ws_id,
                 "launch_pending": pending,
             })
@@ -13098,10 +13105,11 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
                 .map(status_paint)
                 .unwrap_or_else(|_| dim(st));
             println!(
-                "{}  {}  {}  {}",
+                "{}  {}  {}  {}  {}",
                 kind_paint(r["kind"].as_str().unwrap_or("?")),
                 dim(r["name"].as_str().unwrap_or("?")),
                 st,
+                dim(r["verdict"].as_str().unwrap_or("Unknown")),
                 dim(r["pane_id"].as_str().unwrap_or(""))
             );
         }
@@ -34754,7 +34762,10 @@ mod why_resume_tests {
                 ("B".to_string(), "weird".to_string()),
             ],
         );
-        assert_eq!(model.presence.get("A"), Some(&workspace::Presence::Working));
+        assert_eq!(
+            model.presence.get("A"),
+            Some(&workspace::Presence::from_str("working"))
+        );
         assert_eq!(
             model.presence.get("B"),
             Some(&workspace::Presence::Unknown),
