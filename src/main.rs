@@ -370,6 +370,117 @@ pub(crate) fn stage_prompt_with_params(name: &str, raw_params: &[String]) -> Res
     let params = stages::parse_params(raw_params)?;
     stages::render_stage(&stage.prompt.clone(), &stage.params.clone(), &params)
 }
+/// Project-aware stage render for sends: the project's `.flywheel/stages.toml`
+/// tier rides along, so project-authored dispatch stages (lane-bead,
+/// stall-wake) resolve from CLI sends — not just the workflow engine.
+/// Missing file falls back to the untiered library (byte-identical).
+pub(crate) fn stage_prompt_with_params_project(
+    name: &str,
+    raw_params: &[String],
+    project_dir: &Path,
+) -> Result<String> {
+    let path = project_dir.join(".flywheel/stages.toml");
+    let lib = if path.is_file() {
+        stages::StageLibrary::load_layered(Some(&path))?
+    } else {
+        stages::StageLibrary::load()?
+    };
+    let stage = lib.get_stage(name).ok_or_else(|| {
+        anyhow!(
+            "unknown stage: {name} (known: {})",
+            lib.list()
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    let params = stages::parse_params(raw_params)?;
+    stages::render_stage(&stage.prompt.clone(), &stage.params.clone(), &params)
+}
+
+#[cfg(test)]
+mod send_project_stage_tests {
+    use super::*;
+
+    fn tmp_toml(contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "flywheel-send-stage-test-{}",
+            std::process::id()
+        ));
+        let fw = dir.join(".flywheel");
+        std::fs::create_dir_all(&fw).expect("fw dir");
+        std::fs::write(fw.join("stages.toml"), contents).expect("write toml");
+        dir
+    }
+
+    /// Project-tier slotted stages render through sends; unknown names fail loud.
+    #[test]
+    fn project_stage_renders_params_for_send() {
+        let dir = tmp_toml(
+            "[stages.probe]\nname = \"probe\"\nphase = \"implement\"\nparams = [\"bead\"]\nprompt = \"Bound bead: {{bead}}.\"\n",
+        );
+        let out = stage_prompt_with_params_project(
+            "probe",
+            &["bead=bd-1".to_string()],
+            &dir,
+        )
+        .expect("renders");
+        assert!(out.contains("bd-1"), "slot substituted: {out}");
+        assert!(stage_prompt_with_params_project("nope", &[], &dir).is_err());
+        // missing tier file falls back without failing
+        let bare = std::env::temp_dir().join(format!(
+            "flywheel-send-stage-test-empty-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&bare).expect("tmp dir");
+        assert!(stage_prompt_with_params_project("ce-execute", &[], &bare).is_ok());
+    }
+}
+/// Stage + explicit message combine: the message is operator intent and rides
+/// after the rendered stage — never silently dropped (hollow-dispatch fix).
+fn combine_stage_message(rendered: String, msg: Option<&str>) -> String {
+    match msg {
+        Some(t) => format!("{rendered}\n\n{t}"),
+        None => rendered,
+    }
+}
+
+/// Dispatch header: the TASK-ID is routing metadata, never the work order.
+/// Names the bound bead, or states plainly that none is bound (do not act).
+fn dispatch_header(task_id: &str, bead: Option<&str>) -> String {
+    match bead {
+        Some(b) => format!(
+            "TASK-ID: {task_id} (routing metadata only — not a bead id, never `br show` it)\nBEAD: {b} (the bound work order; `br show {b}` is the contract)"
+        ),
+        None => format!(
+            "TASK-ID: {task_id} (routing metadata only — not a bead id, never `br show` it)\nBEAD: none bound — no work order rides this dispatch. Do NOT act; ask the captain for the bead id."
+        ),
+    }
+}
+
+#[cfg(test)]
+mod send_dispatch_header_tests {
+    use super::*;
+
+    /// Message text survives alongside a stage; header binds or disclaims.
+    #[test]
+    fn stage_message_combine_and_header() {
+        assert_eq!(
+            combine_stage_message("stage".to_string(), Some("brief")),
+            "stage\n\nbrief"
+        );
+        assert_eq!(
+            combine_stage_message("stage".to_string(), None),
+            "stage"
+        );
+        let bound = dispatch_header("task-1", Some("bd-2"));
+        assert!(bound.contains("bd-2"), "names the bead: {bound}");
+        assert!(bound.contains("not a bead"), "disclaims the task id: {bound}");
+        let unbound = dispatch_header("task-1", None);
+        assert!(unbound.contains("Do NOT act"), "no-bead disclaimer: {unbound}");
+    }
+}
 
 // ---- CLI surface ----
 
@@ -7958,14 +8069,19 @@ projects available: {}",
                 &agent.pane_id,
                 mail_identity.as_deref(),
             );
-            // GS-030 slice 3: auto-bind the crew role to the pin.
-            bind_spawn_role(
-                cfg,
+            // GS-030 slice 3: auto-bind the crew role to the pin — best-effort:
+            // a failed bind warns loud and lets the spawn continue, never aborts
+            // panes 2..N (the alias re-binds via `toron role pin`).
+            note_role_bind_result(
+                bind_spawn_role(
+                    cfg,
+                    project,
+                    item.profile.as_deref(),
+                    &item.short,
+                    mail_identity.as_deref(),
+                ),
                 project,
-                item.profile.as_deref(),
-                &item.short,
-                mail_identity.as_deref(),
-            )?;
+            );
             // Fail-closed already ran BEFORE agent_start; remaining None-pin
             // cases are legacy+warn only (mail not configured).
             let entry = match (&item.profile, &mail_identity) {
@@ -13464,7 +13580,14 @@ fn cmd_send(
     let text = match (stage, msg) {
         // ADR-0006 D1: --param k=v substitutes the stage template's {{k}}
         // slots; a declared-but-missing required slot is a usage error.
-        (Some(s), _) => stage_prompt_with_params(s, params)?,
+        // Project tier (.flywheel/stages.toml) rides along so lane-bead and
+        // stall-wake resolve from CLI sends. Explicit message text is
+        // operator intent: it appends after the rendered stage, never dropped
+        // (silent-drop caused hollow dispatches).
+        (Some(s), m) => combine_stage_message(
+            stage_prompt_with_params_project(s, params, &project_dir(cfg, project))?,
+            m,
+        ),
         (None, Some(m)) => m.to_string(),
         (None, None) => bail!("provide --stage NAME or a message text"),
     };
@@ -13473,11 +13596,18 @@ fn cmd_send(
     // --thread-id <task-id>`, subject `[<task-id>] ...`), so non-bead work
     // has greppable history instead of subject-only drift. Explicit
     // `--param task_id=...` wins; otherwise one is minted per send.
+    // The header names the bound bead (or its absence) so a TASK-ID is never
+    // mistaken for a work order (hollow-dispatch class).
     let task_id = match params.iter().find(|p| p.starts_with("task_id=")) {
         Some(kv) => kv.trim_start_matches("task_id=").to_string(),
         None => mint_task_id(),
     };
-    let text = format!("TASK-ID: {task_id}\n\n{text}");
+    let bead = params
+        .iter()
+        .find(|p| p.starts_with("bead="))
+        .map(|kv| kv.trim_start_matches("bead=").to_string())
+        .filter(|b| !b.is_empty());
+    let text = format!("{}\n\n{text}", dispatch_header(&task_id, bead.as_deref()));
 
     // safety guard: refuse destructive prompts unless --force
     if !force {
@@ -16989,6 +17119,28 @@ fn bind_spawn_role(
         }
     }
     Ok(())
+}
+/// Spawn-path role-bind is best-effort: the pane is the product and the alias
+/// is re-bindable via `toron role pin`. A failed bind warns loud and lets the
+/// spawn continue — it must never abort panes 2..N (1-pane-cap root cause).
+fn note_role_bind_result(res: anyhow::Result<()>, project: &str) {
+    if let Err(e) = res {
+        eprintln!(
+            "flywheel: warn: {e:#} — role alias unbound; re-bind with `toron role pin <role> <pin> --project {project}`"
+        );
+    }
+}
+
+#[cfg(test)]
+mod role_bind_best_effort_tests {
+    use super::*;
+
+    /// Both arms return normally: a role-bind failure is non-fatal to spawn.
+    #[test]
+    fn role_bind_result_never_aborts() {
+        note_role_bind_result(Ok(()), "proj");
+        note_role_bind_result(Err(anyhow::anyhow!("daemon down")), "proj");
+    }
 }
 
 /// Persist + queue `Msg::RoleBound` so the doorbell owner ticks it

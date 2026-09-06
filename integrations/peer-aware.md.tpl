@@ -115,6 +115,7 @@ with a BODY carrying the report fields:
 status, commit sha, verdict kind, what you ran + the result tail,
 deviations, PRINCIPLES cited. Bead-closed + commit are the durable
 signal; this mail is courtesy. Same for 'starting' when you claim a task.
+ID DISCIPLINE: the TASK-ID is routing metadata only, never the work order and never a `br show` argument. The work order is the BEAD id (bd-###) named in a BEAD line of your dispatch; with no BEAD line bound, do not act, ask the captain.
 
 Bounded budget: max {poll_budget_minutes} minutes of
 peer-wake AND max {max_peer_prompts} peer-prompts per task (enforced by
