@@ -542,6 +542,126 @@ pub fn decide(target: &str, snap: &Snapshot) -> Decision {
             ],
         );
     }
+    // 24c. debate -> debate (adversarial briefs + oracle decide).
+    if has(
+        &t,
+        &[
+            "argue both sides",
+            "devil's advocate",
+            "debate the",
+            "steelman",
+        ],
+    ) {
+        return dec(
+            "debate",
+            "debate — adversarial briefs, oracle decides",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "debate",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 24d. brainstorm -> ce-brainstorm (requirements-first ideation).
+    if has(
+        &t,
+        &[
+            "brainstorm",
+            "sharpen the requirements",
+            "requirements-only",
+            "ideate",
+        ],
+    ) {
+        return dec(
+            "ce-brainstorm",
+            "ce-brainstorm — requirements-first ideation (oracles diverge, planner reduces)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "ce-brainstorm",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 24e. bead-ready plan -> ce-plan (decompose, approval gate).
+    if has(
+        &t,
+        &[
+            "bead-ready plan",
+            "decompose this goal",
+            "break this down",
+            "make a bead-ready plan",
+        ],
+    ) {
+        return dec(
+            "ce-plan",
+            "ce-plan — goal to bead-ready plan, approval gate",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "ce-plan",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 24f. ship chain -> ship (resolve -> verify gated chain).
+    if has(
+        &t,
+        &[
+            "ship the chain",
+            "run the ship",
+            "ship chain",
+            "resolve to verify",
+        ],
+    ) {
+        return dec(
+            "ship",
+            "ship — resolve to verify gated chain",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "ship",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 24g. plan -> tracker beads -> beads (thin conversion).
+    if has(
+        &t,
+        &[
+            "file these as beads",
+            "track this plan",
+            "convert to beads",
+            "beads from this plan",
+        ],
+    ) {
+        return dec(
+            "beads",
+            "beads — plan to tracker (planner files the beads)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "beads",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
     // 25. Ready beads + work-ish intent → run the loop, not hand-rolled sends.
     if snap.ready_bead_count > 0
         && !implement
@@ -663,6 +783,11 @@ pub fn decide_trigger_for(workflow: &str) -> Option<&'static str> {
         "autonomous-work" => Some("autonomous-work"),
         "reflect" => Some("reflect"),
         "awareness-digest" => Some("awareness-digest"),
+        "debate" => Some("argue both sides"),
+        "ce-brainstorm" => Some("brainstorm"),
+        "ce-plan" => Some("break this down"),
+        "ship" => Some("ship the chain"),
+        "beads" => Some("convert to beads"),
         "onboard" => Some("onboard"),
         "wave-swarm" => Some("wave-swarm"),
         "repair-until-verified" => Some("repair-until-verified"),
@@ -1491,6 +1616,62 @@ mod tests {
             assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
         }
     }
+    #[test]
+    fn row24c_debate_goes_to_debate() {
+        for t in ["argue both sides of this", "play devil's advocate here"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "debate", "target: {t}");
+            assert!(d.argv.contains(&"debate".to_string()), "argv: {:?}", d.argv);
+            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
+        }
+    }
+
+    #[test]
+    fn row24d_brainstorm_goes_to_ce_brainstorm() {
+        for t in [
+            "brainstorm the retry design",
+            "sharpen the requirements first",
+        ] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "ce-brainstorm", "target: {t}");
+            assert!(
+                d.argv.contains(&"ce-brainstorm".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
+        }
+    }
+
+    #[test]
+    fn row24e_breakdown_goes_to_ce_plan() {
+        for t in ["break this down into beads", "make a bead-ready plan"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "ce-plan", "target: {t}");
+            assert!(
+                d.argv.contains(&"ce-plan".to_string()),
+                "argv: {:?}",
+                d.argv
+            );
+        }
+    }
+
+    #[test]
+    fn row24f_ship_chain_goes_to_ship() {
+        for t in ["ship the chain", "run the ship workflow"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "ship", "target: {t}");
+            assert!(d.argv.contains(&"ship".to_string()), "argv: {:?}", d.argv);
+        }
+    }
+
+    #[test]
+    fn row24g_convert_goes_to_beads() {
+        for t in ["convert to beads", "file these as beads"] {
+            let d = decide(t, &snap());
+            assert_eq!(d.primitive, "beads", "target: {t}");
+            assert!(d.argv.contains(&"beads".to_string()), "argv: {:?}", d.argv);
+        }
+    }
 
     #[test]
     fn decide_trigger_for_maps_routed_and_unrouted() {
@@ -1501,11 +1682,15 @@ mod tests {
             decide_trigger_for("awareness-digest"),
             Some("awareness-digest")
         );
+        // routed since ADR-0009 (agent-native pickup)
+        assert_eq!(decide_trigger_for("debate"), Some("argue both sides"));
+        assert_eq!(decide_trigger_for("ce-brainstorm"), Some("brainstorm"));
+        assert_eq!(decide_trigger_for("ce-plan"), Some("break this down"));
+        assert_eq!(decide_trigger_for("ship"), Some("ship the chain"));
+        assert_eq!(decide_trigger_for("beads"), Some("convert to beads"));
         // deliberately unrouted
-        assert_eq!(decide_trigger_for("debate"), None);
         assert_eq!(decide_trigger_for("plan-review"), None);
         assert_eq!(decide_trigger_for("phase-resolve"), None);
-        assert_eq!(decide_trigger_for("ship"), None);
         assert_eq!(decide_trigger_for("wave-swarm"), Some("wave-swarm"));
         assert_eq!(
             decide_trigger_for("repair-until-verified"),

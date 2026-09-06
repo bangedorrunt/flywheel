@@ -3863,6 +3863,7 @@ fn main() {
             "daemon": "flywheel daemon start|stop|restart|status — supervised serve lifecycle (launchd/systemd/pidfile); restart verifies the new daemon answers; stop/refuse unmanaged port holders without --force",
             "stages": ["ce-brainstorm", "ce-plan", "ce-plan-review", "ce-execute", "ce-simplify", "ce-review", "ce-compound", "commit-and-push"],
             "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
+            "workflows": "agent-native catalog: EVERY row of `workflow list --json` carries description + run + compose_token + decide_trigger — select from list exactly like a skill catalog, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
             "catalog": {
                 "slots": "flywheel slot list/show/set/remove — cheap/standard/premium = harness+model; profiles alias @cheap/@standard/@premium (ADR-0007 D1)",
                 "models": "flywheel model list/show/add/set/remove — `set <id> --slot <s>` selects a model as a slot DEFAULT; registry ids are provider/model with tier cheap|standard|premium; compiled-ins are permanent",
@@ -3871,8 +3872,8 @@ fn main() {
                 "hub": "flywheel catalog [--json] — ratatui multi-panel; refuses non-TTY/NO_COLOR/TERM=dumb naming the CLI (ADR-0007 D4)"
             },
             "wave_dispatch": "loop run --work --wave-label wave-N scopes the ready set to that label and holds (naming blockers) while any lower wave-M (M<N) is open/in_progress; default --work unchanged; label-based transitional until beads ADR-0001 schema-18 (ADR-0006 D2)",
-            "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/VERIFY/SIGNOFF; SIGNOFF=request_approval (captain-only). Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Bounded by FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
-            "beads_lifecycle_compose_token": "preferred: workflow compose \"<objective>\" --parts beads-lifecycle --run --project <p> (compose token); legacy alias: workflow run beads-lifecycle --execute. grill/create/review1/review2/integrate/implement/verify outer SIGNOFF; nests ordinary builtins (phase-plan/beads/plan-review/phase-implement/phase-verify) via call_workflow; inputs.until early-exits SUCCESS after any phase; SIGNOFF outer-only; after integrate hand off to wave-swarm (until=integrate), never merge (ADR-0008 6.7)",
+            "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/REVIEW/VERIFY/COMPOUND/SIGNOFF (ADR-0009: REVIEW audits diffs pre-verify, COMPOUND captures learnings post-verify); SIGNOFF=request_approval (captain-only). Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Bounded by FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
+            "beads_lifecycle_compose_token": "preferred: workflow compose \"<objective>\" --parts beads-lifecycle --run --project <p> (compose token); legacy alias: workflow run beads-lifecycle --execute. grill/create/review1/review2/integrate/implement/verify outer SIGNOFF; nests ordinary builtins (phase-plan/beads/ce-plan-review/phase-implement/phase-verify) via call_workflow; inputs.until early-exits SUCCESS after any phase; SIGNOFF outer-only; after integrate hand off to wave-swarm (until=integrate), never merge (ADR-0008 6.7)",
             "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error" }
         }));
         return;
@@ -24693,10 +24694,22 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 println!("no workflows defined");
                 return Ok(());
             }
+            // Agent-native selection surface (ADR-0009): every row carries
+            // the skill-style description + the preferred run form, so an
+            // agent picks from `list` exactly like a skill catalog.
             let mut rows: Vec<Value> = Vec::new();
             for (name, (wf, source)) in &all {
+                let token = crate::builtin_workflows::is_compose_token(name);
+                let run = if token {
+                    format!("workflow compose \"<objective>\" --parts {name} --run")
+                } else {
+                    format!("workflow run {name} --execute")
+                };
                 rows.push(json!({
                     "name": name,
+                    "description": wf.description,
+                    "run": run,
+                    "compose_token": token,
                     "source": source,
                     "trigger": wf.trigger.as_ref().map(|t| t.type_name()),
                     "crew": match &wf.crew {
@@ -24741,10 +24754,18 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let token = crate::builtin_workflows::is_compose_token(&wf.name);
+            let run = if token {
+                format!("workflow compose \"<objective>\" --parts {} --run", wf.name)
+            } else {
+                format!("workflow run {} --execute", wf.name)
+            };
             print_json(&json!({
                 "name": wf.name,
                 "source": source,
                 "description": wf.description,
+                "run": run,
+                "compose_token": token,
                 "trigger": wf.trigger.as_ref().map(|t| t.type_name()),
                 "guard": wf.guard,
                 "crew": crew,
@@ -31150,6 +31171,43 @@ mod integration_tests {
                 "/{excluded} must NOT be a workflow command (behind-the-scenes)"
             );
         }
+    }
+    /// ADR-0009 addon: `workflow list` is the agent-native selection surface
+    /// — every compiled-in row carries a non-empty description, a run form,
+    /// and the token flag (select from list like a skill catalog).
+    #[test]
+    fn workflow_list_rows_carry_description_and_run() {
+        let wfs = builtin_workflows::builtin_workflows();
+        for (name, wf) in &wfs {
+            let desc = wf.description.as_deref().unwrap_or("");
+            assert!(!desc.is_empty(), "{name} carries a description");
+            let token = crate::builtin_workflows::is_compose_token(name);
+            let run = if token {
+                format!("workflow compose \"<objective>\" --parts {name} --run")
+            } else {
+                format!("workflow run {name} --execute")
+            };
+            if token {
+                assert!(run.contains("--parts"), "{name} token runs via compose");
+            } else {
+                assert!(run.contains("--execute"), "{name} runs via execute");
+            }
+        }
+        // Spot-check the flagship rows.
+        assert!(
+            wfs["wave-swarm"]
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("REVIEW")
+        );
+        assert!(
+            wfs["ce-compound"]
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("docs/learnings")
+        );
     }
 
     /// bd-oj9o #3: a rendered workflow command = frontmatter (with the

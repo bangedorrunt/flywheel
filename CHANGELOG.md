@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Loop-mode wiring**: beads-body lifecycle gains the grounding read + the post-verify compound gate (learning ships in the same commit). **Open-mode wiring**: standing orders + one-shot `workflow run ce-compound --execute`.
 - Terminal states (`done|clean_skip|blocked|failed`) + `settled:` decision labels + independence doctrine, in stage contracts.
 - toron ADR-0022 addendum: `Phase` enum gains `compound` (six-value closed vocabulary, deserialize-gated as before).
+- **Agent-native workflow selection (ADR-0009 addon):** every `workflow list --json` row now carries `description` + `run` (exact invocation) + `compose_token` + `decide_trigger` — select from `list` like a skill catalog. `decide` routes five previously-unpickable intents: debate, brainstorm→ce-brainstorm, bead-ready plan→ce-plan, ship the chain→ship, convert to beads→beads (+ trigger phrases). `robot_capabilities` gains the `workflows` discovery object.
 
 ### Changed — ADR-0009
 - Builtins renamed where they ARE CE concepts: `brainstorm`→`ce-brainstorm`, `plan`→`ce-plan`, `plan-review`→`ce-plan-review` (slash short-forms `/plan` `/plan-review` `/brainstorm` keep their names, retargeted). `goal`/`goal-direct`/`beads`/`beads-lifecycle` stage refs updated to ce- names. `stage list` drops the alias column; robot_capabilities `stages` carries the ce- loop.
