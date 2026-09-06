@@ -23,26 +23,26 @@ Ask operator for model routing per profile before dispatch; blank keeps default.
    '{"objective": "<target>"}'`. Slash /swarm-mode pins this compose token. Beads-lifecycle hands off here after integrate (`until=integrate`).
    GATE->DISPATCH->EXECUTE->OBSERVE->VERIFY->SIGNOFF. The run parks at
    SIGNOFF: resolve via `flywheel workflow approve`. DISPATCH briefs
-   `--stage systematic-execute` (p6) onto coder panes, never p1. Legacy
+   `--stage ce-execute` onto coder panes, never raw. Legacy
    alias: `workflow run wave-swarm --execute` (not preferred). Swarm =
    supervision topology, never "swarm workflow".
 
-3. GATE PREP: `br sync --flush-only`; clear stale assignees; commit tracker.
+2. GATE PREP: `br sync --flush-only`; clear stale assignees; commit tracker.
    Map bead graph. Waves ONE AT A TIME; epics are gates.
 
-4. LANES: single-writer file ownership from bead SCOPE. builtins/main.rs/
+3. LANES: single-writer file ownership from bead SCOPE. builtins/main.rs/
    one-file-at-a-time = handoff chain; disjoint files = parallel. Max 5
    crews: 3 coder + scout (read-only) + verifier (re-runs VERIFY,
    posts VERIFIED/FAILED). guard-the-context-window: bulk to subagents,
    summaries in main thread.
 
-5. SPAWN (escape; un-waved ad-hoc lanes only): `flywheel spawn <proj>
+4. SPAWN (escape; un-waved ad-hoc lanes only): `flywheel spawn <proj>
    --profile <role> --count N --escape`; kind/count + --model/--provider
    without --escape warns. `/swarm-mode peer-aware=off` maps to spawn
    `--no-peer-aware`. Escape forfeits SIGNOFF + artifacts: write the
    trail (timeline/beads) or it does not exist.
 
-6. BRIEF: lane dispatch authoritative. Peer wakes are signals, not tasks;
+5. BRIEF: lane dispatch authoritative. Peer wakes are signals, not tasks;
    peer-aware wake rides the doorbell.
    Bead ids, files, pin, claim (br update in_progress), reserve (toron
    reserve acquire 4min), build slot, TDD (RED first), commit-before-close
@@ -53,29 +53,29 @@ Ask operator for model routing per profile before dispatch; blank keeps default.
    wave-swarm, or "none: raw") in the brief's first line; crews restate
    it in their report (status, sha, verify, deviations, stage). Coder
    execution dispatches
-   --stage systematic-execute (p6), never raw p1; --raw is for
+   --stage ce-execute, never raw; --raw is for
    nudges/wakes only. Join the steer channel at spawn (--join-channel)
    so "post to steer channel" is real. Turn-based crews
    stall silently: when a claimed bead shows no commits for ~2 polls,
    send a status+continue wake; third contact = finish or release.
 
-7. CONFLICT: soft -> `toron reserve request-release` -> respond
+6. CONFLICT: soft -> `toron reserve request-release` -> respond
    agreed|denied|deferred -> escalate on steer channel, captain LAST.
    Hard conflict -> serialize. Design question -> collab peer or
    interrogate/debate. Cross-sweep -> flag, victim re-commits.
    never-block-on-the-human.
 
-8. WAVE GATE: captain verifies with fresh eyes -- suite+fmt+clippy AND the
+7. WAVE GATE: captain verifies with fresh eyes -- suite+fmt+clippy AND the
    actual wiring. Live doorbell and swarm_loop must call workspace::tick
    (slice reducers stay private). Verify dropped-behavior lists (grep
    `let _ =` on action vecs). Close the epic with evidence, then next wave.
 
-9. TEARDOWN: release reservations + slot, kill --force-working, br sync,
+8. TEARDOWN: release reservations + slot, kill --force-working, br sync,
    commit .beads.
    - `toron reserve release --project <p> --agent <pin>`
    - `flywheel mail slot release <project> --slot cargo --as <pin>`
    - `flywheel kill <project> --force --force-working`
 
-10. REPORT: each crew posts status/commit/verify/deviations on lane thread.
+9. REPORT: each crew posts status/commit/verify/deviations on lane thread.
 
 {{VERSION}} {{GENERATED}}

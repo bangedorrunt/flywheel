@@ -21368,12 +21368,18 @@ fn apply_argument_adapter(kind: &str, frontmatter: &str, body: &str) -> (String,
         "grok" => "objective=... --work (trailing text, not interpolated)",
         _ => "args",
     };
+    // YAML-quoting: pi's directory loader parses frontmatter strictly — an
+    // unquoted `argument-hint: [objective=...] ...` is a flow-sequence parse
+    // error, the load throws, and the command silently vanishes from
+    // /-autocomplete (beads/workflow carry no hint, so they survived; omp
+    // already ships its hint quoted). Quote the injected hint like pi's own
+    // docs (`argument-hint: "<PR-URL>"`).
     let fm = if frontmatter.contains("argument-hint:") {
         frontmatter.to_string()
     } else {
         frontmatter.replace(
             "description: ",
-            &format!("argument-hint: {hint}\ndescription: "),
+            &format!("argument-hint: \"{hint}\"\ndescription: "),
         )
     };
     let note = argument_note(kind);
@@ -31419,6 +31425,27 @@ mod integration_tests {
         );
         assert!(out.contains("argument-hint:"));
         assert!(out.contains("trailing text") || out.contains("do not interpolate"));
+    }
+
+    #[test]
+    fn orchestration_hint_is_quoted_yaml_scalar() {
+        // Pi's prompts-dir loader YAML-parses frontmatter strictly: an
+        // unquoted hint (`argument-hint: [objective=...] ...`) is a
+        // flow-sequence parse error, the load throws, and the command
+        // silently vanishes from /-autocomplete. Pin the quoted form for
+        // every kind whose hint is injected (opencode/pi/grok).
+        for kind in ["opencode", "pi", "grok"] {
+            let out = render_orchestration_prompt(kind, "swarm-mode", "0.1.0", "ts").unwrap();
+            let line = out
+                .lines()
+                .find(|l| l.starts_with("argument-hint:"))
+                .expect("hint line present");
+            let val = line["argument-hint:".len()..].trim();
+            assert!(
+                val.starts_with('"') && val.ends_with('"') && val.len() > 2,
+                "{kind} hint must be a quoted YAML scalar, got: {val}"
+            );
+        }
     }
 
     #[test]

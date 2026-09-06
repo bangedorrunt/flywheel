@@ -1,5 +1,5 @@
 ---
-# flywheel beads prompt — flywheel {{VERSION}}, generated {{GENERATED}}; source: integrations/prompts/beads-*.md.tpl + beads-body.md.tpl
+# flywheel prompt — flywheel {{VERSION}}, generated {{GENERATED}}
 description: {{PHASE_DESCRIPTION}}
 aliases: bead-executor, bead-worker, beads-executor
 thinking: high
