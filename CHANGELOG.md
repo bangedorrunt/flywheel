@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
+### Fixed — GS-039 CoS-honest-5 (hold merge)
+- **P0-1 Wake (reprobe):** stamp `last_wake` from REAL observations — herdr Status events, poll **status transitions** into `working|idle|done|blocked` (not static already-idle rows every poll), successfully delivered prompts, **and** `send --wait` landed+settled status (covers idle→idle when Status push has no transition). Never from planned injects / `doorbell_persist_wake` invent-green. `doorbell_note_observed_wake` advances only when wall clock moves past prior (no `saturating_add(1)` ratchet). Robot never-wake after meaningful dispatch stays hard-fail.
+- **P0-3 Solo dry-run (reprobe):** compose `--parts repair-until-verified` preserves recipe Explicit crew `coder:1`+`reviewer:1` (no Auto-infer balloon to 3+3 over repair/evaluate nodes).
+- **P0-1 Wake (prior):** Mail send defaults `--wake tasked`. Poll/sweep observed-wake saves loud-warn (no `let _ =`).
+- **P0-2 Open-mode:** operator/`--raw` framed AUTHORITATIVE; open.md.tpl + peer-aware carve-out so create-file tasks are not chatter.
+- **P0-3 Solo compose:** `--retire-orphans` defaults **off**. Multi-crew requires `--allow-crew-expand`; robot/CI/`--json`/`FLYWHEEL_ROBOT`/non-interactive **hard-bail** (no `read_line`); interactive TTY y/N ask is humans only. `repair-until-verified` crew is `coder:1` + `reviewer:1`.
+- **P0-4 Name-binding:** post-settle rename + fail spawn if any pane missing, empty-named, **or wrong-named** (fail closed under verify).
+- **P1:** presence publish retries on unknown-agent race; repair `error_kinds` for R-E2; peer-aware prefers `flywheel mail --as <pin>`.
+- **P2:** swarm ready advertises `--stage ce-execute` (p1 ghost gone); opencode-go missing keys fail-closed in provider-funded preflight.
+- **UX:** default model remains `opencode-go/muse-spark-1.3-contributor` (@standard); compose multi-crew asks humans before silent N.
+- **test-attr:** restored `#[test]` on `spawn_starts_doorbell_dispatcher` + `provider_funded_zero_balance_fails_naming_provider`.
+
+
 ### Added — ADR-0009 compound spine (bd-4el4, 2026-09-06)
 - **ce- stage vocabulary** (compound-engineering loop): `ce-brainstorm` (new), `ce-plan` (was decompose-beads/p4), `ce-plan-review` (was plan-review/p5), `ce-execute` (was systematic-execute/p6), `ce-simplify` (new), `ce-review` (was code-review/p2 — + detection conditions, quoted-evidence confidence, independence rule, autofix classes, settled_conflict), `ce-compound` (new — the learning gate). **p-code aliases RETIRED** (clean cutover: `--stage p6` errors naming the fix).
 - **Compounded wave-swarm token** — now EIGHT phases: GATE (grounding-reads `docs/learnings/`) → DISPATCH (`--param learnings=` when matched) → EXECUTE (ce-execute: idempotent re-entry + simplify-as-you-go) → OBSERVE (`lesson:` line on every escalation) → **REVIEW** (ce-review audits the diff pre-verify) → VERIFY (**residual gate**: every finding fixed or filed as a bead) → **COMPOUND** (ce-compound, `phase: compound`, `on_error: continue`) → SIGNOFF.

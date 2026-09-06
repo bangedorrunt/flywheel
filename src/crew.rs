@@ -346,6 +346,13 @@ pub fn compose_workflow_with(
         .unwrap_or_default();
     let mut extra_inputs: Vec<InputDecl> = Vec::new();
     let mut ordinal = 0u32;
+    // GS-039 P0-3: preserve Explicit crew from compose-token recipes
+    // (repair-until-verified declares coder:1+reviewer:1). Forcing Auto here
+    // used to balloon dry-run/plan to coder:3+reviewer:3 from 3 repair + 3
+    // evaluate graph nodes. Auto recipes / non-recipe parts still force Auto.
+    let mut explicit_from_recipes: Option<BTreeMap<String, u32>> = None;
+    let mut recipe_requested_auto = false;
+    let mut non_recipe_parts = false;
     for part in parts {
         // ADR-0006 D3 + ADR-0008 §6.7: a compose token expands to its
         // compiled-in steps (or graph nodes) right where it sits; its declared inputs merge into the
@@ -358,6 +365,18 @@ pub fn compose_workflow_with(
                     "compose part {name:?}: unknown compose token (known: wave-swarm, repair-until-verified, beads-lifecycle)"
                 )
             })?;
+            match expanded.crew {
+                Some(CrewSpec::Explicit(map)) => {
+                    let dst = explicit_from_recipes.get_or_insert_with(BTreeMap::new);
+                    for (role, count) in map {
+                        let e = dst.entry(role).or_insert(0);
+                        *e = (*e).max(count);
+                    }
+                }
+                Some(CrewSpec::Auto) | None => {
+                    recipe_requested_auto = true;
+                }
+            }
             for input in expanded.inputs {
                 if !steps_has_input(&extra_inputs, &input.name)
                     && !steps_has_input(&base_inputs_snapshot, &input.name)
@@ -381,6 +400,7 @@ pub fn compose_workflow_with(
             ordinal += 1;
             continue;
         }
+        non_recipe_parts = true;
         ordinal += 1;
         steps.push(build_part_step(part, ordinal, objective, affinity)?);
     }
@@ -388,6 +408,15 @@ pub fn compose_workflow_with(
         None
     } else {
         Some(toron_workflow::schema::Graph { nodes: graph_nodes })
+    };
+    let crew = if !non_recipe_parts && !recipe_requested_auto {
+        if let Some(map) = explicit_from_recipes {
+            Some(CrewSpec::Explicit(map))
+        } else {
+            Some(CrewSpec::Auto)
+        }
+    } else {
+        Some(CrewSpec::Auto)
     };
     Ok(Workflow {
         name: name.to_string(),
@@ -406,7 +435,7 @@ pub fn compose_workflow_with(
             }
             inputs
         },
-        crew: Some(CrewSpec::Auto),
+        crew,
         principles: vec![],
     })
 }
@@ -1797,6 +1826,31 @@ steps:
         let mut null = serde_json::Value::Null;
         apply_input_defaults(&wf, &mut null);
         assert!(null.is_null(), "non-object inputs untouched");
+    }
+
+    /// GS-039 P0-3: `--parts repair-until-verified` must keep the recipe's
+    /// explicit crew coder:1+reviewer:1 — Auto-infer over 3 repair + 3
+    /// evaluate nodes must NOT balloon dry-run to 3+3.
+    #[test]
+    fn repair_compose_token_preserves_explicit_crew_1_plus_1() {
+        let part = parse_compose_part("repair-until-verified").expect("token");
+        let wf = compose_workflow("composed-repair", "solo dry-run", None, &[part])
+            .expect("compose repair");
+        assert_eq!(
+            wf.crew,
+            Some(CrewSpec::Explicit(BTreeMap::from([
+                ("coder".to_string(), 1),
+                ("reviewer".to_string(), 1),
+            ]))),
+            "repair compose must preserve explicit crew, got {:?}",
+            wf.crew
+        );
+        let plan = plan_crew(&wf);
+        assert_eq!(plan.members.get("coder").copied(), Some(1));
+        assert_eq!(plan.members.get("reviewer").copied(), Some(1));
+        let rendered = render_dry_run(&wf, &|_| None);
+        assert_eq!(rendered["crew"]["coder"], 1);
+        assert_eq!(rendered["crew"]["reviewer"], 1);
     }
 
     /// A graph-form token mixes with ordinary parts (token nodes land in
