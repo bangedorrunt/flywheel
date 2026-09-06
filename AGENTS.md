@@ -6,14 +6,16 @@ toron (`MailSurface`); never the reverse.
 ## Commands
 
 ```bash
-cargo test
+mbx +nightly-aarch64-apple-darwin test
 bash scripts/verify-clippy.sh
 bash docs/decisions/_scripts/verify-review-fixes.sh
-cargo install --path . --force
+mbx +nightly-aarch64-apple-darwin install --path . --force
 # macOS (only if a stale-signature SIGKILL appears): codesign --force --sign - ~/.cargo/bin/flywheel
 ```
 
-Live ignored tests need herdr + mail. `cargo test --exclude-ignored` is invalid.
+Rust runs through mbx (cargo cache): prefix every cargo invocation with `mbx +nightly-aarch64-apple-darwin` (bare `cargo` misparses under the mbx shim).
+
+Live ignored tests need herdr + mail. `mbx +nightly-aarch64-apple-darwin test --exclude-ignored` is invalid.
 
 ## Critical overrides
 
@@ -27,7 +29,7 @@ Live ignored tests need herdr + mail. `cargo test --exclude-ignored` is invalid.
   Both sides of the seam use it: `mail locks reserve/release/renew`
   bind the lease holder to the RESOLVED actor (never the raw slug), and the toron strict guard
   attributes commits through the same order — so a wrapper-acquired lease always covers its own
-  holder's commits. Self-test: `cargo test reservation_identity actor_resolution_passthrough`.
+  holder's commits. Self-test: `mbx +nightly-aarch64-apple-darwin test reservation_identity actor_resolution_passthrough`.
 - **One operator is one npub across projects** (bd-register-portability-3c2b): `mail register`
   requires `--name` (it never silently mints an unnamed key) and binds instead of forking via
   `--from-project <slug>` (reuse that project's key for the pin) or `--adopt-unnamed <name>`
@@ -39,7 +41,7 @@ Live ignored tests need herdr + mail. `cargo test --exclude-ignored` is invalid.
 - **Bead close is two-step and policy-enforced (bd-ut8l lesson):** record the verdict first — `br gate report <id> --gate unit-test-verified --provider <pin> --status pass --to closed` — then `br close <id> --commit-sha <sha>` (the sha's commit message must cite the bead id). Without a legal gate row the close fails; `--force` variants need `BR_OPERATOR=1` + `--bypass-reason`. Crews that commit a fix but skip the close leave the bead claimed and block dependents — wake them with "finish or release".
 - **TUI theme (hacker-night, tui-design skill):** Primary theme is **Ghostty v2 hacker-night** (`#08080e` void / `#c8d0e8` fg / `#0db9d7` cyan / `#bb9af7` lav / `#73daca` mint / `#e0af68` amber / `#f7768e` red / `#89ddff` ice / `#1a1a3e` selection). Single source per crate: `flywheel/src/output.rs` (Slot enum: `paint_slot` with truecolor→256→16 degrade), `toron-cli/src/theme.rs` (`HackerNight`), `beads/src/tui/theme.rs` (same palette, `NO_COLOR`/`TERM=dumb` → `Reset`, `COLORTERM=truecolor` → `Rgb`). Widget code references **semantic slots** only — never hardcodes hex/ANSI (skill §4). Bare `br` TUI lives in `beads/src/tui/{mod,app,ui,keys,theme}.rs`; `toron tui` lives in `toron-cli/src/tui.rs` (`toron-cli/src/theme.rs`); `flywheel` viewer is `view`/`watch`/`status` + `steer_brief.rs` (ANSI-painted, alt-screen sanitized, subscription+poll fallback). Use `tui-design` skill before touching any TUI: layout (§1), responsive (§2, 80×12 min gate, 100-col split, 80-col board stack), interaction (§3, vim `j/k g/G`, `?` help, `[q]uit [/]search [?]help [Tab]focus`), visual hierarchy (§4, bold/dim + symbol, never color alone), and anti-patterns §7. Test at 80×24 / 120×40 / 200×60, inside tmux, with `NO_COLOR=1` and `COLORTERM=truecolor`.
 - **Kill:** `--force` skips confirm. Working agents also need `--force-working`, or `--drain` for the graceful two-phase stop (asks each working agent to finish its VERIFY fence via `drain_prompt`, records drain on `ActiveLoop.drain_pending` — the poll seeds `ws.swarm.drain_pending` from it and tick enforces 3-poll grace, past grace → Respawn+LoudMiss with the bead id; skips the close). `--reap-crews` overrides `on_captain_death` (ADR-0025 Spec 4).
-  - **Artifacts + loop journal (ADR-0027 one-workspace tick, Tick Law):** `flywheel artifacts <run_id> [--json]` / `stitch`; `flywheel loop replay <project>` (re-drives `Msg` journal through `tick`, sequence-equal) / `flywheel loop why <project> <seq> --corr <id> --seq <n>` + `flywheel doorbell why <project> <pin> --corr <id> --seq <n>` (both print `msg`/`state-delta`/`Vec<Cmd>` triple by folding `tick` from `Default` over `state_dir/journals/doorbell-journal-{workspace}.jsonl`; `seq` is `WorkspaceModel.seq`; replay asserts `Cmd` sequence — not pin-substring grep). Poll path journals every `Msg` under `state_dir/journals/doorbell-journal-{workspace}.jsonl` (not `doorbell/<ws_hash>.jsonl`). **One reducer is the law (ADR-0027) and is held on the live path:** doorbell dispatcher and `swarm_loop` both call `workspace::tick`; `doorbell_tick::tick` / `durable::tick` are `pub(crate)` slice reducers. Reclaim is a Msg. FetchInbox Cmd is the sweep. Fact ticks the live model. Tests: `cargo test adr0027_s1` (S1/S2), `cargo test role_model` (roles), `cargo test presence_model` (presence), `cargo test --workspace adr0027_s2` (S3), `cargo test adr0027_s3` (S4/S5 + secrets tripwire).
+  - **Artifacts + loop journal (ADR-0027 one-workspace tick, Tick Law):** `flywheel artifacts <run_id> [--json]` / `stitch`; `flywheel loop replay <project>` (re-drives `Msg` journal through `tick`, sequence-equal) / `flywheel loop why <project> <seq> --corr <id> --seq <n>` + `flywheel doorbell why <project> <pin> --corr <id> --seq <n>` (both print `msg`/`state-delta`/`Vec<Cmd>` triple by folding `tick` from `Default` over `state_dir/journals/doorbell-journal-{workspace}.jsonl`; `seq` is `WorkspaceModel.seq`; replay asserts `Cmd` sequence — not pin-substring grep). Poll path journals every `Msg` under `state_dir/journals/doorbell-journal-{workspace}.jsonl` (not `doorbell/<ws_hash>.jsonl`). **One reducer is the law (ADR-0027) and is held on the live path:** doorbell dispatcher and `swarm_loop` both call `workspace::tick`; `doorbell_tick::tick` / `durable::tick` are `pub(crate)` slice reducers. Reclaim is a Msg. FetchInbox Cmd is the sweep. Fact ticks the live model. Tests: `mbx +nightly-aarch64-apple-darwin test adr0027_s1` (S1/S2), `mbx +nightly-aarch64-apple-darwin test role_model` (roles), `mbx +nightly-aarch64-apple-darwin test presence_model` (presence), `mbx +nightly-aarch64-apple-darwin test --workspace adr0027_s2` (S3), `mbx +nightly-aarch64-apple-darwin test adr0027_s3` (S4/S5 + secrets tripwire).
 - **Execution topologies:** `open-mode` = direct current-pane work with no lifecycle; `loop-mode` = durable solo execution in one current harness (`--work` opts into tracked work); `swarm-mode`/`steer` = captain-led multi-crew execution. A workflow is a reusable procedure, not a topology. `workflow run` without `--execute` records control-flow only (no pane dispatch). `--mode` default is headless. `/swarm-mode` pins `compose --parts wave-swarm --run`. `/loop-mode` pins `loop-mode run <project> --work`.
 - **`cron run`** is a 25s dry-run by default; `--live` force-fires once
   through the durable-loop runner (real dispatch). Recurring ticks are
