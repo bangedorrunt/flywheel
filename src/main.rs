@@ -6677,6 +6677,28 @@ mod spawn_boot_reliability_tests {
     /// GS-039: CoS-honest folds — real wake observation, open-mode authority,
     /// solo compose sizing, name-bind fail-closed, no invent-green.
     #[test]
+    fn gs040_collab_watch_waits_empty_thread() {
+        // GS-040: mail watch must NOT process::exit(1) on an empty thread
+        // mid-wait (collab asker outbound is invisible in inbox). Source
+        // tripwire — keep polling until timeout.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("waiting for reply"),
+            "mail_watch must wait on empty thread (GS-040 collab)"
+        );
+        assert!(
+            src.contains("empty_noted"),
+            "mail_watch must rate-limit empty-thread note via empty_noted"
+        );
+        // Old early-exit pattern must be gone (invent-fail on empty thread).
+        let bad = concat!(
+            "has no messages yet\");\n",
+            "                    std::process::exit(1);"
+        );
+        assert!(!src.contains(bad), "mail_watch must not early-exit(1) on empty thread");
+    }
+
+    #[test]
     fn gs039_cos_honest_folds_present() {
         let src = include_str!("main.rs");
         // P0-1: aim at the PRODUCTION Status comment via rfind — never the
@@ -17595,6 +17617,7 @@ fn cmd_mail_watch(
     let start = std::time::Instant::now();
     let seen: Option<String> =
         latest(&mail)?.and_then(|m| m.get("id").and_then(|i| i.as_str()).map(String::from));
+    let mut empty_noted = false;
     eprintln!(
         "flywheel: watching thread {thread_id} (latest {}); Ctrl-C to abort",
         seen.as_deref().unwrap_or("<none>")
@@ -17614,9 +17637,15 @@ fn cmd_mail_watch(
                 }
             }
             None => {
-                if seen.is_none() {
-                    eprintln!("flywheel: thread {thread_id} has no messages yet");
-                    std::process::exit(1);
+                // GS-040: empty thread is normal while waiting for the first
+                // reply — the asker's OUTBOUND collab ask does not appear in
+                // their inbox projection, so `seen` starts None. Keep polling
+                // until timeout (no invent-fail / early exit).
+                if seen.is_none() && !empty_noted {
+                    eprintln!(
+                        "flywheel: thread {thread_id} has no messages yet (waiting for reply…)"
+                    );
+                    empty_noted = true;
                 }
             }
         }
