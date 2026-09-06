@@ -10037,20 +10037,10 @@ fn doorbell_sweep_inbox(
         if in_process_ok.is_some() {
             continue;
         }
-        // Fallback: CLI spawn (when in-process mailbox unavailable, e.g. tests)
+        // Fallback: CLI spawn (when in-process mailbox unavailable, e.g. tests).
+        // bd-em85: `--as`, never `--agent` (toron has no `--agent` flag).
         let output = Command::new("toron")
-            .args([
-                "mail",
-                "inbox",
-                "--agent",
-                pin,
-                "--project",
-                project,
-                "--since",
-                &since,
-                "--limit",
-                "50",
-            ])
+            .args(mail_inbox_fallback_argv(pin, project, &since))
             .output();
         let Ok(output) = output else {
             doorbell::audit_append(
@@ -30437,6 +30427,64 @@ fn tail_of(s: &str) -> String {
 /// Best-effort build-slot hold for cargo VERIFY (ADR-0019: "cargo commands
 /// under the build slot"). Advisory — a slot failure must never block the
 /// loop (the always-serialize gate already serializes cargo dispatch).
+///
+/// bd-em85: toron's slot/inbox surface takes `--as`, never `--agent`
+/// (flywheel shelled `--agent` and every acquire/release/inbox-fallback
+/// failed loud). The argv builders below keep the flag pin-able by test.
+fn slot_acquire_argv(project: &str, agent: &str) -> Vec<String> {
+    [
+        "slot",
+        "acquire",
+        "--project",
+        project,
+        "--as",
+        agent,
+        "--slot",
+        "cargo",
+        "--exclusive",
+        "--json",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+fn slot_release_argv(project: &str, agent: &str) -> Vec<String> {
+    [
+        "slot",
+        "release",
+        "--project",
+        project,
+        "--as",
+        agent,
+        "--slot",
+        "cargo",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// argv for the `toron mail inbox` CLI fallback (in-process mailbox
+/// unavailable). Same `--as` contract as the slot builders above.
+fn mail_inbox_fallback_argv(pin: &str, project: &str, since: &str) -> Vec<String> {
+    [
+        "mail",
+        "inbox",
+        "--as",
+        pin,
+        "--project",
+        project,
+        "--since",
+        since,
+        "--limit",
+        "50",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 fn acquire_cargo_slot(cfg: &Config, project: &str) {
     let agent = cfg
         .agent_mail
@@ -30444,18 +30492,7 @@ fn acquire_cargo_slot(cfg: &Config, project: &str) {
         .and_then(|m| m.name.clone())
         .unwrap_or_else(|| "flywheel-toron-loop1".to_string());
     if let Ok(out) = std::process::Command::new("toron")
-        .args([
-            "slot",
-            "acquire",
-            "--project",
-            project,
-            "--agent",
-            &agent,
-            "--slot",
-            "cargo",
-            "--exclusive",
-            "--json",
-        ])
+        .args(slot_acquire_argv(project, &agent))
         .output()
         && !out.status.success()
     {
@@ -30473,16 +30510,7 @@ fn release_cargo_slot(cfg: &Config, project: &str) {
         .and_then(|m| m.name.clone())
         .unwrap_or_else(|| "flywheel-toron-loop1".to_string());
     let _ = std::process::Command::new("toron")
-        .args([
-            "slot",
-            "release",
-            "--project",
-            project,
-            "--agent",
-            &agent,
-            "--slot",
-            "cargo",
-        ])
+        .args(slot_release_argv(project, &agent))
         .output();
 }
 
@@ -31465,6 +31493,42 @@ mod integration_tests {
     fn render_orchestration_rejects_unknown() {
         assert!(render_orchestration_prompt("claude", "swarm-mode", "0.1.0", "ts").is_err());
         assert!(render_orchestration_prompt("opencode", "bogus-cmd", "0.1.0", "ts").is_err());
+    }
+
+    /// bd-em85: flywheel shells `toron slot/inbox` — toron's surface takes
+    /// `--as`, never `--agent`. Pin the flag on all three argv builders so
+    /// a renamed flag fails here, not as a silent advisory miss in prod.
+    #[test]
+    fn toron_shell_argv_uses_as_never_agent() {
+        for argv in [
+            slot_acquire_argv("flywheel", "DustySparrow"),
+            slot_release_argv("flywheel", "DustySparrow"),
+            mail_inbox_fallback_argv("DustySparrow", "flywheel", "2026-09-06T00:00:00Z"),
+        ] {
+            assert!(
+                argv.contains(&"--as".to_string()),
+                "toron argv must carry --as: {argv:?}"
+            );
+            assert!(
+                !argv.contains(&"--agent".to_string()),
+                "toron has no --agent flag: {argv:?}"
+            );
+        }
+        assert_eq!(
+            slot_acquire_argv("p", "a"),
+            vec![
+                "slot",
+                "acquire",
+                "--project",
+                "p",
+                "--as",
+                "a",
+                "--slot",
+                "cargo",
+                "--exclusive",
+                "--json"
+            ],
+        );
     }
 
     /// bd-glup: the swarm template is ASCII-only (the bd-zq8u peer-aware
