@@ -221,6 +221,11 @@ pub struct WorkspaceModel {
     /// never reads it. Expiry/cap-eviction happens in the Sweep arm and
     /// always records Cmd::Audit wait-timeout (never silent drop).
     pub pending_wait: std::collections::BTreeMap<String, u64>,
+    /// ADR-0010 D1 (bd-w98c): re-ring ladder entries by corr. The
+    /// dispatcher owns this cache; swarm never reads it. Entries are
+    /// advanced on the AckSlaTick beat; registration rides the send
+    /// path (residual: cross-process registration, see bead).
+    pub rering: std::collections::BTreeMap<String, ReringEntry>,
 }
 
 /// bd-zfnx.6: a parked corr lives at most this long before the Sweep arm
@@ -229,6 +234,110 @@ pub const PENDING_WAIT_TTL_SECS: u64 = 3600;
 /// bd-zfnx.6: hard cap on parked corrs. Over-cap inserts evict the
 /// earliest deadline first, each with an Audit wait-timeout record.
 pub const PENDING_WAIT_CAP: usize = 512;
+
+// ---------------------------------------------------------------------------
+// ADR-0010 D1 (bd-w98c): re-ring ladder — the dispatcher wake budget.
+//
+// The toron message IS the delivery; the herdr prompt is a doorbell.
+// An un-acked corr older than one grace window is due one re-ring per
+// window; after RING_MAX the wake escalates: Dead → respawn path,
+// Unknown → digest naming pin+corr+attempt count. This REPLACES the flat
+// 120s deaf-pane digest. Fire-and-forget and already-acked corrs skip
+// the ladder; --raw without an id rings once and never escalates.
+// Functional core (no I/O): tick advances entries, effect layer prompts.
+// ---------------------------------------------------------------------------
+
+/// Default grace window between re-rings (secs). Override with
+/// FLYWHEEL_DOORBELL_GRACE_SECS.
+pub const DOORBELL_GRACE_DEFAULT_SECS: u64 = 90;
+/// Default max rings before escalation. Override with
+/// FLYWHEEL_DOORBELL_RING_MAX.
+pub const DOORBELL_RING_MAX_DEFAULT: u32 = 3;
+
+/// Grace window secs for the re-ring ladder (env override, default 90).
+pub fn doorbell_grace_secs() -> u64 {
+    std::env::var("FLYWHEEL_DOORBELL_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DOORBELL_GRACE_DEFAULT_SECS)
+}
+
+/// Max rings before escalation (env override, default 3).
+pub fn doorbell_ring_max() -> u32 {
+    std::env::var("FLYWHEEL_DOORBELL_RING_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DOORBELL_RING_MAX_DEFAULT)
+}
+
+/// D1 shrunk prompt: the payload rides the toron message, herdr gets
+/// the doorbell only.
+pub fn doorbell_mail_line(unacked: usize, pin: &str, corr: &str) -> String {
+    format!("[doorbell] inbox: {unacked} unacked for {pin}; latest corr={corr}; read + ack")
+}
+
+/// One tracked delivery: a toron corr awaiting its crew ack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReringEntry {
+    pub pin: String,
+    /// Rings already emitted for this corr.
+    pub attempts: u32,
+    /// Unix secs of the current grace window start.
+    pub window_start_unix: u64,
+    /// Acked corrs skip the ladder (handling fact already observed).
+    pub acked: bool,
+    /// --fire-and-forget deliveries never climb the ladder.
+    pub fire_and_forget: bool,
+    /// --raw without an id rings once and never escalates.
+    pub raw_without_id: bool,
+}
+
+/// Ladder outcome for one corr at one tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReringDecision {
+    /// Emit ring number `attempt` (0-based) now; caller bumps the entry.
+    Ring { attempt: u32 },
+    /// Past max rings and the pane is Dead → respawn path.
+    RecoverDead,
+    /// Past max rings and the pane is Unknown → digest (no prompt).
+    DigestUnknown,
+    /// Inside a grace window: nothing due yet.
+    Pending,
+    /// Opt-out: acked, fire-and-forget, or raw already rang once.
+    Skip,
+}
+
+/// Pure ladder step. `verdict` is the pin's current presence verdict
+/// ("Dead" / "Unknown" / other) — read by the tick arm, never
+/// constructed here, so the Presence enum stays Lane-2 owned.
+pub fn rering_due(entry: &ReringEntry, now: u64, verdict: &str) -> ReringDecision {
+    if entry.acked || entry.fire_and_forget {
+        return ReringDecision::Skip;
+    }
+    if entry.raw_without_id {
+        if entry.attempts == 0 {
+            return ReringDecision::Ring { attempt: 0 };
+        }
+        return ReringDecision::Skip;
+    }
+    let grace = doorbell_grace_secs();
+    let max = doorbell_ring_max();
+    if entry.attempts >= max {
+        return match verdict {
+            "Dead" => ReringDecision::RecoverDead,
+            "Unknown" => ReringDecision::DigestUnknown,
+            _ => ReringDecision::Ring { attempt: max },
+        };
+    }
+    if now.saturating_sub(entry.window_start_unix) >= grace {
+        return ReringDecision::Ring {
+            attempt: entry.attempts,
+        };
+    }
+    ReringDecision::Pending
+}
 
 // ---------------------------------------------------------------------------
 // Msg — one union covering mail / watch / status / heal / reclaim / receipt / role / human / presence
@@ -1031,6 +1140,63 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             );
             next.doorbell = dm;
             cmds.extend(c);
+            // ADR-0010 D1 (bd-w98c): advance the re-ring ladder. One
+            // ring per grace window; past max rings Dead→respawn and
+            // Unknown→digest. Acked / fire-and-forget entries leave
+            // without a sound. Presence is read-only here; the enum
+            // itself stays Lane-2 (bd-s8bo) owned.
+            let corrs: Vec<String> = next.rering.keys().cloned().collect();
+            for corr in corrs {
+                let Some(entry) = next.rering.get(&corr).cloned() else {
+                    continue;
+                };
+                if entry.acked || entry.fire_and_forget {
+                    next.rering.remove(&corr);
+                    continue;
+                }
+                let verdict = match next.presence.get(&entry.pin) {
+                    Some(Presence::Dead { .. }) => "Dead",
+                    Some(Presence::Unknown) => "Unknown",
+                    _ => "other",
+                };
+                match rering_due(&entry, *now, verdict) {
+                    ReringDecision::Ring { attempt } => {
+                        cmds.push(Cmd::Prompt {
+                            pin: entry.pin.clone(),
+                            line: doorbell_mail_line(1, &entry.pin, &corr),
+                        });
+                        if let Some(e) = next.rering.get_mut(&corr) {
+                            e.attempts = attempt + 1;
+                            e.window_start_unix = *now;
+                            if e.raw_without_id {
+                                next.rering.remove(&corr);
+                            }
+                        }
+                    }
+                    ReringDecision::RecoverDead => {
+                        cmds.push(Cmd::Respawn {
+                            name: entry.pin.clone(),
+                            reason: format!(
+                                "doorbell re-ring exhausted pin={} corr={corr} attempts={}",
+                                entry.pin, entry.attempts
+                            ),
+                        });
+                        next.rering.remove(&corr);
+                    }
+                    ReringDecision::DigestUnknown => {
+                        cmds.push(Cmd::Audit {
+                            kind: "doorbell-unanswered-digest".into(),
+                            pin: entry.pin.clone(),
+                            detail: format!(
+                                "doorbell: unanswered pin={} corr={corr} attempts={}",
+                                entry.pin, entry.attempts
+                            ),
+                        });
+                        next.rering.remove(&corr);
+                    }
+                    ReringDecision::Pending | ReringDecision::Skip => {}
+                }
+            }
         }
         Msg::Sweep { since, now } => {
             cmds.push(Cmd::FetchInbox {
@@ -3303,5 +3469,181 @@ mod cmd_schema_tests {
                 "malformed tags must not write assignment"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod adr0010_d1_tests {
+    // governed-by: ADR-0010 D1 (bd-w98c) — re-ring ladder behavior.
+    use super::*;
+
+    fn entry(pin: &str) -> ReringEntry {
+        ReringEntry {
+            pin: pin.into(),
+            attempts: 0,
+            window_start_unix: 0,
+            acked: false,
+            fire_and_forget: false,
+            raw_without_id: false,
+        }
+    }
+
+    #[test]
+    fn adr0010_d1_line_shape_is_shrunk_doorbell() {
+        assert_eq!(
+            doorbell_mail_line(3, "EmeraldSparrow", "c-9"),
+            "[doorbell] inbox: 3 unacked for EmeraldSparrow; latest corr=c-9; read + ack"
+        );
+    }
+
+    #[test]
+    fn adr0010_d1_duplicate_ring_is_zero_duplicate_work() {
+        let e = entry("P");
+        let a = rering_due(&e, DOORBELL_GRACE_DEFAULT_SECS + 1, "other");
+        let b = rering_due(&e, DOORBELL_GRACE_DEFAULT_SECS + 1, "other");
+        assert_eq!(a, b, "same state + same beat must decide identically");
+        assert_eq!(
+            doorbell_mail_line(1, "P", "c"),
+            doorbell_mail_line(1, "P", "c"),
+            "re-ring line is a pure function of (n, pin, corr)"
+        );
+    }
+
+    #[test]
+    fn adr0010_d1_one_ring_per_grace_window_then_escalate() {
+        let grace = doorbell_grace_secs();
+        let max = doorbell_ring_max();
+        let mut e = entry("P");
+        for attempt in 0..max {
+            // Inside the window: nothing due.
+            assert_eq!(
+                rering_due(&e, e.window_start_unix + grace - 1, "other"),
+                ReringDecision::Pending
+            );
+            // Window elapsed: ring once.
+            assert_eq!(
+                rering_due(&e, e.window_start_unix + grace, "other"),
+                ReringDecision::Ring { attempt }
+            );
+            e.attempts = attempt + 1;
+            e.window_start_unix += grace;
+        }
+        assert_eq!(
+            rering_due(&e, e.window_start_unix + grace, "Dead"),
+            ReringDecision::RecoverDead,
+            "past max rings a Dead pane takes the respawn path"
+        );
+        assert_eq!(
+            rering_due(&e, e.window_start_unix + grace, "Unknown"),
+            ReringDecision::DigestUnknown,
+            "past max rings an Unknown pane takes the digest path"
+        );
+    }
+
+    #[test]
+    fn adr0010_d1_skips_never_climb() {
+        let mut acked = entry("P");
+        acked.acked = true;
+        assert_eq!(rering_due(&acked, u64::MAX, "Dead"), ReringDecision::Skip);
+        let mut faf = entry("P");
+        faf.fire_and_forget = true;
+        assert_eq!(rering_due(&faf, u64::MAX, "Dead"), ReringDecision::Skip);
+    }
+
+    #[test]
+    fn adr0010_d1_raw_without_id_rings_once_never_escalates() {
+        let mut e = entry("P");
+        e.raw_without_id = true;
+        assert_eq!(
+            rering_due(&e, 0, "other"),
+            ReringDecision::Ring { attempt: 0 }
+        );
+        e.attempts = 1;
+        assert_eq!(
+            rering_due(&e, u64::MAX, "Dead"),
+            ReringDecision::Skip,
+            "raw without id must never escalate, even past max on a Dead pane"
+        );
+    }
+
+    #[test]
+    fn adr0010_d1_tick_advances_ladder_on_ack_sla_beat() {
+        let mut m = WorkspaceModel::default();
+        m.presence.insert(
+            "P".into(),
+            Presence::Busy {
+                source: "test".into(),
+            },
+        );
+        m.rering.insert("c-1".into(), entry("P"));
+        // Fresh entry: inside grace window, no re-ring (other beat
+        // cmds like CheckAckSla may still appear).
+        let (_, cmds) = tick(&m, &Msg::AckSlaTick { now: 1 });
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
+            "fresh entry must not ring inside its window: {cmds:?}"
+        );
+        // Past grace: exactly one re-ring prompt with the shrunk line
+        // (alongside the standing CheckAckSla + FetchInbox beat cmds).
+        let (next, cmds) = tick(
+            &m,
+            &Msg::AckSlaTick {
+                now: doorbell_grace_secs() + 1,
+            },
+        );
+        assert_eq!(
+            cmds.iter()
+                .filter(|c| matches!(c, Cmd::Prompt { .. }))
+                .count(),
+            1,
+            "one re-ring prompt per grace window: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::Prompt { pin, line }
+                if pin == "P"
+                    && line == "[doorbell] inbox: 1 unacked for P; latest corr=c-1; read + ack")),
+            "re-ring must prompt the shrunk doorbell line, not the payload: {cmds:?}"
+        );
+        assert_eq!(next.rering["c-1"].attempts, 1);
+    }
+
+    #[test]
+    fn adr0010_d1_tick_escalates_dead_and_digests_unknown() {
+        let mut m = WorkspaceModel::default();
+        m.presence.insert(
+            "D".into(),
+            Presence::Dead {
+                source: "test".into(),
+            },
+        );
+        m.presence.insert("U".into(), Presence::Unknown);
+        let max = doorbell_ring_max();
+        let mut ed = entry("D");
+        ed.attempts = max;
+        ed.window_start_unix = 0;
+        let mut eu = entry("U");
+        eu.attempts = max;
+        eu.window_start_unix = 0;
+        m.rering.insert("c-d".into(), ed);
+        m.rering.insert("c-u".into(), eu);
+        let (next, cmds) = tick(
+            &m,
+            &Msg::AckSlaTick {
+                now: doorbell_grace_secs() + 1,
+            },
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::Respawn { name, reason }
+                if name == "D" && reason.contains("c-d"))),
+            "exhausted Dead entry must take the respawn path: {cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::Audit { kind, pin, detail }
+                if kind == "doorbell-unanswered-digest" && pin == "U" && detail.contains("c-u"))),
+            "exhausted Unknown entry must digest naming pin+corr+attempts: {cmds:?}"
+        );
+        assert!(next.rering.is_empty(), "terminal entries leave the ladder");
     }
 }

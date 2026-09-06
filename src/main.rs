@@ -693,8 +693,11 @@ enum Commands {
         raw: bool,
         /// GS-037 P0-A: allow exit 0 without land/wake receipt. Default
         /// without `--wait` is fail-loud (no invent green on dispatched).
-        #[arg(long = "fire-and-forget")]
-        fire_and_forget: bool,
+        /// ADR-0010 D1 (bd-w98c): optional caller-supplied <delivery-id>;
+        /// re-enqueue under the same id is idempotent, and the id keys
+        /// the re-ring ladder skip (fire-and-forget never climbs).
+        #[arg(long = "fire-and-forget", num_args = 0..=1, default_missing_value = "")]
+        fire_and_forget: Option<String>,
         /// ADR-0025 Spec 5: explicit plane override. Private by default
         /// (pane prompt + gift-wrap completion mail); `--plane s` is the
         /// explicit public act (kind-9 / channel). Classifier never flips
@@ -4166,7 +4169,7 @@ fn main() {
             *force,
             *respawn_on_stall,
             *raw,
-            *fire_and_forget,
+            fire_and_forget.clone(),
             plane.as_deref(),
             *unsafe_plane,
         ),
@@ -13581,7 +13584,7 @@ fn cmd_send(
     force: bool,
     respawn_on_stall: bool,
     raw: bool,
-    fire_and_forget: bool,
+    fire_and_forget: Option<String>,
     plane: Option<&str>,
     unsafe_plane: bool,
 ) -> Result<()> {
@@ -13907,7 +13910,7 @@ fn cmd_send(
         EventKind::Send,
         json!({
             "to": to, "stage": stage, "text_len": text.len(), "wait": wait,
-            "raw": raw, "fire_and_forget": fire_and_forget, "results": results
+            "raw": raw, "fire_and_forget": fire_and_forget, "delivery_id": delivery_id_of(&fire_and_forget), "results": results
         }),
     );
     if !std::io::stdout().is_terminal() {
@@ -14008,7 +14011,7 @@ fn cmd_send(
     // GS-037 P0-A: fire-and-forget must not invent green (dispatched:true
     // exit 0 without land/wake receipt). Require --wait or explicit
     // --fire-and-forget.
-    if !wait && !fire_and_forget {
+    if !wait && fire_and_forget.is_none() {
         bail!(
             "send dispatched without land/wake receipt — refuse invent-green exit 0 (GS-037 P0-A). Re-run with --wait (receipt-backed) or pass --fire-and-forget to acknowledge no receipt."
         );
@@ -14047,6 +14050,17 @@ fn mint_task_id() -> String {
         .unwrap_or(0);
     let h = format!("{:016x}", nanos as u64 ^ (n << 48));
     format!("task-{}", &h[..8])
+}
+
+/// ADR-0010 D1 (bd-w98c): normalize `--fire-and-forget` to an optional
+/// caller-supplied delivery id. Bare flag = opt-out without an id;
+/// `--fire-and-forget <id>` = idempotent re-enqueue key (same id re-sent
+/// is the same delivery, never a second ladder entry).
+fn delivery_id_of(fire_and_forget: &Option<String>) -> Option<&str> {
+    match fire_and_forget {
+        Some(id) if !id.is_empty() => Some(id.as_str()),
+        _ => None,
+    }
 }
 
 /// One send-result row. `dispatched: true` means the prompt was handed to
@@ -34834,6 +34848,27 @@ mod single_writer_tests {
         assert!(
             ws.contains("The end-state is one RAM owner"),
             "Option A: speech must name one RAM owner as the end-state"
+        );
+    }
+}
+
+#[cfg(test)]
+mod adr0010_d1_tests {
+    // governed-by: ADR-0010 D1 (bd-w98c) — fire-and-forget delivery-id bind.
+    use super::*;
+
+    #[test]
+    fn adr0010_d1_delivery_id_normalizes_flag_shape() {
+        assert_eq!(delivery_id_of(&None), None, "absent flag = no id");
+        assert_eq!(
+            delivery_id_of(&Some(String::new())),
+            None,
+            "bare --fire-and-forget = opt-out without an id"
+        );
+        assert_eq!(
+            delivery_id_of(&Some("d-77".into())),
+            Some("d-77"),
+            "--fire-and-forget <id> = idempotent re-enqueue key"
         );
     }
 }
