@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed — GS-039 CoS-honest-5 (hold merge)
-- **P0-1 Wake (reprobe):** stamp `last_wake` from REAL observations — herdr Status / poll `working|idle|done|blocked`, successfully delivered prompts, **and** `send --wait` landed+settled status (covers idle→idle when Status push has no transition). Never from planned injects / `doorbell_persist_wake` invent-green. Observed-wake always advances past a prior stamp. Robot never-wake after meaningful dispatch stays hard-fail.
+- **P0-1 Wake (reprobe):** stamp `last_wake` from REAL observations — herdr Status events, poll **status transitions** into `working|idle|done|blocked` (not static already-idle rows every poll), successfully delivered prompts, **and** `send --wait` landed+settled status (covers idle→idle when Status push has no transition). Never from planned injects / `doorbell_persist_wake` invent-green. `doorbell_note_observed_wake` advances only when wall clock moves past prior (no `saturating_add(1)` ratchet). Robot never-wake after meaningful dispatch stays hard-fail.
 - **P0-3 Solo dry-run (reprobe):** compose `--parts repair-until-verified` preserves recipe Explicit crew `coder:1`+`reviewer:1` (no Auto-infer balloon to 3+3 over repair/evaluate nodes).
 - **P0-1 Wake (prior):** Mail send defaults `--wake tasked`. Poll/sweep observed-wake saves loud-warn (no `let _ =`).
 - **P0-2 Open-mode:** operator/`--raw` framed AUTHORITATIVE; open.md.tpl + peer-aware carve-out so create-file tasks are not chatter.
