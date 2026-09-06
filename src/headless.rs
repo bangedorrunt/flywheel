@@ -972,11 +972,11 @@ mod tests {
     fn dispatch_spec_extracts_profile_and_stage() {
         let spec = DispatchSpec {
             profile: Some("@planner".into()),
-            stage: Some("systematic-execute".into()),
+            stage: Some("ce-execute".into()),
             ..Default::default()
         };
         assert_eq!(dispatch_spec_profile(&spec), Some("@planner"));
-        assert_eq!(dispatch_spec_stage(&spec), Some("systematic-execute"));
+        assert_eq!(dispatch_spec_stage(&spec), Some("ce-execute"));
         let bare = DispatchSpec {
             profile: Some("@coder".into()),
             ..Default::default()

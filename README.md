@@ -23,9 +23,9 @@ These five nouns are not interchangeable.
 
 | Noun | What it is | What it is not |
 |------|------------|----------------|
-| **stage** | One named prompt. `flywheel send --to <pin> --stage systematic-execute`. Catalog: `stage list`. | Not a runner. p-codes (`p6`) are aliases for semantic names. |
-| **workflow** | An engine procedure (YAML steps or graph). A step *may* dispatch a stage to a role (`dispatch_job` + `@coder` + `systematic-execute`). Other steps are not stages: `request_approval`, `retry`, `call_workflow`, mail. | Not a topology. Loop, swarm, and open are how work is supervised. |
-| **compose token** | A bare name legal as `--parts`: `wave-swarm` or `repair-until-verified`. Preferred door: `workflow compose … --parts <token> --run`. Legacy alias: `workflow run <token> --execute`. | Not every builtin. `captain-audit` / `bug-fix` / `plan` are `workflow run <name> --execute`. |
+| **stage** | One named prompt. `flywheel send --to <pin> --stage ce-execute`. Catalog: `stage list`. The `ce-` family is the compound-engineering loop (ADR-0009); p-codes are retired. | Not a runner. |
+| **workflow** | An engine procedure (YAML steps or graph). A step *may* dispatch a stage to a role (`dispatch_job` + `@coder` + `ce-execute`). Other steps are not stages: `request_approval`, `retry`, `call_workflow`, mail. | Not a topology. Loop, swarm, and open are how work is supervised. |
+| **compose token** | A bare name legal as `--parts`: `wave-swarm` or `repair-until-verified`. Preferred door: `workflow compose … --parts <token> --run`. Legacy alias: `workflow run <token> --execute`. | Not every builtin. `captain-audit` / `bug-fix` / `feature` are `workflow run <name> --execute`. |
 | **profile** | A role template: harness + model + behavior + skills. `spawn --profile coder`. `crew: auto` counts the `@roles` the workflow named. | Not what makes a compose token. N panes = how many roles were named, each with that profile's default harness. |
 | **topology** | How work is supervised: loop / swarm / open. | Not Workflow YAML. "Loop workflow" is forbidden speech. |
 
@@ -266,9 +266,9 @@ alerts land within one active interval.
 ## Command map (legacy aliases)
 
 `flywheel loop run` still works as an alias for `loop-mode run`. Stages
-resolve semantic or p-code (`p1` = fresh-eyes-explore). `send --stage NAME
---param k=v` substitutes template slots; a missing required slot exits
-naming it.
+resolve by semantic name only (`fresh-eyes-explore`, `ce-execute` — p-codes
+retired, ADR-0009). `send --stage NAME --param k=v` substitutes template
+slots; a missing required slot exits naming it.
 
 ## Backend protocol (herdr default)
 

@@ -60,14 +60,28 @@ Live ignored tests need herdr + mail. `cargo test --exclude-ignored` is invalid.
 - **Wave-scoped dispatch (ADR-0006 D2):** `loop-mode run --work --wave-label wave-N` = ready ∩ exact
   label, held with named blockers while any open/in_progress bead carries wave-M (M<N). Default
   `--work` unchanged. Label-based hold is transitional (TODO → beads ADR-0001 schema-18 typed field).
-- **wave-swarm compose token (ADR-0006 D3 + §9 addendum):** preferred door
+- **wave-swarm compose token (ADR-0006 D3 + ADR-0009 compound spine):** preferred door
   `workflow compose "<objective>" --parts wave-swarm [--inputs '<json>'] --run`
-  (legacy alias: `workflow run wave-swarm --execute`). Expands GATE→DISPATCH→EXECUTE→OBSERVE→VERIFY→SIGNOFF
-  over the compiled-in `wave-*` stages (EXECUTE landed 9ad47e9 — dispatch-only crews never touched the bead;
-  `--inputs` carries captain_pin etc., b800381/d2d6f3e); SIGNOFF suspends the run on `request_approval`
-  (captain-only by construction). Bounded by `FLYWHEEL_COMPOSE_MAX_SECONDS`. Compose tokens legal as bare
-  `--parts`: `wave-swarm`, `repair-until-verified`, `beads-lifecycle`. Ordinary builtins (e.g. captain-audit):
-  `workflow run <name> --execute`, NOT bare `--parts`.
+  (legacy alias: `workflow run wave-swarm --execute`). Expands EIGHT phases
+  GATE→DISPATCH→EXECUTE→OBSERVE→**REVIEW**→VERIFY→**COMPOUND**→SIGNOFF over the compiled-in
+  `wave-*` + `ce-*` stages: GATE grounding-reads `docs/learnings/` (ADR-0009); REVIEW
+  (`ce-review`) audits each closed bead's diff against its brief BEFORE verify audits receipts;
+  VERIFY carries the residual gate (every finding fixed or filed as a bead id); COMPOUND
+  (`ce-compound`, `phase: compound`, `on_error: continue`) runs the learning gate after VERIFY;
+  SIGNOFF suspends on `request_approval` (captain-only). Bounded by `FLYWHEEL_COMPOSE_MAX_SECONDS`.
+  Compose tokens legal as bare `--parts`: `wave-swarm`, `repair-until-verified`, `beads-lifecycle`.
+  Ordinary builtins (e.g. captain-audit): `workflow run <name> --execute`, NOT bare `--parts`.
+- **Compound spine (ADR-0009):** the ce- loop stages are `ce-brainstorm / ce-plan /
+  ce-plan-review / ce-execute / ce-simplify / ce-review / ce-compound` (builtins
+  `ce-brainstorm`/`ce-plan`/`ce-plan-review` renamed from brainstorm/plan/plan-review; slash
+  short-forms retarget). **p-code aliases are RETIRED** — `send --stage p6` errors naming the
+  fix; the name is `ce-execute`. Phase vocabulary is SIX values (toron ADR-0022 addendum):
+  + `compound`. Learnings live in per-project `docs/learnings/` (bug/knowledge track,
+  frontmatter, `rg`-able); every topology compounds — swarm via the token, loop via the
+  beads-body brief (grounding read + post-verify compound gate), open via
+  `workflow run ce-compound --execute` (decide routes "compound the learning"). Terminal
+  states `done|clean_skip|blocked|failed` in reports; `settled:` captain decisions are not
+  re-litigated (settled_conflict routing). Corpus maintenance: `workflow run ce-sweep --execute`.
 - **Control-plane vocabulary (ADR-0028 E7, post-swarm truth):** sensors are `Msg` producers only — `WatchNdjson` (bus watch), `HerdrStatus` (pane lifecycle), `AckSlaTick` (60s clock), presence-20001, `Sweep`→`FetchInbox`→`InboxRows` (plane-P sweep). No Sensor module. `WorkspaceModel` partitions: perception (`presence`, `roles`), assignment (`corr` receipts, `pending_wait`), swarm (heal/dispatch), human (`open_human`). No second Memory store (Model + beads + receipts sqlite only). Strategy stays five nouns (stage/workflow/profile/topology/compose verb; compose token vs ordinary builtin); outcomes → `VerifySink` + beads; Branch lives in the toron engine, tick never branches on YAML. Timers stay `Msg` producers (no 30015/wake kind). Action schema: per-arm invariants in `src/workspace.rs` `Msg`/`Cmd` docs — `Publish` is rumor-14 + `corr`, `WaitCorr` carries non-empty `corr`, malformed tags → `LoudMiss` (send-side `SendTags` hard-errors). Post-swarm contracts: corr authority (sender mints, `thread_id`≠`corr`), presence trust (self-report or `Msg::Presence`; Unknown never prompts), correlated HITL (`Publish` corr → answer `--corr`/`--verdict` → one `HumanDecision`), honest `why`-fold (journal `effect` + crash-resume seed). `pending_wait` drains on watch batches only (GS-016: sweep peek removed); explicit TTL+cap landed (`PENDING_WAIT_TTL_SECS=3600`, `CAP=512`, Sweep-enforced with Audit wait-timeout records).
 - TDD. No script-based code edits. No file deletion without permission.
 - **Model routing is STRICT (nothing bypasses the registry):** profile models are composite `provider/model` registry ids (keys are `provider/model` — e.g. `[models."opencode-go/deepseek-v4-flash"]`); `ModelRegistry::load_routing()` (compiled-in defaults + user `models.toml`) + `resolve_strict()` add the provider prefix and enforce `caps`. Bare `[models.<id>]` keys fail loudly naming the rewrite; `Profile.provider` pins the composite key (unknown provider fails naming `qqq`/`glm-5.2`), bare ids fall back to the default provider (user-file entries first, else alphabetically-first key). An unregistered id or caps-excluded harness fails the spawn naming the fix. big-pickle is opencode-only (scout). Explicit ad-hoc `--model` keeps lenient passthrough. Dot-bearing ids must be quoted in models.toml (`[models."glm-5.2"]`).

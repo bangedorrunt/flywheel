@@ -12,6 +12,7 @@ This directory contains records of the major architectural decisions made for th
 | [0006](0006-parameterized-stage-payloads-and-wave-scoped-dispatch.md) | Parameterized Stage Payloads + Wave-Scoped Dispatch (the unattended wave swarm) | **Accepted** (2026-08-22; D1–D4; `verify-0006.sh` 9/9; graduation GREEN 2026-08-23 — composed wave-swarm closed fixture bead grad-fw-43424-9da via legal close, kept to catalog) |
 | [0007](0007-catalog-slots-and-agent-native-cli.md) | Catalog slots + agent-native catalog CLI | **Accepted** (2026-09-05; D1 slots=harness+model, D2 six job profiles, D3 compiled-in squads, D4 catalog CLI+TUI; Wave 7 catalog-only; `verify-0007.sh` 14/14) |
 | [0008](0008-workflow-compose-topology-agent-optimal-mental-model.md) | Workflow / Compose / Topology — Agent-Optimal Mental Model | **Accepted** (2026-09-05; GS-024; design set wave-swarm\|repair-until-verified\|beads-lifecycle; live `is_compose_token` three tokens since 84fbfb7; beads-lifecycle implemented (guard-fix 2010d78); `verify-0008.sh`) |
+| [0009](0009-compound-spine-ce-vocabulary-and-learnings-corpus.md) | Compound Spine — ce- Vocabulary, Compounded wave-swarm (8 phases), Learnings Corpus | **Accepted** (2026-09-06; bd-4el4; ce- loop stages, p-codes retired, REVIEW+COMPOUND in the token, docs/learnings/ + ce-compound/ce-sweep, toron ADR-0022 phase addendum; `verify-0009.sh` 13/13; flywheel bin 1449/0) |
 
 ## Related toron ADRs
 

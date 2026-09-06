@@ -208,8 +208,8 @@ pub enum PrinciplesCheck {
 /// - names must be from the canonical 21-name registry (unknown -> fail,
 ///   regardless of priority).
 ///
-/// The builder emits the field; this checker enforces it (the stage p2
-/// reviewer BLOCKER language is the human-side of the same rule).
+/// The builder emits the field; this checker enforces it (the ce-review
+/// stage BLOCKER language is the human-side of the same rule).
 pub fn check_principles(priority: u8, principles: &str) -> PrinciplesCheck {
     let lines: Vec<&str> = principles
         .lines()

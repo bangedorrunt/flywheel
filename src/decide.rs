@@ -335,11 +335,11 @@ pub fn decide(target: &str, snap: &Snapshot) -> Decision {
             ],
         );
     }
-    // 16. goal -> goal (meta: brainstorm -> plan -> beads -> build -> review -> ship).
+    // 16. goal -> goal (meta: ce-brainstorm -> plan -> beads -> build -> review -> ship).
     if has(&t, &["goal"]) {
         return dec(
             "goal",
-            "goal — meta-workflow (brainstorm -> plan -> beads -> build)",
+            "goal — meta-workflow (ce-brainstorm -> plan -> beads -> build)",
             &[
                 "flywheel",
                 "workflow",
@@ -419,12 +419,55 @@ pub fn decide(target: &str, snap: &Snapshot) -> Decision {
     if has(&t, &["reflect"]) {
         return dec(
             "reflect",
-            "reflect — corrections become structure (scan -> emit hook bead -> prune)",
+            "reflect — corrections become structure (hook bead, never a paragraph)",
             &[
                 "flywheel",
                 "workflow",
                 "run",
                 "reflect",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    //     learning after verified work — any topology).
+    if has(
+        &t,
+        &[
+            "compound the learning",
+            "capture the learning",
+            "capture what we learned",
+            "compound this",
+        ],
+    ) {
+        return dec(
+            "ce-compound",
+            "ce-compound — run the compound gate over verified work (docs/learnings/)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "ce-compound",
+                "--execute",
+                "--mode",
+                "pane",
+            ],
+        );
+    }
+    // 23. sweep the learnings -> ce-sweep (ADR-0009 corpus maintenance).
+    if has(
+        &t,
+        &["sweep the learnings", "learning sweep", "compound-refresh"],
+    ) {
+        return dec(
+            "ce-sweep",
+            "ce-sweep — maintain docs/learnings/ (keep/update/consolidate/delete)",
+            &[
+                "flywheel",
+                "workflow",
+                "run",
+                "ce-sweep",
                 "--execute",
                 "--mode",
                 "pane",
@@ -623,6 +666,8 @@ pub fn decide_trigger_for(workflow: &str) -> Option<&'static str> {
         "onboard" => Some("onboard"),
         "wave-swarm" => Some("wave-swarm"),
         "repair-until-verified" => Some("repair-until-verified"),
+        "ce-compound" => Some("compound the learning"),
+        "ce-sweep" => Some("sweep the learnings"),
         _ => None,
     }
 }

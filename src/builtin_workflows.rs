@@ -7,16 +7,16 @@
 //! + control-flow (Spec 4). The catalog loads these as the compiled-in
 //!   defaults, overridable by `~/.config/flywheel/workflows/*.yaml`.
 //!
-//! - `brainstorm` — graph: parallel dispatch @oracle (over 3) → @planner
-//!   reduce (task consumes {{steps.diverge}}; fail_run on reduce).
-//! - `plan` — dispatch @planner (task carries {{inputs.goal}}; fail_run on
-//!   decompose) → request_approval gate.
-//! - `beads` — dispatch @planner stage:systematic-execute (spec.plan carries
+//! - `ce-brainstorm` — graph: parallel dispatch @oracle (over 3) → @planner
+//!   reduce via the ce-brainstorm stage (fail_run on reduce).
+//! - `ce-plan` — dispatch @planner stage:ce-plan (task carries
+//!   {{inputs.goal}}; fail_run on decompose) → request_approval gate.
+//! - `beads` — dispatch @planner stage:ce-execute (spec.plan carries
 //!   the plan; fail_run on create).
 //! - `debate` — graph: parallel dispatch @reviewer (over 2) → @oracle decide
 //!   (task consumes {{steps.briefs}}; fail_run on decide).
-//! - `goal` — meta: call_workflow brainstorm→plan→beads→dispatch @coder
-//!   stage:systematic-execute→@reviewer stage:code-review→@housekeeper
+//! - `goal` — meta: call_workflow ce-brainstorm→plan→beads→dispatch @coder
+//!   stage:ce-execute→@reviewer stage:ce-review→@housekeeper
 //!   stage:commit-and-push; each dispatch carries the prior step's output via
 //!   spec.plan, each fails the run on error.
 //! - `triage` — the canonical message_posted reactive workflow (payload
@@ -211,10 +211,10 @@ steps:
 "##,
     ),
     (
-        "brainstorm",
+        "ce-brainstorm",
         r##"
-name: brainstorm
-description: Divergent ideation — fan out oracles, a planner reduces to ranked options.
+name: ce-brainstorm
+description: "Requirements-first divergent ideation (ADR-0009) — fan out oracles, the planner reduces to a requirements-only artifact via the ce-brainstorm stage."
 trigger:
   type: webhook
 crew: auto
@@ -229,16 +229,16 @@ graph:
     reduce:
       action: dispatch_job
       assignee: x
-      spec: { profile: "@planner", task: "Reduce these oracle outputs into ranked options for: {{inputs.question}}\n\nOracle outputs: {{steps.diverge}}" }
+      spec: { profile: "@planner", stage: "ce-brainstorm", task: "Reduce these oracle outputs into ranked options for: {{inputs.question}}\n\nOracle outputs: {{steps.diverge}}" }
       needs: [diverge]
       on_error: fail_run
 "##,
     ),
     (
-        "plan",
+        "ce-plan",
         r##"
-name: plan
-description: Goal → bead-ready plan via the planner, with an optional approval gate.
+name: ce-plan
+description: "Goal → bead-ready plan via the ce-plan stage, with an optional approval gate."
 trigger:
   type: webhook
 crew: auto
@@ -248,7 +248,7 @@ steps:
   - name: decompose
     action: dispatch_job
     assignee: x
-    spec: { profile: "@planner", task: "Decompose this goal into a bead-ready plan (tasks, subtasks, dependency structure): {{inputs.goal}}" }
+    spec: { profile: "@planner", stage: "ce-plan", task: "Decompose this goal into a bead-ready plan (tasks, subtasks, dependency structure): {{inputs.goal}}" }
     on_error: fail_run
   - name: gate
     action: request_approval
@@ -259,7 +259,7 @@ steps:
         "beads",
         r##"
 name: beads
-description: Plan → tracker. The planner runs the systematic-execute stage.
+description: Plan → tracker. The planner runs the ce-execute stage.
 trigger:
   type: webhook
 crew: auto
@@ -269,7 +269,7 @@ steps:
   - name: create
     action: dispatch_job
     assignee: x
-    spec: { profile: "@planner", stage: "systematic-execute", plan: "{{inputs.plan}}" }
+    spec: { profile: "@planner", stage: "ce-execute", plan: "{{inputs.plan}}" }
     on_error: fail_run
 "##,
     ),
@@ -301,7 +301,7 @@ graph:
         "goal",
         r##"
 name: goal
-description: The meta-workflow — brainstorm → plan → beads → build → review → ship.
+description: The meta-workflow — ce-brainstorm → plan → beads → build → review → ship.
 trigger:
   type: webhook
 crew: auto
@@ -310,7 +310,7 @@ inputs:
 steps:
   - name: ideate
     action: call_workflow
-    workflow: brainstorm
+    workflow: ce-brainstorm
     inputs: { question: "{{inputs.objective}}" }
   - name: plan
     action: call_workflow
@@ -323,12 +323,12 @@ steps:
   - name: build
     action: dispatch_job
     assignee: x
-    spec: { profile: "@coder", stage: "systematic-execute", plan: "{{steps.track}}" }
+    spec: { profile: "@coder", stage: "ce-execute", plan: "{{steps.track}}" }
     on_error: fail_run
   - name: review
     action: dispatch_job
     assignee: x
-    spec: { profile: "@reviewer", harness: "opencode", stage: "code-review", plan: "{{steps.build}}" }
+    spec: { profile: "@reviewer", harness: "opencode", stage: "ce-review", plan: "{{steps.build}}" }
     on_error: fail_run
   - name: ship
     action: dispatch_job
@@ -341,7 +341,7 @@ steps:
         "goal-direct",
         r##"
 name: goal-direct
-description: "Captain-free DIRECT arm of goal (bd-t86p) — brainstorm → plan → build → review → ship with NO bead tracking and NO plan approval gate: non-bead targets flow straight to the coder. `flywheel steer \"<target>\" --direct` runs this."
+description: "Captain-free DIRECT arm of goal (bd-t86p) — ce-brainstorm → plan → build → review → ship with NO bead tracking and NO plan approval gate: non-bead targets flow straight to the coder. `flywheel steer \"<target>\" --direct` runs this."
 trigger:
   type: webhook
 crew: auto
@@ -350,7 +350,7 @@ inputs:
 steps:
   - name: ideate
     action: call_workflow
-    workflow: brainstorm
+    workflow: ce-brainstorm
     inputs: { question: "{{inputs.objective}}" }
   - name: plan
     action: call_workflow
@@ -359,12 +359,12 @@ steps:
   - name: build
     action: dispatch_job
     assignee: x
-    spec: { profile: "@coder", stage: "systematic-execute", plan: "{{steps.plan}}" }
+    spec: { profile: "@coder", stage: "ce-execute", plan: "{{steps.plan}}" }
     on_error: fail_run
   - name: review
     action: dispatch_job
     assignee: x
-    spec: { profile: "@reviewer", stage: "code-review", plan: "{{steps.build}}" }
+    spec: { profile: "@reviewer", stage: "ce-review", plan: "{{steps.build}}" }
     on_error: fail_run
   - name: ship
     action: dispatch_job
@@ -377,7 +377,7 @@ steps:
         "plan-direct",
         r##"
 name: plan-direct
-description: "Goal → execution plan WITHOUT the approval gate (bd-t86p): the captain-free companion to `plan`. The plan gate is the one interactive checkpoint; a steer --direct run must not park on it — the captain already stated the target."
+description: "Goal → execution plan WITHOUT the approval gate (bd-t86p): the captain-free companion to `ce-plan`. The plan gate is the one interactive checkpoint; a steer --direct run must not park on it — the captain already stated the target."
 trigger:
   type: webhook
 crew: auto
@@ -412,10 +412,10 @@ steps:
 "##,
     ),
     (
-        "plan-review",
+        "ce-plan-review",
         r##"
-name: plan-review
-description: Review a plan bead-by-bead before implementation — the p5 stage.
+name: ce-plan-review
+description: Review a plan bead-by-bead before implementation — the ce-plan-review stage.
 trigger:
   type: webhook
 crew: auto
@@ -425,7 +425,7 @@ steps:
   - name: review
     action: dispatch_job
     assignee: x
-    spec: { profile: "@reviewer", harness: "opencode", stage: "plan-review", plan: "{{inputs.plan}}" }
+    spec: { profile: "@reviewer", harness: "opencode", stage: "ce-plan-review", plan: "{{inputs.plan}}" }
     on_error: fail_run
 "##,
     ),
@@ -517,6 +517,57 @@ graph:
         task: "ANALYSIS ONLY — no beads, no repo edits. Challenge the synthesized report: {{steps.synthesize}}. Audit topic: {{inputs.topic}}. Check evidence, gaps, and overclaiming; append your adversarial verdict section to the report at: {{inputs.report_path}}."
       needs: [synthesize]
       on_error: fail_run
+"##,
+    ),
+    // ---- ADR-0009 compound-engineering workflows ----
+    (
+        "ce-compound",
+        r##"
+name: ce-compound
+description: "ADR-0009 standalone compound gate: capture the durable learning from a verified bead/wave/session into docs/learnings/ — usable from ANY topology (open/loop/swarm). One learning per run; clean_skip is a success."
+trigger:
+  type: webhook
+crew: auto
+principles:
+  - encode-lessons-in-structure
+inputs:
+  - name: source
+    default: ""
+  - name: bead
+    default: ""
+steps:
+  - name: compound
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@housekeeper"
+      phase: compound
+      stage: ce-compound
+      task: 'Run the compound gate (ADR-0009) over: bead {{inputs.bead}} {{inputs.source}}. Ground in the commit at HEAD, the steer-channel lessons (lesson: lines), and the receipts under .flywheel/receipts/. Reply with ONLY the terminal JSON. One learning per run.'
+    on_error: continue
+"##,
+    ),
+    (
+        "ce-sweep",
+        r##"
+name: ce-sweep
+description: "ADR-0009 learnings maintenance sweep (compound-refresh): Keep / Update / Consolidate / Replace / Delete over docs/learnings/ — a learning contradicting standing-orders or AGENTS.md guidance outranks ordinary staleness; resolve by which side the code follows. Cron-able."
+trigger:
+  type: webhook
+crew: auto
+principles:
+  - encode-lessons-in-structure
+  - prove-it-works
+inputs:
+  - name: project
+steps:
+  - name: sweep
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@housekeeper"
+      task: 'SWEEP docs/learnings/ (ADR-0009): for EACH entry, classify Keep / Update / Consolidate / Replace / Delete. Evidence per verdict: cited paths still exist, cited SHAs still reachable, guidance-layer contradictions (standing-orders / AGENTS.md / skill) named explicitly — a contradiction resolves by which side current code follows, and a wrong guidance FILE is reported, never edited here. High-overlap pairs become ONE canonical doc (oldest path wins, last_updated stamped). Output a JSON array [{path, verdict, evidence}] and apply the Deletes/Consolidates directly in git (one commit, message cites ce-sweep).'
+    on_error: fail_run
 "##,
     ),
     (
@@ -986,7 +1037,7 @@ steps:
         "ship-beads",
         r##"
 name: ship-beads
-description: "Ship beads (ADR-0019 Spec 7.2, pstack shipping without merge-when-ready): predicate = no ready beads AND claim-watch empty AND every newly closed bead legal on the ledger -> @housekeeper commit-and-push (stage p8). Principles: prove-it-works, sequence-verifiable-units."
+description: "Ship beads (ADR-0019 Spec 7.2, pstack shipping without merge-when-ready): predicate = no ready beads AND claim-watch empty AND every newly closed bead legal on the ledger -> @housekeeper commit-and-push. Principles: prove-it-works, sequence-verifiable-units."
 trigger:
   type: webhook
 crew: auto
@@ -1097,18 +1148,15 @@ steps:
     on_error: fail_run
 "##,
     ),
-    // ---- ADR-0006 D3 wave-swarm compose token (bd-wave-swarm-recipe-wsot) ------
-    // The composed unattended wave swarm: GATE (D2 filter + preflight) ->
-    // DISPATCH (D1 --param payloads per ready bead, D4 report_file contract)
-    // -> OBSERVE (escalate, never adjudicate) -> VERIFY (receipt at HEAD +
-    // VERIFY tail + principles citations) -> SIGNOFF (request_approval — the
-    // engine SUSPENDS until the captain settles; captain-only by
-    // construction). Bounded by FLYWHEEL_COMPOSE_MAX_SECONDS at run time.
+    // ---- ADR-0006 D3 wave-swarm compose token (bd-wave-swarm-recipe-wsot),
+    // compounded by ADR-0009: REVIEW (ce-review — evidence-gated findings
+    // between OBSERVE and VERIFY) and COMPOUND (ce-compound, on_error:
+    // continue, after VERIFY). Bounded by FLYWHEEL_COMPOSE_MAX_SECONDS.
     (
         "wave-swarm",
         r##"
 name: wave-swarm
-description: "ADR-0006 D3: the composed wave swarm. GATE scopes br ready to one wave label and holds on any open lower wave; DISPATCH emits send --stage systematic-execute --param payloads (bead/scope/exit/channel/pin/report_file); OBSERVE escalates to the captain and never adjudicates; VERIFY checks receipts at committed HEAD + close-reason VERIFY tails + decision-naming principles citations; SIGNOFF suspends for captain-only approval."
+description: "ADR-0006 D3 + ADR-0009: the compounded wave swarm. GATE scopes br ready to one wave label (grounding-reads docs/learnings/), holds on any open lower wave; DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to docs/learnings/ (never blocks); SIGNOFF suspends for captain-only approval."
 trigger:
   type: webhook
 crew: auto
@@ -1116,6 +1164,7 @@ principles:
   - never-block-on-the-human
   - guard-the-context-window
   - subtract-before-you-add
+  - encode-lessons-in-structure
 inputs:
   - name: objective
   - name: wave_label
@@ -1140,7 +1189,7 @@ steps:
     spec:
       profile: "@planner"
       stage: wave-dispatch
-      task: 'Dispatch ONLY the beads in .flywheel/wave/{{inputs.wave_label}}-ready.json — one send --stage systematic-execute --param payload per bead, each naming its bead id + the claim/close contract; onto {{inputs.steer_channel}}. The crew escalates to orchestrator pin {{inputs.captain_pin}}. Objective: {{inputs.objective}}'
+      task: 'Dispatch ONLY the beads in .flywheel/wave/{{inputs.wave_label}}-ready.json — one send --stage ce-execute --param payload per bead, each naming its bead id + the claim/close contract (+ learnings when the gate matched); onto {{inputs.steer_channel}}. The crew escalates to orchestrator pin {{inputs.captain_pin}}. Objective: {{inputs.objective}}'
     on_error: fail_run
     error_kinds: [timeout, rate_limit, unknown]
   - name: execute
@@ -1148,7 +1197,7 @@ steps:
     assignee: x
     spec:
       profile: "@coder"
-      stage: systematic-execute
+      stage: ce-execute
       task: 'Execute the wave beads listed in .flywheel/wave/{{inputs.wave_label}}-ready.json (claim -> run each bead''s VERIFY -> commit before close -> ledger-legal close with VERIFY tail + principles citations). Objective: {{inputs.objective}}'
     on_error: fail_run
     error_kinds: [timeout, rate_limit, unknown]
@@ -1160,18 +1209,36 @@ steps:
       stage: wave-observe
       task: 'Watch {{inputs.steer_channel}}: escalate, never adjudicate. Escalation target = the orchestrator pin {{inputs.captain_pin}} (flywheel mail send --project <slug> --to {{inputs.captain_pin}}) — DM THAT pin, never guess. Objective: {{inputs.objective}}'
     on_error: continue
+  - name: review
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@reviewer"
+      stage: ce-review
+      task: 'Review every closed bead of {{inputs.wave_label}} for {{inputs.objective}}: audit the committed diff against each brief''s ACCEPTANCE/VERIFY — detection conditions, quoted file:line evidence, severity + autofix class per finding; single-lens pass (no corroboration claims). Findings JSON to {{inputs.steer_channel}}. Objective: {{inputs.objective}}'
+    on_error: fail_run
+    error_kinds: [timeout, rate_limit, unknown]
   - name: verify
     action: dispatch_job
     assignee: x
     spec:
       profile: "@reviewer"
       stage: wave-verify
-      task: 'Verify every close claim: receipt at committed HEAD + VERIFY tail + principles citations. Objective: {{inputs.objective}}'
+      task: 'Verify every close claim: receipt at committed HEAD + VERIFY tail + principles citations + the residual gate (each REVIEW finding from {{steps.review}} fixed in the diff or filed as a bead id). Objective: {{inputs.objective}}'
     on_error: fail_run
     error_kinds: [timeout, rate_limit, unknown]
+  - name: compound
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@housekeeper"
+      phase: compound
+      stage: ce-compound
+      task: 'Run the compound gate over {{inputs.wave_label}} for {{inputs.objective}}: the wave''s verified solutions + the OBSERVE escalation lessons — capture what qualifies to docs/learnings/, clean_skip the rest. Report written/updated/clean_skip counts.'
+    on_error: continue
   - name: signoff
     action: request_approval
-    message: "Wave signoff (captain-only) for {{inputs.objective}} [{{inputs.wave_label}}]: review the VERIFY receipts and the steer-channel summary; approve closes the wave gate, reject reopens."
+    message: "Wave signoff (captain-only) for {{inputs.objective}} [{{inputs.wave_label}}]: review the VERIFY receipts, the REVIEW findings, and the COMPOUND learnings summary; approve closes the wave gate, reject reopens."
 "##,
     ),
     (
@@ -1291,7 +1358,7 @@ graph:
         "beads-lifecycle",
         r##"
 name: beads-lifecycle
-description: "ADR-0008 §6.7: the beads authoring lifecycle. grill sharpens the objective (ADR/goal JSON); create nests phase-plan via call_workflow; review1 (@reviewer plan-review) + review2 (@oracle judge-arms) are two bead-graph passes; integrate folds AGREE-WITH-CHANGES and re-checks cycles; implement runs systematic-execute (or hands off to wave-swarm); verify proves with evidence; signoff suspends for captain-only approval. inputs.until early-exits SUCCESS after any phase; gate_before_implement adds one outer approval between integrate and implement."
+description: "ADR-0008 §6.7: the beads authoring lifecycle. grill (ce-brainstorm) sharpens the objective (ADR/goal JSON); create nests phase-plan via call_workflow; review1 (@reviewer ce-plan-review) + review2 (@oracle judge-arms) are two bead-graph passes; integrate folds AGREE-WITH-CHANGES and re-checks cycles; implement runs ce-execute (or hands off to wave-swarm); verify proves with evidence; signoff suspends for captain-only approval. inputs.until early-exits SUCCESS after any phase; gate_before_implement adds one outer approval between integrate and implement."
 trigger:
   type: webhook
 crew: auto
@@ -1316,6 +1383,7 @@ graph:
       assignee: x
       spec:
         profile: "@planner"
+        stage: ce-brainstorm
         task: 'Grill the objective for {{inputs.objective}} (project {{inputs.project}}): sharpen scope, emit ADR/goal JSON to {{inputs.steer_channel}}. Escalate to {{inputs.captain_pin}} on ambiguity.'
       on_error: fail_run
     create:
@@ -1332,7 +1400,7 @@ graph:
       assignee: x
       spec:
         profile: "@reviewer"
-        stage: plan-review
+        stage: ce-plan-review
         task: 'Bead-graph pass A for {{inputs.objective}}: review the plan from {{steps.create}}; return findings JSON + verdict to {{inputs.steer_channel}}.'
       on_error: fail_run
     review2:
@@ -1370,7 +1438,7 @@ graph:
       assignee: x
       spec:
         profile: "@coder"
-        stage: systematic-execute
+        stage: ce-execute
         task: 'Implement the integrated bead set for {{inputs.objective}} from {{steps.integrate}} (project {{inputs.project}}): claim, VERIFY, commit before close, ledger-legal close. For wave execution hand off to wave-swarm instead of merging it.'
       on_error: fail_run
     verify:
@@ -1513,18 +1581,20 @@ mod tests {
             "all built-ins load"
         );
         for name in [
-            "brainstorm",
-            "plan",
+            "ce-brainstorm",
+            "ce-plan",
             "beads",
             "debate",
             "goal",
             "triage",
-            "plan-review",
+            "ce-plan-review",
             "onboard",
             "triage-deep",
             "captain-audit",
             "interrogate",
             "forensics",
+            "ce-compound",
+            "ce-sweep",
         ] {
             assert!(wfs.contains_key(name), "built-in {name} present");
         }
@@ -1990,12 +2060,12 @@ mod tests {
     fn purpose_named_workflows_are_crew_auto() {
         let wfs = builtin_workflows();
         for name in [
-            "brainstorm",
-            "plan",
+            "ce-brainstorm",
+            "ce-plan",
             "beads",
             "debate",
             "goal",
-            "plan-review",
+            "ce-plan-review",
             "onboard",
             "triage-deep",
         ] {
@@ -2041,7 +2111,7 @@ mod tests {
                 _ => {}
             }
         }
-        for name in ["debate", "goal", "plan-review", "captain-audit"] {
+        for name in ["debate", "goal", "ce-plan-review", "captain-audit"] {
             let mut found = 0;
             for step in &wfs[name].steps {
                 scan_action(&step.action, name, &mut found);
@@ -2070,7 +2140,7 @@ mod tests {
             })
             .collect();
         assert!(
-            chain.contains(&"brainstorm")
+            chain.contains(&"ce-brainstorm")
                 && chain.contains(&"phase-plan")
                 && chain.contains(&"beads"),
             "goal chains the built-ins: {chain:?}"
@@ -2322,7 +2392,7 @@ mod tests {
     #[test]
     fn onboard_triage_deep_plan_review_present() {
         let wfs = builtin_workflows();
-        for name in ["onboard", "triage-deep", "plan-review"] {
+        for name in ["onboard", "triage-deep", "ce-plan-review"] {
             assert!(wfs.contains_key(name), "built-in {name} present (bd-oj9o)");
         }
     }
@@ -2515,7 +2585,7 @@ mod tests {
     fn brainstorm_and_debate_fan_out() {
         use toron_workflow::schema::Action;
         let wfs = builtin_workflows();
-        for (name, node) in [("brainstorm", "diverge"), ("debate", "briefs")] {
+        for (name, node) in [("ce-brainstorm", "diverge"), ("debate", "briefs")] {
             let wf = &wfs[name];
             let g = wf
                 .graph
@@ -2589,7 +2659,7 @@ mod tests {
         use toron_workflow::schema::Action;
         let wfs = builtin_workflows();
         for (name, node, token) in [
-            ("brainstorm", "reduce", "{{steps.diverge}}"),
+            ("ce-brainstorm", "reduce", "{{steps.diverge}}"),
             ("debate", "decide", "{{steps.briefs}}"),
         ] {
             let g = wfs[name].graph.as_ref().expect("graph present");
@@ -2742,12 +2812,13 @@ mod tests {
             out
         }
         let checks: &[(&str, &[&str])] = &[
-            ("brainstorm", &["reduce"]),
-            ("plan", &["decompose"]),
+            ("ce-brainstorm", &["reduce"]),
+            ("ce-plan", &["decompose"]),
             ("beads", &["create"]),
             ("debate", &["decide"]),
             ("goal", &["build", "review", "ship"]),
-            ("plan-review", &["review"]),
+            ("ce-plan-review", &["review"]),
+            ("ce-sweep", &["sweep"]),
             ("onboard", &["map", "seed"]),
             ("triage-deep", &["triage", "prioritize", "spawn"]),
         ];

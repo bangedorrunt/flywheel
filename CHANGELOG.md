@@ -4,8 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
 ## [Unreleased]
+
+### Added — ADR-0009 compound spine (bd-4el4, 2026-09-06)
+- **ce- stage vocabulary** (compound-engineering loop): `ce-brainstorm` (new), `ce-plan` (was decompose-beads/p4), `ce-plan-review` (was plan-review/p5), `ce-execute` (was systematic-execute/p6), `ce-simplify` (new), `ce-review` (was code-review/p2 — + detection conditions, quoted-evidence confidence, independence rule, autofix classes, settled_conflict), `ce-compound` (new — the learning gate). **p-code aliases RETIRED** (clean cutover: `--stage p6` errors naming the fix).
+- **Compounded wave-swarm token** — now EIGHT phases: GATE (grounding-reads `docs/learnings/`) → DISPATCH (`--param learnings=` when matched) → EXECUTE (ce-execute: idempotent re-entry + simplify-as-you-go) → OBSERVE (`lesson:` line on every escalation) → **REVIEW** (ce-review audits the diff pre-verify) → VERIFY (**residual gate**: every finding fixed or filed as a bead) → **COMPOUND** (ce-compound, `phase: compound`, `on_error: continue`) → SIGNOFF.
+- **Learnings corpus** `docs/learnings/` (per-project, bug/knowledge track, frontmatter, `rg`-able) + `ce-compound`/`ce-sweep` workflows (standalone capture any topology; corpus maintenance cron-able) + `decide` rows ("compound the learning", "sweep the learnings").
+- **Loop-mode wiring**: beads-body lifecycle gains the grounding read + the post-verify compound gate (learning ships in the same commit). **Open-mode wiring**: standing orders + one-shot `workflow run ce-compound --execute`.
+- Terminal states (`done|clean_skip|blocked|failed`) + `settled:` decision labels + independence doctrine, in stage contracts.
+- toron ADR-0022 addendum: `Phase` enum gains `compound` (six-value closed vocabulary, deserialize-gated as before).
+
+### Changed — ADR-0009
+- Builtins renamed where they ARE CE concepts: `brainstorm`→`ce-brainstorm`, `plan`→`ce-plan`, `plan-review`→`ce-plan-review` (slash short-forms `/plan` `/plan-review` `/brainstorm` keep their names, retargeted). `goal`/`goal-direct`/`beads`/`beads-lifecycle` stage refs updated to ce- names. `stage list` drops the alias column; robot_capabilities `stages` carries the ce- loop.
+
 
 ## [0.4.0] — 2026-09-05 ADR-0007 catalog slots + daemon lifecycle
 

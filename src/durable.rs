@@ -15577,7 +15577,9 @@ mod single_writer_tests {
         );
         // Seed block must not use if-let-Ok swallow (the later dispatch_pending
         // loads may still use if-let; only the seed path is gated here).
-        let seed_at = body.find("let mut swarm = LoopModel::default()").expect("swarm default");
+        let seed_at = body
+            .find("let mut swarm = LoopModel::default()")
+            .expect("swarm default");
         let seed_slice = &body[seed_at..body.len().min(seed_at + 900)];
         assert!(
             !seed_slice.contains("if let Ok(Some(al))"),

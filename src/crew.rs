@@ -830,7 +830,7 @@ pub fn planner_authoring_prompt(
     objective: &str,
     workflows: &[(&str, &str)],
     profiles: &[&str],
-    stages: &[(&str, &str)],
+    stages: &[&str],
 ) -> String {
     let mut wf_rows = String::new();
     for (name, desc) in workflows {
@@ -841,8 +841,8 @@ pub fn planner_authoring_prompt(
         profile_rows.push_str(&format!("- @{p}\n"));
     }
     let mut stage_rows = String::new();
-    for (name, desc) in stages {
-        stage_rows.push_str(&format!("- {name}: {desc}\n"));
+    for name in stages {
+        stage_rows.push_str(&format!("- {name}\n"));
     }
     format!(
         "You are the workflow composer. Author a NEW flywheel workflow YAML for this target:\n\
@@ -1328,7 +1328,7 @@ steps:
             },
             ComposePart::PhaseStage {
                 phase: "implement".into(),
-                stage: "systematic-execute".into(),
+                stage: "ce-execute".into(),
             },
         ];
         let lib = crate::stages::StageLibrary::compiled_in();
@@ -1614,17 +1614,17 @@ steps:
         enforce_budget_caps(&wf).expect("within caps");
     }
 
-    /// ADR-0006 D3: the `wave-swarm` compose token expands to the
-    /// six-step workflow — GATE → DISPATCH → EXECUTE → OBSERVE → VERIFY → SIGNOFF —
-    /// and the expansion lints clean.
+    /// ADR-0006 D3 + ADR-0009: the `wave-swarm` compose token expands to
+    /// the EIGHT-step compounded workflow — GATE → DISPATCH → EXECUTE →
+    /// OBSERVE → REVIEW → VERIFY → COMPOUND → SIGNOFF — and lints clean.
     #[test]
-    fn wave_swarm_compose_token_expands_six_steps_and_lints_clean() {
+    fn wave_swarm_compose_token_expands_eight_steps_and_lints_clean() {
         use toron_workflow::schema::Action;
         let lib = crate::stages::StageLibrary::compiled_in();
         let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
         let part = parse_compose_part("wave-swarm").expect("compose token parses");
         let wf = compose_workflow_with("composed-wave", "obj", None, &[part], &affinity).unwrap();
-        assert_eq!(wf.steps.len(), 6, "{:?}", wf.steps.iter().map(|s| &s.name));
+        assert_eq!(wf.steps.len(), 8, "{:?}", wf.steps.iter().map(|s| &s.name));
         assert!(
             matches!(&wf.steps[0].action, Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("@planner")
@@ -1640,7 +1640,7 @@ steps:
         assert!(
             matches!(&wf.steps[2].action, Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("@coder")
-                    && spec.stage.as_deref() == Some("systematic-execute")),
+                    && spec.stage.as_deref() == Some("ce-execute")),
             "EXECUTE third (bd-wave-swarm-graduation-fix-98io: the crew needs an executor)"
         );
         assert!(
@@ -1652,14 +1652,27 @@ steps:
         assert!(
             matches!(&wf.steps[4].action, Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("@reviewer")
-                    && spec.stage.as_deref() == Some("wave-verify")),
-            "VERIFY fifth"
+                    && spec.stage.as_deref() == Some("ce-review")),
+            "REVIEW fifth (ADR-0009: audit the diff before VERIFY audits the receipts)"
         );
         assert!(
-            matches!(&wf.steps[5].action, Action::RequestApproval { message }
+            matches!(&wf.steps[5].action, Action::DispatchJob { spec, .. }
+                if spec.profile.as_deref() == Some("@reviewer")
+                    && spec.stage.as_deref() == Some("wave-verify")),
+            "VERIFY sixth"
+        );
+        assert!(
+            matches!(&wf.steps[6].action, Action::DispatchJob { spec, .. }
+                if spec.profile.as_deref() == Some("@housekeeper")
+                    && spec.stage.as_deref() == Some("ce-compound")
+                    && spec.phase.as_deref() == Some("compound")),
+            "COMPOUND seventh (ADR-0009: phase compound, housekeeper)"
+        );
+        assert!(
+            matches!(&wf.steps[7].action, Action::RequestApproval { message }
                 if message.contains("captain")),
             "SIGNOFF last, captain-only: {:?}",
-            wf.steps[5].action.type_name()
+            wf.steps[7].action.type_name()
         );
         let report = toron_workflow::lint_workflow(&wf);
         assert!(
@@ -1681,7 +1694,7 @@ steps:
             .map(|t| parse_compose_part(t).unwrap())
             .collect();
         let wf = compose_workflow_with("mixed", "obj", None, &parts, &affinity).unwrap();
-        assert_eq!(wf.steps.len(), 7, "1 plain + 6 compose-token steps");
+        assert_eq!(wf.steps.len(), 9, "1 plain + 8 compose-token steps");
     }
 
     // ---- ADR-0008 §10.C (bd-adr0008-expand-tests-7ui6) ----
@@ -2333,10 +2346,7 @@ steps:
                 ("plan", "goal to plan"),
             ],
             &["planner", "coder"],
-            &[
-                ("fresh-eyes-explore", "fresh eyes"),
-                ("plan-workflow", "plan a workflow"),
-            ],
+            &["fresh-eyes-explore", "ce-execute"],
         );
         assert!(prompt.contains("harden the loop"), "{prompt}");
         assert!(

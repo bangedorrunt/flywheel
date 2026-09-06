@@ -857,9 +857,9 @@ oc = 2
     fn workflows_parse() {
         let raw = r#"
 daily = [
-  { type = "send", to = "all", stage = "p1" },
+  { type = "send", to = "all", stage = "fresh-eyes-explore" },
   { type = "wait", until = "idle", timeout_ms = 600000 },
-  { type = "send", to = "oc", stage = "p6" },
+  { type = "send", to = "oc", stage = "ce-execute" },
 ]
 "#;
         let w: Workflows = toml::from_str(raw).unwrap();
@@ -867,7 +867,7 @@ daily = [
         assert_eq!(steps.len(), 3);
         match &steps[0] {
             WorkflowStep::Send { stage, to, .. } => {
-                assert_eq!(stage.as_deref(), Some("p1"));
+                assert_eq!(stage.as_deref(), Some("fresh-eyes-explore"));
                 assert_eq!(to, "all");
             }
             _ => panic!("expected send"),
