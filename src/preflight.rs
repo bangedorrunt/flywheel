@@ -902,14 +902,16 @@ mod tests {
 
     #[test]
     fn provider_funded_no_endpoint_is_skip_with_honest_reason() {
+        // Serialize env + clear balance override so a parallel zero-balance
+        // test (or ambient FLYWHEEL_FUNDED_BALANCE_ZAI) cannot invent Fail.
+        let _g = crate::config::lock_env();
+        unsafe { std::env::remove_var("FLYWHEEL_FUNDED_BALANCE_ZAI") };
         let c = check_provider_funded("zai", "coder");
         match c.status {
             Status::Skip(r) => assert!(r.contains("no funded endpoint")),
-            _ => panic!(),
+            other => panic!("expected Skip(no funded endpoint), got {other:?}"),
         }
     }
-    #[test]
-    
     #[test]
     fn gs039_opencode_go_missing_keys_fails_closed() {
         // Ensure neither key is set for this assertion (best-effort; if the
@@ -922,6 +924,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn provider_funded_zero_balance_fails_naming_provider() {
         let _g = crate::config::lock_env();
         unsafe { std::env::set_var("FLYWHEEL_FUNDED_BALANCE_ZAI", "0") };

@@ -7,13 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed — GS-039 CoS-honest-5 (hold merge)
-- **P0-1 Wake:** doorbell advances `last_wake` from real herdr Status (working/idle/done/blocked) and from successfully delivered prompts (`doorbell_prompt_and_hear` → pins; `doorbell_note_observed_wake`). Mail send defaults `--wake tasked` (no wake:null theater). Robot never-wake after meaningful dispatch stays hard-fail. `cmd_send` still must not self-mint wake (no invent-green).
+- **P0-1 Wake:** doorbell advances `last_wake` only from real herdr Status (working/idle/done/blocked) or **successfully delivered** prompt pins — never from planned injects on delivery miss (no `or_else(injects.first())` invent-green). Poll/sweep observed-wake saves fail-loud (no `let _ =`). Mail send defaults `--wake tasked`. Robot never-wake after meaningful dispatch stays hard-fail. `cmd_send` still must not self-mint wake.
 - **P0-2 Open-mode:** operator/`--raw` framed AUTHORITATIVE; open.md.tpl + peer-aware carve-out so create-file tasks are not chatter.
-- **P0-3 Solo compose:** `--retire-orphans` defaults **off** (explicit required). `--allow-crew-expand` required for multi-crew (TTY y/N ask otherwise). `repair-until-verified` crew is `coder:1` + `reviewer:1` (no auto 3+3 balloon).
-- **P0-4 Name-binding:** post-settle rename + fail spawn if any pane unbound.
+- **P0-3 Solo compose:** `--retire-orphans` defaults **off**. Multi-crew requires `--allow-crew-expand`; robot/CI/`--json`/`FLYWHEEL_ROBOT`/non-interactive **hard-bail** (no `read_line`); interactive TTY y/N ask is humans only. `repair-until-verified` crew is `coder:1` + `reviewer:1`.
+- **P0-4 Name-binding:** post-settle rename + fail spawn if any pane missing, empty-named, **or wrong-named** (fail closed under verify).
 - **P1:** presence publish retries on unknown-agent race; repair `error_kinds` for R-E2; peer-aware prefers `flywheel mail --as <pin>`.
 - **P2:** swarm ready advertises `--stage ce-execute` (p1 ghost gone); opencode-go missing keys fail-closed in provider-funded preflight.
-- **UX:** default model remains `opencode-go/muse-spark-1.3-contributor` (@standard); compose multi-crew asks before silent N.
+- **UX:** default model remains `opencode-go/muse-spark-1.3-contributor` (@standard); compose multi-crew asks humans before silent N.
+- **test-attr:** restored `#[test]` on `spawn_starts_doorbell_dispatcher` + `provider_funded_zero_balance_fails_naming_provider`.
 
 
 ### Added — ADR-0009 compound spine (bd-4el4, 2026-09-06)
