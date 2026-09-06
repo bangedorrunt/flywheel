@@ -616,12 +616,21 @@ fn provider_funded_checks(_cfg: &Config, project: Option<&str>) -> Vec<Check> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut providers: Vec<(String, String)> = Vec::new();
     for (name, profile) in &catalog.profiles {
-        let prov = profile.provider.trim();
+        // GS-040: default profiles pin provider in the model id
+        // (`opencode-go/muse-…`) while `profile.provider` stays empty
+        // (ADR-0007). Derive provider from model prefix when unset so
+        // funded-key checks actually run instead of SKIP theater.
+        let mut prov = profile.provider.trim().to_string();
+        if prov.is_empty() {
+            if let Some((p, _)) = profile.model.split_once('/') {
+                prov = p.trim().to_string();
+            }
+        }
         if prov.is_empty() {
             continue;
         }
-        if seen.insert(prov.to_string()) {
-            providers.push((prov.to_string(), name.clone()));
+        if seen.insert(prov.clone()) {
+            providers.push((prov, name.clone()));
         }
     }
     if providers.is_empty() {
