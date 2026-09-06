@@ -56,7 +56,7 @@ pub const LOOPS_SCHEMA_VERSION: u32 = 3;
 /// Reserved top-level key in `loops.json` (not a project path).
 const LOOPS_SCHEMA_KEY: &str = "schema";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
     Spawn,
@@ -168,7 +168,7 @@ pub struct HealState {
 /// New fields use `#[serde(default)]` so a v1-shaped JSON still deserializes
 /// (fresh defaults). A v1 binary reading this struct's v2/v3 JSON ignores the
 /// extra keys (serde default for structs without `deny_unknown_fields`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActiveLoop {
     pub id: String,
     pub params: serde_json::Value,
@@ -318,7 +318,7 @@ pub fn spawn_registry_key(project: &str) -> String {
 }
 
 #[cfg(test)]
-pub(crate) struct RegistryRootOverrideGuard;
+pub struct RegistryRootOverrideGuard;
 
 #[cfg(test)]
 impl Drop for RegistryRootOverrideGuard {
@@ -330,7 +330,7 @@ impl Drop for RegistryRootOverrideGuard {
 }
 
 #[cfg(test)]
-pub(crate) fn set_registry_root_override(root: PathBuf) -> RegistryRootOverrideGuard {
+pub fn set_registry_root_override(root: PathBuf) -> RegistryRootOverrideGuard {
     if let Ok(mut guard) = REGISTRY_ROOT_OVERRIDE.lock() {
         *guard = Some(root);
     }
@@ -467,7 +467,7 @@ impl<'de> Deserialize<'de> for SpawnEntry {
             },
         }
         match Raw::deserialize(d)? {
-            Raw::Legacy((pane_id, name)) => Ok(SpawnEntry {
+            Raw::Legacy((pane_id, name)) => Ok(Self {
                 pane_id,
                 name,
                 profile: None,
@@ -482,7 +482,7 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 harness,
                 mail_identity,
                 skills_injected,
-            } => Ok(SpawnEntry {
+            } => Ok(Self {
                 pane_id,
                 name,
                 profile,
@@ -714,7 +714,9 @@ pub fn load_captain_alias(project: &str) -> Option<String> {
     let path = captain_alias_file(project);
     let raw = std::fs::read_to_string(&path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    v.get("pin").and_then(|p| p.as_str()).map(|s| s.to_string())
+    v.get("pin")
+        .and_then(|p| p.as_str())
+        .map(std::string::ToString::to_string)
 }
 
 pub fn save_captain_alias(project: &str, pin: &str) -> Result<()> {
@@ -930,7 +932,7 @@ fn ensure_loops_migrated() -> Result<()> {
     // epoch seconds — fixed width, so lexicographic order is chronological.
     if let Ok(rd) = std::fs::read_dir(legacy.parent().unwrap()) {
         let mut markers: Vec<PathBuf> = rd
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .map(|e| e.path())
             .filter(|p| {
                 p.file_name()
@@ -1007,7 +1009,7 @@ pub fn parse_loops_registry(raw: &str) -> (u32, BTreeMap<String, ActiveLoop>) {
 
     let schema = obj
         .get(LOOPS_SCHEMA_KEY)
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .map(|n| n as u32)
         .unwrap_or(1); // missing schema → v1
 
@@ -1233,7 +1235,7 @@ pub fn trim_last_sent(records: &mut Vec<SentRecord>) {
 /// loop process for the same project exists — stale nohup'd loops can no
 /// longer accumulate and race new invocations (observed: 7 stale loops
 /// polling toron+flywheel, writing into each other's logs).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoopPidEntry {
     pub pid: u32,
     pub started_at: String,
@@ -1590,7 +1592,7 @@ fn compact_ts(secs: u64, ms: u32) -> String {
     format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}{ms:03}")
 }
 
-pub(crate) fn utc_now() -> (u64, u32) {
+pub fn utc_now() -> (u64, u32) {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => (d.as_secs(), d.subsec_millis()),
         Err(_) => (0, 0),
@@ -1599,12 +1601,12 @@ pub(crate) fn utc_now() -> (u64, u32) {
 
 /// Convert unix seconds to UTC civil time (year, month, day, h, m, s).
 /// chrono-backed (is1.2) — the crate's single calendar implementation.
-pub(crate) fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+pub fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     use chrono::{Datelike, Timelike};
     let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
         .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
     (
-        dt.year() as i64,
+        i64::from(dt.year()),
         dt.month(),
         dt.day(),
         dt.hour(),
@@ -2318,7 +2320,7 @@ mod loops_sidecar_tests {
     fn loops_dir_markers() -> Vec<String> {
         std::fs::read_dir(loops_file().parent().unwrap())
             .map(|rd| {
-                rd.filter_map(|e| e.ok())
+                rd.filter_map(std::result::Result::ok)
                     .map(|e| e.file_name().to_string_lossy().into_owned())
                     .filter(|n| n.starts_with("loops.json.migrated-"))
                     .collect()

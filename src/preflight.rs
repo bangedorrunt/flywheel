@@ -323,7 +323,7 @@ fn check_herdr(cfg: &Config) -> Check {
 
 fn check_resonate(cfg: &Config) -> Check {
     match resonate_health(cfg) {
-        Ok(_) => Check::pass("resonate"),
+        Ok(()) => Check::pass("resonate"),
         Err(e) => Check::fail("resonate", format!("{e}")),
     }
 }
@@ -510,12 +510,12 @@ pub fn check_standing_orders_at(global: &Path, fence: Option<&Path>) -> Check {
     if global.exists() {
         return Check::pass("standing-orders");
     }
-    if fence.is_some_and(|f| f.exists()) {
+    if fence.is_some_and(std::path::Path::exists) {
         return Check::pass("standing-orders");
     }
     // first run: generate the global, then require it present
     match crate::standing_orders::regen_global(global) {
-        Ok(_) => Check::pass("standing-orders"),
+        Ok(()) => Check::pass("standing-orders"),
         Err(e) => Check::fail(
             "standing-orders",
             format!(
@@ -608,7 +608,7 @@ fn provider_funded_checks(_cfg: &Config, project: Option<&str>) -> Vec<Check> {
     use std::collections::BTreeSet;
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut providers: Vec<(String, String)> = Vec::new();
-    for (name, profile) in catalog.profiles.iter() {
+    for (name, profile) in &catalog.profiles {
         let prov = profile.provider.trim();
         if prov.is_empty() {
             continue;

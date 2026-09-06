@@ -12,7 +12,7 @@ pub struct Bv {
 
 impl Bv {
     pub fn new(cwd: &str) -> Self {
-        Bv {
+        Self {
             cwd: cwd.to_string(),
         }
     }

@@ -335,7 +335,7 @@ mod tests {
                 assert!(
                     message.contains("superlogical"),
                     "names the backend: {message}"
-                )
+                );
             }
             Ok(_) => panic!("stub must not Ok"),
             Err(e) => panic!("expected Unsupported, got {e:?}"),

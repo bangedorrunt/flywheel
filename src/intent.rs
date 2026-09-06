@@ -304,13 +304,13 @@ fn glob_covers(outer: &str, inner: &str) -> bool {
 pub fn common_parent(a: &str, b: &str) -> Option<String> {
     let parts_a: Vec<&str> = a
         .trim_end_matches('/')
-        .trim_end_matches("*")
+        .trim_end_matches('*')
         .split('/')
         .filter(|p| !p.is_empty() && *p != "*" && !p.contains('*'))
         .collect();
     let parts_b: Vec<&str> = b
         .trim_end_matches('/')
-        .trim_end_matches("*")
+        .trim_end_matches('*')
         .split('/')
         .filter(|p| !p.is_empty() && *p != "*" && !p.contains('*'))
         .collect();

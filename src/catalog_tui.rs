@@ -97,7 +97,7 @@ fn model_rows(reg: &ModelRegistry) -> Vec<CatalogRow> {
             label: id.clone(),
             detail: format!(
                 "tier={} ${:.2}/${:.2} caps={}",
-                e.tier.map(|t| t.as_str()).unwrap_or("-"),
+                e.tier.map(super::models::Tier::as_str).unwrap_or("-"),
                 e.cost_in_per_mtok,
                 e.cost_out_per_mtok,
                 if e.caps.is_empty() {
@@ -177,7 +177,7 @@ fn profile_rows(cat: &ProfileCatalog) -> Vec<CatalogRow> {
 fn panel_block(title: &'static str, focused: bool) -> Block<'static> {
     let title_span = Span::styled(
         if focused {
-            format!(" {title} ",)
+            format!(" {title} ")
         } else {
             format!(" {title} ")
         },

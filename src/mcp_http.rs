@@ -47,8 +47,8 @@ impl ServerKind {
     /// The truthful backend label used in error strings (BUG3 fix).
     pub fn label(self) -> &'static str {
         match self {
-            ServerKind::AgentMail => "agent-mail",
-            ServerKind::Toron => "toron",
+            Self::AgentMail => "agent-mail",
+            Self::Toron => "toron",
         }
     }
 }
@@ -68,8 +68,8 @@ pub enum McpError {
 impl std::fmt::Display for McpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            McpError::Transport(e) => write!(f, "transport: {e}"),
-            McpError::Tool(e) => write!(f, "{e}"),
+            Self::Transport(e) => write!(f, "transport: {e}"),
+            Self::Tool(e) => write!(f, "{e}"),
         }
     }
 }

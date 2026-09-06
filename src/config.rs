@@ -25,11 +25,11 @@ use serde::{Deserialize, Serialize};
 /// tests own the reference pattern; every other module's env-mutating test
 /// takes this lock.
 #[cfg(test)]
-pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Take the crate-wide env lock (poison-tolerant). Test-only (193.2).
 #[cfg(test)]
-pub(crate) fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+pub fn lock_env() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -43,7 +43,7 @@ pub(crate) fn lock_env() -> std::sync::MutexGuard<'static, ()> {
 /// processes; writing it poisons later runs (e.g. a v1 fixture left behind
 /// re-triggers the sidecar migration mid-suite).
 #[cfg(test)]
-pub(crate) struct TestStateHome {
+pub struct TestStateHome {
     _env: std::sync::MutexGuard<'static, ()>,
     dir: PathBuf,
 }
@@ -58,7 +58,7 @@ impl Drop for TestStateHome {
 
 /// Begin a hermetic state-dir test (see [`TestStateHome`]).
 #[cfg(test)]
-pub(crate) fn test_state_home() -> TestStateHome {
+pub fn test_state_home() -> TestStateHome {
     let _env = lock_env();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -314,20 +314,20 @@ impl Config {
         // the legacy file as backup; every later run reads/writes XDG.
         let xdg = config_file();
         let legacy = legacy_config_file();
-        let mut cfg: Config = if xdg.exists() {
+        let mut cfg: Self = if xdg.exists() {
             let raw =
                 std::fs::read_to_string(&xdg).with_context(|| format!("read {}", xdg.display()))?;
             toml::from_str(&raw).with_context(|| format!("parse {}", xdg.display()))?
         } else if legacy.exists() {
             let raw = std::fs::read_to_string(&legacy)
                 .with_context(|| format!("read {}", legacy.display()))?;
-            let parsed: Config =
+            let parsed: Self =
                 toml::from_str(&raw).with_context(|| format!("parse {}", legacy.display()))?;
             // Write-through to XDG thereafter (copy, not move — V5).
             migrate_legacy_config(&legacy, &xdg);
             parsed
         } else {
-            Config::default()
+            Self::default()
         };
         // env overrides
         if let Ok(v) = std::env::var("FLYWHEEL_SOCKET") {
@@ -351,7 +351,7 @@ impl Config {
         // / FLYWHEEL_AGENTMAIL_TOKEN feed `[mail.agentmail]` ONLY (ADR-0003 V3 —
         // never toron), merging over config.toml; FLYWHEEL_MAIL_NAME feeds the
         // shared `[agent_mail]` identity.
-        let (am_url, am_token, mail_name) = Config::mail_env_overrides();
+        let (am_url, am_token, mail_name) = Self::mail_env_overrides();
         if am_url.is_some() || am_token.is_some() {
             let mut am = cfg
                 .mail
@@ -683,7 +683,7 @@ impl Recipes {
     pub fn load() -> Result<Self> {
         let path = config_dir().join("recipes.toml");
         if !path.exists() {
-            return Ok(Recipes::default());
+            return Ok(Self::default());
         }
         let raw =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -724,7 +724,7 @@ impl Workflows {
     pub fn load() -> Result<Self> {
         let path = config_dir().join("workflows.toml");
         if !path.exists() {
-            return Ok(Workflows::default());
+            return Ok(Self::default());
         }
         let raw =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -744,7 +744,7 @@ impl Pipelines {
     pub fn load() -> Result<Self> {
         let path = config_dir().join("pipelines.toml");
         if !path.exists() {
-            return Ok(Pipelines::default());
+            return Ok(Self::default());
         }
         let raw =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -766,7 +766,7 @@ impl Policy {
     pub fn load() -> Result<Self> {
         let path = config_dir().join("policy.toml");
         if !path.exists() {
-            return Ok(Policy::default());
+            return Ok(Self::default());
         }
         let raw =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -782,7 +782,7 @@ impl Policy {
                     .map(|re| re.is_match(msg))
                     .unwrap_or_else(|_| msg.contains(p.as_str()))
             })
-            .map(|s| s.as_str())
+            .map(std::string::String::as_str)
     }
 }
 
@@ -839,7 +839,7 @@ verifier_family_override = "deepseek"
 
     #[test]
     fn recipes_parse() {
-        let raw = r#"
+        let raw = r"
 [swarm]
 oc = 1
 pi = 1
@@ -847,7 +847,7 @@ gk = 1
 
 [qa]
 oc = 2
-"#;
+";
         let r: Recipes = toml::from_str(raw).unwrap();
         assert_eq!(r.recipes["swarm"].oc, Some(1));
         assert_eq!(r.recipes["qa"].oc, Some(2));
@@ -1280,7 +1280,10 @@ daily = [
         aliases.insert("proj".into(), "OldCaptain".into());
         // recover == adopt: alias rebound to recovering pin
         apply_captain_adopt(&mut aliases, "proj", "NewCaptain");
-        assert_eq!(aliases.get("proj").map(|s| s.as_str()), Some("NewCaptain"));
+        assert_eq!(
+            aliases.get("proj").map(std::string::String::as_str),
+            Some("NewCaptain")
+        );
         // clear helper (toron contact captain --clear)
         clear_captain_alias(&mut aliases, "proj");
         assert!(captain_alias_cleared(&aliases, "proj"));

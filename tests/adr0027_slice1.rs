@@ -35,7 +35,7 @@ fn flywheel_bin() -> String {
     // cargo test sets CARGO_BIN_EXE_flywheel when the binary is built;
     // otherwise fall back to a relative target/debug path.
     option_env!("CARGO_BIN_EXE_flywheel")
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .unwrap_or_else(|| {
             let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/flywheel");
             if p.exists() {
@@ -92,7 +92,7 @@ impl Scratch {
             .unwrap()
             .as_nanos();
         let base = std::env::temp_dir().join(format!("fw-adr27-{tag}-{}-{ts}", std::process::id()));
-        let s = Scratch {
+        let s = Self {
             dir: base.join("proj"),
             mailbox: base.join("mailbox"),
             cfg: base.join("cfg/flywheel"),
@@ -246,7 +246,7 @@ fn adr0027_s1_receipt_store_contract() {
     // Look for receipts table migration / store files — must be exact schema, not just the word "receipts"
     let has_receipts_table = std::fs::read_dir(&mailbox)
         .map(|entries| {
-            entries.filter_map(|e| e.ok()).any(|e| {
+            entries.filter_map(std::result::Result::ok).any(|e| {
                 let p = e.path();
                 p.extension().map(|x| x == "rs").unwrap_or(false)
                     && read_file(&p).contains("corr TEXT PRIMARY KEY")
@@ -261,7 +261,7 @@ fn adr0027_s1_receipt_store_contract() {
             if mig.exists() {
                 std::fs::read_dir(&mig)
                     .map(|ents| {
-                        ents.filter_map(|e| e.ok()).any(|e| {
+                        ents.filter_map(std::result::Result::ok).any(|e| {
                             let p = e.path();
                             p.is_file()
                                 && read_file(&p).contains("CREATE TABLE")
@@ -321,12 +321,11 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
     if !Path::new(&fw).exists() && fw != "flywheel" {
         // try PATH fallback
         let out = Command::new(&fw).arg("--help").output();
-        if out.is_err() || !out.unwrap().status.success() {
-            panic!(
-                "RED (bd-gmjo S1): flywheel binary not found at {} — build with cargo build --bin flywheel",
-                fw
-            );
-        }
+        assert!(
+            !(out.is_err() || !out.unwrap().status.success()),
+            "RED (bd-gmjo S1): flywheel binary not found at {} — build with cargo build --bin flywheel",
+            fw
+        )
     }
     let scratch = Scratch::new("s1-walker");
     // minimal beads project so receipts have a workspace context (beads not required for mail, but we mimic loop)
@@ -401,16 +400,15 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
         let stderr = String::from_utf8_lossy(&out.stderr).to_string()
             + &String::from_utf8_lossy(&out.stdout);
         // If the flag is still unrecognized, that's the RED we care about (bd-2u27)
-        if stderr.contains("unexpected argument") {
-            panic!(
-                "RED (bd-gmjo S1, bd-2u27): toron mail send --corr failed (expected GREEN after bd-2u27 lands)\n\
-                 args: {:?}\nstdout: {}\nstderr: {}\n\
-                 Contract: SendMessage.extra_tags carries corr/wake/priority/audience/result_path (never 1059 envelope).",
-                send_args,
-                String::from_utf8_lossy(&out.stdout),
-                stderr
-            );
-        }
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "RED (bd-gmjo S1, bd-2u27): toron mail send --corr failed (expected GREEN after bd-2u27 lands)\n\
+             args: {:?}\nstdout: {}\nstderr: {}\n\
+             Contract: SendMessage.extra_tags carries corr/wake/priority/audience/result_path (never 1059 envelope).",
+            send_args,
+            String::from_utf8_lossy(&out.stdout),
+            stderr
+        );
         // If flag is recognized but recipient/project setup fails, that's a harness issue
         // not the contract under test — treat as skip for this S1 CLI integration.
         // The deeper flag+receipt contract is proven in toron-cli/tests and send_tags.rs.
@@ -440,15 +438,14 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
         &toron,
         &["receipt", "get", "--project", proj, "--corr", corr],
     );
-    if !out.status.success() {
-        panic!(
-            "RED (bd-gmjo S1, bd-gokp): toron receipt get --corr {corr} failed after send\n\
-             stdout: {}\nstderr: {}\n\
-             Contract: receipts sqlite next to message_reads/inbox_cursors; new process rebuilds Model assignment from table (not journal fold). ReceiptState owed|acked|resulted.",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    assert!(
+        out.status.success(),
+        "RED (bd-gmjo S1, bd-gokp): toron receipt get --corr {corr} failed after send\n\
+         stdout: {}\nstderr: {}\n\
+         Contract: receipts sqlite next to message_reads/inbox_cursors; new process rebuilds Model assignment from table (not journal fold). ReceiptState owed|acked|resulted.",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
         panic!(
             "receipt get bad json: {e} stdout: {}",
@@ -505,13 +502,12 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
             "/tmp/adr27-result.txt",
         ],
     );
-    if !out.status.success() {
-        panic!(
-            "RED (bd-gmjo S1 empty tasked): empty tasked send failed\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    assert!(
+        out.status.success(),
+        "RED (bd-gmjo S1 empty tasked): empty tasked send failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     // After tick (assignment in Model), the empty tasked should have recorded a result
     // For now we just assert receipt exists and has result_path
     let out = scratch2.run(
@@ -533,11 +529,10 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
 #[test]
 fn adr0027_s1_standing_empty_silent_tasked_empty_result() {
     let ws = flywheel_manifest_dir().join("src/workspace.rs");
-    if !ws.exists() {
-        panic!(
-            "RED (bd-gmjo S2, bd-7fat): src/workspace.rs missing — S2 pins standing/tasked in tick (E3)"
-        );
-    }
+    assert!(
+        ws.exists(),
+        "RED (bd-gmjo S2, bd-7fat): src/workspace.rs missing — S2 pins standing/tasked in tick (E3)"
+    );
     let content = read_file(&ws);
     // S2 contract: standing + empty -> no Cmd to human pin; tasked + empty -> Cmd records result
     assert!(

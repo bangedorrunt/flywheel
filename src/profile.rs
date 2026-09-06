@@ -690,7 +690,9 @@ mod tests {
     static TMP_SEQ: AtomicU32 = AtomicU32::new(0);
 
     fn tmp_profiles_toml(contents: &str) -> std::path::PathBuf {
-        let _g = TMP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = TMP_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let seq = TMP_SEQ.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("flywheel-profile-test-{seq}"));
         fs::create_dir_all(&dir).expect("create temp dir");

@@ -42,10 +42,10 @@ impl Tier {
     /// The tag surfaced by `stage list --all` / `stage show`.
     pub fn tag(self) -> &'static str {
         match self {
-            Tier::Seed => "seed",
-            Tier::Repo => "repo",
-            Tier::User => "user",
-            Tier::Project => "project",
+            Self::Seed => "seed",
+            Self::Repo => "repo",
+            Self::User => "user",
+            Self::Project => "project",
         }
     }
 }
@@ -319,7 +319,7 @@ impl StageLibrary {
         }
         let tiers: BTreeMap<String, Tier> =
             stages.keys().map(|k| (k.clone(), Tier::Seed)).collect();
-        StageLibrary { stages, tiers }
+        Self { stages, tiers }
     }
 
     /// The repo DATA tier: `repo-stages.toml` compiled into the binary
@@ -552,7 +552,7 @@ pub fn render_stage(
 ) -> Result<String> {
     let missing: Vec<&str> = required
         .iter()
-        .map(|r| r.as_str())
+        .map(std::string::String::as_str)
         .filter(|r| !params.contains_key(*r))
         .collect();
     if !missing.is_empty() {

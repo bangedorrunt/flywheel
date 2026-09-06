@@ -306,7 +306,7 @@ pub fn transition(
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct LoopModel {
     pub queue: Vec<String>,
     pub per_bead_phase: std::collections::BTreeMap<String, LoopPhase>,
@@ -353,7 +353,7 @@ pub struct LoopModel {
 /// done-mail dedup carries verbatim, drains restart with fresh grace (a
 /// crash must never force-kill immediately; the prompt re-sends and send
 /// dedup protects).
-pub(crate) fn seed_swarm_resume(
+pub fn seed_swarm_resume(
     model: &mut LoopModel,
     heal_states: &std::collections::BTreeMap<String, crate::state::HealState>,
     done_mailed: &std::collections::HashSet<String>,
@@ -393,7 +393,7 @@ pub(crate) fn seed_swarm_resume(
 /// ActiveLoop. Shared Model path — doorbell (the RAM owner) calls this
 /// at start; tests / why-replay may too. Loop-only callers keep
 /// [`seed_swarm_resume`] on a `LoopModel`.
-pub(crate) fn seed_workspace_from_active_loop(
+pub fn seed_workspace_from_active_loop(
     ws: &mut crate::workspace::WorkspaceModel,
     project: &str,
 ) -> anyhow::Result<()> {
@@ -439,7 +439,7 @@ fn tick_loop_owner(
 /// One drain in flight (bd-zfnx.10). Crash-safe via ActiveLoop (name →
 /// bead id; grace restarts fresh on resume — a crash must never
 /// force-kill immediately).
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct DrainState {
     pub bead_id: String,
     pub grace_polls: u32,
@@ -452,7 +452,7 @@ pub struct DrainState {
 /// see the kill safety rules); the force path always records a LoudMiss
 /// with the bead id so the receipt is recoverable, never silent.
 pub const DRAIN_GRACE_POLLS: u32 = 3;
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LoopMsg {
     Herdr(PollEvent),
     BrClose {
@@ -510,7 +510,7 @@ pub enum LoopMsg {
 }
 
 #[allow(dead_code)] // TODO: wire into status rendering for delivery-verdict ADR (deferred)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoopSnapshot {
     pub per_bead_phase: std::collections::BTreeMap<String, LoopPhase>,
     pub mail_degraded: bool,
@@ -530,7 +530,7 @@ impl LoopSnapshot {
     }
 }
 
-pub(crate) fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
+pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
     let mut next = model.clone();
     let mut actions = Vec::new();
     // Pure, total, deterministic: no I/O, no &mut, no br/herdr calls
@@ -633,7 +633,7 @@ pub(crate) fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopActi
                     reason: reason.into(),
                 }),
                 HealAction::EscalateBlocked => {
-                    actions.push(LoopAction::Blocked { name: name.clone() })
+                    actions.push(LoopAction::Blocked { name: name.clone() });
                 }
             }
         }
@@ -681,7 +681,7 @@ pub(crate) fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopActi
             // the record (executor kills + LoudMiss). Exit via Heal fulfills
             // first (arm above), so a finished pane is never force-stopped.
             let mut expired: Vec<(String, String)> = Vec::new();
-            for (name, ds) in next.drain_pending.iter_mut() {
+            for (name, ds) in &mut next.drain_pending {
                 if ds.grace_polls == 0 {
                     expired.push((name.clone(), ds.bead_id.clone()));
                 } else {
@@ -1397,10 +1397,9 @@ async fn loop_run_verify(args: LoopRunVerifyArgs) -> Result<Value> {
                     "warning": warning,
                     "filtered": filtered,
                 }));
-            } else {
-                // Advisory: annotate + warn, but still record the proof.
-                // The warning will be appended to the receipt after it is written.
             }
+            // Advisory: annotate + warn, but still record the proof.
+            // The warning will be appended to the receipt after it is written.
         }
         let receipt =
             crate::verdict::write_command_verified_receipt(cwd, &args.bead_id, &sha, output);
@@ -1732,7 +1731,7 @@ pub struct NotifyArgs {
 
 /// What the `notify_blocked` leaf computed and persisted (cg6.1). The
 /// workflow body acts on these values — it never recomputes the tier.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EscalationOutcome {
     /// Escalation tier 0..3, derived from the PERSISTED first-blocked
     /// timestamp at leaf-execution time.
@@ -1923,7 +1922,7 @@ async fn run_leaf_cmd_bounded(
                         // GS-025: `kill -9 -<pgid>` is unreliable across
                         // procps on GHA (watchdog tests saw full 30s sleep).
                         // Prefer `kill -s KILL -- -<pgid>` + direct child.kill.
-                        let pgid = child.id() as i64;
+                        let pgid = i64::from(child.id());
                         let _ = std::process::Command::new("kill")
                             .args(["-s", "KILL", "--", &format!("-{pgid}")])
                             .status();
@@ -2156,7 +2155,7 @@ async fn poll_ready(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
 /// and `__inprogress` (id/title/assignee) into `ReadyBead` rows. Pure —
 /// bd-87hq regression pin: the producer emitters (cmd_internal_ready /
 /// cmd_internal_inprogress in main.rs) and this consumer must never drift.
-pub(crate) fn parse_bead_list(v: &serde_json::Value, what: &str) -> anyhow::Result<Vec<ReadyBead>> {
+pub fn parse_bead_list(v: &serde_json::Value, what: &str) -> anyhow::Result<Vec<ReadyBead>> {
     let beads = v
         .get("beads")
         .and_then(serde_json::Value::as_array)
@@ -2200,7 +2199,7 @@ pub(crate) fn parse_bead_list(v: &serde_json::Value, what: &str) -> anyhow::Resu
             priority: b
                 .get("priority")
                 .and_then(serde_json::Value::as_u64)
-                .map(|p| p.min(u8::MAX as u64) as u8)
+                .map(|p| p.min(u64::from(u8::MAX)) as u8)
                 .unwrap_or(3),
             principles: b
                 .get("principles")
@@ -2428,11 +2427,11 @@ pub enum GuardSignalKind {
 impl GuardSignalKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            GuardSignalKind::Claim => "claim",
-            GuardSignalKind::Announce => "announce",
-            GuardSignalKind::Done => "done",
-            GuardSignalKind::StandDown => "stand_down",
-            GuardSignalKind::Handoff => "handoff",
+            Self::Claim => "claim",
+            Self::Announce => "announce",
+            Self::Done => "done",
+            Self::StandDown => "stand_down",
+            Self::Handoff => "handoff",
         }
     }
 }
@@ -2443,7 +2442,7 @@ impl GuardSignalKind {
 /// handoff beats a stand-down phrase, and claim/announce come last.
 /// Keyword-based on purpose: the guard must read BOTH harness mails and
 /// human posts without a schema.
-pub(crate) fn classify_guard_signal(subject: &str, body: &str) -> Option<GuardSignalKind> {
+pub fn classify_guard_signal(subject: &str, body: &str) -> Option<GuardSignalKind> {
     let s = subject.to_lowercase();
     let b = body.to_lowercase();
     // Done: "[<bead>] done" close reports — anchored (see subject_done).
@@ -3449,15 +3448,14 @@ async fn poll_mail_digests(args: MailDigestArgs) -> Result<Vec<MailDigest>> {
     for agent in &args.agents {
         let mut cmd = Command::new(&exe);
         cmd.args(["__mail-digest", &args.project, agent]);
-        let out = match run_leaf_cmd(cmd, "__mail-digest").await {
-            Ok(o) => o,
-            Err(_) => {
-                digests.push(MailDigest {
-                    agent: agent.clone(),
-                    ..Default::default()
-                });
-                continue;
-            }
+        let out = if let Ok(o) = run_leaf_cmd(cmd, "__mail-digest").await {
+            o
+        } else {
+            digests.push(MailDigest {
+                agent: agent.clone(),
+                ..Default::default()
+            });
+            continue;
         };
         let raw = String::from_utf8_lossy(&out.stdout);
         let mut d: MailDigest = serde_json::from_str(raw.trim()).unwrap_or_else(|_| MailDigest {
@@ -3883,22 +3881,18 @@ fn redact_secrets_tail(s: &str) -> String {
                             final_out.push_str(&token_buf);
                         }
                         continue;
-                    } else {
-                        final_out.push_str(&buf);
-                        final_out.push(sep);
-                        continue;
                     }
-                } else {
                     final_out.push_str(&buf);
+                    final_out.push(sep);
                     continue;
                 }
-            } else {
                 final_out.push_str(&buf);
                 continue;
             }
-        } else {
-            final_out.push(c);
+            final_out.push_str(&buf);
+            continue;
         }
+        final_out.push(c);
     }
     final_out
 }
@@ -4047,7 +4041,7 @@ fn emit_lease_lapsed(project: &str, path: &str, bead_id: Option<&str>) {
         project,
         IngressEvent::LeaseLapsed {
             path: path.to_string(),
-            bead_id: bead_id.map(|s| s.to_string()),
+            bead_id: bead_id.map(std::string::ToString::to_string),
         },
     );
 }
@@ -4074,7 +4068,7 @@ fn emit_lease_lapsed(project: &str, path: &str, bead_id: Option<&str>) {
 /// `DispatchImmediate` is the event-path twin of `Send` (bd-event-dispatch):
 /// same `__send` leaf, same FIFO pop, marked so the loop can track
 /// dispatch-pending until a `working` event confirms landing.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoopAction {
     Send {
         name: String,
@@ -4238,7 +4232,7 @@ fn urgent_wake_prompt(d: &MailDigest) -> String {
 /// placeholder strings in an id slot are phantom handles: the banner drops
 /// them rather than sending the agent hunting for a message that does not
 /// exist.
-pub(crate) fn citable_wake_id(id: Option<&str>) -> bool {
+pub fn citable_wake_id(id: Option<&str>) -> bool {
     match id {
         Some(id) => {
             let id = id.trim();
@@ -4524,7 +4518,7 @@ pub fn claim_watch_step(
                         }
                     }
                     // engaged but never claimed → nudge after N polls
-                    Some("working") | Some("unknown") => {
+                    Some("working" | "unknown") => {
                         cw.unclaimed_polls += 1;
                         if cw.unclaimed_polls >= nudge_after {
                             cw.unclaimed_polls = 0;
@@ -4596,7 +4590,7 @@ pub fn claim_watch_step(
     actions
 }
 
-pub(crate) fn plan_actions(
+pub fn plan_actions(
     model: &LoopModel,
     states: &[AgentState],
     nudge: Option<&str>,
@@ -5185,7 +5179,7 @@ pub fn is_swarm_assignee(assignee: &str) -> bool {
     if assignee.contains('-') {
         return true;
     }
-    assignee.chars().any(|c| c.is_uppercase())
+    assignee.chars().any(char::is_uppercase)
 }
 pub fn parse_updated_at_secs(s: Option<&str>) -> Option<i64> {
     let raw = s?;
@@ -5684,7 +5678,7 @@ fn match_expected_agent<'a>(
 /// description, or a `workflow:<name>` label. Title text NEVER opts in —
 /// the c57dfd4-era stub logged "invoking graph" for any bead with "graph"
 /// in its title and then did nothing.
-pub(crate) fn workflow_for_bead(bead: &ReadyBead) -> Option<String> {
+pub fn workflow_for_bead(bead: &ReadyBead) -> Option<String> {
     for line in bead.description.lines() {
         if let Some(rest) = line.trim().strip_prefix("## WORKFLOW ") {
             let name = rest.trim();
@@ -5693,16 +5687,17 @@ pub(crate) fn workflow_for_bead(bead: &ReadyBead) -> Option<String> {
             }
         }
     }
-    bead.labels
-        .iter()
-        .find_map(|l| l.strip_prefix("workflow:").map(|s| s.to_string()))
+    bead.labels.iter().find_map(|l| {
+        l.strip_prefix("workflow:")
+            .map(std::string::ToString::to_string)
+    })
 }
 
 /// Outcome of a graph-vehicle spawn attempt. AlreadySpawned is a DISTINCT
 /// ok-arm: the vehicle owns the bead (loop keeps claim-watch), and the
 /// caller must NOT fall through to a normal brief (that would double-
 /// dispatch the bead every poll while the vehicle runs).
-pub(crate) enum VehicleOutcome {
+pub enum VehicleOutcome {
     Spawned,
     AlreadySpawned,
 }
@@ -5714,7 +5709,7 @@ pub(crate) enum VehicleOutcome {
 /// receipt; close still requires loop VERIFY + CommandVerified.
 /// `graph_invoked` dedupes within one loop process; across restarts the
 /// marker file answers AlreadySpawned (loud, typed — never a silent Ok).
-pub(crate) fn spawn_graph_vehicle(
+pub fn spawn_graph_vehicle(
     project: &str,
     bead_id: &str,
     workflow: &str,
@@ -7092,7 +7087,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
          -> Vec<LoopAction> {
             let before = swarm.clone();
             let cmds = tick_loop_owner(swarm, &ws_msg);
-            let acts: Vec<LoopAction> = cmds.iter().filter_map(|c| c.to_loop_action()).collect();
+            let acts: Vec<LoopAction> = cmds
+                .iter()
+                .filter_map(super::workspace::Cmd::to_loop_action)
+                .collect();
             let _ = crate::state::journal_loop_msg(&params.project, &journal, &before, &acts);
             acts
         };
@@ -7198,7 +7196,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     // Only prune terminal phases; keep non-terminal for correctness
                     if matches!(
                         per_bead_phase.get(&k),
-                        Some(LoopPhase::Complete) | Some(LoopPhase::WaveHeld)
+                        Some(LoopPhase::Complete | LoopPhase::WaveHeld)
                     ) {
                         per_bead_phase.remove(&k);
                     } else if per_bead_phase.len() <= 400 {
@@ -7328,7 +7326,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
 
         let mut satisfied_names: Vec<String> = Vec::new();
         let mut escalate_names: Vec<String> = Vec::new();
-        for (agent, exp) in expected_replies.iter_mut() {
+        for (agent, exp) in &mut expected_replies {
             // The file stores the MAIL identity (collab resolved it); the
             // swarm states use herdr names — map one to the other so the
             // settle check, the thread check, and the reminder target agree.
@@ -12343,7 +12341,7 @@ mod tests {
             assert!(
                 DEFAULT_LEAF_FAILURE_ABORT_POLLS >= 3,
                 "abort is not instant"
-            )
+            );
         };
     }
 

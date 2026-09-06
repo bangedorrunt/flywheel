@@ -108,7 +108,7 @@ pub enum BackendError {
 impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BackendError::Unsupported {
+            Self::Unsupported {
                 backend,
                 method,
                 reason,
@@ -116,7 +116,7 @@ impl std::fmt::Display for BackendError {
                 f,
                 "backend '{backend}' does not implement '{method}': {reason}"
             ),
-            BackendError::Other(e) => write!(f, "{e}"),
+            Self::Other(e) => write!(f, "{e}"),
         }
     }
 }

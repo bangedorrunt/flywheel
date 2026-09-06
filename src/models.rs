@@ -266,7 +266,7 @@ impl ModelRegistry {
                 default = default.or(Some(k.as_str()));
             }
         }
-        default.map(|s| s.to_string())
+        default.map(std::string::ToString::to_string)
     }
 
     /// Look up one id: an exact `provider/model` composite, or a bare

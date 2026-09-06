@@ -1,2 +1,6 @@
 [toolchain]
-channel = "stable"
+# Pinned for reproducibility, shared with sibling beads + toron
+# (bd-14ea): nightly-2026-08-20 builds and tests green, including the
+# stricter pedantic+nursery clippy lints it adds over floating nightly.
+channel = "nightly-2026-08-20"
+components = ["rustfmt", "clippy"]

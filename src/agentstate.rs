@@ -34,7 +34,7 @@ pub struct AgentStateFile {
 }
 
 /// Default freshness window for agent state files.
-pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+pub const DEFAULT_MAX_AGE: Duration = Duration::from_mins(15);
 
 /// Why an agent name was rejected for path building.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,9 +47,9 @@ pub enum NameError {
 impl std::fmt::Display for NameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NameError::Empty => write!(f, "agent name is empty"),
-            NameError::Traversal => write!(f, "agent name contains a path traversal component"),
-            NameError::BadChar => write!(f, "agent name contains an unsafe character"),
+            Self::Empty => write!(f, "agent name is empty"),
+            Self::Traversal => write!(f, "agent name contains a path traversal component"),
+            Self::BadChar => write!(f, "agent name contains an unsafe character"),
         }
     }
 }
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn freshness_boundary() {
         let ts = "2026-08-03T03:00:00Z"; // unix 1_785_726_000
-        let max = Duration::from_secs(15 * 60);
+        let max = Duration::from_mins(15);
         // exactly max_age old → fresh
         assert!(is_fresh_at(ts, 1_785_726_000 + 900, max));
         // one second older → stale
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn freshness_default_max_age() {
-        assert_eq!(DEFAULT_MAX_AGE, Duration::from_secs(900));
+        assert_eq!(DEFAULT_MAX_AGE, Duration::from_mins(15));
     }
 
     #[test]
@@ -366,7 +366,7 @@ mod tests {
         assert!(!is_fresh_at(
             "garbage",
             1_785_726_000,
-            Duration::from_secs(900)
+            Duration::from_mins(15)
         ));
     }
 }

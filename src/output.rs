@@ -32,7 +32,7 @@ fn truecolor_enabled() -> bool {
             .ok()
             .map(|v| v.to_ascii_lowercase())
             .as_deref(),
-        Some("truecolor") | Some("24bit")
+        Some("truecolor" | "24bit")
     )
 }
 

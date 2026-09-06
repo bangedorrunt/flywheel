@@ -12,7 +12,7 @@ use toron_workflow::schema::Trigger;
 
 /// Minimal typed herdr event surface the loop consumes today. Pane death is
 /// observable — the reclaim trigger (ADR-0025 Spec 1).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HerdrEvent {
     /// A pane's agent status changed (idle/working/blocked/unknown).
@@ -22,7 +22,7 @@ pub enum HerdrEvent {
 }
 
 /// Minimal typed watch hit (the `toron watch --once` doorbell).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WatchHit {
     pub project: String,
     pub kind: String,
@@ -31,7 +31,7 @@ pub struct WatchHit {
 }
 
 /// Ledger fact event kind (bd-cy0s).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LedgerEvent {
     Claimed,

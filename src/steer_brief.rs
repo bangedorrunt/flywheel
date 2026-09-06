@@ -366,7 +366,7 @@ mod tests {
     fn empty_source_defaults_to_steer_for_back_compat() {
         let c = BriefingContext {
             workflow: "goal".into(),
-            source: "".into(),
+            source: String::new(),
             ..Default::default()
         };
         let mut inp = std::io::Cursor::new("\n");

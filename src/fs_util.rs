@@ -86,7 +86,7 @@ mod tests {
         assert!(!path.exists(), "no destination written on failure");
         let leftovers: Vec<_> = std::fs::read_dir(std::env::temp_dir())
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| e.file_name().to_string_lossy().contains(".x.toml.tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "temp cleaned up on failure");

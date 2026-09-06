@@ -44,7 +44,7 @@ fn flywheel_cargo_toml_lists_toron_workflow() {
 async fn sc_fw_flywheel_invokes_workflow_through_engine() {
     let engine = WorkflowEngine::local(noop_runner()).expect("engine");
     let wf = parse_workflow(
-        r##"
+        r#"
 name: sc-fw-demo
 trigger:
   type: webhook
@@ -55,7 +55,7 @@ steps:
     action: send_dm
     to: "pi"
     body: "planning {{inputs.goal}}"
-"##,
+"#,
     )
     .expect("parse");
 

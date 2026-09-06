@@ -55,11 +55,11 @@ pub enum Blast {
 impl Blast {
     /// ADR-0019 derivation rule: High iff overlapping reserved paths OR the AC
     /// is judgment.
-    pub fn of(overlap: bool, ac: AcShape) -> Blast {
+    pub fn of(overlap: bool, ac: AcShape) -> Self {
         if overlap || ac == AcShape::Judgment {
-            Blast::High
+            Self::High
         } else {
-            Blast::Normal
+            Self::Normal
         }
     }
 }
@@ -100,14 +100,14 @@ pub enum VerdictKind {
 
 impl VerdictKind {
     /// Every kind; the exhaustive-match surface for `legal_close`.
-    pub const ALL: [VerdictKind; 7] = [
-        VerdictKind::CommandVerified,
-        VerdictKind::UnitTestVerified,
-        VerdictKind::LiveVerified,
-        VerdictKind::ReviewerSigned,
-        VerdictKind::WorkerReceipt,
-        VerdictKind::VerifierBlocked,
-        VerdictKind::VerifierFailed,
+    pub const ALL: [Self; 7] = [
+        Self::CommandVerified,
+        Self::UnitTestVerified,
+        Self::LiveVerified,
+        Self::ReviewerSigned,
+        Self::WorkerReceipt,
+        Self::VerifierBlocked,
+        Self::VerifierFailed,
     ];
 
     /// br gate name (kebab-cased `VerdictKind`, ADR-0019 Spec 1). Only PASS
@@ -115,27 +115,27 @@ impl VerdictKind {
     /// exist so the mapping is total.
     pub fn gate_name(self) -> &'static str {
         match self {
-            VerdictKind::CommandVerified => "command-verified",
-            VerdictKind::UnitTestVerified => "unit-test-verified",
-            VerdictKind::LiveVerified => "live-verified",
-            VerdictKind::ReviewerSigned => "reviewer-signed",
-            VerdictKind::WorkerReceipt => "worker-receipt",
-            VerdictKind::VerifierBlocked => "verifier-blocked",
-            VerdictKind::VerifierFailed => "verifier-failed",
+            Self::CommandVerified => "command-verified",
+            Self::UnitTestVerified => "unit-test-verified",
+            Self::LiveVerified => "live-verified",
+            Self::ReviewerSigned => "reviewer-signed",
+            Self::WorkerReceipt => "worker-receipt",
+            Self::VerifierBlocked => "verifier-blocked",
+            Self::VerifierFailed => "verifier-failed",
         }
     }
 
     /// Inverse of `gate_name` — parse a br gate row's gate name back into a
     /// kind. Unknown names -> `None` (not a verdict row).
-    pub fn from_gate_name(name: &str) -> Option<VerdictKind> {
+    pub fn from_gate_name(name: &str) -> Option<Self> {
         Some(match name {
-            "command-verified" => VerdictKind::CommandVerified,
-            "unit-test-verified" => VerdictKind::UnitTestVerified,
-            "live-verified" => VerdictKind::LiveVerified,
-            "reviewer-signed" => VerdictKind::ReviewerSigned,
-            "worker-receipt" => VerdictKind::WorkerReceipt,
-            "verifier-blocked" => VerdictKind::VerifierBlocked,
-            "verifier-failed" => VerdictKind::VerifierFailed,
+            "command-verified" => Self::CommandVerified,
+            "unit-test-verified" => Self::UnitTestVerified,
+            "live-verified" => Self::LiveVerified,
+            "reviewer-signed" => Self::ReviewerSigned,
+            "worker-receipt" => Self::WorkerReceipt,
+            "verifier-blocked" => Self::VerifierBlocked,
+            "verifier-failed" => Self::VerifierFailed,
             _ => return None,
         })
     }
@@ -165,7 +165,7 @@ pub fn parse_timebox(description: &str) -> Option<u64> {
             continue;
         };
         let rest = rest.trim_start_matches(':').trim();
-        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let num: String = rest.chars().take_while(char::is_ascii_digit).collect();
         if let Ok(mins) = num.parse::<u64>()
             && mins > 0
         {
