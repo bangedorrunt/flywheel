@@ -6740,6 +6740,26 @@ mod spawn_boot_reliability_tests {
                 && !src.contains(&silent),
             "poll/sweep must loud-warn on observed-wake save failure (no silent let _ =)"
         );
+        // Poll wake: transition gate — not static already-idle on every poll.
+        let refresh = crate::tripwire::find_fn(src, "doorbell_refresh_status");
+        let refresh_end = crate::tripwire::find_fn(src, "doorbell_refresh_pins");
+        let refresh_body = &src[refresh..refresh_end];
+        assert!(
+            refresh_body.contains("transitioned_status_pins")
+                && refresh_body.contains("from_l")
+                && !refresh_body.contains("observed_status_pins")
+                && refresh_body.contains("doorbell_note_observed_wake"),
+            "doorbell_refresh_status must gate wake on status transition (not static idle rows)"
+        );
+        let note = crate::tripwire::find_fn(src, "doorbell_note_observed_wake");
+        let note_end = crate::tripwire::find_fn(src, "upsert_workspace_receipt");
+        let note_body = &src[note..note_end];
+        // Split so this tripwire's own message cannot match the needle.
+        let ratchet = format!("{}{}", "prev.", "saturating_add(1)");
+        assert!(
+            note_body.contains("now <= prev") && !note_body.contains(&ratchet),
+            "doorbell_note_observed_wake must not prev.saturating_add ratchet without new observation"
+        );
         // P0-2: raw AUTHORITATIVE framing
         assert!(
             src.contains("AUTHORITATIVE OPERATOR OBJECTIVE")
@@ -9421,17 +9441,21 @@ fn doorbell_persist_wake_with_plane_s(
 
 /// GS-039 P0-1: stamp last_wake from a REAL observation without clobbering
 /// plane-P/S high-waters (refresh/sweep callers lack the live since map).
-/// Always advances past a prior stamp (same-second observations still move
-/// `last_wake` forward so send --wait fail-closed can see the receipt).
+/// Advance only when the observation is new/meaningful: wall clock moved
+/// strictly past the prior stamp. Same-second re-notes must not bump the
+/// prior stamp by one — that let background polls ratchet `last_wake` without
+/// a fresh observation (invent-adjacent).
 fn doorbell_note_observed_wake(workspace: &str, pin: &str) -> Result<()> {
     let path = doorbell::wake_state_file(&config::state_dir(), workspace);
     let mut st = doorbell::load_wake_state(&path);
     let now = doorbell_now_unix();
-    let at = match st.last_wake_unix {
-        Some(prev) if now <= prev => prev.saturating_add(1),
-        _ => now,
-    };
-    doorbell::note_wake(&mut st, pin, at);
+    if let Some(prev) = st.last_wake_unix {
+        if now <= prev {
+            // Same-second or clock-behind re-note: keep prior (no false advance).
+            return Ok(());
+        }
+    }
+    doorbell::note_wake(&mut st, pin, now);
     doorbell::save_wake_state(&path, &st).with_context(|| {
         format!(
             "doorbell observed-wake save failed at {} — refuse silent drop (GS-039 P0-1)",
@@ -10089,9 +10113,11 @@ fn doorbell_refresh_status(
         return;
     };
     let mut injects = Vec::new();
-    // GS-039 P0-1: poll mirrors Status-arm — herdr working|idle|done|blocked
-    // is a REAL observation (not planned injects).
-    let mut observed_status_pins: Vec<String> = Vec::new();
+    // GS-039 P0-1: poll stamps wake only on (a) delivered prompts or
+    // (b) observed status TRANSITION into working|idle|done|blocked —
+    // never from static already-idle rows on every background poll
+    // (that ratcheted last_wake continuously — invent-adjacent).
+    let mut transitioned_status_pins: Vec<String> = Vec::new();
     for a in agents {
         let pin = registry
             .iter()
@@ -10102,12 +10128,24 @@ fn doorbell_refresh_status(
         };
         let to = a.agent_status.as_str().to_string();
         let status_l = to.to_ascii_lowercase();
-        if status_l == "working"
+        let from_l = workspace_model
+            .doorbell
+            .statuses
+            .get(&pin)
+            .map(|s| s.to_ascii_lowercase());
+        let wake_worthy = status_l == "working"
             || status_l == "idle"
             || status_l == "done"
-            || status_l == "blocked"
-        {
-            observed_status_pins.push(pin.clone());
+            || status_l == "blocked";
+        // Transition gate: first sighting OR from != to into wake-worthy.
+        if wake_worthy {
+            let transitioned = match from_l.as_deref() {
+                Some(f) => f != status_l.as_str(),
+                None => true,
+            };
+            if transitioned {
+                transitioned_status_pins.push(pin.clone());
+            }
         }
         // bd-a2vx: drain decision via tick. No side map; tick sees `from` on Model.
         workspace_model.doorbell.index = index.clone();
@@ -10139,12 +10177,13 @@ fn doorbell_refresh_status(
         workspace,
         generation,
     );
-    // GS-039 P0-1: poll-path wake stamp from observed herdr status OR
-    // successful prompt delivery. Refuse silent drop — loud warn.
+    // GS-039 P0-1: poll-path wake stamp from delivered prompt OR status
+    // transition into wake-worthy — not static already-idle rows.
+    // Refuse silent drop — loud warn.
     let woke = delivered
         .first()
         .map(String::as_str)
-        .or_else(|| observed_status_pins.first().map(String::as_str));
+        .or_else(|| transitioned_status_pins.first().map(String::as_str));
     if let Some(pin) = woke {
         if let Err(e) = doorbell_note_observed_wake(workspace, pin) {
             eprintln!(
