@@ -1885,6 +1885,10 @@ enum MailCmd {
         /// thread id (use bead id for collab threads)
         #[arg(long = "thread-id")]
         thread_id: Option<String>,
+        /// GS-039 P0-1: wake tag on the gift-wrap (`standing`|`tasked`).
+        /// Default `tasked` so mail deliveries are not wake:null theater.
+        #[arg(long = "wake", default_value = "tasked")]
+        wake: String,
     },
     /// reserve / inspect file locks (advisory; subcommands: reserve, list, show)
     Locks {
@@ -2964,12 +2968,17 @@ enum WorkflowCmd {
         /// registry pin as `spawn --profile`.
         #[arg(long = "role-model", value_name = "ROLE=PROVIDER/MODEL")]
         role_model: Vec<String>,
-        /// GS-037 P1: pane-mode stale-workspace protection — DEFAULT ON
-        /// (restore prior always-retire; do not silently stop retiring).
-        /// Pass `--no-retire-orphans` to keep stale workspaces (dangerous).
-        #[arg(long = "retire-orphans", default_value_t = true, action = clap::ArgAction::SetTrue)]
+        /// GS-039 P0-3: NEVER silent-reap desks. Default OFF — pass
+        /// `--retire-orphans` explicitly to close pre-existing workspaces.
+        /// (`--no-retire-orphans` kept as an explicit alias of the default.)
+        #[arg(long = "retire-orphans", default_value_t = false, action = clap::ArgAction::SetTrue)]
         #[arg(long = "no-retire-orphans", action = clap::ArgAction::SetFalse)]
         retire_orphans: bool,
+        /// GS-039 P0-3: refuse multi-crew expansion unless explicitly allowed
+        /// (repair/loop must not silently balloon; wave-swarm needs this or a
+        /// TTY crew-count ask).
+        #[arg(long = "allow-crew-expand", default_value_t = false)]
+        allow_crew_expand: bool,
         /// pane mode: bind an existing workspace id instead of spawning fresh
         #[arg(long)]
         reuse: Option<String>,
@@ -6655,16 +6664,78 @@ mod spawn_boot_reliability_tests {
             spawn_body.contains("presence_project") && spawn_body.contains("GS-037 P0-D"),
             "presence publish must use absolute project key (register-before-presence)"
         );
-        // Compose: default_value_t = true for retire_orphans (safe default).
+        // GS-039 P0-3: retire_orphans defaults FALSE (never silent-reap).
         assert!(
             src.contains("no-retire-orphans")
-                && src.contains("default_value_t = true")
+                && src.contains("GS-039 P0-3")
+                && src.contains("allow-crew-expand")
                 && src.contains("retire_orphans: bool"),
-            "compose --retire-orphans must default true (prior always-retire)"
+            "compose must default retire_orphans false + expose --allow-crew-expand (GS-039 P0-3)"
         );
     }
 
     #[test]
+
+    /// GS-039: CoS-honest folds — real wake observation, open-mode authority,
+    /// solo compose sizing, name-bind fail-closed, no invent-green.
+    #[test]
+    fn gs039_cos_honest_folds_present() {
+        let src = include_str!("main.rs");
+        // P0-1: real observation path (Status working/idle stamps wake;
+        // prompt_and_hear returns delivered pins; note_observed_wake exists).
+        assert!(
+            src.contains("GS-039 P0-1 REAL observation")
+                && src.contains("doorbell_note_observed_wake")
+                && src.contains("fn doorbell_prompt_and_hear"),
+            "GS-039 P0-1 wake observation path must be present"
+        );
+        let pah = crate::tripwire::find_fn(src, "doorbell_prompt_and_hear");
+        let pah_body = &src[pah..pah + 600];
+        assert!(
+            pah_body.contains("-> Vec<String>"),
+            "doorbell_prompt_and_hear must return delivered pins for wake stamp"
+        );
+        // cmd_send still must NOT self-mint last_wake
+        let send = crate::tripwire::find_fn(src, "cmd_send");
+        let send_end = crate::tripwire::find_fn(src, "stall_step");
+        let send_body = &src[send..send_end];
+        assert!(
+            !send_body.contains("doorbell_persist_wake(")
+                && !send_body.contains("doorbell_note_observed_wake("),
+            "cmd_send must not invent-green last_wake (observe via doorbell only)"
+        );
+        // P0-2: raw AUTHORITATIVE framing
+        assert!(
+            src.contains("AUTHORITATIVE OPERATOR OBJECTIVE")
+                && src.contains("GS-039 P0-2"),
+            "open-mode/--raw must frame AUTHORITATIVE operator objective"
+        );
+        // P0-3: retire default false + allow-crew-expand gate
+        assert!(
+            src.contains("allow-crew-expand")
+                && src.contains("GS-039 P0-3")
+                && src.contains("compose would spawn multi-crew"),
+            "compose must gate multi-crew behind --allow-crew-expand"
+        );
+        // P0-4: name-bind fail-closed
+        assert!(
+            src.contains("GS-039 P0-4")
+                && src.contains("panes still unbound"),
+            "spawn must fail if panes unbound after settle"
+        );
+        // P2: no p1 ghost on ready banner
+        assert!(
+            src.contains("dim(\"--to all --stage ce-execute\")")
+                && !src.contains("dim(\"--to all --stage p1\")"),
+            "swarm ready must advertise ce-execute, not retired p1"
+        );
+        // Mail wake default
+        assert!(
+            src.contains("send_with_wake") && src.contains("default_value = \"tasked\""),
+            "mail send must default --wake tasked"
+        );
+    }
+
     fn spawn_starts_doorbell_dispatcher() {
         let src = include_str!("main.rs");
         let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
@@ -7716,6 +7787,49 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
         }
     }
 
+    // GS-039 P0-4: atomic name-binding — after settle, rename every registry
+    // pane to its registered name; fail spawn if any pane remains unbound
+    // (name:null). Never declare ready with addressable-by-name holes.
+    if !opts.no_verify && !registry.is_empty() {
+        let agents_now = c.agent_list()?;
+        for e in &registry {
+            if e.pane_id.is_empty() {
+                continue;
+            }
+            let unbound = agents_now.iter().any(|a| {
+                a.pane_id == e.pane_id
+                    && (a.name.as_deref().is_none_or(|n| n.is_empty())
+                        || a.name.as_deref() != Some(e.name.as_str()))
+            });
+            if unbound {
+                if let Err(err) = c.agent_rename(&e.pane_id, &e.name) {
+                    eprintln!(
+                        "flywheel: GS-039 P0-4 name-bind rename {} → {} failed: {err:#}",
+                        e.pane_id, e.name
+                    );
+                }
+            }
+        }
+        let agents_after = c.agent_list()?;
+        let still_unbound: Vec<String> = registry
+            .iter()
+            .filter(|e| !e.pane_id.is_empty())
+            .filter(|e| {
+                agents_after.iter().any(|a| {
+                    a.pane_id == e.pane_id
+                        && a.name.as_deref().is_none_or(|n| n.is_empty())
+                })
+            })
+            .map(|e| format!("{} ({})", e.name, e.pane_id))
+            .collect();
+        if !still_unbound.is_empty() {
+            bail!(
+                "spawn name-binding failed after settle (GS-039 P0-4): panes still unbound: {}. Refusing swarm ready — rebind manually (flywheel rebind {project}) or re-spawn.",
+                still_unbound.join(", ")
+            );
+        }
+    }
+
     // bd-4pxy: spawn readiness — "swarm ready" must never print while an
     // agent is still launch_pending (herdr: the launcher command has not
     // finished; a harness that cannot start stays pending). Wait briefly,
@@ -7778,25 +7892,44 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
         .unwrap_or_else(|| project.to_string());
     for e in &registry {
         if let Some(pin) = &e.mail_identity {
-            let status = Command::new("toron")
-                .args([
-                    "presence",
-                    "publish",
-                    "--as",
-                    pin,
-                    "--state",
-                    "working",
-                    "--project",
-                    &presence_project,
-                ])
-                .output();
-            match status {
-                Ok(o) if o.status.success() => {}
-                Ok(o) => eprintln!(
-                    "flywheel: presence publish failed for {pin}: {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                ),
-                Err(e) => eprintln!("flywheel: presence publish failed for {pin}: {e}"),
+            // GS-039 P1: presence race — register-before-presence already
+            // uses absolute project key; retry once on "unknown agent" after
+            // a short settle (GS-034/035/036/038 race class).
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let status = Command::new("toron")
+                    .args([
+                        "presence",
+                        "publish",
+                        "--as",
+                        pin,
+                        "--state",
+                        "working",
+                        "--project",
+                        &presence_project,
+                    ])
+                    .output();
+                match status {
+                    Ok(o) if o.status.success() => break,
+                    Ok(o) => {
+                        let err = String::from_utf8_lossy(&o.stderr);
+                        let unknown = err.to_ascii_lowercase().contains("unknown agent");
+                        if unknown && attempt < 3 {
+                            std::thread::sleep(Duration::from_millis(200 * attempt as u64));
+                            continue;
+                        }
+                        eprintln!(
+                            "flywheel: presence publish failed for {pin}: {}",
+                            err.trim()
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("flywheel: presence publish failed for {pin}: {e}");
+                        break;
+                    }
+                }
             }
         }
     }
@@ -7849,7 +7982,7 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
         "swarm ready: flywheel {} {} {}",
         kind_paint("send"),
         dim(project),
-        dim("--to all --stage p1")
+        dim("--to all --stage ce-execute")
     );
     Ok(())
 }
@@ -8873,7 +9006,7 @@ fn cmd_internal_doorbell(
                     }
                     doorbell_persist_hear(workspace, &hear);
                 }
-                doorbell_prompt_and_hear(
+                let delivered_pins = doorbell_prompt_and_hear(
                     herdr.as_mut(),
                     &registry,
                     &injects,
@@ -8883,11 +9016,14 @@ fn cmd_internal_doorbell(
                     workspace,
                     generation.as_ref(),
                 );
-                doorbell_persist_wake(
-                    workspace,
-                    &since_by_pin,
-                    injects.first().map(|(pin, _)| pin.as_str()),
-                )?;
+                // GS-039 P0-1: stamp last_wake from successful prompt delivery
+                // (real observation), else from planned inject, else from
+                // watch pubkey→pin resolve when the event was heard.
+                let woke = delivered_pins
+                    .first()
+                    .map(String::as_str)
+                    .or_else(|| injects.first().map(|(p, _)| p.as_str()));
+                doorbell_persist_wake(workspace, &since_by_pin, woke)?;
             }
             Ok(Bell::Status { pane_id, to }) => {
                 let Some(pin) = pane_to_pin.get(&pane_id).cloned() else {
@@ -8917,7 +9053,7 @@ fn cmd_internal_doorbell(
                     Some(&pins),
                 );
                 let registry = state::load_spawn_registry(project);
-                doorbell_prompt_and_hear(
+                let _delivered = doorbell_prompt_and_hear(
                     herdr.as_mut(),
                     &registry,
                     &injects,
@@ -8927,11 +9063,21 @@ fn cmd_internal_doorbell(
                     workspace,
                     generation.as_ref(),
                 );
-                doorbell_persist_wake(
-                    workspace,
-                    &since_by_pin,
-                    injects.first().map(|(pin, _)| pin.as_str()),
-                )?;
+                // GS-039 P0-1 REAL observation: herdr status transitions that
+                // show the agent woke (working) or settled after work
+                // (idle/done) advance last_wake — independent of Prompt
+                // injects. Never invent-green from cmd_send; observe here.
+                let status_l = to.to_ascii_lowercase();
+                let observed = status_l == "working"
+                    || status_l == "idle"
+                    || status_l == "done"
+                    || status_l == "blocked";
+                let woke = if observed {
+                    Some(pin.as_str())
+                } else {
+                    injects.first().map(|(p, _)| p.as_str())
+                };
+                doorbell_persist_wake(workspace, &since_by_pin, woke)?;
             }
             Ok(Bell::Died) => {
                 // Gap 3 fix: watch self-restart with backoff instead of deaf break.
@@ -9217,6 +9363,21 @@ fn doorbell_persist_wake_with_plane_s(
     doorbell::save_wake_state(&path, &st).with_context(|| {
         format!(
             "doorbell wake state save failed at {} — refuse silent drop (GS-037 P0-C)",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// GS-039 P0-1: stamp last_wake from a REAL observation without clobbering
+/// plane-P/S high-waters (refresh/sweep callers lack the live since map).
+fn doorbell_note_observed_wake(workspace: &str, pin: &str) -> Result<()> {
+    let path = doorbell::wake_state_file(&config::state_dir(), workspace);
+    let mut st = doorbell::load_wake_state(&path);
+    doorbell::note_wake(&mut st, pin, doorbell_now_unix());
+    doorbell::save_wake_state(&path, &st).with_context(|| {
+        format!(
+            "doorbell observed-wake save failed at {} — refuse silent drop (GS-039 P0-1)",
             path.display()
         )
     })?;
@@ -9830,12 +9991,15 @@ fn doorbell_prompt_and_hear(
     project: &str,
     workspace: &str,
     generation: Option<&doorbell::WatcherGen>,
-) {
+) -> Vec<String> {
     let now = doorbell_now_unix();
-    for pin in doorbell_prompt(herdr, registry, injects, generation, project, workspace) {
-        hear.note_inject(&pin, index.npub(&pin), now);
+    let ok = doorbell_prompt(herdr, registry, injects, generation, project, workspace);
+    for pin in &ok {
+        hear.note_inject(pin, index.npub(pin), now);
     }
     doorbell_persist_hear(workspace, hear);
+    // GS-039 P0-1: callers stamp last_wake from successfully delivered pins.
+    ok
 }
 
 /// Seed / poll pane status. Drain queues on working → idle|done.
@@ -9897,7 +10061,7 @@ fn doorbell_refresh_status(
         );
         injects.extend(raw);
     }
-    doorbell_prompt_and_hear(
+    let delivered = doorbell_prompt_and_hear(
         Some(client),
         &registry,
         &injects,
@@ -9907,6 +10071,10 @@ fn doorbell_refresh_status(
         workspace,
         generation,
     );
+    // GS-039 P0-1: poll-path wake stamp from successful prompt delivery.
+    if let Some(pin) = delivered.first() {
+        let _ = doorbell_note_observed_wake(workspace, pin);
+    }
 }
 
 fn doorbell_refresh_pins(project: &str, pane_to_pin: &mut BTreeMap<String, String>) {
@@ -10146,9 +10314,13 @@ fn doorbell_sweep_inbox(
             "injected": injects.iter().map(|(p,_)| p).collect::<Vec<_>>(),
         }),
     );
-    doorbell_prompt_and_hear(
+    let delivered = doorbell_prompt_and_hear(
         herdr, &registry, &injects, hear, index, project, workspace, generation,
     );
+    // GS-039 P0-1: inbox sweep wake stamp from successful delivery.
+    if let Some(pin) = delivered.first() {
+        let _ = doorbell_note_observed_wake(workspace, pin);
+    }
 }
 
 fn project_base(project: &str) -> String {
@@ -12916,7 +13088,14 @@ fn condition_send_target(
         return (text.to_string(), None, false);
     };
     if raw {
-        return (text.to_string(), None, false);
+        // GS-039 P0-2: operator/raw current-pane text is AUTHORITATIVE —
+        // prefix so peer-aware agents cannot classify it as chatter.
+        let framed = format!(
+            "AUTHORITATIVE OPERATOR OBJECTIVE (open-mode / --raw; GS-039 P0-2 — NOT chatter; execute now; outranks stale captain diagnose TASK-IDs):
+
+{text}"
+        );
+        return (framed, None, false);
     }
     let Some(profile_obj) = catalog.get(profile_name) else {
         eprintln!(
@@ -13287,7 +13466,7 @@ fn cmd_send(
         let before_unix = wake_before_unix;
         if after.last_wake_unix.is_none() {
             bail!(
-                "send --wait reported landed:true but doorbell last_wake did not advance (still never) — independent wake receipt missing (GS-037 P0-C). Wake stamp must come from doorbell/agent wake observation, not cmd_send. Inspect `flywheel doorbell status` / wake state under the workspace label."
+                "send --wait reported landed:true but doorbell last_wake did not advance (still never) — independent wake receipt missing (GS-037 P0-C / GS-039 P0-1). Wake stamp must come from doorbell/agent wake observation (Status working/idle or delivered prompt), not cmd_send. Robot-mode: never-wake after meaningful dispatch is a HARD FAIL — inspect `flywheel doorbell status` / wake state under the workspace label."
             );
         }
         match (before_unix, after.last_wake_unix) {
@@ -15838,6 +16017,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             ack,
             as_agent,
             thread_id,
+            wake,
         } => {
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
@@ -15892,7 +16072,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                     anyhow::bail!(e);
                 }
             }
-            let v = mail.send(
+            let v = mail.send_with_wake(
                 &key,
                 &targets,
                 subject,
@@ -15900,6 +16080,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 importance,
                 *ack,
                 thread_id.as_deref(),
+                Some(wake.as_str()),
             )?;
             print_json(&v);
         }
@@ -25198,6 +25379,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             idempotency_key,
             role_model,
             retire_orphans,
+            allow_crew_expand,
             reuse,
             json,
         } => {
@@ -25385,6 +25567,34 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // is invoked directly (the engine takes ANY Workflow).
             let mut catalog = profile::ProfileCatalog::load()?;
             catalog.apply_role_models(role_model)?;
+            // GS-039 P0-3 + UX: multi-crew compose must not silently N.
+            // Ask on TTY (recommended default = inferred plan); otherwise
+            // require --allow-crew-expand when total crew > 1.
+            let crew_total: u32 = crew_plan.members.values().copied().sum();
+            if crew_total > 1 {
+                let tty = std::io::stdin().is_terminal() && !*json;
+                if tty && !*allow_crew_expand {
+                    eprintln!(
+                        "flywheel: compose would spawn multi-crew ({crew_total} agents: {:?}) — recommended default is the inferred plan. Pass --allow-crew-expand to confirm, or reduce the recipe.",
+                        crew_plan.members
+                    );
+                    eprint!("  proceed with this crew? [y/N] (profiles use default model opencode-go/muse-spark-1.3-contributor unless --role-model overrides): ");
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    let ans = line.trim().to_ascii_lowercase();
+                    if ans != "y" && ans != "yes" {
+                        bail!(
+                            "compose multi-crew refused (GS-039 P0-3 / UX) — re-run with --allow-crew-expand after confirming crew count, or use a solo-shaped recipe"
+                        );
+                    }
+                } else if !*allow_crew_expand {
+                    bail!(
+                        "compose would spawn multi-crew ({crew_total} agents: {:?}) without --allow-crew-expand (GS-039 P0-3). Loop/open solo paths must not silently balloon; pass --allow-crew-expand to confirm, or set an explicit crew of 1.",
+                        crew_plan.members
+                    );
+                }
+            }
             let ctx = pane::pre_spawn_crew(
                 cfg,
                 project_name,

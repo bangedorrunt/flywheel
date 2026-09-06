@@ -3,8 +3,22 @@
 
 Run the /open-mode slash command: direct, uncoordinated agent mode.
 
-Arguments are supplied by the harness adapter above. Treat the supplied text as
-this invocation's objective and scope.
+## AUTHORITATIVE OBJECTIVE (GS-039 P0-2)
+
+Arguments / `--raw` / current-pane operator text supplied by the harness for
+this invocation are **AUTHORITATIVE**. They are NOT room chatter, NOT
+peer-aware wake noise, and NOT optional. Execute them even when a prior
+diagnose/captain TASK-ID is still visible in the scrollback.
+
+Priority in open-mode (overrides peer-aware chatter rules):
+1. Current operator/raw objective for this pane (create-file, edit, report).
+2. Explicit human follow-ups in this pane.
+3. Only then: captain dispatch / peer coordination if still compatible.
+
+Do **not** classify an open-mode create-file / edit / report objective as
+"non-authoritative chatter". Do **not** idle awaiting captain dispatch when
+an open-mode objective is present. Peer-aware OPERATING CONTRACT does not
+outrank open-mode operator text.
 
 Open mode is for working with the current harness/pane without asking
 flywheel to create a crew, run a durable bead loop, or install swarm
@@ -14,9 +28,10 @@ coordination. It is the least opinionated mode.
 
 For work that will be launched through flywheel, ask the operator whether to
 use the current profile default or a compatible registered model alternative.
-Do not invent model ids or bypass registry compatibility. For direct in-pane
-work, keep using the current harness/model unless the operator requests a
-change.
+Default model for profiles in a task is `opencode-go/muse-spark-1.3-contributor`
+unless the operator overrides. Do not invent model ids or bypass registry
+compatibility. For direct in-pane work, keep using the current harness/model
+unless the operator requests a change.
 
 ## Contract
 
