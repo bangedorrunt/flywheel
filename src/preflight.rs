@@ -622,7 +622,20 @@ fn provider_funded_checks(_cfg: &Config, project: Option<&str>) -> Vec<Check> {
         // funded-key checks actually run instead of SKIP theater.
         let mut prov = profile.provider.trim().to_string();
         if prov.is_empty() {
-            if let Some((p, _)) = profile.model.split_once('/') {
+            // Resolve @slot aliases (coder → @standard → opencode-go/muse-…)
+            // then take the provider/ half of the composite model id.
+            let model_id = if profile.model.starts_with('@') {
+                crate::models::ModelRegistry::load_routing()
+                    .ok()
+                    .and_then(|reg| {
+                        reg.slot(&profile.model)
+                            .map(|s| s.model.clone())
+                    })
+                    .unwrap_or_else(|| profile.model.clone())
+            } else {
+                profile.model.clone()
+            };
+            if let Some((p, _)) = model_id.split_once('/') {
                 prov = p.trim().to_string();
             }
         }
