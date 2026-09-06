@@ -6670,8 +6670,10 @@ mod spawn_boot_reliability_tests {
             src.contains("retire-orphans")
                 && src.contains("GS-039 P0-3")
                 && src.contains("allow-crew-expand")
-                && src.contains("retire_orphans: bool"),
-            "compose must default retire_orphans false + expose --allow-crew-expand / --retire-orphans (GS-039/040)"
+                && src.contains("retire_orphans: bool")
+                && src.contains("#[arg(long = \"retire-orphans\"")
+                && !src.contains("long = \"no-retire-orphans\""),
+            "compose must default retire_orphans false + single --retire-orphans (no dual-#[arg]) (GS-039/040)"
         );
     }
 
@@ -6686,8 +6688,44 @@ mod spawn_boot_reliability_tests {
             "compose wf_name must include project tag (avoid truncated-ISO collisions)"
         );
         assert!(
-            src.contains("chrono::Utc::now().format(") && src.contains("%H%M%S"),
-            "compose wf_name must use HHMMSS not truncated composed-ISO"
+            src.contains("chrono::Utc::now().format(") && src.contains("%m%d%H%M%S"),
+            "compose wf_name must use date-bearing %m%d%H%M%S (unique across days in 16-char slug)"
+        );
+    }
+
+    #[test]
+    fn gs040_retire_orphans_single_arg_no_dual() {
+        // TEST-INVENT-GREEN: dual #[arg] dropped --retire-orphans (only
+        // --no-retire-orphans survived). Keep single positive flag; default
+        // false. Do NOT restore dual-#[arg] / hidden SetFalse alias here
+        // (compat ask is Firstmate-owned).
+        let src = include_str!("main.rs");
+        let compose_marker = "Runtime workflow composition (bd-8xca)";
+        let start = src.find(compose_marker).expect("Compose docs");
+        // Compose variant body until next top-level doc or enum end — scan
+        // a generous window for the clap field.
+        let window = &src[start..start + 12000];
+        let needle = "#[arg(long = \"retire-orphans\"";
+        let hits: Vec<_> = window.match_indices(needle).collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "Compose must have exactly one #[arg(long = \"retire-orphans\" ...)]"
+        );
+        // Field that follows must be retire_orphans: bool without a second
+        // #[arg] (dual SetTrue/SetFalse) on the same field.
+        let after = &window[hits[0].0..hits[0].0 + 280];
+        assert!(
+            after.contains("retire_orphans: bool"),
+            "retire-orphans arg must bind retire_orphans: bool"
+        );
+        assert!(
+            !after.contains("no-retire-orphans"),
+            "must not dual-#[arg] no-retire-orphans on same field (clap drop bug)"
+        );
+        assert!(
+            after.contains("default_value_t = false"),
+            "retire_orphans must default false"
         );
     }
 
@@ -25635,9 +25673,10 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let all = all_workflows_layered(Some(&project_root))?;
             // GS-040: crew_agent_name keeps only 16 chars of the wf slug.
             // `composed-{ISO}` truncated to `composed-2026090` collided across
-            // concurrent projects in the same hour. Encode project tag +
-            // HHMMSS + pid nibble so names stay unique within herdr's 32-char
-            // agent-name budget (`crew-{slug}-{role}`).
+            // concurrent projects / days. Encode project tag (4) + date-bearing
+            // compact stamp %m%d%H%M%S (10) + pid nibble (2 hex) = 16 chars so
+            // uniqueness holds across days within the 16-char crew slug budget
+            // (`crew-{slug}-{role}` still fits herdr's 32-char agent-name).
             let proj_tag: String = std::path::Path::new(project_name)
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -25647,9 +25686,9 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 .take(4)
                 .collect();
             let wf_name = format!(
-                "{}{}{:x}",
+                "{}{}{:02x}",
                 proj_tag,
-                chrono::Utc::now().format("%H%M%S"),
+                chrono::Utc::now().format("%m%d%H%M%S"),
                 std::process::id() % 256
             );
             let composed = if let Some(src) = from_yaml {

@@ -555,33 +555,36 @@ fn check_mail(cfg: &Config) -> Check {
         Err(e) => Check::fail("toron-mail", format!("{e}")),
     }
 }
+/// True iff `name` is set to a non-empty trimmed value (never logs the value).
+fn env_nonempty_trimmed(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
 pub fn check_provider_funded(provider: &str, profile: &str) -> Check {
     // GS-037 P0-4: louder provider preflight for opencode-go — name the env
-    // vars (never values). Fail-closed only when FLYWHEEL_FUNDED_BALANCE_* set
-    // and empty/zero; otherwise warn via skip message when neither API key
-    // name is present for opencode-go.
+    // vars (never values). Fail-closed when neither key has a non-empty
+    // trimmed value; empty/whitespace exports must NOT invent commercial PASS.
     if provider.eq_ignore_ascii_case("opencode-go") || provider.eq_ignore_ascii_case("opencode") {
-        let api = std::env::var_os("OPENCODE_API_KEY").is_some();
-        let go = std::env::var_os("OPENCODE_GO_API_KEY").is_some();
+        // GS-040 PF-EMPTY-KEY-PASS: var_os().is_some() is insufficient —
+        // `export OPENCODE_API_KEY=` must not Pass.
+        let api = env_nonempty_trimmed("OPENCODE_API_KEY");
+        let go = env_nonempty_trimmed("OPENCODE_GO_API_KEY");
         if !api && !go {
-            // GS-039 P2: refuse fail-open commercially — missing keys are a
-            // hard fail (not SKIP theater). Export OPENCODE_GO_API_KEY or
-            // OPENCODE_API_KEY before funded spawn.
+            // GS-039 P2: refuse fail-open commercially — missing/empty keys
+            // are a hard fail (not SKIP theater). Export OPENCODE_GO_API_KEY
+            // (primary) or OPENCODE_API_KEY before funded spawn.
             return Check::fail(
                 "provider-funded",
                 "opencode-go/opencode: neither OPENCODE_API_KEY nor OPENCODE_GO_API_KEY is set — refuse fail-open (GS-039 P2). Export one (flywheel aliases GO→API into pane env).",
             );
         }
-        if go && !api {
-            // Informative skip — alias will wire pane env at spawn.
-            return Check::skip(
-                "provider-funded",
-                "OPENCODE_GO_API_KEY set; OPENCODE_API_KEY unset — flywheel aliases GO→API into pane env at spawn (GS-037 P0-4)",
-            );
-        }
-        // GS-040: API key present (alone or with GO) → PASS commercially.
-        // Do not fall through to "no funded endpoint" SKIP theater when the
-        // operator already exported funded credentials.
+        // GS-040 PF-GO-ONLY-SKIP: documented primary path is OPENCODE_GO_API_KEY
+        // alone (alias GO→API into pane env at spawn). GO-only with a non-empty
+        // trimmed key is commercial PASS — not Skip theater. API-only / both
+        // also PASS.
         return Check::pass("provider-funded");
     }
     let env_key = format!("FLYWHEEL_FUNDED_BALANCE_{}", provider.to_ascii_uppercase());
@@ -615,6 +618,25 @@ fn provider_funded_checks(_cfg: &Config, project: Option<&str>) -> Vec<Check> {
     use std::collections::BTreeSet;
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut providers: Vec<(String, String)> = Vec::new();
+    // GS-040 PF-SLOT-RESOLVE-OK-SWALLOW: load routing once. If any profile
+    // needs @slot resolve and routing is corrupt, fail-loud — never .ok()-
+    // swallow into silent "no funded endpoint" SKIP (fail-open invent-green).
+    let needs_slot = catalog
+        .profiles
+        .values()
+        .any(|p| p.provider.trim().is_empty() && p.model.starts_with('@'));
+    let routing = match crate::models::ModelRegistry::load_routing() {
+        Ok(reg) => Some(reg),
+        Err(e) if needs_slot => {
+            return vec![Check::fail(
+                "provider-funded",
+                format!(
+                    "model routing load failed while resolving @slot profiles — refuse silent SKIP (GS-040): {e}"
+                ),
+            )];
+        }
+        Err(_) => None,
+    };
     for (name, profile) in &catalog.profiles {
         // GS-040: default profiles pin provider in the model id
         // (`opencode-go/muse-…`) while `profile.provider` stays empty
@@ -625,13 +647,23 @@ fn provider_funded_checks(_cfg: &Config, project: Option<&str>) -> Vec<Check> {
             // Resolve @slot aliases (coder → @standard → opencode-go/muse-…)
             // then take the provider/ half of the composite model id.
             let model_id = if profile.model.starts_with('@') {
-                crate::models::ModelRegistry::load_routing()
-                    .ok()
-                    .and_then(|reg| {
-                        reg.slot(&profile.model)
-                            .map(|s| s.model.clone())
-                    })
-                    .unwrap_or_else(|| profile.model.clone())
+                match routing
+                    .as_ref()
+                    .and_then(|reg| reg.slot(&profile.model).map(|s| s.model.clone()))
+                {
+                    Some(m) => m,
+                    None => {
+                        // GS-040: @slot present but unresolved — fail-loud,
+                        // never silent SKIP "no funded endpoint".
+                        return vec![Check::fail(
+                            "provider-funded",
+                            format!(
+                                "profile '{name}' model '{}' could not resolve @slot — refuse silent SKIP (GS-040)",
+                                profile.model
+                            ),
+                        )];
+                    }
+                }
             } else {
                 profile.model.clone()
             };
@@ -941,23 +973,150 @@ mod tests {
 
     #[test]
     fn gs040_opencode_keys_present_passes() {
-        let src = include_str!("preflight.rs");
+        // Behavioral: non-empty API key → Pass (never print key values).
+        let _g = crate::config::lock_env();
+        let prev_api = std::env::var_os("OPENCODE_API_KEY");
+        let prev_go = std::env::var_os("OPENCODE_GO_API_KEY");
+        unsafe {
+            std::env::remove_var("OPENCODE_GO_API_KEY");
+            std::env::set_var("OPENCODE_API_KEY", "test-api-key-not-a-secret-fixture");
+        }
+        let c = check_provider_funded("opencode-go", "coder");
         assert!(
-            src.contains("GS-040: API key present"),
-            "opencode keys present must PASS provider-funded (not SKIP theater)"
+            matches!(c.status, Status::Pass),
+            "non-empty OPENCODE_API_KEY must PASS provider-funded, got {:?}",
+            c.status
+        );
+        unsafe {
+            match prev_api {
+                Some(v) => std::env::set_var("OPENCODE_API_KEY", v),
+                None => std::env::remove_var("OPENCODE_API_KEY"),
+            }
+            match prev_go {
+                Some(v) => std::env::set_var("OPENCODE_GO_API_KEY", v),
+                None => std::env::remove_var("OPENCODE_GO_API_KEY"),
+            }
+        }
+    }
+
+    #[test]
+    fn gs040_empty_opencode_api_key_must_not_pass() {
+        // PF-EMPTY-KEY-PASS: empty / whitespace export must NOT invent Pass.
+        let _g = crate::config::lock_env();
+        let prev_api = std::env::var_os("OPENCODE_API_KEY");
+        let prev_go = std::env::var_os("OPENCODE_GO_API_KEY");
+        for empty in ["", "   ", "\t"] {
+            unsafe {
+                std::env::remove_var("OPENCODE_GO_API_KEY");
+                std::env::set_var("OPENCODE_API_KEY", empty);
+            }
+            let c = check_provider_funded("opencode-go", "coder");
+            assert!(
+                !matches!(c.status, Status::Pass),
+                "empty/whitespace OPENCODE_API_KEY must NOT Pass provider-funded, got {:?}",
+                c.status
+            );
+            assert!(
+                matches!(c.status, Status::Fail(_)),
+                "empty/whitespace OPENCODE_API_KEY must Fail (or not Pass), got {:?}",
+                c.status
+            );
+        }
+        unsafe {
+            match prev_api {
+                Some(v) => std::env::set_var("OPENCODE_API_KEY", v),
+                None => std::env::remove_var("OPENCODE_API_KEY"),
+            }
+            match prev_go {
+                Some(v) => std::env::set_var("OPENCODE_GO_API_KEY", v),
+                None => std::env::remove_var("OPENCODE_GO_API_KEY"),
+            }
+        }
+    }
+
+    #[test]
+    fn gs040_go_only_nonempty_must_pass() {
+        // PF-GO-ONLY-SKIP: OPENCODE_GO_API_KEY alone (primary path) → Pass.
+        let _g = crate::config::lock_env();
+        let prev_api = std::env::var_os("OPENCODE_API_KEY");
+        let prev_go = std::env::var_os("OPENCODE_GO_API_KEY");
+        unsafe {
+            std::env::remove_var("OPENCODE_API_KEY");
+            std::env::set_var("OPENCODE_GO_API_KEY", "test-go-key-not-a-secret-fixture");
+        }
+        let c = check_provider_funded("opencode-go", "coder");
+        assert!(
+            matches!(c.status, Status::Pass),
+            "GO-only non-empty must PASS provider-funded, got {:?}",
+            c.status
+        );
+        unsafe {
+            match prev_api {
+                Some(v) => std::env::set_var("OPENCODE_API_KEY", v),
+                None => std::env::remove_var("OPENCODE_API_KEY"),
+            }
+            match prev_go {
+                Some(v) => std::env::set_var("OPENCODE_GO_API_KEY", v),
+                None => std::env::remove_var("OPENCODE_GO_API_KEY"),
+            }
+        }
+    }
+
+    #[test]
+    fn gs040_slot_resolve_does_not_ok_swallow_routing() {
+        // PF-SLOT-RESOLVE-OK-SWALLOW: no load_routing().ok() swallow; fail-loud
+        // when @slot cannot resolve.
+        let src = include_str!("preflight.rs");
+        let start = src
+            .find("fn provider_funded_checks")
+            .expect("provider_funded_checks");
+        let body = &src[start..start + 2500];
+        assert!(
+            !body.contains("load_routing().ok()")
+                && !body.contains("load_routing()\n                    .ok()"),
+            "provider_funded_checks must not .ok()-swallow load_routing Err"
+        );
+        // Also reject the chained form used before the fix.
+        assert!(
+            !body.contains("load_routing()\n                    .ok()\n                    .and_then"),
+            "no chained load_routing().ok().and_then swallow"
+        );
+        assert!(
+            body.contains("refuse silent SKIP (GS-040)") && body.contains("needs_slot"),
+            "provider_funded_checks must fail-loud when @slot cannot resolve"
         );
     }
 
     #[test]
     fn gs039_opencode_go_missing_keys_fails_closed() {
-        // Ensure neither key is set for this assertion (best-effort; if the
-        // ambient env has keys the fail path is still covered by the string
-        // marker in check_provider_funded).
+        let _g = crate::config::lock_env();
+        let prev_api = std::env::var_os("OPENCODE_API_KEY");
+        let prev_go = std::env::var_os("OPENCODE_GO_API_KEY");
+        unsafe {
+            std::env::remove_var("OPENCODE_API_KEY");
+            std::env::remove_var("OPENCODE_GO_API_KEY");
+        }
+        let c = check_provider_funded("opencode-go", "coder");
+        assert!(
+            matches!(c.status, Status::Fail(_)),
+            "opencode-go missing keys must fail-closed, got {:?}",
+            c.status
+        );
         let src = include_str!("preflight.rs");
         assert!(
             src.contains("refuse fail-open (GS-039 P2)"),
             "opencode-go missing keys must fail-closed, not SKIP"
         );
+        unsafe {
+            match prev_api {
+                Some(v) => std::env::set_var("OPENCODE_API_KEY", v),
+                None => std::env::remove_var("OPENCODE_API_KEY"),
+            }
+            match prev_go {
+                Some(v) => std::env::set_var("OPENCODE_GO_API_KEY", v),
+                None => std::env::remove_var("OPENCODE_GO_API_KEY"),
+            }
+        }
     }
 
     #[test]
