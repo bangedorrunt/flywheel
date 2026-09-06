@@ -579,6 +579,10 @@ pub fn check_provider_funded(provider: &str, profile: &str) -> Check {
                 "OPENCODE_GO_API_KEY set; OPENCODE_API_KEY unset — flywheel aliases GO→API into pane env at spawn (GS-037 P0-4)",
             );
         }
+        // GS-040: API key present (alone or with GO) → PASS commercially.
+        // Do not fall through to "no funded endpoint" SKIP theater when the
+        // operator already exported funded credentials.
+        return Check::pass("provider-funded");
     }
     let env_key = format!("FLYWHEEL_FUNDED_BALANCE_{}", provider.to_ascii_uppercase());
     if let Ok(val) = std::env::var(&env_key) {
@@ -912,6 +916,16 @@ mod tests {
             other => panic!("expected Skip(no funded endpoint), got {other:?}"),
         }
     }
+
+    #[test]
+    fn gs040_opencode_keys_present_passes() {
+        let src = include_str!("preflight.rs");
+        assert!(
+            src.contains("GS-040: API key present"),
+            "opencode keys present must PASS provider-funded (not SKIP theater)"
+        );
+    }
+
     #[test]
     fn gs039_opencode_go_missing_keys_fails_closed() {
         // Ensure neither key is set for this assertion (best-effort; if the
@@ -938,6 +952,7 @@ mod tests {
         }
         unsafe { std::env::remove_var("FLYWHEEL_FUNDED_BALANCE_ZAI") };
     }
+
     #[test]
     fn loop_identity_fails_without_key() {
         let cfg = crate::config::Config::default();
