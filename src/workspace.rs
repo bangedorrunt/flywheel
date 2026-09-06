@@ -24,35 +24,154 @@ pub struct Receipt {
     pub result_path: Option<String>,
 }
 
-/// Presence per pin; missing key = Unknown (invariant 9).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Presence verdict per pin; missing key = Unknown (invariant 9).
+/// Governed-by: ADR-0010 D3. Busy/Idle/Dead carry the evidence source:
+/// "presence" (20001 wire authority), "herdr-evidence" (native busy,
+/// never authority), "legacy" (pre-D3 snapshot), "endpoint" (death).
+/// Unknown is never promoted, never absorbs a wake, never prompts.
+/// Native herdr idle is never trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub enum Presence {
     #[default]
     Unknown,
-    Idle,
-    Working,
-    Blocked,
-    Done,
+    Busy {
+        source: String,
+    },
+    Idle {
+        source: String,
+    },
+    Dead {
+        source: String,
+    },
 }
 
 impl Presence {
+    /// Wire authority: 20001/jsonl state words. blocked reads as Busy
+    /// (occupied, needs decision via digest not prompt); done reads as
+    /// Idle (available). Anything unparseable is Unknown, never idle.
     pub fn from_str(s: &str) -> Self {
-        match s {
-            "idle" => Self::Idle,
-            "working" => Self::Working,
-            "blocked" => Self::Blocked,
-            "done" => Self::Done,
+        match s.trim().to_ascii_lowercase().as_str() {
+            "working" | "busy" | "blocked" => Self::Busy {
+                source: "presence".into(),
+            },
+            "idle" | "done" => Self::Idle {
+                source: "presence".into(),
+            },
+            "dead" | "endpoint-dead" | "endpoint" => Self::Dead {
+                source: "presence".into(),
+            },
             _ => Self::Unknown,
         }
     }
     pub fn as_str(&self) -> &str {
         match self {
             Self::Unknown => "unknown",
-            Self::Idle => "idle",
-            Self::Working => "working",
-            Self::Blocked => "blocked",
-            Self::Done => "done",
+            Self::Busy { .. } => "busy",
+            Self::Idle { .. } => "idle",
+            Self::Dead { .. } => "dead",
         }
+    }
+    /// Evidence source of this verdict ("none" for Unknown).
+    pub fn source(&self) -> &str {
+        match self {
+            Self::Unknown => "none",
+            Self::Busy { source } | Self::Idle { source } | Self::Dead { source } => source,
+        }
+    }
+    /// Status-render token: verdict plus source, so `flywheel status`
+    /// prints verdict+source per pin (D3). Unknown renders bare.
+    pub fn status_token(&self) -> String {
+        match self {
+            Self::Unknown => "Unknown".into(),
+            Self::Busy { source } => format!("Busy({source})"),
+            Self::Idle { source } => format!("Idle({source})"),
+            Self::Dead { source } => format!("Dead({source})"),
+        }
+    }
+}
+
+// Pre-D3 snapshots stored flat unit strings ("Working", "Idle", ...).
+// New verdicts serialize as maps ({"Busy":{"source":"..."}}). Accept
+// both so a snapshot written before D3 still loads; flat words land with
+// source "legacy", never authority.
+impl<'de> serde::Deserialize<'de> for Presence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v = serde_json::Value::deserialize(deserializer)?;
+        if let Some(s) = v.as_str() {
+            return Ok(match s {
+                "Busy" | "Working" | "Blocked" => Self::Busy {
+                    source: "legacy".into(),
+                },
+                "Idle" | "Done" => Self::Idle {
+                    source: "legacy".into(),
+                },
+                "Dead" => Self::Dead {
+                    source: "legacy".into(),
+                },
+                _ => Self::Unknown,
+            });
+        }
+        let source_of = |key: &str| {
+            v.get(key)
+                .and_then(|inner| inner.get("source"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("presence")
+                .to_string()
+        };
+        if v.get("Busy").is_some() {
+            return Ok(Self::Busy {
+                source: source_of("Busy"),
+            });
+        }
+        if v.get("Idle").is_some() {
+            return Ok(Self::Idle {
+                source: source_of("Idle"),
+            });
+        }
+        if v.get("Dead").is_some() {
+            return Ok(Self::Dead {
+                source: source_of("Dead"),
+            });
+        }
+        Ok(Self::Unknown)
+    }
+}
+
+/// D3 verdict resolution: exact verdicts only. Known presence verdicts
+/// pass through untouched. Unknown/missing presence never promotes:
+/// native herdr busy yields Busy labeled "herdr-evidence" (evidence,
+/// not authority — consumers still never prompt from it), native idle is
+/// never trusted (stays Unknown), and only endpoint death overrides to
+/// Dead. The CLI status render calls this with known=None (no live
+/// Model in the render path); the tick path passes Model.presence.
+pub fn verdict_for(known: Option<&Presence>, herdr_status: &str, endpoint_alive: bool) -> Presence {
+    if !endpoint_alive {
+        return Presence::Dead {
+            source: "endpoint".into(),
+        };
+    }
+    match known {
+        Some(Presence::Busy { source }) => Presence::Busy {
+            source: source.clone(),
+        },
+        Some(Presence::Idle { source }) => Presence::Idle {
+            source: source.clone(),
+        },
+        Some(Presence::Dead { source }) => Presence::Dead {
+            source: source.clone(),
+        },
+        Some(Presence::Unknown) | None => match herdr_status.trim().to_ascii_lowercase().as_str() {
+            "working" | "busy" => Presence::Busy {
+                source: "herdr-evidence".into(),
+            },
+            "dead" => Presence::Dead {
+                source: "endpoint".into(),
+            },
+            _ => Presence::Unknown,
+        },
     }
 }
 
@@ -414,22 +533,21 @@ impl Cmd {
     }
 }
 
-/// ADR-0028 E5 inject gate: Working never prompts; Unknown (missing key
-/// or unparseable state) never prompts on presence alone — it falls back
-/// to herdr status, defaulting to "unknown" (never idle), which
-/// should_inject rejects. Explicit Idle/Blocked/Done consult presence.
+/// ADR-0028 E5 inject gate as amended by ADR-0010 D3: only an exact
+/// Idle verdict prompts. Busy never prompts; Dead is Lane-1 drain
+/// territory; Unknown (missing key or unparseable state) never prompts
+/// and never absorbs a wake — it surfaces for inspection via status
+/// (Unknown→digest is the re-ring ladder's read, not this gate's).
+/// DEVIATION (bd-s8bo): pre-D3, blocked done idle all prompted via
+/// should_inject; now blocked parses to Busy and does not prompt — a
+/// blocked pin needs a human decision via digest, not a wake.
 fn prompt_allowed(model: &WorkspaceModel, pin: &str) -> bool {
     match model.presence.get(pin) {
-        Some(Presence::Working) => false,
-        Some(Presence::Unknown) | None => crate::doorbell::should_inject(
-            model
-                .doorbell
-                .statuses
-                .get(pin)
-                .map(String::as_str)
-                .unwrap_or("unknown"),
-        ),
-        Some(p) => crate::doorbell::should_inject(p.as_str()),
+        Some(Presence::Idle { .. }) => true,
+        Some(Presence::Busy { .. })
+        | Some(Presence::Dead { .. })
+        | Some(Presence::Unknown)
+        | None => false,
     }
 }
 
@@ -1131,6 +1249,10 @@ mod tests {
     fn ws_model_herdr_status_is_inject_truth() {
         let mut m = empty_model();
         m.doorbell.index.insert_pin("BlueRidge".into(), None);
+        // D3: prompt needs an exact Idle verdict (presence authority);
+        // herdr statuses remain evidence in doorbell.statuses.
+        m.presence
+            .insert("BlueRidge".into(), Presence::from_str("idle"));
         let (m, _) = tick(
             &m,
             &Msg::HerdrStatus {
@@ -1173,6 +1295,10 @@ mod tests {
     fn ws_model_tick_composes_doorbell_watchndjson() {
         let mut m = empty_model();
         m.doorbell.index.insert_pin("BlueRidge".into(), None);
+        // D3: herdr idle alone never prompts (never trusted); the exact
+        // Idle verdict below is the authority that lets the Prompt through.
+        m.presence
+            .insert("BlueRidge".into(), Presence::from_str("idle"));
         m.doorbell
             .statuses
             .insert("BlueRidge".into(), "idle".into());
@@ -1245,7 +1371,10 @@ mod tests {
                 state: "idle".into(),
             },
         );
-        assert_eq!(next.presence.get("GhostPin"), Some(&Presence::Idle));
+        assert_eq!(
+            next.presence.get("GhostPin"),
+            Some(&Presence::from_str("idle"))
+        );
         let (next2, _) = tick(
             &next,
             &Msg::Presence {
@@ -1253,7 +1382,10 @@ mod tests {
                 state: "working".into(),
             },
         );
-        assert_eq!(next2.presence.get("GhostPin"), Some(&Presence::Working));
+        assert_eq!(
+            next2.presence.get("GhostPin"),
+            Some(&Presence::from_str("working"))
+        );
         let (next3, _) = tick(
             &next2,
             &Msg::Presence {
@@ -1476,7 +1608,8 @@ mod tests {
         m.doorbell
             .statuses
             .insert("BlueRidge".into(), "idle".into());
-        m.presence.insert("BlueRidge".into(), Presence::Working);
+        m.presence
+            .insert("BlueRidge".into(), Presence::from_str("working"));
         let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#;
         let (_, cmds) = tick(&m, &Msg::WatchNdjson { line: line.into() });
         assert!(
@@ -2453,7 +2586,10 @@ mod presence_model_tests {
                 state: "idle".into(),
             },
         );
-        assert_eq!(next.presence.get("Ghost"), Some(&Presence::Idle));
+        assert_eq!(
+            next.presence.get("Ghost"),
+            Some(&Presence::from_str("idle"))
+        );
         let (next2, _) = tick(
             &next,
             &Msg::Presence {
@@ -2463,18 +2599,18 @@ mod presence_model_tests {
         );
         assert_eq!(next2.presence.get("Ghost"), Some(&Presence::Unknown));
         // Unknown should never be treated as idle for inject
-        let has_idle = next2.presence.get("Ghost") == Some(&Presence::Idle);
+        let has_idle = next2.presence.get("Ghost") == Some(&Presence::from_str("idle"));
         assert!(!has_idle, "unknown must stay unknown, never silently idle");
     }
 
     #[test]
     fn presence_model_working_queues() {
         let mut m = empty_model();
-        m.presence.insert("P".into(), Presence::Working);
+        m.presence.insert("P".into(), Presence::from_str("working"));
         // Simulate a watch wake for P when working — should queue, not prompt
         // We test via InboxRows with a corr that would normally prompt, but presence is working
         // For now, check that presence map correctly reports Working
-        assert_eq!(m.presence.get("P"), Some(&Presence::Working));
+        assert_eq!(m.presence.get("P"), Some(&Presence::from_str("working")));
         // Inject should queue, not prompt — we test via tick's handling of InboxRows with presence working
         // The tick should not produce Prompt for working (it would queue)
         // For this unit test, we just verify the map
@@ -2485,7 +2621,7 @@ mod presence_model_tests {
                 state: "idle".into(),
             },
         );
-        assert_eq!(next.presence.get("P"), Some(&Presence::Idle));
+        assert_eq!(next.presence.get("P"), Some(&Presence::from_str("idle")));
     }
 
     #[test]
@@ -2498,7 +2634,7 @@ mod presence_model_tests {
                 state: "blocked".into(),
             },
         );
-        assert_eq!(next.presence.get("A"), Some(&Presence::Blocked));
+        assert_eq!(next.presence.get("A"), Some(&Presence::from_str("blocked")));
         let src = include_str!("workspace.rs");
         assert!(src.contains("Presence"), "presence must be in Model");
         assert!(
@@ -2572,7 +2708,10 @@ mod presence_model_tests {
             r#"{{"kind":20001,"id":"e2","pubkey":"{npub_self}","tags":[["p","BlueRidge"]],"content":"idle"}}"#
         );
         let (next, cmds) = tick(&m, &Msg::WatchNdjson { line });
-        assert_eq!(next.presence.get("BlueRidge"), Some(&Presence::Idle));
+        assert_eq!(
+            next.presence.get("BlueRidge"),
+            Some(&Presence::from_str("idle"))
+        );
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::LoudMiss { .. })),
             "self-reported 20001 must not LoudMiss, got {cmds:?}"
@@ -2591,6 +2730,94 @@ mod presence_model_tests {
             !cmds.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
             "Unknown pin must get no Prompt, got {cmds:?}"
         );
+    }
+
+    /// D3 property: no consumer branch is reachable from Unknown.
+    /// verdict_for never yields Idle from Unknown/missing presence;
+    /// herdr busy yields evidence-labeled Busy, never authority.
+    #[test]
+    fn d3_verdict_never_promotes_unknown() {
+        let busy_evidence = Presence::Busy {
+            source: "herdr-evidence".into(),
+        };
+        let dead_endpoint = Presence::Dead {
+            source: "endpoint".into(),
+        };
+        for herdr in [
+            "working", "busy", "idle", "done", "blocked", "unknown", "weird",
+        ] {
+            let v = verdict_for(None, herdr, true);
+            let expected = match herdr {
+                "working" | "busy" => busy_evidence.clone(),
+                _ => Presence::Unknown,
+            };
+            assert_eq!(v, expected, "herdr={herdr}");
+            assert_eq!(
+                verdict_for(None, herdr, false),
+                dead_endpoint,
+                "herdr={herdr}"
+            );
+            assert_eq!(
+                verdict_for(Some(&Presence::Unknown), herdr, true),
+                v,
+                "Unknown behaves as missing: herdr={herdr}"
+            );
+        }
+        // Known verdicts pass through with source intact.
+        let idle = Presence::Idle {
+            source: "presence".into(),
+        };
+        assert_eq!(verdict_for(Some(&idle), "idle", true), idle);
+        // Wire words and legacy snapshots.
+        assert_eq!(
+            Presence::from_str("blocked"),
+            Presence::Busy {
+                source: "presence".into()
+            }
+        );
+        assert_eq!(Presence::from_str("done"), idle);
+        assert_eq!(Presence::from_str("weird"), Presence::Unknown);
+        let legacy: Presence = serde_json::from_str("\"Working\"").unwrap();
+        assert_eq!(
+            legacy,
+            Presence::Busy {
+                source: "legacy".into()
+            }
+        );
+        // Render tokens carry source.
+        assert_eq!(busy_evidence.status_token(), "Busy(herdr-evidence)");
+        assert_eq!(idle.status_token(), "Idle(presence)");
+        assert_eq!(Presence::Unknown.status_token(), "Unknown");
+        // Prompt gate: only exact Idle prompts.
+        let mut m = empty_model();
+        for (pin, presence, prompts) in [
+            (
+                "i",
+                Presence::Idle {
+                    source: "presence".into(),
+                },
+                true,
+            ),
+            (
+                "b",
+                Presence::Busy {
+                    source: "presence".into(),
+                },
+                false,
+            ),
+            (
+                "d",
+                Presence::Dead {
+                    source: "endpoint".into(),
+                },
+                false,
+            ),
+            ("u", Presence::Unknown, false),
+        ] {
+            m.presence.insert(pin.into(), presence);
+            assert_eq!(prompt_allowed(&m, pin), prompts, "pin={pin}");
+        }
+        assert!(!prompt_allowed(&m, "missing"), "missing key never prompts");
     }
 }
 

@@ -1560,6 +1560,16 @@ mod tests {
             .statuses
             .insert("LilacChapel".into(), "idle".into());
         model.doorbell.index = SelfIndex::from_pins(["BlueRidge", "LilacChapel"]);
+        // D3 (bd-s8bo): herdr idle is evidence, never authority — the exact
+        // Idle verdict below is what lets the Prompt through the gate.
+        model.presence.insert(
+            "BlueRidge".into(),
+            crate::workspace::Presence::from_str("idle"),
+        );
+        model.presence.insert(
+            "LilacChapel".into(),
+            crate::workspace::Presence::from_str("idle"),
+        );
         let (next, cmds) = crate::workspace::tick(
             &model,
             &crate::workspace::Msg::WatchNdjson {
@@ -1584,12 +1594,14 @@ mod tests {
         let mut status = BTreeMap::new();
         status.insert("BlueRidge".into(), "idle".into());
         status.insert("LilacChapel".into(), "idle".into());
+        // D3 (bd-s8bo): the once/debug path carries no presence authority,
+        // so herdr-only idle stays silent for every pin — mentioned or not.
+        // Mention routing with authority is covered at tick level by
+        // sc_d1_kind9_at_pin_injects_when_idle.
         let json = once_json(kind9_at_blueridge(), &status);
-        assert!(json.contains("BlueRidge"), "mentioned pin rings: {json}");
-        assert!(json.contains("[doorbell]"), "line is a doorbell: {json}");
-        assert!(
-            !json.contains("LilacChapel"),
-            "unmentioned pin stays quiet: {json}"
+        assert_eq!(
+            json, "[]",
+            "herdr-only idle must not inject without presence authority: {json}"
         );
     }
 
@@ -1604,7 +1616,9 @@ mod tests {
             !src.contains(&needle),
             "RED: once_json still map-assigns statuses; tick Msg::HerdrStatus instead"
         );
-        // Behavioral: working pin must queue (no prompt), idle must inject.
+        // Behavioral: working pin must queue (no prompt). D3 (bd-s8bo):
+        // herdr idle alone never prompts (never trusted) — the once/debug
+        // path carries no presence authority, so idle stays silent too.
         let mut working = BTreeMap::new();
         working.insert("BlueRidge".into(), "working".into());
         let json = once_json(kind9_at_blueridge(), &working);
@@ -1612,7 +1626,10 @@ mod tests {
         let mut idle = BTreeMap::new();
         idle.insert("BlueRidge".into(), "idle".into());
         let json = once_json(kind9_at_blueridge(), &idle);
-        assert!(json.contains("BlueRidge"), "idle pin rings: {json}");
+        assert_eq!(
+            json, "[]",
+            "herdr-only idle must not inject without presence authority: {json}"
+        );
     }
 
     #[test]
@@ -1708,6 +1725,14 @@ mod tests {
         };
         let (seeded, _) = crate::workspace::tick(&model, &idle);
         model = seeded;
+        // D3 (bd-s8bo): the Prompt needs presence authority; journal the
+        // Presence msg so the replay fold reproduces it exactly.
+        let presence = crate::workspace::Msg::Presence {
+            pin: "BlueRidge".into(),
+            state: "idle".into(),
+        };
+        let (seeded, _) = crate::workspace::tick(&model, &presence);
+        model = seeded;
         let msg = crate::workspace::Msg::WatchNdjson {
             line: kind9_at_blueridge().to_string(),
         };
@@ -1720,10 +1745,18 @@ mod tests {
             "seed must produce a Prompt, got {cmds:?}"
         );
         let _ = next;
+        journal_append_workspace(
+            &dir,
+            "ws1",
+            &presence,
+            &[],
+            serde_json::json!({}),
+            Some(&pins),
+        );
         journal_append_workspace(&dir, "ws1", &idle, &[], serde_json::json!({}), Some(&pins));
         journal_append_workspace(&dir, "ws1", &msg, &cmds, serde_json::json!({}), Some(&pins));
         let entries = journal_read_all(&dir);
-        assert_eq!(entries.len(), 2, "roundtrip must read 2 entries");
+        assert_eq!(entries.len(), 3, "roundtrip must read 3 entries");
         let mut folded = crate::workspace::WorkspaceModel::default();
         for (workspace, entry) in &entries {
             assert_eq!(workspace, "ws1");
@@ -1789,6 +1822,13 @@ mod tests {
             .collect();
         assert!(prompts.is_empty(), "working pin must not inject");
         assert_eq!(next.doorbell.queues.get("BlueRidge").map(Vec::len), Some(1));
+        // D3 (bd-s8bo): the drain needs presence authority; herdr idle
+        // alone stays Unknown and silent.
+        let mut next = next;
+        next.presence.insert(
+            "BlueRidge".into(),
+            crate::workspace::Presence::from_str("idle"),
+        );
         let (next2, cmds2) = crate::workspace::tick(
             &next,
             &crate::workspace::Msg::HerdrStatus {
@@ -1834,6 +1874,11 @@ mod tests {
             .statuses
             .insert("LilacChapel".into(), "idle".into());
         model.doorbell.index = index;
+        // D3 (bd-s8bo): exact Idle verdict required; herdr idle alone is evidence.
+        model.presence.insert(
+            "BlueRidge".into(),
+            crate::workspace::Presence::from_str("idle"),
+        );
         let (_, cmds) =
             crate::workspace::tick(&model, &crate::workspace::Msg::WatchNdjson { line });
         let prompts: Vec<_> = cmds
@@ -1864,6 +1909,11 @@ mod tests {
             .statuses
             .insert("BlueRidge".into(), "idle".into());
         model.doorbell.index = SelfIndex::from_pins(["BlueRidge"]);
+        // D3 (bd-s8bo): exact Idle verdict required; herdr idle alone is evidence.
+        model.presence.insert(
+            "BlueRidge".into(),
+            crate::workspace::Presence::from_str("idle"),
+        );
         // also insert npub mapping so p-tag resolves but content also rings
         model
             .doorbell
@@ -1909,6 +1959,12 @@ mod tests {
         use crate::workspace::{Msg, WorkspaceModel};
         let mut model = WorkspaceModel::default();
         model.doorbell.index.insert_pin("BlueRidge".into(), None);
+        // D3 (bd-s8bo): urgent still needs an exact Idle verdict; herdr
+        // idle alone stays Unknown and silent.
+        model.presence.insert(
+            "BlueRidge".into(),
+            crate::workspace::Presence::from_str("idle"),
+        );
         let (model, _) = crate::workspace::tick(
             &model,
             &Msg::HerdrStatus {

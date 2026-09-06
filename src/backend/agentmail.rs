@@ -340,6 +340,7 @@ impl MailSurface for AgentMailBackend {
                     model: opt_string_field(a, &["model"]),
                     task_description: opt_string_field(a, &["task_description"]),
                     last_active_ts_us: ts_us(a, &["last_active_ts_us", "last_active_ts"]),
+                    stale: false,
                 })
             })
             .collect()
@@ -354,6 +355,7 @@ impl MailSurface for AgentMailBackend {
             model: opt_string_field(&v, &["model"]),
             task_description: opt_string_field(&v, &["task_description"]),
             last_active_ts_us: ts_us(&v, &["last_active_ts_us", "last_active_ts"]),
+            stale: false,
         })
     }
 
