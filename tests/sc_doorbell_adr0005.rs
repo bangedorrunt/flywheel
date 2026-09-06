@@ -422,7 +422,7 @@ fn captain_triggers_spawn_loop_and_integration_exist() {
 fn adr_d5_names_collab_without_loop_and_bead_dispatch() {
     let adr = read("docs/decisions/0005-always-on-collab-baseline-and-command-surface.md");
     assert!(
-        adr.contains("### D5 — Execution topology and captain operation (binding)"),
+        adr.contains("### D5 — Captain with and without a loop"),
         "D5 heading missing"
     );
     assert!(adr.contains("**Open**"), "no-loop captain mode missing");

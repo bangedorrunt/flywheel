@@ -43,7 +43,7 @@ Ask operator for model routing per profile before dispatch; blank keeps default.
    trail (timeline/beads) or it does not exist.
 
 5. BRIEF: lane dispatch authoritative. Peer wakes are signals, not tasks;
-   peer-aware wake rides the doorbell.
+   peer-aware wake rides the doorbell. Loop is bead dispatch, not wake.
    Bead ids, files, pin, claim (br update in_progress), reserve (toron
    reserve acquire 4min), build slot, TDD (RED first), commit-before-close
    with VERIFY tail, stage ONLY reserved paths (never git add -A),
