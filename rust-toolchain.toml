@@ -1,6 +1,7 @@
 [toolchain]
-# Pinned for reproducibility, shared with sibling beads + toron
-# (bd-14ea): nightly-2026-08-20 builds and tests green, including the
-# stricter pedantic+nursery clippy lints it adds over floating nightly.
-channel = "nightly-2026-08-20"
+# Floating nightly, shared with siblings beads + toron (operator choice
+# 2026-09-06: was pinned nightly-2026-08-20 per bd-14ea, unpinned for
+# latest-nightly features). Cost: CI/local must tolerate nightly drift —
+# new pedantic/nursery lints can fail the gates after a toolchain bump.
+channel = "nightly"
 components = ["rustfmt", "clippy"]
