@@ -60,7 +60,59 @@ pub(crate) fn herdr_integration_env(
         env.insert("AGENT_NAME".to_string(), pin.to_string());
         env.insert("FLYWHEEL_MAIL_AS".to_string(), pin.to_string());
     }
+    // GS-037 P0-4: Captain secret name OPENCODE_GO_API_KEY must reach panes as
+    // OPENCODE_API_KEY (pi/opencode-go catalog). Alias when GO is set and API
+    // unset — never log the value.
+    apply_opencode_go_api_key_alias(&mut env);
     env
+}
+
+/// GS-037 P0-4: if `OPENCODE_GO_API_KEY` is set in the process env and
+/// `OPENCODE_API_KEY` is unset (process + pane map), copy the bytes under the
+/// API name into the pane env so opencode-go models authenticate.
+pub(crate) fn apply_opencode_go_api_key_alias(
+    env: &mut std::collections::BTreeMap<String, String>,
+) {
+    if env.contains_key("OPENCODE_API_KEY") {
+        return;
+    }
+    if std::env::var_os("OPENCODE_API_KEY").is_some() {
+        return;
+    }
+    if let Ok(v) = std::env::var("OPENCODE_GO_API_KEY") {
+        if !v.is_empty() {
+            env.insert("OPENCODE_API_KEY".to_string(), v);
+            // Also keep the GO name so auth.json `$OPENCODE_GO_API_KEY` refs work.
+            if !env.contains_key("OPENCODE_GO_API_KEY") {
+                if let Ok(go) = std::env::var("OPENCODE_GO_API_KEY") {
+                    env.insert("OPENCODE_GO_API_KEY".to_string(), go);
+                }
+            }
+        }
+    }
+}
+
+/// GS-037 P1: herdr `integration.install` fails when parent config dirs are
+/// missing (pi/omp/opencode). Create the documented parent dirs before install
+/// so zero-touch spawn works on a cold box.
+pub(crate) fn ensure_integration_parent_dirs(kind: &str) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let home = std::path::PathBuf::from(home);
+    let dirs: &[&str] = match kind {
+        "pi" => &[".pi/agent/extensions"],
+        "omp" => &[".omp/agent/extensions"],
+        "opencode" => &[".config/opencode/plugins"],
+        _ => &[],
+    };
+    for rel in dirs {
+        let p = home.join(rel);
+        if let Err(e) = std::fs::create_dir_all(&p) {
+            eprintln!(
+                "flywheel: warn: cannot create {} for {kind} integration install: {e}",
+                p.display()
+            );
+        }
+    }
 }
 
 /// Parse `AgentStatus` from its wire string (the old inherent `parse` —
@@ -238,6 +290,8 @@ pub fn integration_status_all() -> Result<Vec<(String, IntegrationStatus)>> {
 pub fn integration_install_socket(c: &mut Client, kind: &str) -> Result<Vec<String>> {
     let target = integration_target(kind)
         .ok_or_else(|| anyhow!("kind {kind} has no herdr integration target"))?;
+    // GS-037 P1: mkdir parent dirs before socket install (pi/omp/opencode).
+    ensure_integration_parent_dirs(target);
     let resp = c.call("integration.install", json!({ "target": target }))?;
     let messages = resp
         .get("messages")
@@ -1495,7 +1549,7 @@ mod process_liveness_tests {
 
 #[cfg(test)]
 mod herdr_env_tests {
-    use super::herdr_integration_env;
+    use super::{apply_opencode_go_api_key_alias, herdr_integration_env};
 
     fn cfg() -> crate::config::Config {
         crate::config::Config::default()
@@ -1532,6 +1586,44 @@ mod herdr_env_tests {
         let env = herdr_integration_env(&cfg(), Some(""));
         assert!(!env.contains_key("AGENT_NAME"));
         assert!(!env.contains_key("FLYWHEEL_MAIL_AS"));
+    }
+
+    /// GS-037 P0-4: OPENCODE_GO_API_KEY aliases into OPENCODE_API_KEY when API unset.
+    #[test]
+    fn env_aliases_opencode_go_api_key_when_api_unset() {
+        let _g = crate::config::lock_env();
+        unsafe {
+            std::env::remove_var("OPENCODE_API_KEY");
+            std::env::set_var("OPENCODE_GO_API_KEY", "test-go-key-not-a-secret-fixture");
+        }
+        let env = herdr_integration_env(&cfg(), None);
+        assert_eq!(
+            env.get("OPENCODE_API_KEY").map(String::as_str),
+            Some("test-go-key-not-a-secret-fixture")
+        );
+        unsafe {
+            std::env::remove_var("OPENCODE_GO_API_KEY");
+            std::env::remove_var("OPENCODE_API_KEY");
+        }
+    }
+
+    #[test]
+    fn env_does_not_clobber_existing_opencode_api_key() {
+        let _g = crate::config::lock_env();
+        unsafe {
+            std::env::set_var("OPENCODE_API_KEY", "already-set");
+            std::env::set_var("OPENCODE_GO_API_KEY", "go-key");
+        }
+        let mut map = std::collections::BTreeMap::new();
+        apply_opencode_go_api_key_alias(&mut map);
+        assert!(
+            map.get("OPENCODE_API_KEY").is_none(),
+            "must not invent a pane override when process already has API key"
+        );
+        unsafe {
+            std::env::remove_var("OPENCODE_GO_API_KEY");
+            std::env::remove_var("OPENCODE_API_KEY");
+        }
     }
 }
 
