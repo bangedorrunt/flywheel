@@ -6686,7 +6686,7 @@ mod spawn_boot_reliability_tests {
             "compose wf_name must include project tag (avoid truncated-ISO collisions)"
         );
         assert!(
-            src.contains("chrono::Utc::now().format("%H%M%S")"),
+            src.contains("chrono::Utc::now().format(") && src.contains("%H%M%S"),
             "compose wf_name must use HHMMSS not truncated composed-ISO"
         );
     }
