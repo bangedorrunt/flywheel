@@ -2970,11 +2970,23 @@ enum WorkflowCmd {
         role_model: Vec<String>,
         /// GS-039 P0-3: NEVER silent-reap desks. Default OFF — pass
         /// `--retire-orphans` explicitly to close pre-existing workspaces.
-        // GS-040: clap dual-#[arg] previously dropped `--retire-orphans`
-        // (only `--no-retire-orphans` survived). Single SetTrue long flag;
-        // default false = never silent-reap.
-        #[arg(long = "retire-orphans", default_value_t = false)]
+        // GS-040 B2: hidden `--no-retire-orphans` is a SEPARATE field linked
+        // via overrides_with — NOT dual-#[arg] on the same field (that
+        // dropped the positive flag; only --no-retire-orphans survived).
+        #[arg(
+            long = "retire-orphans",
+            action = clap::ArgAction::SetTrue,
+            overrides_with = "_no_retire_orphans"
+        )]
         retire_orphans: bool,
+        /// Hidden SetFalse alias for script compat (GS-040 B2).
+        #[arg(
+            long = "no-retire-orphans",
+            action = clap::ArgAction::SetFalse,
+            overrides_with = "retire_orphans",
+            hide = true
+        )]
+        _no_retire_orphans: bool,
         /// GS-039 P0-3: refuse multi-crew expansion unless explicitly allowed
         /// (repair/loop must not silently balloon; wave-swarm needs this or a
         /// TTY crew-count ask).
@@ -6665,15 +6677,18 @@ mod spawn_boot_reliability_tests {
             spawn_body.contains("presence_project") && spawn_body.contains("GS-037 P0-D"),
             "presence publish must use absolute project key (register-before-presence)"
         );
-        // GS-039 P0-3: retire_orphans defaults FALSE (never silent-reap).
+        // GS-039 P0-3 / GS-040 B2: retire_orphans defaults FALSE; positive
+        // flag visible; hidden --no-retire-orphans via SEPARATE field.
         assert!(
             src.contains("retire-orphans")
                 && src.contains("GS-039 P0-3")
                 && src.contains("allow-crew-expand")
                 && src.contains("retire_orphans: bool")
-                && src.contains("#[arg(long = \"retire-orphans\"")
-                && !src.contains("long = \"no-retire-orphans\""),
-            "compose must default retire_orphans false + single --retire-orphans (no dual-#[arg]) (GS-039/040)"
+                && src.contains("long = \"retire-orphans\"")
+                && src.contains("long = \"no-retire-orphans\"")
+                && src.contains("overrides_with")
+                && src.contains("hide = true"),
+            "compose must default retire_orphans false + visible --retire-orphans + hidden --no-retire-orphans via overrides_with (GS-039/040 B2)"
         );
     }
 
@@ -6695,38 +6710,146 @@ mod spawn_boot_reliability_tests {
 
     #[test]
     fn gs040_retire_orphans_single_arg_no_dual() {
-        // TEST-INVENT-GREEN: dual #[arg] dropped --retire-orphans (only
-        // --no-retire-orphans survived). Keep single positive flag; default
-        // false. Do NOT restore dual-#[arg] / hidden SetFalse alias here
-        // (compat ask is Firstmate-owned).
+        // GS-040 B2 tripwire: dual #[arg] on the SAME field dropped
+        // --retire-orphans (only --no-retire-orphans survived). Hidden
+        // SetFalse alias MUST be a separate field linked via overrides_with.
         let src = include_str!("main.rs");
         let compose_marker = "Runtime workflow composition (bd-8xca)";
         let start = src.find(compose_marker).expect("Compose docs");
-        // Compose variant body until next top-level doc or enum end — scan
-        // a generous window for the clap field.
         let window = &src[start..start + 12000];
-        let needle = "#[arg(long = \"retire-orphans\"";
+        let needle = "long = \"retire-orphans\"";
         let hits: Vec<_> = window.match_indices(needle).collect();
         assert_eq!(
             hits.len(),
             1,
-            "Compose must have exactly one #[arg(long = \"retire-orphans\" ...)]"
+            "Compose must declare long = \"retire-orphans\" exactly once"
         );
-        // Field that follows must be retire_orphans: bool without a second
-        // #[arg] (dual SetTrue/SetFalse) on the same field.
-        let after = &window[hits[0].0..hits[0].0 + 280];
+        // Positive flag binds retire_orphans: bool before any no- alias.
+        let after_pos = &window[hits[0].0..hits[0].0 + 220];
         assert!(
-            after.contains("retire_orphans: bool"),
+            after_pos.contains("retire_orphans: bool"),
             "retire-orphans arg must bind retire_orphans: bool"
         );
         assert!(
-            !after.contains("no-retire-orphans"),
-            "must not dual-#[arg] no-retire-orphans on same field (clap drop bug)"
+            !after_pos.contains("long = \"no-retire-orphans\""),
+            "must not dual-#[arg] long=no-retire-orphans on same field (clap drop bug)"
         );
         assert!(
-            after.contains("default_value_t = false"),
-            "retire_orphans must default false"
+            after_pos.contains("ArgAction::SetTrue") || after_pos.contains("overrides_with"),
+            "positive --retire-orphans must SetTrue / link via overrides_with"
         );
+        // Separate hidden SetFalse field (not stacked #[arg] on retire_orphans).
+        assert!(
+            window.contains("long = \"no-retire-orphans\"")
+                && window.contains("ArgAction::SetFalse")
+                && window.contains("hide = true")
+                && window.contains("_no_retire_orphans: bool"),
+            "hidden --no-retire-orphans SetFalse must be a separate field"
+        );
+        // Dual-#[arg] regression: two #[arg] attrs with no field between them
+        // immediately before retire_orphans: bool.
+        let dual_bug = "#[arg(long = \"retire-orphans\"";
+        let dual_bug2 = "#[arg(long = \"no-retire-orphans\"";
+        if let (Some(a), Some(b)) = (window.find(dual_bug), window.find(dual_bug2)) {
+            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+            let between = &window[lo..hi];
+            assert!(
+                between.contains(": bool"),
+                "no-retire-orphans #[arg] must not stack on same field as retire-orphans"
+            );
+        }
+    }
+
+    #[test]
+    fn gs040_retire_orphans_clap_help_and_parse() {
+        // Behavioral (not invent-green): help lists --retire-orphans; parse
+        // covers default / positive / hidden negative / overrides last-wins.
+        use clap::CommandFactory;
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let cmd = Cli::command();
+                let wf = cmd
+                    .find_subcommand("workflow")
+                    .expect("workflow subcommand");
+                let compose = wf
+                    .find_subcommand("compose")
+                    .expect("workflow compose subcommand");
+                let mut help = Vec::new();
+                compose.clone().write_long_help(&mut help).expect("help");
+                let help_s = String::from_utf8(help).expect("utf8");
+                assert!(
+                    help_s.contains("--retire-orphans"),
+                    "compose help must list --retire-orphans"
+                );
+                assert!(
+                    !help_s.contains("--no-retire-orphans"),
+                    "compose help must hide --no-retire-orphans"
+                );
+
+                let parse = |args: &[&str]| -> bool {
+                    let cli = Cli::try_parse_from(args).unwrap_or_else(|e| {
+                        panic!("parse {:?} failed: {e}", args)
+                    });
+                    match cli.command {
+                        Some(Commands::Workflow {
+                            cmd:
+                                WorkflowCmd::Compose {
+                                    retire_orphans, ..
+                                },
+                        }) => retire_orphans,
+                        _ => panic!("expected workflow compose"),
+                    }
+                };
+                assert!(
+                    !parse(&["flywheel", "workflow", "compose", "t"]),
+                    "bare default retire_orphans=false"
+                );
+                assert!(
+                    parse(&[
+                        "flywheel",
+                        "workflow",
+                        "compose",
+                        "t",
+                        "--retire-orphans"
+                    ]),
+                    "--retire-orphans => true"
+                );
+                assert!(
+                    !parse(&[
+                        "flywheel",
+                        "workflow",
+                        "compose",
+                        "t",
+                        "--no-retire-orphans"
+                    ]),
+                    "--no-retire-orphans => false"
+                );
+                assert!(
+                    !parse(&[
+                        "flywheel",
+                        "workflow",
+                        "compose",
+                        "t",
+                        "--retire-orphans",
+                        "--no-retire-orphans"
+                    ]),
+                    "--retire-orphans then --no-retire-orphans => false (overrides_with)"
+                );
+                assert!(
+                    parse(&[
+                        "flywheel",
+                        "workflow",
+                        "compose",
+                        "t",
+                        "--no-retire-orphans",
+                        "--retire-orphans"
+                    ]),
+                    "--no-retire-orphans then --retire-orphans => true (overrides_with)"
+                );
+            })
+            .expect("spawn clap probe");
+        handle.join().expect("clap probe thread");
     }
 
     #[test]
@@ -25630,6 +25753,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             idempotency_key,
             role_model,
             retire_orphans,
+            _no_retire_orphans: _,
             allow_crew_expand,
             reuse,
             json,
