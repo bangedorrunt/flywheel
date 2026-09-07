@@ -701,7 +701,9 @@ enum Commands {
         /// ADR-0010 D1 (bd-w98c): optional caller-supplied <delivery-id>;
         /// re-enqueue under the same id is idempotent, and the id keys
         /// the re-ring ladder skip (fire-and-forget never climbs).
-        #[arg(long = "fire-and-forget", num_args = 0..=1, default_missing_value = "")]
+        /// Equals form only (`--fire-and-forget=<id>`): a bare following word
+        /// is a positional MSG, never eaten as the id (hollow-dispatch trap).
+        #[arg(long = "fire-and-forget", num_args = 0..=1, default_missing_value = "", require_equals = true)]
         fire_and_forget: Option<String>,
         /// ADR-0025 Spec 5: explicit plane override. Private by default
         /// (pane prompt + gift-wrap completion mail); `--plane s` is the
@@ -6896,6 +6898,12 @@ mod spawn_boot_reliability_tests {
                 && send_body.contains("refuse invent-green exit 0")
                 && send_body.contains("produced no landed:true receipt"),
             "cmd_send must fail-loud without --wait/--fire-and-forget AND on --wait with no landed"
+        );
+        // D1 harden (bd-w98c reverify): --fire-and-forget takes its id by
+        // equals only, so a following positional MSG is never eaten as the id.
+        assert!(
+            src.contains("require_equals = true"),
+            "--fire-and-forget must require equals form so MSG positionals survive"
         );
         // Behavior: observe independent wake — must NOT call doorbell_persist_wake
         // from cmd_send (self-stamp invent-green).
