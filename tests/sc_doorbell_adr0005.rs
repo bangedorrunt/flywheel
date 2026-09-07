@@ -62,27 +62,23 @@ fn sc_d10_loop_playbook_is_not_a_five_min_poll() {
     );
 }
 
-/// SC-D1 herdr-mock: kind-9 `@pin` becomes a `[doorbell]` inject. No
-/// `loop run`. Two pins registered; only the mentioned pin rings.
+/// SC-D1 herdr-mock: kind-9 `@pin` routes at the edge but triages to
+/// routine (bd-l72k) — no `[doorbell]` inject, no `loop run`. Two pins
+/// registered; the mention is counted, never prompted.
 /// ADR-0010 D3: the mock `--status` is evidence only; trusted presence
-/// arrives via a 20001 self-attest line (first stdin line), then kind-9 rings.
+/// arrives via a 20001 self-attest line (first stdin line).
 #[test]
-fn sc_d1_kind9_at_pin_becomes_doorbell_prompt() {
+fn sc_d1_kind9_at_pin_is_routine_without_prompt() {
     let presence = r#"{"kind":20001,"tags":[["p","BlueRidge"]],"content":"idle"}"#;
     let kind9 = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","steer-x"]],"content":"@BlueRidge hi"}"#;
     let stdin = format!("{presence}\n{kind9}");
     let stdout = run_doorbell_once(&stdin, &["BlueRidge=idle", "LilacChapel=idle"]);
-    assert!(
-        stdout.contains("[doorbell]"),
-        "kind-9 @pin must become a [doorbell] prompt, got {stdout}"
-    );
-    assert!(
-        stdout.contains("BlueRidge"),
-        "mentioned pin must be the inject target, got {stdout}"
-    );
-    assert!(
-        !stdout.contains("LilacChapel"),
-        "unmentioned pin must stay quiet, got {stdout}"
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or(serde_json::json!(null));
+    assert_eq!(
+        v,
+        serde_json::json!([]),
+        "bd-l72k: routine kind-9 spends zero prompts, got {stdout}"
     );
     assert!(
         !stdout.contains("loop run"),
@@ -90,20 +86,22 @@ fn sc_d1_kind9_at_pin_becomes_doorbell_prompt() {
     );
 }
 
-/// Live wire: kind-9 `p` is npub hex, body has `@pin`. Must still inject.
+/// Live wire: kind-9 `p` is npub hex. Plain kind-9 triages to routine
+/// (bd-l72k), so npub resolution is proven through an urgent-tagged line —
+/// the SelfIndex npub lookup is identical either way.
 /// ADR-0010 D3: trusted presence via 20001 self-attest first.
 #[test]
-fn sc_d1_kind9_live_npub_p_tag_still_rings() {
+fn sc_d1_kind9_live_npub_p_tag_urgent_rings() {
     let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
     let presence = r#"{"kind":20001,"tags":[["p","BlueRidge"]],"content":"idle"}"#;
     let kind9 = format!(
-        r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["h","steer-x"]],"content":"@BlueRidge hi"}}"#
+        r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["toron-kind","mail-delivered"],["h","steer-x"]],"content":"@BlueRidge hi"}}"#
     );
     let stdin = format!("{presence}\n{kind9}");
     let stdout = run_doorbell_once(&stdin, &["BlueRidge=idle", "LilacChapel=idle"]);
     assert!(
         stdout.contains("[doorbell]"),
-        "live npub p-tag + @pin must become a doorbell, got {stdout}"
+        "urgent npub line must become a doorbell, got {stdout}"
     );
     assert!(stdout.contains("BlueRidge"), "got {stdout}");
     assert!(!stdout.contains("LilacChapel"), "got {stdout}");
@@ -612,6 +610,8 @@ async fn sc_d1_live_kind9_channel_post_rings() {
     let stdout = {
         // ADR-0010 D3: trusted presence (20001 self-attest) before the kind-9
         // line; `--status` alone is evidence-only and never prompts.
+        // bd-l72k: the live routine line triages silent — the assertions
+        // above already proved the live wire shape (npub p-tag, @content).
         let presence = format!(
             r#"{{"kind":20001,"tags":[["p","{target}"]],"content":"idle"}}"#
         );
@@ -621,14 +621,12 @@ async fn sc_d1_live_kind9_channel_post_rings() {
             &[&format!("{target}=idle"), &format!("{poster}=idle")],
         )
     };
-    assert!(
-        stdout.contains("[doorbell]"),
-        "live watch line must become a doorbell, got {stdout}"
-    );
-    assert!(stdout.contains(target), "target pin rings, got {stdout}");
-    assert!(
-        !stdout.contains(poster),
-        "poster must stay quiet, got {stdout}"
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or(serde_json::json!(null));
+    assert_eq!(
+        v,
+        serde_json::json!([]),
+        "bd-l72k: live routine line spends zero prompts, got {stdout}"
     );
     let _ = fs::remove_dir_all(&dir);
 }

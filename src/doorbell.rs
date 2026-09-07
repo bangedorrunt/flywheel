@@ -1548,7 +1548,10 @@ mod tests {
     }
 
     #[test]
-    fn sc_d1_kind9_at_pin_injects_when_idle() {
+    fn sc_d1_kind9_at_pin_is_routine_without_prompt_when_idle() {
+        // bd-l72k supersedes the old inject: addressed kind-9 still routes
+        // at the edge (doorbell::classify unchanged) but workspace triage
+        // demotes it to routine — zero prompts, counters only.
         // Ported to workspace::tick per bd-3wzl — no second reducer
         let mut model = crate::workspace::WorkspaceModel::default();
         model
@@ -1583,10 +1586,21 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(prompts.len(), 1);
-        assert_eq!(prompts[0].0, "BlueRidge");
-        assert!(prompts[0].1.contains("[doorbell]"));
+        assert!(
+            prompts.is_empty(),
+            "bd-l72k: routine kind-9 spends zero prompts, got {prompts:?}"
+        );
         assert!(next.doorbell.queues.is_empty(), "idle pin must not queue");
+        assert_eq!(
+            next.wake_counters.get("routine"),
+            Some(&1),
+            "routine tick counted: {:?}",
+            next.wake_counters
+        );
+        assert!(
+            next.digest_queue.is_empty(),
+            "routine never enters the digest"
+        );
     }
 
     #[test]
@@ -1734,7 +1748,10 @@ mod tests {
         let (seeded, _) = crate::workspace::tick(&model, &presence);
         model = seeded;
         let msg = crate::workspace::Msg::WatchNdjson {
-            line: kind9_at_blueridge().to_string(),
+            // bd-l72k: only urgent lines deliver prompts — seed the
+            // round-trip with an urgent wake so the fold still proves
+            // Prompt reproduction (routine wakes are silent by design).
+            line: r#"{"kind":14,"id":"u1","tags":[["p","BlueRidge"],["toron-kind","request-release"]],"content":"release?"}"#.to_string(),
         };
         let (next, cmds) = crate::workspace::tick(&model, &msg);
         assert!(
@@ -1779,6 +1796,298 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edge_triage_journal_roundtrip_full_cycle() {
+        // bd-l72k E2E (pure level): fixture journal (benign + routine +
+        // captain + urgent) through file round-trip, refolded from Default
+        // with pins restoring the index — markers advance, the digest
+        // drains the captain set, only the urgent row injects.
+        use crate::workspace::{Cmd, Msg, WorkspaceModel};
+        let dir = std::env::temp_dir().join(format!("fw-edge-journal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pins = vec!["BlueRidge".to_string()];
+        let mut model = WorkspaceModel::default();
+        for p in &pins {
+            model.doorbell.index.insert_pin(p.clone(), None);
+        }
+        let presence = Msg::Presence {
+            pin: "BlueRidge".into(),
+            state: "idle".into(),
+        };
+        let (next, cmds) = crate::workspace::tick(&model, &presence);
+        assert!(cmds.is_empty());
+        journal_append_workspace(
+            &dir,
+            "ws1",
+            &presence,
+            &cmds,
+            serde_json::json!({}),
+            Some(&pins),
+        );
+        model = next;
+        let idle = Msg::HerdrStatus {
+            pin: "BlueRidge".into(),
+            status: "idle".into(),
+        };
+        let (next, cmds) = crate::workspace::tick(&model, &idle);
+        journal_append_workspace(
+            &dir,
+            "ws1",
+            &idle,
+            &cmds,
+            serde_json::json!({}),
+            Some(&pins),
+        );
+        model = next;
+        let rows = [
+            r#"{"kind":9,"id":"b1","tags":[["h","ch-1"]],"content":"room talk"}"#,
+            r#"{"kind":9,"id":"r1","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#,
+            r#"{"kind":43001,"id":"c1","tags":[["p","BlueRidge"],["h","steer-x"]],"content":"job ready"}"#,
+            r#"{"kind":14,"id":"u1","tags":[["p","BlueRidge"],["toron-kind","request-release"]],"content":"release?"}"#,
+        ];
+        for line in rows {
+            let msg = Msg::WatchNdjson {
+                line: line.to_string(),
+            };
+            let (next, cmds) = crate::workspace::tick(&model, &msg);
+            journal_append_workspace(&dir, "ws1", &msg, &cmds, serde_json::json!({}), Some(&pins));
+            model = next;
+        }
+        let prompts: Vec<_> = model
+            .digest_queue
+            .iter()
+            .filter(|e| e.kind == "urgent-prompt")
+            .collect();
+        assert_eq!(
+            prompts.len(),
+            1,
+            "urgent row recorded once: {:?}",
+            model.digest_queue
+        );
+        // Refold from Default: every recorded Cmd sequence reproduces.
+        let entries = journal_read_all(&dir);
+        assert_eq!(entries.len(), 6, "presence+idle+4 rows round-trip");
+        let mut folded = WorkspaceModel::default();
+        let mut live_prompts = 0;
+        for (workspace, entry) in &entries {
+            assert_eq!(workspace, "ws1");
+            if let Some(ps) = entry.get("pins").and_then(|p| p.as_array()) {
+                for pin in ps.iter().filter_map(|v| v.as_str()) {
+                    folded.doorbell.index.insert_pin(pin.to_string(), None);
+                }
+            }
+            let m: Msg = serde_json::from_value(entry.get("msg").cloned().unwrap()).unwrap();
+            let expected: Vec<Cmd> =
+                serde_json::from_value(entry.get("actions").cloned().unwrap()).unwrap();
+            let (n, actual) = crate::workspace::tick(&folded, &m);
+            folded = n;
+            assert_eq!(actual, expected, "fold reproduces recorded Cmds for {m:?}");
+            live_prompts += actual
+                .iter()
+                .filter(|c| matches!(c, Cmd::Prompt { .. }))
+                .count();
+        }
+        assert_eq!(live_prompts, 1, "only the urgent row injects on refold");
+        assert_eq!(
+            folded.digest_queue.len(),
+            2,
+            "captain entry plus urgent record: {:?}",
+            folded.digest_queue
+        );
+        assert!(
+            folded.wake_counters.get("routine").copied().unwrap_or(0) >= 1
+                && folded.wake_counters.get("benign").copied().unwrap_or(0) >= 1,
+            "markers advance on refold: {:?}",
+            folded.wake_counters
+        );
+        // Digest drains on a now-bearing beat.
+        let (drained, cmds) = crate::workspace::tick(&folded, &Msg::Tick { now: 1_000_000 });
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::Digest { .. })),
+            "digest batch emits: {cmds:?}"
+        );
+        assert!(drained.digest_queue.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "bd-l72k LIVE probe: needs live toron daemon + flywheel project + TurquoiseSparrow pin"]
+    fn edge_triage_live_probe_urgent_only_injects() {
+        // bd-l72k AC(2): a live pin receiving benign room noise plus one
+        // urgent mail shows only the urgent injection through
+        // workspace::tick. Run explicitly; never in CI.
+        use std::process::Command;
+        let proj = "flywheel";
+        let pin = "TurquoiseSparrow";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let marker = format!("edge-probe-{}-{}", std::process::id(), now);
+        let run = |args: &[&str]| -> String {
+            let out = Command::new("toron")
+                .args(args)
+                .output()
+                .expect("toron CLI on PATH for live probe");
+            assert!(
+                out.status.success(),
+                "live probe needs the toron CLI to succeed: {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        // Benign room noise on a scratch channel (create/join idempotent).
+        run(&[
+            "channel",
+            "create",
+            "edge-triage-probe",
+            "--name",
+            "edge-triage-probe",
+            "--project",
+            proj,
+            "--as",
+            pin,
+        ]);
+        run(&[
+            "channel",
+            "join",
+            "edge-triage-probe",
+            "--project",
+            proj,
+            "--as",
+            pin,
+        ]);
+        run(&[
+            "channel",
+            "post",
+            "edge-triage-probe",
+            "--project",
+            proj,
+            "--as",
+            pin,
+            "--body",
+            &format!("benign noise {marker}"),
+        ]);
+        // One urgent plane-P mail to self.
+        run(&[
+            "mail",
+            "send",
+            "--project",
+            proj,
+            "--as",
+            pin,
+            "--to",
+            pin,
+            "--subject",
+            &format!("urgent {marker}"),
+            "--body",
+            "release please",
+            "--importance",
+            "urgent",
+        ]);
+        // Capture the benign line live off the bus.
+        let mut benign_line = None;
+        for _ in 0..3 {
+            let out = run(&[
+                "watch",
+                "--project",
+                proj,
+                "--kinds",
+                "9",
+                "--channel",
+                "edge-triage-probe",
+                "--once",
+                "--timeout-ms",
+                "8000",
+            ]);
+            benign_line = out.lines().find_map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                if v.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains(&marker))
+                {
+                    Some(l.to_string())
+                } else {
+                    None
+                }
+            });
+            if benign_line.is_some() {
+                break;
+            }
+        }
+        let benign_line = benign_line.expect("live probe must observe its benign post");
+        // Pull the urgent row live from the inbox.
+        let mut urgent_row: Option<serde_json::Value> = None;
+        for _ in 0..5 {
+            let out = Command::new("flywheel")
+                .args([
+                    "mail", "inbox", proj, "--as", pin, "--since", "last", "--json",
+                ])
+                .output()
+                .expect("flywheel CLI on PATH for live probe");
+            if let Ok(v) =
+                serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&out.stdout))
+            {
+                let items = if let Some(a) = v.as_array() {
+                    a.clone()
+                } else {
+                    vec![v]
+                };
+                urgent_row = items.into_iter().find(|r| {
+                    r.get("subject")
+                        .and_then(|s| s.as_str())
+                        .is_some_and(|s| s.contains(&marker))
+                });
+            }
+            if urgent_row.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        let urgent_row = urgent_row.expect("live probe must observe its urgent mail");
+        // Both through the triage tick with presence authority.
+        let mut model = crate::workspace::WorkspaceModel::default();
+        model.doorbell.index = SelfIndex::from_pins([pin.to_string()]);
+        model
+            .doorbell
+            .statuses
+            .insert(pin.to_string(), "idle".into());
+        model.presence.insert(
+            pin.to_string(),
+            crate::workspace::Presence::from_str("idle"),
+        );
+        let (m1, cmds1) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::WatchNdjson { line: benign_line },
+        );
+        assert!(
+            cmds1
+                .iter()
+                .all(|c| !matches!(c, crate::workspace::Cmd::Prompt { .. })),
+            "live benign noise spends zero prompts: {cmds1:?}"
+        );
+        let (m2, cmds2) = crate::workspace::tick(
+            &m1,
+            &crate::workspace::Msg::InboxRows {
+                rows: vec![urgent_row],
+                pin: pin.to_string(),
+            },
+        );
+        let urgent_prompts: Vec<_> = cmds2
+            .iter()
+            .filter_map(|c| match c {
+                crate::workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            urgent_prompts.len(),
+            1,
+            "live urgent mail injects exactly once, got {urgent_prompts:?}"
+        );
+        let _ = m2;
     }
 
     #[test]
@@ -1843,23 +2152,28 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].0, "BlueRidge");
-        assert!(drained[0].1.contains("[doorbell]"));
+        assert!(
+            drained.is_empty(),
+            "bd-l72k: drained routine wakes spend zero prompts, got {drained:?}"
+        );
         assert!(
             next2
                 .doorbell
                 .queues
                 .get("BlueRidge")
-                .is_none_or(Vec::is_empty)
+                .is_none_or(Vec::is_empty),
+            "drain still empties the doorbell queue"
         );
     }
 
     #[test]
     fn sc_d1_kind9_npub_p_tag_rings_pin() {
+        // bd-l72k: plain kind-9 no longer delivers, so npub resolution is
+        // proven through an urgent (mail-delivered) line — the resolution
+        // mechanism (SelfIndex npub lookup) is identical.
         let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
         let line = format!(
-            r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["h","steer-x"]],"content":"@BlueRidge hi"}}"#
+            r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["toron-kind","mail-delivered"],["h","steer-x"]],"content":"sealed"}}"#
         );
         let mut index = SelfIndex::default();
         index.insert_pin("BlueRidge".into(), Some(npub.into()));
@@ -1899,6 +2213,8 @@ mod tests {
 
     #[test]
     fn sc_d1_kind9_at_pin_in_content_rings_without_pin_p_tag() {
+        // bd-l72k: content-@mention routing is proven at the routing seam
+        // (watch_targets) — plain kind-9 ticks no longer deliver prompts.
         let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
         let line = format!(
             r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["h","steer-x"]],"content":"@BlueRidge take the repro"}}"#
@@ -1919,21 +2235,12 @@ mod tests {
             .doorbell
             .index
             .insert_pin("BlueRidge".into(), Some(npub.into()));
-        let (_, cmds) =
-            crate::workspace::tick(&model, &crate::workspace::Msg::WatchNdjson { line });
-        let prompts: Vec<_> = cmds
-            .iter()
-            .filter_map(|c| match c {
-                crate::workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
-                _ => None,
-            })
-            .collect();
+        let targets = watch_targets(&line, &model.doorbell.index);
         assert_eq!(
-            prompts.len(),
-            1,
-            "content @pin must ring even when p is npub"
+            targets,
+            vec!["BlueRidge".to_string()],
+            "content @pin must route even when p is npub, got {targets:?}"
         );
-        assert_eq!(prompts[0].0, "BlueRidge");
     }
 
     #[test]

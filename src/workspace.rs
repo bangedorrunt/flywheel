@@ -450,18 +450,37 @@ impl WakeClass {
 }
 
 /// A doorbell line that must ring now, never batch: plane-P urgent,
-/// request-release, reservation conflicts, ack-SLA expiry.
+/// request-release, reservation conflicts, ack-SLA expiry (including the
+/// re-ring vehicle `doorbell_mail_line`, which carries "unacked for").
 pub fn is_urgent_line(line: &str) -> bool {
     line.contains("plane-P urgent")
         || line.contains("request-release")
         || line.contains("kind 30031")
         || line.contains("ack-sla-expired")
+        || line.contains("unacked for")
+}
+
+/// Edge-triage predicate (bd-l72k): a machine-rendered addressed kind-9
+/// wake (`doorbell::doorbell_line(Channel, _)` head). Routine chatter:
+/// advances markers with zero prompts, never enters the digest. Urgent
+/// lines never carry this head, but callers must test urgency first.
+/// Unknown/unmarked prompts default CaptainRelevant (digest-visible),
+/// never silently routine.
+pub fn is_routine_wake_line(line: &str) -> bool {
+    line.starts_with("[doorbell] kind 9.")
 }
 
 /// Classify one emitted cmd for wake spend.
+///
+/// Edge triage (bd-l72k): addressed kind-9 chatter is Routine — it is
+/// stripped before delivery (zero prompts, counters only), so a Routine
+/// tick may textually contain a pre-strip Prompt. Captain-relevant
+/// prompts are stripped the same way but keep their digest entry.
+/// Only urgent prompts deliver.
 pub fn classify_cmd(cmd: &Cmd) -> WakeClass {
     match cmd {
         Cmd::Prompt { line, .. } if is_urgent_line(line) => WakeClass::Urgent,
+        Cmd::Prompt { line, .. } if is_routine_wake_line(line) => WakeClass::Routine,
         Cmd::Prompt { .. }
         | Cmd::Audit { .. }
         | Cmd::FactMiss { .. }
@@ -1788,6 +1807,12 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
     let mut replays: Vec<Cmd> = Vec::new();
     for cmd in &cmds {
         if let Cmd::Prompt { pin, line } = cmd {
+            // bd-l72k: only urgent lines re-ring. Routine/captain prompts
+            // never deliver (stripped below), so they must never enter
+            // the ledger or resurrect as replays — digest/counters own them.
+            if !is_urgent_line(line) {
+                continue;
+            }
             let watermark = next.wake_acked.get(pin).copied().unwrap_or(0);
             if let Some(entries) = next.presented.get(pin) {
                 for e in entries {
@@ -1811,6 +1836,12 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
     cmds.splice(0..0, replays);
     for cmd in &cmds {
         if let Cmd::Prompt { pin, line } = cmd {
+            // bd-l72k: the ledger records deliveries only. Non-urgent
+            // prompts are stripped below — recording them would grow
+            // `presented` with lines that never deliver and re-ring forever.
+            if !is_urgent_line(line) {
+                continue;
+            }
             let slot = next.presented.entry(pin.clone()).or_default();
             if let Some(found) = slot.iter_mut().find(|e| e.line == *line) {
                 found.seq = next.seq;
@@ -1848,6 +1879,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 pin: pin.clone(),
                 detail: digest_detail_truncate(line),
             }),
+            Cmd::Prompt { line, .. } if is_routine_wake_line(line) => None,
             Cmd::Prompt { pin, line } => {
                 let short = digest_detail_truncate(line);
                 let queued = next
@@ -1911,6 +1943,10 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
         .wake_counters
         .entry(tick_class.label().to_string())
         .or_insert(0) += 1;
+    // bd-l72k edge triage: non-urgent prompts never deliver (no LLM turn).
+    // Captain-relevant entries are already queued above; routine ticks are
+    // already counted above. Only urgent prompts reach the effect layer.
+    cmds.retain(|c| !matches!(c, Cmd::Prompt { line, .. } if !is_urgent_line(line)));
     if let Some(now) = match msg {
         Msg::AckSlaTick { now } | Msg::Sweep { now, .. } | Msg::Tick { now } => Some(*now),
         _ => None,
@@ -2012,9 +2048,11 @@ mod tests {
                 status: "idle".into(),
             },
         );
+        // bd-l72k: the drain still fires from Model (queue empties), but
+        // the drained routine wake no longer delivers a prompt.
         assert!(
-            cmds2.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
-            "working->idle drain fires from Model, not a parallel map"
+            !cmds2.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
+            "drained routine wakes spend zero prompts: {cmds2:?}"
         );
         assert!(
             m2.doorbell
@@ -2037,11 +2075,17 @@ mod tests {
             .insert("BlueRidge".into(), "idle".into());
         let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#.to_string();
         let (next, cmds) = tick(&m, &Msg::WatchNdjson { line });
-        assert_eq!(cmds.len(), 1);
-        match &cmds[0] {
-            Cmd::Prompt { pin, .. } => assert_eq!(pin, "BlueRidge"),
-            other => panic!("expected Prompt got {:?}", other),
-        }
+        // bd-l72k: addressed kind-9 is routine — zero prompts, counters only.
+        assert!(
+            cmds.iter().all(|c| !matches!(c, Cmd::Prompt { .. })),
+            "routine wakes spend zero prompts: {cmds:?}"
+        );
+        assert_eq!(
+            next.wake_counters.get("routine"),
+            Some(&1),
+            "routine tick counted: {:?}",
+            next.wake_counters
+        );
         assert_eq!(next.seq, 1);
     }
 
@@ -4444,8 +4488,10 @@ mod adr0010_d2_tests {
     }
 
     fn fact(summary: &str) -> Msg {
+        // bd-l72k: the D2 ledger records deliveries only, and only urgent
+        // prompts deliver — so ledger tests drive urgent facts.
         Msg::Fact {
-            summary: summary.into(),
+            summary: format!("plane-P urgent {summary}"),
         }
     }
 
@@ -4463,7 +4509,7 @@ mod adr0010_d2_tests {
         let s = prompt_setup();
         // Presentation: first wake prompts exactly once.
         let (a, cmds1) = tick(&s, &fact("w1"));
-        let l1 = "[doorbell] w1".to_string();
+        let l1 = "[doorbell] plane-P urgent w1".to_string();
         assert_eq!(prompts(&cmds1), vec![l1.clone()]);
         assert_eq!(
             a.presented.get("P"),
@@ -4479,7 +4525,7 @@ mod adr0010_d2_tests {
         assert_eq!(cmds1, cmds1b, "refold reproduces the live Cmd sequence");
         // Next prompt re-presents the unacked wake exactly once more.
         let (b, cmds2) = tick(&a, &fact("w2"));
-        let l2 = "[doorbell] w2".to_string();
+        let l2 = "[doorbell] plane-P urgent w2".to_string();
         let got = prompts(&cmds2);
         assert_eq!(
             got.iter().filter(|l| *l == &l1).count(),
@@ -4507,7 +4553,10 @@ mod adr0010_d2_tests {
         );
         // After ack, the next prompt carries only the new wake.
         let (_, cmds3) = tick(&c, &fact("w3"));
-        assert_eq!(prompts(&cmds3), vec!["[doorbell] w3".to_string()]);
+        assert_eq!(
+            prompts(&cmds3),
+            vec!["[doorbell] plane-P urgent w3".to_string()]
+        );
     }
 
     #[test]
@@ -4814,8 +4863,190 @@ mod adr0010_d5_tests {
                 pin: "P".into(),
                 line: "[doorbell] kind 9. Pull: ch".into(),
             }),
+            WakeClass::Routine,
+            "bd-l72k: addressed kind-9 chatter is routine (zero prompts, counters only)"
+        );
+        assert_eq!(
+            classify_cmd(&Cmd::Prompt {
+                pin: "P".into(),
+                line: doorbell_mail_line(1, "P", "c-1"),
+            }),
+            WakeClass::Urgent,
+            "re-ring is the ack-SLA vehicle and bypasses batching"
+        );
+        assert_eq!(
+            classify_cmd(&Cmd::Prompt {
+                pin: "P".into(),
+                line: "[doorbell] something unmarked".into(),
+            }),
             WakeClass::CaptainRelevant,
-            "spent prompts are captain-visible, never routine"
+            "unmarked prompts default captain-visible, never silently routine"
+        );
+    }
+
+    // bd-l72k RED: edge triage — D5 predicates at the injection decision.
+    // Benign/routine advance markers with zero prompts; captain-relevant
+    // queue to the digest; urgent injects immediately.
+
+    fn edge_model(pin: &str) -> WorkspaceModel {
+        let mut m = idle_captain(pin);
+        m.doorbell.index = crate::doorbell::SelfIndex::from_pins([pin.to_string()]);
+        m
+    }
+
+    fn edge_watch(kind: u16, id: &str, tags: &str, content: &str) -> String {
+        format!("{{\"kind\":{kind},\"id\":\"{id}\",\"tags\":{tags},\"content\":\"{content}\"}}")
+    }
+
+    #[test]
+    fn edge_triage_fixture_replay_zero_prompts_for_benign_routine() {
+        let mut m = edge_model("BlueRidge");
+        // Benign: unaddressed room chatter (no p tag for self).
+        let benign = edge_watch(9, "b1", r#"[["h","ch-1"]]"#, "room talk");
+        // Routine: addressed kind-9 chatter, no urgency.
+        let routine = edge_watch(
+            9,
+            "r1",
+            r#"[["p","BlueRidge"],["h","ch-1"]]"#,
+            "@BlueRidge hi",
+        );
+        // Captain: addressed job wake.
+        let captain = edge_watch(
+            43001,
+            "c1",
+            r#"[["p","BlueRidge"],["h","steer-x"]]"#,
+            "job ready",
+        );
+        // Urgent: request-release addressed to self.
+        let urgent = edge_watch(
+            14,
+            "u1",
+            r#"[["p","BlueRidge"],["toron-kind","request-release"]]"#,
+            "release please",
+        );
+        let mut prompts = Vec::new();
+        for line in [&benign, &routine, &captain, &urgent] {
+            let (next, cmds) = tick(&m, &Msg::WatchNdjson { line: line.clone() });
+            prompts.extend(cmds.iter().filter_map(|c| match c {
+                Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                _ => None,
+            }));
+            m = next;
+        }
+        assert_eq!(
+            prompts.len(),
+            1,
+            "only the urgent row may inject, got {prompts:?}"
+        );
+        assert_eq!(prompts[0].0, "BlueRidge");
+        assert!(
+            is_urgent_line(&prompts[0].1),
+            "the surviving prompt must be urgent: {}",
+            prompts[0].1
+        );
+        assert_eq!(
+            m.digest_queue.len(),
+            2,
+            "digest holds the captain set plus the urgent record (urgent prompts AND queues), got {:?}",
+            m.digest_queue
+        );
+        let kinds: Vec<&str> = m.digest_queue.iter().map(|e| e.kind.as_str()).collect();
+        assert!(
+            kinds.contains(&"prompt") && kinds.contains(&"urgent-prompt"),
+            "one captain entry plus one urgent record, got {:?}",
+            m.digest_queue
+        );
+        assert!(
+            m.digest_queue.iter().all(|e| e.pin == "BlueRidge"),
+            "no routine/benign entry may enter the digest: {:?}",
+            m.digest_queue
+        );
+        assert!(
+            m.digest_queue[0].detail.contains("43001"),
+            "digest entry is the job wake, got {}",
+            m.digest_queue[0].detail
+        );
+        assert!(
+            m.wake_counters.get("routine").copied().unwrap_or(0) >= 1,
+            "routine ticks must be counted, got {:?}",
+            m.wake_counters
+        );
+        assert!(
+            m.wake_counters.get("benign").copied().unwrap_or(0) >= 1,
+            "benign ticks must be counted, got {:?}",
+            m.wake_counters
+        );
+    }
+
+    #[test]
+    fn edge_triage_routine_advances_markers_without_prompt_or_digest() {
+        let m = edge_model("BlueRidge");
+        let line = edge_watch(
+            9,
+            "r1",
+            r#"[["p","BlueRidge"],["h","ch-1"]]"#,
+            "@BlueRidge hi",
+        );
+        let (next, cmds) = tick(&m, &Msg::WatchNdjson { line });
+        assert!(
+            cmds.iter().all(|c| !matches!(c, Cmd::Prompt { .. })),
+            "routine wakes spend zero prompts: {cmds:?}"
+        );
+        assert!(
+            next.digest_queue.is_empty(),
+            "routine never enters the digest: {:?}",
+            next.digest_queue
+        );
+        assert_eq!(
+            next.wake_counters.get("routine"),
+            Some(&1),
+            "routine tick counted once: {:?}",
+            next.wake_counters
+        );
+        assert_eq!(next.seq, 1);
+    }
+
+    #[test]
+    fn edge_triage_captain_queues_digest_and_batch_emits() {
+        let m = edge_model("BlueRidge");
+        let line = edge_watch(43001, "c1", r#"[["p","BlueRidge"]]"#, "job ready");
+        let (m1, cmds) = tick(&m, &Msg::WatchNdjson { line });
+        assert!(
+            cmds.iter().all(|c| !matches!(c, Cmd::Prompt { .. })),
+            "captain-relevant queues, never injects immediately: {cmds:?}"
+        );
+        assert_eq!(
+            m1.digest_queue.len(),
+            1,
+            "job wake queued for digest: {:?}",
+            m1.digest_queue
+        );
+        assert_eq!(m1.digest_queue[0].pin, "BlueRidge");
+        // Batch emits on a now-bearing beat past the interval; the queue drains.
+        let (m2, cmds2) = tick(&m1, &Msg::Tick { now: 1_000_000 });
+        assert!(
+            cmds2
+                .iter()
+                .any(|c| matches!(c, Cmd::Digest { entries } if entries.len() == 1)),
+            "digest batch must emit the captain entry: {cmds2:?}"
+        );
+        assert!(m2.digest_queue.is_empty(), "batch drains the queue");
+    }
+
+    #[test]
+    fn edge_triage_rering_line_is_urgent_and_injects() {
+        let line = doorbell_mail_line(1, "BlueRidge", "c-1");
+        assert!(
+            is_urgent_line(&line),
+            "re-ring is the ack-SLA vehicle and must ring now: {line}"
+        );
+        assert_eq!(
+            classify_cmd(&Cmd::Prompt {
+                pin: "BlueRidge".into(),
+                line: line.clone(),
+            }),
+            WakeClass::Urgent,
+            "re-ring prompts bypass batching"
         );
     }
 }

@@ -7563,6 +7563,27 @@ mod spawn_boot_reliability_tests {
         );
     }
 
+    #[test]
+    fn edge_triage_escape_spawn_keeps_dispatcher() {
+        // bd-l72k: dispatchers for every spawn — the escape hatch
+        // (--escape kind/count + --model) must not silence the doorbell.
+        // The only dispatcher gate is peer-aware (default-on); escape
+        // never disables it, so escape panes triage with the same predicates.
+        let src = include_str!("main.rs");
+        let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
+        let spawn_end = crate::tripwire::find_fn(src, "cmd_internal_doorbell");
+        let body = &src[spawn..spawn_end];
+        assert!(
+            body.contains("if peer_aware"),
+            "dispatcher gate is peer-aware only, never escape-gated"
+        );
+        let gate = body.find("if peer_aware").unwrap();
+        assert!(
+            !body[gate..gate + 200].contains("escape"),
+            "escape must not appear in the dispatcher gate"
+        );
+    }
+
     /// bd-durable-doorbell-lngf: the wake layer is supervised and
     /// observable — status shows liveness AND lazy-heals; recover restores
     /// dispatchers after a crash; doctor warns on dead ones; the persisted
