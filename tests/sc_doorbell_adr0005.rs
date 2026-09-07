@@ -64,10 +64,14 @@ fn sc_d10_loop_playbook_is_not_a_five_min_poll() {
 
 /// SC-D1 herdr-mock: kind-9 `@pin` becomes a `[doorbell]` inject. No
 /// `loop run`. Two pins registered; only the mentioned pin rings.
+/// ADR-0010 D3: the mock `--status` is evidence only; trusted presence
+/// arrives via a 20001 self-attest line (first stdin line), then kind-9 rings.
 #[test]
 fn sc_d1_kind9_at_pin_becomes_doorbell_prompt() {
-    let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","steer-x"]],"content":"@BlueRidge hi"}"#;
-    let stdout = run_doorbell_once(line, &["BlueRidge=idle", "LilacChapel=idle"]);
+    let presence = r#"{"kind":20001,"tags":[["p","BlueRidge"]],"content":"idle"}"#;
+    let kind9 = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","steer-x"]],"content":"@BlueRidge hi"}"#;
+    let stdin = format!("{presence}\n{kind9}");
+    let stdout = run_doorbell_once(&stdin, &["BlueRidge=idle", "LilacChapel=idle"]);
     assert!(
         stdout.contains("[doorbell]"),
         "kind-9 @pin must become a [doorbell] prompt, got {stdout}"
@@ -87,13 +91,16 @@ fn sc_d1_kind9_at_pin_becomes_doorbell_prompt() {
 }
 
 /// Live wire: kind-9 `p` is npub hex, body has `@pin`. Must still inject.
+/// ADR-0010 D3: trusted presence via 20001 self-attest first.
 #[test]
 fn sc_d1_kind9_live_npub_p_tag_still_rings() {
     let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-    let line = format!(
+    let presence = r#"{"kind":20001,"tags":[["p","BlueRidge"]],"content":"idle"}"#;
+    let kind9 = format!(
         r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["h","steer-x"]],"content":"@BlueRidge hi"}}"#
     );
-    let stdout = run_doorbell_once(&line, &["BlueRidge=idle", "LilacChapel=idle"]);
+    let stdin = format!("{presence}\n{kind9}");
+    let stdout = run_doorbell_once(&stdin, &["BlueRidge=idle", "LilacChapel=idle"]);
     assert!(
         stdout.contains("[doorbell]"),
         "live npub p-tag + @pin must become a doorbell, got {stdout}"
@@ -602,10 +609,18 @@ async fn sc_d1_live_kind9_channel_post_rings() {
         "content has @pin, got {content}"
     );
 
-    let stdout = run_doorbell_once(
-        line,
-        &[&format!("{target}=idle"), &format!("{poster}=idle")],
-    );
+    let stdout = {
+        // ADR-0010 D3: trusted presence (20001 self-attest) before the kind-9
+        // line; `--status` alone is evidence-only and never prompts.
+        let presence = format!(
+            r#"{{"kind":20001,"tags":[["p","{target}"]],"content":"idle"}}"#
+        );
+        let stdin = format!("{presence}\n{line}");
+        run_doorbell_once(
+            &stdin,
+            &[&format!("{target}=idle"), &format!("{poster}=idle")],
+        )
+    };
     assert!(
         stdout.contains("[doorbell]"),
         "live watch line must become a doorbell, got {stdout}"
