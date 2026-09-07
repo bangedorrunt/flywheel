@@ -1425,6 +1425,22 @@ enum Commands {
         #[arg(long)]
         role: Option<String>,
     },
+    /// internal: ADR-0010 D13 subagent-guard (tool-surface fence). Vendor
+    /// PreToolUse hooks on the captain/steer pane call
+    /// `flywheel __subagent-guard <tool> [--role crew]`; exit 0 = allow,
+    /// exit 2 = deny (JSON names the stem + the sanctioned alternative).
+    /// Delegation-shaped stems: agent|subagent|task|workflow|spawn|dispatch|
+    /// worktree|delegate; mcp__* excluded; observe/stop + session-local todo
+    /// allowlisted. Crew panes pass --role crew (exempt — pane.split stamps
+    /// FLYWHEEL_ROLE=crew). Crew panes can still be flywheel spawn'd.
+    #[command(name = "__subagent-guard", hide = true)]
+    __SubagentGuard {
+        /// harness tool name being evaluated (e.g. Task, spawn_agent)
+        tool: String,
+        /// captain (default) or crew. Crew is exempt, always allow.
+        #[arg(long)]
+        role: Option<String>,
+    },
     /// internal: the project's expected-reply entries (checkpointed leaf —
     /// collab may have written new ones while the loop runs)
     #[command(name = "__expected-replies", hide = true)]
@@ -4643,6 +4659,9 @@ fn main() {
         }
         Some(Commands::__MailDigest { project, agent }) => {
             cmd_internal_mail_digest(&cfg, project, agent)
+        }
+        Some(Commands::__SubagentGuard { tool, role }) => {
+            cmd_subagent_guard(tool, role.as_deref())
         }
         Some(Commands::__CheckReply {
             project,
@@ -30231,6 +30250,76 @@ fn in_flight_count(project_root: &std::path::Path) -> Option<u64> {
     v.get("issues")?.as_array().map(|a| a.len() as u64)
 }
 
+// ---- subagent-guard (ADR-0010 D13, bd-eo39) ----
+
+/// Delegation-shaped tool stems denied on the captain/steer pane (the
+/// dispatcher-owning primary). A delegation-shaped harness spawn creates
+/// work with NO spawn-registry metadata — invisible to the doorbell, the
+/// dispatcher, and the guard — so the fence sits on the tool surface, not
+/// in a prompt.
+const DELEGATION_STEMS: [&str; 8] = [
+    "agent", "subagent", "task", "workflow", "spawn", "dispatch", "worktree", "delegate",
+];
+
+/// Delegation-shaped but LEGAL: observe/stop verbs + session-local todo.
+/// These cannot create untracked work.
+const DELEGATION_ALLOW: [&str; 5] = [
+    "taskoutput",
+    "taskstop",
+    "tasklist",
+    "taskcreate",
+    "taskupdate",
+];
+
+/// Pure deny matcher: `Some(stem)` = delegation-shaped tool to deny on a
+/// captain/steer pane; `None` = allow. mcp__* is excluded (toron MCP is the
+/// SANCTIONED coordination surface — denying it would fence the guardrail
+/// itself). Exact allowlist entries win over the `task` stem.
+fn delegation_deny(tool: &str) -> Option<&'static str> {
+    let t = tool.trim().to_ascii_lowercase();
+    if t.is_empty() || t.starts_with("mcp__") {
+        return None;
+    }
+    if DELEGATION_ALLOW.contains(&t.as_str()) {
+        return None;
+    }
+    DELEGATION_STEMS
+        .iter()
+        .find(|s| t.starts_with(**s))
+        .copied()
+}
+
+/// Role-aware decision: crew panes are EXEMPT (they are the sanctioned
+/// spawn target — a crew pane calling its harness's delegation tool would
+/// just double-fence; the registry tracks them). Default (no role) = the
+/// captain/steer primary → enforced.
+fn subagent_guard_decision(role: Option<&str>, tool: &str) -> Result<(), &'static str> {
+    if matches!(role.map(str::to_ascii_lowercase).as_deref(), Some("crew")) {
+        return Ok(());
+    }
+    match delegation_deny(tool) {
+        None => Ok(()),
+        Some(_) => Err(
+            "delegation-shaped tool denied on the captain/steer pane (ADR-0010 D13): a harness-native spawn creates work with no spawn-registry metadata — use flywheel spawn/send, or toron mail to an existing crew pin",
+        ),
+    }
+}
+
+fn cmd_subagent_guard(tool: &str, role: Option<&str>) -> Result<()> {
+    match subagent_guard_decision(role, tool) {
+        Ok(()) => {
+            print_json(
+                &json!({ "decision": "allow", "tool": tool, "role": role.unwrap_or("captain") }),
+            );
+            Ok(())
+        }
+        Err(reason) => {
+            print_json(&json!({ "decision": "deny", "tool": tool, "reason": reason }));
+            std::process::exit(2);
+        }
+    }
+}
+
 fn cmd_turn_guard(cfg: &Config, project: &str, role: Option<&str>) -> Result<()> {
     let is_crew = matches!(role.map(str::to_ascii_lowercase).as_deref(), Some("crew"));
     let grace_secs: u64 = std::env::var("FLYWHEEL_GUARD_GRACE_SECS")
@@ -35404,6 +35493,82 @@ mod single_writer_tests {
             ws.contains("The end-state is one RAM owner"),
             "Option A: speech must name one RAM owner as the end-state"
         );
+    }
+}
+
+#[cfg(test)]
+mod adr0010_d13_tests {
+    // governed-by: ADR-0010 D13 (bd-eo39) — captain/steer subagent-guard.
+    use super::*;
+
+    #[test]
+    fn adr0010_d13_delegation_shaped_names_denied_on_captain() {
+        for tool in [
+            "Task",
+            "task",
+            "subagent",
+            "Agent",
+            "spawn",
+            "dispatch",
+            "worktree",
+            "delegate",
+            "workflow",
+            "agent_worker",
+        ] {
+            assert!(
+                subagent_guard_decision(None, tool).is_err(),
+                "{tool} must deny on the captain pane"
+            );
+        }
+    }
+
+    #[test]
+    fn adr0010_d13_observe_stop_and_todo_allowed_on_captain() {
+        for tool in [
+            "taskoutput",
+            "taskstop",
+            "tasklist",
+            "taskcreate",
+            "taskupdate",
+            "TaskOutput",
+        ] {
+            assert!(
+                subagent_guard_decision(None, tool).is_ok(),
+                "{tool} is observe/stop or session-local todo — allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn adr0010_d13_mcp_tools_never_denied() {
+        for tool in ["mcp__toron__send_message", "mcp__context7__query-docs"] {
+            assert!(
+                subagent_guard_decision(None, tool).is_ok(),
+                "{tool}: mcp__* excluded (toron MCP is the sanctioned surface)"
+            );
+        }
+    }
+
+    #[test]
+    fn adr0010_d13_crew_panes_exempt_and_creatable() {
+        // Crew panes are exempt from the fence...
+        assert!(subagent_guard_decision(Some("crew"), "Task").is_ok());
+        assert!(subagent_guard_decision(Some("CREW"), "spawn").is_ok());
+        // ...and the spawn path that CREATES crew panes is untouched: the
+        // fence lives on the captain's tool surface, not the spawn command.
+        assert!(
+            !delegation_deny("flywheel").is_some(),
+            "the flywheel CLI itself is never delegation-shaped"
+        );
+        // Non-crew roles are enforced (default captain).
+        assert!(subagent_guard_decision(Some("captain"), "Task").is_err());
+    }
+
+    #[test]
+    fn adr0010_d13_empty_and_unknown_tools_allow() {
+        assert!(subagent_guard_decision(None, "").is_ok());
+        assert!(subagent_guard_decision(None, "   ").is_ok());
+        assert!(subagent_guard_decision(None, "read_file").is_ok());
     }
 }
 

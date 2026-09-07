@@ -73,4 +73,15 @@ provider/model overrides it. Record the choice in the launch/report summary.
 7. PROMOTE (optional): switch to `/swarm-mode` only on operator choice.
    Solo stays one harness + reviewer.
 
+## NO HARNESS-NATIVE DELEGATION (ADR-0010 D13)
+
+The loop pane is a dispatcher-owning primary: no harness-native delegation
+tools (agent/subagent/task/workflow/spawn/dispatch/worktree/delegate-shaped).
+They bypass the spawn registry (doorbell + dispatcher + guards see nothing).
+Fence: `flywheel __subagent-guard <tool>` (exit 2 = deny); observe/stop and
+session-local todo stay legal; mcp__* always allowed; crew panes exempt
+(`--role crew` / `FLYWHEEL_ROLE=crew`). Spawn help via `flywheel spawn` so
+the registry tracks it. Defense-in-depth: the fence is the guard, not this
+text.
+
 {{VERSION}} {{GENERATED}}
