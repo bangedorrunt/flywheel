@@ -1852,7 +1852,9 @@ enum StandingOrdersCmd {
 enum MailCmd {
     /// fetch inbox (default: config identity; override with --as / FLYWHEEL_MAIL_AS / AGENT_NAME)
     Inbox {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         #[arg(long)]
         urgent: bool,
         #[arg(long)]
@@ -1872,7 +1874,9 @@ enum MailCmd {
     },
     /// reply to a message in its thread (thread = the message id or thread id)
     Reply {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// message id to reply to (toron hex event id / thread id)
         #[arg(long = "message-id")]
         message_id: String,
@@ -1885,7 +1889,9 @@ enum MailCmd {
     /// mark a message read (read receipt; the projection honors it once
     /// read-state lands toron-side — bd-5icg)
     Read {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// message id (toron hex event id)
         #[arg(long = "message-id")]
         message_id: String,
@@ -1895,7 +1901,9 @@ enum MailCmd {
     },
     /// acknowledge a message that had ack_required=true
     Ack {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// message id (toron hex event id)
         #[arg(long = "message-id")]
         message_id: String,
@@ -1905,7 +1913,9 @@ enum MailCmd {
     },
     /// FTS5 search over the project's indexed messages
     Search {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// FTS5 query (phrase/prefix/boolean; hyphenated ids are quoted)
         query: String,
         #[arg(long, default_value = "20")]
@@ -1928,7 +1938,9 @@ enum MailCmd {
     },
     /// summarize a thread (participants, key points, action items)
     Summarize {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// thread id or message id
         #[arg(long = "thread-id")]
         thread_id: String,
@@ -1938,7 +1950,9 @@ enum MailCmd {
     },
     /// resolve an agent's profile (npub, program, model, task)
     Whois {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// agent (adjective+noun or herdr short name)
         agent: String,
     },
@@ -1946,7 +1960,9 @@ enum MailCmd {
     /// identity (bd-register-portability-3c2b): a name is REQUIRED — bind an
     /// existing key with --from-project/--adopt-unnamed instead of minting.
     Register {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// agent name (adjective+noun pin; REQUIRED unless importing)
         #[arg(long)]
         name: Option<String>,
@@ -1969,7 +1985,9 @@ enum MailCmd {
     },
     /// renew this identity's file reservations (extend the TTL)
     Renew {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// seconds to extend from the current expiry (default 3600)
         #[arg(long, default_value = "3600")]
         extend_seconds: u64,
@@ -1982,7 +2000,9 @@ enum MailCmd {
     },
     /// operator force-release of a stale reservation (herdr-down / abandoned)
     ForceUnlock {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// path (or glob) of the stale reservation to revoke — the daemon
         /// resolves the active lease on this path itself (bd-cumj)
         #[arg(long = "paths", value_name = "PATH")]
@@ -2004,7 +2024,9 @@ enum MailCmd {
     },
     /// set this agent's inbound contact policy
     Policy {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// policy: open|auto|contacts_only|block_all
         #[arg(long)]
         policy: String,
@@ -2015,7 +2037,9 @@ enum MailCmd {
     /// per-agent mail digest: unread/urgent counts + last sender/subject
     /// (orchestrator "who has mail" view; default = own identity)
     Digest {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// act as this registered agent (adjective+noun or herdr short name)
         #[arg(long = "as")]
         as_agent: Option<String>,
@@ -2025,7 +2049,9 @@ enum MailCmd {
     },
     /// wait until a thread gains a new message (blocks; Ctrl-C to abort)
     Watch {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// thread id or message id to watch
         #[arg(long = "thread")]
         thread_id: String,
@@ -2041,7 +2067,9 @@ enum MailCmd {
     },
     /// send a message to registered agents
     Send {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// recipients: comma-separated pins/herdr shorts; REQUIRED unless
         /// --crew expands them for you (bd-mail-crew-fanout-xq6b)
         #[arg(long)]
@@ -2078,13 +2106,17 @@ enum MailCmd {
     },
     /// release this identity's reservations
     Unlock {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         #[arg(long = "as")]
         as_agent: Option<String>,
     },
     /// check reservation conflicts for paths
     Conflicts {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         #[arg(long)]
         paths: Vec<String>,
         #[arg(long = "as")]
@@ -2093,7 +2125,9 @@ enum MailCmd {
     /// list registered agents in the project (active within 24h by default;
     /// --all shows the full history incl. stale registrations)
     Agents {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// include ALL registered identities (history), not just active ones
         #[arg(long)]
         all: bool,
@@ -2109,7 +2143,9 @@ enum MailCmd {
     /// and degraded (bookkeeping failed after enqueue — likely delivered).
     /// A plain re-run of `mail send` mints a NEW corr and duplicates.
     Resend {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// the corr stamped on the original send (from receipts / the
         /// transport-unknown print)
         #[arg(long)]
@@ -2217,7 +2253,9 @@ enum ToronMailCmd {
 enum MailLockCmd {
     /// reserve files (advisory locks)
     Reserve {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         #[arg(long)]
         paths: Vec<String>,
         #[arg(long, default_value = "7200")]
@@ -2232,14 +2270,18 @@ enum MailLockCmd {
     },
     /// dump the active lock board (path, holder, exclusive, reason, expires, id)
     List {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// filter to one holder's leases
         #[arg(long)]
         holder: Option<String>,
     },
     /// show the holders of one path/glob (glob-overlap match)
     Show {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         /// path or glob whose holders to show
         path: String,
     },
@@ -2249,7 +2291,9 @@ enum MailLockCmd {
 enum MailContactCmd {
     /// request contact with an agent (optionally in another project)
     Request {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         #[arg(long)]
         to: String,
         /// target project path for cross-project contact
@@ -2260,21 +2304,31 @@ enum MailContactCmd {
     },
     /// accept a pending contact request
     Approve {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         #[arg(long)]
         from: String,
     },
     /// deny a pending contact request
     Deny {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         #[arg(long)]
         from: String,
     },
     /// list contact links for the flywheel identity
-    List { project: String },
+    List {
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
+    },
     /// set contact policy: open|auto|contacts_only|block_all
     Policy {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         #[arg(long)]
         policy: String,
     },
@@ -2284,7 +2338,9 @@ enum MailContactCmd {
 enum MailSlotCmd {
     /// acquire the advisory build slot (exclusive recommended)
     Acquire {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         #[arg(long, default_value = "cargo")]
         slot: String,
         #[arg(long)]
@@ -2297,7 +2353,9 @@ enum MailSlotCmd {
     },
     /// extend an active slot lease
     Renew {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         #[arg(long, default_value = "cargo")]
         slot: String,
         #[arg(long, default_value = "1800")]
@@ -2308,7 +2366,9 @@ enum MailSlotCmd {
     },
     /// release an active slot lease (non-destructive)
     Release {
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
         #[arg(long, default_value = "cargo")]
         slot: String,
         /// act as this registered agent (adjective+noun or herdr short name)
@@ -2328,7 +2388,9 @@ enum MailProductCmd {
     Link {
         #[arg(long)]
         product: String,
-        project: String,
+        project: Option<String>,
+        #[arg(long = "project", value_name = "PROJECT")]
+        project_flag: Option<String>,
     },
     /// search messages across a product
     Search {
@@ -7113,6 +7175,108 @@ mod spawn_boot_reliability_tests {
             })
             .expect("spawn clap probe");
         handle.join().expect("clap probe thread");
+    }
+
+    /// bd-3npc: every user-facing mail-cli positional PROJECT also accepts
+    /// --project. Behavioral (not invent-green): help lists the flag; the
+    /// flag form and the positional form fill the same effective project;
+    /// the pure resolver is total over flag/positional/both/neither.
+    #[test]
+    fn bd_3npc_mail_project_flag_alias() {
+        use clap::CommandFactory;
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let cmd = Cli::command();
+                let mail = cmd.find_subcommand("mail").expect("mail subcommand");
+                let send = mail.find_subcommand("send").expect("mail send subcommand");
+                let mut help = Vec::new();
+                send.clone().write_long_help(&mut help).expect("help");
+                let help_s = String::from_utf8(help).expect("utf8");
+                assert!(
+                    help_s.contains("--project"),
+                    "mail send help must list --project"
+                );
+
+                let project_of = |args: &[&str]| -> String {
+                    let cli = Cli::try_parse_from(args)
+                        .unwrap_or_else(|e| panic!("parse {args:?} failed: {e}"));
+                    match cli.command {
+                        Some(Commands::Mail {
+                            cmd:
+                                MailCmd::Send {
+                                    project,
+                                    project_flag,
+                                    ..
+                                },
+                        }) => super::mail_project(&project, &project_flag, "send")
+                            .expect("resolve")
+                            .to_string(),
+                        _ => panic!("expected mail send"),
+                    }
+                };
+                assert_eq!(
+                    project_of(&[
+                        "flywheel",
+                        "mail",
+                        "send",
+                        "--project",
+                        "flywheel",
+                        "--to",
+                        "TanOtter",
+                        "--subject",
+                        "s",
+                        "--body",
+                        "b"
+                    ]),
+                    "flywheel",
+                    "--project must fill the project field"
+                );
+                assert_eq!(
+                    project_of(&[
+                        "flywheel",
+                        "mail",
+                        "send",
+                        "flywheel",
+                        "--to",
+                        "TanOtter",
+                        "--subject",
+                        "s",
+                        "--body",
+                        "b"
+                    ]),
+                    "flywheel",
+                    "positional project must keep working"
+                );
+            })
+            .expect("spawn clap probe");
+        handle.join().expect("clap probe thread");
+    }
+
+    /// bd-3npc: the positional/--project resolver is total — flag wins on
+    /// both, neither fails loud. Pure function, tested exhaustively.
+    #[test]
+    fn bd_3npc_mail_project_resolver_is_total() {
+        let pos = Some("pos".to_string());
+        let flag = Some("flag".to_string());
+        let none: Option<String> = None;
+        assert_eq!(
+            super::mail_project(&pos, &none, "send").expect("pos"),
+            "pos"
+        );
+        assert_eq!(
+            super::mail_project(&none, &flag, "send").expect("flag"),
+            "flag"
+        );
+        assert_eq!(
+            super::mail_project(&pos, &flag, "send").expect("both"),
+            "flag",
+            "flag wins when both are given"
+        );
+        assert!(
+            super::mail_project(&none, &none, "send").is_err(),
+            "neither must fail loud, never an empty project"
+        );
     }
 
     #[test]
@@ -16734,16 +16898,35 @@ fn cmd_xproj(cfg: &Config, cmd: &XprojCmd) -> Result<()> {
     Ok(())
 }
 
+/// bd-3npc: `--project` flag alias for every mail-cli positional PROJECT.
+/// Flag wins when both are given; neither fails loud naming the subcommand.
+/// Total over all four cases — a missing project is never an empty string.
+fn mail_project<'a>(
+    positional: &'a Option<String>,
+    flag: &'a Option<String>,
+    sub: &str,
+) -> Result<&'a str> {
+    match (positional, flag) {
+        (_, Some(f)) => Ok(f.as_str()),
+        (Some(p), None) => Ok(p.as_str()),
+        (None, None) => anyhow::bail!(
+            "mail {sub} requires a project: pass PROJECT positionally or --project <slug>"
+        ),
+    }
+}
+
 fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
     match cmd {
         MailCmd::Inbox {
             project,
+            project_flag,
             urgent,
             unread,
             limit,
             as_agent,
             json,
         } => {
+            let project = mail_project(project, project_flag, "inbox")?;
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
@@ -16784,10 +16967,12 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         }
         MailCmd::Reply {
             project,
+            project_flag,
             message_id,
             body,
             as_agent,
         } => {
+            let project = mail_project(project, project_flag, "reply")?;
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
@@ -16796,9 +16981,11 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         }
         MailCmd::Read {
             project,
+            project_flag,
             message_id,
             as_agent,
         } => {
+            let project = mail_project(project, project_flag, "read")?;
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
@@ -16808,9 +16995,11 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         }
         MailCmd::Ack {
             project,
+            project_flag,
             message_id,
             as_agent,
         } => {
+            let project = mail_project(project, project_flag, "ack")?;
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
@@ -16820,6 +17009,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         }
         MailCmd::Search {
             project,
+            project_flag,
             query,
             limit,
             sender,
@@ -16828,6 +17018,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             recency,
             bodies,
         } => {
+            let project = mail_project(project, project_flag, "search")?;
             let key = project_dir_str(cfg, project)?;
             let mail = mail_or_die(cfg)?;
             mail.ensure_project(&key)?;
@@ -16848,16 +17039,23 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         }
         MailCmd::Summarize {
             project,
+            project_flag,
             thread_id,
             examples,
         } => {
+            let project = mail_project(project, project_flag, "summarize")?;
             let key = project_dir_str(cfg, project)?;
             let mail = mail_or_die(cfg)?;
             mail.ensure_project(&key)?;
             let v = mail.summarize_thread(&key, thread_id, *examples)?;
             print_json(&v);
         }
-        MailCmd::Whois { project, agent } => {
+        MailCmd::Whois {
+            project,
+            project_flag,
+            agent,
+        } => {
+            let project = mail_project(project, project_flag, "whois")?;
             let key = project_dir_str(cfg, project)?;
             let mail = mail_or_die(cfg)?;
             mail.ensure_project(&key)?;
@@ -16866,6 +17064,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         }
         MailCmd::Register {
             project,
+            project_flag,
             name,
             program,
             model,
@@ -16873,6 +17072,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             from_project,
             adopt_unnamed,
         } => {
+            let project = mail_project(project, project_flag, "register")?;
             let key = project_dir_str(cfg, project)?;
             let mail = mail_or_die(cfg)?;
             mail.ensure_project(&key)?;
@@ -16920,10 +17120,12 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         }
         MailCmd::Renew {
             project,
+            project_flag,
             extend_seconds,
             paths,
             as_agent,
         } => {
+            let project = mail_project(project, project_flag, "renew")?;
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
@@ -16933,11 +17135,13 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         }
         MailCmd::ForceUnlock {
             project,
+            project_flag,
             path,
             holder,
             note,
             as_agent,
         } => {
+            let project = mail_project(project, project_flag, "force-unlock")?;
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
@@ -16955,11 +17159,13 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         MailCmd::Slot { cmd } => match cmd {
             MailSlotCmd::Acquire {
                 project,
+                project_flag,
                 slot,
                 exclusive,
                 ttl_seconds,
                 as_agent,
             } => {
+                let project = mail_project(project, project_flag, "slot-acquire")?;
                 let key = project_dir_str(cfg, project)?;
                 let mail = mail_as(cfg, &key, as_agent.as_deref())?;
                 mail.ensure_project(&key)?;
@@ -16969,10 +17175,12 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             }
             MailSlotCmd::Renew {
                 project,
+                project_flag,
                 slot,
                 extend_seconds,
                 as_agent,
             } => {
+                let project = mail_project(project, project_flag, "slot-renew")?;
                 let key = project_dir_str(cfg, project)?;
                 let mail = mail_as(cfg, &key, as_agent.as_deref())?;
                 mail.ensure_project(&key)?;
@@ -16982,9 +17190,11 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             }
             MailSlotCmd::Release {
                 project,
+                project_flag,
                 slot,
                 as_agent,
             } => {
+                let project = mail_project(project, project_flag, "slot-release")?;
                 let key = project_dir_str(cfg, project)?;
                 let mail = mail_as(cfg, &key, as_agent.as_deref())?;
                 mail.ensure_project(&key)?;
@@ -16995,9 +17205,11 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         },
         MailCmd::Policy {
             project,
+            project_flag,
             policy,
             as_agent,
         } => {
+            let project = mail_project(project, project_flag, "policy")?;
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
@@ -17007,9 +17219,11 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         }
         MailCmd::Digest {
             project,
+            project_flag,
             as_agent,
             all,
         } => {
+            let project = mail_project(project, project_flag, "digest")?;
             let key = project_dir_str(cfg, project)?;
             if *all {
                 let mail = mail_or_die(cfg)?;
@@ -17041,11 +17255,13 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         }
         MailCmd::Watch {
             project,
+            project_flag,
             thread_id,
             as_agent,
             timeout_secs,
             interval_secs,
         } => {
+            let project = mail_project(project, project_flag, "watch")?;
             cmd_mail_watch(
                 cfg,
                 project,
@@ -17057,6 +17273,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         }
         MailCmd::Send {
             project,
+            project_flag,
             to,
             crew,
             subject,
@@ -17067,6 +17284,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             thread_id,
             wake,
         } => {
+            let project = mail_project(project, project_flag, "send")?;
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
@@ -17135,12 +17353,14 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         }
         MailCmd::Resend {
             project,
+            project_flag,
             corr,
             to,
             subject,
             body,
             as_agent,
         } => {
+            let project = mail_project(project, project_flag, "resend")?;
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
@@ -17195,12 +17415,14 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         MailCmd::Locks { cmd } => match cmd {
             MailLockCmd::Reserve {
                 project,
+                project_flag,
                 paths,
                 ttl_seconds,
                 exclusive,
                 reason,
                 as_agent,
             } => {
+                let project = mail_project(project, project_flag, "locks-reserve")?;
                 let key = project_dir_str(cfg, project)?;
                 let mail = mail_as(cfg, &key, as_agent.as_deref())?;
                 mail.ensure_project(&key)?;
@@ -17213,20 +17435,35 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 let v = mail.reserve(&key, &agent, paths, *ttl_seconds, *exclusive, reason)?;
                 print_json(&v);
             }
-            MailLockCmd::List { project, holder } => {
+            MailLockCmd::List {
+                project,
+                project_flag,
+                holder,
+            } => {
+                let project = mail_project(project, project_flag, "locks-list")?;
                 let key = project_dir_str(cfg, project)?;
                 let mail = mail_or_die(cfg)?;
                 let v = mail.list_active(&key, holder.as_deref(), None)?;
                 print_json(&v);
             }
-            MailLockCmd::Show { project, path } => {
+            MailLockCmd::Show {
+                project,
+                project_flag,
+                path,
+            } => {
+                let project = mail_project(project, project_flag, "locks-show")?;
                 let key = project_dir_str(cfg, project)?;
                 let mail = mail_or_die(cfg)?;
                 let v = mail.list_active(&key, None, Some(path))?;
                 print_json(&v);
             }
         },
-        MailCmd::Unlock { project, as_agent } => {
+        MailCmd::Unlock {
+            project,
+            project_flag,
+            as_agent,
+        } => {
+            let project = mail_project(project, project_flag, "unlock")?;
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             // bd-reservation-identity-tlnf: resolved actor, never the raw slug.
@@ -17236,9 +17473,11 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         }
         MailCmd::Conflicts {
             project,
+            project_flag,
             paths,
             as_agent,
         } => {
+            let project = mail_project(project, project_flag, "conflicts")?;
             let key = project_dir_str(cfg, project)?;
             let mail = mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
@@ -17247,7 +17486,12 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let v = mail.conflicts_for(&key, &agent, paths)?;
             print_json(&v);
         }
-        MailCmd::Agents { project, all } => {
+        MailCmd::Agents {
+            project,
+            project_flag,
+            all,
+        } => {
+            let project = mail_project(project, project_flag, "agents")?;
             let key = project_dir_str(cfg, project)?;
             let mail = mail_or_die(cfg)?;
             mail.ensure_project(&key)?;
@@ -17261,10 +17505,12 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         MailCmd::Contact { cmd } => match cmd {
             MailContactCmd::Request {
                 project,
+                project_flag,
                 to,
                 to_project,
                 reason,
             } => {
+                let project = mail_project(project, project_flag, "contact-request")?;
                 let key = project_dir_str(cfg, project)?;
                 let mail = mail_as(cfg, &key, None)?;
                 mail.ensure_project(&key)?;
@@ -17280,7 +17526,12 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                     mail.request_contact(&key, &from, &to_mail, to_proj.as_deref(), reason, None)?;
                 print_json(&v);
             }
-            MailContactCmd::Approve { project, from } => {
+            MailContactCmd::Approve {
+                project,
+                project_flag,
+                from,
+            } => {
+                let project = mail_project(project, project_flag, "contact-approve")?;
                 let key = project_dir_str(cfg, project)?;
                 let mail = mail_as(cfg, &key, None)?;
                 let to = mail.name.clone();
@@ -17290,7 +17541,12 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 let v = mail.respond_contact(&key, &to, &from_mail, true)?;
                 print_json(&v);
             }
-            MailContactCmd::Deny { project, from } => {
+            MailContactCmd::Deny {
+                project,
+                project_flag,
+                from,
+            } => {
+                let project = mail_project(project, project_flag, "contact-deny")?;
                 let key = project_dir_str(cfg, project)?;
                 let mail = mail_as(cfg, &key, None)?;
                 let to = mail.name.clone();
@@ -17298,14 +17554,23 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 let v = mail.respond_contact(&key, &to, &from_mail, false)?;
                 print_json(&v);
             }
-            MailContactCmd::List { project } => {
+            MailContactCmd::List {
+                project,
+                project_flag,
+            } => {
+                let project = mail_project(project, project_flag, "contact-list")?;
                 let key = project_dir_str(cfg, project)?;
                 let mail = mail_as(cfg, &key, None)?;
                 let name = mail.name.clone();
                 let v = mail.list_contacts(&key, &name)?;
                 print_json(&v);
             }
-            MailContactCmd::Policy { project, policy } => {
+            MailContactCmd::Policy {
+                project,
+                project_flag,
+                policy,
+            } => {
+                let project = mail_project(project, project_flag, "contact-policy")?;
                 let key = project_dir_str(cfg, project)?;
                 let mail = mail_as(cfg, &key, None)?;
                 let name = mail.name.clone();
@@ -17319,7 +17584,12 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 let v = mail.ensure_product(name, Some(name))?;
                 print_json(&v);
             }
-            MailProductCmd::Link { product, project } => {
+            MailProductCmd::Link {
+                product,
+                project,
+                project_flag,
+            } => {
+                let project = mail_project(project, project_flag, "product-link")?;
                 let key = project_dir_str(cfg, project)?;
                 let mail = mail_or_die(cfg)?;
                 mail.ensure_project(&key)?;
