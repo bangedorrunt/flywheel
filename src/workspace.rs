@@ -233,6 +233,16 @@ pub struct WorkspaceModel {
     /// ADR-0010 D2 (bd-8jlv): ack watermark per pin — highest handled
     /// presentation seq. Entries with seq <= watermark are handled fact.
     pub wake_acked: std::collections::BTreeMap<String, u64>,
+    /// ADR-0010 D5 (bd-65he): captain-relevant wakes awaiting the afk
+    /// digest batch. Drained into Cmd::Digest on interval/threshold.
+    pub digest_queue: Vec<DigestEntry>,
+    /// ADR-0010 D5 (bd-65he): per-class tick counts (journal+counter
+    /// for routine; proves benign/routine classes spend zero prompts).
+    pub wake_counters: std::collections::BTreeMap<String, u64>,
+    /// ADR-0010 D5 (bd-65he): last wall-clock seen on a now-bearing Msg.
+    pub last_now: u64,
+    /// ADR-0010 D5 (bd-65he): wall-clock of the last emitted digest.
+    pub last_digest_unix: u64,
 }
 
 /// ADR-0010 D2 (bd-8jlv): one presented wake — the line as prompted,
@@ -241,6 +251,157 @@ pub struct WorkspaceModel {
 pub struct PresentedWake {
     pub seq: u64,
     pub line: String,
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0010 D5 (bd-65he): wake classification + afk digest.
+//
+// Pure predicates in workspace::tick: benign (zero prompts), routine
+// (journal+counter), captain-relevant (digest queue), urgent (immediate
+// prompt, 5/30/3 cap unchanged). Every Prompt counts as spent wake, so
+// non-urgent prompts queue as captain-relevant (visible) rather than
+// routine — routine ticks provably contain no Cmd::Prompt. Urgent
+// bypasses batching: it prompts now AND queues for the digest record.
+// ---------------------------------------------------------------------------
+
+/// Default digest batching interval (secs). Override with
+/// FLYWHEEL_DIGEST_SECS.
+pub const DIGEST_INTERVAL_DEFAULT_SECS: u64 = 300;
+/// Default digest queue depth that forces a batch. Override with
+/// FLYWHEEL_DIGEST_THRESHOLD.
+pub const DIGEST_THRESHOLD_DEFAULT: usize = 10;
+
+/// Digest batching interval secs (env override, default 300).
+pub fn digest_interval_secs() -> u64 {
+    std::env::var("FLYWHEEL_DIGEST_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DIGEST_INTERVAL_DEFAULT_SECS)
+}
+
+/// Digest queue depth that forces a batch (env override, default 10).
+pub fn digest_threshold() -> usize {
+    std::env::var("FLYWHEEL_DIGEST_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DIGEST_THRESHOLD_DEFAULT)
+}
+
+/// Wake severity, lowest to highest. Tick class is the max over its cmds;
+/// a tick with no cmds is Benign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WakeClass {
+    Benign,
+    Routine,
+    CaptainRelevant,
+    Urgent,
+}
+
+impl WakeClass {
+    pub fn label(self) -> &'static str {
+        match self {
+            WakeClass::Benign => "benign",
+            WakeClass::Routine => "routine",
+            WakeClass::CaptainRelevant => "captain",
+            WakeClass::Urgent => "urgent",
+        }
+    }
+}
+
+/// A doorbell line that must ring now, never batch: plane-P urgent,
+/// request-release, reservation conflicts, ack-SLA expiry.
+pub fn is_urgent_line(line: &str) -> bool {
+    line.contains("plane-P urgent")
+        || line.contains("request-release")
+        || line.contains("kind 30031")
+        || line.contains("ack-sla-expired")
+}
+
+/// Classify one emitted cmd for wake spend.
+pub fn classify_cmd(cmd: &Cmd) -> WakeClass {
+    match cmd {
+        Cmd::Prompt { line, .. } if is_urgent_line(line) => WakeClass::Urgent,
+        Cmd::Prompt { .. }
+        | Cmd::Audit { .. }
+        | Cmd::FactMiss { .. }
+        | Cmd::LoudMiss { .. }
+        | Cmd::Respawn { .. }
+        | Cmd::Diagnose { .. } => WakeClass::CaptainRelevant,
+        Cmd::Wait => WakeClass::Benign,
+        // A batch just emitted: captain-facing work, but never re-queued
+        // (the D5 loop skips Digest cmds so batches cannot self-feed).
+        Cmd::Digest { .. } => WakeClass::CaptainRelevant,
+        _ => WakeClass::Routine,
+    }
+}
+
+/// One captain-relevant wake awaiting the digest batch.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DigestEntry {
+    pub seq: u64,
+    /// Last wall-clock seen when recorded (0 = before any clock Msg).
+    pub at_unix: u64,
+    pub kind: String,
+    pub pin: String,
+    pub detail: String,
+}
+
+/// Digest detail is bounded: prompt lines can be long, the queue is not
+/// a log. Truncation is marked.
+pub fn digest_detail_truncate(detail: &str) -> String {
+    const MAX: usize = 200;
+    if detail.len() <= MAX {
+        return detail.to_string();
+    }
+    format!("{}…[{} chars]", &detail[..MAX], detail.len())
+}
+
+/// Extract bead ids (`bd-…` tokens) from digest details, sorted dedup.
+pub fn digest_bead_ids(entries: &[DigestEntry]) -> Vec<String> {
+    let mut ids: Vec<String> = entries
+        .iter()
+        .flat_map(|e| e.detail.split(|c: char| !c.is_alphanumeric() && c != '-'))
+        .filter(|t| t.starts_with("bd-") && t.len() > 3)
+        .map(str::to_string)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Render the afk digest: outcomes first with ages, bead ids kept,
+/// exact commands last. Pure — the afk CLI and the Digest effect share it.
+pub fn render_digest(entries: &[DigestEntry], now: u64) -> String {
+    let mut out = format!("doorbell afk digest ({} items)\n", entries.len());
+    for e in entries {
+        let age = now.saturating_sub(e.at_unix);
+        out.push_str(&format!(
+            "- [{}s ago] {} {}: {}\n",
+            age, e.kind, e.pin, e.detail
+        ));
+    }
+    let beads = digest_bead_ids(entries);
+    if beads.is_empty() {
+        out.push_str("beads: none in this digest\n");
+    } else {
+        out.push_str(&format!("beads: {}\n", beads.join(", ")));
+    }
+    out.push_str("commands:\n");
+    for b in &beads {
+        out.push_str(&format!("  br show {b}\n"));
+    }
+    if beads.is_empty() {
+        out.push_str("  (no bead commands)\n");
+    }
+    out
+}
+
+/// Wedge alarm: a non-empty queue older than two batch intervals means
+/// the digest path cannot deliver — fail loud, never silently batch.
+pub fn digest_overdue(queue_len: usize, last_digest_unix: u64, now: u64) -> bool {
+    queue_len > 0 && now.saturating_sub(last_digest_unix) > 2 * digest_interval_secs()
 }
 
 /// bd-zfnx.6: a parked corr lives at most this long before the Sweep arm
@@ -508,6 +669,11 @@ pub enum Cmd {
         pin: String,
         detail: String,
     },
+    /// ADR-0010 D5 (bd-65he): afk digest batch — drained captain-relevant
+    /// entries for the effect layer to deliver (steer channel post).
+    /// Rendered with render_digest; never holds prompt content beyond
+    /// the bounded DigestEntry details.
+    Digest { entries: Vec<DigestEntry> },
 
     // swarm slice — data equivalents of LoopAction
     /// Swarm send. Name is the herdr pane, text the full prompt.
@@ -1442,6 +1608,108 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     line: line.clone(),
                 });
             }
+        }
+    }
+
+    // ADR-0010 D5 (bd-65he): classify the tick, queue captain-relevant
+    // wakes for the afk digest, count every tick once. Digest cmds never
+    // re-queue themselves. Batch emits on now-bearing beats when the
+    // queue hits depth N or the interval lapses; urgent prompts bypass
+    // batching by construction (prompted immediately above).
+    if let Some(now) = match msg {
+        Msg::AckSlaTick { now } | Msg::Sweep { now, .. } | Msg::Tick { now } => Some(*now),
+        _ => None,
+    } {
+        next.last_now = now;
+    }
+    let mut tick_class = WakeClass::Benign;
+    for cmd in &cmds {
+        if matches!(cmd, Cmd::Digest { .. }) {
+            continue;
+        }
+        tick_class = tick_class.max(classify_cmd(cmd));
+        let entry = match cmd {
+            Cmd::Prompt { pin, line } if is_urgent_line(line) => Some(DigestEntry {
+                seq: next.seq,
+                at_unix: next.last_now,
+                kind: "urgent-prompt".into(),
+                pin: pin.clone(),
+                detail: digest_detail_truncate(line),
+            }),
+            Cmd::Prompt { pin, line } => {
+                let short = digest_detail_truncate(line);
+                let queued = next
+                    .digest_queue
+                    .iter()
+                    .any(|e| e.pin == *pin && e.detail == short);
+                if queued {
+                    None
+                } else {
+                    Some(DigestEntry {
+                        seq: next.seq,
+                        at_unix: next.last_now,
+                        kind: "prompt".into(),
+                        pin: pin.clone(),
+                        detail: short,
+                    })
+                }
+            }
+            Cmd::Audit { kind, pin, detail } => Some(DigestEntry {
+                seq: next.seq,
+                at_unix: next.last_now,
+                kind: format!("audit:{kind}"),
+                pin: pin.clone(),
+                detail: digest_detail_truncate(detail),
+            }),
+            Cmd::FactMiss { why } => Some(DigestEntry {
+                seq: next.seq,
+                at_unix: next.last_now,
+                kind: "fact-miss".into(),
+                pin: "-".into(),
+                detail: digest_detail_truncate(why),
+            }),
+            Cmd::LoudMiss { why } => Some(DigestEntry {
+                seq: next.seq,
+                at_unix: next.last_now,
+                kind: "loud-miss".into(),
+                pin: "-".into(),
+                detail: digest_detail_truncate(why),
+            }),
+            Cmd::Respawn { name, reason } => Some(DigestEntry {
+                seq: next.seq,
+                at_unix: next.last_now,
+                kind: "respawn".into(),
+                pin: name.clone(),
+                detail: digest_detail_truncate(reason),
+            }),
+            Cmd::Diagnose { name, reason } => Some(DigestEntry {
+                seq: next.seq,
+                at_unix: next.last_now,
+                kind: "diagnose".into(),
+                pin: name.clone(),
+                detail: digest_detail_truncate(reason),
+            }),
+            _ => None,
+        };
+        if let Some(e) = entry {
+            next.digest_queue.push(e);
+        }
+    }
+    *next
+        .wake_counters
+        .entry(tick_class.label().to_string())
+        .or_insert(0) += 1;
+    if let Some(now) = match msg {
+        Msg::AckSlaTick { now } | Msg::Sweep { now, .. } | Msg::Tick { now } => Some(*now),
+        _ => None,
+    } {
+        if !next.digest_queue.is_empty()
+            && (next.digest_queue.len() >= digest_threshold()
+                || now.saturating_sub(next.last_digest_unix) >= digest_interval_secs())
+        {
+            let entries = std::mem::take(&mut next.digest_queue);
+            next.last_digest_unix = now;
+            cmds.push(Cmd::Digest { entries });
         }
     }
 
@@ -3897,6 +4165,234 @@ mod adr0010_d2_tests {
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
             "gated pin prompts nothing, re-present included: {cmds:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod adr0010_d5_tests {
+    // governed-by: ADR-0010 D5 (bd-65he) — wake classification + afk digest.
+    use super::*;
+
+    fn urgent_row() -> serde_json::Value {
+        serde_json::json!({"importance": "urgent", "subject": "wake"})
+    }
+
+    fn idle_captain(pin: &str) -> WorkspaceModel {
+        let mut m = WorkspaceModel::default();
+        m.presence.insert(
+            pin.into(),
+            Presence::Idle {
+                source: "test".into(),
+            },
+        );
+        // The doorbell slice gates inject on its own status map.
+        m.doorbell.statuses.insert(pin.into(), "idle".into());
+        m.roles.insert("captain".into(), pin.into());
+        m
+    }
+
+    #[test]
+    fn adr0010_d5_fixture_replay_afk_classes() {
+        // AFK fixture: chatter (benign), sla beats (routine), alias-less
+        // fact (captain-relevant miss), urgent inbox pull (urgent).
+        let mut m = idle_captain("P");
+        let chatter = r#"{"kind":9,"id":"z","tags":[["p","Nobody"],["h","ch"]],"content":"hi"}"#;
+        let (m1, c1) = tick(
+            &m,
+            &Msg::WatchNdjson {
+                line: chatter.into(),
+            },
+        );
+        m = m1;
+        assert!(
+            !c1.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
+            "benign chatter spends zero prompts: {c1:?}"
+        );
+        let (m2, c2) = tick(&m, &Msg::AckSlaTick { now: 10 });
+        m = m2;
+        assert!(
+            !c2.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
+            "routine beats spend zero prompts: {c2:?}"
+        );
+        // Alias-less fact (no captain role on a fresh model) is a miss.
+        let mut m3 = WorkspaceModel::default();
+        m3.presence.insert(
+            "P".into(),
+            Presence::Idle {
+                source: "test".into(),
+            },
+        );
+        let (m4, c4) = tick(
+            &m3,
+            &Msg::Fact {
+                summary: "orphan".into(),
+            },
+        );
+        assert!(
+            c4.iter().any(|c| matches!(c, Cmd::FactMiss { .. })),
+            "alias-less fact must miss loud: {c4:?}"
+        );
+        assert!(
+            !c4.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
+            "misses spend zero prompts: {c4:?}"
+        );
+        assert_eq!(m4.digest_queue.len(), 1, "miss queues for digest");
+        assert_eq!(m4.digest_queue[0].kind, "fact-miss");
+        // Urgent inbox pull prompts immediately (bypasses batching).
+        let (m5, c5) = tick(
+            &m,
+            &Msg::InboxRows {
+                rows: vec![urgent_row()],
+                pin: "P".into(),
+            },
+        );
+        assert!(
+            c5.iter().any(|c| matches!(c, Cmd::Prompt { pin, line }
+                if pin == "P" && is_urgent_line(line))),
+            "urgent bypasses batching with an immediate prompt: {c5:?}"
+        );
+        let _ = m5;
+    }
+
+    #[test]
+    fn adr0010_d5_digest_batch_interval_and_threshold() {
+        let mut m = WorkspaceModel::default();
+        // Two captain-relevant misses queue without emitting.
+        for i in 0..2 {
+            let (next, cmds) = tick(
+                &m,
+                &Msg::Fact {
+                    summary: format!("orphan-{i}"),
+                },
+            );
+            assert!(
+                !cmds.iter().any(|c| matches!(c, Cmd::Digest { .. })),
+                "below threshold/interval no batch emits yet"
+            );
+            m = next;
+        }
+        assert_eq!(m.digest_queue.len(), 2);
+        // Interval lapse flushes exactly the queued set with ages.
+        let (next, cmds) = tick(
+            &m,
+            &Msg::AckSlaTick {
+                now: digest_interval_secs() + 1,
+            },
+        );
+        let digests: Vec<&Vec<DigestEntry>> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::Digest { entries } => Some(entries),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(digests.len(), 1, "one batch per due beat: {cmds:?}");
+        assert_eq!(digests[0].len(), 2, "digest is exactly the queued set");
+        assert!(
+            digests[0].iter().all(|e| e.seq > 0 && e.at_unix == 0),
+            "entries carry generation + clock (0 = pre-clock fixture)"
+        );
+        assert!(next.digest_queue.is_empty(), "batch drains the queue");
+        assert_eq!(next.last_digest_unix, digest_interval_secs() + 1);
+    }
+
+    #[test]
+    fn adr0010_d5_counters_prove_zero_prompt_classes() {
+        let m = idle_captain("P");
+        let chatter = r#"{"kind":9,"id":"z","tags":[["p","Nobody"],["h","ch"]],"content":"hi"}"#;
+        let (m, _) = tick(
+            &m,
+            &Msg::WatchNdjson {
+                line: chatter.into(),
+            },
+        );
+        let (m, _) = tick(&m, &Msg::AckSlaTick { now: 5 });
+        assert_eq!(m.wake_counters.get("benign"), Some(&1));
+        assert_eq!(m.wake_counters.get("routine"), Some(&1));
+        assert_eq!(m.wake_counters.get("captain"), None);
+        assert_eq!(m.wake_counters.get("urgent"), None);
+    }
+
+    #[test]
+    fn adr0010_d5_render_digest_shape() {
+        let entries = vec![
+            DigestEntry {
+                seq: 4,
+                at_unix: 100,
+                kind: "respawn".into(),
+                pin: "P".into(),
+                detail: "doorbell re-ring exhausted pin=P corr=c attempts=3 (bd-8jlv)".into(),
+            },
+            DigestEntry {
+                seq: 7,
+                at_unix: 160,
+                kind: "fact-miss".into(),
+                pin: "-".into(),
+                detail: "fact without captain alias: deploy".into(),
+            },
+        ];
+        let text = render_digest(&entries, 200);
+        assert!(text.contains("doorbell afk digest (2 items)"), "{text}");
+        assert!(text.contains("[100s ago] respawn P:"), "{text}");
+        assert!(text.contains("[40s ago] fact-miss -:"), "{text}");
+        assert!(text.contains("beads: bd-8jlv"), "{text}");
+        assert!(text.contains("br show bd-8jlv"), "{text}");
+        assert!(
+            text.trim_end().ends_with("br show bd-8jlv"),
+            "ends with exact commands: {text}"
+        );
+    }
+
+    #[test]
+    fn adr0010_d5_wedge_alarm_predicate() {
+        assert!(!digest_overdue(0, 0, 10_000), "empty queue never wedges");
+        assert!(
+            !digest_overdue(3, 9_900, 10_000),
+            "fresh digest is not a wedge"
+        );
+        assert!(
+            digest_overdue(3, 0, 2 * digest_interval_secs() + 1),
+            "stale non-empty queue is a wedge"
+        );
+    }
+
+    #[test]
+    fn adr0010_d5_classify_cmd_table() {
+        assert_eq!(
+            classify_cmd(&Cmd::Wait),
+            WakeClass::Benign,
+            "waits spend nothing"
+        );
+        assert_eq!(
+            classify_cmd(&Cmd::CheckAckSla),
+            WakeClass::Routine,
+            "sla scans journal+count"
+        );
+        assert_eq!(
+            classify_cmd(&Cmd::Audit {
+                kind: "k".into(),
+                pin: "P".into(),
+                detail: "d".into(),
+            }),
+            WakeClass::CaptainRelevant,
+            "audits queue for digest"
+        );
+        assert_eq!(
+            classify_cmd(&Cmd::Prompt {
+                pin: "P".into(),
+                line: "[doorbell] plane-P urgent. Pull: inbox".into(),
+            }),
+            WakeClass::Urgent,
+            "urgent lines ring now"
+        );
+        assert_eq!(
+            classify_cmd(&Cmd::Prompt {
+                pin: "P".into(),
+                line: "[doorbell] kind 9. Pull: ch".into(),
+            }),
+            WakeClass::CaptainRelevant,
+            "spent prompts are captain-visible, never routine"
         );
     }
 }
