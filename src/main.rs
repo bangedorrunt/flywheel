@@ -30542,8 +30542,15 @@ fn cmd_internal_dispatch_guard(cfg: &Config, project: &str, bead: &str) -> Resul
                     let signals: Vec<Value> = items
                         .iter()
                         .filter_map(|m| {
-                            durable::classify_guard_signal(&m.subject, &m.body_md)
-                                .map(|k| json!({ "ts_us": m.created_ts_us, "kind": k.as_str() }))
+                            // ADR-0010 D9 (bd-l0fz): the projected `bead=<id>`
+                            // tag is the structural done-hold; the subject is
+                            // decoration for humans.
+                            durable::classify_guard_signal(
+                                &m.subject,
+                                &m.body_md,
+                                m.bead.as_deref(),
+                            )
+                            .map(|k| json!({ "ts_us": m.created_ts_us, "kind": k.as_str() }))
                         })
                         .collect();
                     facts["signals"] = json!(signals);
@@ -31269,16 +31276,21 @@ fn send_done_mail(
             "Bead **{bead_id}** (`{title}`) closed with a legal verdict.\n\nReport:\n```text\n{report}\n```"
         )
     };
-    mail_send(
-        mail,
-        key,
-        std::slice::from_ref(&captain.to_string()),
-        &subject,
-        &body,
-        "normal",
-        true,
-        Some(bead_id),
-    )
+    // ADR-0010 D9 (bd-l0fz): the reporter-of-record keeps the `[{id}] done`
+    // subject for humans and gains the structural `bead=<id>` tag — the
+    // dispatch guard matches the TAG, never the subject.
+    Ok(backend::run_mail(mail.send(&backend::SendMail {
+        project: key.to_string(),
+        sender: mail.agent_name().to_string(),
+        to: vec![captain.to_string()],
+        subject,
+        body_md: body,
+        importance: Some("normal".to_string()),
+        ack_required: true,
+        thread_id: Some(bead_id.to_string()),
+        bead: Some(bead_id.to_string()),
+        ..Default::default()
+    }))?)
 }
 
 /// internal leaf: close-detect SHA check (ADR-0019 SHA rule, bd-w1-sha-xyhd).
@@ -33566,6 +33578,7 @@ mod plan_review_tests {
                 importance: "high".to_string(),
                 ack_required: true,
                 thread_id: thread.map(backend::MessageId::from),
+                bead: None,
                 created_ts_us: ts,
                 duplicate_of: None,
             };
@@ -33605,6 +33618,7 @@ mod plan_review_tests {
             importance: "high".to_string(),
             ack_required: true,
             thread_id: Some(backend::MessageId::from("debate-20260806T130548")),
+            bead: None,
             created_ts_us: ts,
             duplicate_of: None,
         };
