@@ -543,6 +543,63 @@ pub fn digest_overdue(queue_len: usize, last_digest_unix: u64, now: u64) -> bool
     queue_len > 0 && now.saturating_sub(last_digest_unix) > 2 * digest_interval_secs()
 }
 
+/// bd-2fxx: deadline-attached holds. The pending_wait value IS the
+/// needed-by unix secs (stamped now+TTL at the WaitCorr effect site,
+/// decided in the Sweep arm). No new store: these folds read it.
+pub fn sorted_holds(model: &WorkspaceModel) -> Vec<(String, u64)> {
+    let mut holds: Vec<(String, u64)> = model
+        .pending_wait
+        .iter()
+        .map(|(c, d)| (c.clone(), *d))
+        .collect();
+    holds.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
+    holds
+}
+
+/// bd-2fxx: holds whose needed-by has passed — the wedge-pattern
+/// escalation signal (mirrors digest_overdue: fail loud, never silently
+/// batch). Non-empty means escalate now.
+pub fn overdue_holds(model: &WorkspaceModel, now: u64) -> Vec<(String, u64)> {
+    sorted_holds(model)
+        .into_iter()
+        .filter(|(_, d)| *d <= now)
+        .collect()
+}
+
+/// bd-2fxx: digest render with the hold section appended, earliest
+/// needed-by first; overdue rows carry ESCALATE. Pure — both the afk
+/// CLI and the Digest effect share it. render_digest delegates with
+/// no holds so entries-only callers stay unbroken.
+pub fn render_digest_with_holds(
+    entries: &[DigestEntry],
+    holds: &[(String, u64)],
+    now: u64,
+) -> String {
+    let mut out = render_digest(entries, now);
+    if holds.is_empty() {
+        out.push_str("holds: none\n");
+        return out;
+    }
+    out.push_str(&format!(
+        "holds ({} earliest-deadline first):\n",
+        holds.len()
+    ));
+    for (corr, needed_by) in holds {
+        if *needed_by <= now {
+            let overdue = now.saturating_sub(*needed_by);
+            out.push_str(&format!(
+                "- ESCALATE {corr} needed-by {needed_by} ({overdue}s overdue)\n"
+            ));
+        } else {
+            let remaining = needed_by.saturating_sub(now);
+            out.push_str(&format!(
+                "- {corr} needed-by {needed_by} ({remaining}s left)\n"
+            ));
+        }
+    }
+    out
+}
+
 /// bd-zfnx.6: a parked corr lives at most this long before the Sweep arm
 /// times it out (deadline path removes + Audit wait-timeout record).
 pub const PENDING_WAIT_TTL_SECS: u64 = 3600;
@@ -2418,6 +2475,64 @@ mod tests {
             "over-cap evictions recorded too ({} timeouts)",
             timeouts.len()
         );
+    }
+
+    #[test]
+    fn deadline_holds_sorted_digest_and_overdue_escalation() {
+        // bd-2fxx RED: holds carry needed-by; digest renders
+        // earliest-deadline first; overdue auto-escalates on the wedge
+        // pattern (no new store: pending_wait + digest + wedge alarm).
+        let now = 1_000_000u64;
+        let mut m = empty_model();
+        m.pending_wait.insert("late".into(), now - 1);
+        m.pending_wait.insert("soon".into(), now + 10);
+        m.pending_wait.insert("later".into(), now + 100);
+        // Future-dated holds sort earliest-deadline first.
+        let order: Vec<String> = sorted_holds(&m).iter().map(|(c, _)| c.clone()).collect();
+        assert_eq!(
+            order,
+            vec!["late".to_string(), "soon".to_string(), "later".to_string()],
+            "holds sort earliest needed-by first: {order:?}"
+        );
+        // Overdue set is the wedge-pattern escalation signal.
+        let overdue: Vec<String> = overdue_holds(&m, now)
+            .iter()
+            .map(|(c, _)| c.clone())
+            .collect();
+        assert_eq!(
+            overdue,
+            vec!["late".to_string()],
+            "only past needed-by escalates: {overdue:?}"
+        );
+        // Past needed-by surfaces as escalation on the sweep beat:
+        // re-surfaced (never dropped) + wait-timeout audit record.
+        let (next, cmds) = tick(
+            &m,
+            &Msg::Sweep {
+                since: "0".into(),
+                now,
+            },
+        );
+        assert!(
+            next.open_human.contains_key("late"),
+            "overdue hold re-surfaces"
+        );
+        assert!(
+            cmds.iter().any(
+                |c| matches!(c, Cmd::Audit { kind, pin, .. } if kind == "wait-timeout" && pin == "late")
+            ),
+            "overdue hold gets a timeout record: {cmds:?}"
+        );
+        // Digest renders holds earliest-deadline first, overdue flagged.
+        let text = render_digest_with_holds(&[], &sorted_holds(&m), now);
+        let late_pos = text.find("late").expect("digest names overdue hold");
+        let soon_pos = text.find("soon").expect("digest names holds");
+        let later_pos = text.find("later").expect("digest names holds");
+        assert!(
+            late_pos < soon_pos && soon_pos < later_pos,
+            "earliest deadline first:\n{text}"
+        );
+        assert!(text.contains("ESCALATE"), "overdue hold flagged:\n{text}");
     }
 }
 
