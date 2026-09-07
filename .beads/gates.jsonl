@@ -142,3 +142,5 @@
 {"id":142,"issue_id":"bd-tl65","from_status":"in_progress","to_status":"closed","status_revision":2524,"gate":"unit-test-verified","provider":"BeigeOtter","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-07 01:31:06"}
 {"id":143,"issue_id":"bd-67qg","from_status":"in_progress","to_status":"closed","status_revision":2522,"gate":"unit-test-verified","provider":"EmeraldSparrow","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-07 01:34:07"}
 {"id":144,"issue_id":"bd-l0fz","from_status":"in_progress","to_status":"closed","status_revision":2499,"gate":"unit-test-verified","provider":"SandyBay","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-07 01:34:40"}
+{"id":145,"issue_id":"bd-d8e4","from_status":"open","to_status":"closed","status_revision":2535,"gate":"unit-test-verified","provider":"assistant","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-07 01:54:15"}
+{"id":146,"issue_id":"bd-65he","from_status":"open","to_status":"closed","status_revision":2532,"gate":"unit-test-verified","provider":"assistant","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-07 01:55:19"}
