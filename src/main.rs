@@ -451,7 +451,7 @@ fn dispatch_header(task_id: &str, bead: Option<&str>) -> String {
             "TASK-ID: {task_id} (routing metadata only — not a bead id, never `br show` it)\nBEAD: {b} (the bound work order; `br show {b}` is the contract)"
         ),
         None => format!(
-            "TASK-ID: {task_id} (routing metadata only — not a bead id, never `br show` it)\nBEAD: none bound — no work order rides this dispatch. Do NOT act; ask the captain for the bead id."
+            "TASK-ID: {task_id} (routing metadata only — not a bead id, never `br show` it)\nBEAD: none bound by this dispatch — follow the message text; if it carries no actionable content, ask the captain for the bead id."
         ),
     }
 }
@@ -476,8 +476,12 @@ mod send_dispatch_header_tests {
         );
         let unbound = dispatch_header("task-1", None);
         assert!(
-            unbound.contains("Do NOT act"),
-            "no-bead disclaimer: {unbound}"
+            unbound.contains("follow the message text"),
+            "unbound dispatch defers to message text (raw nudges stay actionable): {unbound}"
+        );
+        assert!(
+            !unbound.contains("Do NOT act"),
+            "must not self-negate raw messages: {unbound}"
         );
     }
 }
