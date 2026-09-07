@@ -50,6 +50,7 @@ mod principles;
 mod profile;
 mod run_log;
 mod smart_cron;
+mod snapshot;
 mod stages;
 mod standing_orders;
 mod state;
@@ -626,6 +627,11 @@ enum Commands {
     },
     /// Show one swarm's agents and states
     Status { project: Option<String> },
+    /// Print the fleet snapshot contract (flywheel-snapshot.v1) as robot JSON
+    Snapshot { project: String },
+    /// Session-start drain over the snapshot: OPEN DECISIONS, UNREAD
+    /// STATUS, RECORD DIVERGENCE — always printed, even when empty
+    Helm { project: String },
     /// Classify a target into one captain primitive (no dispatch)
     Decide {
         /// free-text target / intent
@@ -3664,7 +3670,7 @@ fn workspace_label_aliases(project: &str, spawn_meta: Option<&str>) -> Vec<Strin
     out
 }
 
-fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
+pub(crate) fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
     let aliases = workspace_label_aliases(project, state::load_spawn_meta(project).as_deref());
     let matches: Vec<herdr_shim::WorkspaceInfo> = c
         .workspace_list()?
@@ -4125,6 +4131,8 @@ fn main() {
             "loop-mode (alias: loop) run/status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts",
             "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
             "doorbell status/start/stop/re-inject/afk/why (supervised pane-wake layer: lazy-heal + persisted wake state; afk batches captain-relevant wakes)",
+            "snapshot <project> (fleet snapshot flywheel-snapshot.v1 as robot JSON)",
+            "helm <project> (session-start drain: OPEN DECISIONS, UNREAD STATUS, RECORD DIVERGENCE)",
                 "coalition debate plan-review profile squad model slot catalog runs",
                 "workflow cron recipes workflows pipeline template stage ensemble",
                 "checkpoint timeline audit history changes resume analytics",
@@ -4239,6 +4247,8 @@ fn main() {
         }) => cmd_add(&cfg, project, counts, kinds, *settle_secs),
         Some(Commands::List { all }) => cmd_list(&cfg, *all),
         Some(Commands::Status { project }) => cmd_status(&cfg, project.as_deref()),
+        Some(Commands::Snapshot { project }) => cmd_snapshot(&cfg, project),
+        Some(Commands::Helm { project }) => cmd_helm(&cfg, project),
         Some(Commands::Decide {
             target,
             ready_beads,
@@ -8917,35 +8927,7 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str) -> Result<()> {
     rebuild_assignment_from_receipts(&mut model);
     for (_, entry) in &entries {
         let msg_val = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
-        let replay_msg: Option<workspace::Msg> = if let Ok(m) =
-            serde_json::from_value::<workspace::Msg>(msg_val.clone())
-        {
-            Some(m)
-        } else if let Ok(dm) = serde_json::from_value::<doorbell_tick::DoorbellMsg>(msg_val.clone())
-        {
-            Some(match dm {
-                doorbell_tick::DoorbellMsg::WatchNdjson { line } => {
-                    workspace::Msg::WatchNdjson { line }
-                }
-                doorbell_tick::DoorbellMsg::InboxItems { raw, pin } => {
-                    workspace::Msg::InboxItems { raw, pin }
-                }
-                doorbell_tick::DoorbellMsg::InboxRows { rows, pin } => {
-                    workspace::Msg::InboxRows { rows, pin }
-                }
-                doorbell_tick::DoorbellMsg::HerdrStatus { pin, status } => {
-                    workspace::Msg::HerdrStatus { pin, status }
-                }
-                doorbell_tick::DoorbellMsg::Fact { summary } => workspace::Msg::Fact { summary },
-                doorbell_tick::DoorbellMsg::AckSlaTick { now } => {
-                    workspace::Msg::AckSlaTick { now }
-                }
-                doorbell_tick::DoorbellMsg::WatchDied => workspace::Msg::WatchDied,
-            })
-        } else {
-            None
-        };
-        if let Some(msg) = replay_msg {
+        if let Some(msg) = snapshot::replay_msg(&msg_val) {
             if let Some(pins) = entry.get("pins").and_then(|p| p.as_array()) {
                 for pin in pins.iter().filter_map(|v| v.as_str()) {
                     model.doorbell.index.insert_pin(pin.to_string(), None);
@@ -13243,6 +13225,26 @@ pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
     }
 }
 
+/// ADR-0010 D10 (bd-67qg): print the fleet snapshot contract as robot
+/// JSON. Validates against `snapshot::schema_keys` — a missing key is a
+/// contract break, never an empty section.
+fn cmd_snapshot(cfg: &Config, project: &str) -> Result<()> {
+    let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+    let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+    print_json(&serde_json::to_value(&snap)?);
+    Ok(())
+}
+
+/// ADR-0010 D10 (bd-67qg): the one session-start drain over the snapshot.
+/// Always the three sections, even on an empty queue.
+fn cmd_helm(cfg: &Config, project: &str) -> Result<()> {
+    let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+    let now = doorbell_now_unix();
+    let snap = snapshot::assemble(cfg, project, &ws_label, now);
+    print!("{}", snapshot::render_helm(&snap, now));
+    Ok(())
+}
+
 fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let Some(project) = project else {
@@ -13297,27 +13299,16 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
         .collect();
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
     let dispatcher = doorbell::dispatcher_status_line(&config::state_dir(), &ws_label);
-    // ADR-0010 D6 (bd-f14d): OPEN DECISIONS via journal replay fold — the
-    // same replay rule as cmd_doorbell_why (unparseable rows skipped).
-    // Renders on every status until an answer/--verdict clears the call.
-    let open_decision_rows: Vec<Value> = {
-        let mut model = crate::workspace::WorkspaceModel::default();
-        for (ws, entry) in doorbell::journal_read_all(&config::state_dir()) {
-            if ws != ws_label {
-                continue;
-            }
-            if let Some(msgval) = entry.get("msg") {
-                if let Ok(msg) = serde_json::from_value::<crate::workspace::Msg>(msgval.clone()) {
-                    let (next, _) = crate::workspace::tick(&model, &msg);
-                    model = next;
-                }
-            }
-        }
-        crate::workspace::open_decisions(&model)
-            .into_iter()
-            .map(|d| json!({"corr": d.corr, "body": d.body, "created_at": d.created_at}))
-            .collect()
-    };
+    // ADR-0010 D10 (bd-67qg): OPEN DECISIONS from the one snapshot call —
+    // the journal fold lives in snapshot::assemble (same replay rule as
+    // cmd_doorbell_why), not inline here. Renders on every status until
+    // an answer/--verdict clears the call.
+    let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+    let open_decision_rows: Vec<Value> = snap
+        .decisions
+        .iter()
+        .map(|d| json!({"corr": d.key, "body": d.waits_on, "created_at": d.opened_at}))
+        .collect();
     let unanswered =
         doorbell::read_unanswered(&doorbell::unanswered_file(&config::state_dir(), &ws_label));
     let report = doorbell::report_text(&config::state_dir(), &ws_label);
@@ -15315,6 +15306,13 @@ fn client_read_with_fallback(
 
 fn cmd_view(cfg: &Config, project: &str, to: &str, lines: Option<u32>, source: &str) -> Result<()> {
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
+    // ADR-0010 D10 (bd-67qg): one snapshot call feeds the TTY bearings
+    // line (pipes stay byte-identical).
+    if std::io::stdout().is_terminal() {
+        let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+        let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+        eprintln!("{}", snapshot::bearings_line(&snap));
+    }
     let ws_id = find_workspace(&mut c, project)?;
     let targets = resolve_agents(&mut c, &ws_id, project, to)?;
     for a in &targets {
@@ -15368,6 +15366,12 @@ fn cmd_watch(
     let until_status: Option<AgentStatus> =
         until.map(herdr_shim::parse_agent_status).transpose()?;
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
+    // ADR-0010 D10 (bd-67qg): one snapshot call feeds the TTY bearings line.
+    if std::io::stdout().is_terminal() {
+        let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+        let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+        eprintln!("{}", snapshot::bearings_line(&snap));
+    }
     let ws_id = find_workspace(&mut c, project)?;
 
     // initial state
@@ -25650,6 +25654,13 @@ fn cmd_steer(
     }
     let brief = briefing_enabled(json, yes, crew, std::io::stdin().is_terminal());
     if brief {
+        // ADR-0010 D10 (bd-67qg): the steer surface renders fleet bearings
+        // from one snapshot call before the briefing gate.
+        if let Some(p) = project {
+            let ws_label = state::load_spawn_meta(p).unwrap_or_else(|| swarm_label(p));
+            let snap = snapshot::assemble(cfg, p, &ws_label, doorbell_now_unix());
+            eprintln!("{}", snapshot::bearings_line(&snap));
+        }
         let ctx = steer_briefing_context(objective, if direct { "goal-direct" } else { "goal" })?;
         let outcome =
             steer_brief::run_briefing(&ctx, &mut std::io::stdin().lock(), &mut std::io::stdout())?;
