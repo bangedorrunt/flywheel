@@ -184,6 +184,145 @@ pub struct Question {
     pub created_at: u64,
 }
 
+// ---------------------------------------------------------------------------
+// ADR-0010 D6 (bd-f14d): OPEN DECISIONS fold + RECORD DIVERGENCE.
+//
+// open_human IS the captain-hold cache (single store — no second table).
+// The fold below renders every open decision until an answer/--verdict
+// clears it (apply_human_decision is the only remover). Teardown, kill,
+// corr TTL, and pending_wait expiry never close a call: expiry PROMOTES
+// into open_human (re-surface, never drop). Divergence rows only report.
+// ---------------------------------------------------------------------------
+
+/// One open captain call, folded from the open_human cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenDecision {
+    pub corr: String,
+    pub body: String,
+    pub created_at: u64,
+}
+
+/// OPEN DECISIONS fold: every open_human entry, oldest first (corr
+/// tiebreak — stable across folds). Never truncated: a buried decision
+/// renders no matter how many routine rows surround it.
+pub fn open_decisions(model: &WorkspaceModel) -> Vec<OpenDecision> {
+    let mut rows: Vec<OpenDecision> = model
+        .open_human
+        .values()
+        .map(|q| OpenDecision {
+            corr: q.corr.clone(),
+            body: q.body.clone(),
+            created_at: q.created_at,
+        })
+        .collect();
+    rows.sort_by(|a, b| (a.created_at, &a.corr).cmp(&(b.created_at, &b.corr)));
+    rows
+}
+
+/// OPEN DECISIONS from a journal-msg sequence (status/helm consumer
+/// path): fold ticks from Default over the msgs and return the open
+/// fold. Same replay rule as cmd_doorbell_why; commands are discarded —
+/// only the open_human cache matters here.
+pub fn open_decisions_from_msgs(msgs: &[Msg]) -> Vec<OpenDecision> {
+    let mut model = WorkspaceModel::default();
+    for m in msgs {
+        let (next, _) = tick(&model, m);
+        model = next;
+    }
+    open_decisions(&model)
+}
+
+/// Status/helm/digest rendering of the fold. Always prints the section
+/// (even empty — "none" is a fact); entries are never cut off.
+pub fn render_open_decisions(model: &WorkspaceModel) -> String {
+    let rows = open_decisions(model);
+    let mut out = String::from("OPEN DECISIONS");
+    if rows.is_empty() {
+        out.push_str(": none");
+        return out;
+    }
+    for r in &rows {
+        out.push_str(&format!("\n- [{}] {}", r.corr, r.body));
+    }
+    out
+}
+
+/// A recorded divergence between the call ledger and the bead ledger.
+/// Reporting only — recording never closes, drops, or silent-resolves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Divergence {
+    /// Bead shows closed while its call is still open.
+    ClosedBeadOpenCorr { bead: String, corr: String },
+    /// Call was answered while its bead is still held.
+    AnsweredCorrHeldBead { corr: String, bead: String },
+    /// A [{id}] done report with no legal close behind it.
+    DoneWithoutLegalClose { bead: String },
+}
+
+/// Divergence inputs. Corr↔bead linkage comes from the caller (br JSON +
+/// receipts sqlite at the status consumer); typed `--kind captain` holds
+/// feed `held_beads` when beads D11 lands — no flywheel-only column here.
+pub struct DivergenceSpec<'a> {
+    pub open_corrs: &'a [(String, String)],
+    pub closed_beads: &'a [String],
+    pub answered_corrs: &'a [(String, String)],
+    pub held_beads: &'a [String],
+    pub done_without_close: &'a [String],
+}
+
+/// RECORD DIVERGENCE fold. Pure report: every rule pushes rows, nothing
+/// is removed or closed as a side effect.
+pub fn record_divergence(spec: &DivergenceSpec) -> Vec<Divergence> {
+    let mut rows = Vec::new();
+    for (corr, bead) in spec.open_corrs {
+        if spec.closed_beads.iter().any(|b| b == bead) {
+            rows.push(Divergence::ClosedBeadOpenCorr {
+                bead: bead.clone(),
+                corr: corr.clone(),
+            });
+        }
+    }
+    for (corr, bead) in spec.answered_corrs {
+        if spec.held_beads.iter().any(|b| b == bead) {
+            rows.push(Divergence::AnsweredCorrHeldBead {
+                corr: corr.clone(),
+                bead: bead.clone(),
+            });
+        }
+    }
+    for bead in spec.done_without_close {
+        rows.push(Divergence::DoneWithoutLegalClose { bead: bead.clone() });
+    }
+    rows
+}
+
+/// RECORD DIVERGENCE rendering. Empty is "none" — the check ran.
+pub fn render_divergence(rows: &[Divergence]) -> String {
+    let mut out = String::from("RECORD DIVERGENCE");
+    if rows.is_empty() {
+        out.push_str(": none");
+        return out;
+    }
+    for r in rows {
+        match r {
+            Divergence::ClosedBeadOpenCorr { bead, corr } => {
+                out.push_str(&format!(
+                    "\n- closed-bead/open-corr bead={bead} corr={corr}"
+                ));
+            }
+            Divergence::AnsweredCorrHeldBead { corr, bead } => {
+                out.push_str(&format!(
+                    "\n- answered-corr/held-bead corr={corr} bead={bead}"
+                ));
+            }
+            Divergence::DoneWithoutLegalClose { bead } => {
+                out.push_str(&format!("\n- done-without-legal-close bead={bead}"));
+            }
+        }
+    }
+    out
+}
+
 /// One workspace model — honest composition, not a god object.
 ///
 /// OWNERSHIP (GS-033 / ADR-0027 Option A): one live RAM owner.
@@ -1420,6 +1559,22 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 }
             }
             for (corr, why) in gone {
+                // D6 (bd-f14d): expiry PROMOTES into the open_human cache —
+                // re-surface, never drop. Silent cache insert (no Publish:
+                // promotion must not re-ring); the Audit below stays the
+                // observable record. Clears only via answer/--verdict.
+                if !next.open_human.contains_key(&corr) {
+                    next.open_human.insert(
+                        corr.clone(),
+                        Question {
+                            corr: corr.clone(),
+                            body: format!(
+                                "pending-wait {why} without receipt — re-surfaced, never dropped"
+                            ),
+                            created_at: *now,
+                        },
+                    );
+                }
                 cmds.push(Cmd::Audit {
                     kind: "wait-timeout".into(),
                     pin: corr,
@@ -3697,6 +3852,159 @@ mod human_decision_tests {
             cmds.iter()
                 .any(|c| matches!(c, Cmd::WaitCorr { corr } if corr == "FM-LIVE"))
         );
+    }
+}
+
+#[cfg(test)]
+mod d6_open_decisions_tests {
+    // ADR-0010 D6 (bd-f14d): OPEN DECISIONS fold + RECORD DIVERGENCE +
+    // pending_wait promotion. Tick classification predicates and the
+    // Digest cmd are Lane 1 (bd-65he) — untouched here.
+    use super::*;
+
+    fn empty_model() -> WorkspaceModel {
+        WorkspaceModel::default()
+    }
+
+    #[test]
+    fn d6_buried_decision_renders_after_routine_rows() {
+        let mut m = empty_model();
+        for i in 0..20 {
+            m.assignment.insert(
+                format!("R-{i:02}"),
+                Receipt {
+                    state: "owed".into(),
+                    wake: "tasked".into(),
+                    due_at: None,
+                    result_path: None,
+                },
+            );
+        }
+        m.open_human.insert(
+            "FM-BURIED".into(),
+            Question {
+                corr: "FM-BURIED".into(),
+                body: "captain call?".into(),
+                created_at: 7,
+            },
+        );
+        let text = render_open_decisions(&m);
+        assert!(text.starts_with("OPEN DECISIONS"), "section header: {text}");
+        assert!(
+            text.contains("FM-BURIED"),
+            "buried decision renders: {text}"
+        );
+        assert!(text.contains("captain call?"), "body renders: {text}");
+        assert_eq!(
+            render_open_decisions(&empty_model()),
+            "OPEN DECISIONS: none"
+        );
+    }
+
+    #[test]
+    fn d6_pending_wait_expiry_promotes_never_drops() {
+        let mut m = empty_model();
+        m.pending_wait.insert("FM-W".into(), 100);
+        let (next, cmds) = tick(
+            &m,
+            &Msg::Sweep {
+                since: "t0".into(),
+                now: 200,
+            },
+        );
+        assert!(
+            !next.pending_wait.contains_key("FM-W"),
+            "expired entry leaves the wait cache"
+        );
+        let q = next
+            .open_human
+            .get("FM-W")
+            .expect("expiry promotes into open_human");
+        assert!(
+            q.body.contains("re-surfaced"),
+            "promotion body marks the source: {}",
+            q.body
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::Audit { kind, .. } if kind == "wait-timeout")),
+            "wait-timeout audit kept: {cmds:?}"
+        );
+        // No Publish on promotion: re-surfacing must not re-ring.
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::Publish { corr, .. } if corr == "FM-W")),
+            "promotion is silent: {cmds:?}"
+        );
+        // Answer clears the promoted call.
+        let (next2, _) = tick(
+            &next,
+            &Msg::HumanDecision {
+                corr: "FM-W".into(),
+                verdict: "approve".into(),
+            },
+        );
+        assert!(!next2.open_human.contains_key("FM-W"), "answer clears");
+    }
+
+    #[test]
+    fn d6_journal_fold_matches_live_tick() {
+        // Consumer helper must equal ticking the same msgs live.
+        let msgs = vec![
+            Msg::Presence {
+                pin: "P".into(),
+                state: "idle".into(),
+            },
+            Msg::Sweep {
+                since: "t0".into(),
+                now: 200,
+            },
+        ];
+        let mut live = empty_model();
+        for m in &msgs {
+            let (next, _) = tick(&live, m);
+            live = next;
+        }
+        assert_eq!(open_decisions_from_msgs(&msgs), open_decisions(&live));
+    }
+
+    #[test]
+    fn d6_divergence_reports_all_three_without_closing() {
+        let spec = DivergenceSpec {
+            open_corrs: &[("C-1".to_string(), "bd-1".to_string())],
+            closed_beads: &["bd-1".to_string()],
+            answered_corrs: &[("C-2".to_string(), "bd-2".to_string())],
+            held_beads: &["bd-2".to_string()],
+            done_without_close: &["bd-3".to_string()],
+        };
+        let rows = record_divergence(&spec);
+        assert_eq!(rows.len(), 3, "all three rules fire: {rows:?}");
+        assert!(rows.contains(&Divergence::ClosedBeadOpenCorr {
+            bead: "bd-1".into(),
+            corr: "C-1".into()
+        }));
+        assert!(rows.contains(&Divergence::AnsweredCorrHeldBead {
+            corr: "C-2".into(),
+            bead: "bd-2".into()
+        }));
+        assert!(rows.contains(&Divergence::DoneWithoutLegalClose {
+            bead: "bd-3".into()
+        }));
+        let text = render_divergence(&rows);
+        assert!(text.contains("closed-bead/open-corr"), "{text}");
+        assert!(text.contains("answered-corr/held-bead"), "{text}");
+        assert!(text.contains("done-without-legal-close"), "{text}");
+        // Empty inputs: the check ran, nothing held.
+        let empty = DivergenceSpec {
+            open_corrs: &[],
+            closed_beads: &[],
+            answered_corrs: &[],
+            held_beads: &[],
+            done_without_close: &[],
+        };
+        assert!(record_divergence(&empty).is_empty());
+        assert_eq!(render_divergence(&[]), "RECORD DIVERGENCE: none");
     }
 }
 
