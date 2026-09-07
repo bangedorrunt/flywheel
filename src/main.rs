@@ -13297,6 +13297,27 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
         .collect();
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
     let dispatcher = doorbell::dispatcher_status_line(&config::state_dir(), &ws_label);
+    // ADR-0010 D6 (bd-f14d): OPEN DECISIONS via journal replay fold — the
+    // same replay rule as cmd_doorbell_why (unparseable rows skipped).
+    // Renders on every status until an answer/--verdict clears the call.
+    let open_decision_rows: Vec<Value> = {
+        let mut model = crate::workspace::WorkspaceModel::default();
+        for (ws, entry) in doorbell::journal_read_all(&config::state_dir()) {
+            if ws != ws_label {
+                continue;
+            }
+            if let Some(msgval) = entry.get("msg") {
+                if let Ok(msg) = serde_json::from_value::<crate::workspace::Msg>(msgval.clone()) {
+                    let (next, _) = crate::workspace::tick(&model, &msg);
+                    model = next;
+                }
+            }
+        }
+        crate::workspace::open_decisions(&model)
+            .into_iter()
+            .map(|d| json!({"corr": d.corr, "body": d.body, "created_at": d.created_at}))
+            .collect()
+    };
     let unanswered =
         doorbell::read_unanswered(&doorbell::unanswered_file(&config::state_dir(), &ws_label));
     let report = doorbell::report_text(&config::state_dir(), &ws_label);
@@ -13354,6 +13375,18 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             facts_count,
             last_fact.as_deref().unwrap_or("none")
         );
+        if open_decision_rows.is_empty() {
+            println!("OPEN DECISIONS: none");
+        } else {
+            println!("OPEN DECISIONS");
+            for r in &open_decision_rows {
+                println!(
+                    "- [{}] {}",
+                    r["corr"].as_str().unwrap_or("?"),
+                    r["body"].as_str().unwrap_or("")
+                );
+            }
+        }
     } else {
         print_json(&json!({
             "workspace_id": ws_id, "agents": rows, "integrations": integrations,
@@ -13367,7 +13400,8 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             "facts": {
                 "count": facts_count,
                 "last": last_fact,
-            }
+            },
+            "open_decisions": open_decision_rows,
         }));
     }
     Ok(())
