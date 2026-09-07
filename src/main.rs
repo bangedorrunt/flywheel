@@ -407,10 +407,8 @@ mod send_project_stage_tests {
     use super::*;
 
     fn tmp_toml(contents: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "flywheel-send-stage-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("flywheel-send-stage-test-{}", std::process::id()));
         let fw = dir.join(".flywheel");
         std::fs::create_dir_all(&fw).expect("fw dir");
         std::fs::write(fw.join("stages.toml"), contents).expect("write toml");
@@ -423,12 +421,8 @@ mod send_project_stage_tests {
         let dir = tmp_toml(
             "[stages.probe]\nname = \"probe\"\nphase = \"implement\"\nparams = [\"bead\"]\nprompt = \"Bound bead: {{bead}}.\"\n",
         );
-        let out = stage_prompt_with_params_project(
-            "probe",
-            &["bead=bd-1".to_string()],
-            &dir,
-        )
-        .expect("renders");
+        let out = stage_prompt_with_params_project("probe", &["bead=bd-1".to_string()], &dir)
+            .expect("renders");
         assert!(out.contains("bd-1"), "slot substituted: {out}");
         assert!(stage_prompt_with_params_project("nope", &[], &dir).is_err());
         // missing tier file falls back without failing
@@ -473,15 +467,18 @@ mod send_dispatch_header_tests {
             combine_stage_message("stage".to_string(), Some("brief")),
             "stage\n\nbrief"
         );
-        assert_eq!(
-            combine_stage_message("stage".to_string(), None),
-            "stage"
-        );
+        assert_eq!(combine_stage_message("stage".to_string(), None), "stage");
         let bound = dispatch_header("task-1", Some("bd-2"));
         assert!(bound.contains("bd-2"), "names the bead: {bound}");
-        assert!(bound.contains("not a bead"), "disclaims the task id: {bound}");
+        assert!(
+            bound.contains("not a bead"),
+            "disclaims the task id: {bound}"
+        );
         let unbound = dispatch_header("task-1", None);
-        assert!(unbound.contains("Do NOT act"), "no-bead disclaimer: {unbound}");
+        assert!(
+            unbound.contains("Do NOT act"),
+            "no-bead disclaimer: {unbound}"
+        );
     }
 }
 
