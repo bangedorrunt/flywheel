@@ -804,6 +804,7 @@ impl Mail {
             ack,
             thread_id,
             Some("tasked"),
+            None,
         )
     }
 
@@ -820,12 +821,24 @@ impl Mail {
         ack: bool,
         thread_id: Option<&str>,
         wake: Option<&str>,
+        corr: Option<&str>,
     ) -> Result<Value> {
         // bd-pncn: `all` (the broadcast token) is expanded to the project's
         // registered roster BEFORE the backend call — the toron surfaces
         // (in-process mailbox + daemon tool) reject a literal "all"
         // recipient. Zero registered agents is a clear error.
         let targets = self.expand_broadcast(project_key, to)?;
+        // ADR-0010 D8 (bd-d8e4): a corr-preserving resend stamps the ORIGINAL
+        // corr — toron's idempotent claim dedupes within TTL and the receipt
+        // stays corr-keyed. The remote wire surface does not carry extra_tags,
+        // so refuse rather than silently drop the corr (a dropped corr is a
+        // NEW corr = duplicate).
+        if corr.is_some() && matches!(self.backend, BackendKind::Remote(_)) {
+            bail!(
+                "mail resend requires the in-process toron mailbox (no [mail.toron] url) — \
+                 the remote wire surface cannot carry a corr tag"
+            );
+        }
         let extra_tags = match wake {
             Some(w) if !w.is_empty() => {
                 let w = w.trim().to_ascii_lowercase();
@@ -840,6 +853,17 @@ impl Mail {
                 ]
             }
             _ => Vec::new(),
+        };
+        let extra_tags = match corr {
+            Some(c) if !c.trim().is_empty() => {
+                let mut v = extra_tags;
+                v.push(
+                    toron_core::nostr::Tag::parse(["corr", c.trim()])
+                        .map_err(|e| anyhow!("corr tag: {e}"))?,
+                );
+                v
+            }
+            _ => extra_tags,
         };
         match &self.backend {
             BackendKind::InProcess => {
