@@ -93,4 +93,15 @@ Continue the supplied task. Report what you changed and what you verified;
 do not claim bead closure or swarm completion unless those actions were
 explicitly performed.
 
+## NO HARNESS-NATIVE DELEGATION (ADR-0010 D13)
+
+Open-mode panes can own a dispatcher (peer-aware). Do not spawn work through
+harness-native delegation tools (agent/subagent/task/workflow/spawn/dispatch/
+worktree/delegate-shaped) — they bypass the spawn registry, so the doorbell,
+dispatcher, and guards see nothing. Fence: `flywheel __subagent-guard <tool>`
+(exit 2 = deny); observe/stop verbs and session-local todo stay legal;
+mcp__* always allowed; crew panes exempt (`--role crew` /
+`FLYWHEEL_ROLE=crew`). Spawn help via `flywheel spawn`. Defense-in-depth:
+the fence is the guard, not this text.
+
 {{VERSION}} {{GENERATED}}

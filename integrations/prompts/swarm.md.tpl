@@ -78,4 +78,18 @@ Ask operator for model routing per profile before dispatch; blank keeps default.
 
 9. REPORT: each crew posts status/commit/verify/deviations on lane thread.
 
+## NO HARNESS-NATIVE DELEGATION (ADR-0010 D13)
+
+This pane is the dispatcher-owning primary: it MUST NOT spawn work through
+harness-native delegation tools (agent/subagent/task/workflow/spawn/dispatch/
+worktree/delegate-shaped — e.g. Claude's Task, harness subagent spawns).
+Those bypass the spawn registry: the doorbell, dispatcher, and guards cannot
+see the work. The tool-surface fence is `flywheel __subagent-guard <tool>`
+(exit 2 = deny); observe/stop verbs and session-local todo stay legal, and
+mcp__* (toron) is always allowed. Crew panes are exempt
+(`--role crew` / pane env `FLYWHEEL_ROLE=crew`). Dispatch all work via
+`flywheel spawn` / `flywheel send` / toron mail so the registry tracks it.
+This standing order is DEFENSE-IN-DEPTH — the fence is the guard, not this
+text.
+
 {{VERSION}} {{GENERATED}}

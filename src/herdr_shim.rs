@@ -1016,6 +1016,13 @@ pub fn pane_split(
     params.insert("direction".into(), serde_json::json!(direction));
     params.insert("cwd".into(), serde_json::json!(cwd));
     if let Some(env) = env {
+        // ADR-0010 D13: every pane.split pane is a CREW pane (the captain
+        // rides the root pane's workspace-level env). Stamp the role so the
+        // subagent-guard fence exempts crew: the deny list must disarm
+        // nobody it does not own. Caller-supplied wins on collision.
+        let mut env = env.clone();
+        env.entry("FLYWHEEL_ROLE".to_string())
+            .or_insert_with(|| "crew".to_string());
         params.insert("env".into(), serde_json::json!(env));
     }
     let res = c.call("pane.split", serde_json::Value::Object(params))?;
