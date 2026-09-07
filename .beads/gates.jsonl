@@ -152,3 +152,4 @@
 {"id":152,"issue_id":"bd-1wwc","from_status":"in_progress","to_status":"closed","status_revision":2571,"gate":"unit-test-verified","provider":"RoseDog","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-07 03:40:25"}
 {"id":153,"issue_id":"bd-zd2v","from_status":"in_progress","to_status":"closed","status_revision":2573,"gate":"unit-test-verified","provider":"TanOtter","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-07 03:47:35"}
 {"id":154,"issue_id":"bd-lpho","from_status":"in_progress","to_status":"closed","status_revision":2580,"gate":"unit-test-verified","provider":"assistant","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-07 04:02:50"}
+{"id":155,"issue_id":"bd-ursy","from_status":"in_progress","to_status":"closed","status_revision":2583,"gate":"unit-test-verified","provider":"assistant","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-07 04:06:41"}
