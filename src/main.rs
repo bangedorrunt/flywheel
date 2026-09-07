@@ -1441,6 +1441,22 @@ enum Commands {
         #[arg(long)]
         role: Option<String>,
     },
+    /// internal: ADR-0010 D12 bounded GATE grounding read. Scans
+    /// docs/learnings/ (tier + reinforced frontmatter), projects the top-N
+    /// entries by reinforcement recency within the token budget (pinned
+    /// never decays; aging 30d, perishable 7d unreinforced decays OUT).
+    /// The wave-gate stage calls this INSTEAD of a bare corpus rg. Prints
+    /// {budget, projected: [{path, tier, reinforced, cost_tokens}]}.
+    #[command(name = "__gate-learnings", hide = true)]
+    __GateLearnings {
+        /// learnings corpus root (default docs/learnings)
+        #[arg(long, default_value = "docs/learnings")]
+        root: String,
+        /// token budget (default FLYWHEEL_GATE_BUDGET ~4k, or
+        /// FLYWHEEL_GATE_BUDGET env)
+        #[arg(long)]
+        budget: Option<usize>,
+    },
     /// internal: the project's expected-reply entries (checkpointed leaf —
     /// collab may have written new ones while the loop runs)
     #[command(name = "__expected-replies", hide = true)]
@@ -4660,8 +4676,9 @@ fn main() {
         Some(Commands::__MailDigest { project, agent }) => {
             cmd_internal_mail_digest(&cfg, project, agent)
         }
-        Some(Commands::__SubagentGuard { tool, role }) => {
-            cmd_subagent_guard(tool, role.as_deref())
+        Some(Commands::__SubagentGuard { tool, role }) => cmd_subagent_guard(tool, role.as_deref()),
+        Some(Commands::__GateLearnings { root, budget }) => {
+            cmd_gate_learnings(&root, budget.unwrap_or_else(default_gate_budget))
         }
         Some(Commands::__CheckReply {
             project,
@@ -30318,6 +30335,81 @@ fn cmd_subagent_guard(tool: &str, role: Option<&str>) -> Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+fn default_gate_budget() -> usize {
+    std::env::var("FLYWHEEL_GATE_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(stages::learning::FLYWHEEL_GATE_BUDGET)
+}
+
+/// ADR-0010 D12: scan the learnings corpus and project the bounded GATE
+/// grounding read — top-N by reinforcement recency within the budget.
+/// Cost estimate per entry: frontmatter + rg-context allowance (chars/4);
+/// the projection never touches the corpus (ce-sweep archives, never this).
+fn cmd_gate_learnings(root: &str, budget: usize) -> Result<()> {
+    use stages::learning::{LearningEntry, gate_projection, parse_learning_frontmatter};
+    let today = chrono::Local::now().date_naive();
+    let mut entries: Vec<LearningEntry> = Vec::new();
+    for path in walkdir_sorted(root)? {
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some((tier, reinforced)) = parse_learning_frontmatter(&src) else {
+            continue;
+        };
+        let block = src.strip_prefix("---\n").unwrap_or("");
+        let fm_chars = block
+            .split("\n---")
+            .next()
+            .map(|fm| fm.len() + 4)
+            .unwrap_or(0);
+        // frontmatter verbatim + a bounded rg-context allowance (~40 lines)
+        let cost_tokens = fm_chars / 4 + 150;
+        entries.push(LearningEntry {
+            path: path.display().to_string(),
+            tier,
+            reinforced,
+            cost_tokens,
+        });
+    }
+    let projected = gate_projection(&entries, today, budget);
+    print_json(&json!({
+        "budget": budget,
+        "corpus": entries.len(),
+        "projected": projected,
+    }));
+    Ok(())
+}
+
+/// Sorted .md files under root, archive/ excluded (archived learnings are
+/// out of the projection — ce-sweep moved them there).
+fn walkdir_sorted(root: &str) -> Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![std::path::PathBuf::from(root)];
+    while let Some(dir) = stack.pop() {
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        for e in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let e = e?;
+            let p = e.path();
+            if p.is_dir() {
+                if p.file_name().is_some_and(|n| n == "archive") {
+                    continue;
+                }
+                dirs.push(p);
+            } else if p.extension().is_some_and(|x| x == "md") {
+                files.push(p);
+            }
+        }
+        files.sort();
+        out.extend(files);
+        dirs.sort();
+        stack.extend(dirs);
+    }
+    out.sort();
+    Ok(out)
 }
 
 fn cmd_turn_guard(cfg: &Config, project: &str, role: Option<&str>) -> Result<()> {
