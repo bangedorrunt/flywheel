@@ -54,15 +54,19 @@ fn check_file(name: &str, src: &str) {
         if !line.contains(needle) {
             continue;
         }
+        // Replay folds (pure tick over journal + local render, no dispatcher,
+        // no binds, no writes) are not live owners: cmd_doorbell_why,
+        // cmd_doorbell_afk (bd-65he reverify: read-only digest render).
         let allowed = cur_test
             || cur_fn == "tick_loop_owner"
             || (name == "main.rs" && cur_fn == "cmd_internal_doorbell")
-            || (name == "main.rs" && cur_fn == "cmd_doorbell_why");
+            || (name == "main.rs" && cur_fn == "cmd_doorbell_why")
+            || (name == "main.rs" && cur_fn == "cmd_doorbell_afk");
         assert!(
             allowed,
             "D0 (bd-aucr): {name}:{} live WorkspaceModel::default() inside fn {cur_fn} — \
              second live owner (allowed: tick_loop_owner, cmd_internal_doorbell, \
-             cmd_doorbell_why replay, tests)",
+             cmd_doorbell_why/cmd_doorbell_afk replay, tests)",
             idx + 1
         );
     }
