@@ -838,8 +838,9 @@ mod tests {
 
     // ---- ADR-0006 D1: parameterized stage payloads (bd-stage-params-pqo9) ----
 
-    /// The reserved D1 payload slots (ADR-0006 §3 D1). Test-only vocabulary
-    /// today; promote to production when a D3/D4 payload emitter consumes it.
+    /// The reserved D1 payload slots (ADR-0006 §3 D1). `bead` is
+    /// production-consumed (cmd_send headers every dispatch with it);
+    /// the rest substitute into templates that declare them.
     const RESERVED_SLOTS: &[&str] = &["bead", "scope", "exit", "channel", "pin", "report_file"];
 
     /// `--param k=v` parses into a map; a pair without `=` is an error naming
