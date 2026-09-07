@@ -111,6 +111,14 @@ Never percent-done or activity prose ("working on X", "update:").
 Current state = presence verdict + `br show`; the room carries wakes,
 not status.
 
+Urgency discipline (`--importance urgent` writes the outer urgency tag and
+injects immediately — spend it): mark urgent ONLY a file-conflict block, a
+request-release gone unanswered past one work unit, a decision without which
+you cannot proceed, or a wedge/deadlock signal. Status, done reports,
+questions with no deadline, and FYI are routine (digest-batched, still
+delivered). Urgency inflation is noise: if everything is urgent the triage
+means nothing.
+
 Ask-user authority (worker never self-answer): a finding that asks
 the user a question is never answered by the worker that raised it.
 Reconstruct accepted intent from the brief (GOAL / SCOPE / ACCEPTANCE).
