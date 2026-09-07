@@ -111,6 +111,20 @@ Never percent-done or activity prose ("working on X", "update:").
 Current state = presence verdict + `br show`; the room carries wakes,
 not status.
 
+Ask-user authority (worker never self-answer): a finding that asks
+the user a question is never answered by the worker that raised it.
+Reconstruct accepted intent from the brief (GOAL / SCOPE / ACCEPTANCE).
+RESTORATION, an unambiguous restoration of accepted behavior including
+hard but in-scope corrections: the captain-facing agent may auto-decide;
+the stage Publishes its corr (journaled) and proceeds. EXPANSION (new
+guarantee, threat model, architecture, destructive, security): the
+stage STOPS, Publishes its corr, and parks on WaitCorr. Escalate with
+five elements -- (1) original criterion, (2) proposed expansion,
+(3) smallest compliant alternative, (4) accept-vs-decline consequences,
+(5) recommendation. Expansions stay human; the open call parks in OPEN
+DECISIONS until an answer/--verdict clears it. Worker-side auto-close
+of an ask-user finding is a LoudMiss, never a close.
+
 Delivery visibility: "did X report?" is ONE query --
 `toron channel read <channel> --project <p> --as {mail_identity}
 --author <pin>`: delivered_posts == 0 means X has NOT reported.
