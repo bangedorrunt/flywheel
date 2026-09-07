@@ -9221,7 +9221,14 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str) -> Result<()> {
     if model.digest_queue.is_empty() {
         println!("doorbell afk: queue empty — nothing needs the captain");
     } else {
-        print!("{}", workspace::render_digest(&model.digest_queue, now));
+        print!(
+            "{}",
+            workspace::render_digest_with_holds(
+                &model.digest_queue,
+                &workspace::sorted_holds(&model),
+                now
+            )
+        );
     }
     let counters: Vec<String> = ["benign", "routine", "captain", "urgent"]
         .iter()
@@ -9231,6 +9238,15 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str) -> Result<()> {
     if workspace::digest_overdue(model.digest_queue.len(), model.last_digest_unix, now) {
         println!(
             "WEDGE ALARM: digest queue cannot drain (stale batch, dispatcher may be down) — inspect `flywheel doorbell status`"
+        );
+    }
+    let overdue = workspace::overdue_holds(&model, now);
+    if !overdue.is_empty() {
+        let names: Vec<String> = overdue.iter().map(|(c, _)| c.clone()).collect();
+        println!(
+            "HOLD ESCALATION: {} hold(s) past needed-by ({}) — scheduled batch, not a pager interrupt",
+            overdue.len(),
+            names.join(", ")
         );
     }
     Ok(())
@@ -10456,7 +10472,11 @@ fn handle_workspace_cmds(
                 let now = chrono::Utc::now().timestamp() as u64;
                 eprintln!(
                     "flywheel: [Digest]\n{}",
-                    workspace::render_digest(entries, now)
+                    workspace::render_digest_with_holds(
+                        entries,
+                        &workspace::sorted_holds(&workspace_model),
+                        now
+                    )
                 );
             }
             workspace::Cmd::Send { .. }
