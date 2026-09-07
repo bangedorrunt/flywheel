@@ -1614,6 +1614,11 @@ enum DoorbellCmd {
     /// re-inject the peer-aware handler + identity line into EXISTING panes
     /// (covers herdr pane-split additions and post-crash respawns).
     ReInject { project: String },
+    /// batch captain-relevant wakes since the last digest (ADR-0010 D5).
+    /// Folds tick from Default over the doorbell journal (same trust
+    /// surface as `why`); urgent wakes never batch. Wedge alarm when the
+    /// queue cannot drain.
+    Afk { project: String },
     /// why did (or didn't) a pin get rung? Replays the doorbell journal —
     /// GS-007 bd-yw4s: the trust surface, not log tailing. Folds tick from Default.
     Why {
@@ -4119,7 +4124,7 @@ fn main() {
             "crew preview|control (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
             "loop-mode (alias: loop) run/status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts",
             "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
-            "doorbell status/start/stop/re-inject (supervised pane-wake layer: lazy-heal + persisted wake state)",
+            "doorbell status/start/stop/re-inject/afk/why (supervised pane-wake layer: lazy-heal + persisted wake state; afk batches captain-relevant wakes)",
                 "coalition debate plan-review profile squad model slot catalog runs",
                 "workflow cron recipes workflows pipeline template stage ensemble",
                 "checkpoint timeline audit history changes resume analytics",
@@ -4311,6 +4316,7 @@ fn main() {
             DoorbellCmd::Start { project } => cmd_doorbell_start(&cfg, project),
             DoorbellCmd::Stop { project, workspace } => cmd_doorbell_stop(&cfg, project, workspace),
             DoorbellCmd::ReInject { project } => cmd_doorbell_re_inject(&cfg, project),
+            DoorbellCmd::Afk { project } => cmd_doorbell_afk(&cfg, project),
             DoorbellCmd::Why {
                 project,
                 pin,
@@ -8891,6 +8897,83 @@ fn cmd_doorbell_why(
     Ok(())
 }
 
+/// ADR-0010 D5 (bd-65he): `flywheel doorbell afk <project>` — batch the
+/// captain-relevant wakes the live dispatcher queued since the last digest.
+/// Folds tick from Default over the doorbell journal (same trust surface
+/// as `why`), then renders the folded digest_queue with ages from the
+/// current clock. Urgent wakes never batch (prompted immediately live),
+/// so their presence here is record, not backlog. Wedge alarm when the
+/// queue cannot drain (overdue predicate); empty queue is clean, not an
+/// error — AFK with nothing queued means nothing needs the captain.
+fn cmd_doorbell_afk(cfg: &Config, project: &str) -> Result<()> {
+    let _ = cfg;
+    let _ = project;
+    let entries = doorbell::journal_read_all(&config::state_dir());
+    if entries.is_empty() {
+        println!("doorbell afk: no journal entries — nothing queued");
+        return Ok(());
+    }
+    let mut model = workspace::WorkspaceModel::default();
+    rebuild_assignment_from_receipts(&mut model);
+    for (_, entry) in &entries {
+        let msg_val = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
+        let replay_msg: Option<workspace::Msg> = if let Ok(m) =
+            serde_json::from_value::<workspace::Msg>(msg_val.clone())
+        {
+            Some(m)
+        } else if let Ok(dm) = serde_json::from_value::<doorbell_tick::DoorbellMsg>(msg_val.clone())
+        {
+            Some(match dm {
+                doorbell_tick::DoorbellMsg::WatchNdjson { line } => {
+                    workspace::Msg::WatchNdjson { line }
+                }
+                doorbell_tick::DoorbellMsg::InboxItems { raw, pin } => {
+                    workspace::Msg::InboxItems { raw, pin }
+                }
+                doorbell_tick::DoorbellMsg::InboxRows { rows, pin } => {
+                    workspace::Msg::InboxRows { rows, pin }
+                }
+                doorbell_tick::DoorbellMsg::HerdrStatus { pin, status } => {
+                    workspace::Msg::HerdrStatus { pin, status }
+                }
+                doorbell_tick::DoorbellMsg::Fact { summary } => workspace::Msg::Fact { summary },
+                doorbell_tick::DoorbellMsg::AckSlaTick { now } => {
+                    workspace::Msg::AckSlaTick { now }
+                }
+                doorbell_tick::DoorbellMsg::WatchDied => workspace::Msg::WatchDied,
+            })
+        } else {
+            None
+        };
+        if let Some(msg) = replay_msg {
+            if let Some(pins) = entry.get("pins").and_then(|p| p.as_array()) {
+                for pin in pins.iter().filter_map(|v| v.as_str()) {
+                    model.doorbell.index.insert_pin(pin.to_string(), None);
+                }
+            }
+            let (next, _) = workspace::tick(&model, &msg);
+            model = next;
+        }
+    }
+    let now = doorbell_now_unix();
+    if model.digest_queue.is_empty() {
+        println!("doorbell afk: queue empty — nothing needs the captain");
+    } else {
+        print!("{}", workspace::render_digest(&model.digest_queue, now));
+    }
+    let counters: Vec<String> = ["benign", "routine", "captain", "urgent"]
+        .iter()
+        .map(|k| format!("{k}={}", model.wake_counters.get(*k).copied().unwrap_or(0)))
+        .collect();
+    println!("wake counters: {}", counters.join(" "));
+    if workspace::digest_overdue(model.digest_queue.len(), model.last_digest_unix, now) {
+        println!(
+            "WEDGE ALARM: digest queue cannot drain (stale batch, dispatcher may be down) — inspect `flywheel doorbell status`"
+        );
+    }
+    Ok(())
+}
+
 fn why_entry_mentions_pin(pin: &str, msg: &workspace::Msg, cmds: &[workspace::Cmd]) -> bool {
     let cmd_hit = cmds.iter().any(|c| match c {
         workspace::Cmd::Prompt { pin: p, .. } => p == pin,
@@ -10101,6 +10184,18 @@ fn handle_workspace_cmds(
             }
             workspace::Cmd::Audit { kind, pin, detail } => {
                 eprintln!("flywheel: [Audit {kind}] {pin}: {detail}");
+            }
+            workspace::Cmd::Digest { entries } => {
+                // ADR-0010 D5 (bd-65he): afk digest batch — render to
+                // stderr (journal-observable like Audit); steer-channel
+                // delivery is the dispatcher's apply step. Undelivered
+                // batches stay visible via `flywheel doorbell afk` +
+                // the wedge alarm.
+                let now = chrono::Utc::now().timestamp() as u64;
+                eprintln!(
+                    "flywheel: [Digest]\n{}",
+                    workspace::render_digest(entries, now)
+                );
             }
             workspace::Cmd::Send { .. }
             | workspace::Cmd::PinStamp { .. }
