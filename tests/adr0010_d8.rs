@@ -111,8 +111,8 @@ async fn adr0010_d8_degraded_state_roundtrip_and_guards() {
 fn adr0010_d8_resend_guidance_names_corr_preserving_resend() {
     let g = resend_guidance(Some("C-1"));
     assert!(
-        g.contains("flywheel mail resend --corr C-1"),
-        "transport-unknown guidance must name the corr-preserving resend command, got: {g}"
+        g.contains("toron mail send --corr C-1"),
+        "transport-unknown guidance must name the live corr-preserving resend command (bd-d8e4 reverify: flywheel mail resend never existed), got: {g}"
     );
     assert!(
         g.to_lowercase().contains("duplicat"),
