@@ -81,7 +81,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 toron-core = { path = "../toron/crates/toron-core" }
 
 [profile.release]
-strip = true
+# strip disabled (bd-lpho): the floating nightly's strip pass mis-aligns
+# proc-macro dylib LINKEDIT (libsqlx_macros dlopen fails), breaking every
+# release build/install. Re-enable after repinning past the bad nightly or
+# verifying a fixed toolchain. Cost: ~1MB larger binary, no behavior change.
+strip = false
 lto = true
 
 [lints.clippy]
