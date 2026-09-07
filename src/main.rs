@@ -485,6 +485,50 @@ mod send_dispatch_header_tests {
         );
     }
 }
+/// Build the filtered-inbox filter for `mail inbox` (bd-ursy): every
+/// filtered arm carries the CLI limit — a default 0 limit reads as take(0)
+/// downstream and yields a silent []. `None` selects the legacy path.
+fn inbox_cli_filter(
+    urgent: bool,
+    unread: bool,
+    since: Option<&str>,
+    limit: u32,
+) -> Option<mail_shim::MailInboxFilter> {
+    match (since, unread) {
+        (Some(ts), _) => Some(mail_shim::MailInboxFilter {
+            urgent_only: urgent,
+            unread_only: unread,
+            include_bodies: true,
+            limit,
+            since_ts: Some(ts.to_string()),
+            ..Default::default()
+        }),
+        (None, true) => Some(mail_shim::MailInboxFilter {
+            unread_only: true,
+            include_bodies: true,
+            limit,
+            ..Default::default()
+        }),
+        (None, false) => None,
+    }
+}
+
+#[cfg(test)]
+mod inbox_filter_tests {
+    use super::*;
+
+    /// bd-ursy: unread-only must carry the CLI limit (default 0 = take(0)).
+    #[test]
+    fn unread_only_carries_limit() {
+        let f = inbox_cli_filter(false, true, None, 10).expect("filtered");
+        assert!(f.unread_only);
+        assert_eq!(f.limit, 10, "limit rides every filtered arm");
+        assert!(inbox_cli_filter(false, false, None, 10).is_none());
+        let s = inbox_cli_filter(true, false, Some("x"), 7).expect("since");
+        assert_eq!(s.limit, 7);
+        assert!(s.urgent_only);
+    }
+}
 
 // ---- CLI surface ----
 
@@ -17010,31 +17054,9 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             // bd-zd2v: --since (RFC3339 or the `last` cursor) rides the
             // filtered surface with the other flags passed through; without
             // it the legacy path below is byte-identical to before.
-            let v = if let Some(since_ts) = since.as_deref() {
-                mail.inbox_filtered(
-                    &key,
-                    &name,
-                    &mail_shim::MailInboxFilter {
-                        urgent_only: *urgent,
-                        unread_only: *unread,
-                        include_bodies: true,
-                        limit: *limit,
-                        since_ts: Some(since_ts.to_string()),
-                        ..Default::default()
-                    },
-                )?
-            } else if *unread {
-                mail.inbox_filtered(
-                    &key,
-                    &name,
-                    &mail_shim::MailInboxFilter {
-                        unread_only: true,
-                        include_bodies: true,
-                        ..Default::default()
-                    },
-                )?
-            } else {
-                mail.inbox(&key, &name, *urgent, *limit)?
+            let v = match inbox_cli_filter(*urgent, *unread, since.as_deref(), *limit) {
+                Some(f) => mail.inbox_filtered(&key, &name, &f)?,
+                None => mail.inbox(&key, &name, *urgent, *limit)?,
             };
             // bd-mail-inbox-json-a7wc: --json is the DOCUMENTED machine
             // contract (stable keys + types); the default dump stays
