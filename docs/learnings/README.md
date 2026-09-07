@@ -25,6 +25,9 @@ problem_type: integration_issue   # closed-ish: bug track uses these, knowledge 
 tags: [dispatch, boot-race]
 bead: bd-wave-swarm-graduation-fix-98io   # provenance
 created: 2026-09-06
+tier: aging           # ADR-0010 D12: pinned | aging | perishable (default aging)
+reinforced: 2026-09-06  # YYYY-MM-DD — last re-verification; gates the GATE projection
+expires: 2026-10-01   # REQUIRED for tier: perishable — a checkable expiry
 ---
 ## Symptoms            # bug track: Symptoms / What Didn't Work / Solution /
 ## What didn't work    #         Why This Works / Prevention
@@ -33,7 +36,13 @@ created: 2026-09-06
 # knowledge track instead: Context / Guidance / Why This Matters / When to Apply
 ```
 
-- High overlap with an existing entry ⇒ UPDATE it (stamp `last_updated`), never duplicate.
+- High overlap with an existing entry ⇒ UPDATE it (stamp `last_updated` + re-stamp `reinforced` —
+  ADR-0010 D12 reinforcement), never duplicate.
+- Decay (ADR-0010 D12): `tier: pinned` never decays; `aging` leaves the GATE projection after
+  30d unreinforced; `perishable` after 7d AND must name a checkable `expires:`. Leave the corpus
+  is ce-sweep's ARCHIVE (`git mv docs/learnings/archive/`), never delete. `flywheel
+  __gate-learnings` is the bounded GATE projection (top-N by reinforcement recency,
+  `FLYWHEEL_GATE_BUDGET` ~4k tokens).
 - A learning contradicting standing-orders/AGENTS.md guidance **outranks ordinary staleness** —
   resolve by which side current code follows; report a wrong guidance file, never edit it here
   (`ce-sweep` owns that).

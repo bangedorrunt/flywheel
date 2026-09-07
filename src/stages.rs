@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use crate::config::config_dir;
@@ -202,7 +203,7 @@ impl StageLibrary {
             ),
             (
                 "ce-compound",
-                "Compound gate (ADR-0009): after a VERIFIED solution, decide whether the work produced a durable learning, then capture it. The gate is three-part and ALL must hold: NON-OBVIOUS (the reasoning is not recoverable from the final code, tests, types, or comments), DURABLE (an invariant, root cause, rejected approach, or convention useful beyond this diff), MATERIAL (forgetting it would plausibly cause recurrence or substantial rediscovery). Counterfactual: if the learning doc vanished, would the next crew redo this investigation? If not, reply {\"terminal\": \"clean_skip\"} — completion alone never qualifies; effort and diff size are not evidence. ONE learning per run. Qualifying: check overlap FIRST (`rg -il \"<keywords>\" docs/learnings/`) — high overlap UPDATES the existing doc (add last_updated), never a duplicate. Otherwise write `docs/learnings/<category>/<slug>.md` with frontmatter track: bug|knowledge, module, problem_type, tags, bead, created — bug track sections: Symptoms / What Didn't Work / Solution / Why This Works / Prevention; knowledge track: Context / Guidance / Why This Matters / When to Apply. The learning ships in the SAME commit as the work it came from. Reply with ONLY {\"terminal\": \"written|updated|clean_skip\", \"path\": \"...\", \"track\": \"...\"}. A failed capture NEVER blocks the run — report and move on.",
+                "Compound gate (ADR-0009): after a VERIFIED solution, decide whether the work produced a durable learning, then capture it. The gate is three-part and ALL must hold: NON-OBVIOUS (the reasoning is not recoverable from the final code, tests, types, or comments), DURABLE (an invariant, root cause, rejected approach, or convention useful beyond this diff), MATERIAL (forgetting it would plausibly cause recurrence or substantial rediscovery). Counterfactual: if the learning doc vanished, would the next crew redo this investigation? If not, reply {\"terminal\": \"clean_skip\"} — completion alone never qualifies; effort and diff size are not evidence. ONE learning per run. Qualifying: check overlap FIRST (`rg -il \"<keywords>\" docs/learnings/`) — high overlap UPDATES the existing doc (add last_updated + re-stamp reinforced: <today> — ADR-0010 D12 reinforcement), never a duplicate. Otherwise write `docs/learnings/<category>/<slug>.md` with frontmatter track: bug|knowledge, module, problem_type, tags, bead, created, tier: aging (pinned ONLY for invariants that must never decay out of the GATE projection; perishable ONLY when the doc names a checkable expiry via `expires:`), reinforced: <today> — bug track sections: Symptoms / What Didn't Work / Solution / Why This Works / Prevention; knowledge track: Context / Guidance / Why This Matters / When to Apply. The learning ships in the SAME commit as the work it came from. Reply with ONLY {\"terminal\": \"written|updated|clean_skip\", \"path\": \"...\", \"track\": \"...\"}. A failed capture NEVER blocks the run — report and move on.",
             ),
             (
                 "commit-and-push",
@@ -274,7 +275,7 @@ impl StageLibrary {
             // gate.
             (
                 "wave-gate",
-                "Wave gate (ADR-0006 D3): run `flywheel preflight --mode workflow` — a failed check STOPS the wave (post `[gate] blocked: <check>` to the steer channel; never fix infra yourself mid-gate). Then scope the ready set for this wave: `br ready --json` intersected with the wave label, and if ANY bead with an earlier wave-M (M<N) is open or in_progress, post `[gate] held: <bead ids>` and STOP (waves run in order, never around them). GROUNDING READ (ADR-0009): `rg -il \"<objective keywords>\" docs/learnings/` — matching entries become the wave's carried constraints. BINDING CONTRACT (bd-wave-swarm-graduation-fix-98io — GATE output is the DISPATCH input): `mkdir -p .flywheel/wave` then write `.flywheel/wave/<wave-label>-ready.json` containing EXACTLY {\"wave_label\": \"<label>\", \"held\": <bool>, \"blockers\": [\"<bead-id>\"], \"ready\": [{\"id\": \"<bead-id>\", \"title\": \"...\", \"verify\": \"<VERIFY command>\", \"priority\": <n>}]} plus, when the grounding read matched, \"learnings\": [\"docs/learnings/<...>\"]. Reply with ONLY that JSON object. Never dispatch, never adjudicate — gate, write the artifact, report.",
+                "Wave gate (ADR-0006 D3): run `flywheel preflight --mode workflow` — a failed check STOPS the wave (post `[gate] blocked: <check>` to the steer channel; never fix infra yourself mid-gate). Then scope the ready set for this wave: `br ready --json` intersected with the wave label, and if ANY bead with an earlier wave-M (M<N) is open or in_progress, post `[gate] held: <bead ids>` and STOP (waves run in order, never around them). GROUNDING READ (ADR-0009, bounded by ADR-0010 D12): `flywheel __gate-learnings --budget ${FLYWHEEL_GATE_BUDGET:-4000}` — a budgeted projection of docs/learnings (top-N by reinforcement recency within ~4k tokens; pinned never decays, aging 30d / perishable 7d unreinforced decays OUT of the projection). Read ONLY the projected paths — frontmatter + rg context, under the budget; matching entries become the wave's carried constraints. BINDING CONTRACT (bd-wave-swarm-graduation-fix-98io — GATE output is the DISPATCH input): `mkdir -p .flywheel/wave` then write `.flywheel/wave/<wave-label>-ready.json` containing EXACTLY {\"wave_label\": \"<label>\", \"held\": <bool>, \"blockers\": [\"<bead-id>\"], \"ready\": [{\"id\": \"<bead-id>\", \"title\": \"...\", \"verify\": \"<VERIFY command>\", \"priority\": <n>}]} plus, when the grounding read matched, \"learnings\": [\"docs/learnings/<...>\"]. Reply with ONLY that JSON object. Never dispatch, never adjudicate — gate, write the artifact, report.",
             ),
             (
                 "wave-dispatch",
@@ -572,10 +573,263 @@ pub fn render_stage(
             // class): warn loud, keep rendering. Never a hard error.
             // `task_id` is exempt: the send machinery consumes it for thread
             // routing, so the template need not carry its slot.
-            eprintln!("flywheel: warn: --param {k} matches no {{{{{k}}}}} slot in stage — value ignored");
+            eprintln!(
+                "flywheel: warn: --param {k} matches no {{{{{k}}}}} slot in stage — value ignored"
+            );
         }
     }
     Ok(out)
+}
+
+// ---- learnings tier/reinforced + bounded GATE projection (ADR-0010 D12) ----
+
+/// Learning corpus decay model (bd-fmya). Frontmatter carries
+/// `tier: pinned|aging|perishable` + `reinforced: YYYY-MM-DD` (perishable
+/// docs additionally name a checkable `expires:`). The GATE grounding read
+/// is a BUDGETED PROJECTION of `docs/learnings/`, never the corpus itself
+/// (guard-the-context-window); decay is frontmatter, not a prompt
+/// (encode-lessons-in-structure). Archiving is ce-sweep's job — this layer
+/// only ranks + bounds, never deletes.
+pub mod learning {
+    use chrono::NaiveDate;
+
+    /// Default GATE grounding budget (~4k tokens).
+    pub const FLYWHEEL_GATE_BUDGET: usize = 4000;
+    /// aging: drops out of the projection when unreinforced beyond this.
+    pub const AGING_TTL_DAYS: i64 = 30;
+    /// perishable: drops out beyond this; the doc must name a checkable
+    /// `expires:` (ce-sweep archives it when past).
+    pub const PERISHABLE_TTL_DAYS: i64 = 7;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+    pub enum LearningTier {
+        /// Never decays out of the projection (invariants).
+        Pinned,
+        /// Default (migration backfill); decays after `AGING_TTL_DAYS`
+        /// unreinforced.
+        Aging,
+        /// Short-lived; decays after `PERISHABLE_TTL_DAYS` unreinforced.
+        Perishable,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+    pub struct LearningEntry {
+        pub path: String,
+        pub tier: LearningTier,
+        /// `reinforced: YYYY-MM-DD` (None = never re-verified).
+        pub reinforced: Option<String>,
+        /// Estimated token cost of grounding on this entry (frontmatter +
+        /// rg context). The projection sums these under the budget.
+        pub cost_tokens: usize,
+    }
+
+    /// Parse `tier` + `reinforced` from a learning file's frontmatter
+    /// (dashes block optional). Unknown/missing tier = Aging (the
+    /// migration default); missing reinforced = None.
+    pub fn parse_learning_frontmatter(src: &str) -> Option<(LearningTier, Option<String>)> {
+        let block = src.strip_prefix("---\n")?;
+        let fm = block.split("\n---").next()?;
+        let mut tier = None;
+        let mut reinforced = None;
+        for line in fm.lines() {
+            if let Some(v) = line.strip_prefix("tier:") {
+                tier = Some(match v.trim() {
+                    "pinned" => LearningTier::Pinned,
+                    "perishable" => LearningTier::Perishable,
+                    _ => LearningTier::Aging,
+                });
+            } else if let Some(v) = line.strip_prefix("reinforced:") {
+                reinforced = Some(v.trim().to_string());
+            }
+        }
+        Some((tier.unwrap_or(LearningTier::Aging), reinforced))
+    }
+
+    fn age_days(reinforced: &str, today: NaiveDate) -> Option<i64> {
+        let r = NaiveDate::parse_from_str(reinforced, "%Y-%m-%d").ok()?;
+        Some((today - r).num_days())
+    }
+
+    /// The GATE projection: corpus IN (ranking over a borrowed slice), a
+    /// bounded ranked list OUT — top-N by reinforcement recency within
+    /// `budget_tokens`. pinned entries never age out; aging/perishable
+    /// decay past their TTL unreinforced; never-reinforced entries rank
+    /// last but stay eligible ONLY when pinned.
+    pub fn gate_projection<'a>(
+        entries: &'a [LearningEntry],
+        today: NaiveDate,
+        budget_tokens: usize,
+    ) -> Vec<&'a LearningEntry> {
+        let mut eligible: Vec<&LearningEntry> = entries
+            .iter()
+            .filter(|e| match e.tier {
+                LearningTier::Pinned => true,
+                LearningTier::Aging => e
+                    .reinforced
+                    .as_deref()
+                    .and_then(|r| age_days(r, today))
+                    .is_some_and(|age| age <= AGING_TTL_DAYS),
+                LearningTier::Perishable => e
+                    .reinforced
+                    .as_deref()
+                    .and_then(|r| age_days(r, today))
+                    .is_some_and(|age| age <= PERISHABLE_TTL_DAYS),
+            })
+            .collect();
+        // newest reinforcement first; never-reinforced (pinned only) last.
+        eligible.sort_by(|a, b| b.reinforced.as_deref().cmp(&a.reinforced.as_deref()));
+        let mut out = Vec::new();
+        let mut spent = 0usize;
+        for e in eligible {
+            if spent + e.cost_tokens > budget_tokens {
+                continue;
+            }
+            spent += e.cost_tokens;
+            out.push(e);
+        }
+        out
+    }
+}
+
+mod adr0010_d12_tests {
+    // governed-by: ADR-0010 D12 (bd-fmya) — learnings tier/reinforced +
+    // bounded GATE projection.
+    use super::learning::{
+        LearningEntry, LearningTier, gate_projection, parse_learning_frontmatter,
+    };
+    use chrono::NaiveDate;
+
+    fn d(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").expect("date")
+    }
+
+    fn entry(
+        path: &str,
+        tier: LearningTier,
+        reinforced: Option<&str>,
+        tokens: usize,
+    ) -> LearningEntry {
+        LearningEntry {
+            path: path.to_string(),
+            tier,
+            reinforced: reinforced.map(String::from),
+            cost_tokens: tokens,
+        }
+    }
+
+    // AC: GATE output bounded under budget with 50 seeded learnings.
+    #[test]
+    fn adr0010_d12_projection_bounded_under_budget_with_50_seeded() {
+        let today = d("2026-09-07");
+        let entries: Vec<LearningEntry> = (0..50)
+            .map(|i| {
+                entry(
+                    &format!("docs/learnings/k/l{i:02}.md"),
+                    LearningTier::Aging,
+                    Some("2026-09-07"),
+                    100,
+                )
+            })
+            .collect();
+        // budget fits 5 entries only
+        let out = gate_projection(&entries, today, 500);
+        assert_eq!(out.len(), 5, "projection stops at the budget");
+        // newest-reinforced-first ranking: all fresh here, so stable order
+        assert!(
+            out.iter()
+                .all(|e| e.reinforced.as_deref() == Some("2026-09-07"))
+        );
+    }
+
+    // AC: un-reinforced 40d aging entry absent from projection, present in
+    // corpus.
+    #[test]
+    fn adr0010_d12_unreinforced_40d_aging_entry_absent_from_projection() {
+        let today = d("2026-09-07");
+        let entries = vec![
+            entry(
+                "docs/learnings/k/stale.md",
+                LearningTier::Aging,
+                Some("2026-07-29"),
+                100,
+            ), // 40d
+            entry(
+                "docs/learnings/k/fresh.md",
+                LearningTier::Aging,
+                Some("2026-09-01"),
+                100,
+            ),
+        ];
+        let out = gate_projection(&entries, today, 10_000);
+        assert!(
+            !out.iter().any(|e| e.path.contains("stale")),
+            "40d aging decays out"
+        );
+        assert!(out.iter().any(|e| e.path.contains("fresh")));
+        // corpus unchanged (projection never deletes)
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn adr0010_d12_tier_matrix() {
+        let today = d("2026-09-07");
+        let entries = vec![
+            // pinned survives no reinforced stamp at all
+            entry("docs/learnings/k/pin.md", LearningTier::Pinned, None, 100),
+            // aging exactly at the 30d TTL: still in (<= 30d)
+            entry(
+                "docs/learnings/k/edge30.md",
+                LearningTier::Aging,
+                Some("2026-08-08"),
+                100,
+            ),
+            // perishable fresh (<= 7d): in
+            entry(
+                "docs/learnings/k/perish-fresh.md",
+                LearningTier::Perishable,
+                Some("2026-09-03"),
+                100,
+            ),
+            // perishable stale (> 7d): out
+            entry(
+                "docs/learnings/k/perish-old.md",
+                LearningTier::Perishable,
+                Some("2026-08-20"),
+                100,
+            ),
+        ];
+        let out = gate_projection(&entries, today, 10_000);
+        let paths: Vec<&str> = out.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"docs/learnings/k/pin.md"));
+        assert!(paths.contains(&"docs/learnings/k/edge30.md"));
+        assert!(paths.contains(&"docs/learnings/k/perish-fresh.md"));
+        assert!(!paths.contains(&"docs/learnings/k/perish-old.md"));
+        // ranking: newest reinforced first (pinned-with-no-stamp last)
+        assert_eq!(paths[0], "docs/learnings/k/perish-fresh.md");
+    }
+
+    // frontmatter parse: tier + reinforced (+ expires for perishable docs)
+    #[test]
+    fn adr0010_d12_frontmatter_parse() {
+        let fm = "---\ntrack: bug\ntier: aging\nreinforced: 2026-09-07\n---\n# body";
+        let (tier, reinforced) = parse_learning_frontmatter(fm).expect("parses");
+        assert_eq!(tier, LearningTier::Aging);
+        assert_eq!(reinforced, Some("2026-09-07".to_string()));
+        // legacy entries (no tier/reinforced): unknown tier, no stamp
+        let fm2 = "---\ntrack: bug\n---\n# body";
+        let (tier2, r2) = parse_learning_frontmatter(fm2).expect("parses");
+        assert_eq!(tier2, LearningTier::Aging); // migration default
+        assert_eq!(r2, None);
+        // no frontmatter at all
+        assert!(parse_learning_frontmatter("# just a doc").is_none());
+    }
+
+    #[test]
+    fn adr0010_d12_unknown_tier_string_is_aging_not_panic() {
+        let fm = "---\ntier: broadcast\n---\n# body";
+        let (tier, _) = parse_learning_frontmatter(fm).expect("parses");
+        assert_eq!(tier, LearningTier::Aging);
+    }
 }
 
 #[cfg(test)]
