@@ -65,6 +65,7 @@ Live ignored tests need herdr + mail. `mbx +nightly-aarch64-apple-darwin test --
   header naming the bound bead (`BEAD: <id>`) or stating none is bound (do not act on the
   TASK-ID: routing metadata only, never `br show` it). Project tier `.flywheel/stages.toml`
   resolves in CLI sends.
+- **Wake triage + urgency + deadlines:** benign/routine wakes advance markers with zero prompts (never wait for a ring on chatter); `--importance urgent` injects immediately, spend it on file-conflict blocks, unanswered request-releases, can't-proceed decisions, wedge signals only; digest renders earliest-deadline first, overdue escalates. Details in the flywheel skill (edge triage) and toron skill (`--importance`, `wait` TTL).
 - **Wave-scoped dispatch (ADR-0006 D2):** `loop-mode run --work --wave-label wave-N` = ready ∩ exact
   label, held with named blockers while any open/in_progress bead carries wave-M (M<N). Default
   `--work` unchanged. Label-based hold is transitional (TODO → beads ADR-0001 schema-18 typed field).

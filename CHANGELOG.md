@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
+### Added — ADR-0010 delivery semantics, attention triage, decision lifecycle
+- One live `WorkspaceModel` (doorbell loop owns it); `poll_mail_digests` deleted as wake producer; doorbell-with-inbox delivery with 90s/3-ring re-ring ladder and `--fire-and-forget` skip.
+- Generation-bound wake ack watermark; Busy/Idle/Unknown/Dead verdicts (Unknown never promoted); reservation write-liveness defers respawn; captain turn-end guard; wake classification in tick with AFK digest; OPEN DECISIONS fold with typed captain-hold and divergence reporting; ask-user authority policy.
+- `crew control` (interrupt/exit/relaunch) with `FLYWHEEL_OP:` marker; degraded receipts with printed corr-preserving resend; `--resolve-bead` structural done-hold; captain subagent-guard; `flywheel-snapshot.v1` + `helm`; tiered learnings with bounded GATE projection.
+- Coordination breakthroughs: edge triage (benign/routine zero-prompt, urgent injects), outer urgency tag behavior, deadline-attached holds with earliest-first digest.
+- Dispatch hardening: role-bind failure no longer aborts multi-pane spawn; CLI sends load the project stage tier; message text appends (never dropped); BEAD header on every send; unconsumed `--param` warns; `--fire-and-forget` id by equals-only; `mail inbox --unread` carries the limit.
 
 ### Fixed — GS-039 CoS-honest-5 (hold merge)
 - **P0-1 Wake (reprobe):** stamp `last_wake` from REAL observations — herdr Status events, poll **status transitions** into `working|idle|done|blocked` (not static already-idle rows every poll), successfully delivered prompts, **and** `send --wait` landed+settled status (covers idle→idle when Status push has no transition). Never from planned injects / `doorbell_persist_wake` invent-green. `doorbell_note_observed_wake` advances only when wall clock moves past prior (no `saturating_add(1)` ratchet). Robot never-wake after meaningful dispatch stays hard-fail.
