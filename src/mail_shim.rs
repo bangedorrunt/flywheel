@@ -219,7 +219,9 @@ pub struct MailInboxFilter {
     pub include_bodies: bool,
     pub limit: u32,
     /// Keep only messages with `created_ts_us` strictly newer than this
-    /// RFC3339 timestamp (c3b.3 — applied by the toron projection).
+    /// RFC3339 timestamp (c3b.3 — applied by the toron projection), or the
+    /// literal `last` (bd-zd2v — the daemon-side cursor, resolved + bumped
+    /// by the toron projection, never parsed as a timestamp here).
     pub since_ts: Option<String>,
     /// Keep only messages in this thread (bd-harvest-thread-filter-yp9r).
     /// Post-unwrap filter on the toron projection; `None` = no thread bound.
@@ -612,11 +614,20 @@ impl Mail {
                  (inbox rows carry no ack_ts) — use the dedicated ack_overdue() surface"
             ));
         }
-        let since_us = filter
-            .since_ts
-            .as_deref()
-            .map(parse_since_ts_us)
-            .transpose()?;
+        // bd-zd2v: the literal `last` is the daemon-side cursor
+        // (read-then-bump, resolved by the toron projection) — not RFC3339,
+        // so it bypasses timestamp parsing AND Remote client-side filtering
+        // (the server applies the cursor; filtering here would be wrong).
+        let is_last = filter.since_ts.as_deref() == Some("last");
+        let since_us = if is_last {
+            None
+        } else {
+            filter
+                .since_ts
+                .as_deref()
+                .map(parse_since_ts_us)
+                .transpose()?
+        };
         match &self.backend {
             BackendKind::InProcess => {
                 // bd-55nx.12: since_ts is applied ONCE by the toron
@@ -657,10 +668,19 @@ impl Mail {
                 )?;
                 // Same policy on the wire rows (InboxMessageOut carries
                 // `importance` + `created_ts_us`): filter client-side.
-                let rows = v
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
+                // bd-zd2v: the daemon answers `{"messages": [...]}` (object),
+                // not a bare array — accept both shapes (the bare-array arm
+                // keeps InProcess-shaped remotes byte-identical). Without
+                // this every Remote filtered read (incl. --unread) is [].
+                let rows_src: Vec<Value> = match &v {
+                    Value::Array(a) => a.clone(),
+                    v => v
+                        .get("messages")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                };
+                let rows = rows_src
                     .into_iter()
                     .filter(|row| {
                         !filter.urgent_only

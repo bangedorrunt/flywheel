@@ -1861,6 +1861,10 @@ enum MailCmd {
         unread: bool,
         #[arg(long, default_value = "20")]
         limit: u32,
+        /// only messages strictly newer than this RFC3339 timestamp, or the
+        /// literal `last` (daemon-side crash-proof cursor, read-then-bump)
+        #[arg(long)]
+        since: Option<String>,
         /// act as this registered agent (adjective+noun or herdr short name)
         #[arg(long = "as")]
         as_agent: Option<String>,
@@ -7277,6 +7281,65 @@ mod spawn_boot_reliability_tests {
             super::mail_project(&none, &none, "send").is_err(),
             "neither must fail loud, never an empty project"
         );
+    }
+
+    /// bd-zd2v: `mail inbox` gains `--since` parity with toron (RFC3339 or
+    /// the literal `last` cursor). Behavioral: help lists the flag; the
+    /// flag fills the inbox filter field.
+    #[test]
+    fn bd_zd2v_mail_inbox_since_flag() {
+        use clap::CommandFactory;
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let cmd = Cli::command();
+                let mail = cmd.find_subcommand("mail").expect("mail subcommand");
+                let inbox = mail
+                    .find_subcommand("inbox")
+                    .expect("mail inbox subcommand");
+                let mut help = Vec::new();
+                inbox.clone().write_long_help(&mut help).expect("help");
+                let help_s = String::from_utf8(help).expect("utf8");
+                assert!(
+                    help_s.contains("--since"),
+                    "mail inbox help must list --since"
+                );
+
+                let since_of = |args: &[&str]| -> Option<String> {
+                    let cli = Cli::try_parse_from(args)
+                        .unwrap_or_else(|e| panic!("parse {args:?} failed: {e}"));
+                    match cli.command {
+                        Some(Commands::Mail {
+                            cmd: MailCmd::Inbox { since, .. },
+                        }) => since,
+                        _ => panic!("expected mail inbox"),
+                    }
+                };
+                assert_eq!(
+                    since_of(&["flywheel", "mail", "inbox", "flywheel", "--since", "last"]),
+                    Some("last".to_string()),
+                    "--since last must fill the filter field"
+                );
+                assert_eq!(
+                    since_of(&[
+                        "flywheel",
+                        "mail",
+                        "inbox",
+                        "flywheel",
+                        "--since",
+                        "2026-09-07T00:00:00Z"
+                    ]),
+                    Some("2026-09-07T00:00:00Z".to_string()),
+                    "--since RFC3339 must fill the filter field"
+                );
+                assert_eq!(
+                    since_of(&["flywheel", "mail", "inbox", "flywheel"]),
+                    None,
+                    "absent --since stays None (default path byte-identical)"
+                );
+            })
+            .expect("spawn clap probe");
+        handle.join().expect("clap probe thread");
     }
 
     #[test]
@@ -16923,6 +16986,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             urgent,
             unread,
             limit,
+            since,
             as_agent,
             json,
         } => {
@@ -16943,7 +17007,23 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             // --unread needs the filtered surface; --urgent rides the same
             // inbox() call, which honors the flag with id-set parity to
             // inbox_filtered/MCP urgent_only (bd-mail-surface-drift-7r2o).
-            let v = if *unread {
+            // bd-zd2v: --since (RFC3339 or the `last` cursor) rides the
+            // filtered surface with the other flags passed through; without
+            // it the legacy path below is byte-identical to before.
+            let v = if let Some(since_ts) = since.as_deref() {
+                mail.inbox_filtered(
+                    &key,
+                    &name,
+                    &mail_shim::MailInboxFilter {
+                        urgent_only: *urgent,
+                        unread_only: *unread,
+                        include_bodies: true,
+                        limit: *limit,
+                        since_ts: Some(since_ts.to_string()),
+                        ..Default::default()
+                    },
+                )?
+            } else if *unread {
                 mail.inbox_filtered(
                     &key,
                     &name,
