@@ -493,6 +493,7 @@ fn spawn_crew_into(
                 harness: Some(harness.clone()),
                 mail_identity,
                 skills_injected: false,
+                incarnation: 0,
             });
             eprintln!("  crew {}: {} ({}) @{}", label, name, agent_pane_id, role);
         }
@@ -1356,6 +1357,7 @@ mod tests {
                 harness: Some("omp".into()),
                 mail_identity: None,
                 skills_injected: false,
+                incarnation: 0,
             },
             SpawnEntry {
                 pane_id: "w1:p2".into(),
@@ -1364,6 +1366,7 @@ mod tests {
                 harness: Some("omp".into()),
                 mail_identity: None,
                 skills_injected: false,
+                incarnation: 0,
             },
             SpawnEntry::legacy("w1:p3", "plain-agent"),
         ];
@@ -1387,6 +1390,7 @@ mod tests {
                 harness: Some("omp".into()),
                 mail_identity: None,
                 skills_injected: false,
+                incarnation: 0,
             },
             SpawnEntry {
                 pane_id: "w1:p2".into(),
@@ -1395,6 +1399,7 @@ mod tests {
                 harness: Some("opencode".into()),
                 mail_identity: None,
                 skills_injected: false,
+                incarnation: 0,
             },
         ];
         let e = resolve_pane_by_harness(&entries, "opencode").expect("opencode pane");
@@ -1418,6 +1423,7 @@ mod tests {
                 harness: Some("omp".into()),
                 mail_identity: None,
                 skills_injected: false,
+                incarnation: 0,
             },
             SpawnEntry::legacy("w1:p3", "plain"),
         ];

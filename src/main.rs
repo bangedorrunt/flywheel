@@ -22,6 +22,7 @@ mod builtin_workflows;
 mod catalog_tui;
 mod coalition;
 mod config;
+mod control;
 mod crew;
 mod cron;
 mod daemon;
@@ -710,6 +711,13 @@ enum Commands {
         /// `--raw` never bypasses.
         #[arg(long = "unsafe-plane")]
         unsafe_plane: bool,
+    },
+    /// Crew plane: preview + lifecycle control (ADR-0010 D7). Control has
+    /// NO arbitrary-text entry point — the verbs are interrupt|exit|relaunch
+    /// only; text the worker reads is not a lifecycle verb.
+    Crew {
+        #[command(subcommand)]
+        cmd: CrewCmd,
     },
     /// Interrupt an agent (sends Escape by default — cancels the current
     /// tool call and returns to the prompt). Kill-style keys (ctrl+c) are
@@ -2049,6 +2057,28 @@ enum MailCmd {
         #[command(subcommand)]
         cmd: MailContactCmd,
     },
+    /// ADR-0010 D8 (bd-d8e4): corr-preserving resend. Re-runs the send under
+    /// the SAME corr — toron's idempotent claim dedupes within TTL and the
+    /// receipt stays corr-keyed. Refuses resulted (resend would duplicate)
+    /// and degraded (bookkeeping failed after enqueue — likely delivered).
+    /// A plain re-run of `mail send` mints a NEW corr and duplicates.
+    Resend {
+        project: String,
+        /// the corr stamped on the original send (from receipts / the
+        /// transport-unknown print)
+        #[arg(long)]
+        corr: String,
+        /// recipients: comma-separated pins (the original delivery set)
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        body: String,
+        /// act as this agent (the original sender pin)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+    },
     /// product grouping for multi-project search/inbox
     Product {
         #[command(subcommand)]
@@ -2955,6 +2985,38 @@ enum RunsCmd {
         #[arg(long, default_value_t = 3)]
         broken_after: u32,
     },
+}
+
+/// ADR-0010 D7 crew plane: workflow preview + lifecycle verbs.
+#[derive(Subcommand)]
+enum CrewCmd {
+    /// Preview the auto-crew a workflow would spawn (crew: auto)
+    Preview {
+        /// workflow name (built-in or catalog)
+        name: String,
+    },
+    /// Lifecycle verbs for a spawned agent pane. NO arbitrary-text entry
+    /// point: interrupt|exit|relaunch are the whole surface (ADR-0010 D7).
+    Control {
+        project: String,
+        /// the pane target (herdr agent name, kind short, or pane id)
+        pin: String,
+        #[command(subcommand)]
+        verb: ControlVerbCmd,
+    },
+}
+
+/// The three control verbs (postconditions asserted in src/control.rs).
+#[derive(Subcommand)]
+enum ControlVerbCmd {
+    /// Cancel the current tool call (Escape only — kill-style keys stay off
+    /// this plane). Confirmed only when the composer is provably empty.
+    Interrupt,
+    /// Stop the agent pane. Reservations + dirty files preserved.
+    Exit,
+    /// Journaled relaunch: checkpoint the spawn record, stop, launch the
+    /// same pin with an incarnation token; rollback on launch failure.
+    Relaunch,
 }
 
 /// Unified workflow commands (ADR-0005 Spec 5 / P3.7). `lint` is the
@@ -4022,6 +4084,7 @@ fn main() {
             "commands": [
                 "init spawn add list status decide rebind recover",
             "send interrupt view output watch zoom attach kill",
+            "crew preview|control (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
             "loop-mode (alias: loop) run/status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts",
             "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
             "doorbell status/start/stop/re-inject (supervised pane-wake layer: lazy-heal + persisted wake state)",
@@ -4192,6 +4255,7 @@ fn main() {
             keys,
             force,
         }) => cmd_interrupt(&cfg, project, to, keys, *force),
+        Some(Commands::Crew { cmd }) => cmd_crew(&cfg, cmd),
         Some(Commands::View {
             project,
             to,
@@ -9813,6 +9877,9 @@ fn upsert_workspace_receipt(corr: &str, receipt: &workspace::Receipt) {
         "owed" => toron_core::mailbox::receipts::ReceiptState::Owed,
         "acked" => toron_core::mailbox::receipts::ReceiptState::Acked,
         "resulted" => toron_core::mailbox::receipts::ReceiptState::Resulted,
+        // ADR-0010 D8 (bd-d8e4): degraded (acked-unknown) is a real state —
+        // dropping it here was the silent bookkeeping loss D8 forbids.
+        "degraded" => toron_core::mailbox::receipts::ReceiptState::Degraded,
         _ => return,
     };
     let wake = match receipt.wake.as_str() {
@@ -14845,6 +14912,221 @@ fn cmd_interrupt(
     Ok(())
 }
 
+// ---- crew control (ADR-0010 D7) ----
+
+/// `flywheel crew` — preview + lifecycle control plane. Preview mirrors the
+/// `workflow crew <name>` report; control has NO arbitrary-text entry point
+/// (interrupt|exit|relaunch are the whole surface).
+fn cmd_crew(cfg: &Config, cmd: &CrewCmd) -> Result<()> {
+    match cmd {
+        CrewCmd::Preview { name } => {
+            let mut all: BTreeMap<String, (toron_workflow::schema::Workflow, &'static str)> =
+                BTreeMap::new();
+            for (n, wf) in builtin_workflows::builtin_workflows() {
+                all.insert(n, (wf, "builtin"));
+            }
+            let cat = workflow_catalog::WorkflowCatalog::load()?;
+            for (n, wf) in cat.workflows {
+                all.insert(n, (wf, "catalog"));
+            }
+            let wf = all
+                .get(name.as_str())
+                .map(|(wf, _)| wf)
+                .ok_or_else(|| anyhow!("unknown workflow {name:?} (flywheel workflow list)"))?;
+            let resolve = |sub: &str| all.get(sub).map(|(w, _)| w.clone());
+            let plan = crew::plan_crew_with(wf, &resolve);
+            let members: Vec<Value> = plan
+                .members
+                .iter()
+                .map(|(role, count)| json!({ "role": role, "count": count }))
+                .collect();
+            if members.is_empty() {
+                println!("workflow {name} has no crew (crew omitted or no profile refs)");
+                return Ok(());
+            }
+            print_json(&json!({ "workflow": name, "crew": members }));
+            Ok(())
+        }
+        CrewCmd::Control { project, pin, verb } => cmd_crew_control(cfg, project, pin, verb),
+    }
+}
+
+/// Marker-prefixed relaunch prime: the worker's handler template tells
+/// control-plane prompts from captain payloads by the U+2063 + FLYWHEEL_OP:
+/// prefix (byte-checked round-trip in src/control.rs tests).
+fn relaunch_prime_line(name: &str, pin: Option<&str>, token: &str) -> String {
+    control::op_prompt(&format!(
+        "CREW CONTROL relaunch: pane for {name} was recreated by the control plane \
+         (incarnation {token}). Re-anchor to your current task and re-ack the \
+         doorbell; your mail identity is {}.",
+        pin.unwrap_or(name)
+    ))
+}
+
+fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCmd) -> Result<()> {
+    let mut c = Client::connect(Some(&cfg.socket_path()))?;
+    let ws_id = find_workspace(&mut c, project)?;
+    let targets = resolve_agents(&mut c, &ws_id, project, pin)?;
+    if targets.len() != 1 {
+        bail!(
+            "crew control targets ONE pane — '{pin}' resolved {} ({}); name one pin",
+            targets.len(),
+            targets
+                .iter()
+                .filter_map(|a| a.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let a = &targets[0];
+    let name = a
+        .name
+        .clone()
+        .unwrap_or_else(|| agent_target(a).to_string());
+    match verb {
+        &ControlVerbCmd::Interrupt => {
+            let status = herdr_shim::parse_agent_status(a.agent_status.as_str())
+                .unwrap_or(crate::herdr_shim::AgentStatus::Unknown);
+            let plan = control::interrupt_plan(status);
+            c.agent_send_keys(agent_target(a), plan.keys)?;
+            let verdict = if plan.confirmed {
+                "confirmed (composer provably empty)"
+            } else {
+                "UNCONFIRMED (agent was working — re-check the pane)"
+            };
+            println!("interrupted {name} — cancel {verdict}");
+            log(
+                project,
+                EventKind::Interrupt,
+                json!({ "to": pin, "keys": plan.keys, "confirmed": plan.confirmed, "plane": "crew-control" }),
+            );
+        }
+        &ControlVerbCmd::Exit => {
+            // pane.close — the agent goes with the pane. Exit deliberately
+            // touches NOTHING else: reservations (toron leases) and dirty
+            // worktree files are preserved (control::EXIT_POSTCONDITION).
+            c.call_coded("pane.close", json!({ "pane_id": a.pane_id }))
+                .with_context(|| format!("pane.close for {name} ({})", a.pane_id))?;
+            println!(
+                "exited {name} ({}) — reservations + dirty files preserved",
+                a.pane_id
+            );
+            log(
+                project,
+                EventKind::State,
+                json!({ "op": "crew-control exit", "name": name, "pane_id": a.pane_id }),
+            );
+        }
+        &ControlVerbCmd::Relaunch => {
+            let registry = state::load_spawn_registry(project);
+            let old = registry
+                .iter()
+                .find(|e| e.name == name || e.pane_id == a.pane_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("{name} ({}) not in the spawn registry — relaunch reconstructs the launch from the registry profile row", a.pane_id))?;
+            let catalog = profile::ProfileCatalog::load()?;
+            let profile = old.profile.as_ref().ok_or_else(|| anyhow!(
+                "{name} has no profile row — crew-control relaunch reconstructs launch args from the profile; re-spawn instead (flywheel spawn {project})"
+            ))?;
+            let p = catalog
+                .get(profile)
+                .ok_or_else(|| anyhow!("unknown profile '{profile}' (flywheel profile list)"))?;
+            let kind = old.harness.clone().unwrap_or_else(|| p.harness.clone());
+            let args = profile_launch_args(&kind, p, None)?;
+
+            // Journaled transaction: checkpoint → stop → launch → commit/rollback.
+            control::save_relaunch_journal(project, &old)?;
+            c.call_coded("pane.close", json!({ "pane_id": a.pane_id }))
+                .with_context(|| format!("stop old pane for {name} ({})", a.pane_id))?;
+
+            // Fresh pane from the workspace root (same env contract as add).
+            let panes = c.pane_list(Some(&ws_id))?;
+            let root = panes
+                .first()
+                .ok_or_else(|| anyhow!("workspace {ws_id} has no panes"))?;
+            let mail_identity = old.mail_identity.clone();
+            let pane_env = herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
+            let dir = project_dir(cfg, project);
+            let new_pane = herdr_shim::pane_split(
+                &mut c,
+                &root.pane_id,
+                "down",
+                Some(&utf8_path(&dir, "workspace dir")?),
+                Some(&pane_env),
+            )?;
+            let pane_id = new_pane.pane_id.clone();
+            let shell_ready =
+                herdr_shim::wait_shell_prompt(&mut c, &pane_id, Duration::from_secs(15))?;
+            if !shell_ready {
+                eprintln!(
+                    "flywheel: warn: shell for {name} ({pane_id}) did not render a prompt \
+                     within 15s — the launch command may be mangled by the booting shell"
+                );
+            }
+            let launch = start_agent_with_retry(&mut c, &name, &kind, &pane_id, &args);
+            match control::relaunch_decide(launch.is_ok()) {
+                control::RelaunchAction::Commit => {
+                    let _ = launch.with_context(|| format!("launch {name} ({kind})"))?;
+                    let _ = herdr_shim::wait_agent_foreground(
+                        &mut c,
+                        &pane_id,
+                        &kind,
+                        &name,
+                        Duration::from_secs(15),
+                    );
+                    // Published record wins even when the agent is unconfirmed
+                    // (relaunch_decide already committed on launch Ok).
+                    let mut entries = state::load_spawn_registry(project);
+                    if let Some(e) = entries
+                        .iter_mut()
+                        .find(|e| e.name == name || e.pane_id == old.pane_id)
+                    {
+                        e.pane_id = pane_id.clone();
+                        e.incarnation += 1;
+                    }
+                    state::save_spawn_registry(project, &entries)?;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let token = control::incarnation_token(&old, now);
+                    prime_line_via_send_text(
+                        &mut c,
+                        &pane_id,
+                        &relaunch_prime_line(&name, mail_identity.as_deref(), &token),
+                    );
+                    control::clear_relaunch_journal(project)?;
+                    println!(
+                        "relaunched {name} → {pane_id} (incarnation {token}; reservations + dirty preserved)"
+                    );
+                    log(
+                        project,
+                        EventKind::Respawn,
+                        json!({ "op": "crew-control relaunch", "name": name, "pane_id": pane_id, "token": token }),
+                    );
+                }
+                control::RelaunchAction::Rollback => {
+                    let journal = control::load_relaunch_journal(project)?
+                        .ok_or_else(|| anyhow!("relaunch journal vanished mid-transaction"))?;
+                    control::rollback_relaunch(project, &journal)?;
+                    control::clear_relaunch_journal(project)?;
+                    log(
+                        project,
+                        EventKind::Respawn,
+                        json!({ "op": "crew-control relaunch ROLLED BACK", "name": name, "err": format!("{:#}", launch.unwrap_err()) }),
+                    );
+                    bail!(
+                        "relaunch of {name} failed after the stop — the prior durable record is restored; \
+                         the old pane ({}) is closed and the workspace has no agent for it: re-spawn or retry",
+                        old.pane_id
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// bd-fw-view-alt-screen-blocked-ct9: a working agent's `recent` history is
 /// on the alternate screen and cannot be captured (herdr rejects with
 /// `agent_not_idle`). Fall back to the `visible` buffer with a note instead
@@ -16669,8 +16951,68 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 *ack,
                 thread_id.as_deref(),
                 Some(wake.as_str()),
+                None,
             )?;
             print_json(&v);
+        }
+        MailCmd::Resend {
+            project,
+            corr,
+            to,
+            subject,
+            body,
+            as_agent,
+        } => {
+            let key = project_dir_str(cfg, project)?;
+            let mail = mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            // ADR-0010 D8 (bd-d8e4): look the receipt up FIRST — the resend is
+            // only safe while the corr is genuinely outstanding.
+            let receipt = crate::mail_shim::block_on(async {
+                let mb = crate::mail_shim::try_mailbox()
+                    .ok_or_else(|| anyhow::anyhow!("no in-process toron mailbox"))?;
+                let store = mb
+                    .receipt_store()
+                    .map_err(|e| anyhow::anyhow!("receipts store unavailable: {e}"))?;
+                store.get(corr.trim()).await
+            })?;
+            match receipt {
+                None => anyhow::bail!(
+                    "no receipt for corr {corr} — nothing to correlate; a fresh send is a NEW corr"
+                ),
+                Some(r) if r.state == toron_core::mailbox::ReceiptState::Resulted => {
+                    anyhow::bail!(
+                        "corr {corr} already resulted — do NOT resend (a resend would duplicate)"
+                    );
+                }
+                Some(r) if r.state == toron_core::mailbox::ReceiptState::Degraded => {
+                    anyhow::bail!("{}", toron_core::mailbox::receipts::DEGRADED_NOTE);
+                }
+                Some(r) => {
+                    // Preserve the original wake tag; default tasked (the
+                    // send default) when the receipt carries none.
+                    let wake = r
+                        .wake
+                        .map(|w| w.as_str().to_string())
+                        .unwrap_or_else(|| "tasked".to_string());
+                    let targets: Vec<String> = to
+                        .split(',')
+                        .map(|s| resolve_mail_target_registry(project, s.trim()))
+                        .collect();
+                    let v = mail.send_with_wake(
+                        &key,
+                        &targets,
+                        subject,
+                        body,
+                        "normal",
+                        false,
+                        None,
+                        Some(&wake),
+                        Some(corr.trim()),
+                    )?;
+                    print_json(&v);
+                }
+            }
         }
         MailCmd::Locks { cmd } => match cmd {
             MailLockCmd::Reserve {
@@ -35066,6 +35408,115 @@ mod single_writer_tests {
 }
 
 #[cfg(test)]
+mod adr0010_d7_tests {
+    // governed-by: ADR-0010 D7 (bd-w5fn) — crew control verbs + FLYWHEEL_OP
+    // marker. Code-pointer gates over the imperative wiring; the pure
+    // postconditions live in src/control.rs (adr0010_d7_* tests).
+    use super::*;
+
+    #[test]
+    fn adr0010_d7_no_arbitrary_text_entry_point() {
+        // The verb enum is exactly interrupt|exit|relaunch, all unit
+        // variants — text the worker reads is not a lifecycle verb.
+        let start = include_str!("main.rs")
+            .find("enum ControlVerbCmd {")
+            .expect("ControlVerbCmd enum present");
+        let src = include_str!("main.rs");
+        let end = start + src[start..].find("\n}\n").expect("enum closes");
+        let body = &src[start..end];
+        for verb in ["Interrupt", "Exit", "Relaunch"] {
+            assert!(body.contains(verb), "{verb} variant present: {body}");
+        }
+        assert!(!body.contains("String"), "no payload variants: {body}");
+    }
+
+    #[test]
+    fn adr0010_d7_interrupt_goes_through_the_gated_plan() {
+        let body = fn_slice("cmd_crew_control");
+        assert!(
+            body.contains("control::interrupt_plan"),
+            "interrupt routes through the capability-gated pure plan"
+        );
+        assert!(
+            body.contains("confirmed (composer provably empty)"),
+            "cancel confirmation is reported, not implied"
+        );
+    }
+
+    #[test]
+    fn adr0010_d7_exit_never_releases_reservations_or_touches_dirty() {
+        let body = fn_slice("cmd_crew_control");
+        let exit = body.find("ControlVerbCmd::Exit => {").expect("exit arm");
+        let relaunch = body
+            .find("ControlVerbCmd::Relaunch => {")
+            .expect("relaunch arm");
+        let exit_arm = &body[exit..relaunch];
+        assert!(
+            exit_arm.contains("pane.close"),
+            "exit closes the pane: {exit_arm}"
+        );
+        for banned in [
+            "release",
+            "clear_pane_identity",
+            "remove_dir_all",
+            "remove_file",
+        ] {
+            assert!(
+                !exit_arm.contains(banned),
+                "exit must preserve reservations + dirty files; found `{banned}`"
+            );
+        }
+    }
+
+    #[test]
+    fn adr0010_d7_relaunch_journals_before_stop_and_rolls_back_on_fail() {
+        let body = fn_slice("cmd_crew_control");
+        let relaunch = body
+            .find("ControlVerbCmd::Relaunch => {")
+            .expect("relaunch arm");
+        let relaunch_arm = &body[relaunch..];
+        let checkpoint = relaunch_arm
+            .find("save_relaunch_journal")
+            .expect("journal checkpoint");
+        let stop = relaunch_arm.find("pane.close").expect("stop");
+        assert!(
+            checkpoint < stop,
+            "checkpoint BEFORE stop (journaled transaction)"
+        );
+        assert!(
+            relaunch_arm.contains("RelaunchAction::Rollback")
+                && relaunch_arm.contains("rollback_relaunch"),
+            "launch failure restores the prior durable record"
+        );
+        assert!(
+            relaunch_arm.contains("incarnation_token"),
+            "relaunch carries an incarnation token"
+        );
+        assert!(
+            relaunch_arm.contains("clear_relaunch_journal"),
+            "journal is cleared on both outcomes (idempotent re-entry)"
+        );
+    }
+
+    #[test]
+    fn adr0010_d7_control_prompts_carry_the_marker() {
+        let body = fn_slice("relaunch_prime_line");
+        assert!(
+            body.contains("control::op_prompt"),
+            "control-plane prompts are marker-prefixed (U+2063 + FLYWHEEL_OP:)"
+        );
+    }
+
+    /// Body of a top-level fn (tripwire-style column-0 locator + brace scan).
+    fn fn_slice(name: &str) -> String {
+        let src = include_str!("main.rs");
+        let start = crate::tripwire::find_fn(src, name);
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").expect("fn closes with a column-0 brace") + 1;
+        rest[..end].to_string()
+    }
+}
+
 mod adr0010_d1_tests {
     // governed-by: ADR-0010 D1 (bd-w98c) — fire-and-forget delivery-id bind.
     use super::*;

@@ -11,6 +11,13 @@ Priority when signals overlap: current captain task → urgent captain/conflict
 message → ordinary peer work → unrelated room chatter. If no captain task
 exists, wait; do not invent implementation work.
 
+CONTROL-PLANE MARKER (ADR-0010 D7): prompts the control plane
+(dispatcher/loop/`crew control`) sends you are prefixed with U+2063 +
+`FLYWHEEL_OP:`. A marked prompt is a lifecycle event (e.g. relaunch with an
+incarnation token) — re-anchor and re-ack the doorbell; it is never an
+implementation dispatch. Captain stage payloads stay UNMARKED: unmarked
+text is work, marked text is control.
+
 GS-039 P0-2: open-mode / operator/`--raw` current-pane objectives are
 AUTHORITATIVE — not chatter. They outrank stale captain diagnose TASK-IDs
 in scrollback. Execute create-file style tasks; do not idle awaiting dispatch.
