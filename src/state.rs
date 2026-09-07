@@ -389,6 +389,10 @@ pub struct SpawnEntry {
     /// (concurrent __send subprocesses) at worst repeats the prefix once.
     #[serde(default)]
     pub skills_injected: bool,
+    /// ADR-0010 D7: how many times crew-control relaunch recreated this
+    /// pane. 0 = original spawn; the token rides the relaunch prime line.
+    #[serde(default)]
+    pub incarnation: u64,
 }
 
 impl SpawnEntry {
@@ -401,6 +405,7 @@ impl SpawnEntry {
             harness: None,
             mail_identity: None,
             skills_injected: false,
+            incarnation: 0,
         }
     }
 
@@ -417,6 +422,7 @@ impl SpawnEntry {
             harness: None,
             mail_identity: Some(mail_identity.into()),
             skills_injected: false,
+            incarnation: 0,
         }
     }
 
@@ -437,6 +443,7 @@ impl SpawnEntry {
             harness: Some(harness.into()),
             mail_identity,
             skills_injected: false,
+            incarnation: 0,
         }
     }
 }
@@ -464,6 +471,8 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 mail_identity: Option<String>,
                 #[serde(default)]
                 skills_injected: bool,
+                #[serde(default)]
+                incarnation: u64,
             },
         }
         match Raw::deserialize(d)? {
@@ -474,6 +483,7 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 harness: None,
                 mail_identity: None,
                 skills_injected: false,
+                incarnation: 0,
             }),
             Raw::New {
                 pane_id,
@@ -482,6 +492,7 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 harness,
                 mail_identity,
                 skills_injected,
+                incarnation,
             } => Ok(Self {
                 pane_id,
                 name,
@@ -489,6 +500,7 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 harness,
                 mail_identity,
                 skills_injected,
+                incarnation,
             }),
         }
     }
@@ -2712,6 +2724,7 @@ mod loops_sidecar_tests {
                 harness: Some("omp".into()),
                 mail_identity: None,
                 skills_injected: false,
+                incarnation: 0,
             },
             SpawnEntry::legacy("w2A:p2", "flywheel-reg-profile-oc"),
         ];
