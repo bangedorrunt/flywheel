@@ -195,6 +195,9 @@ fn mail_item_from(v: &Value, op: &str) -> Result<MailItem, MailError> {
             .unwrap_or(false),
         thread_id: opt_string_field(v, &["thread_id"]).map(MessageId::from),
         duplicate_of: opt_string_field(v, &["duplicate_of"]).map(MessageId::from),
+        // ADR-0010 D9 (bd-l0fz): the legacy agent-mail wire carries no bead
+        // tag — None is correct there (the hold is toron-rumor-tagged).
+        bead: opt_string_field(v, &["bead"]),
         created_ts_us: ts_us(v, &["created_ts_us", "created_ts"]),
     })
 }

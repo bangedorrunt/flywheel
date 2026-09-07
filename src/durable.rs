@@ -2441,25 +2441,11 @@ impl GuardSignalKind {
 /// handoff beats a stand-down phrase, and claim/announce come last.
 /// Keyword-based on purpose: the guard must read BOTH harness mails and
 /// human posts without a schema.
-///
-/// ADR-0010 D9 (bd-l0fz): the done-hold is STRUCTURAL — the projected
-/// `bead=<id>` tag (stamped by `toron mail send --resolve-bead` and the loop
-/// reporter-of-record). The `[{id}] done` subject is decoration for humans:
-/// a subject alone NEVER fires the hold (clean cutover, no dual-match shim;
-/// the old subject-anchor false-classified participles and is deleted, not
-/// shimmed).
-pub fn classify_guard_signal(
-    subject: &str,
-    body: &str,
-    bead: Option<&str>,
-) -> Option<GuardSignalKind> {
+pub fn classify_guard_signal(subject: &str, body: &str) -> Option<GuardSignalKind> {
     let s = subject.to_lowercase();
     let b = body.to_lowercase();
-    // Done: the `bead=<id>` tag — the tag is the hold; the subject is
-    // decoration (D9). Presence is enough: the scan is already thread-scoped
-    // to the guarded bead's thread, and holding on a cross-stamped tag is
-    // the safe direction (dispatch held, never a false go).
-    if bead.is_some() {
+    // Done: "[<bead>] done" close reports — anchored (see subject_done).
+    if subject_done(&s) {
         return Some(GuardSignalKind::Done);
     }
     let standdown =
@@ -2488,6 +2474,16 @@ pub fn classify_guard_signal(
         return Some(GuardSignalKind::Claim);
     }
     None
+}
+
+/// bd-dispatch-dedupe-2zlz done anchoring: `done` is the close-report verb
+/// only when the subject ENDS with `] done`. The bare `"] done"` substring
+/// false-classified `[bd-123] done investigating` (a participle, not a close
+/// report) as done and held dispatch on probe/analysis subjects. A `Re:`/
+/// `Fwd:` prefix still matches because the anchor is at the end, not the
+/// start.
+fn subject_done(s: &str) -> bool {
+    s.trim_end().ends_with("] done")
 }
 
 /// Everything the guard weighs, collected by the `__dispatch-guard` scan.
@@ -8668,7 +8664,6 @@ mod dispatch_guard_tests {
             classify_guard_signal(
                 "[bd-adr22-w4-steer-engine-w69z] starting — steer durable-rail survey + plan",
                 "Claimed bd-adr22-w4-steer-engine-w69z. Write-set: flywheel src/main.rs...",
-                None,
             ),
             Some(Announce)
         );
@@ -8676,7 +8671,6 @@ mod dispatch_guard_tests {
             classify_guard_signal(
                 "[bd-adr22-w7-delegated-compose-fhdy] STAND-DOWN — live concurrent executor on full surface",
                 "Retracting my earlier split proposal — superseded by events.",
-                None,
             ),
             Some(StandDown)
         );
@@ -8684,85 +8678,39 @@ mod dispatch_guard_tests {
             classify_guard_signal(
                 "oqe6: agreed + cli lease released — you execute; full handoff inside",
                 "**agreed + released** — lease is released to you. You are the executor; I stand down.",
-                None,
             ),
             Some(Handoff),
             "explicit transfer beats a passing stand-down phrase"
         );
         assert_eq!(
-            classify_guard_signal("[bd-x] done", "**status**: closed", None),
-            None,
-            "D9: `] done` subject alone NEVER fires the hold (subject is decoration)"
+            classify_guard_signal("[bd-x] done", "**status**: closed"),
+            Some(Done)
         );
         assert_eq!(
-            classify_guard_signal("[bd-123] done investigating", "still reproing", None),
+            classify_guard_signal("[bd-123] done investigating", "still reproing"),
             None,
             "participle 'done' is not a close report"
         );
         assert_eq!(
-            classify_guard_signal(
-                "[bd-adr22-w4-steer-engine-w69z] starting — steer durable-rail survey + plan",
-                "Claimed bd-adr22-w4-steer-engine-w69z. Write-set: flywheel src/main.rs...",
-                Some("bd-adr22-w4-steer-engine-w69z"),
-            ),
+            classify_guard_signal("Re: [bd-x] done", "closed"),
             Some(Done),
-            "D9: tag present + arbitrary subject → hold fires (tag beats participle)"
+            "a reply prefix does not break the anchored done"
         );
         assert_eq!(
-            classify_guard_signal("Re: [bd-x] done", "closed", None),
-            None,
-            "a reply prefix alone is not the hold (D9 clean cutover)"
+            classify_guard_signal("[bd-x] done ", "closed"),
+            Some(Done),
+            "trailing whitespace does not break the anchored done"
         );
         assert_eq!(
-            classify_guard_signal("[bd-x] done ", "closed", None),
-            None,
-            "trailing whitespace does not resurrect the subject match"
-        );
-        assert_eq!(
-            classify_guard_signal(
-                "re: bd-y question",
-                "is claim-watch armed for this bead?",
-                None
-            ),
+            classify_guard_signal("re: bd-y question", "is claim-watch armed for this bead?"),
             None,
             "claim-watch mentions are not claims"
         );
         assert_eq!(
-            classify_guard_signal("[BD-X] DONE", "closed", None),
-            None,
-            "uppercase subject alone never fires the hold (D9)"
+            classify_guard_signal("[BD-X] DONE", "closed"),
+            Some(Done),
+            "the anchored done is case-insensitive (classify lowercases first)"
         );
-    }
-
-    /// ADR-0010 D9 (bd-l0fz): the bead tag is the hold, the subject is
-    /// decoration. Locks the AC both ways: tag present + arbitrary subject →
-    /// Done; tag absent + `] done` subject → None. No dual-match shim: a
-    /// future loosening back to subject matching must fail red.
-    #[test]
-    fn done_hold_is_the_bead_tag_not_the_subject() {
-        use GuardSignalKind::*;
-        // Tag present, arbitrary subject (even a participle): hold fires.
-        for subject in [
-            "[bd-x] done",
-            "[bd-123] done investigating",
-            "shipped and verified",
-            "all done",
-            "",
-        ] {
-            assert_eq!(
-                classify_guard_signal(subject, "closed", Some("bd-l0fz")),
-                Some(Done),
-                "bead tag fires the hold regardless of subject {subject:?}"
-            );
-        }
-        // Tag absent, canonical `] done` subjects: hold does NOT fire.
-        for subject in ["[bd-x] done", "Re: [bd-x] done", "[bd-x] done."] {
-            assert_eq!(
-                classify_guard_signal(subject, "**status**: closed", None),
-                None,
-                "subject {subject:?} alone is decoration (D9)"
-            );
-        }
     }
 
     /// bd-dispatch-dedupe-2zlz: `done` is the close-report verb ONLY as the
@@ -8770,6 +8718,41 @@ mod dispatch_guard_tests {
     /// ("done reviewing"), an adverb ("well done"), punctuation — is not a
     /// close report and must not hold dispatch. Locks the anchor in so a
     /// future loosening back to a bare `contains("] done")` fails red.
+    #[test]
+    fn subject_done_anchors_the_terminal_verb() {
+        // canonical + tolerated shapes (must match)
+        assert!(subject_done("[bd-x] done"), "canonical close report");
+        assert!(
+            subject_done("[bd-x] done "),
+            "trailing whitespace tolerated"
+        );
+        assert!(subject_done("re: [bd-x] done"), "reply prefix tolerated");
+        assert!(subject_done("fwd: [bd-x] done"), "forward prefix tolerated");
+
+        // participle / adverb subjects (must NOT match — the false-Done bug)
+        assert!(!subject_done("done reviewing"), "participle");
+        assert!(!subject_done("well done"), "adverb + participle");
+        assert!(!subject_done("all done"), "not a close-report subject");
+        assert!(
+            !subject_done("[bd-123] done investigating"),
+            "participle after done"
+        );
+        assert!(
+            !subject_done("[bd-123] done with the repro"),
+            "participle phrase"
+        );
+        assert!(
+            !subject_done("I have done the work"),
+            "done mid-subject, not terminal"
+        );
+
+        // strict anchor: a trailing period breaks the match. The canonical
+        // emitters produce exactly `[{id}] done`; the guard is a dedupe hold,
+        // not a parser — a missed hold is low-harm (br close is the primary
+        // signal), a false hold is not.
+        assert!(!subject_done("[bd-x] done."), "punctuation after done");
+    }
+
     #[test]
     fn unexpired_peer_announce_holds_fresh_dispatch() {
         let now = 1_000 * MIN;
