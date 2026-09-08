@@ -9587,6 +9587,51 @@ fn cmd_internal_doorbell(
         Status { pane_id: String, to: String },
         Died,
     }
+
+    /// Spawn a push forwarder for `pane_ids` (one long-lived `events.subscribe`
+    /// socket per call); returns whether the subscription landed. herdr 0.9
+    /// (protocol 22) subscriptions are live-only (#1270) and per-pane — the
+    /// doorbell spawns one at startup and again from the sweep whenever the
+    /// spawn registry grows (bd-8hv0), giving late panes push
+    /// coverage instead of the polling fallback. Proven live: concurrent
+    /// per-pane subscribe sockets each deliver only their own pane's events.
+    fn doorbell_spawn_status_forwarder(
+        cfg: &Config,
+        pane_ids: Vec<String>,
+        tx: &std::sync::mpsc::Sender<Bell>,
+    ) -> bool {
+        if pane_ids.is_empty() {
+            return false;
+        }
+        let Ok(mut sub_client) = Client::connect(Some(&cfg.socket_path())) else {
+            return false;
+        };
+        let subs: Vec<Subscription> = pane_ids
+            .into_iter()
+            .map(Subscription::agent_status_changed)
+            .collect();
+        let Ok(mut stream) = herdr_shim::subscribe(&mut sub_client, &subs) else {
+            return false;
+        };
+        let tx_st = tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(Some(ev)) = stream.read_event() {
+                if let herdr_shim::HerdrEventData::PaneAgentStatusChanged(change)
+                | herdr_shim::HerdrEventData::PaneAgentStatusChangedSub(change) = ev.data
+                    && tx_st
+                        .send(Bell::Status {
+                            pane_id: change.pane_id,
+                            to: change.agent_status.as_str().to_string(),
+                        })
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        true
+    }
+
     let (tx, rx) = std::sync::mpsc::channel::<Bell>();
     let mut watch_child: Option<std::process::Child> = None;
     // Try in-process bus watch first (zero fork, gap 13) — fallback to CLI
@@ -9730,35 +9775,18 @@ fn cmd_internal_doorbell(
     // status change in the pre-snapshot window is delivered, not lost.
     // Pre-snapshot pushes are idempotent status transitions, so ordering is
     // safe (bd-myab).
+    // bd-8hv0: forwarder spawn is shared with the sweep so panes
+    // that join the registry after startup get push coverage too.
     let mut subscribed = false;
-    if let Ok(mut sub_client) = Client::connect(Some(&cfg.socket_path())) {
-        let registry = state::load_spawn_registry(project);
-        let subs: Vec<Subscription> = registry
-            .iter()
-            .filter(|e| !e.pane_id.is_empty())
-            .map(|e| Subscription::agent_status_changed(e.pane_id.clone()))
+    let mut covered_panes: HashSet<String> = HashSet::new();
+    {
+        let pane_ids: Vec<String> = state::load_spawn_registry(project)
+            .into_iter()
+            .map(|e| e.pane_id)
+            .filter(|p| !p.is_empty())
             .collect();
-        if !subs.is_empty()
-            && let Ok(mut stream) = herdr_shim::subscribe(&mut sub_client, &subs)
-        {
-            subscribed = true;
-            let tx_st = tx.clone();
-            std::thread::spawn(move || {
-                while let Ok(Some(ev)) = stream.read_event() {
-                    if let herdr_shim::HerdrEventData::PaneAgentStatusChanged(change)
-                    | herdr_shim::HerdrEventData::PaneAgentStatusChangedSub(change) = ev.data
-                        && tx_st
-                            .send(Bell::Status {
-                                pane_id: change.pane_id,
-                                to: change.agent_status.as_str().to_string(),
-                            })
-                            .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-        }
+        covered_panes.extend(pane_ids.iter().cloned());
+        subscribed = doorbell_spawn_status_forwarder(cfg, pane_ids, &tx);
     }
 
     doorbell_refresh_status(
@@ -10222,7 +10250,18 @@ fn cmd_internal_doorbell(
                         cfg,
                     );
                 } else {
-                    doorbell_refresh_pins(project, &mut pane_to_pin);
+                    // bd-8hv0: the push spine covers startup panes
+                    // only; registry additions get their own forwarder so
+                    // late crew panes are push-covered, not poll-covered.
+                    let registry = state::load_spawn_registry(project);
+                    doorbell_refresh_pins(&registry, &mut pane_to_pin);
+                    let pane_ids =
+                        doorbell_uncovered_panes(&covered_panes, &registry_pane_ids(&registry));
+                    if !pane_ids.is_empty()
+                        && doorbell_spawn_status_forwarder(cfg, pane_ids.clone(), &tx)
+                    {
+                        covered_panes.extend(pane_ids);
+                    }
                 }
                 let _ = hear.expire(doorbell_now_unix(), doorbell::UNANSWERED_SECS);
                 doorbell_persist_hear(workspace, &hear);
@@ -11165,16 +11204,32 @@ fn doorbell_refresh_status(
     }
 }
 
-fn doorbell_refresh_pins(project: &str, pane_to_pin: &mut BTreeMap<String, String>) {
-    let registry = state::load_spawn_registry(project);
+fn doorbell_refresh_pins(
+    registry: &[state::SpawnEntry],
+    pane_to_pin: &mut BTreeMap<String, String>,
+) {
     pane_to_pin.clear();
-    for e in &registry {
+    for e in registry {
         if let Some(pin) = &e.mail_identity
             && !e.pane_id.is_empty()
         {
             pane_to_pin.insert(e.pane_id.clone(), pin.clone());
         }
     }
+}
+
+/// Registry pane ids, materialized for the delta check.
+fn registry_pane_ids(registry: &[state::SpawnEntry]) -> Vec<String> {
+    registry.iter().map(|e| e.pane_id.clone()).collect()
+}
+
+/// Registry pane ids not yet covered by a live forwarder (pure — tested).
+fn doorbell_uncovered_panes(covered: &HashSet<String>, pane_ids: &[String]) -> Vec<String> {
+    pane_ids
+        .iter()
+        .filter(|p| !p.is_empty() && !covered.contains(*p))
+        .cloned()
+        .collect()
 }
 
 /// bd-unpinned-loud-1mlt (GS-028 B6+B7): names of registry entries with no
@@ -21647,6 +21702,26 @@ mod loop_run_verify_tests {
 #[cfg(test)]
 mod loop_tests {
     use super::*;
+
+    /// bd-8hv0: the sweep must re-subscribe only panes the push
+    /// spine does not already cover; empty ids never count as new.
+    #[test]
+    fn doorbell_delta_covers_only_uncovered_panes() {
+        let covered: HashSet<String> = ["w1:p1".to_string()].into_iter().collect();
+        let ids = vec![
+            "w1:p1".to_string(),
+            String::new(),
+            "w2:p9".to_string(),
+            "w3:p1".to_string(),
+        ];
+        assert_eq!(
+            doorbell_uncovered_panes(&covered, &ids),
+            vec!["w2:p9".to_string(), "w3:p1".to_string()]
+        );
+        // Fully covered -> empty delta (no forwarder churn per sweep).
+        let all: HashSet<String> = ids.into_iter().filter(|p| !p.is_empty()).collect();
+        assert!(doorbell_uncovered_panes(&all, &["w1:p1".to_string()]).is_empty());
+    }
 
     /// bd-loop-mode-rename-0tqy: the clap subcommand is `loop-mode` with a
     /// back-compat visible alias `loop` — harness built-in `loop` conflicts
