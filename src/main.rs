@@ -8327,7 +8327,7 @@ projects available: {}",
             detail.join(", ")
         );
         for ws in &dead_owned {
-            if let Err(e) = c.workspace_close(&ws.workspace_id) {
+            if let Err(e) = c.workspace_close(&ws.workspace_id, true) {
                 eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
             }
         }
@@ -8350,7 +8350,7 @@ projects available: {}",
                 detail.join(", ")
             );
             for ws in &orphans {
-                if let Err(e) = c.workspace_close(&ws.workspace_id) {
+                if let Err(e) = c.workspace_close(&ws.workspace_id, true) {
                     eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
                 }
             }
@@ -9725,25 +9725,11 @@ fn cmd_internal_doorbell(
         doorbell_self_index(cfg, project, &pins)
     };
 
-    doorbell_refresh_status(
-        herdr.as_mut(),
-        project,
-        &mut pane_to_pin,
-        &mut workspace_model,
-        &mut hear,
-        &index,
-        workspace,
-        generation.as_ref(),
-        cfg,
-    );
-
-    // Ack-SLA scanner cadence: the SLA is 30-min granularity — a 1 Hz SQL
-    // scan is waste. 60s keeps the wake prompt while off the hot loop.
-    let mut last_ack_sla_check: u64 = 0;
-    const ACK_SLA_CHECK_SECS: u64 = 60;
-    // Watch respawn retry gate (GS-007): unix secs of the next respawn try.
-    let mut watch_retry_at: Option<u64> = None;
-    const WATCH_RETRY_SECS: u64 = 16;
+    // herdr 0.9 (protocol 22): lifecycle subscriptions are LIVE-ONLY — no
+    // retained replay (#1270). Subscribe BEFORE the refresh snapshot so a
+    // status change in the pre-snapshot window is delivered, not lost.
+    // Pre-snapshot pushes are idempotent status transitions, so ordering is
+    // safe (bd-myab).
     let mut subscribed = false;
     if let Ok(mut sub_client) = Client::connect(Some(&cfg.socket_path())) {
         let registry = state::load_spawn_registry(project);
@@ -9774,6 +9760,28 @@ fn cmd_internal_doorbell(
             });
         }
     }
+
+    doorbell_refresh_status(
+        herdr.as_mut(),
+        project,
+        &mut pane_to_pin,
+        &mut workspace_model,
+        &mut hear,
+        &index,
+        workspace,
+        generation.as_ref(),
+        cfg,
+    );
+
+    // Ack-SLA scanner cadence: the SLA is 30-min granularity — a 1 Hz SQL
+    // scan is waste. 60s keeps the wake prompt while off the hot loop.
+    let mut last_ack_sla_check: u64 = 0;
+    const ACK_SLA_CHECK_SECS: u64 = 60;
+    // Watch respawn retry gate (GS-007): unix secs of the next respawn try.
+    let mut watch_retry_at: Option<u64> = None;
+    const WATCH_RETRY_SECS: u64 = 16;
+    // (subscription moved above the refresh — live-only subscriptions must
+    // precede the snapshot, bd-myab)
 
     // bd-yw4s BIND: the tick's model — the decision layer the live loop feeds.
     // (single bell_model for dispatcher lifetime — leftover #6 fixed, no second Default)
@@ -16088,6 +16096,12 @@ fn cmd_watch(
             None
         }
     };
+    // herdr 0.9 (protocol 22): subscriptions are live-only — a status change
+    // between the pane_list snapshot and the subscribe ack would never be
+    // seen. One poll closes the window (bd-myab).
+    if stream.is_some() && watch_poll(&mut c, &watch_names, until_status)? {
+        return Ok(());
+    }
 
     let deadline = timeout_ms.map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
     loop {
@@ -16340,7 +16354,7 @@ fn cmd_kill(
         }
         _ => {}
     }
-    c.workspace_close(&ws_id)?;
+    c.workspace_close(&ws_id, false)?;
     if let Err(e) = doorbell::stop(&config::state_dir(), &ws_label) {
         eprintln!("flywheel: doorbell stop failed: {e:#}");
     }
@@ -27264,7 +27278,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 && !ctx.retained
             {
                 let mut c = Client::connect(Some(&cfg.socket_path()))?;
-                match c.workspace_close(&ctx.workspace_id) {
+                match c.workspace_close(&ctx.workspace_id, true) {
                     Ok(_) => reaped = true,
                     Err(e) => eprintln!(
                         "flywheel: workspace close {} failed: {e:#}",
@@ -27733,7 +27747,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let mut reaped = false;
             if !ctx.retained {
                 let mut c = Client::connect(Some(&cfg.socket_path()))?;
-                match c.workspace_close(&ctx.workspace_id) {
+                match c.workspace_close(&ctx.workspace_id, true) {
                     Ok(_) => reaped = true,
                     Err(e) => eprintln!(
                         "flywheel: workspace close {} failed: {e:#}",
