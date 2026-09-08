@@ -582,11 +582,6 @@ impl CoalitionStore {
     ///
     /// Idempotent: a member already in the manifest is a no-op success.
     ///
-    /// `#[allow(dead_code)]` (bd-hkw5.4): the CLI surface (`coalition
-    /// join`/`leave` subcommands) lives in main.rs — held by the orchestrator
-    /// during this bead's window; the store methods + hermetic GATE tests are
-    /// the landed slice, wired by the main.rs holder next.
-    #[allow(dead_code)]
     pub fn join(
         &self,
         id: &str,

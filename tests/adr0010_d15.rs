@@ -14,7 +14,10 @@ fn adr0010_d15_worker_never_self_answers() {
     }
     // Both stage bodies carry the policy (2 occurrences in stages.rs).
     let hits = STAGES.matches("ask-user").count();
-    assert!(hits >= 2, "ce-execute + ce-review bodies must carry ask-user policy, found {hits}");
+    assert!(
+        hits >= 2,
+        "ce-execute + ce-review bodies must carry ask-user policy, found {hits}"
+    );
 }
 
 #[test]

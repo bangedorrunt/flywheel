@@ -1,26 +1,24 @@
 // governed-by: ADR-0024
-//! Auto-crew / smart steering (ADR-0005 Spec 4c / P3.6).
+// governed-by: ADR-0011
+//! Auto-crew / smart steering (ADR-0005 Spec 4c / P3.6, ADR-0011 D2).
 //!
 //! The orchestrator smartly steers the crew FROM the workflow. The captain
-//! writes INTENT (roles + fan-out); this module computes the crew the
-//! orchestrator spawns. The ENGINE never spawns — it consumes fan-out counts
-//! via the injected `ProfileResolver` seam. This is the flywheel-side crew
-//! planner:
+//! writes INTENT (roles); this module computes the crew the orchestrator
+//! spawns. The ENGINE never spawns — it consumes fan-out counts via the
+//! injected `ProfileResolver` seam. This is the flywheel-side crew planner:
 //!
-//! - **Auto** (`crew: auto`): infer members from the workflow's `profile:`
-//!   refs. Count = max parallelism the graph demands for that role (each
-//!   distinct `profile: "@X"` becomes a crew member; fan-out in `parallel
-//!   over:` raises the count).
-//! - **Explicit** (`crew: { role: count }`): the squad is declared; `@crew.r`
-//!   binds to that role's members.
-//! - **`@crew.<role>` fan-out count**: how many concurrent copies of a
-//!   `parallel over: "@crew.<role>"` step the engine should run (translated
-//!   to a concrete N before invoke — staged: sequential at P3, durable at P5).
+//! - **Auto** (`crew: auto`): unique roles from `@profile` refs (two
+//!   `@planner` steps ⇒ one planner). YAML counts are a role inventory,
+//!   not a spawn lock.
+//! - **Pack** (`pack_crew`): unique roles into total N, cap `crew.max`
+//!   (default 5). Overflow roles alias onto the first kept role.
+//! - **`@crew.<role>` fan-out**: copies = packed member count for that role.
 //!
 //! governed-by: ADR-0005 Spec 4c, P3.6
 //! governed-by: ADR-0022 §3.6 (compose versatility ladder T1/T2 + safety
 //! envelope: full-grammar part forms, --from-yaml, budget caps fail closed,
 //! structural dry-run rendering)
+//! governed-by: ADR-0011 D2 (crew budget N)
 
 use std::collections::BTreeMap;
 
@@ -49,6 +47,306 @@ impl CrewPlan {
             over.trim().parse().unwrap_or(1).max(1)
         }
     }
+
+    /// Sum of spawned panes.
+    pub fn total(&self) -> u32 {
+        self.members.values().copied().sum()
+    }
+}
+
+/// Operator-owned pane cap (ADR-0011 D2). Repo config must not raise this.
+pub const DEFAULT_CREW_MAX: u32 = 5;
+
+/// Packed spawn plan: members to spawn + overflow role aliases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackedCrew {
+    pub members: BTreeMap<String, u32>,
+    /// overflow role → host role (dispatch rewrites `@overflow` to `@host`)
+    pub aliases: BTreeMap<String, String>,
+    pub budget: u32,
+    pub unique: u32,
+    pub cap: u32,
+}
+
+impl PackedCrew {
+    pub fn total(&self) -> u32 {
+        self.members.values().copied().sum()
+    }
+
+    pub fn as_plan(&self) -> CrewPlan {
+        CrewPlan {
+            members: self.members.clone(),
+        }
+    }
+
+    /// One-line human/robot announcement (ADR-0011 D2 loud).
+    pub fn announce(&self, workflow: &str) -> String {
+        let mut kept: Vec<&str> = self.members.keys().map(String::as_str).collect();
+        kept.sort();
+        let mut extra = String::new();
+        if !self.aliases.is_empty() {
+            let mut bits: Vec<String> = self
+                .aliases
+                .iter()
+                .map(|(from, to)| format!("{from} → {to}"))
+                .collect();
+            bits.sort();
+            extra = format!(" ({})", bits.join(", "));
+        }
+        format!(
+            "packing {workflow} into {} panes (cap={}, unique={}): {}{extra}",
+            self.total(),
+            self.cap,
+            self.unique,
+            kept.join(", ")
+        )
+    }
+}
+
+/// Keep-priority for packing when unique > N (ADR-0011 D2).
+pub fn role_keep_priority(role: &str) -> u32 {
+    match role {
+        "coder" => 0,
+        "reviewer" => 1,
+        "planner" => 2,
+        "scout" => 3,
+        "oracle" => 4,
+        "housekeeper" => 5,
+        _ => 100,
+    }
+}
+
+/// `--crew` flag parse (ADR-0011 D2). Bare integer = total N.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrewFlag {
+    Default,
+    Total(u32),
+    Map(BTreeMap<String, u32>),
+    Named(String),
+}
+
+pub fn parse_crew_flag(s: &str) -> CrewFlag {
+    let t = s.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("auto") {
+        return CrewFlag::Default;
+    }
+    if let Ok(n) = t.parse::<u32>() {
+        return CrewFlag::Total(n);
+    }
+    if t.contains(':') {
+        let mut map = BTreeMap::new();
+        for part in t.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let Some((role, count)) = part.split_once(':') else {
+                return CrewFlag::Named(t.to_string());
+            };
+            let role = role.trim().trim_start_matches('@');
+            let Ok(n) = count.trim().parse::<u32>() else {
+                return CrewFlag::Named(t.to_string());
+            };
+            if role.is_empty() || n == 0 {
+                return CrewFlag::Named(t.to_string());
+            }
+            map.insert(role.to_string(), n);
+        }
+        if map.is_empty() {
+            return CrewFlag::Named(t.to_string());
+        }
+        return CrewFlag::Map(map);
+    }
+    CrewFlag::Named(t.to_string())
+}
+
+fn sort_roles(roles: &mut [String]) {
+    roles.sort_by(|a, b| {
+        role_keep_priority(a)
+            .cmp(&role_keep_priority(b))
+            .then_with(|| a.cmp(b))
+    });
+}
+
+/// Pack unique roles into total N (ADR-0011 D2). Fails closed when N > max.
+pub fn pack_crew(unique: &[String], n: u32, max: u32) -> Result<PackedCrew, String> {
+    if n == 0 {
+        return Err("crew budget must be >= 1".into());
+    }
+    if n > max {
+        return Err(format!(
+            "crew budget {n} exceeds crew.max={max} (set FLYWHEEL_CREW_MAX or ~/.config/flywheel [crew].max)"
+        ));
+    }
+    let mut roles: Vec<String> = unique
+        .iter()
+        .map(|r| r.trim_start_matches('@').to_string())
+        .filter(|r| !r.is_empty())
+        .collect();
+    roles.sort();
+    roles.dedup();
+    if roles.is_empty() {
+        return Ok(PackedCrew {
+            members: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            budget: n,
+            unique: 0,
+            cap: max,
+        });
+    }
+    sort_roles(&mut roles);
+    let unique_n = roles.len() as u32;
+    let keep_n = (n as usize).min(roles.len());
+    let kept = &roles[..keep_n];
+    let overflow = &roles[keep_n..];
+    let host = kept.first().cloned().unwrap_or_else(|| "coder".to_string());
+    let mut members = BTreeMap::new();
+    for r in kept {
+        members.insert(r.clone(), 1u32);
+    }
+    if n > unique_n {
+        let extra = n - unique_n;
+        let worker = if members.contains_key("coder") {
+            "coder"
+        } else {
+            host.as_str()
+        };
+        *members.entry(worker.to_string()).or_insert(1) += extra;
+    }
+    let mut aliases = BTreeMap::new();
+    for r in overflow {
+        aliases.insert(r.clone(), host.clone());
+    }
+    Ok(PackedCrew {
+        members,
+        aliases,
+        budget: n,
+        unique: unique_n,
+        cap: max,
+    })
+}
+
+/// Pack an inferred unique-role plan with a request.
+pub fn pack_inferred(inferred: &CrewPlan, req: &CrewFlag, max: u32) -> Result<PackedCrew, String> {
+    let unique: Vec<String> = inferred.members.keys().cloned().collect();
+    match req {
+        CrewFlag::Default | CrewFlag::Named(_) => {
+            let n = (unique.len() as u32).max(1).min(max);
+            if unique.is_empty() {
+                return pack_crew(&unique, 1, max);
+            }
+            pack_crew(&unique, n, max)
+        }
+        CrewFlag::Total(n) => pack_crew(&unique, *n, max),
+        CrewFlag::Map(map) => {
+            let n: u32 = map.values().copied().sum();
+            if n == 0 {
+                return Err("crew map must spawn at least 1 pane".into());
+            }
+            if n > max {
+                return Err(format!(
+                    "crew budget {n} exceeds crew.max={max} (set FLYWHEEL_CREW_MAX or ~/.config/flywheel [crew].max)"
+                ));
+            }
+            let host = map
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "coder".to_string());
+            let mut aliases = BTreeMap::new();
+            for role in &unique {
+                if !map.contains_key(role) {
+                    aliases.insert(role.clone(), host.clone());
+                }
+            }
+            Ok(PackedCrew {
+                members: map.clone(),
+                aliases,
+                budget: n,
+                unique: unique.len() as u32,
+                cap: max,
+            })
+        }
+    }
+}
+
+fn rewrite_profile(profile: &Option<String>, aliases: &BTreeMap<String, String>) -> Option<String> {
+    let raw = profile.as_ref()?;
+    let name = raw.strip_prefix('@').unwrap_or(raw.as_str());
+    aliases
+        .get(name)
+        .map(|host| format!("@{host}"))
+        .or_else(|| Some(raw.clone()))
+}
+
+fn rewrite_action(action: &Action, aliases: &BTreeMap<String, String>) -> Action {
+    match action {
+        Action::DispatchJob {
+            spec,
+            assignee,
+            channel,
+        } => {
+            let mut spec = spec.clone();
+            spec.profile = rewrite_profile(&spec.profile, aliases);
+            Action::DispatchJob {
+                spec,
+                assignee: assignee.clone(),
+                channel: channel.clone(),
+            }
+        }
+        Action::Parallel { over, each } => Action::Parallel {
+            over: over.clone(),
+            each: Box::new(rewrite_step(each, aliases)),
+        },
+        Action::Retry {
+            max_attempts,
+            backoff_secs,
+            step,
+        } => Action::Retry {
+            max_attempts: *max_attempts,
+            backoff_secs: *backoff_secs,
+            step: Box::new(rewrite_step(step, aliases)),
+        },
+        Action::Branch {
+            if_guard,
+            then,
+            else_steps,
+        } => Action::Branch {
+            if_guard: if_guard.clone(),
+            then: rewrite_steps(then, aliases),
+            else_steps: rewrite_steps(else_steps, aliases),
+        },
+        Action::Foreach { over, each } => Action::Foreach {
+            over: over.clone(),
+            each: Box::new(rewrite_step(each, aliases)),
+        },
+        other => other.clone(),
+    }
+}
+
+fn rewrite_step(step: &Step, aliases: &BTreeMap<String, String>) -> Step {
+    let mut step = step.clone();
+    step.action = rewrite_action(&step.action, aliases);
+    step
+}
+
+fn rewrite_steps(steps: &[Step], aliases: &BTreeMap<String, String>) -> Vec<Step> {
+    steps.iter().map(|s| rewrite_step(s, aliases)).collect()
+}
+
+/// Rewrite overflow `@role` dispatch profiles onto their host (ADR-0011 D2).
+pub fn apply_role_aliases(workflow: &Workflow, aliases: &BTreeMap<String, String>) -> Workflow {
+    if aliases.is_empty() {
+        return workflow.clone();
+    }
+    let mut wf = workflow.clone();
+    wf.steps = rewrite_steps(&wf.steps, aliases);
+    if let Some(graph) = wf.graph.as_mut() {
+        for node in graph.nodes.values_mut() {
+            node.action = rewrite_action(&node.action, aliases);
+        }
+    }
+    wf
 }
 
 /// Resolve a workflow's elastic fan-out refs (`parallel over: "@crew.<role>"`)
@@ -967,7 +1265,8 @@ fn extract_fenced_yaml(response: &str) -> Option<String> {
 pub fn plan_crew_with(workflow: &Workflow, resolve: &dyn Fn(&str) -> Option<Workflow>) -> CrewPlan {
     match &workflow.crew {
         Some(CrewSpec::Explicit(map)) => CrewPlan {
-            members: map.clone(),
+            // ADR-0011 D2: YAML counts are a role inventory, not a spawn lock.
+            members: map.keys().cloned().map(|k| (k, 1u32)).collect(),
         },
         Some(CrewSpec::Auto) => {
             let mut visited = std::collections::HashSet::new();
@@ -990,7 +1289,7 @@ fn infer_auto(
 
     fn bump_role(role: &str, counts: &mut BTreeMap<String, u32>) {
         if let Some(role) = role.strip_prefix('@') {
-            *counts.entry(role.to_string()).or_insert(0) += 1;
+            counts.entry(role.to_string()).or_insert(1);
         }
     }
     fn bump_fanout(over: &str, counts: &mut BTreeMap<String, u32>) {
@@ -998,7 +1297,7 @@ fn infer_auto(
             // A fan-out step needs at least one member per role; parallel
             // over the whole role means count >= 1 (the orchestrator may
             // raise it).
-            counts.entry(role.to_string()).or_insert(0);
+            counts.entry(role.to_string()).or_insert(1);
         }
     }
     fn scan_action(
@@ -1171,8 +1470,9 @@ steps:
         )
         .expect("parse");
         let plan = plan_crew(&wf);
-        assert_eq!(plan.members.get("reviewer"), Some(&2), "{:?}", plan.members);
+        assert_eq!(plan.members.get("reviewer"), Some(&1), "{:?}", plan.members);
         assert_eq!(plan.members.get("oracle"), Some(&1), "{:?}", plan.members);
+        assert_eq!(plan.total(), 2, "unique roles, not occurrence count");
     }
 
     /// bd-t86p: crew:auto on a COMPOSED workflow (call_workflow steps) must
@@ -1981,7 +2281,9 @@ steps:
 "#,
         )
         .expect("parse");
-        let rendered = render_dry_run(&wf, &|_| None);
+        let packed = pack_inferred(&plan_crew(&wf), &CrewFlag::Total(3), 5).expect("pack");
+        let resolved = resolve_crew_fanouts(&wf, &packed.as_plan());
+        let rendered = render_dry_run(&resolved, &|_| None);
         let s = serde_json::to_string(&rendered).unwrap();
         assert!(s.contains("\"fanout\":3"), "fanout count missing: {s}");
         assert!(s.contains("implement"), "phase tag missing: {s}");
@@ -2058,8 +2360,9 @@ steps:
         )
         .expect("parse");
         let plan = plan_crew(&wf);
-        assert_eq!(plan.members.get("coder"), Some(&2));
+        assert_eq!(plan.members.get("coder"), Some(&1));
         assert_eq!(plan.members.get("planner"), Some(&1));
+        assert_eq!(plan.members.get("reviewer"), Some(&1));
     }
 
     /// `parallel over: "@crew.coder"` fans across the role's members (row
@@ -2081,10 +2384,11 @@ steps:
         )
         .expect("parse");
         let plan = plan_crew(&wf);
+        let packed = pack_inferred(&plan, &CrewFlag::Total(2), 5).expect("pack");
         assert_eq!(
-            plan.fanout_count("@crew.coder"),
+            packed.as_plan().fanout_count("@crew.coder"),
             2,
-            "@crew.coder -> 2 coders"
+            "@crew.coder -> extra budget lands on coder"
         );
         // Elastic N stays N.
         assert_eq!(plan.fanout_count("4"), 4);
@@ -2138,7 +2442,9 @@ steps:
 "#,
         )
         .expect("parse");
-        let plan = plan_crew(&wf);
+        let plan = pack_inferred(&plan_crew(&wf), &CrewFlag::Total(3), 5)
+            .expect("pack")
+            .as_plan();
         let resolved = resolve_crew_fanouts(&wf, &plan);
 
         fn parallel_overs(step: &Step, out: &mut Vec<String>) {
@@ -2206,7 +2512,9 @@ graph:
 "#,
         )
         .expect("parse");
-        let plan = plan_crew(&wf);
+        let plan = pack_inferred(&plan_crew(&wf), &CrewFlag::Total(3), 5)
+            .expect("pack")
+            .as_plan();
         let resolved = resolve_crew_fanouts(&wf, &plan);
         let graph = resolved.graph.as_ref().expect("graph");
         match &graph.nodes["build"].action {
@@ -2638,5 +2946,131 @@ steps:
             "green verify must not fail: {out2}"
         );
         assert_eq!(out2["verify-1"]["ok"], true, "green verify ok: {out2}");
+    }
+
+    // ---- ADR-0011 D2: unique-role pack into total N ----
+
+    #[test]
+    fn parse_crew_flag_integer_is_total() {
+        assert_eq!(parse_crew_flag("4"), CrewFlag::Total(4));
+        assert_eq!(parse_crew_flag("auto"), CrewFlag::Default);
+        assert_eq!(
+            parse_crew_flag("coder:2,reviewer:1"),
+            CrewFlag::Map(BTreeMap::from([
+                ("coder".into(), 2),
+                ("reviewer".into(), 1)
+            ]))
+        );
+        assert_eq!(parse_crew_flag("trio"), CrewFlag::Named("trio".into()));
+    }
+
+    #[test]
+    fn pack_crew_n_gt_max_fails_closed() {
+        let err = pack_crew(&["coder".into(), "reviewer".into()], 8, 5).unwrap_err();
+        assert!(err.contains("crew.max=5"), "{err}");
+        assert!(err.contains("FLYWHEEL_CREW_MAX"), "{err}");
+    }
+
+    #[test]
+    fn pack_five_unique_default_is_five_not_seven() {
+        let unique = vec![
+            "planner".into(),
+            "coder".into(),
+            "scout".into(),
+            "reviewer".into(),
+            "housekeeper".into(),
+        ];
+        let packed = pack_crew(&unique, 5, 5).expect("pack");
+        assert_eq!(packed.total(), 5, "{:?}", packed.members);
+        assert!(packed.aliases.is_empty());
+        assert_eq!(packed.members.get("planner"), Some(&1));
+        assert_eq!(packed.members.get("reviewer"), Some(&1));
+    }
+
+    #[test]
+    fn pack_n4_of_5_aliases_housekeeper_onto_coder() {
+        let unique = vec![
+            "planner".into(),
+            "coder".into(),
+            "scout".into(),
+            "reviewer".into(),
+            "housekeeper".into(),
+        ];
+        let packed = pack_crew(&unique, 4, 5).expect("pack");
+        assert_eq!(packed.total(), 4, "{:?}", packed.members);
+        assert_eq!(
+            packed.aliases.get("housekeeper").map(String::as_str),
+            Some("coder"),
+            "{:?}",
+            packed.aliases
+        );
+        assert!(!packed.members.contains_key("housekeeper"));
+        let line = packed.announce("wave-swarm");
+        assert!(line.contains("into 4 panes"), "{line}");
+        assert!(line.contains("housekeeper → coder"), "{line}");
+    }
+
+    #[test]
+    fn pack_n_gt_unique_extra_goes_to_coder() {
+        let unique = vec!["coder".into(), "reviewer".into()];
+        let packed = pack_crew(&unique, 4, 5).expect("pack");
+        assert_eq!(packed.total(), 4);
+        assert_eq!(packed.members.get("coder"), Some(&3));
+        assert_eq!(packed.members.get("reviewer"), Some(&1));
+    }
+
+    #[test]
+    fn apply_role_aliases_rewrites_overflow_profile() {
+        let wf = parse_workflow(
+            r#"
+name: wave
+trigger: { type: webhook }
+crew: auto
+steps:
+  - name: execute
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@coder" }
+  - name: compound
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@housekeeper" }
+"#,
+        )
+        .expect("parse");
+        let aliases = BTreeMap::from([("housekeeper".into(), "coder".into())]);
+        let rewritten = apply_role_aliases(&wf, &aliases);
+        match &rewritten.steps[1].action {
+            Action::DispatchJob { spec, .. } => {
+                assert_eq!(spec.profile.as_deref(), Some("@coder"));
+            }
+            other => panic!("expected dispatch, got {other:?}"),
+        }
+        match &rewritten.steps[0].action {
+            Action::DispatchJob { spec, .. } => {
+                assert_eq!(spec.profile.as_deref(), Some("@coder"));
+            }
+            other => panic!("expected dispatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pack_inferred_default_caps_at_max() {
+        let mut members = BTreeMap::new();
+        for r in [
+            "coder",
+            "reviewer",
+            "planner",
+            "scout",
+            "housekeeper",
+            "oracle",
+        ] {
+            members.insert(r.to_string(), 1);
+        }
+        let inferred = CrewPlan { members };
+        let packed = pack_inferred(&inferred, &CrewFlag::Default, 5).expect("pack");
+        assert_eq!(packed.total(), 5);
+        assert_eq!(packed.unique, 6);
+        assert_eq!(packed.aliases.len(), 1);
     }
 }

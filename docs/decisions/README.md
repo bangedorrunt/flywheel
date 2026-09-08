@@ -14,6 +14,7 @@ This directory contains records of the major architectural decisions made for th
 | [0008](0008-workflow-compose-topology-agent-optimal-mental-model.md) | Workflow / Compose / Topology — Agent-Optimal Mental Model | **Accepted** (2026-09-05; GS-024; design set wave-swarm\|repair-until-verified\|beads-lifecycle; live `is_compose_token` three tokens since 84fbfb7; beads-lifecycle implemented (guard-fix 2010d78); `verify-0008.sh`) |
 | [0009](0009-compound-spine-ce-vocabulary-and-learnings-corpus.md) | Compound Spine — ce- Vocabulary, Compounded wave-swarm (8 phases), Learnings Corpus | **Accepted** (2026-09-06; bd-4el4; ce- loop stages, p-codes retired, REVIEW+COMPOUND in the token, docs/learnings/ + ce-compound/ce-sweep, toron ADR-0022 phase addendum; `verify-0009.sh` 13/13; flywheel bin 1449/0) |
 | [0010](0010-delivery-semantics-attention-triage-decision-lifecycle.md) | Adopt delivery semantics, attention triage, and a keyed decision lifecycle | **Accepted** (2026-09-07; captain; D0–D15; HarborPilot + KeenAuditor agreed on `adr-0010-peer-review`) |
+| [0011](0011-session-conductor-crew-budget-captain-fcfs-join-loud.md) | Session conductor — crew budget N, captain FCFS, join-loud | **Accepted** (2026-09-08; Waves A–D: pack N + briefing.v1 + join-loud/FCFS + rot/SIGNOFF; `verify-0011.sh`) |
 
 ## Related toron ADRs
 

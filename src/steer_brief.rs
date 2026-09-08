@@ -45,8 +45,12 @@ pub struct BriefingContext {
     /// source of the briefing: "steer" or "workflow" (empty = "steer" for
     /// back-compat — bd-nmzk shared prompt module).
     pub source: String,
-    /// inferred crew plan: role -> count (editable)
+    /// inferred unique roles (preview of who will be packed into N)
     pub crew_plan: BTreeMap<String, u32>,
+    /// ADR-0011 D2: operator cap
+    pub crew_max: u32,
+    /// ADR-0011 D2: default total N = min(unique, cap)
+    pub default_budget: u32,
     /// per-role model menus
     pub models: Vec<RoleModelChoice>,
     /// squad recommendation from the profile catalog, if one fits
@@ -63,9 +67,8 @@ pub struct BriefingContext {
 /// The operator's verdict plus the confirmed plan (post-edit).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BriefingOutcome {
-    /// proceed — dispatch exactly as briefed (edits applied to the preview;
-    /// dispatch itself is downstream machinery)
-    Go,
+    /// proceed — `budget` is the confirmed total pane count (ADR-0011 D2)
+    Go { budget: u32 },
     /// abort before any dispatch
     Abort,
 }
@@ -91,22 +94,42 @@ pub fn run_briefing(
     )?;
     writeln!(out, "  {} {}", dim("objective:"), accent(&ctx.objective))?;
 
-    // (1) inferred crew plan with editable counts.
+    // (1) total pane budget N (ADR-0011 D2). Per-role counts are packed, not edited.
+    let unique = ctx.crew_plan.len() as u32;
+    let default_n = if ctx.default_budget > 0 {
+        ctx.default_budget
+    } else {
+        unique
+            .max(1)
+            .min(if ctx.crew_max == 0 { 5 } else { ctx.crew_max })
+    };
+    let cap = if ctx.crew_max == 0 { 5 } else { ctx.crew_max };
     writeln!(
         out,
         "\n{} {}",
         accent_lav("[1/4]"),
-        ok("inferred crew plan (Enter keeps the count):")
+        ok("crew budget N (total panes; Enter keeps the default):")
     )?;
-    for (role, count) in &ctx.crew_plan {
-        write!(out, "  {} {} > ", accent(role), dim(&format!("x{count}")))?;
-        out.flush()?;
-        let line = read_line(input)?;
-        if let Ok(n) = line.trim().parse::<u32>()
-            && n > 0
-        {
-            writeln!(out, "  {} -> {}", dim(role), ok(&format!("x{n}")))?;
-        }
+    writeln!(
+        out,
+        "  {} unique={} cap={} default={}",
+        dim("roles:"),
+        unique,
+        cap,
+        default_n
+    )?;
+    for (role, _) in &ctx.crew_plan {
+        writeln!(out, "  - {role}")?;
+    }
+    write!(out, "  N > ")?;
+    out.flush()?;
+    let line = read_line(input)?;
+    let mut budget = default_n;
+    if let Ok(n) = line.trim().parse::<u32>()
+        && n > 0
+    {
+        budget = n;
+        writeln!(out, "  {} -> {}", dim("N"), ok(&format!("{n}")))?;
     }
 
     // (2) per-role models with cost/caps + funded column (ADR-0026 Spec 2).
@@ -199,7 +222,7 @@ pub fn run_briefing(
         }
         _ => {
             writeln!(out, "{}", ok("dispatching."))?;
-            Ok(BriefingOutcome::Go)
+            Ok(BriefingOutcome::Go { budget })
         }
     }
 }
@@ -225,6 +248,8 @@ mod tests {
             workflow: "goal".into(),
             source: "steer".into(),
             crew_plan: BTreeMap::from([("planner".into(), 1), ("coder".into(), 2)]),
+            crew_max: 5,
+            default_budget: 2,
             models: vec![RoleModelChoice {
                 role: "coder".into(),
                 harness: "omp".into(),
@@ -258,13 +283,13 @@ mod tests {
 
     #[test]
     fn blank_answers_keep_defaults_and_go() {
-        // 2 count prompts + 1 model prompt + go/no-go = blank,blank,blank,y
-        let (outcome, rendered) = drive(&["", "", "", ""]);
-        assert_eq!(outcome, BriefingOutcome::Go);
+        // N prompt + 1 model prompt + go/no-go
+        let (outcome, rendered) = drive(&["", "", ""]);
+        assert_eq!(outcome, BriefingOutcome::Go { budget: 2 });
         // The golden sections all render.
         assert!(rendered.contains("== captain briefing: steer \"goal\""));
-        assert!(rendered.contains("planner x1"));
-        assert!(rendered.contains("coder x2"));
+        assert!(rendered.contains("crew budget N"));
+        assert!(rendered.contains("default=2"));
         assert!(rendered.contains("deepseek-v4-flash"));
         assert!(rendered.contains("$0.001/mtok"));
         assert!(rendered.contains("caps=omp,opencode"));
@@ -276,17 +301,17 @@ mod tests {
 
     #[test]
     fn explicit_no_aborts_before_dispatch() {
-        let (outcome, rendered) = drive(&["", "", "", "n"]);
+        let (outcome, rendered) = drive(&["", "", "n"]);
         assert_eq!(outcome, BriefingOutcome::Abort);
         assert!(rendered.contains("aborted."));
         assert!(!rendered.contains("dispatching."));
     }
 
     #[test]
-    fn edits_change_the_preview_not_the_context() {
-        // coder count 1 -> x5; keep planner; model pick index 1 (zai/glm-5.2).
-        let (_, rendered) = drive(&["5", "", "1", "y"]);
-        assert!(rendered.contains("coder -> x5"), "{rendered}");
+    fn edits_apply_budget() {
+        let (outcome, rendered) = drive(&["4", "1", "y"]);
+        assert_eq!(outcome, BriefingOutcome::Go { budget: 4 });
+        assert!(rendered.contains("N -> 4"), "{rendered}");
         assert!(rendered.contains("coder -> zai/glm-5.2"), "{rendered}");
     }
 
@@ -296,7 +321,11 @@ mod tests {
         let mut inp = std::io::Cursor::new("");
         let mut out: Vec<u8> = Vec::new();
         let outcome = run_briefing(&ctx(), &mut inp, &mut out).expect("eof-safe");
-        assert_eq!(outcome, BriefingOutcome::Go, "EOF counts as Enter/yes");
+        assert_eq!(
+            outcome,
+            BriefingOutcome::Go { budget: 2 },
+            "EOF counts as Enter/yes"
+        );
     }
 
     #[test]
@@ -327,6 +356,8 @@ mod tests {
             bare_override: None,
             stage_chain: vec!["review".into(), "ship".into()],
             funded: BTreeMap::new(),
+            crew_max: 5,
+            default_budget: 1,
         };
         let mut inp = std::io::Cursor::new("\n\n\n");
         let mut out: Vec<u8> = Vec::new();
@@ -337,7 +368,7 @@ mod tests {
             "workflow prefix: {rendered}"
         );
         assert!(rendered.contains("objective: run the weekly-review flow"));
-        assert!(rendered.contains("[1/4] inferred crew plan"));
+        assert!(rendered.contains("[1/4] crew budget N"));
         assert!(rendered.contains("[2/4] per-role models"));
         assert!(rendered.contains("[3/4] fleet shape"));
         assert!(rendered.contains("[4/4] stage chain"));

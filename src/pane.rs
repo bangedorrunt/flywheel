@@ -1190,6 +1190,52 @@ pub fn start_approval_drainer(
                             "flywheel: approval parked: promise {promise_id} for project {project} — resolve with: flywheel workflow approve {run_tag} {promise_id} --decision approve|reject --project {project}",
                             run_tag = format!("run-{}", &promise_id[..promise_id.len().min(8)])
                         );
+                        // ADR-0011 D7: SIGNOFF auto-pass iff REVIEW residual
+                        // empty AND OPEN DECISIONS empty. Irreversible
+                        // preference still parks.
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let ws = crate::state::load_spawn_meta(&project)
+                            .unwrap_or_else(|| project.clone());
+                        let snap = crate::snapshot::assemble(&cfg, &project, &ws, now);
+                        let review_residual = snap
+                            .lanes
+                            .iter()
+                            .filter(|l| {
+                                l.status.contains("review") && l.status != "closed"
+                            })
+                            .count();
+                        let review_degraded = snap
+                            .degraded
+                            .iter()
+                            .any(|d| d.contains("review"));
+                        if crate::signoff::observe(
+                            snap.decisions.len(),
+                            review_residual,
+                            review_degraded,
+                        ) {
+                            match engine
+                                .resolve_approval(
+                                    &promise_id,
+                                    &toron_workflow::engine::Decision::approved(
+                                        "auto-pass: REVIEW residual empty, OPEN DECISIONS empty",
+                                    ),
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    eprintln!(
+                                        "flywheel: SIGNOFF auto-pass: promise {promise_id} (REVIEW residual empty, OPEN DECISIONS empty)"
+                                    );
+                                    seen.remove(&promise_id);
+                                }
+                                Err(e) => eprintln!(
+                                    "flywheel: SIGNOFF auto-pass resolve {promise_id} failed: {e:#}"
+                                ),
+                            }
+                        }
                     }
                     // Resolve pass: scan inbox for decision tokens on parked ids.
                     if let Some(mail) = &mail {

@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
+### Added — ADR-0011 session conductor Waves B–D
+- `flywheel briefing` emits `flywheel-briefing.v1` (world + proposal + topology/N questions). `--commit`/`--yes` run argv. Joinable worlds propose `arrive`, not a second compose.
+- `decide --json` emits `topology`. `--project` fills Snapshot from helm (ready beads, pins, contention).
+- `flywheel arrive` + `spawn --join`: JOINING banner, coalition join, FCFS captain (stale eviction + override), doorbell start. Watch child is `toron watch --live`.
+- Helm mail/reservations read `toron receipt list` / `reserve conflicts` (degrade only on miss).
+- Rot Wave 1 scorer on `LoopMsg::Rot` (Restart→Respawn, Compact→steer). Nudge cap 3 (`interrupt_nudge`; 4th+ mail-only). WaitCorr drains on Sweep as well as WatchNdjson. SIGNOFF auto-pass iff REVIEW residual empty AND OPEN DECISIONS empty.
+- Slash `/swarm` `/loop` `/open` start with arrive+briefing.
+
+### Added — ADR-0011 session conductor Wave A (crew budget N)
+- Unique-role infer + `pack_crew` into total **N**, cap `crew.max` default **5** (operator-only; `FLYWHEEL_CREW_MAX` / `--crew-max`). Overflow roles alias onto the first kept role.
+- `workflow compose --crew N` (also `auto` / `role:n,role:n` / squad). `--allow-crew-expand` is a no-op and does not raise the cap.
+- TTY briefing asks N; confirmed budget mutates spawn (no more preview-only edits).
+- Loud pack line on every compose/run: `packing <wf> into N panes (cap=…, unique=…)`.
+
 ### Added — ADR-0010 delivery semantics, attention triage, decision lifecycle
 - One live `WorkspaceModel` (doorbell loop owns it); `poll_mail_digests` deleted as wake producer; doorbell-with-inbox delivery with 90s/3-ring re-ring ladder and `--fire-and-forget` skip.
 - Generation-bound wake ack watermark; Busy/Idle/Unknown/Dead verdicts (Unknown never promoted); reservation write-liveness defers respawn; captain turn-end guard; wake classification in tick with AFK digest; OPEN DECISIONS fold with typed captain-hold and divergence reporting; ask-user authority policy.

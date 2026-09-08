@@ -18,7 +18,9 @@
 mod agentstate;
 mod artifact;
 mod backend;
+mod briefing;
 mod builtin_workflows;
+mod captain_slot;
 mod catalog_tui;
 mod coalition;
 mod config;
@@ -48,7 +50,9 @@ mod plane_route;
 mod preflight;
 mod principles;
 mod profile;
+mod rot;
 mod run_log;
+mod signoff;
 mod smart_cron;
 mod snapshot;
 mod stages;
@@ -647,6 +651,9 @@ enum Commands {
         /// Kind/count + --model/--provider without --escape prints a warning.
         #[arg(long)]
         escape: bool,
+        /// ADR-0011 D5: join the live fleet instead of refusing / killing it.
+        #[arg(long)]
+        join: bool,
     },
     /// Extend a running swarm with more agent panes
     Add {
@@ -677,6 +684,34 @@ enum Commands {
     /// Session-start drain over the snapshot: OPEN DECISIONS, UNREAD
     /// STATUS, RECORD DIVERGENCE — always printed, even when empty
     Helm { project: String },
+    /// ADR-0011 D3: session briefing (observe + propose). `--commit` runs argv.
+    Briefing {
+        objective: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        commit: bool,
+        #[arg(long)]
+        yes: bool,
+        /// total pane budget (ADR-0011 D2)
+        #[arg(long)]
+        crew: Option<u32>,
+    },
+    /// ADR-0011 D5/D6: arrive on a project — helm, join-loud, doorbell, FCFS captain.
+    Arrive {
+        project: String,
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+        #[arg(long)]
+        coalition: Option<String>,
+        #[arg(long)]
+        objective: Option<String>,
+        /// operator override for captain slot
+        #[arg(long)]
+        captain: Option<String>,
+    },
     /// Classify a target into one captain primitive (no dispatch)
     Decide {
         /// free-text target / intent
@@ -693,6 +728,11 @@ enum Commands {
         /// file-contention signal
         #[arg(long)]
         contention: bool,
+        /// ADR-0011 D3: observe helm/snapshot for this project so Snapshot
+        /// flags fill automatically. Explicit --ready-beads/--profiled-panes
+        /// still override zeros.
+        #[arg(long)]
+        project: Option<String>,
         /// machine JSON (primitive, reason, argv)
         #[arg(long)]
         json: bool,
@@ -1107,7 +1147,7 @@ enum Commands {
         /// (non-bead targets)
         #[arg(long)]
         direct: bool,
-        /// crew strategy: auto | <squad> (default auto)
+        /// crew strategy: auto | <N total panes> | role:n,role:n | <squad> (ADR-0011 D2)
         #[arg(long)]
         crew: Option<String>,
         /// pane mode: the project whose workspace hosts the crew
@@ -3028,6 +3068,28 @@ enum CoalitionCmd {
         #[arg(long)]
         json: bool,
     },
+    /// ADR-0011 D5: join an active coalition (wires CoalitionStore::join).
+    Join {
+        id: String,
+        #[arg(long = "as")]
+        as_agent: String,
+        #[arg(long)]
+        member_project: Option<String>,
+        #[arg(long, default_value = "toron")]
+        project: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Leave an active coalition.
+    Leave {
+        id: String,
+        #[arg(long = "as")]
+        as_agent: String,
+        #[arg(long, default_value = "toron")]
+        project: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// List coalitions (id, goal, status).
     List {
         /// toron project slug (default: toron)
@@ -3211,7 +3273,7 @@ enum WorkflowCmd {
         /// JSON inputs for the invoke path ({{inputs.x}})
         #[arg(long)]
         inputs: Option<String>,
-        /// crew strategy: auto | <squad> (default auto)
+        /// crew strategy: auto | <N total panes> | role:n,role:n | <squad> (ADR-0011 D2)
         #[arg(long)]
         crew: Option<String>,
         /// real execution (ADR-0010 Spec A): without it the action runner
@@ -3332,9 +3394,14 @@ enum WorkflowCmd {
             hide = true
         )]
         _no_retire_orphans: bool,
-        /// GS-039 P0-3: refuse multi-crew expansion unless explicitly allowed
-        /// (repair/loop must not silently balloon; wave-swarm needs this or a
-        /// TTY crew-count ask).
+        /// crew strategy: auto | <N total panes> | role:n,role:n | <squad> (ADR-0011 D2)
+        #[arg(long)]
+        crew: Option<String>,
+        /// operator pane cap override (ADR-0011 D2). Default crew.max=5.
+        #[arg(long = "crew-max")]
+        crew_max: Option<u32>,
+        /// Deprecated: packed-under-cap no longer needs a confirm (ADR-0011 D2).
+        /// Kept so old argv does not hard-bail; does not raise the cap.
         #[arg(long = "allow-crew-expand", default_value_t = false)]
         allow_crew_expand: bool,
         /// pane mode: bind an existing workspace id instead of spawning fresh
@@ -4326,6 +4393,7 @@ fn main() {
             model,
             provider,
             escape,
+            join,
         }) => cmd_spawn(
             &cfg,
             project,
@@ -4350,6 +4418,7 @@ fn main() {
                 bare_provider: provider.clone().unwrap_or_default(),
                 idempotency_key: None,
                 escape: *escape,
+                join: *join,
             },
         ),
         Some(Commands::Add {
@@ -4362,19 +4431,52 @@ fn main() {
         Some(Commands::Status { project }) => cmd_status(&cfg, project.as_deref()),
         Some(Commands::Snapshot { project }) => cmd_snapshot(&cfg, project),
         Some(Commands::Helm { project }) => cmd_helm(&cfg, project),
+        Some(Commands::Briefing {
+            objective,
+            project,
+            json,
+            commit,
+            yes,
+            crew,
+        }) => cmd_briefing(
+            &cfg,
+            objective,
+            project.as_deref(),
+            *json,
+            *commit,
+            *yes,
+            *crew,
+        ),
+        Some(Commands::Arrive {
+            project,
+            as_agent,
+            coalition,
+            objective,
+            captain,
+        }) => cmd_arrive(
+            &cfg,
+            project,
+            as_agent.as_deref(),
+            coalition.as_deref(),
+            objective.as_deref(),
+            captain.as_deref(),
+        ),
         Some(Commands::Decide {
             target,
             ready_beads,
             profiled_panes,
             launch_pending,
             contention,
+            project,
             json,
         }) => cmd_decide(
+            &cfg,
             target,
             *ready_beads,
             *profiled_panes,
             *launch_pending,
             *contention,
+            project.as_deref(),
             *json,
         ),
         Some(Commands::Rebind { project }) => cmd_rebind(&cfg, project),
@@ -7500,14 +7602,13 @@ mod spawn_boot_reliability_tests {
             src.contains("AUTHORITATIVE OPERATOR OBJECTIVE") && src.contains("GS-039 P0-2"),
             "open-mode/--raw must frame AUTHORITATIVE operator objective"
         );
-        // P0-3: retire default false + allow-crew-expand gate + robot hard-bail
+        // P0-3: retire default false. Multi-crew packs under crew.max (ADR-0011 D2).
         assert!(
             src.contains("allow-crew-expand")
                 && src.contains("GS-039 P0-3")
-                && src.contains("compose would spawn multi-crew")
-                && src.contains("hard-bail (no read_line)")
-                && src.contains("FLYWHEEL_ROBOT"),
-            "compose must gate multi-crew + robot/CI hard-bail (no read_line)"
+                && src.contains("ADR-0011 D2")
+                && src.contains("packed-under-cap is the default"),
+            "compose must pack under crew.max (ADR-0011) instead of robot hard-bail"
         );
         // P0-4: name-bind fail-closed (empty OR wrong-name)
         assert!(
@@ -7872,6 +7973,8 @@ struct SpawnOpts {
     idempotency_key: Option<String>,
     /// Operator labeled this spawn as an escape from compose/wave-swarm.
     escape: bool,
+    /// ADR-0011 D5: join live fleet.
+    join: bool,
 }
 
 impl Default for SpawnOpts {
@@ -7897,6 +8000,7 @@ impl Default for SpawnOpts {
             bare_provider: String::new(),
             idempotency_key: None,
             escape: false,
+            join: false,
         }
     }
 }
@@ -8250,9 +8354,19 @@ projects available: {}",
                     eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
                 }
             }
+        } else if opts.join {
+            eprintln!(
+                "JOINING — not spawning  project={project} live={}  (ADR-0011 D5; reuse first workspace)",
+                detail.join(", ")
+            );
+            let pin = std::env::var("AGENT_NAME")
+                .ok()
+                .or_else(|| std::env::var("TORON_AGENT").ok())
+                .or_else(|| std::env::var("FLYWHEEL_MAIL_AS").ok());
+            return cmd_arrive(cfg, project, pin.as_deref(), None, None, None);
         } else {
             bail!(
-                "found {} pre-existing workspace(s) for {project} — stale panes from a killed swarm would race the new one: {}. Close them first (flywheel kill {project} or herdr workspace close <id>), or pass --retire-orphans to close them automatically.",
+                "found {} pre-existing workspace(s) for {project} — stale panes from a killed swarm would race the new one: {}. Close them first (flywheel kill {project} or herdr workspace close <id>), pass --join to attach, or --retire-orphans to close them automatically.",
                 orphans.len(),
                 detail.join(", ")
             );
@@ -8939,7 +9053,12 @@ fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
 fn cmd_doorbell_start(_cfg: &Config, project: &str) -> Result<()> {
     ensure_doorbell_supervisor();
     let exe = std::env::current_exe()?;
-    for ws in doorbell_project_workspaces(project) {
+    let workspaces = doorbell_project_workspaces(project);
+    if workspaces.is_empty() {
+        eprintln!("doorbell: absent (no swarm workspace yet — attach after spawn)");
+        return Ok(());
+    }
+    for ws in workspaces {
         let action = doorbell::ensure_running(&exe, &config::state_dir(), &ws, project)
             .with_context(|| format!("doorbell start {project}/{ws}"))?;
         println!("{project}/{ws}: {action:?}");
@@ -9532,7 +9651,7 @@ fn cmd_internal_doorbell(
     if in_process_ok.is_none() {
         let kinds = DOORBELL_WATCH_KINDS;
         let mut child = match Command::new("toron")
-            .args(["watch", "--project", project, "--kinds", kinds])
+            .args(["watch", "--live", "--project", project, "--kinds", kinds])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -10057,7 +10176,8 @@ fn cmd_internal_doorbell(
                 let msg = workspace::Msg::Sweep { since, now };
                 let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
                 workspace_model = next_model;
-                if handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, false) {
+                // ADR-0011 D7: WaitCorr also drains on Sweep, not only WatchNdjson.
+                if handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, true) {
                     doorbell_sweep_inbox(
                         cfg,
                         project,
@@ -10164,7 +10284,7 @@ where
 {
     let kinds = DOORBELL_WATCH_KINDS;
     let mut child = Command::new("toron")
-        .args(["watch", "--project", project, "--kinds", kinds])
+        .args(["watch", "--live", "--project", project, "--kinds", kinds])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -10390,11 +10510,11 @@ fn handle_workspace_cmds(
     cfg: &Config,
     drain_waits: bool,
 ) -> bool {
-    // drain_waits (ADR-0028 E2): the pending_wait sqlite peek is the
-    // fast path AFTER a genuine wake (WatchNdjson batch — kind-9 ring,
-    // kind-14 assignment, InboxRows), never the wake itself. Sweep,
-    // Fact, AckSla, HerdrStatus and Died batches pass false so the 1s
-    // cadence cannot become a poll.
+    // drain_waits (ADR-0028 E2 + ADR-0011 D7): the pending_wait sqlite
+    // peek is the fast path AFTER a genuine wake (WatchNdjson) AND on
+    // Sweep (D7 amends GS-016 — WaitCorr also drains on the 1s sweep).
+    // Fact, AckSla, HerdrStatus and Died batches still pass false so
+    // those cadences cannot become a poll.
     let mut fetch_inbox = false;
     for cmd in cmds {
         match cmd {
@@ -10411,12 +10531,11 @@ fn handle_workspace_cmds(
                 // subscribes to kinds 9/14/1059/43001/43004 and unparks on bus
                 // event or deadline, then re-checks receipts sqlite — no sleep
                 // poll. Here the corr parks in pending_wait and
-                // drain_pending_wait_corrs re-peeks sqlite after WATCH batches
-                // only (drain_waits=true; GS-016: the 1s sweep/Fact/AckSla
-                // batches pass false — the peek is a post-wake fast path,
-                // never the wake). A missed receipt still expires via the
-                // Sweep-arm TTL with an Audit wait-timeout record. The swarm
-                // fold (durable.rs) never produces or drains WaitCorr.
+                // drain_pending_wait_corrs re-peeks sqlite after WATCH and
+                // Sweep batches (drain_waits=true; ADR-0011 D7). Fact/AckSla
+                // batches still pass false. A missed receipt still expires
+                // via the Sweep-arm TTL with an Audit wait-timeout record.
+                // The swarm fold (durable.rs) never produces or drains WaitCorr.
                 // bd-zfnx.6: the park is bounded — deadline TTL stamped here,
                 // expiry/cap-eviction decided in the Sweep arm (tick), each
                 // with an Audit wait-timeout record. Never silent drop.
@@ -10471,9 +10590,6 @@ fn handle_workspace_cmds(
                 if let Err(e) = cmd_workflow(cfg, &run) {
                     eprintln!("flywheel: [LoudMiss] invoke {corr} ({workflow}): {e:#}");
                 }
-            }
-            workspace::Cmd::FactMiss { why } => {
-                eprintln!("flywheel: [FactMiss] {why}");
             }
             workspace::Cmd::Prompt { .. }
             | workspace::Cmd::CheckAckSla
@@ -10587,7 +10703,11 @@ mod waitcorr_doorbell_only_tests {
         );
         assert!(
             slice.contains("drain_waits"),
-            "E2 (GS-016): the peek is gated to genuine wake batches, never the 1s sweep"
+            "E2: the peek is gated by drain_waits"
+        );
+        assert!(
+            slice.contains("ADR-0011 D7"),
+            "ADR-0011 D7: WaitCorr also drains on Sweep, not only WatchNdjson"
         );
     }
 
@@ -13361,30 +13481,54 @@ fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
 
 /// Classify only. Never dispatches.
 fn cmd_decide(
+    cfg: &Config,
     target: &str,
     ready_beads: u32,
     profiled_panes: u32,
     launch_pending: u32,
     contention: bool,
+    project: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let d = decide::decide(
-        target,
-        &decide::Snapshot {
-            ready_bead_count: ready_beads,
-            profiled_panes,
-            launch_pending,
-            contention,
-        },
-    );
+    let mut snap = decide::Snapshot {
+        ready_bead_count: ready_beads,
+        profiled_panes,
+        launch_pending,
+        contention,
+    };
+    if let Some(project) = project {
+        let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+        let live = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+        if snap.ready_bead_count == 0 {
+            snap.ready_bead_count = live
+                .lanes
+                .iter()
+                .filter(|l| l.status == "open" || l.status == "ready")
+                .count() as u32;
+        }
+        if snap.profiled_panes == 0 {
+            snap.profiled_panes = live.pins.len() as u32;
+        }
+        if !snap.contention {
+            snap.contention = !live.held_paths.is_empty();
+        }
+    }
+    let d = decide::decide(target, &snap);
     if json {
         print_json(&serde_json::json!({
             "primitive": d.primitive,
             "reason": d.reason,
             "argv": d.argv,
+            "topology": d.topology,
         }));
     } else {
-        println!("{}\n{}\n{}", d.primitive, d.reason, d.argv.join(" "));
+        println!(
+            "{}\n{}\n{}\ntopology {}",
+            d.primitive,
+            d.reason,
+            d.argv.join(" "),
+            d.topology
+        );
     }
     Ok(())
 }
@@ -13558,6 +13702,210 @@ fn cmd_snapshot(cfg: &Config, project: &str) -> Result<()> {
 
 /// ADR-0010 D10 (bd-67qg): the one session-start drain over the snapshot.
 /// Always the three sections, even on an empty queue.
+fn cmd_briefing(
+    cfg: &Config,
+    objective: &str,
+    project: Option<&str>,
+    json: bool,
+    commit: bool,
+    yes: bool,
+    crew: Option<u32>,
+) -> Result<()> {
+    let project = project.unwrap_or("toron");
+    let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+    let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+    let world = briefing::World {
+        project: project.to_string(),
+        ready_beads: snap
+            .lanes
+            .iter()
+            .filter(|l| l.status == "open" || l.status == "ready")
+            .count() as u32,
+        dispatcher: snap.dispatcher.clone(),
+        joinable: snap.joinable,
+        degraded: snap.degraded.clone(),
+        foreign_workspaces: Vec::new(),
+        pin_count: snap.pins.len() as u32,
+        held_paths: snap.held_paths.clone(),
+        coalition_id: snap.coalitions.first().cloned(),
+    };
+    if world.joinable {
+        eprintln!("{}", briefing::join_banner(&world));
+    } else {
+        eprintln!(
+            "ARRIVE  project={} dispatcher={} pins={} (no live fleet)",
+            world.project, world.dispatcher, world.pin_count
+        );
+    }
+    let unique: Vec<String> = Vec::new();
+    let mut b = briefing::assemble(objective, &world, &unique, cfg.crew_max());
+    if let Some(n) = crew {
+        b.questions
+            .iter_mut()
+            .find(|q| q.id == "crew")
+            .map(|q| q.default = n.to_string());
+        if !b.proposal.argv.iter().any(|a| a == "--crew") && b.proposal.topology != "join" {
+            b.proposal.argv.push("--crew".into());
+            b.proposal.argv.push(n.to_string());
+        }
+    }
+    if json {
+        print_json(&serde_json::to_value(&b)?);
+    } else {
+        println!("schema {}", b.schema);
+        println!(
+            "topology {}  workflow {}",
+            b.proposal.topology, b.proposal.workflow
+        );
+        println!("why {}", b.proposal.why);
+        println!("argv {}", b.proposal.argv.join(" "));
+        println!(
+            "questions topology={} crew={}",
+            b.questions[0].default, b.questions[1].default
+        );
+    }
+    if commit || yes {
+        let argv = b.proposal.argv.clone();
+        eprintln!("flywheel: briefing --commit {}", argv.join(" "));
+        if argv.len() < 2 {
+            bail!("briefing commit: empty argv");
+        }
+        let status = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .status()?;
+        if !status.success() {
+            bail!("briefing commit exited {status}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_arrive(
+    cfg: &Config,
+    project: &str,
+    as_agent: Option<&str>,
+    coalition: Option<&str>,
+    objective: Option<&str>,
+    captain_override: Option<&str>,
+) -> Result<()> {
+    let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+    let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+    let world = briefing::World {
+        project: project.to_string(),
+        dispatcher: snap.dispatcher.clone(),
+        joinable: snap.joinable,
+        pin_count: snap.pins.len() as u32,
+        held_paths: snap.held_paths.clone(),
+        coalition_id: coalition
+            .map(str::to_string)
+            .or_else(|| snap.coalitions.first().cloned()),
+        degraded: snap.degraded.clone(),
+        ..briefing::World::default()
+    };
+    if world.joinable {
+        eprintln!("{}", briefing::join_banner(&world));
+    } else {
+        eprintln!(
+            "ARRIVE  project={} dispatcher={} pins={} (no live fleet — not joining)",
+            world.project, world.dispatcher, world.pin_count
+        );
+    }
+    print!("{}", snapshot::render_helm(&snap, doorbell_now_unix()));
+    // Only join a coalition the operator named. Auto-joining the first
+    // JSON file in state_dir (month-old "active" rows) is a silent hijack.
+    if let Some(id) = coalition
+        && let Some(agent) = as_agent
+    {
+        let store =
+            coalition::CoalitionStore::open(project, config::state_dir().join("coalitions"))?;
+        match store.join(id, agent, None) {
+            Ok(m) => eprintln!("joined coalition {} members {}", m.id, m.members.len()),
+            Err(e) => eprintln!("flywheel: coalition join skipped: {e:#}"),
+        }
+    }
+    if let Some(agent) = as_agent {
+        let st = std::process::Command::new("toron")
+            .args([
+                "presence",
+                "publish",
+                "--project",
+                project,
+                "--as",
+                agent,
+                "--state",
+                "working",
+            ])
+            .status();
+        match st {
+            Ok(s) if s.success() => eprintln!("presence working as {agent}"),
+            Ok(s) => eprintln!("flywheel: presence publish exited {s}"),
+            Err(e) => eprintln!("flywheel: presence publish failed: {e:#}"),
+        }
+    }
+    let arriver = as_agent.unwrap_or("");
+    let (holder, whois_stale) = lookup_captain_holder(project);
+    let pane_alive = holder
+        .as_ref()
+        .map(|h| snap.pins.iter().any(|p| p.pin == *h))
+        .unwrap_or(false);
+    let ev = captain_slot::CaptainEvidence {
+        holder,
+        // whois.stale=false is live (CLI actors like TealDune have no pane).
+        presence_fresh: !whois_stale,
+        last_wake_fresh: snap.dispatcher == "up",
+        pane_alive,
+        override_pin: captain_override.map(str::to_string),
+    };
+    let action = captain_slot::next_action(&ev, arriver);
+    if let Some(line) = captain_slot::claim_line(&action) {
+        eprintln!("{line}");
+        if let captain_slot::CaptainAction::Claim { pin, .. }
+        | captain_slot::CaptainAction::Override { pin } = action
+        {
+            let status = std::process::Command::new("toron")
+                .args(["contact", "captain", "--project", project, "--pin", &pin])
+                .status();
+            if let Err(e) = status {
+                eprintln!("flywheel: captain claim CLI failed: {e:#}");
+            }
+        }
+    }
+    match cmd_doorbell_start(cfg, project) {
+        Ok(()) => {}
+        Err(e) => eprintln!("flywheel: doorbell start: {e:#}"),
+    }
+    if let Some(obj) = objective {
+        cmd_briefing(cfg, obj, Some(project), false, false, false, None)?;
+    }
+    Ok(())
+}
+
+/// (holder pin, whois.stale). Missing/failed whois → (None, true).
+fn lookup_captain_holder(project: &str) -> (Option<String>, bool) {
+    let out = std::process::Command::new("toron")
+        .args(["mail", "whois", project, "captain", "--json"])
+        .output();
+    let Ok(out) = out else {
+        return (None, true);
+    };
+    if !out.status.success() {
+        return (None, true);
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return (None, true);
+    };
+    let name = v
+        .get("name")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    if name.is_empty() || name == "captain" {
+        return (None, true);
+    }
+    let stale = v.get("stale").and_then(|s| s.as_bool()).unwrap_or(true);
+    (Some(name), stale)
+}
+
 fn cmd_helm(cfg: &Config, project: &str) -> Result<()> {
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
     let now = doorbell_now_unix();
@@ -15411,8 +15759,8 @@ fn cmd_crew(cfg: &Config, cmd: &CrewCmd) -> Result<()> {
                 .map(|(wf, _)| wf)
                 .ok_or_else(|| anyhow!("unknown workflow {name:?} (flywheel workflow list)"))?;
             let resolve = |sub: &str| all.get(sub).map(|(w, _)| w.clone());
-            let plan = crew::plan_crew_with(wf, &resolve);
-            let members: Vec<Value> = plan
+            let packed = packed_from_flag(cfg, wf, &resolve, None, None)?;
+            let members: Vec<Value> = packed
                 .members
                 .iter()
                 .map(|(role, count)| json!({ "role": role, "count": count }))
@@ -15421,7 +15769,15 @@ fn cmd_crew(cfg: &Config, cmd: &CrewCmd) -> Result<()> {
                 println!("workflow {name} has no crew (crew omitted or no profile refs)");
                 return Ok(());
             }
-            print_json(&json!({ "workflow": name, "crew": members }));
+            print_json(&json!({
+                "workflow": name,
+                "crew": members,
+                "budget": packed.budget,
+                "cap": packed.cap,
+                "unique": packed.unique,
+                "aliases": packed.aliases,
+                "announce": packed.announce(name),
+            }));
             Ok(())
         }
         CrewCmd::Control { project, pin, verb } => cmd_crew_control(cfg, project, pin, verb),
@@ -20675,6 +21031,7 @@ fn cmd_loop(
                 kind: String::new(),
                 pane_id: String::new(),
                 mail_identity: None,
+                nudge_streak: 0,
             })
             .collect();
         let actions = durable::plan_actions(
@@ -21336,6 +21693,7 @@ mod loop_tests {
             kind: String::new(),
             pane_id: String::new(),
             mail_identity: None,
+            nudge_streak: 0,
         }
     }
 
@@ -24830,6 +25188,42 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
             }
             Ok(())
         }
+        CoalitionCmd::Join {
+            id,
+            as_agent,
+            member_project,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let m = store.join(id, as_agent, member_project.as_deref())?;
+            eprintln!(
+                "JOINING — not spawning  coalition={} members={}",
+                m.id,
+                m.members.len()
+            );
+            if *json {
+                print_json(&serde_json::to_value(&m)?);
+            } else {
+                println!("joined {} as {as_agent} members {}", m.id, m.members.len());
+            }
+            Ok(())
+        }
+        CoalitionCmd::Leave {
+            id,
+            as_agent,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let m = store.leave(id, as_agent)?;
+            if *json {
+                print_json(&serde_json::to_value(&m)?);
+            } else {
+                println!("left {} as {as_agent} members {}", m.id, m.members.len());
+            }
+            Ok(())
+        }
         CoalitionCmd::List { project, json } => {
             let store = CoalitionStore::open(project, coalitions_root())?;
             let list = store.list()?;
@@ -26049,6 +26443,41 @@ fn briefing_enabled(json: bool, yes: bool, crew: Option<&str>, is_tty: bool) -> 
     !json && !yes && crew.is_none() && is_tty
 }
 
+/// ADR-0011 D2: unique-role infer then pack into total N (cap crew.max).
+fn packed_from_flag(
+    cfg: &Config,
+    wf: &toron_workflow::schema::Workflow,
+    resolve: &dyn Fn(&str) -> Option<toron_workflow::schema::Workflow>,
+    crew: Option<&str>,
+    crew_max_flag: Option<u32>,
+) -> Result<crew::PackedCrew> {
+    let max = crew_max_flag.unwrap_or_else(|| cfg.crew_max());
+    let inferred = crew::plan_crew_with(wf, resolve);
+    let flag = match crew {
+        None => crew::CrewFlag::Default,
+        Some(s) => crew::parse_crew_flag(s),
+    };
+    let req = match flag {
+        crew::CrewFlag::Named(name) => {
+            let cat = profile::ProfileCatalog::load()?;
+            let recipes = config::Recipes::load()?.recipes;
+            let counts = match recipes.get(&name) {
+                Some(r) => profile::Squad::from_recipe(r).counts,
+                None if cat.get(&name).is_some() => {
+                    let mut m = BTreeMap::new();
+                    m.insert(name.clone(), 1u32);
+                    m
+                }
+                None => bail!("unknown squad {name:?} (flywheel squad list)"),
+            };
+            let n: u32 = counts.values().copied().sum();
+            crew::CrewFlag::Total(n.max(1))
+        }
+        other => other,
+    };
+    crew::pack_inferred(&inferred, &req, max).map_err(|e| anyhow!(e))
+}
+
 /// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
 #[allow(clippy::too_many_arguments)]
 fn cmd_steer(
@@ -26066,6 +26495,7 @@ fn cmd_steer(
     if objective.trim().is_empty() {
         bail!("steer: objective must not be empty");
     }
+    let mut crew_owned = crew.map(|s| s.to_string());
     // bd-xe9r: on an INTERACTIVE TTY — skipped by --json, --yes, or an
     // explicit --crew (an agent driver knows its fleet already) — brief the
     // operator before dispatch. Non-TTY output stays byte-identical.
@@ -26086,8 +26516,13 @@ fn cmd_steer(
         let ctx = steer_briefing_context(objective, if direct { "goal-direct" } else { "goal" })?;
         let outcome =
             steer_brief::run_briefing(&ctx, &mut std::io::stdin().lock(), &mut std::io::stdout())?;
-        if outcome == steer_brief::BriefingOutcome::Abort {
-            bail!("steer: aborted by the operator at the briefing gate");
+        match outcome {
+            steer_brief::BriefingOutcome::Abort => {
+                bail!("steer: aborted by the operator at the briefing gate");
+            }
+            steer_brief::BriefingOutcome::Go { budget } => {
+                crew_owned = Some(budget.to_string());
+            }
         }
     }
     // bd-t86p: ONE compose call — the goal workflow (bead-tracked) or its
@@ -26099,7 +26534,7 @@ fn cmd_steer(
     let run = steer_run_cmd(
         objective,
         direct,
-        crew,
+        crew_owned.as_deref(),
         project,
         reuse,
         retain,
@@ -26260,11 +26695,15 @@ fn briefing_context_inner(
                     .all(|m| plan_roles.contains(m.as_str()))
         })
         .map(|(name, _)| name.clone());
+    let unique = plan.members.len() as u32;
+    let cap = crate::crew::DEFAULT_CREW_MAX;
     Ok(steer_brief::BriefingContext {
         objective: objective.to_string(),
         workflow: wf_name.to_string(),
         source: source.to_string(),
         crew_plan: plan.members,
+        crew_max: cap,
+        default_budget: unique.max(1).min(cap),
         models,
         squad_recommendation,
         bare_override: None,
@@ -26570,6 +27009,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // cmd_workflow itself needs no opt-out state
             allow_worktree: _,
         } => {
+            let mut crew_sel = crew.clone();
             // bd-nmzk: interactive captain briefing for `workflow run --execute`
             // (same skip flags as `steer` — shared prompt module so both stay
             // in lockstep). Arms only on an interactive TTY with --execute.
@@ -26587,8 +27027,13 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     &mut std::io::stdin().lock(),
                     &mut std::io::stdout(),
                 )?;
-                if outcome == steer_brief::BriefingOutcome::Abort {
-                    bail!("workflow run: aborted by the operator at the briefing gate");
+                match outcome {
+                    steer_brief::BriefingOutcome::Abort => {
+                        bail!("workflow run: aborted by the operator at the briefing gate");
+                    }
+                    steer_brief::BriefingOutcome::Go { budget } => {
+                        crew_sel = Some(budget.to_string());
+                    }
                 }
             } else if *execute && !json && *yes && crew.is_some() {
                 eprintln!(
@@ -26620,27 +27065,16 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     .cloned()
                     .or_else(|| builtin_workflows::builtin_workflows().get(sub).cloned())
             });
-            let crew_plan = match crew.as_deref() {
-                None | Some("auto") => crew::plan_crew_with(&wf, &|sub| workflow_resolver(sub)),
-                Some(squad) => {
-                    let cat = profile::ProfileCatalog::load()?;
-                    let recipes = config::Recipes::load()?.recipes;
-                    let squad_counts = match recipes.get(squad) {
-                        Some(r) => profile::Squad::from_recipe(r).counts,
-                        None if cat.get(squad).is_some() => {
-                            let mut m = BTreeMap::new();
-                            m.insert(squad.to_string(), 1u32);
-                            m
-                        }
-                        None => {
-                            bail!("unknown squad {squad:?} (flywheel squad list)")
-                        }
-                    };
-                    crew::CrewPlan {
-                        members: squad_counts,
-                    }
-                }
-            };
+            let packed = packed_from_flag(
+                cfg,
+                &wf,
+                &|sub| workflow_resolver(sub),
+                crew_sel.as_deref(),
+                None,
+            )?;
+            eprintln!("flywheel: {}", packed.announce(name));
+            let wf = crew::apply_role_aliases(&wf, &packed.aliases);
+            let crew_plan = packed.as_plan();
             // A recording action runner: flywheel's CLI run exercises the
             // engine (delays, approvals park durably, graph scheduling,
             // control-flow); action side-effects are recorded, not dispatched
@@ -26937,6 +27371,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             role_model,
             retire_orphans,
             _no_retire_orphans: _,
+            crew,
+            crew_max,
             allow_crew_expand,
             reuse,
             json,
@@ -27061,10 +27497,17 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 );
             }
 
-            // The crew plan (auto-inferred from the composed parts) — the
-            // captain's fleet preview + the run's spawn.
+            // ADR-0011 D2: unique-role pack into total N (cap crew.max).
             let resolve = |sub: &str| all.get(sub).map(|(w, _)| w.clone());
-            let crew_plan = crew::plan_crew_with(&composed, &resolve);
+            let packed = packed_from_flag(cfg, &composed, &resolve, crew.as_deref(), *crew_max)?;
+            eprintln!("flywheel: {}", packed.announce(&wf_name));
+            if *allow_crew_expand {
+                eprintln!(
+                    "flywheel: warn: --allow-crew-expand is a no-op under ADR-0011 (cap is crew.max; pass --crew N)"
+                );
+            }
+            let composed = crew::apply_role_aliases(&composed, &packed.aliases);
+            let crew_plan = packed.as_plan();
 
             // §3.6 envelope #2: structural dry-run first-class — resolved
             // graph, fanout counts, phase tags. No dispatch, no persist.
@@ -27144,40 +27587,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // is invoked directly (the engine takes ANY Workflow).
             let mut catalog = profile::ProfileCatalog::load()?;
             catalog.apply_role_models(role_model)?;
-            // GS-039 P0-3 + UX: multi-crew compose must not silently N.
-            // Interactive TTY ask ONLY for humans. Robot/CI/--json/
-            // FLYWHEEL_ROBOT/non-interactive MUST hard-bail requiring
-            // --allow-crew-expand (never read_line — hangs robots).
-            let crew_total: u32 = crew_plan.members.values().copied().sum();
-            if crew_total > 1 && !*allow_crew_expand {
-                let robotish = *json
-                    || std::env::var_os("FLYWHEEL_ROBOT").is_some()
-                    || std::env::var_os("CI").is_some()
-                    || !std::io::stdin().is_terminal();
-                if robotish {
-                    bail!(
-                        "compose would spawn multi-crew ({crew_total} agents: {:?}) without --allow-crew-expand (GS-039 P0-3). Robot/CI/--json/FLYWHEEL_ROBOT/non-interactive paths hard-bail (no read_line); pass --allow-crew-expand to confirm, or set an explicit crew of 1.",
-                        crew_plan.members
-                    );
-                }
-                // Interactive human TTY only.
-                eprintln!(
-                    "flywheel: compose would spawn multi-crew ({crew_total} agents: {:?}) — recommended default is the inferred plan. Pass --allow-crew-expand to confirm, or reduce the recipe.",
-                    crew_plan.members
-                );
-                eprint!(
-                    "  proceed with this crew? [y/N] (profiles use default model opencode-go/muse-spark-1.3-contributor unless --role-model overrides): "
-                );
-                let _ = std::io::Write::flush(&mut std::io::stderr());
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line)?;
-                let ans = line.trim().to_ascii_lowercase();
-                if ans != "y" && ans != "yes" {
-                    bail!(
-                        "compose multi-crew refused (GS-039 P0-3 / UX) — re-run with --allow-crew-expand after confirming crew count, or use a solo-shaped recipe"
-                    );
-                }
-            }
+            // ADR-0011 D2: packed-under-cap is the default. The pack line
+            // already announced N. --allow-crew-expand does not raise crew.max.
             let ctx = pane::pre_spawn_crew(
                 cfg,
                 project_name,
@@ -27459,8 +27870,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let all = all_workflows()?;
             let wf = resolve_workflow(name, &all)?;
             let resolve = |sub: &str| all.get(sub).map(|(w, _)| w.clone());
-            let plan = crew::plan_crew_with(wf, &resolve);
-            let members: Vec<Value> = plan
+            let packed = packed_from_flag(cfg, wf, &resolve, None, None)?;
+            let members: Vec<Value> = packed
                 .members
                 .iter()
                 .map(|(role, count)| json!({ "role": role, "count": count }))
@@ -27469,7 +27880,15 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 println!("workflow {name} has no crew (crew omitted or no profile refs)");
                 return Ok(());
             }
-            print_json(&json!({ "workflow": name, "crew": members }));
+            print_json(&json!({
+                "workflow": name,
+                "crew": members,
+                "budget": packed.budget,
+                "cap": packed.cap,
+                "unique": packed.unique,
+                "aliases": packed.aliases,
+                "announce": packed.announce(name),
+            }));
             Ok(())
         }
         WorkflowCmd::Remove { name } => {

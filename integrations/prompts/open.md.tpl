@@ -33,6 +33,14 @@ unless the operator overrides. Do not invent model ids or bypass registry
 compatibility. For direct in-pane work, keep using the current harness/model
 unless the operator requests a change.
 
+## Arrive then brief (ADR-0011)
+
+Session start is `flywheel arrive <project> --as <pin>` then
+`flywheel briefing "<objective>" --project <p> --json`. Open-mode
+stays current-pane when briefing topology is `open` or `join`.
+Join-loud prints JOINING — not spawning. Do not fork a dispatcher
+when one is already up; attach `toron watch --live`.
+
 ## Contract
 
 - Work only on the task supplied in this invocation or by the human.
