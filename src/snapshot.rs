@@ -80,6 +80,15 @@ pub struct Snapshot {
     pub drain_pending: usize,
     pub afk: usize,
     pub degraded: Vec<String>,
+    /// ADR-0011 D5/D6: live fleet join surface
+    #[serde(default)]
+    pub joinable: bool,
+    #[serde(default)]
+    pub dispatcher: String,
+    #[serde(default)]
+    pub held_paths: Vec<String>,
+    #[serde(default)]
+    pub coalitions: Vec<String>,
 }
 
 /// Top-level keys the robot JSON must carry (schema validation).
@@ -97,6 +106,10 @@ pub fn schema_keys() -> Vec<&'static str> {
         "drain_pending",
         "afk",
         "degraded",
+        "joinable",
+        "dispatcher",
+        "held_paths",
+        "coalitions",
     ]
 }
 
@@ -276,10 +289,26 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
     let drain_pending = model.pending_wait.len();
     let afk = model.digest_queue.len();
 
-    // Mail + reservations: no cheap read path from this process —
-    // degraded-empty by contract (fields stay, sources named).
-    degraded.push("mail".to_string());
-    degraded.push("reservations".to_string());
+    // ADR-0011 D6: attempt live mail/reservation reads; degrade only on miss.
+    let (mail, mail_degraded) = read_mail_counts(project);
+    if mail_degraded {
+        degraded.push("mail".to_string());
+    }
+    let (held_paths, res_degraded) = read_held_paths(project);
+    if res_degraded {
+        degraded.push("reservations".to_string());
+    }
+
+    let dispatcher = crate::doorbell::dispatcher_status_line(&crate::config::state_dir(), ws_label);
+    let dispatcher = if dispatcher.contains("up") {
+        "up".to_string()
+    } else if dispatcher.contains("DOWN") {
+        "down".to_string()
+    } else {
+        "absent".to_string()
+    };
+    let coalitions = list_active_coalitions(project);
+    let joinable = fleet_joinable(&dispatcher, &pins);
 
     Snapshot {
         schema: SNAPSHOT_SCHEMA.to_string(),
@@ -289,27 +318,145 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
         pins,
         lanes,
         decisions,
-        mail: MailCounts {
-            owed: 0,
-            acked: 0,
-            resulted: 0,
-            degraded: true,
-        },
+        mail,
         journal,
         drain_pending,
         afk,
         degraded,
+        joinable,
+        dispatcher,
+        held_paths,
+        coalitions,
     }
+}
+
+fn read_mail_counts(_project: &str) -> (MailCounts, bool) {
+    // `toron receipt list` has no --project (sqlite is the daemon store).
+    let out = std::process::Command::new("toron")
+        .args(["receipt", "list", "--json"])
+        .output();
+    let Ok(out) = out else {
+        return (
+            MailCounts {
+                owed: 0,
+                acked: 0,
+                resulted: 0,
+                degraded: true,
+            },
+            true,
+        );
+    };
+    if !out.status.success() {
+        return (
+            MailCounts {
+                owed: 0,
+                acked: 0,
+                resulted: 0,
+                degraded: true,
+            },
+            true,
+        );
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return (
+            MailCounts {
+                owed: 0,
+                acked: 0,
+                resulted: 0,
+                degraded: true,
+            },
+            true,
+        );
+    };
+    let rows = v.as_array().cloned().unwrap_or_default();
+    let mut owed = 0u64;
+    let mut acked = 0u64;
+    let mut resulted = 0u64;
+    for r in &rows {
+        match r.get("state").and_then(|s| s.as_str()).unwrap_or("") {
+            "owed" => owed += 1,
+            "acked" => acked += 1,
+            "resulted" => resulted += 1,
+            _ => {}
+        }
+    }
+    (
+        MailCounts {
+            owed,
+            acked,
+            resulted,
+            degraded: false,
+        },
+        false,
+    )
+}
+
+fn read_held_paths(_project: &str) -> (Vec<String>, bool) {
+    // Additive board is MCP `list_file_reservations` / flywheel `__reservation-board`.
+    // In-process mailbox when embedded; degrade (never lie calm) on miss.
+    let Some(mail) = crate::mail_shim::try_mailbox() else {
+        return (Vec::new(), true);
+    };
+    let Ok(rows) = crate::mail_shim::block_on(mail.active_reservations(_project)) else {
+        return (Vec::new(), true);
+    };
+    let paths = rows.into_iter().map(|r| r.path_pattern).collect();
+    (paths, false)
+}
+
+/// herdr pane ids look like `wP:p1` / `w6:p2`. A lone current pane is not a fleet.
+pub fn looks_like_pane_id(pin: &str) -> bool {
+    let Some((ws, pane)) = pin.split_once(':') else {
+        return false;
+    };
+    !ws.is_empty() && pane.starts_with('p')
+}
+
+/// Live fleet: doorbell up, or at least one named pin (not just this pane id).
+/// Month-old coalition JSON is not a fleet (ADR-0011 D5).
+pub fn fleet_joinable(dispatcher: &str, pins: &[PinRow]) -> bool {
+    dispatcher == "up"
+        || pins
+            .iter()
+            .any(|p| !looks_like_pane_id(&p.pin) && !p.pin.is_empty())
+}
+
+fn list_active_coalitions(_project: &str) -> Vec<String> {
+    let root = crate::config::state_dir().join("coalitions");
+    let Ok(rd) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        if v.get("status").and_then(|s| s.as_str()) == Some("active")
+            && let Some(id) = v.get("id").and_then(|s| s.as_str())
+        {
+            ids.push(id.to_string());
+        }
+    }
+    ids
 }
 
 /// Captain bearings: one-line fleet summary for TTY surfaces.
 pub fn bearings_line(snap: &Snapshot) -> String {
+    let join = if snap.joinable { " JOINABLE" } else { "" };
     format!(
-        "fleet: {} pins, {} open decisions, {} afk queued, {} unacked wakes{}",
+        "fleet: {} pins, {} open decisions, {} afk queued, {} unacked wakes dispatcher={}{join}{}",
         snap.pins.len(),
         snap.decisions.len(),
         snap.afk,
         snap.journal.unacked_wakes,
+        snap.dispatcher,
         if snap.degraded.is_empty() {
             String::new()
         } else {
@@ -378,6 +525,17 @@ pub fn render_helm(snap: &Snapshot, now: u64) -> String {
     } else {
         out.push_str(&format!("\n{}", crate::workspace::render_divergence(&rows)));
     }
+    out.push_str("\nFLEET");
+    if snap.joinable {
+        out.push_str(&format!(
+            ": JOINING — not spawning  dispatcher={} pins={} coalitions={}",
+            snap.dispatcher,
+            snap.pins.len(),
+            snap.coalitions.len()
+        ));
+    } else {
+        out.push_str(&format!(": none live (dispatcher={})", snap.dispatcher));
+    }
     out.push('\n');
     out
 }
@@ -440,6 +598,10 @@ mod adr0010_d10_tests {
             drain_pending: 0,
             afk: 0,
             degraded: vec![],
+            joinable: false,
+            dispatcher: "absent".into(),
+            held_paths: vec![],
+            coalitions: vec![],
         }
     }
 
@@ -453,6 +615,37 @@ mod adr0010_d10_tests {
         for key in schema_keys() {
             assert!(v.get(key).is_some(), "robot JSON missing key {key}");
         }
+    }
+
+    #[test]
+    fn pane_id_is_not_a_named_pin() {
+        assert!(looks_like_pane_id("wP:p1"));
+        assert!(looks_like_pane_id("w6:p2"));
+        assert!(!looks_like_pane_id("LucidFalcon"));
+        assert!(!looks_like_pane_id("TealDune"));
+    }
+
+    #[test]
+    fn lone_herdr_pane_is_not_joinable() {
+        let pins = vec![PinRow {
+            pin: "wP:p1".into(),
+            verdict: "Busy(herdr-evidence)".into(),
+            source: "herdr".into(),
+            since: String::new(),
+            bead: None,
+            reservations: vec![],
+        }];
+        assert!(!fleet_joinable("absent", &pins));
+        assert!(fleet_joinable("up", &pins));
+        let named = vec![PinRow {
+            pin: "LucidFalcon".into(),
+            verdict: "Idle(herdr)".into(),
+            source: "herdr".into(),
+            since: String::new(),
+            bead: None,
+            reservations: vec![],
+        }];
+        assert!(fleet_joinable("absent", &named));
     }
 
     #[test]

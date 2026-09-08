@@ -153,6 +153,15 @@ pub struct Config {
     /// captain pane dies. Default `stop`.
     #[serde(default)]
     pub on_captain_death: Option<OnCaptainDeath>,
+    /// ADR-0011 D2: operator-owned pane cap. Repo `.flywheel/` must not raise it.
+    #[serde(default)]
+    pub crew: Option<CrewBudgetConfig>,
+}
+
+/// `[crew] max = 5` in operator config (ADR-0011 D2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CrewBudgetConfig {
+    pub max: Option<u32>,
 }
 
 /// Parent-death policy for the captain (ADR-0025 Spec 4, Wave 4a).
@@ -302,6 +311,21 @@ impl Config {
     /// Parent-death policy (ADR-0025 Spec 4, Wave 4a): `stop` by default.
     pub fn on_captain_death(&self) -> OnCaptainDeath {
         self.on_captain_death.unwrap_or_default()
+    }
+
+    /// ADR-0011 D2: pane cap. Env `FLYWHEEL_CREW_MAX` > `[crew].max` > 5.
+    pub fn crew_max(&self) -> u32 {
+        if let Ok(v) = std::env::var("FLYWHEEL_CREW_MAX")
+            && let Ok(n) = v.parse::<u32>()
+            && n >= 1
+        {
+            return n;
+        }
+        self.crew
+            .as_ref()
+            .and_then(|c| c.max)
+            .filter(|n| *n >= 1)
+            .unwrap_or(crate::crew::DEFAULT_CREW_MAX)
     }
 
     pub fn load() -> Result<Self> {

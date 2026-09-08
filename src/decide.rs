@@ -24,6 +24,9 @@ pub struct Decision {
     pub primitive: &'static str,
     pub reason: String,
     pub argv: Vec<String>,
+    /// ADR-0011 D1: topology is a briefing axis, never collapsed into the
+    /// workflow primitive. Join is decided by the briefing world, not here.
+    pub topology: &'static str,
 }
 
 fn has(t: &str, needles: &[&str]) -> bool {
@@ -44,11 +47,21 @@ fn compose_parts_value(target: &str) -> String {
     "<role:stage,...>".to_string()
 }
 
+pub fn topology_for_primitive(primitive: &str) -> &'static str {
+    match primitive {
+        "loop-work" | "pickup" | "pause" => "loop",
+        "spawn-send" | "captain-audit" | "forensics" | "babysit-bead" => "open",
+        "wave-swarm" | "coalition-form" => "swarm",
+        _ => "swarm",
+    }
+}
+
 fn dec(primitive: &'static str, reason: &str, argv: &[&str]) -> Decision {
     Decision {
         primitive,
         reason: reason.to_string(),
         argv: argv.iter().map(|s| (*s).to_string()).collect(),
+        topology: topology_for_primitive(primitive),
     }
 }
 
@@ -1062,6 +1075,7 @@ mod tests {
     fn wave_label_routes_to_wave_swarm_without_recipe_token() {
         let d = decide("implement the parser for wave-1", &with_beads(3));
         assert_eq!(d.primitive, "wave-swarm");
+        assert_eq!(d.topology, "swarm");
         assert!(d.argv.contains(&"compose".to_string()));
         assert!(d.argv.contains(&"wave-swarm".to_string()));
     }

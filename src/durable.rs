@@ -509,6 +509,11 @@ pub enum LoopMsg {
         name: String,
         bead_id: String,
     },
+    /// ADR-0011 D7 / ADR-0029 Wave 1: rot scorer input for one pane.
+    Rot {
+        name: String,
+        events: crate::rot::RotEvents,
+    },
     Tick {
         now: u64,
     },
@@ -675,6 +680,17 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
                 text: drain_prompt(bead_id),
             });
         }
+        LoopMsg::Rot { name, events } => match crate::rot::action(events) {
+            crate::rot::RotAction::Respawn => actions.push(LoopAction::Respawn {
+                name: name.clone(),
+                reason: "rot".into(),
+            }),
+            crate::rot::RotAction::Compact => actions.push(LoopAction::Send {
+                name: name.clone(),
+                text: crate::rot::compact_prompt().into(),
+            }),
+            crate::rot::RotAction::Advise | crate::rot::RotAction::None => {}
+        },
         LoopMsg::Tick { now } => {
             let _ = now;
             // Tick is the clock beat: heartbeat plan (queue -> Send). Heal and
@@ -768,7 +784,7 @@ fn default_active_interval() -> u64 {
 }
 
 /// One polled agent state: (name, status string).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AgentState {
     pub name: String,
     pub status: String,
@@ -788,6 +804,9 @@ pub struct AgentState {
     /// checkpoints written before this field existed.
     #[serde(default)]
     pub mail_identity: Option<String>,
+    /// ADR-0011 D7: consecutive nudges without progress. 4th+ is mail-only.
+    #[serde(default)]
+    pub nudge_streak: u32,
 }
 
 /// One ready bead from `br ready --json`.
@@ -4611,10 +4630,18 @@ pub fn plan_actions(
                     });
                 } else if nudge.is_some() {
                     // orchestrator direction beats the autonomous mail wake —
-                    // the captain's instruction is the higher-signal work
-                    actions.push(LoopAction::Nudge {
-                        name: s.name.clone(),
-                    });
+                    // the captain's instruction is the higher-signal work.
+                    // ADR-0011 D7: 4th+ consecutive nudge is mail-only.
+                    if crate::rot::interrupt_nudge(s.nudge_streak) {
+                        actions.push(LoopAction::Nudge {
+                            name: s.name.clone(),
+                        });
+                    } else {
+                        actions.push(LoopAction::Send {
+                            name: s.name.clone(),
+                            text: format!("[nudge-mail] {}", nudge.unwrap_or("proceed")),
+                        });
+                    }
                 } else if let Some(d) = digests.get(&s.name)
                     && (d.urgent > 0 || d.plane_s > 0)
                     && !wake_suppressed.contains(&s.name)
@@ -5080,6 +5107,7 @@ pub fn parse_poll_entry(v: &serde_json::Value) -> anyhow::Result<AgentState> {
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        nudge_streak: 0,
     })
 }
 
@@ -8969,6 +8997,7 @@ mod tests {
             kind: String::new(),
             pane_id: String::new(),
             mail_identity: None,
+            nudge_streak: 0,
         }
     }
 
@@ -8979,6 +9008,7 @@ mod tests {
             kind: "opencode".to_string(),
             pane_id: pane.to_string(),
             mail_identity: None,
+            nudge_streak: 0,
         }
     }
 
@@ -8989,6 +9019,7 @@ mod tests {
             kind: "opencode".to_string(),
             pane_id: String::new(),
             mail_identity: Some(pin.to_string()),
+            nudge_streak: 0,
         }
     }
 
@@ -11315,6 +11346,53 @@ mod tests {
     }
 
     #[test]
+    fn plan_actions_nudge_cap_fourth_is_mail_only() {
+        let queue: Vec<String> = Vec::new();
+        let mut s = st("flywheel-proj-oc", "idle");
+        s.nudge_streak = 3;
+        let d = digest_map(digest(0, 0, "", ""));
+        let actions = plan_actions(
+            &LoopModel {
+                queue: queue.clone(),
+                ..Default::default()
+            },
+            &[s],
+            Some("proceed"),
+            &d,
+            &std::collections::HashSet::new(),
+        );
+        match &actions[0] {
+            LoopAction::Send { text, .. } => {
+                assert!(text.contains("[nudge-mail]"), "{text}");
+            }
+            other => panic!("expected mail-only Send past nudge cap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rot_restart_emits_respawn() {
+        let ev = crate::rot::RotEvents {
+            bytes: 9000,
+            ceiling: 8000,
+            repetition: 3,
+            marker_silence_turns: 3,
+            ..crate::rot::RotEvents::default()
+        };
+        let (next, actions) = tick(
+            &LoopModel::default(),
+            &LoopMsg::Rot {
+                name: "a".into(),
+                events: ev,
+            },
+        );
+        let _ = next;
+        assert!(
+            matches!(&actions[0], LoopAction::Respawn { name, reason } if name == "a" && reason == "rot"),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
     fn plan_actions_suppresses_wake_for_already_woken_agent() {
         // wake dedup: the same urgent message id must NOT re-wake an agent
         // every iteration — the digest still prefixes prompts, but the
@@ -12216,6 +12294,7 @@ mod tests {
                 kind: "pi".into(),
                 pane_id: String::new(),
                 mail_identity: None,
+                nudge_streak: 0,
             },
             AgentState {
                 name: "b".into(),
@@ -12223,6 +12302,7 @@ mod tests {
                 kind: "opencode".into(),
                 pane_id: String::new(),
                 mail_identity: None,
+                nudge_streak: 0,
             },
         ];
         learn_kinds(&mut kinds, &states);
@@ -12242,6 +12322,7 @@ mod tests {
             kind: String::new(),
             pane_id: String::new(),
             mail_identity: None,
+            nudge_streak: 0,
         }];
         learn_kinds(&mut kinds, &states);
         assert_eq!(kinds.get("a").map(String::as_str), Some("opencode"));
@@ -13131,6 +13212,7 @@ mod tests {
                 kind: "opencode".into(),
                 pane_id: "w1:p1".into(),
                 mail_identity: None,
+                nudge_streak: 0,
             },
             AgentState {
                 name: "WorkingAgent".into(),
@@ -13138,6 +13220,7 @@ mod tests {
                 kind: "opencode".into(),
                 pane_id: "w1:p2".into(),
                 mail_identity: None,
+                nudge_streak: 0,
             },
         ];
         let stalled = detect_stalled_panes(&[old_bead.clone()], &states, now, threshold);
@@ -13167,6 +13250,7 @@ mod tests {
             kind: "opencode".into(),
             pane_id: "w1:p1".into(),
             mail_identity: None,
+            nudge_streak: 0,
         }];
         let stalled_working = detect_stalled_panes(&[old_bead], &working_states, now, threshold);
         assert!(
@@ -13287,6 +13371,7 @@ mod tests {
                 kind: "opencode".into(),
                 pane_id: "w1:p1".into(),
                 mail_identity: None,
+                nudge_streak: 0,
             },
             AgentState {
                 name: "StallAgent".into(),
@@ -13294,6 +13379,7 @@ mod tests {
                 kind: "opencode".into(),
                 pane_id: "w1:p2".into(),
                 mail_identity: None,
+                nudge_streak: 0,
             },
         ];
         // watching bead should emit watching severity
@@ -13372,6 +13458,7 @@ mod tests {
             kind: "opencode".into(),
             pane_id: "w1:p1".into(),
             mail_identity: None,
+            nudge_streak: 0,
         }];
         // Evidence with rate_limit signature + secret — should classify rate_limit and redact
         let raw_tail = "some log line\nrate limit hit: 429 overloaded\nnsec1abc123 secret token=xyz\nfinal line";
@@ -13493,6 +13580,7 @@ mod tests {
             kind: "opencode".into(),
             pane_id: "w1:p1".into(),
             mail_identity: None,
+            nudge_streak: 0,
         }];
         let mut read_count = 0usize;
         let _ = detect_stalled_panes_with_evidence(
@@ -13609,6 +13697,7 @@ mod resume_dedup_tests {
             kind: String::new(),
             pane_id: String::new(),
             mail_identity: None,
+            nudge_streak: 0,
         }
     }
 
@@ -14503,6 +14592,7 @@ mod reclaim_tests {
             kind: "opencode".into(),
             pane_id: "p1".into(),
             mail_identity: Some("GoldCove".into()),
+            nudge_streak: 0,
         }];
         let heal = HealState {
             respawn_count: 0,
@@ -14539,6 +14629,7 @@ mod reclaim_tests {
             kind: "opencode".into(),
             pane_id: "p1".into(),
             mail_identity: Some("GoldCove".into()),
+            nudge_streak: 0,
         }];
         let panes_gone: Vec<AgentState> = vec![];
         let heal0 = HealState::default();
@@ -14631,6 +14722,7 @@ mod reclaim_tests {
             kind: "opencode".into(),
             pane_id: "p1".into(),
             mail_identity: Some("GoldCove".into()),
+            nudge_streak: 0,
         }];
         let board: Vec<(String, String)> = vec![];
         assert!(plan_reclaim(now, &[bead], &panes, &board).is_empty());

@@ -9,9 +9,20 @@ files don't overlap. Keep objective authoritative, each lane verifiable.
 
 ## Playbook
 
-CLASSIFY once if unclear (`flywheel decide "<target>" --json
---ready-beads N`; sequence-verifiable-units); /swarm-mode pins
-wave-swarm, never re-run decide after compose.
+ARRIVE then BRIEF (ADR-0011). Do not pin wave-swarm before briefing
+sees joinable / ready-beads / N.
+
+0. ARRIVE: `flywheel arrive <project> --as <pin>` (helm + JOINING banner
+   if a live fleet exists, FCFS captain, doorbell `--live`). Then
+   `flywheel briefing "<objective>" --project <p> --json`. Print the
+   proposal, ask topology + N, `--commit` (or `--yes` for defaults).
+   A joinable world proposes `arrive`, not a second compose. `decide`
+   is the classifier leaf inside briefing — do not invent a second
+   selector.
+
+CLASSIFY once if unclear (`flywheel briefing "<target>" --project <p>
+--json`; sequence-verifiable-units). /swarm-mode does NOT pin
+wave-swarm until briefing says swarm.
 
 `decide` returning steer on a multi-lane target is NOT an escape: run
 wave-swarm. Cross-repo lanes: register the pin on both projects, one

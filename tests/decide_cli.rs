@@ -1,8 +1,8 @@
 //! flywheel decide CLI — clap parse + `--json` shape (bd-irrt).
 //!
 //! `flywheel decide <target> [--ready-beads N] [--profiled-panes N]
-//! [--launch-pending N] [--contention] [--json]` classifies a captain
-//! target into ONE primitive and prints `{primitive, reason, argv}`.
+//! [--launch-pending N] [--contention] [--project P] [--json]` classifies a captain
+//! target into ONE primitive and prints `{primitive, reason, argv, topology}`.
 //! Never dispatches. Exit 0. Absent snapshot facts stay zero/false.
 //!
 //! The classifier itself is unit-tested in `src/decide.rs` (bd-5inr);
@@ -64,6 +64,7 @@ fn decide_audit_json_shape() {
     );
     let v = stdout_json(&out);
     assert_eq!(v["primitive"], "captain-audit");
+    assert_eq!(v["topology"], "open");
     assert!(v["reason"].as_str().is_some_and(|r| !r.is_empty()));
     assert_eq!(
         v["argv"],
@@ -183,10 +184,15 @@ fn decide_plain_mode_prints_three_lines() {
     assert!(out.status.success());
     let s = String::from_utf8(out.stdout).expect("utf8 stdout");
     let lines: Vec<&str> = s.lines().collect();
-    assert_eq!(lines.len(), 3, "primitive / reason / argv lines: {s}");
+    assert_eq!(
+        lines.len(),
+        4,
+        "primitive / reason / argv / topology lines: {s}"
+    );
     assert_eq!(lines[0], "captain-audit");
     assert!(lines[1].contains("read-only"));
     assert!(lines[2].starts_with("flywheel workflow run captain-audit"));
+    assert_eq!(lines[3], "topology open");
 }
 
 #[test]
@@ -225,5 +231,5 @@ fn decide_json_never_dispatches() {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, vec!["argv", "primitive", "reason"]);
+    assert_eq!(keys, vec!["argv", "primitive", "reason", "topology"]);
 }

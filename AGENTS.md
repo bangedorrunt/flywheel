@@ -19,7 +19,7 @@ Live ignored tests need herdr + mail. `mbx +nightly-aarch64-apple-darwin test --
 
 ## Critical overrides
 
-- **Classify first:** `flywheel decide "<target>" --json`. Run `argv`. Do not invent a second selector.
+- **Classify first (ADR-0011):** `flywheel arrive <project> --as <pin>` then `flywheel briefing "<target>" --project <p> --json`. `--commit` runs argv. `decide --json` is the classifier leaf (emits `topology`). A live fleet joins loud; do not spawn a second swarm.
 - **Deps:** flywheel → toron-workflow → toron-core. Never reverse.
 - **Mail:** `toron_core::mailbox::surface::MailSurface`. Local `MailBackend` is deleted. Default mail = toron (absent `[mail.toron] url` → embed).
 - **Identity resolution is ONE ladder everywhere** (bd-reservation-identity-tlnf): explicit

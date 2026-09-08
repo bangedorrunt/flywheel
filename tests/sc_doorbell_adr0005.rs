@@ -612,9 +612,7 @@ async fn sc_d1_live_kind9_channel_post_rings() {
         // line; `--status` alone is evidence-only and never prompts.
         // bd-l72k: the live routine line triages silent — the assertions
         // above already proved the live wire shape (npub p-tag, @content).
-        let presence = format!(
-            r#"{{"kind":20001,"tags":[["p","{target}"]],"content":"idle"}}"#
-        );
+        let presence = format!(r#"{{"kind":20001,"tags":[["p","{target}"]],"content":"idle"}}"#);
         let stdin = format!("{presence}\n{line}");
         run_doorbell_once(
             &stdin,

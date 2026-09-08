@@ -18,13 +18,19 @@ them.
 
 ## The loop
 
+0. ARRIVE then BRIEF (ADR-0011): `flywheel arrive <project> --as <pin>`
+   then `flywheel briefing "<objective>" --project <p> --json`. If the
+   proposal topology is join, do not start a second loop. If it is loop,
+   continue. `decide` is the leaf inside briefing.
+
 Before each managed run, ask the operator to choose the profile and model
 routing. Present the profile default plus compatible registry alternatives
 with known cost/capabilities. Blank keeps the default; an explicit
 provider/model overrides it. Record the choice in the launch/report summary.
 
-1. SETUP: `flywheel loop-mode run <project> --work`. Slash /loop-mode pins
-   this. Do not re-run `flywheel decide`. One pane via `flywheel spawn <proj>
+1. SETUP: `flywheel loop-mode run <project> --work` after briefing
+   commits loop. Slash /loop-mode does not skip arrive+briefing.
+   One pane via `flywheel spawn <proj>
    --profile <role>` (or run in-place if already pane'd). The selected/current
    harness is the execution harness for the whole solo run. Write the objective
    as a brief with GOAL / SCOPE / CONTEXT / ACCEPTANCE / VERIFY / TIMEBOX /
