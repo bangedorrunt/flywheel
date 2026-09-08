@@ -263,7 +263,7 @@ pub fn pre_spawn_crew(
                 detail.join(", ")
             );
             for ws in &orphans {
-                if let Err(e) = c.workspace_close(&ws.workspace_id) {
+                if let Err(e) = c.workspace_close(&ws.workspace_id, true) {
                     eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
                 }
             }
