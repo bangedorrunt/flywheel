@@ -825,11 +825,15 @@ impl Mail {
             thread_id,
             Some("tasked"),
             None,
+            None,
         )
     }
 
     /// GS-039 P0-1: mail send with an explicit wake tag (default tasked) so
     /// deliveries are not wake:null theater. Pass None to omit the tag.
+    /// `bead` stamps the ADR-0010 D9 structural done-hold (`bead=<id>`) — the
+    /// dispatch guard matches the TAG, never the `[bd-###] done` subject, so a
+    /// subject without this tag never fires the hold (bd-7qg6).
     #[allow(clippy::too_many_arguments)]
     pub fn send_with_wake(
         &self,
@@ -842,6 +846,7 @@ impl Mail {
         thread_id: Option<&str>,
         wake: Option<&str>,
         corr: Option<&str>,
+        bead: Option<&str>,
     ) -> Result<Value> {
         // bd-pncn: `all` (the broadcast token) is expanded to the project's
         // registered roster BEFORE the backend call — the toron surfaces
@@ -859,6 +864,18 @@ impl Mail {
                  the remote wire surface cannot carry a corr tag"
             );
         }
+        // bd-7qg6: same refuse-don't-drop rule for the structural bead tag —
+        // a dropped bead tag is a `[bd-###] done` subject that never fires the
+        // dispatch-guard hold (the exact theater D9 was cut to kill). Remote
+        // callers use `toron mail send --resolve-bead` directly.
+        if bead.is_some_and(|b| !b.trim().is_empty())
+            && matches!(self.backend, BackendKind::Remote(_))
+        {
+            bail!(
+                "mail --resolve-bead requires the in-process toron mailbox (no [mail.toron] url) — \
+                 the remote wire surface cannot carry a bead tag; use `toron mail send --resolve-bead` directly"
+            );
+        }
         let extra_tags = match wake {
             Some(w) if !w.is_empty() => {
                 let w = w.trim().to_ascii_lowercase();
@@ -874,7 +891,7 @@ impl Mail {
             }
             _ => Vec::new(),
         };
-        let extra_tags = match corr {
+        let mut extra_tags = match corr {
             Some(c) if !c.trim().is_empty() => {
                 let mut v = extra_tags;
                 v.push(
@@ -885,6 +902,13 @@ impl Mail {
             }
             _ => extra_tags,
         };
+        // ADR-0010 D9 (bd-l0fz): structural done-hold tag. Empty = absent.
+        if let Some(b) = bead.filter(|s| !s.trim().is_empty()) {
+            extra_tags.push(
+                toron_core::nostr::Tag::parse(["bead", b.trim()])
+                    .map_err(|e| anyhow!("bead tag: {e}"))?,
+            );
+        }
         match &self.backend {
             BackendKind::InProcess => {
                 let result = block_on(mailbox().send_message(&SendMessage {

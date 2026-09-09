@@ -1066,10 +1066,31 @@ fn prompt_allowed(model: &WorkspaceModel, pin: &str) -> bool {
 }
 
 fn filter_prompts(model: &WorkspaceModel, cmds: Vec<Cmd>) -> Vec<Cmd> {
+    // bd-7qg6: the old filter silently dropped every non-Idle Prompt — including
+    // URGENT wakes to Busy pins, which never reached the post-pass urgent
+    // bypass (classify-then-retain) and vanished without a digest trace. New
+    // rule: Idle prompts; Busy+urgent BREAKS THROUGH (ADR-0005 gap 5, E5 —
+    // urgency exists for working panes); everything else becomes an Audit so
+    // the wake stays digest-visible instead of vanishing. Unknown never
+    // prompts (invariant 9) and Dead stays Lane-1 drain territory — both audit.
     cmds.into_iter()
-        .filter(|c| match c {
-            Cmd::Prompt { pin, .. } => prompt_allowed(model, pin),
-            _ => true,
+        .flat_map(|c| match c {
+            Cmd::Prompt { pin, line } => {
+                if prompt_allowed(model, &pin) {
+                    vec![Cmd::Prompt { pin, line }]
+                } else if is_urgent_line(&line)
+                    && matches!(model.presence.get(&pin), Some(Presence::Busy { .. }))
+                {
+                    vec![Cmd::Prompt { pin, line }]
+                } else {
+                    vec![Cmd::Audit {
+                        kind: "prompt_filtered".into(),
+                        pin,
+                        detail: format!("non-injectable presence held wake for digest: {line}"),
+                    }]
+                }
+            }
+            _ => vec![c],
         })
         .collect()
 }
@@ -3457,6 +3478,51 @@ mod presence_model_tests {
             },
         );
         assert_eq!(next.presence.get("P"), Some(&Presence::from_str("idle")));
+    }
+
+    #[test]
+    fn filter_prompts_busy_urgent_breaks_through_rest_audits() {
+        // bd-7qg6: Busy+urgent must break through (ADR-0005 gap 5, E5);
+        // everything non-injectable becomes a digest-visible Audit, never a
+        // silent drop; Unknown never prompts even when urgent.
+        let mut m = empty_model();
+        m.presence.insert("I".into(), Presence::from_str("idle"));
+        m.presence.insert("B".into(), Presence::from_str("working"));
+        let urgent = "[doorbell] plane-P urgent. Pull: toron mail inbox --since last";
+        let routine = "[doorbell] kind 9. Pull: toron channel read h=ch-1";
+        let cmds = vec![
+            Cmd::Prompt {
+                pin: "I".into(),
+                line: routine.into(),
+            },
+            Cmd::Prompt {
+                pin: "B".into(),
+                line: urgent.into(),
+            },
+            Cmd::Prompt {
+                pin: "B".into(),
+                line: routine.into(),
+            },
+            Cmd::Prompt {
+                pin: "Ghost".into(),
+                line: urgent.into(),
+            },
+        ];
+        let out = filter_prompts(&m, cmds);
+        assert_eq!(out.len(), 4, "nothing vanishes: {out:?}");
+        assert!(matches!(&out[0], Cmd::Prompt { pin, .. } if pin == "I"));
+        assert!(
+            matches!(&out[1], Cmd::Prompt { pin, .. } if pin == "B"),
+            "busy+urgent breaks through: {out:?}"
+        );
+        assert!(
+            matches!(&out[2], Cmd::Audit { kind, pin, .. } if kind == "prompt_filtered" && pin == "B"),
+            "busy+routine audits for the digest: {out:?}"
+        );
+        assert!(
+            matches!(&out[3], Cmd::Audit { kind, pin, .. } if kind == "prompt_filtered" && pin == "Ghost"),
+            "unknown never prompts, even urgent: {out:?}"
+        );
     }
 
     #[test]

@@ -5972,6 +5972,13 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     max_seq: 0,
                     stream_error: Some(format!("leaf error: {e}")),
                 }
+    // bd-7qg6: flood_seen lives OUTSIDE the poll loop — declared per-poll it
+    // reset every iteration, so a legit 7+ batch counted as "new" forever and
+    // never dispatched. Hoisted: paused ids are known next poll (one pause,
+    // then dispatch); ever-new runaway ids still trip every poll. Resets only
+    // on crash-resume (one extra pause, bounded — full ctx persistence is the
+    // bd-eign.2 follow-up).
+    let mut flood_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             }
         };
         if event_batch.stream_error.is_some() {
@@ -6252,13 +6259,11 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // bd-gnej wave-gate: ready beads held this poll (earlier wave open).
         // Hoisted so the completion gate below can require them empty.
         let mut wave_held: Vec<String> = Vec::new();
-        // bd-eign.2.1 (2026-08-17): beads the flood guard PAUSED this
-        // invocation. A legit pre-created batch (>3 beads opened at once by
-        // reclaims/creation) must pause ONE poll and then dispatch — without
-        // this, the same beads count as "new" every poll (they never enter
-        // `assigned` while paused) and dispatch locks forever. The guard
+        // bd-eign.2.1 (2026-08-17) + bd-7qg6: beads the flood guard PAUSED this
+        // invocation persist in `flood_seen` (hoisted above the poll loop) —
+        // without this, the same beads count as "new" every poll (they never
+        // enter `assigned` while paused) and dispatch locks forever. The guard
         // still fires for EVER-NEW bead ids (the runaway signature).
-        let mut flood_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         if params.work {
             // interrupted work first: an in-progress bead's agent went idle —
             // resume it before handing out fresh beads. bd-627z.1: live names

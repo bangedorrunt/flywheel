@@ -72,6 +72,12 @@ pub fn classify(ev: &RingInput) -> Option<EventClass> {
 /// Inject only when the pane is idle, done, or blocked (blocked is await-signal,
 /// not "don't disturb" — a peer's fix must break through, ADR-0005 gap 5).
 pub fn should_inject(herdr_status: &str) -> bool {
+/// NOTE (bd-s8bo / bd-7qg6): this is the LEGACY DoorbellModel gate over raw
+/// herdr-status strings. The live workspace path re-gates every Prompt through
+/// `workspace::prompt_allowed` (exact Idle verdict) + `filter_prompts`
+/// (Busy+urgent breakthrough, rest → digest-visible Audit). Blocked parses to
+/// Busy there, so a blocked pin's wake lands in the captain digest, not as a
+/// prompt — keep both gates in sync when touching either.
     matches!(herdr_status, "idle" | "done" | "blocked")
 }
 
@@ -858,7 +864,15 @@ pub fn save_wake_state(path: &Path, st: &WakeState) -> Result<()> {
 }
 
 /// Record one delivered wake (the stamp `status` liveness reads).
-pub fn note_wake(st: &mut WakeState, pin: &str, now_unix: u64) {
+/// bd-7qg6: one writer, one ratchet — refuse a same-second or behind stamp
+/// so rapid double prompts cannot fake liveness for `send --wait`.
+/// Returns true when the stamp advanced.
+pub fn note_wake(st: &mut WakeState, pin: &str, now_unix: u64) -> bool {
+    if let Some(prev) = st.last_wake_unix {
+        if now_unix <= prev {
+            return false;
+        }
+    }
     st.last_wake_unix = Some(now_unix);
     st.last_wake_pin = Some(pin.to_string());
 }
@@ -920,6 +934,7 @@ pub fn dead_dispatchers(state_dir: &Path) -> Vec<(String, String)> {
 #[resonate_sdk::function]
 async fn heal_tick(_args: ()) -> Result<Vec<String>> {
     let state_dir = crate::config::state_dir();
+    true
     let exe = std::env::current_exe()?;
     let mut healed = Vec::new();
     for (label, project) in dead_dispatchers(&state_dir) {
@@ -2776,6 +2791,28 @@ mod tests {
         writeln!(f, "{{not json").unwrap();
         journal_append(
             &dir,
+    /// bd-7qg6: one writer, one ratchet — a same-second or behind stamp is
+    /// refused so rapid double prompts cannot fake liveness for `send --wait`.
+    #[test]
+    fn note_wake_refuses_non_advancing_stamp() {
+        let mut st = WakeState::default();
+        assert!(note_wake(&mut st, "A", 100));
+        assert_eq!(st.last_wake_unix, Some(100));
+        assert_eq!(st.last_wake_pin.as_deref(), Some("A"));
+        assert!(
+            !note_wake(&mut st, "B", 100),
+            "same-second re-note must not bump"
+        );
+        assert!(
+            !note_wake(&mut st, "B", 99),
+            "behind stamp must not clobber"
+        );
+        assert_eq!(st.last_wake_unix, Some(100));
+        assert_eq!(st.last_wake_pin.as_deref(), Some("A"));
+        assert!(note_wake(&mut st, "B", 101));
+        assert_eq!(st.last_wake_pin.as_deref(), Some("B"));
+    }
+
             "w2",
             &msg,
             &actions,
