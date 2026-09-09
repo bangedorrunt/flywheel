@@ -2187,6 +2187,12 @@ enum MailCmd {
         #[arg(long = "wake", default_value = "tasked")]
         wake: String,
     },
+        /// ADR-0010 D9 (bd-l0fz, bd-7qg6): stamp the structural done-hold
+        /// (`bead=<id>` extra tag). The loop's dispatch guard matches the TAG,
+        /// never the `[bd-###] done` subject — a done subject without this tag
+        /// never fires the hold. In-process mailbox only (refuses loud remote).
+        #[arg(long = "resolve-bead")]
+        resolve_bead: Option<String>,
     /// reserve / inspect file locks (advisory; subcommands: reserve, list, show)
     Locks {
         #[command(subcommand)]
@@ -7489,6 +7495,63 @@ mod spawn_boot_reliability_tests {
     }
 
     #[test]
+    /// bd-7qg6: `mail send` gains `--resolve-bead` parity with toron
+    /// (ADR-0010 D9 structural done-hold). Help lists the flag; the flag
+    /// fills the send field; absent stays None (default path byte-identical).
+    #[test]
+    fn bd_7qg6_mail_send_resolve_bead_flag() {
+        use clap::CommandFactory;
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let cmd = Cli::command();
+                let mail = cmd.find_subcommand("mail").expect("mail subcommand");
+                let send = mail.find_subcommand("send").expect("mail send subcommand");
+                let mut help = Vec::new();
+                send.clone().write_long_help(&mut help).expect("help");
+                let help_s = String::from_utf8(help).expect("utf8");
+                assert!(
+                    help_s.contains("--resolve-bead"),
+                    "mail send help must list --resolve-bead"
+                );
+
+                let bead_of = |args: &[&str]| -> Option<String> {
+                    let cli = Cli::try_parse_from(args)
+                        .unwrap_or_else(|e| panic!("parse {args:?} failed: {e}"));
+                    match cli.command {
+                        Some(Commands::Mail {
+                            cmd: MailCmd::Send { resolve_bead, .. },
+                        }) => resolve_bead,
+                        _ => panic!("expected mail send"),
+                    }
+                };
+                let base = [
+                    "flywheel",
+                    "mail",
+                    "send",
+                    "flywheel",
+                    "--to",
+                    "TanOtter",
+                    "--subject",
+                    "s",
+                    "--body",
+                    "b",
+                ];
+                assert_eq!(
+                    bead_of(&[base.as_slice(), &["--resolve-bead", "bd-123"]].concat()),
+                    Some("bd-123".to_string()),
+                    "--resolve-bead must fill the send field"
+                );
+                assert_eq!(
+                    bead_of(&base),
+                    None,
+                    "absent --resolve-bead stays None (default path byte-identical)"
+                );
+            })
+            .expect("spawn clap probe");
+        handle.join().expect("clap probe thread");
+    }
+
     fn gs040_collab_watch_waits_empty_thread() {
         // GS-040: mail watch must NOT process::exit(1) on an empty thread
         // mid-wait (collab asker outbound is invisible in inbox). Source
@@ -9023,7 +9086,7 @@ fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
             })
             .unwrap_or_else(|| "last_wake=never".into());
         println!(
-            "{project}/{ws}: dispatcher {} {last}{}",
+            "{project}/{ws}: dispatcher {} {last}{}{}",
             if alive { "up" } else { "DOWN" },
             {
                 let pins = doorbell::read_unanswered(&doorbell::unanswered_file(&state_dir, &ws));
@@ -9098,22 +9161,28 @@ fn cmd_doorbell_why(
     let _ = project;
     // fold tick from Default — replay is the trust surface, not grep
     // WorkspaceModel is the single owner; journal entries may be DoorbellMsg (old) or workspace::Msg (new)
+            },
+            // bd-7qg6: plane-S cursor age makes a hung-but-alive watch child
+            // inspectable — dispatcher `up` with an ancient cursor and fresh
+            // bus traffic is the live-pid-deaf signature (heal_tick only
+            // restarts dead pids). Age alone never triggers a restart here.
+            match wake.plane_s_cursor_us {
+                Some(us) => {
+                    let age = doorbell_now_unix().saturating_sub((us / 1_000_000) as u64);
+                    format!(" watch_idle={age}s")
+                }
+                None => " watch_idle=never".to_string(),
     let entries = doorbell::journal_read_all(&config::state_dir());
-    // Build fold model from Default and verify each journal entry's Cmd sequence matches replay
-    let mut model = workspace::WorkspaceModel::default();
-    // bd-adr0027-proven-leftovers-55nx.1: crash-resume seed — the same
-    // durable caches the live dispatcher reloads at start (receipts sqlite
-    // → assignment; presence.jsonl snapshot → presence). Journal Msgs fold
-    // on top. Never the live dispatcher's RAM, never a second store.
-    rebuild_assignment_from_receipts(&mut model);
-    if let Ok(body) =
+    // bd-7qg6: fold per workspace — one shared Model replayed foreign
+    // presence/assignment into a single proof (tenant contamination).
+    // Each workspace folds its own entries from an identically-seeded Default.
+    let presence_rows =
         std::fs::read_to_string(crate::mail_shim::mailbox_roots().0.join("presence.jsonl"))
-    {
-        seed_why_presence(
-            &mut model,
-            timeout_presence_rows(&body, doorbell_now_unix()),
-        );
-    }
+            .ok()
+            .map(|body| timeout_presence_rows(&body, doorbell_now_unix()))
+            .unwrap_or_default();
+    let mut models: std::collections::BTreeMap<String, workspace::WorkspaceModel> =
+        std::collections::BTreeMap::new();
     let mut replay_seq: u64 = 0;
     let mut shown = 0usize;
     let mut matched = 0usize;
@@ -9193,14 +9262,14 @@ fn cmd_doorbell_why(
                         model.doorbell.index.insert_pin(pin.to_string(), None);
                     }
                 }
-                workspace::tick(&model, &msg)
+                workspace::tick(model, &msg)
             };
             if actual != expected {
                 eprintln!(
                     "replay mismatch at seq {replay_seq} workspace {workspace}: expected {expected:?} got {actual:?}"
                 );
             }
-            model = next;
+            models.insert(workspace.clone(), next);
             replay_seq += 1;
             // 55nx.9: the journal line carries the budget-gate outcome
             // (effect); dropped-pin Prompts replayed below are the EFFECTIVE
@@ -9209,7 +9278,10 @@ fn cmd_doorbell_why(
             let seq_match = seq.map(|s| s == replay_seq - 1).unwrap_or(true);
             let corr_match = match corr {
                 Some(c) => {
-                    model.assignment.contains_key(c)
+                    models
+                        .get(workspace)
+                        .map(|m| m.assignment.contains_key(c))
+                        .unwrap_or(false)
                         || actual.iter().any(|cmd| match cmd {
                             workspace::Cmd::WaitCorr { corr } => corr == c,
                             workspace::Cmd::SqliteUpsert { corr, .. } => corr == c,
@@ -9257,6 +9329,17 @@ fn cmd_doorbell_why(
                                 && dropped.iter().any(|d| d == p)
                             {
                                 return None;
+                // bd-7qg6: per-workspace fold (see setup above).
+                let model = models.entry(workspace.clone()).or_insert_with(|| {
+                    // bd-adr0027-proven-leftovers-55nx.1: crash-resume seed — the same
+                    // durable caches the live dispatcher reloads at start (receipts sqlite
+                    // → assignment; presence.jsonl snapshot → presence). Journal Msgs fold
+                    // on top. Never the live dispatcher's RAM, never a second store.
+                    let mut m = workspace::WorkspaceModel::default();
+                    rebuild_assignment_from_receipts(&mut m);
+                    seed_why_presence(&mut m, presence_rows.clone());
+                    m
+                });
                             }
                             Some(if v.get("Prompt").is_some() {
                                 "prompt"
@@ -9343,9 +9426,9 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str) -> Result<()> {
         println!("doorbell afk: no journal entries — nothing queued");
         return Ok(());
     }
-    let mut model = workspace::WorkspaceModel::default();
-    rebuild_assignment_from_receipts(&mut model);
-    for (_, entry) in &entries {
+    let mut models: std::collections::BTreeMap<String, workspace::WorkspaceModel> =
+        std::collections::BTreeMap::new();
+    for (ws, entry) in &entries {
         let msg_val = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
         if let Some(msg) = snapshot::replay_msg(&msg_val) {
             if let Some(pins) = entry.get("pins").and_then(|p| p.as_array()) {
@@ -9353,42 +9436,42 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str) -> Result<()> {
                     model.doorbell.index.insert_pin(pin.to_string(), None);
                 }
             }
-            let (next, _) = workspace::tick(&model, &msg);
-            model = next;
+            let (next, _) = workspace::tick(model, &msg);
+            *model = next;
+        }
+    }
+    // bd-7qg6: merge the per-workspace folds for display (same tenant
+    // isolation as `why`; one shared fold mixed foreign presence into the
+    // digest proof). Entries sort oldest-first; counters sum.
+    let mut queue: Vec<workspace::DigestEntry> = Vec::new();
+    let mut last_digest_unix: u64 = u64::MAX;
+    let mut counters: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for m in models.values() {
+        queue.extend(m.digest_queue.iter().cloned());
+        for k in ["benign", "routine", "captain", "urgent"] {
+            *counters.entry(k).or_insert(0) += m.wake_counters.get(k).copied().unwrap_or(0);
         }
     }
     let now = doorbell_now_unix();
-    if model.digest_queue.is_empty() {
+    if queue.is_empty() {
         println!("doorbell afk: queue empty — nothing needs the captain");
     } else {
-        print!(
-            "{}",
-            workspace::render_digest_with_holds(
-                &model.digest_queue,
-                &workspace::sorted_holds(&model),
-                now
-            )
-        );
+        print!("{}", workspace::render_digest_with_holds(&queue, &[], now));
     }
     let counters: Vec<String> = ["benign", "routine", "captain", "urgent"]
         .iter()
-        .map(|k| format!("{k}={}", model.wake_counters.get(*k).copied().unwrap_or(0)))
+        .map(|k| format!("{k}={}", counters.get(*k).copied().unwrap_or(0)))
         .collect();
     println!("wake counters: {}", counters.join(" "));
-    if workspace::digest_overdue(model.digest_queue.len(), model.last_digest_unix, now) {
+    if workspace::digest_overdue(queue.len(), last_digest_unix, now) {
         println!(
             "WEDGE ALARM: digest queue cannot drain (stale batch, dispatcher may be down) — inspect `flywheel doorbell status`"
         );
     }
-    let overdue = workspace::overdue_holds(&model, now);
-    if !overdue.is_empty() {
-        let names: Vec<String> = overdue.iter().map(|(c, _)| c.clone()).collect();
-        println!(
-            "HOLD ESCALATION: {} hold(s) past needed-by ({}) — scheduled batch, not a pager interrupt",
-            overdue.len(),
-            names.join(", ")
-        );
-    }
+    // bd-7qg6: HOLD ESCALATION section removed — afk folds never seed
+    // pending_wait (insertion is effect-side only), so overdue_holds was
+    // always empty here. Live hold escalation rides the Sweep-arm TTL +
+    // Audit wait-timeout records, not this display.
     Ok(())
 }
 
@@ -9417,6 +9500,11 @@ fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> {
     ensure_doorbell_supervisor();
     let registry = state::load_spawn_registry(project);
     let peer_tpl = include_str!("../integrations/peer-aware.md.tpl");
+            let model = models.entry(ws.clone()).or_insert_with(|| {
+                let mut m = workspace::WorkspaceModel::default();
+                rebuild_assignment_from_receipts(&mut m);
+                m
+            });
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let mut injected = 0;
     for e in &registry {
@@ -9425,6 +9513,11 @@ fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> {
         }
         let Some(identity) = e.mail_identity.as_deref() else {
             continue;
+        last_digest_unix = last_digest_unix.min(m.last_digest_unix);
+    }
+    queue.sort_by(|a, b| (a.at_unix, a.seq).cmp(&(b.at_unix, b.seq)));
+    if last_digest_unix == u64::MAX {
+        last_digest_unix = 0;
         };
         let mut lines = vec![doorbell::identity_prime(&e.name, identity)];
         lines.push(peer_prompt_template(
@@ -9913,7 +10006,37 @@ fn cmd_internal_doorbell(
                 .iter()
                 .any(|a| matches!(a, workspace::Cmd::CheckAckSla));
             if scan && let Some(mb) = crate::mail_shim::try_mailbox() {
-                let _ = crate::mail_shim::block_on(mb.check_ack_sla_expired(project, None));
+                // bd-7qg6: the scan returns the emitted overdue post ids —
+                // discarding them hid SLA fires. Audit the count loudly; the
+                // emitted kind-9 wakes re-enter through the watch path.
+                match crate::mail_shim::block_on(mb.check_ack_sla_expired(project, None)) {
+                    Ok(emitted) if emitted.is_empty() => {}
+                    Ok(emitted) => {
+                        doorbell::audit_append(
+                            &config::state_dir(),
+                            workspace,
+                            serde_json::json!({
+                                "ts": chrono::Utc::now().to_rfc3339(),
+                                "workspace": workspace,
+                                "kind": "ack_sla_fired",
+                                "count": emitted.len(),
+                                "posts": emitted.iter().take(10).collect::<Vec<_>>(),
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        doorbell::audit_append(
+                            &config::state_dir(),
+                            workspace,
+                            serde_json::json!({
+                                "ts": chrono::Utc::now().to_rfc3339(),
+                                "workspace": workspace,
+                                "kind": "inbox_error",
+                                "error": format!("ack-sla scan failed: {e:#}"),
+                            }),
+                        );
+                    }
+                }
             }
             // Journal via workspace model — keep file as doorbell journal for replay compatibility
             // (legacy DoorbellMsg/Action entries still replay via workspace slice; new entries are workspace Msg/Cmd)
@@ -10139,6 +10262,11 @@ fn cmd_internal_doorbell(
                 let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
                 workspace_model = next_model;
                 handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, false);
+                // bd-7qg6: expire here too — the Timeout-branch expire starves
+                // under continuous watch traffic, delaying deaf detection
+                // indefinitely. Expiry is idempotent; persist keeps it crash-safe.
+                let _ = hear.expire(doorbell_now_unix(), doorbell::UNANSWERED_SECS);
+                doorbell_persist_hear(workspace, &hear);
                 let mut backoff = 1u64;
                 let mut restarted = false;
                 for _ in 0..5 {
@@ -11285,7 +11413,6 @@ fn doorbell_sweep_inbox(
     generation: Option<&doorbell::WatcherGen>,
 ) {
     let registry = state::load_spawn_registry(project);
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let mut injects = Vec::new();
     // 55nx.9: per-pin journal payloads, written AFTER the batch budget gate
     // below so each line carries its gate outcome (effect). High-water
@@ -11341,7 +11468,21 @@ fn doorbell_sweep_inbox(
                 since_by_pin.insert(pin.to_string(), hw);
             } else if arr.is_empty() {
             } else {
-                since_by_pin.insert(pin.to_string(), now.clone());
+                // bd-7qg6: never advance the high-water on unparseable rows —
+                // the old `now` advance silently skipped mail (at-most-once).
+                // Hold the cursor so the batch re-sweeps; the audit is the proof.
+                doorbell::audit_append(
+                    &config::state_dir(),
+                    workspace,
+                    serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                        "workspace": workspace,
+                        "kind": "inbox_gap_skip",
+                        "pin": pin,
+                        "rows": arr.len(),
+                        "error": "non-empty inbox batch with no parseable timestamp — cursor held, will re-sweep",
+                    }),
+                );
             }
             Some(())
         })();
@@ -11411,7 +11552,20 @@ fn doorbell_sweep_inbox(
             since_by_pin.insert(pin.to_string(), hw);
         } else if raw.trim().is_empty() || raw.trim() == "[]" || raw.trim() == "{}" {
         } else {
-            since_by_pin.insert(pin.to_string(), now.clone());
+            // bd-7qg6: same no-advance rule on the CLI fallback path — hold
+            // the cursor and audit loudly instead of skipping to `now`.
+            doorbell::audit_append(
+                &config::state_dir(),
+                workspace,
+                serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "workspace": workspace,
+                    "kind": "inbox_gap_skip",
+                    "pin": pin,
+                    "raw_len": raw.len(),
+                    "error": "non-empty CLI inbox batch with no parseable timestamp — cursor held, will re-sweep",
+                }),
+            );
         }
     }
     let took = injects.len();
@@ -17952,6 +18106,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                     );
                 }
                 Some(r) if r.state == toron_core::mailbox::ReceiptState::Degraded => {
+            resolve_bead,
                     anyhow::bail!("{}", toron_core::mailbox::receipts::DEGRADED_NOTE);
                 }
                 Some(r) => {
@@ -18017,6 +18172,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             MailLockCmd::Show {
                 project,
                 project_flag,
+                resolve_bead.as_deref(),
                 path,
             } => {
                 let project = mail_project(project, project_flag, "locks-show")?;
@@ -18076,6 +18232,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 project_flag,
                 to,
                 to_project,
+                        None,
                 reason,
             } => {
                 let project = mail_project(project, project_flag, "contact-request")?;
