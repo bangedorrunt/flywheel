@@ -524,4 +524,34 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    #[tokio::test]
+    async fn e10_hold_expiry_wakes_with_zero_swarm() {
+        // E10/S1 live at sensor level: real sqlite ledger with an already-
+        // expired hold, real 30s loop, no swarm. One Fact within ~one pass.
+        let base = std::env::temp_dir().join(format!("dbll-e10-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let own = base.join("own");
+        mk_beads_db(
+            &own,
+            "INSERT INTO captain_holds VALUES('bd-9x','c1','2026-09-10T03:00:00Z',1);",
+            "INSERT INTO issues VALUES('bd-9x','blocked','t0');",
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let _sensor = spawn_beads_poller(tx, own.clone());
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(POLL_SECS + 10),
+            rx.recv(),
+        )
+        .await
+        .expect("E10: no expiry wake within one pass");
+        match got.expect("sensor died") {
+            crate::BrainMsg::Fact { summary } => {
+                assert!(summary.contains("bd-9x"), "wake names hold: {summary}");
+                assert!(summary.contains("c1"), "wake carries corr: {summary}");
+            }
+            other => panic!("expected Fact wake, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
