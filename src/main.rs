@@ -9245,7 +9245,41 @@ fn cmd_doorbell_why(
     // fold tick from Default — replay is the trust surface, not grep
     // WorkspaceModel is the single owner; journal entries may be DoorbellMsg (old) or workspace::Msg (new)
     let entries = doorbell::journal_read_all(&config::state_dir());
-    // bd-7qg6: fold per workspace — one shared Model replayed foreign
+    // bd-asr2.4 D4.4/D4.3: fold honesty before replay — torn tails stop
+    // loudly per workspace, and a --seq older than retention names the
+    // first foldable seq instead of folding a partial proof.
+    {
+        // Owned workspace set (entries plus zero-row survivors of a fully
+        // torn fold, discovered from active journal files).
+        let mut workspaces: std::collections::BTreeSet<String> =
+            entries.iter().map(|(ws, _)| ws.clone()).collect();
+        if let Ok(dir) = std::fs::read_dir(config::state_dir().join("journals")) {
+            for entry in dir.filter_map(|e| e.ok()) {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(rest) = name
+                    .strip_prefix("doorbell-journal-")
+                    .and_then(|n| n.strip_suffix(".jsonl"))
+                    && !rest.is_empty()
+                    && !rest.contains('.')
+                {
+                    workspaces.insert(rest.to_string());
+                }
+            }
+        }
+        for ws in &workspaces {
+            let (torn, first_seq) = doorbell::journal_fold_status(&config::state_dir(), ws);
+            if let Some(t) = torn {
+                eprintln!("doorbell why: {t} (workspace {ws})");
+            }
+            if let (Some(q), Some(first)) = (seq, first_seq)
+                && q < first
+            {
+                eprintln!(
+                    "doorbell why: seq {q} predates retention, first foldable seq is {first} (workspace {ws})"
+                );
+            }
+        }
+    }
     // presence/assignment into a single proof (tenant contamination).
     // Each workspace folds its own entries from an identically-seeded Default.
     let presence_rows =

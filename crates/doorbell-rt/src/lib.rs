@@ -28,7 +28,7 @@ pub use msg::{AskKind, AskReply, BrainMsg};
 pub use policy::{RestartPolicy, WatchRetry};
 pub use sensors::{SensorHandle, bridge, interval_ticker, supervise};
 pub use sinks::{MockSink, PromptSink, SendOutcome, SinkManager, Undelivered};
-pub use store::FileStore;
+pub use store::{FileStore, Fold, TornTail};
 
 /// Single-writer brain inbox capacity (D3: slow brain parks sensors).
 pub const BRAIN_CAP: usize = 1024;
