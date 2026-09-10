@@ -1192,6 +1192,20 @@ fn apply_assignment(
         corr: corr.clone(),
         receipt,
     });
+    // bd-bdpx: the park deadline is stamped HERE from the tick clock
+    // (last_now), never wall-clock in the effect handler — replay reproduces
+    // it byte-identically from the Msg log. last_now==0 means no clock Msg
+    // has folded yet (pre-first-beat boot sliver or a bare Default in
+    // tests): the Cmd still emits, but no deadline is registered — the live
+    // dispatcher seeds last_now at construction so the sliver never happens
+    // there. Sweep-arm expiry + cap-eviction stay the deciders, each with an
+    // Audit wait-timeout record. Never silent drop.
+    if next.last_now > 0 {
+        next.pending_wait.insert(
+            corr.clone(),
+            next.last_now.saturating_add(PENDING_WAIT_TTL_SECS),
+        );
+    }
     cmds.push(Cmd::WaitCorr { corr });
 }
 
@@ -2505,6 +2519,60 @@ mod tests {
             let (next, _) = tick(&m, &msg);
             assert_eq!(next.seq, 1, "seq must increment for {:?}", msg);
         }
+    }
+
+    #[test]
+    fn pending_wait_deadline_stamped_from_tick_clock_not_wall_clock() {
+        // bd-bdpx: the park deadline stamps from last_now inside tick, so
+        // replay reproduces it from the Msg log (the effect handler no longer
+        // reads wall-clock). With no clock folded yet the Cmd still emits
+        // but nothing registers — the live dispatcher seeds last_now at
+        // construction so the sliver never happens there.
+        let row = || {
+            serde_json::json!({
+                "corr": "C-W",
+                "wake": "tasked",
+                "audience": "agents",
+                "priority": "queue",
+                "body": "do x",
+            })
+        };
+        let mut m = empty_model();
+        m.last_now = 1_000_000;
+        let (next, cmds) = tick(
+            &m,
+            &Msg::InboxRows {
+                rows: vec![row()],
+                pin: "p".into(),
+            },
+        );
+        assert_eq!(
+            next.pending_wait.get("C-W"),
+            Some(&(1_000_000 + PENDING_WAIT_TTL_SECS)),
+            "deadline = tick clock + TTL"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::WaitCorr { corr } if corr == "C-W")),
+            "WaitCorr Cmd still emits: {cmds:?}"
+        );
+        let (bare, bare_cmds) = tick(
+            &empty_model(),
+            &Msg::InboxRows {
+                rows: vec![row()],
+                pin: "p".into(),
+            },
+        );
+        assert!(
+            !bare.pending_wait.contains_key("C-W"),
+            "pre-clock model registers nothing"
+        );
+        assert!(
+            bare_cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::WaitCorr { corr } if corr == "C-W")),
+            "pre-clock Cmd still emits: {bare_cmds:?}"
+        );
     }
 
     #[test]
