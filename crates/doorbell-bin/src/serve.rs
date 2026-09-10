@@ -197,17 +197,45 @@ async fn handle_http(
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .unwrap_or("/");
-    let (code, body) = match path {
-        "/health" => ("200 OK", health_body(started, &state_dir)),
+    let (code, content_type, body) = match path.split('?').next().unwrap_or("/") {
+        "/health" => (
+            "200 OK",
+            "application/json",
+            health_body(started, &state_dir),
+        ),
+        "/stats" => (
+            "200 OK",
+            "application/json",
+            stats_body(started, &state_dir),
+        ),
+        "/events" => {
+            let since = path
+                .split("since=")
+                .nth(1)
+                .and_then(|s| s.split('&').next()?.parse::<u64>().ok())
+                .or_else(|| {
+                    req.lines().find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        (k.trim().to_ascii_lowercase() == "last-event-id")
+                            .then(|| v.trim().parse::<u64>().ok())?
+                    })
+                });
+            (
+                "200 OK",
+                "text/event-stream",
+                events_body(&state_dir, since),
+            )
+        }
         _ => (
             "404 Not Found",
+            "application/json",
             serde_json::json!({"error": "not found"}).to_string(),
         ),
     };
     let _ = stream
         .write_all(
             format!(
-                "HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {code}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             )
             .as_bytes(),
@@ -260,4 +288,104 @@ fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".into())
+}
+
+/// Retained journal rows as an SSE replay (D8, bd-asr2.12). Strictly
+/// read-only fan-out; live wake/digest/audit push binds when the daemon
+/// hosts the loop (bd-ene2) — until then this replays retained history
+/// plus a closing comment (no infinite hold on an unchanging file).
+fn events_body(state_dir: &std::path::Path, since: Option<u64>) -> String {
+    use doorbell_rt::api::{Replay, SseEvent, replay_range};
+    let store = doorbell_rt::FileStore::new(state_dir);
+    let mut out = String::new();
+    let mut workspaces: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(state_dir.join("journals")) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(rest) = name
+                .strip_prefix("doorbell-journal-")
+                .and_then(|n| n.strip_suffix(".jsonl"))
+                && !rest.is_empty()
+                && !rest.contains('.')
+            {
+                workspaces.push(rest.to_string());
+            }
+        }
+    }
+    workspaces.sort();
+    for ws in workspaces {
+        let fold = store.fold_workspace(&ws);
+        match replay_range(&fold.rows, fold.first_seq, since) {
+            Replay::Events(events) => {
+                for ev in events {
+                    out.push_str(&ev.format());
+                }
+            }
+            Replay::Gone { .. } => {}
+        }
+        // Retention honesty per workspace (same rule as `why`).
+        if let (Some(q), Some(first)) = (since, fold.first_seq)
+            && q < first.saturating_sub(1)
+        {
+            out.push_str(
+                &SseEvent {
+                    id: 0,
+                    kind: "retention".into(),
+                    data: format!("first replayable seq is {first}"),
+                }
+                .format(),
+            );
+        }
+        if let Some(t) = fold.torn {
+            out.push_str(
+                &SseEvent {
+                    id: 0,
+                    kind: "torn".into(),
+                    data: format!("fold stopped: {}", t.reason),
+                }
+                .format(),
+            );
+        }
+    }
+    out.push_str(": ready\n\n");
+    out
+}
+
+/// Host-level counters (D8 stats shape; runtime counters bind when the
+/// daemon hosts the loop in bd-ene2 — until then journal-derived truth).
+fn stats_body(started: std::time::Instant, state_dir: &std::path::Path) -> String {
+    let store = doorbell_rt::FileStore::new(state_dir);
+    let mut journal_rows = 0u64;
+    let mut workspaces = 0u64;
+    if let Ok(entries) = std::fs::read_dir(state_dir.join("journals")) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(rest) = name
+                .strip_prefix("doorbell-journal-")
+                .and_then(|n| n.strip_suffix(".jsonl"))
+                && !rest.is_empty()
+                && !rest.contains('.')
+            {
+                workspaces += 1;
+                journal_rows += store.journal_row_count(&rest.to_string());
+            }
+        }
+    }
+    serde_json::json!({
+        "protocol": doorbell_rt::api::PING.protocol,
+        "core_v": doorbell_rt::api::PING.core_v,
+        "journal_v": doorbell_rt::api::PING.journal_v,
+        "uptime_s": started.elapsed().as_secs(),
+        "workspaces": workspaces,
+        "journal_rows": journal_rows,
+        "torn_tail": store.any_torn_tail(),
+        "rings_by_class": {},
+        "injects": 0,
+        "drops": 0,
+        "sheds": 0,
+        "deaf": 0,
+        "digest_batches": 0,
+        "note": "runtime counters bind when the daemon hosts the loop (bd-ene2)",
+    })
+    .to_string()
 }

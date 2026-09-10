@@ -87,9 +87,46 @@ else
   pass "non-doorbell squatter hard fail"
 fi
 kill "$SQ" 2>/dev/null
+"$BIN" start --state-dir "$STATE" --port "$PORT" >/dev/null 2>&1 \
+  || { fail "restart for events tests"; echo "RESULT: FAIL"; exit 1; }
+# Seed retained journal rows for replay.
+mkdir -p "$STATE/journals"
+printf '{"v":2,"seq":10,"executed":{"stage":"decided"}}\n{"v":2,"seq":11,"executed":{"stage":"sweep"}}\n{"v":2,"seq":12,"executed":{"stage":"digest"}}\n' \
+  > "$STATE/journals/doorbell-journal-ws.jsonl"
+# Full replay streams every retained row with ids.
+EVENTS="$(curl -sf "http://127.0.0.1:$PORT/events" 2>/dev/null)" \
+  || { fail "/events unreachable"; echo "RESULT: FAIL"; exit 1; }
+echo "$EVENTS" | grep -Fq "id: 10" || fail "events replay missing id 10"
+echo "$EVENTS" | grep -Fq "id: 12" || fail "events replay missing id 12"
+pass "events full replay streams retained rows"
+# Last-Event-ID resumes gap-free from 12 (only newer rows stream).
+TAIL="$(curl -sf -H "Last-Event-ID: 11" "http://127.0.0.1:$PORT/events" 2>/dev/null)"
+echo "$TAIL" | grep -Fq "id: 12" || fail "reconnect must resume at 12"
+echo "$TAIL" | grep -Fq "id: 10" && fail "reconnect must not replay 10" || pass "reconnect gap-free resume"
+# Cursor predating retention names the first replayable seq.
+OLD="$(curl -sf "http://127.0.0.1:$PORT/events?since=1" 2>/dev/null)"
+echo "$OLD" | grep -Fq "first replayable seq is 10" || fail "retention notice missing"
+pass "retention notice names first replayable seq"
+# Stats shape carries the D8 counter keys.
+STATS="$(curl -sf "http://127.0.0.1:$PORT/stats" 2>/dev/null)" \
+  || { fail "/stats unreachable"; echo "RESULT: FAIL"; exit 1; }
+for key in protocol core_v journal_v uptime_s journal_rows rings_by_class injects drops sheds deaf digest_batches; do
+  echo "$STATS" | grep -Fq "\"$key\"" || { fail "/stats missing key: $key"; }
+done
+pass "/stats carries D8 counters"
+# Ping handshake: matching versions pass, skew names both.
+"$BIN" ping --state-dir "$STATE" --port "$PORT" >/dev/null 2>&1 \
+  || fail "ping handshake failed against own daemon"
+pass "ping handshake passes"
+if "$BIN" ping --state-dir "$STATE" --port "$PORT" --expect-core "doorbell-core.v0" >/dev/null 2>&1; then
+  fail "stale CLI handshake must refuse"
+else
+  pass "E16 skew refusal names versions"
+fi
+"$BIN" ping --state-dir "$STATE" --port "$PORT" --expect-core "doorbell-core.v0" 2>&1 \
+  | grep -Fq "doorbell-core.v1" || fail "skew error must name the daemon version"
 "$BIN" stop --state-dir "$STATE" --port "$PORT" >/dev/null 2>&1 \
-  || fail "final stop exited non-zero"
-sleep 1
+  || fail "events-phase stop failed"
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 \
   && fail "port still answers after final stop" \
   || pass "final stop leaves port dead"

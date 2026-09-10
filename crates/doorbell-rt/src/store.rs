@@ -235,6 +235,14 @@ impl FileStore {
         (lines, bytes, oldest)
     }
 
+    /// Retained journal rows (stats denominator for journal lag).
+    pub fn journal_row_count(&self, workspace: &str) -> u64 {
+        self.journal_chain(workspace)
+            .iter()
+            .map(|p| count_lines(p))
+            .sum::<usize>() as u64
+    }
+
     /// Highest seq across active + generations (0 when none). The Brain
     /// resumes its counter from here so seq stays monotonic per workspace.
     pub fn last_seq(&self, workspace: &str) -> u64 {

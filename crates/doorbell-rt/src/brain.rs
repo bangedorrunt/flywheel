@@ -677,6 +677,7 @@ impl<H: Host> Brain<H> {
             s.sweep_lag_s = self.host.now_unix().saturating_sub(last);
         }
         s.deaf = self.hear.unanswered_pins().len() as u64;
+        s.journal_rows = self.store.journal_row_count(&self.cfg.workspace);
         s
     }
 }
