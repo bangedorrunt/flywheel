@@ -32,7 +32,8 @@ pub struct Undelivered {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendOutcome {
-    Sent,
+    /// Accepted into the sink queue (F5: not delivered — see Delivered).
+    Queued,
     Shed { pin: String, line: String },
     Absent,
 }
@@ -104,8 +105,11 @@ impl SinkManager {
         );
     }
 
-    /// Deliver-or-shed (async only for the brief queue lock; never waits
+    /// Enqueue-or-shed (async only for the brief queue lock; never waits
     /// on the endpoint — a slow sink sheds instead of blocking).
+    /// F5: `Queued` means accepted into the sink queue, NOT delivered.
+    /// The worker reports `BrainMsg::Delivered` after adapter.send succeeds;
+    /// hear/deaf tracking keys off that receipt, never this return.
     pub async fn send(&mut self, sink: &str, pin: &str, line: &str) -> SendOutcome {
         let Some(st) = self.sinks.get_mut(sink) else {
             return SendOutcome::Absent;
@@ -128,7 +132,7 @@ impl SinkManager {
         inner.queue.push_back((pin.into(), line.into()));
         inner.sends += 1;
         inner.notify.notify_one();
-        SendOutcome::Sent
+        SendOutcome::Queued
     }
 
     /// Restart a parked sink's worker under the Transient policy, keeping
@@ -277,6 +281,10 @@ async fn worker_loop(
                 .await;
             return;
         }
+        // F5: delivery receipt — hear keys off this, never enqueue.
+        let _ = degraded_tx
+            .send(BrainMsg::Delivered { pin })
+            .await;
     }
 }
 
@@ -662,7 +670,7 @@ mod tests {
         // Fill the webhook queue past its cap of 1.
         assert!(matches!(
             mgr.send("webhook", "svc", "one").await,
-            SendOutcome::Sent
+            SendOutcome::Queued
         ));
         let mut sheds = 0;
         for i in 0..4 {
@@ -676,7 +684,7 @@ mod tests {
         let t = tokio::time::Instant::now();
         assert!(matches!(
             mgr.send("herdr", "p", "urgent").await,
-            SendOutcome::Sent
+            SendOutcome::Queued
         ));
         assert!(
             t.elapsed() < std::time::Duration::from_secs(5),

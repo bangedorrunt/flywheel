@@ -31,6 +31,9 @@ pub enum BrainMsg {
     SlaFired { posts: Vec<String> },
     /// Fault-as-data: sensor/sink death, never fatal to the runtime.
     Degraded { source: String, reason: String },
+    /// F5: delivery receipt — worker confirms adapter.send succeeded.
+    /// Hear/deaf tracking keys off this, not enqueue.
+    Delivered { pin: String },
     /// Ask-verb query; reply travels the oneshot (see [`crate::api`]).
     Ask {
         kind: AskKind,

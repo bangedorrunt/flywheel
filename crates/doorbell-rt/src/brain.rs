@@ -198,6 +198,28 @@ impl<H: Host> Brain<H> {
                     serde_json::json!({"stage": "degraded", "reason": reason}),
                     &[],
                 );
+                // F5: worker-parked intents must surface — drain shed
+                // overflow into the digest (never silent) with an audit row.
+                for u in self.sinks.drain_shed_overflow().await {
+                    self.stats.sheds += 1;
+                    self.audit(
+                        "shed_overflow",
+                        serde_json::json!({ "sink": u.sink, "pin": u.pin }),
+                    );
+                    self.digest_push(u.pin, u.line);
+                }
+                self.maybe_flush_digest().await;
+            }
+            BrainMsg::Delivered { pin } => {
+                // F5: hear keys off worker-confirmed delivery, not enqueue.
+                // Queued intents already counted stats.injects at enqueue;
+                // this receipt only stamps hear (deaf tracking).
+                self.hear.note_inject(
+                    &pin,
+                    self.host.pin_npub(&pin).as_deref(),
+                    self.host.now_unix(),
+                );
+                self.persist_hear();
             }
             BrainMsg::Ask { kind, reply } => {
                 let _ = reply.send(match kind {
@@ -521,21 +543,18 @@ impl<H: Host> Brain<H> {
     }
 
     async fn deliver_prompts(&mut self, injects: Vec<(String, String)>) -> Vec<String> {
-        let mut delivered = Vec::new();
+        let mut queued = Vec::new();
         let sink = self.cfg.main_sink.clone();
         for (pin, line) in injects {
             if !self.host.inject_allowed(&pin) {
                 continue;
             }
             match self.sinks.send(&sink, &pin, &line).await {
-                crate::sinks::SendOutcome::Sent => {
+                crate::sinks::SendOutcome::Queued => {
+                    // F5: queued, not delivered — count the accepted intent
+                    // for wake/journal purposes; hear stamps on Delivered.
                     self.stats.injects += 1;
-                    self.hear.note_inject(
-                        &pin,
-                        self.host.pin_npub(&pin).as_deref(),
-                        self.host.now_unix(),
-                    );
-                    delivered.push(pin);
+                    queued.push(pin);
                 }
                 crate::sinks::SendOutcome::Shed { pin, line } => {
                     self.stats.sheds += 1;
@@ -546,9 +565,8 @@ impl<H: Host> Brain<H> {
                 }
             }
         }
-        self.persist_hear();
         self.maybe_flush_digest().await;
-        delivered
+        queued
     }
 
     fn digest_push(&mut self, pin: String, line: String) {
@@ -590,7 +608,7 @@ impl<H: Host> Brain<H> {
         for (pin, lines) in by_pin {
             let batch = format!("[digest] {} queued: {}", lines.len(), lines.join(" | "));
             match self.sinks.send(&sink, &pin, &batch).await {
-                SendOutcome::Sent => {}
+                SendOutcome::Queued => {}
                 SendOutcome::Shed { pin, line } => {
                     self.digest_push(pin, line);
                 }
@@ -788,6 +806,30 @@ mod tests {
         assert_eq!(brain.stats.degraded, 1);
         let journal = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
         assert!(journal.contains("bus-watch"), "{journal}");
+    }
+    #[tokio::test]
+    async fn hear_stamps_on_delivered_not_enqueue() {
+        // F5: enqueue is not delivery — hear stamps only on the worker's
+        // Delivered receipt (pending → expire → unanswered).
+        let (mut brain, _rx, _tx) = test_brain("hear", vec![]);
+        let (sink, _sent) = MockSink::new();
+        brain.sinks.add_sink("herdr", Box::new(sink));
+        let queued = brain
+            .deliver_prompts(vec![("p".into(), "[doorbell] x".into())])
+            .await;
+        assert_eq!(queued, vec!["p".to_string()]);
+        assert!(
+            brain
+                .hear
+                .expire(1_000_000 + 200, doorbell_core::UNANSWERED_SECS)
+                .is_empty(),
+            "enqueue must not stamp hear"
+        );
+        brain.dispatch(BrainMsg::Delivered { pin: "p".into() }).await;
+        let expired = brain
+            .hear
+            .expire(1_000_000 + 121, doorbell_core::UNANSWERED_SECS);
+        assert!(expired.contains(&"p".to_string()), "Delivered stamps hear");
     }
 
     #[tokio::test]
