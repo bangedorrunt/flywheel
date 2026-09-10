@@ -623,6 +623,18 @@ pub fn take_allowed_like(
     }
     out
 }
+/// A doorbell line that must ring now, never batch: plane-P urgent,
+/// request-release, reservation conflicts, ack-SLA expiry (including the
+/// re-ring vehicle `doorbell_mail_line`, which carries "unacked for").
+/// Moved verbatim from flywheel `workspace.rs` (bd-ene2): one definition —
+/// the daemon FileHost presence filter and the embedded path share it.
+pub fn is_urgent_line(line: &str) -> bool {
+    line.contains("plane-P urgent")
+        || line.contains("request-release")
+        || line.contains("kind 30031")
+        || line.contains("ack-sla-expired")
+        || line.contains("unacked for")
+}
 
 /// Expand an inbox JSON blob into row values: array, single object, or the
 /// `{"messages":[...]}` wrapper `fetch_inbox` emits.

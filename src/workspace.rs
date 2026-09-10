@@ -449,16 +449,9 @@ impl WakeClass {
     }
 }
 
-/// A doorbell line that must ring now, never batch: plane-P urgent,
-/// request-release, reservation conflicts, ack-SLA expiry (including the
-/// re-ring vehicle `doorbell_mail_line`, which carries "unacked for").
-pub fn is_urgent_line(line: &str) -> bool {
-    line.contains("plane-P urgent")
-        || line.contains("request-release")
-        || line.contains("kind 30031")
-        || line.contains("ack-sla-expired")
-        || line.contains("unacked for")
-}
+/// Single definition lives in `doorbell-core` (bd-ene2) — the daemon
+/// FileHost presence filter shares it; this re-export keeps call sites.
+pub use doorbell_core::is_urgent_line;
 
 /// Edge-triage predicate (bd-l72k): a machine-rendered addressed kind-9
 /// wake (`doorbell::doorbell_line(Channel, _)` head). Routine chatter:

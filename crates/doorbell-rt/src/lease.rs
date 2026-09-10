@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 /// Seconds without a heartbeat before a live-pid lease counts stale.
 pub const LEASE_STALE_SECS: u64 = 90;
 
-/// `state_dir/doorbell/owner.json`: who runs the loop right now.
+/// `state_dir/doorbell/owner-{workspace}.json`: who runs the loop for
+/// that workspace right now. Per-workspace (D9: one writer PER workspace;
+/// bd-ene2 fixes the Phase-1 global file that wrongly excluded a second
+/// workspace's loop). Pre-per-ws `owner.json` files are orphaned, never read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerLease {
     pub pid: u32,
@@ -20,8 +23,10 @@ pub struct OwnerLease {
     pub started_unix: u64,
     pub heartbeat_unix: u64,
 }
-pub fn owner_file(state_dir: &Path) -> PathBuf {
-    state_dir.join("doorbell").join("owner.json")
+pub fn owner_file(state_dir: &Path, workspace: &str) -> PathBuf {
+    state_dir
+        .join("doorbell")
+        .join(format!("owner-{workspace}.json"))
 }
 
 pub fn unix_now() -> u64 {
@@ -60,9 +65,37 @@ pub fn pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-pub fn read_lease(state_dir: &Path) -> Option<OwnerLease> {
-    let raw = std::fs::read_to_string(owner_file(state_dir)).ok()?;
+pub fn read_lease(state_dir: &Path, workspace: &str) -> Option<OwnerLease> {
+    let raw = std::fs::read_to_string(owner_file(state_dir, workspace)).ok()?;
     serde_json::from_str(&raw).ok()
+}
+
+/// Live (non-stale) leases across workspaces — the ws-blind deference
+/// probe (flywheel `resolve_host` has no workspace yet at decide time).
+pub fn live_leases(state_dir: &Path, now_unix: u64) -> Vec<(String, OwnerLease)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(state_dir.join("doorbell")) else {
+        return out;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(ws) = name
+            .strip_prefix("owner-")
+            .and_then(|n| n.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if ws.is_empty() {
+            continue;
+        }
+        if let Some(lease) = read_lease(state_dir, ws)
+            && !lease_stale(&lease, now_unix)
+        {
+            out.push((ws.to_string(), lease));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// Stale = pid dead OR heartbeat older than 90s (either suffices; a live
@@ -77,8 +110,12 @@ pub fn lease_stale(lease: &OwnerLease, now_unix: u64) -> bool {
 /// Writer side: claim the lease (fails when a live lease holds it) and
 /// refresh the heartbeat every sweep. Same-host pid comparison only —
 /// cross-host fleets revisit this in the federation ADR (D10).
-pub fn acquire_lease(state_dir: &Path, now_unix: u64) -> Result<OwnerLease, LeaseDenied> {
-    if let Some(cur) = read_lease(state_dir)
+pub fn acquire_lease(
+    state_dir: &Path,
+    workspace: &str,
+    now_unix: u64,
+) -> Result<OwnerLease, LeaseDenied> {
+    if let Some(cur) = read_lease(state_dir, workspace)
         && !lease_stale(&cur, now_unix)
     {
         return Err(LeaseDenied::Held(cur));
@@ -90,27 +127,32 @@ pub fn acquire_lease(state_dir: &Path, now_unix: u64) -> Result<OwnerLease, Leas
         started_unix: now_unix,
         heartbeat_unix: now_unix,
     };
-    write_lease(state_dir, &lease)?;
+    write_lease(state_dir, workspace, &lease)?;
     Ok(lease)
 }
 
-pub fn refresh_lease(state_dir: &Path, lease: &mut OwnerLease, now_unix: u64) -> bool {
+pub fn refresh_lease(
+    state_dir: &Path,
+    workspace: &str,
+    lease: &mut OwnerLease,
+    now_unix: u64,
+) -> bool {
     lease.heartbeat_unix = now_unix;
-    write_lease(state_dir, lease).is_ok()
+    write_lease(state_dir, workspace, lease).is_ok()
 }
 
-pub fn release_lease(state_dir: &Path, lease: &OwnerLease) {
+pub fn release_lease(state_dir: &Path, workspace: &str, lease: &OwnerLease) {
     // Only release our own claim (pid + boot match); never drop a stranger.
-    match read_lease(state_dir) {
+    match read_lease(state_dir, workspace) {
         Some(cur) if cur.pid == lease.pid && cur.boot_id == lease.boot_id => {
-            let _ = std::fs::remove_file(owner_file(state_dir));
+            let _ = std::fs::remove_file(owner_file(state_dir, workspace));
         }
         _ => {}
     }
 }
 
-fn write_lease(state_dir: &Path, lease: &OwnerLease) -> Result<(), LeaseDenied> {
-    let path = owner_file(state_dir);
+fn write_lease(state_dir: &Path, workspace: &str, lease: &OwnerLease) -> Result<(), LeaseDenied> {
+    let path = owner_file(state_dir, workspace);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|_| LeaseDenied::Io)?;
     }
@@ -166,23 +208,30 @@ mod tests {
     fn acquire_heartbeat_takeover_cycle() {
         let d = dir("cycle");
         let now = unix_now();
-        let mut lease = acquire_lease(&d, now).expect("first acquire");
+        let mut lease = acquire_lease(&d, "w", now).expect("first acquire");
         // Second acquire while live refuses.
-        assert!(matches!(acquire_lease(&d, now), Err(LeaseDenied::Held(_))));
+        assert!(matches!(
+            acquire_lease(&d, "w", now),
+            Err(LeaseDenied::Held(_))
+        ));
+        // A second workspace is independent (bd-ene2 per-ws scope).
+        assert!(acquire_lease(&d, "x", now).is_ok());
         // Heartbeat refreshes.
-        assert!(refresh_lease(&d, &mut lease, now + 10));
-        assert_eq!(read_lease(&d).unwrap().heartbeat_unix, now + 10);
+        assert!(refresh_lease(&d, "w", &mut lease, now + 10));
+        assert_eq!(read_lease(&d, "w").unwrap().heartbeat_unix, now + 10);
         // Dead-pid lease is stale: takeover succeeds.
         let mut dead = lease.clone();
         dead.pid = 999_999_999;
         dead.heartbeat_unix = now;
-        write_lease(&d, &dead).unwrap();
+        write_lease(&d, "w", &dead).unwrap();
         assert!(lease_stale(&dead, now + 1));
-        let next = acquire_lease(&d, now + 1).expect("stale takeover");
+        let next = acquire_lease(&d, "w", now + 1).expect("stale takeover");
         assert_eq!(next.pid, std::process::id());
         // Release drops our own claim only.
-        release_lease(&d, &next);
-        assert!(read_lease(&d).is_none());
+        release_lease(&d, "w", &next);
+        assert!(read_lease(&d, "w").is_none());
+        // live_leases sees the surviving workspace claim only.
+        assert_eq!(live_leases(&d, now + 10).len(), 1);
         let _ = std::fs::remove_dir_all(&d);
     }
 

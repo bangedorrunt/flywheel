@@ -26,7 +26,7 @@ done
 pass "core manifest is effect-free (failures listed above if any)"
 
 # Required pure symbols moved verbatim (no signature change).
-for sym in "pub enum EventClass" "pub struct RingInput" "pub fn classify" "pub fn should_inject" "pub fn is_drain_transition" "pub struct DoorbellQueue" "pub struct SelfIndex" "pub fn watch_targets" "pub fn parse_watch_ndjson" "pub fn parse_inbox_item" "pub fn doorbell_line" "pub enum DoorbellMsg" "pub enum DoorbellAction" "pub struct DoorbellModel" "pub fn tick"; do
+for sym in "pub enum EventClass" "pub struct RingInput" "pub fn classify" "pub fn should_inject" "pub fn is_drain_transition" "pub struct DoorbellQueue" "pub struct SelfIndex" "pub fn watch_targets" "pub fn parse_watch_ndjson" "pub fn parse_inbox_item" "pub fn doorbell_line" "pub fn is_urgent_line" "pub enum DoorbellMsg" "pub enum DoorbellAction" "pub struct DoorbellModel" "pub fn tick"; do
   grep -Fq "$sym" "$CORE" || { fail "core missing: $sym"; }
 done
 pass "core symbol surface present (failures listed above if any)"
@@ -72,9 +72,10 @@ rm -rf "$MIG_SRC" "$MIG_DST"
 # Referenced gates (each green in its own bead, recorded here):
 # - proxy byte-identical: proven live (bd-asr2.5 close note)
 # - fence E13: verify-doorbell-daemon.sh green (bd-asr2.2/bd-asr2.3)
-# NOTE (honest gap, bd-ene2): embedded-vs-daemon journal parity needs the
-# daemon to host the loop (Phase 3 cutover work); the daemon is still a
-# lifecycle shell. Tracked, not faked.
+# NOTE (bd-ene2): embedded-vs-daemon journal parity is proven by the
+# Phase 3 section below (differential journals + serve smoke). Remaining,
+# honestly out of scope: G1 ack-SLA publish (no toron CLI verb) and the
+# cutover (default host flip, spawn-API registration, launchd --host).
 
 echo "== ADR-0012 Phase 2 (bd-asr2.11: human digest, second consumer) =="
 # Human wake with zero swarm: rt-level proof (subscription + sink delivery
@@ -95,7 +96,45 @@ pass "why --subscriber smoke"
 # - budget durability: rt crash test (bd-asr2.9)
 # - slow-sink E15: rt isolation test (bd-asr2.10)
 # - authz negatives: rt matrix tests (bd-asr2.8)
-# - SSE replay: daemon gate section (bd-asr2.12)
+echo "== ADR-0012 Phase 3 (bd-ene2: daemon-side loop hosting) =="
+# FileHost unit suite (registry/presence/filter/gen/drains/stub CLIs).
+$CARGO test -p doorbell-rt --lib file_host 2>&1 | tail -n 2
+[ "${PIPESTATUS[0]}" -eq 0 ] || fail "file_host suite red"
+# Differential parity: same scripted log through Brain+embedded vs
+# Brain+daemon yields identical journals modulo ts (the bead verify).
+$CARGO test --bin flywheel parity_tests 2>&1 | tail -n 2
+# Serve smoke: a hosted loop journals sweeps, then a TERM-triggered
+# graceful stop releases leases. NOTE: backgrounded `&` children of a
+# non-interactive shell may inherit ignored TERM, so the daemon runs
+# under `timeout -s TERM -k` (foreground-spawned children keep a normal
+# disposition): TERM at 12s must exit 0 with leases released; the -k
+# fallback exits 137 with the lease held and fails the gate loudly.
+$CARGO build -p doorbell-bin 2>&1 | tail -n 1
+SMOKE_D="$(mktemp -d "${TMPDIR:-/tmp}/doorbell-smoke.XXXXXX")"
+mkdir -p "$SMOKE_D/fw/agents" "$SMOKE_D/dd"
+echo '[{"pane_id":"pane-a","name":"herdr-a","mail_identity":"PinA"}]' > "$SMOKE_D/fw/agents/smokeproj.json"
+DOORBELL_TORON_BIN=true DOORBELL_HERDR_BIN=true \
+  timeout --preserve-status -s TERM -k 5 12 \
+  "$ROOT/target/debug/doorbell" serve --state-dir "$SMOKE_D/dd" --port 18999 \
+  --flywheel-state-dir "$SMOKE_D/fw" --host smokeproj/smokews >"$SMOKE_D/serve.log" 2>&1 &
+SMOKE_WATCHER=$!
+smoke_ok=0
+for _ in $(seq 1 30); do
+  if curl -sm 2 http://127.0.0.1:18999/health 2>/dev/null | grep -q '"mode":"hosted"'; then smoke_ok=1; break; fi
+  sleep 0.5
+done
+[ "$smoke_ok" -eq 1 ] || { kill -9 "$SMOKE_WATCHER" 2>/dev/null; fail "serve smoke never reached hosted mode"; }
+sleep 3
+grep -q '"stage":"sweep"' "$SMOKE_D/fw/journals/doorbell-journal-smokews.jsonl" 2>/dev/null \
+  || { kill -9 "$SMOKE_WATCHER" 2>/dev/null; fail "hosted loop journaled no sweeps"; }
+pass "serve smoke hosted + sweeping"
+# TERM fires at 12s; graceful exit releases the per-ws lease. A KILL
+# fallback (137) leaves the lease held and fails the next check loudly.
+wait "$SMOKE_WATCHER"
+[ "$?" -eq 0 ] || fail "serve did not exit clean on SIGTERM"
+[ -e "$SMOKE_D/fw/doorbell/owner-smokews.json" ] && fail "graceful stop left the lease held"
+pass "serve SIGTERM graceful (leases released)"
+rm -rf "$SMOKE_D"
 echo "== ADR-0012 Phase 4 analytics (bd-asr2.19) =="
 ART="$ROOT/docs/learnings/doorbell/wake-analytics-2026-09-10.md"
 [ -f "$ART" ] || fail "wake analytics artifact missing"

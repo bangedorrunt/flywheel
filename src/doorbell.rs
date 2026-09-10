@@ -900,15 +900,18 @@ pub enum DoorbellHost {
 }
 
 pub fn resolve_host(state_dir: &Path, cfg_url: Option<String>) -> DoorbellHost {
-    use doorbell_rt::lease::{deference_decision, read_lease};
+    use doorbell_rt::lease::{deference_decision, live_leases};
     const DEFAULT_URL: &str = "http://127.0.0.1:18980";
-    // F3: lease-aware deference (D9). Daemon health decides defer; live lease
-    // without a daemon means another embedded writer runs — run_embedded
-    // refuses via acquire_lease, never double-runs.
+    // F3/bd-ene2 lease-aware deference (D9, per-ws scope). Daemon health
+    // decides defer; a live lease without a daemon means another writer
+    // runs — the per-workspace acquire in run_embedded refuses, never
+    // double-runs. This probe is workspace-blind (any live lease warns).
     let now = doorbell_rt::lease::unix_now();
+    let live = live_leases(state_dir, now);
+    let probe = live.into_iter().next().map(|(_, lease)| lease);
     if let Some(url) = cfg_url {
         let healthy = daemon_healthy(&url);
-        match deference_decision(read_lease(state_dir).as_ref(), healthy, now) {
+        match deference_decision(probe.as_ref(), healthy, now) {
             doorbell_rt::lease::Deference::DeferToDaemon => return DoorbellHost::Proxy { url },
             doorbell_rt::lease::Deference::TakeLease => {
                 if !healthy {
@@ -920,21 +923,21 @@ pub fn resolve_host(state_dir: &Path, cfg_url: Option<String>) -> DoorbellHost {
             }
             doorbell_rt::lease::Deference::RefuseDoubleRun => {
                 eprintln!(
-                    "flywheel doorbell: live lease held by another writer — refusing second loop (see owner.json)"
+                    "flywheel doorbell: live lease held by another writer — refusing second loop (see doorbell/owner-*.json)"
                 );
                 return DoorbellHost::Embedded;
             }
         }
     }
     let healthy = daemon_healthy(DEFAULT_URL);
-    match deference_decision(read_lease(state_dir).as_ref(), healthy, now) {
+    match deference_decision(probe.as_ref(), healthy, now) {
         doorbell_rt::lease::Deference::DeferToDaemon => DoorbellHost::Proxy {
             url: DEFAULT_URL.to_string(),
         },
         doorbell_rt::lease::Deference::TakeLease => DoorbellHost::Embedded,
         doorbell_rt::lease::Deference::RefuseDoubleRun => {
             eprintln!(
-                "flywheel doorbell: live lease held by another writer — refusing second loop (see owner.json)"
+                "flywheel doorbell: live lease held by another writer — refusing second loop (see doorbell/owner-*.json)"
             );
             DoorbellHost::Embedded
         }
