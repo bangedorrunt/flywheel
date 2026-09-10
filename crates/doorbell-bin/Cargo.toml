@@ -1,0 +1,19 @@
+[package]
+name = "doorbell-bin"
+version = "0.1.0"
+edition = "2024"
+description = "Doorbell daemon binary (ADR-0012 Phase 1) — lifecycle, UDS+TCP bind, /health"
+license = "MIT"
+
+[[bin]]
+name = "doorbell"
+path = "src/main.rs"
+
+[dependencies]
+doorbell-rt = { path = "../doorbell-rt" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
