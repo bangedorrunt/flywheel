@@ -439,12 +439,15 @@ impl<H: Host> Brain<H> {
             }
         }
         // Live AckSla arm also sweeps the inbox when tick asks for it.
+        // F4: route fetched rows via on_inbox_fetched (was fire-and-drop).
         if effects
             .iter()
             .any(|e| matches!(e, Effect::FetchInbox { .. }))
         {
             let since = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            self.fetch_all_inbox(since).await;
+            for (pin, rows) in self.fetch_all_inbox(since).await {
+                self.on_inbox_fetched(pin, rows).await;
+            }
         }
         self.deliver(effects, "acksla").await;
     }
