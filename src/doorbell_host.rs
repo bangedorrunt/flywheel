@@ -500,6 +500,12 @@ impl RtHost {
 /// brain to shutdown. Replaces the in-file `cmd_internal_doorbell` loop.
 pub fn run_embedded(cfg: &Config, project: &str, workspace: &str) -> anyhow::Result<()> {
     use anyhow::Context;
+    // F3: D9 layer 1 — claim the single-writer lease before starting. Live
+    // lease held elsewhere means another loop runs: refuse, never double-run.
+    let now = doorbell_rt::lease::unix_now();
+    let lease = doorbell_rt::lease::acquire_lease(&config::state_dir(), now).map_err(|e| {
+        anyhow::anyhow!("flywheel doorbell: embedded refuse double-run (live lease): {e:?}")
+    })?;
     let path = doorbell::pid_file(&config::state_dir(), workspace);
     doorbell::write_pid(&path, std::process::id())?;
     let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
@@ -513,12 +519,15 @@ pub fn run_embedded(cfg: &Config, project: &str, workspace: &str) -> anyhow::Res
         .enable_all()
         .build()
         .context("doorbell rt runtime")?;
-    rt.block_on(run_embedded_async(
+    let res = rt.block_on(run_embedded_async(
         cfg.clone(),
         project,
         workspace,
         generation,
-    ))
+    ));
+    // Release our claim only (never drop a stranger's lease).
+    doorbell_rt::lease::release_lease(&config::state_dir(), &lease);
+    res
 }
 
 async fn run_embedded_async(
@@ -564,6 +573,19 @@ async fn run_embedded_async(
                 now: unix_now(),
             }
         });
+    // F3: D9 heartbeat — refresh our lease every 30s so a crash goes stale
+    // within 90s and a wedged writer cannot hold it forever.
+    let _lease_beat = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            let sd = config::state_dir();
+            let now = doorbell_rt::lease::unix_now();
+            if let Some(mut cur) = doorbell_rt::lease::read_lease(&sd) {
+                doorbell_rt::lease::refresh_lease(&sd, &mut cur, now);
+            }
+        }
+    });
     let sla_tx = tx.clone();
     let _sla_ticker =
         doorbell_rt::interval_ticker("ack-sla", sla_tx, Duration::from_secs(60), || {
@@ -613,6 +635,7 @@ async fn run_embedded_async(
     let brain = Brain::new(BrainConfig::new(workspace), host, store, sinks);
     let report = brain.run(rx).await;
     drop(sweep_ticker);
+    _lease_beat.abort();
     if let Some(mut c) = watch_child {
         let _ = c.kill();
     }
