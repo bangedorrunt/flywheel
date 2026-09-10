@@ -559,7 +559,12 @@ async fn run_embedded_async(
         doorbell_rt::interval_ticker("ack-sla", sla_tx, Duration::from_secs(60), || {
             BrainMsg::AckSlaTick { now: unix_now() }
         });
-    // Liveness watch: pid file dropped or binary superseded → shutdown.
+    // Beads-ledger producer (bd-asr2.15, D7, flag-gated): read-only WAL
+    // poll emitting Fact Msgs. Repo root is the spawn-time cwd.
+    let _beads_poller = cfg.doorbell_beads_poller().then(|| {
+        let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        doorbell_rt::pollers::spawn_beads_poller(tx.clone(), repo)
+    });
     let pid_path = doorbell::pid_file(&config::state_dir(), workspace);
     let gen_path = doorbell::gen_file(&config::state_dir(), workspace);
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));

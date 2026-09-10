@@ -116,7 +116,13 @@ pub struct DoorbellSection {
     /// opt-in so migration parity holds with the flag off.
     #[serde(default)]
     pub arrival_triple: bool,
+    /// beads-poller sensor (bd-asr2.15, D7): read-only WAL poll of the br
+    /// sqlite (holds, issue changes) emitting Fact Msgs. Default false.
+    /// The poller NEVER writes: `sqlite3 --readonly` + SELECT only.
+    #[serde(default)]
+    pub beads_poller: bool,
 }
+
 /// `[mail]` section — the per-backend transport table (ADR-0003 V3). Splitting
 /// the old shared `[agent_mail] url` fixes the BUG1 misroute: each backend
 /// reads ONLY its own section.
@@ -502,6 +508,14 @@ impl Config {
         self.doorbell
             .as_ref()
             .map(|d| d.arrival_triple)
+            .unwrap_or(false)
+    }
+
+    /// Beads-poller flag (bd-asr2.15, D7): false unless opted in.
+    pub fn doorbell_beads_poller(&self) -> bool {
+        self.doorbell
+            .as_ref()
+            .map(|d| d.beads_poller)
             .unwrap_or(false)
     }
 
