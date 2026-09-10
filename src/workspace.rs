@@ -2762,32 +2762,32 @@ mod bell_fold_tests {
 
     #[test]
     fn bell_fold_no_status_by_pin_side_map() {
+        // bd-asr2.5 topology: the refresh/sweep helpers are gone (their arms
+        // live in doorbell_host.rs + the rt Brain). The invariant survives:
+        // no status side map anywhere — Model.doorbell.statuses is the only
+        // herdr-status map, written by tick alone.
         let src = include_str!("main.rs");
-        let start = crate::tripwire::find_fn(src, "cmd_internal_doorbell");
-        let refresh = crate::tripwire::find_fn(src, "doorbell_refresh_status");
-        let sweep = crate::tripwire::find_fn(src, "doorbell_sweep_inbox");
-        let dispatcher = &src[start..refresh];
         assert!(
-            !dispatcher.contains("let mut status_by_pin"),
-            "RED: live dispatcher still owns status_by_pin; Model.doorbell.statuses is the only herdr-status map"
+            !src.contains("fn doorbell_refresh_status("),
+            "migration incomplete: refresh helper still present"
         );
         assert!(
-            !dispatcher.contains("status_by_pin"),
-            "RED: dispatcher still passes status_by_pin into sweep/refresh"
+            !src.contains("fn doorbell_sweep_inbox("),
+            "migration incomplete: sweep helper still present"
         );
-        let refresh_fn = &src[refresh..sweep];
         assert!(
-            !refresh_fn.contains("status_by_pin"),
-            "RED: doorbell_refresh_status still takes/writes status_by_pin; tick HerdrStatus writes Model"
+            !src.contains("status_by_pin"),
+            "RED: a status_by_pin side map survives; tick HerdrStatus writes Model"
         );
-        let sweep_end = src[sweep..]
-            .find("\nfn ")
-            .map(|i| sweep + i)
-            .unwrap_or(src.len());
-        let sweep_fn = &src[sweep..sweep_end];
+        let host = include_str!("doorbell_host.rs");
         assert!(
-            !sweep_fn.contains("status_by_pin"),
-            "RED: doorbell_sweep_inbox still takes status_by_pin; inject reads Model after InboxRows tick"
+            !host.contains("status_by_pin") && !host.contains(".statuses.insert"),
+            "RED: host writes a status side map; Model.doorbell.statuses is the only map"
+        );
+        let brain = include_str!("../crates/doorbell-rt/src/brain.rs");
+        assert!(
+            !brain.contains("statuses"),
+            "RED: brain owns status state; perception lives in the ticked model"
         );
     }
 
@@ -2837,25 +2837,29 @@ mod bell_fold_tests {
             dt.contains("Fact"),
             "RED (bd-6b1y #10): DoorbellMsg::Fact missing in doorbell-core"
         );
+        // Live path is the host binding now (bd-asr2.5): drain → tick →
+        // budget gate → sink, all around the live model.
+        let host = include_str!("doorbell_host.rs");
         assert!(
-            src.contains("DoorbellMsg::Fact") || src.contains("Fact {"),
-            "RED (bd-6b1y #10): DoorbellMsg::Fact not on live path in main.rs"
+            host.contains("BrainMsg::Fact") && host.contains("workspace::Msg::Fact"),
+            "RED (bd-6b1y #10): Fact not on the live host path"
         );
         assert!(
-            !src.contains("WorkspaceModel::default(), &msg"),
+            !host.contains("WorkspaceModel::default(), &msg"),
             "Fact must tick the live workspace_model, not Default"
+        );
+        let brain = include_str!("../crates/doorbell-rt/src/brain.rs");
+        assert!(
+            brain.contains("drain_facts") && brain.contains("on_fact"),
+            "dispatcher must drain live facts every sweep"
+        );
+        assert!(
+            brain.contains("take_allowed"),
+            "Fact injects must honor 5/30/3 — Watch/Status/Sweep already do"
         );
         assert!(
             src.contains("drain_pending_facts") && src.contains("append_pending_fact"),
             "ingress queues facts; dispatcher ticks them on the live model"
-        );
-        let fact_loop = src
-            .find("for summary in drain_pending_facts")
-            .expect("fact drain");
-        let slice = &src[fact_loop..src.len().min(fact_loop + 1400)];
-        assert!(
-            slice.contains("take_allowed"),
-            "Fact injects must honor 5/30/3 — Watch/Status/Sweep already do"
         );
         let fact_fn = src
             .find("pub fn captain_fact_inject")

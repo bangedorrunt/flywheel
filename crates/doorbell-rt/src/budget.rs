@@ -73,17 +73,17 @@ pub fn take_allowed(
 }
 
 #[cfg(test)]
-    #[test]
-    fn three_per_pin_per_window_then_cut() {
-        let mut m = BTreeMap::new();
-        let one = |pin: &str| vec![(pin.to_string(), "x".into())];
-        // 3 prompts for one pin pass; the 4th inside the window drops.
-        for _ in 0..3 {
-            assert_eq!(take_allowed(one("p"), &mut m, 1000).len(), 1);
-        }
-        assert!(take_allowed(one("p"), &mut m, 1001).is_empty());
-        // A different pin is unaffected (per-pin buckets).
-        assert_eq!(take_allowed(one("q"), &mut m, 1001).len(), 1);
-        // Window slides: 30 min later the pin passes again.
-        assert_eq!(take_allowed(one("p"), &mut m, 1000 + 1800).len(), 1);
+#[test]
+fn three_per_pin_per_window_then_cut() {
+    let mut m = BTreeMap::new();
+    let one = |pin: &str| vec![(pin.to_string(), "x".into())];
+    // 3 prompts for one pin pass; the 4th inside the window drops.
+    for _ in 0..3 {
+        assert_eq!(take_allowed(one("p"), &mut m, 1000).len(), 1);
     }
+    assert!(take_allowed(one("p"), &mut m, 1001).is_empty());
+    // A different pin is unaffected (per-pin buckets).
+    assert_eq!(take_allowed(one("q"), &mut m, 1001).len(), 1);
+    // Window slides: 30 min later the pin passes again.
+    assert_eq!(take_allowed(one("p"), &mut m, 1000 + 1800).len(), 1);
+}

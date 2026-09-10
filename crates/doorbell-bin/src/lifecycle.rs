@@ -51,11 +51,7 @@ impl Config {
 }
 
 fn read_pid(path: &PathBuf) -> Option<u32> {
-    std::fs::read_to_string(path)
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -147,14 +143,16 @@ pub fn start(cfg: &Config) -> Result<()> {
     if wait_for(|| health_probe(cfg).is_some(), START_TIMEOUT) {
         // The probe answering is not enough: a stale orphan on this port
         // answers too. The owner must be the child we just spawned.
-        if let Some(owner) = health_probe(cfg)
-            .and_then(|h| h.get("owner")?.get("pid")?.as_u64())
+        if let Some(owner) = health_probe(cfg).and_then(|h| h.get("owner")?.get("pid")?.as_u64())
             && owner == u64::from(pid)
         {
             println!("doorbell: started (pid {pid}, port {})", cfg.port);
             return Ok(());
         }
-        anyhow::bail!("doorbell: port {} answered by foreign owner, not child {pid}", cfg.port);
+        anyhow::bail!(
+            "doorbell: port {} answered by foreign owner, not child {pid}",
+            cfg.port
+        );
     }
     anyhow::bail!("doorbell: serve child (pid {pid}) never answered /health");
 }

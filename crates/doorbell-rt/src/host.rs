@@ -18,7 +18,10 @@ pub enum Effect {
     /// Restart the watch child with backoff.
     RestartWatch,
     /// Loud miss: journal + stderr, never silent `Ok(())`.
-    Audit { kind: String, detail: serde_json::Value },
+    Audit {
+        kind: String,
+        detail: serde_json::Value,
+    },
 }
 
 /// Flywheel-shaped capabilities the brain orchestrates. All synchronous:
@@ -41,6 +44,26 @@ pub trait Host: Send {
     }
     /// Pins this brain owns (.5: spawn registry + role binds).
     fn pins(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Npub for hear tracking (.5: SelfIndex; default unknown).
+    fn pin_npub(&self, _pin: &str) -> Option<String> {
+        None
+    }
+    /// Last-known status for the transition gate (.5: Model statuses).
+    fn prev_status(&self, _pin: &str) -> Option<String> {
+        None
+    }
+    /// Per-sweep maintenance: registry/index refresh, forwarder respawn.
+    /// Returns presence rows (pin, state) for trusted-edge ticks.
+    fn sweep_maintenance(&mut self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    /// Live role-bind/fact drains at the top of each sweep.
+    fn drain_role_bounds(&mut self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    fn drain_facts(&mut self) -> Vec<String> {
         Vec::new()
     }
 }

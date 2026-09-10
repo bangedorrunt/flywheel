@@ -23,7 +23,10 @@ pub enum BrainMsg {
     /// Presence projection row (trusted internal edge).
     Presence { pin: String, state: String },
     /// Inbox rows fetched off-loop re-enter here (pipe pattern).
-    InboxFetched { pin: String, rows: Vec<serde_json::Value> },
+    InboxFetched {
+        pin: String,
+        rows: Vec<serde_json::Value>,
+    },
     /// Ack-SLA scan results re-enter here (pipe pattern).
     SlaFired { posts: Vec<String> },
     /// Fault-as-data: sensor/sink death, never fatal to the runtime.

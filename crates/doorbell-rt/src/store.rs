@@ -72,7 +72,10 @@ impl FileStore {
         writeln!(f, "{entry}")?;
         f.flush()?;
         // Same 5 MiB / 5k line cap as today (rotation replaces this in .4).
-        if f.metadata().map(|m| m.len() > 5 * 1024 * 1024).unwrap_or(false) {
+        if f.metadata()
+            .map(|m| m.len() > 5 * 1024 * 1024)
+            .unwrap_or(false)
+        {
             if let Ok(raw) = std::fs::read_to_string(&path) {
                 let lines: Vec<&str> = raw.lines().collect();
                 if lines.len() > 5000 {
@@ -116,11 +119,7 @@ impl FileStore {
             .unwrap_or_default()
     }
 
-    pub fn save_wake(
-        &self,
-        workspace: &str,
-        st: &doorbell_core::WakeState,
-    ) -> anyhow::Result<()> {
+    pub fn save_wake(&self, workspace: &str, st: &doorbell_core::WakeState) -> anyhow::Result<()> {
         let json = serde_json::to_string(st)?;
         let path = self.wake_file(workspace);
         if let Some(parent) = path.parent() {

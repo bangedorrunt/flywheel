@@ -134,7 +134,12 @@ impl SinkManager {
     /// Restart a parked sink's worker under the Transient policy, keeping
     /// the queued intents (the new worker pumps them). False = cap
     /// exhausted, stays parked (+ caller emits Degraded/audit).
-    pub async fn restart(&mut self, sink: &str, now_unix: u64, adapter: Box<dyn PromptSink>) -> bool {
+    pub async fn restart(
+        &mut self,
+        sink: &str,
+        now_unix: u64,
+        adapter: Box<dyn PromptSink>,
+    ) -> bool {
         let degraded_tx = self.degraded_tx.clone();
         let name = sink.to_string();
         let Some(st) = self.sinks.get_mut(sink) else {
@@ -152,12 +157,7 @@ impl SinkManager {
             let _ = w.await;
         }
         let inner = st.inner.clone();
-        st.worker = Some(tokio::spawn(worker_loop(
-            name,
-            inner,
-            adapter,
-            degraded_tx,
-        )));
+        st.worker = Some(tokio::spawn(worker_loop(name, inner, adapter, degraded_tx)));
         true
     }
 

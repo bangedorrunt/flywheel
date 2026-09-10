@@ -10,6 +10,7 @@ members = ["crates/doorbell-core", "crates/doorbell-rt", "crates/doorbell-bin"]
 
 [dependencies]
 doorbell-core = { path = "crates/doorbell-core" }
+doorbell-rt = { path = "crates/doorbell-rt" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"

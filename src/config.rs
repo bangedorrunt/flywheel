@@ -104,6 +104,14 @@ pub struct MailServerConfig {
     pub token: Option<String>,
 }
 
+/// `[doorbell]` section (ADR-0012 D2): the plane-D daemon host.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DoorbellSection {
+    /// daemon base URL (default `http://127.0.0.1:18980` when the section
+    /// exists). The section's presence selects the daemon host; absence
+    /// selects embedded (with a 200ms loopback deference probe, D9).
+    pub url: Option<String>,
+}
 /// `[mail]` section — the per-backend transport table (ADR-0003 V3). Splitting
 /// the old shared `[agent_mail] url` fixes the BUG1 misroute: each backend
 /// reads ONLY its own section.
@@ -140,6 +148,11 @@ pub struct Config {
     /// per-backend mail transport (ADR-0003 V3): `[mail.agentmail]` for the
     /// real agent-mail server, `[mail.toron]` for the toron daemon
     pub mail: Option<MailSections>,
+    /// `[doorbell]` — doorbell plane-D daemon (ADR-0012 D2): `url` selects
+    /// the daemon host (default `http://127.0.0.1:18980` when the section
+    /// exists). Absent section → embedded in-process host, with a 200ms
+    /// loopback probe that still defers to a running daemon (D9).
+    pub doorbell: Option<DoorbellSection>,
     /// Resonate server URL for the durable loop (default http://localhost:8001)
     pub resonate_url: Option<String>,
     /// short name -> herdr agent kind (default: oc=opencode, pi=pi, gk=grok)
@@ -465,6 +478,18 @@ impl Config {
                 }),
             name: legacy.and_then(|c| c.name.clone()),
         }
+    }
+
+    /// Effective doorbell host (ADR-0012 D1): `[doorbell] url`, defaulting
+    /// to `http://127.0.0.1:18980` when the section exists. `None` selects
+    /// embedded (D9 probe may still defer to a running daemon).
+    pub fn doorbell_url(&self) -> Option<String> {
+        self.doorbell.as_ref().map(|d| {
+            d.url
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "http://127.0.0.1:18980".to_string())
+        })
     }
 
     pub fn socket_path(&self) -> String {
