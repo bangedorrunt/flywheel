@@ -121,8 +121,12 @@ pub struct DoorbellSection {
     /// The poller NEVER writes: `sqlite3 --readonly` + SELECT only.
     #[serde(default)]
     pub beads_poller: bool,
+    /// cron doorbell sink (bd-asr2.16, D7): cron tick completion journals a
+    /// Fact row and queues a pending wake (digest-visible with zero swarm;
+    /// emit/deliver binding lands in bd-asr2.17). Default false.
+    #[serde(default)]
+    pub cron_doorbell_sink: bool,
 }
-
 /// `[mail]` section — the per-backend transport table (ADR-0003 V3). Splitting
 /// the old shared `[agent_mail] url` fixes the BUG1 misroute: each backend
 /// reads ONLY its own section.
@@ -516,6 +520,14 @@ impl Config {
         self.doorbell
             .as_ref()
             .map(|d| d.beads_poller)
+            .unwrap_or(false)
+    }
+
+    /// Cron doorbell-sink flag (bd-asr2.16, D7): false unless opted in.
+    pub fn doorbell_cron_sink(&self) -> bool {
+        self.doorbell
+            .as_ref()
+            .map(|d| d.cron_doorbell_sink)
             .unwrap_or(false)
     }
 

@@ -1082,9 +1082,10 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
             }),
         )?;
         let sink = engine.policy_sink().clone();
+        let proj = project.map(str::to_string);
         drain_tasks.push(tokio::spawn(async move {
             let _ = cron_mgr.start().await;
-            drain_policy_sink(sink).await;
+            drain_policy_sink(sink, proj).await;
         }));
     }
 
@@ -1107,9 +1108,10 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
             std::sync::Arc::new(move || regs.iter().filter(|&r| r.name == name).cloned().collect())
         })?;
         let sink = engine.policy_sink().clone();
+        let proj = project.map(str::to_string);
         drain_tasks.push(tokio::spawn(async move {
             let _ = cron_mgr.start().await;
-            drain_policy_sink(sink).await;
+            drain_policy_sink(sink, proj).await;
         }));
     }
 
@@ -1125,7 +1127,7 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
 /// when the oracle honestly found nothing worth proposing. Failure events for
 /// the same cron still take the failure-bead path below (the output won't
 /// parse as an idea).
-async fn drain_policy_sink(sink: toron_workflow::PolicySink) {
+async fn drain_policy_sink(sink: toron_workflow::PolicySink, project: Option<String>) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let drained: Vec<toron_workflow::PolicyEvent> = {
@@ -1176,10 +1178,15 @@ async fn drain_policy_sink(sink: toron_workflow::PolicySink) {
                     ev.cron, ev.tick
                 ),
             }
+            // bd-asr2.16 (doorbell sink, flag-gated): every drained tick
+            // completion journals a Fact wake (digest-visible with zero
+            // swarm). Best-effort inside the flag check; never fails drain.
+            if let Some(p) = project.as_deref() {
+                crate::doorbell::cron_tick_wake(p, &ev.cron, &ev.tick.to_string(), "fired");
+            }
         }
     }
 }
-
 impl CronManager for RegistryCronManager {
     fn list(&self) -> Result<Vec<MergedCron>> {
         self.merged()

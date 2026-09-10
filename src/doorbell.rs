@@ -495,6 +495,40 @@ pub fn register_workspace_subscriptions(state_dir: &Path, workspace: &str, pins:
     }
 }
 
+/// Cron doorbell sink (bd-asr2.16, D7, flag-gated): on tick completion,
+/// journal a Fact row and queue a pending wake. Digest-visible with zero
+/// swarm (the embedded Brain ticks drains on sweep); the emit/deliver
+/// binding for direct human push lands in bd-asr2.17. Testable core
+/// ([`cron_tick_wake_in`]) takes explicit dirs.
+pub fn cron_tick_wake(project: &str, cron: &str, tick: &str, outcome: &str) {
+    if !crate::config::Config::load()
+        .ok()
+        .map(|c| c.doorbell_cron_sink())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let summary = format!("cron {cron} tick {tick} {outcome}");
+    cron_tick_wake_in(&crate::config::state_dir(), project, &summary);
+}
+
+pub fn cron_tick_wake_in(state_dir: &Path, project: &str, summary: &str) {
+    let msg = crate::workspace::Msg::Fact {
+        summary: summary.to_string(),
+    };
+    journal_append_workspace(
+        state_dir,
+        project,
+        &msg,
+        &[],
+        serde_json::json!({ "stage": "cron_tick", "summary": summary }),
+        None,
+    );
+    if let Err(e) = crate::append_pending_fact(project, summary) {
+        eprintln!("flywheel: cron doorbell sink: pending queue failed: {e:#}");
+    }
+}
+
 fn spawn_child(
     exe: &Path,
     project: &str,
@@ -2703,5 +2737,49 @@ mod tests {
         let rendered = render_roster(&rows);
         assert!(rendered[0].starts_with("ROSTER"));
         assert!(rendered[2].contains("Q") && rendered[2].contains("bd-1"));
+    }
+
+    #[test]
+    fn cron_tick_wake_journals_fact_row() {
+        // bd-asr2.16: the sink writes a fact_pending journal row (plus a
+        // dispatcher pending-fact entry — same helper production arms use).
+        let dir = std::env::temp_dir().join(format!("dbll-cron-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let msg = crate::workspace::Msg::Fact {
+            summary: "cron nightly tick t1 completed".into(),
+        };
+        journal_append_workspace(
+            &dir,
+            "proj",
+            &msg,
+            &[],
+            serde_json::json!({ "stage": "cron_tick", "summary": "x" }),
+            None,
+        );
+        let rows = doorbell_rt::FileStore::new(&dir)
+            .fold_workspace("proj")
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["executed"]["stage"], serde_json::json!("cron_tick"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cron_sink_flag_off_writes_nothing() {
+        // bd-asr2.16: without the flag, tick completion is a silent no-op.
+        // Uses the real state dir (read-only listing) — the flag gate
+        // returns before any write path.
+        let listed = || -> Vec<String> {
+            std::fs::read_dir(crate::config::state_dir().join("journals"))
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let before = listed();
+        cron_tick_wake("flagprobe-ws", "nightly", "t1", "completed");
+        assert_eq!(before, listed(), "flag-off tick must not touch journals");
     }
 }
