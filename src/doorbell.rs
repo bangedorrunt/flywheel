@@ -521,7 +521,7 @@ pub fn cron_tick_wake_in(state_dir: &Path, project: &str, summary: &str) {
         project,
         &msg,
         &[],
-        serde_json::json!({ "stage": "cron_tick", "summary": summary }),
+        serde_json::json!({ "stage": "cron_tick", "summary": summary, "workspace": project, "corr": None::<String> }),
         None,
     );
     if let Err(e) = crate::append_pending_fact(project, summary) {
@@ -577,12 +577,136 @@ pub fn service_emit_wake_in(state_dir: &Path, project: &str, service: &str, to: 
         project,
         &msg,
         &[],
-        serde_json::json!({ "stage": "emit", "service": service, "to": to }),
+        serde_json::json!({ "stage": "emit", "service": service, "to": to, "workspace": project, "corr": None::<String> }),
         None,
     );
     if let Err(e) = crate::append_pending_fact(project, &summary) {
         eprintln!("flywheel: service emit: pending queue failed: {e:#}");
     }
+}
+
+/// Cross-workspace scopes (bd-asr2.18, D5, flag-gated): widen one pin's
+/// subscription from its home workspace to an explicit extra workspace.
+/// Scope stays explicit (Scope::Many, deduped) — never an implicit
+/// all-workspace watch. Flag off or non-operator actor refuses.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CrossScopeDeny {
+    FlagOff,
+    NoSubscription,
+    NeedsOperator,
+    Store(doorbell_rt::subscribe::Refusal),
+}
+
+pub fn subscribe_extra_workspace(
+    state_dir: &Path,
+    workspace: &str,
+    pin: &str,
+    extra: &str,
+    operator: bool,
+) -> Result<Vec<String>, CrossScopeDeny> {
+    let on = crate::config::Config::load()
+        .ok()
+        .map(|c| c.doorbell_cross_workspace())
+        .unwrap_or(false);
+    subscribe_extra_workspace_in(state_dir, workspace, pin, extra, operator, on)
+}
+
+pub fn subscribe_extra_workspace_in(
+    state_dir: &Path,
+    workspace: &str,
+    pin: &str,
+    extra: &str,
+    operator: bool,
+    cross_on: bool,
+) -> Result<Vec<String>, CrossScopeDeny> {
+    use doorbell_rt::subscribe::*;
+    if !cross_on {
+        return Err(CrossScopeDeny::FlagOff);
+    }
+    if !operator {
+        return Err(CrossScopeDeny::NeedsOperator);
+    }
+    let mut store = SubscriptionStore::open(state_dir);
+    let id = format!("spawn-{workspace}-{pin}");
+    let mut sub = store.get(&id).ok_or(CrossScopeDeny::NoSubscription)?;
+    let mut ws = sub.scope.workspaces();
+    if !ws.contains(&extra.to_string()) {
+        ws.push(extra.to_string());
+    }
+    sub.scope = Scope::Many(ws.clone());
+    store
+        .subscribe(Actor::operator(), sub, workspace)
+        .map_err(CrossScopeDeny::Store)?;
+    Ok(ws)
+}
+
+/// Parse an external-block corr (`external:<project>:<bead>`).
+pub fn parse_external_corr(corr: &str) -> Option<(String, String)> {
+    let rest = corr.strip_prefix("external:")?;
+    let (proj, bead) = rest.split_once(':')?;
+    if proj.is_empty() || bead.is_empty() {
+        return None;
+    }
+    Some((proj.to_string(), bead.to_string()))
+}
+
+/// Cross-project re-ring (bd-asr2.18, D5/E9, flag-gated, same-host): for
+/// every open captain hold parked behind `external:<proj>:<bead>`, check
+/// resolve the hold and queue one wake (one wake within one sweep, zero
+/// swarm). The `run` seam keeps this testable (prod shells br).
+pub fn check_external_unblocks(
+    project: &str,
+    foreign_paths: &std::collections::HashMap<String, String>,
+    run: &dyn Fn(&str, &[&str], Option<&str>) -> Option<String>,
+) -> Vec<String> {
+    let on = crate::config::Config::load()
+        .ok()
+        .map(|c| c.doorbell_cross_workspace())
+        .unwrap_or(false);
+    check_external_unblocks_in(project, foreign_paths, run, on)
+}
+
+pub fn check_external_unblocks_in(
+    project: &str,
+    foreign_paths: &std::collections::HashMap<String, String>,
+    run: &dyn Fn(&str, &[&str], Option<&str>) -> Option<String>,
+    cross_on: bool,
+) -> Vec<String> {
+    if !cross_on {
+        return Vec::new();
+    }
+    let holds_raw = run("br", &["hold", "--list", "--json"], None).unwrap_or_default();
+    let holds: serde_json::Value =
+        serde_json::from_str(&holds_raw).unwrap_or(serde_json::Value::Null);
+    let rows = holds
+        .get("holds")
+        .and_then(|h| h.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut rerung = Vec::new();
+    for row in rows {
+        let corr = row.get("corr").and_then(|c| c.as_str()).unwrap_or("");
+        let Some((fproj, fbead)) = parse_external_corr(corr) else {
+            continue;
+        };
+        let Some(fpath) = foreign_paths.get(&fproj) else {
+            continue;
+        };
+        let show = run("br", &["show", &fbead, "--json"], Some(fpath)).unwrap_or_default();
+        let st = serde_json::from_str::<serde_json::Value>(&show)
+            .ok()
+            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        if st != "closed" {
+            continue;
+        }
+        run("br", &["hold", "--resolve", "--corr", corr], None);
+        let summary = format!("external {fproj}:{fbead} closed — re-ring {corr}");
+        if crate::append_pending_fact(project, &summary).is_ok() {
+            rerung.push(corr.to_string());
+        }
+    }
+    rerung
 }
 
 fn spawn_child(
@@ -2899,5 +3023,117 @@ mod tests {
         assert_eq!(rows[0]["executed"]["stage"], serde_json::json!("emit"));
         assert_eq!(rows[0]["executed"]["service"], serde_json::json!("ci"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn seed_home_sub(dir: &std::path::Path, ws: &str, pin: &str) {
+        use doorbell_rt::subscribe::*;
+        let mut store = SubscriptionStore::open(dir);
+        let sub = Subscription {
+            id: format!("spawn-{ws}-{pin}"),
+            identity: Identity::Pin(pin.to_string()),
+            scope: Scope::One(ws.to_string()),
+            filter: Filter::default(),
+            sink: SinkKind::Herdr,
+            budget: Budget::default_530(),
+        };
+        store
+            .subscribe(Actor::local_process(), sub, ws)
+            .expect("seed home sub");
+    }
+
+    #[test]
+    fn cross_widen_many_deduped() {
+        // bd-asr2.18: explicit extra workspace -> Scope::Many, deduped.
+        let dir = std::env::temp_dir().join(format!("dbll-xw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        seed_home_sub(&dir, "wA", "P");
+        let ws = subscribe_extra_workspace_in(&dir, "wA", "P", "wB", true, true).expect("widen");
+        assert_eq!(ws, vec!["wA".to_string(), "wB".to_string()]);
+        let ws2 =
+            subscribe_extra_workspace_in(&dir, "wA", "P", "wB", true, true).expect("re-widen");
+        assert_eq!(ws2.len(), 2, "dedupe: no second wB");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cross_widen_refusals() {
+        // bd-asr2.18: flag off / non-operator / missing sub refuse.
+        let dir = std::env::temp_dir().join(format!("dbll-xwref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        seed_home_sub(&dir, "wA", "P");
+        assert_eq!(
+            subscribe_extra_workspace_in(&dir, "wA", "P", "wB", true, false),
+            Err(CrossScopeDeny::FlagOff)
+        );
+        assert_eq!(
+            subscribe_extra_workspace_in(&dir, "wA", "P", "wB", false, true),
+            Err(CrossScopeDeny::NeedsOperator)
+        );
+        assert_eq!(
+            subscribe_extra_workspace_in(&dir, "wA", "NOBODY", "wB", true, true),
+            Err(CrossScopeDeny::NoSubscription)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_corr_parses() {
+        assert_eq!(
+            parse_external_corr("external:toron:bd-9"),
+            Some(("toron".to_string(), "bd-9".to_string()))
+        );
+        assert_eq!(parse_external_corr("captain:abc"), None);
+        assert_eq!(parse_external_corr("external:onlyproj"), None);
+        assert_eq!(parse_external_corr("external::bd-1"), None);
+    }
+
+    #[test]
+    fn external_rering_closed_resolves() {
+        // bd-asr2.18: foreign close -> resolve + one wake; open/non-external
+        // rows skipped; flag off -> empty.
+        use std::sync::{Arc, Mutex};
+        let resolved: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let r2 = resolved.clone();
+        let run = move |cmd: &str, args: &[&str], _dir: Option<&str>| -> Option<String> {
+            if cmd == "br" && args.get(1) == Some(&"--list") {
+                return Some(
+                    r#"{"holds":[{"corr":"external:fp:bd-1"},{"corr":"external:fp:bd-2"},{"corr":"local:xyz"}]}"#.to_string(),
+                );
+            }
+            if cmd == "br" && args.first() == Some(&"show") {
+                let st = if args.get(1) == Some(&"bd-1") {
+                    "closed"
+                } else {
+                    "open"
+                };
+                return Some(format!(r#"{{"id":"x","status":"{st}"}}"#));
+            }
+            if cmd == "br" && args.contains(&"--resolve") {
+                if let Some(pos) = args.iter().position(|a| *a == "--corr") {
+                    r2.lock().unwrap().push(args[pos + 1].to_string());
+                }
+                return Some("{}".to_string());
+            }
+            None
+        };
+        let mut paths = std::collections::HashMap::new();
+        paths.insert("fp".to_string(), "/tmp".to_string());
+        let proj = "xw-test-probe";
+        let got = check_external_unblocks_in(proj, &paths, &run, true);
+        assert_eq!(got, vec!["external:fp:bd-1".to_string()]);
+        assert_eq!(
+            *resolved.lock().unwrap(),
+            vec!["external:fp:bd-1".to_string()]
+        );
+        // One queued wake; clean up the probe's pending file.
+        let pend = crate::config::state_dir()
+            .join("facts")
+            .join(format!("{}-pending.jsonl", crate::state::state_key(proj)));
+        let body = std::fs::read_to_string(&pend).unwrap_or_default();
+        assert!(body.contains("external:fp:bd-1"), "one wake queued");
+        let _ = std::fs::remove_file(&pend);
+        // Flag off: silent empty, no runner calls matter.
+        let none = check_external_unblocks_in(proj, &paths, &run, false);
+        assert!(none.is_empty());
     }
 }
