@@ -28,10 +28,8 @@ async fn host_workspace(
 ) -> doorbell_rt::RunReport {
     use doorbell_rt::{Brain, BrainConfig, FileHost, FileHostConfig, Host, SinkManager};
     use doorbell_rt::{CliPromptSink, FileStore};
-    let toron_bin =
-        std::env::var("DOORBELL_TORON_BIN").unwrap_or_else(|_| "toron".into());
-    let herdr_bin =
-        std::env::var("DOORBELL_HERDR_BIN").unwrap_or_else(|_| "herdr".into());
+    let toron_bin = std::env::var("DOORBELL_TORON_BIN").unwrap_or_else(|_| "toron".into());
+    let herdr_bin = std::env::var("DOORBELL_HERDR_BIN").unwrap_or_else(|_| "herdr".into());
     let mut fcfg = FileHostConfig::new(fw_state.clone(), project.clone(), workspace.clone());
     fcfg.toron_bin = toron_bin;
     fcfg.herdr_bin = herdr_bin.clone();
@@ -41,21 +39,30 @@ async fn host_workspace(
     // stale (same rule as the embedded WatcherGen gate, daemon-keyed).
     doorbell_rt::ensure_daemon_gen(&fw_state, &workspace);
     let mut sinks = SinkManager::new(tx.clone());
-    sinks.add_sink(
+    // Supervised registration (audit P1): a failed herdr CLI park gets a
+    // fresh adapter under the Transient policy instead of dying until
+    // process restart. Targets table is shared, so the factory sees the
+    // refreshed routing after registry changes.
+    let targets = host.target_table();
+    sinks.add_sink_with_factory(
         "herdr",
-        Box::new(CliPromptSink::new(herdr_bin, host.target_table())),
+        Box::new(CliPromptSink::new(herdr_bin.clone(), targets.clone())),
+        move || Box::new(CliPromptSink::new(herdr_bin.clone(), targets.clone())),
     );
     let store = FileStore::new(fw_state);
     // Watch child (CLI; the in-process bus needs toron-core, which the
     // lean daemon never links). Backoff + retry gate live in the host.
     host.restart_watch();
     // Beats: 1s sweep, 60s ack-SLA (same cadences as embedded).
-    let sweep_ticker = doorbell_rt::interval_ticker("sweep", tx.clone(), std::time::Duration::from_secs(1), || {
-        doorbell_rt::BrainMsg::Sweep {
+    let sweep_ticker = doorbell_rt::interval_ticker(
+        "sweep",
+        tx.clone(),
+        std::time::Duration::from_secs(1),
+        || doorbell_rt::BrainMsg::Sweep {
             since: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             now: doorbell_rt::lease::unix_now(),
-        }
-    });
+        },
+    );
     let _sla_ticker = doorbell_rt::interval_ticker(
         "ack-sla",
         tx.clone(),
@@ -155,11 +162,7 @@ pub async fn run(cfg: &Config) -> Result<()> {
         .with_context(|| format!("bind {}", sock_path.display()))?;
     let started = std::time::Instant::now();
     let log_path = cfg.log_file();
-    let hosted: Vec<String> = cfg
-        .hosts
-        .iter()
-        .map(|(p, w)| format!("{p}/{w}"))
-        .collect();
+    let hosted: Vec<String> = cfg.hosts.iter().map(|(p, w)| format!("{p}/{w}")).collect();
     eprintln!(
         "doorbell serve: up on 127.0.0.1:{} + {} (hosting {})",
         cfg.port,
@@ -412,7 +415,9 @@ fn hosted_sweep_age(fw_state: &std::path::Path, hosted: &[String]) -> (Option<u6
         let Some(ws) = hw.split('/').nth(1) else {
             continue;
         };
-        let path = fw_state.join("journals").join(format!("doorbell-journal-{ws}.jsonl"));
+        let path = fw_state
+            .join("journals")
+            .join(format!("doorbell-journal-{ws}.jsonl"));
         if let Ok(md) = std::fs::metadata(&path) {
             let age = md
                 .modified()

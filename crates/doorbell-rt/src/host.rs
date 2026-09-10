@@ -4,6 +4,7 @@
 //! and toron mailbox here without touching brain logic.
 
 use crate::msg::BrainMsg;
+use std::collections::BTreeMap;
 
 /// Effect intents the brain journals, then executes through the [`Host`].
 /// Mirrors `doorbell-core::DoorbellAction` plus the live loop's extra arms.
@@ -77,6 +78,9 @@ pub struct MockHost {
     pub script: std::collections::VecDeque<Vec<Effect>>,
     pub tick_log: Vec<String>,
     pub restarts: u32,
+    /// Last-known status per pin, recorded at tick time (mirrors the
+    /// real hosts so `prev_status` ordering is testable at the brain).
+    pub statuses: BTreeMap<String, String>,
 }
 
 impl MockHost {
@@ -88,6 +92,7 @@ impl MockHost {
             script: Default::default(),
             tick_log: Vec::new(),
             restarts: 0,
+            statuses: Default::default(),
         }
     }
 
@@ -101,7 +106,16 @@ impl MockHost {
 impl Host for MockHost {
     fn tick(&mut self, msg: &BrainMsg) -> Vec<Effect> {
         self.tick_log.push(format!("{msg:?}"));
+        // Record the new status at tick time (mirrors FileHost/RtHost):
+        // a pre-tick `prev_status` read sees the previous value.
+        if let BrainMsg::HerdrStatus { pin, status } = msg {
+            self.statuses.insert(pin.clone(), status.clone());
+        }
         self.script.pop_front().unwrap_or_default()
+    }
+
+    fn prev_status(&self, pin: &str) -> Option<String> {
+        self.statuses.get(pin).cloned()
     }
 
     fn now_unix(&self) -> u64 {

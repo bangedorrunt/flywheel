@@ -6,6 +6,71 @@
 
 use std::path::PathBuf;
 
+/// Journal/audit/wake files hold agent-mail wake metadata (pins, lines,
+/// corr ids) — created owner-only (audit P2: the daemon carefully guards
+/// its socket dir 0700 while the state files were umask-dependent).
+/// `mode()` applies only at creation; existing files keep their perms.
+#[cfg(unix)]
+fn private_append(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = path.parent() {
+        private_dir(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn private_append(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        private_dir(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+/// Owner-only write (create/truncate).
+#[cfg(unix)]
+fn private_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = path.parent() {
+        private_dir(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(bytes)
+}
+
+#[cfg(not(unix))]
+fn private_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
+}
+
+/// Create `dir` (all the way down) owner-only.
+#[cfg(unix)]
+fn private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+#[cfg(not(unix))]
+fn private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
 /// Total retention across active + generations (D4.3: same bound as the old
 /// head-trim, no silent loss within retention).
 pub const RETENTION_LINES: usize = 5000;
@@ -84,7 +149,7 @@ impl FileStore {
     ) -> std::io::Result<()> {
         let path = self.journal_file(workspace);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            private_dir(parent)?;
         }
         let mut entry = serde_json::json!({
             "v": crate::JOURNAL_V,
@@ -104,10 +169,7 @@ impl FileStore {
             obj.insert("subscriber".into(), sub.into());
         }
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut f = private_append(&path)?;
         writeln!(f, "{entry}")?;
         f.flush()?;
         drop(f);
@@ -389,14 +451,10 @@ impl FileStore {
     pub fn append_audit(&self, workspace: &str, entry: serde_json::Value) {
         let path = self.audit_file(workspace);
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            let _ = private_dir(parent);
         }
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
+        if let Ok(mut f) = private_append(&path) {
             let _ = writeln!(f, "{entry}");
         }
     }
@@ -414,9 +472,9 @@ impl FileStore {
         let json = serde_json::to_string(st)?;
         let path = self.wake_file(workspace);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            private_dir(parent)?;
         }
-        std::fs::write(path, json)?;
+        private_write(&path, json.as_bytes())?;
         Ok(())
     }
 
@@ -435,9 +493,9 @@ impl FileStore {
     pub fn save_unanswered(&self, workspace: &str, pins: &[String]) {
         let path = self.unanswered_file(workspace);
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            let _ = private_dir(parent);
         }
-        let _ = std::fs::write(path, pins.join("\n") + "\n");
+        let _ = private_write(&path, (pins.join("\n") + "\n").as_bytes());
     }
 
     /// Envelope version; missing `v` reads as 1, unknown `v` must refuse
@@ -541,6 +599,29 @@ mod tests {
         let fold = st.fold_workspace("w");
         assert!(fold.torn.is_none(), "rotation must not tear the fold");
         assert!(!fold.rows.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_files_and_dirs() {
+        // Audit P2: journal/audit/wake/unanswered files are created
+        // owner-only (0600, dirs 0700) — they carry wake metadata.
+        let (st, dir) = test_store("perms");
+        append_seq(&st, "w", 1);
+        st.append_audit("w", serde_json::json!({"kind": "x"}));
+        st.save_wake("w", &Default::default()).unwrap();
+        st.save_unanswered("w", &["p".into()]);
+        let mode = |p: &std::path::Path| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!(mode(&st.journal_file("w")), 0o600, "journal");
+        assert_eq!(mode(&st.audit_file("w")), 0o600, "audit");
+        assert_eq!(mode(&st.wake_file("w")), 0o600, "wake");
+        assert_eq!(mode(&st.unanswered_file("w")), 0o600, "unanswered");
+        assert_eq!(mode(&dir.join("journals")), 0o700, "journals dir");
+        assert_eq!(mode(&dir.join("doorbell")), 0o700, "doorbell dir");
         let _ = std::fs::remove_dir_all(dir);
     }
 
