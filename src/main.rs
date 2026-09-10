@@ -9293,7 +9293,7 @@ fn cmd_doorbell_why(
     let mut shown = 0usize;
     let mut matched = 0usize;
     for (workspace, entry) in &entries {
-        if doorbell::journal_entry_version(entry) != 1 {
+        if !doorbell::journal_version_accepted(entry) {
             eprintln!(
                 "doorbell why: refusing entry with unknown journal v (workspace {workspace}) — no fold-past"
             );
@@ -9541,7 +9541,7 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str) -> Result<()> {
     let mut models: std::collections::BTreeMap<String, workspace::WorkspaceModel> =
         std::collections::BTreeMap::new();
     for (ws, entry) in &entries {
-        if doorbell::journal_entry_version(entry) != 1 {
+        if !doorbell::journal_version_accepted(entry) {
             eprintln!(
                 "doorbell afk: refusing entry with unknown journal v (workspace {ws}) — no fold-past"
             );

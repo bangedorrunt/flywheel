@@ -488,7 +488,7 @@ mod tests {
         .unwrap();
         let raw = std::fs::read_to_string(st.journal_file("w")).unwrap();
         let v: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
-        assert_eq!(FileStore::entry_version(&v), 1);
+        assert_eq!(FileStore::entry_version(&v), 2);
         assert_eq!(FileStore::entry_version(&serde_json::json!({})), 1);
         assert!(st.load_wake("missing").since_by_pin.is_empty());
         let _ = std::fs::remove_dir_all(dir);

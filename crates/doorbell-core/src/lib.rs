@@ -538,6 +538,90 @@ pub struct DoorbellModel {
     pub statuses: BTreeMap<String, String>,
     /// Pins (+npubs) this dispatcher owns.
     pub index: SelfIndex,
+    /// Per-pin prompt budgets (D4.5, bd-asr2.9): durable model state,
+    /// rebuilt exactly by journal refold (budget rows). The gate stays in
+    /// the effect layer (take_allowed below) — threading it into tick
+    /// would reshape decided rows and break the .6 parity gate.
+    pub budgets: BTreeMap<String, PinBudget>,
+}
+
+/// Per-pin 5/30/3 budget (D1 item 2, D4.5 home).
+/// Rolling token bucket: 3 prompts per 30-min window, refilled continuously.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinBudget {
+    pub budget_minutes: u32,
+    pub max_prompts: u32,
+    /// unix secs of each granted prompt (rolling window)
+    pub prompts: Vec<u64>,
+    pub started_unix: u64,
+}
+
+impl PinBudget {
+    pub fn adr_default(started_unix: u64) -> Self {
+        Self::new(30, 3, started_unix)
+    }
+
+    pub fn new(budget_minutes: u32, max_prompts: u32, started_unix: u64) -> Self {
+        Self {
+            budget_minutes,
+            max_prompts,
+            prompts: Vec::new(),
+            started_unix,
+        }
+    }
+
+    fn window_secs(&self) -> u64 {
+        u64::from(self.budget_minutes) * 60
+    }
+
+    pub fn allows(&self, now_unix: u64) -> bool {
+        let window = self.window_secs();
+        let recent = self
+            .prompts
+            .iter()
+            .filter(|t| now_unix.saturating_sub(**t) < window)
+            .count();
+        (recent as u32) < self.max_prompts
+    }
+
+    pub fn record_at(&mut self, now_unix: u64) {
+        let window = self.window_secs();
+        self.prompts
+            .retain(|t| now_unix.saturating_sub(*t) < window);
+        self.prompts.push(now_unix);
+    }
+}
+
+/// Drop injects that exceed the pin's budget (rolling). Pure model
+/// transition over the map (D4.5): no clock reads, `now` arrives as a
+/// parameter — replayable, refoldable.
+pub fn take_allowed(
+    injects: Vec<(String, String)>,
+    budgets: &mut BTreeMap<String, PinBudget>,
+    now_unix: u64,
+) -> Vec<(String, String)> {
+    take_allowed_like(injects, budgets, now_unix, 30, 3)
+}
+
+/// Budget gate with a subscription override template (D5).
+pub fn take_allowed_like(
+    injects: Vec<(String, String)>,
+    budgets: &mut BTreeMap<String, PinBudget>,
+    now_unix: u64,
+    window_minutes: u32,
+    max_prompts: u32,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (pin, msg) in injects {
+        let b = budgets
+            .entry(pin.clone())
+            .or_insert_with(|| PinBudget::new(window_minutes, max_prompts, now_unix));
+        if b.allows(now_unix) {
+            b.record_at(now_unix);
+            out.push((pin, msg));
+        }
+    }
+    out
 }
 
 /// Expand an inbox JSON blob into row values: array, single object, or the
@@ -823,5 +907,21 @@ mod tests {
             "parse failure must be a loud audit, got {:?}",
             actions
         );
+    }
+
+    #[test]
+    fn three_per_pin_per_window_then_cut() {
+        use std::collections::BTreeMap;
+        let mut m: BTreeMap<String, super::PinBudget> = BTreeMap::new();
+        let one = |pin: &str| vec![(pin.to_string(), "x".into())];
+        // 3 prompts for one pin pass; the 4th inside the window drops.
+        for _ in 0..3 {
+            assert_eq!(super::take_allowed(one("p"), &mut m, 1000).len(), 1);
+        }
+        assert!(super::take_allowed(one("p"), &mut m, 1001).is_empty());
+        // A different pin is unaffected (per-pin buckets).
+        assert_eq!(super::take_allowed(one("q"), &mut m, 1001).len(), 1);
+        // Window slides: 30 min later the pin passes again.
+        assert_eq!(super::take_allowed(one("p"), &mut m, 1000 + 1800).len(), 1);
     }
 }

@@ -6,12 +6,12 @@
 //! (sensors fetch off-loop and deliver results as messages).
 
 use crate::api::Stats;
-use crate::budget::{PinBudget, take_allowed_like};
 use crate::hear::HearTracker;
 use crate::host::{Effect, Host};
 use crate::msg::{AskKind, AskReply, BrainMsg};
 use crate::sinks::{SendOutcome, SinkManager, Undelivered};
 use crate::store::FileStore;
+use doorbell_core::{PinBudget, take_allowed_like};
 use std::collections::BTreeMap;
 
 pub struct BrainConfig {
@@ -71,11 +71,46 @@ impl<H: Host> Brain<H> {
         let mut hear = HearTracker::default();
         hear.seed_unanswered(store.load_unanswered(&cfg.workspace));
         let next_seq = store.last_seq(&cfg.workspace) + 1;
+        // Durable budgets (D4.5): refold grant rows so a restart resumes
+        // exact window state — a crash buys no extra prompts.
+        let mut budgets = BTreeMap::new();
+        for row in &store.fold_workspace(&cfg.workspace).rows {
+            let is_budget = row
+                .get("executed")
+                .and_then(|e| e.get("stage"))
+                .and_then(|s| s.as_str())
+                == Some("budget");
+            if !is_budget {
+                continue;
+            }
+            let ts = row
+                .get("ts")
+                .and_then(|t| t.as_str())
+                .and_then(|t| doorbell_core::parse_rfc3339_micros(t).ok())
+                .map(|us| (us / 1_000_000) as u64)
+                .unwrap_or(0);
+            let grants: Vec<String> = row
+                .get("executed")
+                .and_then(|e| e.get("grants"))
+                .and_then(|g| g.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for pin in grants {
+                budgets
+                    .entry(pin)
+                    .or_insert_with(|| {
+                        PinBudget::new(cfg.budget.window_minutes, cfg.budget.max_prompts, ts)
+                    })
+                    .record_at(ts);
+            }
+        }
         // Crash-resume (D4.6/E12): journaled-but-unconfirmed Prompt intents
-        // redeliver within budget; the resume row makes the redelivery
-        // visible instead of silent. Budgets are RAM-only pre-v2 (known
-        // hole, asserted by the crash test) — a restart buys a fresh
-        // window, never breaks one.
+        // redeliver within the refolded budget; the resume row makes the
+        // redelivery visible instead of silent.
         let redelivered = count_journaled_prompts(&store, &cfg.workspace);
         if redelivered > 0 {
             let _ = store.append_journal(
@@ -91,7 +126,7 @@ impl<H: Host> Brain<H> {
             host,
             store,
             sinks,
-            budgets: BTreeMap::new(),
+            budgets,
             hear,
             wake,
             digest: Vec::new(),
@@ -438,10 +473,27 @@ impl<H: Host> Brain<H> {
     }
 
     /// Per-subscriber budget gate (D5): new pins inherit the owning
-    /// subscription's template instead of flat 5/30/3.
+    /// subscription's template instead of flat 5/30/3. Every grant set is
+    /// journaled as a budget row (D4.5) so crash-resume refolds exact state.
     fn gated(&mut self, raw: Vec<(String, String)>, now: u64) -> Vec<(String, String)> {
         let b = self.cfg.budget;
-        take_allowed_like(raw, &mut self.budgets, now, b.window_minutes, b.max_prompts)
+        let allowed =
+            take_allowed_like(raw, &mut self.budgets, now, b.window_minutes, b.max_prompts);
+        if !allowed.is_empty() {
+            let grants: Vec<String> = allowed.iter().map(|(p, _)| p.clone()).collect();
+            self.journal(
+                &serde_json::json!({"rt_kind": "Budget"}),
+                &[],
+                serde_json::json!({
+                    "stage": "budget",
+                    "grants": grants,
+                    "window_minutes": b.window_minutes,
+                    "max_prompts": b.max_prompts,
+                }),
+                &grants,
+            );
+        }
+        allowed
     }
 
     async fn deliver_prompts(&mut self, injects: Vec<(String, String)>) -> Vec<String> {
@@ -791,15 +843,14 @@ mod tests {
         assert!(a.contains("\"stage\":\"decided\""), "{a}");
     }
 
-    /// E12 crash harness (process-crash model): aesign task abort (no
-    /// graceful shutdown — the async equivalent of SIGKILL for journal
-    /// semantics: flushed bytes survive, in-flight vanishes) then rebuild
-    /// on the same store. Asserts: no lost wake beyond redelivery (every
-    /// delivered intent was journaled first), resume logs its redelivery
-    /// row, seq resumes monotonic, and the pre-v2 RAM budget reset is
-    /// exactly as documented (fresh window after restart — known hole).
+    /// E12 crash harness (process-crash model): task abort (no graceful
+    /// shutdown — the async equivalent of SIGKILL for journal semantics:
+    /// flushed bytes survive, in-flight vanishes) then rebuild on the same
+    /// store. Acceptance: 3 prompts fill the window, restart, 0 further
+    /// prompts in the window; refold reproduces budget state exactly; every
+    /// delivered intent was journaled first; resume logs its redelivery row.
     #[tokio::test]
-    async fn crash_abort_resumes_loud_with_ram_budget_reset() {
+    async fn crash_abort_restart_grants_zero_further_in_window() {
         let dir = std::env::temp_dir().join(format!("dbrt-crash-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mk = || {
@@ -814,12 +865,20 @@ mod tests {
                     pin: "p".into(),
                     line: "m2".into(),
                 }],
+                vec![Effect::Prompt {
+                    pin: "p".into(),
+                    line: "m3".into(),
+                }],
+                vec![Effect::Prompt {
+                    pin: "p".into(),
+                    line: "m4".into(),
+                }],
             ]);
             let sinks = SinkManager::new(tx.clone());
             let brain = Brain::new(BrainConfig::new("w"), host, FileStore::new(&dir), sinks);
             (brain, rx, tx)
         };
-        // Pre-crash: one decided+delivered wake, one decided wake.
+        // Pre-crash: three decided+delivered wakes fill the 5/30/3 window.
         let (mut a, _rx, _tx) = mk();
         let (sink, _sent) = MockSink::new();
         a.sinks.add_sink("herdr", Box::new(sink));
@@ -828,29 +887,35 @@ mod tests {
             summary: "x".into(),
         })
         .await;
-        assert_eq!(a.stats.injects, 2);
-        drop(a); // abort: no shutdown drain, RAM state (budgets) vanishes
-        // Resume on the same store.
+        a.dispatch(BrainMsg::Fact {
+            summary: "y".into(),
+        })
+        .await;
+        assert_eq!(a.stats.injects, 3);
+        drop(a); // abort: no shutdown drain, RAM state vanishes
+        // Resume on the same store: refold reproduces budget state exactly.
         let (mut b, _rx2, _tx2) = mk();
+        let budget = b.budgets.get("p").expect("refolded budget row");
+        assert_eq!(budget.prompts.len(), 3, "all three grants refolded");
         let (sink_b, _sent_b) = MockSink::new();
         b.sinks.add_sink("herdr", Box::new(sink_b));
         let journal = std::fs::read_to_string(b.store.journal_file("w")).unwrap();
         assert!(
-            journal.contains("\"stage\":\"resume\"") && journal.contains("\"redelivered\":2"),
+            journal.contains("\"stage\":\"resume\"") && journal.contains("\"redelivered\":3"),
             "resume logs its redelivery set: {journal}"
         );
         // Seq resumes monotonic past the crash.
         let before = b.store.last_seq("w");
         b.dispatch(BrainMsg::Fact {
-            summary: "y".into(),
+            summary: "z".into(),
         })
         .await;
         assert!(b.store.last_seq("w") > before, "seq advances past resume");
-        // Pre-v2 RAM hole, explicitly: the fresh brain grants a full new
-        // window for the same pin (budgets did not survive the crash).
-        assert_eq!(b.stats.injects, 1, "post-crash prompt delivers");
+        // 0 further prompts in the window: the crash bought nothing.
+        assert_eq!(b.stats.injects, 0, "window stays shut after restart");
+        assert_eq!(b.stats.drops, 1, "fourth prompt drops loudly");
         // No unjournaled delivery: every delivered line was journaled first.
-        for line in ["m1", "m2"] {
+        for line in ["m1", "m2", "m3"] {
             assert!(journal.contains(line), "delivered intent journaled: {line}");
         }
         let _ = std::fs::remove_dir_all(&dir);
