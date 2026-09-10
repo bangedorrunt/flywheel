@@ -253,8 +253,17 @@ async fn worker_loop(
                     if guard.closed {
                         return;
                     }
+                    // Wait WITHOUT holding the lock across the await. Holding
+                    // it wedges `send()` (audit P0, probe-proven): the parked
+                    // worker owns the lock while awaiting, so a sender can
+                    // never take the lock to push+notify — the first prompt
+                    // after the worker goes idle hung forever. Clone the
+                    // Notify handle, drop the guard, then await: tokio's
+                    // Notify stores a permit when no waiter is registered,
+                    // so a send between drop and await cannot be missed.
+                    let notify = guard.notify.clone();
                     drop(guard);
-                    inner.lock().await.notify.notified().await;
+                    notify.notified().await;
                     continue;
                 }
             }
@@ -331,6 +340,70 @@ impl PromptSink for MockSink {
 
     fn name(&self) -> &str {
         "mock"
+    }
+}
+/// herdr CLI prompt sink (bd-ene2 Phase 3): delivers via
+/// `herdr agent prompt <name> <line>`, resolving the pin through the
+/// shared routing table the `FileHost` index refresh owns. Unknown pin
+/// audits LOUD to stderr and counts delivered-skipped as Ok: the pin
+/// left the registry mid-queue (operator error), and parking the whole
+/// sink over one stale intent would shed every other pin's wake. This
+/// is the one documented delivery difference from the embedded path
+/// (which sheds unknown pins to digest); the miss stays visible in the
+/// audit trail either way.
+pub struct CliPromptSink {
+    bin: String,
+    targets: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
+    audit_dir: Option<std::path::PathBuf>,
+}
+
+impl CliPromptSink {
+    pub fn new(
+        bin: impl Into<String>,
+        targets: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
+    ) -> Self {
+        Self {
+            bin: bin.into(),
+            targets,
+            audit_dir: None,
+        }
+    }
+
+    pub fn with_audit_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.audit_dir = Some(dir);
+        self
+    }
+
+    fn miss(&self, pin: &str) {
+        eprintln!("doorbell: [DoorbellMiss] pin {pin} not in registry — no pane to prompt (loud)");
+    }
+}
+
+impl PromptSink for CliPromptSink {
+    fn send(&mut self, pin: &str, line: &str) -> anyhow::Result<()> {
+        let name = self
+            .targets
+            .lock()
+            .ok()
+            .and_then(|t| t.get(pin).cloned())
+            .unwrap_or_default();
+        if name.is_empty() {
+            self.miss(pin);
+            return Ok(());
+        }
+        let out = crate::file_host::run_cli(&self.bin, &["agent", "prompt", &name, line], 30)
+            .ok_or_else(|| anyhow::anyhow!("herdr prompt spawn/timeout failed"))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "herdr prompt failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "herdr-cli"
     }
 }
 
@@ -539,6 +612,29 @@ mod tests {
     fn sent_len(sent: &Arc<std::sync::Mutex<Vec<(String, String)>>>) -> usize {
         sent.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
+
+    /// Audit P0 regression: send AFTER the worker has drained its queue and
+    /// parked. The parked worker must NOT hold the queue lock across its
+    /// wait — holding it wedged every later `send()` (the first prompt after
+    /// idle hung forever). Guard-free wait + Notify permit = no lost wakeup.
+    #[tokio::test]
+    async fn send_after_worker_idle_does_not_wedge() {
+        let (deg_tx, _deg_rx) = mpsc::channel(16);
+        let mut mgr = SinkManager::new(deg_tx);
+        let (sink, sent) = MockSink::new();
+        mgr.add_sink("herdr", Box::new(sink));
+        // Yield long enough for the worker to drain the (empty) queue and park.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            mgr.send("herdr", "p", "after-idle").await
+        })
+        .await
+        .expect("send after idle must not wedge on the parked worker's lock");
+        assert!(matches!(outcome, SendOutcome::Queued), "got {outcome:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(sent_len(&sent), 1, "intent must deliver after the park");
+    }
+
     #[tokio::test]
     async fn stalled_sink_sheds_while_worker_still_pumps() {
         let (deg_tx, _deg_rx) = mpsc::channel(16);

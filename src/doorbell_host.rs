@@ -498,16 +498,17 @@ impl RtHost {
     }
 }
 
-/// Run the embedded host: pid/gen setup, watch source, forwarders, beats,
-/// brain to shutdown. Replaces the in-file `cmd_internal_doorbell` loop.
 pub fn run_embedded(cfg: &Config, project: &str, workspace: &str) -> anyhow::Result<()> {
     use anyhow::Context;
-    // F3: D9 layer 1 — claim the single-writer lease before starting. Live
-    // lease held elsewhere means another loop runs: refuse, never double-run.
+    // F3/bd-ene2 D9 layer 1 — claim the single-writer lease for THIS
+    // workspace before starting (per-ws scope: a second workspace's loop
+    // is independent). Live lease held elsewhere for the same workspace
+    // means another loop runs: refuse, never double-run.
     let now = doorbell_rt::lease::unix_now();
-    let lease = doorbell_rt::lease::acquire_lease(&config::state_dir(), now).map_err(|e| {
-        anyhow::anyhow!("flywheel doorbell: embedded refuse double-run (live lease): {e:?}")
-    })?;
+    let lease =
+        doorbell_rt::lease::acquire_lease(&config::state_dir(), workspace, now).map_err(|e| {
+            anyhow::anyhow!("flywheel doorbell: embedded refuse double-run (live lease): {e:?}")
+        })?;
     let path = doorbell::pid_file(&config::state_dir(), workspace);
     doorbell::write_pid(&path, std::process::id())?;
     let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
@@ -528,7 +529,7 @@ pub fn run_embedded(cfg: &Config, project: &str, workspace: &str) -> anyhow::Res
         generation,
     ));
     // Release our claim only (never drop a stranger's lease).
-    doorbell_rt::lease::release_lease(&config::state_dir(), &lease);
+    doorbell_rt::lease::release_lease(&config::state_dir(), workspace, &lease);
     res
 }
 
@@ -575,16 +576,17 @@ async fn run_embedded_async(
                 now: unix_now(),
             }
         });
-    // F3: D9 heartbeat — refresh our lease every 30s so a crash goes stale
-    // within 90s and a wedged writer cannot hold it forever.
+    // F3/bd-ene2 D9 heartbeat — refresh our workspace lease every 30s so
+    // a crash goes stale within 90s and a wedged writer cannot hold it.
+    let beat_ws = workspace.to_string();
     let _lease_beat = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         loop {
             tick.tick().await;
             let sd = config::state_dir();
             let now = doorbell_rt::lease::unix_now();
-            if let Some(mut cur) = doorbell_rt::lease::read_lease(&sd) {
-                doorbell_rt::lease::refresh_lease(&sd, &mut cur, now);
+            if let Some(mut cur) = doorbell_rt::lease::read_lease(&sd, &beat_ws) {
+                doorbell_rt::lease::refresh_lease(&sd, &beat_ws, &mut cur, now);
             }
         }
     });
@@ -708,4 +710,386 @@ fn spawn_bus_watch(cfg: &Config, project: &str, tx: mpsc::Sender<BrainMsg>) -> b
         Some(())
     })()
     .is_some()
+}
+
+#[cfg(test)]
+mod parity_tests {
+    //! bd-ene2 Phase 3 parity gate: the same scripted [`BrainMsg`]log
+    //! through `Brain` + embedded `RtHost` vs `Brain` + daemon `FileHost`
+    //! yields byte-identical journals modulo `ts` (the bead verify).
+    //!
+    //! Parity surface (scripted below; divergences outside it are
+    //! documented, not silent): idle/working statuses, heard presence,
+    //! addressed channel/job/request-release rings, urgent breakthrough,
+    //! queue/drain, role binds (classification-neutral), facts, inbox
+    //! rows, sweep/ack beats. Excluded: multi-urgent replays (workspace
+    //! presented ledger), ack-SLA publish (G1, no toron CLI verb),
+    //! Receipt/Publish/Invoke inputs.
+    use super::*;
+    use doorbell_rt::{Brain, BrainConfig, BrainMsg, FileHost, FileHostConfig, MockSink, SinkManager};
+
+    fn strip_ts(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(m) => {
+                m.remove("ts");
+                for v in m.values_mut() {
+                    strip_ts(v);
+                }
+            }
+            serde_json::Value::Array(a) => {
+                for v in a.iter_mut() {
+                    strip_ts(v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn read_journal(dir: &std::path::Path, ws: &str) -> Vec<serde_json::Value> {
+        let raw = std::fs::read_to_string(dir.join("journals").join(format!(
+            "doorbell-journal-{ws}.jsonl"
+        )))
+        .unwrap_or_default();
+        raw.lines()
+            .filter_map(|l| {
+                let mut v: serde_json::Value = serde_json::from_str(l).ok()?;
+                strip_ts(&mut v);
+                Some(v)
+            })
+            .collect()
+    }
+
+    fn watch(kind: u16, tags: serde_json::Value, id: &str, ts: u64) -> String {
+        serde_json::json!({
+            "kind": kind, "id": id, "pubkey": "ab",
+            "tags": tags, "content": "hello", "created_at": ts
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn registry_key_mirrors_state_key() {
+        for proj in ["proj", "/tmp/x/proj", "a/b/c"] {
+            assert_eq!(
+                doorbell_rt::file_host::registry_key(proj),
+                crate::state::state_key(proj),
+                "key mirror for {proj:?}"
+            );
+        }
+    }
+    #[test]
+    fn embedded_vs_daemon_journal_parity() {
+        // Plain sync test: hosts construct on the main thread, OUTSIDE
+        // any runtime — mail_shim::block_on panics nested inside one.
+        // Each side runs SEQUENTIALLY under its own XDG state tree with
+        // identical fixture files: sweep drains are destructive
+        // (files deleted after read), so concurrent sides race.
+        // Hermetic: NOTHING writes outside temp dirs. Live toron/herdr
+        // CLIs may run read-only (whois/inbox/list on fixture pins fail
+        // empty); the toron transport is remote-refused (production uses
+        // remote sync HTTP; in-process block_ons inside a runtime).
+        let _home = crate::config::test_state_home();
+        let toron_dir =
+            std::env::temp_dir().join(format!("parity-toron-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&toron_dir);
+        std::fs::create_dir_all(&toron_dir).unwrap();
+        // SAFETY: under ENV_LOCK via _home; restored below.
+        unsafe {
+            std::env::set_var("TORON_DATA_DIR", &toron_dir);
+            std::env::remove_var("TORON_MCP_DATA_DIR");
+        }
+        let proj_dir =
+            std::env::temp_dir().join(format!("parity-proj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&proj_dir);
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let project = proj_dir.to_string_lossy().into_owned();
+        let ws = "pw";
+        let key = crate::state::spawn_registry_key(&project);
+        let role_key = crate::state::state_key(&project);
+        // Heard presence for both pins (freshness uses the real clock;
+        // both sides read the same file).
+        let now = unix_now();
+        std::fs::write(
+            toron_dir.join("presence.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"name": "PinA", "state": "idle", "ts": now}).to_string(),
+                serde_json::json!({"name": "PinB", "state": "idle", "ts": now}).to_string(),
+            ),
+        )
+        .unwrap();
+
+        // Identical destructive inputs per side (drains delete after read).
+        fn write_fixture(state: &std::path::Path, key: &str, role_key: &str) {
+            let agents = state.join("agents");
+            std::fs::create_dir_all(&agents).unwrap();
+            std::fs::write(
+                agents.join(format!("{key}.json")),
+                serde_json::json!([
+                    {"pane_id": "pane-a", "name": "herdr-a", "mail_identity": "PinA"},
+                    {"pane_id": "pane-b", "name": "herdr-b", "mail_identity": "PinB"}
+                ])
+                .to_string(),
+            )
+            .unwrap();
+            let roles = state.join("roles");
+            let facts = state.join("facts");
+            std::fs::create_dir_all(&roles).unwrap();
+            std::fs::create_dir_all(&facts).unwrap();
+            std::fs::write(
+                roles.join(format!("{role_key}-pending.jsonl")),
+                "{\"role\":\"coder\",\"pin\":\"PinA\"}\n",
+            )
+            .unwrap();
+            std::fs::write(
+                facts.join(format!("{role_key}-pending.jsonl")),
+                "\"deploy\"\n",
+            )
+            .unwrap();
+        }
+
+        // SAFETY: under ENV_LOCK; the guard restores nothing — XDG is
+        // removed by _home's Drop, TORON_* below.
+        fn set_xdg(state: &std::path::Path) {
+            unsafe {
+                std::env::set_var("XDG_STATE_HOME", state);
+            }
+        }
+
+        // One scripted Msg log; fixed `since`/`now` payloads so only `ts`
+        // differs between runs. Built twice (BrainMsg is not Clone).
+        let inbox_row = |ts: &str| {
+            serde_json::json!({"importance": "urgent", "created_ts": ts, "tags": []})
+        };
+        let mk_script = || {
+            vec![
+                BrainMsg::HerdrStatus {
+                    pin: "PinA".into(),
+                    status: "idle".into(),
+                },
+                BrainMsg::HerdrStatus {
+                    pin: "PinB".into(),
+                    status: "working".into(),
+                },
+                BrainMsg::Presence {
+                    pin: "PinA".into(),
+                    state: "idle".into(),
+                },
+                BrainMsg::Presence {
+                    pin: "PinB".into(),
+                    state: "idle".into(),
+                },
+                BrainMsg::Watch(watch(
+                    9,
+                    serde_json::json!([["p", "PinA"]]),
+                    "e1",
+                    1,
+                )),
+                BrainMsg::Watch(watch(
+                    9,
+                    serde_json::json!([["p", "PinB"]]),
+                    "e2",
+                    2,
+                )),
+                BrainMsg::Watch(watch(
+                    43001,
+                    serde_json::json!([["assignee", "PinA"]]),
+                    "e3",
+                    3,
+                )),
+                BrainMsg::HerdrStatus {
+                    pin: "PinB".into(),
+                    status: "idle".into(),
+                },
+                BrainMsg::InboxFetched {
+                    pin: "PinA".into(),
+                    rows: vec![inbox_row("2026-09-10T08:00:01Z")],
+                },
+                BrainMsg::RoleBound {
+                    role: "coder".into(),
+                    pin: "PinA".into(),
+                },
+                BrainMsg::Fact {
+                    summary: "deploy".into(),
+                },
+                BrainMsg::Sweep {
+                    since: "2026-09-10T08:00:00Z".into(),
+                    now: 1_700_000_000,
+                },
+                // NOTE: no AckSlaTick in the live run (the embedded scan
+                // block_ons inside a runtime); tick parity asserted above.
+                // Busy presence holds the next routine ring on both hosts...
+                BrainMsg::Presence {
+                    pin: "PinA".into(),
+                    state: "working".into(),
+                },
+                BrainMsg::HerdrStatus {
+                    pin: "PinA".into(),
+                    status: "working".into(),
+                },
+                BrainMsg::Watch(watch(
+                    9,
+                    serde_json::json!([["p", "PinA"]]),
+                    "e4",
+                    4,
+                )),
+                // ...while urgent breaks through on both.
+                BrainMsg::Watch(watch(
+                    14,
+                    serde_json::json!([["p", "PinA"], ["toron-kind", "request-release"]]),
+                    "e5",
+                    5,
+                )),
+                // Drain under busy presence: routine audits, urgent prompts.
+                BrainMsg::HerdrStatus {
+                    pin: "PinA".into(),
+                    status: "idle".into(),
+                },
+            ]
+        };
+
+        async fn run_script<H: doorbell_rt::Host + Send + 'static>(
+            brain: Brain<H>,
+            tx: tokio::sync::mpsc::Sender<BrainMsg>,
+            rx: tokio::sync::mpsc::Receiver<BrainMsg>,
+            script: Vec<BrainMsg>,
+        ) -> doorbell_rt::RunReport {
+            let handle = tokio::spawn(async move { brain.run(rx).await });
+            for msg in script {
+                tx.send(msg).await.unwrap();
+            }
+            tx.send(BrainMsg::Shutdown).await.unwrap();
+            drop(tx);
+            handle.await.unwrap()
+        }
+
+        // Remote (refused) toron transport, both sides: fast-fails to the
+        // hermetic CLI fallback (see module docs).
+        fn remote_cfg() -> crate::config::Config {
+            let mut cfg = crate::config::Config::default();
+            cfg.mail = Some(crate::config::MailSections {
+                agentmail: None,
+                toron: Some(crate::config::MailServerConfig {
+                    url: Some("http://127.0.0.1:9/mcp".into()),
+                    token: None,
+                }),
+            });
+            cfg
+        }
+
+        // Side A: embedded host.
+        let state_a =
+            std::env::temp_dir().join(format!("parity-state-a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_a);
+        set_xdg(&state_a);
+        write_fixture(&state_a, &key, &role_key);
+        let dir_a =
+            std::env::temp_dir().join(format!("parity-a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let (tx_a, rx_a) = tokio::sync::mpsc::channel(doorbell_rt::BRAIN_CAP);
+        let rt_host =
+            RtHost::new(remote_cfg(), &project, ws, tx_a.clone())
+                .expect("rthost builds in sandbox");
+        // Tick-level AckSla parity on throwaways (scan excluded live).
+        {
+            use doorbell_rt::Host;
+            let mut rt = RtHost::new(remote_cfg(), &project, ws, tx_a.clone())
+                .expect("throwaway rthost");
+            let mut fh = FileHost::new(FileHostConfig::new(
+                crate::config::state_dir(),
+                project.clone(),
+                ws.to_string(),
+            ));
+            let a = rt.tick(&BrainMsg::AckSlaTick { now: 1_700_000_000 });
+            let b = fh.tick(&BrainMsg::AckSlaTick { now: 1_700_000_000 });
+            assert_eq!(format!("{a:?}"), format!("{b:?}"), "acksla tick parity");
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let rep_a = rt.block_on(async {
+            let mut sinks_a = SinkManager::new(tx_a.clone());
+            sinks_a.add_sink("herdr", Box::new(MockSink::new().0));
+            let brain_a = Brain::new(
+                BrainConfig::new(ws),
+                rt_host,
+                doorbell_rt::FileStore::new(&dir_a),
+                sinks_a,
+            );
+            run_script(brain_a, tx_a, rx_a, mk_script()).await
+        });
+        drop(rt);
+
+        // Side B: daemon host (own state tree, same fixture content).
+        let state_b =
+            std::env::temp_dir().join(format!("parity-state-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_b);
+        set_xdg(&state_b);
+        write_fixture(&state_b, &key, &role_key);
+        let dir_b =
+            std::env::temp_dir().join(format!("parity-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let (tx_b, rx_b) = tokio::sync::mpsc::channel(doorbell_rt::BRAIN_CAP);
+        let mut fcfg = FileHostConfig::new(
+            crate::config::state_dir(),
+            project.clone(),
+            ws.to_string(),
+        );
+        fcfg.toron_bin = "true".into();
+        fcfg.herdr_bin = "true".into();
+        let file_host = FileHost::new(fcfg).with_tx(tx_b.clone());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let rep_b = rt.block_on(async {
+            let mut sinks_b = SinkManager::new(tx_b.clone());
+            sinks_b.add_sink("herdr", Box::new(MockSink::new().0));
+            let brain_b = Brain::new(
+                BrainConfig::new(ws),
+                file_host,
+                doorbell_rt::FileStore::new(&dir_b),
+                sinks_b,
+            );
+            run_script(brain_b, tx_b, rx_b, mk_script()).await
+        });
+        drop(rt);
+
+        // Same scripted inputs → same delivery accounting.
+        assert_eq!(rep_a.stats.injects, rep_b.stats.injects, "injects");
+        assert_eq!(rep_a.stats.sheds, rep_b.stats.sheds, "sheds");
+        assert_eq!(rep_a.stats.degraded, rep_b.stats.degraded, "degraded");
+        assert_eq!(
+            rep_a.stats.digest_batches, rep_b.stats.digest_batches,
+            "digests"
+        );
+        // Journal diff empty modulo ts: the bd-ene2 verify.
+        let a = read_journal(&dir_a, ws);
+        let b = read_journal(&dir_b, ws);
+        assert_eq!(a.len(), b.len(), "journal row counts differ");
+        for (i, (ra, rb)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(ra, rb, "journal row {i} differs:\n{ra:?}\n{rb:?}");
+        }
+        unsafe {
+            std::env::remove_var("TORON_DATA_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&state_a);
+        let _ = std::fs::remove_dir_all(&state_b);
+        let _ = std::fs::remove_dir_all(&toron_dir);
+        let _ = std::fs::remove_dir_all(&proj_dir);
+    }
+
+    #[test]
+    fn died_tick_parity() {
+        // RestartWatch effect agrees tick-level (dispatch would spawn
+        // watch children on both sides — covered by unit tests instead).
+        let mut core = doorbell_rt::CoreReducer::default();
+        let fx = core.tick_effects(&BrainMsg::Died);
+        assert!(fx
+            .iter()
+            .any(|e| matches!(e, doorbell_rt::Effect::RestartWatch)));
+    }
 }

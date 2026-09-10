@@ -15,10 +15,53 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 pub struct Config {
     pub state_dir: PathBuf,
     pub port: u16,
+    /// Flywheel state dir (journals, leases, registries live here —
+    /// shared with embedded loops). Mirrors flywheel's own resolution:
+    /// `DOORBELL_FLYWHEEL_STATE_DIR` > `XDG_STATE_HOME/flywheel` >
+    /// platform state dir + `flywheel`.
+    pub flywheel_state: PathBuf,
+    /// Hosted loops as `(project, workspace)` pairs (`--host p/w`,
+    /// repeatable). Empty = standby: bind + reads only.
+    pub hosts: Vec<(String, String)>,
+}
+
+/// Parse one `--host project/workspace` value.
+pub fn parse_host(s: &str) -> anyhow::Result<(String, String)> {
+    match s.split_once('/') {
+        Some((p, w)) if !p.is_empty() && !w.is_empty() => Ok((p.to_string(), w.to_string())),
+        _ => anyhow::bail!("--host must be project/workspace, got {s:?}"),
+    }
+}
+
+pub fn default_flywheel_state() -> PathBuf {
+    std::env::var_os("DOORBELL_FLYWHEEL_STATE_DIR")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            std::env::var_os("XDG_STATE_HOME").map(PathBuf::from).map(|d| d.join("flywheel"))
+        })
+        .unwrap_or_else(|| {
+            dirs::state_dir()
+                .unwrap_or_else(|| {
+                    dirs::home_dir()
+                        .unwrap_or_else(|| PathBuf::from("~"))
+                        .join(".local/state")
+                })
+                .join("flywheel")
+        })
 }
 
 impl Config {
     pub fn resolve(state_dir: Option<PathBuf>, port: Option<u16>) -> Result<Self> {
+        Self::resolve_full(state_dir, port, None, Vec::new())
+    }
+
+    pub fn resolve_full(
+        state_dir: Option<PathBuf>,
+        port: Option<u16>,
+        flywheel_state: Option<PathBuf>,
+        hosts: Vec<(String, String)>,
+    ) -> Result<Self> {
         let state_dir = state_dir
             .or_else(|| std::env::var_os("DOORBELL_STATE_DIR").map(PathBuf::from))
             .or_else(|| dirs::data_dir().map(|d| d.join("doorbell")))
@@ -30,7 +73,13 @@ impl Config {
                     .and_then(|v| v.parse().ok())
             })
             .unwrap_or(DEFAULT_PORT);
-        Ok(Self { state_dir, port })
+        let flywheel_state = flywheel_state.unwrap_or_else(default_flywheel_state);
+        Ok(Self {
+            state_dir,
+            port,
+            flywheel_state,
+            hosts,
+        })
     }
 
     pub fn pid_file(&self) -> PathBuf {
@@ -110,14 +159,6 @@ fn wait_for(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
 /// when the daemon answers. Stale socket files are removed after proving
 /// nothing listens; a live TCP squatter fails loudly (bind fence is .3).
 pub fn start(cfg: &Config) -> Result<()> {
-    std::fs::create_dir_all(&cfg.state_dir)
-        .with_context(|| format!("mkdir {}", cfg.state_dir.display()))?;
-    if let Some(pid) = managed(cfg)
-        && health_probe(cfg).is_some()
-    {
-        println!("doorbell: already running (pid {pid})");
-        return Ok(());
-    }
     let exe = std::env::current_exe().context("current_exe")?;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -125,12 +166,18 @@ pub fn start(cfg: &Config) -> Result<()> {
         .open(cfg.log_file())
         .with_context(|| format!("open {}", cfg.log_file().display()))?;
     let err_log = log.try_clone().context("clone log handle")?;
-    let child = std::process::Command::new(exe)
-        .arg("serve")
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("serve")
         .arg("--state-dir")
         .arg(&cfg.state_dir)
         .arg("--port")
         .arg(cfg.port.to_string())
+        .arg("--flywheel-state-dir")
+        .arg(&cfg.flywheel_state);
+    for (p, w) in &cfg.hosts {
+        cmd.arg("--host").arg(format!("{p}/{w}"));
+    }
+    let child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(log)
         .stderr(err_log)

@@ -55,8 +55,8 @@ echo "-- E13-lite: split-brain fence --"
   || fail "second start over healthy peer must exit 0"
 pass "double-start clean exit 0"
 # No lease + healthy peer: raw serve must exit 0 via the bind fence
-# (delete the lease file; the daemon still holds the port).
-rm -f "$STATE/doorbell/owner.json"
+# (delete the per-ws lease files; the daemon still holds the port).
+rm -f "$STATE"/doorbell/owner-*.json
 "$BIN" serve --state-dir "$STATE" --port "$PORT" >/dev/null 2>&1 &
 SRV=$!
 wait "$SRV"

@@ -19,6 +19,14 @@ struct Cli {
     /// TCP port override, mostly for tests (default 18980).
     #[arg(long, global = true)]
     port: Option<u16>,
+    /// Flywheel state dir override (journals, leases, registries).
+    /// Default mirrors flywheel: $XDG_STATE_HOME/flywheel, else platform.
+    #[arg(long, global = true)]
+    flywheel_state_dir: Option<std::path::PathBuf>,
+    /// Hosted loop as project/workspace, repeatable (bd-ene2 Phase 3).
+    /// Empty = standby: bind + reads only.
+    #[arg(long, global = true)]
+    host: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -62,7 +70,16 @@ enum Cmd {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let cfg = lifecycle::Config::resolve(cli.state_dir, cli.port)?;
+    let mut hosts = Vec::new();
+    for h in &cli.host {
+        hosts.push(lifecycle::parse_host(h)?);
+    }
+    let cfg = lifecycle::Config::resolve_full(
+        cli.state_dir,
+        cli.port,
+        cli.flywheel_state_dir,
+        hosts,
+    )?;
     match cli.cmd {
         Cmd::Start => lifecycle::start(&cfg),
         Cmd::Stop { force } => lifecycle::stop(&cfg, force),

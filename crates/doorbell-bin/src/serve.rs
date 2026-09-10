@@ -3,8 +3,12 @@
 //! copy-truncate logrotate. No HTTP framework: one GET route needs
 //! sixty lines, not a dependency.
 //!
-//! Standby in Phase 1: no brain is hosted yet (tick binding is bd-asr2.5),
-//! so liveness fields report honestly and dynamic ones wait their phase.
+//! Phase 3 (bd-ene2): the daemon hosts one [`Brain`](doorbell_rt::Brain)
+//! per configured `--host project/workspace`, driven by the daemon-native
+//! [`FileHost`](doorbell_rt::FileHost) (file/CLI inputs, no flywheel
+//! types). Journals land in the flywheel state dir, shared with
+//! `flywheel doorbell why/digest/afk`. No `--host` = standby (bind +
+//! reads only), reported honestly in `/health`.
 
 use crate::lifecycle::Config;
 use anyhow::{Context, Result};
@@ -12,20 +16,89 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const LOGROTATE_BYTES: u64 = 1024 * 1024;
 
+/// One hosted loop: watch child + sweep/ack beats around a Brain. The
+/// channel comes from `run` so shutdown (drop all senders) ends the
+/// brain cleanly with drained, journaled intents.
+async fn host_workspace(
+    fw_state: std::path::PathBuf,
+    project: String,
+    workspace: String,
+    tx: tokio::sync::mpsc::Sender<doorbell_rt::BrainMsg>,
+    rx: tokio::sync::mpsc::Receiver<doorbell_rt::BrainMsg>,
+) -> doorbell_rt::RunReport {
+    use doorbell_rt::{Brain, BrainConfig, FileHost, FileHostConfig, Host, SinkManager};
+    use doorbell_rt::{CliPromptSink, FileStore};
+    let toron_bin =
+        std::env::var("DOORBELL_TORON_BIN").unwrap_or_else(|_| "toron".into());
+    let herdr_bin =
+        std::env::var("DOORBELL_HERDR_BIN").unwrap_or_else(|_| "herdr".into());
+    let mut fcfg = FileHostConfig::new(fw_state.clone(), project.clone(), workspace.clone());
+    fcfg.toron_bin = toron_bin;
+    fcfg.herdr_bin = herdr_bin.clone();
+    let mut host = FileHost::new(fcfg).with_tx(tx.clone());
+    // Daemon-keyed generation: first run captures the doorbell binary
+    // identity so a mid-run upgrade retires the loop instead of waking
+    // stale (same rule as the embedded WatcherGen gate, daemon-keyed).
+    doorbell_rt::ensure_daemon_gen(&fw_state, &workspace);
+    let mut sinks = SinkManager::new(tx.clone());
+    sinks.add_sink(
+        "herdr",
+        Box::new(CliPromptSink::new(herdr_bin, host.target_table())),
+    );
+    let store = FileStore::new(fw_state);
+    // Watch child (CLI; the in-process bus needs toron-core, which the
+    // lean daemon never links). Backoff + retry gate live in the host.
+    host.restart_watch();
+    // Beats: 1s sweep, 60s ack-SLA (same cadences as embedded).
+    let sweep_ticker = doorbell_rt::interval_ticker("sweep", tx.clone(), std::time::Duration::from_secs(1), || {
+        doorbell_rt::BrainMsg::Sweep {
+            since: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            now: doorbell_rt::lease::unix_now(),
+        }
+    });
+    let _sla_ticker = doorbell_rt::interval_ticker(
+        "ack-sla",
+        tx.clone(),
+        std::time::Duration::from_secs(60),
+        || doorbell_rt::BrainMsg::AckSlaTick {
+            now: doorbell_rt::lease::unix_now(),
+        },
+    );
+    let brain = Brain::new(BrainConfig::new(&workspace), host, store, sinks);
+    let report = brain.run(rx).await;
+    drop(sweep_ticker);
+    eprintln!(
+        "doorbell serve: hosted loop {project}/{workspace} exited (injects={} sheds={} degraded={})",
+        report.stats.injects, report.stats.sheds, report.stats.degraded
+    );
+    report
+}
+/// Shared read state for the HTTP/UDS handlers.
+#[derive(Clone)]
+struct AppState {
+    started: std::time::Instant,
+    fw_state: std::path::PathBuf,
+    hosted: Vec<String>,
+}
+
 pub async fn run(cfg: &Config) -> Result<()> {
     use doorbell_rt::lease;
     let now = lease::unix_now();
-    // D9 layer 1 first: a live lease means another writer runs — refuse
-    // before touching its socket (never clobber a stranger's bind).
-    if let Some(cur) = lease::read_lease(&cfg.state_dir)
-        && !lease::lease_stale(&cur, now)
-    {
-        anyhow::bail!(
-            "doorbell serve: refused, live lease held by pid {} on {} (started {})",
-            cur.pid,
-            cur.host,
-            cur.started_unix
-        );
+    // D9 layer 1 first, per workspace: a live lease means another writer
+    // runs there — refuse before touching its socket (never clobber a
+    // stranger's bind). Leases live in the FLYWHEEL state dir, shared
+    // with embedded loops, so either side excludes the other per ws.
+    for (project, workspace) in &cfg.hosts {
+        if let Some(cur) = lease::read_lease(&cfg.flywheel_state, workspace)
+            && !lease::lease_stale(&cur, now)
+        {
+            anyhow::bail!(
+                "doorbell serve: refused, live lease for {project}/{workspace} held by pid {} on {} (started {})",
+                cur.pid,
+                cur.host,
+                cur.started_unix
+            );
+        }
     }
     let tcp = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", cfg.port)).await {
         Ok(l) => l,
@@ -52,9 +125,19 @@ pub async fn run(cfg: &Config) -> Result<()> {
         }
         Err(e) => return Err(e).with_context(|| format!("bind 127.0.0.1:{}", cfg.port)),
     };
-    // Claim the writer lease before serving (heartbeat below keeps it).
-    let owned = lease::acquire_lease(&cfg.state_dir, lease::unix_now())
-        .map_err(|e| anyhow::anyhow!("doorbell serve: lease claim failed after bind: {e:?}"))?;
+    // Claim one writer lease per hosted workspace before serving.
+    let mut owned: Vec<(String, doorbell_rt::lease::OwnerLease)> = Vec::new();
+    for (_, workspace) in &cfg.hosts {
+        match lease::acquire_lease(&cfg.flywheel_state, workspace, lease::unix_now()) {
+            Ok(l) => owned.push((workspace.clone(), l)),
+            Err(e) => {
+                for (ws, l) in &owned {
+                    lease::release_lease(&cfg.flywheel_state, ws, l);
+                }
+                anyhow::bail!("doorbell serve: lease claim failed after bind: {e:?}");
+            }
+        }
+    }
     let sock_path = cfg.socket_path();
     if let Some(parent) = sock_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -72,11 +155,38 @@ pub async fn run(cfg: &Config) -> Result<()> {
         .with_context(|| format!("bind {}", sock_path.display()))?;
     let started = std::time::Instant::now();
     let log_path = cfg.log_file();
+    let hosted: Vec<String> = cfg
+        .hosts
+        .iter()
+        .map(|(p, w)| format!("{p}/{w}"))
+        .collect();
     eprintln!(
-        "doorbell serve: up on 127.0.0.1:{} + {}",
+        "doorbell serve: up on 127.0.0.1:{} + {} (hosting {})",
         cfg.port,
-        sock_path.display()
+        sock_path.display(),
+        if hosted.is_empty() {
+            "nothing (standby)".to_string()
+        } else {
+            hosted.join(", ")
+        }
     );
+    // Host loops: one Brain per configured workspace. Shutdown = drop
+    // every sender (tickers + loop handle), so each brain drains its
+    // sinks, journals undelivered intents, and returns its report.
+    let mut loops = Vec::new();
+    let mut loop_txs = Vec::new();
+    for (project, workspace) in &cfg.hosts {
+        let (tx, rx) = tokio::sync::mpsc::channel(doorbell_rt::BRAIN_CAP);
+        loop_txs.push(tx.clone());
+        let (fw, p, w) = (
+            cfg.flywheel_state.clone(),
+            project.clone(),
+            workspace.clone(),
+        );
+        loops.push(tokio::spawn(async move {
+            host_workspace(fw, p, w, tx, rx).await
+        }));
+    }
     let rotate_tick = tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
@@ -84,11 +194,16 @@ pub async fn run(cfg: &Config) -> Result<()> {
             copy_truncate_over(&log_path, LOGROTATE_BYTES);
         }
     });
+    let app = AppState {
+        started,
+        fw_state: cfg.flywheel_state.clone(),
+        hosted: hosted.clone(),
+    };
     let serve_tcp = async {
         loop {
             let (stream, _) = tcp.accept().await?;
-            let sd = cfg.state_dir.clone();
-            tokio::spawn(handle_http(stream, started, sd));
+            let app = app.clone();
+            tokio::spawn(handle_http(stream, app));
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
@@ -96,33 +211,66 @@ pub async fn run(cfg: &Config) -> Result<()> {
     let serve_uds = async {
         loop {
             let (stream, _) = uds.accept().await?;
-            tokio::spawn(handle_uds(stream, started));
+            let app = app.clone();
+            tokio::spawn(handle_uds(stream, app));
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
     };
-    // D9 layer 1 upkeep: heartbeat every 30s (the live dispatcher rewrites
-    // it each sweep in .5; the daemon has no sweep yet, so wall-clock it).
-    let hb_state = cfg.state_dir.clone();
+    // D9 layer 1 upkeep: heartbeat every 30s per held lease.
+    let hb_state = cfg.flywheel_state.clone();
+    let hb_owned: Vec<String> = owned.iter().map(|(ws, _)| ws.clone()).collect();
     let heartbeat = tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             tick.tick().await;
             let now = doorbell_rt::lease::unix_now();
-            if let Some(mut cur) = doorbell_rt::lease::read_lease(&hb_state) {
-                doorbell_rt::lease::refresh_lease(&hb_state, &mut cur, now);
+            for ws in &hb_owned {
+                if let Some(mut cur) = doorbell_rt::lease::read_lease(&hb_state, ws) {
+                    doorbell_rt::lease::refresh_lease(&hb_state, ws, &mut cur, now);
+                }
             }
         }
     });
-    let finish = |owned: &doorbell_rt::lease::OwnerLease| {
+    let finish = |owned: &[(String, doorbell_rt::lease::OwnerLease)]| {
         heartbeat.abort();
         rotate_tick.abort();
-        doorbell_rt::lease::release_lease(&cfg.state_dir, owned);
+        for (ws, l) in owned {
+            doorbell_rt::lease::release_lease(&cfg.flywheel_state, ws, l);
+        }
+    };
+    // Graceful shutdown on Ctrl-C and SIGTERM (`doorbell stop` sends
+    // TERM: drain sinks, journal undelivered intents, release leases).
+    #[cfg(unix)]
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM listener");
+    #[cfg(unix)]
+    let shutdown = async {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = term.recv() => {},
+        }
+    };
+    #[cfg(not(unix))]
+    let shutdown = async {
+        tokio::signal::ctrl_c().await.ok();
     };
     tokio::select! {
         r = serve_tcp => { finish(&owned); r }
         r = serve_uds => { finish(&owned); r }
-        _ = tokio::signal::ctrl_c() => {
+        _ = shutdown => {
+            // Shutdown travels as a message (ticker + forwarder senders
+            // stay open until their tasks end with the brain).
+            eprintln!("doorbell serve: shutdown signal received, draining loops");
+            for tx in &loop_txs {
+                let _ = tx.send(doorbell_rt::BrainMsg::Shutdown).await;
+            }
+            eprintln!("doorbell serve: shutdown sent, joining loops");
+            drop(loop_txs);
+            for h in loops {
+                let _ = h.await;
+            }
+            eprintln!("doorbell serve: loops joined, releasing leases");
             finish(&owned);
             eprintln!("doorbell serve: shutting down");
             Ok(())
@@ -182,11 +330,7 @@ fn copy_truncate_over(path: &std::path::Path, cap: u64) {
     }
 }
 
-async fn handle_http(
-    mut stream: tokio::net::TcpStream,
-    started: std::time::Instant,
-    state_dir: std::path::PathBuf,
-) {
+async fn handle_http(mut stream: tokio::net::TcpStream, app: AppState) {
     let mut buf = vec![0u8; 4096];
     let Ok(n) = stream.read(&mut buf).await else {
         return;
@@ -198,16 +342,8 @@ async fn handle_http(
         .and_then(|l| l.split_whitespace().nth(1))
         .unwrap_or("/");
     let (code, content_type, body) = match path.split('?').next().unwrap_or("/") {
-        "/health" => (
-            "200 OK",
-            "application/json",
-            health_body(started, &state_dir),
-        ),
-        "/stats" => (
-            "200 OK",
-            "application/json",
-            stats_body(started, &state_dir),
-        ),
+        "/health" => ("200 OK", "application/json", health_body(&app)),
+        "/stats" => ("200 OK", "application/json", stats_body(&app)),
         "/events" => {
             let since = path
                 .split("since=")
@@ -223,7 +359,7 @@ async fn handle_http(
             (
                 "200 OK",
                 "text/event-stream",
-                events_body(&state_dir, since),
+                events_body(&app.fw_state, since),
             )
         }
         _ => (
@@ -243,7 +379,7 @@ async fn handle_http(
         .await;
 }
 
-async fn handle_uds(mut stream: tokio::net::UnixStream, started: std::time::Instant) {
+async fn handle_uds(mut stream: tokio::net::UnixStream, app: AppState) {
     // UDS speaks the same minimal surface: one JSON line in, one out.
     // Verbs ride here in Phase 2; today only `ping` answers.
     let mut buf = vec![0u8; 4096];
@@ -257,28 +393,68 @@ async fn handle_uds(mut stream: tokio::net::UnixStream, started: std::time::Inst
             .to_string()
             + "\n"
     } else {
-        serde_json::json!({"alive": true, "uptime_s": started.elapsed().as_secs()}).to_string()
+        serde_json::json!({"alive": true, "uptime_s": app.started.elapsed().as_secs()}).to_string()
             + "\n"
     };
     let _ = stream.write_all(body.as_bytes()).await;
 }
-fn health_body(started: std::time::Instant, state_dir: &std::path::Path) -> String {
+
+/// Journal mtime age per hosted workspace — sweep liveness without
+/// shared mutable state (the journal IS the ground truth D4 points to).
+fn hosted_sweep_age(fw_state: &std::path::Path, hosted: &[String]) -> (Option<u64>, u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut min_age: Option<u64> = None;
+    let mut max_seq = 0u64;
+    for hw in hosted {
+        let Some(ws) = hw.split('/').nth(1) else {
+            continue;
+        };
+        let path = fw_state.join("journals").join(format!("doorbell-journal-{ws}.jsonl"));
+        if let Ok(md) = std::fs::metadata(&path) {
+            let age = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|t| now.saturating_sub(t.as_secs()));
+            min_age = Some(match (min_age, age) {
+                (Some(a), Some(b)) => a.min(b),
+                (a, b) => a.or(b).unwrap_or(u64::MAX),
+            });
+        }
+        let store = doorbell_rt::FileStore::new(fw_state);
+        max_seq = max_seq.max(store.last_seq(ws));
+    }
+    (min_age.filter(|a| *a != u64::MAX), max_seq)
+}
+
+fn health_body(app: &AppState) -> String {
     // D4.4: a torn journal tail degrades loudly here (bd-asr2.4).
-    let store = doorbell_rt::FileStore::new(state_dir);
+    let store = doorbell_rt::FileStore::new(&app.fw_state);
     let mut degraded = Vec::new();
     if store.any_torn_tail() {
         degraded.push("journal_torn_tail".to_string());
     }
+    let mode = if app.hosted.is_empty() {
+        "standby"
+    } else {
+        "hosted"
+    };
+    let (sweep_age, max_seq) = hosted_sweep_age(&app.fw_state, &app.hosted);
     serde_json::json!({
         "protocol": doorbell_rt::api::PING.protocol,
         "core_v": doorbell_rt::api::PING.core_v,
         "journal_v": doorbell_rt::api::PING.journal_v,
-        "uptime_s": started.elapsed().as_secs(),
-        "watch": {"state": "standby", "last_event_age_s": null},
-        "sweep": {"last_age_s": null},
+        "uptime_s": app.started.elapsed().as_secs(),
+        "mode": mode,
+        "hosted": app.hosted,
+        "watch": {"state": if app.hosted.is_empty() { "standby" } else { "hosted" }, "last_event_age_s": null},
+        "sweep": {"last_age_s": sweep_age},
         "subscribers": 0,
         "degraded": degraded,
-        "journal": {"seq": 0, "lag_lines": 0},
+        "journal": {"seq": max_seq, "lag_lines": 0},
         "owner": {"pid": std::process::id(), "gen": null, "host": hostname()},
     })
     .to_string()
@@ -350,14 +526,13 @@ fn events_body(state_dir: &std::path::Path, since: Option<u64>) -> String {
     out.push_str(": ready\n\n");
     out
 }
-
-/// Host-level counters (D8 stats shape; runtime counters bind when the
-/// daemon hosts the loop in bd-ene2 — until then journal-derived truth).
-fn stats_body(started: std::time::Instant, state_dir: &std::path::Path) -> String {
-    let store = doorbell_rt::FileStore::new(state_dir);
+/// Host-level counters (D8 stats shape; journal-derived truth across the
+/// flywheel state dir; per-loop runtime counters stay in RunReports).
+fn stats_body(app: &AppState) -> String {
+    let store = doorbell_rt::FileStore::new(&app.fw_state);
     let mut journal_rows = 0u64;
     let mut workspaces = 0u64;
-    if let Ok(entries) = std::fs::read_dir(state_dir.join("journals")) {
+    if let Ok(entries) = std::fs::read_dir(app.fw_state.join("journals")) {
         for entry in entries.filter_map(|e| e.ok()) {
             let name = entry.file_name().to_string_lossy().into_owned();
             if let Some(rest) = name
@@ -375,7 +550,9 @@ fn stats_body(started: std::time::Instant, state_dir: &std::path::Path) -> Strin
         "protocol": doorbell_rt::api::PING.protocol,
         "core_v": doorbell_rt::api::PING.core_v,
         "journal_v": doorbell_rt::api::PING.journal_v,
-        "uptime_s": started.elapsed().as_secs(),
+        "uptime_s": app.started.elapsed().as_secs(),
+        "mode": if app.hosted.is_empty() { "standby" } else { "hosted" },
+        "hosted": app.hosted,
         "workspaces": workspaces,
         "journal_rows": journal_rows,
         "torn_tail": store.any_torn_tail(),
@@ -385,7 +562,6 @@ fn stats_body(started: std::time::Instant, state_dir: &std::path::Path) -> Strin
         "sheds": 0,
         "deaf": 0,
         "digest_batches": 0,
-        "note": "runtime counters bind when the daemon hosts the loop (bd-ene2)",
     })
     .to_string()
 }

@@ -971,6 +971,7 @@ name = "doorbell-bin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "dirs",
  "doorbell-rt",
@@ -994,9 +995,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "dirs",
  "doorbell-core",
+ "hex",
  "serde",
  "serde_json",
+ "sha1",
  "tokio",
 ]
 
