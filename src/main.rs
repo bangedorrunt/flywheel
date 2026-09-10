@@ -1713,6 +1713,21 @@ enum DoorbellCmd {
     /// surface as `why`); urgent wakes never batch. Wedge alarm when the
     /// queue cannot drain.
     Afk { project: String },
+    /// generalized digest (bd-asr2.11, D8): per-identity wake digest over
+    /// any window — earliest first, unanswered escalated on top. `afk`
+    /// stays as the captain-default alias. Roster-free (no arrival triple).
+    Digest {
+        project: String,
+        /// identity to digest for (pin, subscriber tag, or npub); empty = all
+        #[arg(long)]
+        identity: Option<String>,
+        /// only rows at/after this RFC3339 timestamp
+        #[arg(long)]
+        since: Option<String>,
+        /// output format: text (default) or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
     /// why did (or didn't) a pin get rung? Replays the doorbell journal —
     /// GS-007 bd-yw4s: the trust surface, not log tailing. Folds tick from Default.
     Why {
@@ -1728,6 +1743,10 @@ enum DoorbellCmd {
         /// replay by seq — folds tick from Default up to this seq
         #[arg(long)]
         seq: Option<u64>,
+        /// replay only rows tagged for this subscriber (bd-asr2.11);
+        /// untagged legacy rows are excluded under a filter
+        #[arg(long)]
+        subscriber: Option<String>,
     },
 }
 
@@ -4549,13 +4568,28 @@ fn main() {
             DoorbellCmd::Stop { project, workspace } => cmd_doorbell_stop(&cfg, project, workspace),
             DoorbellCmd::ReInject { project } => cmd_doorbell_re_inject(&cfg, project),
             DoorbellCmd::Afk { project } => cmd_doorbell_afk(&cfg, project),
+            DoorbellCmd::Digest {
+                project,
+                identity,
+                since,
+                format,
+            } => cmd_doorbell_digest(&cfg, project, identity.as_deref(), since.as_deref(), format),
             DoorbellCmd::Why {
                 project,
                 pin,
                 limit,
                 corr,
                 seq,
-            } => cmd_doorbell_why(&cfg, &project, &pin, *limit, corr.as_deref(), *seq),
+                subscriber,
+            } => cmd_doorbell_why(
+                &cfg,
+                &project,
+                &pin,
+                *limit,
+                corr.as_deref(),
+                *seq,
+                subscriber.as_deref(),
+            ),
         },
         Some(Commands::LoopMode { cmd }) => match cmd {
             LoopCmd::Run {
@@ -9239,6 +9273,7 @@ fn cmd_doorbell_why(
     limit: usize,
     corr: Option<&str>,
     seq: Option<u64>,
+    subscriber: Option<&str>,
 ) -> Result<()> {
     let _ = cfg;
     let _ = project;
@@ -9299,12 +9334,19 @@ fn cmd_doorbell_why(
             );
             continue;
         }
+        // Subscriber-filtered replay (bd-asr2.11): untagged legacy rows
+        // cannot be attributed, so a filter excludes them loudly-once.
+        if let Some(sub) = subscriber {
+            match entry.get("subscriber").and_then(|s| s.as_str()) {
+                Some(tag) if tag == sub => {}
+                _ => continue,
+            }
+        }
         let msg_val = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
         let actions_val = entry
             .get("actions")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        // Deserialize msg for replay — prefer workspace::Msg, fallback to DoorbellMsg (legacy journal)
         let replay_msg: Option<workspace::Msg> = if let Ok(m) =
             serde_json::from_value::<workspace::Msg>(msg_val.clone())
         {
@@ -9595,6 +9637,118 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str) -> Result<()> {
     // pending_wait (insertion is effect-side only), so overdue_holds was
     // always empty here. Live hold escalation rides the Sweep-arm TTL +
     // Audit wait-timeout records, not this display.
+    Ok(())
+}
+
+/// Generalized digest (bd-asr2.11, D8): per-identity wake digest over any
+/// window. `afk` above stays byte-identical (captain default); this verb
+/// filters by identity/subscriber tag and `--since`, renders text or JSON,
+/// and escalates unanswered pins first. Roster-free.
+fn cmd_doorbell_digest(
+    cfg: &Config,
+    project: &str,
+    identity: Option<&str>,
+    since: Option<&str>,
+    format: &str,
+) -> Result<()> {
+    let _ = cfg;
+    let _ = project;
+    let entries = doorbell::journal_read_all(&config::state_dir());
+    let since_us = since.and_then(|s| doorbell_core::parse_rfc3339_micros(s).ok());
+    // Unanswered pins escalate first (deaf services surface, S3).
+    let mut unanswered: std::collections::BTreeSet<String> = Default::default();
+    for ws in doorbell::journal_workspaces_list(&config::state_dir()) {
+        for pin in doorbell::read_unanswered(&doorbell::unanswered_file(&config::state_dir(), &ws))
+        {
+            if identity.is_none_or(|id| pin == id) {
+                unanswered.insert(pin);
+            }
+        }
+    }
+    let mut rows: Vec<(String, String, String, String)> = Vec::new();
+    for (ws, entry) in &entries {
+        if !doorbell::journal_version_accepted(entry) {
+            continue;
+        }
+        if let Some(id) = identity {
+            let tag = entry.get("subscriber").and_then(|s| s.as_str());
+            let in_pins = entry
+                .get("pins")
+                .and_then(|p| p.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).any(|p| p == id))
+                .unwrap_or(false);
+            if tag != Some(id) && !in_pins {
+                continue;
+            }
+        }
+        if let Some(floor) = since_us {
+            let ts_us = entry
+                .get("ts")
+                .and_then(|t| t.as_str())
+                .and_then(|t| doorbell_core::parse_rfc3339_micros(t).ok());
+            if ts_us.is_some_and(|t| t < floor) {
+                continue;
+            }
+        }
+        let ts = entry
+            .get("ts")
+            .and_then(|t| t.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let stage = entry
+            .get("executed")
+            .and_then(|e| e.get("stage"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let who = entry
+            .get("subscriber")
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                entry
+                    .get("pins")
+                    .and_then(|p| p.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default()
+            });
+        rows.push((ws.clone(), ts, stage, who));
+    }
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::json!({
+                "identity": identity,
+                "since": since,
+                "unanswered": unanswered.iter().collect::<Vec<_>>(),
+                "rows": rows.iter().map(|(ws, ts, stage, who)| {
+                    serde_json::json!({"workspace": ws, "ts": ts, "stage": stage, "who": who})
+                }).collect::<Vec<_>>(),
+            })
+        );
+        return Ok(());
+    }
+    if !unanswered.is_empty() {
+        println!(
+            "UNANSWERED (escalated): {}",
+            unanswered
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if rows.is_empty() {
+        println!("doorbell digest: nothing queued");
+    }
+    for (ws, ts, stage, who) in rows {
+        println!("{ts} {ws}/{stage} {who}");
+    }
     Ok(())
 }
 
