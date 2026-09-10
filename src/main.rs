@@ -2186,13 +2186,13 @@ enum MailCmd {
         /// Default `tasked` so mail deliveries are not wake:null theater.
         #[arg(long = "wake", default_value = "tasked")]
         wake: String,
-    },
         /// ADR-0010 D9 (bd-l0fz, bd-7qg6): stamp the structural done-hold
         /// (`bead=<id>` extra tag). The loop's dispatch guard matches the TAG,
         /// never the `[bd-###] done` subject — a done subject without this tag
         /// never fires the hold. In-process mailbox only (refuses loud remote).
         #[arg(long = "resolve-bead")]
         resolve_bead: Option<String>,
+    },
     /// reserve / inspect file locks (advisory; subcommands: reserve, list, show)
     Locks {
         #[command(subcommand)]
@@ -9072,6 +9072,16 @@ fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
     ensure_doorbell_supervisor();
     let _ = cfg;
     let state_dir = config::state_dir();
+    // bd-bdpx: unbound-but-live panes are invisible to role wake and skipped
+    // by the sweep — surface them in status (not just the per-sweep stderr
+    // warn) so the operator sees them in one place. Re-bind via
+    // `toron role pin <role> <pin> --project <project>`.
+    let unpinned = unpinned_registry_names(&state::load_spawn_registry(project));
+    let unpinned_seg = if unpinned.is_empty() {
+        String::new()
+    } else {
+        format!(" unpinned={}", unpinned.join(","))
+    };
     for ws in doorbell_project_workspaces(project) {
         let pid = doorbell::read_pid(&doorbell::pid_file(&state_dir, &ws));
         let alive = pid.is_some_and(doorbell::pid_alive);
@@ -9086,7 +9096,7 @@ fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
             })
             .unwrap_or_else(|| "last_wake=never".into());
         println!(
-            "{project}/{ws}: dispatcher {} {last}{}{}",
+            "{project}/{ws}: dispatcher {} {last}{}{}{}",
             if alive { "up" } else { "DOWN" },
             {
                 let pins = doorbell::read_unanswered(&doorbell::unanswered_file(&state_dir, &ws));
@@ -9095,7 +9105,19 @@ fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
                 } else {
                     format!(" unanswered={}", pins.join(","))
                 }
-            }
+            },
+            unpinned_seg,
+            // bd-7qg6: plane-S cursor age makes a hung-but-alive watch child
+            // inspectable — dispatcher `up` with an ancient cursor and fresh
+            // bus traffic is the live-pid-deaf signature (heal_tick only
+            // restarts dead pids). Age alone never triggers a restart here.
+            match wake.plane_s_cursor_us {
+                Some(us) => {
+                    let age = doorbell_now_unix().saturating_sub((us / 1_000_000) as u64);
+                    format!(" watch_idle={age}s")
+                }
+                None => " watch_idle=never".to_string(),
+            },
         );
         if !alive {
             // lazy heal: report AND restart (requirement 1)
@@ -9161,17 +9183,6 @@ fn cmd_doorbell_why(
     let _ = project;
     // fold tick from Default — replay is the trust surface, not grep
     // WorkspaceModel is the single owner; journal entries may be DoorbellMsg (old) or workspace::Msg (new)
-            },
-            // bd-7qg6: plane-S cursor age makes a hung-but-alive watch child
-            // inspectable — dispatcher `up` with an ancient cursor and fresh
-            // bus traffic is the live-pid-deaf signature (heal_tick only
-            // restarts dead pids). Age alone never triggers a restart here.
-            match wake.plane_s_cursor_us {
-                Some(us) => {
-                    let age = doorbell_now_unix().saturating_sub((us / 1_000_000) as u64);
-                    format!(" watch_idle={age}s")
-                }
-                None => " watch_idle=never".to_string(),
     let entries = doorbell::journal_read_all(&config::state_dir());
     // bd-7qg6: fold per workspace — one shared Model replayed foreign
     // presence/assignment into a single proof (tenant contamination).
@@ -9257,6 +9268,17 @@ fn cmd_doorbell_why(
                 // the fold index so classification reproduces deterministically.
                 // Entries lacking pins (pre-field journals) keep the empty
                 // Default index: Unknown-presence semantics, never invent idle.
+                // bd-7qg6: per-workspace fold (see setup above).
+                let model = models.entry(workspace.clone()).or_insert_with(|| {
+                    // bd-adr0027-proven-leftovers-55nx.1: crash-resume seed — the same
+                    // durable caches the live dispatcher reloads at start (receipts sqlite
+                    // → assignment; presence.jsonl snapshot → presence). Journal Msgs fold
+                    // on top. Never the live dispatcher's RAM, never a second store.
+                    let mut m = workspace::WorkspaceModel::default();
+                    rebuild_assignment_from_receipts(&mut m);
+                    seed_why_presence(&mut m, presence_rows.clone());
+                    m
+                });
                 if let Some(pins) = entry.get("pins").and_then(|p| p.as_array()) {
                     for pin in pins.iter().filter_map(|v| v.as_str()) {
                         model.doorbell.index.insert_pin(pin.to_string(), None);
@@ -9329,17 +9351,6 @@ fn cmd_doorbell_why(
                                 && dropped.iter().any(|d| d == p)
                             {
                                 return None;
-                // bd-7qg6: per-workspace fold (see setup above).
-                let model = models.entry(workspace.clone()).or_insert_with(|| {
-                    // bd-adr0027-proven-leftovers-55nx.1: crash-resume seed — the same
-                    // durable caches the live dispatcher reloads at start (receipts sqlite
-                    // → assignment; presence.jsonl snapshot → presence). Journal Msgs fold
-                    // on top. Never the live dispatcher's RAM, never a second store.
-                    let mut m = workspace::WorkspaceModel::default();
-                    rebuild_assignment_from_receipts(&mut m);
-                    seed_why_presence(&mut m, presence_rows.clone());
-                    m
-                });
                             }
                             Some(if v.get("Prompt").is_some() {
                                 "prompt"
@@ -9431,6 +9442,11 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str) -> Result<()> {
     for (ws, entry) in &entries {
         let msg_val = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
         if let Some(msg) = snapshot::replay_msg(&msg_val) {
+            let model = models.entry(ws.clone()).or_insert_with(|| {
+                let mut m = workspace::WorkspaceModel::default();
+                rebuild_assignment_from_receipts(&mut m);
+                m
+            });
             if let Some(pins) = entry.get("pins").and_then(|p| p.as_array()) {
                 for pin in pins.iter().filter_map(|v| v.as_str()) {
                     model.doorbell.index.insert_pin(pin.to_string(), None);
@@ -9500,11 +9516,6 @@ fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> {
     ensure_doorbell_supervisor();
     let registry = state::load_spawn_registry(project);
     let peer_tpl = include_str!("../integrations/peer-aware.md.tpl");
-            let model = models.entry(ws.clone()).or_insert_with(|| {
-                let mut m = workspace::WorkspaceModel::default();
-                rebuild_assignment_from_receipts(&mut m);
-                m
-            });
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let mut injected = 0;
     for e in &registry {
@@ -9513,11 +9524,6 @@ fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> {
         }
         let Some(identity) = e.mail_identity.as_deref() else {
             continue;
-        last_digest_unix = last_digest_unix.min(m.last_digest_unix);
-    }
-    queue.sort_by(|a, b| (a.at_unix, a.seq).cmp(&(b.at_unix, b.seq)));
-    if last_digest_unix == u64::MAX {
-        last_digest_unix = 0;
         };
         let mut lines = vec![doorbell::identity_prime(&e.name, identity)];
         lines.push(peer_prompt_template(
@@ -9850,6 +9856,14 @@ fn cmd_internal_doorbell(
     let wake_state = doorbell::load_wake_state(&wake_state_path);
     let mut since_by_pin: BTreeMap<String, String> = wake_state.since_by_pin.clone();
     let mut plane_s_cursor_us: Option<i64> = wake_state.plane_s_cursor_us;
+    // bd-bdpx: seed the tick clock here — WaitCorr park deadlines stamp from
+    // last_now inside tick, so a pre-first-beat wake parks with a real
+    // deadline instead of skipping registration (last_now==0). Placed AFTER
+    // the wake-state load so the supervised-observable tripwire window above
+    // keeps its shape; order vs the load is irrelevant (disjoint state).
+    // Explicit effect-side bootstrap; tick itself stays pure (clock still
+    // enters tick only as Msg payload).
+    workspace_model.last_now = doorbell_now_unix();
     let mut hear = doorbell::HearTracker::default();
     hear.seed_unanswered(doorbell::read_unanswered(&doorbell::unanswered_file(
         &config::state_dir(),
@@ -10699,26 +10713,24 @@ fn handle_workspace_cmds(
             workspace::Cmd::FetchInbox { .. } => {
                 fetch_inbox = true;
             }
-            workspace::Cmd::WaitCorr { corr } => {
+            workspace::Cmd::WaitCorr { .. } => {
                 // bd-adr0027-proven-leftovers-55nx.6: doorbell drain-on-wake
                 // IS the WaitCorr implementation (same bus as watch). Toron CLI
                 // equivalent is `wait_for_corr` (toron-cli/src/plane.rs): it
                 // subscribes to kinds 9/14/1059/43001/43004 and unparks on bus
                 // event or deadline, then re-checks receipts sqlite — no sleep
-                // poll. Here the corr parks in pending_wait and
+                // poll. The corr parks in pending_wait and
                 // drain_pending_wait_corrs re-peeks sqlite after WATCH and
                 // Sweep batches (drain_waits=true; ADR-0011 D7). Fact/AckSla
                 // batches still pass false. A missed receipt still expires
                 // via the Sweep-arm TTL with an Audit wait-timeout record.
                 // The swarm fold (durable.rs) never produces or drains WaitCorr.
-                // bd-zfnx.6: the park is bounded — deadline TTL stamped here,
-                // expiry/cap-eviction decided in the Sweep arm (tick), each
-                // with an Audit wait-timeout record. Never silent drop.
-                let now = chrono::Utc::now().timestamp() as u64;
-                workspace_model.pending_wait.insert(
-                    corr.clone(),
-                    now.saturating_add(workspace::PENDING_WAIT_TTL_SECS),
-                );
+                // bd-zfnx.6 + bd-bdpx: the park is bounded — the deadline is
+                // stamped in TICK (apply_assignment, from the tick clock), not
+                // here: the handler is drain-only, so replay reproduces the
+                // deadline from the Msg log. Expiry/cap-eviction decided in
+                // the Sweep arm (tick), each with an Audit wait-timeout
+                // record. Never silent drop.
             }
             workspace::Cmd::Publish {
                 kind,
@@ -18005,6 +18017,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             as_agent,
             thread_id,
             wake,
+            resolve_bead,
         } => {
             let project = mail_project(project, project_flag, "send")?;
             let key = project_dir_str(cfg, project)?;
@@ -18070,6 +18083,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 thread_id.as_deref(),
                 Some(wake.as_str()),
                 None,
+                resolve_bead.as_deref(),
             )?;
             print_json(&v);
         }
@@ -18106,7 +18120,6 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                     );
                 }
                 Some(r) if r.state == toron_core::mailbox::ReceiptState::Degraded => {
-            resolve_bead,
                     anyhow::bail!("{}", toron_core::mailbox::receipts::DEGRADED_NOTE);
                 }
                 Some(r) => {
@@ -18130,6 +18143,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                         None,
                         Some(&wake),
                         Some(corr.trim()),
+                        None,
                     )?;
                     print_json(&v);
                 }
@@ -18172,7 +18186,6 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             MailLockCmd::Show {
                 project,
                 project_flag,
-                resolve_bead.as_deref(),
                 path,
             } => {
                 let project = mail_project(project, project_flag, "locks-show")?;
@@ -18232,7 +18245,6 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 project_flag,
                 to,
                 to_project,
-                        None,
                 reason,
             } => {
                 let project = mail_project(project, project_flag, "contact-request")?;
