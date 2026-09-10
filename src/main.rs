@@ -5358,9 +5358,25 @@ fn bare_model_launch_args(harness: &str, model: &str, provider: &str) -> Result<
     // the harness's implied slot's model (opencode→cheap, pi→standard,
     // grok→premium). Unknown kind / unconfigured slot → no model flag.
     let model = if model.is_empty() {
-        match registry.implied_slot_for_harness(harness) {
-            Some(slot) if !slot.model.is_empty() => slot.model.clone(),
-            _ => return Ok(vec![]),
+        if harness == "grok" {
+            // bd-ovew: never imply the premium zai id onto the grok
+            // harness — it runs only its own models. Route a registered
+            // grok-family id (user entries first); with none registered,
+            // fail loud naming --model instead of launching wrong.
+            match registry.grok_default_model() {
+                Some(id) => id,
+                None => anyhow::bail!(
+                    "bare grok spawn has no grok-family model registered — add \
+                     [models.\"grok/<id>\"] to ~/.config/flywheel/models.toml \
+                     or pass --model grok/<id> (the grok harness runs only its \
+                     own models; premium zai ids are not routed there)"
+                ),
+            }
+        } else {
+            match registry.implied_slot_for_harness(harness) {
+                Some(slot) if !slot.model.is_empty() => slot.model.clone(),
+                _ => return Ok(vec![]),
+            }
         }
     } else {
         model.to_string()
@@ -5869,6 +5885,39 @@ mod spawn_profile_plan_tests {
             bare_model_launch_args("omp", "", "")
                 .expect("omp has no implied slot")
                 .is_empty()
+        );
+    }
+
+    /// bd-ovew: bare grok spawn must never imply the premium zai id — the
+    /// grok harness runs only its own models. Zero-config (nothing
+    /// grok-family registered) fails loud naming --model; a registered
+    /// grok id routes in bare flag form.
+    #[test]
+    fn bare_grok_spawn_never_implies_foreign_model() {
+        let _g = lock_env();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let cfg_home = dir.path().join("config");
+        std::fs::create_dir_all(cfg_home.join("flywheel")).expect("config dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
+        // Zero-config: no grok-family id exists — fail loud, never zai.
+        let err = bare_model_launch_args("grok", "", "")
+            .expect_err("bare grok without a registered grok model must fail loud");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--model") && !msg.contains("glm"),
+            "loud error names --model, leaks no zai id: {msg}"
+        );
+        // Registered grok id routes in the grok bare-flag form.
+        std::fs::write(
+            cfg_home.join("flywheel/models.toml"),
+            "[models.\"grok/grok-4.5\"]\n",
+        )
+        .expect("models.toml");
+        let args = bare_model_launch_args("grok", "", "").expect("grok routed");
+        assert_eq!(
+            args,
+            vec!["-m", "grok-4.5"],
+            "registered grok id routes, no premium leak: {args:?}"
         );
     }
 

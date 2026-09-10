@@ -493,6 +493,12 @@ impl ModelRegistry {
 
     /// Implicit kind→slot: a bare-harness spawn with no profile uses this
     /// slot's model (ADR-0007 D1). Unknown kind → None.
+    ///
+    /// NOTE (bd-ovew): the returned model's provider is NOT harness-checked
+    /// — notably `grok` maps here for its budget band while its model is a
+    /// zai id the grok harness cannot run. Consumers launching on grok must
+    /// go through [`Self::grok_default_model`] (route) or fail loud, never
+    /// imply this slot's model onto that harness.
     pub fn implied_slot_for_harness(&self, kind: &str) -> Option<&SlotSpec> {
         let name = match kind {
             "opencode" | "oc" => SLOT_CHEAP,
@@ -540,6 +546,24 @@ impl ModelRegistry {
     /// Pane budget: verifier dispatches share the spawn budget with workers;
     /// one reusable verifier pane per project, headless preferred (pane only
     /// when VERIFY needs a live TUI/UI).
+    /// bd-ovew: default model id for the grok harness — a registered
+    /// grok-family id (user entries first, then any compiled-in one), else
+    /// `None` so the caller fails loud. Never the premium slot's
+    /// foreign-provider id: the grok harness runs only its own models
+    /// (operator note, `resolve_profile_route_full` step 4).
+    pub fn grok_default_model(&self) -> Option<String> {
+        let mut user = self.models.keys().filter(|k| {
+            self.user_keys.contains(k.as_str()) && self.family_of(k.as_str()) == "grok"
+        });
+        if let Some(key) = user.next() {
+            return Some(key.clone());
+        }
+        self.models
+            .keys()
+            .find(|k| self.family_of(k.as_str()) == "grok")
+            .cloned()
+    }
+
     pub fn verifier_for(
         &self,
         worker_model: &str,
@@ -1519,6 +1543,35 @@ model = "opencode/big-pickle"
             "grok implies premium, whose fallback_harness is grok"
         );
         assert!(reg.implied_slot_for_harness("omp").is_none());
+    }
+
+    /// bd-ovew: the grok default prefers user entries, then any compiled
+    /// grok-family id, else None (caller fails loud — never a foreign id).
+    #[test]
+    fn grok_default_model_prefers_user_entries() {
+        let _g = with_config_dir();
+        let mut reg = ModelRegistry::default();
+        assert_eq!(reg.grok_default_model(), None, "empty registry: no default");
+        reg.models.insert("aaa/glm-5.2".into(), sample_entry());
+        reg.models.insert("zai/glm-5.3".into(), sample_entry());
+        assert_eq!(
+            reg.grok_default_model(),
+            None,
+            "foreign-provider ids never qualify, however many exist"
+        );
+        reg.models.insert("zzz/grok-4".into(), sample_entry());
+        reg.models.insert("grok/grok-4.5".into(), sample_entry());
+        assert_eq!(
+            reg.grok_default_model().as_deref(),
+            Some("grok/grok-4.5"),
+            "no user keys: deterministic BTree order over qualifying ids"
+        );
+        reg.user_keys.insert("grok/grok-4.5".into());
+        assert_eq!(
+            reg.grok_default_model().as_deref(),
+            Some("grok/grok-4.5"),
+            "user entry wins over alphabetical fallback"
+        );
     }
 
     #[test]
