@@ -565,6 +565,20 @@ async fn run_embedded_async(
         let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         doorbell_rt::pollers::spawn_beads_poller(tx.clone(), repo)
     });
+    // External re-ring driver (E9, bd-4gco, flag-gated): read-only
+    // foreign-close watch emitting Fact Msgs. Same-host only; the daemon
+    // host gains the same spawn when the Phase-3 Brain loop lands there.
+    let _external_rering = (cfg.doorbell_cross_workspace()
+        && !cfg.doorbell_external_projects().is_empty())
+    .then(|| {
+        let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let foreign: Vec<(String, PathBuf)> = cfg
+            .doorbell_external_projects()
+            .into_iter()
+            .map(|(k, v)| (k, PathBuf::from(v)))
+            .collect();
+        doorbell_rt::pollers::spawn_external_rering(tx.clone(), repo, foreign)
+    });
     let pid_path = doorbell::pid_file(&config::state_dir(), workspace);
     let gen_path = doorbell::gen_file(&config::state_dir(), workspace);
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
