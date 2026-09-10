@@ -9427,15 +9427,42 @@ fn proxy_doorbell_verb(cfg: &Config, verb: &str, extra: &[String]) -> Result<boo
         .and_then(|h| h.split(':').nth(1))
         .unwrap_or("18980");
     eprintln!("flywheel doorbell: daemon host {url} — proxying `{verb}`");
-    let st = std::process::Command::new("doorbell")
+    // F1: resolve the daemon CLI co-located with this binary first
+    // (`cargo install --path crates/doorbell-bin` drops it beside flywheel
+    // in ~/.cargo/bin), then PATH. Neither found → degraded local handling,
+    // never a hard fail for status/start/stop.
+    let colocated = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("doorbell")))
+        .filter(|p| p.is_file());
+    let mut cmd = match colocated {
+        Some(p) => std::process::Command::new(p),
+        None => std::process::Command::new("doorbell"),
+    };
+    let st = cmd
         .arg(verb)
         .args(extra)
         .arg("--state-dir")
         .arg(config::state_dir())
         .arg("--port")
         .arg(port)
-        .status()
-        .with_context(|| "exec `doorbell` (is doorbell-bin installed on PATH?)")?;
+        .status();
+    let st = match st {
+        Ok(st) => st,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "flywheel doorbell: `doorbell` binary not on PATH nor beside {} — degraded local handling (install with `cargo install --path crates/doorbell-bin`): {e:#}",
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.display().to_string()))
+                    .unwrap_or_else(|| "?".into())
+            );
+            return Ok(false);
+        }
+        Err(e) => {
+            anyhow::bail!("exec `doorbell` (is doorbell-bin installed on PATH?): {e:#}")
+        }
+    };
     if !st.success() {
         anyhow::bail!("doorbell {verb} failed: {st}");
     }

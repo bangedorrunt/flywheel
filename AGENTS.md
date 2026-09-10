@@ -7,6 +7,7 @@ mbx +nightly-aarch64-apple-darwin test
 bash scripts/verify-clippy.sh
 k
 mbx +nightly-aarch64-apple-darwin install --path . --force
+mbx +nightly-aarch64-apple-darwin install --path crates/doorbell-bin --force # plane D CLI (bd-s4fc: proxy resolves it co-located or on PATH)
 # macOS (only if a stale-signature SIGKILL appears): codesign --force --sign - ~/.cargo/bin/flywheel
 ```
 
