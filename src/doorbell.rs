@@ -1025,6 +1025,13 @@ pub fn journal_entry_version(entry: &serde_json::Value) -> u64 {
     entry.get("v").and_then(|v| v.as_u64()).unwrap_or(1)
 }
 
+/// Envelope versions this binary folds (bd-asr2.9): v1 (legacy, no seq)
+/// and v2 (subscriber scoping + budget rows). Anything else refuses
+/// loudly — never fold-past into a mis-render.
+pub fn journal_version_accepted(entry: &serde_json::Value) -> bool {
+    journal_entry_version(entry) <= 2
+}
+
 /// All journal entries across every workspace, oldest first — active plus
 /// retained generations (bd-asr2.4). Corrupt lines stop that workspace's
 /// fold loudly (see [`journal_fold_status`]); this compat reader skips
@@ -2530,6 +2537,33 @@ mod tests {
         assert_eq!(all.len(), 2, "two good entries survive the corrupt line");
         assert_eq!(all[0].0, "w1");
         assert_eq!(all[1].1["msg"]["HerdrStatus"]["pin"], "BlueRidge");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn journal_v1_v2_fold_and_v3_refusal() {
+        // v1 (legacy, no seq) and v2 (subscriber + budget rows) both fold;
+        // v3+ refuses loudly (bd-asr2.9 D4.1).
+        assert!(journal_version_accepted(&serde_json::json!({})));
+        assert!(journal_version_accepted(&serde_json::json!({"v": 1})));
+        assert!(journal_version_accepted(&serde_json::json!({"v": 2})));
+        assert!(!journal_version_accepted(&serde_json::json!({"v": 3})));
+        // Mixed v1+v2 lines fold together through the store.
+        let dir = std::env::temp_dir().join(format!("dbll-v12-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = doorbell_rt::FileStore::new(&dir);
+        store
+            .append_journal(
+                "w",
+                &serde_json::json!({"rt_kind": "Legacy"}),
+                &serde_json::json!([]),
+                serde_json::json!({"stage": "sweep"}),
+                &[],
+            )
+            .unwrap();
+        let fold = store.fold_workspace("w");
+        assert_eq!(fold.rows.len(), 1, "v1 legacy row folds");
+        assert!(fold.torn.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

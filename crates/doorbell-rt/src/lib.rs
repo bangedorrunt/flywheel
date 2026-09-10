@@ -8,7 +8,6 @@
 //! plain tasks + `mpsc`/`oneshot` (kameo concepts, Appendix A).
 pub mod api;
 pub mod brain;
-pub mod budget;
 pub mod hear;
 pub mod host;
 pub mod lease;
@@ -20,7 +19,7 @@ pub mod store;
 pub mod subscribe;
 pub use api::{AskError, Ping, Stats, ask};
 pub use brain::{Brain, BrainConfig};
-pub use budget::{PinBudget, take_allowed};
+pub use doorbell_core::{PinBudget, take_allowed, take_allowed_like};
 pub use hear::HearTracker;
 pub use host::{CoreReducer, Effect, Host, MockHost};
 pub use lease::{Deference, OwnerLease, acquire_lease, deference_decision, lease_stale};
@@ -34,9 +33,11 @@ pub use subscribe::{
     authorize_subscribe,
 };
 
+/// Journal envelope version this runtime writes (D4.1: v2 adds subscriber
+/// scoping + budget rows; readers tolerate unknown fields, refuse unknown
+/// versions loudly).
+pub const JOURNAL_V: u64 = 2;
 /// Single-writer brain inbox capacity (D3: slow brain parks sensors).
 pub const BRAIN_CAP: usize = 1024;
 /// Per-sink bounded queue capacity (D3: kameo's default 64).
 pub const SINK_CAP: usize = 64;
-/// Journal envelope version this runtime writes (D4.1).
-pub const JOURNAL_V: u64 = 1;
