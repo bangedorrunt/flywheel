@@ -538,6 +538,59 @@ pub fn restart(state: &Path, addr: &str, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Plane-D ride-along for `flywheel daemon start`: ensure the doorbell
+/// daemon is running by shelling its own lifecycle (`doorbell start`
+/// verifies /health before exit 0 — same bar as ours). Binary lookup:
+/// PATH first, then beside our own exe (dev checkouts). Absent binary
+/// fails loudly naming the install (`cargo install --path
+/// crates/doorbell-bin`) — never a silent skip, or the operator believes
+/// wake is always-on while nothing hosts it.
+pub fn ensure_doorbell() -> anyhow::Result<()> {
+    let bin = which_doorbell().ok_or_else(|| {
+        anyhow::anyhow!(
+            "doorbell binary not found on PATH or beside {:?}; install it (`cargo install --path crates/doorbell-bin`) so `flywheel daemon start` can host plane D",
+            std::env::current_exe().ok()
+        )
+    })?;
+    // A unit-hosted daemon (launchd/systemd) answers health without a
+    // pidfile, which `doorbell start` reads as a foreign squatter and
+    // refuses. So: healthy port first means already running.
+    let status = Command::new(&bin).arg("status").output();
+    if let Ok(o) = status {
+        let body = String::from_utf8_lossy(&o.stdout);
+        if o.status.success() && (body.contains("\"alive\":true") || body.contains("\"health\":{")) {
+            println!("doorbell: already running");
+            return Ok(());
+        }
+    }
+    let out = Command::new(&bin)
+        .arg("start")
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawn {}: {e:#}", bin.display()))?;
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+    if !out.status.success() {
+        anyhow::bail!(
+            "`doorbell start` failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+fn which_doorbell() -> Option<PathBuf> {
+    if let Some(found) = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join("doorbell"))
+            .find(|p| p.is_file())
+    }) {
+        return Some(found);
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("doorbell")))
+        .filter(|p| p.is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

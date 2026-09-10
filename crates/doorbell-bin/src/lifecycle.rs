@@ -210,3 +210,117 @@ pub fn status(cfg: &Config) -> Result<()> {
     println!("{out}");
     Ok(())
 }
+
+/// Install the autostart unit (idempotent) and load it: macOS launchd
+/// agent, Linux systemd user unit. Template placeholders take the live
+/// binary path + state dir; `serve` reads both back from argv/env so the
+/// unit and the pidfile path never diverge. Other platforms: loud error
+/// naming manual `doorbell start`.
+pub fn install(cfg: &Config) -> Result<()> {
+    let exe = std::env::current_exe().context("current_exe")?;
+    let body = render_autostart(
+        &exe.display().to_string(),
+        &cfg.state_dir.display().to_string(),
+    );
+    install_rendered(cfg, &body)
+}
+
+/// Render the platform autostart unit with live paths (pure — golden
+/// tested). Placeholders take the binary path + state dir; `serve` reads
+/// both back from argv/env so the unit and the pidfile path never diverge.
+pub fn render_autostart(exe: &str, state_dir: &str) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return include_str!("../units/com.doorbell.serve.plist")
+            .replace("DOORBELL_BIN", exe)
+            .replace("DOORBELL_STATE_DIR", state_dir);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        return include_str!("../units/doorbell.service")
+            .replace("DOORBELL_BIN", exe)
+            .replace("DOORBELL_STATE_DIR", state_dir);
+    }
+}
+
+fn install_rendered(_cfg: &Config, body: &str) -> Result<()> {
+    {
+        let home = std::env::var("HOME").context("HOME unset")?;
+        let dir = PathBuf::from(home).join("Library").join("LaunchAgents");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("com.doorbell.serve.plist");
+        std::fs::write(&path, body)?;
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "501".to_string());
+        let domain = format!("gui/{uid}/com.doorbell.serve");
+        let boot = std::process::Command::new("launchctl")
+            .args(["bootstrap", &format!("gui/{uid}"), &path.display().to_string()])
+            .output();
+        match boot {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                // Already loaded (or kicked): kickstart -k restarts into the
+                // current binary instead of failing install.
+                let kick = std::process::Command::new("launchctl")
+                    .args(["kickstart", "-k", &domain])
+                    .output();
+                if !kick.map(|o| o.status.success()).unwrap_or(false) {
+                    anyhow::bail!("launchctl bootstrap + kickstart both failed for {domain}");
+                }
+            }
+        }
+        println!("doorbell: autostart installed ({})", path.display());
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))
+            .context("neither XDG_CONFIG_HOME nor HOME set")?;
+        let dir = base.join("systemd").join("user");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doorbell.service");
+        std::fs::write(&path, body)?;
+        for args in [
+            vec!["--user", "daemon-reload"],
+            vec!["--user", "enable", "doorbell.service"],
+        ] {
+            let st = std::process::Command::new("systemctl")
+                .args(&args)
+                .status()
+                .context("systemctl failed (no user systemd?)")?;
+            if !st.success() {
+                anyhow::bail!("systemctl {} failed", args.join(" "));
+            }
+        }
+        println!("doorbell: autostart installed ({})", path.display());
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    {
+        anyhow::bail!(
+            "no autostart unit for this platform; run `doorbell start` (pidfile) instead"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_substitutes_live_paths() {
+        let body = render_autostart("/opt/doorbell", "/var/dbll");
+        assert!(body.contains("/opt/doorbell"), "binary path rendered");
+        assert!(body.contains("/var/dbll"), "state dir rendered");
+        assert!(!body.contains("DOORBELL_BIN"), "no placeholder survives");
+        assert!(!body.contains("DOORBELL_STATE_DIR"), "no placeholder survives");
+    }
+}

@@ -34,6 +34,10 @@ enum Cmd {
     Restart,
     /// JSON status (no side effects).
     Status,
+    /// Install the autostart unit (idempotent) and load it: macOS
+    /// launchd agent, Linux systemd user unit. Afterwards the daemon
+    /// survives reboots; `start` keeps working for right-now.
+    Install,
     /// Run the serve loop (spawned by `start`; humans rarely run this).
     Serve,
     /// Adopt a dispatcher's state dir byte-identically (bd-asr2.6).
@@ -64,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Stop { force } => lifecycle::stop(&cfg, force),
         Cmd::Restart => lifecycle::restart(&cfg),
         Cmd::Status => lifecycle::status(&cfg),
+        Cmd::Install => lifecycle::install(&cfg),
         Cmd::Serve | Cmd::InternalServe => serve::run(&cfg).await,
         Cmd::Migrate { from } => {
             let copied = migrate::migrate(&from, &cfg.state_dir)?;
