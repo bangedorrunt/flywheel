@@ -13,7 +13,7 @@ how to get the most out of the workflow system: when to run what exists,
 when to compose something new, how to do it safely, and how to promote what
 works into the catalog so nobody improvises the same thing twice.
 
-Companion skill: `runtime-adaptation` (the compose arm, lean version of §3).
+Compose-arm reference: `flywheel` skill §1 + §5 (the `runtime-adaptation` skill was folded into it; the compose-arm content now lives there).
 Design doc: toron `docs/decisions/0022-phase-native-orchestration.md`.
 
 ---
