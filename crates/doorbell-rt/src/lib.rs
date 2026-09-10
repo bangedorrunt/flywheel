@@ -17,7 +17,7 @@ pub mod policy;
 pub mod sensors;
 pub mod sinks;
 pub mod store;
-
+pub mod subscribe;
 pub use api::{AskError, Ping, Stats, ask};
 pub use brain::{Brain, BrainConfig};
 pub use budget::{PinBudget, take_allowed};
@@ -29,6 +29,10 @@ pub use policy::{RestartPolicy, WatchRetry};
 pub use sensors::{SensorHandle, bridge, interval_ticker, supervise};
 pub use sinks::{MockSink, PromptSink, SendOutcome, SinkManager, Undelivered};
 pub use store::{FileStore, Fold, TornTail};
+pub use subscribe::{
+    Actor, Budget, Filter, Identity, Refusal, Scope, SinkKind, Subscription, SubscriptionStore,
+    authorize_subscribe,
+};
 
 /// Single-writer brain inbox capacity (D3: slow brain parks sensors).
 pub const BRAIN_CAP: usize = 1024;

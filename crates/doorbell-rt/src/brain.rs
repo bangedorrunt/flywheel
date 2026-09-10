@@ -6,7 +6,7 @@
 //! (sensors fetch off-loop and deliver results as messages).
 
 use crate::api::Stats;
-use crate::budget::{PinBudget, take_allowed};
+use crate::budget::{PinBudget, take_allowed_like};
 use crate::hear::HearTracker;
 use crate::host::{Effect, Host};
 use crate::msg::{AskKind, AskReply, BrainMsg};
@@ -19,15 +19,24 @@ pub struct BrainConfig {
     pub digest_threshold: usize,
     pub digest_interval_secs: u64,
     pub main_sink: String,
+    /// Owning subscription tag for journal rows (D5; default
+    /// `workspace:{ws}` until the subscription store binds in .8+).
+    pub subscriber: String,
+    /// Per-subscriber budget override (D5 policy evaluation).
+    pub budget: crate::subscribe::Budget,
 }
 
 impl BrainConfig {
     pub fn new(workspace: impl Into<String>) -> Self {
+        let workspace = workspace.into();
+        let subscriber = format!("workspace:{workspace}");
         Self {
-            workspace: workspace.into(),
+            workspace,
             digest_threshold: 10,
             digest_interval_secs: 300,
             main_sink: "herdr".into(),
+            subscriber,
+            budget: crate::subscribe::Budget::default_530(),
         }
     }
 }
@@ -182,7 +191,7 @@ impl<H: Host> Brain<H> {
             })
             .collect();
         let now = self.host.now_unix();
-        let injects = take_allowed(raw.clone(), &mut self.budgets, now);
+        let injects = self.gated(raw.clone(), now);
         let effect = serde_json::json!({
             "allowed": injects.len(), "gated": raw.len().saturating_sub(injects.len()),
         });
@@ -220,7 +229,7 @@ impl<H: Host> Brain<H> {
         });
         let raw = self.prompts_of(&effects);
         let now = self.host.now_unix();
-        let injects = take_allowed(raw.clone(), &mut self.budgets, now);
+        let injects = self.gated(raw.clone(), now);
         self.journal(
             &serde_json::json!({"rt_kind": "HerdrStatus", "pin": pin}),
             &effects,
@@ -420,12 +429,19 @@ impl<H: Host> Brain<H> {
             return Vec::new();
         }
         let now = self.host.now_unix();
-        let injects = take_allowed(raw.clone(), &mut self.budgets, now);
+        let injects = self.gated(raw.clone(), now);
         if raw.len() != injects.len() {
             self.stats.drops += (raw.len() - injects.len()) as u64;
         }
         let _ = self.store.sync_journal(&self.cfg.workspace);
         self.deliver_prompts(injects).await
+    }
+
+    /// Per-subscriber budget gate (D5): new pins inherit the owning
+    /// subscription's template instead of flat 5/30/3.
+    fn gated(&mut self, raw: Vec<(String, String)>, now: u64) -> Vec<(String, String)> {
+        let b = self.cfg.budget;
+        take_allowed_like(raw, &mut self.budgets, now, b.window_minutes, b.max_prompts)
     }
 
     async fn deliver_prompts(&mut self, injects: Vec<(String, String)>) -> Vec<String> {
@@ -529,6 +545,7 @@ impl<H: Host> Brain<H> {
             executed,
             pins,
             Some(seq),
+            Some(self.cfg.subscriber.as_str()),
         );
     }
 

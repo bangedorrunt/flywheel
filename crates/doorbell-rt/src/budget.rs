@@ -59,11 +59,23 @@ pub fn take_allowed(
     budgets: &mut BTreeMap<String, PinBudget>,
     now_unix: u64,
 ) -> Vec<(String, String)> {
+    take_allowed_like(injects, budgets, now_unix, 30, 3)
+}
+
+/// Budget gate with a subscription override template (D5: per-subscriber
+/// policy evaluation; new pins inherit the template instead of 5/30/3).
+pub fn take_allowed_like(
+    injects: Vec<(String, String)>,
+    budgets: &mut BTreeMap<String, PinBudget>,
+    now_unix: u64,
+    window_minutes: u32,
+    max_prompts: u32,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (pin, msg) in injects {
         let b = budgets
             .entry(pin.clone())
-            .or_insert_with(|| PinBudget::adr_default(now_unix));
+            .or_insert_with(|| PinBudget::new(window_minutes, max_prompts, now_unix));
         if b.allows(now_unix) {
             b.record_at(now_unix);
             out.push((pin, msg));

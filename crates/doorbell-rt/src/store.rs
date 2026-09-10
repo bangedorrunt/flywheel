@@ -69,7 +69,7 @@ impl FileStore {
         executed: serde_json::Value,
         pins: &[String],
     ) -> std::io::Result<()> {
-        self.append_journal_seq(workspace, msg, actions, executed, pins, None)
+        self.append_journal_seq(workspace, msg, actions, executed, pins, None, None)
     }
 
     pub fn append_journal_seq(
@@ -80,6 +80,7 @@ impl FileStore {
         executed: serde_json::Value,
         pins: &[String],
         seq: Option<u64>,
+        subscriber: Option<&str>,
     ) -> std::io::Result<()> {
         let path = self.journal_file(workspace);
         if let Some(parent) = path.parent() {
@@ -96,6 +97,11 @@ impl FileStore {
         });
         if let (Some(seq), Some(obj)) = (seq, entry.as_object_mut()) {
             obj.insert("seq".into(), seq.into());
+        }
+        // D5: subscriber tag (additive — v1 readers tolerate unknown fields;
+        // full per-subscriber scoping rides journal v2 in bd-asr2.9).
+        if let (Some(sub), Some(obj)) = (subscriber, entry.as_object_mut()) {
+            obj.insert("subscriber".into(), sub.into());
         }
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -502,6 +508,7 @@ mod tests {
             serde_json::json!({"stage": "sweep"}),
             &[],
             Some(seq),
+            None,
         )
         .unwrap();
     }
