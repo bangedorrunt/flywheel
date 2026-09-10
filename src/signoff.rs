@@ -42,4 +42,9 @@ mod tests {
     fn observe_open_decision_blocks() {
         assert!(!observe(1, 0, false));
     }
+
+    #[test]
+    fn open_lanes_are_review_residual() {
+        assert!(!observe(0, 3, false));
+    }
 }

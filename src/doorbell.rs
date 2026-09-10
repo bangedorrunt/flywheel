@@ -1,5 +1,6 @@
 // governed-by: ADR-0025
 // governed-by: ADR-0005
+// governed-by: ADR-0011
 //! Workspace doorbell (ADR-0005 D1): ring rules, queue coalesce, inject
 //! gate. The live dispatcher process is spawn-owned; this module is the
 //! functional core the e2e gate tests.
@@ -71,13 +72,13 @@ pub fn classify(ev: &RingInput) -> Option<EventClass> {
 
 /// Inject only when the pane is idle, done, or blocked (blocked is await-signal,
 /// not "don't disturb" — a peer's fix must break through, ADR-0005 gap 5).
-pub fn should_inject(herdr_status: &str) -> bool {
 /// NOTE (bd-s8bo / bd-7qg6): this is the LEGACY DoorbellModel gate over raw
 /// herdr-status strings. The live workspace path re-gates every Prompt through
 /// `workspace::prompt_allowed` (exact Idle verdict) + `filter_prompts`
 /// (Busy+urgent breakthrough, rest → digest-visible Audit). Blocked parses to
 /// Busy there, so a blocked pin's wake lands in the captain digest, not as a
 /// prompt — keep both gates in sync when touching either.
+pub fn should_inject(herdr_status: &str) -> bool {
     matches!(herdr_status, "idle" | "done" | "blocked")
 }
 
@@ -148,10 +149,68 @@ pub fn dispatcher_status_line(state_dir: &Path, workspace: &str) -> String {
     }
 }
 
+/// Helm/snapshot token: `absent` (never started) vs `down` (dead) vs `up`.
+/// Snapshot must not treat lowercase `down` as absent.
+pub fn dispatcher_token(state_dir: &Path, workspace: &str) -> &'static str {
+    let pid_path = pid_file(state_dir, workspace);
+    let gen_path = gen_file(state_dir, workspace);
+    if !pid_path.exists() && !gen_path.exists() {
+        return "absent";
+    }
+    match inspect_lock(&pid_path) {
+        LockAction::Attach { .. } | LockAction::Superseded { .. } => "up",
+        LockAction::Reloaded { .. } | LockAction::Start => "down",
+    }
+}
+
+/// Workspace keys a doorbell might own. Always includes `swarm_label` so
+/// arrive-started dispatchers stay visible with an empty spawn registry.
+pub fn candidate_workspaces(
+    swarm_label: &str,
+    spawn_meta: Option<&str>,
+    registry_labels: &[String],
+) -> Vec<String> {
+    let mut keys = std::collections::BTreeSet::new();
+    if !swarm_label.is_empty() {
+        keys.insert(swarm_label.to_string());
+    }
+    if let Some(meta) = spawn_meta.filter(|s| !s.is_empty()) {
+        keys.insert(meta.to_string());
+    }
+    for label in registry_labels {
+        if !label.is_empty() {
+            keys.insert(label.clone());
+        }
+    }
+    keys.into_iter().collect()
+}
+
+/// Helm/snapshot workspace: live dispatcher first, then any started
+/// lock, then swarm_label. Stale spawn-meta (e.g. `adrx28`) must not hide
+/// the arrive-started child.
+pub fn preferred_workspace(
+    swarm_label: &str,
+    spawn_meta: Option<&str>,
+    token: impl Fn(&str) -> &'static str,
+) -> String {
+    let keys = candidate_workspaces(swarm_label, spawn_meta, &[]);
+    for label in &keys {
+        if token(label) == "up" {
+            return label.clone();
+        }
+    }
+    for label in &keys {
+        if token(label) != "absent" {
+            return label.clone();
+        }
+    }
+    swarm_label.to_string()
+}
+
 /// One-line identity prime. Injected even with `--no-peer-aware` (D1 item 1).
 pub fn identity_prime(name: &str, mail_identity: &str) -> String {
     format!(
-        "You are {name}. Your mail identity is {mail_identity}. Guard will block unattributed/unreserved commits."
+        "You are {name}. Your mail identity is {mail_identity}. Before any spawn: flywheel arrive <project> --as {mail_identity} then flywheel briefing \"<objective>\" --json. Guard will block unattributed/unreserved commits."
     )
 }
 
@@ -875,6 +934,7 @@ pub fn note_wake(st: &mut WakeState, pin: &str, now_unix: u64) -> bool {
     }
     st.last_wake_unix = Some(now_unix);
     st.last_wake_pin = Some(pin.to_string());
+    true
 }
 
 // ---- bd-durable-doorbell-lngf: Resonate-primary supervision --------------
@@ -934,7 +994,6 @@ pub fn dead_dispatchers(state_dir: &Path) -> Vec<(String, String)> {
 #[resonate_sdk::function]
 async fn heal_tick(_args: ()) -> Result<Vec<String>> {
     let state_dir = crate::config::state_dir();
-    true
     let exe = std::env::current_exe()?;
     let mut healed = Vec::new();
     for (label, project) in dead_dispatchers(&state_dir) {
@@ -2403,6 +2462,51 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_token_absent_down_up() {
+        let dir = std::env::temp_dir().join(format!("fw-doorbell-token-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join("doorbell"));
+        assert_eq!(dispatcher_token(&dir, "w1"), "absent");
+        write_pid(&pid_file(&dir, "w1"), 999_998).expect("stale");
+        assert_eq!(dispatcher_token(&dir, "w1"), "down");
+        write_pid(&pid_file(&dir, "w1"), std::process::id()).expect("live");
+        assert_eq!(dispatcher_token(&dir, "w1"), "up");
+        // Don't stop() while the pid file names this test process.
+        clear_pid(&pid_file(&dir, "w1"));
+        assert_eq!(dispatcher_token(&dir, "w1"), "absent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn candidate_workspaces_includes_swarm_label_when_registry_empty() {
+        let keys = candidate_workspaces("flywheel-toron", None, &[]);
+        assert_eq!(keys, vec!["flywheel-toron".to_string()]);
+        let keys = candidate_workspaces("flywheel-toron", Some("custom-ws"), &[]);
+        assert!(keys.contains(&"flywheel-toron".to_string()));
+        assert!(keys.contains(&"custom-ws".to_string()));
+    }
+
+    #[test]
+    fn preferred_workspace_ignores_stale_meta() {
+        let token = |l: &str| match l {
+            "flywheel-toron" => "down",
+            "adrx28" => "absent",
+            _ => "absent",
+        };
+        assert_eq!(
+            preferred_workspace("flywheel-toron", Some("adrx28"), token),
+            "flywheel-toron"
+        );
+        let live = |l: &str| match l {
+            "flywheel-toron" => "up",
+            _ => "absent",
+        };
+        assert_eq!(
+            preferred_workspace("flywheel-toron", Some("adrx28"), live),
+            "flywheel-toron"
+        );
+    }
+
+    #[test]
     fn hear_pubkey_clears_pending() {
         let mut h = HearTracker::default();
         let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
@@ -2687,6 +2791,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// bd-7qg6: one writer, one ratchet — a same-second or behind stamp is
+    /// refused so rapid double prompts cannot fake liveness for `send --wait`.
+    #[test]
+    fn note_wake_refuses_non_advancing_stamp() {
+        let mut st = WakeState::default();
+        assert!(note_wake(&mut st, "A", 100));
+        assert_eq!(st.last_wake_unix, Some(100));
+        assert_eq!(st.last_wake_pin.as_deref(), Some("A"));
+        assert!(
+            !note_wake(&mut st, "B", 100),
+            "same-second re-note must not bump"
+        );
+        assert!(
+            !note_wake(&mut st, "B", 99),
+            "behind stamp must not clobber"
+        );
+        assert_eq!(st.last_wake_unix, Some(100));
+        assert_eq!(st.last_wake_pin.as_deref(), Some("A"));
+        assert!(note_wake(&mut st, "B", 101));
+        assert_eq!(st.last_wake_pin.as_deref(), Some("B"));
+    }
+
     /// A missing/corrupt wake state file loads as DEFAULT (never a crash) —
     /// at-least-once degrades to re-delivery, which is idempotent.
     #[test]
@@ -2791,28 +2917,6 @@ mod tests {
         writeln!(f, "{{not json").unwrap();
         journal_append(
             &dir,
-    /// bd-7qg6: one writer, one ratchet — a same-second or behind stamp is
-    /// refused so rapid double prompts cannot fake liveness for `send --wait`.
-    #[test]
-    fn note_wake_refuses_non_advancing_stamp() {
-        let mut st = WakeState::default();
-        assert!(note_wake(&mut st, "A", 100));
-        assert_eq!(st.last_wake_unix, Some(100));
-        assert_eq!(st.last_wake_pin.as_deref(), Some("A"));
-        assert!(
-            !note_wake(&mut st, "B", 100),
-            "same-second re-note must not bump"
-        );
-        assert!(
-            !note_wake(&mut st, "B", 99),
-            "behind stamp must not clobber"
-        );
-        assert_eq!(st.last_wake_unix, Some(100));
-        assert_eq!(st.last_wake_pin.as_deref(), Some("A"));
-        assert!(note_wake(&mut st, "B", 101));
-        assert_eq!(st.last_wake_pin.as_deref(), Some("B"));
-    }
-
             "w2",
             &msg,
             &actions,
