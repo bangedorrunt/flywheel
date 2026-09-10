@@ -27787,6 +27787,11 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
                             );
                             print_json(&output);
                         }
+                        // bd-asr2.16 (doorbell sink, flag-gated): live tick
+                        // completion journals a Fact wake for zero-swarm humans.
+                        if let Some(p) = project {
+                            doorbell::cron_tick_wake(p, name, &run_id, "completed");
+                        }
                         Ok(())
                     }
                     Err(e) => {
