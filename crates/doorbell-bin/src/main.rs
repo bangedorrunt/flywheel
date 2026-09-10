@@ -1,15 +1,8 @@
 // governed-by: ADR-0012
 //! `doorbell` daemon binary (ADR-0012 D2, Phase 1).
-//!
-//! Toron-parity lifecycle (corrected per the rev-2 audit): UDS primary +
-//! TCP `127.0.0.1:18980`, JSON `/health` (toron has none — doorbell's
-//! consumers are non-MCP), `Restart=on-failure` units, pidfile fallback,
-//! verify-before-exit-0, hourly 1 MiB copy-truncate logrotate from day one.
-//!
-//! Phase 1 serves `/health` in standby (no brain yet — the tick-host
-//! binding lands in bd-asr2.5); every standby field says so explicitly.
 
 mod lifecycle;
+mod migrate;
 mod serve;
 
 use clap::{Parser, Subcommand};
@@ -42,11 +35,16 @@ enum Cmd {
     Status,
     /// Run the serve loop (spawned by `start`; humans rarely run this).
     Serve,
+    /// Adopt a dispatcher's state dir byte-identically (bd-asr2.6).
+    Migrate {
+        /// Source state dir to adopt from.
+        #[arg(long)]
+        from: std::path::PathBuf,
+    },
     /// Daemon command (compat alias for serve foreground).
     #[command(hide = true)]
     InternalServe,
 }
-
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -57,5 +55,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Restart => lifecycle::restart(&cfg),
         Cmd::Status => lifecycle::status(&cfg),
         Cmd::Serve | Cmd::InternalServe => serve::run(&cfg).await,
+        Cmd::Migrate { from } => {
+            let copied = migrate::migrate(&from, &cfg.state_dir)?;
+            println!("{}", serde_json::json!({"migrated": copied}).to_string());
+            Ok(())
+        }
     }
 }

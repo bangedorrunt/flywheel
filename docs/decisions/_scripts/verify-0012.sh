@@ -47,5 +47,30 @@ $CARGO test -p doorbell-core 2>&1 | tail -n 3
 $CARGO test -p flywheel --test sc_doorbell_adr0005 2>&1 | tail -n 3
 [ "${PIPESTATUS[0]}" -eq 0 ] || fail "sc_doorbell_adr0005 red"
 
+echo "== ADR-0012 Phase 1 (bd-asr2.6: migration + parity harness) =="
+# rt-level S4 parity: same Msg log, identical journals modulo ts.
+$CARGO test -p doorbell-rt --lib parity_same_log_same_journal_modulo_ts 2>&1 | tail -n 2
+[ "${PIPESTATUS[0]}" -eq 0 ] || fail "rt journal parity red"
+# State migration: craft an old-layout dir, adopt it, compare bytes.
+MIG_SRC="$(mktemp -d "${TMPDIR:-/tmp}/doorbell-mig-src.XXXXXX")"
+MIG_DST="$(mktemp -d "${TMPDIR:-/tmp}/doorbell-mig-dst.XXXXXX")"
+mkdir -p "$MIG_SRC/doorbell" "$MIG_SRC/journals"
+echo '{"since_by_pin":{}}' > "$MIG_SRC/doorbell-wake-ws.json"
+printf '{"v":1,"seq":1}\n{"v":1,"seq":2}\n' > "$MIG_SRC/journals/doorbell-journal-ws.jsonl"
+echo "ping" > "$MIG_SRC/doorbell/ws.unanswered"
+"$ROOT/target/debug/doorbell" migrate --state-dir "$MIG_DST" --from "$MIG_SRC" >/dev/null 2>&1 \
+  || fail "doorbell migrate exited non-zero"
+cmp -s "$MIG_SRC/doorbell-wake-ws.json" "$MIG_DST/doorbell-wake-ws.json" || fail "wake not byte-identical"
+cmp -s "$MIG_SRC/journals/doorbell-journal-ws.jsonl" "$MIG_DST/journals/doorbell-journal-ws.jsonl" || fail "journal not byte-identical"
+cmp -s "$MIG_SRC/doorbell/ws.unanswered" "$MIG_DST/doorbell/ws.unanswered" || fail "unanswered not byte-identical"
+pass "state migration byte-identical"
+rm -rf "$MIG_SRC" "$MIG_DST"
+# Referenced gates (each green in its own bead, recorded here):
+# - proxy byte-identical: proven live (bd-asr2.5 close note)
+# - fence E13: verify-doorbell-daemon.sh green (bd-asr2.2/bd-asr2.3)
+# NOTE (honest gap, bd-ene2): embedded-vs-daemon journal parity needs the
+# daemon to host the loop (Phase 3 cutover work); the daemon is still a
+# lifecycle shell. Tracked, not faked.
+
 if [ "$FAIL" -eq 0 ]; then echo "RESULT: PASS"; else echo "RESULT: FAIL"; fi
 exit "$FAIL"
