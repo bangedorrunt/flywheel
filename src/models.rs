@@ -92,6 +92,29 @@ impl Tier {
     }
 }
 
+/// Operator-wide default model (bd-ll3k): when BOTH fields are set, every
+/// slot alias (`@cheap`/`@standard`/`@premium`) resolves through this pair
+/// instead of its slot. Empty/absent = legacy per-slot behavior. Explicit
+/// per-profile harness and concrete (non-alias) model ids always win —
+/// defaults replace the SLOT layer only, never an explicit choice.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefaultsSpec {
+    #[serde(default)]
+    pub harness: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+}
+
+impl DefaultsSpec {
+    /// Active only when both halves are set — a half-written record is
+    /// inert, never a misroute.
+    pub fn active(&self) -> bool {
+        !self.harness.is_empty() && !self.model.is_empty()
+    }
+}
+
 /// One routing slot: default harness + model for a cost band (ADR-0007 D1).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotSpec {
@@ -109,6 +132,18 @@ pub struct SlotSpec {
 pub const SLOT_CHEAP: &str = "cheap";
 pub const SLOT_STANDARD: &str = "standard";
 pub const SLOT_PREMIUM: &str = "premium";
+
+/// bd-ll3k: kind → slot NAME mapping behind [`ModelRegistry::implied_slot_for_harness`].
+/// Split out so consumers that resolve through [`ModelRegistry::effective_slot_model`]
+/// (defaults-aware) share the exact mapping instead of re-matching kinds.
+pub fn implied_slot_name_for_harness(kind: &str) -> Option<&'static str> {
+    match kind {
+        "opencode" | "oc" => Some(SLOT_CHEAP),
+        "pi" => Some(SLOT_STANDARD),
+        "grok" | "gk" => Some(SLOT_PREMIUM),
+        _ => None,
+    }
+}
 
 /// Map `@cheap` / `free` / `smol` / … onto a canonical slot name.
 /// Requires the `@` prefix on profile.model so a model id `cheap` is not stolen.
@@ -172,6 +207,9 @@ pub struct ModelsFile {
     pub models: BTreeMap<String, ModelEntry>,
     #[serde(default)]
     pub slots: BTreeMap<String, SlotSpec>,
+    /// Operator-wide default (bd-ll3k): `[defaults] harness/model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defaults: Option<DefaultsSpec>,
 }
 
 /// The registry: parsed `models.toml` entries keyed by `provider/model`.
@@ -184,6 +222,10 @@ pub struct ModelRegistry {
     /// prefers these, so a user override wins even when its provider name
     /// sorts after the compiled-in one.
     pub user_keys: std::collections::BTreeSet<String>,
+    /// Operator-wide default pair (bd-ll3k): merged from user `[defaults]`
+    /// by [`ModelRegistry::load_routing`]; `None` (or inactive) = legacy
+    /// per-slot behavior.
+    pub defaults: Option<DefaultsSpec>,
 }
 
 impl ModelRegistry {
@@ -200,6 +242,7 @@ impl ModelRegistry {
     pub fn load_from(path: Option<&Path>) -> Result<Self> {
         let mut models = BTreeMap::new();
         let mut slots = BTreeMap::new();
+        let mut defaults = None;
         if let Some(path) = path
             && path.exists()
         {
@@ -210,13 +253,22 @@ impl ModelRegistry {
             for key in file.models.keys() {
                 validate_key(key).with_context(|| format!("parse {}", path.display()))?;
             }
+            if let Some(d) = &file.defaults {
+                if d.model.starts_with('@') {
+                    anyhow::bail!(
+                        "models.toml: [defaults] model must be a concrete id — defaults cannot alias slots"
+                    );
+                }
+            }
             models = file.models;
             slots = file.slots;
+            defaults = file.defaults;
         }
         Ok(Self {
             models,
             slots,
             user_keys: Default::default(),
+            defaults,
         })
     }
 
@@ -239,10 +291,15 @@ impl ModelRegistry {
         for (name, spec) in user.slots {
             slots.insert(name, spec);
         }
+        // bd-ll3k: user `[defaults]` replaces wholesale (one record —
+        // whole-replace is correct here, unlike per-field stage merges).
+        // Inactive (half-written) records stay inert downstream.
+        let defaults = user.defaults;
         Ok(Self {
             models,
             slots,
             user_keys,
+            defaults,
         })
     }
 
@@ -359,6 +416,17 @@ impl ModelRegistry {
     /// Concrete model + empty harness is an error (must pin a harness or a slot).
     pub fn resolve_profile_route(&self, harness: &str, model: &str) -> Result<(String, String)> {
         if let Some(name) = slot_alias(model) {
+            // bd-ll3k: active `[defaults]` short-circuits the slot layer —
+            // every alias resolves to the default pair. An explicit profile
+            // harness still wins; concrete ids never reach this arm.
+            if let Some(d) = self.defaults.as_ref().filter(|d| d.active()) {
+                let h = if harness.is_empty() {
+                    d.harness.clone()
+                } else {
+                    harness.to_string()
+                };
+                return Ok((h, d.model.clone()));
+            }
             let slot = self.slots.get(name).ok_or_else(|| {
                 anyhow::anyhow!(
                     "slot '{name}' is not configured — `flywheel slot set {name} --harness <h> --model <id>`"
@@ -491,6 +559,17 @@ impl ModelRegistry {
         )
     }
 
+    /// Slot model honoring `[defaults]` (bd-ll3k): the role-flag surface
+    /// (`resolve_role_flag` / `expand_slot_model`) funnels here so slow/
+    /// plan stop burning premium the moment defaults are set. `None` = no
+    /// such slot (unchanged legacy behavior).
+    pub fn effective_slot_model(&self, name: &str) -> Option<String> {
+        if let Some(d) = self.defaults.as_ref().filter(|d| d.active()) {
+            return Some(d.model.clone());
+        }
+        self.slots.get(name).map(|s| s.model.clone())
+    }
+
     /// Implicit kind→slot: a bare-harness spawn with no profile uses this
     /// slot's model (ADR-0007 D1). Unknown kind → None.
     ///
@@ -500,12 +579,7 @@ impl ModelRegistry {
     /// go through [`Self::grok_default_model`] (route) or fail loud, never
     /// imply this slot's model onto that harness.
     pub fn implied_slot_for_harness(&self, kind: &str) -> Option<&SlotSpec> {
-        let name = match kind {
-            "opencode" | "oc" => SLOT_CHEAP,
-            "pi" => SLOT_STANDARD,
-            "grok" | "gk" => SLOT_PREMIUM,
-            _ => return None,
-        };
+        let name = implied_slot_name_for_harness(kind)?;
         self.slots.get(name)
     }
 
@@ -623,6 +697,7 @@ impl ModelRegistry {
         let raw = toml::to_string_pretty(&ModelsFile {
             models: self.models.clone(),
             slots: self.slots.clone(),
+            defaults: self.defaults.clone(),
         })?;
         std::fs::write(path, raw).with_context(|| format!("write {}", path.display()))?;
         Ok(())
@@ -937,6 +1012,7 @@ mod tests {
                 .collect(),
             slots: Default::default(),
             user_keys: Default::default(),
+            defaults: None,
         }
     }
 
@@ -1519,6 +1595,85 @@ model = "opencode/big-pickle"
         assert!(
             !raw.contains("[slots.standard]"),
             "save must not bake compiled-in standard: {raw}"
+        );
+    }
+
+    /// bd-ll3k: `[defaults]` overrides every slot alias while set.
+    /// Precedence: explicit harness/model > concrete id > defaults > slot.
+    /// Empty defaults = legacy per-slot behavior, byte-identical.
+    #[test]
+    fn defaults_override_all_slot_aliases() {
+        let _g = with_config_dir();
+        let mut reg = ModelRegistry::load_routing().expect("routing");
+        // No defaults: legacy routes hold.
+        assert_eq!(
+            reg.resolve_profile_route("", "@premium").expect("route"),
+            ("omp".to_string(), "zai/glm-5.3".to_string())
+        );
+        reg.defaults = Some(DefaultsSpec {
+            harness: "pi".to_string(),
+            model: "opencode-go/muse-spark-1.3-contributor".to_string(),
+            fallback: None,
+        });
+        // Every alias collapses onto the default pair.
+        for alias in ["@premium", "@standard", "@cheap"] {
+            assert_eq!(
+                reg.resolve_profile_route("", alias).expect("route"),
+                (
+                    "pi".to_string(),
+                    "opencode-go/muse-spark-1.3-contributor".to_string()
+                ),
+                "alias {alias} follows defaults"
+            );
+        }
+        // Explicit profile harness wins; concrete ids never detour.
+        assert_eq!(
+            reg.resolve_profile_route("opencode", "@premium")
+                .expect("route")
+                .0,
+            "opencode",
+            "explicit harness survives defaults"
+        );
+        assert_eq!(
+            reg.resolve_profile_route("omp", "zai/glm-5.3")
+                .expect("route"),
+            ("omp".to_string(), "zai/glm-5.3".to_string()),
+            "concrete ids bypass defaults"
+        );
+        // Role-flag surface follows too (slow/plan burn premium today).
+        assert_eq!(
+            reg.effective_slot_model("premium").as_deref(),
+            Some("opencode-go/muse-spark-1.3-contributor")
+        );
+        assert_eq!(
+            reg.effective_slot_model("cheap").as_deref(),
+            Some("opencode-go/muse-spark-1.3-contributor")
+        );
+    }
+
+    /// bd-ll3k: user `[defaults]` merges over compiled-ins via load_routing
+    /// and round-trips through save_to.
+    #[test]
+    fn load_routing_merges_user_defaults() {
+        let _g = with_config_dir();
+        let dir = std::env::temp_dir().join(format!("fw-defaults-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("models.toml");
+        std::fs::write(
+            &path,
+            "[defaults]\nharness = \"pi\"\nmodel = \"opencode-go/muse-spark-1.3-contributor\"\n",
+        )
+        .expect("models.toml");
+        let reg = ModelRegistry::load_from(Some(&path)).expect("load");
+        let d = reg.defaults.as_ref().expect("defaults parsed");
+        assert_eq!(d.harness, "pi");
+        assert_eq!(d.model, "opencode-go/muse-spark-1.3-contributor");
+        let out = dir.join("roundtrip.toml");
+        reg.save_to(&out).expect("save");
+        let back = ModelRegistry::load_from(Some(&out)).expect("reload");
+        assert_eq!(
+            back.defaults, reg.defaults,
+            "defaults survive the round trip"
         );
     }
 

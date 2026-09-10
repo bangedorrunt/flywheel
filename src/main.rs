@@ -652,6 +652,10 @@ enum Commands {
         /// Kind/count + --model/--provider without --escape prints a warning.
         #[arg(long)]
         escape: bool,
+        /// skip the pre-spawn model reconfirm (bd-ll3k; non-TTY and loop
+        /// drivers never block — the gate is TTY-only)
+        #[arg(long)]
+        yes: bool,
         /// ADR-0011 D5: join the live fleet instead of refusing / killing it.
         #[arg(long)]
         join: bool,
@@ -3551,6 +3555,40 @@ enum ModelCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Set the operator-wide default model pair (bd-ll3k): every slot
+    /// alias (@cheap/@standard/@premium) resolves through it while set.
+    /// Writes `[defaults]` to the user models.toml overlay — explicit
+    /// per-profile harness and concrete model ids still win (CLI >
+    /// concrete id > defaults > slot).
+    SetDefault {
+        /// concrete model id (provider/model or bare; must be registered)
+        #[arg(long)]
+        model: Option<String>,
+        /// harness (pi | omp | opencode | grok | ...)
+        #[arg(long)]
+        harness: Option<String>,
+        /// never prompt (non-interactive; missing halves are an error)
+        #[arg(long)]
+        no_input: bool,
+        /// show what would change without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show the effective default pair and which aliases it overrides.
+    Defaults {
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+    /// Clear the operator-wide default (back to per-slot behavior).
+    ClearDefault {
+        /// actually clear (skip the confirm)
+        #[arg(long)]
+        force: bool,
+        /// never prompt (non-interactive)
+        #[arg(long)]
+        no_input: bool,
+    },
     /// Remove registry entries. Bare ids resolve via the default provider.
     /// Compiled-in ids are refused unless --shadow (writes a user shadow).
     /// TTY with no ids → dialoguer MultiSelect. Requires --force to delete.
@@ -4419,6 +4457,7 @@ fn main() {
             model,
             provider,
             escape,
+            yes,
             join,
         }) => cmd_spawn(
             &cfg,
@@ -4444,6 +4483,7 @@ fn main() {
                 bare_provider: provider.clone().unwrap_or_default(),
                 idempotency_key: None,
                 escape: *escape,
+                yes: *yes,
                 join: *join,
             },
         ),
@@ -5310,6 +5350,47 @@ fn spawn_items_from_plan(
     items
 }
 
+/// bd-ll3k: pre-spawn model table — one (lane, harness, model) row per
+/// spawn item, resolved through the routing registry (`[defaults]`
+/// included, so the operator sees the spend they are about to approve).
+/// Pure — the reconfirm gate renders exactly this. Profile rows resolve
+/// the profile route; kind rows show the bare override, the implied slot
+/// model, or the harness default when neither applies.
+pub(crate) fn spawn_model_rows(
+    items: &[SpawnItem],
+    catalog: &profile::ProfileCatalog,
+    registry: &models::ModelRegistry,
+    cfg: &Config,
+    bare_model: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let mut rows = Vec::new();
+    for item in items {
+        if let Some(name) = item.profile.as_deref() {
+            let p = catalog
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown profile '@{name}' (flywheel profile list)"))?;
+            let (h, m) = registry.resolve_profile_route(&p.harness, &p.model)?;
+            rows.push((format!("@{name} x{}", item.count), h, m));
+            continue;
+        }
+        let kind = spawn_item_kind(cfg, item, catalog, registry)?;
+        let model = if !bare_model.is_empty() {
+            bare_model.to_string()
+        } else {
+            // bd-ll3k: resolve through the effective (defaults-aware)
+            // surface — a bare kind lane must not bypass `[defaults]`.
+            match models::implied_slot_name_for_harness(&kind)
+                .and_then(|n| registry.effective_slot_model(n))
+            {
+                Some(m) if !m.is_empty() => m,
+                _ => "(harness default)".to_string(),
+            }
+        };
+        rows.push((format!("{} x{}", item.short, item.count), kind, model));
+    }
+    Ok(rows)
+}
+
 fn spawn_item_kind(
     cfg: &Config,
     item: &SpawnItem,
@@ -5373,8 +5454,12 @@ fn bare_model_launch_args(harness: &str, model: &str, provider: &str) -> Result<
                 ),
             }
         } else {
-            match registry.implied_slot_for_harness(harness) {
-                Some(slot) if !slot.model.is_empty() => slot.model.clone(),
+            // bd-ll3k: defaults-aware exactly like the reconfirm table —
+            // display and launch must never disagree on the model.
+            match models::implied_slot_name_for_harness(harness)
+                .and_then(|n| registry.effective_slot_model(n))
+            {
+                Some(m) if !m.is_empty() => m,
                 _ => return Ok(vec![]),
             }
         }
@@ -5398,13 +5483,17 @@ fn expand_slot_model(registry: &models::ModelRegistry, id: &str) -> Result<Strin
         return Ok(String::new());
     }
     if let Some(name) = models::slot_alias(id) {
-        let slot = registry.slot(name).ok_or_else(|| {
-            anyhow!("slot '{name}' is not configured — `flywheel slot set {name} --model <id>`")
-        })?;
-        if slot.model.is_empty() {
-            anyhow::bail!("slot '{name}' has no model — `flywheel slot set {name} --model <id>`");
+        // bd-ll3k: routes through active `[defaults]` first (slow/plan
+        // stop burning premium the moment defaults are set).
+        if let Some(model) = registry.effective_slot_model(name) {
+            if model.is_empty() {
+                anyhow::bail!(
+                    "slot '{name}' has no model — `flywheel slot set {name} --model <id>`"
+                );
+            }
+            return Ok(model);
         }
-        return Ok(slot.model.clone());
+        anyhow::bail!("slot '{name}' is not configured — `flywheel slot set {name} --model <id>`")
     }
     Ok(id.to_string())
 }
@@ -5918,6 +6007,64 @@ mod spawn_profile_plan_tests {
             args,
             vec!["-m", "grok-4.5"],
             "registered grok id routes, no premium leak: {args:?}"
+        );
+    }
+
+    /// bd-ll3k: the reconfirm table resolves profile and kind lanes
+    /// through the registry, collapsing onto `[defaults]` when set.
+    #[test]
+    fn spawn_model_rows_show_resolved_pairs_and_defaults() {
+        let _g = lock_env();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let cfg_home = dir.path().join("config");
+        std::fs::create_dir_all(cfg_home.join("flywheel")).expect("config dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
+        let cfg = Config::default();
+        let catalog = profile::ProfileCatalog::load_from(None).expect("catalog");
+        let mut reg = models::ModelRegistry::load_routing().expect("routing");
+        let items = vec![
+            SpawnItem {
+                short: "coder".into(),
+                count: 2,
+                kind: None,
+                profile: Some("coder".into()),
+            },
+            SpawnItem {
+                short: "oc".into(),
+                count: 1,
+                kind: None,
+                profile: None,
+            },
+        ];
+        let rows = spawn_model_rows(&items, &catalog, &reg, &cfg, "").expect("rows");
+        assert_eq!(
+            rows[0],
+            (
+                "@coder x2".to_string(),
+                "pi".to_string(),
+                "opencode-go/muse-spark-1.3-contributor".to_string()
+            ),
+            "coder resolves the standard slot: {rows:?}"
+        );
+        assert_eq!(
+            rows[1],
+            (
+                "oc x1".to_string(),
+                "opencode".to_string(),
+                "opencode/big-pickle".to_string()
+            ),
+            "kind lane rides its implied slot: {rows:?}"
+        );
+        reg.defaults = Some(models::DefaultsSpec {
+            harness: "pi".to_string(),
+            model: "opencode-go/muse-spark-1.3-contributor".to_string(),
+            fallback: None,
+        });
+        let rows = spawn_model_rows(&items, &catalog, &reg, &cfg, "").expect("rows");
+        assert!(
+            rows.iter()
+                .all(|(_, _, m)| m == "opencode-go/muse-spark-1.3-contributor"),
+            "defaults collapse every lane: {rows:?}"
         );
     }
 
@@ -8128,6 +8275,9 @@ struct SpawnOpts {
     idempotency_key: Option<String>,
     /// Operator labeled this spawn as an escape from compose/wave-swarm.
     escape: bool,
+    /// Skip the pre-spawn model reconfirm (bd-ll3k). CLI `--yes` passes
+    /// false-on-TTY (prompt); internal callers default true (never block).
+    yes: bool,
     /// ADR-0011 D5: join live fleet.
     join: bool,
 }
@@ -8155,6 +8305,7 @@ impl Default for SpawnOpts {
             bare_provider: String::new(),
             idempotency_key: None,
             escape: false,
+            yes: true,
             join: false,
         }
     }
@@ -8385,6 +8536,31 @@ projects available: {}",
     }
     if label.is_empty() {
         bail!("workspace label must contain at least one alphanumeric character");
+    }
+    // bd-ll3k: pre-spawn model reconfirm — interactive TTY only, skipped
+    // by --yes (non-TTY/loop drivers never block, byte-identical). Shows
+    // the resolved spend table with the operator default marked, then
+    // go/no-go. Steer/workflow-run already brief this way; spawn was the
+    // silent auto-dispatch hole.
+    if !opts.yes && std::io::stdin().is_terminal() {
+        let rows = spawn_model_rows(&items, &catalog, &model_reg, cfg, &opts.bare_model)?;
+        let defaults_on = model_reg.defaults.as_ref().is_some_and(|d| d.active());
+        eprintln!("flywheel: spawn {project} — resolved models:");
+        for (lane, h, m) in &rows {
+            eprintln!("  {lane:24} {h:10} {m}");
+        }
+        if defaults_on {
+            eprintln!(
+                "  (operator default active: all slot aliases resolve through it — flywheel model clear-default to lift)"
+            );
+        }
+        let go: bool = dialoguer::Confirm::new()
+            .with_prompt("dispatch this crew?")
+            .default(true)
+            .interact()?;
+        if !go {
+            bail!("spawn: aborted by the operator at the model reconfirm gate");
+        }
     }
     // bd-vik: record the custom label so project-based discovery still works
     // after a custom-label spawn (find_workspace falls back to this).
@@ -25674,8 +25850,8 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                     "unknown slot {slot_name:?} (cheap | standard | premium; never \"default\" — that is the compiled-in squad)"
                 );
             }
-            let mut reg = models::ModelRegistry::load_routing()?;
-            let current = reg.slot(&slot_name).cloned().unwrap_or_default();
+            let routing = models::ModelRegistry::load_routing()?;
+            let current = routing.slot(&slot_name).cloned().unwrap_or_default();
             // Loud warn (not refusal — the operator may know something the
             // registry does not): a caps whitelist that excludes the slot's
             // harness means every spawn detours through the fallback ladder.
@@ -25702,9 +25878,135 @@ fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                 }));
                 return Ok(());
             }
-            reg.slots.insert(slot_name.clone(), next);
-            reg.save()?;
+            // bd-ll3k: persist through the USER registry only — saving the
+            // routing layer here baked every compiled-in entry into the
+            // user file (contradicting this verb's own never-bake rule and
+            // freezing future compiled-in updates out for this user).
+            let mut user = models::ModelRegistry::load()?;
+            user.slots.insert(slot_name.clone(), next);
+            user.save()?;
             println!("slot {slot_name} default model → {key}");
+            Ok(())
+        }
+        ModelCmd::SetDefault {
+            model,
+            harness,
+            no_input,
+            dry_run,
+        } => {
+            let reg = models::ModelRegistry::load_routing()?;
+            // Resolve halves: flags, else TTY prompt, else error.
+            // Non-interactive callers must pass both halves explicitly.
+            let mut model_id = model.as_deref().map(str::trim).unwrap_or("").to_string();
+            let mut harness_id = harness.as_deref().map(str::trim).unwrap_or("").to_string();
+            if (model_id.is_empty() || harness_id.is_empty())
+                && (*no_input || !std::io::stdin().is_terminal())
+            {
+                bail!(
+                    "model set-default: pass --model <provider/id> and --harness <h> (or run on a TTY)"
+                );
+            }
+            if model_id.is_empty() {
+                model_id = dialoguer::Input::new()
+                    .with_prompt("default model (provider/id, must be registered)")
+                    .interact_text()?;
+            }
+            if harness_id.is_empty() {
+                harness_id = dialoguer::Input::new()
+                    .with_prompt("default harness (pi | omp | opencode | grok | ...)")
+                    .interact_text()?;
+            }
+            let (model_id, harness_id) =
+                (model_id.trim().to_string(), harness_id.trim().to_string());
+            if model_id.starts_with('@') {
+                bail!("defaults model must be a concrete id — defaults cannot alias slots");
+            }
+            let key = reg.key_for(&model_id).ok_or_else(|| {
+                anyhow!("unknown model {model_id:?} — register it first: flywheel model add <id> --provider <p>")
+            })?;
+            if harness_id.is_empty() {
+                bail!("defaults harness must not be empty");
+            }
+            let from = reg.defaults.clone().filter(|d| d.active());
+            let next = models::DefaultsSpec {
+                harness: harness_id.clone(),
+                model: key.clone(),
+                fallback: from.as_ref().and_then(|d| d.fallback.clone()),
+            };
+            if *dry_run {
+                print_json(&json!({
+                    "dry_run": true,
+                    "from": from,
+                    "to": { "harness": next.harness, "model": next.model },
+                    "overrides_aliases": ["@cheap", "@standard", "@premium"],
+                }));
+                return Ok(());
+            }
+            let mut user = models::ModelRegistry::load()?;
+            user.defaults = Some(next);
+            user.save()?;
+            println!(
+                "default model → {key} on {harness_id} (all slot aliases resolve through it; clear with: flywheel model clear-default)"
+            );
+            Ok(())
+        }
+        ModelCmd::Defaults { json } => {
+            let reg = models::ModelRegistry::load_routing()?;
+            match reg.defaults.clone().filter(|d| d.active()) {
+                Some(d) => {
+                    let out = json!({
+                        "harness": d.harness,
+                        "model": d.model,
+                        "fallback": d.fallback,
+                        "overrides_aliases": ["@cheap", "@standard", "@premium"],
+                    });
+                    if *json {
+                        print_json(&out);
+                    } else {
+                        println!(
+                            "default: {} on {} (aliases @cheap/@standard/@premium all resolve here)",
+                            d.model, d.harness
+                        );
+                    }
+                }
+                None => {
+                    if *json {
+                        print_json(&json!({ "defaults": Value::Null }));
+                    } else {
+                        println!(
+                            "no operator default set (per-slot behavior; flywheel model set-default ...)"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        ModelCmd::ClearDefault { force, no_input } => {
+            let reg = models::ModelRegistry::load_routing()?;
+            let Some(current) = reg.defaults.clone().filter(|d| d.active()) else {
+                println!("no operator default set (nothing to clear)");
+                return Ok(());
+            };
+            if !*force {
+                if *no_input || !std::io::stdin().is_terminal() {
+                    bail!("model clear-default: pass --force (or run on a TTY to confirm)");
+                }
+                let confirm: bool = dialoguer::Confirm::new()
+                    .with_prompt(format!(
+                        "clear default {} on {} (back to per-slot routing)?",
+                        current.model, current.harness
+                    ))
+                    .default(false)
+                    .interact()?;
+                if !confirm {
+                    println!("kept");
+                    return Ok(());
+                }
+            }
+            let mut user = models::ModelRegistry::load()?;
+            user.defaults = None;
+            user.save()?;
+            println!("default cleared (back to per-slot routing)");
             Ok(())
         }
         ModelCmd::Remove {
