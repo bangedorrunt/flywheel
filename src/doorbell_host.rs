@@ -79,6 +79,10 @@ pub struct RtHost {
     brain_tx: mpsc::Sender<BrainMsg>,
     covered_panes: HashSet<String>,
     retry: doorbell_rt::WatchRetry,
+    // F7: cache the whois-backed index — rebuild at most every 60s or when
+    // the registry pin set changes (was every 1s sweep: N whois RPCs/sec).
+    index_refreshed_at: u64,
+    index_pins: Vec<String>,
 }
 
 impl RtHost {
@@ -99,6 +103,11 @@ impl RtHost {
         model.last_now = unix_now();
         let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
         let index = build_index(&cfg, project);
+        let now = unix_now();
+        let index_pins = state::load_spawn_registry(project)
+            .iter()
+            .filter_map(|e| e.mail_identity.clone())
+            .collect();
         Ok(Self {
             cfg,
             project: project.to_string(),
@@ -110,6 +119,8 @@ impl RtHost {
             brain_tx,
             covered_panes: HashSet::new(),
             retry: doorbell_rt::WatchRetry::default(),
+            index_refreshed_at: now,
+            index_pins,
         })
     }
 
@@ -355,17 +366,16 @@ impl Host for RtHost {
             .collect()
     }
 
-    fn pin_npub(&self, pin: &str) -> Option<String> {
-        self.index.npub(pin).map(str::to_string)
-    }
-
-    fn prev_status(&self, pin: &str) -> Option<String> {
-        self.model.doorbell.statuses.get(pin).cloned()
-    }
-
     fn sweep_maintenance(&mut self) -> Vec<(String, String)> {
-        // Index rebuild from the current registry (late joins included).
-        self.index = build_index(&self.cfg, &self.project);
+        // F7: cached index — registry pin-set change or 60s TTL triggers the
+        // whois-backed rebuild; steady-state sweeps skip N RPCs/sec.
+        let pins_now: Vec<String> = self.registry_pins();
+        let now = unix_now();
+        if pins_now != self.index_pins || now.saturating_sub(self.index_refreshed_at) >= 60 {
+            self.index = build_index(&self.cfg, &self.project);
+            self.index_pins = pins_now;
+            self.index_refreshed_at = now;
+        }
         self.cover_new_panes();
         // Presence hear: presence.jsonl is the real projection for ephemeral
         // 20001 (bus never stores it). Trust root stays the tick (Brain
