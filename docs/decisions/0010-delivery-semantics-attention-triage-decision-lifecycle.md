@@ -8,7 +8,7 @@
 | **Authors** | HarborPilot (draft), KeenAuditor (peer review + fold) |
 | **Relates to** | [ADR-0001](0001-event-driven-agent-collaboration-spine.md) (spine, escalation), [ADR-0005](0005-always-on-collab-baseline-and-command-surface.md) (always-on baseline), [ADR-0009](0009-compound-spine-ce-vocabulary-and-learnings-corpus.md) (learnings corpus — extended by D12), toron [ADR-0020](../../../toron/docs/decisions/0020-nostr-two-plane-cli-and-crew-steering.md) (crew steering), toron [ADR-0025](../../../toron/docs/decisions/0025-adopt-graph-dispatch-artifact-reduce-pin-supervision.md) (pin supervision — extended by D3), toron [ADR-0026](../../../toron/docs/decisions/0026-failure-taxonomy-funded-preflight-fallback-chains-mail-health-escalation.md) (failure taxonomy — extended by D5/D8), toron [ADR-0027](../../../toron/docs/decisions/0027-one-workspace-tick-control-plane.md) (one-workspace tick — **amended by D0**; D5 is gated on D0), toron [ADR-0028](../../../toron/docs/decisions/0028-jido-behavior-first-on-wheelhouse-nouns.md) (action schema — extended by D7), beads ADR-0001 (typed fields — **D11 requires a successor ADR in the beads repo**, this ADR does not ship beads schema), [kunchenguid/firstmate](https://github.com/kunchenguid/firstmate) (MIT — concepts adopted, no code; D13 class: commit `50cc24a`) |
 | **Governs (on acceptance)** | `src/workspace.rs` (tick, Msg/Cmd, wake ack, worker state, one live Model), `src/doorbell*.rs` (re-ring ladder, digest), `src/durable.rs` (`poll_mail_digests` deleted as producer; drain + write-liveness), `src/main.rs` (`helm`, `doorbell afk`, `crew control`, `snapshot`, `--fire-and-forget`), `src/send.rs`, `src/snapshot.rs` (new), `src/write_liveness.rs` (new), toron `crates/toron-core/src/mailbox/{receipts,send_tags}.rs` (degraded state, `bead=` tag), `integrations/peer-aware.md.tpl`, captain/steer harness deny lists (D13), `docs/learnings/` (tiering), beads close-gate shape **via the beads successor ADR** |
-| **Verification** | planned per-wave gates in §13 (no `verify-0010.sh` until Wave A.0 lands) |
+| **Verification** | per-wave gates `verify-0010{a0,a,b,c,d}.sh` authored + all green 2026-09-11 (§13); behavioral fixtures pinned in cargo tests |
 
 ---
 
@@ -802,29 +802,29 @@ toron skill where the flag lives.
 
 ## 13. Verification plan (gates per wave; checkboxes open until landed)
 
-- [ ] **Wave A.0 (D0):** `verify-0010a0.sh` — source scan: no live second
+- [x] **Wave A.0 (D0):** `verify-0010a0.sh` — source scan: no live second
       `WorkspaceModel::default()` outside `tick_loop_owner` + tests; extend
       `workspace.rs` L1769-style assert to "no second construction site
       survives"; `poll_mail_digests` is not a Msg producer (rg tripwire)
-- [ ] **Wave A:** `verify-0010a.sh` — D1 kill-pane survival + duplicate-ring
+- [x] **Wave A:** `verify-0010a.sh` — D1 kill-pane survival + duplicate-ring
       no-op + `--fire-and-forget <id>` never escalates; D2 crash-between-handle-
       and-ack replay asserts once-more re-presentation; D3 no-consumer-from-
       Unknown property + kind-9 verb template; D4 write-evidence defers,
       failed walk does not; D14 in_progress + stale beacon blocks captain
       turn-end, crew pane exempt
-- [ ] **Wave B:** `verify-0010b.sh` — D5 fixture replay **and** D0 gate;
+- [x] **Wave B:** `verify-0010b.sh` — D5 fixture replay **and** D0 gate;
       zero prompts for benign/routine; digest contents exact; urgent bypass;
       D6 buried-decision + divergence + pending_wait-expiry-promotes;
       D15 auto-decide vs park fixtures
-- [ ] **Wave C:** `verify-0010c.sh` — D7 verb postconditions + marker
+- [x] **Wave C:** `verify-0010c.sh` — D7 verb postconditions + marker
       round-trip + relaunch rollback; D8 failure-injection triad; D9 tag-hold
       fires / subject-only never fires; D13 delegation-shaped deny on captain
       profile, observe/stop allowed
-- [ ] **Wave D:** `verify-0010d.sh` — D10 schema validation + helm empty-queue
+- [x] **Wave D:** `verify-0010d.sh` — D10 schema validation + helm empty-queue
       still prints three sections; D11 skipped until beads successor lands
       (checkbox names the successor id); D12 projection bounded at 50 seeded
       learnings
-- [ ] Skill Sync Contract honored on every CLI-adjacent Dn
+- [x] Skill Sync Contract honored on every CLI-adjacent Dn
 - [ ] toron-side changes (D8, D9) carry toron ADR addenda + `catalog_freshness`
       if any MCP surface moves
 
