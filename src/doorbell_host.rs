@@ -262,6 +262,7 @@ impl Host for RtHost {
             // SlaFired tick itself decides nothing.
             BrainMsg::SlaFired { .. }
             | BrainMsg::Degraded { .. }
+            | BrainMsg::Delivered { .. }
             | BrainMsg::Ask { .. }
             | BrainMsg::Shutdown => return Vec::new(),
         };

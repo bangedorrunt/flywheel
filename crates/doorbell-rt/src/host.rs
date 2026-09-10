@@ -151,6 +151,7 @@ impl CoreReducer {
             | BrainMsg::InboxFetched { .. }
             | BrainMsg::SlaFired { .. }
             | BrainMsg::Degraded { .. }
+            | BrainMsg::Delivered { .. }
             | BrainMsg::Ask { .. }
             | BrainMsg::Shutdown => return vec![],
         };
