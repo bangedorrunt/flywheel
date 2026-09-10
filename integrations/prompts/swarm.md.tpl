@@ -13,13 +13,15 @@ ARRIVE then BRIEF (ADR-0011). Do not pin wave-swarm before briefing
 sees joinable / ready-beads / N.
 
 0. ARRIVE: `flywheel arrive <project> --as <pin>` (helm + JOINING banner
-   if a live fleet exists, FCFS captain, doorbell `--live`). Then
+   if a live fleet exists, FCFS captain, doorbell `--live`). With the
+   `arrival_triple` flag on, arriving also presence-publishes, role-binds
+   from your spawn-registry profile, and puts your roster row in every
+   digest — no extra command. Then
    `flywheel briefing "<objective>" --project <p> --json`. Print the
    proposal, ask topology + N, `--commit` (or `--yes` for defaults).
    A joinable world proposes `arrive`, not a second compose. `decide`
    is the classifier leaf inside briefing — do not invent a second
    selector.
-
 CLASSIFY once if unclear (`flywheel briefing "<target>" --project <p>
 --json`; sequence-verifiable-units). /swarm-mode does NOT pin
 wave-swarm until briefing says swarm.

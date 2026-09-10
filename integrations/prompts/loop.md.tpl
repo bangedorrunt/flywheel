@@ -38,6 +38,9 @@ provider/model overrides it. Record the choice in the launch/report summary.
    files before edit (toron reserve acquire; renew 4min); build slot for cargo.
    Wake is the workspace doorbell: show you heard it, then pull the relevant
    inbox, channel, or job. Do not start a self-managed polling timer.
+   To ring someone from the console (test a wake, no swarm needed):
+   `flywheel doorbell inject <project> <pin> <line>` — journaled, budgeted,
+   digest-visible. Subscriptions live in the store (`doorbell subscriptions`).
 
 2. EXECUTE: TDD red-green per unit (RED test first, GREEN minimal code,
    REFACTOR while green). Stage ONLY reserved paths (never git add -A --
