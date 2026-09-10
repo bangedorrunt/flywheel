@@ -277,14 +277,17 @@ fn peer_triggered_soak_a_wakes_b() {
     let help = String::from_utf8_lossy(&out.stdout);
     assert!(help.contains("--peer-aware"));
 
-    // Integration template documents peer mail wake
-    let agents = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("AGENTS.md");
-    let body = std::fs::read_to_string(agents).unwrap_or_default();
+    // Peer-aware spawn template documents peer mail wake (AGENTS.md was
+    // trimmed to repo invariants; the peer contract lives in the template
+    // injected into every peer-aware pane).
+    let tpl =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("integrations/peer-aware.md.tpl");
+    let body = std::fs::read_to_string(&tpl).unwrap_or_default();
     assert!(
         body.to_ascii_lowercase().contains("peer")
             || body.contains("peer-triggered")
             || body.contains("Collaboration"),
-        "AGENTS should document peer/collaboration patterns"
+        "peer-aware template should document peer/collaboration patterns"
     );
 }
 

@@ -278,10 +278,20 @@ fn reopen_mail_count(s: &Scratch, bead_id: &str, as_agent: &str) -> usize {
 }
 
 fn bead_status(dir: &Path, bead_id: &str) -> String {
-    br_json(dir, &["show", bead_id, "--json"])[0]["status"]
+    bead_of(dir, bead_id)["status"]
         .as_str()
         .unwrap_or("?")
         .to_string()
+}
+
+/// br show --json: bare object (newer br) or 1-elem array (older).
+fn bead_of(dir: &Path, bead_id: &str) -> serde_json::Value {
+    let v = br_json(dir, &["show", bead_id, "--json"]);
+    match &v {
+        serde_json::Value::Array(items) => items.first().cloned().unwrap_or_default(),
+        obj @ serde_json::Value::Object(_) => obj.clone(),
+        _ => serde_json::Value::Null,
+    }
 }
 
 fn close(dir: &Path, bead_id: &str, sha: &str) {
@@ -439,7 +449,7 @@ fn close_with_commit_but_no_gate_row_reopens() {
             .exists(),
         "sha-keyed dedup marker missing"
     );
-    let created_by = br_json(&dir, &["show", &bead_id, "--json"])[0]["created_by"]
+    let created_by = bead_of(&dir, &bead_id)["created_by"]
         .as_str()
         .unwrap_or("bangedorrunt")
         .to_string();

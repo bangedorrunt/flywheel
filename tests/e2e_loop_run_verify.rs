@@ -168,7 +168,14 @@ fn git(cwd: &Path, args: &[&str]) {
 }
 
 fn bead_status(dir: &Path, bead_id: &str) -> String {
-    br_json(dir, &["show", bead_id, "--json"])[0]["status"]
+    let v = br_json(dir, &["show", bead_id, "--json"]);
+    // br show --json: bare object (newer br) or 1-elem array (older).
+    let bead = match &v {
+        serde_json::Value::Array(items) => items.first().cloned().unwrap_or_default(),
+        obj @ serde_json::Value::Object(_) => obj.clone(),
+        _ => serde_json::Value::Null,
+    };
+    bead["status"]
         .as_str()
         .unwrap_or("?")
         .to_string()

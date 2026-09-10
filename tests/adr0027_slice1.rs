@@ -733,9 +733,8 @@ fn adr0027_s1_guard_every_live_event_constructs_msg() {
     // After fold they live only in doorbell_tick.rs / workspace.rs
     // For now we just assert tick is the only state transition
     assert!(
-        content.contains("doorbell_tick::tick(&bell_model, &msg)")
-            || content.contains("tick(&WorkspaceModel"),
-        "RED (bd-6b1y E1): live dispatcher must call tick(Model, Msg) as the only state transition"
+        content.contains("workspace::tick(") || content.contains("doorbell_tick::tick("),
+        "RED (bd-6b1y E1): live dispatcher must call tick(Model, Msg) as the only state transition (workspace::tick since the ADR-0027 reducer fold)"
     );
 }
 
@@ -767,8 +766,12 @@ fn adr0027_s1_guard_heal_reclaim_fact_fetch_folded() {
         "RED (bd-6b1y #13): FetchInbox never emitted — must be a real Cmd whose rows re-enter as InboxRows"
     );
     // DoorbellMsg::Fact on live captain path; adapter must not swallow Err into ()
+    // (bd-6b1y #10; reducer now lives in doorbell-core — doorbell_tick.rs is a
+    // re-export shim, so the Fact arm is asserted at its new home).
+    let doorbell_core = flywheel_manifest_dir().join("crates/doorbell-core/src/lib.rs");
+    let core = read_file(&doorbell_core);
     assert!(
-        dt.contains("Fact") && m.contains("Fact"),
+        core.contains("Fact") && m.contains("Fact"),
         "RED (bd-6b1y #10): DoorbellMsg::Fact not on live path — captain_fact_inject + adapter must not swallow Err"
     );
     assert!(
