@@ -126,6 +126,28 @@ pub struct DoorbellSection {
     /// emit/deliver binding lands in bd-asr2.17). Default false.
     #[serde(default)]
     pub cron_doorbell_sink: bool,
+    /// Service identities allowed to ring via POST /api/v1/emit
+    /// (bd-asr2.17, D7): name -> token hash + channel scope + rate.
+    /// Empty (default) disables the endpoint. Revocation = delete entry.
+    #[serde(default)]
+    pub services: std::collections::HashMap<String, ServiceEmit>,
+}
+
+/// One tokened service identity (bd-asr2.17, D7): the token itself never
+/// lives here, only its hex sha256. `channels` scopes which `to` targets
+/// the token may ring (`*` = any). `rate_per_min` bounds burst intake.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServiceEmit {
+    #[serde(default)]
+    pub token_sha256: String,
+    #[serde(default)]
+    pub channels: Vec<String>,
+    #[serde(default = "default_service_rate")]
+    pub rate_per_min: u32,
+}
+
+fn default_service_rate() -> u32 {
+    6
 }
 /// `[mail]` section — the per-backend transport table (ADR-0003 V3). Splitting
 /// the old shared `[agent_mail] url` fixes the BUG1 misroute: each backend
@@ -531,6 +553,15 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// Service identities for POST /api/v1/emit (bd-asr2.17, D7):
+    /// empty map = endpoint disabled.
+    pub fn doorbell_services(&self) -> std::collections::HashMap<String, ServiceEmit> {
+        self.doorbell
+            .as_ref()
+            .map(|d| d.services.clone())
+            .unwrap_or_default()
+    }
+
     pub fn socket_path(&self) -> String {
         self.socket_path
             .clone()
@@ -538,7 +569,6 @@ impl Config {
             .unwrap_or_else(|| {
                 // Converge with the module's own XDG-first base (is1.6): the
                 // canonical herdr client (toron-core backend/herdr.rs) resolves
-                // `HERDR_SOCKET_PATH` or `$XDG_CONFIG_HOME/herdr/herdr.sock`.
                 // `dirs::config_dir()` would point at ~/Library/Application
                 // Support on macOS — divergent, and a real "flywheel can't
                 // find herdr" bug with default config.
