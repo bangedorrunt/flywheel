@@ -13,17 +13,40 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const LOGROTATE_BYTES: u64 = 1024 * 1024;
 
 pub async fn run(cfg: &Config) -> Result<()> {
+    use doorbell_rt::lease;
+    let now = lease::unix_now();
+    // D9 layer 1 first: a live lease means another writer runs — refuse
+    // before touching its socket (never clobber a stranger's bind).
+    if let Some(cur) = lease::read_lease(&cfg.state_dir)
+        && !lease::lease_stale(&cur, now)
+    {
+        anyhow::bail!(
+            "doorbell serve: refused, live lease held by pid {} on {} (started {})",
+            cur.pid,
+            cur.host,
+            cur.started_unix
+        );
+    }
     let tcp = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", cfg.port)).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // Clean exit over a port conflict must STAY dead under
-            // Restart=on-failure (bd-serve-double-spawn lesson): no respawn
-            // war, no crash loop. Full bind fence (owner lease) is bd-asr2.3.
-            eprintln!("doorbell serve: port {} in use, exiting 0", cfg.port);
-            std::process::exit(0);
+            // D9 layer 2: healthy doorbell peer → clean exit 0 (no respawn
+            // war under Restart=on-failure); anyone else → hard fail naming
+            // the squatter (toron serve_lock precedent).
+            match peer_health(cfg).await {
+                Some(v) if v.get("protocol").and_then(|p| p.as_str()) == Some(doorbell_rt::api::PING.protocol) => {
+                    eprintln!("doorbell serve: healthy doorbell peer on {}, exiting 0", cfg.port);
+                    std::process::exit(0);
+                }
+                _ => anyhow::bail!("doorbell serve: port {} held by non-doorbell squatter", cfg.port),
+            }
         }
         Err(e) => return Err(e).with_context(|| format!("bind 127.0.0.1:{}", cfg.port)),
     };
+    // Claim the writer lease before serving (heartbeat below keeps it).
+    let owned = lease::acquire_lease(&cfg.state_dir, lease::unix_now()).map_err(|e| {
+        anyhow::anyhow!("doorbell serve: lease claim failed after bind: {e:?}")
+    })?;
     let sock_path = cfg.socket_path();
     if let Some(parent) = sock_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -62,11 +85,29 @@ pub async fn run(cfg: &Config) -> Result<()> {
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
     };
+    // D9 layer 1 upkeep: heartbeat every 30s (the live dispatcher rewrites
+    // it each sweep in .5; the daemon has no sweep yet, so wall-clock it).
+    let hb_state = cfg.state_dir.clone();
+    let heartbeat = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            let now = doorbell_rt::lease::unix_now();
+            if let Some(mut cur) = doorbell_rt::lease::read_lease(&hb_state) {
+                doorbell_rt::lease::refresh_lease(&hb_state, &mut cur, now);
+            }
+        }
+    });
+    let finish = |owned: &doorbell_rt::lease::OwnerLease| {
+        heartbeat.abort();
+        rotate_tick.abort();
+        doorbell_rt::lease::release_lease(&cfg.state_dir, owned);
+    };
     tokio::select! {
-        r = serve_tcp => { rotate_tick.abort(); r }
-        r = serve_uds => { rotate_tick.abort(); r }
+        r = serve_tcp => { finish(&owned); r }
+        r = serve_uds => { finish(&owned); r }
         _ = tokio::signal::ctrl_c() => {
-            rotate_tick.abort();
+            finish(&owned);
             eprintln!("doorbell serve: shutting down");
             Ok(())
         }
@@ -75,6 +116,36 @@ pub async fn run(cfg: &Config) -> Result<()> {
 
 fn parent_of(p: &std::path::Path) -> &std::path::Path {
     p.parent().unwrap_or(std::path::Path::new("/tmp"))
+}
+
+
+/// Minimal blocking /health probe for the bind fence (async callers use
+/// this before deciding exit-0 vs hard-fail).
+async fn peer_health(cfg: &Config) -> Option<serde_json::Value> {
+    let body = tokio::task::spawn_blocking({
+        let port = cfg.port;
+        move || {
+            use std::io::{Read, Write};
+            let mut stream = std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{port}").parse().ok()?,
+                std::time::Duration::from_secs(2),
+            )
+            .ok()?;
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).ok()?;
+            write!(
+                stream,
+                "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            )
+            .ok()?;
+            let mut body = String::new();
+            stream.read_to_string(&mut body).ok()?;
+            let idx = body.find("\r\n\r\n")?;
+            Some(body[idx + 4..].to_string())
+        }
+    })
+    .await
+    .ok()??;
+    serde_json::from_str(&body).ok()
 }
 
 /// Hourly 1 MiB copy-truncate (toron parity shape): readers keep their
