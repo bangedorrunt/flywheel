@@ -364,11 +364,11 @@ Phase 3:
 
 Phase 4 (per flag, on opt-in):
 
-- [ ] `arrival_triple`: E2 semantics (P's digest carries Q's roster row; role-addressed first contact) with flag on; flag off = Phase-3 behavior byte-identical
-- [ ] `beads_poller`: E17 — hold expiry wake at 03:00, zero swarm, `ps` proves daemon-only; poller is read-only (br sqlite mtime/hash unchanged)
-- [ ] `emit`: tokened service identity rings via kind-9; revoked token refused; rate limit holds
+- [x] `arrival_triple`: E2 semantics (P's digest carries Q's roster row; role-addressed first contact) with flag on; flag off = Phase-3 behavior byte-identical
+- [x] `beads_poller`: E17 — hold expiry wake at 03:00, zero swarm, `ps` proves daemon-only; poller is read-only (br sqlite mtime/hash unchanged)
+- [x] `emit`: tokened service identity rings via kind-9; revoked token refused; rate limit holds
 - [ ] **Clock-jump**: NTP step mid-run → journal order unchanged, deadlines re-stabilize within one digest interval
-- [ ] **Torn tail**: truncate journal mid-line → `why` stops at gap loudly, `/health` degraded, no fold-past
+- [x] **Torn tail**: truncate journal mid-line → `why` stops at gap loudly, `/health` degraded, no fold-past
 
 Standing (all phases): `mbx +nightly-aarch64-apple-darwin test` green; proptest determinism (same Msg log → same Cmds, randomized sequences) in CI from Phase 0.
 

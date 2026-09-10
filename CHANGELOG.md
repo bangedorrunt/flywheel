@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
+### Added — ADR-0012 Phase 4 behavior flags (all default-off, live-proven)
+- `arrival_triple`: presence publish + role auto-bind + join ring + scope-bound roster headers on arrive; flag off is byte-identical.
+- `beads_poller`: read-only WAL poll of the br sqlite emitting Fact Msgs (hold expiry, closes); never writes the ledger.
+- `cron_doorbell_sink`: cron tick completion journals a Fact wake, digest-visible with zero swarm.
+- `doorbell emit` endpoint + tokened service identities (scoped × channeled × rated, revocable) ringing kind-9 through toron.
+- `cross_workspace`: explicit Scope::Many widening, `(workspace, corr)` journal envelope, same-host external re-ring driver in doorbell-rt.
+- `doorbell inject` console verb (ratcheted, budgeted) and `subscribe`/`subscriptions`/`unsubscribe` store verbs (D8).
+- Wake analytics learning artifact + phase4 gate in verify-0012.sh.
+### Fixed — ADR-0011 vision proofs
+- `"N crews"` / `coder:N` parse into `--crew N` (total panes). `"swarm with 2 crews"` classifies wave-swarm, not steer.
+- `"join the fleet"` → `arrive`. One-line typo → open spawn-send.
+- Arrive starts a doorbell even with no prior swarm workspace; helm assembles after start-or-attach.
+- `doorbell status` lists arrive-started dispatchers (empty spawn registry no longer hides them).
+- Helm dispatcher token is `absent`/`down`/`up` (lowercase `down` is no longer mapped to absent).
+- Helm/snapshot pick the live doorbell workspace, not stale spawn-meta (`adrx28`).
+- Doorbell child uses `try_mailbox` so a remote `[mail.toron] url` no longer panics the watcher.
+- Helm reservations use the Mail facade (`list_active`), so a remote daemon no longer always degrades.
+- Skill/AGENTS/QUICK-REF session door is arrive+briefing.
+- Month-old coalition JSON is dropped from JOINING (48h live window). Held paths are a count, not a dump.
+- SIGNOFF residual is non-closed lanes (not a `status contains "review"` miss). SIGNOFF assemble uses the live doorbell workspace.
+
 ### Added — ADR-0011 session conductor Waves B–D
 - `flywheel briefing` emits `flywheel-briefing.v1` (world + proposal + topology/N questions). `--commit`/`--yes` run argv. Joinable worlds propose `arrive`, not a second compose.
 - `decide --json` emits `topology`. `--project` fills Snapshot from helm (ready beads, pins, contention).
