@@ -305,7 +305,8 @@ impl Host for RtHost {
 
     /// Fetch-only slice of the old sweep arm (classify + prompt moved to
     /// tick via InboxRows — the bd-9hco pipe, unchanged semantics).
-    fn fetch_inbox(&mut self, pin: &str, since: &str) -> Vec<serde_json::Value> {
+    /// F6: shared borrow (no mutation; enables future off-loop pipe).
+    fn fetch_inbox(&self, pin: &str, since: &str) -> Vec<serde_json::Value> {
         if let Some(rows) = self.fetch_inbox_process(pin, since) {
             return rows;
         }
