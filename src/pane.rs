@@ -634,18 +634,28 @@ pub fn pane_dispatch(
     // never a hang).
     let mut attempts = 0;
     const MAX_ATTEMPTS: u32 = 6;
+    // bd-mukq: 429 reroute state — the CURRENT send target (starts at the
+    // resolved entry) plus the attempted profiles (starts at the step's
+    // own). A 429 swaps the target to a live fallback-profile pane and
+    // re-drives the same loop ONCE; the second 429 fails loud with a
+    // trail instead of redriving the exhausted route.
+    let mut attempt_entry: &SpawnEntry = entry;
+    let mut attempt_profile = profile_name.to_string();
+    let mut attempted: Vec<String> = vec![profile_name.to_string()];
+    let mut reroute_trail: Vec<Value> = Vec::new();
+    let rate_limit_kind = crate::failure::FailureKind::RateLimit.to_string();
     loop {
         let mut cmd = Command::new(std::env::current_exe()?);
         cmd.arg("__send")
             .arg(project)
-            .arg(&entry.name)
+            .arg(&attempt_entry.name)
             .arg(&prompt)
             .arg("--confirm")
             .arg("--profile")
-            .arg(profile_name);
+            .arg(&attempt_profile);
         let output = cmd
             .output()
-            .with_context(|| format!("__send for @{profile_name} ({})", entry.name))?;
+            .with_context(|| format!("__send for @{attempt_profile} ({})", attempt_entry.name))?;
         let raw = String::from_utf8_lossy(&output.stdout).to_string();
         let trimmed = raw.trim();
         if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
@@ -657,7 +667,7 @@ pub fn pane_dispatch(
             if transient && attempts < MAX_ATTEMPTS {
                 attempts += 1;
                 eprintln!(
-                    "flywheel: @{profile_name} not ready (attempt {attempts}/{MAX_ATTEMPTS}) — retrying in 10s"
+                    "flywheel: @{attempt_profile} not ready (attempt {attempts}/{MAX_ATTEMPTS}) — retrying in 10s"
                 );
                 std::thread::sleep(std::time::Duration::from_secs(10));
                 continue;
@@ -672,8 +682,8 @@ pub fn pane_dispatch(
                 );
             }
             let mut out = json!({
-                "profile": profile_name,
-                "agent": entry.name,
+                "profile": attempt_profile.clone(),
+                "agent": attempt_entry.name,
                 "send": v.clone(),
             });
             // ADR-0024 W1a: classify pane dispatch failures (rate_limit/timeout/auth)
@@ -690,6 +700,49 @@ pub fn pane_dispatch(
                     out["kind"] = json!(cf.kind.to_string());
                     out["retryable"] = json!(cf.retryable);
                 }
+                // bd-mukq: 429 reroute — ONE hop to a live fallback-profile
+                // pane (ADR-0026 shared chain; the running agent keeps its
+                // model and session, the self-contained prompt reroutes).
+                // No chain or no live pane, or the second 429, fails LOUD
+                // with a trail + hint instead of redriving exhausted quota.
+                if out.get("kind").and_then(Value::as_str) == Some(rate_limit_kind.as_str()) {
+                    match dispatch_reroute_target(catalog, entries, &attempt_profile, &attempted) {
+                        Some((next_profile, next_name)) => {
+                            attempted.push(next_profile.clone());
+                            crate::record_reroute_audit(
+                                project,
+                                0,
+                                &attempt_profile,
+                                crate::failure::FailureKind::RateLimit,
+                                &err_str,
+                            );
+                            eprintln!(
+                                "flywheel: dispatch @{attempt_profile} rate-limited (429) — rerouting prompt to @{next_profile} ({next_name}), one hop"
+                            );
+                            reroute_trail.push(json!({
+                                "from": attempt_profile.clone(),
+                                "to": next_profile.clone(),
+                                "evidence": err_str,
+                            }));
+                            if let Some(e) = resolve_pane_entry(entries, &next_profile) {
+                                attempt_entry = e;
+                                attempt_profile = next_profile;
+                                continue;
+                            }
+                            // Pane vanished between select and send: loud trail.
+                            out["reroute"] = json!("target-pane-gone");
+                        }
+                        None => {
+                            out["reroute"] = json!("none-available");
+                            out["hint"] = json!(format!(
+                                "429 on @{attempt_profile} with no further fallback pane live — spawn the fallback profile or wait for quota; redriving the same route hammers quota"
+                            ));
+                        }
+                    }
+                }
+            }
+            if !reroute_trail.is_empty() {
+                out["reroute_trail"] = json!(reroute_trail);
             }
             return Ok(crate::phase_chain::annotate_dispatch_output(
                 spec, inputs, out,
@@ -713,6 +766,44 @@ pub fn pane_dispatch(
             out["retryable"] = json!(cf.retryable);
         }
         return Ok(out);
+    }
+}
+
+/// bd-mukq: select a one-hop 429 reroute target for a pane dispatch — the
+/// next fallback profile in the PASSED catalog's chain (ADR-0026) that has
+/// a LIVE pane in this run's entries. Pure — the unit surface. Returns
+/// (profile, entry_name). `None` = fail loud locally: no chain, chain
+/// panes not live in this run, or the hop already happened (the caller
+/// passes prior attempts; second same-class failure is terminal).
+/// Reads the chain from the passed catalog (never reloads from disk —
+/// `next_fallback` re-loads the user catalog, which diverges in tests
+/// and wastes a disk load per call in prod). An in-pane model swap is
+/// deliberately NOT offered: the running agent owns its model and its
+/// session — the prompt reroutes to a live fallback pane whose brief is
+/// self-contained, or the step fails loud.
+pub fn dispatch_reroute_target(
+    catalog: &ProfileCatalog,
+    entries: &[SpawnEntry],
+    profile_name: &str,
+    attempted: &[String],
+) -> Option<(String, String)> {
+    let mut tried: Vec<String> = attempted.to_vec();
+    if !tried.iter().any(|a| a == profile_name) {
+        tried.push(profile_name.to_string());
+    }
+    loop {
+        let chain = catalog
+            .get(profile_name)
+            .map(|p| p.fallback.clone())
+            .unwrap_or_default();
+        let next = chain.into_iter().find(|fb| !tried.contains(fb))?;
+        tried.push(next.clone());
+        if catalog.get(&next).is_none() {
+            continue;
+        }
+        if let Some(e) = resolve_pane_entry(entries, &next) {
+            return Some((next, e.name.clone()));
+        }
     }
 }
 
@@ -1387,6 +1478,68 @@ mod tests {
         ));
         assert!(!is_transient_dispatch_reason("unknown profile @nope"));
         assert!(!is_transient_dispatch_reason(""));
+    }
+
+    /// bd-mukq: 429 reroute target — the next fallback profile in the
+    /// chain that has a LIVE pane in this run wins, exactly once.
+    /// Empty chain, no live pane, or already-attempted → None (fail loud
+    /// locally instead of redriving the exhausted route).
+    #[test]
+    fn dispatch_429_fallback_hop() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "fw-pane-reroute-{}-{}.toml",
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::write(
+            &path,
+            "[profiles.oracle]\nharness = \"omp\"\nmodel = \"@premium\"\nfallback = [\"coder\"]\n\
+             [profiles.coder]\nharness = \"pi\"\nmodel = \"@standard\"\n",
+        )
+        .expect("profiles.toml");
+        let catalog = ProfileCatalog::load_from(Some(&path)).expect("catalog");
+        let _ = std::fs::remove_file(&path);
+        let entry = |pane_id: &str, name: &str, profile: &str| SpawnEntry {
+            pane_id: pane_id.to_string(),
+            name: name.to_string(),
+            profile: Some(profile.to_string()),
+            harness: None,
+            mail_identity: None,
+            skills_injected: false,
+            incarnation: 0,
+        };
+        let entries = vec![
+            entry("w1:p1", "crew-wf-oracle", "oracle"),
+            entry("w1:p2", "crew-wf-coder", "coder"),
+        ];
+        // Oracle 429s → coder pane is live: one hop.
+        assert_eq!(
+            dispatch_reroute_target(&catalog, &entries, "oracle", &[]),
+            Some(("coder".to_string(), "crew-wf-coder".to_string()))
+        );
+        // Coder has no chain: fail loud locally.
+        assert_eq!(
+            dispatch_reroute_target(&catalog, &entries, "coder", &[]),
+            None
+        );
+        // Fallback pane not live in this run: no hop.
+        let oracle_only = vec![entry("w1:p1", "crew-wf-oracle", "oracle")];
+        assert_eq!(
+            dispatch_reroute_target(&catalog, &oracle_only, "oracle", &[]),
+            None
+        );
+        // Already hopped once: terminal, never a second hop.
+        assert_eq!(
+            dispatch_reroute_target(
+                &catalog,
+                &entries,
+                "oracle",
+                &["oracle".to_string(), "coder".to_string()]
+            ),
+            None
+        );
     }
 
     #[test]
