@@ -362,8 +362,18 @@ impl<H: Host> Brain<H> {
             since: since.clone(),
             now,
         });
-        // FetchInbox per known pin (the live loop's need_fetch arm).
-        let fetched = self.fetch_all_inbox(since).await;
+        // F6: fetch only when tick asks (need_fetch arm) — was unconditional
+        // per-pin I/O every 1s sweep. Full pipe (fetch off-loop as Msgs)
+        // stays the follow-up; this cuts the steady-state sweep to tick
+        // plus presence when no inbox work is due.
+        let fetched = if effects
+            .iter()
+            .any(|e| matches!(e, Effect::FetchInbox { .. }))
+        {
+            self.fetch_all_inbox(since)
+        } else {
+            Vec::new()
+        };
         self.journal(
             &serde_json::json!({"rt_kind": "Sweep"}),
             &effects,
@@ -403,8 +413,10 @@ impl<H: Host> Brain<H> {
         self.deliver(effects, "inbox").await;
     }
 
-    async fn fetch_all_inbox(
-        &mut self,
+    // F6: shared borrow — inbox fetch needs no &mut host (enables future
+    // off-loop pipe; today it at least stops excluding concurrent readers).
+    fn fetch_all_inbox(
+        &self,
         since_fallback: String,
     ) -> Vec<(String, Vec<serde_json::Value>)> {
         let mut fetched = Vec::new();
@@ -445,7 +457,7 @@ impl<H: Host> Brain<H> {
             .any(|e| matches!(e, Effect::FetchInbox { .. }))
         {
             let since = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            for (pin, rows) in self.fetch_all_inbox(since).await {
+            for (pin, rows) in self.fetch_all_inbox(since) {
                 self.on_inbox_fetched(pin, rows).await;
             }
         }

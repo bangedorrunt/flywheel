@@ -31,9 +31,9 @@ pub trait Host: Send {
     fn tick(&mut self, msg: &BrainMsg) -> Vec<Effect>;
     /// Wall-clock unix secs (enters tick only as payload, replayable).
     fn now_unix(&self) -> u64;
-    /// Plane-P inbox rows for one pin (pipe worker in .5; immediate here).
-    fn fetch_inbox(&mut self, pin: &str, since: &str) -> Vec<serde_json::Value>;
-    /// Ack-SLA scan; overdue post ids re-enter through the watch path in .5.
+    /// Plane-P inbox rows for one pin (F6: shared borrow — fetch needs no
+    /// &mut; pipe worker in .5 calls this off-loop, immediate here).
+    fn fetch_inbox(&self, pin: &str, since: &str) -> Vec<serde_json::Value>;
     fn scan_ack_sla(&mut self) -> Vec<String>;
     /// Restart the watch child with backoff (GS-007 never-deaf rule).
     /// The brain calls this on `Died`; results re-enter as watch Msgs.
@@ -108,7 +108,7 @@ impl Host for MockHost {
         self.now
     }
 
-    fn fetch_inbox(&mut self, pin: &str, since: &str) -> Vec<serde_json::Value> {
+    fn fetch_inbox(&self, pin: &str, since: &str) -> Vec<serde_json::Value> {
         self.inbox
             .get(&(pin.to_string(), since.to_string()))
             .cloned()
