@@ -131,6 +131,15 @@ pub struct DoorbellSection {
     /// Empty (default) disables the endpoint. Revocation = delete entry.
     #[serde(default)]
     pub services: std::collections::HashMap<String, ServiceEmit>,
+    /// Cross-workspace scopes (bd-asr2.18, D5): subscriptions may span N
+    /// workspaces and external:<proj>:<bead> holds re-ring on foreign
+    /// close. Default false — off is byte-identical single-workspace.
+    #[serde(default)]
+    pub cross_workspace: bool,
+    /// Same-host foreign repo paths for external re-ring (bd-asr2.18):
+    /// project slug -> repo dir containing .beads. Cross-host is out.
+    #[serde(default)]
+    pub external_projects: std::collections::HashMap<String, String>,
 }
 
 /// One tokened service identity (bd-asr2.17, D7): the token itself never
@@ -562,6 +571,22 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// Cross-workspace scopes flag (bd-asr2.18, D5): false unless opted in.
+    pub fn doorbell_cross_workspace(&self) -> bool {
+        self.doorbell
+            .as_ref()
+            .map(|d| d.cross_workspace)
+            .unwrap_or(false)
+    }
+
+    /// Same-host foreign repo paths for external re-ring (bd-asr2.18).
+    pub fn doorbell_external_projects(&self) -> std::collections::HashMap<String, String> {
+        self.doorbell
+            .as_ref()
+            .map(|d| d.external_projects.clone())
+            .unwrap_or_default()
+    }
+
     pub fn socket_path(&self) -> String {
         self.socket_path
             .clone()
@@ -569,6 +594,7 @@ impl Config {
             .unwrap_or_else(|| {
                 // Converge with the module's own XDG-first base (is1.6): the
                 // canonical herdr client (toron-core backend/herdr.rs) resolves
+                // `HERDR_SOCKET_PATH` or `$XDG_CONFIG_HOME/herdr/herdr.sock`.
                 // `dirs::config_dir()` would point at ~/Library/Application
                 // Support on macOS — divergent, and a real "flywheel can't
                 // find herdr" bug with default config.
