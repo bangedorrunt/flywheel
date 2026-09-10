@@ -203,3 +203,4 @@
 {"id":203,"issue_id":"bd-s4fc","from_status":"in_progress","to_status":"closed","status_revision":2968,"gate":"unit-test-verified","provider":"QuietBadger","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-10 08:40:02"}
 {"id":204,"issue_id":"bd-ene2","from_status":"in_progress","to_status":"closed","status_revision":2972,"gate":"unit-test-verified","provider":"QuietBadger","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-10 10:00:35"}
 {"id":205,"issue_id":"bd-4zcp","from_status":"in_progress","to_status":"closed","status_revision":2978,"gate":"unit-test-verified","provider":"QuietBadger","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-10 10:07:25"}
+{"id":206,"issue_id":"bd-audit-adr0012-doorbell-huit","from_status":"open","to_status":"closed","status_revision":0,"gate":"unit-test-verified","provider":"TealDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-10 11:23:54"}
