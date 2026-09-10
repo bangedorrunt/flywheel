@@ -1315,19 +1315,9 @@ pub fn journal_append(
     {
         let _ = writeln!(f, "{entry}");
     }
-    // Bounded retention: doorbell journal also grows without bound — same
-    // 5 MiB / 5k line cap as loop journal. Keep recent history for `why`.
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() > 5 * 1024 * 1024 {
-            if let Ok(raw) = std::fs::read_to_string(&path) {
-                let lines: Vec<&str> = raw.lines().collect();
-                if lines.len() > 5000 {
-                    let keep = lines[lines.len() - 5000..].join("\n") + "\n";
-                    let _ = std::fs::write(&path, keep);
-                }
-            }
-        }
-    }
+    // F8: no second retention impl here — rotation plus audit lives in
+    // doorbell-rt FileStore (RETENTION_LINES/BYTES). Legacy silent head-trim
+    // deleted; live path uses journal_append_workspace via the store.
 }
 
 /// Workspace-tick journal entry writer. `pins` is the inject-relevant pin set
@@ -1766,19 +1756,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn s_proof_why_producer_retention_bound() {
-        // zfnx.9 producer contract: 5MiB / 5k-line retention cap on the live path.
-        let src = include_str!("doorbell.rs");
-        assert!(
-            src.contains("5 * 1024 * 1024"),
-            "journal retention must keep the 5MiB bound"
-        );
-        assert!(
-            src.contains("5000"),
-            "journal retention must keep the 5k-line bound"
-        );
-    }
 
     #[test]
     fn s_proof_why_fold_reproduces_cmds() {
