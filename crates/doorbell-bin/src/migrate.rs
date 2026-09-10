@@ -20,11 +20,11 @@ fn inventory_match(dir: &str, name: &str) -> bool {
                 && !name.contains("..")
         }
         "journals" => {
-            name.starts_with("doorbell-journal-") && name.ends_with(".jsonl") && !name.contains("..")
+            name.starts_with("doorbell-journal-")
+                && name.ends_with(".jsonl")
+                && !name.contains("..")
         }
-        "" => {
-            name.starts_with("doorbell-wake-") && name.ends_with(".json") && !name.contains("..")
-        }
+        "" => name.starts_with("doorbell-wake-") && name.ends_with(".json") && !name.contains(".."),
         _ => false,
     }
 }

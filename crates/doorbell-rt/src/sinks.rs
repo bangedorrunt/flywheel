@@ -524,13 +524,13 @@ impl DmTransport for MockDmTransport {
         Ok(())
     }
 }
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn sent_len(sent: &Arc<std::sync::Mutex<Vec<(String, String)>>>) -> usize {
         sent.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
-
     #[tokio::test]
     async fn stalled_sink_sheds_while_worker_still_pumps() {
         let (deg_tx, _deg_rx) = mpsc::channel(16);
