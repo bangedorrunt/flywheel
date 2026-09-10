@@ -2832,10 +2832,10 @@ mod bell_fold_tests {
     #[test]
     fn bell_fold_fact_path_live() {
         let src = include_str!("main.rs");
-        let dt = include_str!("doorbell_tick.rs");
+        let dt = include_str!("../crates/doorbell-core/src/lib.rs");
         assert!(
             dt.contains("Fact"),
-            "RED (bd-6b1y #10): DoorbellMsg::Fact missing in doorbell_tick.rs"
+            "RED (bd-6b1y #10): DoorbellMsg::Fact missing in doorbell-core"
         );
         assert!(
             src.contains("DoorbellMsg::Fact") || src.contains("Fact {"),
@@ -2878,7 +2878,7 @@ mod bell_fold_tests {
 
     #[test]
     fn bell_fold_fetch_inbox_emitted() {
-        let dt = include_str!("doorbell_tick.rs");
+        let dt = include_str!("../crates/doorbell-core/src/lib.rs");
         let main = include_str!("main.rs");
         // FetchInbox must be emitted as real Cmd, rows re-enter as InboxRows
         assert!(

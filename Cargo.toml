@@ -5,7 +5,11 @@ edition = "2024"
 description = "Multi-agent swarm orchestrator on the herdr backend — NTM-parity daily loop for opencode/pi/grok"
 license = "MIT"
 
+[workspace]
+members = ["crates/doorbell-core"]
+
 [dependencies]
+doorbell-core = { path = "crates/doorbell-core" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
