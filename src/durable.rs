@@ -562,14 +562,14 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             };
             if let Ok(to) = transition(&from, &event) {
                 next.per_bead_phase.insert(bead_id.clone(), to);
-                // Pop queue FIFO into model' where visible
-                if !next.queue.is_empty() {
-                    next.queue.remove(0);
-                }
-                actions.push(LoopAction::Send {
-                    name: bead_id.clone(),
-                    text: format!("dispatch {bead_id}"),
-                });
+                // bd-loop-goal-name-dispatch-eo4u: retired as a dispatch
+                // vehicle — the old arm popped the queue into Send.name (bead
+                // id / brief text as the agent name), which __read/__kind/send
+                // cannot resolve, and replaced the brief with a "dispatch ..."
+                // stub (content lost). Dispatch now happens only paired with a
+                // real agent (Tick arm, route_event). The phase transition
+                // stays; no pop, no misaddressed Send. The variant is kept
+                // for journal compat — it has no live constructors.
             }
         }
         LoopMsg::BrClose { bead_id } => {
@@ -718,14 +718,41 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
                 });
             }
             if !next.mail_degraded && !next.queue.is_empty() {
-                // Simple plan: pop one and send
-                let bead = next.queue.remove(0);
-                if !next.dispatch_pending.contains(&bead) {
-                    next.dispatch_pending.insert(bead.clone());
-                    actions.push(LoopAction::Send {
-                        name: bead.clone(),
-                        text: format!("dispatch {bead}"),
-                    });
+                // bd-loop-goal-name-dispatch-eo4u: pair the queue head with a
+                // real idle|done agent HERE at the dispatch source. The old
+                // code popped the brief into Send.name (the whole GOAL text as
+                // the agent name) with a "dispatch ..." stub as content —
+                // __read/__kind/send failed on the bogus name, the brief was
+                // lost, claim-watch never reconciled, and the loop exited
+                // `complete` with beads open. No idle agent → PARK: the queue
+                // stays intact (complete_now cannot fire on our watch) and the
+                // next poll retries. Never pop without a taker. One head per
+                // tick (the old pop cadence); unknown/working/blocked agents
+                // never take work.
+                if let Some(i) = next.states.iter().position(|s| {
+                    matches!(s.status.as_str(), "idle" | "done")
+                        && !next.dispatch_pending.contains(&s.name)
+                }) {
+                    let brief = next.queue.remove(0);
+                    let agent = next.states[i].name.clone();
+                    // {AGENT_NAME} is the pin when the state knows it, else
+                    // the herdr name (bd-pin-public-plane-s-easy.2 — same as
+                    // plan_actions / route_event).
+                    let pin = next.states[i]
+                        .mail_identity
+                        .clone()
+                        .unwrap_or_else(|| agent.clone());
+                    let text = brief.replace("{AGENT_NAME}", &pin);
+                    // ADR-0001 Wave 3 pin stamp, mirroring plan_actions: bead
+                    // briefs stamp the orchestrator-resolved pin on claim.
+                    if let Some(bead_id) = bead_id_from_prompt(&text) {
+                        actions.push(LoopAction::PinStamp {
+                            bead_id: bead_id.to_string(),
+                            pin,
+                        });
+                    }
+                    next.dispatch_pending.insert(agent.clone());
+                    actions.push(LoopAction::Send { name: agent, text });
                 }
             }
         }
@@ -15235,10 +15262,84 @@ mod tick_replay_tests {
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (next, actions) = tick(&model, &msg);
-        // Queue pop should be visible in next.queue
-        assert_eq!(next.queue, vec!["b".to_string()]);
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], LoopAction::Send { .. }));
+        // bd-loop-goal-name-dispatch-eo4u: no idle agent → PARK — the queue
+        // stays intact and nothing is sent (the old pop-into-Send.name fed
+        // the whole brief text to __read/__kind/send, then completed).
+        assert_eq!(next.queue, vec!["a".to_string(), "b".to_string()]);
+        assert!(actions.is_empty(), "parked tick emits nothing: {actions:?}");
+    }
+
+    #[test]
+    fn tick_pairs_queue_head_with_idle_agent_not_brief_text() {
+        // bd-loop-goal-name-dispatch-eo4u regression: the queue head must
+        // reach a REAL agent name with its content intact — never the brief
+        // text as the target, never a "dispatch ..." stub as the content.
+        let brief_text = brief("bd-12", "fix auth flow", "flywheel", false);
+        let idle = AgentState {
+            name: "flywheel-proj-oc".to_string(),
+            status: "idle".to_string(),
+            mail_identity: Some("DustySparrow".to_string()),
+            ..Default::default()
+        };
+        let model = LoopModel {
+            queue: vec![brief_text.clone()],
+            per_bead_phase: Default::default(),
+            wake_suppression: Default::default(),
+            done_mailed: Default::default(),
+            event_cursor: None,
+            escalation: Default::default(),
+            respawn: Default::default(),
+            mail_health: Default::default(),
+            mail_degraded: false,
+            heal_states: Default::default(),
+            heal_grace: Default::default(),
+            heal_threshold: Default::default(),
+            heal_budget: Default::default(),
+            pending_events: Default::default(),
+            states: vec![idle],
+            dispatch_pending: Default::default(),
+            drain_pending: Default::default(),
+        };
+        let (next, actions) = tick(&model, &LoopMsg::Tick { now: 0 });
+        assert!(next.queue.is_empty(), "taken head leaves the queue");
+        assert!(next.dispatch_pending.contains("flywheel-proj-oc"));
+        // PinStamp (bead brief → orchestrator-resolved pin) precedes Send.
+        assert!(
+            matches!(&actions[0], LoopAction::PinStamp { bead_id, pin }
+                if bead_id == "bd-12" && pin == "DustySparrow"),
+            "bead brief stamps the pin first: {actions:?}"
+        );
+        match &actions[1] {
+            LoopAction::Send { name, text } => {
+                assert_eq!(name, "flywheel-proj-oc", "real agent name, not brief text");
+                assert!(
+                    text.starts_with("GOAL Execute bd-12:"),
+                    "brief content intact, not a stub: {text:.80}"
+                );
+                assert!(
+                    text.contains("DustySparrow"),
+                    "{{AGENT_NAME}} takes the pin: {text:.120}"
+                );
+                assert!(
+                    !text.contains("{AGENT_NAME}"),
+                    "no unsubstituted placeholder remains"
+                );
+            }
+            other => panic!("expected paired Send, got {other:?}"),
+        }
+        // Working-only crews park too — urgency never invents a taker.
+        let busy = LoopModel {
+            states: vec![AgentState {
+                name: "flywheel-proj-oc".to_string(),
+                status: "working".to_string(),
+                mail_identity: Some("DustySparrow".to_string()),
+                ..Default::default()
+            }],
+            ..model.clone()
+        };
+        let (parked, no_actions) = tick(&busy, &LoopMsg::Tick { now: 0 });
+        assert_eq!(parked.queue.len(), 1, "working crew holds the queue");
+        assert!(no_actions.is_empty());
     }
 }
 
@@ -15421,12 +15522,16 @@ mod loop_invoke_vehicle_tests {
             dispatch_pending: Default::default(),
             drain_pending: Default::default(),
         };
-        // For a bead that is not opted-in for graph, tick with Tick should just do normal plan_actions
+        // For a bead that is not opted-in for graph, tick with Tick must not
+        // invoke anything — and with no idle agent it parks (bd-loop-goal-name-
+        // dispatch-eo4u): queue intact, no misaddressed Send, no vehicle.
         let msg = LoopMsg::Tick { now: 0 };
         let (next, actions) = tick(&model, &msg);
-        // Should have popped the queue and created a Send action (normal path)
-        assert_eq!(next.queue.len(), 0);
-        assert_eq!(actions.len(), 1);
+        assert_eq!(next.queue.len(), 1, "parked queue stays intact");
+        assert!(
+            actions.is_empty(),
+            "no taker, no vehicle, no send: {actions:?}"
+        );
     }
 
     #[test]

@@ -2299,16 +2299,35 @@ mod tests {
 
     #[test]
     fn tick_clock_drives_swarm_queue() {
+        // bd-loop-goal-name-dispatch-eo4u: Tick pairs the queue head with a
+        // REAL agent — never the bead id / brief text as the target. With no
+        // agents it parks (queue intact, no misaddressed Send); with an idle
+        // agent the head dispatches under the agent's own name.
         let mut m = empty_model();
         m.swarm.queue.push("bd-1".into());
+        let (parked, no_cmds) = tick(&m, &Msg::Tick { now: 1 });
+        assert!(
+            parked.swarm.queue == vec!["bd-1".to_string()],
+            "parked tick keeps the queue: {:?}",
+            parked.swarm.queue
+        );
+        assert!(
+            !no_cmds.iter().any(|c| matches!(c, Cmd::Send { .. })),
+            "parked tick sends nothing: {no_cmds:?}"
+        );
+        m.swarm.states.push(crate::durable::AgentState {
+            name: "oc".to_string(),
+            status: "idle".to_string(),
+            ..Default::default()
+        });
         let (next, cmds) = tick(&m, &Msg::Tick { now: 1 });
         assert!(
             cmds.iter()
-                .any(|c| matches!(c, Cmd::Send { name, .. } if name == "bd-1")),
-            "Msg::Tick must run swarm_slice, not no-op"
+                .any(|c| matches!(c, Cmd::Send { name, .. } if name == "oc")),
+            "Msg::Tick must run swarm_slice, not no-op: {cmds:?}"
         );
         assert!(next.swarm.queue.is_empty());
-        assert!(next.swarm.dispatch_pending.contains("bd-1"));
+        assert!(next.swarm.dispatch_pending.contains("oc"));
     }
 
     #[test]
