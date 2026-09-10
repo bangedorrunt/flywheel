@@ -585,8 +585,106 @@ pub fn service_emit_wake_in(state_dir: &Path, project: &str, service: &str, to: 
     }
 }
 
+/// Operator console inject (D8, bd-woha): journal a Fact row (stage
+/// `inject`) into the named workspace scope plus queue one pending wake —
+/// digest-visible with zero swarm. Same-second ratchet (identical pin+line
+/// within one unix second refuses) and a persisted per-pin 5/30/3 rolling
+/// budget (the CLI is one-shot; RAM cannot hold the window). The console
+/// IS the operator (local loopback invocation), so no separate token.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InjectDeny {
+    Ratchet,
+    Budget,
+}
+
+fn inject_budget_path(state_dir: &Path, project: &str) -> PathBuf {
+    state_dir.join(format!(
+        "inject-budget-{}.json",
+        crate::state::state_key(project)
+    ))
+}
+
+fn inject_budget_load(
+    state_dir: &Path,
+    project: &str,
+) -> std::collections::BTreeMap<String, Vec<u64>> {
+    std::fs::read_to_string(inject_budget_path(state_dir, project))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+pub fn inject_wake_in(
+    state_dir: &Path,
+    project: &str,
+    workspace: &str,
+    pin: &str,
+    line: &str,
+    now_unix: u64,
+) -> Result<String, InjectDeny> {
+    // Same-second ratchet: scan the scope journal tail for an identical
+    // pin+line stamped this same second.
+    let journal_path = doorbell_rt::FileStore::new(state_dir).journal_file(workspace);
+    if let Ok(raw) = std::fs::read_to_string(&journal_path) {
+        for row in raw.lines().rev().take(32) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(row) else {
+                break;
+            };
+            let msg = v.get("msg");
+            let summary = msg
+                .and_then(|m| {
+                    m.get("summary")
+                        .or_else(|| m.get("Fact").and_then(|f| f.get("summary")))
+                })
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            let same_pin = summary.contains(pin) && summary.contains(line);
+            let same_sec = v
+                .get("executed")
+                .and_then(|e| e.get("inject_ts"))
+                .and_then(|t| t.as_u64())
+                .is_some_and(|t| t == now_unix);
+            if same_pin && same_sec {
+                return Err(InjectDeny::Ratchet);
+            }
+        }
+    }
+    let mut budgets = inject_budget_load(state_dir, project);
+    let stamps = budgets.entry(pin.to_string()).or_default();
+    stamps.retain(|t| now_unix.saturating_sub(*t) < 1800);
+    if stamps.len() >= 3 {
+        return Err(InjectDeny::Budget);
+    }
+    stamps.push(now_unix);
+    let budget_path = inject_budget_path(state_dir, project);
+    if let Some(parent) = budget_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::write(
+        budget_path,
+        serde_json::to_string(&budgets).unwrap_or_default(),
+    )
+    .is_err()
+    {
+        return Err(InjectDeny::Budget);
+    }
+    let summary = format!("inject {pin}: {line}");
+    let msg = crate::workspace::Msg::Fact {
+        summary: summary.clone(),
+    };
+    journal_append_workspace(
+        state_dir,
+        workspace,
+        &msg,
+        &[],
+        serde_json::json!({ "stage": "inject", "pin": pin, "workspace": workspace, "inject_ts": now_unix }),
+        None,
+    );
+    let _ = crate::append_pending_fact(project, &summary);
+    Ok(summary)
+}
+
 /// Cross-workspace scopes (bd-asr2.18, D5, flag-gated): widen one pin's
-/// subscription from its home workspace to an explicit extra workspace.
 /// Scope stays explicit (Scope::Many, deduped) — never an implicit
 /// all-workspace watch. Flag off or non-operator actor refuses.
 #[derive(Debug, PartialEq, Eq)]
@@ -3135,5 +3233,81 @@ mod tests {
         // Flag off: silent empty, no runner calls matter.
         let none = check_external_unblocks_in(proj, &paths, &run, false);
         assert!(none.is_empty());
+    }
+
+    fn inject_cleanup(proj: &str) {
+        let pend = crate::config::state_dir()
+            .join("facts")
+            .join(format!("{}-pending.jsonl", crate::state::state_key(proj)));
+        let _ = std::fs::remove_file(pend);
+    }
+
+    #[test]
+    fn inject_journals_row_and_queues_wake() {
+        // D8/bd-woha: console inject lands a stage=inject Fact row in the
+        // named scope journal plus one pending wake. Real pending queue
+        // (fake project), temp journal — cleaned after.
+        let dir = std::env::temp_dir().join(format!("dbll-inj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let proj = "inject-probe";
+        let out = inject_wake_in(&dir, proj, "manual", "P", "hello", 1_700_000).expect("inject");
+        assert!(out.contains('P') && out.contains("hello"));
+        let rows = doorbell_rt::FileStore::new(&dir)
+            .fold_workspace("manual")
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["executed"]["stage"], serde_json::json!("inject"));
+        assert_eq!(rows[0]["executed"]["pin"], serde_json::json!("P"));
+        let pend = crate::config::state_dir()
+            .join("facts")
+            .join(format!("{}-pending.jsonl", crate::state::state_key(proj)));
+        let body = std::fs::read_to_string(&pend).unwrap_or_default();
+        assert!(body.contains("hello"), "one wake queued");
+        inject_cleanup(proj);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inject_ratchet_refuses_same_second_dup() {
+        // D8: identical pin+line within one unix second refuses.
+        let dir = std::env::temp_dir().join(format!("dbll-injr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let proj = "inject-probe-r";
+        inject_wake_in(&dir, proj, "manual", "P", "hello", 1_700_000).expect("first");
+        assert_eq!(
+            inject_wake_in(&dir, proj, "manual", "P", "hello", 1_700_000),
+            Err(InjectDeny::Ratchet)
+        );
+        // Next second: admitted (budget still has room).
+        inject_wake_in(&dir, proj, "manual", "P", "hello", 1_700_001).expect("next second");
+        inject_cleanup(proj);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inject_budget_denies_fourth_in_window() {
+        // D8: 3 per 1800s rolling; the 4th refuses, spend is persisted.
+        let dir = std::env::temp_dir().join(format!("dbll-injb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let proj = "inject-probe-b";
+        for i in 0..3 {
+            inject_wake_in(
+                &dir,
+                proj,
+                "manual",
+                "P",
+                &format!("m{i}"),
+                1_700_000 + i * 10,
+            )
+            .expect("within budget");
+        }
+        assert_eq!(
+            inject_wake_in(&dir, proj, "manual", "P", "m3", 1_700_030),
+            Err(InjectDeny::Budget)
+        );
+        // Window rolls: t+1801 admits again.
+        inject_wake_in(&dir, proj, "manual", "P", "later", 1_700_000 + 1801).expect("rolled");
+        inject_cleanup(proj);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
