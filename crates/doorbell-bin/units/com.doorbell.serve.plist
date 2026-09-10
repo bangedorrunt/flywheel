@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- governed-by: ADR-0012 — com.doorbell.serve (doorbell plane-D daemon) -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.doorbell.serve</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>DOORBELL_BIN</string>
+        <string>serve</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Restart=on-failure semantics: a clean exit (e.g. port conflict,
+         which exits 0) must STAY dead — no respawn war (bd-serve-double-spawn).
+         launchd has no SuccessfulExit key; the binary exits 0 on conflict
+         and non-zero on crash, and KeepAlive/SuccessfulExit=false pairs it. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>DOORBELL_STATE_DIR/doorbell.log</string>
+    <key>StandardErrorPath</key>
+    <string>DOORBELL_STATE_DIR/doorbell.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DOORBELL_STATE_DIR</key>
+        <string>DOORBELL_STATE_DIR</string>
+    </dict>
+</dict>
+</plist>

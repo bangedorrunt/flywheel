@@ -1,0 +1,17 @@
+# governed-by: ADR-0012 — doorbell.service (doorbell plane-D daemon, user unit)
+[Unit]
+Description=Doorbell plane-D daemon (ADR-0012)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=DOORBELL_BIN serve
+Environment=DOORBELL_STATE_DIR=DOORBELL_STATE_DIR
+# Restart=on-failure with SuccessfulExit=false semantics: a clean exit
+# (e.g. port conflict, which exits 0) must STAY dead — no respawn war
+# (bd-serve-double-spawn lesson).
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
