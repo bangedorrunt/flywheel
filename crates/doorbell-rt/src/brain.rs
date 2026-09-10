@@ -143,12 +143,30 @@ impl<H: Host> Brain<H> {
     }
 
     pub async fn run(mut self, mut rx: tokio::sync::mpsc::Receiver<BrainMsg>) -> RunReport {
-        while let Some(msg) = rx.recv().await {
-            if matches!(msg, BrainMsg::Shutdown) {
-                break;
+        // Digest time-flush: `maybe_flush_digest` was event-driven only,
+        // so a batch could sit past `digest_interval_secs` forever when no
+        // further event arrived (audit P1). The timer is a cheap no-op
+        // while no batch is pending (due_time gates on digest_since).
+        let mut digest_tick = tokio::time::interval(std::time::Duration::from_secs(
+            self.cfg.digest_interval_secs.max(1),
+        ));
+        digest_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    if matches!(msg, BrainMsg::Shutdown) {
+                        break;
+                    }
+                    self.dispatch(msg).await;
+                }
+                _ = digest_tick.tick() => {
+                    self.maybe_flush_digest().await;
+                }
             }
-            self.dispatch(msg).await;
         }
+        // Drain any pending digest batch before the sinks shut down.
+        self.maybe_flush_digest().await;
         let undelivered = self.sinks.shutdown().await;
         if !undelivered.is_empty() {
             let pins: Vec<String> = undelivered.iter().map(|u| u.pin.clone()).collect();
@@ -198,15 +216,42 @@ impl<H: Host> Brain<H> {
                     serde_json::json!({"stage": "degraded", "reason": reason}),
                     &[],
                 );
-                // F5: worker-parked intents must surface — drain shed
-                // overflow into the digest (never silent) with an audit row.
-                for u in self.sinks.drain_shed_overflow().await {
-                    self.stats.sheds += 1;
-                    self.audit(
-                        "shed_overflow",
-                        serde_json::json!({ "sink": u.sink, "pin": u.pin }),
-                    );
-                    self.digest_push(u.pin, u.line);
+                // Supervision (audit P1): `sink:<name>` degradations are
+                // park events — attempt a Transient-policy restart with a
+                // fresh adapter and requeue its shed overflow (at-least-
+                // once). No factory or cap exhausted → shed to digest as
+                // before (never silent).
+                if let Some(sink) = source.strip_prefix("sink:") {
+                    let now = self.host.now_unix();
+                    if self.sinks.restart_sink(sink, now).await {
+                        let n = self.sinks.requeue_shed_overflow(sink).await;
+                        if n > 0 {
+                            self.audit(
+                                "sink_restarted",
+                                serde_json::json!({ "sink": sink, "requeued": n }),
+                            );
+                        }
+                    } else {
+                        for u in self.sinks.drain_shed_overflow().await {
+                            self.stats.sheds += 1;
+                            self.audit(
+                                "shed_overflow",
+                                serde_json::json!({ "sink": u.sink, "pin": u.pin }),
+                            );
+                            self.digest_push(u.pin, u.line);
+                        }
+                    }
+                } else {
+                    // Non-sink degradation (bus-watch etc.): drain shed
+                    // overflow into the digest (F5, never silent).
+                    for u in self.sinks.drain_shed_overflow().await {
+                        self.stats.sheds += 1;
+                        self.audit(
+                            "shed_overflow",
+                            serde_json::json!({ "sink": u.sink, "pin": u.pin }),
+                        );
+                        self.digest_push(u.pin, u.line);
+                    }
                 }
                 self.maybe_flush_digest().await;
             }
@@ -224,7 +269,14 @@ impl<H: Host> Brain<H> {
             BrainMsg::Ask { kind, reply } => {
                 let _ = reply.send(match kind {
                     AskKind::Stats => AskReply::Stats(self.snapshot_stats()),
-                    AskKind::Digest => AskReply::Digest(std::mem::take(&mut self.digest)),
+                    AskKind::Digest => {
+                        // The read empties the batch: reset the interval
+                        // clock too, or the next event-driven flush fires
+                        // immediately with only fresh lines (audit P1).
+                        let digest = std::mem::take(&mut self.digest);
+                        self.digest_since = None;
+                        AskReply::Digest(digest)
+                    }
                 });
             }
             BrainMsg::Shutdown => {}
@@ -285,6 +337,13 @@ impl<H: Host> Brain<H> {
     }
 
     async fn on_status(&mut self, pin: String, status: String) {
+        // GS-039 ordering: capture the previous status BEFORE the tick —
+        // the host records the new status at tick time (FileHost inserts
+        // into its map, the reducer updates the model), so a post-tick
+        // `prev_status` read always sees the value we just wrote and the
+        // transition gate never fires (audit P1). The gate is advisory:
+        // an unknown pin still counts as transitioned.
+        let from = self.host.prev_status(&pin).map(|f| f.to_ascii_lowercase());
         let effects = self.host.tick(&BrainMsg::HerdrStatus {
             pin: pin.clone(),
             status: status.clone(),
@@ -305,7 +364,6 @@ impl<H: Host> Brain<H> {
         // (idle/done/blocked) advance last_wake — OR a pin that actually
         // delivered. Static already-idle rows never ratchet liveness.
         let s = status.to_ascii_lowercase();
-        let from = self.host.prev_status(&pin).map(|f| f.to_ascii_lowercase());
         let transitioned = match from.as_deref() {
             Some(f) => f != s.as_str(),
             None => true,
@@ -437,10 +495,7 @@ impl<H: Host> Brain<H> {
 
     // F6: shared borrow — inbox fetch needs no &mut host (enables future
     // off-loop pipe; today it at least stops excluding concurrent readers).
-    fn fetch_all_inbox(
-        &self,
-        since_fallback: String,
-    ) -> Vec<(String, Vec<serde_json::Value>)> {
+    fn fetch_all_inbox(&self, since_fallback: String) -> Vec<(String, Vec<serde_json::Value>)> {
         let mut fetched = Vec::new();
         for pin in self.host.pins() {
             let pin_since = self
@@ -825,7 +880,9 @@ mod tests {
                 .is_empty(),
             "enqueue must not stamp hear"
         );
-        brain.dispatch(BrainMsg::Delivered { pin: "p".into() }).await;
+        brain
+            .dispatch(BrainMsg::Delivered { pin: "p".into() })
+            .await;
         let expired = brain
             .hear
             .expire(1_000_000 + 121, doorbell_core::UNANSWERED_SECS);
@@ -1118,13 +1175,13 @@ mod tests {
         let body = async {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
-                let s = sent.lock().unwrap_or_else(|e| e.into_inner());
-                let text = s
-                    .iter()
-                    .map(|(_, l)| l.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                drop(s);
+                let text = {
+                    let s = sent.lock().unwrap_or_else(|e| e.into_inner());
+                    s.iter()
+                        .map(|(_, l)| l.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
                 if text.contains("[deaf]") || tokio::time::Instant::now() >= deadline {
                     return text;
                 }
@@ -1185,5 +1242,178 @@ mod tests {
         drop(tx);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = sent;
+    }
+
+    // ---- Audit regression tests (bd-0012 verify) ----
+
+    #[tokio::test]
+    async fn status_transition_gate_sees_pre_tick_status() {
+        // Audit P1: the wake-liveness ratchet must compare the PREVIOUS
+        // status. The old code read prev_status AFTER the tick (which
+        // records the new status), so `transitioned` was always false on
+        // real hosts and last_wake never advanced on benign transitions.
+        let (mut brain, _rx, _tx) = test_brain("statusgate", vec![]);
+        brain
+            .dispatch(BrainMsg::HerdrStatus {
+                pin: "p".into(),
+                status: "working".into(),
+            })
+            .await;
+        let first = brain.wake.last_wake_unix;
+        brain
+            .dispatch(BrainMsg::HerdrStatus {
+                pin: "p".into(),
+                status: "idle".into(),
+            })
+            .await;
+        let second = brain.wake.last_wake_unix;
+        assert!(
+            second.is_some(),
+            "working -> idle transition must ratchet last_wake (prev status = working)"
+        );
+        // Same-status repeats never ratchet (static rows stay silent).
+        brain
+            .dispatch(BrainMsg::HerdrStatus {
+                pin: "p".into(),
+                status: "idle".into(),
+            })
+            .await;
+        assert_eq!(
+            brain.wake.last_wake_unix, second,
+            "already-idle repeats must not advance liveness"
+        );
+        // The first dispatch (unknown -> working) transitioned too, but the
+        // clock is frozen in tests; what matters is that the benign
+        // working -> idle transition ratcheted at all (old code: never).
+        assert!(first.is_none() || first == second);
+        assert!(second.is_some());
+    }
+
+    #[tokio::test]
+    async fn digest_ask_resets_interval_clock() {
+        // Audit P1: AskKind::Digest took the batch but left digest_since
+        // running — the next flush fired immediately with only fresh lines.
+        let (mut brain, _rx, _tx) = test_brain("digestask", vec![]);
+        brain.digest_push("p".into(), "[doorbell] one".into());
+        assert!(brain.digest_since.is_some());
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        brain
+            .dispatch(BrainMsg::Ask {
+                kind: AskKind::Digest,
+                reply: rtx,
+            })
+            .await;
+        let AskReply::Digest(lines) = rrx.await.unwrap() else {
+            panic!("digest reply");
+        };
+        assert_eq!(lines.len(), 1);
+        assert!(
+            brain.digest_since.is_none(),
+            "taking the batch must reset the interval clock"
+        );
+    }
+
+    #[tokio::test]
+    async fn sink_degrade_restarts_and_requeues_with_factory() {
+        // Audit P1: supervision was unwired — a parked sink stayed dead
+        // until process restart. With a factory, Degraded must restart the
+        // sink and requeue its shed overflow (at-least-once).
+        let (deg_tx, mut deg_rx) = tokio::sync::mpsc::channel::<BrainMsg>(16);
+        let (mut brain, _rx, _tx2) = test_brain("sinkrestart", vec![]);
+        brain.sinks = SinkManager::new(deg_tx);
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct FailingThenOk {
+            n: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            fail: bool,
+        }
+        impl crate::sinks::PromptSink for FailingThenOk {
+            fn send(&mut self, _pin: &str, _line: &str) -> anyhow::Result<()> {
+                if self.fail {
+                    anyhow::bail!("endpoint down");
+                }
+                self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            fn name(&self) -> &str {
+                "failing-then-ok"
+            }
+        }
+        let n2 = n.clone();
+        brain.sinks.add_sink_with_factory(
+            "herdr",
+            Box::new(FailingThenOk {
+                n: n.clone(),
+                fail: true,
+            }),
+            move || {
+                Box::new(FailingThenOk {
+                    n: n2.clone(),
+                    fail: false,
+                })
+            },
+        );
+        // First intent fails at the endpoint → park; second sheds.
+        brain
+            .deliver_prompts(vec![("p".into(), "[doorbell] wake".into())])
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(brain.sinks.parked("herdr").await, "failed adapter parks");
+        assert!(
+            matches!(
+                brain.sinks.send("herdr", "p", "[doorbell] two").await,
+                SendOutcome::Shed { .. }
+            ),
+            "parked sink sheds"
+        );
+        // The worker's Degraded lands on deg_rx; feed it through dispatch
+        // exactly as the run loop would.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while let Ok(m) = deg_rx.try_recv() {
+            brain.dispatch(m).await;
+        }
+        // Restarted (fail=false) adapter must have delivered the requeued
+        // failed intent; the sink is unparked and pumping again.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            n.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "restarted adapter delivered the requeued intent, got {}",
+            n.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(!brain.sinks.parked("herdr").await, "sink revived");
+        // And it accepts new intents again (no longer parked).
+        assert!(
+            matches!(
+                brain.sinks.send("herdr", "p", "[doorbell] three").await,
+                SendOutcome::Queued
+            ),
+            "revived sink queues"
+        );
+    }
+
+    #[tokio::test]
+    async fn sink_degrade_without_factory_sheds_to_digest() {
+        // No factory → restart refuses; shed overflow lands in the digest
+        // (never silent, the pre-supervision path).
+        let (deg_tx, _deg_rx) = tokio::sync::mpsc::channel::<BrainMsg>(16);
+        let (mut brain, _rx, _tx2) = test_brain("sinknofactory", vec![]);
+        brain.sinks = SinkManager::new(deg_tx);
+        let (mut sink, _sent) = MockSink::new();
+        sink.fail_after = Some(0);
+        brain.sinks.add_sink("herdr", Box::new(sink));
+        brain
+            .deliver_prompts(vec![("p".into(), "[doorbell] wake".into())])
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(brain.sinks.parked("herdr").await);
+        brain
+            .dispatch(BrainMsg::Degraded {
+                source: "sink:herdr".into(),
+                reason: "delivery failed: endpoint down".into(),
+            })
+            .await;
+        assert!(
+            brain.sinks.parked("herdr").await,
+            "no factory: stays parked"
+        );
     }
 }

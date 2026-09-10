@@ -22,6 +22,13 @@ pub trait PromptSink: Send + 'static {
 
 type Intent = (String, String);
 
+/// Builds a fresh adapter for a sink. Supervision (audit P1): without a
+/// factory a parked sink could never be restarted — the failed endpoint
+/// adapter is gone with its worker, so `restart` needs a way to mint a
+/// new one. `add_sink` without a factory keeps working (restart then
+/// refuses loudly via `false`).
+type SinkFactory = std::sync::Arc<dyn Fn() -> Box<dyn PromptSink> + Send + Sync>;
+
 /// A prompt intent that never left the queue (graceful-stop drain).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Undelivered {
@@ -34,7 +41,10 @@ pub struct Undelivered {
 pub enum SendOutcome {
     /// Accepted into the sink queue (F5: not delivered — see Delivered).
     Queued,
-    Shed { pin: String, line: String },
+    Shed {
+        pin: String,
+        line: String,
+    },
     Absent,
 }
 
@@ -53,6 +63,9 @@ struct Sink {
     inner: Arc<Mutex<SinkInner>>,
     policy: RestartPolicy,
     worker: Option<tokio::task::JoinHandle<()>>,
+    /// Fresh-adapter builder for supervised restarts (None = not
+    /// restartable).
+    factory: Option<SinkFactory>,
 }
 
 /// Per-subscription sink actors with shed-to-digest and supervision.
@@ -75,8 +88,31 @@ impl SinkManager {
         }
     }
 
-    /// Register a sink adapter; spawns its supervised worker.
+    /// Register a sink adapter; spawns its supervised worker. The sink
+    /// cannot be restarted after an endpoint failure (see
+    /// [`Self::add_sink_with_factory`] for supervised registration).
     pub fn add_sink(&mut self, name: impl Into<String>, sink: Box<dyn PromptSink>) {
+        self.add_sink_inner(name, sink, None);
+    }
+
+    /// Register with a fresh-adapter builder so [`Self::restart_sink`] can
+    /// revive the sink under the Transient policy after an endpoint
+    /// failure.
+    pub fn add_sink_with_factory(
+        &mut self,
+        name: impl Into<String>,
+        sink: Box<dyn PromptSink>,
+        factory: impl Fn() -> Box<dyn PromptSink> + Send + Sync + 'static,
+    ) {
+        self.add_sink_inner(name, sink, Some(std::sync::Arc::new(factory)));
+    }
+
+    fn add_sink_inner(
+        &mut self,
+        name: impl Into<String>,
+        sink: Box<dyn PromptSink>,
+        factory: Option<SinkFactory>,
+    ) {
         let name = name.into();
         let cap = self.cap;
         let inner = Arc::new(Mutex::new(SinkInner {
@@ -101,6 +137,7 @@ impl SinkManager {
                 inner,
                 policy: RestartPolicy::transient(),
                 worker: Some(worker),
+                factory,
             },
         );
     }
@@ -135,23 +172,30 @@ impl SinkManager {
         SendOutcome::Queued
     }
 
-    /// Restart a parked sink's worker under the Transient policy, keeping
-    /// the queued intents (the new worker pumps them). False = cap
-    /// exhausted, stays parked (+ caller emits Degraded/audit).
-    pub async fn restart(
-        &mut self,
-        sink: &str,
-        now_unix: u64,
-        adapter: Box<dyn PromptSink>,
-    ) -> bool {
-        let degraded_tx = self.degraded_tx.clone();
-        let name = sink.to_string();
+    /// Restart a parked sink under the Transient policy using its
+    /// registered factory, keeping the queued intents (the new worker
+    /// pumps them). False = cap exhausted, not parked, or no factory —
+    /// stays parked (+ caller emits Degraded/audit). Audit P1: this was
+    /// unwired (zero callers) — a parked sink stayed dead until process
+    /// restart, contradicting the supervised-sink contract.
+    pub async fn restart_sink(&mut self, sink: &str, now_unix: u64) -> bool {
         let Some(st) = self.sinks.get_mut(sink) else {
             return false;
         };
+        let Some(factory) = st.factory.clone() else {
+            return false;
+        };
+        {
+            let inner = st.inner.lock().await;
+            if !inner.parked || inner.closed {
+                return false;
+            }
+        }
         if !st.policy.should_restart(now_unix) {
             return false;
         }
+        let degraded_tx = self.degraded_tx.clone();
+        let name = sink.to_string();
         {
             let mut inner = st.inner.lock().await;
             inner.parked = false;
@@ -161,8 +205,30 @@ impl SinkManager {
             let _ = w.await;
         }
         let inner = st.inner.clone();
-        st.worker = Some(tokio::spawn(worker_loop(name, inner, adapter, degraded_tx)));
+        st.worker = Some(tokio::spawn(worker_loop(
+            name,
+            inner,
+            factory(),
+            degraded_tx,
+        )));
         true
+    }
+
+    /// Move shed overflow back into the queue (supervised restart: the
+    /// new worker pumps it again — at-least-once). Notifies so a
+    /// freshly-parked worker wakes. Returns the count requeued.
+    pub async fn requeue_shed_overflow(&mut self, sink: &str) -> usize {
+        let Some(st) = self.sinks.get(sink) else {
+            return 0;
+        };
+        let mut inner = st.inner.lock().await;
+        let n = inner.shed_overflow.len();
+        if n > 0 {
+            let overflow: Vec<Intent> = inner.shed_overflow.drain(..).collect();
+            inner.queue.extend(overflow);
+            inner.notify.notify_one();
+        }
+        n
     }
 
     /// Shed overflow awaiting journaling + digest intake (endpoint died
@@ -270,18 +336,18 @@ async fn worker_loop(
         };
         let (pin, line) = next;
         if let Err(e) = adapter.send(&pin, &line) {
-            // Park + move the remainder to shed overflow under one lock.
-            let rest = {
-                let mut guard = inner.lock().await;
-                guard.parked = true;
-                let mut rest: Vec<Intent> = guard.queue.drain(..).collect();
-                guard.sheds += rest.len() as u64;
-                std::mem::take(&mut rest)
-            };
-            {
-                let mut guard = inner.lock().await;
-                guard.shed_overflow.extend(rest);
-            }
+            // Park + shed the remainder AND the failed intent under one
+            // lock. Audit P2: the failed intent itself used to be dropped
+            // here (only the queue remainder shed) — contradicting
+            // at-least-once; it now lands in shed overflow first so the
+            // original order is preserved.
+            let mut guard = inner.lock().await;
+            guard.parked = true;
+            guard.sheds += (guard.queue.len() + 1) as u64;
+            guard.shed_overflow.push((pin, line));
+            let rest: Vec<Intent> = guard.queue.drain(..).collect();
+            guard.shed_overflow.extend(rest);
+            drop(guard);
             let _ = degraded_tx
                 .send(BrainMsg::Degraded {
                     source: format!("sink:{name}"),
@@ -291,9 +357,7 @@ async fn worker_loop(
             return;
         }
         // F5: delivery receipt — hear keys off this, never enqueue.
-        let _ = degraded_tx
-            .send(BrainMsg::Delivered { pin })
-            .await;
+        let _ = degraded_tx.send(BrainMsg::Delivered { pin }).await;
     }
 }
 
@@ -790,5 +854,100 @@ mod tests {
         assert_eq!(sent_len(&sent), 1, "herdr worker pumps independently");
         // A shed storm is visible: drain overflow names the subscriber sink.
         let _ = deg_rx.try_recv();
+    }
+
+    #[tokio::test]
+    async fn failed_intent_is_preserved_in_shed_overflow() {
+        // Audit P2: the intent that FAILED at the endpoint used to be
+        // dropped (only the queue remainder shed) — contradicting
+        // at-least-once. It must land in shed overflow, first.
+        let (deg_tx, _deg_rx) = mpsc::channel(16);
+        let mut mgr = SinkManager::new(deg_tx);
+        let (mut sink, _sent) = MockSink::new();
+        sink.fail_after = Some(0);
+        mgr.add_sink("webhook", Box::new(sink));
+        mgr.send("webhook", "p", "the-failed-one").await;
+        mgr.send("webhook", "p", "queued-behind").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(mgr.parked("webhook").await);
+        let drained = mgr.drain_shed_overflow().await;
+        let lines: Vec<&str> = drained.iter().map(|u| u.line.as_str()).collect();
+        assert_eq!(
+            lines.first(),
+            Some(&"the-failed-one"),
+            "failed intent is shed first, got {lines:?}"
+        );
+        assert!(lines.contains(&"queued-behind"), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn restart_sink_revives_and_requeues() {
+        // Audit P1: supervised restart with a fresh adapter; the shed
+        // overflow requeues and the new worker delivers it.
+        let (deg_tx, _deg_rx) = mpsc::channel(16);
+        let mut mgr = SinkManager::new(deg_tx);
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counting {
+            n: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            fail: bool,
+        }
+        impl PromptSink for Counting {
+            fn send(&mut self, _pin: &str, _line: &str) -> anyhow::Result<()> {
+                if self.fail {
+                    anyhow::bail!("down");
+                }
+                self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            fn name(&self) -> &str {
+                "counting"
+            }
+        }
+        let n2 = n.clone();
+        mgr.add_sink_with_factory(
+            "webhook",
+            Box::new(Counting {
+                n: n.clone(),
+                fail: true,
+            }),
+            move || {
+                Box::new(Counting {
+                    n: n2.clone(),
+                    fail: false,
+                })
+            },
+        );
+        mgr.send("webhook", "p", "one").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(mgr.parked("webhook").await);
+        assert!(mgr.restart_sink("webhook", 1_000).await, "restarts");
+        assert_eq!(mgr.requeue_shed_overflow("webhook").await, 1);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            n.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "fresh adapter delivered the requeued intent"
+        );
+        assert!(!mgr.parked("webhook").await);
+        // Missing sink / not parked: restart refuses without burning a
+        // policy slot.
+        assert!(!mgr.restart_sink("missing", 9_000).await);
+        assert!(!mgr.restart_sink("webhook", 9_000).await);
+    }
+
+    #[tokio::test]
+    async fn restart_sink_refuses_without_factory() {
+        let (deg_tx, _deg_rx) = mpsc::channel(16);
+        let mut mgr = SinkManager::new(deg_tx);
+        let (mut sink, _sent) = MockSink::new();
+        sink.fail_after = Some(0);
+        mgr.add_sink("webhook", Box::new(sink));
+        mgr.send("webhook", "p", "x").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(mgr.parked("webhook").await);
+        assert!(
+            !mgr.restart_sink("webhook", 1_000).await,
+            "no factory: restart refuses loudly (false)",
+        );
+        assert!(mgr.parked("webhook").await, "still parked");
     }
 }

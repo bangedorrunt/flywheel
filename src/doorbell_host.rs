@@ -304,6 +304,14 @@ impl Host for RtHost {
         unix_now()
     }
 
+    /// GS-039 transition gate (audit P1): the reducer model owns the
+    /// last-known status — `tick` ran `workspace::tick` before the brain
+    /// reads this, so it must return the PREVIOUS tick's value. Untrained
+    /// pins (not in the map) report None (unknown → transitioned).
+    fn prev_status(&self, pin: &str) -> Option<String> {
+        self.model.doorbell.statuses.get(pin).cloned()
+    }
+
     /// Fetch-only slice of the old sweep arm (classify + prompt moved to
     /// tick via InboxRows — the bd-9hco pipe, unchanged semantics).
     /// F6: shared borrow (no mutation; enables future off-loop pipe).
@@ -544,7 +552,17 @@ async fn run_embedded_async(
     let mut host = RtHost::new(cfg.clone(), project, workspace, tx.clone())?;
     host.set_generation(generation.clone());
     let mut sinks = SinkManager::new(tx.clone());
-    sinks.add_sink(
+    // Supervised registration (audit P1): fresh adapter + reconnect on a
+    // failed herdr client park (Transient policy) instead of dying until
+    // process restart. The generation stamps the fresh adapter so a
+    // mid-run binary upgrade still self-retires it.
+    let (fp, fw, fgen) = (
+        project.to_string(),
+        workspace.to_string(),
+        generation.clone(),
+    );
+    let cfg_for_factory = cfg.clone();
+    sinks.add_sink_with_factory(
         "herdr",
         Box::new(HerdrPromptSink::new(
             &cfg,
@@ -552,6 +570,14 @@ async fn run_embedded_async(
             workspace,
             generation.clone(),
         )),
+        move || {
+            Box::new(HerdrPromptSink::new(
+                &cfg_for_factory,
+                &fp,
+                &fw,
+                fgen.clone(),
+            ))
+        },
     );
     let store = FileStore::new(config::state_dir());
     // Watch source: in-process bus watch first (zero fork), CLI child fallback.
@@ -726,7 +752,9 @@ mod parity_tests {
     //! presented ledger), ack-SLA publish (G1, no toron CLI verb),
     //! Receipt/Publish/Invoke inputs.
     use super::*;
-    use doorbell_rt::{Brain, BrainConfig, BrainMsg, FileHost, FileHostConfig, MockSink, SinkManager};
+    use doorbell_rt::{
+        Brain, BrainConfig, BrainMsg, FileHost, FileHostConfig, MockSink, SinkManager,
+    };
 
     fn strip_ts(v: &mut serde_json::Value) {
         match v {
@@ -746,9 +774,10 @@ mod parity_tests {
     }
 
     fn read_journal(dir: &std::path::Path, ws: &str) -> Vec<serde_json::Value> {
-        let raw = std::fs::read_to_string(dir.join("journals").join(format!(
-            "doorbell-journal-{ws}.jsonl"
-        )))
+        let raw = std::fs::read_to_string(
+            dir.join("journals")
+                .join(format!("doorbell-journal-{ws}.jsonl")),
+        )
         .unwrap_or_default();
         raw.lines()
             .filter_map(|l| {
@@ -789,8 +818,7 @@ mod parity_tests {
         // empty); the toron transport is remote-refused (production uses
         // remote sync HTTP; in-process block_ons inside a runtime).
         let _home = crate::config::test_state_home();
-        let toron_dir =
-            std::env::temp_dir().join(format!("parity-toron-{}", std::process::id()));
+        let toron_dir = std::env::temp_dir().join(format!("parity-toron-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&toron_dir);
         std::fs::create_dir_all(&toron_dir).unwrap();
         // SAFETY: under ENV_LOCK via _home; restored below.
@@ -798,8 +826,7 @@ mod parity_tests {
             std::env::set_var("TORON_DATA_DIR", &toron_dir);
             std::env::remove_var("TORON_MCP_DATA_DIR");
         }
-        let proj_dir =
-            std::env::temp_dir().join(format!("parity-proj-{}", std::process::id()));
+        let proj_dir = std::env::temp_dir().join(format!("parity-proj-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&proj_dir);
         std::fs::create_dir_all(&proj_dir).unwrap();
         let project = proj_dir.to_string_lossy().into_owned();
@@ -858,9 +885,8 @@ mod parity_tests {
 
         // One scripted Msg log; fixed `since`/`now` payloads so only `ts`
         // differs between runs. Built twice (BrainMsg is not Clone).
-        let inbox_row = |ts: &str| {
-            serde_json::json!({"importance": "urgent", "created_ts": ts, "tags": []})
-        };
+        let inbox_row =
+            |ts: &str| serde_json::json!({"importance": "urgent", "created_ts": ts, "tags": []});
         let mk_script = || {
             vec![
                 BrainMsg::HerdrStatus {
@@ -879,18 +905,8 @@ mod parity_tests {
                     pin: "PinB".into(),
                     state: "idle".into(),
                 },
-                BrainMsg::Watch(watch(
-                    9,
-                    serde_json::json!([["p", "PinA"]]),
-                    "e1",
-                    1,
-                )),
-                BrainMsg::Watch(watch(
-                    9,
-                    serde_json::json!([["p", "PinB"]]),
-                    "e2",
-                    2,
-                )),
+                BrainMsg::Watch(watch(9, serde_json::json!([["p", "PinA"]]), "e1", 1)),
+                BrainMsg::Watch(watch(9, serde_json::json!([["p", "PinB"]]), "e2", 2)),
                 BrainMsg::Watch(watch(
                     43001,
                     serde_json::json!([["assignee", "PinA"]]),
@@ -927,12 +943,7 @@ mod parity_tests {
                     pin: "PinA".into(),
                     status: "working".into(),
                 },
-                BrainMsg::Watch(watch(
-                    9,
-                    serde_json::json!([["p", "PinA"]]),
-                    "e4",
-                    4,
-                )),
+                BrainMsg::Watch(watch(9, serde_json::json!([["p", "PinA"]]), "e4", 4)),
                 // ...while urgent breaks through on both.
                 BrainMsg::Watch(watch(
                     14,
@@ -978,23 +989,20 @@ mod parity_tests {
         }
 
         // Side A: embedded host.
-        let state_a =
-            std::env::temp_dir().join(format!("parity-state-a-{}", std::process::id()));
+        let state_a = std::env::temp_dir().join(format!("parity-state-a-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&state_a);
         set_xdg(&state_a);
         write_fixture(&state_a, &key, &role_key);
-        let dir_a =
-            std::env::temp_dir().join(format!("parity-a-{}", std::process::id()));
+        let dir_a = std::env::temp_dir().join(format!("parity-a-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir_a);
         let (tx_a, rx_a) = tokio::sync::mpsc::channel(doorbell_rt::BRAIN_CAP);
-        let rt_host =
-            RtHost::new(remote_cfg(), &project, ws, tx_a.clone())
-                .expect("rthost builds in sandbox");
+        let rt_host = RtHost::new(remote_cfg(), &project, ws, tx_a.clone())
+            .expect("rthost builds in sandbox");
         // Tick-level AckSla parity on throwaways (scan excluded live).
         {
             use doorbell_rt::Host;
-            let mut rt = RtHost::new(remote_cfg(), &project, ws, tx_a.clone())
-                .expect("throwaway rthost");
+            let mut rt =
+                RtHost::new(remote_cfg(), &project, ws, tx_a.clone()).expect("throwaway rthost");
             let mut fh = FileHost::new(FileHostConfig::new(
                 crate::config::state_dir(),
                 project.clone(),
@@ -1022,20 +1030,15 @@ mod parity_tests {
         drop(rt);
 
         // Side B: daemon host (own state tree, same fixture content).
-        let state_b =
-            std::env::temp_dir().join(format!("parity-state-b-{}", std::process::id()));
+        let state_b = std::env::temp_dir().join(format!("parity-state-b-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&state_b);
         set_xdg(&state_b);
         write_fixture(&state_b, &key, &role_key);
-        let dir_b =
-            std::env::temp_dir().join(format!("parity-b-{}", std::process::id()));
+        let dir_b = std::env::temp_dir().join(format!("parity-b-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir_b);
         let (tx_b, rx_b) = tokio::sync::mpsc::channel(doorbell_rt::BRAIN_CAP);
-        let mut fcfg = FileHostConfig::new(
-            crate::config::state_dir(),
-            project.clone(),
-            ws.to_string(),
-        );
+        let mut fcfg =
+            FileHostConfig::new(crate::config::state_dir(), project.clone(), ws.to_string());
         fcfg.toron_bin = "true".into();
         fcfg.herdr_bin = "true".into();
         let file_host = FileHost::new(fcfg).with_tx(tx_b.clone());
@@ -1088,8 +1091,9 @@ mod parity_tests {
         // watch children on both sides — covered by unit tests instead).
         let mut core = doorbell_rt::CoreReducer::default();
         let fx = core.tick_effects(&BrainMsg::Died);
-        assert!(fx
-            .iter()
-            .any(|e| matches!(e, doorbell_rt::Effect::RestartWatch)));
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, doorbell_rt::Effect::RestartWatch))
+        );
     }
 }
