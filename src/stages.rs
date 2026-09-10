@@ -98,6 +98,30 @@ pub struct Stage {
     pub params: Vec<String>,
 }
 
+/// Field-level stage merge (bd-cfgv): `over` fields that are present
+/// (Some / non-empty) win; absent fields inherit `base`. `prompt` is
+/// serde-required so it always comes from `over`; `name` is the map key.
+fn merge_stage(base: Stage, over: Stage) -> Stage {
+    Stage {
+        name: over.name,
+        prompt: over.prompt,
+        role: over.role.or(base.role),
+        phase: over.phase.or(base.phase),
+        principles: if over.principles.is_empty() {
+            base.principles
+        } else {
+            over.principles
+        },
+        author: over.author.or(base.author),
+        origin_run: over.origin_run.or(base.origin_run),
+        params: if over.params.is_empty() {
+            base.params
+        } else {
+            over.params
+        },
+    }
+}
+
 /// The stages library: semantic name → stage.
 #[derive(Debug, Clone, Default)]
 pub struct StageLibrary {
@@ -332,6 +356,10 @@ impl StageLibrary {
     }
 
     /// Apply one tier's `stages.toml` (field-level merge, later tier wins).
+    /// A tier entry carrying only some fields MERGES over the record below
+    /// it: present fields win, absent fields inherit (bd-cfgv) — a
+    /// prompt-only user override no longer silently wipes seed role,
+    /// phase, principles, or the D1 required-params contract.
     fn apply_toml(&mut self, raw: &str, tier: Tier) -> Result<()> {
         #[derive(Deserialize)]
         struct TierStages {
@@ -342,7 +370,10 @@ impl StageLibrary {
             toml::from_str(raw).with_context(|| format!("parse {tier:?} stages.toml"))?;
         for (name, stage) in parsed.stages {
             self.tiers.insert(name.clone(), tier);
-            self.stages.insert(name, stage);
+            match self.stages.remove(&name) {
+                Some(base) => self.stages.insert(name, merge_stage(base, stage)),
+                None => self.stages.insert(name, stage),
+            };
         }
         Ok(())
     }
@@ -1213,6 +1244,44 @@ mod tests {
         // Seed tag on an untouched compiled entry.
         assert_eq!(lib.tier_of("ce-execute"), Some(Tier::Seed));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-cfgv: a prompt-only tier override MERGES field-level — seed
+    /// role/phase/params survive; a tier that re-declares a field wins it.
+    #[test]
+    fn cfgv_stage_override_field_level_merge() {
+        let mut lib = StageLibrary::compiled_in();
+        // Seed ce-execute carries role + phase (SEED_AFFINITY/SEED_PHASE).
+        assert_eq!(lib.get_stage("ce-execute").unwrap().role.as_deref(), Some("coder"));
+        // User tier overrides ONLY the prompt: role/phase inherit.
+        lib.apply_toml(
+            "[stages.ce-execute]\nname = \"ce-execute\"\nprompt = \"USER PROMPT\"\n",
+            Tier::User,
+        )
+        .unwrap();
+        let s = lib.get_stage("ce-execute").unwrap();
+        assert_eq!(s.prompt, "USER PROMPT", "override wins its own field");
+        assert_eq!(s.role.as_deref(), Some("coder"), "seed role survives prompt-only override");
+        assert_eq!(s.phase.as_deref(), Some("implement"), "seed phase survives");
+        assert_eq!(lib.tier_of("ce-execute"), Some(Tier::User), "tier tag reports the top tier");
+        // Re-declaring a field replaces it (later tier wins per-field).
+        lib.apply_toml(
+            "[stages.ce-execute]\nname = \"ce-execute\"\nprompt = \"P2\"\nrole = \"reviewer\"\nparams = [\"bead\"]\n",
+            Tier::Project,
+        )
+        .unwrap();
+        let s = lib.get_stage("ce-execute").unwrap();
+        assert_eq!(s.role.as_deref(), Some("reviewer"), "declared field wins");
+        assert_eq!(s.params, vec!["bead".to_string()], "declared params win");
+        assert_eq!(s.phase.as_deref(), Some("implement"), "undeclared phase still inherits");
+        // An unknown name in a tier is a fresh record, not a merge.
+        lib.apply_toml(
+            "[stages.fresh]\nname = \"fresh\"\nprompt = \"ONLY\"\n",
+            Tier::User,
+        )
+        .unwrap();
+        assert_eq!(lib.get_stage("fresh").unwrap().prompt, "ONLY");
+        assert_eq!(lib.get_stage("fresh").unwrap().role, None);
     }
 
     /// W6: `stage lint` rejects bad affinity + phase names (and unknown

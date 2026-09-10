@@ -631,6 +631,31 @@ pub fn compose_workflow_with(
     parts: &[ComposePart],
     affinity: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Workflow> {
+    compose_workflow_with_resolvers(
+        name,
+        objective,
+        base,
+        parts,
+        affinity,
+        // Test/default arm: compiled-in tokens only (bd-qd87 keeps the
+        // production surface catalog-first).
+        &|n| crate::builtin_workflows::builtin_recipe(n),
+    )
+}
+
+/// [`compose_workflow_with`] plus a compose-token resolver: the same
+/// catalog-first rule `workflow run <name>` follows (bd-qd87). A user or
+/// project override of a token (e.g. `wave-swarm`) now expands on compose
+/// exactly as it resolves on run — two paths, one truth. Pure over the
+/// injected resolver.
+pub fn compose_workflow_with_resolvers(
+    name: &str,
+    objective: &str,
+    base: Option<&Workflow>,
+    parts: &[ComposePart],
+    affinity: &dyn Fn(&str) -> Option<String>,
+    recipe_resolver: &dyn Fn(&str) -> Option<Workflow>,
+) -> Result<Workflow> {
     let base_inputs_snapshot: Vec<InputDecl> =
         base.map(|b| b.inputs.clone()).unwrap_or_else(|| {
             vec![InputDecl {
@@ -658,7 +683,7 @@ pub fn compose_workflow_with(
         // The builtin's own on_error (e.g. bug-fix fail_run) is preserved
         // verbatim; bare non-token parts are FailRun via build_part_step (bd-gs005).
         if let ComposePart::Recipe { name } = part {
-            let expanded = crate::builtin_workflows::builtin_recipe(name).ok_or_else(|| {
+            let expanded = recipe_resolver(name).ok_or_else(|| {
                 anyhow::anyhow!(
                     "compose part {name:?}: unknown compose token (known: wave-swarm, repair-until-verified, beads-lifecycle)"
                 )
@@ -1931,9 +1956,68 @@ steps:
         enforce_budget_caps(&wf).expect("within caps");
     }
 
-    /// ADR-0006 D3 + ADR-0009: the `wave-swarm` compose token expands to
-    /// the EIGHT-step compounded workflow — GATE → DISPATCH → EXECUTE →
-    /// OBSERVE → REVIEW → VERIFY → COMPOUND → SIGNOFF — and lints clean.
+    /// bd-qd87: a catalog override of a compose token wins at expansion
+    /// (catalog-first, matching `workflow run`), and the compiled-in token
+    /// still expands when the catalog has no override.
+    #[test]
+    fn qd87_compose_token_catalog_first_resolution() {
+        use toron_workflow::schema::Action;
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
+        // A user-tier override of `wave-swarm`: one dispatch_job step
+        // (same step shape as the builtin's YAML dialect).
+        let override_wf = crate::crew::workflow_from_yaml(
+            r#"
+name: wave-swarm
+description: user override
+steps:
+  - name: custom-gate
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@planner"
+      stage: fresh-eyes-explore
+      task: "custom"
+"#
+        )
+        .expect("override yaml parses");
+        let resolver = |n: &str| {
+            if n == "wave-swarm" {
+                Some(override_wf.clone())
+            } else {
+                crate::builtin_workflows::builtin_recipe(n)
+            }
+        };
+        let part = parse_compose_part("wave-swarm").expect("compose token parses");
+        let wf = compose_workflow_with_resolvers(
+            "composed-override",
+            "obj",
+            None,
+            &[part.clone()],
+            &affinity,
+            &resolver,
+        )
+        .unwrap();
+        assert_eq!(wf.steps.len(), 1, "override expands, not the 8-step builtin");
+        assert!(
+            matches!(&wf.steps[0].action, Action::DispatchJob { spec, .. }
+                if spec.stage.as_deref() == Some("fresh-eyes-explore")),
+            "the override's own step ran: {:?}",
+            wf.steps[0].action.type_name()
+        );
+        // No override in the resolver: builtin expands as before.
+        let wf_builtin = compose_workflow_with_resolvers(
+            "composed-builtin",
+            "obj",
+            None,
+            &[part],
+            &affinity,
+            &|n| crate::builtin_workflows::builtin_recipe(n),
+        )
+        .unwrap();
+        assert_eq!(wf_builtin.steps.len(), 8, "builtin token unchanged");
+    }
+
     #[test]
     fn wave_swarm_compose_token_expands_eight_steps_and_lints_clean() {
         use toron_workflow::schema::Action;

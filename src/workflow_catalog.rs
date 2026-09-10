@@ -37,6 +37,67 @@ use toron_workflow::schema::{Action, InputDecl, Step, Workflow, parse_workflow};
 
 use crate::config::config_dir;
 
+/// The workflow NAME that resolves at each merge site, plus its source tag
+/// ("builtin" | "catalog") — the vocabulary `workflow list` reports.
+pub type ResolvedWorkflow = (Workflow, &'static str);
+
+/// bd-xmq5: THE one builtin+user(+project) merge. Previously copy-pasted at
+/// ~7 sites with inconsistent tiers (some user-only `load()`, some
+/// `load_layered`), so project-tier overrides applied on some paths and were
+/// silently ignored on others. Precedence everywhere now: seed builtins <
+/// user catalog < project tier (same Ord as StageLibrary tiers). The
+/// `&'static str` source tag is the `workflow list` vocabulary.
+///
+/// `project_root` participates the project tier when given; callers without
+/// project context pass `None` (user tier only — the old `load()` shape).
+pub fn all_workflows_merged(
+    project_root: Option<&Path>,
+) -> Result<BTreeMap<String, ResolvedWorkflow>> {
+    let mut out: BTreeMap<String, ResolvedWorkflow> = BTreeMap::new();
+    for (name, wf) in crate::builtin_workflows::builtin_workflows() {
+        out.insert(name, (wf, "builtin"));
+    }
+    let cat = match project_root {
+        Some(root) => WorkflowCatalog::load_layered(Some(root))?,
+        None => WorkflowCatalog::load()?,
+    };
+    for (name, wf) in cat.workflows {
+        // Catalog (user or project tier) wins over a same-named builtin —
+        // the catalog is the home; built-ins are zero-config defaults.
+        out.insert(name, (wf, "catalog"));
+    }
+    Ok(out)
+}
+
+/// [`all_workflows_merged`] without the source tag — the plain name →
+/// workflow map most resolvers want.
+pub fn all_workflows_plain(
+    project_root: Option<&Path>,
+) -> Result<BTreeMap<String, Workflow>> {
+    Ok(all_workflows_merged(project_root)?
+        .into_iter()
+        .map(|(k, (wf, _))| (k, wf))
+        .collect())
+}
+
+/// The sub-workflow resolver closure used by engine call sites: catalog
+/// (user+project when `project_root` given) first, builtins as fallback.
+/// Errors inside `load` degrade to builtins-only (the engine resolver must
+/// never hard-fail on a missing config dir).
+pub fn subworkflow_resolver(
+    project_root: Option<&Path>,
+) -> impl Fn(&str) -> Option<Workflow> + use<> {
+    let root = project_root.map(|p| p.to_path_buf());
+    move |sub: &str| {
+        let cat = match &root {
+            Some(r) => WorkflowCatalog::load_layered(Some(r)).ok(),
+            None => WorkflowCatalog::load().ok(),
+        };
+        cat.and_then(|c| c.workflows.get(sub).cloned())
+            .or_else(|| crate::builtin_workflows::builtin_workflows().get(sub).cloned())
+    }
+}
+
 /// The legacy `workflows.toml` step shapes (mirrored from flywheel's
 /// `config::WorkflowStep` — the catalog parses the legacy file itself so the
 /// absorber is self-contained, no dependency on the live config struct).

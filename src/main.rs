@@ -7002,11 +7002,8 @@ mod steer_engine_tests {
             .remove("goal-direct")
             .expect("goal-direct builtin workflow");
         let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(|sub: &str| {
-            let cat = workflow_catalog::WorkflowCatalog::load().ok()?;
-            cat.workflows
-                .get(sub)
-                .cloned()
-                .or_else(|| builtin_workflows::builtin_workflows().get(sub).cloned())
+            // bd-xmq5: shared sub-workflow resolver (catalog-first).
+            workflow_catalog::subworkflow_resolver(None)(sub)
         });
         let crew_plan = crew::plan_crew_with(&wf, &|sub| workflow_resolver(sub));
         let invoke_wf = crew::resolve_crew_fanouts(&wf, &crew_plan);
@@ -7779,7 +7776,6 @@ mod spawn_boot_reliability_tests {
         handle.join().expect("clap probe thread");
     }
 
-    #[test]
     /// bd-7qg6: `mail send` gains `--resolve-bead` parity with toron
     /// (ADR-0010 D9 structural done-hold). Help lists the flag; the flag
     /// fills the send field; absent stays None (default path byte-identical).
@@ -15632,15 +15628,10 @@ fn cmd_interrupt(
 fn cmd_crew(cfg: &Config, cmd: &CrewCmd) -> Result<()> {
     match cmd {
         CrewCmd::Preview { name } => {
-            let mut all: BTreeMap<String, (toron_workflow::schema::Workflow, &'static str)> =
-                BTreeMap::new();
-            for (n, wf) in builtin_workflows::builtin_workflows() {
-                all.insert(n, (wf, "builtin"));
-            }
-            let cat = workflow_catalog::WorkflowCatalog::load()?;
-            for (n, wf) in cat.workflows {
-                all.insert(n, (wf, "catalog"));
-            }
+            // bd-xmq5: shared merge — the project tier now participates
+            // in crew preview like every other resolution path.
+            let project_root = project_dir(cfg, "flywheel");
+            let all = workflow_catalog::all_workflows_merged(Some(&project_root))?;
             let wf = all
                 .get(name.as_str())
                 .map(|(wf, _)| wf)
@@ -19990,18 +19981,11 @@ fn build_queue(
         // falling back to legacy workflows.toml Send/Wait (config.rs:725).
         let mut handled = false;
         {
-            // Inline all_workflows() logic (builtin + catalog, catalog wins) — the inner
-            // all_workflows() lives inside cmd_workflow and is not in scope here.
-            let mut all: std::collections::BTreeMap<String, toron_workflow::schema::Workflow> =
-                std::collections::BTreeMap::new();
-            for (name, wf) in builtin_workflows::builtin_workflows() {
-                all.insert(name, wf);
-            }
-            if let Ok(cat) = workflow_catalog::WorkflowCatalog::load() {
-                for (name, wf) in cat.workflows {
-                    all.insert(name, wf);
-                }
-            }
+            // bd-xmq5: the shared merge replaces the inline copy (which was
+            // user-tier only — loop-side workflow resolution now honors the
+            // project tier too).
+            let all = workflow_catalog::all_workflows_plain(None)
+                .unwrap_or_else(|_| builtin_workflows::builtin_workflows());
             if let Some(_uwf) = all.get(wf) {
                 // Builtins run via the engine, not the queue. Formerly this
                 // bailed and told the operator to run `workflow run --execute`
@@ -26703,13 +26687,8 @@ fn briefing_context_inner(
     wf_name: &str,
     source: &str,
 ) -> Result<steer_brief::BriefingContext> {
-    let mut all: std::collections::BTreeMap<String, toron_workflow::Workflow> =
-        builtin_workflows::builtin_workflows();
-    if let Ok(cat) = workflow_catalog::WorkflowCatalog::load() {
-        for (name, wf) in cat.workflows {
-            all.insert(name, wf);
-        }
-    }
+    // bd-xmq5: shared merge (builtins < user catalog).
+    let all = workflow_catalog::all_workflows_plain(None)?;
     let wf = all
         .get(wf_name)
         .ok_or_else(|| anyhow!("unknown workflow {wf_name:?} for {source} briefing"))?
@@ -26877,17 +26856,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
     /// The full workflow set: built-ins (compiled-in) + catalog (canonical
     /// YAML + absorbed legacy), name → (workflow, source).
     fn all_workflows() -> Result<BTreeMap<String, (Workflow, &'static str)>> {
-        let mut out: BTreeMap<String, (Workflow, &'static str)> = BTreeMap::new();
-        for (name, wf) in builtin_workflows::builtin_workflows() {
-            out.insert(name, (wf, "builtin"));
-        }
-        let cat = workflow_catalog::WorkflowCatalog::load()?;
-        for (name, wf) in cat.workflows {
-            // Canonical YAML / absorbed legacy wins over a same-named built-in
-            // (the catalog is the home; built-ins are zero-config defaults).
-            out.insert(name, (wf, "catalog"));
-        }
-        Ok(out)
+        // bd-xmq5: the one shared merge (builtins < user catalog).
+        workflow_catalog::all_workflows_merged(None)
     }
 
     /// W6 (§3.8): [`all_workflows`] plus the PROJECT tier —
@@ -26896,17 +26866,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
     fn all_workflows_layered(
         project_root: Option<&Path>,
     ) -> Result<BTreeMap<String, (Workflow, &'static str)>> {
-        let mut out: BTreeMap<String, (Workflow, &'static str)> = BTreeMap::new();
-        for (name, wf) in builtin_workflows::builtin_workflows() {
-            out.insert(name, (wf, "builtin"));
-        }
-        // load_layered merges user + project with project winning; the
-        // catalog-vs-builtin source tag stays the workflow-list vocabulary.
-        let cat = workflow_catalog::WorkflowCatalog::load_layered(project_root)?;
-        for (name, wf) in cat.workflows {
-            out.insert(name, (wf, "catalog"));
-        }
-        Ok(out)
+        // bd-xmq5: the one shared merge, project tier included.
+        workflow_catalog::all_workflows_merged(project_root)
     }
 
     /// §3.6 envelope #3 (wall-clock half): seconds a composed `--run` may
@@ -27140,11 +27101,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             crew::apply_input_defaults(&wf, &mut inputs_value);
             // engine invoke.
             let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(|sub: &str| {
-                let cat = workflow_catalog::WorkflowCatalog::load().ok()?;
-                cat.workflows
-                    .get(sub)
-                    .cloned()
-                    .or_else(|| builtin_workflows::builtin_workflows().get(sub).cloned())
+                // bd-xmq5: shared sub-workflow resolver (catalog-first).
+                workflow_catalog::subworkflow_resolver(None)(sub)
             });
             let packed = packed_from_flag(
                 cfg,
@@ -27563,7 +27521,26 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 // declared role affinity (project tier overrides included).
                 let stage_lib = stages::StageLibrary::load_layered(Some(&project_stages))?;
                 let affinity = |s: &str| stage_lib.get_stage(s).and_then(|st| st.role.clone());
-                crew::compose_workflow_with(&wf_name, target, base_wf.as_ref(), &parsed, &affinity)?
+                // bd-qd87: compose-token expansion is catalog-first, matching
+                // `workflow run` — a user/project override of a token expands
+                // here instead of being silently ignored. `all` already has
+                // catalog entries shadowing built-ins; the builtin fallback
+                // covers the compiled-in token set.
+                let all_for_recipes = all.clone();
+                let recipe_resolver = move |n: &str| {
+                    all_for_recipes
+                        .get(n)
+                        .map(|(wf, _)| wf.clone())
+                        .or_else(|| crate::builtin_workflows::builtin_recipe(n))
+                };
+                crew::compose_workflow_with_resolvers(
+                    &wf_name,
+                    target,
+                    base_wf.as_ref(),
+                    &parsed,
+                    &affinity,
+                    &recipe_resolver,
+                )?
             };
 
             // §3.6 envelope #3: budget caps fail closed BEFORE the lint gate
@@ -27731,12 +27708,10 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // resolves for call_workflow sub-runs.
             let resolver_root = project_root.clone();
             let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(move |sub: &str| {
-                let cat =
-                    workflow_catalog::WorkflowCatalog::load_layered(Some(&resolver_root)).ok()?;
-                cat.workflows
-                    .get(sub)
-                    .cloned()
-                    .or_else(|| builtin_workflows::builtin_workflows().get(sub).cloned())
+                // bd-xmq5: shared sub-workflow resolver; the project tier
+                // participates for call_workflow sub-runs (kept composed
+                // entries resolve).
+                workflow_catalog::subworkflow_resolver(Some(&resolver_root))(sub)
             });
             let profile_resolver = profile::ProfileCatalog::catalog_profile_resolver();
             // bd-omwg: the SpawnSink drainer — pane mode keeps the engine
@@ -28259,11 +28234,8 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
             // ADR-0012: the cron body composes workflows via call_workflow —
             // resolve them against the flywheel catalog + built-ins.
             let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(|name: &str| {
-                let cat = workflow_catalog::WorkflowCatalog::load().ok()?;
-                cat.workflows
-                    .get(name)
-                    .cloned()
-                    .or_else(|| builtin_workflows::builtin_workflows().get(name).cloned())
+                // bd-xmq5: shared sub-workflow resolver (catalog-first).
+                workflow_catalog::subworkflow_resolver(None)(name)
             });
             let profile_resolver = profile::ProfileCatalog::catalog_profile_resolver();
             if *live {
