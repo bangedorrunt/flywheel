@@ -76,5 +76,26 @@ rm -rf "$MIG_SRC" "$MIG_DST"
 # daemon to host the loop (Phase 3 cutover work); the daemon is still a
 # lifecycle shell. Tracked, not faked.
 
+echo "== ADR-0012 Phase 2 (bd-asr2.11: human digest, second consumer) =="
+# Human wake with zero swarm: rt-level proof (subscription + sink delivery
+# with no panes alive) runs in the rt suite.
+$CARGO test -p doorbell-rt --lib human_subscription_wake_needs_no_swarm 2>&1 | tail -n 2
+[ "${PIPESTATUS[0]}" -eq 0 ] || fail "zero-swarm human wake red"
+# Digest verb smoke: empty state exits 0 in both formats.
+"$ROOT/target/debug/flywheel" doorbell digest flywheel --format json >/dev/null 2>&1 \
+  || fail "doorbell digest json smoke failed"
+"$ROOT/target/debug/flywheel" doorbell digest flywheel --format text >/dev/null 2>&1 \
+  || fail "doorbell digest text smoke failed"
+pass "digest verb smoke (json + text)"
+# why --subscriber smoke on an empty journal.
+"$ROOT/target/debug/flywheel" doorbell why flywheel somepin --limit 2 --subscriber "workspace:x" >/dev/null 2>&1 \
+  || fail "why --subscriber smoke failed"
+pass "why --subscriber smoke"
+# Referenced Phase-2 gates (each green in its own bead):
+# - budget durability: rt crash test (bd-asr2.9)
+# - slow-sink E15: rt isolation test (bd-asr2.10)
+# - authz negatives: rt matrix tests (bd-asr2.8)
+# - SSE replay: daemon gate section (bd-asr2.12)
+
 if [ "$FAIL" -eq 0 ]; then echo "RESULT: PASS"; else echo "RESULT: FAIL"; fi
 exit "$FAIL"

@@ -1078,10 +1078,29 @@ pub fn journal_fold_status(state_dir: &Path, workspace: &str) -> (Option<String>
     (torn, fold.first_seq)
 }
 
+/// Workspaces with journal files (active only; generations fold with
+/// their workspace). Used for zero-row survivors of fully torn folds.
+pub fn journal_workspaces_list(state_dir: &Path) -> Vec<String> {
+    let mut out = std::collections::BTreeSet::new();
+    if let Ok(dir) = std::fs::read_dir(state_dir.join("journals")) {
+        for entry in dir.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(rest) = name
+                .strip_prefix("doorbell-journal-")
+                .and_then(|n| n.strip_suffix(".jsonl"))
+                && !rest.is_empty()
+                && !rest.contains('.')
+            {
+                out.insert(rest.to_string());
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn base() -> RingInput {
         RingInput {

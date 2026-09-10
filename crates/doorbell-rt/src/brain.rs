@@ -1080,4 +1080,53 @@ mod tests {
             "deaf digest names subscriber+attempts: {body}"
         );
     }
+
+    /// Second consumer (bd-asr2.11): a subscribed human identity receives
+    /// a wake with zero swarm alive — no panes, no processes, no dispatcher
+    /// beyond this Brain. The journal row carries the subscriber tag so
+    /// `why --subscriber` replays it.
+    #[tokio::test]
+    async fn human_subscription_wake_needs_no_swarm() {
+        use crate::subscribe::*;
+        let dir = std::env::temp_dir().join(format!("dbrt-human-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Operator subscribes the human (npub) on the herdr sink.
+        let mut store = SubscriptionStore::open(&dir);
+        let sub = Subscription {
+            id: "human-1".into(),
+            identity: Identity::Npub("npub1human".into()),
+            scope: Scope::One("w".into()),
+            filter: Filter::default(),
+            sink: SinkKind::Herdr,
+            budget: Budget::default_530(),
+        };
+        let sub = store
+            .subscribe(Actor::operator(), sub, "w")
+            .expect("operator subscribes human");
+        // Brain bound to the subscription (tag + budget template).
+        let (tx, _rx) = tokio::sync::mpsc::channel(crate::BRAIN_CAP);
+        let mut host = MockHost::new(1_000_000);
+        host.script = VecDeque::from(vec![vec![Effect::Prompt {
+            pin: "human".into(),
+            line: "[doorbell] hold expired".into(),
+        }]]);
+        let sinks = SinkManager::new(tx.clone());
+        let mut cfg = BrainConfig::new("w");
+        cfg.subscriber = sub.identity.tag();
+        cfg.budget = sub.budget;
+        let mut brain = Brain::new(cfg, host, FileStore::new(&dir), sinks);
+        let (sink, sent) = MockSink::new();
+        brain.sinks.add_sink("herdr", Box::new(sink));
+        brain.dispatch(BrainMsg::Watch("{\"kind\":9}".into())).await;
+        assert_eq!(brain.stats.injects, 1, "human wake delivers");
+        // Journal row carries the subscriber tag (why --subscriber replays).
+        let journal = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
+        assert!(
+            journal.contains("\"subscriber\":\"npub:npub1human\""),
+            "wake row tagged: {journal}"
+        );
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = sent;
+    }
 }
