@@ -1,14 +1,11 @@
-# flywheel
-
-herdr swarm orchestrator. NTM-parity CLI + Resonate durable loop. Embeds
-toron (`MailSurface`); never the reverse.
+# AGENT INSTRUCTION
 
 ## Commands
 
 ```bash
 mbx +nightly-aarch64-apple-darwin test
 bash scripts/verify-clippy.sh
-bash docs/decisions/_scripts/verify-review-fixes.sh
+k
 mbx +nightly-aarch64-apple-darwin install --path . --force
 # macOS (only if a stale-signature SIGKILL appears): codesign --force --sign - ~/.cargo/bin/flywheel
 ```
@@ -100,7 +97,23 @@ Live ignored tests need herdr + mail. `mbx +nightly-aarch64-apple-darwin test --
 - **`[{id}] done` has two senders (bd-loop-reporter-of-record):** the executor's courtesy copy (brief `REPORT`) and the loop's reporter-of-record copy (`__mail-done` → `send_done_mail`, 2026-08-18) — sent only on a verified LEGAL close, best-effort + once per bead per loop invocation (`done_mailed` set), so the captain is notified even when the agent forgets. The durable close signal is `br close` (claim-watch → `close_check`); the `[{id}] done` subject is the dispatch-guard's ANCHORED done hold (`subject_done`: subject ENDS with `] done` — a participle like `[bd-123] done investigating` does NOT match). Duplicate `[{id}] done` mails are expected and harmless.
 - **Preflight:** `steer`/`loop-mode run`/`workflow run --execute` auto-run prerequisite checks (herdr, resonate, br, beads, operator key, mail). `--skip-preflight` bypasses. Standalone: `flywheel preflight --mode {steer|loop|workflow|cron}`. `loop-mode` without `--work` is still solo durable execution; only the `--work` specialization requires beads.
 - **Captain briefing (bd-xe9r/bd-nmzk):** interactive TTY `steer` and `workflow run --execute` prompt before dispatch — inferred crew counts (editable), per-role model menus w/ cost/caps from the registry, squad/bare-harness shape (including bare `provider/model` escape hatch, bd-j3so), stage-chain preview, go/no-go. Skipped by `--json`, `--yes`, or an explicit `--crew`; non-TTY dispatch is byte-identical. Shared prompt module `src/steer_brief.rs` (`source` fork only, `workflow_briefing_context` extracts `objective`/`goal`/`target` from `--inputs`); prompt logic is pure over injected IO.
- - **Doorbell is plane D, not spawn-owned (ADR-0012):** wake lives in `doorbell-core` (pure) + `doorbell-rt` (brain/sensors/sinks) + `doorbell` daemon (UDS + 127.0.0.1:18980). Spawn records a subscription row and defers to a healthy daemon (no local loop, no double prompts); no daemon means embedded degraded mode. `kill` never touches the daemon. `flywheel doorbell {status,start,stop,digest,why,events}` + `doorbell {start,stop,status,ping,migrate}`; wake state, journals (v2, rotated, seq-stamped), and subscriptions persist so pending wakes survive crashes at-least-once.
+ - **Doorbell is plane D, not spawn-owned (ADR-0012):** wake lives in `doorbell-core` (pure) + `doorbell-rt` (brain/sensors/sinks) + `doorbell` daemon (UDS + 127.0.0.1:18980). Spawn records a subscription row and defers to a healthy daemon (no local loop, no double prompts); no daemon means embedded degraded mode. `kill` never touches the daemon. `flywheel doorbell {status,start,stop,digest,why,events,inject,subscribe,subscriptions,unsubscribe}` + `doorbell {start,stop,status,ping,migrate}`; Phase-4 flags (all default-off): `arrival_triple`, `beads_poller`, `cron_doorbell_sink`, service `emit` identities, `cross_workspace` + foreign map; wake state, journals (v2, rotated, seq-stamped), and subscriptions persist so pending wakes survive crashes at-least-once.
+
+## Public API
+
+- Keep the public API surface as small as possible. Use the narrowest visibility that satisfies the current requirement.
+- Add public types, traits, methods, features, or re-exports only for a concrete user need.
+- Preserve backward compatibility unless a breaking change is explicitly required.
+- Document public API changes and update the affected crate's changelog when appropriate.
+- Respect the workspace MSRV, feature boundaries, and no_std support where applicable.
+
+## Performance
+
+- Code must remain efficient on low-end and resource-constrained devices.
+- Keep CPU, memory, allocation, storage, and network costs proportional to the work performed.
+- Avoid unnecessary cloning, repeated parsing or serialization, redundant I/O, and unbounded collections, queues, tasks, or retries.
+- Benchmark performance-sensitive changes when practical, and investigate meaningful regressions.
+- Prefer clear, efficient code over speculative micro-optimizations. Explain non-obvious optimizations and their tradeoffs.
 
 ## Skill Sync Contract
 
