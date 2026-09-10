@@ -33428,7 +33428,13 @@ fn cmd_daemon(cmd: &DaemonCmd) -> Result<()> {
     std::fs::create_dir_all(&state)?;
     let addr = |port: u16| format!("127.0.0.1:{port}");
     match cmd {
-        DaemonCmd::Start { port } => daemon::start(&state, &addr(*port)),
+        DaemonCmd::Start { port } => {
+            daemon::start(&state, &addr(*port))?;
+            // Plane D rides along: `flywheel daemon start` also ensures the
+            // doorbell daemon is running (loud if its binary is absent —
+            // autostart persistence stays opt-in via `doorbell install`).
+            daemon::ensure_doorbell()
+        }
         DaemonCmd::Stop { port, force } => daemon::stop(&state, &addr(*port), *force),
         DaemonCmd::Restart { port, force } => daemon::restart(&state, &addr(*port), *force),
         DaemonCmd::Status { port } => daemon::status(&state, &addr(*port)),
@@ -33447,7 +33453,6 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
     use axum::http::StatusCode;
     use axum::routing::{get, post};
     use std::sync::Arc;
-
     #[derive(Clone)]
     struct AppState {
         cfg: config::Config,

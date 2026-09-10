@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cross_workspace`: explicit Scope::Many widening, `(workspace, corr)` journal envelope, same-host external re-ring driver in doorbell-rt.
 - `doorbell inject` console verb (ratcheted, budgeted) and `subscribe`/`subscriptions`/`unsubscribe` store verbs (D8).
 - Wake analytics learning artifact + phase4 gate in verify-0012.sh.
+- `doorbell install` autostart unit (launchd/systemd, idempotent); `flywheel daemon start` rides the doorbell daemon along.
 ### Fixed — ADR-0011 vision proofs
 - `"N crews"` / `coder:N` parse into `--crew N` (total panes). `"swarm with 2 crews"` classifies wave-swarm, not steer.
 - `"join the fleet"` → `arrive`. One-line typo → open spawn-send.
