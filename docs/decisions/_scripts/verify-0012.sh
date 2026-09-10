@@ -96,6 +96,13 @@ pass "why --subscriber smoke"
 # - slow-sink E15: rt isolation test (bd-asr2.10)
 # - authz negatives: rt matrix tests (bd-asr2.8)
 # - SSE replay: daemon gate section (bd-asr2.12)
+echo "== ADR-0012 Phase 4 analytics (bd-asr2.19) =="
+ART="$ROOT/docs/learnings/doorbell/wake-analytics-2026-09-10.md"
+[ -f "$ART" ] || fail "wake analytics artifact missing"
+grep -q "^track: knowledge" "$ART" || fail "artifact frontmatter track missing"
+grep -q "^reinforced: " "$ART" || fail "artifact reinforcement field missing"
+grep -q "502" "$ART" || fail "artifact has no ring/drop counters"
+pass "wake analytics artifact (frontmatter + reinforcement + counters)"
 
 if [ "$FAIL" -eq 0 ]; then echo "RESULT: PASS"; else echo "RESULT: FAIL"; fi
 exit "$FAIL"
