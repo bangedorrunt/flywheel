@@ -429,7 +429,6 @@ fn hosted_sweep_age(fw_state: &std::path::Path, hosted: &[String]) -> (Option<u6
     }
     (min_age.filter(|a| *a != u64::MAX), max_seq)
 }
-
 fn health_body(app: &AppState) -> String {
     // D4.4: a torn journal tail degrades loudly here (bd-asr2.4).
     let store = doorbell_rt::FileStore::new(&app.fw_state);
@@ -465,11 +464,9 @@ fn hostname() -> String {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".into())
 }
-
 /// Retained journal rows as an SSE replay (D8, bd-asr2.12). Strictly
-/// read-only fan-out; live wake/digest/audit push binds when the daemon
-/// hosts the loop (bd-ene2) — until then this replays retained history
-/// plus a closing comment (no infinite hold on an unchanging file).
+/// read-only fan-out over retained history plus a closing comment (no
+/// infinite hold on an unchanging file); live push fan-out stays future.
 fn events_body(state_dir: &std::path::Path, since: Option<u64>) -> String {
     use doorbell_rt::api::{Replay, SseEvent, replay_range};
     let store = doorbell_rt::FileStore::new(state_dir);
