@@ -1,4 +1,5 @@
 // governed-by: ADR-0010 D10 (bd-67qg)
+// governed-by: ADR-0011
 //! One fleet snapshot contract (`flywheel-snapshot.v1`) + helm drain data.
 //!
 //! Assembled once per invocation from the workspace model (journal fold,
@@ -294,20 +295,14 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
     if mail_degraded {
         degraded.push("mail".to_string());
     }
-    let (held_paths, res_degraded) = read_held_paths(project);
+    let (held_paths, res_degraded) = read_held_paths(cfg, project);
     if res_degraded {
         degraded.push("reservations".to_string());
     }
 
-    let dispatcher = crate::doorbell::dispatcher_status_line(&crate::config::state_dir(), ws_label);
-    let dispatcher = if dispatcher.contains("up") {
-        "up".to_string()
-    } else if dispatcher.contains("DOWN") {
-        "down".to_string()
-    } else {
-        "absent".to_string()
-    };
-    let coalitions = list_active_coalitions(project);
+    let dispatcher =
+        crate::doorbell::dispatcher_token(&crate::config::state_dir(), ws_label).to_string();
+    let coalitions = list_active_coalitions(project, now);
     let joinable = fleet_joinable(&dispatcher, &pins);
 
     Snapshot {
@@ -391,17 +386,28 @@ fn read_mail_counts(_project: &str) -> (MailCounts, bool) {
     )
 }
 
-fn read_held_paths(_project: &str) -> (Vec<String>, bool) {
-    // Additive board is MCP `list_file_reservations` / flywheel `__reservation-board`.
-    // In-process mailbox when embedded; degrade (never lie calm) on miss.
-    let Some(mail) = crate::mail_shim::try_mailbox() else {
-        return (Vec::new(), true);
-    };
-    let Ok(rows) = crate::mail_shim::block_on(mail.active_reservations(_project)) else {
-        return (Vec::new(), true);
-    };
-    let paths = rows.into_iter().map(|r| r.path_pattern).collect();
-    (paths, false)
+fn parse_held_paths(board: &serde_json::Value) -> Vec<String> {
+    board
+        .get("reservations")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| r.get("path").and_then(|p| p.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn read_held_paths(cfg: &crate::config::Config, project: &str) -> (Vec<String>, bool) {
+    // Mail facade covers remote daemon AND in-process. try_mailbox() is
+    // in-process only — a configured URL never fills it, so helm degraded.
+    match crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config())) {
+        Ok(Some(mail)) => match mail.list_active(project, None, None) {
+            Ok(v) => (parse_held_paths(&v), false),
+            Err(_) => (Vec::new(), true),
+        },
+        _ => (Vec::new(), true),
+    }
 }
 
 /// herdr pane ids look like `wP:p1` / `w6:p2`. A lone current pane is not a fleet.
@@ -421,7 +427,17 @@ pub fn fleet_joinable(dispatcher: &str, pins: &[PinRow]) -> bool {
             .any(|p| !looks_like_pane_id(&p.pin) && !p.pin.is_empty())
 }
 
-fn list_active_coalitions(_project: &str) -> Vec<String> {
+/// Month-old "active" JSON is not a live fleet (ADR-0011 D5).
+pub const COALITION_LIVE_SECS: u64 = 48 * 3600;
+
+pub fn coalition_is_live(created_at: &str, now_unix: u64) -> bool {
+    let Ok(t) = chrono::DateTime::parse_from_rfc3339(created_at) else {
+        return false;
+    };
+    now_unix.saturating_sub(t.timestamp() as u64) < COALITION_LIVE_SECS
+}
+
+fn list_active_coalitions(_project: &str, now_unix: u64) -> Vec<String> {
     let root = crate::config::state_dir().join("coalitions");
     let Ok(rd) = std::fs::read_dir(&root) else {
         return Vec::new();
@@ -438,9 +454,14 @@ fn list_active_coalitions(_project: &str) -> Vec<String> {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
             continue;
         };
-        if v.get("status").and_then(|s| s.as_str()) == Some("active")
-            && let Some(id) = v.get("id").and_then(|s| s.as_str())
-        {
+        if v.get("status").and_then(|s| s.as_str()) != Some("active") {
+            continue;
+        }
+        let created = v.get("created_at").and_then(|s| s.as_str()).unwrap_or("");
+        if !coalition_is_live(created, now_unix) {
+            continue;
+        }
+        if let Some(id) = v.get("id").and_then(|s| s.as_str()) {
             ids.push(id.to_string());
         }
     }
@@ -699,5 +720,25 @@ mod adr0010_d10_tests {
         assert_eq!(lanes[0].bead, "bd-9");
         assert_eq!(lanes[0].priority, 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_held_paths_from_board() {
+        let board = serde_json::json!({
+            "project": "toron",
+            "count": 1,
+            "reservations": [
+                {"id": "abc", "path": "src/**", "holder": "LucidFalcon"}
+            ]
+        });
+        assert_eq!(parse_held_paths(&board), vec!["src/**"]);
+        assert!(parse_held_paths(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn month_old_coalition_is_not_live() {
+        assert!(!coalition_is_live("2026-08-10T00:28:26Z", 1_788_840_000));
+        assert!(coalition_is_live("2026-09-07T12:00:00Z", 1_788_840_000));
+        assert!(!coalition_is_live("not-a-date", 1_788_840_000));
     }
 }

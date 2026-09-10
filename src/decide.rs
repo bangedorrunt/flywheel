@@ -50,9 +50,55 @@ fn compose_parts_value(target: &str) -> String {
 pub fn topology_for_primitive(primitive: &str) -> &'static str {
     match primitive {
         "loop-work" | "pickup" | "pause" => "loop",
+        "join" => "join",
         "spawn-send" | "captain-audit" | "forensics" | "babysit-bead" => "open",
         "wave-swarm" | "coalition-form" => "swarm",
         _ => "swarm",
+    }
+}
+
+/// Total pane budget N from free text. `"2 crews"` / `"3 crew"` / `"coder:2"`.
+/// Captain cut: N is total panes, not coder-N.
+pub fn parse_budget_n(target: &str) -> Option<u32> {
+    let lower = target.to_ascii_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != ':')
+        .filter(|w| !w.is_empty())
+        .collect();
+    for pair in words.windows(2) {
+        if matches!(pair[1], "crew" | "crews")
+            && let Ok(n) = pair[0].parse::<u32>()
+            && n >= 1
+        {
+            return Some(n);
+        }
+    }
+    for w in &words {
+        for prefix in ["coder:", "n:", "crew:"] {
+            if let Some(rest) = w.strip_prefix(prefix)
+                && let Ok(n) = rest.parse::<u32>()
+                && n >= 1
+            {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+fn apply_crew_budget(d: &mut Decision, target: &str) {
+    let Some(n) = parse_budget_n(target) else {
+        return;
+    };
+    if d.argv.iter().any(|a| a == "--crew") {
+        return;
+    }
+    if matches!(
+        d.primitive,
+        "wave-swarm" | "repair-until-verified" | "beads-lifecycle"
+    ) {
+        d.argv.push("--crew".into());
+        d.argv.push(n.to_string());
     }
 }
 
@@ -100,6 +146,12 @@ fn dec(primitive: &'static str, reason: &str, argv: &[&str]) -> Decision {
 /// Unmatched targets fall back to steer (the catalog loudly rejects unknown
 /// shapes — never a silent no-op).
 pub fn decide(target: &str, snap: &Snapshot) -> Decision {
+    let mut d = classify(target, snap);
+    apply_crew_budget(&mut d, target);
+    d
+}
+
+fn classify(target: &str, snap: &Snapshot) -> Decision {
     let t = target.to_ascii_lowercase();
     let implement = has(&t, &["implement", "fix"]);
 
@@ -519,9 +571,28 @@ pub fn decide(target: &str, snap: &Snapshot) -> Decision {
             ],
         );
     }
+    // 23b. join the fleet (second harness). Briefing still overrides when
+    // the world is joinable; this needle covers the free-text proof.
+    if has(&t, &["join the fleet", "join fleet", "joining"]) {
+        return dec(
+            "join",
+            "join the live fleet — arrive, do not spawn a second swarm",
+            &["flywheel", "arrive"],
+        );
+    }
+    // 23c. one-line typo / nit → open (spawn-send), not a swarm.
+    if has(&t, &["typo", "one-line", "one line"]) {
+        return dec(
+            "spawn-send",
+            "one-line / typo — current pane, no crew",
+            &["flywheel", "spawn", "--profile", "<role>", "--count", "1"],
+        );
+    }
     // 24. wave-swarm -> compose --parts wave-swarm (ADR-0006 D3).
     // Do not require the recipe name in the objective (GS-013: kill the easter egg).
-    let wave_shaped = has(&t, &["wave-swarm", "wave swarm", "lanes", "waves"])
+    // "swarm with 2 crews" is wave-shaped (ADR-0011); "join" already returned.
+    let wave_shaped = has(&t, &["wave-swarm", "wave swarm", "lanes", "waves", "swarm"])
+        || parse_budget_n(target).is_some()
         || t.split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
             .any(|w| w.starts_with("wave-") && w.len() > 5);
     if wave_shaped {
@@ -1084,6 +1155,52 @@ mod tests {
     fn lanes_keyword_routes_to_wave_swarm() {
         let d = decide("run the lanes", &snap());
         assert_eq!(d.primitive, "wave-swarm");
+    }
+
+    #[test]
+    fn swarm_with_2_crews_is_wave_swarm_with_crew_2() {
+        let d = decide("swarm with 2 crews", &snap());
+        assert_eq!(d.primitive, "wave-swarm");
+        assert_eq!(d.topology, "swarm");
+        assert!(
+            d.argv.windows(2).any(|w| w == ["--crew", "2"]),
+            "argv: {:?}",
+            d.argv
+        );
+    }
+
+    #[test]
+    fn wave_swarm_3_crews_honors_n() {
+        let d = decide("wave-swarm 3 crews", &snap());
+        assert_eq!(d.primitive, "wave-swarm");
+        assert!(
+            d.argv.windows(2).any(|w| w == ["--crew", "3"]),
+            "{:?}",
+            d.argv
+        );
+    }
+
+    #[test]
+    fn join_the_fleet_is_join_topology() {
+        let d = decide("join the fleet", &snap());
+        assert_eq!(d.primitive, "join");
+        assert_eq!(d.topology, "join");
+        assert!(d.argv.contains(&"arrive".to_string()));
+    }
+
+    #[test]
+    fn one_line_typo_is_open_spawn_send() {
+        let d = decide("fix a one-line typo", &snap());
+        assert_eq!(d.primitive, "spawn-send");
+        assert_eq!(d.topology, "open");
+    }
+
+    #[test]
+    fn parse_budget_n_examples() {
+        assert_eq!(parse_budget_n("swarm with 2 crews"), Some(2));
+        assert_eq!(parse_budget_n("wave-swarm 3 crews"), Some(3));
+        assert_eq!(parse_budget_n("coder:4"), Some(4));
+        assert_eq!(parse_budget_n("work the ready beads"), None);
     }
 
     // Row 4 — implement/fix + no tracker|direct → steer-direct.

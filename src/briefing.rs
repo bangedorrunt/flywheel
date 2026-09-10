@@ -67,7 +67,15 @@ pub struct Briefing {
     pub questions: Vec<Question>,
 }
 
-/// Loud join banner (ADR-0011 D5). Never silent.
+fn held_summary(paths: &[String]) -> String {
+    match paths {
+        [] => "none".into(),
+        [one] => one.clone(),
+        [first, ..] => format!("{} ({}…)", paths.len(), first),
+    }
+}
+
+/// Loud join banner (ADR-0011 D5). Never silent. Held is a count, not a dump.
 pub fn join_banner(world: &World) -> String {
     format!(
         "JOINING — not spawning  project={} pins={} dispatcher={} coalition={} held={}",
@@ -75,11 +83,7 @@ pub fn join_banner(world: &World) -> String {
         world.pin_count,
         world.dispatcher,
         world.coalition_id.as_deref().unwrap_or("-"),
-        if world.held_paths.is_empty() {
-            "none".to_string()
-        } else {
-            world.held_paths.join(",")
-        }
+        held_summary(&world.held_paths)
     )
 }
 
@@ -95,6 +99,7 @@ fn topology_for(decision: &Decision, world: &World) -> String {
         return "join".into();
     }
     match decision.primitive {
+        "join" => "join".into(),
         "loop-work" => "loop".into(),
         "spawn-send" | "captain-audit" | "forensics" => "open".into(),
         "wave-swarm" | "coalition-form" => "swarm".into(),
@@ -123,7 +128,8 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
         unique_roles.to_vec()
     };
     let unique_roles = unique_owned.as_slice();
-    let n = default_n(unique_roles.len() as u32, cap);
+    let n = decide::parse_budget_n(objective)
+        .unwrap_or_else(|| default_n(unique_roles.len() as u32, cap));
     let packed = crew::pack_crew(unique_roles, n, cap).unwrap_or_else(|_| crew::PackedCrew {
         members: BTreeMap::new(),
         aliases: BTreeMap::new(),
@@ -245,6 +251,21 @@ mod tests {
     }
 
     #[test]
+    fn join_banner_summarizes_held_paths() {
+        let world = World {
+            project: "toron".into(),
+            dispatcher: "up".into(),
+            joinable: true,
+            pin_count: 1,
+            held_paths: (0..10).map(|i| format!("p{i}")).collect(),
+            ..World::default()
+        };
+        let banner = join_banner(&world);
+        assert!(banner.contains("held=10 (p0…)"), "{banner}");
+        assert!(!banner.contains("p9"), "{banner}");
+    }
+
+    #[test]
     fn empty_world_wave_swarm_emits_crew_n() {
         let roles = vec![
             "planner".into(),
@@ -278,6 +299,15 @@ mod tests {
         let b = assemble("work the ready beads", &world, &["coder".into()], 5);
         assert_eq!(b.proposal.workflow, "loop-work");
         assert_eq!(b.proposal.topology, "loop");
+    }
+
+    #[test]
+    fn two_crews_packs_n_2_not_default_5() {
+        let b = assemble("swarm with 2 crews", &world_empty(), &[], 5);
+        assert_eq!(b.proposal.topology, "swarm");
+        assert_eq!(b.proposal.workflow, "wave-swarm");
+        assert_eq!(b.proposal.crew_total, 2);
+        assert!(b.proposal.argv.windows(2).any(|w| w == ["--crew", "2"]));
     }
 
     #[test]

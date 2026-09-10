@@ -1,5 +1,6 @@
 // governed-by: ADR-0024
 // governed-by: ADR-0027
+// governed-by: ADR-0011
 //! Pane runner (ADR-0010 Spec A pane row, P10.3, bd-ghcj.1): real herdr
 //! PANE execution for interactive workflows — a crew pre-spawned from the
 //! workflow's `crew` plan, then each `dispatch_job` step sent to the running
@@ -1197,15 +1198,25 @@ pub fn start_approval_drainer(
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        let ws = crate::state::load_spawn_meta(&project)
-                            .unwrap_or_else(|| project.clone());
+                        let swarm = crate::swarm_label(&project);
+                        let ws = crate::doorbell::preferred_workspace(
+                            &swarm,
+                            crate::state::load_spawn_meta(&project).as_deref(),
+                            |l| {
+                                crate::doorbell::dispatcher_token(
+                                    &crate::config::state_dir(),
+                                    l,
+                                )
+                            },
+                        );
                         let snap = crate::snapshot::assemble(&cfg, &project, &ws, now);
+                        // REVIEW residual: any non-closed lane. Bead status
+                        // is never the word "review", so that filter always
+                        // auto-passed.
                         let review_residual = snap
                             .lanes
                             .iter()
-                            .filter(|l| {
-                                l.status.contains("review") && l.status != "closed"
-                            })
+                            .filter(|l| l.status != "closed")
                             .count();
                         let review_degraded = snap
                             .degraded

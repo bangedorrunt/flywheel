@@ -4605,6 +4605,48 @@ pub fn claim_watch_step(
     actions
 }
 
+/// Carry nudge_streak across a poll snapshot (poll JSON has no streak).
+/// Working/done resets it. Idle keeps the prior count.
+pub fn carry_nudge_streaks(polled: Vec<AgentState>, prior: &[AgentState]) -> Vec<AgentState> {
+    polled
+        .into_iter()
+        .map(|mut s| {
+            if s.status == "working" || s.status == "done" {
+                s.nudge_streak = 0;
+                return s;
+            }
+            if let Some(p) = prior.iter().find(|p| p.name == s.name) {
+                s.nudge_streak = p.nudge_streak;
+            }
+            s
+        })
+        .collect()
+}
+
+/// Increment streak after a Nudge is applied. Returns a rot action when
+/// the named proxy (streak as repetition+silence) crosses Compact.
+pub fn bump_nudge_streak(states: &mut [AgentState], name: &str) -> crate::rot::RotAction {
+    let Some(s) = states.iter_mut().find(|s| s.name == name) else {
+        return crate::rot::RotAction::None;
+    };
+    s.nudge_streak = s.nudge_streak.saturating_add(1);
+    let ev = crate::rot::RotEvents {
+        repetition: s.nudge_streak,
+        marker_silence_turns: if s.status == "idle" {
+            s.nudge_streak
+        } else {
+            0
+        },
+        ..crate::rot::RotEvents::default()
+    };
+    let a = crate::rot::action(&ev);
+    if s.nudge_streak == 3 && a == crate::rot::RotAction::Compact {
+        a
+    } else {
+        crate::rot::RotAction::None
+    }
+}
+
 pub fn plan_actions(
     model: &LoopModel,
     states: &[AgentState],
@@ -5957,6 +5999,13 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // replay, so the correctness floor is never skipped.
     let mut states: Vec<AgentState> = Vec::new();
     let mut since_snapshot: u64 = 0;
+    // bd-7qg6: flood_seen lives OUTSIDE the poll loop — declared per-poll it
+    // reset every iteration, so a legit 7+ batch counted as "new" forever and
+    // never dispatched. Hoisted: paused ids are known next poll (one pause,
+    // then dispatch); ever-new runaway ids still trip every poll. Resets only
+    // on crash-resume (one extra pause, bounded — full ctx persistence is the
+    // bd-eign.2 follow-up).
+    let mut flood_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         iteration += 1;
@@ -5999,13 +6048,6 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     max_seq: 0,
                     stream_error: Some(format!("leaf error: {e}")),
                 }
-    // bd-7qg6: flood_seen lives OUTSIDE the poll loop — declared per-poll it
-    // reset every iteration, so a legit 7+ batch counted as "new" forever and
-    // never dispatched. Hoisted: paused ids are known next poll (one pause,
-    // then dispatch); ever-new runaway ids still trip every poll. Resets only
-    // on crash-resume (one extra pause, bounded — full ctx persistence is the
-    // bd-eign.2 follow-up).
-    let mut flood_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             }
         };
         if event_batch.stream_error.is_some() {
@@ -6039,6 +6081,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             since_snapshot,
         ) {
             since_snapshot = 0;
+            let prior_states = states.clone();
             states = match ctx
                 .run(
                     poll_swarm,
@@ -6049,7 +6092,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 )
                 .await
             {
-                Ok(s) => s,
+                Ok(s) => carry_nudge_streaks(s, &prior_states),
                 Err(e) => {
                     // cg6.2: the correctness floor must not be a crash point —
                     // a transient herdr failure yields an empty snapshot; the
@@ -7106,6 +7149,28 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         swarm.heal_budget = params.respawn_budget;
         swarm.pending_events = Vec::new();
         swarm.dispatch_pending = dispatch_pending.clone();
+        // ADR-0029 Wave 1: one rot score per agent when nudge-without-progress
+        // hits Compact (streak==3). Consume to 4 so the next poll does not
+        // re-fire. Named proxy: streak stands in for repetition+silence until
+        // pane-byte events exist.
+        let mut rot_msgs: Vec<LoopMsg> = Vec::new();
+        for s in &mut states {
+            if s.nudge_streak == 3 {
+                rot_msgs.push(LoopMsg::Rot {
+                    name: s.name.clone(),
+                    events: crate::rot::RotEvents {
+                        repetition: s.nudge_streak,
+                        marker_silence_turns: if s.status == "idle" {
+                            s.nudge_streak
+                        } else {
+                            0
+                        },
+                        ..crate::rot::RotEvents::default()
+                    },
+                });
+                s.nudge_streak = 4;
+            }
+        }
         swarm.states = states.clone();
         // done_mailed + heal_states deliberately untouched: they persist on
         // swarm across polls (seeded from ActiveLoop at startup).
@@ -7140,6 +7205,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // Heal + nudge + reclaim all ride workspace::tick (one live entry).
         let mut extra_msgs = std::mem::take(&mut heal_msgs);
         extra_msgs.append(&mut nudge_msgs);
+        extra_msgs.append(&mut rot_msgs);
         for m in extra_msgs {
             let ws_msg = match &m {
                 LoopMsg::Heal {
@@ -7164,6 +7230,18 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     bead_id: bead_id.clone(),
                     title: title.clone(),
                 },
+                LoopMsg::Rot { name, events } => {
+                    let (next, acts) = tick(
+                        &swarm,
+                        &LoopMsg::Rot {
+                            name: name.clone(),
+                            events: events.clone(),
+                        },
+                    );
+                    swarm = next;
+                    poll_actions.extend(acts);
+                    continue;
+                }
                 other => {
                     eprintln!(
                         "flywheel: unmapped LoopMsg in workspace fold (skipped, no durable::tick): {other:?}"
@@ -7687,6 +7765,24 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     }
                 }
                 LoopAction::Nudge { name } => {
+                    let rot_hit = bump_nudge_streak(&mut states, name);
+                    if rot_hit == crate::rot::RotAction::Compact {
+                        let _ = ctx
+                            .run(
+                                send_prompt,
+                                SendArgs {
+                                    project: params.project.clone(),
+                                    name: name.clone(),
+                                    text: crate::rot::compact_prompt().into(),
+                                    confirm: params.confirm_sends,
+                                    confirm_timeout_ms: params.confirm_timeout_ms,
+                                    invocation: params.invocation.clone(),
+                                    iteration,
+                                    profile: String::new(),
+                                },
+                            )
+                            .await;
+                    }
                     if let Some(n) = &params.nudge {
                         // same failure contract as the Send path: a leaf error
                         // (agent dropped mid-wait) must NOT kill the loop —
@@ -11375,6 +11471,36 @@ mod tests {
             LoopAction::Nudge { .. } => {}
             other => panic!("expected Nudge (orchestrator direction wins), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn carry_nudge_streaks_survives_poll_reset() {
+        let prior = vec![{
+            let mut s = st("a", "idle");
+            s.nudge_streak = 2;
+            s
+        }];
+        let polled = vec![st("a", "idle")];
+        let out = carry_nudge_streaks(polled, &prior);
+        assert_eq!(out[0].nudge_streak, 2);
+        let working = vec![st("a", "working")];
+        assert_eq!(carry_nudge_streaks(working, &prior)[0].nudge_streak, 0);
+    }
+
+    #[test]
+    fn bump_nudge_streak_compacts_at_three() {
+        let mut states = vec![st("a", "idle")];
+        assert_eq!(
+            bump_nudge_streak(&mut states, "a"),
+            crate::rot::RotAction::None
+        );
+        assert_eq!(states[0].nudge_streak, 1);
+        bump_nudge_streak(&mut states, "a");
+        assert_eq!(
+            bump_nudge_streak(&mut states, "a"),
+            crate::rot::RotAction::Compact
+        );
+        assert_eq!(states[0].nudge_streak, 3);
     }
 
     #[test]
