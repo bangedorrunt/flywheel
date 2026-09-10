@@ -9198,6 +9198,10 @@ fn cmd_doorbell_why(
     let mut shown = 0usize;
     let mut matched = 0usize;
     for (workspace, entry) in &entries {
+        if doorbell::journal_entry_version(entry) != 1 {
+            eprintln!("doorbell why: refusing entry with unknown journal v (workspace {workspace}) — no fold-past");
+            continue;
+        }
         let msg_val = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
         let actions_val = entry
             .get("actions")
@@ -9440,6 +9444,10 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str) -> Result<()> {
     let mut models: std::collections::BTreeMap<String, workspace::WorkspaceModel> =
         std::collections::BTreeMap::new();
     for (ws, entry) in &entries {
+        if doorbell::journal_entry_version(entry) != 1 {
+            eprintln!("doorbell afk: refusing entry with unknown journal v (workspace {ws}) — no fold-past");
+            continue;
+        }
         let msg_val = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
         if let Some(msg) = snapshot::replay_msg(&msg_val) {
             let model = models.entry(ws.clone()).or_insert_with(|| {

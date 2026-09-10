@@ -1,0 +1,827 @@
+// governed-by: ADR-0012
+//! Doorbell pure core (ADR-0012 Phase 0): ring rules, queue coalesce, inject
+//! gate, watch/inbox parsing, and the Elm tick. Moved verbatim from
+//! `src/doorbell.rs` (pure fns, no signature changes) and `src/doorbell_tick.rs`
+//! (verbatim). No I/O, no `&mut` across the API, no tokio/toron/herdr/resonate.
+//! The effect layer (`cmd_internal_doorbell`, pid files, supervision) stays in
+//! flywheel. Tests assert `same Msg log -> byte-identical Action sequence`.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+/// One class of doorbell. Queued last-write-wins per class (ADR-0005 D1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EventClass {
+    Channel,
+    Job,
+    RequestRelease,
+    ReservationConflict,
+    PlanePUrgent,
+}
+
+/// A watch/inbox edge the dispatcher might ring on.
+#[derive(Debug, Clone)]
+pub struct RingInput {
+    pub kind: u16,
+    /// Kind-9 `p` / job assignee / request-release target is this pin.
+    pub addressed_to_self: bool,
+    pub toron_kind_request_release: bool,
+    pub toron_kind_mail_delivered: bool,
+    pub importance_high_or_urgent: bool,
+    pub reservation_conflicts_self: bool,
+    /// Room chatter: kind 9 with no self address.
+    pub is_presence: bool,
+    pub is_ack_only: bool,
+}
+
+/// Classify a bus/inbox edge. `None` = do not ring.
+pub fn classify(ev: &RingInput) -> Option<EventClass> {
+    if ev.is_presence || ev.is_ack_only {
+        return None;
+    }
+    if ev.toron_kind_request_release && ev.addressed_to_self {
+        return Some(EventClass::RequestRelease);
+    }
+    if ev.reservation_conflicts_self && ev.kind == 30031 {
+        return Some(EventClass::ReservationConflict);
+    }
+    if ev.addressed_to_self && ev.kind == 43001 {
+        return Some(EventClass::Job);
+    }
+    // GS-006 bug 1: kind 9 mail-delivered (NIP-17 gift-wrap wake) must pull mail, not channel.
+    // Tagged `toron-kind=mail-delivered` on kind 9; reuse PlanePUrgent (inbox pull) path.
+    if ev.addressed_to_self && ev.kind == 9 && ev.toron_kind_mail_delivered {
+        return Some(EventClass::PlanePUrgent);
+    }
+    if ev.addressed_to_self && ev.kind == 9 {
+        return Some(EventClass::Channel);
+    }
+    // GS-006 bug 2: kind 39002 join/leave addressed to self must ring.
+    // Reuse Channel semantics (membership wake) — hint falls back to channel read.
+    if ev.addressed_to_self && ev.kind == 39002 {
+        return Some(EventClass::Channel);
+    }
+    if ev.importance_high_or_urgent && ev.addressed_to_self {
+        return Some(EventClass::PlanePUrgent);
+    }
+    None
+}
+
+/// Inject only when the pane is idle, done, or blocked (blocked is await-signal,
+/// not "don't disturb" — a peer's fix must break through, ADR-0005 gap 5).
+/// NOTE (bd-s8bo / bd-7qg6): this is the LEGACY DoorbellModel gate over raw
+/// herdr-status strings. The live workspace path re-gates every Prompt through
+/// `workspace::prompt_allowed` (exact Idle verdict) + `filter_prompts`
+/// (Busy+urgent breakthrough, rest → digest-visible Audit). Blocked parses to
+/// Busy there, so a blocked pin's wake lands in the captain digest, not as a
+/// prompt — keep both gates in sync when touching either.
+pub fn should_inject(herdr_status: &str) -> bool {
+    matches!(herdr_status, "idle" | "done" | "blocked")
+}
+
+/// Drain when leaving a non-injectable state for an injectable one.
+/// Working is the only non-injectable state; idle|done|blocked are injectable.
+pub fn is_drain_transition(from: &str, to: &str) -> bool {
+    !should_inject(from) && should_inject(to)
+}
+
+/// Last-write-wins queue, one line per (EventClass, hint/channel).
+/// Gap 6 fix: per-channel coalesce — two channels while working no longer collide.
+#[derive(Debug, Default)]
+pub struct DoorbellQueue {
+    pending: BTreeMap<(EventClass, String), String>,
+}
+
+impl DoorbellQueue {
+    pub fn push(&mut self, class: EventClass, line: impl Into<String>) {
+        let line = line.into();
+        // hint is the Pull part; use full line as key fallback when hint unknown.
+        // For correct per-channel dedup, callers pass the hint-derived line.
+        // Extract the hint suffix for keying when possible.
+        let hint = line.split("Pull: ").nth(1).unwrap_or(&line).to_string();
+        self.pending.insert((class, hint), line);
+    }
+
+    /// Direct insertion with explicit channel/hint key (preserves per-channel).
+    #[allow(dead_code)]
+    pub fn push_with_hint(&mut self, class: EventClass, hint: String, line: String) {
+        self.pending.insert((class, hint), line);
+    }
+
+    #[allow(dead_code)] // asserted by queue coalesce tests
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Drain in class+hint order. Empty after.
+    pub fn drain(&mut self) -> Vec<(EventClass, String)> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.pending)
+            .into_iter()
+            .map(|((class, _), line)| (class, line))
+            .collect()
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SelfIndex {
+    pins: BTreeMap<String, String>,
+    npubs: BTreeMap<String, String>,
+}
+
+impl SelfIndex {
+    pub fn from_pins<I, S>(pins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut idx = Self::default();
+        for p in pins {
+            idx.insert_pin(p.into(), None);
+        }
+        idx
+    }
+
+    pub fn insert_pin(&mut self, pin: String, npub: Option<String>) {
+        if let Some(n) = npub.filter(|s| !s.is_empty()) {
+            let n = n.to_lowercase();
+            self.npubs.insert(n.clone(), pin.clone());
+            self.pins.insert(pin, n);
+        } else {
+            self.pins.entry(pin).or_default();
+        }
+    }
+
+    pub fn resolve(&self, token: &str) -> Option<String> {
+        if self.pins.contains_key(token) {
+            return Some(token.to_string());
+        }
+        self.npubs.get(&token.to_lowercase()).cloned()
+    }
+
+    pub fn pin_names(&self) -> impl Iterator<Item = &str> {
+        self.pins.keys().map(String::as_str)
+    }
+
+    pub fn npub(&self, pin: &str) -> Option<&str> {
+        let n = self.pins.get(pin)?;
+        if n.is_empty() { None } else { Some(n.as_str()) }
+    }
+}
+
+/// Seconds after inject with no agent-originated event before the pin is
+/// unanswered (presence / kind-9 / reaction from their npub).
+pub const UNANSWERED_SECS: u64 = 120;
+
+/// bd-durable-doorbell-lngf: when NO wake-state high-water exists (first
+/// run, or state lost), the inbox sweep looks this far back instead of
+/// `now` — mail that arrived while the dispatcher was dead still wakes.
+/// Bounded so a never-seen inbox does not replay forever; the `[doorbell]`
+/// line + per-pin budget keep the replay idempotent and cheap.
+pub const REDELIVERY_LOOKBACK_HOURS: u64 = 24;
+
+pub fn watch_pubkey(line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    v.get("pubkey")
+        .and_then(|p| p.as_str())
+        .map(str::to_lowercase)
+}
+
+/// Event id on a watch NDJSON line (gap 17 trust: hint carries proof).
+pub fn watch_id(line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    v.get("id")
+        .and_then(|p| p.as_str())
+        .map(std::string::ToString::to_string)
+}
+
+/// `created_at` unix secs on a watch NDJSON line (gap 1 fix: plane-S cursor).
+#[allow(dead_code)]
+pub fn watch_created_at(line: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    v.get("created_at").and_then(serde_json::Value::as_u64)
+}
+
+/// Persisted per-workspace wake state (bd-durable-doorbell-lngf). File I/O
+/// stays in flywheel; this struct + `note_wake` are the pure core.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct WakeState {
+    /// plane-P inbox high-water per pin (RFC3339) — survives restarts.
+    #[serde(default)]
+    pub since_by_pin: BTreeMap<String, String>,
+    /// plane-S high-water (unix micros of newest seen watch event) — gap 1 fix.
+    #[serde(default)]
+    pub plane_s_cursor_us: Option<i64>,
+    /// last successful wake injection (unix secs) — status liveness.
+    #[serde(default)]
+    pub last_wake_unix: Option<u64>,
+    #[serde(default)]
+    pub last_wake_pin: Option<String>,
+}
+
+/// Record one delivered wake (the stamp `status` liveness reads).
+/// bd-7qg6: one writer, one ratchet — refuse a same-second or behind stamp
+/// so rapid double prompts cannot fake liveness for `send --wait`.
+/// Returns true when the stamp advanced.
+pub fn note_wake(st: &mut WakeState, pin: &str, now_unix: u64) -> bool {
+    if let Some(prev) = st.last_wake_unix {
+        if now_unix <= prev {
+            return false;
+        }
+    }
+    st.last_wake_unix = Some(now_unix);
+    st.last_wake_pin = Some(pin.to_string());
+    true
+}
+
+pub fn watch_targets(line: &str, index: &SelfIndex) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Vec::new();
+    };
+    let mut out = BTreeSet::new();
+    if let Some(tags) = v.get("tags").and_then(|t| t.as_array()) {
+        for t in tags {
+            let Some(a) = t.as_array() else { continue };
+            let Some(key) = a.first().and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let Some(val) = a.get(1).and_then(|x| x.as_str()) else {
+                continue;
+            };
+            if matches!(key, "p" | "assignee")
+                && let Some(pin) = index.resolve(val)
+            {
+                out.insert(pin);
+            }
+        }
+    }
+    if v.get("kind").and_then(serde_json::Value::as_u64) == Some(9)
+        && let Some(content) = v.get("content").and_then(|c| c.as_str())
+    {
+        for pin in index.pin_names() {
+            if content.contains(&format!("@{pin}")) {
+                out.insert(pin.to_string());
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Parse one `toron watch` NDJSON line (`{kind,id,tags,content}`).
+pub fn parse_watch_ndjson(line: &str, index: &SelfIndex) -> Option<(EventClass, String)> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let kind = v.get("kind")?.as_u64()? as u16;
+    let tags = v.get("tags")?.as_array()?;
+    let addressed_to_self = !watch_targets(line, index).is_empty();
+    let toron_kind_request_release = tags.iter().any(|t| {
+        t.as_array()
+            .map(|a| {
+                a.first().and_then(|x| x.as_str()) == Some("toron-kind")
+                    && a.get(1).and_then(|x| x.as_str()) == Some("request-release")
+            })
+            .unwrap_or(false)
+    });
+    // mail-delivered AND ack-sla-expired are mailbox wakes (kind 9 metadata
+    // rings for sealed NIP-17 mail) — both must pull the inbox, never
+    // `channel read` on a thread id.
+    let toron_kind_mail_delivered = tags.iter().any(|t| {
+        t.as_array()
+            .map(|a| {
+                a.first().and_then(|x| x.as_str()) == Some("toron-kind")
+                    && matches!(
+                        a.get(1).and_then(|x| x.as_str()),
+                        Some("mail-delivered" | "ack-sla-expired")
+                    )
+            })
+            .unwrap_or(false)
+    });
+    let class = classify(&RingInput {
+        kind,
+        addressed_to_self,
+        toron_kind_request_release,
+        toron_kind_mail_delivered,
+        importance_high_or_urgent: false,
+        reservation_conflicts_self: kind == 30031 && addressed_to_self,
+        is_presence: kind == 20001,
+        is_ack_only: false,
+    })?;
+    let h = tags.iter().find_map(|t| {
+        let a = t.as_array()?;
+        if a.first()?.as_str()? == "h" {
+            a.get(1)?.as_str()
+        } else {
+            None
+        }
+    });
+    let hint = pull_hint(class, h);
+    Some((class, hint))
+}
+
+fn pull_hint(class: EventClass, channel: Option<&str>) -> String {
+    match class {
+        EventClass::Channel => match channel {
+            Some(h) => format!("toron channel read h={h}"),
+            None => "toron channel read".into(),
+        },
+        EventClass::Job => "toron job list".into(),
+        EventClass::RequestRelease | EventClass::PlanePUrgent => "toron mail inbox --since".into(),
+        EventClass::ReservationConflict => "toron reserve list".into(),
+    }
+}
+
+/// Classify one `fetch_inbox` row (plane P). Inbox is already pin-scoped.
+pub fn parse_inbox_item(v: &serde_json::Value) -> Option<(EventClass, String)> {
+    if v.get("ack_only")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let tags = v.get("tags").and_then(|t| t.as_array());
+    let request_release = tags
+        .map(|tags| {
+            tags.iter().any(|t| {
+                t.as_array()
+                    .map(|a| {
+                        a.first().and_then(|x| x.as_str()) == Some("toron-kind")
+                            && a.get(1).and_then(|x| x.as_str()) == Some("request-release")
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    let importance = v.get("importance").and_then(|x| x.as_str()).unwrap_or("");
+    let class = if request_release {
+        EventClass::RequestRelease
+    } else if matches!(importance, "high" | "urgent") {
+        EventClass::PlanePUrgent
+    } else {
+        return None;
+    };
+    Some((class, pull_hint(class, None)))
+}
+
+/// Rumor-time of one inbox JSON row: live ToJson uses `created_ts_us` (i64
+/// micros); CLI/legacy blobs may still carry `created_ts` RFC3339.
+pub fn row_created_us(v: &serde_json::Value) -> Option<i64> {
+    if let Some(n) = v.get("created_ts_us") {
+        if let Some(i) = n.as_i64() {
+            return Some(i);
+        }
+        if let Some(u) = n.as_u64() {
+            return Some(u as i64);
+        }
+        if let Some(s) = n.as_str() {
+            return s.parse().ok();
+        }
+    }
+    v.get("created_ts")
+        .and_then(|t| t.as_str())
+        .and_then(|s| parse_rfc3339_micros(s).ok())
+}
+
+fn us_to_rfc3339(us: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_micros(us)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+}
+
+fn inbox_items(v: &serde_json::Value) -> Vec<&serde_json::Value> {
+    if let Some(arr) = v.as_array() {
+        arr.iter().collect()
+    } else if let Some(arr) = v.get("messages").and_then(|m| m.as_array()) {
+        arr.iter().collect()
+    } else if v.is_object() {
+        vec![v]
+    } else {
+        Vec::new()
+    }
+}
+
+pub fn inbox_high_water_from_values(items: Vec<&serde_json::Value>) -> Option<String> {
+    let mut best: Option<(i64, String)> = None;
+    for i in items {
+        let Some(us) = row_created_us(i) else {
+            continue;
+        };
+        let label = i
+            .get("created_ts")
+            .and_then(|t| t.as_str())
+            .map(str::to_string)
+            .or_else(|| us_to_rfc3339(us));
+        let Some(label) = label else {
+            continue;
+        };
+        if best.as_ref().map(|(u, _)| us > *u).unwrap_or(true) {
+            best = Some((us, label));
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+/// Newest created time in an inbox blob as RFC3339, for the high-water.
+/// Compares numerically (micros). Live JSON is `created_ts_us`.
+pub fn inbox_high_water(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    inbox_high_water_from_values(inbox_items(&v))
+}
+
+/// Newest created time as unix-micros (None if unparseable).
+pub fn inbox_high_water_micros(raw: &str) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    inbox_items(&v).into_iter().filter_map(row_created_us).max()
+}
+
+pub fn parse_rfc3339_micros(ts: &str) -> Result<i64, chrono::ParseError> {
+    chrono::DateTime::parse_from_rfc3339(ts).map(|dt| dt.timestamp_micros())
+}
+
+/// One `[doorbell]` line. Body stays pull.
+pub fn doorbell_line(class: EventClass, hint: &str) -> String {
+    let kind = match class {
+        EventClass::Channel => "kind 9",
+        EventClass::Job => "kind 43001",
+        EventClass::RequestRelease => "request-release",
+        EventClass::ReservationConflict => "kind 30031",
+        EventClass::PlanePUrgent => "plane-P urgent",
+    };
+    format!("[doorbell] {kind}. Pull: {hint}")
+}
+
+/// Trust-aware line that carries the triggering event id for proof (gap 17).
+pub fn doorbell_line_with_event(class: EventClass, hint: &str, event_id: &str) -> String {
+    if event_id.is_empty() {
+        doorbell_line(class, hint)
+    } else {
+        let kind = match class {
+            EventClass::Channel => "kind 9",
+            EventClass::Job => "kind 43001",
+            EventClass::RequestRelease => "request-release",
+            EventClass::ReservationConflict => "kind 30031",
+            EventClass::PlanePUrgent => "plane-P urgent",
+        };
+        format!("[doorbell] {kind} event={event_id}. Pull: {hint}")
+    }
+}
+
+/// Parse `--status pin=idle` pairs for the herdr-mock (`__doorbell --once`).
+pub fn parse_status_pair(s: &str) -> Option<(String, String)> {
+    let (pin, st) = s.split_once('=')?;
+    if pin.is_empty() || st.is_empty() {
+        return None;
+    }
+    Some((pin.to_string(), st.to_string()))
+}
+
+// ---- Elm tick (moved verbatim from src/doorbell_tick.rs) ------------------
+// Pure `tick(Model,Msg)->(Model,Actions)` — no I/O, no &mut, no herdr/toron.
+
+/// One doorbell message. Every bus/inbox/status edge is a Msg; nothing
+/// happens outside `tick`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DoorbellMsg {
+    /// Plane-S watch NDJSON line (`{kind,id,tags,content}`).
+    WatchNdjson { line: String },
+    /// Plane-P inbox rows for one pin (raw `fetch_inbox` JSON).
+    InboxItems { raw: String, pin: String },
+    /// Plane-P sweep path: rows already parsed (no serde round-trip).
+    InboxRows {
+        rows: Vec<serde_json::Value>,
+        pin: String,
+    },
+    /// Herdr status change for one pin.
+    HerdrStatus { pin: String, status: String },
+    /// Captain-bound fact (no alias info here — honest FactMiss).
+    Fact { summary: String },
+    /// Periodic tick (60s cadence in the live dispatcher); drives the
+    /// Ack-SLA scan effect.
+    AckSlaTick { now: u64 },
+    /// The watch child died; supervisor must restart (never exit).
+    WatchDied,
+}
+
+/// What the effect layer should do. Prompt is the only delivery; FetchInbox /
+/// CheckAckSla / RestartWatch are effects whose results re-enter as Msgs;
+/// FactMiss and Audit are loud misses (journal + stderr), never silent Ok(()).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DoorbellAction {
+    Prompt {
+        pin: String,
+        line: String,
+    },
+    FetchInbox {
+        since: String,
+    },
+    /// Effect: run `check_ack_sla_expired` for the project (toron mailbox).
+    /// Overdue wakes re-enter as WatchNdjson Msgs via plane S.
+    CheckAckSla,
+    RestartWatch,
+    FactMiss {
+        why: String,
+    },
+    Audit {
+        kind: String,
+        pin: String,
+        detail: String,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DoorbellModel {
+    /// LWW queues per pin (working panes hold their wake here).
+    pub queues: BTreeMap<String, Vec<String>>,
+    /// Last-known herdr status per pin.
+    pub statuses: BTreeMap<String, String>,
+    /// Pins (+npubs) this dispatcher owns.
+    pub index: SelfIndex,
+}
+
+/// Expand an inbox JSON blob into row values: array, single object, or the
+/// `{"messages":[...]}` wrapper `fetch_inbox` emits.
+fn expand_inbox_rows(v: &serde_json::Value) -> Vec<&serde_json::Value> {
+    match v {
+        serde_json::Value::Array(arr) => arr.iter().collect(),
+        other if other.get("messages").is_some() => other
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|arr| arr.iter().collect())
+            .unwrap_or_default(),
+        other => vec![other],
+    }
+}
+
+/// Pure, total, deterministic: no I/O, no &mut, no herdr/toron calls.
+pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<DoorbellAction>) {
+    let mut next = model.clone();
+    let mut actions = Vec::new();
+    match msg {
+        DoorbellMsg::WatchNdjson { line } => {
+            let Some((class, hint)) = parse_watch_ndjson(line, &next.index) else {
+                return (next, actions);
+            };
+            let line_out = doorbell_line(class, &hint);
+            for pin in watch_targets(line, &next.index) {
+                route_or_queue(&mut next, &mut actions, &pin, line_out.clone());
+            }
+        }
+        DoorbellMsg::InboxItems { raw, pin } => {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+                actions.push(DoorbellAction::Audit {
+                    kind: "inbox_parse_failure".into(),
+                    pin: pin.clone(),
+                    detail: raw.clone(),
+                });
+                return (next, actions);
+            };
+            for item in expand_inbox_rows(&v) {
+                let Some((class, hint)) = parse_inbox_item(item) else {
+                    continue;
+                };
+                let line_out = doorbell_line(class, &hint);
+                route_or_queue(&mut next, &mut actions, pin, line_out);
+            }
+        }
+        DoorbellMsg::InboxRows { rows, pin } => {
+            // Plane-P sweep path: rows already parsed (Values), no round-trip.
+            for item in rows {
+                let Some((class, hint)) = parse_inbox_item(item) else {
+                    continue;
+                };
+                let line_out = doorbell_line(class, &hint);
+                route_or_queue(&mut next, &mut actions, pin, line_out);
+            }
+        }
+        DoorbellMsg::HerdrStatus { pin, status } => {
+            let from = next
+                .statuses
+                .get(pin)
+                .cloned()
+                .unwrap_or_else(|| "unknown".into());
+            if is_drain_transition(&from, status) {
+                if let Some(q) = next.queues.get_mut(pin) {
+                    for line in std::mem::take(q) {
+                        actions.push(DoorbellAction::Prompt {
+                            pin: pin.clone(),
+                            line,
+                        });
+                    }
+                }
+            }
+            next.statuses.insert(pin.clone(), status.clone());
+        }
+        DoorbellMsg::Fact { summary } => {
+            // The doorbell-side reducer has no captain alias — an alias-less
+            // fact is a LOUD miss (never registry.first()).
+            actions.push(DoorbellAction::FactMiss {
+                why: format!("fact without captain alias: {}", summary),
+            });
+        }
+        DoorbellMsg::AckSlaTick { now } => {
+            // The scan is check_ack_sla_expired (toron), not an inbox fetch.
+            // Overdue wakes arrive back as kind-9 ack-sla-expired WatchNdjson.
+            actions.push(DoorbellAction::CheckAckSla);
+            // leftover #13: FetchInbox is now a real Cmd whose rows re-enter as InboxRows
+            actions.push(DoorbellAction::FetchInbox {
+                since: format!("{now}"),
+            });
+        }
+        DoorbellMsg::WatchDied => {
+            // Never exit the dispatcher: restart is the only path (heal_tick is backup).
+            actions.push(DoorbellAction::RestartWatch);
+        }
+    }
+    (next, actions)
+}
+
+/// Idle/done/blocked panes get a Prompt now; working panes queue (drained on
+/// the next working -> idle|done|blocked HerdrStatus).
+fn route_or_queue(
+    next: &mut DoorbellModel,
+    actions: &mut Vec<DoorbellAction>,
+    pin: &str,
+    line: String,
+) {
+    let status = next
+        .statuses
+        .get(pin)
+        .map(String::as_str)
+        .unwrap_or("unknown");
+    if should_inject(status) {
+        actions.push(DoorbellAction::Prompt {
+            pin: pin.to_string(),
+            line,
+        });
+    } else {
+        next.queues.entry(pin.to_string()).or_default().push(line);
+    }
+}
+
+impl DoorbellAction {
+    /// Test/debug label (also keeps the enum honest in logs).
+    pub fn to_label(&self) -> String {
+        match self {
+            Self::Prompt { pin, .. } => format!("prompt {pin}"),
+            Self::FetchInbox { since } => format!("fetch-inbox {since}"),
+            Self::CheckAckSla => "check-ack-sla".into(),
+            Self::RestartWatch => "restart-watch".into(),
+            Self::FactMiss { why } => format!("fact-miss {why}"),
+            Self::Audit { kind, pin, .. } => format!("audit {kind} {pin}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model_with(pin: &str) -> DoorbellModel {
+        let mut m = DoorbellModel::default();
+        m.index.insert_pin(pin.to_string(), None);
+        m.statuses.insert(pin.to_string(), "idle".into());
+        m
+    }
+
+    #[test]
+    fn doorbell_tick_is_pure_and_deterministic() {
+        let model = model_with("BlueRidge");
+        let msg = DoorbellMsg::WatchDied;
+        let (m1, a1) = tick(&model, &msg);
+        let (m2, a2) = tick(&model, &msg);
+        assert_eq!(a1, a2);
+        assert_eq!(m1.queues.len(), m2.queues.len());
+    }
+
+    #[test]
+    fn doorbell_tick_watch_died_produces_restart() {
+        let model = DoorbellModel::default();
+        let (_, actions) = tick(&model, &DoorbellMsg::WatchDied);
+        assert!(actions.contains(&DoorbellAction::RestartWatch));
+    }
+
+    #[test]
+    fn doorbell_tick_watch_line_prompts_idle_pin() {
+        let model = model_with("BlueRidge");
+        let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#;
+        let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            DoorbellAction::Prompt { pin, line } => {
+                assert_eq!(pin, "BlueRidge");
+                assert!(line.contains("[doorbell]"));
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+        assert!(next.queues.is_empty(), "idle pin must not queue");
+    }
+
+    #[test]
+    fn doorbell_tick_watch_line_queues_working_pin_then_drains() {
+        let mut model = model_with("BlueRidge");
+        model.statuses.insert("BlueRidge".into(), "working".into());
+        let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#;
+        let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
+        assert!(actions.is_empty(), "working pin must not prompt");
+        assert_eq!(next.queues.get("BlueRidge").map(Vec::len), Some(1));
+        let (next2, actions2) = tick(
+            &next,
+            &DoorbellMsg::HerdrStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        assert_eq!(actions2.len(), 1);
+        assert!(actions2[0].to_label().contains("BlueRidge"));
+        assert!(
+            next2
+                .queues
+                .get("BlueRidge")
+                .is_none_or(std::vec::Vec::is_empty)
+        );
+    }
+
+    #[test]
+    fn doorbell_tick_mail_delivered_pulls_inbox_not_channel() {
+        let model = model_with("BlueRidge");
+        let line = r#"{"kind":9,"id":"aa","tags":[["p","BlueRidge"],["toron-kind","mail-delivered"],["h","t-1"]],"content":"sealed"}"#;
+        let (_, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            DoorbellAction::Prompt { line, .. } => {
+                assert!(line.contains("inbox"), "mail wake must pull inbox: {line}");
+                assert!(
+                    !line.contains("channel read"),
+                    "mail wake must not channel read: {line}"
+                );
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doorbell_tick_room_chatter_is_silent() {
+        let mut model = model_with("BlueRidge");
+        model.index.insert_pin("LilacChapel".into(), None);
+        let line = r#"{"kind":9,"id":"cc","tags":[["h","ch-1"]],"content":"room talk"}"#;
+        let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
+        assert!(actions.is_empty(), "unaddressed chatter must not ring");
+        assert!(next.queues.is_empty());
+    }
+
+    #[test]
+    fn doorbell_tick_inbox_messages_wrapper_parses() {
+        // fetch_inbox also emits {"messages":[...]} — must expand, not treat
+        // the wrapper as one unparseable row.
+        let model = model_with("BlueRidge");
+        let raw = r#"{"messages":[{"importance":"urgent"},{"importance":"high"},{"importance":"normal"}]}"#;
+        let (_, actions) = tick(
+            &model,
+            &DoorbellMsg::InboxItems {
+                raw: raw.into(),
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert_eq!(actions.len(), 2, "urgent+high ring, normal stays quiet");
+    }
+
+    #[test]
+    fn doorbell_tick_inbox_rows_prompts_idle_pin() {
+        let model = model_with("BlueRidge");
+        let rows = vec![
+            serde_json::json!({"importance":"urgent"}),
+            serde_json::json!({"importance":"high"}),
+            serde_json::json!({"importance":"normal"}),
+        ];
+        let (_, actions) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows,
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert_eq!(actions.len(), 2, "urgent+high ring, normal stays quiet");
+        for a in &actions {
+            assert!(a.to_label().contains("BlueRidge"));
+        }
+    }
+
+    #[test]
+    fn doorbell_tick_bad_inbox_json_is_loud_audit() {
+        let model = model_with("BlueRidge");
+        let (_, actions) = tick(
+            &model,
+            &DoorbellMsg::InboxItems {
+                raw: "{not json".into(),
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "inbox_parse_failure"),
+            "parse failure must be a loud audit, got {:?}",
+            actions
+        );
+    }
+}

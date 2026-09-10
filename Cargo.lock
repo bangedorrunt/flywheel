@@ -967,6 +967,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "doorbell-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dotenvy"
 version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1138,6 +1147,7 @@ dependencies = [
  "crossterm",
  "dialoguer",
  "dirs",
+ "doorbell-core",
  "dotenvy",
  "evalexpr",
  "futures-core",

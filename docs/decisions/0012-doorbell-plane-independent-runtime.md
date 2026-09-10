@@ -1,7 +1,7 @@
 <!-- governed-by: ADR-0005, ADR-0010, ADR-0011, toron ADR-0020, toron ADR-0027, toron ADR-0028 -->
 ---
-status: proposed
-revision: 2 (2026-09-10 — captain found rev 1 gappy; rewritten around three design pillars)
+status: accepted
+revision: 3 (2026-09-10 — accepted; Phase 0 landed via bd-asr2)
 date: 2026-09-09 (rev 1), 2026-09-10 (rev 2)
 decision-makers: Captain (bangedorrunt)
 consulted: |
@@ -17,7 +17,7 @@ informed: flywheel × toron × beads maintainers; harness agents (grok/pi/omp/op
 
 | Field | Value |
 |-------|-------|
-| **Status** | **Proposed** (rev 2, 2026-09-10) |
+| **Status** | **Accepted** (rev 3, 2026-09-10; Phase 0 landed via bd-asr2) |
 | **Decision-makers** | Captain (bangedorrunt) |
 | **Extends** | [ADR-0005](0005-always-on-collab-baseline-and-command-surface.md) (doorbell Layer 0, peer-aware, 5/30/3 budget), [ADR-0010](0010-delivery-semantics-attention-triage-decision-lifecycle.md) (delivery semantics, attention triage, `why`-fold), [ADR-0011](0011-session-conductor-crew-budget-captain-fcfs-join-loud.md) (arrive/briefing/join-loud, doorbell-on-arrive), [toron ADR-0020](../../toron/docs/decisions/0020-nostr-two-plane-cli-and-crew-steering.md) (planes P/S/J/N/W, CLI-first), [toron ADR-0027](../../toron/docs/decisions/0027-one-workspace-tick-control-plane.md) (one tick, Tick Law, one-RAM-owner — the flywheel-side implementation), [toron ADR-0028](../../toron/docs/decisions/0028-jido-behavior-first-on-wheelhouse-nouns.md) (control-plane vocabulary: sensors are Msg producers; no second bus) |
 | **Does not amend** | frozen MCP tool surface; toron kind registry; one-way deps (extends them: doorbell crates become new leaves); Tick Law (slices stay private, one live reducer per owner); fail-closed bead close; SIGNOFF captain-only |
