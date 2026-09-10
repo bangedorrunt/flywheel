@@ -87,7 +87,8 @@ pub async fn run(cfg: &Config) -> Result<()> {
     let serve_tcp = async {
         loop {
             let (stream, _) = tcp.accept().await?;
-            tokio::spawn(handle_http(stream, started));
+            let sd = cfg.state_dir.clone();
+            tokio::spawn(handle_http(stream, started, sd));
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
@@ -181,7 +182,11 @@ fn copy_truncate_over(path: &std::path::Path, cap: u64) {
     }
 }
 
-async fn handle_http(mut stream: tokio::net::TcpStream, started: std::time::Instant) {
+async fn handle_http(
+    mut stream: tokio::net::TcpStream,
+    started: std::time::Instant,
+    state_dir: std::path::PathBuf,
+) {
     let mut buf = vec![0u8; 4096];
     let Ok(n) = stream.read(&mut buf).await else {
         return;
@@ -193,7 +198,7 @@ async fn handle_http(mut stream: tokio::net::TcpStream, started: std::time::Inst
         .and_then(|l| l.split_whitespace().nth(1))
         .unwrap_or("/");
     let (code, body) = match path {
-        "/health" => ("200 OK", health_body(started)),
+        "/health" => ("200 OK", health_body(started, &state_dir)),
         _ => (
             "404 Not Found",
             serde_json::json!({"error": "not found"}).to_string(),
@@ -229,11 +234,13 @@ async fn handle_uds(mut stream: tokio::net::UnixStream, started: std::time::Inst
     };
     let _ = stream.write_all(body.as_bytes()).await;
 }
-
-/// D2 `/health`: read-only, unauthenticated on loopback/UDS. Dynamic
-/// fields report standby until their phase binds them (subscribers:
-/// bd-asr2.8; watch/sweep: bd-asr2.5; journal seq: bd-asr2.6).
-fn health_body(started: std::time::Instant) -> String {
+fn health_body(started: std::time::Instant, state_dir: &std::path::Path) -> String {
+    // D4.4: a torn journal tail degrades loudly here (bd-asr2.4).
+    let store = doorbell_rt::FileStore::new(state_dir);
+    let mut degraded = Vec::new();
+    if store.any_torn_tail() {
+        degraded.push("journal_torn_tail".to_string());
+    }
     serde_json::json!({
         "protocol": doorbell_rt::api::PING.protocol,
         "core_v": doorbell_rt::api::PING.core_v,
@@ -242,7 +249,7 @@ fn health_body(started: std::time::Instant) -> String {
         "watch": {"state": "standby", "last_event_age_s": null},
         "sweep": {"last_age_s": null},
         "subscribers": 0,
-        "degraded": [],
+        "degraded": degraded,
         "journal": {"seq": 0, "lag_lines": 0},
         "owner": {"pid": std::process::id(), "gen": null, "host": hostname()},
     })

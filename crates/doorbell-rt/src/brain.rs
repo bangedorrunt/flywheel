@@ -49,8 +49,10 @@ pub struct Brain<H: Host> {
     digest_since: Option<tokio::time::Instant>,
     stats: Stats,
     sweep_last: Option<u64>,
+    /// Next journal seq (D4.4): resumed from the tail so rows stay
+    /// monotonic per workspace across restarts.
+    next_seq: u64,
 }
-
 impl<H: Host> Brain<H> {
     /// Wire: `let (tx, rx) = mpsc::channel(BRAIN_CAP);`
     /// `let sinks = SinkManager::new(tx.clone());`
@@ -59,6 +61,7 @@ impl<H: Host> Brain<H> {
         let wake = store.load_wake(&cfg.workspace);
         let mut hear = HearTracker::default();
         hear.seed_unanswered(store.load_unanswered(&cfg.workspace));
+        let next_seq = store.last_seq(&cfg.workspace) + 1;
         Self {
             cfg,
             host,
@@ -71,6 +74,7 @@ impl<H: Host> Brain<H> {
             digest_since: None,
             stats: Stats::default(),
             sweep_last: None,
+            next_seq,
         }
     }
 
@@ -220,8 +224,8 @@ impl<H: Host> Brain<H> {
             Some(f) => f != s.as_str(),
             None => true,
         };
-        let observed = transitioned
-            && matches!(s.as_str(), "working" | "idle" | "done" | "blocked");
+        let observed =
+            transitioned && matches!(s.as_str(), "working" | "idle" | "done" | "blocked");
         let woke = if observed {
             Some(pin.clone())
         } else {
@@ -477,7 +481,7 @@ impl<H: Host> Brain<H> {
     }
 
     fn journal(
-        &self,
+        &mut self,
         msg: &serde_json::Value,
         effects: &[Effect],
         executed: serde_json::Value,
@@ -501,9 +505,16 @@ impl<H: Host> Brain<H> {
                 })
                 .collect::<Vec<_>>()
         );
-        let _ = self
-            .store
-            .append_journal(&self.cfg.workspace, msg, &actions, executed, pins);
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let _ = self.store.append_journal_seq(
+            &self.cfg.workspace,
+            msg,
+            &actions,
+            executed,
+            pins,
+            Some(seq),
+        );
     }
 
     fn audit(&self, kind: &str, mut detail: serde_json::Value) {
@@ -530,9 +541,7 @@ impl<H: Host> Brain<H> {
         if let Some(pin) = woke {
             changed |= doorbell_core::note_wake(&mut self.wake, pin, self.host.now_unix());
         }
-        if changed
-            && let Err(e) = self.store.save_wake(&self.cfg.workspace, &self.wake)
-        {
+        if changed && let Err(e) = self.store.save_wake(&self.cfg.workspace, &self.wake) {
             // GS-039: refuse silent drop — loud warn with the failing arm.
             eprintln!(
                 "doorbell-rt: observed-wake stamp FAILED on {ctx} — refuse silent drop (GS-039): {e:#}"

@@ -1001,6 +1001,9 @@ pub fn journal_append(
 /// the field) fold with Unknown-presence semantics — the fold never invents
 /// idle. Serde-side the field is plain JSON (`null` when absent); readers use
 /// `entry.get("pins")` with missing/null meaning unknown.
+/// Append via the doorbell-rt store (bd-asr2.4): rotation, seq-capable
+/// envelope, one implementation. Legacy writer (no seq): the fold
+/// tolerates seq-less rows without a contiguity check.
 pub fn journal_append_workspace(
     state_dir: &Path,
     workspace: &str,
@@ -1009,39 +1012,10 @@ pub fn journal_append_workspace(
     executed: serde_json::Value,
     pins: Option<&[String]>,
 ) {
-    let path = journal_file(state_dir, workspace);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let entry = serde_json::json!({
-        "v": 1,
-        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        "workspace": workspace,
-        "msg": msg,
-        "actions": cmds,
-        "executed": executed,
-        "pins": pins,
-    });
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(f, "{entry}");
-    }
-    // Same 5 MiB / 5k line cap — workspace journal is the same file.
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() > 5 * 1024 * 1024 {
-            if let Ok(raw) = std::fs::read_to_string(&path) {
-                let lines: Vec<&str> = raw.lines().collect();
-                if lines.len() > 5000 {
-                    let keep = lines[lines.len() - 5000..].join("\n") + "\n";
-                    let _ = std::fs::write(&path, keep);
-                }
-            }
-        }
-    }
+    let store = doorbell_rt::FileStore::new(state_dir);
+    let msg_v = serde_json::to_value(msg).unwrap_or(serde_json::Value::Null);
+    let actions_v = serde_json::to_value(cmds).unwrap_or(serde_json::Value::Null);
+    let _ = store.append_journal(workspace, &msg_v, &actions_v, executed, pins.unwrap_or(&[]));
 }
 
 /// Journal envelope version (ADR-0012 D4.1, Phase 0). Writers stamp `"v": 1`;
@@ -1051,44 +1025,50 @@ pub fn journal_entry_version(entry: &serde_json::Value) -> u64 {
     entry.get("v").and_then(|v| v.as_u64()).unwrap_or(1)
 }
 
-/// All journal entries across every workspace, oldest first. Missing or
-/// corrupt lines are skipped (a journal is a trust surface, not a WAL).
+/// All journal entries across every workspace, oldest first — active plus
+/// retained generations (bd-asr2.4). Corrupt lines stop that workspace's
+/// fold loudly (see [`journal_fold_status`]); this compat reader skips
+/// past the tear so existing callers keep working, and strips the `.N`
+/// generation suffix back to the workspace name.
 pub fn journal_read_all(state_dir: &Path) -> Vec<(String, serde_json::Value)> {
-    let dir = state_dir.join("journals");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    let store = doorbell_rt::FileStore::new(state_dir);
+    let mut workspaces = std::collections::BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(state_dir.join("journals")) else {
         return Vec::new();
     };
-    let mut paths: Vec<PathBuf> = entries
-        .filter_map(std::result::Result::ok)
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("doorbell-journal-") && n.ends_with(".jsonl"))
-                .unwrap_or(false)
-        })
-        .collect();
-    paths.sort();
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(rest) = name
+            .strip_prefix("doorbell-journal-")
+            .and_then(|n| n.strip_suffix(".jsonl"))
+            && !rest.is_empty()
+        {
+            workspaces.insert(rest.split('.').next().unwrap_or(rest).to_string());
+        }
+    }
     let mut out = Vec::new();
-    for p in paths {
-        let workspace = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| {
-                n.trim_start_matches("doorbell-journal-")
-                    .trim_end_matches(".jsonl")
-                    .to_string()
-            })
-            .unwrap_or_default();
-        if let Ok(raw) = std::fs::read_to_string(&p) {
-            for line in raw.lines() {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                    out.push((workspace.clone(), v));
-                }
-            }
+    for ws in workspaces {
+        let fold = store.fold_workspace(&ws);
+        for row in fold.rows {
+            out.push((ws.clone(), row));
         }
     }
     out
+}
+
+/// Loud fold status for `why` and `/health` (bd-asr2.4 D4.4): torn tail
+/// (file, line, reason) and the first foldable seq for retention-honest
+/// queries. `None` torn + `None` first_seq = empty journal, not an error.
+pub fn journal_fold_status(state_dir: &Path, workspace: &str) -> (Option<String>, Option<u64>) {
+    let store = doorbell_rt::FileStore::new(state_dir);
+    let fold = store.fold_workspace(workspace);
+    let torn = fold.torn.map(|t| {
+        format!(
+            "fold stopped at {} line {} ({}); nothing folds past the gap",
+            t.file, t.at_line, t.reason
+        )
+    });
+    (torn, fold.first_seq)
 }
 
 #[cfg(test)]
