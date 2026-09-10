@@ -2717,7 +2717,11 @@ mod bell_fold_tests {
         );
         let main = include_str!("main.rs");
         assert!(
-            !main.contains(&sub),
+            // `::` prefix so it cannot match the LEGITIMATE doorbell
+            // subscription CLI arm (bd-55nx.7 targets the deleted
+            // workspace Cmd variant, not the doorbell subscription verb).
+            // Needle is split so this self-scan does not match its own source.
+            !main.contains(&["::Cmd::Sub", "scribe"].concat()),
             "RED (55nx.7): main.rs still matches the dead Subscribe Cmd — delete the no-op arm"
         );
         assert!(

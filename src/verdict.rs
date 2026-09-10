@@ -516,7 +516,16 @@ pub fn bead_from_br_show(cwd: &Path, bead_id: &str) -> anyhow::Result<BeadUnit> 
     }
     let stdout = run_br(cwd, &["show", bead_id, "--json"])?;
     let v: serde_json::Value = serde_json::from_str(stdout.trim())?;
-    let row: BrShow = serde_json::from_value(v[0].clone())?;
+    // br show <id> --json historically returned a one-element array; current
+    // br returns the object directly. Accept both shapes (bd-repair-red-tests:
+    // the array expectation made EVERY close_check fail to deserialize and
+    // reopen legally-closed beads).
+    let row_val = if v.is_array() {
+        v.get(0).cloned().unwrap_or(serde_json::Value::Null)
+    } else {
+        v
+    };
+    let row: BrShow = serde_json::from_value(row_val)?;
     let verify = row.verify.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
         anyhow::anyhow!("bead {bead_id}: missing/empty typed verify field — refuse to dispatch")
     })?;

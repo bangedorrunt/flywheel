@@ -31,14 +31,19 @@ fn builtin_bug_fix() -> Workflow {
     toron_workflow::schema::parse_workflow(&yaml).expect("bug-fix parses")
 }
 
-/// Pull the raw `r##"..."##` YAML for `name` from BUILTIN_WORKFLOWS_YAML.
+/// Pull the raw YAML for `name` from BUILTIN_WORKFLOWS_YAML (r##" or r#"
+/// delimiters — bd-w2-fix-path moved fix-path playbooks to r##" blocks).
 fn extract_builtin_yaml(src: &str, name: &str) -> Option<String> {
     let marker = format!("(\n        \"{name}\",\n");
     let start = src.find(&marker)? + marker.len();
     let rest = &src[start..];
-    let open = rest.find("r##\"")?;
-    let body_start = open + 4;
-    let body_end = rest[body_start..].find("\"##")? + body_start;
+    let (open, delim) = [("r##\"", "##"), ("r#\"", "#")]
+        .iter()
+        .filter_map(|(d, end)| rest.find(d).map(|pos| (pos, *end)))
+        .min_by_key(|(pos, _)| *pos)?;
+    let body_start = open + delim.len() + 2; // r + hashes + opening quote
+    let end_marker = format!("\"{delim}");
+    let body_end = rest[body_start..].find(&end_marker)? + body_start;
     Some(rest[body_start..body_end].to_string())
 }
 
@@ -163,11 +168,13 @@ fn bug_fix_cli_control_flow_reports_all_nodes() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json stdout");
-    // crew: scout (repro) + recipe coders/reviewers + reviewer (prove)
-    // repair-until-verified has 3 coder + 3 reviewer nodes, plus prove reviewer
+    // crew: scout (repro) + recipe coders/reviewers + reviewer (prove).
+    // GS-039 P0-3 (ADR-0011 D2): repair-until-verified ships an EXPLICIT
+    // crew coder:1 reviewer:1 — never auto-balloon to 3+3 — so the expanded
+    // run reports one member per role (sub-workflow roles take max).
     assert_eq!(v["crew"]["scout"], 1, "crew: {v}");
-    assert_eq!(v["crew"]["coder"], 3, "crew: {v}");
-    assert_eq!(v["crew"]["reviewer"], 4, "crew: {v}");
+    assert_eq!(v["crew"]["coder"], 1, "crew: {v}");
+    assert_eq!(v["crew"]["reviewer"], 1, "crew: {v}");
     // repro, fix (recipe), prove dispatched (recording mode reports each node)
     let output = v["output"].as_object().expect("output object");
     for node in ["repro", "fix", "prove"] {

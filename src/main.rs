@@ -7889,9 +7889,8 @@ mod spawn_boot_reliability_tests {
             "GS-039 P0-1 wake observation helper must be present"
         );
         assert!(
-            brain_rt.contains("async fn deliver_prompts")
-                && brain_rt.contains("delivered.push(pin)"),
-            "deliver_prompts must return delivered pins for the wake stamp"
+            brain_rt.contains("async fn deliver_prompts") && brain_rt.contains("queued.push(pin)"),
+            "deliver_prompts must return accepted-intent pins for the wake stamp (F5: Queued counts, hear stamps on Delivered)"
         );
         // Split needles so this assert body cannot invent-green-match itself.
         let invent_a = format!("{}{}{}", "or_else(", "|", "| injects.first()");
@@ -20082,7 +20081,21 @@ fn build_queue(
 fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
     let v: Value =
         serde_json::from_str(raw.trim()).map_err(|e| anyhow!("br ready bad JSON: {e}: {raw}"))?;
-    let beads: Vec<Value> = v.as_array().cloned().unwrap_or_default();
+    // br ready --json is a bare array (older br) or {"issues":[...]} (newer,
+    // schema-18 pagination envelope) — accept both. An unknown object shape
+    // is loud, never a silent empty dispatch queue.
+    let beads: Vec<Value> = match &v {
+        Value::Array(items) => items.clone(),
+        Value::Object(obj) => {
+            let issues = obj.get("issues").cloned().unwrap_or_default();
+            anyhow::ensure!(
+                issues.is_array(),
+                "br ready JSON: unrecognized object shape (expected issues array): {raw}"
+            );
+            issues.as_array().cloned().unwrap_or_default()
+        }
+        _ => anyhow::bail!("br ready JSON: expected array or issues object: {raw}"),
+    };
     Ok(beads
         .into_iter()
         .map(|b| durable::ReadyBead {
@@ -21194,7 +21207,14 @@ mod verifier_dispatch_tests {
             .output()
             .unwrap();
         let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-        v[0]["status"].as_str().unwrap_or("").to_string()
+        // br show --json returns either a bare object or a 1-elem array
+        // (schema drift across br versions) — accept both.
+        let bead = match &v {
+            Value::Array(items) => items.first().cloned().unwrap_or(Value::Null),
+            obj @ Value::Object(_) => obj.clone(),
+            _ => Value::Null,
+        };
+        bead["status"].as_str().unwrap_or("").to_string()
     }
 
     /// A config whose mail backend fails FAST (daemon at port 1) so the
@@ -21407,7 +21427,14 @@ mod loop_run_verify_tests {
             .output()
             .unwrap();
         let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-        v[0]["status"].as_str().unwrap_or("").to_string()
+        // br show --json returns either a bare object or a 1-elem array
+        // (schema drift across br versions) — accept both.
+        let bead = match &v {
+            Value::Array(items) => items.first().cloned().unwrap_or(Value::Null),
+            obj @ Value::Object(_) => obj.clone(),
+            _ => Value::Null,
+        };
+        bead["status"].as_str().unwrap_or("").to_string()
     }
 
     fn no_mail_cfg() -> Config {
@@ -22110,8 +22137,19 @@ mod loop_tests {
                     .expect("br ready");
                 let rv: serde_json::Value =
                     serde_json::from_slice(&ready.stdout).expect("ready json");
+                // br ready --json: bare array (older br) or issues envelope
+                // (newer) — accept both.
+                let ready_items = match &rv {
+                    serde_json::Value::Array(items) => items.as_slice(),
+                    serde_json::Value::Object(obj) => obj
+                        .get("issues")
+                        .and_then(Value::as_array)
+                        .map(|a| a.as_slice())
+                        .unwrap_or(&[]),
+                    _ => &[],
+                };
                 assert!(
-                    rv.as_array().unwrap().iter().any(|b| b["id"] == bead_id),
+                    ready_items.iter().any(|b| b["id"] == bead_id),
                     "reopened bead is back in br ready: {rv}"
                 );
                 // tick 2 (repeated): no second mail — exactly one per (bead, sha)
@@ -32119,10 +32157,15 @@ fn resolve_planner_for_bead(project_dir: &str, bead_id: &str, fallback: &str) ->
         .output()
         && out.status.success()
         && let Ok(v) = serde_json::from_slice::<Value>(&out.stdout)
-        && let Some(created_by) = v
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(|b| b.get("created_by"))
+        // br show --json is a bare object (newer br) or a 1-elem array
+        // (older) — accept both shapes.
+        && let Some(bead) = match &v {
+            Value::Array(items) => items.first(),
+            obj @ Value::Object(_) => Some(obj),
+            _ => None,
+        }
+        && let Some(created_by) = bead
+            .get("created_by")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
     {
@@ -35418,7 +35461,21 @@ mod send_conditioning_tests {
             state::SpawnEntry::profiled("w:p3", "crew-scout", "scout", "opencode", None);
         let (text, profile, _) =
             condition_send_target(Some(&mut entry), &catalog, "echo who you are", true);
-        assert_eq!(text, "echo who you are", "--raw sends verbatim");
+        // GS-039 P0-2: --raw skips profile conditioning (no behavior
+        // preamble) but frames the text AUTHORITATIVE so peer-aware agents
+        // cannot classify operator text as chatter.
+        assert!(
+            !text.contains("You are a SCOUT."),
+            "--raw bypasses profile conditioning: {text:?}"
+        );
+        assert!(
+            text.contains("AUTHORITATIVE OPERATOR OBJECTIVE") && text.contains("GS-039 P0-2"),
+            "--raw is framed AUTHORITATIVE: {text:?}"
+        );
+        assert!(
+            text.contains("echo who you are"),
+            "mission preserved verbatim: {text:?}"
+        );
         assert_eq!(profile, None);
     }
 
@@ -36662,7 +36719,9 @@ mod why_resume_tests {
     fn why_seeds_assignment_before_fold() {
         let src = include_str!("main.rs");
         let pos = src.find("fn cmd_doorbell_why(").expect("cmd_doorbell_why");
-        let slice = &src[pos..std::cmp::min(src.len(), pos + 6000)];
+        // Window must cover the fold setup (~7.3k chars in): receipts seed,
+        // presence seed, per-ws Default, and the replay loop.
+        let slice = &src[pos..std::cmp::min(src.len(), pos + 9000)];
         assert!(
             slice.contains("rebuild_assignment_from_receipts"),
             "RED (55nx.1): why folds from Default without the receipts seed — tasked corrs vanish from replay"

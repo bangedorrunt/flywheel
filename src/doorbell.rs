@@ -3047,8 +3047,18 @@ mod tests {
     #[test]
     fn cron_sink_flag_off_writes_nothing() {
         // bd-asr2.16: without the flag, tick completion is a silent no-op.
-        // Uses the real state dir (read-only listing) — the flag gate
-        // returns before any write path.
+        // Hermetic home (the operator's real config may carry
+        // cron_doorbell_sink = true, which made this env-dependent): a
+        // fresh XDG config+state pair parses with the flag at its
+        // default-off, so the gate must return before any write path.
+        let _home = crate::config::test_state_home();
+        let cfg_dir = crate::config::config_dir();
+        std::fs::create_dir_all(&cfg_dir).expect("cfg dir");
+        std::fs::write(
+            crate::config::config_file(),
+            "[doorbell]\nbeads_poller = false\ncron_doorbell_sink = false\n",
+        )
+        .expect("write hermetic config");
         let listed = || -> Vec<String> {
             std::fs::read_dir(crate::config::state_dir().join("journals"))
                 .map(|rd| {
