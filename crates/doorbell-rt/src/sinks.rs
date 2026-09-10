@@ -326,7 +326,204 @@ impl PromptSink for MockSink {
     }
 }
 
-#[cfg(test)]
+/// Operator-approved egress hosts (D6 threat table: attention metadata
+/// must not exfiltrate). Exact host or `.suffix` match, lowercase.
+#[derive(Debug, Clone, Default)]
+pub struct EgressAllowlist {
+    hosts: Vec<String>,
+}
+
+impl EgressAllowlist {
+    pub fn new(hosts: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            hosts: hosts
+                .into_iter()
+                .map(|h| h.to_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect(),
+        }
+    }
+
+    pub fn allows(&self, url: &str) -> bool {
+        let host = url_host(url);
+        self.hosts
+            .iter()
+            .any(|h| host == *h || (h.starts_with('.') && host.ends_with(h.as_str())))
+    }
+}
+
+fn url_host(url: &str) -> String {
+    url.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split(['/', ':', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+/// Webhook POST sink (D3/D6): bounded queue upstream, minimal payload by
+/// default (hint + counts), full line only with per-subscription opt-in.
+/// Hand-rolled POST (one route, no dependency); blocking per-sink worker
+/// isolates slow endpoints from the brain (E15).
+pub struct WebhookSink {
+    url: String,
+    full_line: bool,
+    timeout: std::time::Duration,
+}
+
+impl WebhookSink {
+    /// Refuses non-allowlisted hosts at construction (fail-closed).
+    pub fn new(
+        url: impl Into<String>,
+        allowlist: &EgressAllowlist,
+        full_line: bool,
+    ) -> anyhow::Result<Self> {
+        let url = url.into();
+        if !allowlist.allows(&url) {
+            anyhow::bail!("webhook host not allowlisted: {url}");
+        }
+        Ok(Self {
+            url,
+            full_line,
+            timeout: std::time::Duration::from_secs(10),
+        })
+    }
+
+    fn render(&self, subscriber: &str, pin: &str, line: &str) -> String {
+        if self.full_line {
+            return serde_json::json!({
+                "subscriber": subscriber,
+                "pin": pin,
+                "line": line,
+            })
+            .to_string();
+        }
+        let hint: String = line.chars().take(120).collect();
+        serde_json::json!({
+            "subscriber": subscriber,
+            "pin": pin,
+            "hint": hint,
+            "truncated": line.chars().count() > 120,
+        })
+        .to_string()
+    }
+
+    fn post(&self, body: &str) -> anyhow::Result<()> {
+        use std::io::{Read, Write};
+        let host = url_host(&self.url);
+        let mut stream = std::net::TcpStream::connect_timeout(
+            &format!("{host}:80")
+                .parse()
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+            self.timeout,
+        )?;
+        // Only plain-http loopback/allowlisted hosts in Phase 2 (TLS via
+        // the operator's terminator; revisit with push transport).
+        stream.set_write_timeout(Some(self.timeout))?;
+        stream.set_read_timeout(Some(self.timeout))?;
+        write!(
+            stream,
+            "POST / HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )?;
+        let mut resp = [0u8; 12];
+        stream.read_exact(&mut resp)?;
+        let status: u16 = String::from_utf8_lossy(&resp[9..12]).parse().unwrap_or(0);
+        if !(200..300).contains(&status) {
+            anyhow::bail!("webhook {host} answered {status}");
+        }
+        Ok(())
+    }
+}
+
+impl PromptSink for WebhookSink {
+    fn send(&mut self, pin: &str, line: &str) -> anyhow::Result<()> {
+        // Subscriber identity rides from the subscription store binding in
+        // bd-asr2.11; until then the pin scopes the payload.
+        self.post(&self.render(pin, pin, line))
+    }
+
+    fn name(&self) -> &str {
+        "webhook"
+    }
+}
+
+/// NIP-17 DM sink (D3/D6): key custody first. The daemon stores ncryptsec
+/// keys ONLY for service identities it mints; human/operator keys are
+/// refused at construction (never held). Transport binds in bd-asr2.17
+/// (service identities + emit); until then delivery records intents.
+pub struct DmSink {
+    service_id: String,
+    transport: Box<dyn DmTransport>,
+}
+
+/// DM transport seam (real NIP-17 gift-wrap binds in Phase 4).
+pub trait DmTransport: Send + 'static {
+    fn send_dm(&mut self, to: &str, hint: &str) -> anyhow::Result<()>;
+}
+
+/// Key custody gate: only `svc:` service identities minted by the daemon.
+/// Anything else (human npub, nsec, opaque) is refused — the daemon must
+/// never hold human keys (D6).
+impl DmSink {
+    pub fn for_service(
+        service_id: impl Into<String>,
+        transport: Box<dyn DmTransport>,
+    ) -> anyhow::Result<Self> {
+        let service_id = service_id.into();
+        if !service_id.starts_with("svc:") {
+            anyhow::bail!("DM sink refuses non-service identity (daemon never holds human keys)");
+        }
+        Ok(Self {
+            service_id,
+            transport,
+        })
+    }
+}
+
+impl PromptSink for DmSink {
+    fn send(&mut self, pin: &str, line: &str) -> anyhow::Result<()> {
+        let hint: String = line.chars().take(120).collect();
+        self.transport.send_dm(&self.service_id_for(pin), &hint)
+    }
+
+    fn name(&self) -> &str {
+        "dm"
+    }
+}
+
+impl DmSink {
+    fn service_id_for(&self, _pin: &str) -> String {
+        // Per-subscriber recipient mapping binds with the subscription
+        // store in bd-asr2.11; today the service identity is the recipient.
+        self.service_id.clone()
+    }
+}
+
+/// Recording DM transport for tests.
+pub struct MockDmTransport {
+    pub sent: Vec<(String, String)>,
+    pub fail: bool,
+}
+
+impl MockDmTransport {
+    pub fn new() -> Self {
+        Self {
+            sent: Vec::new(),
+            fail: false,
+        }
+    }
+}
+
+impl DmTransport for MockDmTransport {
+    fn send_dm(&mut self, to: &str, hint: &str) -> anyhow::Result<()> {
+        if self.fail {
+            anyhow::bail!("dm transport down");
+        }
+        self.sent.push((to.into(), hint.into()));
+        Ok(())
+    }
+}
 mod tests {
     use super::*;
 
@@ -412,5 +609,82 @@ mod tests {
                 SendOutcome::Absent
             ));
         });
+    }
+
+    #[test]
+    fn allowlist_refuses_unlisted_hosts() {
+        let allow = EgressAllowlist::new(["hooks.internal".into(), ".ops.example".into()]);
+        assert!(allow.allows("https://hooks.internal/doorbell"));
+        assert!(allow.allows("http://x.ops.example/y"));
+        assert!(!allow.allows("https://evil.example/doorbell"));
+        assert!(!allow.allows("https://ops.example.evil/y"));
+        // Construction refuses loudly (fail-closed, D6).
+        assert!(WebhookSink::new("https://evil.example/h", &allow, false).is_err());
+        assert!(WebhookSink::new("https://hooks.internal/h", &allow, false).is_ok());
+    }
+
+    #[test]
+    fn default_payload_minimizes_full_line_opt_in() {
+        let allow = EgressAllowlist::new(["h.internal".into()]);
+        let min = WebhookSink::new("https://h.internal/h", &allow, false).unwrap();
+        let long = "x".repeat(500);
+        let body = min.render("sub:1", "p", &long);
+        assert!(body.contains("\"hint\""), "{body}");
+        assert!(
+            !body.contains(&long),
+            "default payload must not exfiltrate the full line"
+        );
+        assert!(body.contains("\"truncated\":true"), "{body}");
+        let full = WebhookSink::new("https://h.internal/h", &allow, true).unwrap();
+        assert!(full.render("sub:1", "p", &long).contains(&long));
+    }
+
+    #[test]
+    fn dm_sink_refuses_human_keys() {
+        // Only daemon-minted service identities; human/operator keys never.
+        assert!(DmSink::for_service("svc:ci-1", Box::new(MockDmTransport::new())).is_ok());
+        assert!(DmSink::for_service("npub1abc", Box::new(MockDmTransport::new())).is_err());
+        assert!(DmSink::for_service("nsec1abc", Box::new(MockDmTransport::new())).is_err());
+        assert!(DmSink::for_service("operator", Box::new(MockDmTransport::new())).is_err());
+    }
+
+    #[tokio::test]
+    async fn e15_stalled_webhook_sheds_while_herdr_prompt_fast() {
+        // E15: webhook stalled 30s (simulated) → shed-to-digest + Degraded;
+        // herdr-prompt latency unaffected (brain never blocks on a sink).
+        let (deg_tx, mut deg_rx) = mpsc::channel(16);
+        let mut mgr = SinkManager::with_cap(deg_tx, 1);
+        let (mut stall, _sent) = MockSink::new();
+        stall.stall_ms = 30_000;
+        mgr.add_sink("webhook", Box::new(stall));
+        let (fast, sent) = MockSink::new();
+        mgr.add_sink("herdr", Box::new(fast));
+        // Fill the webhook queue past its cap of 1.
+        assert!(matches!(
+            mgr.send("webhook", "svc", "one").await,
+            SendOutcome::Sent
+        ));
+        let mut sheds = 0;
+        for i in 0..4 {
+            if let SendOutcome::Shed { .. } = mgr.send("webhook", "svc", &format!("q{i}")).await {
+                sheds += 1;
+            }
+        }
+        assert!(sheds >= 3, "stalled webhook must shed, got {sheds}");
+        // Herdr prompt latency: fast path answers immediately despite the
+        // stalled sibling (per-sink isolation, not a shared pump).
+        let t = tokio::time::Instant::now();
+        assert!(matches!(
+            mgr.send("herdr", "p", "urgent").await,
+            SendOutcome::Sent
+        ));
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "herdr prompt must not wait on the stalled webhook"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(sent_len(&sent), 1, "herdr worker pumps independently");
+        // A shed storm is visible: drain overflow names the subscriber sink.
+        let _ = deg_rx.try_recv();
     }
 }

@@ -61,7 +61,11 @@ pub struct Brain<H: Host> {
     /// Next journal seq (D4.4): resumed from the tail so rows stay
     /// monotonic per workspace across restarts.
     next_seq: u64,
+    /// Consecutive unanswered expiries per pin (S3 deaf digest names
+    /// subscriber + attempts; corr binds in bd-asr2.11 with receipts).
+    deaf_attempts: BTreeMap<String, u32>,
 }
+
 impl<H: Host> Brain<H> {
     /// Wire: `let (tx, rx) = mpsc::channel(BRAIN_CAP);`
     /// `let sinks = SinkManager::new(tx.clone());`
@@ -134,6 +138,7 @@ impl<H: Host> Brain<H> {
             stats: Stats::default(),
             sweep_last: None,
             next_seq,
+            deaf_attempts: BTreeMap::new(),
         }
     }
 
@@ -369,7 +374,11 @@ impl<H: Host> Brain<H> {
         for (pin, rows) in fetched {
             self.on_inbox_fetched(pin, rows).await;
         }
-        let _ = self.hear.expire(now, doorbell_core::UNANSWERED_SECS);
+        for pin in self.hear.expire(now, doorbell_core::UNANSWERED_SECS) {
+            *self.deaf_attempts.entry(pin).or_insert(0) += 1;
+        }
+        let unanswered = self.hear.unanswered_pins();
+        self.deaf_attempts.retain(|pin, _| unanswered.contains(pin));
         self.persist_hear();
     }
 
@@ -539,7 +548,7 @@ impl<H: Host> Brain<H> {
         let due_time = self
             .digest_since
             .is_some_and(|t| t.elapsed().as_secs() >= self.cfg.digest_interval_secs);
-        if !(due_len || due_time) || self.digest.is_empty() {
+        if !(due_len || due_time) {
             return;
         }
         // One batched line per pin, earliest batch first (ordering refines
@@ -547,6 +556,18 @@ impl<H: Host> Brain<H> {
         let mut by_pin: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (pin, line) in std::mem::take(&mut self.digest) {
             by_pin.entry(pin).or_default().push(line);
+        }
+        // S3: deaf services name subscriber + attempts (corr binds in .11).
+        for pin in self.hear.unanswered_pins() {
+            if let Some(n) = self.deaf_attempts.get(&pin) {
+                by_pin.entry(pin.clone()).or_default().push(format!(
+                    "[deaf] subscriber={} attempts={n} unanswered",
+                    self.cfg.subscriber,
+                ));
+            }
+        }
+        if by_pin.is_empty() {
+            return;
         }
         self.digest_since = None;
         self.stats.digest_batches += 1;
@@ -1014,5 +1035,48 @@ mod tests {
             }
             assert_eq!(traces[0], traces[1], "seed {seed} must replay identically");
         }
+    }
+
+    /// S3 deaf-service digest: an unanswered pin batches a line naming
+    /// subscriber + attempts (corr binds in bd-asr2.11 with receipts).
+    #[tokio::test]
+    async fn deaf_digest_names_subscriber_and_attempts() {
+        let (mut brain, _rx, _tx) = test_brain("deaf", vec![vec![]]);
+        brain.cfg.digest_threshold = 1;
+        let (sink, sent) = MockSink::new();
+        brain.sinks.add_sink("herdr", Box::new(sink));
+        // Inject, then sweep past the 120s hear window: pin goes deaf.
+        brain.hear.note_inject("svc", None, 1_000_000);
+        brain
+            .dispatch(BrainMsg::Sweep {
+                since: "2026-09-10T00:00:00Z".into(),
+                now: 1_000_000 + 120,
+            })
+            .await;
+        assert_eq!(brain.hear.unanswered_pins(), vec!["svc".to_string()]);
+        brain.digest_push("svc".into(), "queued".into());
+        brain.maybe_flush_digest().await;
+        // Poll the async worker for the batch.
+        let body = async {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let s = sent.lock().unwrap_or_else(|e| e.into_inner());
+                let text = s
+                    .iter()
+                    .map(|(_, l)| l.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                drop(s);
+                if text.contains("[deaf]") || tokio::time::Instant::now() >= deadline {
+                    return text;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        .await;
+        assert!(
+            body.contains("[deaf] subscriber=workspace:w attempts=1"),
+            "deaf digest names subscriber+attempts: {body}"
+        );
     }
 }
