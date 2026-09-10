@@ -190,7 +190,10 @@ mod tests {
     fn deference_matrix() {
         let now = unix_now();
         assert_eq!(deference_decision(None, false, now), Deference::TakeLease);
-        assert_eq!(deference_decision(None, true, now), Deference::DeferToDaemon);
+        assert_eq!(
+            deference_decision(None, true, now),
+            Deference::DeferToDaemon
+        );
         let live = OwnerLease {
             pid: std::process::id(),
             boot_id: boot_id(),
@@ -206,7 +209,10 @@ mod tests {
             deference_decision(Some(&live), false, now),
             Deference::RefuseDoubleRun
         );
-        let stale = OwnerLease { heartbeat_unix: now - LEASE_STALE_SECS - 1, ..live };
+        let stale = OwnerLease {
+            heartbeat_unix: now - LEASE_STALE_SECS - 1,
+            ..live
+        };
         // Live pid but stuck heartbeat still counts stale (wedged writer).
         assert!(lease_stale(&stale, now));
     }

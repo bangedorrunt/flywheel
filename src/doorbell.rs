@@ -15,17 +15,13 @@ use anyhow::{Context, Result};
 // ADR-0012 Phase 0: pure core lives in `doorbell-core`; this module re-exports
 // it (single source) and keeps the effect layer (pid files, supervision,
 // journal, inject). No signature changes in the move.
-pub use doorbell_core::{EventClass, RingInput, classify, should_inject, is_drain_transition, DoorbellQueue, SelfIndex, UNANSWERED_SECS, REDELIVERY_LOOKBACK_HOURS, watch_pubkey, watch_id, watch_created_at, WakeState, note_wake, watch_targets, parse_watch_ndjson, parse_inbox_item, row_created_us, inbox_high_water_from_values, inbox_high_water, inbox_high_water_micros, parse_rfc3339_micros, doorbell_line, doorbell_line_with_event, parse_status_pair};
-
-
-
-
-
-
-
-
-
-
+pub use doorbell_core::{
+    DoorbellQueue, EventClass, REDELIVERY_LOOKBACK_HOURS, RingInput, SelfIndex, UNANSWERED_SECS,
+    WakeState, classify, doorbell_line, doorbell_line_with_event, inbox_high_water,
+    inbox_high_water_from_values, inbox_high_water_micros, is_drain_transition, note_wake,
+    parse_inbox_item, parse_rfc3339_micros, parse_status_pair, parse_watch_ndjson, row_created_us,
+    should_inject, watch_created_at, watch_id, watch_pubkey, watch_targets,
+};
 
 /// Pid file: `~/.local/state/flywheel/doorbell/<workspace>.pid`.
 pub fn pid_file(state_dir: &Path, workspace: &str) -> PathBuf {
@@ -523,6 +519,20 @@ pub fn ensure_running(
     workspace: &str,
     project: &str,
 ) -> Result<LockAction> {
+    // D9 layer 3 (bd-asr2.5): a healthy daemon owns wake — attach as its
+    // client, never spawn a local loop (no double prompts). Subscription
+    // registration via API lands in bd-asr2.8; until then this is a loud
+    // attach with no local writer. Stop local dispatchers before enabling
+    // the daemon host (`flywheel kill`), else both ring (Phase 3 ends this).
+    let cfg_url = crate::config::Config::load()
+        .ok()
+        .and_then(|c| c.doorbell_url());
+    if matches!(resolve_host(state_dir, cfg_url), DoorbellHost::Proxy { .. }) {
+        eprintln!(
+            "flywheel doorbell: daemon host alive — attached, local loop suppressed (deference)"
+        );
+        return Ok(LockAction::Attach { pid: 0 });
+    }
     let path = pid_file(state_dir, workspace);
     let gen_path = gen_file(state_dir, workspace);
     let action = inspect_lock_generation(&path, &gen_path, binary_identity(exe), pid_alive);
@@ -545,6 +555,71 @@ pub fn ensure_running(
     }
 }
 
+/// Host resolution (ADR-0012 D1/D9): explicit `[doorbell] url` whose
+/// `/health` answers selects the daemon; otherwise a 200ms loopback probe
+/// defers to a running daemon, else embedded in-process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DoorbellHost {
+    Embedded,
+    Proxy { url: String },
+}
+
+pub fn resolve_host(state_dir: &Path, cfg_url: Option<String>) -> DoorbellHost {
+    const DEFAULT_URL: &str = "http://127.0.0.1:18980";
+    if let Some(url) = cfg_url {
+        if daemon_healthy(&url) {
+            return DoorbellHost::Proxy { url };
+        }
+        eprintln!(
+            "flywheel doorbell: configured daemon {url} unreachable — embedded degraded mode"
+        );
+        return DoorbellHost::Embedded;
+    }
+    if daemon_healthy(DEFAULT_URL) {
+        return DoorbellHost::Proxy {
+            url: DEFAULT_URL.to_string(),
+        };
+    }
+    let _ = state_dir;
+    DoorbellHost::Embedded
+}
+
+/// 200ms loopback probe: `/health` answers with our protocol.
+pub fn daemon_healthy(url: &str) -> bool {
+    let health_url = format!("{url}/health");
+    let addr = health_url
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let Ok(sock) = addr
+        .parse::<std::net::SocketAddr>()
+        .or_else(|_| format!("{addr}:80").parse::<std::net::SocketAddr>())
+    else {
+        return false;
+    };
+    let Ok(mut stream) =
+        std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_millis(200))
+    else {
+        return false;
+    };
+    use std::io::{Read, Write};
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    if write!(
+        stream,
+        "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let mut body = String::new();
+    if stream.read_to_string(&mut body).is_err() {
+        return false;
+    }
+    body.contains("\"protocol\":\"doorbell.v1\"")
+}
 /// Fan-out: given classified rings and pane status, produce (pin, line)
 /// pairs that should be prompted now. Working pins are skipped (queued
 /// by the caller).
@@ -563,12 +638,6 @@ pub fn fanout_now(
     }
     out
 }
-
-
-
-
-
-
 
 #[derive(Debug, Clone)]
 struct PendingRing {
@@ -698,13 +767,6 @@ pub fn read_unanswered(path: &Path) -> Vec<String> {
 
 /// Poster pubkey on a `toron watch` NDJSON line.
 
-
-
-
-
-
-
-
 pub fn wake_state_file(state_dir: &Path, workspace: &str) -> PathBuf {
     state_dir.join(format!("doorbell-wake-{workspace}.json"))
 }
@@ -726,8 +788,6 @@ pub fn save_wake_state(path: &Path, st: &WakeState) -> Result<()> {
     fs::write(path, json)?;
     Ok(())
 }
-
-
 
 // ---- bd-durable-doorbell-lngf: Resonate-primary supervision --------------
 // The lazily-healed watcher is the LOW-LATENCY push path; the Resonate
@@ -847,17 +907,6 @@ pub fn audit_append(state_dir: &Path, workspace: &str, entry: serde_json::Value)
 
 /// Pins addressed by this watch line: `p`/`assignee` (pin or npub) plus
 /// kind-9 `@pin` in content (live posts do both; `p` is npub).
-
-
-
-
-
-
-
-
-
-
-
 
 /// Second reducers deleted per bd-3wzl.
 /// Live dispatcher now routes every watch/status edge through `workspace::tick` (tick(&WorkspaceModel, &Msg)).

@@ -30,6 +30,7 @@ mod cron;
 mod daemon;
 mod decide;
 mod doorbell;
+mod doorbell_host;
 mod doorbell_tick;
 mod durable;
 mod failure;
@@ -7578,27 +7579,35 @@ mod spawn_boot_reliability_tests {
 
     #[test]
     fn gs039_cos_honest_folds_present() {
-        let src = include_str!("main.rs");
-        // P0-1: aim at the PRODUCTION Status comment via rfind — never the
-        // tripwire's own src.contains / string literals (TW-STATUS-AIM).
-        // Full production comment (leading // + trailing :) — rfind lands on
-        // the Status arm, not this tripwire's earlier string literal.
-        let status_marker = "// GS-039 P0-1 REAL observation:";
-        let status_idx = src
-            .rfind(status_marker)
-            .expect("production Status REAL observation marker");
-        let status_chunk = &src[status_idx..status_idx + 900];
+        // bd-asr2.5 topology: the Status arm lives in the rt Brain
+        // (on_status); the honesty contract is unchanged — stamp last_wake
+        // only from observed status or delivered pins, never planned injects.
+        let brain_rt = include_str!("../crates/doorbell-rt/src/brain.rs");
         assert!(
-            status_chunk.contains("status_l == \"working\"")
-                && status_chunk.contains("doorbell_persist_wake")
-                && !status_chunk.contains("injects.first().map")
-                && !status_chunk.contains("or_else"),
-            "Status wake arm must observe herdr status / delivered pins — no invent-green injects.first"
+            brain_rt.contains("REAL observation"),
+            "production Status REAL observation marker must survive the move"
         );
         assert!(
-            src.contains("doorbell_note_observed_wake")
-                && src.contains("fn doorbell_prompt_and_hear"),
-            "GS-039 P0-1 wake observation helpers must be present"
+            brain_rt.contains("\"working\" | \"idle\" | \"done\" | \"blocked\""),
+            "Status arm must observe herdr status transitions"
+        );
+        assert!(
+            brain_rt.contains("persist_wake"),
+            "Status wake arm must stamp wake from observed/delivered pins"
+        );
+        assert!(
+            !brain_rt.contains("injects.first()"),
+            "Status arm must not invent-green from planned injects"
+        );
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("doorbell_note_observed_wake"),
+            "GS-039 P0-1 wake observation helper must be present"
+        );
+        assert!(
+            brain_rt.contains("async fn deliver_prompts")
+                && brain_rt.contains("delivered.push(pin)"),
+            "deliver_prompts must return delivered pins for the wake stamp"
         );
         // Split needles so this assert body cannot invent-green-match itself.
         let invent_a = format!("{}{}{}", "or_else(", "|", "| injects.first()");
@@ -7607,13 +7616,6 @@ mod spawn_boot_reliability_tests {
             !src.contains(&invent_a) && !src.contains(&invent_b),
             "P0-1 must NOT stamp last_wake from planned injects (no invent-green or_else+injects.first)"
         );
-        let pah = crate::tripwire::find_fn(src, "doorbell_prompt_and_hear");
-        let pah_body = &src[pah..pah + 600];
-        assert!(
-            pah_body.contains("-> Vec<String>"),
-            "doorbell_prompt_and_hear must return delivered pins for wake stamp"
-        );
-        // cmd_send must NOT invent via doorbell_persist_wake / injects.
         // It MAY stamp via doorbell_note_observed_wake when --wait OBSERVED
         // herdr settled_status working|idle|done|blocked after land (GS-039).
         let send = crate::tripwire::find_fn(src, "cmd_send");
@@ -7641,15 +7643,22 @@ mod spawn_boot_reliability_tests {
             "poll/sweep must loud-warn on observed-wake save failure (no silent let _ =)"
         );
         // Poll wake: transition gate — not static already-idle on every poll.
-        let refresh = crate::tripwire::find_fn(src, "doorbell_refresh_status");
-        let refresh_end = crate::tripwire::find_fn(src, "doorbell_refresh_pins");
-        let refresh_body = &src[refresh..refresh_end];
+        // bd-asr2.5 topology: the refresh helper is gone; the gate lives in
+        // the Brain status arm with previous-status from the ticked model.
+        let brain_rt = include_str!("../crates/doorbell-rt/src/brain.rs");
         assert!(
-            refresh_body.contains("transitioned_status_pins")
-                && refresh_body.contains("from_l")
-                && !refresh_body.contains("observed_status_pins")
-                && refresh_body.contains("doorbell_note_observed_wake"),
-            "doorbell_refresh_status must gate wake on status transition (not static idle rows)"
+            brain_rt.contains("transitioned")
+                && brain_rt.contains("prev_status")
+                && brain_rt.contains("Static already-idle rows never ratchet"),
+            "brain status arm must gate wake on transition (not static idle rows)"
+        );
+        // Poll/sweep/watch/status: loud warn on observed-wake save Err.
+        // bd-asr2.5 topology: the saver lives in the Brain with the arm
+        // name as context (no let _ = swallow).
+        assert!(
+            brain_rt.contains("refuse silent drop (GS-039)")
+                && brain_rt.contains("observed-wake stamp FAILED on"),
+            "brain wake saves must loud-warn with arm context on failure"
         );
         let note = crate::tripwire::find_fn(src, "doorbell_note_observed_wake");
         let note_end = crate::tripwire::find_fn(src, "upsert_workspace_receipt");
@@ -9068,7 +9077,51 @@ fn ensure_doorbell_supervisor() {
     }
 }
 
+/// Thin proxy to the daemon CLI when it hosts wake (bd-asr2.5, D1).
+/// Lifecycle verbs (status/start/stop) exec `doorbell` — byte-identical
+/// output by construction. Read verbs (why/afk/re_inject) stay local: they
+/// read the same journal files either way, so output is identical without
+/// a proxy hop. Returns true when proxied.
+fn proxy_doorbell_verb(cfg: &Config, verb: &str, extra: &[String]) -> Result<bool> {
+    let url = match doorbell::resolve_host(&config::state_dir(), cfg.doorbell_url()) {
+        doorbell::DoorbellHost::Proxy { url } => url,
+        doorbell::DoorbellHost::Embedded => return Ok(false),
+    };
+    // Only loopback daemons are addressable from here (the daemon CLI has
+    // no remote mode); remote hosts are operated out of band.
+    let host = url
+        .trim_start_matches("http://")
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("");
+    if host != "127.0.0.1" && host != "localhost" {
+        anyhow::bail!("flywheel doorbell {verb}: remote daemon {url} is operated out of band");
+    }
+    let port = url
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .and_then(|h| h.split(':').nth(1))
+        .unwrap_or("18980");
+    eprintln!("flywheel doorbell: daemon host {url} — proxying `{verb}`");
+    let st = std::process::Command::new("doorbell")
+        .arg(verb)
+        .args(extra)
+        .arg("--state-dir")
+        .arg(config::state_dir())
+        .arg("--port")
+        .arg(port)
+        .status()
+        .with_context(|| "exec `doorbell` (is doorbell-bin installed on PATH?)")?;
+    if !st.success() {
+        anyhow::bail!("doorbell {verb} failed: {st}");
+    }
+    Ok(true)
+}
 fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
+    if proxy_doorbell_verb(cfg, "status", &[])? {
+        return Ok(());
+    }
     ensure_doorbell_supervisor();
     let _ = cfg;
     let state_dir = config::state_dir();
@@ -9135,7 +9188,10 @@ fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_doorbell_start(_cfg: &Config, project: &str) -> Result<()> {
+fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
+    if proxy_doorbell_verb(cfg, "start", &[])? {
+        return Ok(());
+    }
     ensure_doorbell_supervisor();
     let exe = std::env::current_exe()?;
     let workspaces = doorbell_project_workspaces(project);
@@ -9151,7 +9207,12 @@ fn cmd_doorbell_start(_cfg: &Config, project: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_doorbell_stop(_cfg: &Config, project: &str, workspace: &str) -> Result<()> {
+fn cmd_doorbell_stop(cfg: &Config, project: &str, workspace: &str) -> Result<()> {
+    // Daemon mode owns all wake: any stop targets the daemon (per-workspace
+    // dispatchers no longer exist there; Phase 3 removes them everywhere).
+    if workspace == "all" && proxy_doorbell_verb(cfg, "stop", &[])? {
+        return Ok(());
+    }
     let workspaces: Vec<String> = if workspace == "all" {
         doorbell_project_workspaces(project)
     } else {
@@ -9199,7 +9260,9 @@ fn cmd_doorbell_why(
     let mut matched = 0usize;
     for (workspace, entry) in &entries {
         if doorbell::journal_entry_version(entry) != 1 {
-            eprintln!("doorbell why: refusing entry with unknown journal v (workspace {workspace}) — no fold-past");
+            eprintln!(
+                "doorbell why: refusing entry with unknown journal v (workspace {workspace}) — no fold-past"
+            );
             continue;
         }
         let msg_val = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
@@ -9445,7 +9508,9 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str) -> Result<()> {
         std::collections::BTreeMap::new();
     for (ws, entry) in &entries {
         if doorbell::journal_entry_version(entry) != 1 {
-            eprintln!("doorbell afk: refusing entry with unknown journal v (workspace {ws}) — no fold-past");
+            eprintln!(
+                "doorbell afk: refusing entry with unknown journal v (workspace {ws}) — no fold-past"
+            );
             continue;
         }
         let msg_val = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
@@ -9561,18 +9626,19 @@ fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> {
 #[cfg(test)]
 mod timeout_presence_tests {
     // bd-adr0027-proven-leftovers-55nx.5 RED: timeout must tick Msg::Presence.
+    // bd-asr2.5 topology: the sweep arm lives in the rt Brain (maintenance
+    // rows tick the trusted edge); the host only projects the jsonl.
     #[test]
     fn timeout_arm_ticks_presence_not_only_hear() {
-        let src = include_str!("main.rs");
-        let pos = crate::tripwire::find_fn(src, "cmd_internal_doorbell");
-        let end = src[pos..]
-            .find("\nfn spawn_watch_child")
-            .map(|i| pos + i)
-            .unwrap_or(src.len());
-        let slice = &src[pos..end];
+        let host = include_str!("doorbell_host.rs");
         assert!(
-            slice.contains("Msg::Presence"),
-            "RED (55nx.5): timeout arm reads presence.jsonl into HearTracker only; tick Msg::Presence"
+            host.contains("presence.jsonl") && host.contains("Msg::Presence"),
+            "RED (55nx.5): sweep must project presence.jsonl rows into tick Msg::Presence"
+        );
+        let brain = include_str!("../crates/doorbell-rt/src/brain.rs");
+        assert!(
+            brain.contains("sweep_maintenance") && brain.contains("BrainMsg::Presence"),
+            "RED (55nx.5): brain must tick Presence rows every sweep, not hear-only"
         );
     }
 
@@ -9677,797 +9743,16 @@ fn cmd_internal_doorbell(
         return Ok(());
     }
 
-    let path = doorbell::pid_file(&config::state_dir(), workspace);
-    doorbell::write_pid(&path, std::process::id())?;
-    // bd-stale-doorbell-wake-0fic: generation ground truth. The spawning
-    // parent normally wrote this record; self-stamp on manual start so the
-    // tick gate below always has a binary identity to compare against.
-    let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
-    let gen_path = doorbell::gen_file(&config::state_dir(), workspace);
-    let generation = match doorbell::read_gen(&gen_path) {
-        Some(record) => Some(record),
-        None => doorbell::WatcherGen::capture(&exe_path, doorbell_now_unix())
-            .filter(|record| doorbell::write_gen(&gen_path, record).is_ok()),
-    };
-    enum Bell {
-        Watch(String),
-        Status { pane_id: String, to: String },
-        Died,
-    }
-
-    /// Spawn a push forwarder for `pane_ids` (one long-lived `events.subscribe`
-    /// socket per call); returns whether the subscription landed. herdr 0.9
-    /// (protocol 22) subscriptions are live-only (#1270) and per-pane — the
-    /// doorbell spawns one at startup and again from the sweep whenever the
-    /// spawn registry grows (bd-8hv0), giving late panes push
-    /// coverage instead of the polling fallback. Proven live: concurrent
-    /// per-pane subscribe sockets each deliver only their own pane's events.
-    fn doorbell_spawn_status_forwarder(
-        cfg: &Config,
-        pane_ids: Vec<String>,
-        tx: &std::sync::mpsc::Sender<Bell>,
-    ) -> bool {
-        if pane_ids.is_empty() {
-            return false;
+    // bd-asr2.5: host selection — one implementation, two hosts. Daemon
+    // mode never runs a local loop (subscription registration via API
+    // lands in bd-asr2.8); embedded mode drives doorbell-rt's Brain.
+    match doorbell::resolve_host(&config::state_dir(), cfg.doorbell_url()) {
+        doorbell::DoorbellHost::Proxy { url } => {
+            eprintln!("flywheel doorbell: daemon host {url} — no local loop (attach only)");
+            return Ok(());
         }
-        let Ok(mut sub_client) = Client::connect(Some(&cfg.socket_path())) else {
-            return false;
-        };
-        let subs: Vec<Subscription> = pane_ids
-            .into_iter()
-            .map(Subscription::agent_status_changed)
-            .collect();
-        let Ok(mut stream) = herdr_shim::subscribe(&mut sub_client, &subs) else {
-            return false;
-        };
-        let tx_st = tx.clone();
-        std::thread::spawn(move || {
-            while let Ok(Some(ev)) = stream.read_event() {
-                if let herdr_shim::HerdrEventData::PaneAgentStatusChanged(change)
-                | herdr_shim::HerdrEventData::PaneAgentStatusChangedSub(change) = ev.data
-                    && tx_st
-                        .send(Bell::Status {
-                            pane_id: change.pane_id,
-                            to: change.agent_status.as_str().to_string(),
-                        })
-                        .is_err()
-                {
-                    break;
-                }
-            }
-        });
-        true
+        doorbell::DoorbellHost::Embedded => doorbell_host::run_embedded(cfg, project, workspace),
     }
-
-    let (tx, rx) = std::sync::mpsc::channel::<Bell>();
-    let mut watch_child: Option<std::process::Child> = None;
-    // Try in-process bus watch first (zero fork, gap 13) — fallback to CLI
-    let in_process_ok = (|| -> Option<()> {
-        let _mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
-            .ok()
-            .flatten()?;
-        let bus = crate::mail_shim::block_on(async {
-            Ok::<std::sync::Arc<dyn toron_core::bus::Bus>, anyhow::Error>(
-                crate::mail_shim::mailbox().bus().clone(),
-            )
-        })
-        .ok()?;
-        let filter = {
-            use toron_core::bus::Filter;
-            use toron_core::nostr::kinds::toron_kind;
-            Filter::new()
-                .kinds([
-                    toron_kind(9),
-                    toron_kind(14),
-                    toron_kind(20001),
-                    toron_kind(30013),
-                    toron_kind(43001),
-                    toron_kind(30031),
-                    toron_kind(39002),
-                ])
-                .hashtag(project)
-        };
-        let mut sub = crate::mail_shim::block_on(bus.subscribe_trusted(filter)).ok()?;
-        let tx_in = tx.clone();
-        std::thread::spawn(move || {
-            loop {
-                let ev_opt = crate::mail_shim::block_on(sub.next());
-                match ev_opt {
-                    Some(toron_core::bus::SubscriptionEvent::Event(e)) => {
-                        let tags: Vec<Vec<String>> =
-                            e.tags.iter().map(|t| t.clone().to_vec()).collect();
-                        let v = serde_json::json!({
-                            "kind": e.kind.as_u16(),
-                            "id": e.id.to_hex(),
-                            "pubkey": e.pubkey.to_hex(),
-                            "content": e.content,
-                            "tags": tags,
-                            "created_at": e.created_at.as_secs(),
-                        });
-                        if let Ok(line) = serde_json::to_string(&v)
-                            && tx_in.send(Bell::Watch(line)).is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Some(toron_core::bus::SubscriptionEvent::Eose) => continue,
-                    Some(toron_core::bus::SubscriptionEvent::Closed(_)) | None => {
-                        let _ = tx_in.send(Bell::Died);
-                        break;
-                    }
-                }
-            }
-        });
-        Some(())
-    })();
-    if in_process_ok.is_none() {
-        let kinds = DOORBELL_WATCH_KINDS;
-        let mut child = match Command::new("toron")
-            .args(["watch", "--live", "--project", project, "--kinds", kinds])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("flywheel doorbell: toron watch failed ({e}); idle until pid file drops");
-                loop {
-                    std::thread::sleep(Duration::from_secs(30));
-                    if !path.exists() {
-                        break;
-                    }
-                }
-                return Ok(());
-            }
-        };
-        let stdout = child.stdout.take().context("doorbell watch stdout")?;
-        let tx_watch = tx.clone();
-        std::thread::spawn(move || {
-            use std::io::BufRead;
-            for line in std::io::BufReader::new(stdout).lines() {
-                match line {
-                    Ok(l) => {
-                        if tx_watch.send(Bell::Watch(l)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            let _ = tx_watch.send(Bell::Died);
-        });
-        watch_child = Some(child);
-    } else {
-        eprintln!("flywheel doorbell: using in-process watch for {}", project);
-    }
-
-    let mut herdr = Client::connect(Some(&cfg.socket_path())).ok();
-    let mut pane_to_pin: BTreeMap<String, String> = BTreeMap::new();
-    let mut _queues: BTreeMap<String, doorbell::DoorbellQueue> = BTreeMap::new();
-    let mut workspace_model = workspace::WorkspaceModel::default();
-    if let Some(pin) = state::load_captain_alias(project) {
-        workspace_model.roles.insert("captain".into(), pin);
-    }
-    // GS-033 B1 / NEW-L2: seed swarm onto the one RAM owner from ActiveLoop
-    // (same helper the loop uses). Two-process topology may remain; two
-    // WorkspaceModel::default()s may not. Fail-loud on I/O (not silent skip).
-    crate::durable::seed_workspace_from_active_loop(&mut workspace_model, project)?;
-    // GS-033 B8: seed crew roles from the spawn-time RoleBound snapshot
-    // so inject/Prompt resolution does not wait on 30013 watch.
-    seed_roles_from_binds(&mut workspace_model, project)?;
-    // bd-7xsf: rebuild assignment from receipts table at dispatcher startup (durable)
-    rebuild_assignment_from_receipts(&mut workspace_model);
-    let mut budgets: BTreeMap<String, doorbell::PinBudget> = BTreeMap::new();
-    // bd-durable-doorbell-lngf: plane-P/S high-waters + the last-wake stamp
-    // survive a crash — at-least-once redelivery with an idempotent line.
-    let wake_state_path = doorbell::wake_state_file(&config::state_dir(), workspace);
-    let wake_state = doorbell::load_wake_state(&wake_state_path);
-    let mut since_by_pin: BTreeMap<String, String> = wake_state.since_by_pin.clone();
-    let mut plane_s_cursor_us: Option<i64> = wake_state.plane_s_cursor_us;
-    // bd-bdpx: seed the tick clock here — WaitCorr park deadlines stamp from
-    // last_now inside tick, so a pre-first-beat wake parks with a real
-    // deadline instead of skipping registration (last_now==0). Placed AFTER
-    // the wake-state load so the supervised-observable tripwire window above
-    // keeps its shape; order vs the load is irrelevant (disjoint state).
-    // Explicit effect-side bootstrap; tick itself stays pure (clock still
-    // enters tick only as Msg payload).
-    workspace_model.last_now = doorbell_now_unix();
-    let mut hear = doorbell::HearTracker::default();
-    hear.seed_unanswered(doorbell::read_unanswered(&doorbell::unanswered_file(
-        &config::state_dir(),
-        workspace,
-    )));
-    let mut index = {
-        let pins: Vec<String> = state::load_spawn_registry(project)
-            .iter()
-            .filter_map(|e| e.mail_identity.clone())
-            .collect();
-        doorbell_self_index(cfg, project, &pins)
-    };
-
-    // herdr 0.9 (protocol 22): lifecycle subscriptions are LIVE-ONLY — no
-    // retained replay (#1270). Subscribe BEFORE the refresh snapshot so a
-    // status change in the pre-snapshot window is delivered, not lost.
-    // Pre-snapshot pushes are idempotent status transitions, so ordering is
-    // safe (bd-myab).
-    // bd-8hv0: forwarder spawn is shared with the sweep so panes
-    // that join the registry after startup get push coverage too.
-    let mut subscribed = false;
-    let mut covered_panes: HashSet<String> = HashSet::new();
-    {
-        let pane_ids: Vec<String> = state::load_spawn_registry(project)
-            .into_iter()
-            .map(|e| e.pane_id)
-            .filter(|p| !p.is_empty())
-            .collect();
-        covered_panes.extend(pane_ids.iter().cloned());
-        subscribed = doorbell_spawn_status_forwarder(cfg, pane_ids, &tx);
-    }
-
-    doorbell_refresh_status(
-        herdr.as_mut(),
-        project,
-        &mut pane_to_pin,
-        &mut workspace_model,
-        &mut hear,
-        &index,
-        workspace,
-        generation.as_ref(),
-        cfg,
-    );
-
-    // Ack-SLA scanner cadence: the SLA is 30-min granularity — a 1 Hz SQL
-    // scan is waste. 60s keeps the wake prompt while off the hot loop.
-    let mut last_ack_sla_check: u64 = 0;
-    const ACK_SLA_CHECK_SECS: u64 = 60;
-    // Watch respawn retry gate (GS-007): unix secs of the next respawn try.
-    let mut watch_retry_at: Option<u64> = None;
-    const WATCH_RETRY_SECS: u64 = 16;
-    // (subscription moved above the refresh — live-only subscriptions must
-    // precede the snapshot, bd-myab)
-
-    // bd-yw4s BIND: the tick's model — the decision layer the live loop feeds.
-    // (single bell_model for dispatcher lifetime — leftover #6 fixed, no second Default)
-    // ADR-0027: tick(&WorkspaceModel, &Msg) is the only state transition for the live dispatcher
-    loop {
-        if !path.exists() {
-            break;
-        }
-        let pending_bounds = match drain_pending_role_bounds(project) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!(
-                    "flywheel doorbell: drain_pending_role_bounds failed (refusing silent skip): {e:#}"
-                );
-                Vec::new()
-            }
-        };
-        for (role, pin) in pending_bounds {
-            let msg = workspace::Msg::RoleBound {
-                role: role.clone(),
-                pin: pin.clone(),
-            };
-            let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
-            workspace_model = next_model;
-            let _ = handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, false);
-            let pins = [pin.clone()];
-            doorbell::journal_append_workspace(
-                &config::state_dir(),
-                workspace,
-                &msg,
-                &cmds,
-                serde_json::json!({ "stage": "role_bound_live", "role": role, "pin": pin }),
-                Some(pins.as_slice()),
-            );
-        }
-        for summary in drain_pending_facts(project) {
-            let msg = workspace::Msg::Fact {
-                summary: summary.clone(),
-            };
-            let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
-            workspace_model = next_model;
-            let _ = handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, false);
-            let injects =
-                doorbell::take_allowed(prompt_injects(&cmds), &mut budgets, doorbell_now_unix());
-            if !injects.is_empty() {
-                doorbell_prompt(
-                    herdr.as_mut(),
-                    &state::load_spawn_registry(project),
-                    &injects,
-                    generation.as_ref(),
-                    project,
-                    workspace,
-                );
-            }
-            doorbell::journal_append_workspace(
-                &config::state_dir(),
-                workspace,
-                &msg,
-                &cmds,
-                serde_json::json!({
-                    "stage": "fact_live",
-                    "summary": summary,
-                    "effect": budget_effect(&prompt_injects(&cmds), &injects),
-                }),
-                Some(
-                    &prompt_injects(&cmds)
-                        .iter()
-                        .map(|(p, _)| p.clone())
-                        .collect::<Vec<_>>(),
-                ),
-            );
-        }
-        // GS-006 bug 3: Ack-SLA was test-only (0 production callers). The dispatcher
-        // tick is the live caller, gated to once per 60s (30-min SLA needs no 1 Hz SQL
-        // scan). Runs at loop top so heavy watch traffic cannot starve it (a Timeout-
-        // only placement starves whenever events keep arriving).
-        let now_s = doorbell_now_unix();
-        if now_s.saturating_sub(last_ack_sla_check) >= ACK_SLA_CHECK_SECS {
-            last_ack_sla_check = now_s;
-            // bd-yw4s BIND: the scan decision comes from the tick.
-            let msg = workspace::Msg::AckSlaTick { now: now_s };
-            let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
-            workspace_model = next_model;
-            let need_fetch =
-                handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, false);
-            if need_fetch {
-                doorbell_sweep_inbox(
-                    cfg,
-                    project,
-                    &mut workspace_model,
-                    &mut since_by_pin,
-                    &mut budgets,
-                    herdr.as_mut(),
-                    &mut hear,
-                    &index,
-                    workspace,
-                    generation.as_ref(),
-                );
-            }
-            let scan = cmds
-                .iter()
-                .any(|a| matches!(a, workspace::Cmd::CheckAckSla));
-            if scan && let Some(mb) = crate::mail_shim::try_mailbox() {
-                // bd-7qg6: the scan returns the emitted overdue post ids —
-                // discarding them hid SLA fires. Audit the count loudly; the
-                // emitted kind-9 wakes re-enter through the watch path.
-                match crate::mail_shim::block_on(mb.check_ack_sla_expired(project, None)) {
-                    Ok(emitted) if emitted.is_empty() => {}
-                    Ok(emitted) => {
-                        doorbell::audit_append(
-                            &config::state_dir(),
-                            workspace,
-                            serde_json::json!({
-                                "ts": chrono::Utc::now().to_rfc3339(),
-                                "workspace": workspace,
-                                "kind": "ack_sla_fired",
-                                "count": emitted.len(),
-                                "posts": emitted.iter().take(10).collect::<Vec<_>>(),
-                            }),
-                        );
-                    }
-                    Err(e) => {
-                        doorbell::audit_append(
-                            &config::state_dir(),
-                            workspace,
-                            serde_json::json!({
-                                "ts": chrono::Utc::now().to_rfc3339(),
-                                "workspace": workspace,
-                                "kind": "inbox_error",
-                                "error": format!("ack-sla scan failed: {e:#}"),
-                            }),
-                        );
-                    }
-                }
-            }
-            // Journal via workspace model — keep file as doorbell journal for replay compatibility
-            // (legacy DoorbellMsg/Action entries still replay via workspace slice; new entries are workspace Msg/Cmd)
-            doorbell::journal_append_workspace(
-                &config::state_dir(),
-                workspace,
-                &msg,
-                &cmds,
-                serde_json::json!({ "stage": "executed", "scanned": scan }),
-                Some(&journal_pins(&workspace_model)),
-            );
-        }
-        // GS-007: a watch that died and exhausted its restart burst must not leave
-        // the dispatcher permanently deaf — heal_tick will NOT heal a live pid.
-        // One non-blocking respawn attempt per pass from here, forever.
-        if let Some(at) = watch_retry_at
-            && doorbell_now_unix() >= at
-        {
-            let tx_g = tx.clone();
-            match spawn_watch_child(project, move |ev| {
-                let _ = match ev {
-                    Some(l) => tx_g.send(Bell::Watch(l)),
-                    None => tx_g.send(Bell::Died),
-                };
-            }) {
-                Some(child) => {
-                    watch_child = Some(child);
-                    watch_retry_at = None;
-                    eprintln!("flywheel doorbell: watch respawned from retry gate");
-                    doorbell::audit_append(
-                        &config::state_dir(),
-                        workspace,
-                        serde_json::json!({
-                            "ts": chrono::Utc::now().to_rfc3339(),
-                            "workspace": workspace,
-                            "kind": "watch_restart",
-                        }),
-                    );
-                }
-                None => watch_retry_at = Some(doorbell_now_unix() + WATCH_RETRY_SECS),
-            }
-        }
-        match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(Bell::Watch(line)) => {
-                // Gap 1: plane-S cursor — skip old history on restart
-                if let Some(created_at) = doorbell::watch_created_at(&line) {
-                    let us = (created_at as i64) * 1_000_000;
-                    if plane_s_cursor_us.is_some_and(|c| us <= c) {
-                        continue;
-                    }
-                    plane_s_cursor_us = Some(plane_s_cursor_us.map(|c| c.max(us)).unwrap_or(us));
-                    // Persist cursor early so a crash right after doesn't re-ring
-                    let path = doorbell::wake_state_file(&config::state_dir(), workspace);
-                    let mut st = doorbell::load_wake_state(&path);
-                    st.plane_s_cursor_us = plane_s_cursor_us;
-                    doorbell::save_wake_state(&path, &st).with_context(|| {
-                        format!(
-                            "doorbell plane-S cursor save failed at {} — refuse silent drop (GS-037 P0-C)",
-                            path.display()
-                        )
-                    })?;
-                }
-                let registry = state::load_spawn_registry(project);
-                let pins: Vec<String> = registry
-                    .iter()
-                    .filter_map(|e| e.mail_identity.clone())
-                    .collect();
-                for pin in &pins {
-                    index.insert_pin(pin.clone(), None);
-                }
-                // bd-yw4s BIND: the tick is the decider (classify + queue-or-
-                // prompt); the live loop is the effect layer (budget gate,
-                // herdr prompt, hear, persist). Same rules, one producer.
-                workspace_model.doorbell.index = index.clone();
-                let msg = workspace::Msg::WatchNdjson { line: line.clone() };
-                let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
-                workspace_model = next_model;
-                handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, true);
-                let mut delivered = Vec::new();
-                for a in &cmds {
-                    if !matches!(a, workspace::Cmd::Prompt { .. }) {
-                        delivered.push(serde_json::to_value(a).unwrap_or_default());
-                    }
-                }
-                let raw_injects = prompt_injects(&cmds);
-                let budget_before = raw_injects.len();
-                // Effect layer: budget gate BEFORE the decided journal so the
-                // line carries the gate outcome (55nx.9) — gate is pure.
-                let injects =
-                    doorbell::take_allowed(raw_injects.clone(), &mut budgets, doorbell_now_unix());
-                let effect = budget_effect(&raw_injects, &injects);
-                let pins: Vec<String> = raw_injects.iter().map(|(p, _)| p.clone()).collect();
-                doorbell::journal_append_workspace(
-                    &config::state_dir(),
-                    workspace,
-                    &msg,
-                    &cmds,
-                    serde_json::json!({ "stage": "decided", "effect": effect }),
-                    Some(&pins),
-                );
-                if !delivered.is_empty() {
-                    doorbell::journal_append_workspace(
-                        &config::state_dir(),
-                        workspace,
-                        &msg,
-                        &cmds,
-                        serde_json::json!({ "stage": "executed", "delivered": delivered }),
-                        Some(&journal_pins(&workspace_model)),
-                    );
-                }
-                if budget_before != injects.len() {
-                    doorbell::audit_append(
-                        &config::state_dir(),
-                        workspace,
-                        serde_json::json!({
-                            "ts": chrono::Utc::now().to_rfc3339(),
-                            "workspace": workspace,
-                            "kind": "budget_drop",
-                            "event_id": doorbell::watch_id(&line).unwrap_or_default(),
-                            "dropped": budget_before - injects.len(),
-                        }),
-                    );
-                }
-                // Audit every watch ring
-                doorbell::audit_append(
-                    &config::state_dir(),
-                    workspace,
-                    serde_json::json!({
-                        "ts": chrono::Utc::now().to_rfc3339(),
-                        "workspace": workspace,
-                        "kind": "watch",
-                        "event_id": doorbell::watch_id(&line).unwrap_or_default(),
-                        "created_at": doorbell::watch_created_at(&line),
-                        "targets": doorbell::watch_targets(&line, &index),
-                        "injected": injects.iter().map(|(p,_)| p).collect::<Vec<_>>(),
-                    }),
-                );
-                if let Some(pk) = doorbell::watch_pubkey(&line) {
-                    hear.note_heard_pubkey(&pk);
-                    if let Some(pin) = index.resolve(&pk) {
-                        hear.note_heard_pin(&pin);
-                    }
-                    doorbell_persist_hear(workspace, &hear);
-                }
-                let delivered_pins = doorbell_prompt_and_hear(
-                    herdr.as_mut(),
-                    &registry,
-                    &injects,
-                    &mut hear,
-                    &index,
-                    project,
-                    workspace,
-                    generation.as_ref(),
-                );
-                // GS-039 P0-1: stamp last_wake ONLY from successfully
-                // delivered pins — never from planned injects when delivery
-                // fails/empty (no invent-green or_else injects.first()).
-                let woke = delivered_pins.first().map(String::as_str);
-                doorbell_persist_wake(workspace, &since_by_pin, woke)?;
-            }
-            Ok(Bell::Status { pane_id, to }) => {
-                let Some(pin) = pane_to_pin.get(&pane_id).cloned() else {
-                    continue;
-                };
-                // Model.doorbell.statuses is truth. Tick sees `from`; do not pre-insert.
-                let msg = workspace::Msg::HerdrStatus {
-                    pin: pin.clone(),
-                    status: to.clone(),
-                };
-                let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
-                workspace_model = next_model;
-                handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, false);
-                let raw_injects = prompt_injects(&cmds);
-                // Budget gate BEFORE the drain journal so the line carries
-                // the gate outcome (55nx.9) — gate is pure.
-                let injects =
-                    doorbell::take_allowed(raw_injects.clone(), &mut budgets, doorbell_now_unix());
-                let effect = budget_effect(&raw_injects, &injects);
-                let pins: Vec<String> = raw_injects.iter().map(|(p, _)| p.clone()).collect();
-                doorbell::journal_append_workspace(
-                    &config::state_dir(),
-                    workspace,
-                    &msg,
-                    &cmds,
-                    serde_json::json!({ "stage": "drain", "effect": effect }),
-                    Some(&pins),
-                );
-                let registry = state::load_spawn_registry(project);
-                let delivered = doorbell_prompt_and_hear(
-                    herdr.as_mut(),
-                    &registry,
-                    &injects,
-                    &mut hear,
-                    &index,
-                    project,
-                    workspace,
-                    generation.as_ref(),
-                );
-                // GS-039 P0-1 REAL observation: herdr status transitions that
-                // show the agent woke (working) or settled after work
-                // (idle/done/blocked) advance last_wake — OR a pin that
-                // actually delivered. Never invent-green from planned
-                // injects when delivery failed / status not observed.
-                let status_l = to.to_ascii_lowercase();
-                let observed = status_l == "working"
-                    || status_l == "idle"
-                    || status_l == "done"
-                    || status_l == "blocked";
-                let woke = if observed {
-                    Some(pin.as_str())
-                } else {
-                    delivered.first().map(String::as_str)
-                };
-                doorbell_persist_wake(workspace, &since_by_pin, woke)?;
-            }
-            Ok(Bell::Died) => {
-                // Gap 3 fix: watch self-restart with backoff instead of deaf break.
-                // If the burst exhausts, watch_retry_at keeps single-shot respawns
-                // coming from the 1s pass — heal_tick will NOT heal a live pid, so
-                // the dispatcher itself must never give up (GS-007 never-deaf rule).
-                eprintln!("flywheel doorbell: watch died, restarting with backoff");
-                let msg = workspace::Msg::WatchDied;
-                let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
-                workspace_model = next_model;
-                handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, false);
-                // bd-7qg6: expire here too — the Timeout-branch expire starves
-                // under continuous watch traffic, delaying deaf detection
-                // indefinitely. Expiry is idempotent; persist keeps it crash-safe.
-                let _ = hear.expire(doorbell_now_unix(), doorbell::UNANSWERED_SECS);
-                doorbell_persist_hear(workspace, &hear);
-                let mut backoff = 1u64;
-                let mut restarted = false;
-                for _ in 0..5 {
-                    std::thread::sleep(Duration::from_secs(backoff));
-                    let tx_g = tx.clone();
-                    match spawn_watch_child(project, move |ev| {
-                        let _ = match ev {
-                            Some(l) => tx_g.send(Bell::Watch(l)),
-                            None => tx_g.send(Bell::Died),
-                        };
-                    }) {
-                        Some(child) => {
-                            watch_child = Some(child);
-                            eprintln!("flywheel doorbell: watch restarted");
-                            doorbell::audit_append(
-                                &config::state_dir(),
-                                workspace,
-                                serde_json::json!({
-                                    "ts": chrono::Utc::now().to_rfc3339(),
-                                    "workspace": workspace,
-                                    "kind": "watch_restart",
-                                }),
-                            );
-                            restarted = true;
-                            break;
-                        }
-                        None => eprintln!("flywheel doorbell: watch restart failed"),
-                    }
-                    backoff = (backoff * 2).min(16);
-                }
-                if restarted {
-                    doorbell::journal_append_workspace(
-                        &config::state_dir(),
-                        workspace,
-                        &msg,
-                        &cmds,
-                        serde_json::json!({ "stage": "executed", "restarted": true }),
-                        Some(&journal_pins(&workspace_model)),
-                    );
-                    continue;
-                }
-                doorbell::journal_append_workspace(
-                    &config::state_dir(),
-                    workspace,
-                    &msg,
-                    &cmds,
-                    serde_json::json!({ "stage": "executed", "restarted": false, "retry_gate_secs": WATCH_RETRY_SECS }),
-                    Some(&journal_pins(&workspace_model)),
-                );
-                eprintln!(
-                    "flywheel doorbell: watch restart burst exhausted — dispatcher stays alive, retry gate respawns every {WATCH_RETRY_SECS}s (never exit, never deaf)"
-                );
-                watch_retry_at = Some(doorbell_now_unix() + WATCH_RETRY_SECS);
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // bd-stale-doorbell-wake-0fic: a watcher whose binary
-                // changed underneath it runs pre-fix wake logic. Refuse
-                // every further wake, log once, self-retire; the next
-                // spawn starts a fresh current-binary dispatcher.
-                if let Some(record) = &generation
-                    && !doorbell::inject_allowed(record, &exe_path)
-                {
-                    eprintln!(
-                        "flywheel doorbell: binary changed since watcher start (up={}, bin_mtime={}); retiring without further wakes",
-                        record.started_unix, record.binary_mtime_unix
-                    );
-                    break;
-                }
-                let since = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                let now = chrono::Utc::now().timestamp() as u64;
-                let msg = workspace::Msg::Sweep { since, now };
-                let (next_model, cmds) = workspace::tick(&workspace_model, &msg);
-                workspace_model = next_model;
-                // ADR-0011 D7: WaitCorr also drains on Sweep, not only WatchNdjson.
-                if handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, true) {
-                    doorbell_sweep_inbox(
-                        cfg,
-                        project,
-                        &mut workspace_model,
-                        &mut since_by_pin,
-                        &mut budgets,
-                        herdr.as_mut(),
-                        &mut hear,
-                        &index,
-                        workspace,
-                        generation.as_ref(),
-                    );
-                }
-                doorbell::journal_append_workspace(
-                    &config::state_dir(),
-                    workspace,
-                    &msg,
-                    &cmds,
-                    serde_json::json!({ "stage": "sweep" }),
-                    Some(&journal_pins(&workspace_model)),
-                );
-                // ADR-0005: subscribe is the drain signal. Poll herdr only
-                // when the event spine is down.
-                if !subscribed {
-                    doorbell_refresh_status(
-                        herdr.as_mut(),
-                        project,
-                        &mut pane_to_pin,
-                        &mut workspace_model,
-                        &mut hear,
-                        &index,
-                        workspace,
-                        generation.as_ref(),
-                        cfg,
-                    );
-                } else {
-                    // bd-8hv0: the push spine covers startup panes
-                    // only; registry additions get their own forwarder so
-                    // late crew panes are push-covered, not poll-covered.
-                    let registry = state::load_spawn_registry(project);
-                    doorbell_refresh_pins(&registry, &mut pane_to_pin);
-                    let pane_ids =
-                        doorbell_uncovered_panes(&covered_panes, &registry_pane_ids(&registry));
-                    if !pane_ids.is_empty()
-                        && doorbell_spawn_status_forwarder(cfg, pane_ids.clone(), &tx)
-                    {
-                        covered_panes.extend(pane_ids);
-                    }
-                }
-                let _ = hear.expire(doorbell_now_unix(), doorbell::UNANSWERED_SECS);
-                doorbell_persist_hear(workspace, &hear);
-                doorbell_persist_wake_with_plane_s(
-                    workspace,
-                    &since_by_pin,
-                    plane_s_cursor_us,
-                    None,
-                )?;
-                let pins: Vec<String> = state::load_spawn_registry(project)
-                    .iter()
-                    .filter_map(|e| e.mail_identity.clone())
-                    .collect();
-                index = doorbell_self_index(cfg, project, &pins);
-                for pin in &pins {
-                    hear.remember_npub(pin, index.npub(pin));
-                }
-                // Gap 2: presence hear — presence.jsonl is the real projection for
-                // ephemeral 20001 (bus never stores it). A recent presence (<30s)
-                // means the agent heard, even if no channel post arrived.
-                // bd-adr0027-proven-leftovers-55nx.5: inject truth is
-                // Model.presence, so each fresh row ticks Msg::Presence (the
-                // trusted internal edge — no author check, dispatcher is the
-                // trust root). Hear derives from Model after tick; jsonl is
-                // never a second oracle. Kind 20001 remains the wire.
-                let presence_path = crate::mail_shim::mailbox_roots().0.join("presence.jsonl");
-                if let Ok(body) = std::fs::read_to_string(&presence_path) {
-                    let now = doorbell_now_unix();
-                    for (pin, state) in timeout_presence_rows(&body, now) {
-                        if !pins.contains(&pin) {
-                            continue;
-                        }
-                        let (next_model, cmds) = workspace::tick(
-                            &workspace_model,
-                            &workspace::Msg::Presence {
-                                pin: pin.clone(),
-                                state,
-                            },
-                        );
-                        workspace_model = next_model;
-                        let _ =
-                            handle_workspace_cmds(&mut workspace_model, &cmds, project, cfg, false);
-                        if workspace_model.presence.contains_key(&pin) {
-                            hear.note_heard_pin(&pin);
-                        }
-                    }
-                    doorbell_persist_hear(workspace, &hear);
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    if let Some(mut c) = watch_child {
-        let _ = c.kill();
-    }
-    Ok(())
 }
 /// Spawn the CLI `toron watch` plane-S child + its NDJSON reader thread.
 /// Shared by the initial fallback and both respawn paths (Died burst +
@@ -11221,151 +10506,6 @@ fn doorbell_prompt(
     ok
 }
 
-#[allow(clippy::too_many_arguments)]
-fn doorbell_prompt_and_hear(
-    herdr: Option<&mut Client>,
-    registry: &[state::SpawnEntry],
-    injects: &[(String, String)],
-    hear: &mut doorbell::HearTracker,
-    index: &doorbell::SelfIndex,
-    project: &str,
-    workspace: &str,
-    generation: Option<&doorbell::WatcherGen>,
-) -> Vec<String> {
-    let now = doorbell_now_unix();
-    let ok = doorbell_prompt(herdr, registry, injects, generation, project, workspace);
-    for pin in &ok {
-        hear.note_inject(pin, index.npub(pin), now);
-    }
-    doorbell_persist_hear(workspace, hear);
-    // GS-039 P0-1: callers stamp last_wake from successfully delivered pins.
-    ok
-}
-
-/// Seed / poll pane status. Drain queues on working → idle|done.
-/// Status writes go through `Msg::HerdrStatus` so Model.doorbell.statuses is truth.
-#[allow(clippy::too_many_arguments)]
-fn doorbell_refresh_status(
-    herdr: Option<&mut Client>,
-    project: &str,
-    pane_to_pin: &mut BTreeMap<String, String>,
-    workspace_model: &mut workspace::WorkspaceModel,
-    hear: &mut doorbell::HearTracker,
-    index: &doorbell::SelfIndex,
-    workspace: &str,
-    generation: Option<&doorbell::WatcherGen>,
-    cfg: &Config,
-) {
-    let registry = state::load_spawn_registry(project);
-    pane_to_pin.clear();
-    for e in &registry {
-        if let Some(pin) = &e.mail_identity
-            && !e.pane_id.is_empty()
-        {
-            pane_to_pin.insert(e.pane_id.clone(), pin.clone());
-        }
-    }
-    let Some(client) = herdr else {
-        return;
-    };
-    let Ok(agents) = client.agent_list() else {
-        return;
-    };
-    let mut injects = Vec::new();
-    // GS-039 P0-1: poll stamps wake only on (a) delivered prompts or
-    // (b) observed status TRANSITION into working|idle|done|blocked —
-    // never from static already-idle rows on every background poll
-    // (that ratcheted last_wake continuously — invent-adjacent).
-    let mut transitioned_status_pins: Vec<String> = Vec::new();
-    for a in agents {
-        let pin = registry
-            .iter()
-            .find(|e| e.pane_id == a.pane_id || e.name == a.name.as_deref().unwrap_or(""))
-            .and_then(|e| e.mail_identity.clone());
-        let Some(pin) = pin else {
-            continue;
-        };
-        let to = a.agent_status.as_str().to_string();
-        let status_l = to.to_ascii_lowercase();
-        let from_l = workspace_model
-            .doorbell
-            .statuses
-            .get(&pin)
-            .map(|s| s.to_ascii_lowercase());
-        let wake_worthy = status_l == "working"
-            || status_l == "idle"
-            || status_l == "done"
-            || status_l == "blocked";
-        // Transition gate: first sighting OR from != to into wake-worthy.
-        if wake_worthy {
-            let transitioned = match from_l.as_deref() {
-                Some(f) => f != status_l.as_str(),
-                None => true,
-            };
-            if transitioned {
-                transitioned_status_pins.push(pin.clone());
-            }
-        }
-        // bd-a2vx: drain decision via tick. No side map; tick sees `from` on Model.
-        workspace_model.doorbell.index = index.clone();
-        let msg = workspace::Msg::HerdrStatus {
-            pin: pin.clone(),
-            status: to.clone(),
-        };
-        let (next_model, cmds) = workspace::tick(workspace_model, &msg);
-        *workspace_model = next_model;
-        handle_workspace_cmds(workspace_model, &cmds, project, cfg, false);
-        let raw = prompt_injects(&cmds);
-        doorbell::journal_append_workspace(
-            &config::state_dir(),
-            workspace,
-            &msg,
-            &cmds,
-            serde_json::json!({ "stage": "refresh_status", "pin": pin }),
-            Some(&journal_pins(workspace_model)),
-        );
-        injects.extend(raw);
-    }
-    let delivered = doorbell_prompt_and_hear(
-        Some(client),
-        &registry,
-        &injects,
-        hear,
-        index,
-        project,
-        workspace,
-        generation,
-    );
-    // GS-039 P0-1: poll-path wake stamp from delivered prompt OR status
-    // transition into wake-worthy — not static already-idle rows.
-    // Refuse silent drop — loud warn.
-    let woke = delivered
-        .first()
-        .map(String::as_str)
-        .or_else(|| transitioned_status_pins.first().map(String::as_str));
-    if let Some(pin) = woke {
-        if let Err(e) = doorbell_note_observed_wake(workspace, pin) {
-            eprintln!(
-                "flywheel doorbell: observed-wake stamp FAILED on poll for pin={pin}: {e:#} — refuse silent drop (GS-039)"
-            );
-        }
-    }
-}
-
-fn doorbell_refresh_pins(
-    registry: &[state::SpawnEntry],
-    pane_to_pin: &mut BTreeMap<String, String>,
-) {
-    pane_to_pin.clear();
-    for e in registry {
-        if let Some(pin) = &e.mail_identity
-            && !e.pane_id.is_empty()
-        {
-            pane_to_pin.insert(e.pane_id.clone(), pin.clone());
-        }
-    }
-}
-
 /// Registry pane ids, materialized for the delta check.
 fn registry_pane_ids(registry: &[state::SpawnEntry]) -> Vec<String> {
     registry.iter().map(|e| e.pane_id.clone()).collect()
@@ -11413,235 +10553,6 @@ pub(crate) fn unpinned_spawn_fate(mail_configured: bool) -> UnpinnedFate {
         UnpinnedFate::FailClosed
     } else {
         UnpinnedFate::LegacyWarn
-    }
-}
-
-/// Plane P: one `toron mail inbox --since` per pin, batched on the 1s tick.
-/// Gap 13: prefers in-process `Mailbox::fetch_inbox` (zero fork) and falls back
-/// to `toron mail inbox` CLI only when the in-process mailbox is unavailable.
-#[allow(clippy::too_many_arguments)]
-fn doorbell_sweep_inbox(
-    cfg: &Config,
-    project: &str,
-    workspace_model: &mut workspace::WorkspaceModel,
-    since_by_pin: &mut BTreeMap<String, String>,
-    budgets: &mut BTreeMap<String, doorbell::PinBudget>,
-    herdr: Option<&mut Client>,
-    hear: &mut doorbell::HearTracker,
-    index: &doorbell::SelfIndex,
-    workspace: &str,
-    generation: Option<&doorbell::WatcherGen>,
-) {
-    let registry = state::load_spawn_registry(project);
-    let mut injects = Vec::new();
-    // 55nx.9: per-pin journal payloads, written AFTER the batch budget gate
-    // below so each line carries its gate outcome (effect). High-water
-    // updates stay inline — they are independent of the gate.
-    let mut pending: Vec<(String, workspace::Msg, Vec<workspace::Cmd>, &'static str)> = Vec::new();
-    // bd-unpinned-loud-1mlt: legacy rows without a pin are skipped by the
-    // sweep below — count them loudly (once per sweep) instead of silently.
-    let unpinned = unpinned_registry_names(&registry);
-    if !unpinned.is_empty() {
-        eprintln!(
-            "flywheel: warn: doorbell sweep skipping {} unpinned pane(s) with no mail identity ({}); re-register with a mail identity to restore inbox checks",
-            unpinned.len(),
-            unpinned.join(", ")
-        );
-    }
-    for e in &registry {
-        let Some(pin) = e.mail_identity.as_deref() else {
-            continue;
-        };
-        let since = since_by_pin.get(pin).cloned().unwrap_or_else(|| {
-            (chrono::Utc::now()
-                - chrono::Duration::hours(doorbell::REDELIVERY_LOOKBACK_HOURS as i64))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        });
-        // Status enters via HerdrStatus ticks, never pre-insert before InboxRows.
-        workspace_model.doorbell.index = index.clone();
-        // Prefer in-process mailbox (zero fork) — fallback to CLI only if unavailable
-        let in_process_ok = (|| -> Option<()> {
-            let mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
-                .ok()
-                .flatten()?;
-            let filter = crate::mail_shim::MailInboxFilter {
-                since_ts: Some(since.clone()),
-                limit: 50,
-                include_bodies: true,
-                ..Default::default()
-            };
-            let v = mail.inbox_filtered(project, pin, &filter).ok()?;
-            let arr = v.as_array()?;
-            // Feed rows through the tick (bd-9hco: plane-P sweep via tick).
-            let rows: Vec<serde_json::Value> = arr.clone();
-            let msg = workspace::Msg::InboxRows {
-                rows,
-                pin: pin.to_string(),
-            };
-            let (next_model, cmds) = workspace::tick(workspace_model, &msg);
-            *workspace_model = next_model;
-            handle_workspace_cmds(workspace_model, &cmds, project, cfg, true);
-            let raw = prompt_injects(&cmds);
-            pending.push((pin.to_string(), msg, cmds, "sweep_inbox"));
-            injects.extend(raw);
-            if let Some(hw) = doorbell::inbox_high_water_from_values(arr.iter().collect()) {
-                since_by_pin.insert(pin.to_string(), hw);
-            } else if arr.is_empty() {
-            } else {
-                // bd-7qg6: never advance the high-water on unparseable rows —
-                // the old `now` advance silently skipped mail (at-most-once).
-                // Hold the cursor so the batch re-sweeps; the audit is the proof.
-                doorbell::audit_append(
-                    &config::state_dir(),
-                    workspace,
-                    serde_json::json!({
-                        "ts": chrono::Utc::now().to_rfc3339(),
-                        "workspace": workspace,
-                        "kind": "inbox_gap_skip",
-                        "pin": pin,
-                        "rows": arr.len(),
-                        "error": "non-empty inbox batch with no parseable timestamp — cursor held, will re-sweep",
-                    }),
-                );
-            }
-            Some(())
-        })();
-        if in_process_ok.is_some() {
-            continue;
-        }
-        // Fallback: CLI spawn (when in-process mailbox unavailable, e.g. tests).
-        // bd-em85: `--as`, never `--agent` (toron has no `--agent` flag).
-        let output = Command::new("toron")
-            .args(mail_inbox_fallback_argv(pin, project, &since))
-            .output();
-        let Ok(output) = output else {
-            doorbell::audit_append(
-                &config::state_dir(),
-                workspace,
-                serde_json::json!({
-                    "ts": chrono::Utc::now().to_rfc3339(),
-                    "workspace": workspace,
-                    "kind": "inbox_error",
-                    "pin": pin,
-                    "error": "toron spawn failed",
-                }),
-            );
-            continue;
-        };
-        if !output.status.success() {
-            doorbell::audit_append(
-                &config::state_dir(),
-                workspace,
-                serde_json::json!({
-                    "ts": chrono::Utc::now().to_rfc3339(),
-                    "workspace": workspace,
-                    "kind": "inbox_error",
-                    "pin": pin,
-                    "error": String::from_utf8_lossy(&output.stderr).to_string(),
-                }),
-            );
-            continue;
-        }
-        let raw = String::from_utf8_lossy(&output.stdout);
-        // Parse CLI output into rows and feed through tick as well.
-        let parsed: serde_json::Value =
-            serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
-        let rows: Vec<serde_json::Value> = match &parsed {
-            serde_json::Value::Array(arr) => arr.clone(),
-            v if v.get("messages").is_some() => v
-                .get("messages")
-                .and_then(|m| m.as_array())
-                .cloned()
-                .unwrap_or_default(),
-            other if other.is_object() => vec![other.clone()],
-            _ => vec![],
-        };
-        if !rows.is_empty() {
-            let msg = workspace::Msg::InboxRows {
-                rows: rows.clone(),
-                pin: pin.to_string(),
-            };
-            let (next_model, cmds) = workspace::tick(workspace_model, &msg);
-            *workspace_model = next_model;
-            handle_workspace_cmds(workspace_model, &cmds, project, cfg, true);
-            let raw_injects = prompt_injects(&cmds);
-            pending.push((pin.to_string(), msg, cmds, "sweep_inbox_cli"));
-            injects.extend(raw_injects);
-        }
-        if let Some(hw) = doorbell::inbox_high_water(&raw) {
-            since_by_pin.insert(pin.to_string(), hw);
-        } else if raw.trim().is_empty() || raw.trim() == "[]" || raw.trim() == "{}" {
-        } else {
-            // bd-7qg6: same no-advance rule on the CLI fallback path — hold
-            // the cursor and audit loudly instead of skipping to `now`.
-            doorbell::audit_append(
-                &config::state_dir(),
-                workspace,
-                serde_json::json!({
-                    "ts": chrono::Utc::now().to_rfc3339(),
-                    "workspace": workspace,
-                    "kind": "inbox_gap_skip",
-                    "pin": pin,
-                    "raw_len": raw.len(),
-                    "error": "non-empty CLI inbox batch with no parseable timestamp — cursor held, will re-sweep",
-                }),
-            );
-        }
-    }
-    let took = injects.len();
-    let injects = doorbell::take_allowed(injects, budgets, doorbell_now_unix());
-    // 55nx.9: journal each pin's line AFTER the batch gate with its outcome.
-    {
-        for (pin, msg, cmds, stage) in &pending {
-            let raw_p = prompt_injects(cmds);
-            let allowed_p: Vec<(String, String)> =
-                injects.iter().filter(|(p, _)| p == pin).cloned().collect();
-            let effect = budget_effect(&raw_p, &allowed_p);
-            let pins = [pin.clone()];
-            doorbell::journal_append_workspace(
-                &config::state_dir(),
-                workspace,
-                msg,
-                cmds,
-                serde_json::json!({ "stage": stage, "pin": pin, "effect": effect }),
-                Some(&pins),
-            );
-        }
-    }
-    if took != injects.len() {
-        doorbell::audit_append(
-            &config::state_dir(),
-            workspace,
-            serde_json::json!({
-                "ts": chrono::Utc::now().to_rfc3339(),
-                "workspace": workspace,
-                "kind": "budget_drop",
-                "scope": "inbox",
-                "dropped": took - injects.len(),
-            }),
-        );
-    }
-    doorbell::audit_append(
-        &config::state_dir(),
-        workspace,
-        serde_json::json!({
-            "ts": chrono::Utc::now().to_rfc3339(),
-            "workspace": workspace,
-            "kind": "inbox_sweep",
-            "injected": injects.iter().map(|(p,_)| p).collect::<Vec<_>>(),
-        }),
-    );
-    let delivered = doorbell_prompt_and_hear(
-        herdr, &registry, &injects, hear, index, project, workspace, generation,
-    );
-    // GS-039 P0-1: inbox sweep wake stamp from successful delivery.
-    // Refuse silent drop — loud warn (no let _ = invent-quiet).
-    if let Some(pin) = delivered.first() {
-        if let Err(e) = doorbell_note_observed_wake(workspace, pin) {
-            eprintln!(
-                "flywheel doorbell: observed-wake stamp FAILED on inbox sweep for pin={pin}: {e:#} — refuse silent drop (GS-039)"
-            );
-        }
     }
 }
 
@@ -36814,19 +35725,19 @@ mod why_resume_tests {
 mod single_writer_tests {
     #[test]
     fn option_a_doorbell_seeds_swarm_resume() {
-        let src = include_str!("main.rs");
-        let start = crate::tripwire::find_fn(src, "cmd_internal_doorbell");
-        let slice = &src[start..src.len().min(start + 25000)];
+        // bd-asr2.5 topology: seeds moved with the loop into RtHost::new —
+        // same one-RAM-owner contract, new address.
+        let host = include_str!("doorbell_host.rs");
         assert!(
-            slice.contains("seed_workspace_from_active_loop"),
+            host.contains("seed_workspace_from_active_loop"),
             "Option A: doorbell must seed swarm from ActiveLoop onto the one Model"
         );
         assert!(
-            slice.contains("seed_roles_from_binds"),
+            host.contains("seed_roles_from_binds"),
             "Option A / B8: doorbell must seed roles from the RoleBound snapshot"
         );
         assert!(
-            slice.contains("WorkspaceModel::default()"),
+            host.contains("WorkspaceModel::default()"),
             "doorbell remains the one live WorkspaceModel::default()"
         );
     }

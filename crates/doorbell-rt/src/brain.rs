@@ -104,31 +104,8 @@ impl<H: Host> Brain<H> {
             BrainMsg::HerdrStatus { pin, status } => self.on_status(pin, status).await,
             BrainMsg::Died => self.on_died().await,
             BrainMsg::Sweep { since, now } => self.on_sweep(since, now).await,
-            BrainMsg::RoleBound { role, pin } => {
-                let effects = self.host.tick(&BrainMsg::RoleBound {
-                    role: role.clone(),
-                    pin: pin.clone(),
-                });
-                self.journal(
-                    &serde_json::json!({"rt_kind": "RoleBound", "role": role}),
-                    &effects,
-                    serde_json::json!({"stage": "role_bound_live", "role": role, "pin": pin}),
-                    &[pin.clone()],
-                );
-                self.deliver(effects, "role_bound").await;
-            }
-            BrainMsg::Fact { summary } => {
-                let effects = self.host.tick(&BrainMsg::Fact {
-                    summary: summary.clone(),
-                });
-                self.journal(
-                    &serde_json::json!({"rt_kind": "Fact"}),
-                    &effects,
-                    serde_json::json!({"stage": "fact_live", "summary": summary}),
-                    &self.pins_of(&effects),
-                );
-                self.deliver(effects, "fact").await;
-            }
+            BrainMsg::RoleBound { role, pin } => self.on_rolebound(role, pin).await,
+            BrainMsg::Fact { summary } => self.on_fact(summary).await,
             BrainMsg::AckSlaTick { now } => self.on_ack_sla(now).await,
             BrainMsg::Presence { pin, state } => {
                 // Trusted internal edge; no journal (mirrors the live loop).
@@ -214,7 +191,7 @@ impl<H: Host> Brain<H> {
         let _ = self.store.sync_journal(&self.cfg.workspace);
         let delivered = self.deliver_prompts(injects).await;
         let woke = delivered.first().cloned();
-        self.persist_wake(woke.as_deref());
+        self.persist_wake(woke.as_deref(), "watch");
     }
 
     async fn on_status(&mut self, pin: String, status: String) {
@@ -233,15 +210,24 @@ impl<H: Host> Brain<H> {
         );
         let _ = self.store.sync_journal(&self.cfg.workspace);
         let delivered = self.deliver_prompts(injects).await;
-        // GS-039: stamp last_wake only from real observations.
+        // GS-039 P0-1 REAL observation: wake-worthy status transitions that
+        // show the agent woke (working) or settled after work
+        // (idle/done/blocked) advance last_wake — OR a pin that actually
+        // delivered. Static already-idle rows never ratchet liveness.
         let s = status.to_ascii_lowercase();
-        let observed = matches!(s.as_str(), "working" | "idle" | "done" | "blocked");
+        let from = self.host.prev_status(&pin).map(|f| f.to_ascii_lowercase());
+        let transitioned = match from.as_deref() {
+            Some(f) => f != s.as_str(),
+            None => true,
+        };
+        let observed = transitioned
+            && matches!(s.as_str(), "working" | "idle" | "done" | "blocked");
         let woke = if observed {
             Some(pin.clone())
         } else {
             delivered.first().cloned()
         };
-        self.persist_wake(woke.as_deref());
+        self.persist_wake(woke.as_deref(), "status");
     }
 
     async fn on_died(&mut self) {
@@ -253,30 +239,63 @@ impl<H: Host> Brain<H> {
             &[],
         );
         self.host.restart_watch();
-        let _ = self.hear.expire(self.host.now_unix(), doorbell_core::UNANSWERED_SECS);
+        let _ = self
+            .hear
+            .expire(self.host.now_unix(), doorbell_core::UNANSWERED_SECS);
         self.persist_hear();
     }
 
+    async fn on_rolebound(&mut self, role: String, pin: String) {
+        let effects = self.host.tick(&BrainMsg::RoleBound {
+            role: role.clone(),
+            pin: pin.clone(),
+        });
+        self.journal(
+            &serde_json::json!({"rt_kind": "RoleBound", "role": role}),
+            &effects,
+            serde_json::json!({"stage": "role_bound_live", "role": role, "pin": pin}),
+            &[pin.clone()],
+        );
+        self.deliver(effects, "role_bound").await;
+    }
+
+    async fn on_fact(&mut self, summary: String) {
+        let effects = self.host.tick(&BrainMsg::Fact {
+            summary: summary.clone(),
+        });
+        self.journal(
+            &serde_json::json!({"rt_kind": "Fact"}),
+            &effects,
+            serde_json::json!({"stage": "fact_live", "summary": summary}),
+            &self.pins_of(&effects),
+        );
+        self.deliver(effects, "fact").await;
+    }
     async fn on_sweep(&mut self, since: String, now: u64) {
+        // Live drains first (loop-top order): role binds, then facts.
+        for (role, pin) in self.host.drain_role_bounds() {
+            self.on_rolebound(role, pin).await;
+        }
+        for summary in self.host.drain_facts() {
+            self.on_fact(summary).await;
+        }
+        // Registry/index refresh + forwarder respawn; presence rows tick
+        // the trusted edge (heard = registry pin present after tick).
+        for (pin, state) in self.host.sweep_maintenance() {
+            let effects = self.host.tick(&BrainMsg::Presence {
+                pin: pin.clone(),
+                state: state.clone(),
+            });
+            self.deliver(effects, "presence").await;
+            self.hear.note_heard_pin(&pin);
+        }
         self.sweep_last = Some(now);
         let effects = self.host.tick(&BrainMsg::Sweep {
             since: since.clone(),
             now,
         });
         // FetchInbox per known pin (the live loop's need_fetch arm).
-        let mut fetched: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
-        for pin in self.host.pins() {
-            let pin_since = self
-                .wake
-                .since_by_pin
-                .get(&pin)
-                .cloned()
-                .unwrap_or_else(|| since.clone());
-            let rows = self.host.fetch_inbox(&pin, &pin_since);
-            if !rows.is_empty() {
-                fetched.push((pin, rows));
-            }
-        }
+        let fetched = self.fetch_all_inbox(since).await;
         self.journal(
             &serde_json::json!({"rt_kind": "Sweep"}),
             &effects,
@@ -312,11 +331,29 @@ impl<H: Host> Brain<H> {
         self.deliver(effects, "inbox").await;
     }
 
+    async fn fetch_all_inbox(
+        &mut self,
+        since_fallback: String,
+    ) -> Vec<(String, Vec<serde_json::Value>)> {
+        let mut fetched = Vec::new();
+        for pin in self.host.pins() {
+            let pin_since = self
+                .wake
+                .since_by_pin
+                .get(&pin)
+                .cloned()
+                .unwrap_or_else(|| since_fallback.clone());
+            let rows = self.host.fetch_inbox(&pin, &pin_since);
+            if !rows.is_empty() {
+                fetched.push((pin, rows));
+            }
+        }
+        fetched
+    }
+
     async fn on_ack_sla(&mut self, now: u64) {
         let effects = self.host.tick(&BrainMsg::AckSlaTick { now });
-        let scan = effects
-            .iter()
-            .any(|e| matches!(e, Effect::CheckAckSla));
+        let scan = effects.iter().any(|e| matches!(e, Effect::CheckAckSla));
         self.journal(
             &serde_json::json!({"rt_kind": "AckSlaTick"}),
             &effects,
@@ -329,15 +366,19 @@ impl<H: Host> Brain<H> {
                 self.on_sla_fired(posts).await;
             }
         }
+        // Live AckSla arm also sweeps the inbox when tick asks for it.
+        if effects
+            .iter()
+            .any(|e| matches!(e, Effect::FetchInbox { .. }))
+        {
+            let since = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            self.fetch_all_inbox(since).await;
+        }
         self.deliver(effects, "acksla").await;
     }
-
     async fn on_sla_fired(&mut self, posts: Vec<String>) {
         if !posts.is_empty() {
-            self.audit(
-                "ack_sla_fired",
-                serde_json::json!({ "count": posts.len() }),
-            );
+            self.audit("ack_sla_fired", serde_json::json!({ "count": posts.len() }));
         }
         let effects = self.host.tick(&BrainMsg::SlaFired {
             posts: posts.clone(),
@@ -352,14 +393,11 @@ impl<H: Host> Brain<H> {
     }
 
     /// Budget gate + sink delivery shared by every arm. Returns delivered pins.
+    /// Audit/FactMiss/LoudMiss/Digest effects are recorded by the Host layer
+    /// (single ownership); the journal row above already carries them as data.
     async fn deliver(&mut self, effects: Vec<Effect>, _stage: &str) -> Vec<String> {
         let raw = self.prompts_of(&effects);
         if raw.is_empty() {
-            for e in &effects {
-                if let Effect::Audit { kind, detail } = e {
-                    self.audit(kind, detail.clone());
-                }
-            }
             return Vec::new();
         }
         let now = self.host.now_unix();
@@ -381,7 +419,11 @@ impl<H: Host> Brain<H> {
             match self.sinks.send(&sink, &pin, &line).await {
                 crate::sinks::SendOutcome::Sent => {
                     self.stats.injects += 1;
-                    self.hear.note_inject(&pin, None, self.host.now_unix());
+                    self.hear.note_inject(
+                        &pin,
+                        self.host.pin_npub(&pin).as_deref(),
+                        self.host.now_unix(),
+                    );
                     delivered.push(pin);
                 }
                 crate::sinks::SendOutcome::Shed { pin, line } => {
@@ -407,9 +449,9 @@ impl<H: Host> Brain<H> {
 
     async fn maybe_flush_digest(&mut self) {
         let due_len = self.digest.len() >= self.cfg.digest_threshold;
-        let due_time = self.digest_since.is_some_and(|t| {
-            t.elapsed().as_secs() >= self.cfg.digest_interval_secs
-        });
+        let due_time = self
+            .digest_since
+            .is_some_and(|t| t.elapsed().as_secs() >= self.cfg.digest_interval_secs);
         if !(due_len || due_time) || self.digest.is_empty() {
             return;
         }
@@ -441,22 +483,24 @@ impl<H: Host> Brain<H> {
         executed: serde_json::Value,
         pins: &[String],
     ) {
-        let actions = serde_json::json!(effects
-            .iter()
-            .map(|e| match e {
-                Effect::Prompt { pin, line } => {
-                    serde_json::json!({"Prompt": {"pin": pin, "line": line}})
-                }
-                Effect::FetchInbox { pin, since } => {
-                    serde_json::json!({"FetchInbox": {"pin": pin, "since": since}})
-                }
-                Effect::CheckAckSla => serde_json::json!("CheckAckSla"),
-                Effect::RestartWatch => serde_json::json!("RestartWatch"),
-                Effect::Audit { kind, detail } => {
-                    serde_json::json!({"Audit": {"kind": kind, "detail": detail}})
-                }
-            })
-            .collect::<Vec<_>>());
+        let actions = serde_json::json!(
+            effects
+                .iter()
+                .map(|e| match e {
+                    Effect::Prompt { pin, line } => {
+                        serde_json::json!({"Prompt": {"pin": pin, "line": line}})
+                    }
+                    Effect::FetchInbox { pin, since } => {
+                        serde_json::json!({"FetchInbox": {"pin": pin, "since": since}})
+                    }
+                    Effect::CheckAckSla => serde_json::json!("CheckAckSla"),
+                    Effect::RestartWatch => serde_json::json!("RestartWatch"),
+                    Effect::Audit { kind, detail } => {
+                        serde_json::json!({"Audit": {"kind": kind, "detail": detail}})
+                    }
+                })
+                .collect::<Vec<_>>()
+        );
         let _ = self
             .store
             .append_journal(&self.cfg.workspace, msg, &actions, executed, pins);
@@ -466,7 +510,8 @@ impl<H: Host> Brain<H> {
         if let Some(obj) = detail.as_object_mut() {
             obj.insert(
                 "ts".into(),
-                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                chrono::Utc::now()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
                     .into(),
             );
             obj.insert("workspace".into(), self.cfg.workspace.clone().into());
@@ -480,13 +525,18 @@ impl<H: Host> Brain<H> {
             .save_unanswered(&self.cfg.workspace, &self.hear.unanswered_pins());
     }
 
-    fn persist_wake(&mut self, woke: Option<&str>) {
+    fn persist_wake(&mut self, woke: Option<&str>, ctx: &str) {
         let mut changed = false;
         if let Some(pin) = woke {
             changed |= doorbell_core::note_wake(&mut self.wake, pin, self.host.now_unix());
         }
-        if changed {
-            let _ = self.store.save_wake(&self.cfg.workspace, &self.wake);
+        if changed
+            && let Err(e) = self.store.save_wake(&self.cfg.workspace, &self.wake)
+        {
+            // GS-039: refuse silent drop — loud warn with the failing arm.
+            eprintln!(
+                "doorbell-rt: observed-wake stamp FAILED on {ctx} — refuse silent drop (GS-039): {e:#}"
+            );
         }
     }
 
@@ -551,9 +601,7 @@ mod tests {
             line: "[doorbell] test".into(),
         };
         let (mut brain, _rx, _tx) = test_brain("decided", vec![vec![prompt]]);
-        brain
-            .dispatch(BrainMsg::Watch("{\"kind\":9}".into()))
-            .await;
+        brain.dispatch(BrainMsg::Watch("{\"kind\":9}".into())).await;
         assert_eq!(brain.stats.injects, 0, "no sink registered");
         // Intent was still journaled decided-before-delivery.
         let journal = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
@@ -610,7 +658,11 @@ mod tests {
         let (mut brain, _rx, tx) = test_brain("budget", vec![prompts]);
         let (sink, sent) = MockSink::new();
         brain.sinks.add_sink("herdr", Box::new(sink));
-        brain.dispatch(BrainMsg::Fact { summary: "x".into() }).await;
+        brain
+            .dispatch(BrainMsg::Fact {
+                summary: "x".into(),
+            })
+            .await;
         drop(tx);
         // 3 pass the 5/30/3 gate; the 4th drops to the audit trail.
         assert_eq!(brain.stats.injects, 3);

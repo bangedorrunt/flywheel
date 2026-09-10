@@ -37,7 +37,11 @@ impl SensorHandle {
         }
     }
 }
-pub fn supervise<F, Fut>(name: impl Into<String>, tx: mpsc::Sender<BrainMsg>, task: F) -> SensorHandle
+pub fn supervise<F, Fut>(
+    name: impl Into<String>,
+    tx: mpsc::Sender<BrainMsg>,
+    task: F,
+) -> SensorHandle
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
@@ -165,21 +169,15 @@ mod tests {
         prod_tx.send(2).await.unwrap();
         // Hold the first message without consuming: the bridge parks on the
         // second send instead of dropping it.
-        let first = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            brain_rx.recv(),
-        )
-        .await
-        .expect("first lands")
-        .expect("open");
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), brain_rx.recv())
+            .await
+            .expect("first lands")
+            .expect("open");
         assert!(matches!(first, BrainMsg::Fact { .. }));
-        let second = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            brain_rx.recv(),
-        )
-        .await
-        .expect("parked sender still delivers")
-        .expect("open");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), brain_rx.recv())
+            .await
+            .expect("parked sender still delivers")
+            .expect("open");
         assert!(matches!(second, BrainMsg::Fact { .. }));
     }
 }

@@ -154,70 +154,72 @@ fn run_doorbell_once(stdin_line: &str, status: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// SC-D1 wiring: live dispatcher decides via `doorbell_tick::tick` (bd-yw4s
-/// bind); effects stay herdr `agent.prompt`; one `toron watch` child; no
-/// `loop run`.
+/// SC-D1 wiring (bd-asr2.5 topology): `cmd_internal_doorbell` selects the
+/// host; the embedded live path is `doorbell_host::run_embedded` driving
+/// doorbell-rt's Brain around `RtHost` (tick decides, journal first,
+/// herdr prompt delivers). Same contracts, new addresses.
 #[test]
 fn sc_d1_live_dispatcher_uses_apply_watch_line() {
-    let src = read("src/main.rs");
-    let start = find_toplevel_fn(&src, "cmd_internal_doorbell");
-    let end = find_toplevel_fn(&src, "project_base");
-    let body = &src[start..end];
-    // bd-yw4s: the reducer is the decider on the live path — Watch, Status,
-    // Died, and AckSlaTick all flow through workspace::tick (via doorbell slice).
+    let cmd = read("src/main.rs");
+    let start = find_toplevel_fn(&cmd, "cmd_internal_doorbell");
+    let end = find_toplevel_fn(&cmd, "project_base");
+    let dispatch = &cmd[start..end];
+    // Host selection lives in the command: daemon mode never runs a loop.
     assert!(
-        body.contains("workspace::tick") || body.contains("doorbell_tick::tick"),
-        "live dispatcher must decide via workspace::tick (or legacy doorbell_tick::tick)"
+        dispatch.contains("resolve_host") && dispatch.contains("run_embedded"),
+        "cmd must select the host and run the embedded binding"
     );
     assert!(
-        body.matches("workspace::Msg::").count() >= 3
-            || body.matches("doorbell_tick::DoorbellMsg::").count() >= 3,
-        "live dispatcher must construct Msgs (watch/status/ack-sla)"
-    );
-    assert!(
-        body.contains("doorbell::journal_append"),
-        "live dispatcher must journal ticks for `doorbell why`"
-    );
-    assert!(
-        body.contains("agent_prompt"),
-        "live inject must be herdr agent.prompt"
-    );
-    assert!(
-        !body.contains("loop run"),
+        !dispatch.contains("loop run"),
         "doorbell must not start the loop"
     );
-    // Two `.args(["watch"` literals are the contract: the cold-start CLI
-    // fallback inside the dispatcher body, and the shared spawn_watch_child
-    // helper (Died burst + retry gate respawns) which sits later in the same
-    // region. One workspace still gets exactly ONE live watch child.
-    assert_eq!(
-        body.matches(".args([\"watch\"").count(),
-        2,
-        "cold-start fallback + shared respawn helper are the only watch spawn sites"
+    let host = read("src/doorbell_host.rs");
+    // bd-yw4s: the reducer is the decider on the live path — tick owns
+    // Watch/Status/Died/Sweep/AckSla arms via the Host binding.
+    assert!(
+        host.contains("workspace::tick"),
+        "host binding must decide via workspace::tick"
     );
     assert!(
-        !body.contains("9,7,43001"),
+        host.matches("workspace::Msg::").count() >= 3,
+        "host binding must construct Msgs (watch/status/ack-sla)"
+    );
+    let brain_journal = read("crates/doorbell-rt/src/brain.rs");
+    assert!(
+        brain_journal.contains("append_journal"),
+        "live path must journal ticks for `doorbell why`"
+    );
+    assert!(
+        host.contains("doorbell_prompt"),
+        "live inject must go through the herdr prompt delivery path"
+    );
+    // One watch source: in-process bus watch with the CLI child fallback.
+    assert!(
+        host.contains("subscribe_trusted") && host.contains("spawn_watch_child"),
+        "in-process watch first, CLI child fallback"
+    );
+    assert!(
+        !host.contains("9,7,43001"),
         "watch filter stays tight: reactions (kind 7) are not wake-worthy (bd-qsed.4)"
     );
     assert!(
-        body.contains("20001") && body.contains("30013") && body.contains(",14,"),
-        "fallback + respawn watch must include presence 20001, profile 30013, and rumor 14"
+        host.contains("20001") && host.contains("30013") && host.contains("toron_kind(14)"),
+        "watch must include presence 20001, profile 30013, and rumor 14"
     );
     assert!(
-        !body.contains("let kinds = \"9,43001,30031,39002\""),
-        "spawn_watch_child must not drop 20001/30013"
-    );
-    assert!(
-        body.contains("mail") && body.contains("inbox"),
+        host.contains("inbox_filtered") && host.contains("mail_inbox_fallback_argv"),
         "plane P sweep is fetch_inbox / toron mail inbox --since"
     );
+    let brain = read("crates/doorbell-rt/src/brain.rs");
     assert!(
-        body.contains("take_allowed"),
-        "dispatcher must enforce 5/30/3 budget"
+        brain.contains("take_allowed") && brain.contains("sync_journal"),
+        "brain must enforce 5/30/3 budget behind the write-ahead journal"
     );
+    // Push-only status spine: no snapshot poll fallback (sweep retries
+    // coverage instead — DELTA vs the old refresh_status, same guarantee).
     assert!(
-        body.contains("if !subscribed"),
-        "herdr status poll only when subscribe is down"
+        !host.contains("agent_list"),
+        "no snapshot poll; forwarder push + per-sweep respawn cover status"
     );
 }
 

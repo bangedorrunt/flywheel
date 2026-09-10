@@ -23,12 +23,12 @@ pub use brain::{Brain, BrainConfig};
 pub use budget::{PinBudget, take_allowed};
 pub use hear::HearTracker;
 pub use host::{CoreReducer, Effect, Host, MockHost};
+pub use lease::{Deference, OwnerLease, acquire_lease, deference_decision, lease_stale};
 pub use msg::{AskKind, AskReply, BrainMsg};
 pub use policy::{RestartPolicy, WatchRetry};
 pub use sensors::{SensorHandle, bridge, interval_ticker, supervise};
 pub use sinks::{MockSink, PromptSink, SendOutcome, SinkManager, Undelivered};
-pub use lease::{Deference, OwnerLease, acquire_lease, deference_decision, lease_stale};
-
+pub use store::FileStore;
 
 /// Single-writer brain inbox capacity (D3: slow brain parks sensors).
 pub const BRAIN_CAP: usize = 1024;
