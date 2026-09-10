@@ -9647,13 +9647,96 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str) -> Result<()> {
     // pending_wait (insertion is effect-side only), so overdue_holds was
     // always empty here. Live hold escalation rides the Sweep-arm TTL +
     // Audit wait-timeout records, not this display.
+    // bd-asr2.14: scope-bound roster header when the arrival-triple flag
+    // opts in (flag off = byte-identical to the legacy afk above).
+    for line in digest_roster_lines(cfg, project, now) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// Scope-bound roster lines for digests (bd-asr2.14, D5/E2). Empty unless
+/// the arrival-triple flag opts in — flag-off output stays byte-identical.
+fn digest_roster_lines(cfg: &Config, project: &str, now: u64) -> Vec<String> {
+    if !cfg.doorbell_arrival_triple() {
+        return Vec::new();
+    }
+    let registry = state::load_spawn_registry(project);
+    let pins: Vec<(String, String)> = registry
+        .iter()
+        .filter_map(|e| {
+            e.mail_identity.clone().map(|pin| {
+                let harness = e
+                    .harness
+                    .clone()
+                    .or_else(|| e.profile.clone())
+                    .unwrap_or_else(|| "?".to_string());
+                (pin, harness)
+            })
+        })
+        .collect();
+    if pins.is_empty() {
+        return Vec::new();
+    }
+    // role→pin binds invert to pin→role for the roster.
+    let roles: std::collections::BTreeMap<String, String> = state::load_role_binds(project)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(role, pin)| (pin, role))
+        .collect();
+    // Presence with recency (latest row per pin wins).
+    let mut presence: Vec<(String, String, u64)> = Vec::new();
+    if let Ok(body) =
+        std::fs::read_to_string(crate::mail_shim::mailbox_roots().0.join("presence.jsonl"))
+    {
+        let mut latest: std::collections::HashMap<String, (u64, String)> =
+            std::collections::HashMap::new();
+        for line in body.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if let (Some(name), Some(state), Some(ts)) = (
+                v.get("name").and_then(|n| n.as_str()),
+                v.get("state").and_then(|s| s.as_str()),
+                v.get("ts").and_then(|t| t.as_u64()),
+            ) {
+                latest.insert(name.to_string(), (ts, state.to_string()));
+            }
+        }
+        for (pin, (ts, state)) in latest {
+            presence.push((pin, state, ts));
+        }
+    }
+    // Current bead per pin (best-effort; blank when br is unreachable).
+    let mut beads: std::collections::BTreeMap<String, String> = Default::default();
+    if let Ok(out) = std::process::Command::new("br")
+        .args(["list", "--status", "in_progress", "--json"])
+        .output()
+        && out.status.success()
+        && let Ok(v) =
+            serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&out.stdout))
+    {
+        let issues = v
+            .get("issues")
+            .and_then(|i| i.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for issue in issues {
+            if let (Some(id), Some(who)) = (
+                issue.get("id").and_then(|i| i.as_str()),
+                issue.get("assignee").and_then(|a| a.as_str()),
+            ) {
+                beads.insert(who.to_string(), id.to_string());
+            }
+        }
+    }
+    doorbell::render_roster(&doorbell::build_roster(
+        &pins, &roles, &presence, &beads, now,
+    ))
 }
 
 /// Generalized digest (bd-asr2.11, D8): per-identity wake digest over any
 /// window. `afk` above stays byte-identical (captain default); this verb
-/// filters by identity/subscriber tag and `--since`, renders text or JSON,
-/// and escalates unanswered pins first. Roster-free.
 fn cmd_doorbell_digest(
     cfg: &Config,
     project: &str,
@@ -9729,6 +9812,7 @@ fn cmd_doorbell_digest(
             });
         rows.push((ws.clone(), ts, stage, who));
     }
+    let roster = digest_roster_lines(cfg, project, doorbell_now_unix());
     if format == "json" {
         println!(
             "{}",
@@ -9739,6 +9823,7 @@ fn cmd_doorbell_digest(
                 "rows": rows.iter().map(|(ws, ts, stage, who)| {
                     serde_json::json!({"workspace": ws, "ts": ts, "stage": stage, "who": who})
                 }).collect::<Vec<_>>(),
+                "roster": roster,
             })
         );
         return Ok(());
@@ -9759,9 +9844,11 @@ fn cmd_doorbell_digest(
     for (ws, ts, stage, who) in rows {
         println!("{ts} {ws}/{stage} {who}");
     }
+    for line in roster {
+        println!("{line}");
+    }
     Ok(())
 }
-
 fn why_entry_mentions_pin(pin: &str, msg: &workspace::Msg, cmds: &[workspace::Cmd]) -> bool {
     let cmd_hit = cmds.iter().any(|c| match c {
         workspace::Cmd::Prompt { pin: p, .. } => p == pin,
@@ -13126,6 +13213,37 @@ fn cmd_briefing(
     Ok(())
 }
 
+/// Arrival triple, legs 2–3 (bd-asr2.14, D5; leg 1 is the presence publish
+/// above): role auto-bind from the spawn-registry profile (closes the
+/// GS-030 no-bind-invisible gap — binds publish on the next sweep seed),
+/// best-effort wire publish via the existing `toron role pin` CLI.
+/// Best-effort throughout: never fails arrival.
+fn arrival_triple(project: &str, pin: &str) {
+    let profile = state::load_spawn_registry(project)
+        .into_iter()
+        .find(|e| e.mail_identity.as_deref() == Some(pin))
+        .and_then(|e| e.profile.clone());
+    let Some(role) = profile else {
+        eprintln!("flywheel: arrival triple: no registry profile for {pin} — role bind skipped");
+        return;
+    };
+    match state::upsert_role_bind(project, &role, pin) {
+        Ok(()) => eprintln!("flywheel: arrival triple: role {role} bound for {pin}"),
+        Err(e) => {
+            eprintln!("flywheel: arrival triple: role bind failed: {e:#}");
+            return;
+        }
+    }
+    match std::process::Command::new("toron")
+        .args(["role", "pin", &role, pin, "--project", project])
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!("flywheel: arrival triple: toron role pin exited {s}"),
+        Err(e) => eprintln!("flywheel: arrival triple: toron role pin failed: {e:#}"),
+    }
+}
+
 fn cmd_arrive(
     cfg: &Config,
     project: &str,
@@ -13187,6 +13305,16 @@ fn cmd_arrive(
             Ok(s) => eprintln!("flywheel: presence publish exited {s}"),
             Err(e) => eprintln!("flywheel: presence publish failed: {e:#}"),
         }
+    }
+    // Arrival triple (bd-asr2.14, D5, flag-gated): presence (above) + role
+    // auto-bind from the spawn-registry profile + roster visibility. The
+    // 39002 join-ring leg rides channel membership (coalition --join or
+    // spawn --join-channel, both opt-in and existing) — arrive never
+    // invents channels. Best-effort: never fails arrival.
+    if cfg.doorbell_arrival_triple()
+        && let Some(agent) = as_agent
+    {
+        arrival_triple(project, agent);
     }
     let arriver = as_agent.unwrap_or("");
     let (holder, whois_stale) = lookup_captain_holder(project);

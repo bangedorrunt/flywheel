@@ -111,6 +111,11 @@ pub struct DoorbellSection {
     /// exists). The section's presence selects the daemon host; absence
     /// selects embedded (with a 200ms loopback deference probe, D9).
     pub url: Option<String>,
+    /// arrival triple (bd-asr2.14, D5): presence + role auto-bind + join
+    /// ring + roster headers. Default false — behavior extensions stay
+    /// opt-in so migration parity holds with the flag off.
+    #[serde(default)]
+    pub arrival_triple: bool,
 }
 /// `[mail]` section — the per-backend transport table (ADR-0003 V3). Splitting
 /// the old shared `[agent_mail] url` fixes the BUG1 misroute: each backend
@@ -490,6 +495,14 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "http://127.0.0.1:18980".to_string())
         })
+    }
+
+    /// Arrival triple flag (bd-asr2.14, D5): false unless opted in.
+    pub fn doorbell_arrival_triple(&self) -> bool {
+        self.doorbell
+            .as_ref()
+            .map(|d| d.arrival_triple)
+            .unwrap_or(false)
     }
 
     pub fn socket_path(&self) -> String {
