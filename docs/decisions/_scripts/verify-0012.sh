@@ -51,6 +51,10 @@ echo "== ADR-0012 Phase 1 (bd-asr2.6: migration + parity harness) =="
 # rt-level S4 parity: same Msg log, identical journals modulo ts.
 $CARGO test -p doorbell-rt --lib parity_same_log_same_journal_modulo_ts 2>&1 | tail -n 2
 [ "${PIPESTATUS[0]}" -eq 0 ] || fail "rt journal parity red"
+# bd-asr2.7: full rt suite (crash-harness, clock-jump, determinism fuzz,
+# rotation, torn-tail) — the section 8 durability gate.
+$CARGO test -p doorbell-rt --lib 2>&1 | tail -n 2
+[ "${PIPESTATUS[0]}" -eq 0 ] || fail "doorbell-rt suite red"
 # State migration: craft an old-layout dir, adopt it, compare bytes.
 MIG_SRC="$(mktemp -d "${TMPDIR:-/tmp}/doorbell-mig-src.XXXXXX")"
 MIG_DST="$(mktemp -d "${TMPDIR:-/tmp}/doorbell-mig-dst.XXXXXX")"
