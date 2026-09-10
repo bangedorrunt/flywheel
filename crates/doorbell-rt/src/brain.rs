@@ -690,4 +690,59 @@ mod tests {
         .await;
         assert_eq!(sent_n, 3);
     }
+
+    /// S4 parity gate at the rt level: the same Msg log through two Brains
+    /// yields byte-identical journals modulo `ts` (the normalize rule the
+    /// Phase-1 harness pins: strip `ts` fields only).
+    #[tokio::test]
+    async fn parity_same_log_same_journal_modulo_ts() {
+        async fn run_once(tag: &str) -> String {
+            let prompt = Effect::Prompt {
+                pin: "p".into(),
+                line: "[doorbell] ring".into(),
+            };
+            let (mut brain, _rx, _tx) = test_brain(
+                tag,
+                vec![
+                    vec![prompt.clone()],
+                    vec![],
+                    vec![prompt.clone()],
+                    vec![],
+                    vec![],
+                ],
+            );
+            let (sink, _sent) = MockSink::new();
+            brain.sinks.add_sink("herdr", Box::new(sink));
+            for msg in [
+                BrainMsg::Watch("{\"kind\":9}".into()),
+                BrainMsg::Sweep {
+                    since: "2026-09-10T00:00:00Z".into(),
+                    now: 1_000_100,
+                },
+                BrainMsg::HerdrStatus {
+                    pin: "p".into(),
+                    status: "idle".into(),
+                },
+                BrainMsg::AckSlaTick { now: 1_000_200 },
+                BrainMsg::Fact {
+                    summary: "s".into(),
+                },
+            ] {
+                brain.dispatch(msg).await;
+            }
+            let raw = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
+            raw.lines()
+                .map(|l| {
+                    let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+                    v.as_object_mut().unwrap().remove("ts");
+                    serde_json::to_string(&v).unwrap()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let a = run_once("parity-a").await;
+        let b = run_once("parity-b").await;
+        assert_eq!(a, b, "same Msg log must journal identically modulo ts");
+        assert!(a.contains("\"stage\":\"decided\""), "{a}");
+    }
 }
