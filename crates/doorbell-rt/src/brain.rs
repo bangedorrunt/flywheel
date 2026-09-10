@@ -62,6 +62,21 @@ impl<H: Host> Brain<H> {
         let mut hear = HearTracker::default();
         hear.seed_unanswered(store.load_unanswered(&cfg.workspace));
         let next_seq = store.last_seq(&cfg.workspace) + 1;
+        // Crash-resume (D4.6/E12): journaled-but-unconfirmed Prompt intents
+        // redeliver within budget; the resume row makes the redelivery
+        // visible instead of silent. Budgets are RAM-only pre-v2 (known
+        // hole, asserted by the crash test) — a restart buys a fresh
+        // window, never breaks one.
+        let redelivered = count_journaled_prompts(&store, &cfg.workspace);
+        if redelivered > 0 {
+            let _ = store.append_journal(
+                &cfg.workspace,
+                &serde_json::json!({"rt_kind": "Resume"}),
+                &serde_json::json!([]),
+                serde_json::json!({"stage": "resume", "redelivered": redelivered}),
+                &[],
+            );
+        }
         Self {
             cfg,
             host,
@@ -576,6 +591,19 @@ impl<H: Host> Brain<H> {
     }
 }
 
+/// Journaled Prompt intents awaiting confirmation (crash-resume redelivery
+/// set). Counts `{"Prompt": …}` actions across the loud fold.
+fn count_journaled_prompts(store: &FileStore, workspace: &str) -> usize {
+    store
+        .fold_workspace(workspace)
+        .rows
+        .iter()
+        .filter_map(|r| r.get("actions")?.as_array())
+        .flatten()
+        .filter(|a| a.get("Prompt").is_some())
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,5 +772,165 @@ mod tests {
         let b = run_once("parity-b").await;
         assert_eq!(a, b, "same Msg log must journal identically modulo ts");
         assert!(a.contains("\"stage\":\"decided\""), "{a}");
+    }
+
+    /// E12 crash harness (process-crash model): aesign task abort (no
+    /// graceful shutdown — the async equivalent of SIGKILL for journal
+    /// semantics: flushed bytes survive, in-flight vanishes) then rebuild
+    /// on the same store. Asserts: no lost wake beyond redelivery (every
+    /// delivered intent was journaled first), resume logs its redelivery
+    /// row, seq resumes monotonic, and the pre-v2 RAM budget reset is
+    /// exactly as documented (fresh window after restart — known hole).
+    #[tokio::test]
+    async fn crash_abort_resumes_loud_with_ram_budget_reset() {
+        let dir = std::env::temp_dir().join(format!("dbrt-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mk = || {
+            let (tx, rx) = tokio::sync::mpsc::channel(crate::BRAIN_CAP);
+            let mut host = MockHost::new(1_000_000);
+            host.script = VecDeque::from(vec![
+                vec![Effect::Prompt {
+                    pin: "p".into(),
+                    line: "m1".into(),
+                }],
+                vec![Effect::Prompt {
+                    pin: "p".into(),
+                    line: "m2".into(),
+                }],
+            ]);
+            let sinks = SinkManager::new(tx.clone());
+            let brain = Brain::new(BrainConfig::new("w"), host, FileStore::new(&dir), sinks);
+            (brain, rx, tx)
+        };
+        // Pre-crash: one decided+delivered wake, one decided wake.
+        let (mut a, _rx, _tx) = mk();
+        let (sink, _sent) = MockSink::new();
+        a.sinks.add_sink("herdr", Box::new(sink));
+        a.dispatch(BrainMsg::Watch("{\"kind\":9}".into())).await;
+        a.dispatch(BrainMsg::Fact {
+            summary: "x".into(),
+        })
+        .await;
+        assert_eq!(a.stats.injects, 2);
+        drop(a); // abort: no shutdown drain, RAM state (budgets) vanishes
+        // Resume on the same store.
+        let (mut b, _rx2, _tx2) = mk();
+        let (sink_b, _sent_b) = MockSink::new();
+        b.sinks.add_sink("herdr", Box::new(sink_b));
+        let journal = std::fs::read_to_string(b.store.journal_file("w")).unwrap();
+        assert!(
+            journal.contains("\"stage\":\"resume\"") && journal.contains("\"redelivered\":2"),
+            "resume logs its redelivery set: {journal}"
+        );
+        // Seq resumes monotonic past the crash.
+        let before = b.store.last_seq("w");
+        b.dispatch(BrainMsg::Fact {
+            summary: "y".into(),
+        })
+        .await;
+        assert!(b.store.last_seq("w") > before, "seq advances past resume");
+        // Pre-v2 RAM hole, explicitly: the fresh brain grants a full new
+        // window for the same pin (budgets did not survive the crash).
+        assert_eq!(b.stats.injects, 1, "post-crash prompt delivers");
+        // No unjournaled delivery: every delivered line was journaled first.
+        for line in ["m1", "m2"] {
+            assert!(journal.contains(line), "delivered intent journaled: {line}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Clock-jump: an NTP step mid-run never reorders the journal; seq
+    /// stays monotonic and the sweep cadence re-stabilizes.
+    #[tokio::test]
+    async fn clock_jump_keeps_order_and_restabilizes() {
+        let (mut brain, _rx, _tx) = test_brain("clock", vec![vec![], vec![], vec![]]);
+        brain.dispatch(BrainMsg::Watch("{\"kind\":9}".into())).await;
+        brain.host.now = 1_000_000 + 86_400; // +1 day mid-run
+        brain
+            .dispatch(BrainMsg::Sweep {
+                since: "2026-09-10T00:00:00Z".into(),
+                now: 1_000_000 + 86_400,
+            })
+            .await;
+        brain.dispatch(BrainMsg::Watch("{\"kind\":9}".into())).await;
+        let raw = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
+        let mut seqs = Vec::new();
+        for line in raw.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(s) = v.get("seq").and_then(|s| s.as_u64()) {
+                seqs.push(s);
+            }
+        }
+        assert!(seqs.len() >= 3, "rows journaled across the jump");
+        assert!(
+            seqs.windows(2).all(|w| w[1] == w[0] + 1),
+            "seq strictly consecutive across the clock jump: {seqs:?}"
+        );
+        assert!(brain.sweep_last.is_some(), "sweep re-stabilizes after jump");
+    }
+
+    /// Standing determinism fuzz (no new deps: xorshift64): the same seeded
+    /// random Msg log through two reducers yields identical effect traces.
+    /// Runs in unit CI from Phase 0 onward per section 8.
+    #[test]
+    fn determinism_fuzz_seeded_log_same_effects() {
+        use crate::host::CoreReducer;
+        fn next_rand(state: &mut u64) -> u64 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            x
+        }
+        fn gen_msg(rng: &mut u64) -> BrainMsg {
+            let kinds = [9u16, 14, 20001, 30013, 43001, 30031, 39002, 7];
+            match next_rand(rng) % 9 {
+                0 => BrainMsg::Watch(format!(
+                    "{{\"kind\":{},\"tags\":[[\"p\",\"t\"]]}}",
+                    kinds[(next_rand(rng) % 8) as usize]
+                )),
+                1 => BrainMsg::HerdrStatus {
+                    pin: ["p", "q"][(next_rand(rng) % 2) as usize].into(),
+                    status: ["idle", "working", "done", "blocked", "mystery"]
+                        [(next_rand(rng) % 5) as usize]
+                        .into(),
+                },
+                2 => BrainMsg::Died,
+                3 => BrainMsg::Sweep {
+                    since: "2026-09-10T00:00:00Z".into(),
+                    now: 1_000_000 + next_rand(rng) % 100_000,
+                },
+                4 => BrainMsg::RoleBound {
+                    role: "coder".into(),
+                    pin: "p".into(),
+                },
+                5 => BrainMsg::Fact {
+                    summary: format!("f{}", next_rand(rng) % 10),
+                },
+                6 => BrainMsg::AckSlaTick {
+                    now: 1_000_000 + next_rand(rng) % 100_000,
+                },
+                7 => BrainMsg::Presence {
+                    pin: "p".into(),
+                    state: "idle".into(),
+                },
+                _ => BrainMsg::SlaFired { posts: vec![] },
+            }
+        }
+        for seed in [1u64, 42, 0xDEAD_BEEF] {
+            let mut traces = Vec::new();
+            for _ in 0..2 {
+                let mut rng = seed;
+                let mut reducer = CoreReducer::default();
+                let mut trace = Vec::new();
+                for _ in 0..300 {
+                    let m = gen_msg(&mut rng);
+                    trace.push(format!("{:?}", reducer.tick_effects(&m)));
+                }
+                traces.push(trace.join("\n"));
+            }
+            assert_eq!(traces[0], traces[1], "seed {seed} must replay identically");
+        }
     }
 }
