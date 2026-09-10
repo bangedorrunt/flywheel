@@ -472,6 +472,29 @@ pub fn stop(state_dir: &Path, workspace: &str) -> Result<()> {
     Ok(())
 }
 
+/// Cutover registration (bd-asr2.13, Phase 3): spawn records one
+/// subscription row per pinned crew member (herdr sink, own workspace —
+/// local-actor allowed, D6). Best-effort: a store failure warns loudly and
+/// never fails the spawn. The daemon serves these rows when it hosts wake;
+/// `kill` never touches them (subscriptions outlive swarms by design).
+pub fn register_workspace_subscriptions(state_dir: &Path, workspace: &str, pins: &[String]) {
+    use doorbell_rt::subscribe::*;
+    let mut store = SubscriptionStore::open(state_dir);
+    for pin in pins {
+        let sub = Subscription {
+            id: format!("spawn-{workspace}-{pin}"),
+            identity: Identity::Pin(pin.clone()),
+            scope: Scope::One(workspace.to_string()),
+            filter: Filter::default(),
+            sink: SinkKind::Herdr,
+            budget: Budget::default_530(),
+        };
+        if let Err(e) = store.subscribe(Actor::local_process(), sub, workspace) {
+            eprintln!("flywheel: cannot record wake subscription for {pin}: {e:?}");
+        }
+    }
+}
+
 fn spawn_child(
     exe: &Path,
     project: &str,

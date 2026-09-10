@@ -8809,6 +8809,16 @@ projects available: {}",
     if let Err(e) = state::save_agent_names(&dir, &registry) {
         eprintln!("flywheel: cannot save .flywheel/agent-names.json: {e:#}");
     }
+    // bd-asr2.13 (Phase 3 cutover): spawn records wake subscriptions —
+    // the daemon serves these rows when it hosts wake. Best-effort.
+    doorbell::register_workspace_subscriptions(
+        &config::state_dir(),
+        &label,
+        &registry
+            .iter()
+            .filter_map(|e| e.mail_identity.clone())
+            .collect::<Vec<_>>(),
+    );
 
     // bd-vik A: post-spawn visibility check — herdr's session registry
     // (session.json) can silently fail to persist, leaving the panes LIVE but
