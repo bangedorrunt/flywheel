@@ -1,0 +1,328 @@
+// governed-by: ADR-0012
+//! Subscription store + verb authz (D5/D6, bd-asr2.8).
+//!
+//! Subscription = identity × scope × filter × sink × budget. One shared
+//! classification pass per workspace; N per-subscriber policy evaluations
+//! (budgets/queues/digests, pure, evaluated by the Brain against each
+//! subscription's overrides); delivery adapters in `sinks.rs`. The journal
+//! stays totally ordered, tagged by subscriber (additive field — v1
+//! readers tolerate it; full v2 scoping lands in bd-asr2.9).
+//!
+//! D6 authz matrix (operator = the daemon's operator credential; local =
+//! same-host process over UDS/file-perm trust):
+//!
+//! | Verb                                    | Local | Operator |
+//! |-----------------------------------------+-------+----------|
+//! | read (status/health/why/digest/events)  |   ✔   |    ✔     |
+//! | subscribe herdr-sink, own workspace     |   ✔   |    ✔     |
+//! | subscribe webhook/DM or cross-workspace |   ✖   |    ✔     |
+//! | budget set ≤ default (own)              |   ✔   |    ✔     |
+//! | budget set > default, inject, mint      |   ✖   |    ✔     |
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// Who is woken.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Identity {
+    /// Toron pin (spawned crew, human operator pin).
+    Pin(String),
+    /// Role address (`role:<name>`, bound via 30013).
+    Role(String),
+    /// Operator npub (human subscription).
+    Npub(String),
+    /// Service key (minted by the daemon, D7; endpoint in Phase 4).
+    ServiceKey(String),
+}
+
+impl Identity {
+    pub fn tag(&self) -> String {
+        match self {
+            Identity::Pin(p) => format!("pin:{p}"),
+            Identity::Role(r) => format!("role:{r}"),
+            Identity::Npub(n) => format!("npub:{n}"),
+            Identity::ServiceKey(k) => format!("svc:{k}"),
+        }
+    }
+}
+
+/// Workspace scope. Cross-workspace stays same-host (D10 revisit trigger).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Scope {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Scope {
+    pub fn workspaces(&self) -> Vec<String> {
+        match self {
+            Scope::One(w) => vec![w.clone()],
+            Scope::Many(ws) => ws.clone(),
+        }
+    }
+
+    pub fn is_cross(&self, home: &str) -> bool {
+        match self {
+            Scope::One(w) => w != home,
+            Scope::Many(_) => true,
+        }
+    }
+}
+
+/// Ring-class filter. Empty classes = all rings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Filter {
+    pub classes: Vec<String>,
+    pub kinds: Vec<u16>,
+}
+
+/// Delivery edge (P1 corollary: adapters translate Prompt intents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SinkKind {
+    Herdr,
+    Webhook,
+    Dm,
+}
+
+/// Per-subscription budget override (5/30/3 when absent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Budget {
+    pub window_minutes: u32,
+    pub max_prompts: u32,
+}
+
+impl Budget {
+    pub fn default_530() -> Self {
+        Self {
+            window_minutes: 30,
+            max_prompts: 3,
+        }
+    }
+
+    /// Raises above default need the operator (D6).
+    pub fn needs_operator(&self) -> bool {
+        let d = Self::default_530();
+        self.window_minutes < d.window_minutes || self.max_prompts > d.max_prompts
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Subscription {
+    pub id: String,
+    pub identity: Identity,
+    pub scope: Scope,
+    pub filter: Filter,
+    pub sink: SinkKind,
+    pub budget: Budget,
+}
+
+/// The actor attempting a verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Actor {
+    pub is_operator: bool,
+    pub is_local: bool,
+}
+
+impl Actor {
+    pub fn operator() -> Self {
+        Self {
+            is_operator: true,
+            is_local: true,
+        }
+    }
+
+    pub fn local_process() -> Self {
+        Self {
+            is_operator: false,
+            is_local: true,
+        }
+    }
+
+    pub fn remote() -> Self {
+        Self {
+            is_operator: false,
+            is_local: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// Needs the operator credential.
+    OperatorOnly(String),
+    /// Unknown subscription / bad reference.
+    Absent(String),
+}
+
+/// Authorize a subscribe verb under D6. `home` is the requesting
+/// workspace (cross-workspace detection).
+pub fn authorize_subscribe(
+    actor: Actor,
+    sink: SinkKind,
+    scope: &Scope,
+    home: &str,
+    budget: Budget,
+) -> Result<(), Refusal> {
+    if !actor.is_local && !actor.is_operator {
+        return Err(Refusal::OperatorOnly("non-local subscribe".into()));
+    }
+    if (sink != SinkKind::Herdr || scope.is_cross(home)) && !actor.is_operator {
+        return Err(Refusal::OperatorOnly(
+            "webhook/DM sink or cross-workspace scope needs the operator".into(),
+        ));
+    }
+    if budget.needs_operator() && !actor.is_operator {
+        return Err(Refusal::OperatorOnly(
+            "budget raise above default needs the operator".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Durable subscription registry (JSON file beside the journals).
+pub struct SubscriptionStore {
+    path: PathBuf,
+    subs: BTreeMap<String, Subscription>,
+}
+
+impl SubscriptionStore {
+    pub fn open(state_dir: &Path) -> Self {
+        let path = state_dir.join("doorbell").join("subscriptions.json");
+        let subs = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        Self { path, subs }
+    }
+
+    fn persist(&self) {
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(raw) = serde_json::to_string_pretty(&self.subs) {
+            let _ = std::fs::write(&self.path, raw);
+        }
+    }
+
+    /// Roundtrip: authorize, store, persist. Returns the stored row.
+    pub fn subscribe(
+        &mut self,
+        actor: Actor,
+        sub: Subscription,
+        home: &str,
+    ) -> Result<Subscription, Refusal> {
+        authorize_subscribe(actor, sub.sink, &sub.scope, home, sub.budget)?;
+        if sub.scope.workspaces().is_empty() {
+            return Err(Refusal::Absent("empty scope".into()));
+        }
+        self.subs.insert(sub.id.clone(), sub.clone());
+        self.persist();
+        Ok(sub)
+    }
+
+    pub fn unsubscribe(&mut self, _actor: Actor, id: &str) -> Result<Subscription, Refusal> {
+        // Unsubscribe is self-service (own row) or operator; ownership
+        // binds in Phase 2 with service identities — until then any local
+        // actor may drop a row (loud: the drop is journaled by the caller).
+        self.subs
+            .remove(id)
+            .map(Ok)
+            .unwrap_or(Err(Refusal::Absent(format!("unknown subscription {id}"))))
+            .map(|s| {
+                self.persist();
+                s
+            })
+    }
+
+    pub fn list(&self) -> Vec<Subscription> {
+        self.subs.values().cloned().collect()
+    }
+
+    pub fn get(&self, id: &str) -> Option<Subscription> {
+        self.subs.get(id).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sub() -> Subscription {
+        Subscription {
+            id: "s1".into(),
+            identity: Identity::Pin("p".into()),
+            scope: Scope::One("w".into()),
+            filter: Filter::default(),
+            sink: SinkKind::Herdr,
+            budget: Budget::default_530(),
+        }
+    }
+
+    #[test]
+    fn local_herdr_own_workspace_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("dbrt-sub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = SubscriptionStore::open(&dir);
+        let back = store
+            .subscribe(Actor::local_process(), sub(), "w")
+            .expect("local herdr subscribe");
+        assert_eq!(back.id, "s1");
+        assert_eq!(store.list().len(), 1);
+        // Durable: reopen reads it back.
+        let store2 = SubscriptionStore::open(&dir);
+        assert_eq!(
+            store2.get("s1").unwrap().identity,
+            Identity::Pin("p".into())
+        );
+        // Unsubscribe roundtrips.
+        let dropped = store.unsubscribe(Actor::local_process(), "s1").unwrap();
+        assert_eq!(dropped.id, "s1");
+        assert!(store.list().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_operator_webhook_subscribe_refused() {
+        let dir = std::env::temp_dir().join(format!("dbrt-subdeny-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = SubscriptionStore::open(&dir);
+        let mut hook = sub();
+        hook.id = "web".into();
+        hook.sink = SinkKind::Webhook;
+        assert!(matches!(
+            store.subscribe(Actor::local_process(), hook.clone(), "w"),
+            Err(Refusal::OperatorOnly(_))
+        ));
+        // Operator passes.
+        assert!(store.subscribe(Actor::operator(), hook, "w").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cross_workspace_refused_for_non_operator() {
+        let dir = std::env::temp_dir().join(format!("dbrt-subx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = SubscriptionStore::open(&dir);
+        let mut x = sub();
+        x.id = "x".into();
+        x.scope = Scope::Many(vec!["w".into(), "v".into()]);
+        assert!(matches!(
+            store.subscribe(Actor::local_process(), x.clone(), "w"),
+            Err(Refusal::OperatorOnly(_))
+        ));
+        assert!(store.subscribe(Actor::operator(), x, "w").is_ok());
+        // Budget raise above default needs the operator too.
+        let mut rich = sub();
+        rich.id = "rich".into();
+        rich.budget = Budget {
+            window_minutes: 30,
+            max_prompts: 10,
+        };
+        assert!(matches!(
+            store.subscribe(Actor::local_process(), rich.clone(), "w"),
+            Err(Refusal::OperatorOnly(_))
+        ));
+        assert!(store.subscribe(Actor::operator(), rich, "w").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
