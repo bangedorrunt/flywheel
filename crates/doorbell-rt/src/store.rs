@@ -591,4 +591,36 @@ mod tests {
         assert!(fold.torn.is_some(), "gap is loud");
         let _ = std::fs::remove_dir_all(dir);
     }
+    #[test]
+    fn mixed_v1_v2_folds_in_order() {
+        // F9: migration mix — legacy v1 rows plus v2 seq/subscriber rows fold
+        // in order with no tear; unknown fields tolerated.
+        let (st, dir) = test_store("mixv");
+        use std::io::Write;
+        let path = st.journal_file("w");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "{{\"v\":1,\"workspace\":\"w\",\"msg\":{{\"rt_kind\":\"Legacy\"}},\"actions\":[],\"executed\":{{\"stage\":\"sweep\"}},\"pins\":[]}}").unwrap();
+        drop(f);
+        st.append_journal_seq(
+            "w",
+            &serde_json::json!({"rt_kind": "Sweep"}),
+            &serde_json::json!([]),
+            serde_json::json!({"stage": "sweep"}),
+            &[],
+            Some(1),
+            Some("workspace:w"),
+        )
+        .unwrap();
+        let fold = st.fold_workspace("w");
+        assert!(fold.torn.is_none(), "mixed v1/v2 must not tear");
+        assert_eq!(fold.rows.len(), 2);
+        assert_eq!(FileStore::entry_version(&fold.rows[0]), 1);
+        assert_eq!(FileStore::entry_version(&fold.rows[1]), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
