@@ -1121,6 +1121,74 @@ pub fn journal_workspaces_list(state_dir: &Path) -> Vec<String> {
     out.into_iter().collect()
 }
 
+/// Scope-bound roster row (bd-asr2.14, D5/E2): who is around to be woken.
+/// Pure: the digest commands assemble inputs (registry, binds, presence,
+/// bead map) and render headers from rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterRow {
+    pub pin: String,
+    pub harness: String,
+    pub role: String,
+    pub state: String,
+    pub recency_secs: Option<u64>,
+    pub bead: String,
+}
+
+/// Build scope-bound roster rows: registry pins joined with role binds,
+/// presence states, and current-bead map. Unknowns stay blank (never
+/// invent-green); recency is `now - ts` for fresh rows only.
+pub fn build_roster(
+    pins: &[(String, String)],
+    roles: &std::collections::BTreeMap<String, String>,
+    presence: &[(String, String, u64)],
+    beads: &std::collections::BTreeMap<String, String>,
+    now_unix: u64,
+) -> Vec<RosterRow> {
+    let mut rows = Vec::new();
+    for (pin, harness) in pins {
+        let (state, recency_secs) = presence
+            .iter()
+            .find(|(p, _, _)| p == pin)
+            .map(|(_, s, ts)| (s.clone(), Some(now_unix.saturating_sub(*ts))))
+            .unwrap_or_else(|| ("unknown".to_string(), None));
+        rows.push(RosterRow {
+            pin: pin.clone(),
+            harness: harness.clone(),
+            role: roles.get(pin).cloned().unwrap_or_default(),
+            state,
+            recency_secs,
+            bead: beads.get(pin).cloned().unwrap_or_default(),
+        });
+    }
+    rows
+}
+
+/// Render roster header lines for digest output (scope-bound, one row per
+/// line; a digest for P carries Q's row — E2 discovery without introduction).
+pub fn render_roster(rows: &[RosterRow]) -> Vec<String> {
+    let mut out = vec!["ROSTER (scope-bound):".to_string()];
+    for r in rows {
+        let recency = r
+            .recency_secs
+            .map(|s| format!("{s}s ago"))
+            .unwrap_or_else(|| "never".to_string());
+        let role = if r.role.is_empty() {
+            "-".to_string()
+        } else {
+            r.role.clone()
+        };
+        let bead = if r.bead.is_empty() {
+            "-".to_string()
+        } else {
+            r.bead.clone()
+        };
+        out.push(format!(
+            "  {} [{}] role={} state={} {} bead={}",
+            r.pin, r.harness, role, r.state, recency, bead
+        ));
+    }
+    out
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2607,5 +2675,33 @@ mod tests {
         assert_eq!(fold.rows.len(), 1, "v1 legacy row folds");
         assert!(fold.torn.is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roster_scoped_rows_and_render() {
+        // E2 shape: P's digest carries Q's row (scope-bound roster).
+        let pins = vec![
+            ("P".to_string(), "pi".to_string()),
+            ("Q".to_string(), "pi".to_string()),
+        ];
+        let mut roles = BTreeMap::new();
+        roles.insert("Q".to_string(), "coder".to_string());
+        let presence = vec![("Q".to_string(), "working".to_string(), 900u64)];
+        let mut beads = BTreeMap::new();
+        beads.insert("Q".to_string(), "bd-1".to_string());
+        let rows = build_roster(&pins, &roles, &presence, &beads, 1000);
+        assert_eq!(rows.len(), 2);
+        // P (no presence): unknown, never invent-green.
+        assert_eq!(rows[0].state, "unknown");
+        assert_eq!(rows[0].recency_secs, None);
+        assert_eq!(rows[0].role, "");
+        // Q carries everything the digest needs.
+        assert_eq!(rows[1].role, "coder");
+        assert_eq!(rows[1].state, "working");
+        assert_eq!(rows[1].recency_secs, Some(100));
+        assert_eq!(rows[1].bead, "bd-1");
+        let rendered = render_roster(&rows);
+        assert!(rendered[0].starts_with("ROSTER"));
+        assert!(rendered[2].contains("Q") && rendered[2].contains("bd-1"));
     }
 }
