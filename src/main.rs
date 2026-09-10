@@ -1752,6 +1752,46 @@ enum DoorbellCmd {
         #[arg(long)]
         subscriber: Option<String>,
     },
+    /// operator console inject (D8, bd-woha): journal a Fact row plus queue
+    /// one pending wake — digest-visible with zero swarm. Same-second
+    /// ratchet + persisted per-pin 5/30/3 budget. The console is the
+    /// operator (local loopback invocation), so no separate token.
+    Inject {
+        project: String,
+        /// pin (adjective+noun) to ring
+        pin: String,
+        /// wake line
+        line: String,
+        /// journal scope (default `manual` — console injections are their
+        /// own scope, never mixed into a workspace journal)
+        #[arg(long, default_value = "manual")]
+        workspace: String,
+    },
+    /// subscribe an identity to wake delivery (D8, bd-woha): identity ×
+    /// scope × sink × budget row in the subscription store. Cross-workspace
+    /// scopes and non-herdr sinks require the operator (refused loudly).
+    Subscribe {
+        /// home workspace
+        #[arg(long)]
+        workspace: String,
+        /// pin (adjective+noun) to subscribe
+        #[arg(long)]
+        pin: String,
+        /// sink: herdr (default), webhook, dm (endpoint binds at the adapter)
+        #[arg(long, default_value = "herdr")]
+        sink: String,
+        /// extra workspaces for an explicit cross-workspace scope
+        /// (repeatable; operator-only)
+        #[arg(long)]
+        extra: Vec<String>,
+    },
+    /// list subscription store rows.
+    Subscriptions {},
+    /// drop one subscription row by id.
+    Unsubscribe {
+        /// subscription id (see `subscriptions`)
+        id: String,
+    },
 }
 
 /// Subcommands of `flywheel loop` (bd-fw-stale-loop-processes-gac
@@ -4630,6 +4670,20 @@ fn main() {
                 *seq,
                 subscriber.as_deref(),
             ),
+            DoorbellCmd::Inject {
+                project,
+                pin,
+                line,
+                workspace,
+            } => cmd_doorbell_inject(&cfg, project, pin, line, workspace),
+            DoorbellCmd::Subscribe {
+                workspace,
+                pin,
+                sink,
+                extra,
+            } => cmd_doorbell_subscribe(&cfg, workspace, pin, sink, extra),
+            DoorbellCmd::Subscriptions {} => cmd_doorbell_subscriptions(&cfg),
+            DoorbellCmd::Unsubscribe { id } => cmd_doorbell_unsubscribe(&cfg, id),
         },
         Some(Commands::LoopMode { cmd }) => match cmd {
             LoopCmd::Run {
@@ -9958,6 +10012,114 @@ fn digest_roster_lines(cfg: &Config, project: &str, now: u64) -> Vec<String> {
     doorbell::render_roster(&doorbell::build_roster(
         &pins, &roles, &presence, &beads, now,
     ))
+}
+/// Operator console inject (D8, bd-woha): thin CLI over
+/// [`doorbell::inject_wake_in`]. Prints the queued summary; ratchet and
+/// budget denials exit non-zero naming the reason (no silent drop).
+fn cmd_doorbell_inject(
+    _cfg: &Config,
+    project: &str,
+    pin: &str,
+    line: &str,
+    workspace: &str,
+) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match doorbell::inject_wake_in(&config::state_dir(), project, workspace, pin, line, now) {
+        Ok(summary) => {
+            println!("injected: {summary}");
+            Ok(())
+        }
+        Err(doorbell::InjectDeny::Ratchet) => {
+            anyhow::bail!("inject refused: identical pin+line already injected this second")
+        }
+        Err(doorbell::InjectDeny::Budget) => {
+            anyhow::bail!("inject refused: pin {pin} over the 3-per-30min console budget")
+        }
+    }
+}
+
+/// Subscribe an identity (D8, bd-woha): thin CLI over the subscription
+/// store. The store itself enforces operator-only cross-workspace scopes
+/// and non-herdr sinks — refusals print loudly, never silent.
+fn cmd_doorbell_subscribe(
+    _cfg: &Config,
+    workspace: &str,
+    pin: &str,
+    sink: &str,
+    extra: &[String],
+) -> Result<()> {
+    use doorbell_rt::subscribe::*;
+    let kind = match sink {
+        "herdr" => SinkKind::Herdr,
+        "webhook" => SinkKind::Webhook,
+        "dm" => SinkKind::Dm,
+        other => anyhow::bail!("unknown sink {other} (herdr|webhook|dm)"),
+    };
+    let mut ws = vec![workspace.to_string()];
+    for e in extra {
+        if !ws.contains(e) {
+            ws.push(e.clone());
+        }
+    }
+    let scope = if ws.len() == 1 {
+        Scope::One(ws[0].clone())
+    } else {
+        Scope::Many(ws.clone())
+    };
+    // Console is the operator: cross-scope rows are operator-intended.
+    // Single-workspace herdr rows stay local-process.
+    let cross = scope.is_cross(workspace) || kind != SinkKind::Herdr;
+    let actor = if cross {
+        Actor::operator()
+    } else {
+        Actor::local_process()
+    };
+    let sub = Subscription {
+        id: format!("cli-{workspace}-{pin}"),
+        identity: Identity::Pin(pin.to_string()),
+        scope,
+        filter: Filter {
+            classes: Vec::new(),
+            kinds: Vec::new(),
+        },
+        sink: kind,
+        budget: Budget::default_530(),
+    };
+    let mut store = SubscriptionStore::open(&config::state_dir());
+    match store.subscribe(actor, sub, workspace) {
+        Ok(row) => {
+            println!("subscribed: {} scope={:?} sink={sink}", row.id, row.scope);
+            Ok(())
+        }
+        Err(e) => anyhow::bail!("subscribe refused: {e:?}"),
+    }
+}
+
+fn cmd_doorbell_subscriptions(_cfg: &Config) -> Result<()> {
+    use doorbell_rt::subscribe::*;
+    let store = SubscriptionStore::open(&config::state_dir());
+    for sub in store.list() {
+        println!(
+            "{} identity={:?} scope={:?} sink={:?}",
+            sub.id, sub.identity, sub.scope, sub.sink
+        );
+    }
+    Ok(())
+}
+
+fn cmd_doorbell_unsubscribe(_cfg: &Config, id: &str) -> Result<()> {
+    use doorbell_rt::subscribe::*;
+    let mut store = SubscriptionStore::open(&config::state_dir());
+    match store.unsubscribe(Actor::operator(), id) {
+        Ok(row) => {
+            println!("unsubscribed: {}", row.id);
+            Ok(())
+        }
+        Err(e) => anyhow::bail!("unsubscribe refused: {e:?}"),
+    }
 }
 
 /// Generalized digest (bd-asr2.11, D8): per-identity wake digest over any
@@ -29429,7 +29591,7 @@ fn summarize_status_event(
             status,
         } => (
             "pane.agent_status_changed",
-            pane.0.clone(),
+            pane.as_str().to_string(),
             agent.clone(),
             status.as_str().to_string(),
         ),
@@ -29439,11 +29601,16 @@ fn summarize_status_event(
             status,
         } => (
             "pane.agent_detected",
-            pane.0.clone(),
+            pane.as_str().to_string(),
             agent.clone(),
             status.as_str().to_string(),
         ),
-        PaneExited { pane } => ("pane.exited", pane.0.clone(), None, "exited".to_string()),
+        PaneExited { pane } => (
+            "pane.exited",
+            pane.as_str().to_string(),
+            None,
+            "exited".to_string(),
+        ),
         Raw(_) => return None,
     };
     *seq = seq.saturating_add(1);
@@ -33284,6 +33451,8 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
     #[derive(Clone)]
     struct AppState {
         cfg: config::Config,
+        emit_budgets:
+            Arc<std::sync::Mutex<std::collections::HashMap<String, crate::doorbell::PinBudget>>>,
     }
 
     async fn health() -> &'static str {
@@ -33328,6 +33497,79 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
         Ok(json!({ "ok": true, "targets": targets.len() }).to_string())
     }
 
+    /// Tokened service emit (bd-asr2.17, D7): a config-declared service
+    /// identity rings a `to` target through the existing toron wire
+    /// (`mail send --wake tasked` publishes the kind-9 addressed post —
+    /// never a second bus). Empty services table = 404 (disabled).
+    async fn emit(State(st): State<Arc<AppState>>, body: String) -> Result<String, StatusCode> {
+        use crate::doorbell::EmitDeny;
+        let req: Value = serde_json::from_str(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let service = req["service"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+        let token = req["token"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+        let project = req["project"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+        let to = req["to"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+        let subject = req["subject"].as_str().unwrap_or("doorbell emit");
+        let msg = req["msg"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+        let services = &st.cfg.doorbell_services();
+        if services.is_empty() {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let rate = match crate::doorbell::authorize_emit(services, service, token, to) {
+            Ok(r) => r,
+            Err(EmitDeny::UnknownService) => return Err(StatusCode::UNAUTHORIZED),
+            Err(EmitDeny::BadToken) => return Err(StatusCode::UNAUTHORIZED),
+            Err(EmitDeny::ScopeDenied) => return Err(StatusCode::FORBIDDEN),
+        };
+        // Per-service burst budget (429 when exhausted).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        {
+            let mut budgets = st
+                .emit_budgets
+                .lock()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let b = budgets
+                .entry(service.to_string())
+                .or_insert_with(|| crate::doorbell::PinBudget::new(1, rate, now));
+            if !b.allows(now) {
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            }
+            b.record_at(now);
+        }
+        // Same destructive-command guard as `flywheel send`.
+        let policy = config::Policy::load().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if policy.violation(msg).is_some() {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        // Publish through toron as the service identity (existing wire).
+        let out = std::process::Command::new("toron")
+            .args([
+                "mail",
+                "send",
+                "--project",
+                project,
+                "--as",
+                service,
+                "--to",
+                to,
+                "--wake",
+                "tasked",
+                "--subject",
+                subject,
+                "--body",
+                msg,
+            ])
+            .output()
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        if !out.status.success() {
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+        crate::doorbell::service_emit_wake_in(&config::state_dir(), project, service, to);
+        Ok(json!({ "ok": true, "service": service, "to": to }).to_string())
+    }
+
     async fn sse_handler(State(st): State<Arc<AppState>>) -> axum::response::Response {
         use axum::response::sse::Event;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
@@ -33367,25 +33609,32 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
             .into_response()
     }
 
-    let st = Arc::new(AppState { cfg: cfg.clone() });
+    let st = Arc::new(AppState {
+        cfg: cfg.clone(),
+        emit_budgets: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    });
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/v1/snapshot", get(snapshot))
         .route("/api/v1/send", post(send))
+        .route("/api/v1/emit", post(emit))
         .route("/events", get(sse_handler))
-        .route("/openapi.json", get(|| async {
-            json!({
+        .route(
+            "/openapi.json",
+            get(|| async {
+                json!({
                 "openapi": "3.0.0",
                 "info": { "title": "flywheel", "version": VERSION },
                 "paths": {
                     "/health": { "get": { "summary": "health" } },
                     "/api/v1/snapshot": { "get": { "summary": "full agent state" } },
-                    "/api/v1/send": { "post": { "summary": "send prompt", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "project": {"type":"string"}, "to": {"type":"string"}, "msg": {"type":"string"} } } } } } } },
+                    "/api/v1/emit": { "post": { "summary": "tokened service emit (kind-9 ring)" } },
                     "/events": { "get": { "summary": "SSE state stream" } }
                 }
             })
             .to_string()
-        }))
+            }),
+        )
         .with_state(st);
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
