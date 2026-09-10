@@ -103,6 +103,85 @@ fn read_pid(path: &PathBuf) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// Exclusive-create pidfile claim (symlink to the pid string). `serve`
+/// claims the pidfile itself once both binds succeed — a launchd/systemd
+/// started daemon is then pidfile-managed exactly like a `start` child,
+/// so stop/status/restart see one management surface (the bd-start-adopt
+/// lesson: only `start` used to write the pidfile, leaving a unit-started
+/// daemon "foreign" forever).
+#[cfg(unix)]
+pub fn claim_pid_file(path: &PathBuf, pid: u32) -> std::io::Result<()> {
+    let target = format!("{pid}");
+    let _ = std::fs::remove_file(path); // stale claim; the bind fence is authoritative
+    std::os::unix::fs::symlink(&target, path)
+}
+#[cfg(not(unix))]
+pub fn claim_pid_file(path: &PathBuf, pid: u32) -> std::io::Result<()> {
+    std::fs::write(path, format!("{pid}\n"))
+}
+
+/// Release our own pidfile claim (never drop a stranger's).
+pub fn release_pid_file(path: &PathBuf, pid: u32) {
+    if read_pid(path) == Some(pid) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Who owns the port, as far as the bind fence can tell. Pure over the
+/// pidfile read + /health body so the adopt matrix stays testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerVerdict {
+    /// Healthy doorbell peer, pidfile-managed (matches the pidfile pid).
+    Managed(u32),
+    /// Healthy doorbell peer, no (live) pidfile claim — adoptable.
+    Unclaimed(u32),
+    /// Port answers but not with our protocol: a squatter, refuse loudly.
+    Squatter,
+    /// Nothing answers /health.
+    Unknown,
+}
+
+pub fn classify_owner(pidfile_pid: Option<u32>, health: Option<&serde_json::Value>) -> OwnerVerdict {
+    let Some(h) = health else {
+        return OwnerVerdict::Unknown;
+    };
+    if h.get("protocol").and_then(|p| p.as_str()) != Some(doorbell_rt::api::PING.protocol) {
+        return OwnerVerdict::Squatter;
+    }
+    let owner = h
+        .get("owner")
+        .and_then(|o| o.get("pid"))
+        .and_then(|p| p.as_u64())
+        .map(|p| u32::try_from(p).unwrap_or(0));
+    match (owner, pidfile_pid) {
+        (Some(o), Some(p)) if o == p => OwnerVerdict::Managed(o),
+        (Some(o), _) => OwnerVerdict::Unclaimed(o),
+        (None, _) => OwnerVerdict::Unknown, // protocol peer without an owner row: nothing to attest
+    }
+}
+
+/// Adopt a running daemon before spawning a child. A managed healthy peer
+/// is adopted as-is; an unclaimed healthy peer is attested into the
+/// pidfile (records its pid) so `stop`/`restart` manage it. A squatter
+/// fails loudly before any child is spawned.
+fn try_adopt(cfg: &Config) -> Result<Option<u32>> {
+    let pf = read_pid(&cfg.pid_file());
+    let pf_live = pf.filter(|p| pid_alive(*p));
+    match classify_owner(pf_live, health_probe(cfg).as_ref()) {
+        OwnerVerdict::Managed(p) => Ok(Some(p)),
+        OwnerVerdict::Unclaimed(p) => {
+            std::fs::write(cfg.pid_file(), format!("{p}\n"))
+                .context("attest adopted daemon pidfile")?;
+            Ok(Some(p))
+        }
+        OwnerVerdict::Squatter => anyhow::bail!(
+            "doorbell: port {} held by a non-doorbell process, start refused",
+            cfg.port
+        ),
+        OwnerVerdict::Unknown => Ok(None),
+    }
+}
+
 fn pid_alive(pid: u32) -> bool {
     if pid <= 1 {
         return false;
@@ -155,10 +234,19 @@ fn wait_for(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
     cond()
 }
 
-/// Start: spawn the detached serve child, verify /health, exit 0 only
-/// when the daemon answers. Stale socket files are removed after proving
-/// nothing listens; a live TCP squatter fails loudly (bind fence is .3).
+/// Start: adopt an already-running daemon when one exists (managed or
+/// healthy protocol peer), else spawn the detached serve child and verify
+/// /health, exit 0 only when the daemon answers. Stale socket files are
+/// removed after proving nothing listens; a live TCP squatter fails
+/// loudly (bind fence is .3).
 pub fn start(cfg: &Config) -> Result<()> {
+    if let Some(pid) = try_adopt(cfg)? {
+        println!(
+            "doorbell: already running (pid {pid}, port {}) — adopted",
+            cfg.port
+        );
+        return Ok(());
+    }
     let exe = std::env::current_exe().context("current_exe")?;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -189,17 +277,32 @@ pub fn start(cfg: &Config) -> Result<()> {
     std::fs::write(cfg.pid_file(), format!("{pid}\n")).context("write pidfile")?;
     if wait_for(|| health_probe(cfg).is_some(), START_TIMEOUT) {
         // The probe answering is not enough: a stale orphan on this port
-        // answers too. The owner must be the child we just spawned.
-        if let Some(owner) = health_probe(cfg).and_then(|h| h.get("owner")?.get("pid")?.as_u64())
-            && owner == u64::from(pid)
-        {
-            println!("doorbell: started (pid {pid}, port {})", cfg.port);
-            return Ok(());
+        // answers too. The owner must be the child we just spawned — or a
+        // healthy protocol peer that beat us to the bind (a unit-started
+        // daemon before its first pidfile claim), which we adopt instead
+        // of failing: the operator's intent (a running daemon) holds.
+        let pf = read_pid(&cfg.pid_file());
+        match classify_owner(pf, health_probe(cfg).as_ref()) {
+            OwnerVerdict::Managed(p) if p == pid => {
+                println!("doorbell: started (pid {pid}, port {})", cfg.port);
+                return Ok(());
+            }
+            OwnerVerdict::Managed(p) | OwnerVerdict::Unclaimed(p) => {
+                if pf != Some(p) {
+                    let _ = std::fs::write(cfg.pid_file(), format!("{p}\n"));
+                }
+                println!(
+                    "doorbell: already running (pid {p}, port {}) — adopted",
+                    cfg.port
+                );
+                return Ok(());
+            }
+            OwnerVerdict::Squatter => anyhow::bail!(
+                "doorbell: port {} answered by foreign owner, not child {pid}",
+                cfg.port
+            ),
+            OwnerVerdict::Unknown => {}
         }
-        anyhow::bail!(
-            "doorbell: port {} answered by foreign owner, not child {pid}",
-            cfg.port
-        );
     }
     anyhow::bail!("doorbell: serve child (pid {pid}) never answered /health");
 }
@@ -369,5 +472,45 @@ mod tests {
         assert!(body.contains("/var/dbll"), "state dir rendered");
         assert!(!body.contains("DOORBELL_BIN"), "no placeholder survives");
         assert!(!body.contains("DOORBELL_STATE_DIR"), "no placeholder survives");
+    }
+
+    fn health(pid: u64) -> serde_json::Value {
+        serde_json::json!({
+            "protocol": doorbell_rt::api::PING.protocol,
+            "owner": {"pid": pid},
+        })
+    }
+
+    #[test]
+    fn classify_owner_matrix() {
+        // Managed: health owner matches the live pidfile pid.
+        assert_eq!(
+            classify_owner(Some(42), Some(&health(42))),
+            OwnerVerdict::Managed(42)
+        );
+        // Unclaimed: healthy peer but no live pidfile claim (launchd daemon
+        // before its first claim, or a dead-pid pidfile).
+        assert_eq!(
+            classify_owner(None, Some(&health(42))),
+            OwnerVerdict::Unclaimed(42)
+        );
+        assert_eq!(
+            classify_owner(Some(999_999_999), Some(&health(42))),
+            OwnerVerdict::Unclaimed(42)
+        );
+        // Squatter: port answers without our protocol.
+        let squatter = serde_json::json!({"hello": "world"});
+        assert_eq!(
+            classify_owner(None, Some(&squatter)),
+            OwnerVerdict::Squatter
+        );
+        // Unknown: nothing answers.
+        assert_eq!(classify_owner(Some(42), None), OwnerVerdict::Unknown);
+        // Protocol peer without an owner row: nothing to attest.
+        let no_owner = serde_json::json!({"protocol": doorbell_rt::api::PING.protocol});
+        assert_eq!(
+            classify_owner(None, Some(&no_owner)),
+            OwnerVerdict::Unknown
+        );
     }
 }

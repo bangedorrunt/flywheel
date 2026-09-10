@@ -160,6 +160,16 @@ pub async fn run(cfg: &Config) -> Result<()> {
     }
     let uds = tokio::net::UnixListener::bind(&sock_path)
         .with_context(|| format!("bind {}", sock_path.display()))?;
+    // Pidfile claim lives with the bind owner (bd-start-adopt): `serve`
+    // claims it once both binds succeed, so a launchd/systemd-started
+    // daemon is pidfile-managed identically to a `start` child and
+    // `doorbell start` adopts instead of dying on a foreign-owner fence.
+    if let Err(e) = crate::lifecycle::claim_pid_file(&cfg.pid_file(), std::process::id()) {
+        eprintln!(
+            "doorbell serve: pidfile claim failed ({}): {e}; continuing unclaimed",
+            cfg.pid_file().display()
+        );
+    }
     let started = std::time::Instant::now();
     let log_path = cfg.log_file();
     let hosted: Vec<String> = cfg.hosts.iter().map(|(p, w)| format!("{p}/{w}")).collect();
@@ -238,6 +248,7 @@ pub async fn run(cfg: &Config) -> Result<()> {
     let finish = |owned: &[(String, doorbell_rt::lease::OwnerLease)]| {
         heartbeat.abort();
         rotate_tick.abort();
+        crate::lifecycle::release_pid_file(&cfg.pid_file(), std::process::id());
         for (ws, l) in owned {
             doorbell_rt::lease::release_lease(&cfg.flywheel_state, ws, l);
         }
