@@ -13,6 +13,7 @@ pub mod host;
 pub mod lease;
 pub mod msg;
 pub mod policy;
+pub mod pollers;
 pub mod sensors;
 pub mod sinks;
 pub mod store;

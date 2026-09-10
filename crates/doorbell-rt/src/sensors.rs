@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 /// A spawned sensor task.
 pub struct SensorHandle {
     pub name: String,
-    handle: tokio::task::JoinHandle<()>,
+    pub(crate) handle: tokio::task::JoinHandle<()>,
 }
 
 impl SensorHandle {
