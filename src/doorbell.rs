@@ -529,6 +529,62 @@ pub fn cron_tick_wake_in(state_dir: &Path, project: &str, summary: &str) {
     }
 }
 
+/// Tokened service emit (bd-asr2.17, D7): pure authorize step for
+/// POST /api/v1/emit. Token compared as hex sha256 (constant-length
+/// compare); `to` must match the service channel scope (`*` = any).
+/// Revocation = deleting the service entry (then UnknownService).
+#[derive(Debug, PartialEq, Eq)]
+pub enum EmitDeny {
+    UnknownService,
+    BadToken,
+    ScopeDenied,
+}
+
+pub fn authorize_emit(
+    services: &std::collections::HashMap<String, crate::config::ServiceEmit>,
+    service: &str,
+    token: &str,
+    to: &str,
+) -> Result<u32, EmitDeny> {
+    use sha2::{Digest, Sha256};
+    let svc = services.get(service).ok_or(EmitDeny::UnknownService)?;
+    let mut h = Sha256::new();
+    h.update(token.as_bytes());
+    let hex = format!("{:x}", h.finalize());
+    if hex.len() != svc.token_sha256.len()
+        || !hex
+            .bytes()
+            .zip(svc.token_sha256.bytes())
+            .fold(0u8, |a, (x, y)| a | (x ^ y))
+            .eq(&0)
+    {
+        return Err(EmitDeny::BadToken);
+    }
+    if !svc.channels.iter().any(|c| c == "*" || c == to) {
+        return Err(EmitDeny::ScopeDenied);
+    }
+    Ok(svc.rate_per_min.max(1))
+}
+
+/// Journal + queue the admitted emit as a Fact row (stage `emit`).
+pub fn service_emit_wake_in(state_dir: &Path, project: &str, service: &str, to: &str) {
+    let summary = format!("emit {service} -> {to}");
+    let msg = crate::workspace::Msg::Fact {
+        summary: summary.clone(),
+    };
+    journal_append_workspace(
+        state_dir,
+        project,
+        &msg,
+        &[],
+        serde_json::json!({ "stage": "emit", "service": service, "to": to }),
+        None,
+    );
+    if let Err(e) = crate::append_pending_fact(project, &summary) {
+        eprintln!("flywheel: service emit: pending queue failed: {e:#}");
+    }
+}
+
 fn spawn_child(
     exe: &Path,
     project: &str,
@@ -2781,5 +2837,67 @@ mod tests {
         let before = listed();
         cron_tick_wake("flagprobe-ws", "nightly", "t1", "completed");
         assert_eq!(before, listed(), "flag-off tick must not touch journals");
+    }
+
+    fn emit_services() -> std::collections::HashMap<String, crate::config::ServiceEmit> {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"tok-ci-1");
+        let hex = format!("{:x}", h.finalize());
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "ci".to_string(),
+            crate::config::ServiceEmit {
+                token_sha256: hex,
+                channels: vec!["captain".to_string()],
+                rate_per_min: 6,
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn emit_authorize_matrix() {
+        // bd-asr2.17: ok / unknown service / bad token / scope deny.
+        let m = emit_services();
+        assert_eq!(authorize_emit(&m, "ci", "tok-ci-1", "captain"), Ok(6));
+        assert_eq!(
+            authorize_emit(&m, "nope", "tok-ci-1", "captain"),
+            Err(EmitDeny::UnknownService)
+        );
+        assert_eq!(
+            authorize_emit(&m, "ci", "wrong", "captain"),
+            Err(EmitDeny::BadToken)
+        );
+        assert_eq!(
+            authorize_emit(&m, "ci", "tok-ci-1", "someone-else"),
+            Err(EmitDeny::ScopeDenied)
+        );
+    }
+
+    #[test]
+    fn emit_revoked_service_refused() {
+        // bd-asr2.17: revocation = entry deleted -> UnknownService.
+        let mut m = emit_services();
+        m.remove("ci");
+        assert_eq!(
+            authorize_emit(&m, "ci", "tok-ci-1", "captain"),
+            Err(EmitDeny::UnknownService)
+        );
+    }
+
+    #[test]
+    fn emit_wake_journals_service_row() {
+        // bd-asr2.17: admitted emit leaves a stage=emit Fact row.
+        let dir = std::env::temp_dir().join(format!("dbll-emit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        service_emit_wake_in(&dir, "proj", "ci", "captain");
+        let rows = doorbell_rt::FileStore::new(&dir)
+            .fold_workspace("proj")
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["executed"]["stage"], serde_json::json!("emit"));
+        assert_eq!(rows[0]["executed"]["service"], serde_json::json!("ci"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
