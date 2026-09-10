@@ -47,6 +47,52 @@ if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
 else
   pass "port dead after stop (5s grace honored)"
 fi
+echo "-- E13-lite: split-brain fence --"
+"$BIN" start --state-dir "$STATE" --port "$PORT" >/dev/null 2>&1 \
+  || { fail "restart for fence tests"; echo "RESULT: FAIL"; exit 1; }
+# Second lifecycle start over the live peer exits 0 (no respawn war).
+"$BIN" start --state-dir "$STATE" --port "$PORT" >/dev/null 2>&1 \
+  || fail "second start over healthy peer must exit 0"
+pass "double-start clean exit 0"
+# No lease + healthy peer: raw serve must exit 0 via the bind fence
+# (delete the lease file; the daemon still holds the port).
+rm -f "$STATE/doorbell/owner.json"
+"$BIN" serve --state-dir "$STATE" --port "$PORT" >/dev/null 2>&1 &
+SRV=$!
+wait "$SRV"
+[ "$?" -eq 0 ] || fail "leaseless serve over healthy peer must exit 0"
+pass "bind fence clean exit 0 over healthy peer"
+# Stale lease takeover: kill -9 leaves a dead-pid lease AND frees the port,
+# so the next serve takes over (owner becomes the new pid).
+APID="$(cat "$STATE/doorbell.pid")"
+kill -9 "$APID" 2>/dev/null
+sleep 1
+"$BIN" serve --state-dir "$STATE" --port "$PORT" >/dev/null 2>&1 &
+SRV=$!
+sleep 2
+OWNER="$(curl -sf "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -o '"pid":[0-9]*' | head -n 1)"
+[ "$OWNER" = "\"pid\":$SRV" ] || fail "takeover owner should be $SRV, got $OWNER"
+pass "stale-lease takeover serves"
+kill "$SRV" 2>/dev/null
+wait "$SRV" 2>/dev/null
+sleep 1
+# Non-doorbell squatter: plain HTTP on another port must hard-fail naming it.
+SQUAT=18982
+python3 -m http.server --bind 127.0.0.1 "$SQUAT" >/dev/null 2>&1 &
+SQ=$!
+sleep 1
+if "$BIN" start --state-dir "$STATE" --port "$SQUAT" >/dev/null 2>&1; then
+  fail "start over non-doorbell squatter must hard-fail"
+else
+  pass "non-doorbell squatter hard fail"
+fi
+kill "$SQ" 2>/dev/null
+"$BIN" stop --state-dir "$STATE" --port "$PORT" >/dev/null 2>&1 \
+  || fail "final stop exited non-zero"
+sleep 1
+curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 \
+  && fail "port still answers after final stop" \
+  || pass "final stop leaves port dead"
 
 if [ "$FAIL" -eq 0 ]; then echo "RESULT: PASS"; else echo "RESULT: FAIL"; fi
 exit "$FAIL"

@@ -11,6 +11,7 @@ pub mod brain;
 pub mod budget;
 pub mod hear;
 pub mod host;
+pub mod lease;
 pub mod msg;
 pub mod policy;
 pub mod sensors;
@@ -26,7 +27,7 @@ pub use msg::{AskKind, AskReply, BrainMsg};
 pub use policy::{RestartPolicy, WatchRetry};
 pub use sensors::{SensorHandle, bridge, interval_ticker, supervise};
 pub use sinks::{MockSink, PromptSink, SendOutcome, SinkManager, Undelivered};
-pub use store::FileStore;
+pub use lease::{Deference, OwnerLease, acquire_lease, deference_decision, lease_stale};
 
 
 /// Single-writer brain inbox capacity (D3: slow brain parks sensors).

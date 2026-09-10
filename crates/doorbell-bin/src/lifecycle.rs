@@ -64,6 +64,8 @@ fn pid_alive(pid: u32) -> bool {
     }
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -72,11 +74,6 @@ fn pid_alive(pid: u32) -> bool {
 /// Our pidfile names a live process: managed by us.
 fn managed(self_cfg: &Config) -> Option<u32> {
     read_pid(&self_cfg.pid_file()).filter(|p| pid_alive(*p))
-}
-
-fn health_probe(cfg: &Config) -> Option<serde_json::Value> {
-    let body = health_get(cfg, "/health")?;
-    serde_json::from_str(&body).ok()
 }
 
 fn health_get(cfg: &Config, path: &str) -> Option<String> {
@@ -98,6 +95,10 @@ fn health_get(cfg: &Config, path: &str) -> Option<String> {
     Some(body[idx + 4..].to_string())
 }
 
+fn health_probe(cfg: &Config) -> Option<serde_json::Value> {
+    let body = health_get(cfg, "/health")?;
+    serde_json::from_str(&body).ok()
+}
 fn wait_for(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
