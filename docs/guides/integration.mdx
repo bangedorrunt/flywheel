@@ -88,6 +88,10 @@ Findings longer than about 20 lines go to a durable file first; the post carries
 
 | Path / port | Owner |
 |---|---|
+| `~/.config/flywheel/` | `config.toml`, `workflows/`, `crons/`, `profiles/`, `models/`, `policy/` |
+| `~/.config/herdr/herdr.sock` | herdr socket |
+| `<project>/.flywheel/agent-state/<name>.json` | per-agent context (git-ignored) |
+| launchd `com.flywheel.resonate` | Resonate service (port 8001, `resonate.db`) |
 | `~/.local/state/flywheel/` | flywheel loops, journals, runs, facts, doorbell state |
 | `~/.local/state/toron/toron.pid` | toron pidfile (non-launchd hosts) |
 | `127.0.0.1:18080` | toron daemon (MCP + mailbox) |

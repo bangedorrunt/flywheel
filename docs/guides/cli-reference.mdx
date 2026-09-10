@@ -52,3 +52,7 @@ Conventions: `<p>` is the project slug. The full clap surface is `flywheel --hel
 | `upgrade`, `tutorial` | Reinstall from source; interactive walkthrough |
 
 Rebuild after source changes: `mbx +nightly-aarch64-apple-darwin install --path . --force` (binary `~/.cargo/bin/flywheel`; re-sign only on stale-signature SIGKILL: `codesign --force --sign - ~/.cargo/bin/flywheel`).
+
+## Output contract
+
+Exit codes: `0` ok, `1` herdr or server error, `2` usage error. stdout carries data (`--json` for machines); stderr carries messages and progress. `NO_COLOR` or a piped stdout disables color. `workflow list --json` rows carry `description`, `run`, `compose_token`, and `decide_trigger`. Crew cap: `FLYWHEEL_CREW_MAX` env beats `[crew].max` in `~/.config/flywheel/config.toml`, default 5; `--crew-max` is the per-run operator override.

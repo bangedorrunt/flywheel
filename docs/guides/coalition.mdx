@@ -1,0 +1,54 @@
+---
+title: Coalitions
+description: Captain-formed multi-crew coordination (ADR-0011). Steer and collab as always-on layers, the intent protocol, and the negotiation ladder.
+---
+
+A coalition is a captain-formed, per-goal grouping of pane crews that coordinates through **declared intents** instead of lock-and-block. Steer (captain to coalition: `coalition form|status|disband`) and collab (crew to crew: intents + request-release negotiation) are always-on layers; there is no mode transition. A coalition is a NIP-29 channel (the intent board; membership is access) plus a goal workflow run. Disband closes the channel and ends the run.
+
+## When a coalition
+
+- One agent, one task, you watch: `flywheel send` (no coalition).
+- A fixed daily stage sequence on a live swarm: `loop-mode run --work` (no coalition).
+- A reusable multi-step procedure: a workflow (no coalition).
+- Multi-crew, shared files, needs coordination: `coalition form`.
+
+Coalitions are **pane-crew-only**. Headless cron crews are a separate autonomous world.
+
+## Lifecycle
+
+```bash
+flywheel coalition register <id-or-project> --as <agent>   # members must be REGISTERED agents; profiles are not agents
+flywheel coalition form <goal-workflow> --crews <squad|profile> --as <captain> [--project <p>] [--beads <ids>]
+flywheel coalition status <id>     # manifest + run + channel + intents + reservations + bead gate
+flywheel coalition list
+flywheel coalition disband <id>    # beads-closed gate first; auto-fallback on run terminal/timeout
+```
+
+Formation has two paths: captain-formed, or **auto-coalesce** (the detector merges two unaffiliated crews overlapping on non-trivial source paths; README/config/docs do not count).
+
+## The intent protocol
+
+Crews declare intents (kind-30031 `status:intent`) before acquiring: a TTL-bounded (about 5 minutes) plan to edit a path set. Intents are advisory; the atomic reservation is the enforcement floor.
+
+- Acquire against someone's **intent** (in TTL): **SOFT conflict** — freeze and propose, never a hard block.
+- Acquire against someone's **held** lease: **HARD conflict** — blocked. This floor is never removed; two agents can never hold the same exclusive path.
+- An acquire on the declarer's **own** intent converts it to held at the same coordinate (NIP-33 supersession). Intents auto-expire unless converted, so a speculative `src/**` intent cannot freeze peers.
+
+## Detector and proposer
+
+When intents overlap, a detector (workflow-as-reaction on intent declaration) drives a tiered proposer:
+
+1. Deterministic rules first: split by directory boundary or bead dependency, sequence by dependency, merge when same bead.
+2. LLM planner only on dispute: a rejected rule-split escalates to a headless planner run.
+3. Auto-coalesce: flag and form ad-hoc coalitions for non-trivial overlaps (`coalition detect`, `coalition auto-coalesce`).
+
+## Disputes: the negotiation ladder
+
+```bash
+flywheel coalition negotiate-request <id> --as <asker> --to <holder> --paths <glob>
+flywheel coalition negotiate-respond <id> --as <holder>     # answer or defer
+flywheel coalition negotiate-status <id>                    # pending | responded | escalation-due
+flywheel coalition negotiate-escalate <id>                  # unanswered -> kind-14 DM to the captain
+```
+
+`flywheel mail force-unlock` stays the operator's last resort. File overlap between two agents is always a reservation question; the intent tier exists so contention is negotiated before it becomes a block.
