@@ -9,6 +9,7 @@
     <array>
         <string>DOORBELL_BIN</string>
         <string>serve</string>
+        DOORBELL_SERVE_ARGS
     </array>
     <key>RunAtLoad</key>
     <true/>

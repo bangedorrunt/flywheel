@@ -376,25 +376,63 @@ pub fn install(cfg: &Config) -> Result<()> {
     let body = render_autostart(
         &exe.display().to_string(),
         &cfg.state_dir.display().to_string(),
+        cfg.port,
+        &cfg.flywheel_state.display().to_string(),
+        &cfg.hosts,
     );
     install_rendered(cfg, &body)
 }
 
 /// Render the platform autostart unit with live paths (pure — golden
-/// tested). Placeholders take the binary path + state dir; `serve` reads
-/// both back from argv/env so the unit and the pidfile path never diverge.
-pub fn render_autostart(exe: &str, state_dir: &str) -> String {
+/// tested). The unit reproduces the `start` serve argv (`--state-dir`,
+/// `--port`, `--flywheel-state-dir`, repeatable `--host p/w`) so an
+/// autostarted daemon hosts the same live workspaces as a `start` child
+/// and the unit and the pidfile path never diverge (bd-0zcr.2 unit 4).
+/// Empty hosts = standby (bind + reads only), same as `start`.
+pub fn render_autostart(
+    exe: &str,
+    state_dir: &str,
+    port: u16,
+    flywheel_state: &str,
+    hosts: &[(String, String)],
+) -> String {
     #[cfg(target_os = "macos")]
     {
-        return include_str!("../units/com.doorbell.serve.plist")
+        let mut args = vec![
+            "<string>--state-dir</string>".to_string(),
+            format!("<string>{state_dir}</string>"),
+            "<string>--port</string>".to_string(),
+            format!("<string>{port}</string>"),
+            "<string>--flywheel-state-dir</string>".to_string(),
+            format!("<string>{flywheel_state}</string>"),
+        ];
+        for (p, w) in hosts {
+            args.push("<string>--host</string>".to_string());
+            args.push(format!("<string>{p}/{w}</string>"));
+        }
+        include_str!("../units/com.doorbell.serve.plist")
             .replace("DOORBELL_BIN", exe)
-            .replace("DOORBELL_STATE_DIR", state_dir);
+            .replace("DOORBELL_STATE_DIR", state_dir)
+            .replace("DOORBELL_SERVE_ARGS", &args.join("\n        "))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        return include_str!("../units/doorbell.service")
+        let mut args = vec![
+            "--state-dir".to_string(),
+            state_dir.to_string(),
+            "--port".to_string(),
+            port.to_string(),
+            "--flywheel-state-dir".to_string(),
+            flywheel_state.to_string(),
+        ];
+        for (p, w) in hosts {
+            args.push("--host".to_string());
+            args.push(format!("{p}/{w}"));
+        }
+        include_str!("../units/doorbell.service")
             .replace("DOORBELL_BIN", exe)
-            .replace("DOORBELL_STATE_DIR", state_dir);
+            .replace("DOORBELL_STATE_DIR", state_dir)
+            .replace("DOORBELL_SERVE_ARGS", &args.join(" "))
     }
 }
 
@@ -480,12 +518,31 @@ mod tests {
 
     #[test]
     fn render_substitutes_live_paths() {
-        let body = render_autostart("/opt/doorbell", "/var/dbll");
+        let hosts = vec![("proj".to_string(), "ws".to_string())];
+        let body = render_autostart("/opt/doorbell", "/var/dbll", 18980, "/var/fw", &hosts);
         assert!(body.contains("/opt/doorbell"), "binary path rendered");
         assert!(body.contains("/var/dbll"), "state dir rendered");
+        assert!(body.contains("18980"), "port rendered");
+        assert!(body.contains("/var/fw"), "flywheel state dir rendered");
+        assert!(body.contains("proj/ws"), "--host pair rendered");
         assert!(!body.contains("DOORBELL_BIN"), "no placeholder survives");
         assert!(
             !body.contains("DOORBELL_STATE_DIR"),
+            "no placeholder survives"
+        );
+        assert!(
+            !body.contains("DOORBELL_SERVE_ARGS"),
+            "no placeholder survives"
+        );
+    }
+
+    #[test]
+    fn render_empty_hosts_is_standby() {
+        // No --host = standby (bind + reads only), same as `start`.
+        let body = render_autostart("/opt/doorbell", "/var/dbll", 18980, "/var/fw", &[]);
+        assert!(!body.contains("--host"), "standby carries no --host");
+        assert!(
+            !body.contains("DOORBELL_SERVE_ARGS"),
             "no placeholder survives"
         );
     }
