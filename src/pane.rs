@@ -631,14 +631,30 @@ pub fn pane_dispatch(
                 );
                 override_entry = Some(e);
             }
-            None => bail!(
-                "pane dispatch: step @{profile_name} overrides harness={override_h} but no crew pane runs it (panes: {}) — per-step harness overrides land in --mode headless, or spawn a squad containing a {override_h} pane",
-                entries
-                    .iter()
-                    .map(|e| format!("{}={}", e.name, e.harness.as_deref().unwrap_or("?")))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+            None => {
+                // bd-ytr6: the pin check compares raw profile.harness while
+                // spawn stores the resolved harness, so on hosts where
+                // models.toml defaults short-circuit slot aliases the pin can
+                // name a harness no pane runs. Fall back to the step's @role
+                // pane if one exists; only bail when neither exists.
+                if let Some(role_entry) = resolve_pane_entry(entries, profile_name) {
+                    eprintln!(
+                        "flywheel: WARNING step @{profile_name} pins harness={override_h} but no {override_h} pane exists; dispatching to @{profile_name} pane {} (harness={})",
+                        role_entry.name,
+                        role_entry.harness.as_deref().unwrap_or("?")
+                    );
+                    override_entry = Some(role_entry);
+                } else {
+                    bail!(
+                        "pane dispatch: step @{profile_name} overrides harness={override_h} but no crew pane runs it (panes: {}) — per-step harness overrides land in --mode headless, or spawn a squad containing a {override_h} pane",
+                        entries
+                            .iter()
+                            .map(|e| format!("{}={}", e.name, e.harness.as_deref().unwrap_or("?")))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+            }
         }
     }
     // Role conditioning (Spec C): the behavior preamble is prepended INSIDE
@@ -1802,6 +1818,96 @@ mod tests {
             !harness_override_conflicts("", Some("pi")),
             "empty (slot-inherit) harness must not conflict"
         );
+    }
+
+    /// bd-ytr6: a step pinning harness=X with NO X pane falls back to the
+    /// step's @role pane (different resolved harness) instead of bailing —
+    /// the dispatch lands on the role pane (warned loudly at runtime). The
+    /// `__send` leaf is reached with the role pane's name: in tests the
+    /// subprocess is the test binary, which exits non-JSON, so the returned
+    /// payload proves only the routing decision (agent = role pane).
+    #[test]
+    fn pane_dispatch_harness_fallback_dispatches_role_pane() {
+        // reviewer with a RESOLVED harness (pi) so the opencode pin conflicts.
+        let catalog = test_catalog_with_reviewer_harness("pi");
+        let entry = |pane_id: &str, name: &str, profile: &str, harness: &str| SpawnEntry {
+            pane_id: pane_id.to_string(),
+            name: name.to_string(),
+            profile: Some(profile.to_string()),
+            harness: Some(harness.to_string()),
+            mail_identity: None,
+            skills_injected: false,
+            incarnation: 0,
+        };
+        // No opencode pane anywhere — the role pane runs pi.
+        let entries = vec![entry("w1:p1", "crew-goal-reviewer", "reviewer", "pi")];
+        let action = Action::DispatchJob {
+            assignee: "x".into(),
+            spec: toron_workflow::schema::DispatchSpec {
+                profile: Some("@reviewer".into()),
+                harness: Some("opencode".into()),
+                ..Default::default()
+            },
+            channel: None,
+        };
+        let out = pane_dispatch(&catalog, "proj", "wf", &json!({}), &entries, &action)
+            .expect("fallback must dispatch, not bail");
+        assert_eq!(out["agent"], "crew-goal-reviewer", "role pane wins the dispatch");
+        assert_eq!(out["profile"], "reviewer");
+    }
+
+    /// bd-ytr6: with neither an override-harness pane NOR a role pane, the
+    /// original bail is kept exactly (fail loud, no silent degradation).
+    #[test]
+    fn pane_dispatch_harness_pin_missing_role_still_bails() {
+        let catalog = test_catalog_with_reviewer_harness("pi");
+        let entries = vec![SpawnEntry {
+            pane_id: "w1:p1".into(),
+            name: "crew-goal-coder".into(),
+            profile: Some("coder".into()),
+            harness: Some("pi".into()),
+            mail_identity: None,
+            skills_injected: false,
+            incarnation: 0,
+        }];
+        let action = Action::DispatchJob {
+            assignee: "x".into(),
+            spec: toron_workflow::schema::DispatchSpec {
+                profile: Some("@reviewer".into()),
+                harness: Some("opencode".into()),
+                ..Default::default()
+            },
+            channel: None,
+        };
+        let err = pane_dispatch(&catalog, "proj", "wf", &json!({}), &entries, &action)
+            .expect_err("no opencode pane and no reviewer pane must bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("overrides harness=opencode but no crew pane runs it"),
+            "{msg}"
+        );
+    }
+
+    /// Test fixture: defaults layered with `[profiles.reviewer] harness = H`
+    /// (built-in reviewer's harness is EMPTY — slot-inherit — which never
+    /// conflicts, so the pin path needs an explicit harness to fire).
+    #[cfg(test)]
+    fn test_catalog_with_reviewer_harness(harness: &str) -> ProfileCatalog {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "fw-pane-pin-{}-{}.toml",
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::write(
+            &path,
+            format!("[profiles.reviewer]\nharness = \"{harness}\"\n"),
+        )
+        .expect("profiles.toml");
+        let catalog = ProfileCatalog::load_from(Some(&path)).expect("catalog");
+        let _ = std::fs::remove_file(&path);
+        catalog
     }
 
     /// P10.3: an empty crew plan refuses pane mode (fail-fast, clear error).
