@@ -14,10 +14,9 @@
 //! filter mirrors `workspace::filter_prompts` (Idle keeps, Busy+urgent
 //! breaks through, else `prompt_filtered` Audit — same kind/pin/detail
 //! text); `FetchInbox` effects normalize to empty pin/since like the
-//! embedded advisory mapping. Known gaps (documented, fixture-excluded):
-//! G1 `scan_ack_sla` returns empty (no toron CLI verb for the
-//! ack-SLA scan+publish; overdue posts still arrive via the watch path
-//! once anything publishes them).
+//! embedded advisory mapping. The former G1 gap (`scan_ack_sla` returned
+//! empty for lack of a toron CLI verb) is closed: the daemon shells
+//! `toron ack-sla --project` and relays the expired ids (bd-0zcr.2).
 
 use crate::host::{CoreReducer, Effect, Host};
 use crate::msg::BrainMsg;
@@ -813,10 +812,42 @@ impl Host for FileHost {
     }
 
     fn scan_ack_sla(&mut self) -> Vec<String> {
-        // G1: no toron CLI verb for the ack-SLA scan+publish — the daemon
-        // never invents overdue posts. Overdue wakes still arrive via the
-        // watch path once any scanner publishes them.
-        Vec::new()
+        // bd-0zcr.2 G1 closed: the `toron ack-sla` verb scans + publishes
+        // overdue ack wakes; the daemon relays the expired ids it returns
+        // and never invents overdue posts. Failures audit LOUD and yield
+        // empty — the same at-least-once rule as `fetch_inbox`.
+        let out = run_cli(
+            &self.cfg.toron_bin,
+            &["ack-sla", "--project", &self.cfg.project],
+            CLI_TIMEOUT_SECS,
+        );
+        let Some(out) = out else {
+            self.audit_file(
+                "ack_sla_error",
+                serde_json::json!({ "error": "toron spawn/timeout failed" }),
+            );
+            return Vec::new();
+        };
+        if !out.status.success() {
+            self.audit_file(
+                "ack_sla_error",
+                serde_json::json!({
+                    "error": String::from_utf8_lossy(&out.stderr).to_string(),
+                }),
+            );
+            return Vec::new();
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
+        parsed
+            .get("expired")
+            .and_then(|e| e.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn restart_watch(&mut self) {
