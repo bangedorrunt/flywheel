@@ -251,8 +251,8 @@ loud.
 ## Durability (Resonate)
 
 The loop runs as a **durable Resonate workflow** (requires a Resonate server,
-default `http://localhost:8001` — installed as the launchd service
-`com.flywheel.resonate`; sqlite state survives reboots). Every poll, send, and
+default `http://localhost:8001` — `flywheel deps --ensure` or
+`flywheel daemon start` starts one with sqlite state when none is running). Every poll, send, and
 sleep is a checkpoint: kill the loop process mid-run and `flywheel loop-mode
 run <project>` with the same flags **resumes the same invocation**. State is
 queryable via `flywheel loop-mode status <project>`; `flywheel loop-mode list`

@@ -68,7 +68,9 @@ flywheel profile remove hachiko-researcher
 `planner`/`coder`/`reviewer`/`housekeeper` = `opencode-go/deepseek-v4-flash`,
 `scout` = `opencode/big-pickle`. Registered in `~/.config/flywheel/models.toml`. `reviewer` runs on
 **opencode** in review/debate workflows (a per-step harness override — cross-harness review independence);
-grok/opencode are otherwise used only when a profile/workflow explicitly asks.
+grok/opencode are otherwise used only when a profile/workflow explicitly asks. If a pinned harness has no
+pane (profile resolution yielded none), pane-mode dispatch falls back to the step's `@role` pane with a
+loud WARNING naming the downgrade; it bails only when no role pane exists either.
 
 **Key fields:**
 - `harness` — `pi | oc | grok | omp | ...` (omp is a first-class herdr kind; `herdr agent start --kind omp` works).

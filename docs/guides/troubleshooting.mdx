@@ -19,7 +19,7 @@ description: Named failures and their fixes. Door, spawn, loop, compose, and doo
 | `agent_not_ready` after agent restart, name `null` | Lost binding | `flywheel rebind` restores registered names; `recover` also respawns the dead |
 | SIGKILL on the binary | Stale signature | `codesign --force --sign - ~/.cargo/bin/flywheel` |
 | doorbell `answered by foreign owner, not child <pid>` | Port 18980 conflict | Stop the foreign holder or relocate; arrival itself was unaffected |
-| preflight `resonate ... connection refused` | Durable engine down | Start resonate before loop/compose work, or run open-vehicle work and say so in the trail |
+| preflight `resonate ... connection refused` | Durable engine down | `flywheel deps --ensure` starts it, or run open-vehicle work and say so in the trail |
 | Mail to `captain` fails | Alias cleared by parent death or never bound | `flywheel mail whois <p> captain` to check; `recover`/`adopt` rebinds; `toron contact captain --pin <pin>` sets it |
 
 ## Escape costs

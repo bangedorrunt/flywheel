@@ -8,7 +8,7 @@ description: Bootstrap the fleet on a host, enter through the session door, and 
 ```bash
 toron daemon start                      # mailbox + MCP on 127.0.0.1:18080
 flywheel toron setup-mcp --flywheel     # point flywheel and harnesses at the same daemon
-flywheel deps                           # toolchain health
+flywheel deps --ensure                   # toolchain health; starts resonate if down
 ```
 
 `flywheel preflight` checks herdr socket, resonate, operator key, toron mail, and standing orders. Fix FAILs before fleet work; the loop and compose engine need resonate (`http://localhost:8001`).
