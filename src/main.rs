@@ -8000,6 +8000,41 @@ mod spawn_boot_reliability_tests {
     }
 
     #[test]
+    fn spawn_registers_wake_subscriptions() {
+        // bd-0zcr.1 unit 2: spawn records wake subscriptions (the daemon
+        // serves these rows when it hosts wake) — the Phase-3 cutover
+        // registration path, distinct from the embedded dispatcher child.
+        let src = include_str!("main.rs");
+        let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
+        let spawn_end = crate::tripwire::find_fn(src, "cmd_internal_doorbell");
+        let body = &src[spawn..spawn_end];
+        assert!(
+            body.contains("register_workspace_subscriptions"),
+            "cmd_spawn must record wake subscriptions for the daemon host"
+        );
+    }
+
+    #[test]
+    fn kill_never_touches_daemon() {
+        // bd-0zcr.1 unit 3: kill stops the dispatcher child pid only — it
+        // never addresses the daemon (no port, no serve, no daemon stop).
+        let src = include_str!("main.rs");
+        let kill = crate::tripwire::find_fn(src, "cmd_kill");
+        let kill_end = crate::tripwire::find_fn(src, "cmd_principles");
+        let kbody = &src[kill..kill_end];
+        assert!(
+            kbody.contains("doorbell::stop"),
+            "cmd_kill must stop the dispatcher child"
+        );
+        for needle in ["18980", "serve --port", "daemon stop", "daemon_start"] {
+            assert!(
+                !kbody.contains(needle),
+                "cmd_kill must never touch the daemon ({needle})"
+            );
+        }
+    }
+
+    #[test]
     fn spawn_no_peer_aware_keeps_identity_skips_dispatcher() {
         let src = include_str!("main.rs");
         let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
