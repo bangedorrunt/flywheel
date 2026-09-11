@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
+### Fixed — swarm coordination hardening (bd-ytr6, bd-8vci, bd-ykqd, bd-0gmw)
+- Pane-mode workflow steps that pin a harness no longer strand the run when the host's profile resolution yields no such pane: dispatch falls back to the step's `@role` pane with a loud downgrade warning, and only bails when no role pane exists (bd-ytr6).
+- `send --wait` timeouts no longer discard the landed fact: observed rows are emitted with an `observed_status` read-back and an ambiguous may-have-started error; same-second wake stamps retry once past the second boundary instead of false-failing the advance gate (bd-8vci).
+- `flywheel deps --ensure` and `flywheel daemon start` ensure a loopback resonate: probe `/health`, start a detached sqlite-backed `resonate serve` when down, refuse loudly for remote urls (bd-ykqd).
+- Configured doorbell daemons are ensured at spawn (typed outcome, `FLYWHEEL_NO_DOORBELL_ENSURE=1` opt-out), degradation prints a WARNING with remediation, and preflight carries an advisory doorbell entry (bd-0gmw).
 ### Added — ADR-0012 Phase 4 behavior flags (all default-off, live-proven)
 - `arrival_triple`: presence publish + role auto-bind + join ring + scope-bound roster headers on arrive; flag off is byte-identical.
 - `beads_poller`: read-only WAL poll of the br sqlite emitting Fact Msgs (hold expiry, closes); never writes the ledger.

@@ -161,6 +161,11 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
     // 2. resonate server reachable
     checks.push(check_resonate(cfg));
 
+    // 2b. doorbell daemon (bd-0gmw): advisory only — a configured daemon
+    //     being down degrades to the embedded loop, so this warns (skip)
+    //     and never blocks.
+    checks.push(check_doorbell(cfg));
+
     // 3. br binary on PATH — only bead-driven modes (matches the Mode doc:
     //    "Cron (headless): needs resonate only")
     if mode.needs_beads {
@@ -325,6 +330,25 @@ fn check_resonate(cfg: &Config) -> Check {
     match resonate_health(cfg) {
         Ok(()) => Check::pass("resonate"),
         Err(e) => Check::fail("resonate", format!("{e}")),
+    }
+}
+
+/// bd-0gmw: advisory doorbell entry. A configured daemon being down is a
+/// warning (skip), never a FAIL — embedded mode still works. Mirrors the
+/// advisory-skip pattern; there is no blocking outcome here.
+fn check_doorbell(cfg: &Config) -> Check {
+    match cfg.doorbell_url() {
+        None => Check::skip("doorbell", "embedded (no [doorbell] url configured)"),
+        Some(url) => {
+            if crate::doorbell::daemon_healthy(&url) {
+                Check::pass("doorbell")
+            } else {
+                Check::skip(
+                    "doorbell",
+                    "configured daemon unreachable — remediation: doorbell start | doorbell install | flywheel daemon start",
+                )
+            }
+        }
     }
 }
 

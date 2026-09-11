@@ -864,6 +864,17 @@ pub fn ensure_running(
     let cfg_url = crate::config::Config::load()
         .ok()
         .and_then(|c| c.doorbell_url());
+    // bd-0gmw: a configured daemon that is down gets one pidfile-mode
+    // bring-up attempt (never launchctl bootstrap — persistence stays
+    // opt-in via `doorbell install`) before host resolution degrades us.
+    // Attached/Started → resolve_host below sees /health and defers;
+    // Degraded → fall through, embedded as today.
+    if cfg_url.is_some()
+        && let crate::daemon::DoorbellEnsure::Degraded { hint } =
+            crate::daemon::ensure_doorbell_spawn()
+    {
+        eprintln!("flywheel doorbell: {hint}");
+    }
     if matches!(resolve_host(state_dir, cfg_url), DoorbellHost::Proxy { .. }) {
         eprintln!(
             "flywheel doorbell: daemon host alive — attached, local loop suppressed (deference)"
@@ -918,7 +929,7 @@ pub fn resolve_host(state_dir: &Path, cfg_url: Option<String>) -> DoorbellHost {
             doorbell_rt::lease::Deference::TakeLease => {
                 if !healthy {
                     eprintln!(
-                        "flywheel doorbell: configured daemon {url} unreachable — embedded degraded mode"
+                        "flywheel doorbell: WARNING configured daemon {url} unreachable (remediation: doorbell start | doorbell install | flywheel daemon start) — embedded degraded mode"
                     );
                 }
                 return DoorbellHost::Embedded;

@@ -87,7 +87,7 @@ use herdr_shim::{
 use output::{die, dim, error, kind_paint, ok as paint_ok, print_json, status_paint};
 use profile::ProfileCatalog;
 use state::{EventKind, log_event};
-use toron_core::backend::error::BackendErrorCode;
+use toron_core::backend::{BackendError, error::BackendErrorCode};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -1081,7 +1081,12 @@ enum Commands {
         cmd: PolicyCmd,
     },
     /// Environment + toolchain health check
-    Deps,
+    Deps {
+        /// Best-effort bring-up of a down loopback resonate before the
+        /// report (bd-ykqd). Without it, deps stays report-only.
+        #[arg(long)]
+        ensure: bool,
+    },
     /// Generate the beads-agent integration prompts for an agent kind.
     /// Writes the beads files (beads-{triage,execute,review,commit,create}.md),
     /// the workflow slash commands (workflow-{...}.md), and the orchestration
@@ -4819,8 +4824,8 @@ fn main() {
         }) => cmd_ensemble(&cfg, project, recipe, workflow),
         Some(Commands::Safety) => cmd_safety(&cfg),
         Some(Commands::Guards) => cmd_guards(&cfg),
+        Some(Commands::Deps { ensure }) => cmd_deps(&cfg, *ensure),
         Some(Commands::Policy { cmd }) => cmd_policy(&cfg, cmd),
-        Some(Commands::Deps) => cmd_deps(&cfg),
         Some(Commands::Integration { kind, out }) => {
             cmd_integration(kind.as_deref(), out.as_deref())
         }
@@ -10542,6 +10547,15 @@ fn doorbell_now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// bd-8vci: sleep to the next wall-clock second boundary (bounded, <1s) so a
+/// re-stamp lands strictly after the prior same-second wake stamp.
+fn sleep_to_next_second() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    std::thread::sleep(Duration::from_nanos(1_000_000_000 - u64::from(now.subsec_nanos())));
+}
+
 fn doorbell_persist_hear(workspace: &str, hear: &doorbell::HearTracker) {
     let _ = doorbell::write_unanswered(
         &doorbell::unanswered_file(&config::state_dir(), workspace),
@@ -10602,15 +10616,30 @@ fn doorbell_persist_wake_with_plane_s(
 /// Advance only when the observation is new/meaningful: wall clock moved
 /// strictly past the prior stamp. Same-second re-notes must not bump the
 /// prior stamp by one — that let background polls ratchet `last_wake` without
-/// a fresh observation (invent-adjacent).
+/// a fresh observation (invent-adjacent). bd-8vci: a refused same-second
+/// stamp retries ONCE after sleeping to the next second boundary, so two
+/// sends landing in one wall second still advance the stamp for the caller's
+/// wake-advance gate; a second refusal leaves the caller's bail standing.
 fn doorbell_note_observed_wake(workspace: &str, pin: &str) -> Result<()> {
     let path = doorbell::wake_state_file(&config::state_dir(), workspace);
     let mut st = doorbell::load_wake_state(&path);
-    let now = doorbell_now_unix();
+    let mut now = doorbell_now_unix();
     if let Some(prev) = st.last_wake_unix {
         if now <= prev {
-            // Same-second or clock-behind re-note: keep prior (no false advance).
-            return Ok(());
+            // Same-second or clock-behind re-note: keep prior (no false
+            // advance). bd-8vci: a second send landing in the same wall
+            // second no-ops here and the caller's wake-advance gate
+            // false-fails with "last_wake did not advance" — sleep to the
+            // next second boundary and re-stamp once (bounded).
+            sleep_to_next_second();
+            now = doorbell_now_unix();
+            // Re-load: another writer may have advanced the state meanwhile.
+            st = doorbell::load_wake_state(&path);
+            if let Some(prev) = st.last_wake_unix
+                && now <= prev
+            {
+                return Ok(());
+            }
         }
     }
     doorbell::note_wake(&mut st, pin, now);
@@ -14527,6 +14556,22 @@ fn cmd_send(
     let catalog = profile::ProfileCatalog::load();
     let mut registry_dirty = false;
     let mut results: Vec<Value> = Vec::new();
+    // bd-8vci: one emitter shared by the success tail and the wait-failure
+    // path — a failed --wait still surfaces every observed row before its
+    // nonzero exit instead of discarding the landed fact.
+    let emit_rows = |results: &[Value]| {
+        log(
+            project,
+            EventKind::Send,
+            json!({
+                "to": to, "stage": stage, "text_len": text.len(), "wait": wait,
+                "raw": raw, "fire_and_forget": fire_and_forget, "delivery_id": delivery_id_of(&fire_and_forget), "results": results
+            }),
+        );
+        if !std::io::stdout().is_terminal() {
+            print_json(&json!({ "results": results }));
+        }
+    };
     // GS-037 P0-C / GS-039 P0-1: snapshot wake BEFORE send so a later landed
     // check can require an observed advance (Status/poll/delivery, or
     // herdr settled_status after --wait land — never invent from injects).
@@ -14670,7 +14715,20 @@ fn cmd_send(
                         }
                     }
                     match stall_step(&e.code, stalls_seen, respawn_on_stall) {
-                        None => return Err(e.into()),
+                        None => {
+                            if wait && e.code == BackendErrorCode::Timeout {
+                                // bd-8vci: the wait timed out AFTER herdr
+                                // accepted the bytes — a bare Err here discards
+                                // the landed fact and invents a clean failure.
+                                // Emit the ambiguous row; genuinely non-landed
+                                // errors keep the bare bail.
+                                return Err(wait_failure_exit(
+                                    &mut c, &target, &name, a, cond_profile.as_deref(),
+                                    project, &mut results, &e, &emit_rows,
+                                ));
+                            }
+                            return Err(e.into());
+                        }
                         Some(StallStep::Retry) => {
                             eprintln!(
                                 "flywheel: {target} agent_prompt_stalled — retrying once in {STALL_RETRY_DELAY_SECS}s"
@@ -14698,6 +14756,9 @@ fn cmd_send(
                             let _ = try_send_text_delivery(
                                 &mut c, project, &name, &a.pane_id, &send_text,
                             );
+                            if wait {
+                                return Err(wait_failure_exit(&mut c, &target, &name, a, cond_profile.as_deref(), project, &mut results, &e, &emit_rows));
+                            }
                             return Err(stall_giveup_error(&target, project));
                         }
                     }
@@ -14733,17 +14794,7 @@ fn cmd_send(
         eprintln!("flywheel: cannot persist skills_injected for send targets: {e:#}");
     }
 
-    log(
-        project,
-        EventKind::Send,
-        json!({
-            "to": to, "stage": stage, "text_len": text.len(), "wait": wait,
-            "raw": raw, "fire_and_forget": fire_and_forget, "delivery_id": delivery_id_of(&fire_and_forget), "results": results
-        }),
-    );
-    if !std::io::stdout().is_terminal() {
-        print_json(&json!({ "results": results }));
-    }
+    emit_rows(&results);
 
     // GS-037 P0-A / P0-C: receipt honesty.
     // --wait with no landed must not exit 0 invent-green (P0-A wait-empty).
@@ -14918,6 +14969,79 @@ fn send_result_row(
         v["landed"] = json!(false);
     }
     v
+}
+
+/// bd-8vci: row for a --wait send that ended WITHOUT a settled observation
+/// (timeout/stall) after herdr accepted the bytes. The prompt MAY have
+/// started, so `landed` is deliberately ABSENT (not false) — ambiguity is
+/// the honest report. `observed_status` carries the one lifecycle read-back
+/// taken at failure time; omitted when that query itself failed.
+fn wait_failure_row(
+    target: &str,
+    prior_status: &str,
+    pane_id: &str,
+    profile: Option<&str>,
+    observed_status: Option<&str>,
+) -> Value {
+    let mut v = json!({
+        "target": target,
+        "dispatched": true,
+        "receipt": false,
+        "prior_status": prior_status,
+        "pane_id": pane_id,
+        "profile": profile,
+    });
+    if let Some(s) = observed_status {
+        v["observed_status"] = json!(s);
+    }
+    v
+}
+
+/// bd-8vci: the nonzero-exit error for an ambiguous wait outcome — names the
+/// observed status, the may-have-started ambiguity, and the recovery hint.
+/// Never worded as a clean failure with zero evidence.
+fn wait_failure_error(
+    target: &str,
+    cause: &BackendError,
+    observed_status: Option<&str>,
+    project: &str,
+) -> anyhow::Error {
+    anyhow!(
+        "send --wait: {target} gave no settled observation ({cause}) — the prompt MAY have started (observed_status: {}); treat as ambiguous, not a clean failure. {}",
+        observed_status.unwrap_or("unknown"),
+        stall_recovery_hint(project),
+    )
+}
+
+/// bd-8vci: wait timeout/stall after herdr accepted the send — one lifecycle
+/// read-back becomes the row's `observed_status`, the ambiguous row is pushed
+/// into `results`, the caller's row emitter runs, and the returned error
+/// exits nonzero with the recovery hint.
+fn wait_failure_exit(
+    c: &mut Client,
+    target: &str,
+    name: &str,
+    a: &AgentInfo,
+    profile: Option<&str>,
+    project: &str,
+    results: &mut Vec<Value>,
+    cause: &BackendError,
+    emit: &dyn Fn(&[Value]),
+) -> anyhow::Error {
+    let observed = c.agent_list().ok().and_then(|list| {
+        list.iter()
+            .find(|ag| ag.pane_id == target || ag.name.as_deref() == Some(name))
+            .map(|ag| ag.agent_status.as_str().to_string())
+    });
+    results.push(wait_failure_row(
+        target,
+        a.agent_status.as_str(),
+        &a.pane_id,
+        profile,
+        observed.as_deref(),
+    ));
+    emit(results);
+    wait_failure_error(target, cause, observed.as_deref(), project)
 }
 
 #[cfg(test)]
@@ -24077,10 +24201,25 @@ mod renew_sweep_tests {
     }
 }
 
-fn cmd_deps(cfg: &Config) -> Result<()> {
+fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
     let mut ok = true;
     println!("flywheel {}", dim(VERSION));
 
+    // bd-ykqd opt-in: bring the engine store up before reporting. Without
+    // --ensure this stays report-only (the resonate FAIL below still
+    // fails deps).
+    if ensure {
+        match daemon::ensure_resonate(cfg) {
+            Ok(outcome) => println!(
+                "resonate ensure: {}",
+                match outcome {
+                    daemon::EnsureOutcome::AlreadyUp => "already up",
+                    daemon::EnsureOutcome::Started => "started",
+                }
+            ),
+            Err(e) => println!("resonate ensure: {} ({e:#})", error("FAIL")),
+        }
+    }
     match Client::connect(Some(&cfg.socket_path())) {
         Ok(mut c) => match c.ping() {
             Ok(_) => println!("herdr socket: {}", status_paint(AgentStatus::Idle)),
@@ -33515,7 +33654,17 @@ fn cmd_daemon(cmd: &DaemonCmd) -> Result<()> {
             // Plane D rides along: `flywheel daemon start` also ensures the
             // doorbell daemon is running (loud if its binary is absent —
             // autostart persistence stays opt-in via `doorbell install`).
-            daemon::ensure_doorbell()
+            daemon::ensure_doorbell()?;
+            // Plane C store rides along (bd-ykqd): self-host resonate when
+            // its /health is down and the url is loopback. A failure here
+            // warns but does not fail daemon start — deps/preflight still
+            // report the unhealthy store.
+            match daemon::ensure_resonate(&Config::load()?) {
+                Ok(daemon::EnsureOutcome::AlreadyUp) => println!("resonate: already up"),
+                Ok(daemon::EnsureOutcome::Started) => println!("resonate: started"),
+                Err(e) => eprintln!("flywheel: WARNING resonate ensure failed: {e:#}"),
+            }
+            Ok(())
         }
         DaemonCmd::Stop { port, force } => daemon::stop(&state, &addr(*port), *force),
         DaemonCmd::Restart { port, force } => daemon::restart(&state, &addr(*port), *force),
@@ -35650,6 +35799,54 @@ mod send_result_row_tests {
             interrupt_guard_working(AgentStatus::Idle, false).is_ok(),
             "idle needs no force"
         );
+    }
+}
+
+#[cfg(test)]
+mod send_receipt {
+    use super::{wait_failure_error, wait_failure_row};
+    use toron_core::backend::BackendError;
+    use toron_core::backend::error::BackendErrorCode;
+
+    /// bd-8vci: a --wait timeout/stall row is deliberately AMBIGUOUS —
+    /// receipt:false, NO `landed` key (the prompt may have started), and the
+    /// one lifecycle read-back surfaced as `observed_status`.
+    #[test]
+    fn send_receipt_wait_failure_row_is_ambiguous_not_clean_failure() {
+        let row = wait_failure_row("flywheel-oc", "idle", "%3", Some("pi"), Some("working"));
+        assert_eq!(row["target"], "flywheel-oc");
+        assert_eq!(row["dispatched"], true);
+        assert_eq!(row["receipt"], false);
+        assert_eq!(row["observed_status"], "working");
+        assert!(
+            row.get("landed").is_none(),
+            "landed must be absent on an ambiguous wait failure, not false: {row}"
+        );
+        // Read-back itself failed: observed_status omitted, never invented.
+        let row = wait_failure_row("flywheel-oc", "idle", "%3", None, None);
+        assert!(row.get("observed_status").is_none());
+        assert!(row["profile"].is_null());
+    }
+
+    /// bd-8vci: the wait-failure error must read as ambiguous (prompt MAY
+    /// have started) and carry the recovery hint — nonzero exit intent
+    /// without a clean-failure claim.
+    #[test]
+    fn send_receipt_wait_failure_error_names_status_and_recovery() {
+        let cause = BackendError::new(
+            BackendErrorCode::Timeout,
+            "no lifecycle change within 30000ms",
+        );
+        let err = wait_failure_error("flywheel-oc", &cause, Some("working"), "flywheel");
+        let msg = err.to_string();
+        assert!(msg.contains("MAY have started"), "{msg}");
+        assert!(msg.contains("observed_status: working"), "{msg}");
+        assert!(
+            msg.contains("flywheel recover flywheel"),
+            "recovery hint: {msg}"
+        );
+        let unknown = wait_failure_error("flywheel-oc", &cause, None, "flywheel");
+        assert!(unknown.to_string().contains("observed_status: unknown"));
     }
 }
 
