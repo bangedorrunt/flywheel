@@ -36,7 +36,7 @@ herdr protocol v20. Socket: `HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`.
 
 ## Runtime
 
-- Resonate: launchd `com.flywheel.resonate`, `http://localhost:8001`, sqlite `~/.local/state/flywheel/resonate.db`
+- Resonate: `http://localhost:8001`, sqlite `~/.local/state/flywheel/resonate.db`; `flywheel deps --ensure` or `flywheel daemon start` starts it when down (loopback urls only)
 - Toron daemon (optional): `toron daemon` / `com.toron.serve`, `127.0.0.1:18080`. Passphrase file, never plist.
 - State: `~/.local/state/flywheel/` — event logs, `loops.json` schema v2 (`src/state.rs`)
 - Config: `~/.config/flywheel/config.toml` — models registry `models.toml` uses composite `provider/model` keys (e.g. `[models."opencode-go/deepseek-v4-flash"]`); `Profile.provider` pins the composite; bare `--model`/`--provider` on spawn is lenient fallback, profile routing is strict.

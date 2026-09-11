@@ -78,7 +78,7 @@ Findings longer than about 20 lines go to a durable file first; the post carries
 
 | Symptom | Meaning | Move |
 |---|---|---|
-| `flywheel preflight`: resonate DOWN (127.0.0.1:8001 refused) | durable loop and compose engine degraded | start resonate before loop/compose work, or run open-vehicle work and say so |
+| `flywheel preflight`: resonate DOWN (127.0.0.1:8001 refused) | durable loop and compose engine degraded | `flywheel deps --ensure` starts it, or run open-vehicle work and say so |
 | toron unreachable | no mail, no reservations | claim with explicit assignee, record file scope in a bead comment, check `git status` + `br list --status in_progress`, minimal scope, note it in the close reason |
 | doorbell port held by a foreign owner | `doorbell start` fails loud | port conflict, not corruption: stop the foreign holder or relocate the daemon |
 | no live fleet, stale reservations | briefing may read file contention | check `held_paths` holders; stale leases are visible in `toron list_file_reservations` |
@@ -91,7 +91,6 @@ Findings longer than about 20 lines go to a durable file first; the post carries
 | `~/.config/flywheel/` | `config.toml`, `workflows/`, `crons/`, `profiles/`, `models/`, `policy/` |
 | `~/.config/herdr/herdr.sock` | herdr socket |
 | `<project>/.flywheel/agent-state/<name>.json` | per-agent context (git-ignored) |
-| launchd `com.flywheel.resonate` | Resonate service (port 8001, `resonate.db`) |
 | `~/.local/state/flywheel/` | flywheel loops, journals, runs, facts, doorbell state |
 | `~/.local/state/toron/toron.pid` | toron pidfile (non-launchd hosts) |
 | `127.0.0.1:18080` | toron daemon (MCP + mailbox) |
