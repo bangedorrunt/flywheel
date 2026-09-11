@@ -935,6 +935,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn doorbell_url_defaults_to_daemon_host() {
+        // bd-0zcr.1 unit 1: `[doorbell]` without url selects the daemon
+        // host; absent section selects embedded.
+        let c: Config = toml::from_str("[doorbell]").unwrap();
+        assert_eq!(
+            c.doorbell_url().as_deref(),
+            Some("http://127.0.0.1:18980")
+        );
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.doorbell_url(), None);
+    }
+
+    #[test]
     fn resolve_kind_defaults() {
         let c = Config::default();
         assert_eq!(c.resolve_kind("oc"), "opencode");
