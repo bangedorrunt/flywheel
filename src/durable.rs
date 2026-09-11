@@ -1184,10 +1184,13 @@ pub struct ReservationBoardArgs {
 
 /// Checkpointed leaf — the project's active reservation board as
 /// `(path_pattern, reason)` rows (reason = the holding bead's id, from
-/// `active_reservations`, bd-dsu1). Feeds serialize-on-overlap: the
-/// claim-watch overlap wait set (Spec 3.4) and the always-serialize
-/// dispatch gate (Spec 3.5). Always exits 0 — a mail hiccup degrades to an
-/// empty board (no suppression, existing behavior), never a loop crash.
+/// `active_reservations`, bd-dsu1). Kept for EXTERNAL / detached callers
+/// and tests. bd-9tbb: the live loop body must NOT consume this leaf — a
+/// checkpointed reply replays the stored board on resume, so a stale
+/// always-serialize row serializes dispatch forever. The loop reads the
+/// board LIVE via [`reservation_board_live`].
+/// Always exits 0 — a mail hiccup degrades to an empty board (no
+/// suppression, existing behavior), never a loop crash.
 #[function]
 async fn reservation_board(args: ReservationBoardArgs) -> Result<Vec<(String, String)>> {
     let exe = self_exe().map_err(map_err)?;
@@ -1202,7 +1205,13 @@ async fn reservation_board(args: ReservationBoardArgs) -> Result<Vec<(String, St
     }
     let raw = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_default();
-    Ok(v.get("reservations")
+    Ok(parse_reservation_rows(&v))
+}
+
+/// Parse the `__reservation-board` JSON into `(path, reason)` rows. Shared
+/// by the checkpointed leaf and the live read (bd-9tbb).
+fn parse_reservation_rows(v: &serde_json::Value) -> Vec<(String, String)> {
+    v.get("reservations")
         .and_then(serde_json::Value::as_array)
         .map(|rows| {
             rows.iter()
@@ -1214,7 +1223,47 @@ async fn reservation_board(args: ReservationBoardArgs) -> Result<Vec<(String, St
                 })
                 .collect()
         })
-        .unwrap_or_default())
+        .unwrap_or_default()
+}
+
+/// bd-9tbb (leafReply): LIVE reservation-board read for the loop body —
+/// deliberately NOT a checkpointed leaf. A `ctx.run` board read replays its
+/// STORED result on every resume (resonate replay semantics), so a holder
+/// that released between the crash and the resume kept `serialize_all`
+/// pinned and dispatch stayed gated forever. The board is a world READ, not
+/// a durable effect: it must observe the world as of NOW, and the sends it
+/// gates are already deduped (dispatch_pending / assigned / last-sent
+/// registry), so a replayed poll with a fresher board can only make a
+/// FRESHER gating decision — the same trade the codebase already accepts
+/// for the degrade-to-empty path. Same watchdog + degrade-to-empty contract
+/// as the leaf: any failure logs and returns an empty board, never a crash.
+async fn reservation_board_live(project: &str) -> Vec<(String, String)> {
+    let exe = match self_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("flywheel: reservation board skipped (continuing): {e:#}");
+            return Vec::new();
+        }
+    };
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__reservation-board", project]);
+    let out = match run_leaf_cmd(cmd, "__reservation-board").await {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("flywheel: reservation board failed (continuing): {e:#}");
+            return Vec::new();
+        }
+    };
+    if !out.status.success() {
+        eprintln!(
+            "flywheel: reservation board failed (continuing): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return Vec::new();
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_default();
+    parse_reservation_rows(&v)
 }
 
 /// Args for the `__close-check` leaf (ADR-0019, bd-w1-reopen-f6tw).
@@ -6476,15 +6525,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // claim-watch overlap wait set (Spec 3.4: overlap waits are NOT
             // stuck owners). Best-effort: a fetch failure degrades to an
             // empty board (no gate, existing behavior), never a loop crash.
-            let board: Vec<(String, String)> = ctx
-                .run(
-                    reservation_board,
-                    ReservationBoardArgs {
-                        project: params.project.clone(),
-                    },
-                )
-                .await
-                .unwrap_or_default();
+            // bd-9tbb: LIVE read (leafReply) — a checkpointed reply replays
+            // the stored board on resume and serializes dispatch forever.
+            let board: Vec<(String, String)> =
+                reservation_board_live(&params.project).await;
             let overlap: std::collections::HashSet<String> = {
                 let in_flight: Vec<String> = inprog.iter().map(|b| b.id.clone()).collect();
                 bead_overlap_waits(&board, &in_flight)
@@ -7020,15 +7064,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // will add full event emission later).
         {
             let renew_extend = lease_renew_seconds(params.interval_secs);
-            let board: Vec<(String, String)> = ctx
-                .run(
-                    reservation_board,
-                    ReservationBoardArgs {
-                        project: params.project.clone(),
-                    },
-                )
-                .await
-                .unwrap_or_default();
+            // bd-9tbb: LIVE read — see the dispatch-gate site for the replay
+            // hazard; the renewal threshold check must observe NOW too.
+            let board: Vec<(String, String)> =
+                reservation_board_live(&params.project).await;
             let inprog_for_renew: Vec<ReadyBead> = if params.work {
                 ctx.run(
                     poll_inprogress,
@@ -7904,15 +7943,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 (Some("defer"), Some(n)) => n.parse().unwrap_or(0),
                                 _ => 0,
                             };
-                            let board = ctx
-                                .run(
-                                    reservation_board,
-                                    ReservationBoardArgs {
-                                        project: params.project.clone(),
-                                    },
-                                )
-                                .await
-                                .unwrap_or_default();
+                            // bd-9tbb: LIVE read — the drain-defer glob walk
+                            // must see the board as of NOW, not the replayed
+                            // checkpoint.
+                            let board = reservation_board_live(&params.project).await;
                             let globs: Vec<String> = board
                                 .into_iter()
                                 .filter(|(_, r)| r == bead)
@@ -12009,6 +12043,64 @@ mod tests {
     }
 
     // ---- ADR-0019 Spec 3: serialize-on-overlap + overlap wait reason ----
+
+    /// bd-9tbb (leafReply): the loop body must NEVER consume the checkpointed
+    /// `reservation_board` leaf — a replayed poll would read the STORED board
+    /// and a stale always-serialize row would gate dispatch forever. The live
+    /// sites call `reservation_board_live`; the leaf stays for external
+    /// callers. Pinned by source shape: `ctx.run(reservation_board` must not
+    /// appear in swarm_loop's body.
+    #[test]
+    fn board_reads_in_loop_body_are_live_not_checkpointed() {
+        let src = std::fs::read_to_string(file!()).expect("durable.rs readable");
+        let loop_start = src
+            .find("async fn swarm_loop(")
+            .expect("swarm_loop exists");
+        // swarm_loop runs to the register block (run_durable_loop) — the
+        // whole region that must not re-consume a checkpointed board leaf.
+        let loop_body = &src[loop_start..];
+        let loop_end = loop_body
+            .find("pub async fn run_durable_loop")
+            .expect("run_durable_loop after swarm_loop");
+        let body = &loop_body[..loop_end];
+        assert!(
+            !body.contains("ctx\n .run(") && !body.contains("ctx.run(\n reservation_board") && !body.contains("reservation_board,") ,
+            "bd-9tbb: swarm_loop must read the board LIVE (reservation_board_live), never ctx.run(reservation_board) — a checkpointed board replay serializes dispatch forever"
+        );
+        assert!(
+            body.contains("reservation_board_live("),
+            "the live read helper is on the loop path"
+        );
+        // the checkpointed leaf itself still exists for external callers
+        assert!(
+            src.contains("async fn reservation_board(args: ReservationBoardArgs)"),
+            "checkpointed leaf retained for external/detached callers"
+        );
+    }
+
+    /// parse_reservation_rows shapes: canonical row set, missing field rows
+    /// skipped, non-array reservations degrade to empty (never panic).
+    #[test]
+    fn parse_reservation_rows_shapes() {
+        use serde_json::json;
+        let rows = parse_reservation_rows(&json!({
+            "count": 2,
+            "reservations": [
+                {"path": ".beads/**", "reason": "bd-a", "holder": "x"},
+                {"path": "Cargo.lock", "reason": "bd-b"},
+                {"path": "src/lib.rs"}
+            ]
+        }));
+        assert_eq!(
+            rows,
+            vec![
+                (".beads/**".to_string(), "bd-a".to_string()),
+                ("Cargo.lock".to_string(), "bd-b".to_string()),
+            ]
+        );
+        assert!(parse_reservation_rows(&json!({})).is_empty());
+        assert!(parse_reservation_rows(&json!({"reservations": "nope"})).is_empty());
+    }
 
     /// Always-serialize paths: a held reservation on .beads/**, .flywheel/**,
     /// Cargo.lock, root Cargo.toml, docs/catalog/** or target/** gates ALL
