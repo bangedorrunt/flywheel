@@ -227,3 +227,4 @@
 {"id":227,"issue_id":"bd-8vci","from_status":"in_progress","to_status":"closed","status_revision":3046,"gate":"unit-test-verified","provider":"QuietAnvil","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-11 10:42:03"}
 {"id":228,"issue_id":"bd-ykqd","from_status":"in_progress","to_status":"closed","status_revision":3048,"gate":"live-verified","provider":"QuietAnvil","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-11 10:42:03"}
 {"id":226,"issue_id":"bd-ytr6","from_status":"in_progress","to_status":"closed","status_revision":3044,"gate":"unit-test-verified","provider":"QuietAnvil","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-11 10:42:03"}
+{"id":230,"issue_id":"bd-evz9","from_status":"in_progress","to_status":"closed","status_revision":3062,"gate":"live-verified","provider":"QuietAnvil","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-11 10:51:37"}
