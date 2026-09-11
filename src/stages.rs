@@ -1252,7 +1252,10 @@ mod tests {
     fn cfgv_stage_override_field_level_merge() {
         let mut lib = StageLibrary::compiled_in();
         // Seed ce-execute carries role + phase (SEED_AFFINITY/SEED_PHASE).
-        assert_eq!(lib.get_stage("ce-execute").unwrap().role.as_deref(), Some("coder"));
+        assert_eq!(
+            lib.get_stage("ce-execute").unwrap().role.as_deref(),
+            Some("coder")
+        );
         // User tier overrides ONLY the prompt: role/phase inherit.
         lib.apply_toml(
             "[stages.ce-execute]\nname = \"ce-execute\"\nprompt = \"USER PROMPT\"\n",
@@ -1261,9 +1264,17 @@ mod tests {
         .unwrap();
         let s = lib.get_stage("ce-execute").unwrap();
         assert_eq!(s.prompt, "USER PROMPT", "override wins its own field");
-        assert_eq!(s.role.as_deref(), Some("coder"), "seed role survives prompt-only override");
+        assert_eq!(
+            s.role.as_deref(),
+            Some("coder"),
+            "seed role survives prompt-only override"
+        );
         assert_eq!(s.phase.as_deref(), Some("implement"), "seed phase survives");
-        assert_eq!(lib.tier_of("ce-execute"), Some(Tier::User), "tier tag reports the top tier");
+        assert_eq!(
+            lib.tier_of("ce-execute"),
+            Some(Tier::User),
+            "tier tag reports the top tier"
+        );
         // Re-declaring a field replaces it (later tier wins per-field).
         lib.apply_toml(
             "[stages.ce-execute]\nname = \"ce-execute\"\nprompt = \"P2\"\nrole = \"reviewer\"\nparams = [\"bead\"]\n",
@@ -1273,7 +1284,11 @@ mod tests {
         let s = lib.get_stage("ce-execute").unwrap();
         assert_eq!(s.role.as_deref(), Some("reviewer"), "declared field wins");
         assert_eq!(s.params, vec!["bead".to_string()], "declared params win");
-        assert_eq!(s.phase.as_deref(), Some("implement"), "undeclared phase still inherits");
+        assert_eq!(
+            s.phase.as_deref(),
+            Some("implement"),
+            "undeclared phase still inherits"
+        );
         // An unknown name in a tier is a fresh record, not a merge.
         lib.apply_toml(
             "[stages.fresh]\nname = \"fresh\"\nprompt = \"ONLY\"\n",

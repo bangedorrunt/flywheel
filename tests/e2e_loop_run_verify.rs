@@ -175,10 +175,7 @@ fn bead_status(dir: &Path, bead_id: &str) -> String {
         obj @ serde_json::Value::Object(_) => obj.clone(),
         _ => serde_json::Value::Null,
     };
-    bead["status"]
-        .as_str()
-        .unwrap_or("?")
-        .to_string()
+    bead["status"].as_str().unwrap_or("?").to_string()
 }
 
 /// P3/Normal scratch bead with the given VERIFY, a commit carrying the id

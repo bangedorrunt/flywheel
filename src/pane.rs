@@ -380,14 +380,10 @@ fn spawn_crew_into(
                         // into an occupied one.
                         let panes = c.pane_list(Some(ws_id))?;
                         let agents = c.agent_list()?;
-                        let occupied: std::collections::HashSet<String> = agents
-                            .iter()
-                            .map(|a| a.pane_id.clone())
-                            .collect();
-                        let pane_ids: Vec<String> = panes
-                            .iter()
-                            .map(|p| p.pane_id.clone())
-                            .collect();
+                        let occupied: std::collections::HashSet<String> =
+                            agents.iter().map(|a| a.pane_id.clone()).collect();
+                        let pane_ids: Vec<String> =
+                            panes.iter().map(|p| p.pane_id.clone()).collect();
                         match select_empty_pane(&pane_ids, &occupied) {
                             Some(pid) => pid,
                             None => {
@@ -554,10 +550,7 @@ pub fn select_empty_pane(
     panes: &[String],
     occupied: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    panes
-        .iter()
-        .find(|p| !occupied.contains(*p))
-        .cloned()
+    panes.iter().find(|p| !occupied.contains(*p)).cloned()
 }
 
 /// bd-42fs step 5: does a per-step harness override conflict with the
@@ -1553,8 +1546,7 @@ mod tests {
     #[test]
     fn workflow_packing_probe_before_bind_skips_occupied_panes() {
         let panes = vec!["p1".to_string(), "p2".to_string(), "p3".to_string()];
-        let occupied: std::collections::HashSet<String> =
-            ["p1".to_string()].into_iter().collect();
+        let occupied: std::collections::HashSet<String> = ["p1".to_string()].into_iter().collect();
         assert_eq!(
             select_empty_pane(&panes, &occupied).as_deref(),
             Some("p2"),

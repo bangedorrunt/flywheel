@@ -402,7 +402,7 @@ impl<H: Host> Brain<H> {
             &serde_json::json!({"rt_kind": "RoleBound", "role": role}),
             &effects,
             serde_json::json!({"stage": "role_bound_live", "role": role, "pin": pin}),
-            &[pin.clone()],
+            std::slice::from_ref(&pin),
         );
         self.deliver(effects, "role_bound").await;
     }

@@ -4715,42 +4715,48 @@ mod adr0010_d2_tests {
 
     #[test]
     fn adr0010_d2_duplicate_and_stale_acks_are_noops() {
-        let s = prompt_setup();
-        let (a, _) = tick(&s, &fact("w1"));
-        let (b, _) = tick(
-            &a,
+        let setup = prompt_setup();
+        let (w1, _) = tick(&setup, &fact("w1"));
+        let (w1ack, _) = tick(
+            &w1,
             &Msg::WakeAck {
                 pin: "P".into(),
-                through_seq: a.seq,
+                through_seq: w1.seq,
             },
         );
-        assert!(!b.presented.contains_key("P"));
+        assert!(!w1ack.presented.contains_key("P"));
         // Duplicate ack: same watermark, same empty ledger.
-        let (c, cmds) = tick(
-            &b,
+        let (dup, cmds) = tick(
+            &w1ack,
             &Msg::WakeAck {
                 pin: "P".into(),
-                through_seq: a.seq,
+                through_seq: w1.seq,
             },
         );
         assert!(cmds.is_empty());
-        assert_eq!(c.presented, b.presented, "duplicate ack changes nothing");
-        assert_eq!(c.wake_acked, b.wake_acked, "duplicate ack changes nothing");
+        assert_eq!(
+            dup.presented, w1ack.presented,
+            "duplicate ack changes nothing"
+        );
+        assert_eq!(
+            dup.wake_acked, w1ack.wake_acked,
+            "duplicate ack changes nothing"
+        );
         // Stale ack: through_seq below the watermark is ignored.
-        let (d, _) = tick(&a, &fact("w2"));
-        let (e, _) = tick(
-            &d,
+        let (w2, _) = tick(&w1, &fact("w2"));
+        let (stale, _) = tick(
+            &w2,
             &Msg::WakeAck {
                 pin: "P".into(),
                 through_seq: 1,
             },
         );
         assert_eq!(
-            e.presented.get("P").map(Vec::len),
+            stale.presented.get("P").map(Vec::len),
             Some(2),
             "stale ack must not clear newer presentations"
         );
-        assert_eq!(e.wake_acked.get("P"), Some(&1));
+        assert_eq!(stale.wake_acked.get("P"), Some(&1));
     }
 
     #[test]

@@ -74,12 +74,8 @@ async fn main() -> anyhow::Result<()> {
     for h in &cli.host {
         hosts.push(lifecycle::parse_host(h)?);
     }
-    let cfg = lifecycle::Config::resolve_full(
-        cli.state_dir,
-        cli.port,
-        cli.flywheel_state_dir,
-        hosts,
-    )?;
+    let cfg =
+        lifecycle::Config::resolve_full(cli.state_dir, cli.port, cli.flywheel_state_dir, hosts)?;
     match cli.cmd {
         Cmd::Start => lifecycle::start(&cfg),
         Cmd::Stop { force } => lifecycle::stop(&cfg, force),

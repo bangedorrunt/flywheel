@@ -71,9 +71,7 @@ pub fn all_workflows_merged(
 
 /// [`all_workflows_merged`] without the source tag — the plain name →
 /// workflow map most resolvers want.
-pub fn all_workflows_plain(
-    project_root: Option<&Path>,
-) -> Result<BTreeMap<String, Workflow>> {
+pub fn all_workflows_plain(project_root: Option<&Path>) -> Result<BTreeMap<String, Workflow>> {
     Ok(all_workflows_merged(project_root)?
         .into_iter()
         .map(|(k, (wf, _))| (k, wf))
@@ -93,8 +91,11 @@ pub fn subworkflow_resolver(
             Some(r) => WorkflowCatalog::load_layered(Some(r)).ok(),
             None => WorkflowCatalog::load().ok(),
         };
-        cat.and_then(|c| c.workflows.get(sub).cloned())
-            .or_else(|| crate::builtin_workflows::builtin_workflows().get(sub).cloned())
+        cat.and_then(|c| c.workflows.get(sub).cloned()).or_else(|| {
+            crate::builtin_workflows::builtin_workflows()
+                .get(sub)
+                .cloned()
+        })
     }
 }
 

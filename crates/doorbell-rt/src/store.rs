@@ -137,6 +137,9 @@ impl FileStore {
         self.append_journal_seq(workspace, msg, actions, executed, pins, None, None)
     }
 
+    // 8 args stay positional: 3 call sites, all pass-through journal
+    // fields; a params struct adds indirection for zero behavior gain.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_journal_seq(
         &self,
         workspace: &str,

@@ -38,7 +38,9 @@ pub fn default_flywheel_state() -> PathBuf {
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
         .or_else(|| {
-            std::env::var_os("XDG_STATE_HOME").map(PathBuf::from).map(|d| d.join("flywheel"))
+            std::env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .map(|d| d.join("flywheel"))
         })
         .unwrap_or_else(|| {
             dirs::state_dir()
@@ -141,7 +143,10 @@ pub enum OwnerVerdict {
     Unknown,
 }
 
-pub fn classify_owner(pidfile_pid: Option<u32>, health: Option<&serde_json::Value>) -> OwnerVerdict {
+pub fn classify_owner(
+    pidfile_pid: Option<u32>,
+    health: Option<&serde_json::Value>,
+) -> OwnerVerdict {
     let Some(h) = health else {
         return OwnerVerdict::Unknown;
     };
@@ -410,7 +415,11 @@ fn install_rendered(_cfg: &Config, body: &str) -> Result<()> {
             .unwrap_or_else(|| "501".to_string());
         let domain = format!("gui/{uid}/com.doorbell.serve");
         let boot = std::process::Command::new("launchctl")
-            .args(["bootstrap", &format!("gui/{uid}"), &path.display().to_string()])
+            .args([
+                "bootstrap",
+                &format!("gui/{uid}"),
+                &path.display().to_string(),
+            ])
             .output();
         match boot {
             Ok(o) if o.status.success() => {}
@@ -432,7 +441,11 @@ fn install_rendered(_cfg: &Config, body: &str) -> Result<()> {
     {
         let base = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
-            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".config"))
+            })
             .context("neither XDG_CONFIG_HOME nor HOME set")?;
         let dir = base.join("systemd").join("user");
         std::fs::create_dir_all(&dir)?;
@@ -471,7 +484,10 @@ mod tests {
         assert!(body.contains("/opt/doorbell"), "binary path rendered");
         assert!(body.contains("/var/dbll"), "state dir rendered");
         assert!(!body.contains("DOORBELL_BIN"), "no placeholder survives");
-        assert!(!body.contains("DOORBELL_STATE_DIR"), "no placeholder survives");
+        assert!(
+            !body.contains("DOORBELL_STATE_DIR"),
+            "no placeholder survives"
+        );
     }
 
     fn health(pid: u64) -> serde_json::Value {
@@ -508,9 +524,6 @@ mod tests {
         assert_eq!(classify_owner(Some(42), None), OwnerVerdict::Unknown);
         // Protocol peer without an owner row: nothing to attest.
         let no_owner = serde_json::json!({"protocol": doorbell_rt::api::PING.protocol});
-        assert_eq!(
-            classify_owner(None, Some(&no_owner)),
-            OwnerVerdict::Unknown
-        );
+        assert_eq!(classify_owner(None, Some(&no_owner)), OwnerVerdict::Unknown);
     }
 }

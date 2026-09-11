@@ -19,8 +19,12 @@ pub mod sensors;
 pub mod sinks;
 pub mod store;
 pub mod subscribe;
+pub use api::{AskError, Ping, Stats, ask};
 pub use brain::{Brain, BrainConfig, RunReport};
 pub use doorbell_core::{PinBudget, take_allowed, take_allowed_like};
+pub use file_host::{
+    FileHost, FileHostConfig, WATCH_KINDS, ensure_daemon_gen, registry_key, resolve_registry_file,
+};
 pub use hear::HearTracker;
 pub use host::{CoreReducer, Effect, Host, MockHost};
 pub use lease::{Deference, OwnerLease, acquire_lease, deference_decision, lease_stale};
@@ -28,8 +32,6 @@ pub use msg::{AskKind, AskReply, BrainMsg};
 pub use policy::{RestartPolicy, WatchRetry};
 pub use sensors::{SensorHandle, bridge, interval_ticker, supervise};
 pub use sinks::{CliPromptSink, MockSink, PromptSink, SendOutcome, SinkManager, Undelivered};
-pub use api::{AskError, Ping, Stats, ask};
-pub use file_host::{FileHost, FileHostConfig, WATCH_KINDS, ensure_daemon_gen, registry_key, resolve_registry_file};
 pub use store::{FileStore, Fold, TornTail};
 pub use subscribe::{
     Actor, Budget, Filter, Identity, Refusal, Scope, SinkKind, Subscription, SubscriptionStore,

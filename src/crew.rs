@@ -82,7 +82,7 @@ impl PackedCrew {
     /// One-line human/robot announcement (ADR-0011 D2 loud).
     pub fn announce(&self, workflow: &str) -> String {
         let mut kept: Vec<&str> = self.members.keys().map(String::as_str).collect();
-        kept.sort();
+        kept.sort_unstable();
         let mut extra = String::new();
         if !self.aliases.is_empty() {
             let mut bits: Vec<String> = self
@@ -1978,7 +1978,7 @@ steps:
       profile: "@planner"
       stage: fresh-eyes-explore
       task: "custom"
-"#
+"#,
         )
         .expect("override yaml parses");
         let resolver = |n: &str| {
@@ -1998,7 +1998,11 @@ steps:
             &resolver,
         )
         .unwrap();
-        assert_eq!(wf.steps.len(), 1, "override expands, not the 8-step builtin");
+        assert_eq!(
+            wf.steps.len(),
+            1,
+            "override expands, not the 8-step builtin"
+        );
         assert!(
             matches!(&wf.steps[0].action, Action::DispatchJob { spec, .. }
                 if spec.stage.as_deref() == Some("fresh-eyes-explore")),

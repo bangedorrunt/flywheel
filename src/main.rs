@@ -10073,7 +10073,9 @@ fn cmd_doorbell_subscribe(
     sink: &str,
     extra: &[String],
 ) -> Result<()> {
-    use doorbell_rt::subscribe::*;
+    use doorbell_rt::subscribe::{
+        Actor, Budget, Filter, Identity, Scope, SinkKind, Subscription, SubscriptionStore,
+    };
     let kind = match sink {
         "herdr" => SinkKind::Herdr,
         "webhook" => SinkKind::Webhook,
@@ -10121,7 +10123,7 @@ fn cmd_doorbell_subscribe(
 }
 
 fn cmd_doorbell_subscriptions(_cfg: &Config) -> Result<()> {
-    use doorbell_rt::subscribe::*;
+    use doorbell_rt::subscribe::SubscriptionStore;
     let store = SubscriptionStore::open(&config::state_dir());
     for sub in store.list() {
         println!(
@@ -10133,7 +10135,7 @@ fn cmd_doorbell_subscriptions(_cfg: &Config) -> Result<()> {
 }
 
 fn cmd_doorbell_unsubscribe(_cfg: &Config, id: &str) -> Result<()> {
-    use doorbell_rt::subscribe::*;
+    use doorbell_rt::subscribe::{Actor, SubscriptionStore};
     let mut store = SubscriptionStore::open(&config::state_dir());
     match store.unsubscribe(Actor::operator(), id) {
         Ok(row) => {
@@ -35771,7 +35773,8 @@ fn import_source_key(data_dir: &std::path::Path, from_slug: &str, name: &str) ->
         .join("agents")
         .join(name)
         .join("key.ncryptsec");
-    p.is_file().then_some(p)
+    p.is_file()
+        .then_some(p)
         // Legacy bare-root layout (pre-projects/ strays) still binds.
         .or_else(|| {
             let legacy = legacy_root_from_mailbox(data_dir)
@@ -35788,7 +35791,10 @@ fn import_source_key(data_dir: &std::path::Path, from_slug: &str, name: &str) ->
 fn legacy_root_from_mailbox(mailbox_dir: &std::path::Path) -> std::path::PathBuf {
     mailbox_dir
         .parent()
-        .filter(|p| p.file_name().is_some_and(|n| n == toron_core::config::PROJECTS_RELATIVE))
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n == toron_core::config::PROJECTS_RELATIVE)
+        })
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| mailbox_dir.to_path_buf())
 }

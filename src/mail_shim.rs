@@ -2285,7 +2285,10 @@ mod tests {
         unsafe { std::env::remove_var("TORON_DATA_DIR") };
         unsafe { std::env::remove_var("TORON_MCP_DATA_DIR") };
         let (data_dir, db) = mailbox_roots();
-        assert_eq!(data_dir, PathBuf::from("/tmp/flywheel-se2.1-xdg/toron/projects"));
+        assert_eq!(
+            data_dir,
+            PathBuf::from("/tmp/flywheel-se2.1-xdg/toron/projects")
+        );
         assert_eq!(
             db,
             PathBuf::from("/tmp/flywheel-se2.1-xdg/toron/flywheel-mail.sqlite")
@@ -3245,7 +3248,13 @@ mod agents_list_tests {
             .expect("in-process mail ok")
             .expect("Some (embedded backend)");
         let v = mail
-            .register_agent("hdec-proj", "QuietAnvil", "test-harness", "m", "bd-hdec test")
+            .register_agent(
+                "hdec-proj",
+                "QuietAnvil",
+                "test-harness",
+                "m",
+                "bd-hdec test",
+            )
             .expect("register");
         let key_path = v
             .get("key_path")
