@@ -1852,7 +1852,10 @@ mod tests {
         };
         let out = pane_dispatch(&catalog, "proj", "wf", &json!({}), &entries, &action)
             .expect("fallback must dispatch, not bail");
-        assert_eq!(out["agent"], "crew-goal-reviewer", "role pane wins the dispatch");
+        assert_eq!(
+            out["agent"], "crew-goal-reviewer",
+            "role pane wins the dispatch"
+        );
         assert_eq!(out["profile"], "reviewer");
     }
 

@@ -593,7 +593,10 @@ pub fn ensure_doorbell_spawn() -> DoorbellEnsure {
     print!("{}", String::from_utf8_lossy(&out.stdout));
     if !out.status.success() {
         return DoorbellEnsure::Degraded {
-            hint: format!("`doorbell start` failed: {}", String::from_utf8_lossy(&out.stderr)),
+            hint: format!(
+                "`doorbell start` failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ),
         };
     }
     DoorbellEnsure::Started
@@ -740,17 +743,18 @@ fn url_authority(url: &str) -> &str {
 
 /// PATH lookup, then beside our own exe (dev checkouts).
 fn which_beside(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|d| d.join(name))
-            .find(|p| p.is_file())
-    })
-    .or_else(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|e| e.parent().map(|d| d.join(name)))
-            .filter(|p| p.is_file())
-    })
+    std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|d| d.join(name))
+                .find(|p| p.is_file())
+        })
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|d| d.join(name)))
+                .filter(|p| p.is_file())
+        })
 }
 
 fn which_doorbell() -> Option<PathBuf> {

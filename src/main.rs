@@ -10553,7 +10553,9 @@ fn sleep_to_next_second() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    std::thread::sleep(Duration::from_nanos(1_000_000_000 - u64::from(now.subsec_nanos())));
+    std::thread::sleep(Duration::from_nanos(
+        1_000_000_000 - u64::from(now.subsec_nanos()),
+    ));
 }
 
 fn doorbell_persist_hear(workspace: &str, hear: &doorbell::HearTracker) {
@@ -14723,8 +14725,15 @@ fn cmd_send(
                                 // Emit the ambiguous row; genuinely non-landed
                                 // errors keep the bare bail.
                                 return Err(wait_failure_exit(
-                                    &mut c, &target, &name, a, cond_profile.as_deref(),
-                                    project, &mut results, &e, &emit_rows,
+                                    &mut c,
+                                    &target,
+                                    &name,
+                                    a,
+                                    cond_profile.as_deref(),
+                                    project,
+                                    &mut results,
+                                    &e,
+                                    &emit_rows,
                                 ));
                             }
                             return Err(e.into());
@@ -14757,7 +14766,17 @@ fn cmd_send(
                                 &mut c, project, &name, &a.pane_id, &send_text,
                             );
                             if wait {
-                                return Err(wait_failure_exit(&mut c, &target, &name, a, cond_profile.as_deref(), project, &mut results, &e, &emit_rows));
+                                return Err(wait_failure_exit(
+                                    &mut c,
+                                    &target,
+                                    &name,
+                                    a,
+                                    cond_profile.as_deref(),
+                                    project,
+                                    &mut results,
+                                    &e,
+                                    &emit_rows,
+                                ));
                             }
                             return Err(stall_giveup_error(&target, project));
                         }
