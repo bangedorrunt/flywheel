@@ -17482,6 +17482,9 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             {
                 let (data_dir, _) = mail_shim::mailbox_roots();
                 if let Some(src) = import_source_key(&data_dir, from, &decided) {
+                    // bd-hdec: the bind dst is the canonical mailbox slot
+                    // (`{mailbox}/{project}/agents/{name}`), which the
+                    // in-process register_agent reuses (no second npub).
                     let dst = data_dir.join(project).join("agents").join(&decided);
                     std::fs::create_dir_all(&dst)?;
                     let dst = dst.join("key.ncryptsec");
@@ -35758,6 +35761,10 @@ fn resolve_register_name(explicit: Option<String>, from_project: Option<&str>) -
 
 /// Locate an existing identity key to import: `{data}/{from}/agents/{name}/
 /// key.ncryptsec`. Present = reuse (register_agent adopts it, never mints).
+/// bd-hdec: agent-key slots live at `{data}/{slug}/agents/{name}/` where
+/// `data` is the MAILBOX data dir (`{durable_root}/projects/` — the same
+/// shape toron's bootstrap writes). `data_dir` args at these call sites are
+/// `mailbox_roots().0`, so no extra segment is added here.
 fn import_source_key(data_dir: &std::path::Path, from_slug: &str, name: &str) -> Option<PathBuf> {
     let p = data_dir
         .join(from_slug)
@@ -35765,6 +35772,25 @@ fn import_source_key(data_dir: &std::path::Path, from_slug: &str, name: &str) ->
         .join(name)
         .join("key.ncryptsec");
     p.is_file().then_some(p)
+        // Legacy bare-root layout (pre-projects/ strays) still binds.
+        .or_else(|| {
+            let legacy = legacy_root_from_mailbox(data_dir)
+                .join(from_slug)
+                .join("agents")
+                .join(name)
+                .join("key.ncryptsec");
+            legacy.is_file().then_some(legacy)
+        })
+}
+
+/// The durable root one level above the mailbox data dir (strip the
+/// `projects/` segment); identity layout fix bd-hdec.
+fn legacy_root_from_mailbox(mailbox_dir: &std::path::Path) -> std::path::PathBuf {
+    mailbox_dir
+        .parent()
+        .filter(|p| p.file_name().is_some_and(|n| n == toron_core::config::PROJECTS_RELATIVE))
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| mailbox_dir.to_path_buf())
 }
 
 /// The unnamed mint's key slot: name "" collapses the path to
@@ -35778,13 +35804,25 @@ fn unnamed_key_path(data_dir: &std::path::Path, slug: &str) -> PathBuf {
 /// one identity; no manual DB surgery. Absent unnamed key is an error naming
 /// the state (nothing to adopt).
 fn adopt_unnamed_key(data_dir: &std::path::Path, slug: &str, name: &str) -> Result<PathBuf> {
-    let src = unnamed_key_path(data_dir, slug);
-    if !src.is_file() {
-        anyhow::bail!(
-            "no unnamed mint found at {} — nothing to adopt",
-            src.display()
-        );
-    }
+    let src = match unnamed_key_path(data_dir, slug) {
+        p if p.is_file() => p,
+        // Legacy bare-root unnamed strays (pre-projects/ layout) adopt too.
+        _ => {
+            let legacy = legacy_root_from_mailbox(data_dir)
+                .join(slug)
+                .join("agents")
+                .join("key.ncryptsec");
+            if legacy.is_file() {
+                legacy
+            } else {
+                anyhow::bail!(
+                    "no unnamed mint found under {} or {} — nothing to adopt",
+                    unnamed_key_path(data_dir, slug).display(),
+                    legacy.display()
+                );
+            }
+        }
+    };
     let dst_dir = data_dir.join(slug).join("agents").join(name);
     std::fs::create_dir_all(&dst_dir)?;
     let dst = dst_dir.join("key.ncryptsec");

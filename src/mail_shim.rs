@@ -118,12 +118,13 @@ pub fn mailbox_roots() -> (PathBuf, PathBuf) {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
+    let db_at = |root: &Path| root.join("flywheel-mail.sqlite");
     if toron_data_dir.is_none()
         && let Ok(dir) = std::env::var("TORON_MCP_DATA_DIR")
         && !dir.trim().is_empty()
     {
         let root = PathBuf::from(dir.trim());
-        return (root.clone(), root.join("flywheel-mail.sqlite"));
+        return (mailbox_data_dir(&root), db_at(&root));
     }
     let env = toron_core::config::DataRootEnv {
         toron_data_dir,
@@ -131,7 +132,22 @@ pub fn mailbox_roots() -> (PathBuf, PathBuf) {
         home: env_non_empty_os("HOME"),
     };
     let root = toron_core::config::resolve_data_root(&env);
-    (root.clone(), root.join("flywheel-mail.sqlite"))
+    (mailbox_data_dir(&root), db_at(&root))
+}
+
+/// bd-hdec: the Mailbox data dir is the DURABLE ROOT'S `projects/` segment
+/// (`{root}/projects/`), matching toron's MCP/CLI/bootstrap exactly
+/// (toron-mcp passes `ToronPaths::projects_dir()` as the Mailbox data dir).
+/// The shim previously passed the bare root, so flywheel-minted keys landed
+/// at `{root}/{slug}/agents/...` — a legacy path-slug layout toron's whois
+/// never resolves, and the documented `mail register` + whois flow minted
+/// unresolvable pins. Project roots now land at the canonical
+/// `{root}/projects/{slug}/agents/<name>/key.ncryptsec` for BOTH tools.
+/// Legacy strays under the bare root keep resolving read-only through
+/// toron's alias-reconciliation walk (bd-f5tt); register reuses them via
+/// `alt_agent_key`, so no identity forks.
+fn mailbox_data_dir(durable_root: &Path) -> PathBuf {
+    durable_root.join(toron_core::config::PROJECTS_RELATIVE)
 }
 
 /// Mirror of toron's `env_non_empty` for the ambient os-string vars: empty
@@ -2241,7 +2257,13 @@ mod tests {
         unsafe { std::env::set_var("TORON_MCP_DATA_DIR", "/tmp/flywheel-se2.1-mcp") };
         unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/flywheel-se2.1-xdg") };
         let (data_dir, db) = mailbox_roots();
-        assert_eq!(data_dir, PathBuf::from("/tmp/flywheel-se2.1-durable"));
+        // bd-hdec: the mailbox data dir carries the canonical `projects/`
+        // segment (toron parity) while the index stays at the root.
+        assert_eq!(
+            data_dir,
+            PathBuf::from("/tmp/flywheel-se2.1-durable/projects"),
+            "canonical projects/ segment (bd-hdec)"
+        );
         assert_eq!(
             db,
             PathBuf::from("/tmp/flywheel-se2.1-durable/flywheel-mail.sqlite")
@@ -2250,20 +2272,20 @@ mod tests {
         let (data_dir, _) = mailbox_roots();
         assert_eq!(
             data_dir,
-            PathBuf::from("/tmp/flywheel-se2.1-mcp"),
-            "alias fallback"
+            PathBuf::from("/tmp/flywheel-se2.1-mcp/projects"),
+            "alias fallback, canonical segment"
         );
         unsafe { std::env::set_var("TORON_DATA_DIR", "   ") };
         let (data_dir, _) = mailbox_roots();
         assert_eq!(
             data_dir,
-            PathBuf::from("/tmp/flywheel-se2.1-mcp"),
+            PathBuf::from("/tmp/flywheel-se2.1-mcp/projects"),
             "blank counts as unset"
         );
         unsafe { std::env::remove_var("TORON_DATA_DIR") };
         unsafe { std::env::remove_var("TORON_MCP_DATA_DIR") };
         let (data_dir, db) = mailbox_roots();
-        assert_eq!(data_dir, PathBuf::from("/tmp/flywheel-se2.1-xdg/toron"));
+        assert_eq!(data_dir, PathBuf::from("/tmp/flywheel-se2.1-xdg/toron/projects"));
         assert_eq!(
             db,
             PathBuf::from("/tmp/flywheel-se2.1-xdg/toron/flywheel-mail.sqlite")
@@ -2278,14 +2300,14 @@ mod tests {
         let (data_dir, _) = mailbox_roots();
         assert_eq!(
             data_dir,
-            PathBuf::from("/tmp/flywheel-se2.1-home/.local/share/toron")
+            PathBuf::from("/tmp/flywheel-se2.1-home/.local/share/toron/projects")
         );
         unsafe { std::env::remove_var("HOME") };
         let (data_dir, db) = mailbox_roots();
         assert_eq!(
             data_dir,
-            PathBuf::from("toron-data"),
-            "no env at all → D3 relative fallback, never temp"
+            PathBuf::from("toron-data/projects"),
+            "no env at all → D3 relative fallback, never temp (canonical projects segment)"
         );
         assert_eq!(db, PathBuf::from("toron-data/flywheel-mail.sqlite"));
     }
@@ -3194,5 +3216,53 @@ mod agents_list_tests {
         // degenerate: loud error, never silent empty
         assert!(remotes_to_agents(json!({})).is_err());
         assert!(remotes_to_agents(json!({"agents": "nope"})).is_err());
+    }
+
+    /// bd-hdec regression: on one shared TORON_DATA_DIR, flywheel's register
+    /// writes the key at the CANONICAL `{root}/projects/{slug}/agents/{name}/`
+    /// slot, and a whois through the SAME mailbox resolves the pin — the
+    /// documented session-start flow no longer mints an unresolvable identity
+    /// (nor a second npub on fallback bootstrap).
+    #[test]
+    fn hdec_register_then_whois_resolve_on_shared_root() {
+        let _g = crate::config::lock_env();
+        let root = std::env::temp_dir().join(format!(
+            "fw-hdec-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        unsafe { std::env::set_var("TORON_DATA_DIR", &root) };
+        let (data_dir, _) = mailbox_roots();
+        assert_eq!(
+            data_dir,
+            root.join("projects"),
+            "mailbox data dir carries the projects segment"
+        );
+        let mail = Mail::from_config(None)
+            .expect("in-process mail ok")
+            .expect("Some (embedded backend)");
+        let v = mail
+            .register_agent("hdec-proj", "QuietAnvil", "test-harness", "m", "bd-hdec test")
+            .expect("register");
+        let key_path = v
+            .get("key_path")
+            .and_then(|k| k.as_str())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            key_path.contains("projects/hdec-proj/agents/QuietAnvil"),
+            "key lands in the canonical layout: {key_path}"
+        );
+        let who = mail.whois("hdec-proj", "QuietAnvil").expect("whois");
+        assert_eq!(
+            who.get("name").and_then(|n| n.as_str()),
+            Some("QuietAnvil"),
+            "register+whois resolve against one shared root: {who}"
+        );
+        unsafe { std::env::remove_var("TORON_DATA_DIR") };
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

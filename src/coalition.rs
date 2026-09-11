@@ -1482,8 +1482,8 @@ mod tests {
         let (data_dir, db) = mailbox_roots();
         assert_eq!(
             data_dir,
-            PathBuf::from("/tmp/fw-coalition-xdg/toron"),
-            "coalition mailbox must use resolve_data_root"
+            PathBuf::from("/tmp/fw-coalition-xdg/toron/projects"),
+            "coalition mailbox uses resolve_data_root with the canonical projects segment (bd-hdec)"
         );
         assert!(
             !db.to_string_lossy()
