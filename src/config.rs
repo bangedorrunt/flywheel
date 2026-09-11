@@ -939,10 +939,7 @@ mod tests {
         // bd-0zcr.1 unit 1: `[doorbell]` without url selects the daemon
         // host; absent section selects embedded.
         let c: Config = toml::from_str("[doorbell]").unwrap();
-        assert_eq!(
-            c.doorbell_url().as_deref(),
-            Some("http://127.0.0.1:18980")
-        );
+        assert_eq!(c.doorbell_url().as_deref(), Some("http://127.0.0.1:18980"));
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(c.doorbell_url(), None);
     }
