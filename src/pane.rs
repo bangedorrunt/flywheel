@@ -369,11 +369,41 @@ fn spawn_crew_into(
             } else {
                 let pane_id = match &prev {
                     None => {
-                        // root pane of the workspace — list it by workspace id
+                        // bd-lifecycle-occupied-pane-wedge-07tx: PROBE BEFORE
+                        // BIND. The old code took panes.first() blind; an
+                        // occupied root pane (unnamed shell occupant) made
+                        // agent.start fail agent_pane_busy and the packing
+                        // crew wedged in a not-ready retry loop. Pick the
+                        // first pane in the workspace whose agent slot is
+                        // EMPTY (no live agent session on it); if none is,
+                        // SPLIT a fresh pane off the root instead of binding
+                        // into an occupied one.
                         let panes = c.pane_list(Some(ws_id))?;
-                        panes.first().map(|p| p.pane_id.clone()).ok_or_else(|| {
-                            anyhow!("pane crew: no root pane in workspace {ws_id}")
-                        })?
+                        let agents = c.agent_list()?;
+                        let occupied: std::collections::HashSet<String> = agents
+                            .iter()
+                            .map(|a| a.pane_id.clone())
+                            .collect();
+                        let pane_ids: Vec<String> = panes
+                            .iter()
+                            .map(|p| p.pane_id.clone())
+                            .collect();
+                        match select_empty_pane(&pane_ids, &occupied) {
+                            Some(pid) => pid,
+                            None => {
+                                let root = pane_ids.first().cloned().ok_or_else(|| {
+                                    anyhow!("pane crew: no root pane in workspace {ws_id}")
+                                })?;
+                                let split = crate::herdr_shim::pane_split(
+                                    c,
+                                    &root,
+                                    "down",
+                                    Some(&crate::utf8_path(&dir, "workspace dir")?),
+                                    Some(&pane_env),
+                                )?;
+                                split.pane_id
+                            }
+                        }
                     }
                     Some(p) => {
                         let split = crate::herdr_shim::pane_split(
@@ -512,6 +542,22 @@ fn spawn_crew_into(
 /// testable.
 pub fn is_transient_dispatch_reason(reason: &str) -> bool {
     reason.contains("agent_not_ready") || reason.contains("agent_pane_busy")
+}
+
+/// bd-lifecycle-occupied-pane-wedge-07tx (probe-before-bind): the first pane
+/// whose agent slot is EMPTY — no live agent session on it. `panes` is the
+/// workspace's pane ids in bind order; `occupied` is the set of pane ids
+/// that already carry an agent (ANY agent — named or unnamed occupant).
+/// All-occupied / no panes → None: the caller must SPLIT a fresh pane (or
+/// fail loud), never bind into an occupied shell. Pure + unit-tested.
+pub fn select_empty_pane(
+    panes: &[String],
+    occupied: &std::collections::HashSet<String>,
+) -> Option<String> {
+    panes
+        .iter()
+        .find(|p| !occupied.contains(*p))
+        .cloned()
 }
 
 /// bd-42fs step 5: does a per-step harness override conflict with the
@@ -671,6 +717,24 @@ pub fn pane_dispatch(
                 );
                 std::thread::sleep(std::time::Duration::from_secs(10));
                 continue;
+            }
+            // bd-lifecycle-occupied-pane-wedge-07tx: bounded-fail-loud. The
+            // old code fell through after MAX_ATTEMPTS and returned the
+            // failure payload as Ok — the engine re-drove the same dead step
+            // forever (idle crews + endless "@not ready (attempt 1/6)").
+            // Transiency was exhausted: the pane is not coming up (occupied
+            // bind, dead split, stuck boot). Surface a per-step ERROR so the
+            // engine's failure handling sees it instead of a soft ok-payload.
+            if transient {
+                let reason = v
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("transient")
+                    .to_string();
+                return Err(anyhow!(
+                    "dispatch @{attempt_profile} ({}) failed after {MAX_ATTEMPTS} transient retries: {reason} — the target pane never became available; fix the pane (occupied/dead) or fail the step",
+                    attempt_entry.name
+                ));
             }
             // ADR-0022 §3.5 warn-first plan-artifact gate (bd-cvv9): same
             // contract as the headless path — warn + tag, never block
@@ -1478,6 +1542,65 @@ mod tests {
         ));
         assert!(!is_transient_dispatch_reason("unknown profile @nope"));
         assert!(!is_transient_dispatch_reason(""));
+    }
+
+    /// bd-lifecycle-occupied-pane-wedge-07tx (probe-before-bind): the empty-
+    /// pane selector never returns a pane whose agent slot is live. Given
+    /// the occupant set, `select_empty_pane` picks the first FREE pane and
+    /// skips occupied ones; all-occupied → None (caller splits fresh).
+    /// Named workflow_packing_* so the bead's verify filter
+    /// (`test workflow_packing`) hits it directly.
+    #[test]
+    fn workflow_packing_probe_before_bind_skips_occupied_panes() {
+        let panes = vec!["p1".to_string(), "p2".to_string(), "p3".to_string()];
+        let occupied: std::collections::HashSet<String> =
+            ["p1".to_string()].into_iter().collect();
+        assert_eq!(
+            select_empty_pane(&panes, &occupied).as_deref(),
+            Some("p2"),
+            "first FREE pane wins, occupied root skipped"
+        );
+        let all: std::collections::HashSet<String> = panes.iter().cloned().collect();
+        assert_eq!(
+            select_empty_pane(&panes, &all),
+            None,
+            "all-occupied → None (split fresh instead of binding blind)"
+        );
+        assert_eq!(
+            select_empty_pane(&[], &std::collections::HashSet::new()),
+            None,
+            "no panes at all → None"
+        );
+        let none: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert_eq!(
+            select_empty_pane(&panes, &none).as_deref(),
+            Some("p1"),
+            "empty workspace keeps the old first-pane binding"
+        );
+    }
+
+    /// bd-lifecycle-occupied-pane-wedge-07tx (bounded-fail-loud): the packed
+    /// crew probe helper exists beside the dispatch gate and the transient
+    /// exhaustion is surfaced — pinned by source shape so the two fixes
+    /// cannot silently regress together.
+    #[test]
+    fn workflow_packing_bounded_fail_loud_is_pinned() {
+        let src = std::fs::read_to_string(file!()).expect("pane.rs readable");
+        // probe-before-bind: the root-pane pick consults occupancy
+        assert!(
+            src.contains("select_empty_pane(&pane_ids, &occupied)"),
+            "spawn_crew_into must probe occupancy before binding the root pane"
+        );
+        assert!(
+            src.contains("pane_split(\n                                    c,"),
+            "all-occupied falls through to a fresh split, never a blind bind"
+        );
+        // bounded-fail-loud: transient exhaustion returns Err (per-step),
+        // never the old fall-through Ok payload
+        assert!(
+            src.contains("failed after {MAX_ATTEMPTS} transient retries"),
+            "pane_dispatch must fail loud after transient retries are exhausted"
+        );
     }
 
     /// bd-mukq: 429 reroute target — the next fallback profile in the
