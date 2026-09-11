@@ -74,8 +74,7 @@ pub fn run_cli(bin: &str, args: &[&str], timeout_secs: u64) -> Option<std::proce
         .stderr(std::process::Stdio::piped())
         .spawn()
         .ok()?;
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return child.wait_with_output().ok(),
@@ -281,8 +280,7 @@ pub struct FileHost {
 
 impl FileHost {
     pub fn new(cfg: FileHostConfig) -> Self {
-        let daemon_exe =
-            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("doorbell"));
+        let daemon_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("doorbell"));
         let generation = std::fs::read(
             cfg.flywheel_state
                 .join("doorbell")
@@ -388,8 +386,7 @@ impl FileHost {
         let rows = self.registry_rows();
         let pins: Vec<String> = rows.iter().map(|(p, _, _)| p.clone()).collect();
         let now = Self::now_unix();
-        if pins == self.index_pins && now.saturating_sub(self.index_refreshed_at) < INDEX_TTL_SECS
-        {
+        if pins == self.index_pins && now.saturating_sub(self.index_refreshed_at) < INDEX_TTL_SECS {
             return;
         }
         self.panes = rows
@@ -398,7 +395,10 @@ impl FileHost {
             .collect();
         if let Ok(mut targets) = self.targets.lock() {
             targets.clear();
-            targets.extend(rows.iter().map(|(pin, _, name)| (pin.clone(), name.clone())));
+            targets.extend(
+                rows.iter()
+                    .map(|(pin, _, name)| (pin.clone(), name.clone())),
+            );
         }
         for pin in &pins {
             if self.npubs.contains_key(pin) {
@@ -482,7 +482,9 @@ impl FileHost {
     /// herdr statuses joined to pins: `{pane_id: status}` -> `{pin: status}`.
     fn poll_herdr(&self) -> BTreeMap<String, String> {
         let out = run_cli(&self.cfg.herdr_bin, &["agent", "list"], CLI_TIMEOUT_SECS);
-        let Some(out) = out else { return BTreeMap::new() };
+        let Some(out) = out else {
+            return BTreeMap::new();
+        };
         if !out.status.success() {
             return BTreeMap::new();
         }
@@ -505,11 +507,7 @@ impl FileHost {
         }
         by_pane
             .into_iter()
-            .filter_map(|(pane, status)| {
-                self.panes
-                    .get(&pane)
-                    .map(|pin| (pin.clone(), status))
-            })
+            .filter_map(|(pane, status)| self.panes.get(&pane).map(|pin| (pin.clone(), status)))
             .collect()
     }
 
@@ -517,10 +515,11 @@ impl FileHost {
     /// `{role,pin}` lines; file removed after parse (mirrors the
     /// embedded drain: corrupt lines warn, never silently dropped).
     pub fn drain_role_bounds(&mut self) -> Vec<(String, String)> {
-        let path = self.cfg.flywheel_state.join("roles").join(format!(
-            "{}-pending.jsonl",
-            registry_key(&self.cfg.project)
-        ));
+        let path = self
+            .cfg
+            .flywheel_state
+            .join("roles")
+            .join(format!("{}-pending.jsonl", registry_key(&self.cfg.project)));
         let raw = match std::fs::read_to_string(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
             Err(_) => return Vec::new(),
@@ -552,10 +551,11 @@ impl FileHost {
     /// Drain pending facts: `{state}/facts/{key}-pending.jsonl` JSON
     /// strings; file removed after read (mirrors the embedded drain).
     pub fn drain_facts(&mut self) -> Vec<String> {
-        let path = self.cfg.flywheel_state.join("facts").join(format!(
-            "{}-pending.jsonl",
-            registry_key(&self.cfg.project)
-        ));
+        let path = self
+            .cfg
+            .flywheel_state
+            .join("facts")
+            .join(format!("{}-pending.jsonl", registry_key(&self.cfg.project)));
         let Ok(raw) = std::fs::read_to_string(&path) else {
             return Vec::new();
         };
@@ -568,10 +568,11 @@ impl FileHost {
     /// Seed role binds: `{state}/role_binds/{key}.json` map (missing →
     /// empty; corrupt → loud error, never silent default).
     pub fn load_binds(&self) -> Result<BTreeMap<String, String>, String> {
-        let path = self.cfg.flywheel_state.join("role_binds").join(format!(
-            "{}.json",
-            registry_key(&self.cfg.project)
-        ));
+        let path = self
+            .cfg
+            .flywheel_state
+            .join("role_binds")
+            .join(format!("{}.json", registry_key(&self.cfg.project)));
         match std::fs::read_to_string(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
             Err(e) => Err(format!("role_binds read failed at {}: {e}", path.display())),
@@ -597,9 +598,7 @@ impl FileHost {
             "workspace": self.cfg.workspace,
             "kind": kind,
         });
-        if let (Some(obj), serde_json::Value::Object(map)) =
-            (entry.as_object_mut(), detail)
-        {
+        if let (Some(obj), serde_json::Value::Object(map)) = (entry.as_object_mut(), detail) {
             obj.extend(map);
         }
         if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -622,9 +621,7 @@ impl FileHost {
             .flat_map(|e| match e {
                 Effect::Prompt { pin, line } => match self.presence.get(&pin) {
                     Some(Pres::Idle) => vec![Effect::Prompt { pin, line }],
-                    Some(Pres::Busy)
-                        if doorbell_core::is_urgent_line(&line) =>
-                    {
+                    Some(Pres::Busy) if doorbell_core::is_urgent_line(&line) => {
                         vec![Effect::Prompt { pin, line }]
                     }
                     _ => vec![Effect::Audit {
@@ -645,28 +642,24 @@ impl FileHost {
     fn normalize(&self, actions: Vec<doorbell_core::DoorbellAction>) -> Vec<Effect> {
         actions
             .into_iter()
-            .filter_map(|a| match a {
-                doorbell_core::DoorbellAction::Prompt { pin, line } => {
-                    Some(Effect::Prompt { pin, line })
-                }
+            .map(|a| match a {
+                doorbell_core::DoorbellAction::Prompt { pin, line } => Effect::Prompt { pin, line },
                 // Empty pin/since: the brain fetches every known pin with
                 // per-pin cursors (mirrors the embedded advisory mapping).
-                doorbell_core::DoorbellAction::FetchInbox { .. } => Some(Effect::FetchInbox {
+                doorbell_core::DoorbellAction::FetchInbox { .. } => Effect::FetchInbox {
                     pin: String::new(),
                     since: String::new(),
-                }),
-                doorbell_core::DoorbellAction::CheckAckSla => Some(Effect::CheckAckSla),
-                doorbell_core::DoorbellAction::RestartWatch => Some(Effect::RestartWatch),
-                doorbell_core::DoorbellAction::FactMiss { why } => Some(Effect::Audit {
+                },
+                doorbell_core::DoorbellAction::CheckAckSla => Effect::CheckAckSla,
+                doorbell_core::DoorbellAction::RestartWatch => Effect::RestartWatch,
+                doorbell_core::DoorbellAction::FactMiss { why } => Effect::Audit {
                     kind: "fact_miss".into(),
                     detail: serde_json::json!({ "why": why }),
-                }),
-                doorbell_core::DoorbellAction::Audit { kind, pin, detail } => {
-                    Some(Effect::Audit {
-                        kind,
-                        detail: serde_json::json!({ "pin": pin, "detail": detail }),
-                    })
-                }
+                },
+                doorbell_core::DoorbellAction::Audit { kind, pin, detail } => Effect::Audit {
+                    kind,
+                    detail: serde_json::json!({ "pin": pin, "detail": detail }),
+                },
             })
             .collect()
     }
@@ -775,8 +768,16 @@ impl Host for FileHost {
         let out = run_cli(
             &self.cfg.toron_bin,
             &[
-                "mail", "inbox", "--as", pin, "--project", &self.cfg.project, "--since", since,
-                "--limit", "50",
+                "mail",
+                "inbox",
+                "--as",
+                pin,
+                "--project",
+                &self.cfg.project,
+                "--since",
+                since,
+                "--limit",
+                "50",
             ],
             CLI_TIMEOUT_SECS,
         );
@@ -888,8 +889,11 @@ impl Host for FileHost {
         // Status poll: diff the herdr list against last-known and tell
         // changes back as HerdrStatus (forwarder topology, poll transport).
         let current = self.poll_herdr();
-        let mut changed: Vec<(String, String)> =
-            current.iter().filter(|(pin, st)| self.herdr.get(*pin) != Some(*st)).map(|(p, s)| (p.clone(), s.clone())).collect();
+        let mut changed: Vec<(String, String)> = current
+            .iter()
+            .filter(|(pin, st)| self.herdr.get(*pin) != Some(*st))
+            .map(|(p, s)| (p.clone(), s.clone()))
+            .collect();
         changed.sort();
         // Presence rows tick the trusted edge (same file + freshness rule
         // as the embedded projection).
@@ -984,10 +988,7 @@ mod tests {
         host.refresh_index();
         assert_eq!(host.pins(), vec!["PinA".to_string(), "PinB".to_string()]);
         assert!(host.pin_npub("PinA").is_none());
-        assert_eq!(
-            host.panes.get("pane-a").cloned(),
-            Some("PinA".to_string())
-        );
+        assert_eq!(host.panes.get("pane-a").cloned(), Some("PinA".to_string()));
     }
 
     fn watch_line(pin: &str, content: &str) -> String {
@@ -1015,7 +1016,8 @@ mod tests {
         });
         let fx = host.tick(&BrainMsg::Watch(watch_line("PinA", "hello")));
         assert!(
-            fx.iter().any(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "PinA")),
+            fx.iter()
+                .any(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "PinA")),
             "idle presence + idle status prompts: {fx:?}"
         );
         // Busy presence + routine line -> prompt_filtered Audit.
@@ -1025,7 +1027,8 @@ mod tests {
         });
         let fx = host.tick(&BrainMsg::Watch(watch_line("PinA", "hello again")));
         assert!(
-            fx.iter().any(|e| matches!(e, Effect::Audit { kind, .. } if kind == "prompt_filtered")),
+            fx.iter()
+                .any(|e| matches!(e, Effect::Audit { kind, .. } if kind == "prompt_filtered")),
             "busy presence holds routine wake: {fx:?}"
         );
     }
@@ -1051,7 +1054,8 @@ mod tests {
         .to_string();
         let fx = host.tick(&BrainMsg::Watch(line));
         assert!(
-            fx.iter().any(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "PinA")),
+            fx.iter()
+                .any(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "PinA")),
             "busy + urgent prompts: {fx:?}"
         );
     }

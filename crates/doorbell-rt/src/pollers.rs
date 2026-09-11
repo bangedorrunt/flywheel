@@ -182,7 +182,7 @@ fn readonly_query(db_path: &Path, sql: &str) -> Option<String> {
 /// Beads project db path (`<repo>/.beads/beads.db`, if present).
 pub fn beads_db(repo: &Path) -> Option<PathBuf> {
     let p = repo.join(".beads").join("beads.db");
-    p.exists().then(|| p)
+    p.exists().then_some(p)
 }
 /// Spawn the 30s poll loop (D7): read-only ledger poll, Fact Msgs into
 /// the brain. `br` is never written — see the read-only contract above.
@@ -539,12 +539,9 @@ mod tests {
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let _sensor = spawn_beads_poller(tx, own.clone());
-        let got = tokio::time::timeout(
-            std::time::Duration::from_secs(POLL_SECS + 10),
-            rx.recv(),
-        )
-        .await
-        .expect("E10: no expiry wake within one pass");
+        let got = tokio::time::timeout(std::time::Duration::from_secs(POLL_SECS + 10), rx.recv())
+            .await
+            .expect("E10: no expiry wake within one pass");
         match got.expect("sensor died") {
             crate::BrainMsg::Fact { summary } => {
                 assert!(summary.contains("bd-9x"), "wake names hold: {summary}");

@@ -228,9 +228,8 @@ impl SubscriptionStore {
             .remove(id)
             .map(Ok)
             .unwrap_or(Err(Refusal::Absent(format!("unknown subscription {id}"))))
-            .map(|s| {
+            .inspect(|_| {
                 self.persist();
-                s
             })
     }
 

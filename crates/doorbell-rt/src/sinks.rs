@@ -361,15 +361,18 @@ async fn worker_loop(
     }
 }
 
+/// Shared sent-log handle for the recording test sinks.
+type SentLog = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
 /// Recording sink for tests; `stall_ms` simulates a slow endpoint.
 pub struct MockSink {
-    pub sent: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    pub sent: SentLog,
     pub stall_ms: u64,
     pub fail_after: Option<usize>,
 }
 
 impl MockSink {
-    pub fn new() -> (Self, Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+    pub fn new() -> (Self, SentLog) {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         (
             Self {
@@ -657,6 +660,12 @@ impl MockDmTransport {
             sent: Vec::new(),
             fail: false,
         }
+    }
+}
+
+impl Default for MockDmTransport {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

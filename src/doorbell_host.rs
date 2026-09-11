@@ -61,7 +61,7 @@ impl doorbell_rt::PromptSink for HerdrPromptSink {
         Ok(())
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "herdr"
     }
 }

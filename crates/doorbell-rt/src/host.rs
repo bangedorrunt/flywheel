@@ -173,22 +173,22 @@ impl CoreReducer {
         self.model = next;
         actions
             .into_iter()
-            .filter_map(|a| match a {
-                DoorbellAction::Prompt { pin, line } => Some(Effect::Prompt { pin, line }),
-                DoorbellAction::FetchInbox { since } => Some(Effect::FetchInbox {
+            .map(|a| match a {
+                DoorbellAction::Prompt { pin, line } => Effect::Prompt { pin, line },
+                DoorbellAction::FetchInbox { since } => Effect::FetchInbox {
                     pin: String::new(),
                     since,
-                }),
-                DoorbellAction::CheckAckSla => Some(Effect::CheckAckSla),
-                DoorbellAction::RestartWatch => Some(Effect::RestartWatch),
-                DoorbellAction::FactMiss { why } => Some(Effect::Audit {
+                },
+                DoorbellAction::CheckAckSla => Effect::CheckAckSla,
+                DoorbellAction::RestartWatch => Effect::RestartWatch,
+                DoorbellAction::FactMiss { why } => Effect::Audit {
                     kind: "fact_miss".into(),
                     detail: serde_json::json!({ "why": why }),
-                }),
-                DoorbellAction::Audit { kind, pin, detail } => Some(Effect::Audit {
+                },
+                DoorbellAction::Audit { kind, pin, detail } => Effect::Audit {
                     kind,
                     detail: serde_json::json!({ "pin": pin, "detail": detail }),
-                }),
+                },
             })
             .collect()
     }

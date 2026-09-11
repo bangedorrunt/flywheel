@@ -6527,8 +6527,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // empty board (no gate, existing behavior), never a loop crash.
             // bd-9tbb: LIVE read (leafReply) — a checkpointed reply replays
             // the stored board on resume and serializes dispatch forever.
-            let board: Vec<(String, String)> =
-                reservation_board_live(&params.project).await;
+            let board: Vec<(String, String)> = reservation_board_live(&params.project).await;
             let overlap: std::collections::HashSet<String> = {
                 let in_flight: Vec<String> = inprog.iter().map(|b| b.id.clone()).collect();
                 bead_overlap_waits(&board, &in_flight)
@@ -7066,8 +7065,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             let renew_extend = lease_renew_seconds(params.interval_secs);
             // bd-9tbb: LIVE read — see the dispatch-gate site for the replay
             // hazard; the renewal threshold check must observe NOW too.
-            let board: Vec<(String, String)> =
-                reservation_board_live(&params.project).await;
+            let board: Vec<(String, String)> = reservation_board_live(&params.project).await;
             let inprog_for_renew: Vec<ReadyBead> = if params.work {
                 ctx.run(
                     poll_inprogress,
@@ -7987,9 +7985,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                         // the lane that tracks busy-since.
                                         let verdict =
                                             crate::write_liveness::decide(&outcome, false, &opts);
-                                        if let crate::write_liveness::LivenessVerdict::Respawn {
-                                            inspect: true,
-                                        } = verdict
+                                        if verdict
+                                            == (crate::write_liveness::LivenessVerdict::Respawn {
+                                                inspect: true,
+                                            })
                                         {
                                             eprintln!(
                                                 "flywheel: D4 inspect recommended for {name} (bead {bead}): quiet + not-writing — look before next drain"
@@ -12053,9 +12052,7 @@ mod tests {
     #[test]
     fn board_reads_in_loop_body_are_live_not_checkpointed() {
         let src = std::fs::read_to_string(file!()).expect("durable.rs readable");
-        let loop_start = src
-            .find("async fn swarm_loop(")
-            .expect("swarm_loop exists");
+        let loop_start = src.find("async fn swarm_loop(").expect("swarm_loop exists");
         // swarm_loop runs to the register block (run_durable_loop) — the
         // whole region that must not re-consume a checkpointed board leaf.
         let loop_body = &src[loop_start..];
@@ -12064,7 +12061,9 @@ mod tests {
             .expect("run_durable_loop after swarm_loop");
         let body = &loop_body[..loop_end];
         assert!(
-            !body.contains("ctx\n .run(") && !body.contains("ctx.run(\n reservation_board") && !body.contains("reservation_board,") ,
+            !body.contains("ctx\n .run(")
+                && !body.contains("ctx.run(\n reservation_board")
+                && !body.contains("reservation_board,"),
             "bd-9tbb: swarm_loop must read the board LIVE (reservation_board_live), never ctx.run(reservation_board) — a checkpointed board replay serializes dispatch forever"
         );
         assert!(

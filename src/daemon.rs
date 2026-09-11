@@ -558,7 +558,8 @@ pub fn ensure_doorbell() -> anyhow::Result<()> {
     let status = Command::new(&bin).arg("status").output();
     if let Ok(o) = status {
         let body = String::from_utf8_lossy(&o.stdout);
-        if o.status.success() && (body.contains("\"alive\":true") || body.contains("\"health\":{")) {
+        if o.status.success() && (body.contains("\"alive\":true") || body.contains("\"health\":{"))
+        {
             println!("doorbell: already running");
             return Ok(());
         }

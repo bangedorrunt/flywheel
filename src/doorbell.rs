@@ -478,7 +478,9 @@ pub fn stop(state_dir: &Path, workspace: &str) -> Result<()> {
 /// never fails the spawn. The daemon serves these rows when it hosts wake;
 /// `kill` never touches them (subscriptions outlive swarms by design).
 pub fn register_workspace_subscriptions(state_dir: &Path, workspace: &str, pins: &[String]) {
-    use doorbell_rt::subscribe::*;
+    use doorbell_rt::subscribe::{
+        Actor, Budget, Filter, Identity, Scope, SinkKind, Subscription, SubscriptionStore,
+    };
     let mut store = SubscriptionStore::open(state_dir);
     for pin in pins {
         let sub = Subscription {
@@ -717,7 +719,7 @@ pub fn subscribe_extra_workspace_in(
     operator: bool,
     cross_on: bool,
 ) -> Result<Vec<String>, CrossScopeDeny> {
-    use doorbell_rt::subscribe::*;
+    use doorbell_rt::subscribe::{Actor, Scope, SubscriptionStore};
     if !cross_on {
         return Err(CrossScopeDeny::FlagOff);
     }
@@ -1780,7 +1782,6 @@ mod tests {
             "journal path contract violated: {path:?}"
         );
     }
-
 
     #[test]
     fn s_proof_why_fold_reproduces_cmds() {

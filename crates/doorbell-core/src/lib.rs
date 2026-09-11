@@ -229,10 +229,10 @@ pub struct WakeState {
 /// so rapid double prompts cannot fake liveness for `send --wait`.
 /// Returns true when the stamp advanced.
 pub fn note_wake(st: &mut WakeState, pin: &str, now_unix: u64) -> bool {
-    if let Some(prev) = st.last_wake_unix {
-        if now_unix <= prev {
-            return false;
-        }
+    if let Some(prev) = st.last_wake_unix
+        && now_unix <= prev
+    {
+        return false;
     }
     st.last_wake_unix = Some(now_unix);
     st.last_wake_pin = Some(pin.to_string());
@@ -697,14 +697,14 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 .get(pin)
                 .cloned()
                 .unwrap_or_else(|| "unknown".into());
-            if is_drain_transition(&from, status) {
-                if let Some(q) = next.queues.get_mut(pin) {
-                    for line in std::mem::take(q) {
-                        actions.push(DoorbellAction::Prompt {
-                            pin: pin.clone(),
-                            line,
-                        });
-                    }
+            if is_drain_transition(&from, status)
+                && let Some(q) = next.queues.get_mut(pin)
+            {
+                for line in std::mem::take(q) {
+                    actions.push(DoorbellAction::Prompt {
+                        pin: pin.clone(),
+                        line,
+                    });
                 }
             }
             next.statuses.insert(pin.clone(), status.clone());
