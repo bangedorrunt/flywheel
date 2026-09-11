@@ -326,6 +326,13 @@ fn serialize_gate_unit_suite_is_pinned() {
         src.contains("Cargo.lock"),
         "ALWAYS_SERIALIZE_PATHS keeps Cargo.lock"
     );
+    // bd-9tbb (leafReply): the loop's board reads are LIVE — a checkpointed
+    // board leaf replays its STORED rows on resume, so a released holder
+    // would keep the always-serialize gate closed forever.
+    assert!(
+        src.contains("reservation_board_live"),
+        "durable.rs must keep the live (non-checkpointed) board read on the loop path"
+    );
 }
 
 /// The LOOP dispatch surface has ZERO worktree-create calls: the brief's
