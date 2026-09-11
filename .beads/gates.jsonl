@@ -230,3 +230,4 @@
 {"id":230,"issue_id":"bd-evz9","from_status":"in_progress","to_status":"closed","status_revision":3062,"gate":"live-verified","provider":"QuietAnvil","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-11 10:51:37"}
 {"id":231,"issue_id":"bd-nc80","from_status":"open","to_status":"closed","status_revision":0,"gate":"unit-test-verified","provider":"TealDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-11 11:19:36"}
 {"id":232,"issue_id":"bd-itsc","from_status":"open","to_status":"closed","status_revision":0,"gate":"unit-test-verified","provider":"TealDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-11 12:06:42"}
+{"id":233,"issue_id":"bd-206b","from_status":"open","to_status":"closed","status_revision":0,"gate":"live-verified","provider":"TealDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-11 12:11:32"}
