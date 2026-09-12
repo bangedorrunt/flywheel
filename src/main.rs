@@ -378,6 +378,30 @@ pub(crate) fn stage_prompt_with_params(name: &str, raw_params: &[String]) -> Res
     let params = stages::parse_params(raw_params)?;
     stages::render_stage(&stage.prompt.clone(), &stage.params.clone(), &params)
 }
+
+/// ADR-0032 Spec 9 tail (bd-40d1): project-tier stage resolve for runs.
+/// `<project_dir>/.flywheel/stages.toml` shadows the untiered library; a
+/// missing tier falls back byte-identical to [`stage_prompt`].
+pub(crate) fn stage_prompt_for_project(name: &str, project_dir: &Path) -> Result<String> {
+    let path = project_dir.join(".flywheel/stages.toml");
+    let lib = if path.is_file() {
+        stages::StageLibrary::load_layered(Some(&path))?
+    } else {
+        stages::StageLibrary::load()?
+    };
+    lib.resolve(name)
+        .map(std::string::ToString::to_string)
+        .ok_or_else(|| {
+            anyhow!(
+                "unknown stage: {name} (known: {})",
+                lib.list()
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
 /// Project-aware stage render for sends: the project's `.flywheel/stages.toml`
 /// tier rides along, so project-authored dispatch stages (lane-bead,
 /// stall-wake) resolve from CLI sends — not just the workflow engine.
@@ -25777,6 +25801,76 @@ fn normalize_run_status(raw: &str) -> String {
     }
 }
 
+/// ADR-0032 Spec 9 tail (bd-40d1): derive a run's terminal status from the
+/// engine outcome — failed, blocked, suspended, succeeded, or unknown.
+/// Explicit outcome evidence wins; a null outcome is unknown (never an
+/// invented success); a completed invoke without failure evidence succeeded.
+fn run_terminal_status(output: &Value) -> &'static str {
+    if let Some(s) = output.get("status").and_then(Value::as_str) {
+        return match s {
+            "failed" | "fail" | "error" => "failed",
+            "blocked" => "blocked",
+            "suspended" => "suspended",
+            "succeeded" | "completed" | "done" | "ok" => "succeeded",
+            _ => "unknown",
+        };
+    }
+    if output.get("ok") == Some(&serde_json::json!(false)) {
+        return "failed";
+    }
+    if output.get("error").is_some() {
+        return "failed";
+    }
+    if output.is_null() {
+        return "unknown";
+    }
+    "succeeded"
+}
+
+/// History reader status: a recorded status stands; a missing one is
+/// unknown — never a default "done".
+fn history_row_status(data: &Value) -> String {
+    data.get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// Write a failed run's terminal output to the per-run artifact dir and
+/// return its path for the ledger row. Non-failed runs record nothing.
+/// A write failure warns loudly and records nothing — the ledger row still
+/// lands with its truthful status.
+fn write_terminal_artifact(
+    project: &str,
+    run_id: &str,
+    output: &Value,
+    status: &str,
+) -> Vec<String> {
+    if status != "failed" {
+        return Vec::new();
+    }
+    let path = crate::artifact::artifact_path(project, run_id, "terminal");
+    if let Some(dir) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        eprintln!("flywheel: cannot write failure artifact: {e:#}");
+        return Vec::new();
+    }
+    match serde_json::to_string_pretty(output) {
+        Ok(raw) => match std::fs::write(&path, raw) {
+            Ok(()) => vec![path.display().to_string()],
+            Err(e) => {
+                eprintln!("flywheel: cannot write failure artifact: {e:#}");
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            eprintln!("flywheel: cannot serialize failure artifact: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod runs_status_tests {
     use super::normalize_run_status;
@@ -25799,6 +25893,93 @@ mod runs_status_tests {
     fn unknown_status_passes_through_verbatim() {
         assert_eq!(normalize_run_status("weird"), "weird");
         assert_eq!(normalize_run_status(""), "");
+    }
+}
+
+// ---- ADR-0032 Spec 9 tail (bd-40d1): run-ledger truth contract ----
+//
+// RED: assertions against helpers that do not exist yet. The ledger must
+// record terminal status/project/artifacts honestly — never a default "done".
+#[cfg(test)]
+mod run_ledger_truth_tests {
+    use super::{
+        history_row_status, parse_leaf_output, run_terminal_status, stage_prompt_for_project,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn run_ledger_truth_terminal_status_maps_outcome() {
+        assert_eq!(
+            run_terminal_status(&json!({"status": "failed", "error": "x"})),
+            "failed"
+        );
+        assert_eq!(
+            run_terminal_status(&json!({"status": "blocked"})),
+            "blocked"
+        );
+        assert_eq!(
+            run_terminal_status(&json!({"status": "suspended"})),
+            "suspended"
+        );
+        assert_eq!(
+            run_terminal_status(&json!({"status": "succeeded"})),
+            "succeeded"
+        );
+        assert_eq!(run_terminal_status(&json!({"status": "done"})), "succeeded");
+        assert_eq!(
+            run_terminal_status(&json!({"ok": false, "error": "boom"})),
+            "failed"
+        );
+        assert_eq!(run_terminal_status(&json!({"error": "boom"})), "failed");
+        assert_eq!(run_terminal_status(&json!(null)), "unknown");
+        assert_eq!(run_terminal_status(&json!({"v": {}})), "succeeded");
+    }
+
+    #[test]
+    fn run_ledger_truth_history_missing_status_is_unknown() {
+        assert_eq!(history_row_status(&json!({"run_id": "r1"})), "unknown");
+        assert_eq!(history_row_status(&json!({"status": "failed"})), "failed");
+        assert_eq!(
+            history_row_status(&json!({"status": "suspended"})),
+            "suspended"
+        );
+    }
+
+    #[test]
+    fn run_ledger_truth_stage_tier_shadows_and_falls_back() {
+        let dir =
+            std::env::temp_dir().join(format!("flywheel-run-ledger-stage-{}", std::process::id()));
+        let fw = dir.join(".flywheel");
+        std::fs::create_dir_all(&fw).expect("fw dir");
+        std::fs::write(
+            fw.join("stages.toml"),
+            "[stages.probe]\nname = \"probe\"\nphase = \"implement\"\nparams = []\nprompt = \"Tier probe.\"\n",
+        )
+        .expect("write toml");
+        let out = stage_prompt_for_project("probe", &dir).expect("tier resolves");
+        assert!(out.contains("Tier probe"), "project tier wins: {out}");
+        assert!(stage_prompt_for_project("nope", &dir).is_err());
+        let bare = std::env::temp_dir().join(format!(
+            "flywheel-run-ledger-stage-bare-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&bare).expect("tmp dir");
+        assert!(
+            stage_prompt_for_project("ce-execute", &bare).is_ok(),
+            "missing tier falls back byte-identical"
+        );
+    }
+
+    #[test]
+    fn run_ledger_truth_leaf_garbage_is_typed_failure() {
+        assert!(parse_leaf_output("{\"a\":1}", "raw", "").is_ok());
+        let err = parse_leaf_output("not json at all", "raw-blob", "stderr-blob")
+            .expect_err("garbage must fail, never Ok(ok:false)");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("stderr-blob") || msg.contains("raw-blob"),
+            "evidence rides the error: {msg}"
+        );
     }
 }
 
@@ -27334,8 +27515,19 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         let catalog = profile::ProfileCatalog::load()?;
                         let wf_name = name.clone();
                         let inputs_c = inputs_value.clone();
+                        // ADR-0032 Spec 9 tail: stage prompts resolve the
+                        // project tier on headless runs.
+                        let dispatch_project_dir =
+                            project_dir(cfg, project.as_deref().unwrap_or("flywheel"));
                         Arc::new(move |a: &Action| {
-                            headless_dispatch(&catalog, &wf_name, &inputs_c, None, a)
+                            headless_dispatch(
+                                &catalog,
+                                &wf_name,
+                                &inputs_c,
+                                None,
+                                a,
+                                Some(&dispatch_project_dir),
+                            )
                         })
                     }
                     "pane" => {
@@ -27509,17 +27701,24 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     ),
                 }
             }
+            // ADR-0032 Spec 9 tail (bd-40d1): the ledger row carries the
+            // run's real terminal status, real project, and failure
+            // artifacts — never a default "done" under project "workflow".
+            let run_project = project.as_deref().unwrap_or("flywheel");
+            let terminal = run_terminal_status(&output);
+            let artifact_paths = write_terminal_artifact(run_project, &run_id, &output, terminal);
             log(
-                "workflow",
+                run_project,
                 EventKind::Workflow,
                 json!({
                     "workflow": name,
-                    "status": "done",
+                    "status": terminal,
                     "crew": crew_plan.members,
                     "run_id": run_id,
                     "mode": mode,
                     "panes": pane_ctx.as_ref().map(|c| c.entries.len()),
                     "reaped": reaped,
+                    "artifact_paths": artifact_paths,
                 }),
             );
             if *json {
@@ -27995,26 +28194,33 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     ),
                 }
             }
+            // ADR-0032 Spec 9 tail (bd-40d1): same truthful ledger row for
+            // composed runs — real terminal status, real project, failure
+            // artifacts. The --keep gate below reads the same status.
+            let terminal = run_terminal_status(&output);
+            let artifact_paths = write_terminal_artifact(project_name, &run_id, &output, terminal);
             log(
-                "workflow",
+                project_name,
                 EventKind::Workflow,
                 json!({
                     "workflow": wf_name,
-                    "status": "done",
+                    "status": terminal,
                     "crew": crew_plan.members,
                     "run_id": run_id,
                     "mode": "pane",
                     "panes": entries.len(),
                     "reaped": reaped,
                     "policy_events": policy_receipts_count,
+                    "artifact_paths": artifact_paths,
                 }),
             );
             // W6 (§3.7 T3): graduate a GREEN composed run into the project
-            // catalog. Green = invoke returned Ok and the terminal status is
-            // not "failed". A red run refuses — keep-without-green is the
-            // exact failure mode the evidence ladder exists to prevent.
+            // catalog. Green = invoke returned Ok and the derived terminal
+            // status is not "failed" (same signal the ledger row records).
+            // A red run refuses — keep-without-green is the exact failure
+            // mode the evidence ladder exists to prevent.
             if let Some(keep_name) = keep {
-                let green = output.get("status").and_then(|s| s.as_str()) != Some("failed");
+                let green = terminal != "failed";
                 if !green {
                     bail!(
                         "refusing to keep {keep_name:?}: the composed run {wf_name} did not go green \
@@ -28105,7 +28311,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                             "ts": e.ts,
                             "project": project,
                             "run_id": e.data.get("run_id"),
-                            "status": e.data.get("status").and_then(Value::as_str).unwrap_or("done"),
+                            "status": history_row_status(&e.data),
                             "crew": e.data.get("crew"),
                         }));
                     }
@@ -30983,12 +31189,38 @@ fn cmd_internal_run_headless(
 /// (ADR-0010 Spec E). Headless spawn routing + the `await:false` detached
 /// branch land with the pane runner (P10.3, bd-ghcj.1). P10.1 headless is
 /// dispatch_job-driven — synchronous by engine design.
+/// Parse one `__run-headless` leaf line. Valid JSON passes through;
+/// anything else is a typed leaf failure carrying bounded evidence —
+/// never `Ok(ok:false)` (ADR-0032 Spec 9 tail: a failed leaf fails the
+/// parent run instead of masquerading as a value).
+fn parse_leaf_output(trimmed: &str, raw: &str, err: &str) -> Result<Value> {
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            const LIMIT: usize = 2000;
+            let cut = |s: &str| {
+                if s.len() > LIMIT {
+                    format!("{}…[truncated]", &s[..LIMIT])
+                } else {
+                    s.to_string()
+                }
+            };
+            Err(anyhow!(
+                "headless leaf returned non-JSON output (stdout: {}; stderr: {})",
+                cut(raw),
+                cut(err)
+            ))
+        }
+    }
+}
+
 pub(crate) fn headless_dispatch(
     catalog: &profile::ProfileCatalog,
     wf_name: &str,
     inputs: &Value,
     cron: Option<&str>,
     action: &toron_workflow::schema::Action,
+    project_dir: Option<&Path>,
 ) -> Result<Value> {
     let toron_workflow::schema::Action::DispatchJob { spec, .. } = action else {
         // bd-omwg: a Spawn reaching the runner is an engine-routing bug —
@@ -31015,7 +31247,10 @@ pub(crate) fn headless_dispatch(
     let mut base = match headless::dispatch_spec_task(spec) {
         Some(task) if !task.trim().is_empty() => task.to_string(),
         _ => match headless::dispatch_spec_stage(spec) {
-            Some(s) => stage_prompt(s)?,
+            Some(s) => match project_dir {
+                Some(dir) => stage_prompt_for_project(s, dir)?,
+                None => stage_prompt(s)?,
+            },
             None => headless::base_prompt_for(wf_name, inputs),
         },
     };
@@ -31068,36 +31303,35 @@ pub(crate) fn headless_dispatch(
         .with_context(|| format!("__run-headless for @{profile_name}"))?;
     let raw = String::from_utf8_lossy(&output.stdout).to_string();
     let trimmed = raw.trim();
-    // The leaf prints ONE json line on success / on captured failure. Any
-    // other output (spawn failure, panic) becomes a per-step error value.
-    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-        // ADR-0022 §3.5 warn-first plan-artifact gate (bd-cvv9): an
-        // `implement` dispatch with no plan artifact warns loudly, tags the
-        // run log AND the step output — never blocks (the W5 flip owns
-        // blocking).
-        if phase_chain::plan_artifact_missing(spec, inputs) {
-            eprintln!(
-                "flywheel: phase implement dispatch has NO completed plan artifact — \
-                 warn-first gate (ADR-0022 §3.5); step output tagged plan_artifact_missing"
-            );
-            // headless_dispatch has no project param; warn telemetry lands
-            // in the default project's state log.
-            crate::state::log_event(
-                "flywheel",
-                crate::state::EventKind::Workflow,
-                serde_json::json!({
-                    "workflow": wf_name,
-                    "phase": "implement",
-                    "plan_artifact_missing": true,
-                    "gate_mode": "warn",
-                }),
-            )
-            .ok();
-        }
-        return Ok(phase_chain::annotate_dispatch_output(spec, inputs, v));
-    }
+    // The leaf prints ONE json line on success / on captured failure, and
+    // parse_leaf_output turns anything else into a typed failure: the
+    // engine records a failed step and the run fails truthfully.
     let err = String::from_utf8_lossy(&output.stderr).to_string();
-    Ok(json!({ "ok": false, "error": if err.trim().is_empty() { raw } else { err } }))
+    let v = parse_leaf_output(trimmed, &raw, &err)?;
+    // ADR-0022 §3.5 warn-first plan-artifact gate (bd-cvv9): an
+    // `implement` dispatch with no plan artifact warns loudly, tags the
+    // run log AND the step output — never blocks (the W5 flip owns
+    // blocking).
+    if phase_chain::plan_artifact_missing(spec, inputs) {
+        eprintln!(
+            "flywheel: phase implement dispatch has NO completed plan artifact — \
+             warn-first gate (ADR-0022 §3.5); step output tagged plan_artifact_missing"
+        );
+        // Warn telemetry lands in the default project's state log (only
+        // stage resolution is project-aware here).
+        crate::state::log_event(
+            "flywheel",
+            crate::state::EventKind::Workflow,
+            serde_json::json!({
+                "workflow": wf_name,
+                "phase": "implement",
+                "plan_artifact_missing": true,
+                "gate_mode": "warn",
+            }),
+        )
+        .ok();
+    }
+    Ok(phase_chain::annotate_dispatch_output(spec, inputs, v))
 }
 
 /// bd-omwg: headless fail-closed gate (ADR-0010 Spec E). A workflow carrying
