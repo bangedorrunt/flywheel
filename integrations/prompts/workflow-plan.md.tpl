@@ -1,7 +1,7 @@
 {{TOOL_FRONTMATTER}}
 # Workflow: plan
 
-Run the plan workflow: goal → bead-ready plan via the planner.
+Run the plan workflow: goal -> bead-ready plan via the planner.
 
 ## This command's focus
 

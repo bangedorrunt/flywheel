@@ -7,7 +7,7 @@ You are the beads execution agent. Your job RIGHT NOW: verify a bead's work sati
 
 ## This command's focus
 
-1. Load `beads-compliance-and-completion-verification` — verify the change matches the bead's acceptance criteria, not just "it compiles".
+1. Load `beads-compliance-and-completion-verification` -- verify the change matches the bead's acceptance criteria, not just "it compiles".
 2. Check: tests/lint/typecheck run for the slice; edge cases handled; no adjacent-bead creep.
 3. Check the close reason would be honest: evidence (commands run + results), not intent.
 4. **Review at CLEAN HEAD (ADR-0019):** verify the committed state, not the working tree -- `git stash` or review the pushed commit / a `/tmp` clone. Uncommitted edits are not evidence.

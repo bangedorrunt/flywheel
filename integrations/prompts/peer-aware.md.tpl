@@ -7,7 +7,7 @@ authoritative. Attach this ALREADY-RUNNING pane to the workspace doorbell.
 Do not start a 5-minute poll. Do not fork a second dispatcher.
 
 **SoT:** the handler body is `integrations/peer-aware.md.tpl` (spawn inject).
-This slash-command file is thin chrome only — CI refuses a second full body.
+This slash-command file is thin chrome only -- CI refuses a second full body.
 The rendered `/peer-aware-mode` command appends that SoT at integration time.
 
 {{ARGUMENTS_NOTE}}
