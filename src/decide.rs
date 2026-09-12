@@ -47,14 +47,15 @@ fn compose_parts_value(target: &str) -> String {
     "<role:stage,...>".to_string()
 }
 
+/// Topology is declared per routing row (ADR-0032 Spec 9): the one catalog
+/// table below is the only map. Unknown primitives are explicit `"none"` —
+/// the silent `_ => "swarm"` bucket is deleted.
 pub fn topology_for_primitive(primitive: &str) -> &'static str {
-    match primitive {
-        "loop-work" | "pickup" | "pause" => "loop",
-        "join" => "join",
-        "spawn-send" | "captain-audit" | "forensics" | "babysit-bead" => "open",
-        "wave-swarm" | "coalition-form" => "swarm",
-        _ => "swarm",
-    }
+    ROUTING_TABLE
+        .iter()
+        .find(|e| e.primitive == primitive)
+        .map(|e| e.topology)
+        .unwrap_or("none")
 }
 
 /// Total pane budget N from free text. `"2 crews"` / `"3 crew"` / `"coder:2"`.
@@ -102,737 +103,719 @@ fn apply_crew_budget(d: &mut Decision, target: &str) {
     }
 }
 
-fn dec(primitive: &'static str, reason: &str, argv: &[&str]) -> Decision {
+// ---- ADR-0032 Spec 9 (bd-himk): one catalog-driven routing table ----
+//
+// The flywheel-owned static routing catalog. `decide` and `briefing`
+// consume this one compiled table: matchers are declarative data,
+// overlapping claims fail `compile_routing_table` loud, and table order
+// never decides (most-specific needle wins; ties are explicit none).
+//
+// governed-by: ADR-0032 Spec 9
+
+/// Which snapshots/words admit a routing row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteGate {
+    /// Eligible whenever a matcher hits.
+    Always,
+    /// Diagnosis-only rows: never for implement/fix targets.
+    NoImplement,
+    /// implement/fix + beads|tracker|gate, minus "no tracker".
+    ImplementTracker,
+    /// implement/fix + no tracker|direct.
+    ImplementDirect,
+    /// Ready beads + work-ish intent, never implement/fix.
+    ReadyBeadsWork,
+    /// snap.contention admits even with no keyword; otherwise keywords.
+    ContentionOr,
+    /// babysit AND a bead-ish word must both appear.
+    Babysit,
+    /// implement/fix AND a bug-shaped word must both appear.
+    BugFixShaped,
+}
+
+/// How a routed row builds its argv.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteArgv {
+    /// flywheel workflow run <primitive> --execute --mode <mode>.
+    WorkflowRun {
+        mode: &'static str,
+    },
+    /// flywheel workflow run <primitive> --execute (pause: no --mode).
+    WorkflowRunNoMode,
+    /// flywheel workflow compose <target> --agent.
+    ComposeAgent,
+    /// flywheel workflow compose <target> --parts <extracted value>.
+    ComposeParts,
+    /// flywheel workflow compose <target> --parts <token> --run.
+    ComposeToken {
+        token: &'static str,
+    },
+    Steer,
+    SteerDirect,
+    LoopWork,
+    Join,
+    SpawnSend,
+    CoalitionForm,
+    CronStart,
+}
+
+/// One declarative routing row: matchers + gate + argv shape + topology.
+/// A workflow's `decide_trigger_for` phrase is always `matchers[0]`.
+#[derive(Debug, Clone, Copy)]
+pub struct RouteEntry {
+    pub primitive: &'static str,
+    pub matchers: &'static [&'static str],
+    pub topology: &'static str,
+    pub gate: RouteGate,
+    pub argv: RouteArgv,
+    pub reason: &'static str,
+}
+
+/// The one routing table. Order is cosmetic: resolution is earliest-match
+/// position, then longest needle — never first-match-wins.
+pub static ROUTING_TABLE: &[RouteEntry] = &[
+    RouteEntry {
+        primitive: "captain-audit",
+        matchers: &["audit", "read-only", "analyze"],
+        topology: "open",
+        gate: RouteGate::NoImplement,
+        argv: RouteArgv::WorkflowRun { mode: "headless" },
+        reason: "read-only analysis — captain-audit headless",
+    },
+    RouteEntry {
+        primitive: "bug-fix",
+        matchers: &["repro", "regression", "bug-fix"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "repro/regression/bug-shaped fix — bug-fix workflow (repro first)",
+    },
+    RouteEntry {
+        primitive: "bug-fix",
+        matchers: &[
+            "bug", "crash", "panic", "leak", "broken", "failing", "error",
+        ],
+        topology: "swarm",
+        gate: RouteGate::BugFixShaped,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "repro/regression/bug-shaped fix — bug-fix workflow (repro first)",
+    },
+    RouteEntry {
+        primitive: "refactoring",
+        matchers: &["refactor"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "refactor — refactoring workflow (invariant stays green)",
+    },
+    RouteEntry {
+        primitive: "prototype",
+        matchers: &["prototype", "sketch", "mock"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "prototype/sketch — prototype workflow (2-3 arms, oracle picks)",
+    },
+    RouteEntry {
+        primitive: "arena",
+        matchers: &["arena"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "arena — model race on one brief (declared selection rule)",
+    },
+    RouteEntry {
+        primitive: "perf",
+        matchers: &["perf", "p95", "slow"],
+        topology: "swarm",
+        gate: RouteGate::NoImplement,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "perf/p95/slow — perf workflow (metric + budget)",
+    },
+    RouteEntry {
+        primitive: "hillclimb",
+        matchers: &["hillclimb"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "hillclimb — hillclimb workflow (one commit per accepted win)",
+    },
+    RouteEntry {
+        primitive: "forensics",
+        matchers: &["forensic", "leak", "idle cpu", "spindump"],
+        topology: "open",
+        gate: RouteGate::NoImplement,
+        argv: RouteArgv::WorkflowRun { mode: "headless" },
+        reason: "forensics — diagnosis only, no fix step (bug-fix consumes Act-on)",
+    },
+    RouteEntry {
+        primitive: "babysit-bead",
+        matchers: &["babysit"],
+        topology: "open",
+        gate: RouteGate::Babysit,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "babysit a bead — babysit-bead workflow (no new beads)",
+    },
+    RouteEntry {
+        primitive: "pickup",
+        matchers: &["pickup", "resume session"],
+        topology: "loop",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "pickup / resume session — pickup workflow",
+    },
+    RouteEntry {
+        primitive: "pause",
+        matchers: &["pause", "going offline"],
+        topology: "loop",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRunNoMode,
+        reason: "pause / going offline — checkpoint + standing handoff",
+    },
+    RouteEntry {
+        primitive: "interrogate",
+        matchers: &["interrogate", "tear this apart", "adversarial review"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "headless" },
+        reason: "interrogate — N-model adversarial review (read-only)",
+    },
+    RouteEntry {
+        primitive: "figure-it-out",
+        matchers: &["figure it out", "no playbook"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::ComposeAgent,
+        reason: "no matching playbook — planner compose, lint is the gate",
+    },
+    RouteEntry {
+        primitive: "ship-beads",
+        matchers: &["ship beads", "land the beads"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "ship beads — ledger-green then housekeeper commit",
+    },
+    RouteEntry {
+        primitive: "feature",
+        matchers: &["feature"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "feature — feature workflow (shape -> build -> prove)",
+    },
+    RouteEntry {
+        primitive: "goal",
+        matchers: &["goal"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "goal — meta-workflow (ce-brainstorm -> plan -> beads -> build)",
+    },
+    RouteEntry {
+        primitive: "triage-deep",
+        matchers: &["triage-deep", "triage deep", "deep triage"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "triage-deep — deep backlog triage (bv robot-triage -> spawn crew)",
+    },
+    RouteEntry {
+        primitive: "triage",
+        matchers: &["triage"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "triage — inbound message triage (ack + dispatch)",
+    },
+    RouteEntry {
+        primitive: "weekly-review",
+        matchers: &["weekly-review", "weekly review"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "weekly-review — weekly repo review (scout fanout -> oracle idea)",
+    },
+    RouteEntry {
+        primitive: "autonomous-work",
+        matchers: &["autonomous-work", "autonomous work"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "autonomous-work — autonomous overnight work (loop run --work then ship)",
+    },
+    RouteEntry {
+        primitive: "reflect",
+        matchers: &["reflect"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "reflect — corrections become structure (hook bead, never a paragraph)",
+    },
+    RouteEntry {
+        primitive: "ce-compound",
+        matchers: &[
+            "compound the learning",
+            "capture the learning",
+            "capture what we learned",
+            "compound this",
+        ],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "ce-compound — run the compound gate over verified work (docs/learnings/)",
+    },
+    RouteEntry {
+        primitive: "ce-sweep",
+        matchers: &["sweep the learnings", "learning sweep", "compound-refresh"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "ce-sweep — maintain docs/learnings/ (keep/update/consolidate/delete)",
+    },
+    RouteEntry {
+        primitive: "awareness-digest",
+        matchers: &["awareness-digest", "awareness digest"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "headless" },
+        reason: "awareness-digest — captain digest (presence + reservations + guard)",
+    },
+    RouteEntry {
+        primitive: "onboard",
+        matchers: &["onboard"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "onboard — cold-start newcomer (map repo -> seed first task)",
+    },
+    RouteEntry {
+        primitive: "join",
+        matchers: &["join the fleet", "join fleet", "joining"],
+        topology: "join",
+        gate: RouteGate::Always,
+        argv: RouteArgv::Join,
+        reason: "join the live fleet — arrive, do not spawn a second swarm",
+    },
+    RouteEntry {
+        primitive: "spawn-send",
+        matchers: &[
+            "one pane",
+            "watch me",
+            "single agent",
+            "typo",
+            "one-line",
+            "one line",
+        ],
+        topology: "open",
+        gate: RouteGate::Always,
+        argv: RouteArgv::SpawnSend,
+        reason: "one pane — spawn --profile <role> --count 1, then send --to <full-name> --wait (never --oc)",
+    },
+    // Declared wave trigger only: bare swarm/lanes/waves substrings and lone
+    // budgets never route here (the old wave_shaped sniffing is deleted).
+    RouteEntry {
+        primitive: "wave-swarm",
+        matchers: &["wave-swarm", "wave swarm"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::ComposeToken {
+            token: "wave-swarm",
+        },
+        reason: "wave-swarm — composed wave swarm (GATE -> DISPATCH -> OBSERVE -> VERIFY -> SIGNOFF)",
+    },
+    RouteEntry {
+        primitive: "repair-until-verified",
+        matchers: &["repair-until-verified", "repair until verified"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::ComposeToken {
+            token: "repair-until-verified",
+        },
+        reason: "repair-until-verified — compose --parts repair-until-verified --run",
+    },
+    RouteEntry {
+        primitive: "debate",
+        matchers: &[
+            "argue both sides",
+            "devil's advocate",
+            "debate the",
+            "steelman",
+        ],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "debate — adversarial briefs, oracle decides",
+    },
+    RouteEntry {
+        primitive: "ce-brainstorm",
+        matchers: &[
+            "brainstorm",
+            "sharpen the requirements",
+            "requirements-only",
+            "ideate",
+        ],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "ce-brainstorm — requirements-first ideation (oracles diverge, planner reduces)",
+    },
+    RouteEntry {
+        primitive: "ce-plan",
+        matchers: &[
+            "break this down",
+            "bead-ready plan",
+            "decompose this goal",
+            "make a bead-ready plan",
+        ],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "ce-plan — goal to bead-ready plan, approval gate",
+    },
+    RouteEntry {
+        primitive: "ship",
+        matchers: &[
+            "ship the chain",
+            "run the ship",
+            "ship chain",
+            "resolve to verify",
+        ],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "ship — resolve to verify gated chain",
+    },
+    RouteEntry {
+        primitive: "beads",
+        matchers: &[
+            "convert to beads",
+            "file these as beads",
+            "track this plan",
+            "beads from this plan",
+        ],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "beads — plan to tracker (planner files the beads)",
+    },
+    RouteEntry {
+        primitive: "loop-work",
+        matchers: &["work", "loop", "beads"],
+        topology: "loop",
+        gate: RouteGate::ReadyBeadsWork,
+        argv: RouteArgv::LoopWork,
+        reason: "ready beads — loop-mode run <project> --work",
+    },
+    RouteEntry {
+        primitive: "steer",
+        matchers: &["beads", "tracker", "gate"],
+        topology: "swarm",
+        gate: RouteGate::ImplementTracker,
+        argv: RouteArgv::Steer,
+        reason: "implement + tracker/gate — steer",
+    },
+    RouteEntry {
+        primitive: "steer-direct",
+        matchers: &["no tracker", "direct"],
+        topology: "swarm",
+        gate: RouteGate::ImplementDirect,
+        argv: RouteArgv::SteerDirect,
+        reason: "implement, no tracker — steer --direct",
+    },
+    // Plane-S steering is an explicit route, never the silent fallback.
+    RouteEntry {
+        primitive: "steer",
+        matchers: &["crew-steer", "mention peer", "peer mention"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::Steer,
+        reason: "crew steer / peer mention — steer on plane S (channel post --mention / job claim)",
+    },
+    RouteEntry {
+        primitive: "compose-parts",
+        matchers: &["compose", "catalog miss", "parts:"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::ComposeParts,
+        reason: "catalog cannot express the named parts — compose --parts",
+    },
+    RouteEntry {
+        primitive: "compose-agent",
+        matchers: &["shape unknown", "improvise", "author workflow"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::ComposeAgent,
+        reason: "shape unknown — planner arm, lint is the gate",
+    },
+    RouteEntry {
+        primitive: "coalition-form",
+        matchers: &["contention", "coalition", "shared-file"],
+        topology: "swarm",
+        gate: RouteGate::ContentionOr,
+        argv: RouteArgv::CoalitionForm,
+        reason: "file contention — coalition, not a solo dispatch",
+    },
+    RouteEntry {
+        primitive: "cron-start",
+        matchers: &["cron", "schedule", "nightly"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::CronStart,
+        reason: "scheduled work — cron YAML + cron start",
+    },
+];
+
+/// Earliest match position, longest needle on ties: among the needles of
+/// one row that hit, the smallest index wins and the longest needle breaks
+/// index ties. Returns (pos, len).
+fn earliest_hit(matchers: &[&str], t: &str) -> Option<(usize, usize)> {
+    matchers
+        .iter()
+        .filter_map(|m| t.find(m).map(|pos| (pos, m.len())))
+        .min_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
+}
+
+impl RouteEntry {
+    /// Match key when this row admits the target. Ambient-only matches
+    /// (empty goal, contention with no keyword) sort last so an explicit
+    /// mention always beats world state.
+    fn match_key(&self, t: &str, implement: bool, snap: &Snapshot) -> Option<(usize, usize)> {
+        match self.gate {
+            RouteGate::Always => earliest_hit(self.matchers, t),
+            RouteGate::NoImplement => (!implement)
+                .then(|| earliest_hit(self.matchers, t))
+                .flatten(),
+            RouteGate::ImplementTracker => (implement && !has(t, &["no tracker"]))
+                .then(|| earliest_hit(self.matchers, t))
+                .flatten(),
+            RouteGate::ImplementDirect => {
+                implement.then(|| earliest_hit(self.matchers, t)).flatten()
+            }
+            RouteGate::ReadyBeadsWork => {
+                if snap.ready_bead_count == 0 || implement {
+                    return None;
+                }
+                if t.trim().is_empty() {
+                    return Some((usize::MAX, 0));
+                }
+                earliest_hit(self.matchers, t)
+            }
+            RouteGate::ContentionOr => {
+                if snap.contention {
+                    return Some(earliest_hit(self.matchers, t).unwrap_or((usize::MAX, 0)));
+                }
+                earliest_hit(self.matchers, t)
+            }
+            RouteGate::Babysit => (has(t, &["babysit"]) && has(t, &["bead", "tracker", "issue"]))
+                .then(|| earliest_hit(self.matchers, t))
+                .flatten(),
+            RouteGate::BugFixShaped => implement.then(|| earliest_hit(self.matchers, t)).flatten(),
+        }
+    }
+}
+
+/// Loud load check: one needle claimed by two different routes with
+/// compatible gates fails. Same-primitive rows share one route and never
+/// conflict; disjoint gates (implement vs diagnosis-only) share needles
+/// honestly (e.g. "beads" on steer vs loop-work, "leak" on bug-fix vs
+/// forensics).
+pub fn check_routing_table(table: &[RouteEntry]) -> Result<(), String> {
+    for (i, a) in table.iter().enumerate() {
+        for b in &table[i + 1..] {
+            if a.primitive == b.primitive {
+                continue;
+            }
+            for m in a.matchers {
+                if b.matchers.contains(m) && gates_compatible(a.gate, b.gate) {
+                    return Err(format!(
+                        "routing overlap: needle {m:?} claimed by both {:?} and {:?}",
+                        a.primitive, b.primitive
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn gates_compatible(a: RouteGate, b: RouteGate) -> bool {
+    // 0 = diagnosis-only, 1 = implement-only, 2 = either.
+    fn implement_req(g: RouteGate) -> u8 {
+        match g {
+            RouteGate::NoImplement | RouteGate::ReadyBeadsWork => 0,
+            RouteGate::ImplementTracker | RouteGate::ImplementDirect | RouteGate::BugFixShaped => 1,
+            RouteGate::Always | RouteGate::ContentionOr | RouteGate::Babysit => 2,
+        }
+    }
+    let (x, y) = (implement_req(a), implement_req(b));
+    x == 2 || y == 2 || x == y
+}
+
+/// Compile the one routing table. Loud on overlap — callers fail closed.
+pub fn compile_routing_table() -> Result<(), String> {
+    check_routing_table(ROUTING_TABLE)
+}
+
+fn none_decision(target: &str, why: String) -> Decision {
     Decision {
-        primitive,
-        reason: reason.to_string(),
-        argv: argv.iter().map(|s| (*s).to_string()).collect(),
-        topology: topology_for_primitive(primitive),
+        primitive: "none",
+        reason: format!("no catalog route for {target:?} — {why}"),
+        argv: Vec::new(),
+        topology: "none",
+    }
+}
+
+fn build_decision(entry: &RouteEntry, target: &str, snap: &Snapshot) -> Decision {
+    let p = entry.primitive;
+    let argv: Vec<String> = match entry.argv {
+        RouteArgv::WorkflowRun { mode } => [
+            "flywheel",
+            "workflow",
+            "run",
+            p,
+            "--execute",
+            "--mode",
+            mode,
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect(),
+        RouteArgv::WorkflowRunNoMode => ["flywheel", "workflow", "run", p, "--execute"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        RouteArgv::ComposeAgent => ["flywheel", "workflow", "compose", target, "--agent"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        RouteArgv::ComposeParts => {
+            let parts = compose_parts_value(target);
+            ["flywheel", "workflow", "compose", target, "--parts", &parts]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        }
+        RouteArgv::ComposeToken { token } => [
+            "flywheel", "workflow", "compose", target, "--parts", token, "--run",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect(),
+        RouteArgv::Steer => ["flywheel", "steer", target]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        RouteArgv::SteerDirect => ["flywheel", "steer", target, "--direct"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        RouteArgv::LoopWork => ["flywheel", "loop-mode", "run", "<project>", "--work"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        RouteArgv::Join => ["flywheel", "arrive"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        RouteArgv::SpawnSend => [
+            "flywheel",
+            "spawn",
+            "--profile",
+            "<role>",
+            "--count",
+            "1",
+            "send",
+            "--to",
+            "<full-name>",
+            "--wait",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect(),
+        RouteArgv::CoalitionForm => ["flywheel", "coalition", "form"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        RouteArgv::CronStart => ["flywheel", "cron", "start"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+    };
+    let reason = if p == "loop-work" {
+        format!(
+            "{} ready beads — loop-mode run <project> --work",
+            snap.ready_bead_count
+        )
+    } else {
+        entry.reason.to_string()
+    };
+    Decision {
+        primitive: p,
+        reason,
+        argv,
+        topology: entry.topology,
     }
 }
 
 /// Classify `target` + `snap` into one primitive. No harness special case.
-/// Table order (first match wins):
-///   1 audit|read-only|analyze (not implement/fix) → captain-audit
-///   2 repro|regression|bug-fix, or implement/fix with a bug-shaped needle
-///     (bug/crash/panic/leak/broken/failing/error) → bug-fix
-///   3 refactor → refactoring
-///   4 prototype|sketch|mock → prototype
-///   5 arena → arena
-///   6 perf|p95|slow (not implement/fix) → perf
-///   7 hillclimb → hillclimb
-///   8 forensic|leak|idle cpu|spindump (not implement/fix) → forensics
-///   9 babysit + bead-ish → babysit-bead
-///  10 pickup|resume session → pickup
-///  11 pause|going offline → pause
-///  12 interrogate|tear this apart|adversarial review → interrogate
-///  13 figure it out|no playbook → figure-it-out
-///  14 ship beads|land the beads → ship-beads
-///  15 ready beads + empty|work|loop|beads (not implement/fix) → loop-work
-///  16 implement/fix + beads|tracker|gate (not "no tracker") → steer
-///  17 implement/fix + no tracker|direct → steer-direct
-///  18 compose|catalog miss|parts: → compose-parts (`--parts` always has a value)
-///  19 shape unknown|improvise|author workflow → compose-agent
-///  20 contention|coalition|shared-file (target or snap) → coalition-form
-///  21 one pane|watch me|single agent → spawn-send
-///  22 cron|schedule|nightly → cron-start
-///  23 crew-steer|mention peer|peer mention → steer (plane S: the steer
-///     target runs `toron channel post --mention` / `toron job claim`; no new
-///     primitive — first-match keeps row 16/fallback)
-/// Implement-bearing targets never fall to a diagnosis-only workflow
-/// (Spec 8): `fix the memory leak` → bug-fix, not forensics; `perf`/`slow`
-/// and `forensic`/`leak`/`idle cpu`/`spindump` rows carry the !implement
-/// guard.
-/// Unmatched targets fall back to steer (the catalog loudly rejects unknown
-/// shapes — never a silent no-op).
+///
+/// `decide` is the classifier leaf: it resolves the one routing table and
+/// applies the crew budget. Briefing consumes its output directly.
 pub fn decide(target: &str, snap: &Snapshot) -> Decision {
     let mut d = classify(target, snap);
     apply_crew_budget(&mut d, target);
     d
 }
 
+/// Classify `target` + `snap` against the one routing table.
+///
+/// Resolution: earliest match position wins (fronted intent beats an
+/// incidental later mention — "goal: ship the onboarding flow" is goal, not
+/// onboard); same-position contention resolves to the longest needle
+/// (triage-deep beats triage); exact ties across different primitives and
+/// zero matches are explicit `none`. Table order never decides.
+/// Implement-bearing targets never fall to a diagnosis-only workflow
+/// (Spec 8 guards live in the row gates).
 fn classify(target: &str, snap: &Snapshot) -> Decision {
+    if let Err(e) = compile_routing_table() {
+        return none_decision(target, format!("routing table invalid: {e}"));
+    }
     let t = target.to_ascii_lowercase();
     let implement = has(&t, &["implement", "fix"]);
+    let hits: Vec<((usize, usize), &RouteEntry)> = ROUTING_TABLE
+        .iter()
+        .filter_map(|e| e.match_key(&t, implement, snap).map(|key| (key, e)))
+        .collect();
+    pick(hits, target, snap)
+}
 
-    // 1. Read-only analysis wins over everything (never for implement/fix).
-    if has(&t, &["audit", "read-only", "analyze"]) && !implement {
-        return dec(
-            "captain-audit",
-            "read-only analysis — captain-audit headless",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "captain-audit",
-                "--execute",
-                "--mode",
-                "headless",
-            ],
-        );
+/// Resolve collected row hits: earliest position, then longest needle, then
+/// explicit none on exact cross-primitive ties. Pure and order-free.
+fn pick(mut hits: Vec<((usize, usize), &RouteEntry)>, target: &str, snap: &Snapshot) -> Decision {
+    if hits.is_empty() {
+        return none_decision(target, "declare a trigger or compose --agent".to_string());
     }
-    // 2. repro/regression/bug-fix — plus any implement/fix target carrying a
-    //    bug-shaped needle -> bug-fix. The repro step IS the forensics;
-    //    implement-bearing targets never fall to forensics/perf (Spec 8
-    //    pre-acceptance guard: `fix the memory leak` contains no bug/repro
-    //    token, yet must reach bug-fix, not forensics). Placed before
-    //    loop-work so a repro never hides behind ready-bead dispatch.
-    if has(&t, &["repro", "regression", "bug-fix"])
-        || (implement
-            && has(
-                &t,
-                &[
-                    "bug", "crash", "panic", "leak", "broken", "failing", "error",
-                ],
-            ))
-    {
-        return dec(
-            "bug-fix",
-            "repro/regression/bug-shaped fix — bug-fix workflow (repro first)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "bug-fix",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
+    hits.sort_by(|a, b| a.0.0.cmp(&b.0.0).then(b.0.1.cmp(&a.0.1)));
+    let best = hits[0].0;
+    let top: Vec<&RouteEntry> = hits
+        .into_iter()
+        .filter(|(key, _)| *key == best)
+        .map(|(_, e)| e)
+        .collect();
+    let mut prims: Vec<&str> = top.iter().map(|e| e.primitive).collect();
+    prims.sort_unstable();
+    prims.dedup();
+    if prims.len() == 1 {
+        let entry = top.into_iter().find(|e| e.primitive == prims[0]).unwrap();
+        return build_decision(entry, target, snap);
     }
-    // 3. refactor -> refactoring (baseline -> subtract -> reshape -> prove).
-    if has(&t, &["refactor"]) {
-        return dec(
-            "refactoring",
-            "refactor — refactoring workflow (invariant stays green)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "refactoring",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 4. prototype/sketch/mock it up -> prototype (n >= 2 arms).
-    if has(&t, &["prototype", "sketch", "mock"]) {
-        return dec(
-            "prototype",
-            "prototype/sketch — prototype workflow (2-3 arms, oracle picks)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "prototype",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 5. arena -> arena (same brief on different models).
-    if has(&t, &["arena"]) {
-        return dec(
-            "arena",
-            "arena — model race on one brief (declared selection rule)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "arena",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 6. perf/p95/slow, NOT implement/fix -> perf.
-    if !implement && has(&t, &["perf", "p95", "slow"]) {
-        return dec(
-            "perf",
-            "perf/p95/slow — perf workflow (metric + budget)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "perf",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 7. hillclimb -> hillclimb (hypothesize -> smallest change -> measure).
-    if has(&t, &["hillclimb"]) {
-        return dec(
-            "hillclimb",
-            "hillclimb — hillclimb workflow (one commit per accepted win)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "hillclimb",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 8. forensic/leak/idle cpu/spindump, NOT implement/fix -> forensics
-    //    (diagnosis is the artifact; NO fix step — a fix is a separate
-    //    bug-fix after the captain accepts the diagnosis).
-    if !implement && has(&t, &["forensic", "leak", "idle cpu", "spindump"]) {
-        return dec(
-            "forensics",
-            "forensics — diagnosis only, no fix step (bug-fix consumes Act-on)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "forensics",
-                "--execute",
-                "--mode",
-                "headless",
-            ],
-        );
-    }
-    // 9. babysit + bead-ish -> babysit-bead (no new beads).
-    if has(&t, &["babysit"]) && has(&t, &["bead", "tracker", "issue"]) {
-        return dec(
-            "babysit-bead",
-            "babysit a bead — babysit-bead workflow (no new beads)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "babysit-bead",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 10. pickup / resume session -> pickup.
-    if has(&t, &["pickup", "resume session"]) {
-        return dec(
-            "pickup",
-            "pickup / resume session — pickup workflow",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "pickup",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 11. pause / going offline -> pause (checkpoint + handoff; no --mode).
-    if has(&t, &["pause", "going offline"]) {
-        return dec(
-            "pause",
-            "pause / going offline — checkpoint + standing handoff",
-            &["flywheel", "workflow", "run", "pause", "--execute"],
-        );
-    }
-    // 12. interrogate / tear this apart / adversarial review -> interrogate
-    //     (N reviewers, different families, same rubric, read-only).
-    if has(
-        &t,
-        &["interrogate", "tear this apart", "adversarial review"],
-    ) {
-        return dec(
-            "interrogate",
-            "interrogate — N-model adversarial review (read-only)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "interrogate",
-                "--execute",
-                "--mode",
-                "headless",
-            ],
-        );
-    }
-    // 13. figure it out / no playbook -> figure-it-out (planner authors
-    //     YAML, lint is the gate).
-    if has(&t, &["figure it out", "no playbook"]) {
-        return dec(
-            "figure-it-out",
-            "no matching playbook — planner compose, lint is the gate",
-            &["flywheel", "workflow", "compose", target, "--agent"],
-        );
-    }
-    // 14. ship beads / land the beads -> ship-beads (ledger-green then
-    //     housekeeper commit).
-    if has(&t, &["ship beads", "land the beads"]) {
-        return dec(
-            "ship-beads",
-            "ship beads — ledger-green then housekeeper commit",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "ship-beads",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 15. feature -> feature (bd-x6x4: shape the domain then TDD build).
-    if has(&t, &["feature"]) {
-        return dec(
-            "feature",
-            "feature — feature workflow (shape -> build -> prove)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "feature",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 16. goal -> goal (meta: ce-brainstorm -> plan -> beads -> build -> review -> ship).
-    if has(&t, &["goal"]) {
-        return dec(
-            "goal",
-            "goal — meta-workflow (ce-brainstorm -> plan -> beads -> build)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "goal",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 17. triage-deep before triage (longer phrase wins).
-    if has(&t, &["triage-deep", "triage deep", "deep triage"]) {
-        return dec(
-            "triage-deep",
-            "triage-deep — deep backlog triage (bv robot-triage -> spawn crew)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "triage-deep",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 18. triage -> triage (canonical reactive workflow).
-    if has(&t, &["triage"]) {
-        return dec(
-            "triage",
-            "triage — inbound message triage (ack + dispatch)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "triage",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 19. weekly-review -> weekly-review (schedule: scout fanout 3 -> oracle).
-    if has(&t, &["weekly-review", "weekly review"]) {
-        return dec(
-            "weekly-review",
-            "weekly-review — weekly repo review (scout fanout -> oracle idea)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "weekly-review",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 20. autonomous-work -> autonomous-work (real loop then ship-beads).
-    if has(&t, &["autonomous-work", "autonomous work"]) {
-        return dec(
-            "autonomous-work",
-            "autonomous-work — autonomous overnight work (loop run --work then ship)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "autonomous-work",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 21. reflect -> reflect (corrections become structure).
-    if has(&t, &["reflect"]) {
-        return dec(
-            "reflect",
-            "reflect — corrections become structure (hook bead, never a paragraph)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "reflect",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    //     learning after verified work — any topology).
-    if has(
-        &t,
-        &[
-            "compound the learning",
-            "capture the learning",
-            "capture what we learned",
-            "compound this",
-        ],
-    ) {
-        return dec(
-            "ce-compound",
-            "ce-compound — run the compound gate over verified work (docs/learnings/)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "ce-compound",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 23. sweep the learnings -> ce-sweep (ADR-0009 corpus maintenance).
-    if has(
-        &t,
-        &["sweep the learnings", "learning sweep", "compound-refresh"],
-    ) {
-        return dec(
-            "ce-sweep",
-            "ce-sweep — maintain docs/learnings/ (keep/update/consolidate/delete)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "ce-sweep",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 22. awareness-digest -> awareness-digest (read-only digest, headless).
-    if has(&t, &["awareness-digest", "awareness digest"]) {
-        return dec(
-            "awareness-digest",
-            "awareness-digest — captain digest (presence + reservations + guard)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "awareness-digest",
-                "--execute",
-                "--mode",
-                "headless",
-            ],
-        );
-    }
-    // 23. onboard -> onboard (cold-start map + seed).
-    if has(&t, &["onboard"]) {
-        return dec(
-            "onboard",
-            "onboard — cold-start newcomer (map repo -> seed first task)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "onboard",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 23b. join the fleet (second harness). Briefing still overrides when
-    // the world is joinable; this needle covers the free-text proof.
-    if has(&t, &["join the fleet", "join fleet", "joining"]) {
-        return dec(
-            "join",
-            "join the live fleet — arrive, do not spawn a second swarm",
-            &["flywheel", "arrive"],
-        );
-    }
-    // 23c. one-line typo / nit → open (spawn-send), not a swarm.
-    if has(&t, &["typo", "one-line", "one line"]) {
-        return dec(
-            "spawn-send",
-            "one-line / typo — current pane, no crew",
-            &["flywheel", "spawn", "--profile", "<role>", "--count", "1"],
-        );
-    }
-    // 24. wave-swarm -> compose --parts wave-swarm (ADR-0006 D3).
-    // Do not require the recipe name in the objective (GS-013: kill the easter egg).
-    // "swarm with 2 crews" is wave-shaped (ADR-0011); "join" already returned.
-    let wave_shaped = has(&t, &["wave-swarm", "wave swarm", "lanes", "waves", "swarm"])
-        || parse_budget_n(target).is_some()
-        || t.split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
-            .any(|w| w.starts_with("wave-") && w.len() > 5);
-    if wave_shaped {
-        return dec(
-            "wave-swarm",
-            "wave-swarm — composed wave swarm (GATE -> DISPATCH -> OBSERVE -> VERIFY -> SIGNOFF)",
-            &[
-                "flywheel",
-                "workflow",
-                "compose",
-                target,
-                "--parts",
-                "wave-swarm",
-                "--run",
-            ],
-        );
-    }
-    // 24b. repair-until-verified recipe (not the bug-fix wrapper).
-    if has(&t, &["repair-until-verified", "repair until verified"]) {
-        return dec(
-            "repair-until-verified",
-            "repair-until-verified — compose --parts repair-until-verified --run",
-            &[
-                "flywheel",
-                "workflow",
-                "compose",
-                target,
-                "--parts",
-                "repair-until-verified",
-                "--run",
-            ],
-        );
-    }
-    // 24c. debate -> debate (adversarial briefs + oracle decide).
-    if has(
-        &t,
-        &[
-            "argue both sides",
-            "devil's advocate",
-            "debate the",
-            "steelman",
-        ],
-    ) {
-        return dec(
-            "debate",
-            "debate — adversarial briefs, oracle decides",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "debate",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 24d. brainstorm -> ce-brainstorm (requirements-first ideation).
-    if has(
-        &t,
-        &[
-            "brainstorm",
-            "sharpen the requirements",
-            "requirements-only",
-            "ideate",
-        ],
-    ) {
-        return dec(
-            "ce-brainstorm",
-            "ce-brainstorm — requirements-first ideation (oracles diverge, planner reduces)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "ce-brainstorm",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 24e. bead-ready plan -> ce-plan (decompose, approval gate).
-    if has(
-        &t,
-        &[
-            "bead-ready plan",
-            "decompose this goal",
-            "break this down",
-            "make a bead-ready plan",
-        ],
-    ) {
-        return dec(
-            "ce-plan",
-            "ce-plan — goal to bead-ready plan, approval gate",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "ce-plan",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 24f. ship chain -> ship (resolve -> verify gated chain).
-    if has(
-        &t,
-        &[
-            "ship the chain",
-            "run the ship",
-            "ship chain",
-            "resolve to verify",
-        ],
-    ) {
-        return dec(
-            "ship",
-            "ship — resolve to verify gated chain",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "ship",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 24g. plan -> tracker beads -> beads (thin conversion).
-    if has(
-        &t,
-        &[
-            "file these as beads",
-            "track this plan",
-            "convert to beads",
-            "beads from this plan",
-        ],
-    ) {
-        return dec(
-            "beads",
-            "beads — plan to tracker (planner files the beads)",
-            &[
-                "flywheel",
-                "workflow",
-                "run",
-                "beads",
-                "--execute",
-                "--mode",
-                "pane",
-            ],
-        );
-    }
-    // 25. Ready beads + work-ish intent → run the loop, not hand-rolled sends.
-    if snap.ready_bead_count > 0
-        && !implement
-        && (t.trim().is_empty() || has(&t, &["work", "loop", "beads"]))
-    {
-        return dec(
-            "loop-work",
-            &format!(
-                "{} ready beads — loop-mode run <project> --work",
-                snap.ready_bead_count
-            ),
-            &["flywheel", "loop-mode", "run", "<project>", "--work"],
-        );
-    }
-    // 3. Implement/fix with a tracker/gate → steer (plan gate).
-    if implement && has(&t, &["beads", "tracker", "gate"]) && !has(&t, &["no tracker"]) {
-        return dec(
-            "steer",
-            "implement + tracker/gate — steer",
-            &["flywheel", "steer", target],
-        );
-    }
-    // 4. Implement/fix, no tracker / direct → steer --direct.
-    if implement && has(&t, &["no tracker", "direct"]) {
-        return dec(
-            "steer-direct",
-            "implement, no tracker — steer --direct",
-            &["flywheel", "steer", target, "--direct"],
-        );
-    }
-    // 5. Catalog cannot express it → compose --parts.
-    if has(&t, &["compose", "catalog miss", "parts:"]) {
-        let parts = compose_parts_value(target);
-        return dec(
-            "compose-parts",
-            "catalog cannot express the named parts — compose --parts",
-            &["flywheel", "workflow", "compose", target, "--parts", &parts],
-        );
-    }
-    // 6. Shape unknown → planner arm (lint is the gate).
-    if has(&t, &["shape unknown", "improvise", "author workflow"]) {
-        return dec(
-            "compose-agent",
-            "shape unknown — planner arm, lint is the gate",
-            &["flywheel", "workflow", "compose", target, "--agent"],
-        );
-    }
-    // 7. Shared-file contention → coalition (pane-crew-only).
-    if snap.contention || has(&t, &["contention", "coalition", "shared-file"]) {
-        return dec(
-            "coalition-form",
-            "file contention — coalition, not a solo dispatch",
-            &["flywheel", "coalition", "form"],
-        );
-    }
-    // 8. One pane, captain watches → spawn --profile; NEVER --oc; --to full name.
-    if has(&t, &["one pane", "watch me", "single agent"]) {
-        return dec(
-            "spawn-send",
-            "one pane — spawn --profile <role> --count 1, then send --to <full-name> --wait (never --oc)",
-            &[
-                "flywheel",
-                "spawn",
-                "--profile",
-                "<role>",
-                "--count",
-                "1",
-                "send",
-                "--to",
-                "<full-name>",
-                "--wait",
-            ],
-        );
-    }
-    // 9. Scheduled → cron YAML + cron start (cron run is dry-run).
-    if has(&t, &["cron", "schedule", "nightly"]) {
-        return dec(
-            "cron-start",
-            "scheduled work — cron YAML + cron start",
-            &["flywheel", "cron", "start"],
-        );
-    }
-    // Fallback: forward to the catalog; it rejects unknown shapes loudly.
-    dec(
-        "steer",
-        "default — steer from catalog",
-        &["flywheel", "steer", target],
+    none_decision(
+        target,
+        format!(
+            "ambiguous goal — {} both claim it; narrow the wording",
+            prims.join(" and ")
+        ),
     )
 }
 
@@ -919,7 +902,7 @@ impl Archetype {
             Self::VerifyFence => &["repro-baseline", "tdd-red", "minimal-fix", "prove-verify"],
             Self::Debate => &["judge-arms"],
             Self::Hillclimb => &["baseline-measure", "measure-keep-or-discard"],
-            Self::Review => &["code-review"],
+            Self::Review => &["ce-review"],
         }
     }
 
@@ -1142,24 +1125,24 @@ mod tests {
         );
     }
 
+    // Wave-label sniffing deleted: a wave- label is not a declared trigger.
     #[test]
-    fn wave_label_routes_to_wave_swarm_without_recipe_token() {
+    fn wave_label_without_trigger_is_none() {
         let d = decide("implement the parser for wave-1", &with_beads(3));
-        assert_eq!(d.primitive, "wave-swarm");
-        assert_eq!(d.topology, "swarm");
-        assert!(d.argv.contains(&"compose".to_string()));
-        assert!(d.argv.contains(&"wave-swarm".to_string()));
+        assert_eq!(d.primitive, "none");
+        assert_eq!(d.topology, "none");
     }
 
+    // Wave sniffing deleted: bare lanes/swarm never route to wave-swarm.
     #[test]
-    fn lanes_keyword_routes_to_wave_swarm() {
+    fn lanes_keyword_is_not_wave_swarm() {
         let d = decide("run the lanes", &snap());
-        assert_eq!(d.primitive, "wave-swarm");
+        assert_eq!(d.primitive, "none", "lanes alone is not a declared trigger");
     }
 
     #[test]
-    fn swarm_with_2_crews_is_wave_swarm_with_crew_2() {
-        let d = decide("swarm with 2 crews", &snap());
+    fn wave_swarm_with_2_crews_is_wave_swarm_with_crew_2() {
+        let d = decide("wave-swarm with 2 crews", &snap());
         assert_eq!(d.primitive, "wave-swarm");
         assert_eq!(d.topology, "swarm");
         assert!(
@@ -1348,7 +1331,8 @@ mod tests {
     }
 
     // Row 10 — crew-steer|mention peer|peer mention → steer (plane S verbs
-    // run inside the steer target; no new primitive — first-match preserved).
+    // run inside the steer target; no new primitive — an explicit row, never
+    // the silent fallback).
     #[test]
     fn row10_crew_steer_is_steer_not_new_primitive() {
         for t in [
@@ -1368,12 +1352,13 @@ mod tests {
         }
     }
 
-    // Fallback — unmatched targets forward to steer (catalog rejects loudly).
+    // Fallback — unmatched targets are explicit none, never silent steer.
     #[test]
-    fn unmatched_target_falls_back_to_steer() {
+    fn unmatched_target_is_explicit_none() {
         let d = decide("zzz something odd", &snap());
-        assert_eq!(d.primitive, "steer");
-        assert!(d.argv.contains(&"zzz something odd".to_string()));
+        assert_eq!(d.primitive, "none");
+        assert_eq!(d.topology, "none");
+        assert!(d.argv.is_empty(), "none carries no dispatch: {:?}", d.argv);
     }
 
     // ===== ADR-0019 Spec 8 rows (bd-w2-decide-drgi) =====
@@ -1456,14 +1441,15 @@ mod tests {
         }
     }
 
-    // Row 6 guard — implement + slow is NOT perf (falls through to steer).
+    // Row 6 guard — implement + slow matches no diagnosis row and no
+    // explicit route: explicit none, never silent steer.
     #[test]
     fn row6_implement_slow_is_not_perf() {
         let d = decide("fix the slow dispatch", &snap());
         assert_ne!(d.primitive, "perf");
         assert_eq!(
-            d.primitive, "steer",
-            "implement falls through to steer: {:?}",
+            d.primitive, "none",
+            "implement without a declared trigger is explicit none: {:?}",
             d
         );
     }
@@ -1863,7 +1849,7 @@ mod tests {
         assert!(!r.covered);
         assert_eq!(r.matched, None);
         let parts = r.candidate_parts.expect("miss renders candidate parts");
-        assert_eq!(parts.join(","), "code-review", "review archetype parts");
+        assert_eq!(parts.join(","), "ce-review", "review archetype parts");
         let rendered = render_compose_candidate_for_approval(
             "SandySparrow",
             "adversarial review of the parser module",
@@ -1909,5 +1895,200 @@ mod tests {
         assert!(!compose_request_allowed("  ", &allow));
         // Case-exact pins: near-miss casing denies (pins are CamelCase).
         assert!(!compose_request_allowed("sandysparrow", &allow));
+    }
+}
+
+// ---- ADR-0032 Spec 9 (bd-himk): catalog-driven router contract ----
+//
+// RED batch A: assertions against the existing API. These encode the new
+// truth (explicit none, no wave sniffing, declared topology, ce-review)
+// and MUST fail until the routing table lands.
+#[cfg(test)]
+mod decide_router_tests {
+    use super::*;
+
+    fn snap() -> Snapshot {
+        Snapshot::default()
+    }
+
+    // No match returns explicit none, never silent steer.
+    #[test]
+    fn decide_router_no_match_is_explicit_none() {
+        let d = decide("zzz something odd", &snap());
+        assert_eq!(d.primitive, "none", "no-match must be explicit none");
+        assert_eq!(d.topology, "none");
+        assert!(d.argv.is_empty(), "none carries no dispatch: {:?}", d.argv);
+        assert!(!d.reason.is_empty(), "none names the reason");
+    }
+
+    // wave_shaped substring sniffing is deleted: bare swarm/lanes/waves and
+    // a lone budget never route to wave-swarm. Only the declared trigger does.
+    #[test]
+    fn decide_router_bare_swarm_lanes_budget_do_not_route_wave() {
+        for t in [
+            "swarm the backlog",
+            "run the lanes",
+            "coder:2 tune the loop",
+            "waves of review",
+        ] {
+            let d = decide(t, &snap());
+            assert_ne!(d.primitive, "wave-swarm", "target: {t}");
+        }
+        let d = decide("wave-swarm with 2 crews", &snap());
+        assert_eq!(d.primitive, "wave-swarm", "declared trigger still routes");
+        assert!(
+            d.argv.windows(2).any(|w| w == ["--crew", "2"]),
+            "budget still honored on the declared trigger: {:?}",
+            d.argv
+        );
+    }
+
+    // Topology is declared per workflow: babysit-bead is open, and unknown
+    // primitives are none — the `_ => swarm` bucket is gone.
+    #[test]
+    fn decide_router_topology_declared_no_silent_swarm() {
+        assert_eq!(topology_for_primitive("babysit-bead"), "open");
+        assert_eq!(
+            topology_for_primitive("bogus-primitive-xyz"),
+            "none",
+            "unknown primitives never silently become swarm"
+        );
+    }
+
+    // Fronted intent wins over an incidental later mention: pause@0 beats
+    // arena@6, goal@0 beats onboard@14. Table order never decides.
+    #[test]
+    fn decide_router_earliest_match_wins() {
+        let d = decide("pause the arena", &snap());
+        assert_eq!(d.primitive, "pause", "fronted verb is the intent: {d:?}");
+        let d = decide("goal: ship the onboarding flow", &snap());
+        assert_eq!(d.primitive, "goal", "fronted topic is the intent: {d:?}");
+    }
+
+    // Exact same-position contention across primitives is explicit none.
+    #[test]
+    fn decide_router_same_position_tie_is_explicit_none() {
+        static TIE_A: RouteEntry = RouteEntry {
+            primitive: "aaa",
+            matchers: &["x"],
+            topology: "swarm",
+            gate: RouteGate::Always,
+            argv: RouteArgv::CronStart,
+            reason: "a",
+        };
+        static TIE_B: RouteEntry = RouteEntry {
+            primitive: "bbb",
+            matchers: &["x"],
+            topology: "open",
+            gate: RouteGate::Always,
+            argv: RouteArgv::CronStart,
+            reason: "b",
+        };
+        let d = pick(vec![((0, 5), &TIE_A), ((0, 5), &TIE_B)], "t", &snap());
+        assert_eq!(d.primitive, "none", "tie must not silently pick: {d:?}");
+        assert!(
+            d.reason.contains("aaa") && d.reason.contains("bbb"),
+            "tie names the contenders: {}",
+            d.reason
+        );
+    }
+
+    // Stale stage reference: the review archetype composes ce-review.
+    #[test]
+    fn decide_router_review_archetype_is_ce_review() {
+        assert_eq!(
+            Archetype::Review.default_parts(),
+            &["ce-review"],
+            "no such stage as code-review — only ce-review exists"
+        );
+    }
+
+    // The live table loads loud-clean.
+    #[test]
+    fn decide_router_table_compiles_clean() {
+        compile_routing_table().expect("live routing table must load clean");
+        assert!(!ROUTING_TABLE.is_empty(), "one routing truth exists");
+    }
+
+    // Overlapping matcher claims fail load, naming the needle + claimants.
+    #[test]
+    fn decide_router_overlap_fails_load() {
+        let dup = [
+            RouteEntry {
+                primitive: "aaa",
+                matchers: &["same-needle"],
+                topology: "swarm",
+                gate: RouteGate::Always,
+                argv: RouteArgv::CronStart,
+                reason: "a",
+            },
+            RouteEntry {
+                primitive: "bbb",
+                matchers: &["same-needle"],
+                topology: "open",
+                gate: RouteGate::Always,
+                argv: RouteArgv::CronStart,
+                reason: "b",
+            },
+        ];
+        let err = check_routing_table(&dup).expect_err("duplicate needle must fail load");
+        assert!(err.contains("same-needle"), "names the needle: {err}");
+        assert!(
+            err.contains("aaa") && err.contains("bbb"),
+            "names claimants: {err}"
+        );
+    }
+
+    // One truth: every routed workflow's decide_trigger phrase is its row's
+    // first matcher, so `workflow list --json` and `decide` cannot diverge.
+    #[test]
+    fn decide_router_trigger_phrase_is_first_matcher() {
+        let pairs = [
+            ("captain-audit", "audit"),
+            ("bug-fix", "repro"),
+            ("refactoring", "refactor"),
+            ("prototype", "prototype"),
+            ("arena", "arena"),
+            ("perf", "perf"),
+            ("hillclimb", "hillclimb"),
+            ("forensics", "forensic"),
+            ("babysit-bead", "babysit"),
+            ("pickup", "pickup"),
+            ("pause", "pause"),
+            ("interrogate", "interrogate"),
+            ("figure-it-out", "figure it out"),
+            ("ship-beads", "ship beads"),
+            ("feature", "feature"),
+            ("goal", "goal"),
+            ("triage-deep", "triage-deep"),
+            ("triage", "triage"),
+            ("weekly-review", "weekly-review"),
+            ("autonomous-work", "autonomous-work"),
+            ("reflect", "reflect"),
+            ("awareness-digest", "awareness-digest"),
+            ("debate", "argue both sides"),
+            ("ce-brainstorm", "brainstorm"),
+            ("ce-plan", "break this down"),
+            ("ship", "ship the chain"),
+            ("beads", "convert to beads"),
+            ("onboard", "onboard"),
+            ("wave-swarm", "wave-swarm"),
+            ("repair-until-verified", "repair-until-verified"),
+            ("ce-compound", "compound the learning"),
+            ("ce-sweep", "sweep the learnings"),
+        ];
+        for (workflow, trigger) in pairs {
+            assert_eq!(
+                decide_trigger_for(workflow),
+                Some(trigger),
+                "trigger surface for {workflow}"
+            );
+            assert!(
+                ROUTING_TABLE
+                    .iter()
+                    .any(|e| e.primitive == workflow && e.matchers.first() == Some(&trigger)),
+                "{workflow} row leads with its trigger {trigger:?}"
+            );
+        }
     }
 }
