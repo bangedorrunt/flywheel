@@ -70,6 +70,9 @@ jobs:
           echo "$GITHUB_WORKSPACE/toron/target/debug" >> "$GITHUB_PATH"
       - name: Verify br and toron on PATH
         run: which br toron
+      - name: GS-043 peer-aware SoT gate
+        working-directory: flywheel
+        run: bash scripts/check-peer-aware-sot.sh
       - name: cargo check
         working-directory: flywheel
         run: cargo check --workspace
