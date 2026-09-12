@@ -214,15 +214,28 @@ concurrently. Lint rejects cyclic graphs.
 **Triggers:** `schedule`, `webhook`, `message_posted`, `reaction_added`,
 `reservation_acquired`, `reservation_released`, `agent_state_changed`.
 
-**Actions:** `send_message`, `send_dm`, `react`, `dispatch_job`, `spawn`, `call_webhook`,
-`request_approval`, `delay`, `call_workflow`, `parallel`, `branch`, `retry`, `foreach`.
+**Actions:** `send_message`, `send_dm`, `dispatch_job`, `spawn`, `reduce` (bounded fold over a
+proper list: `all`/`any`/`count`/`sum`/`join`, one scalar), `request_approval`, `delay`,
+`call_workflow`, `parallel`, `branch`, `retry`, `foreach`. Two are **deprecated and
+fail-closed** (bd-i6kc): `react` and `call_webhook` still parse for migration, but the boundary
+rejects them with `unsupported_action` and nothing is posted or dispatched — do not author them
+into new workflows.
 
 **Step policies:** `on_error: continue` (default; backward compat) | `fail_run` (the step's
 error FAILS the run → kind-46012 `status=failed`, the signal smart-cron consumes). `await: true`
 (block for the agent's result); `await: false` (fire-and-forget; headless logs later).
 
 **Templating:** `{{inputs.x}}`, `{{trigger.x}}`, `{{steps.<name>}}` (a step's returned Value).
-Guards are `evalexpr` expressions (100ms timeout).
+Guards are `evalexpr` expressions (100ms timeout), evaluated by ONE `evaluate_step_guard` path
+shared by graph nodes, linear-desugared steps, branch guards, and nested steps. A false guard is
+an explicit skipped outcome carrying node identity; a syntax/type/unresolved-ref error is a
+contract failure, never a silent false and never an `else` branch.
+
+**Validation:** parse/normalize, lint, and invoke all validate against the same closed action
+contracts. Unknown fields, bad refs, invalid collections, and phase typos fail loud at the
+earliest gate; because a valid template can still render an invalid runtime value, invoke
+re-validates the fully rendered action. Lint is fail-stop: a workflow with blocking lint issues
+refuses to run.
 
 ### 3e. Built-in library + slash commands
 
