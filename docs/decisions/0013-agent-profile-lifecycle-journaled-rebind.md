@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0005 Spec 1/1b, ADR-0007, ADR-0011, ADR-0018, ADR-0026, toron ADR-0032 Spec 7 (I4–I5/I6), GS-042, GS-043 -->
 ---
-status: proposed
+status: accepted
 date: 2026-09-12
 decision-makers: Captain (bangedorrunt)
 consulted: |
@@ -16,7 +16,7 @@ informed: flywheel × toron × beads maintainers; harness agents
 
 | Field | Value |
 |-------|-------|
-| **Status** | **Proposed**. Acceptance = captain word on this file. **HOLD merge** of this ADR PR only — GS-043 PR#8 code already on `origin/main` (`772abd8…`). |
+| **Status** | **Accepted** — captain word on this file, 2026-09-12. Wave A (GS-043 shape) landed on `origin/main` (`772abd8…`); Wave B (D9, spawn/register/presence as effects) implemented in the acceptance change set on the flywheel effect journal; Wave C remains open and is sequenced under its own beads. |
 | **Decision-makers** | Captain (bangedorrunt) |
 | **Extends** | [ADR-0005](0005-always-on-collab-baseline-and-command-surface.md) Spec 1/1b (profile catalog), [ADR-0007](0007-catalog-slots-and-agent-native-cli.md) (slots + `profile set`), [ADR-0011](0011-session-conductor-crew-budget-captain-fcfs-join-loud.md) (crew pack), [toron ADR-0018](../../toron/docs/decisions/0018-agent-identity-naming-grammar.md) (pin≠slug / identity grammar), [toron ADR-0026](../../toron/docs/decisions/0026-failure-taxonomy-funded-preflight-fallback-chains-mail-health-escalation.md) (fallback/reroute), [toron ADR-0032](../../toron/docs/decisions/0032-workflow-engine-honesty-jido-contracts.md) Spec 7 / I4–I6 (intent before dispatch; unknown visible; journal ≠ mailbox) |
 | **Does not amend** | Tick Law; frozen MCP tool count; toron kind registry; one-way `flywheel → toron-workflow → toron-core`; beads legal-close ownership; open-mode AUTHORITATIVE text (GS-039); doorbell plane ownership (ADR-0012) |
@@ -280,7 +280,7 @@ Honest rescore vs **post-merge tip** `772abd8…` (2026-09-12 ~19:55 AEST). Audi
 |----|------|------------------------|-------------------------|
 | **P0-1** | Single peer-aware SoT + CI | **FOLDED** — SoT ~10810 B, chrome ~1459 B, CI SoT script | was **STILL** DIFFER ~9894 vs ~2890 |
 | **P0-2** | Immutable `AgentRef` vs role | **FOLDED** — `src/agent_ref.rs` (A1) | was **STILL** |
-| **P0-3** | Profile spawn as ADR-0032 effect | **PARTIAL** — rebind journal; spawn/register/presence **STILL**; toron `workflow_effects` infra under Proposed 0032 | same |
+| **P0-3** | Profile spawn as ADR-0032 effect | **FOLDED (flywheel journal)** — spawn / register / presence + the wake observation each journal intent→in_flight→settled\|failed\|unknown; toron `workflow_effects` wiring still trailed under Proposed 0032 | same |
 | **P0-4** | Open-mode AUTHORITATIVE invariant | **FOLDED** | was already **FOLDED** |
 | **P0-5** | One catalog compiler (0032 Spec 9) | **CHANGED** / remainder **STILL** | unchanged by PR#8 |
 | **P1-6** | Compose-as-data | **CHANGED** | unchanged |
@@ -312,10 +312,12 @@ Honest rescore vs **post-merge tip** `772abd8…` (2026-09-12 ~19:55 AEST). Audi
 3. CLI: `profile set --fallback` + `binding-rebind` (D5–D6) — landed.
 4. Prove suite on tip — keep green; do not regress.
 
-### Wave B — Spawn as effect (D9 / GS-042 P0-3)
+### Wave B — Spawn as effect (D9 / GS-042 P0-3) — **landed on the flywheel journal**
 
-- Wrap spawn/register/presence with intent-before-dispatch using toron `workflow_effects` (under ADR-0032 acceptance/waves).
-- Link wake observation as separate evidence; robot mode hard-fail when observation missing where contract requires it (P1-10 completion).
+- `AgentEffect` / `AgentEffectGuard` in `src/agent_ref.rs` journal `Prepared → InFlight → Settled | Failed | Unknown` on the flywheel event log (I4/I5/I6 — the same journal primitive D3 chooses, so no second retry coordinator and no mailbox-as-journal).
+- `cmd_spawn` opens the spawn effect before `workspace_create` and settles it only on the verified workspace + live panes; `--no-verify` journals `Unknown` instead of inventing `Settled`. Register (`pinned_mail_identity`) and presence publish are their own per-pin effects; an unobservable upsert/publish journals `Unknown`, never a silent absence.
+- The wake-subscription read is a **separate `Wake` observation row** carrying the subscriber count — it never settles spawn / register / presence.
+- **Still trailed:** wiring these effects to toron `workflow_effects` storage (that store is infra ahead of ADR-0032's Proposed status), and the robot-mode hard-fail for a missing wake observation (P1-10) — no live contract requires it yet, so the existing loud `subscribers=0` warning stands rather than being invented into a gate.
 
 ### Wave C — Catalog / digest / portable (P0-5 remainder, P1-7/8, P2)
 
@@ -328,9 +330,9 @@ Honest rescore vs **post-merge tip** `772abd8…` (2026-09-12 ~19:55 AEST). Audi
 
 | Path | Owner | Role |
 |------|-------|------|
-| `src/agent_ref.rs` | flywheel | `AgentRef` / `AgentBinding` / `RebindIntent` / redact / commit helpers |
+| `src/agent_ref.rs` | flywheel | `AgentRef` / `AgentBinding` / `RebindIntent` / `AgentEffect` + `AgentEffectGuard` (D9) / redact / commit helpers |
 | `src/profile.rs` | flywheel | catalog SoT; `fallback` vs `model_fallback` docs |
-| `src/main.rs` | flywheel | `profile set`, `binding-rebind`, spawn wiring |
+| `src/main.rs` | flywheel | `profile set`, `binding-rebind`, spawn / register / presence effect wiring |
 | `src/pane.rs` | flywheel | pane 429 / billing hops through `commit_rebind(_opt)` |
 | `integrations/peer-aware.md.tpl` | flywheel | **only** full peer-aware body |
 | `integrations/prompts/peer-aware.md.tpl` | flywheel | thin chrome |
@@ -345,7 +347,7 @@ Honest rescore vs **post-merge tip** `772abd8…` (2026-09-12 ~19:55 AEST). Audi
 
 | Risk | Mitigation |
 |------|------------|
-| Treat code merge as ADR Accepted | Status stays Proposed until captain word on this file |
+| Treat code merge as ADR Accepted | Status flipped on captain word only (2026-09-12); code merges alone never flipped it |
 | Treat toron `workflow_effects` as “ADR-0032 Accepted” | Status stays Proposed until captain word; infra ≠ acceptance |
 | Chrome regrows into a second SoT | CI byte budget + marker grep |
 | Operators use `profile set` for live hops | Help text + learning doc: live = `binding-rebind` |
@@ -356,19 +358,20 @@ Honest rescore vs **post-merge tip** `772abd8…` (2026-09-12 ~19:55 AEST). Audi
 
 ## 10. Acceptance checklist (captain)
 
-Captain accepts this ADR when **all** of the following are true (word on this file):
+Accepted by captain word on this file (2026-09-12). The checklist records the evidence for each item; the code gates below are re-runnable in one pass with `bash docs/decisions/_scripts/verify-0013.sh`.
 
-- [ ] **Status flip:** front matter + body Status → Accepted (captain-only).
-- [ ] **D1:** tip has one peer-aware SoT + green `check-peer-aware-sot.sh` in CI (code on `772abd8…`; captain confirms).
-- [ ] **D2/A1:** `AgentRef` on tip; `with_npub` freezes once `Some`; pin unbound after settle fails closed where claimed.
-- [ ] **D3/I4–I6:** live rebinds journal Prepared→InFlight→terminal; timeout/empty/mail-ack alone never hop; journal is flywheel event log, not mailbox receipts.
-- [ ] **D4:** `fallback[]` vs `model_fallback[]` taxonomy enforced in code + CLI flags.
-- [ ] **D5:** `profile set --fallback/--model-fallback` and `binding-rebind` documented and distinct from legacy `rebind`.
-- [ ] **D6:** `binding-rebind --model` fail-loud until a live consumer exists; no invent Settled.
-- [ ] **D7/C1:** redact covers journal + reroute audit.
-- [ ] **Rejects:** no AgentServer, no mailbox-as-journal, no dual tpl, no invent Settled — still explicit in this file.
-- [ ] **Beads:** re-cut against this ADR + ADR-0032; no bead claims mailbox receipts give profile exactly-once.
-- [ ] **HOLD discipline:** this ADR PR stays unmerged until captain word; spawn-as-effect (D9) tracked; do not invent-green ADR-0032 Accepted.
+- [x] **Status flip:** front matter + body Status → Accepted (captain, 2026-09-12).
+- [x] **D1:** one peer-aware SoT + green `check-peer-aware-sot.sh` in CI (10808 B body / 1459 B chrome on `772abd8…`; gate re-run green).
+- [x] **D2/A1:** `AgentRef` on tip; `with_npub` freezes once `Some`; pin unbound after settle fails closed where claimed (`agent_ref::tests::npub_freezes_once_some`, `::unbound_pin_fails_closed`).
+- [x] **D3/I4–I6:** live rebinds journal Prepared→InFlight→terminal; timeout/empty/mail-ack alone never hop; journal is the flywheel event log, not mailbox receipts (`agent_ref::tests::timeout_alone_never_allows_rebind`).
+- [x] **D4:** `fallback[]` vs `model_fallback[]` taxonomy enforced in code + CLI flags (`profile::tests::fallback_empty_by_default`).
+- [x] **D5:** `profile set --fallback/--model-fallback` and `binding-rebind` documented and distinct from legacy `rebind`.
+- [x] **D6:** `binding-rebind --model` fail-loud until a live consumer exists; no invent Settled (`gs043_residual_honesty_tests`).
+- [x] **D7/C1:** redact covers journal + reroute audit (`effect_journal_redacts_evidence`, `record_reroute_audit_redacts_evidence`).
+- [x] **D9 (Wave B):** spawn / register / presence journal intent→in_flight→terminal on the flywheel event log; the wake observation is a separate row; `--no-verify` journals Unknown (`adr0013_spawn_effect_tests`).
+- [x] **Rejects:** no AgentServer, no mailbox-as-journal, no dual tpl, no invent Settled — still explicit in this file.
+- [ ] **Beads:** re-cut against this ADR + ADR-0032; no bead claims mailbox receipts give profile exactly-once. *(No open bead makes that claim; the Wave C re-cut is still owed.)*
+- [x] **HOLD discipline:** the HOLD was on *this* ADR PR only — captain word given 2026-09-12; spawn-as-effect (D9) landed on the flywheel journal; toron `workflow_effects` wiring and the P1-10 robot-mode hard-fail stay sequenced under ADR-0032.
 
 **Non-goals for acceptance of this ADR alone:** full Fleet CoS surface (P2-13), portable codec (P2-11), or ADR-0032 Wave 3 completion — those remain sequenced under their own records.
 
@@ -384,6 +387,8 @@ Captain accepts this ADR when **all** of the following are true (word on this fi
 | Dual tpl pre-merge | ~9894 B vs ~2890 B on `193d57e…` |
 | Post-merge SoT | ~10810 B SoT + ~1459 B chrome on `772abd8…` |
 | PR#8 | `9677e9b…` merged as `772abd8…` (2026-09-12 19:55 AEST) |
+| Wave B effect journal | `src/agent_ref.rs` (`AgentEffect`, `AgentEffectGuard`) + `adr0013_spawn_effect_tests` in `src/main.rs` |
+| ADR compliance gate | `docs/decisions/_scripts/verify-0013.sh` |
 | This ship | GS-044 report `GS-044.md` / `GS-044-profile-adr.md` |
 
 ---
@@ -393,3 +398,4 @@ Captain accepts this ADR when **all** of the following are true (word on this fi
 | Rev | Date (AEST) | What |
 |-----|-------------|------|
 | 1 | 2026-09-12 | Proposed — GS-044 self-contained profile lifecycle / journaled fallback ADR; HOLD merge of ADR PR; rescore updated after PR#8 landed on tip `772abd8…` during authorship |
+| 2 | 2026-09-12 | **Accepted** (captain word) — Wave B (D9) implemented: spawn / register / presence effects + a separate wake observation on the flywheel event journal; `binding-rebind` pin aligned to the D5 flag form; acceptance checklist evidence recorded; `verify-0013.sh` added. Wave C (catalog/digest/portable) still open. |
