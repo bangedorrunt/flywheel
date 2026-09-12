@@ -14103,7 +14103,7 @@ fn cmd_binding_rebind(
         .map_err(|e| anyhow!(e))?;
     let from = agent_ref::AgentBinding {
         profile_name: entry.profile.clone().unwrap_or_default(),
-        model: String::new(),
+        model: entry.model.clone().unwrap_or_default(),
         harness: entry.harness.clone().unwrap_or_default(),
     };
     let to = agent_ref::AgentBinding {
@@ -14124,6 +14124,8 @@ fn cmd_binding_rebind(
             bail!("binding-rebind: unknown profile {p:?} (flywheel profile list)");
         }
     }
+    // Honesty: --model must apply onto SpawnEntry or we refuse before Settled
+    // (never invent-green a model rebind with no effect).
     let intent = agent_ref::RebindIntent::prepare(
         agent,
         from,
@@ -14140,6 +14142,16 @@ fn cmd_binding_rebind(
         }
         if let Some(h) = harness {
             e.harness = Some(h.to_string());
+        }
+        if let Some(m) = model {
+            e.model = Some(m.to_string());
+        }
+        // Fail-loud if intent claimed a model change but registry column is empty.
+        if !to.model.is_empty() && model.is_some() && e.model.as_deref() != Some(to.model.as_str()) {
+            anyhow::bail!(
+                "binding-rebind: invent-green refused — --model={:?} did not land on SpawnEntry",
+                to.model
+            );
         }
         state::save_spawn_registry(project, &entries)?;
         Ok(())
@@ -31086,18 +31098,41 @@ fn cmd_internal_run_headless(
         }
         if !hopped {
             // Last rung: registry ModelEntry.fallback (bd-42fs).
+            // GS-043 I4: journal RebindIntent before run_once (parity with
+            // model_fallback path) — never invent-hop a model/harness change.
             let fallback_entry = registry.get(&model_id).and_then(|e| e.fallback.clone());
             if let Some(fallback_id) = fallback_entry {
-                eprintln!(
-                    "flywheel: @{profile_name} rate-limited on {model_id} (429) — retrying with registry fallback {fallback_id}"
-                );
                 let fb_harness = if registry.family_of(&fallback_id) == "grok" {
                     "grok"
                 } else {
                     harness
                 };
                 let fb_model = registry.resolve(&fallback_id, fb_harness);
-                match run_once(fb_harness, &fallback_id, &fb_model, &profile.effort) {
+                let agent = agent_ref::AgentRef::new("flywheel", profile_name);
+                let intent = agent_ref::RebindIntent::prepare(
+                    agent,
+                    agent_ref::AgentBinding {
+                        profile_name: profile_name.to_string(),
+                        model: model_id.clone(),
+                        harness: harness.to_string(),
+                    },
+                    agent_ref::AgentBinding {
+                        profile_name: profile_name.to_string(),
+                        model: fallback_id.clone(),
+                        harness: fb_harness.to_string(),
+                    },
+                    agent_ref::RebindReason::ModelFallback {
+                        kind: "rate_limit".into(),
+                        evidence: err_ev.clone(),
+                    },
+                    0,
+                );
+                eprintln!(
+                    "flywheel: @{profile_name} rate-limited on {model_id} (429) — registry ModelEntry.fallback hop to {fallback_id}"
+                );
+                match agent_ref::commit_rebind("flywheel", intent, |_| {
+                    run_once(fb_harness, &fallback_id, &fb_model, &profile.effort)
+                }) {
                     Ok(fb) => {
                         attempt = fb;
                         retried_fallback = true;
@@ -34624,6 +34659,14 @@ mod integration_tests {
         assert!(
             chrome.contains("integrations/peer-aware.md.tpl"),
             "chrome must point at the SoT path"
+        );
+        assert!(
+            sot.contains("CONTROL-PLANE MARKER") && sot.contains("FLYWHEEL_OP"),
+            "SoT must carry CONTROL-PLANE MARKER / FLYWHEEL_OP (ADR-0010 D7)"
+        );
+        assert!(
+            sot.contains("RED-SURFACE PING"),
+            "SoT must carry RED-SURFACE PING"
         );
     }
 

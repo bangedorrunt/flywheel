@@ -37,4 +37,14 @@ if ! grep -q 'integrations/peer-aware.md.tpl' "$ROOT/src/main.rs"; then
   exit 1
 fi
 
+
+# ADR-0010 D7 + bd-kfy2 contracts must live in the CANONICAL spawn SoT
+# (thinning chrome must not drop them).
+for marker in 'CONTROL-PLANE MARKER' 'FLYWHEEL_OP' 'RED-SURFACE PING'; do
+  if ! grep -q "$marker" "$SOT"; then
+    echo "FAIL: SoT missing required contract marker: $marker"
+    exit 1
+  fi
+done
+
 echo "OK: peer-aware single SoT gate"

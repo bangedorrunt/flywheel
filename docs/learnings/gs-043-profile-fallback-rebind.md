@@ -37,3 +37,13 @@
 5. Rate-limit: profile with `model_fallback = ["…"]` → headless journals `ModelFallback` before second harness invoke
 6. Captain: `flywheel binding-rebind <project> --pin <pin> --profile scout --note "…"` → spawn registry profile column updates; profiles.toml unchanged
 
+## Auto-fix fold (clear_for_pr:false)
+
+| Item | Fix |
+| :--- | :--- |
+| Peer-aware SoT | Migrated `CONTROL-PLANE MARKER` (U+2063 + `FLYWHEEL_OP`) + `RED-SURFACE PING` into `integrations/peer-aware.md.tpl`; CI asserts markers in SoT |
+| Invent-green `--model` | `SpawnEntry.model` column; `binding-rebind --model` applies before Settled |
+| I4 ModelEntry.fallback | Headless + pane registry last rung journals via `commit_rebind` |
+| A1 npub freeze | `AgentRef::with_npub` no-ops when already `Some` |
+| B2 pane 429 ProfileFallback | `commit_rebind_opt` → Prepared→InFlight→Settled\|Unknown (not Prepared-only) |
+| C1 evidence redact | `redact_evidence` strips keys/tokens + truncates before `journal_rebind` persist |

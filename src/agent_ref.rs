@@ -29,6 +29,121 @@ use sha2::{Digest, Sha256};
 use crate::failure::FailureKind;
 use crate::state::{self, EventKind};
 
+/// Max non-secret evidence snippet persisted to the rebind journal (C1).
+const EVIDENCE_JOURNAL_MAX: usize = 256;
+
+/// C1: redact harness stderr before journal persist — strip keys/tokens,
+/// then truncate the remaining non-secret snippet.
+pub fn redact_evidence(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(EVIDENCE_JOURNAL_MAX * 2));
+    let mut i = 0;
+    while i < raw.len() {
+        // Token boundary: start, or previous char not alphanumeric (so
+        // "pre-sk-…" still redacts; "ask-…" does not match mid-word "sk-").
+        let at_boundary = i == 0
+            || !raw[..i]
+                .chars()
+                .next_back()
+                .map(|c| c.is_ascii_alphanumeric())
+                .unwrap_or(false);
+        if at_boundary {
+            if let Some((skip, repl)) = match_secret_at(raw, i) {
+                out.push_str(repl);
+                i += skip;
+                continue;
+            }
+        }
+        let ch = raw[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    if out.len() <= EVIDENCE_JOURNAL_MAX {
+        out
+    } else {
+        let mut end = EVIDENCE_JOURNAL_MAX;
+        while end > 0 && !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!(
+            "{}... [redacted-truncated {} -> {}]",
+            &out[..end],
+            out.len(),
+            EVIDENCE_JOURNAL_MAX
+        )
+    }
+}
+
+fn match_secret_at(s: &str, i: usize) -> Option<(usize, &'static str)> {
+    let rest = &s[i..];
+    let lower = rest.to_ascii_lowercase();
+    if lower.starts_with("authorization:") {
+        // Consume scheme + credential only (not the rest of the stderr line).
+        let mut n = "authorization:".len();
+        while n < rest.len() && rest.as_bytes()[n].is_ascii_whitespace() {
+            n += 1;
+        }
+        let scheme = consume_token(&rest[n..]);
+        n += scheme;
+        while n < rest.len() && rest.as_bytes()[n].is_ascii_whitespace() {
+            n += 1;
+        }
+        n += consume_token(&rest[n..]);
+        return Some((n, "Authorization: [REDACTED]"));
+    }
+    // Bare "Bearer <token>" (not already under Authorization:)
+    if lower.starts_with("bearer ") {
+        let after = consume_token(&rest["bearer ".len()..]);
+        return Some(("bearer ".len() + after, "Bearer [REDACTED]"));
+    }
+    for (prefix, repl) in [
+        ("sk-", "sk-[REDACTED]"),
+        ("xai-", "xai-[REDACTED]"),
+        ("nsec1", "nsec1[REDACTED]"),
+        ("ncryptsec", "ncryptsec[REDACTED]"),
+        ("eyj", "eyJ[REDACTED]"),
+    ] {
+        if lower.starts_with(prefix) {
+            let tok = consume_token(&rest[prefix.len()..]);
+            return Some((prefix.len() + tok, repl));
+        }
+    }
+    for (key, label) in [
+        ("api_key=", "api_key=[REDACTED]"),
+        ("api_key:", "api_key:[REDACTED]"),
+        ("api-key=", "api-key=[REDACTED]"),
+        ("api-key:", "api-key:[REDACTED]"),
+        ("opencode_api_key=", "OPENCODE_API_KEY=[REDACTED]"),
+        ("opencode_go_api_key=", "OPENCODE_GO_API_KEY=[REDACTED]"),
+        ("toron_key_passphrase=", "TORON_KEY_PASSPHRASE=[REDACTED]"),
+    ] {
+        if lower.starts_with(key) {
+            let tok = consume_token(&rest[key.len()..]);
+            return Some((key.len() + tok, label));
+        }
+    }
+    if lower.starts_with("-----begin") && lower.contains("private key") {
+        if let Some(end) = lower.find("-----end") {
+            let end_line = lower[end..]
+                .find("-----")
+                .map(|x| end + x + 5)
+                .unwrap_or(rest.len());
+            return Some((end_line.min(rest.len()), "[REDACTED PRIVATE KEY]"));
+        }
+        return Some((rest.len(), "[REDACTED PRIVATE KEY]"));
+    }
+    None
+}
+
+fn consume_token(s: &str) -> usize {
+    s.chars()
+        .take_while(|c| {
+            !c.is_whitespace() && *c != '"' && *c != '\'' && *c != ',' && *c != ';' && *c != ']'
+        })
+        .map(|c| c.len_utf8())
+        .sum()
+}
+
+
 /// Immutable identity for a pane lifetime (ADR-0018 pin vs slug).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRef {
@@ -49,8 +164,12 @@ impl AgentRef {
         }
     }
 
+    /// Freeze npub once bound (A1): a second `with_npub` is a no-op when
+    /// already `Some` — AgentRef identity is immutable for a pane lifetime.
     pub fn with_npub(mut self, npub: impl Into<String>) -> Self {
-        self.npub = Some(npub.into());
+        if self.npub.is_none() {
+            self.npub = Some(npub.into());
+        }
         self
     }
 
@@ -191,16 +310,27 @@ impl RebindIntent {
 
 /// Journal intent-before-dispatch (I4). Uses flywheel event log — not mailbox.
 pub fn journal_rebind(project: &str, intent: &RebindIntent) -> anyhow::Result<()> {
-    let entry = serde_json::to_value(intent)?;
+    // C1: never persist raw harness stderr — redact keys/tokens, truncate snippet.
+    let mut for_log = intent.clone();
+    match &mut for_log.reason {
+        RebindReason::CaptainRequest { note } => {
+            *note = redact_evidence(note);
+        }
+        RebindReason::ProfileFallback { evidence, .. }
+        | RebindReason::ModelFallback { evidence, .. } => {
+            *evidence = redact_evidence(evidence);
+        }
+    }
+    let entry = serde_json::to_value(&for_log)?;
     state::log_event(project, EventKind::Spawn, entry)?;
     eprintln!(
         "flywheel: rebind journal effect_key={} state={:?} pin={} {} -> {} ({})",
-        intent.effect_key,
-        intent.state,
-        intent.agent.pin,
-        intent.from.profile_name,
-        intent.to.profile_name,
-        match &intent.reason {
+        for_log.effect_key,
+        for_log.state,
+        for_log.agent.pin,
+        for_log.from.profile_name,
+        for_log.to.profile_name,
+        match &for_log.reason {
             RebindReason::CaptainRequest { note } => note.as_str(),
             RebindReason::ProfileFallback { kind, .. } => kind.as_str(),
             RebindReason::ModelFallback { kind, .. } => kind.as_str(),
@@ -223,6 +353,39 @@ where
             intent.state = RebindState::Settled;
             journal_rebind(project, &intent)?;
             Ok(v)
+        }
+        Err(e) => {
+            intent.state = RebindState::Failed;
+            let _ = journal_rebind(project, &intent);
+            Err(e)
+        }
+    }
+}
+/// I4 lifecycle with visible Unknown: Prepared → InFlight → Settled|Unknown.
+/// `None` from apply is not invent-green Settled and not Failed — it journals
+/// [`RebindState::Unknown`] (pane-gone / unresolved hop).
+pub fn commit_rebind_opt<F, T>(
+    project: &str,
+    mut intent: RebindIntent,
+    apply: F,
+) -> anyhow::Result<Option<T>>
+where
+    F: FnOnce(&RebindIntent) -> anyhow::Result<Option<T>>,
+{
+    intent.state = RebindState::Prepared;
+    journal_rebind(project, &intent)?;
+    intent.state = RebindState::InFlight;
+    journal_rebind(project, &intent)?;
+    match apply(&intent) {
+        Ok(Some(v)) => {
+            intent.state = RebindState::Settled;
+            journal_rebind(project, &intent)?;
+            Ok(Some(v))
+        }
+        Ok(None) => {
+            intent.state = RebindState::Unknown;
+            journal_rebind(project, &intent)?;
+            Ok(None)
         }
         Err(e) => {
             intent.state = RebindState::Failed;
@@ -293,5 +456,34 @@ mod tests {
         let r2 = AgentRef::new("p", "Pin");
         assert!(r2.assert_bound_after_settle(true).is_err());
         assert!(r2.with_npub("npub1abc").assert_bound_after_settle(true).is_ok());
+    }
+
+    #[test]
+    fn npub_freezes_once_some() {
+        let r = AgentRef::new("p", "Pin")
+            .with_npub("npub1first")
+            .with_npub("npub1second");
+        assert_eq!(r.npub.as_deref(), Some("npub1first"));
+    }
+
+    #[test]
+    fn redact_evidence_strips_bearer_and_sk() {
+        let raw = "429 rate limit Authorization: Bearer super-secret-token sk-abc123XYZ api_key=hunter2 and Bearer bare-tok";
+        let r = redact_evidence(raw);
+        assert!(!r.contains("super-secret-token"), "{r}");
+        assert!(!r.contains("bare-tok"), "{r}");
+        assert!(!r.contains("sk-abc123XYZ"), "{r}");
+        assert!(!r.contains("hunter2"), "{r}");
+        assert!(r.contains("Authorization: [REDACTED]"), "{r}");
+        assert!(r.contains("sk-[REDACTED]"), "{r}");
+        assert!(r.contains("api_key=[REDACTED]"), "{r}");
+    }
+
+    #[test]
+    fn redact_evidence_truncates_long_non_secret() {
+        let raw = "x".repeat(500);
+        let r = redact_evidence(&raw);
+        assert!(r.len() < 500, "must truncate");
+        assert!(r.contains("redacted-truncated"), "{r}");
     }
 }
