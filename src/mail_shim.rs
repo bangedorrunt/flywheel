@@ -1873,7 +1873,41 @@ impl Mail {
     /// (in-process read — the deleted HTTP client delegated to the agent-mail
     /// MCP tool, which read the same file). No file → a JSON without
     /// `agent_name` (callers treat that as not-found).
+    ///
+    /// bd-k6cw: live pane tokens first — a `toron:mail-identity` stamp
+    /// (`toron_pin` token) wins over the file, so a reused pane id resolves
+    /// to the current pin even when the identity file still names the
+    /// previous occupant. Any herdr failure degrades to the file bridge
+    /// below, never an error.
     pub fn resolve_pane_identity(&self, project_key: &str, pane_id: &str) -> Result<Value> {
+        if multiplexer_is_herdr() {
+            if let Ok(backend) = toron_core::backend::herdr::HerdrBackend::connect(None) {
+                let mut client = backend.client();
+                if let Ok(workspaces) = client.workspace_list() {
+                    for ws in workspaces {
+                        let panes = client.pane_list(Some(&ws.workspace_id)).unwrap_or_default();
+                        match panes.iter().find(|p| p.pane_id == pane_id) {
+                            Some(pane) => {
+                                if let Some(pin) = pane
+                                    .tokens
+                                    .get(toron_core::backend::herdr::TOKEN_PIN)
+                                    .and_then(Value::as_str)
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    return Ok(json!({
+                                        "agent_name": pin,
+                                        "pane_id": pane_id,
+                                        "source": "pane-token",
+                                    }));
+                                }
+                                break; // pane live but unstamped → file bridge
+                            }
+                            None => continue, // not in this workspace → keep looking
+                        }
+                    }
+                }
+            }
+        }
         let path = canonical_identity_path(project_key, pane_id);
         match std::fs::read_to_string(&path) {
             Ok(name) if !name.trim().is_empty() => Ok(json!({
@@ -3060,6 +3094,57 @@ mod tests {
             "note explains the config fact: {note}"
         );
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+    }
+
+    /// bd-k6cw: tokens-first contract — the stamped pin wins over a stale
+    /// occupant name (pinned against toron's token-first core), and with
+    /// herdr unreachable the branch degrades to the legacy file bridge
+    /// (same file-miss shape as before, never Err).
+    #[test]
+    fn resolve_prefers_pane_tokens_over_files() {
+        let pane: toron_core::backend::herdr::PaneInfo =
+            serde_json::from_value(serde_json::json!({
+                "pane_id": "w1:p1",
+                "terminal_id": "term_test",
+                "workspace_id": "w1",
+                "tab_id": "w1:t1",
+                "focused": false,
+                "agent_status": "working",
+                "revision": 1,
+                "tokens": { "toron_pin": "DustySparrow" },
+            }))
+            .expect("test pane parses");
+        let agent: toron_core::backend::herdr::AgentInfo =
+            serde_json::from_value(serde_json::json!({
+                "agent_status": "working",
+                "focused": false,
+                "name": "OldOccupant",
+                "pane_id": "w1:p1",
+                "revision": 1,
+                "tab_id": "w1:t1",
+                "terminal_id": "term_test",
+                "workspace_id": "w1",
+            }))
+            .expect("test agent parses");
+        assert_eq!(
+            toron_core::mailbox::identity::resolve_pin_for_pane(&[pane], &[agent], "w1:p1"),
+            Some("DustySparrow".to_string()),
+            "stamp beats the stale occupant name"
+        );
+        // Degradation: dead socket → file bridge, file-miss shape, no error.
+        let _g = crate::config::lock_env();
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+        unsafe { std::env::set_var("HERDR_SOCKET_PATH", "/tmp/flywheel-k6cw-dead.sock") };
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let v = mail
+            .resolve_pane_identity("k6cw-proj", "w9:p9")
+            .expect("fallback never errors");
+        assert_eq!(v.get("pane_id").and_then(Value::as_str), Some("w9:p9"));
+        assert!(
+            v.get("error").is_some(),
+            "no stamp, no file → file-miss shape"
+        );
+        unsafe { std::env::remove_var("HERDR_SOCKET_PATH") };
     }
 }
 
