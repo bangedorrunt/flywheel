@@ -355,6 +355,20 @@ pub fn restart(cfg: &Config) -> Result<()> {
 pub fn status(cfg: &Config) -> Result<()> {
     let pid = managed(cfg);
     let health = health_probe(cfg);
+    // bd-enov (F17): a standby daemon with known workspaces is DEGRADED, not
+    // green — it delivers no rings/digest wakes and every wake path silently
+    // falls back to manual. Say so on stderr (the JSON stays intact and
+    // additive: `health.degraded` + `health.standby_hint`).
+    if let Some(h) = &health
+        && let Some(rows) = h.get("degraded").and_then(|d| d.as_array())
+        && !rows.is_empty()
+    {
+        let names: Vec<&str> = rows.iter().filter_map(|d| d.as_str()).collect();
+        eprintln!("doorbell status: DEGRADED — {}", names.join(", "));
+        if let Some(hint) = h.get("standby_hint").and_then(|v| v.as_str()) {
+            eprintln!("  {hint}");
+        }
+    }
     let out = serde_json::json!({
         "alive": pid.is_some() && health.is_some(),
         "pid": pid,
