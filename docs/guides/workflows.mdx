@@ -43,11 +43,15 @@ Schema fields: `name` (required), `description`, `trigger`, `guard` (an evalexpr
 
 Triggers (reactive; on-demand `run --execute` always works): `schedule`, `webhook`, `message_posted`, `reaction_added`, `reservation_acquired`, `reservation_released`, `agent_state_changed`.
 
-Actions: `spawn` (the workhorse: `profile`, `stage`, `await`, per-step `harness` override, `inputs`), `dispatch_job` (kind-43001), `send_message` / `send_dm`, `react`, `call_webhook` (SSRF-guarded), `request_approval` (durable suspend; approve and reject are kinds 46011 and 46012), `delay`, `call_workflow` (sub-run; outputs land under `{{steps.<name>}}`), plus control flow: `parallel` (fan out `over:` `@crew.<role>` or N), `branch`, `retry`, `foreach`.
+Actions: `spawn` (the workhorse: `profile`, `stage`, `await`, per-step `harness` override, `no_claim_timeout` default 600s, `inputs`), `dispatch_job` (kind-43001), `send_message` / `send_dm`, `reduce` (bounded fold over a proper list: `all`/`any`/`count`/`sum`/`join`, one scalar), `request_approval` (durable suspend; approve and reject are kinds 46011 and 46012), `delay`, `call_workflow` (sub-run; outputs land under `{{steps.<name>}}`), plus control flow: `parallel` (fan out `over:` `@crew.<role>` or N), `branch`, `retry`, `foreach`. Two actions are **deprecated and fail-closed** (bd-i6kc): `react` and `call_webhook` still parse for migration, but the boundary rejects them with `unsupported_action` and nothing is posted or dispatched.
 
 Step policies: `on_error: continue` (default) or `fail_run` (the step's failure fails the run, kind-46012 `status=failed`); `await: true` blocks for the agent's result. Role conditioning is always on: every spawn and dispatch prompt is prepended with the profile's behavior preamble, which is how a role takes effect at runtime.
 
 Execution modes: `--mode pane` (crew pre-spawned in herdr panes, bus-auditable, best for interactive work) and `--mode headless` (one-shot harness run, no panes, local, best for cron and short idempotent work). `--execute` opts into real dispatch; without it, `workflow run` records control flow only. Lint (fail-stop) checks graph acyclicity, stage and alias resolution, `@profile` resolution, required inputs, and guard syntax.
+
+Three gates validate the same closed action contracts: parse/normalize, lint, and invoke. Unknown fields, bad refs, invalid collections, and phase typos fail loud at the earliest gate; a valid template that renders an invalid runtime value is re-validated at invoke. Guards are explicit: a false guard is a skipped outcome with node identity, while a syntax/type/unresolved-ref error is a contract failure, never a silent false.
+
+Lint passing is not a run. The **run ledger** records the truthful terminal status of a real run — `failed` / `blocked` / `suspended` / `succeeded` / `unknown`, with the real project and failure artifact paths. `workflow history` shows the recorded status and never defaults a missing row to `done` (a missing status reads `unknown`).
 
 ## Run lifecycle
 
