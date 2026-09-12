@@ -12156,6 +12156,30 @@ pub(crate) fn bind_pane_mail_identity(
         if let Err(e) = backend::run_mail(mail.write_pane_identity(&key, pane_id, pin)) {
             eprintln!("flywheel: mail write_pane_identity failed for {name} on {pane_id}: {e}");
         }
+        // bd-ab2p: stamp the herdr pane itself with the mail identity
+        // (display-only metadata; toron resolves tokens-first). Best-effort
+        // like the file bridge above — a down herdr or missing pane is a
+        // stderr note, never a spawn failure.
+        let npub = backend::run_mail(mail.whois(&key, pin))
+            .map(|w| w.npub)
+            .unwrap_or_default();
+        if !npub.is_empty() {
+            match toron_core::backend::herdr::HerdrBackend::connect(None) {
+                Ok(backend) => {
+                    if let Err(e) = backend
+                        .client()
+                        .pane_report_metadata(pane_id, pin, &key, &npub)
+                    {
+                        eprintln!(
+                            "flywheel: pane mail-identity stamp skipped for {name} on {pane_id}: {e}"
+                        );
+                    }
+                }
+                Err(e) => eprintln!(
+                    "flywheel: pane mail-identity stamp skipped for {name} on {pane_id}: {e}"
+                ),
+            }
+        }
     }
     let mut entries = state::load_spawn_registry(project);
     match entries.iter_mut().find(|e| e.name == name) {
@@ -19230,6 +19254,27 @@ mod wake_identity_tests {
     /// UNIQUE adj+noun pin — never the slug — keeps it on re-spawn
     /// (idempotent), and redraws when the agents table already holds the
     /// seed-draw candidate.
+    #[test]
+    fn bind_pane_mail_identity_stamps() {
+        // bd-ab2p: bind never fails the spawn — with no herdr pane behind
+        // the id the stamp degrades to a stderr note while the file bridge
+        // + registry still land (registry is the contract this test pins).
+        let _g = crate::config::lock_env();
+        let data = std::env::temp_dir().join(format!("fw-bind-stamp-{}", uuid::Uuid::new_v4()));
+        unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
+        let cfg = Config::default();
+        let project = "/tmp/fw-bind-stamp-proj";
+        let pin = register_spawned_agent(&cfg, project, "flywheel-bind-oc", "opencode", "w9:p1")
+            .expect("bind registers an identity");
+        let entry = state::load_spawn_registry(project)
+            .into_iter()
+            .find(|e| e.name == "flywheel-bind-oc")
+            .expect("registry entry");
+        assert_eq!(entry.pane_id, "w9:p1");
+        assert_eq!(entry.mail_identity.as_deref(), Some(pin.as_str()));
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
     #[test]
     fn register_spawned_agent_pins_unique_adjnoun_identity() {
         let _g = crate::config::lock_env();
