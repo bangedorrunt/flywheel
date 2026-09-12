@@ -19,7 +19,7 @@
 //! |---|---|---|
 //! | `Send{to, stage, msg}` | `dispatch_job` (assignee=`to`, spec carries the resolved stage prompt / raw msg) | YES (herdr-direct semantics preserved via the engine's injected runner) |
 //! | `Wait{until}` | `delay` (no-op shell; the engine's `spawn{await}` binding is P4) | NO — flagged, run continues |
-//! | pipeline (chain) | workflow of `call_workflow` steps | NO — `call_workflow` is a P5 control-flow action; flagged |
+//! | pipeline (chain) | workflow of `call_workflow` steps (closed action, engine sub-run) | YES |
 //!
 //! `WorkflowEngine::invoke` is the single execution door: flywheel's legacy
 //! `run_workflow`/`run_pipeline` become thin callers of it (main.rs wiring is
@@ -278,11 +278,9 @@ impl WorkflowCatalog {
                     });
                     continue;
                 }
-                let (wf, note) = absorb_pipeline(&name, &chain);
+                let (wf, notes) = absorb_pipeline(&name, &chain);
                 self.workflows.insert(name, wf);
-                if let Some(note) = note {
-                    self.notes.push(note);
-                }
+                self.notes.extend(notes);
             }
         }
         Ok(())
@@ -378,9 +376,10 @@ fn absorb_workflow_steps(name: &str, steps: &[LegacyStep]) -> (Workflow, Vec<Map
 }
 
 /// Map a legacy pipeline (chain of workflow names) into a workflow whose
-/// steps are `call_workflow` (a P5 control-flow action). Until P5 lands, the
-/// steps are flagged.
-fn absorb_pipeline(name: &str, chain: &[String]) -> (Workflow, Option<MappingNote>) {
+/// steps are the closed `call_workflow` action, resolved as sub-runs by the
+/// engine (ADR-0032 Spec 9 tail, bd-40d1). The mapping is exact — one step
+/// per chained workflow — so no flag note is emitted.
+fn absorb_pipeline(name: &str, chain: &[String]) -> (Workflow, Vec<MappingNote>) {
     let mut steps = Vec::new();
     for (i, wf_name) in chain.iter().enumerate() {
         steps.push(Step {
@@ -389,18 +388,9 @@ fn absorb_pipeline(name: &str, chain: &[String]) -> (Workflow, Option<MappingNot
             on_error: Default::default(),
             error_kinds: Vec::new(),
             build_slot: false,
-            // call_workflow is a P5 action; the engine currently rejects it.
-            // The flag below is the honesty contract — the chain is listed but
-            // not runnable until P5 lands.
-            action: Action::DispatchJob {
-                assignee: wf_name.clone(),
-                spec: toron_workflow::schema::DispatchSpec {
-                    extra: [("call_workflow".to_string(), serde_json::Value::Bool(true))]
-                        .into_iter()
-                        .collect(),
-                    ..Default::default()
-                },
-                channel: None,
+            action: Action::CallWorkflow {
+                workflow: wf_name.clone(),
+                inputs: serde_json::Value::Null,
             },
         });
     }
@@ -419,12 +409,7 @@ fn absorb_pipeline(name: &str, chain: &[String]) -> (Workflow, Option<MappingNot
         }],
         principles: vec![],
     };
-    let note = MappingNote {
-        source: format!("pipelines.toml:{name}"),
-        legacy: "pipeline chain".into(),
-        reason: "pipeline maps to call_workflow steps (P5 control-flow); listed but not runnable until P5".into(),
-    };
-    (wf, Some(note))
+    (wf, Vec::new())
 }
 
 /// Write one workflow as canonical catalog YAML — the W6 shared writer
@@ -574,7 +559,31 @@ timeout_ms = 500
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Legacy `pipelines.toml` chain absorbs + is flagged (call_workflow is P5).
+    /// ADR-0032 Spec 9 tail (bd-40d1) RED: a legacy pipeline absorbs to real
+    /// `call_workflow` steps — exact mapping, no DispatchJob shim, no flag.
+    #[test]
+    fn run_ledger_truth_absorb_pipeline_emits_call_workflow() {
+        let (wf, notes) = absorb_pipeline("chain", &["a".to_string(), "b".to_string()]);
+        assert_eq!(wf.steps.len(), 2, "one step per chained workflow");
+        for (step, want) in wf.steps.iter().zip(["a", "b"]) {
+            match &step.action {
+                Action::CallWorkflow { workflow, inputs } => {
+                    assert_eq!(workflow, want);
+                    assert!(inputs.is_null(), "no inputs to forward: {inputs:?}");
+                }
+                other => panic!("pipeline absorbs to CallWorkflow, got {other:?}"),
+            }
+        }
+        assert!(
+            !notes
+                .iter()
+                .any(|n| n.source.starts_with("pipelines.toml:chain")),
+            "exact mapping needs no flag: {notes:?}"
+        );
+    }
+
+    /// Legacy `pipelines.toml` chain absorbs to exact `call_workflow` steps
+    /// (bd-40d1): no DispatchJob shim, no flag note.
     #[test]
     fn legacy_pipeline_absorbs_with_flag() {
         let dir = config_root("legacy-pipe");
@@ -587,11 +596,16 @@ timeout_ms = 500
         let wf = catalog.workflows.get("chain").expect("pipeline absorbed");
         assert_eq!(wf.steps.len(), 1);
         assert!(
-            catalog
+            matches!(wf.steps[0].action, Action::CallWorkflow { .. }),
+            "pipeline absorbs to CallWorkflow, not the DispatchJob shim: {:?}",
+            wf.steps[0].action
+        );
+        assert!(
+            !catalog
                 .notes
                 .iter()
                 .any(|n| n.source.starts_with("pipelines.toml:chain")),
-            "pipeline call_workflow flag present: {:?}",
+            "exact mapping needs no flag: {:?}",
             catalog.notes
         );
         let _ = fs::remove_dir_all(&dir);

@@ -745,7 +745,7 @@ pub fn cron_runner(entry: &CronEntry) -> toron_workflow::ActionRunner {
             let template = entry.template.clone();
             let inputs = Value::Null;
             std::sync::Arc::new(move |a: &Action| {
-                crate::headless_dispatch(&catalog, &template, &inputs, Some(&name), a)
+                crate::headless_dispatch(&catalog, &template, &inputs, Some(&name), a, None)
             })
         }
     }
@@ -806,7 +806,7 @@ pub fn spec_runner(spec: &CronSpec) -> toron_workflow::ActionRunner {
             let name = spec.name.clone();
             let inputs = Value::Null;
             std::sync::Arc::new(move |a: &Action| {
-                crate::headless_dispatch(&catalog, &name, &inputs, Some(&name), a)
+                crate::headless_dispatch(&catalog, &name, &inputs, Some(&name), a, None)
             })
         }
         SpecMode::Pane => {
