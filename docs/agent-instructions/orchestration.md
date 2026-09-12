@@ -17,9 +17,13 @@ ADR-0005 + 0010 + 0011 + 0012. Authoring: [docs/workflow-authoring.md](../workfl
 | swarm mode | `/swarm-mode`: captain-led multi-crew execution with parallel lanes; loop supervision is optional |
 | doorbell | workspace `__doorbell` (ADR-0005 Layer 0). Spawn starts it. `flywheel kill` stops it. `/peer-aware-mode` attaches. Shared by loop-mode and swarm-mode when enabled. |
 
-## Captain selector
+## Session door (ADR-0011)
 
-Run `flywheel decide "<target>" --json` (pure classifier in `src/decide.rs`). Run the returned `argv`. Do not re-derive the table in prose.
+`flywheel arrive <project> --as <pin>` then `flywheel briefing "<target>" --project <p> --json`. `--commit` runs argv. `decide` is the classifier leaf (emits `topology`; `"2 crews"` becomes `--crew 2`). A live fleet proposes join, not a second compose.
+
+## Classifier leaf
+
+`flywheel decide "<target>" --json` is the classifier inside briefing (`src/decide.rs`). Run the returned `argv`. Do not skip arrive+briefing. Do not re-derive the table in prose.
 
 | primitive | argv |
 |-----------|------|

@@ -53,7 +53,8 @@ Invariants (each stated once): **preview ≠ started** — compose without `--ru
 catalog + built-ins          your first stop — something already fits
         │  doesn't fit
         ▼
-flywheel decide              classifies the task shape into an arm
+arrive + briefing            the session door (ADR-0011) — picks the vehicle
+        │  decide is the leaf
         │  compose arm
         ▼
 compose (parts / from-yaml)  assemble or author a Workflow
@@ -75,8 +76,11 @@ for shapes the catalog lacks; graduation is how the catalog learns.
 
 ## 2. The decision procedure (follow in order)
 
-Run `flywheel decide` (or reason it through if you cannot shell out). The
-arms and what they obligate you to do:
+Run the session door first — `flywheel arrive <project> --as <pin>`, then
+`flywheel briefing "<goal>" --project <p> --json` — and read the arm it
+proposes. `decide "<target>" --json` is the classifier **leaf** inside
+briefing (the table lives in `src/decide.rs`), not a second door to skip to.
+The arms and what they obligate you to do:
 
 | Arm | Meaning | Your obligation |
 | :--- | :--- | :--- |
@@ -216,7 +220,8 @@ You composed nothing. That is the win.
 Task: "fresh-eyes exploration of module X, then systematic execution of the
 findings." No single catalog workflow does both in sequence.
 
-1. `flywheel decide` → compose-parts.
+1. `flywheel briefing "explore then fix module X" --project <p> --json` →
+   compose-parts (the `decide` leaf reports the arm).
 2. Compose + preview:
    `flywheel workflow compose "explore then fix module X" --parts "scout:fresh-eyes-explore,coder:ce-execute"`
    → read the lint output and the crew preview.
@@ -365,7 +370,8 @@ flywheel workflow run <n> [--execute --mode headless|pane --project <p>] [--inpu
 flywheel workflow compose "<target>" [--base <wf>] [--parts a,b] [--agent] [--run --project <p>]
 flywheel workflow new <n>
 flywheel runs list | show <id> | digest
-flywheel decide
+flywheel arrive <project> --as <pin>
+flywheel briefing "<goal>" --project <p> --json   # decide is the leaf inside
 flywheel steer "<objective>" [--direct]
 flywheel loop run <project> --work
 ```
