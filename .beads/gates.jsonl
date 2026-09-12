@@ -234,3 +234,4 @@
 {"id":234,"issue_id":"bd-zvp0","from_status":"open","to_status":"closed","status_revision":0,"gate":"command-verified","provider":"QuietHeron","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-11 14:00:06"}
 {"id":235,"issue_id":"bd-zvp0","from_status":"open","to_status":"closed","status_revision":0,"gate":"live-verified","provider":"QuietHeron","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-11 14:00:22"}
 {"id":236,"issue_id":"bd-0wzu","from_status":"open","to_status":"closed","status_revision":0,"gate":"live-verified","provider":"QuietHeron","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-11 14:50:02"}
+{"id":237,"issue_id":"bd-himk","from_status":"in_progress","to_status":"closed","status_revision":3091,"gate":"unit-test-verified","provider":"WindyGlen","passed":true,"recorded_by":"crew-toro091203590020-coder3","recorded_at":"2026-09-12 04:53:22"}
