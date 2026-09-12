@@ -394,7 +394,7 @@ Accepted by captain word on this file (2026-09-12). The checklist records the ev
 | Post-merge SoT | ~10810 B SoT + ~1459 B chrome on `772abd8…` |
 | PR#8 | `9677e9b…` merged as `772abd8…` (2026-09-12 19:55 AEST) |
 | Wave B effect journal | `src/agent_ref.rs` (`AgentEffect`, `AgentEffectGuard`) + `adr0013_spawn_effect_tests` in `src/main.rs` |
-| Wave C ledger digests | `state::SpawnEntry::{model_pin, skills_digest}` + `profile::skills_digest` (P1-7/P1-8) |
+| Wave C ledger digests | `state::SpawnEntry::{model_pin, skills_digest}` + `profile::skills_digest` (P1-7/P1-8) — bead `bd-adr0013-wave-c-digests-ko5y`, work `f11b964` + `20e7cfe` |
 | Catalog unification (P0-5 partial) | `src/decide.rs`: `UNROUTED_PRIMITIVES`, `check_catalog`, `check_workflow_routes`; wired at `cmd_decide` (`src/main.rs`) |
 | ADR compliance gate | `docs/decisions/_scripts/verify-0013.sh` |
 | This ship | GS-044 report `GS-044.md` / `GS-044-profile-adr.md` |
