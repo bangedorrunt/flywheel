@@ -445,6 +445,30 @@ fn hosted_sweep_age(fw_state: &std::path::Path, hosted: &[String]) -> (Option<u6
     }
     (min_age.filter(|a| *a != u64::MAX), max_seq)
 }
+/// bd-enov (F17): workspaces the plane has EVER served — one journal file per
+/// workspace, written by the hosted loop. Their presence while `mode=standby`
+/// is the wake-blind signature: a fleet exists that expects rings/digests, and
+/// this daemon delivers none.
+fn known_journal_workspaces(fw_state: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(fw_state.join("journals")) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(rest) = name
+                .strip_prefix("doorbell-journal-")
+                .and_then(|n| n.strip_suffix(".jsonl"))
+                && !rest.is_empty()
+                && !rest.contains('.')
+            {
+                out.push(rest.to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn health_body(app: &AppState) -> String {
     // D4.4: a torn journal tail degrades loudly here (bd-asr2.4).
     let store = doorbell_rt::FileStore::new(&app.fw_state);
@@ -457,6 +481,16 @@ fn health_body(app: &AppState) -> String {
     } else {
         "hosted"
     };
+    // bd-enov (F17): standby is NOT green when known workspaces exist. A daemon
+    // that adopted without `--host` (plain `doorbell start`) reports
+    // mode=standby and delivers no rings, no inbox-digest wakes, no ack-SLA
+    // nudges — every wake path degrades to manual and NOTHING notices. Mark it
+    // degraded and name the arming verb so `arrive`/`briefing`/`status` see it.
+    let known_workspaces = known_journal_workspaces(&app.fw_state);
+    let wake_blind = mode == "standby" && !known_workspaces.is_empty();
+    if wake_blind {
+        degraded.push("standby_with_known_workspaces".to_string());
+    }
     let (sweep_age, max_seq) = hosted_sweep_age(&app.fw_state, &app.hosted);
     serde_json::json!({
         "protocol": doorbell_rt::api::PING.protocol,
@@ -469,6 +503,16 @@ fn health_body(app: &AppState) -> String {
         "sweep": {"last_age_s": sweep_age},
         "subscribers": 0,
         "degraded": degraded,
+        "known_workspaces": known_workspaces.len(),
+        "standby_hint": if wake_blind {
+            serde_json::Value::String(
+                "armed without --host: no wakes are delivered; re-arm with \
+                 `doorbell start --host <project>/<workspace>`"
+                    .to_string(),
+            )
+        } else {
+            serde_json::Value::Null
+        },
         "journal": {"seq": max_seq, "lag_lines": 0},
         "owner": {"pid": std::process::id(), "gen": null, "host": hostname()},
     })
@@ -577,4 +621,42 @@ fn stats_body(app: &AppState) -> String {
         "digest_batches": 0,
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::known_journal_workspaces;
+
+    /// bd-enov (F17): the wake-blind detector reads exactly the workspaces the
+    /// plane has served — a journal file per workspace, ignoring strays and
+    /// atomic-write temp files.
+    #[test]
+    fn known_journal_workspaces_reads_the_plane_scope() {
+        let dir = std::env::temp_dir().join(format!("db-known-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("journals")).expect("mkdir");
+        assert!(
+            known_journal_workspaces(&dir).is_empty(),
+            "no journals -> no known workspaces"
+        );
+        std::fs::write(
+            dir.join("journals")
+                .join("doorbell-journal-flywheel-toron.jsonl"),
+            b"",
+        )
+        .expect("write journal");
+        std::fs::write(
+            dir.join("journals")
+                .join("doorbell-journal-flywheel-toron.jsonl.tmp"),
+            b"",
+        )
+        .expect("write tmp");
+        std::fs::write(dir.join("journals").join("stray.txt"), b"").expect("write stray");
+        assert_eq!(
+            known_journal_workspaces(&dir),
+            vec!["flywheel-toron".to_string()],
+            "only live journal names count"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

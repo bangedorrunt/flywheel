@@ -3474,6 +3474,19 @@ enum WorkflowCmd {
         /// registry pin as `spawn --profile`.
         #[arg(long = "role-model", value_name = "ROLE=PROVIDER/MODEL")]
         role_model: Vec<String>,
+        /// bd-enov (F6): per-run harness override for compose --run — every
+        /// composed role spawns on KIND (e.g. `opencode`). Removes the need to
+        /// mutate `~/.config/flywheel/profiles.toml` for a one-off run.
+        /// Validated against the herdr kind registry + `[harness.*]` recipes;
+        /// `oc`/`gk` normalize to `opencode`/`grok`.
+        #[arg(long, value_name = "KIND")]
+        harness: Option<String>,
+        /// bd-enov (F7/F8): wall-clock budget for the composed run in seconds.
+        /// On expiry the run fails LOUD (never hangs in the foreground); the
+        /// durable run stays resumable. Overrides
+        /// FLYWHEEL_COMPOSE_MAX_SECONDS (default 3600).
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
         /// GS-039 P0-3: NEVER silent-reap desks. Default OFF — pass
         /// `--retire-orphans` explicitly to close pre-existing workspaces.
         // GS-040 B2: hidden `--no-retire-orphans` is a SEPARATE field linked
@@ -9159,6 +9172,27 @@ projects available: {}",
             .filter_map(|e| e.mail_identity.clone())
             .collect::<Vec<_>>(),
     );
+    // bd-enov (F17): VERIFY the rows landed. The friction's swarm ran an entire
+    // session with subscribers=0 — no rings, no inbox-digest wakes, no ack-SLA
+    // nudges; every wake path silently fell back to manual and no gate noticed.
+    // A subscription that never wrote is a wake-blind spawn: say so, loudly.
+    {
+        use doorbell_rt::subscribe::SubscriptionStore;
+        let prefix = format!("spawn-{label}-");
+        let landed = SubscriptionStore::open(&config::state_dir())
+            .list()
+            .iter()
+            .filter(|s| s.id.starts_with(&prefix))
+            .count();
+        if landed == 0 {
+            eprintln!(
+                "flywheel: WARNING — no doorbell wake subscription landed for workspace {label} \
+                 (subscribers=0): rings / inbox-digest wakes / ack-SLA nudges will NOT be delivered \
+                 to this swarm. Check the plane with `flywheel doorbell status`; re-arm with \
+                 `doorbell start --host {project}/{label}` (bd-enov/F17)."
+            );
+        }
+    }
 
     // bd-vik A: post-spawn visibility check — herdr's session registry
     // (session.json) can silently fail to persist, leaving the panes LIVE but
@@ -9600,12 +9634,23 @@ fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
 }
 
 fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
-    if proxy_doorbell_verb(cfg, "start", &[])? {
+    let workspaces = doorbell_project_workspaces(project);
+    // bd-enov (F17): ARM the plane with this project's workspaces. The old
+    // call proxied a bare `doorbell start` (no --host) — which only adopts the
+    // daemon in STANDBY (mode:standby, subscribers:0). Every wake path then
+    // degrades to manual for the whole swarm and nothing notices. A stale
+    // `doorbell` binary that predates `--host` now fails LOUD here instead of
+    // silently arming a wake-blind plane (proxy bails on non-success).
+    let mut arm: Vec<String> = Vec::new();
+    for ws in &workspaces {
+        arm.push("--host".to_string());
+        arm.push(format!("{project}/{ws}"));
+    }
+    if proxy_doorbell_verb(cfg, "start", &arm)? {
         return Ok(());
     }
     ensure_doorbell_supervisor();
     let exe = std::env::current_exe()?;
-    let workspaces = doorbell_project_workspaces(project);
     if workspaces.is_empty() {
         eprintln!("doorbell: absent (no swarm workspace yet — attach after spawn)");
         return Ok(());
@@ -13211,6 +13256,27 @@ mod agent_mail_name_tests {
             }
         );
     }
+
+    /// bd-enov (F3): the briefing dirt preflight names uncommitted ADRs from
+    /// `git status --porcelain` and ignores unrelated dirt.
+    #[test]
+    fn uncommitted_decision_docs_names_adrs_only() {
+        let porcelain = " M docs/decisions/0032-swarm-dispatch.md\n\
+                         M src/main.rs\n\
+                         ?? docs/decisions/0033-new.md\n\
+                         R  docs/old.md -> docs/decisions/0034-renamed.md\n\
+                         M docs/guides/reservations.mdx\n";
+        assert_eq!(
+            uncommitted_decision_docs(porcelain),
+            vec![
+                "docs/decisions/0032-swarm-dispatch.md".to_string(),
+                "docs/decisions/0033-new.md".to_string(),
+                "docs/decisions/0034-renamed.md".to_string(),
+            ]
+        );
+        assert!(uncommitted_decision_docs(" M src/main.rs\n").is_empty());
+        assert!(uncommitted_decision_docs("").is_empty());
+    }
 }
 
 // ---- add ----
@@ -13724,6 +13790,11 @@ fn cmd_briefing(
             b.questions[0].default, b.questions[1].default
         );
     }
+    // bd-enov (F3): a dirt preflight on the session door. An uncommitted ADR
+    // in the working tree means HEAD carries the SUPERSEDED contract — every
+    // crew that reads git history implements the wrong thing, and no bead
+    // gate witnesses doc-only changes. Name the files loudly before dispatch.
+    warn_uncommitted_decision_docs(cfg, project);
     if commit || yes {
         let argv = b.proposal.argv.clone();
         eprintln!("flywheel: briefing --commit {}", argv.join(" "));
@@ -13738,6 +13809,60 @@ fn cmd_briefing(
         }
     }
     Ok(())
+}
+
+/// bd-enov (F3): parse `git status --porcelain` output for uncommitted
+/// DECISION docs (`docs/decisions/**`) — the contract-bearing files whose
+/// stale committed copy misleads every crew reading git history. Pure.
+/// Handles the `XY <path>` porcelain shape (including `R  old -> new`).
+pub(crate) fn uncommitted_decision_docs(porcelain: &str) -> Vec<String> {
+    let mut out: Vec<String> = porcelain
+        .lines()
+        .filter(|l| l.len() > 3)
+        .filter_map(|l| {
+            let path = l[3..].trim();
+            // Rename/copy rows render as `old -> new`; the NEW path is live.
+            let path = path.rsplit(" -> ").next().unwrap_or(path).trim_matches('"');
+            path.starts_with("docs/decisions/")
+                .then(|| path.to_string())
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Run the decision-doc dirt check for a project and warn loud (never fatal —
+/// a captain may deliberately dispatch mid-doc). Best-effort: a missing git or
+/// non-repo dir is silent (nothing to say).
+fn warn_uncommitted_decision_docs(cfg: &Config, project: &str) {
+    let dir = project_dir(cfg, project);
+    if !dir.is_dir() {
+        return;
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["status", "--porcelain", "--", "docs/decisions"])
+        .output();
+    let Ok(out) = out else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let dirt = uncommitted_decision_docs(&String::from_utf8_lossy(&out.stdout));
+    if dirt.is_empty() {
+        return;
+    }
+    eprintln!(
+        "\n!!! DIRT PREFLIGHT: {} uncommitted decision doc(s) in {} — HEAD carries the \
+         superseded contract and crews reading git history will implement the wrong thing.\n\
+         Commit them before dispatch: {}",
+        dirt.len(),
+        dir.display(),
+        dirt.join(", ")
+    );
 }
 
 /// Arrival triple, legs 2–3 (bd-asr2.14, D5; leg 1 is the presence publish
@@ -13871,10 +13996,30 @@ fn cmd_arrive(
             }
         }
     }
+    // F10 (bd-enov): a KEPT captain slot with nothing live behind it. Roster
+    // staleness is a generous 7 days, so a prior session's pin (pane gone,
+    // no heartbeat, dispatcher down) still reads fresh and `mail --to
+    // captain` reaches nobody. OFFER the rebind verb; never auto-rebind —
+    // a quiet human operator looks identical to a dead session pin.
+    let heartbeat_fresh = ev
+        .holder
+        .as_deref()
+        .map(|h| captain_presence_live(project, h))
+        .unwrap_or(false);
+    if let Some(pin) = captain_slot::rebind_hint(&ev, heartbeat_fresh) {
+        eprintln!(
+            "flywheel: captain `{pin}` is held on roster-presence alone — no live pane, no \
+             dispatcher, no presence heartbeat; mail to `captain` may reach nobody live. Rebind: \
+             toron contact captain --project {project} --pin <pin>  (or --clear to vacate)"
+        );
+    }
     match cmd_doorbell_start(cfg, project) {
         Ok(()) => {}
         Err(e) => eprintln!("flywheel: doorbell start: {e:#}"),
     }
+    // bd-enov (F3): the session door must name uncommitted decision docs
+    // before a crew is dispatched off stale git history.
+    warn_uncommitted_decision_docs(cfg, project);
     if let Some(obj) = objective {
         cmd_briefing(cfg, obj, Some(project), false, false, false, None)?;
     }
@@ -13905,6 +14050,30 @@ fn lookup_captain_holder(project: &str) -> (Option<String>, bool) {
     }
     let stale = v.get("stale").and_then(|s| s.as_bool()).unwrap_or(true);
     (Some(name), stale)
+}
+
+/// F10: is `pin` publishing LIVE presence in `project`? `toron presence
+/// list` already drops heartbeats older than toron's TTL, so a name hit here
+/// IS a live signal. Missing CLI / bad JSON / non-zero exit → false.
+fn captain_presence_live(project: &str, pin: &str) -> bool {
+    let out = std::process::Command::new("toron")
+        .args(["presence", "list", "--project", project, "--json"])
+        .output();
+    let Ok(out) = out else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let Ok(rows) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return false;
+    };
+    rows.as_array()
+        .map(|a| {
+            a.iter()
+                .any(|r| r.get("name").and_then(|n| n.as_str()) == Some(pin))
+        })
+        .unwrap_or(false)
 }
 
 fn cmd_helm(cfg: &Config, project: &str) -> Result<()> {
@@ -14773,8 +14942,11 @@ fn cmd_send(
                                 // accepted the bytes — a bare Err here discards
                                 // the landed fact and invents a clean failure.
                                 // Emit the ambiguous row; genuinely non-landed
-                                // errors keep the bare bail.
-                                return Err(wait_failure_exit(
+                                // errors keep the bare bail. F9/F15: the same
+                                // call also settles a lagging oc pane and
+                                // returns Ok (landed) when it observes the
+                                // working transition.
+                                return wait_failure_exit(
                                     &mut c,
                                     &target,
                                     &name,
@@ -14784,7 +14956,7 @@ fn cmd_send(
                                     &mut results,
                                     &e,
                                     &emit_rows,
-                                ));
+                                );
                             }
                             return Err(e.into());
                         }
@@ -14816,7 +14988,7 @@ fn cmd_send(
                                 &mut c, project, &name, &a.pane_id, &send_text,
                             );
                             if wait {
-                                return Err(wait_failure_exit(
+                                return wait_failure_exit(
                                     &mut c,
                                     &target,
                                     &name,
@@ -14826,7 +14998,7 @@ fn cmd_send(
                                     &mut results,
                                     &e,
                                     &emit_rows,
-                                ));
+                                );
                             }
                             return Err(stall_giveup_error(&target, project));
                         }
@@ -15082,10 +15254,57 @@ fn wait_failure_error(
     )
 }
 
-/// bd-8vci: wait timeout/stall after herdr accepted the send — one lifecycle
-/// read-back becomes the row's `observed_status`, the ambiguous row is pushed
-/// into `results`, the caller's row emitter runs, and the returned error
-/// exits nonzero with the recovery hint.
+/// bd-enov (F9/F15): adaptive-settle budget for the `--wait` failure path.
+/// The opencode observation channel lags the wait windows badly enough that
+/// EVERY oc send read as ambiguous while the pane was visibly working seconds
+/// later — which trains captains to ignore the receipt entirely. A bounded
+/// post-timeout poll for the `working` transition recovers the landed fact
+/// WITHOUT inventing green (only an observed transition counts).
+const WAIT_SETTLE_POLLS: u32 = 4;
+const WAIT_SETTLE_POLL_SECS: u64 = 3;
+
+/// F9/F15 (bd-enov): does a post-timeout status read prove the prompt landed?
+/// Only a transition from a NON-working baseline to `working` — the lagging
+/// observation channel catching up. Pure; `before` is the pane's status at
+/// send time, `observed` the read-back's lowercase status.
+pub(crate) fn wait_advance_landed(before: AgentStatus, observed: &str) -> bool {
+    before != AgentStatus::Working && observed == "working"
+}
+
+/// F7/F8 (bd-enov): is the LATEST composed-run row for `run_id` non-terminal
+/// (`running`)? Read from the same project event log `workflow history` uses.
+/// Only the last row counts — a completed run also carries an earlier
+/// `running` row, and a finished key must stay re-runnable.
+fn running_run_row_exists(project: &str, run_id: &str) -> bool {
+    let Ok(events) = state::read_log(project) else {
+        return false;
+    };
+    events
+        .iter()
+        .filter(|e| {
+            e.kind == state::EventKind::Workflow
+                && e.data.get("run_id").and_then(Value::as_str) == Some(run_id)
+        })
+        .next_back()
+        .and_then(|e| e.data.get("status").and_then(Value::as_str))
+        == Some("running")
+}
+
+/// One lifecycle read-back for a pane, by target or name.
+fn read_pane_status(c: &mut Client, target: &str, name: &str) -> Option<String> {
+    c.agent_list().ok().and_then(|list| {
+        list.iter()
+            .find(|ag| ag.pane_id == target || ag.name.as_deref() == Some(name))
+            .map(|ag| ag.agent_status.as_str().to_string())
+    })
+}
+
+/// bd-8vci: wait timeout/stall after herdr accepted the send. Before declaring
+/// ambiguity, poll briefly for the opencode lagging channel to catch up with a
+/// `working` transition (F9/F15); when it does, the prompt LANDED — emit the
+/// landed row and return Ok. Otherwise one read-back becomes the row's
+/// `observed_status`, the ambiguous row is pushed into `results`, the caller's
+/// row emitter runs, and the returned error exits nonzero with the hint.
 fn wait_failure_exit(
     c: &mut Client,
     target: &str,
@@ -15096,12 +15315,41 @@ fn wait_failure_exit(
     results: &mut Vec<Value>,
     cause: &BackendError,
     emit: &dyn Fn(&[Value]),
-) -> anyhow::Error {
-    let observed = c.agent_list().ok().and_then(|list| {
-        list.iter()
-            .find(|ag| ag.pane_id == target || ag.name.as_deref() == Some(name))
-            .map(|ag| ag.agent_status.as_str().to_string())
-    });
+) -> anyhow::Result<()> {
+    let mut observed = read_pane_status(c, target, name);
+    if !observed
+        .as_deref()
+        .is_some_and(|s| wait_advance_landed(a.agent_status, s))
+    {
+        for _ in 0..WAIT_SETTLE_POLLS {
+            std::thread::sleep(Duration::from_secs(WAIT_SETTLE_POLL_SECS));
+            observed = read_pane_status(c, target, name);
+            if observed
+                .as_deref()
+                .is_some_and(|s| wait_advance_landed(a.agent_status, s))
+            {
+                break;
+            }
+        }
+    }
+    if observed
+        .as_deref()
+        .is_some_and(|s| wait_advance_landed(a.agent_status, s))
+    {
+        let status = observed.as_deref().unwrap_or("working");
+        results.push(send_result_row(
+            target,
+            a.agent_status.as_str(),
+            &a.pane_id,
+            profile,
+            Some(status),
+        ));
+        emit(results);
+        eprintln!(
+            "flywheel: {target} settled after the wait window (observed {status}) — prompt landed"
+        );
+        return Ok(());
+    }
     results.push(wait_failure_row(
         target,
         a.agent_status.as_str(),
@@ -15110,7 +15358,66 @@ fn wait_failure_exit(
         observed.as_deref(),
     ));
     emit(results);
-    wait_failure_error(target, cause, observed.as_deref(), project)
+    Err(wait_failure_error(
+        target,
+        cause,
+        observed.as_deref(),
+        project,
+    ))
+}
+
+#[cfg(test)]
+mod running_run_row_tests {
+    use super::running_run_row_exists;
+    use crate::state::EventKind;
+
+    /// F7/F8 (bd-enov): the adopt-or-refuse guard fires only while the LATEST
+    /// row for the run is `running`; a terminal row re-opens the key.
+    #[test]
+    fn guard_reads_only_the_latest_row() {
+        let _g = crate::config::test_state_home();
+        let project = format!("f7f8-{}", std::process::id());
+        let run = "fw-composed-abc";
+        assert!(!running_run_row_exists(&project, run), "no row yet");
+        crate::log(
+            &project,
+            EventKind::Workflow,
+            serde_json::json!({"workflow": "wf", "status": "running", "run_id": run}),
+        );
+        assert!(running_run_row_exists(&project, run), "running row is live");
+        crate::log(
+            &project,
+            EventKind::Workflow,
+            serde_json::json!({"workflow": "wf", "status": "completed", "run_id": run}),
+        );
+        assert!(
+            !running_run_row_exists(&project, run),
+            "terminal row re-opens the key"
+        );
+        assert!(!running_run_row_exists(&project, "fw-composed-other"));
+    }
+}
+
+#[cfg(test)]
+mod wait_advance_tests {
+    use super::{AgentStatus, wait_advance_landed};
+
+    /// F9/F15 (bd-enov): only a transition from a non-working baseline to
+    /// `working` proves a lagging oc prompt landed; a pane that was already
+    /// working stays ambiguous (no invented green).
+    #[test]
+    fn only_idle_to_working_advance_counts() {
+        assert!(wait_advance_landed(AgentStatus::Idle, "working"));
+        assert!(wait_advance_landed(AgentStatus::Blocked, "working"));
+        assert!(wait_advance_landed(AgentStatus::Done, "working"));
+        assert!(
+            !wait_advance_landed(AgentStatus::Working, "working"),
+            "no advance"
+        );
+        assert!(!wait_advance_landed(AgentStatus::Idle, "idle"));
+        assert!(!wait_advance_landed(AgentStatus::Idle, "blocked"));
+        assert!(!wait_advance_landed(AgentStatus::Idle, "unknown"));
+    }
 }
 
 #[cfg(test)]
@@ -17706,24 +18013,14 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             }
             // Import: copy the source project's key into this project's
             // named slot BEFORE registering — register_agent then REUSES
-            // that npub instead of minting a second identity.
+            // that npub instead of minting a second identity. bd-zugo: a
+            // missing source key is a LOUD refusal, never a silent fresh
+            // mint (the ghost holder that could lease but never commit).
             if let Some(from) = from_project.as_deref()
                 && from != project
             {
                 let (data_dir, _) = mail_shim::mailbox_roots();
-                if let Some(src) = import_source_key(&data_dir, from, &decided) {
-                    // bd-hdec: the bind dst is the canonical mailbox slot
-                    // (`{mailbox}/{project}/agents/{name}`), which the
-                    // in-process register_agent reuses (no second npub).
-                    let dst = data_dir.join(project).join("agents").join(&decided);
-                    std::fs::create_dir_all(&dst)?;
-                    let dst = dst.join("key.ncryptsec");
-                    if !dst.exists() {
-                        std::fs::copy(&src, &dst).with_context(|| {
-                            format!("binding {} into {}", src.display(), dst.display())
-                        })?;
-                    }
-                }
+                bind_source_key(&data_dir, from, project, &decided)?;
             }
             let v = mail.register_agent(
                 &key,
@@ -24763,7 +25060,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             let path = config::config_dir().join("profiles.toml");
             let cat = ProfileCatalog::load()?;
             let base = cat.get(name).cloned().unwrap_or_default();
-            let merged = Profile {
+            let mut merged = Profile {
                 harness: harness.clone().unwrap_or(base.harness),
                 model: model.clone().unwrap_or(base.model),
                 effort: effort.clone().unwrap_or(base.effort),
@@ -24788,6 +25085,24 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 bail!(
                     "profile {name} needs --harness, or a slot alias (@cheap/@standard/@premium)"
                 );
+            }
+            // bd-enov (F6): validate the harness against the herdr kind
+            // registry + the `[harness.<name>]` recipe catalog AT WRITE TIME.
+            // `--harness oc` used to persist verbatim and die later at spawn
+            // (`unsupported interactive agent kind oc`); normalize the alias,
+            // reject anything spawnable by no path, and name the valid set.
+            if !merged.harness.is_empty() {
+                match cat.canonical_harness(&merged.harness) {
+                    Some(kind) => merged.harness = kind,
+                    None => bail!(
+                        "profile {name}: unknown harness {:?} — spawnable harnesses: {} \
+                         (short aliases oc/gk are normalized). For a custom harness add \
+                         `[harness.{}] spawn_cmd = \"...\"` to profiles.toml.",
+                        merged.harness,
+                        cat.known_harnesses().join(", "),
+                        merged.harness
+                    ),
+                }
             }
             // bd-2dao: persist from the RAW user file — the merged catalog
             // rebuild dropped user overrides of built-in profile names.
@@ -27297,10 +27612,14 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
     }
 
     /// §3.6 envelope #3 (wall-clock half): seconds a composed `--run` may
-    /// take in THIS process. Default 3600; `FLYWHEEL_COMPOSE_MAX_SECONDS`
-    /// overrides (parsed values < 1 fall back to the default — never 0).
-    /// The bound errors the attempt; the durable run stays resumable.
-    fn compose_wall_clock_cap() -> u64 {
+    /// take in THIS process. bd-enov (F7/F8): the explicit `--timeout` flag
+    /// wins, then `FLYWHEEL_COMPOSE_MAX_SECONDS`, then the 3600s default
+    /// (parsed/flagged values < 1 fall back — never 0). The bound errors the
+    /// attempt LOUD; the durable run stays resumable.
+    fn compose_wall_clock_cap(timeout_flag: Option<u64>) -> u64 {
+        if let Some(secs) = timeout_flag.filter(|s| *s >= 1) {
+            return secs;
+        }
         std::env::var("FLYWHEEL_COMPOSE_MAX_SECONDS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -27852,6 +28171,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             inputs,
             idempotency_key,
             role_model,
+            harness,
+            timeout,
             retire_orphans,
             _no_retire_orphans: _,
             crew,
@@ -28087,26 +28408,12 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // steer/workflow run — lint passed, spawn the inferred crew +
             // dispatch each step via __send, reap on end. The composed struct
             // is invoked directly (the engine takes ANY Workflow).
-            let mut catalog = profile::ProfileCatalog::load()?;
-            catalog.apply_role_models(role_model)?;
-            // ADR-0011 D2: packed-under-cap is the default. The pack line
-            // already announced N. --allow-crew-expand does not raise crew.max.
-            let ctx = pane::pre_spawn_crew(
-                cfg,
-                project_name,
-                &wf_name,
-                &crew_plan,
-                &catalog,
-                reuse.as_deref(),
-                false,
-                *retire_orphans,
-            )?;
-            let entries = ctx.entries.clone();
-            let project_c = project_name.to_string();
-            let wf_name_c = wf_name.clone();
-            // bd-wave-swarm-graduation-fix-98io: --inputs merges over the
-            // objective — recipe inputs (captain_pin, wave_label, ...) reach
-            // the task templates.
+            //
+            // bd-enov (F7/F8): compute the run identity and PERSIST the run row
+            // BEFORE the crew is spawned. The old order spawned panes first and
+            // logged only at terminal, so killing the CLI mid-run left live
+            // panes + registered agents and ZERO run rows (`workflow history`
+            // empty) — a half-state with no resume verb.
             let mut inputs_value = serde_json::Map::new();
             inputs_value.insert("objective".into(), json!(target));
             if let Some(txt) = inputs.as_deref() {
@@ -28122,17 +28429,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 }
             }
             let inputs_c = Value::Object(inputs_value);
-            let runner: toron_workflow::ActionRunner = {
-                let entries = entries.clone();
-                let inputs_c = inputs_c.clone();
-                Arc::new(move |a: &Action| {
-                    pane::pane_dispatch(&catalog, &project_c, &wf_name_c, &inputs_c, &entries, a)
-                })
-            };
-            let rt = tokio::runtime::Runtime::new()?;
             let run_id =
                 if let Some(k) = idempotency_key.as_deref().filter(|s| !s.trim().is_empty()) {
-                    // Stable key: reuse engine's proven redelivery (already handles dead pane as miss)
                     format!(
                         "fw-composed-{}",
                         k.trim()
@@ -28143,10 +28441,63 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                 {
-                    format!("fw-composed-{}", bid)
+                    format!("fw-composed-{bid}")
                 } else {
                     format!("fw-composed-{}", state::now_iso())
                 };
+            // Idempotency ADOPT-OR-REFUSE: a still-running row for this key
+            // means the run is LIVE — spawning again would fork a second crew
+            // into one workspace (the friction's duplicate-pane incident).
+            // Refuse loudly; adopting the live run keeps its existing panes.
+            if running_run_row_exists(project_name, &run_id) {
+                bail!(
+                    "workflow compose: run `{run_id}` is already RUNNING (idempotency-key hit) — \
+                     refusing to spawn a second crew into {project_name}. Inspect it with `flywheel \
+                     workflow history`, or pass a fresh --idempotency-key."
+                );
+            }
+            log(
+                project_name,
+                EventKind::Workflow,
+                json!({
+                    "workflow": wf_name,
+                    "status": "running",
+                    "crew": crew_plan.members,
+                    "run_id": run_id,
+                    "mode": "pane",
+                    "started": state::now_iso(),
+                }),
+            );
+            let mut catalog = profile::ProfileCatalog::load()?;
+            catalog.apply_role_models(role_model)?;
+            // bd-enov (F6): per-run harness override (after role models, so the
+            // run's harness is authoritative for every composed role).
+            if let Some(kind) = harness.as_deref() {
+                catalog.apply_harness_override(kind)?;
+            }
+            // ADR-0011 D2: packed-under-cap is the default. The pack line
+            // already announced N. --allow-crew-expand does not raise crew.max.
+            let ctx = pane::pre_spawn_crew(
+                cfg,
+                project_name,
+                &wf_name,
+                &crew_plan,
+                &catalog,
+                reuse.as_deref(),
+                false,
+                *retire_orphans,
+            )?;
+            let entries = ctx.entries.clone();
+            let project_c = project_name.to_string();
+            let wf_name_c = wf_name.clone();
+            let runner: toron_workflow::ActionRunner = {
+                let entries = entries.clone();
+                let inputs_c = inputs_c.clone();
+                Arc::new(move |a: &Action| {
+                    pane::pane_dispatch(&catalog, &project_c, &wf_name_c, &inputs_c, &entries, a)
+                })
+            };
+            let rt = tokio::runtime::Runtime::new()?;
             let invoke_wf = crew::resolve_crew_fanouts(&composed, &crew_plan);
             // W6: the project tier participates — a kept composed entry
             // resolves for call_workflow sub-runs.
@@ -28187,7 +28538,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 // PolicyEvents during invoke; drain them on the same runtime
                 // (one-shot — no cron loop) and execute the side-effects here,
                 // never silently dropping the decision.
-                let (output, policy_events) = rt.block_on(async {
+                let invoke_outcome = rt.block_on(async {
                     // §3.6 envelope #3 (wall-clock half): bounded_invoke caps
                     // this attempt; the durable run stays resumable.
                     let out = crew::bounded_invoke(
@@ -28195,7 +28546,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         &run_id,
                         invoke_wf,
                         inputs_c.clone(),
-                        compose_wall_clock_cap(),
+                        compose_wall_clock_cap(*timeout),
                     )
                     .await?;
                     let drained: Vec<toron_workflow::PolicyEvent> = {
@@ -28203,7 +28554,29 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         std::mem::take(&mut *guard)
                     };
                     Ok::<_, anyhow::Error>((out, drained))
-                })?;
+                });
+                let (output, policy_events) = match invoke_outcome {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // bd-enov (F7/F8): a failed/timed-out run must still
+                        // CLOSE its `running` row — a stuck running row would
+                        // make the idempotency adopt-or-refuse guard refuse
+                        // every future retry of the same key.
+                        log(
+                            project_name,
+                            EventKind::Workflow,
+                            json!({
+                                "workflow": wf_name,
+                                "status": "failed",
+                                "run_id": run_id,
+                                "mode": "pane",
+                                "error": e.to_string(),
+                            }),
+                        );
+                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return Err(e);
+                    }
+                };
                 let policy_receipts_count_ = policy_events.len();
                 for ev in &policy_events {
                     match ev.action {
@@ -36293,6 +36666,37 @@ fn resolve_register_name(explicit: Option<String>, from_project: Option<&str>) -
     }
 }
 
+/// bd-zugo: bind an existing identity key from `from_slug` into `to_slug`'s
+/// named slot. NEVER mints — a missing source key is a loud refusal. The
+/// observed bug: `--from-project` with no matching key silently minted a
+/// fresh npub, whose lease landed on a nameless holder that could not commit
+/// (transfer rejected, TTL 2h, operator force-release only).
+fn bind_source_key(
+    data_dir: &std::path::Path,
+    from_slug: &str,
+    to_slug: &str,
+    name: &str,
+) -> Result<PathBuf> {
+    let src = import_source_key(data_dir, from_slug, name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no existing key for `{name}` in project `{from_slug}` — refusing to mint a second \
+             identity (bd-zugo): register `{name}` in `{from_slug}` first, pass \
+             --adopt-unnamed <name>, or drop --from-project to mint a new pin here"
+        )
+    })?;
+    // bd-hdec: the bind dst is the canonical mailbox slot
+    // (`{mailbox}/{project}/agents/{name}`), which the in-process
+    // register_agent reuses (no second npub).
+    let dst_dir = data_dir.join(to_slug).join("agents").join(name);
+    std::fs::create_dir_all(&dst_dir)?;
+    let dst = dst_dir.join("key.ncryptsec");
+    if !dst.exists() {
+        std::fs::copy(&src, &dst)
+            .with_context(|| format!("binding {} into {}", src.display(), dst.display()))?;
+    }
+    Ok(dst)
+}
+
 /// Locate an existing identity key to import: `{data}/{from}/agents/{name}/
 /// key.ncryptsec`. Present = reuse (register_agent adopts it, never mints).
 /// bd-hdec: agent-key slots live at `{data}/{slug}/agents/{name}/` where
@@ -36408,6 +36812,39 @@ mod register_identity_tests {
             import_source_key(&dir, "beads", "Nobody").is_none(),
             "missing key -> None"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-zugo: `--from-project` with no matching source key is a LOUD
+    /// refusal — never a silent fresh mint (the ghost holder bug).
+    #[test]
+    fn register_from_project_missing_source_key_refuses() {
+        let dir = std::env::temp_dir().join(format!("fw-bind-miss-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let err = bind_source_key(&dir, "toron", "flywheel", "WindyGlen").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no existing key"), "names the state: {msg}");
+        assert!(msg.contains("refusing to mint"), "names the refusal: {msg}");
+        assert!(msg.contains("--adopt-unnamed"), "names a remedy: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-zugo: a present source key binds into the target slot (same bytes,
+    /// no mint); a second bind is idempotent (never overwrites the dst).
+    #[test]
+    fn register_from_project_binds_existing_key() {
+        let dir = std::env::temp_dir().join(format!("fw-bind-hit-{}", std::process::id()));
+        let src = dir.join("toron/agents/WindyGlen");
+        std::fs::create_dir_all(&src).expect("mkdir src");
+        std::fs::write(src.join("key.ncryptsec"), b"key-bytes").expect("write src");
+
+        let dst = bind_source_key(&dir, "toron", "flywheel", "WindyGlen").expect("bind");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"key-bytes");
+
+        // Idempotent: a pre-existing dst is left untouched (never clobbered).
+        std::fs::write(&dst, b"already-here").unwrap();
+        let again = bind_source_key(&dir, "toron", "flywheel", "WindyGlen").expect("rebind");
+        assert_eq!(std::fs::read(&again).unwrap(), b"already-here");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -109,6 +109,16 @@ pub fn try_mailbox() -> Option<&'static toron_core::mailbox::Mailbox> {
 /// > invocations share one durable mailbox. The `TORON_MCP_DATA_DIR` alias
 /// > stays as the explicit demo/test isolation override. The SQLite index
 /// > lives at the root. Returns (data_dir, sqlite db path).
+///
+/// **bd-enov (F1/F4): ONE index, toron's.** The db is `{root}/index.sqlite`
+/// — the very file `ToronPaths::index_path()` resolves — not a private
+/// `flywheel-mail.sqlite`. Two files meant two `agents` tables: the same pin
+/// registered on both planes held two npubs (empirically: `DustySparrow`
+/// @2428bb8e in index.sqlite, @514dc258 in flywheel-mail.sqlite), `whois`
+/// resolved on one plane while `reserve` bound the shared key file, and the
+/// strict guard attributed leases through a roster that disagreed with the
+/// key it bound. Keys already landed under the shared `projects/<slug>/`
+/// tree; only the index forked. Unify it.
 pub fn mailbox_roots() -> (PathBuf, PathBuf) {
     // `TORON_DATA_DIR` wins (blank counts as unset — flywheel's old trim
     // semantics); `TORON_MCP_DATA_DIR` is the demo/test isolation alias;
@@ -118,7 +128,9 @@ pub fn mailbox_roots() -> (PathBuf, PathBuf) {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
-    let db_at = |root: &Path| root.join("flywheel-mail.sqlite");
+    // bd-enov: toron's shared index (`ToronPaths::index_path`), NOT a
+    // private flywheel mail store — the identity plane is one roster.
+    let db_at = |root: &Path| root.join("index.sqlite");
     if toron_data_dir.is_none()
         && let Ok(dir) = std::env::var("TORON_MCP_DATA_DIR")
         && !dir.trim().is_empty()
@@ -194,6 +206,18 @@ async fn build_mailbox() -> anyhow::Result<toron_core::mailbox::Mailbox> {
     let (data_dir, db) = mailbox_roots();
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create mail data dir {}", data_dir.display()))?;
+    // bd-enov: a legacy private store means this process used to fork the
+    // identity plane. Name it (non-destructively — the file is left in
+    // place for the operator); never migrate silently.
+    let legacy = db.with_file_name("flywheel-mail.sqlite");
+    if legacy.exists() {
+        eprintln!(
+            "flywheel mail: note — the legacy private store {} is superseded by the shared \
+             toron index {} (bd-enov). It is left untouched for recovery; nothing reads it.",
+            legacy.display(),
+            db.display()
+        );
+    }
     let db_path = db.to_string_lossy().into_owned();
     let pool = toron_core::index::schema::connect(&db_path).await?;
     toron_core::index::schema::migrate(&pool).await?;
@@ -2298,9 +2322,11 @@ mod tests {
             PathBuf::from("/tmp/flywheel-se2.1-durable/projects"),
             "canonical projects/ segment (bd-hdec)"
         );
+        // bd-enov: ONE index — the file toron's ToronPaths::index_path()
+        // resolves, never a private flywheel-mail.sqlite.
         assert_eq!(
             db,
-            PathBuf::from("/tmp/flywheel-se2.1-durable/flywheel-mail.sqlite")
+            PathBuf::from("/tmp/flywheel-se2.1-durable/index.sqlite")
         );
         unsafe { std::env::remove_var("TORON_DATA_DIR") };
         let (data_dir, _) = mailbox_roots();
@@ -2325,7 +2351,7 @@ mod tests {
         );
         assert_eq!(
             db,
-            PathBuf::from("/tmp/flywheel-se2.1-xdg/toron/flywheel-mail.sqlite")
+            PathBuf::from("/tmp/flywheel-se2.1-xdg/toron/index.sqlite")
         );
         assert!(
             !db.to_string_lossy()
@@ -2346,7 +2372,25 @@ mod tests {
             PathBuf::from("toron-data/projects"),
             "no env at all → D3 relative fallback, never temp (canonical projects segment)"
         );
-        assert_eq!(db, PathBuf::from("toron-data/flywheel-mail.sqlite"));
+        assert_eq!(db, PathBuf::from("toron-data/index.sqlite"));
+    }
+
+    /// bd-enov: the embedded mailbox's index is byte-identical to toron's
+    /// `ToronPaths::index_path()` — one roster, no forked identity plane.
+    #[test]
+    fn mailbox_index_is_torons_shared_index() {
+        let _g = crate::config::lock_env();
+        unsafe { std::env::set_var("TORON_DATA_DIR", "/tmp/flywheel-bd-enov") };
+        unsafe { std::env::remove_var("TORON_MCP_DATA_DIR") };
+        let (_data_dir, db) = mailbox_roots();
+        assert_eq!(
+            db,
+            toron_core::config::ToronPaths {
+                root: PathBuf::from("/tmp/flywheel-bd-enov"),
+            }
+            .index_path()
+        );
+        unsafe { std::env::remove_var("TORON_DATA_DIR") };
     }
 
     /// se2.2: toron reservation ids are hex event ids — `list_own_reservations`

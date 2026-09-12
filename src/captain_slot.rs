@@ -53,6 +53,24 @@ pub fn next_action(ev: &CaptainEvidence, arriver: &str) -> CaptainAction {
     }
 }
 
+/// F10: the slot is KEPT, but nothing LIVE backs the holder — no pane, no
+/// dispatcher, no presence heartbeat. Only roster freshness (`whois.stale`,
+/// a generous 7-day threshold) holds it, so a prior session's pin that lost
+/// its pane looks live while `mail --to captain` reaches nobody. Returns the
+/// holder pin so the caller can OFFER a rebind (never auto-rebind: a quiet
+/// human operator is indistinguishable from a dead session pin here).
+pub fn rebind_hint(ev: &CaptainEvidence, heartbeat_fresh: bool) -> Option<String> {
+    let holder = ev.holder.as_ref()?;
+    if ev.override_pin.is_some() {
+        return None; // explicit override wins; nothing to offer
+    }
+    if ev.pane_alive || ev.last_wake_fresh || heartbeat_fresh {
+        return None; // a live signal backs the holder
+    }
+    // Kept only because roster-presence says fresh.
+    (!holder_stale(ev)).then(|| holder.clone())
+}
+
 pub fn claim_line(action: &CaptainAction) -> Option<String> {
     match action {
         CaptainAction::Claim {
@@ -136,6 +154,30 @@ mod tests {
                 pin: "HumanPin".into()
             }
         );
+    }
+
+    /// F10: roster-fresh but no pane / dispatcher / heartbeat → offer a
+    /// rebind instead of silently keeping a ghost holder.
+    #[test]
+    fn roster_only_holder_offers_rebind() {
+        let mut e = ev(Some("QuietAnvil"));
+        e.presence_fresh = true; // whois.stale=false (7-day threshold)
+        assert_eq!(rebind_hint(&e, false).as_deref(), Some("QuietAnvil"));
+        // Any live signal silences the offer.
+        assert!(rebind_hint(&e, true).is_none(), "heartbeat backs it");
+        let mut pane = e.clone();
+        pane.pane_alive = true;
+        assert!(rebind_hint(&pane, false).is_none(), "pane backs it");
+        let mut wake = e.clone();
+        wake.last_wake_fresh = true;
+        assert!(rebind_hint(&wake, false).is_none(), "dispatcher backs it");
+        // An already-stale holder is CLAIMED (claim_line), not merely offered.
+        let dead = ev(Some("QuietAnvil"));
+        assert!(rebind_hint(&dead, false).is_none());
+        // Override already wins — no offer.
+        let mut ov = e.clone();
+        ov.override_pin = Some("HumanPin".into());
+        assert!(rebind_hint(&ov, false).is_none());
     }
 
     #[test]

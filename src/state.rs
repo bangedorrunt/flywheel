@@ -676,7 +676,31 @@ pub fn load_spawn_registry(project: &str) -> Vec<SpawnEntry> {
         .ok()
         .and_then(|raw| serde_json::from_str::<Vec<SpawnEntry>>(&raw).ok())
         .unwrap_or_default();
-    fold_legacy_alias(project, &spawn_registry_key(project), current)
+    let merged = fold_legacy_alias(project, &spawn_registry_key(project), current);
+    if !merged.is_empty() {
+        return merged;
+    }
+    // bd-enov (F12): the state-dir registry reads EMPTY — a lost/rebuilt state
+    // dir or a `close` that cleared it — while the project-local mirror
+    // (`.flywheel/agent-names.json`) still holds the pane→pin bindings the
+    // panes POST with. Without this fallback `--to <pin>` cannot resolve a
+    // LIVE crew pane and the miss reads as "no agents match", sending the
+    // operator back to herdr slugs (`crew-<run>-<role>`) — the exact F12
+    // regression. The mirror lives INSIDE the project, so it survives the
+    // state loss that is the whole reason it exists.
+    load_agent_names(&project_dir_hint(project))
+}
+
+/// Best-effort project dir for a project argument (bare name or absolute
+/// path) — where `.flywheel/agent-names.json` lives. Mirrors the relative/
+/// absolute resolution in [`spawn_registry_key_with`].
+fn project_dir_hint(project: &str) -> PathBuf {
+    let p = PathBuf::from(project);
+    if p.is_absolute() {
+        p
+    } else {
+        effective_registry_root().join(project)
+    }
 }
 
 /// Project-local pane→name bindings (bd-eign.3 A): mirrors the spawn
@@ -2708,6 +2732,42 @@ mod loops_sidecar_tests {
         let _ = std::fs::remove_file(dir.join(".flywheel").join("agent-names.json.tmp"));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&empty_dir);
+    }
+
+    /// bd-enov (F12): an EMPTY state-dir registry falls back to the
+    /// project-local mirror, so `--to <pin>` still resolves the panes that
+    /// POST with those pins. A non-empty state registry still wins outright
+    /// (the mirror never resurrects stale rows over live ones).
+    #[test]
+    fn load_spawn_registry_falls_back_to_project_mirror_when_empty() {
+        let _g = crate::config::test_state_home();
+        let root = std::env::temp_dir().join(format!("fw-f12-mirror-{}", std::process::id()));
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let key = proj.to_string_lossy().into_owned();
+
+        // Mirror holds the crew pins the panes post with; state registry empty.
+        let mirror = vec![
+            SpawnEntry::with_mail_identity("w13:p5", "crew-x-coder", "SwiftBadger"),
+            SpawnEntry::with_mail_identity("w13:p8", "crew-x-reviewer", "BrightCoast"),
+        ];
+        save_agent_names(&proj, &mirror).unwrap();
+        assert_eq!(
+            load_spawn_registry(&key),
+            mirror,
+            "empty state registry must fall back to the project-local mirror"
+        );
+
+        // A live state registry wins; the mirror does not leak stale rows in.
+        let live = vec![SpawnEntry::with_mail_identity(
+            "w14:p1",
+            "flywheel-proj-coder",
+            "WindyGlen",
+        )];
+        save_spawn_registry(&key, &live).unwrap();
+        assert_eq!(load_spawn_registry(&key), live);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// bd-ghcj.1: a PROFILE column on registry entries survives a round-trip,

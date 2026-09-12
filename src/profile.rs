@@ -291,6 +291,14 @@ impl ProfileCatalog {
                 }
             }
         }
+        // bd-enov (F6): repair short aliases already written to disk
+        // (`harness = "oc"`) so an existing broken profile spawns instead of
+        // dying with `unsupported interactive agent kind oc`.
+        for profile in profiles.values_mut() {
+            if !profile.harness.is_empty() {
+                profile.harness = normalize_harness_alias(&profile.harness);
+            }
+        }
         Ok(Self {
             profiles,
             harnesses,
@@ -305,6 +313,25 @@ impl ProfileCatalog {
     /// Look up a profile by name.
     pub fn get(&self, name: &str) -> Option<&Profile> {
         self.profiles.get(name)
+    }
+
+    /// bd-enov (F6): per-run harness override for compose (`--harness KIND`) —
+    /// applied to every profile in the run's catalog so a run can honor "N
+    /// opencode crews" without mutating `~/.config/flywheel/profiles.toml`.
+    /// Validated against the same oracle as `profile create` (aliases
+    /// normalized, unknown rejected loudly).
+    pub fn apply_harness_override(&mut self, kind: &str) -> anyhow::Result<()> {
+        let canonical = self.canonical_harness(kind).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--harness {kind:?} is not spawnable — known: {} (short aliases oc/gk are \
+                 normalized); add `[harness.{kind}] spawn_cmd` for a custom harness",
+                self.known_harnesses().join(", ")
+            )
+        })?;
+        for p in self.profiles.values_mut() {
+            p.harness = canonical.clone();
+        }
+        Ok(())
     }
 
     /// Overlay compose `--role-model ROLE=PROVIDER/MODEL` onto catalog profiles.
@@ -332,6 +359,35 @@ impl ProfileCatalog {
     /// Look up a harness spawn recipe.
     pub fn harness(&self, name: &str) -> Option<&HarnessConfig> {
         self.harnesses.get(name)
+    }
+
+    /// bd-enov (F6): is `kind` a harness flywheel can actually spawn? True for
+    /// a herdr integration kind (`crate::herdr_shim::INTEGRATION_KINDS`) or a
+    /// `[harness.<name>]` spawn recipe (compiled-in `pa`/`jcode` or a user
+    /// entry). Short aliases (`oc`, `gk`) are normalized FIRST so the caller
+    /// can persist the canonical kind. `None` = unknown (reject loudly at
+    /// profile-create time instead of failing later at spawn).
+    pub fn canonical_harness(&self, kind: &str) -> Option<String> {
+        let k = normalize_harness_alias(kind);
+        if crate::herdr_shim::INTEGRATION_KINDS.contains(&k.as_str())
+            || self.harnesses.contains_key(&k)
+        {
+            return Some(k);
+        }
+        None
+    }
+
+    /// Every spawnable harness name, sorted — the payload of the
+    /// profile-create rejection message.
+    pub fn known_harnesses(&self) -> Vec<String> {
+        let mut out: Vec<String> = crate::herdr_shim::INTEGRATION_KINDS
+            .iter()
+            .map(|k| (*k).to_string())
+            .chain(self.harnesses.keys().cloned())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Resolve the backend identifier for a profile (defaults to `herdr`).
@@ -596,6 +652,19 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
         m.insert(name.to_string(), profile);
     }
     m
+}
+
+/// bd-enov (F6): normalize the documented short harness aliases to the herdr
+/// kind they mean. `profile create --harness oc` used to write `oc` verbatim
+/// and the spawn died later with `unsupported interactive agent kind oc`
+/// (herdr's kind is `opencode`). Pure; unknown values pass through untouched
+/// so the caller can reject them loudly.
+pub fn normalize_harness_alias(kind: &str) -> String {
+    match kind {
+        "oc" => "opencode".to_string(),
+        "gk" => "grok".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Compiled-in harness recipes (empty today — the default backends spawn
@@ -926,6 +995,84 @@ spawn_cmd = "hermes --project {project} --role {role}"
         assert_eq!(
             h.spawn_cmd.as_deref(),
             Some("hermes --project {project} --role {role}")
+        );
+    }
+
+    /// bd-enov (F6): `oc`/`gk` normalize to the herdr kinds, and a written
+    /// alias is repaired at load so an existing profile stops dying at spawn.
+    #[test]
+    fn harness_alias_normalizes_and_repairs_on_load() {
+        assert_eq!(normalize_harness_alias("oc"), "opencode");
+        assert_eq!(normalize_harness_alias("gk"), "grok");
+        assert_eq!(normalize_harness_alias("opencode"), "opencode");
+        assert_eq!(
+            normalize_harness_alias("pa"),
+            "pa",
+            "unknown passes through"
+        );
+
+        let path = tmp_profiles_toml(
+            r#"
+[profiles.broken]
+harness = "oc"
+model = "deepseek-v4-flash"
+"#,
+        );
+        let cat = ProfileCatalog::load_from(Some(&path)).expect("load");
+        assert_eq!(
+            cat.get("broken").unwrap().harness,
+            "opencode",
+            "alias repaired at load (spawn no longer fails on kind `oc`)"
+        );
+    }
+
+    /// bd-enov (F6): the write-time oracle accepts integration kinds and
+    /// recipe-backed kinds, normalizes aliases, and rejects the unknown so
+    /// `profile create --harness bogus` fails at write, not at spawn.
+    #[test]
+    fn canonical_harness_validates_against_registry_and_recipes() {
+        let path = tmp_profiles_toml(
+            r#"
+[harness.customx]
+spawn_cmd = "customx --go"
+"#,
+        );
+        let cat = ProfileCatalog::load_from(Some(&path)).expect("load");
+        assert_eq!(cat.canonical_harness("oc").as_deref(), Some("opencode"));
+        assert_eq!(
+            cat.canonical_harness("opencode").as_deref(),
+            Some("opencode")
+        );
+        assert_eq!(cat.canonical_harness("pa").as_deref(), Some("pa"));
+        assert_eq!(cat.canonical_harness("customx").as_deref(), Some("customx"));
+        assert!(cat.canonical_harness("bogus").is_none());
+        let known = cat.known_harnesses();
+        assert!(known.contains(&"opencode".to_string()));
+        assert!(known.contains(&"customx".to_string()));
+    }
+
+    /// bd-enov (F6): the per-run compose harness override rewrites every
+    /// profile's harness (so a pi-pinned catalog can host 4 opencode crews),
+    /// normalizes aliases, and rejects the spawnable-by-no-path kind.
+    #[test]
+    fn apply_harness_override_rewrites_all_profiles() {
+        let path = tmp_profiles_toml(
+            r#"
+[profiles.coder]
+harness = "pi"
+model = "deepseek-v4-flash"
+[profiles.reviewer]
+harness = "pi"
+model = "deepseek-v4-flash"
+"#,
+        );
+        let mut cat = ProfileCatalog::load_from(Some(&path)).expect("load");
+        cat.apply_harness_override("oc").expect("override oc");
+        assert_eq!(cat.get("coder").unwrap().harness, "opencode");
+        assert_eq!(cat.get("reviewer").unwrap().harness, "opencode");
+        assert!(
+            cat.apply_harness_override("bogus").is_err(),
+            "unknown harness must fail loud, not write a dead profile"
         );
     }
 
