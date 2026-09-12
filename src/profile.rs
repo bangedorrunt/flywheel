@@ -100,11 +100,15 @@ pub struct Profile {
     #[serde(default)]
     pub skills: Vec<String>,
     /// Fallback chain for this profile (ADR-0026 Spec 3): **other profile
-    /// names** for billing/auth reroute. Not model ids.
+    /// names** for billing/auth/provider reroute. Not model ids.
+    /// In-flight hops journal via [`crate::agent_ref::RebindIntent`] (I4);
+    /// timeout/mail-ack alone must not consume this chain (ADR-0032 Spec 7).
     #[serde(default)]
     pub fallback: Vec<String>,
     /// Ordered model-id fallbacks for this profile (ADR-0007). Distinct from
-    /// [`Self::fallback`] (those are profile names).
+    /// [`Self::fallback`] (those are profile names). Drives headless/spawn
+    /// model reroute on `rate_limit` with journaled intent before registry
+    /// `ModelEntry.fallback`.
     #[serde(default)]
     pub model_fallback: Vec<String>,
 }

@@ -465,17 +465,39 @@ fn spawn_crew_into(
                                         &profile.slow,
                                         &profile.plan,
                                     ));
+                                    // GS-043 I4: journal before ModelEntry.fallback hop.
+                                    let evidence = e.to_string();
+                                    let intent = crate::agent_ref::RebindIntent::prepare(
+                                        crate::agent_ref::AgentRef::new(project, &name),
+                                        crate::agent_ref::AgentBinding {
+                                            profile_name: role.to_string(),
+                                            model: profile.model.clone(),
+                                            harness: harness.to_string(),
+                                        },
+                                        crate::agent_ref::AgentBinding {
+                                            profile_name: role.to_string(),
+                                            model: fallback_id.clone(),
+                                            harness: fallback_harness.to_string(),
+                                        },
+                                        crate::agent_ref::RebindReason::ModelFallback {
+                                            kind: "rate_limit".into(),
+                                            evidence,
+                                        },
+                                        0,
+                                    );
                                     eprintln!(
-                                        "pane crew: @{role} rate-limited on {} — retrying with fallback {fallback_id}",
+                                        "pane crew: @{role} rate-limited on {} — registry fallback {fallback_id}",
                                         profile.model
                                     );
-                                    crate::start_agent_with_retry(
-                                        c,
-                                        &name,
-                                        fallback_harness,
-                                        &pane_id,
-                                        &fallback_args,
-                                    )?
+                                    crate::agent_ref::commit_rebind(project, intent, |_| {
+                                        crate::start_agent_with_retry(
+                                            c,
+                                            &name,
+                                            fallback_harness,
+                                            &pane_id,
+                                            &fallback_args,
+                                        )
+                                    })?
                                 } else {
                                     return Err(e);
                                 }
@@ -518,6 +540,7 @@ fn spawn_crew_into(
                 name: name.clone(),
                 profile: Some(role.clone()),
                 harness: Some(harness.clone()),
+                model: None,
                 mail_identity,
                 skills_injected: false,
                 incarnation: 0,
@@ -789,6 +812,10 @@ pub fn pane_dispatch(
                                 crate::failure::FailureKind::RateLimit,
                                 &err_str,
                             );
+                            // GS-043 B2 / I4: ProfileFallback full lifecycle —
+                            // Prepared → InFlight → Settled|Unknown (not Prepared-only).
+                            // Pane path cannot swap model in-session; profile.fallback
+                            // pane hop is the rate_limit reroute here.
                             eprintln!(
                                 "flywheel: dispatch @{attempt_profile} rate-limited (429) — rerouting prompt to @{next_profile} ({next_name}), one hop"
                             );
@@ -797,13 +824,67 @@ pub fn pane_dispatch(
                                 "to": next_profile.clone(),
                                 "evidence": err_str,
                             }));
-                            if let Some(e) = resolve_pane_entry(entries, &next_profile) {
-                                attempt_entry = e;
-                                attempt_profile = next_profile;
-                                continue;
+                            if crate::agent_ref::RebindIntent::allowed_from_failure(
+                                crate::failure::FailureKind::RateLimit,
+                                &err_str,
+                            ) {
+                                let intent = crate::agent_ref::RebindIntent::prepare(
+                                    crate::agent_ref::AgentRef::new(project, &attempt_entry.name),
+                                    crate::agent_ref::AgentBinding::profile(&attempt_profile),
+                                    crate::agent_ref::AgentBinding::profile(&next_profile),
+                                    crate::agent_ref::RebindReason::ProfileFallback {
+                                        kind: "rate_limit".into(),
+                                        evidence: err_str.clone(),
+                                    },
+                                    0,
+                                );
+                                match crate::agent_ref::commit_rebind_opt(project, intent, |_| {
+                                    Ok(resolve_pane_entry(entries, &next_profile))
+                                }) {
+                                    Ok(Some(e)) => {
+                                        attempt_entry = e;
+                                        attempt_profile = next_profile;
+                                        continue;
+                                    }
+                                    Ok(None) => {
+                                        // Settled as Unknown: target pane gone mid-hop.
+                                        out["reroute"] = json!("target-pane-gone");
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "flywheel: pane 429 ProfileFallback journal/apply failed: {e:#}"
+                                        );
+                                        out["reroute"] = json!("target-pane-gone");
+                                    }
+                                }
+                            } else {
+                                // B2 residual / I4: empty or disallowed evidence must NOT
+                                // invent a profile hop without journal. Fail-closed —
+                                // journal Unknown, refuse hop (no silent continue).
+                                eprintln!(
+                                    "flywheel: pane 429 ProfileFallback refused — evidence gate closed (I4); no silent hop to @{next_profile}"
+                                );
+                                let intent = crate::agent_ref::RebindIntent::prepare(
+                                    crate::agent_ref::AgentRef::new(project, &attempt_entry.name),
+                                    crate::agent_ref::AgentBinding::profile(&attempt_profile),
+                                    crate::agent_ref::AgentBinding::profile(&next_profile),
+                                    crate::agent_ref::RebindReason::ProfileFallback {
+                                        kind: "rate_limit".into(),
+                                        evidence: if err_str.trim().is_empty() {
+                                            "(empty)".into()
+                                        } else {
+                                            err_str.clone()
+                                        },
+                                    },
+                                    0,
+                                );
+                                let _ = crate::agent_ref::commit_rebind_opt(
+                                    project,
+                                    intent,
+                                    |_| Ok(None::<()>),
+                                );
+                                out["reroute"] = json!("refused-empty-evidence");
                             }
-                            // Pane vanished between select and send: loud trail.
-                            out["reroute"] = json!("target-pane-gone");
                         }
                         None => {
                             out["reroute"] = json!("none-available");
@@ -1141,17 +1222,39 @@ pub fn launch_spawn_job(
                                         &fallback_model,
                                         None,
                                     );
+                                    // GS-043 I4: journal before ModelEntry.fallback hop.
+                                    let evidence = e.to_string();
+                                    let intent = crate::agent_ref::RebindIntent::prepare(
+                                        crate::agent_ref::AgentRef::new(project, &name),
+                                        crate::agent_ref::AgentBinding {
+                                            profile_name: plan.profile.clone(),
+                                            model: profile.model.clone(),
+                                            harness: plan.harness.clone(),
+                                        },
+                                        crate::agent_ref::AgentBinding {
+                                            profile_name: plan.profile.clone(),
+                                            model: fallback_id.clone(),
+                                            harness: fallback_harness.to_string(),
+                                        },
+                                        crate::agent_ref::RebindReason::ModelFallback {
+                                            kind: "rate_limit".into(),
+                                            evidence,
+                                        },
+                                        0,
+                                    );
                                     eprintln!(
-                                        "pane spawn: {} rate-limited — retrying with fallback {fallback_id}",
+                                        "pane spawn: {} rate-limited — registry fallback {fallback_id}",
                                         plan.profile
                                     );
-                                    crate::start_agent_with_retry(
-                                        &mut c,
-                                        &name,
-                                        fallback_harness,
-                                        &split.pane_id,
-                                        &fallback_args,
-                                    )?
+                                    crate::agent_ref::commit_rebind(project, intent, |_| {
+                                        crate::start_agent_with_retry(
+                                            &mut c,
+                                            &name,
+                                            fallback_harness,
+                                            &split.pane_id,
+                                            &fallback_args,
+                                        )
+                                    })?
                                 } else {
                                     return Err(e);
                                 }
@@ -1637,6 +1740,7 @@ mod tests {
             name: name.to_string(),
             profile: Some(profile.to_string()),
             harness: None,
+                model: None,
             mail_identity: None,
             skills_injected: false,
             incarnation: 0,
@@ -1673,6 +1777,38 @@ mod tests {
         );
     }
 
+    /// GS-043 B2 residual: pane 429 empty-evidence must refuse hop + journal
+    /// Unknown — never silent continue without I4.
+    #[test]
+    fn pane_429_empty_evidence_refuses_hop_journals_unknown() {
+        let src = include_str!("pane.rs");
+        assert!(
+            src.contains("refused-empty-evidence"),
+            "pane 429 empty-evidence path must expose refused-empty-evidence"
+        );
+        let dispatch = src
+            .find("bd-mukq: 429 reroute")
+            .expect("429 reroute block");
+        let arm = &src[dispatch..dispatch.saturating_add(12000)];
+        assert!(
+            !arm.contains("still hop (legacy"),
+            "429 reroute arm must not silent-continue hop without I4 journal"
+        );
+        assert!(
+            arm.contains("refused-empty-evidence"),
+            "429 arm must refuse empty-evidence hop"
+        );
+        // The refuse arm journals Unknown via commit_rebind_opt → Ok(None)
+        let idx = src
+            .find("refused-empty-evidence")
+            .expect("refused marker");
+        let window = &src[idx.saturating_sub(900)..idx.saturating_add(200)];
+        assert!(
+            window.contains("commit_rebind_opt") && window.contains("Ok(None"),
+            "refuse arm must journal Unknown via commit_rebind_opt Ok(None)"
+        );
+    }
+
     #[test]
     fn spawn_crew_into_uses_profile_launch_args() {
         let src = include_str!("pane.rs");
@@ -1696,6 +1832,7 @@ mod tests {
                 name: "crew-wf-planner".into(),
                 profile: Some("planner".into()),
                 harness: Some("omp".into()),
+                model: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -1705,6 +1842,7 @@ mod tests {
                 name: "crew-wf-coder".into(),
                 profile: Some("coder".into()),
                 harness: Some("omp".into()),
+                model: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -1729,6 +1867,7 @@ mod tests {
                 name: "crew-wf-reviewer".into(),
                 profile: Some("reviewer".into()),
                 harness: Some("omp".into()),
+                model: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -1738,6 +1877,7 @@ mod tests {
                 name: "crew-wf-scout".into(),
                 profile: Some("scout".into()),
                 harness: Some("opencode".into()),
+                model: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -1762,6 +1902,7 @@ mod tests {
                 name: "crew-wf-coder".into(),
                 profile: Some("coder".into()),
                 harness: Some("omp".into()),
+                model: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -1835,6 +1976,7 @@ mod tests {
             name: name.to_string(),
             profile: Some(profile.to_string()),
             harness: Some(harness.to_string()),
+                model: None,
             mail_identity: None,
             skills_injected: false,
             incarnation: 0,
@@ -1869,6 +2011,7 @@ mod tests {
             name: "crew-goal-coder".into(),
             profile: Some("coder".into()),
             harness: Some("pi".into()),
+                model: None,
             mail_identity: None,
             skills_injected: false,
             incarnation: 0,

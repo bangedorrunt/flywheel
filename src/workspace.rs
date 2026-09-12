@@ -944,6 +944,18 @@ pub enum Cmd {
     /// Tick's hard-error signal. Why is always non-empty and names the
     /// contract broken (forge, malformed tags, unknown corr).
     LoudMiss { why: String },
+
+    /// GS-043: journaled in-flight profile/model rebind (ADR-0032 Spec 7).
+    /// Pin/npub immutable; profile_name/model replaceable. Not a mailbox
+    /// receipt — effect layer journals via agent_ref before applying.
+    RebindBinding {
+        pin: String,
+        profile_name: Option<String>,
+        model: Option<String>,
+        harness: Option<String>,
+        effect_key: String,
+        note: String,
+    },
 }
 
 impl Cmd {
