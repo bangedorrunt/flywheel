@@ -18,6 +18,7 @@ Live ignored tests need herdr + mail. `mbx +nightly-aarch64-apple-darwin test --
 ## Critical overrides (repo invariants — ops live in the flywheel skill)
 
 - **Classify first (ADR-0011):** session door is `arrive` then `briefing --json`, argv runs the work; `decide --json` is the classifier leaf (`topology`, `src/decide.rs`). Live fleets join loud, never double-compose.
+- **Catalogs (ADR-0032 wave 1, landed):** one routing table (`src/decide.rs` `ROUTING_TABLE`: earliest-match position, explicit `none`, topology per row) routes `decide`; one workflow catalog (`src/workflow_catalog.rs`: built-ins < user < project tiers) resolves `workflow list` and sub-workflows. `briefing` consumes decide's output. Run ledger rows carry terminal status + real project + failure artifacts; `workflow history` never defaults to `done`.
 - **Deps:** flywheel → toron-workflow → toron-core. Never reverse.
 - **Mail:** `toron_core::mailbox::surface::MailSurface`. Local `MailBackend` is deleted. Absent `[mail.toron] url` means embedded toron.
 - **Identity is one ladder** (bd-reservation-identity-tlnf): explicit `--as` → `TORON_AGENT` → `FLYWHEEL_MAIL_AS` → `AGENT_NAME` → config `[agent_mail].name`, spawn-registry-resolved. Registered pins pass through verbatim (bd-2mdo); the hash fallback is for unregistered herdr slugs only. Leases bind the resolved actor and the strict guard attributes commits through the same order. Self-test: `mbx +nightly-aarch64-apple-darwin test reservation_identity actor_resolution_passthrough`.
