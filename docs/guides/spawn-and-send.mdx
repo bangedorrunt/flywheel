@@ -20,6 +20,10 @@ flywheel spawn <project> --profile coder --count 2 --join-channel steer-bd-z2d0
 
 Unsure of the role: list first. Bare harness flags (`--oc/--pi/--gk`) count only under an explicit captain harness constraint, recorded in the trail. `--join-channel` auto-joins every spawned pin at pane creation (join-before-post: a non-member post fails loud and names the remedy).
 
+**Identity is immutable; the binding is not.** The pin and npub (`AgentRef`) never change. Profile, harness, and model are a replaceable, journaled `AgentBinding`: move them with `flywheel binding-rebind <project> --pin <pin> [--profile|--harness|--note]`, which updates the live binding and does not edit `profiles.toml`. Never re-mint a pin to change a role. `--model` here is fail-loud, because no spawn/pane/headless consumer reads it yet.
+
+**Spawn, register, and presence are journaled effects** (`intent -> in_flight -> settled|failed|unknown`). Intent is written before dispatch; `--no-verify` journals `Unknown` instead of claiming `Settled`; a register or presence publish that cannot be observed journals `Unknown`, never a bare "no row". A wake observation is separate evidence and never settles them.
+
 Spawn fails closed:
 
 - `launch_pending` is not idle. Wait; never add a second harness.
@@ -34,6 +38,10 @@ Panes are peer-aware by default (`integrations/peer-aware.md.tpl`). Opt out per 
 Registry keys are composite `provider/model`, for example `[models."opencode-go/deepseek-v4-flash"]`. `Profile.provider` pins the composite key; bare ids fall back to the default provider (user-file entries first, else alphabetically first). `resolve_strict` adds the prefix and enforces `caps`; an unregistered id or a caps-excluded harness fails the spawn and names the fix (`flywheel model add <id> --provider <p>`). Nothing bypasses the registry.
 
 Compiled slots: `cheap` (opencode/big-pickle), `standard` (pi + muse-spark), `premium` (omp + glm, fallback grok). The grok harness runs only its own proprietary model; grok models are available on pi, omp, and opencode. Dotted ids need quotes: `[models."glm-5.2"]`.
+
+An `@slot` alias resolves through the operator-wide default pair when one is set (`flywheel model set-default <harness> <model>`; `flywheel model defaults` shows the effective pair, `clear-default` restores per-slot behavior). Precedence is CLI > concrete id > defaults > slot.
+
+**The ledger records the resolved route, never the alias.** A profiled spawn writes `model_pin` (the concrete registry key, e.g. `opencode-go/muse-spark-1.3-contributor`) and `skills_digest` (a bounded identity+count digest of the profile's attached skills; absent when none attach). Both come from one `profile_launch_plan` resolution, so the ledger row and the argv cannot name two different routes. This is *planned* provenance: a mid-spawn reroute hop is separate audit evidence, not a silent row rewrite.
 
 Bare `spawn --model <id> [--provider <p>]` is the lenient fallback for spawns without a named profile; `--provider` requires `--model`.
 
