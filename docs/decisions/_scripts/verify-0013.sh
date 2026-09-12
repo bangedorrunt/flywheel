@@ -93,6 +93,28 @@ else
   bad "spawn-effect wiring tests fail: $out"
 fi
 
+echo "-- P1-7 / P1-8 spawn-ledger digests (Wave C) --"
+if out=$(cargo test --offline skills_digest 2>&1 || true) && echo "$out" | grep -q "test result: ok"; then
+  ok "skills attach digest is bounded, order-sensitive, and absent for an empty attach"
+else
+  bad "skills-digest tests fail"
+fi
+if out=$(cargo test --offline launch_plan_pin_is_the_resolved_route_not_the_slot_alias 2>&1 || true) && echo "$out" | grep -q "1 passed"; then
+  ok "the ledger pin is the resolved route the argv embeds, never the @slot alias"
+else
+  bad "launch-plan pin test fails"
+fi
+if out=$(cargo test --offline spawn_ledger_records_model_pin_and_skills_digest 2>&1 || true) && echo "$out" | grep -q "1 passed"; then
+  ok "spawn records the Muse/slot pin + skills digest from ONE launch-plan resolution"
+else
+  bad "spawn-ledger digest wiring test fails"
+fi
+if out=$(cargo test --offline spawn_registry_pin_and_skills_digest_columns_roundtrip 2>&1 || true) && echo "$out" | grep -q "1 passed"; then
+  ok "pin + digest columns round-trip; absent (never defaulted) when no route resolved"
+else
+  bad "ledger digest round-trip test fails"
+fi
+
 echo
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]
