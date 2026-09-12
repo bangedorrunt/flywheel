@@ -94,17 +94,14 @@ pub fn is_compose_token(primitive: &str) -> bool {
     )
 }
 
+/// Topology comes from decide's one routing table (ADR-0032 Spec 9): the
+/// only briefing-local rule is the joinable-world override. The old private
+/// primitive→topology map is deleted (it diverged on babysit-bead).
 fn topology_for(decision: &Decision, world: &World) -> String {
     if world.joinable {
         return "join".into();
     }
-    match decision.primitive {
-        "join" => "join".into(),
-        "loop-work" => "loop".into(),
-        "spawn-send" | "captain-audit" | "forensics" => "open".into(),
-        "wave-swarm" | "coalition-form" => "swarm".into(),
-        _ => "swarm".into(),
-    }
+    decision.topology.to_string()
 }
 
 fn default_n(unique: u32, cap: u32) -> u32 {
@@ -303,7 +300,7 @@ mod tests {
 
     #[test]
     fn two_crews_packs_n_2_not_default_5() {
-        let b = assemble("swarm with 2 crews", &world_empty(), &[], 5);
+        let b = assemble("wave-swarm with 2 crews", &world_empty(), &[], 5);
         assert_eq!(b.proposal.topology, "swarm");
         assert_eq!(b.proposal.workflow, "wave-swarm");
         assert_eq!(b.proposal.crew_total, 2);
@@ -316,5 +313,21 @@ mod tests {
         assert_eq!(b.proposal.topology, "swarm");
         assert_eq!(b.proposal.crew_total, 5);
         assert!(b.proposal.argv.iter().any(|a| a == "--crew"));
+    }
+
+    // ADR-0032 Spec 9 (bd-himk) RED: briefing reads decide's table — the
+    // babysit-bead divergence (decide open vs briefing swarm) dies.
+    #[test]
+    fn decide_router_briefing_reads_decide_topology() {
+        let world = World {
+            project: "flywheel".into(),
+            dispatcher: "absent".into(),
+            ..World::default()
+        };
+        let b = assemble("babysit the bd-xyz bead", &world, &["coder".into()], 5);
+        let d = decide::decide("babysit the bd-xyz bead", &decide::Snapshot::default());
+        assert_eq!(d.primitive, "babysit-bead");
+        assert_eq!(b.proposal.topology, d.topology);
+        assert_eq!(b.proposal.topology, "open");
     }
 }
