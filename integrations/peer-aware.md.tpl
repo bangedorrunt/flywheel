@@ -40,7 +40,7 @@ room chatter. Do not idle awaiting a new captain dispatch.
 CONTROL-PLANE MARKER (ADR-0010 D7): prompts the control plane
 (dispatcher/loop/`crew control`) sends you are prefixed with U+2063 +
 `FLYWHEEL_OP:`. A marked prompt is a lifecycle event (e.g. relaunch with an
-incarnation token) — re-anchor and re-ack the doorbell; it is never an
+incarnation token) -- re-anchor and re-ack the doorbell; it is never an
 implementation dispatch. Captain stage payloads stay UNMARKED: unmarked
 text is work, marked text is control.
 
@@ -50,10 +50,10 @@ INTERNAL PANE HANDLE: {name}
 Use PUBLIC ADDRESS for Toron, mail, presence, reservations, guards, and
 `flywheel --to`. Never use the internal pane handle for those operations.
 
-GS-039 P1 AGENT-LOCAL MAIL: prefer `flywheel mail … --as <PUBLIC ADDRESS>`
+GS-039 P1 AGENT-LOCAL MAIL: prefer `flywheel mail ... --as <PUBLIC ADDRESS>`
 from this pane (CLI pin plane). Raw `toron mail --as <pin>` needs the
 project-local key minted at spawn; if you see "unknown agent" / "no local
-key", re-run via flywheel mail or `flywheel mail register --name <pin>` —
+key", re-run via flywheel mail or `flywheel mail register --name <pin>` --
 do not invent a slug identity.
 
 Captain task at boot: none assigned in this peer-awareness message.
@@ -121,7 +121,7 @@ Current state = presence verdict + `br show`; the room carries wakes,
 not status.
 
 Urgency discipline (`--importance urgent` writes the outer urgency tag and
-injects immediately — spend it): mark urgent ONLY a file-conflict block, a
+injects immediately -- spend it): mark urgent ONLY a file-conflict block, a
 request-release gone unanswered past one work unit, a decision without which
 you cannot proceed, or a wedge/deadlock signal. Status, done reports,
 questions with no deadline, and FYI are routine (digest-batched, still
@@ -166,8 +166,8 @@ ID DISCIPLINE: the TASK-ID is routing metadata only, never the work order and ne
 
 RED-SURFACE PING: if your working tree leaves a shared
 surface non-compiling, within ONE poll cycle of the first failing
-cargo run post one project-mail line —
-`<pin>: <path> red at <error summary> — fixing by <time>` — and
+cargo run post one project-mail line --
+`<pin>: <path> red at <error summary> -- fixing by <time>` -- and
 re-ping per doorbell cycle while it stays red. A peer must never
 discover your breakage by hitting it.
 
