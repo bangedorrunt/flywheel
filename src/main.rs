@@ -14012,6 +14012,16 @@ fn cmd_decide(
             snap.contention = !live.held_paths.is_empty();
         }
     }
+    // ADR-0032 Spec 9 (one catalog): every route that dispatches `workflow run`
+    // must name a workflow the merged catalog actually resolves. A row pointing
+    // at a renamed or removed workflow is a dangling claim — fail here, where
+    // the fix is named, not later as an unrunnable argv.
+    let known: Vec<String> = workflow_catalog::all_workflows_merged(None)?
+        .into_keys()
+        .collect();
+    if let Err(e) = decide::check_workflow_routes(decide::ROUTING_TABLE, &known) {
+        bail!("{e}");
+    }
     let d = decide::decide(target, &snap);
     if json {
         print_json(&serde_json::json!({
