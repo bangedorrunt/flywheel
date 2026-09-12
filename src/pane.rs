@@ -789,6 +789,26 @@ pub fn pane_dispatch(
                                 crate::failure::FailureKind::RateLimit,
                                 &err_str,
                             );
+                            // GS-043: journal intent before in-flight profile hop (I4).
+                            // Pane path cannot swap model in-session; profile.fallback
+                            // pane hop is the rate_limit reroute here (model_fallback
+                            // drives headless/spawn model ladder).
+                            if crate::agent_ref::RebindIntent::allowed_from_failure(
+                                crate::failure::FailureKind::RateLimit,
+                                &err_str,
+                            ) {
+                                let intent = crate::agent_ref::RebindIntent::prepare(
+                                    crate::agent_ref::AgentRef::new(project, &attempt_entry.name),
+                                    crate::agent_ref::AgentBinding::profile(&attempt_profile),
+                                    crate::agent_ref::AgentBinding::profile(&next_profile),
+                                    crate::agent_ref::RebindReason::ProfileFallback {
+                                        kind: "rate_limit".into(),
+                                        evidence: err_str.clone(),
+                                    },
+                                    0,
+                                );
+                                let _ = crate::agent_ref::journal_rebind(project, &intent);
+                            }
                             eprintln!(
                                 "flywheel: dispatch @{attempt_profile} rate-limited (429) — rerouting prompt to @{next_profile} ({next_name}), one hop"
                             );
