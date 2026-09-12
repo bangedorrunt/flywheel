@@ -282,7 +282,7 @@ Honest rescore vs **post-merge tip** `772abd8…` (2026-09-12 ~19:55 AEST). Audi
 | **P0-2** | Immutable `AgentRef` vs role | **FOLDED** — `src/agent_ref.rs` (A1) | was **STILL** |
 | **P0-3** | Profile spawn as ADR-0032 effect | **FOLDED (flywheel journal)** — spawn / register / presence + the wake observation each journal intent→in_flight→settled\|failed\|unknown; toron `workflow_effects` wiring still trailed under Proposed 0032 | same |
 | **P0-4** | Open-mode AUTHORITATIVE invariant | **FOLDED** | was already **FOLDED** |
-| **P0-5** | One catalog compiler (0032 Spec 9) | **CHANGED** / remainder **STILL** | unchanged by PR#8 |
+| **P0-5** | One catalog compiler (0032 Spec 9) | **CHANGED** (narrowed, Rev 4) — `decide_trigger` derived from the one table + loud load against the merged catalog; profile tier / codec still open | unchanged by PR#8 |
 | **P1-6** | Compose-as-data | **CHANGED** | unchanged |
 | **P1-7** | Muse/slot pin in profile digest | **FOLDED (flywheel ledger)** — `SpawnEntry.model_pin` | was **STILL** |
 | **P1-8** | Skills attach bounded digest | **FOLDED (flywheel ledger)** — `SpawnEntry.skills_digest` | was **STILL** |
@@ -296,6 +296,8 @@ Honest rescore vs **post-merge tip** `772abd8…` (2026-09-12 ~19:55 AEST). Audi
 **No invent-green:** FOLDED = tip proves contract; CHANGED = partial; STILL = gap remains; PARTIAL = rebind only (not full spawn-as-effect).
 
 > **Rev 3 (2026-09-12):** P1-7/P1-8 re-scored on the Wave C digest landing — `model_pin` (the resolved route, never the `@slot` alias) and `skills_digest` (bounded, order-sensitive) ride the spawn ledger row, written from the same `profile_launch_plan` call that builds the argv, all gated in `verify-0013.sh`. The rescore *baseline* column above stays the PR#8-tip audit; the catalog-compiler remainder (P0-5) and the portable codec (P2-11) remain open.
+
+> **Rev 4 (2026-09-12):** P0-5 partially closed (still **CHANGED** — deliberately not FOLDED). The unification it needed was deleting a SECOND truth, not adding a table: `decide_trigger_for`'s hand-kept 32-arm `match` duplicated `ROUTING_TABLE`, and all 32 phrases were measured equal to their row's `matchers[0]` before the match was deleted, so `workflow list --json`'s `decide_trigger` is unchanged. What remains open is named in the §10 PARTIAL item: the profile tier is still its own catalog, and the portable codec (P2-11) / `dead_code` cleanup (P2-14) are untouched.
 
 ---
 
@@ -323,7 +325,7 @@ Honest rescore vs **post-merge tip** `772abd8…` (2026-09-12 ~19:55 AEST). Audi
 
 ### Wave C — Catalog / digest / portable (P0-5 remainder, P1-7/8, P2)
 
-- One compiled catalog table for profiles ⊕ workflow matchers ⊕ topology metadata (Spec 9 remainder).
+- ~~One compiled catalog table for profiles ⊕ workflow matchers ⊕ topology metadata (Spec 9 remainder)~~ **partially landed (Rev 4)**: the one routing table is now the only source for a primitive's trigger — `decide_trigger_for` derives `matchers[0]` and the duplicate 32-arm map is deleted — `UNROUTED_PRIMITIVES` is the single "not routed" declaration, and the table loads LOUD against the merged workflow catalog (`check_catalog` + `check_workflow_routes`, wired into `compile_routing_table()` and the `decide` CLI). **Not folded:** the profile tier stays its own catalog; Spec 9 scopes the one table to flywheel-owned routing metadata (decide_trigger / matcher / primitive / argv / topology) and says it is not added to `toron-workflow::Workflow`, so folding profiles into routing rows would trade one duplication for a real ambiguity.
 - ~~Muse/slot + skills digests on spawn ledger~~ **landed (Rev 3)**: `SpawnEntry.model_pin` + `SpawnEntry.skills_digest`, recorded from the resolved launch plan. Still open: one compiled catalog table; portable ProfileDef codec; drop `dead_code` allow when CLI is sole TOML mutation path.
 
 ---
@@ -373,6 +375,7 @@ Accepted by captain word on this file (2026-09-12). The checklist records the ev
 - [x] **D9 (Wave B):** spawn / register / presence journal intent→in_flight→terminal on the flywheel event log; the wake observation is a separate row; `--no-verify` journals Unknown (`adr0013_spawn_effect_tests`).
 - [x] **P1-7/P1-8 (Wave C digests):** the spawn ledger row carries the resolved Muse/slot pin + a bounded skills digest, both from ONE `profile_launch_plan` call (`adr0013_spawn_effect_tests::spawn_ledger_records_model_pin_and_skills_digest`, `spawn_profile_plan_tests::launch_plan_pin_is_the_resolved_route_not_the_slot_alias`, `state::loops_sidecar_tests::spawn_registry_pin_and_skills_digest_columns_roundtrip`, `profile::skills_digest_tests`).
 - [x] **Rejects:** no AgentServer, no mailbox-as-journal, no dual tpl, no invent Settled — still explicit in this file.
+- [ ] **P0-5 (PARTIAL, Rev 4):** the routing table is the single source for trigger / matcher / argv / topology, it loads loud against the merged catalog, and the trigger derivation is proven equal to the deleted hand list (`decide::decide_router_tests::{decide_router_shared_trigger_fails_load, decide_router_orphan_workflow_route_fails_load, decide_router_unrouted_list_is_real_and_not_keyword_routed, decide_router_live_table_resolves_against_the_real_catalog}`). **Owed:** the profile tier is still a separate catalog, and the portable codec (P2-11) / `dead_code` cleanup (P2-14) are untouched. This item stays unchecked on purpose — partial progress is not a fold.
 - [ ] **Beads:** re-cut against this ADR + ADR-0032; no bead claims mailbox receipts give profile exactly-once. *(No open bead makes that claim; the Wave C re-cut is still owed.)*
 - [x] **HOLD discipline:** the HOLD was on *this* ADR PR only — captain word given 2026-09-12; spawn-as-effect (D9) landed on the flywheel journal; toron `workflow_effects` wiring and the P1-10 robot-mode hard-fail stay sequenced under ADR-0032.
 
@@ -392,6 +395,7 @@ Accepted by captain word on this file (2026-09-12). The checklist records the ev
 | PR#8 | `9677e9b…` merged as `772abd8…` (2026-09-12 19:55 AEST) |
 | Wave B effect journal | `src/agent_ref.rs` (`AgentEffect`, `AgentEffectGuard`) + `adr0013_spawn_effect_tests` in `src/main.rs` |
 | Wave C ledger digests | `state::SpawnEntry::{model_pin, skills_digest}` + `profile::skills_digest` (P1-7/P1-8) |
+| Catalog unification (P0-5 partial) | `src/decide.rs`: `UNROUTED_PRIMITIVES`, `check_catalog`, `check_workflow_routes`; wired at `cmd_decide` (`src/main.rs`) |
 | ADR compliance gate | `docs/decisions/_scripts/verify-0013.sh` |
 | This ship | GS-044 report `GS-044.md` / `GS-044-profile-adr.md` |
 
@@ -404,3 +408,4 @@ Accepted by captain word on this file (2026-09-12). The checklist records the ev
 | 1 | 2026-09-12 | Proposed — GS-044 self-contained profile lifecycle / journaled fallback ADR; HOLD merge of ADR PR; rescore updated after PR#8 landed on tip `772abd8…` during authorship |
 | 2 | 2026-09-12 | **Accepted** (captain word) — Wave B (D9) implemented: spawn / register / presence effects + a separate wake observation on the flywheel event journal; `binding-rebind` pin aligned to the D5 flag form; acceptance checklist evidence recorded; `verify-0013.sh` added. Wave C (catalog/digest/portable) still open. |
 | 3 | 2026-09-12 | Wave C digests landed: `SpawnEntry.model_pin` (resolved route, never the `@slot` alias) + `SpawnEntry.skills_digest` (bounded, order-sensitive), both taken from the single `profile_launch_plan` call that builds the argv; P1-7/P1-8 re-scored FOLDED; `verify-0013.sh` covers them. Still open: one compiled catalog table, portable codec. |
+| 4 | 2026-09-12 | P0-5 narrowed but **not** folded: `decide_trigger_for` is now DERIVED from the one routing table (the duplicate 32-arm match deleted; all 32 phrases were measured equal to `matchers[0]` first, so output is unchanged), `UNROUTED_PRIMITIVES` is the single "not routed" declaration, and the table loads loud against the merged workflow catalog. Profile tier, portable codec, `dead_code` cleanup remain open. D1-adjacent: every file under `integrations/` is now ASCII-only (the launch guard rejects non-ASCII launch text), so the SoT is 10804 B with the chrome at 1458 B. |
