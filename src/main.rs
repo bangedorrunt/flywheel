@@ -15,8 +15,8 @@
 #![allow(clippy::collapsible_if)]
 #![allow(dead_code, clippy::all, unused)]
 
-mod agentstate;
 mod agent_ref;
+mod agentstate;
 mod artifact;
 mod backend;
 mod briefing;
@@ -780,7 +780,10 @@ enum Commands {
     #[command(name = "binding-rebind")]
     BindingRebind {
         project: String,
-        /// public mail pin (AgentRef.pin) — immutable identity
+        /// public mail pin (AgentRef.pin) — immutable identity. A flag, never a
+        /// positional (ADR-0013 D5): the legacy name-bind `rebind <project>
+        /// <name>` keeps the positional form, so the two verbs stay distinct.
+        #[arg(long)]
         pin: String,
         /// replaceable profile name
         #[arg(long)]
@@ -7411,6 +7414,201 @@ mod gs043_residual_honesty_tests {
             "record_reroute_audit must redact before persist/eprintln"
         );
     }
+
+    /// D5 (ADR-0013): the captain verb is `binding-rebind <project> --pin
+    /// <pin>` — the pin is a flag (immutable AgentRef identity), never a
+    /// positional that a caller could confuse with legacy `rebind <project>
+    /// <name>`.
+    #[test]
+    fn binding_rebind_takes_pin_as_a_flag() {
+        // The derived Cli is large — parse on a big stack, like the clap
+        // tests above (a default 2 MiB test stack overflows).
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                use clap::Parser;
+                let cli = crate::Cli::try_parse_from([
+                    "flywheel",
+                    "binding-rebind",
+                    "atlas",
+                    "--pin",
+                    "DustySparrow",
+                    "--profile",
+                    "scout",
+                ])
+                .expect("the ADR-0013 D5 flag form must parse");
+                match cli.command {
+                    Some(crate::Commands::BindingRebind {
+                        project,
+                        pin,
+                        profile,
+                        ..
+                    }) => {
+                        assert_eq!(project, "atlas");
+                        assert_eq!(pin, "DustySparrow");
+                        assert_eq!(profile.as_deref(), Some("scout"));
+                    }
+                    _ => panic!("expected binding-rebind"),
+                }
+                assert!(
+                    crate::Cli::try_parse_from([
+                        "flywheel",
+                        "binding-rebind",
+                        "atlas",
+                        "DustySparrow"
+                    ])
+                    .is_err(),
+                    "the pin is never a positional (ADR-0013 D5)"
+                );
+            })
+            .expect("spawn the parse thread");
+        handle.join().expect("the D5 parse assertions must hold");
+    }
+}
+
+#[cfg(test)]
+mod adr0013_spawn_effect_tests {
+    // ADR-0013 D9 / Wave B: spawn, register, and presence publish are
+    // EFFECTFUL dispatches — each journals intent before it runs (I4) and a
+    // terminal row from observed evidence (I5). Wake observation is separate
+    // evidence and never settles any of them (I6: journal, not mailbox).
+
+    /// Slice one top-level function body. Both needles carry a real newline so
+    /// they can only match real code — never a test literal, which spells the
+    /// newline as an escape and so contains no newline character.
+    fn body_of(src: &'static str, start_needle: &str, end_needle: &str) -> &'static str {
+        let start = src
+            .find(start_needle)
+            .unwrap_or_else(|| panic!("expected {start_needle:?}"));
+        let end = src[start..]
+            .find(end_needle)
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        assert!(start < end, "{start_needle:?} must precede {end_needle:?}");
+        &src[start..end]
+    }
+
+    /// I4: the spawn intent is committed before the workspace dispatch.
+    #[test]
+    fn spawn_journals_intent_before_dispatch() {
+        let src = include_str!("main.rs");
+        let spawn = body_of(src, "\nfn cmd_spawn(", "\nfn doorbell_project_workspaces(");
+        let intent = spawn
+            .find("AgentEffectGuard::begin(project, &label, agent_ref::AgentPhase::Spawn)")
+            .expect("cmd_spawn must journal the spawn intent");
+        let dispatch = spawn
+            .find("c.workspace_create(")
+            .expect("cmd_spawn must create the workspace");
+        assert!(
+            intent < dispatch,
+            "I4: the spawn intent must precede the workspace dispatch"
+        );
+    }
+
+    /// I5: Settled needs apply evidence; `--no-verify` journals Unknown.
+    #[test]
+    fn spawn_never_settles_without_apply_evidence() {
+        let src = include_str!("main.rs");
+        let spawn = body_of(src, "\nfn cmd_spawn(", "\nfn doorbell_project_workspaces(");
+        let unknown = spawn
+            .find("spawn_effect.mark_unknown(Some(\"--no-verify")
+            .expect("--no-verify must journal Unknown, not Settled");
+        let settle = spawn
+            .find("spawn_effect.settle(Some(&format!(")
+            .expect("verified spawns must journal Settled with evidence");
+        assert!(
+            unknown < settle,
+            "Unknown and Settled are exclusive branches"
+        );
+        assert!(
+            spawn.contains("\"workspace={} panes={}\""),
+            "Settled must cite the verified workspace + live panes"
+        );
+    }
+
+    /// I6: the wake read is its own observation row, separate from spawn.
+    #[test]
+    fn wake_observation_is_separate_journal_evidence() {
+        let src = include_str!("main.rs");
+        let spawn = body_of(src, "\nfn cmd_spawn(", "\nfn doorbell_project_workspaces(");
+        let obs = &spawn[spawn
+            .find("the wake observation is SEPARATE evidence")
+            .expect("cmd_spawn must journal the wake observation")..];
+        let row = obs
+            .find("agent_ref::AgentEffect {")
+            .map(|i| &obs[i..])
+            .expect("the wake observation is its own effect row");
+        let row = &row[..row.find("};\n").expect("the wake effect literal ends")];
+        assert!(
+            row.contains("agent_ref::AgentPhase::Wake"),
+            "the wake read is its own effect row: {row}"
+        );
+        assert!(
+            row.contains("subscribers={landed}"),
+            "the wake row must carry the observed subscriber count: {row}"
+        );
+        assert!(
+            row.contains("agent_ref::EffectState::Unknown"),
+            "a wake read that found nothing is Unknown, not a silent absence: {row}"
+        );
+        assert!(
+            !row.contains("spawn_effect"),
+            "wake observation is separate evidence — it must never settle the spawn effect: {row}"
+        );
+    }
+
+    /// D9: register is an effect with intent before the upsert, and both
+    /// failure paths land Unknown (an unobservable upsert is not absence).
+    #[test]
+    fn register_journals_intent_and_unknown_on_failure() {
+        let src = include_str!("main.rs");
+        let register = body_of(
+            src,
+            "\npub(crate) fn pinned_mail_identity(",
+            "\npub(crate) fn bind_pane_mail_identity(",
+        );
+        let intent = register
+            .find("agent_ref::AgentPhase::Register")
+            .expect("pinned_mail_identity must journal the register intent");
+        let upsert = register
+            .find("mail.ensure_project(&key)")
+            .expect("pinned_mail_identity must ensure the project");
+        assert!(
+            intent < upsert,
+            "I4: register intent must precede the first upsert call"
+        );
+        assert_eq!(
+            register.matches("mark_unknown(Some(&format!").count(),
+            2,
+            "ensure_project and register_agent failures both journal Unknown"
+        );
+        assert!(
+            register.contains("g.settle(Some(&format!(\"pin={mail_name}\")"),
+            "a drawn + registered pin settles with the pin as evidence"
+        );
+    }
+
+    /// D9: the per-pin presence publish journals intent before the invoke and
+    /// a terminal row from the observed outcome.
+    #[test]
+    fn presence_journals_per_pin_effect() {
+        let src = include_str!("main.rs");
+        let spawn = body_of(src, "\nfn cmd_spawn(", "\nfn doorbell_project_workspaces(");
+        let intent = spawn
+            .find("agent_ref::AgentPhase::Presence")
+            .expect("presence publish must journal its intent");
+        let invoke = spawn
+            .find("Command::new(\"toron\")")
+            .expect("presence publish invokes toron");
+        assert!(
+            intent < invoke,
+            "I4: presence intent must precede the publish invoke"
+        );
+        assert!(
+            spawn.contains("g.mark_unknown(Some(&ev))"),
+            "an unobservable presence publish journals Unknown, never Settled"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8922,6 +9120,15 @@ projects available: {}",
         pinned_mail_identity(cfg, project, &agent_name_n(project, &item.short, 1), &kind)
     });
     let herdr_env = herdr_shim::herdr_integration_env(cfg, first_pin.as_deref());
+    // D9 (ADR-0013 Wave B): the spawn is an EFFECTFUL dispatch — the intent is
+    // journaled before the workspace exists, so a crash or a dead pane can
+    // never read as "exit 0 = employee ready" (I4/I5). `subject` is the
+    // workspace label (the dispatch unit); the per-pin register / presence
+    // rows and the wake observation are SEPARATE evidence, never settlements
+    // of this row. The `?` is deliberate: a dispatch whose intent cannot be
+    // committed does not run (I4 is a precondition).
+    let spawn_effect =
+        agent_ref::AgentEffectGuard::begin(project, &label, agent_ref::AgentPhase::Spawn)?;
     let (ws, root) = c.workspace_create(
         Some(&utf8_path(&dir, "workspace dir")?),
         Some(&label),
@@ -9257,6 +9464,22 @@ projects available: {}",
             .iter()
             .filter(|s| s.id.starts_with(&prefix))
             .count();
+        // D9: the wake observation is SEPARATE evidence — its row never
+        // settles the spawn / register / presence effects above. A
+        // subscription that never wrote is journaled Unknown (visible), never
+        // a silent absence.
+        let wake = agent_ref::AgentEffect {
+            state: if landed == 0 {
+                agent_ref::EffectState::Unknown
+            } else {
+                agent_ref::EffectState::Settled
+            },
+            evidence: Some(format!("subscribers={landed}")),
+            ..agent_ref::AgentEffect::prepare(project, &label, agent_ref::AgentPhase::Wake)
+        };
+        if let Err(e) = agent_ref::journal_effect(project, &wake) {
+            eprintln!("flywheel: warn: cannot journal wake observation for {label}: {e:#}");
+        }
         if landed == 0 {
             eprintln!(
                 "flywheel: WARNING — no doorbell wake subscription landed for workspace {label} \
@@ -9387,6 +9610,20 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
         }
     }
 
+    // D9: the spawn effect's apply evidence is the verified workspace + live
+    // panes above. `--no-verify` skips exactly those gates, so the honest
+    // terminal there is Unknown — the row stays visible instead of inventing
+    // Settled from a return code (I5).
+    if opts.no_verify {
+        spawn_effect.mark_unknown(Some("--no-verify: workspace + readiness gates skipped"));
+    } else {
+        spawn_effect.settle(Some(&format!(
+            "workspace={} panes={}",
+            ws.workspace_id,
+            booted.len()
+        )));
+    }
+
     // bd-pin-public-plane-s-easy.5: publish spawn presence (plane N, kind
     // 20001) for every freshly spawned agent — the orchestrator + peers see
     // liveness on the presence surface, not by polling mail. Best-effort:
@@ -9404,6 +9641,22 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
             // GS-039 P1: presence race — register-before-presence already
             // uses absolute project key; retry once on "unknown agent" after
             // a short settle (GS-034/035/036/038 race class).
+            // D9: the publish is an effect per pin — intent before the first
+            // invoke, terminal from the OBSERVED outcome. A journal failure
+            // warns rather than failing the spawn (presence stays
+            // best-effort); the outcome is never inferred from the retry.
+            let mut presence_effect = match agent_ref::AgentEffectGuard::begin(
+                project,
+                pin,
+                agent_ref::AgentPhase::Presence,
+            ) {
+                Ok(g) => Some(g),
+                Err(err) => {
+                    eprintln!("flywheel: warn: cannot journal presence intent for {pin}: {err:#}");
+                    None
+                }
+            };
+            let mut failure: Option<String> = None;
             let mut attempt = 0;
             loop {
                 attempt += 1;
@@ -9432,12 +9685,23 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
                             "flywheel: presence publish failed for {pin}: {}",
                             err.trim()
                         );
+                        failure =
+                            Some(format!("presence publish failed for {pin}: {}", err.trim()));
                         break;
                     }
                     Err(e) => {
                         eprintln!("flywheel: presence publish failed for {pin}: {e}");
+                        failure = Some(format!("presence publish failed for {pin}: {e}"));
                         break;
                     }
+                }
+            }
+            if let Some(g) = presence_effect.take() {
+                match failure {
+                    // Unobservable publish (transport error / daemon refusal):
+                    // Unknown — never a silent absence, never invented Settled.
+                    Some(ev) => g.mark_unknown(Some(&ev)),
+                    None => g.settle(Some("presence=working published")),
                 }
             }
         }
@@ -12201,8 +12465,23 @@ pub(crate) fn pinned_mail_identity(
             eprintln!("flywheel: mail register_agent failed for {name}: {e}");
         }
     };
+    // D9: register is an effect — the intent is journaled before the upsert,
+    // and a transport failure is Unknown (an idempotent upsert we cannot
+    // observe is not proof the identity is absent), never silent. Best-effort
+    // like the registration itself: a journal failure only warns.
+    let mut register_effect =
+        match agent_ref::AgentEffectGuard::begin(project, name, agent_ref::AgentPhase::Register) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                eprintln!("flywheel: warn: cannot journal register intent for {name}: {e:#}");
+                None
+            }
+        };
     if let Err(e) = backend::run_mail(mail.ensure_project(&key)) {
         warn_no_identities(&e);
+        if let Some(g) = register_effect.take() {
+            g.mark_unknown(Some(&format!("ensure_project failed: {e}")));
+        }
         return None;
     }
     // S9 (ADR-0018 D1a): the mail identity is a UNIQUE adjective+noun pin.
@@ -12240,6 +12519,9 @@ pub(crate) fn pinned_mail_identity(
         // bd-627z.2: a configured-but-down daemon gets the loud identity
         // warning (agents will have no mail identities until it recovers).
         warn_no_identities(&e);
+        if let Some(g) = register_effect.take() {
+            g.mark_unknown(Some(&format!("register_agent failed: {e}")));
+        }
         return None;
     }
     // bd-pin-public-plane-s-easy.2: fold slug → pin (ADR-0018 D4) so
@@ -12267,6 +12549,9 @@ pub(crate) fn pinned_mail_identity(
     }
     if let Err(e) = state::save_spawn_registry(project, &entries) {
         eprintln!("flywheel: cannot save spawn registry for {name}: {e:#}");
+    }
+    if let Some(g) = register_effect.take() {
+        g.settle(Some(&format!("pin={mail_name}")));
     }
     Some(mail_name)
 }
