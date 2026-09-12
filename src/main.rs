@@ -7459,7 +7459,9 @@ mod spawn_boot_reliability_tests {
         let gi = send_body
             .find(giveup_marker)
             .expect("GiveUp honesty marker");
-        let giveup_slice = &send_body[gi..gi + 600];
+        // GS-037 window is 2000: the if-wait branch lengthened past the old
+        // 600-char reach, while the arm still returns Err on both paths.
+        let giveup_slice = &send_body[gi..gi + 2000];
         assert!(
             giveup_slice.contains("return Err(stall_giveup_error")
                 && !giveup_slice.contains("break agent"),
