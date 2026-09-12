@@ -185,6 +185,19 @@ pub const UNANSWERED_SECS: u64 = 120;
 /// line + per-pin budget keep the replay idempotent and cheap.
 pub const REDELIVERY_LOOKBACK_HOURS: u64 = 24;
 
+/// Bounded backfill floor for cursor-less pins (bd-5d0v): sweep `since` is
+/// wall-clock now, so fetching strictly-newer-than-now for a pin with no
+/// `since_by_pin` entry returns empty forever — and the cursor never
+/// initializes because the high-water only advances on non-empty batches.
+/// The floor bounds the backfill instead; steady state resumes from the
+/// row high-water after the first non-empty batch.
+pub fn redelivery_floor_rfc3339(now_unix: u64) -> String {
+    let floor = now_unix.saturating_sub(REDELIVERY_LOOKBACK_HOURS * 3600);
+    chrono::DateTime::from_timestamp(floor as i64, 0)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".into())
+}
+
 pub fn watch_pubkey(line: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     v.get("pubkey")
@@ -779,6 +792,19 @@ mod tests {
         m.index.insert_pin(pin.to_string(), None);
         m.statuses.insert(pin.to_string(), "idle".into());
         m
+    }
+
+    #[test]
+    fn redelivery_floor_is_now_minus_24h() {
+        // bd-5d0v: the cursor-less backfill floor is exactly the documented
+        // 24h lookback, RFC3339 seconds, parseable by the same parser the
+        // high-water uses.
+        let now = 1_700_000_000u64;
+        let floor = redelivery_floor_rfc3339(now);
+        let us = parse_rfc3339_micros(&floor).expect("floor parses");
+        assert_eq!(us, (now - 24 * 3600) as i64 * 1_000_000, "{floor}");
+        // Saturates instead of underflowing near epoch.
+        assert!(parse_rfc3339_micros(&redelivery_floor_rfc3339(10)).is_ok());
     }
 
     #[test]

@@ -74,6 +74,8 @@ pub struct MockHost {
     pub now: u64,
     pub inbox: std::collections::HashMap<(String, String), Vec<serde_json::Value>>,
     pub sla: Vec<String>,
+    /// Pins the brain owns (fetch_all_inbox iterates these).
+    pub pin_list: Vec<String>,
     /// Scripted tick replies, popped per call; exhausted → empty.
     pub script: std::collections::VecDeque<Vec<Effect>>,
     pub tick_log: Vec<String>,
@@ -89,6 +91,7 @@ impl MockHost {
             now,
             inbox: Default::default(),
             sla: Vec::new(),
+            pin_list: Vec::new(),
             script: Default::default(),
             tick_log: Vec::new(),
             restarts: 0,
@@ -127,6 +130,10 @@ impl Host for MockHost {
             .get(&(pin.to_string(), since.to_string()))
             .cloned()
             .unwrap_or_default()
+    }
+
+    fn pins(&self) -> Vec<String> {
+        self.pin_list.clone()
     }
 
     fn scan_ack_sla(&mut self) -> Vec<String> {

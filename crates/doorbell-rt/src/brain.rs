@@ -450,7 +450,7 @@ impl<H: Host> Brain<H> {
             .iter()
             .any(|e| matches!(e, Effect::FetchInbox { .. }))
         {
-            self.fetch_all_inbox(since)
+            self.fetch_all_inbox()
         } else {
             Vec::new()
         };
@@ -495,7 +495,12 @@ impl<H: Host> Brain<H> {
 
     // F6: shared borrow — inbox fetch needs no &mut host (enables future
     // off-loop pipe; today it at least stops excluding concurrent readers).
-    fn fetch_all_inbox(&self, since_fallback: String) -> Vec<(String, Vec<serde_json::Value>)> {
+    // bd-5d0v: a pin with no cursor backfills from the bounded redelivery
+    // floor, never the sweep's wall-clock now (strict-newer-than-now is
+    // empty forever and the cursor would never initialize — permanent
+    // plane-P deafness for fresh spawns and post-state-loss restarts).
+    fn fetch_all_inbox(&self) -> Vec<(String, Vec<serde_json::Value>)> {
+        let floor = doorbell_core::redelivery_floor_rfc3339(self.host.now_unix());
         let mut fetched = Vec::new();
         for pin in self.host.pins() {
             let pin_since = self
@@ -503,7 +508,7 @@ impl<H: Host> Brain<H> {
                 .since_by_pin
                 .get(&pin)
                 .cloned()
-                .unwrap_or_else(|| since_fallback.clone());
+                .unwrap_or_else(|| floor.clone());
             let rows = self.host.fetch_inbox(&pin, &pin_since);
             if !rows.is_empty() {
                 fetched.push((pin, rows));
@@ -533,8 +538,7 @@ impl<H: Host> Brain<H> {
             .iter()
             .any(|e| matches!(e, Effect::FetchInbox { .. }))
         {
-            let since = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            for (pin, rows) in self.fetch_all_inbox(since) {
+            for (pin, rows) in self.fetch_all_inbox() {
                 self.on_inbox_fetched(pin, rows).await;
             }
         }
@@ -1085,6 +1089,55 @@ mod tests {
             "seq strictly consecutive across the clock jump: {seqs:?}"
         );
         assert!(brain.sweep_last.is_some(), "sweep re-stabilizes after jump");
+    }
+
+    #[tokio::test]
+    async fn cursorless_pin_sweeps_from_redelivery_floor() {
+        // bd-5d0v: a pin with no since_by_pin entry (fresh spawn, state
+        // loss) must backfill from the bounded floor. The old fallback
+        // fetched strictly-newer-than-sweep-now = empty forever, so the
+        // cursor never initialized and the pin stayed plane-P deaf on
+        // every future sweep too.
+        let now = 1_700_000_000u64;
+        let floor = doorbell_core::redelivery_floor_rfc3339(now);
+        let row_us = now as i64 * 1_000_000; // recent mail, inside the floor
+        let (mut brain, _rx, _tx) = test_brain(
+            "floor",
+            vec![
+                vec![Effect::FetchInbox {
+                    pin: String::new(),
+                    since: String::new(),
+                }],
+                vec![],
+            ],
+        );
+        brain.host.now = now;
+        brain.host.pin_list = vec!["p".into()];
+        brain.host.inbox.insert(
+            ("p".into(), floor.clone()),
+            vec![serde_json::json!({
+                "importance": "urgent",
+                "created_ts_us": row_us,
+                "body_md": "hi",
+            })],
+        );
+        assert!(brain.wake.since_by_pin.get("p").is_none());
+        brain
+            .dispatch(BrainMsg::Sweep {
+                since: "2026-09-10T00:00:00Z".into(),
+                now,
+            })
+            .await;
+        let hw = brain
+            .wake
+            .since_by_pin
+            .get("p")
+            .expect("cursor initializes from the floor backfill");
+        assert_eq!(
+            doorbell_core::parse_rfc3339_micros(hw).expect("cursor parses"),
+            row_us,
+            "high-water follows the row's rumor time, not wall-clock now"
+        );
     }
 
     /// Standing determinism fuzz (no new deps: xorshift64): the same seeded
