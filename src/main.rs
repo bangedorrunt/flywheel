@@ -12204,13 +12204,14 @@ pub(crate) fn bind_pane_mail_identity(
         // bd-ab2p: stamp the herdr pane itself with the mail identity
         // (display-only metadata; toron resolves tokens-first). Best-effort
         // like the file bridge above — a down herdr or missing pane is a
-        // stderr note, never a spawn failure.
-        let npub = backend::run_mail(mail.whois(&key, pin))
-            .map(|w| w.npub)
-            .unwrap_or_default();
-        if !npub.is_empty() {
-            match toron_core::backend::herdr::HerdrBackend::connect(None) {
-                Ok(backend) => {
+        // stderr note, never a spawn failure. Connect first (fast fail when
+        // herdr is down) so the whois replay below never runs then.
+        match toron_core::backend::herdr::HerdrBackend::connect(None) {
+            Ok(backend) => {
+                let npub = backend::run_mail(mail.whois(&key, pin))
+                    .map(|w| w.npub)
+                    .unwrap_or_default();
+                if !npub.is_empty() {
                     if let Err(e) = backend
                         .client()
                         .pane_report_metadata(pane_id, pin, &key, &npub)
@@ -12220,9 +12221,9 @@ pub(crate) fn bind_pane_mail_identity(
                         );
                     }
                 }
-                Err(e) => eprintln!(
-                    "flywheel: pane mail-identity stamp skipped for {name} on {pane_id}: {e}"
-                ),
+            }
+            Err(e) => {
+                eprintln!("flywheel: pane mail-identity stamp skipped for {name} on {pane_id}: {e}")
             }
         }
     }
