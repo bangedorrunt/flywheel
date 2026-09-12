@@ -1,5 +1,9 @@
 # Durable loop
 
+Session door is `flywheel arrive` then `flywheel briefing --json`. Briefing
+topology `loop` is what runs this command. Do not start a second loop on a
+joinable fleet.
+
 `flywheel loop-mode run <project> [--work]` is the durable **solo execution
 loop**, implemented with Resonate workflow machinery. Re-run the same command
 to resume. One live loop per project (`loop-mode list` / `loop-mode prune`).
