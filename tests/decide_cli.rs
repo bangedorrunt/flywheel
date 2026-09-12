@@ -196,16 +196,15 @@ fn decide_plain_mode_prints_three_lines() {
 }
 
 #[test]
-fn decide_exit_zero_on_unknown_target_defaults_steer() {
+fn decide_unknown_target_is_explicit_none() {
     let h = hermetic();
     let out = run(&h, &["decide", "zzz fuzzy intent", "--json"]);
     assert!(out.status.success());
     let v = stdout_json(&out);
-    assert_eq!(v["primitive"], "steer");
-    assert_eq!(
-        v["argv"],
-        serde_json::json!(["flywheel", "steer", "zzz fuzzy intent"])
-    );
+    assert_eq!(v["primitive"], "none");
+    assert_eq!(v["topology"], "none");
+    assert_eq!(v["argv"], serde_json::json!([]));
+    assert!(v["reason"].as_str().is_some_and(|r| !r.is_empty()));
 }
 
 #[test]
