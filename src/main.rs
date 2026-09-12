@@ -5649,11 +5649,15 @@ fn resolve_role_flag(registry: &models::ModelRegistry, raw: &str, harness: &str)
     }
 }
 
-pub(crate) fn profile_launch_args(
+/// The resolved launch plan for one profile: the argv flags plus the Muse/slot
+/// pin the launch resolves (ADR-0013 P1-7). One resolution serves both, so the
+/// ledger records the same route the argv embeds (a mid-spawn reroute hop is
+/// audited by `record_reroute_audit`, not folded back into this plan).
+pub(crate) fn profile_launch_plan(
     harness: &str,
     p: &profile::Profile,
     phase: Option<&str>,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, String)> {
     let registry = models::ModelRegistry::load_routing()?;
     // ADR-0007 D1 full ladder: rungs 3-5 (model_fallback / fallback_harness /
     // registry fallback) only detour when the primary route is caps-blocked.
@@ -5691,8 +5695,19 @@ pub(crate) fn profile_launch_args(
         }
         args.extend(extra);
     }
-    Ok(args)
+    Ok((args, model))
 }
+
+/// The argv-only view of [`profile_launch_plan`] — callers that do not journal
+/// the resolved pin.
+pub(crate) fn profile_launch_args(
+    harness: &str,
+    p: &profile::Profile,
+    phase: Option<&str>,
+) -> Result<Vec<String>> {
+    Ok(profile_launch_plan(harness, p, phase)?.0)
+}
+
 /// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
 #[allow(clippy::too_many_arguments)]
 /// Render the peer-aware self-poll template (ADR-0001 S.9.3) with all
@@ -5975,6 +5990,36 @@ mod spawn_profile_plan_tests {
                 .expect("unknown harness, routable model")
                 .is_empty()
         );
+    }
+
+    /// ADR-0013 P1-7: the plan's pin is the CONCRETE registry route the argv
+    /// embeds — a declared `@slot` alias is expanded before it is recorded, so
+    /// the spawn ledger can never pin a pane to an unresolved alias.
+    #[test]
+    fn launch_plan_pin_is_the_resolved_route_not_the_slot_alias() {
+        let _g = lock_env();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        // Compiled-in routing defaults apply zero-config (no models.toml).
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+        let slot = profile("pi", "@standard");
+        let (args, pin) = profile_launch_plan("pi", &slot, None).expect("standard slot plan");
+        assert!(
+            !pin.starts_with('@'),
+            "the pin is the resolved route, never the slot alias: {pin}"
+        );
+        assert_eq!(
+            pin, "opencode-go/muse-spark-1.3-contributor",
+            "the compiled-in `standard` slot resolves to its Muse pin"
+        );
+        assert!(
+            args.iter().any(|a| a.contains(&pin)),
+            "the argv embeds the recorded pin: {args:?} vs {pin}"
+        );
+        // A concrete id takes the same one-resolution path.
+        let (args, pin) = profile_launch_plan("omp", &profile("omp", "glm-5.3"), None)
+            .expect("concrete model plan");
+        assert_eq!(pin, "zai/glm-5.3");
+        assert_eq!(args, vec!["--model=zai/glm-5.3"]);
     }
 
     /// H2 (bd-harness-jcode): the coder profile's default model routes
@@ -7523,6 +7568,36 @@ mod adr0013_spawn_effect_tests {
         assert!(
             spawn.contains("\"workspace={} panes={}\""),
             "Settled must cite the verified workspace + live panes"
+        );
+    }
+
+    /// P1-7/P1-8 (Wave C): the spawn ledger records the Muse/slot pin the
+    /// launch plan resolved AND a bounded digest of the attached skills. One
+    /// `profile_launch_plan` call feeds argv and ledger alike — the spawn path
+    /// never re-derives a second, possibly-divergent route.
+    #[test]
+    fn spawn_ledger_records_model_pin_and_skills_digest() {
+        let src = include_str!("main.rs");
+        let spawn = body_of(src, "\nfn cmd_spawn(", "\nfn doorbell_project_workspaces(");
+        assert!(
+            spawn.contains("profile_launch_plan(&kind, p, None)"),
+            "cmd_spawn must resolve argv + pin in ONE call (P1-7)"
+        );
+        assert!(
+            !spawn.contains("profile_launch_args("),
+            "cmd_spawn must not re-derive a second launch plan"
+        );
+        assert!(
+            spawn.contains("entry.model_pin = model_pin;"),
+            "the spawn row must carry the resolved Muse/slot pin (P1-7)"
+        );
+        assert!(
+            spawn.contains("entry.skills_digest = skills_digest;"),
+            "the spawn row must carry the bounded skills digest (P1-8)"
+        );
+        assert!(
+            spawn.contains("profile::skills_digest(&p.skills)"),
+            "the digest must be taken from the profile's attached skills (P1-8)"
         );
     }
 
@@ -9232,17 +9307,29 @@ projects available: {}",
             // per-harness model args (headless::model_args) + omp role flags,
             // then any launch text (peer template) LAST so a one-shot-capable
             // harness does not swallow the flags as a prompt.
-            let mut agent_args: Vec<String> = match &item.profile {
+            let (mut agent_args, model_pin): (Vec<String>, Option<String>) = match &item.profile {
                 Some(pname) => {
                     let p = catalog
                         .get(pname)
                         .expect("profile resolved at plan build (bd-eign.13)");
-                    profile_launch_args(&kind, p, None)?
+                    let (args, pin) = profile_launch_plan(&kind, p, None)?;
+                    (args, Some(pin))
                 }
                 // bd-j3so: bare harness+model override for kind/count spawns
-                // (no --profile) — lenient registry routing.
-                None => bare_model_launch_args(&kind, &opts.bare_model, &opts.bare_provider)?,
+                // (no --profile) — lenient registry routing. No profile, so
+                // no pin to record (P1-7 is a profile-provenance row).
+                None => (
+                    bare_model_launch_args(&kind, &opts.bare_model, &opts.bare_provider)?,
+                    None,
+                ),
             };
+            // ADR-0013 P1-8: record the ATTACHED skill set as a bounded digest
+            // (identity + count), never the list.
+            let skills_digest = item
+                .profile
+                .as_deref()
+                .and_then(|pname| catalog.get(pname))
+                .and_then(|p| profile::skills_digest(&p.skills));
 
             // bd-peeraware-enametoolong-iswg: launch text NEVER rides
             // agent.start args (opencode reads a positional as a directory).
@@ -9373,7 +9460,7 @@ projects available: {}",
             );
             // Fail-closed already ran BEFORE agent_start; remaining None-pin
             // cases are legacy+warn only (mail not configured).
-            let entry = match (&item.profile, &mail_identity) {
+            let mut entry = match (&item.profile, &mail_identity) {
                 (Some(p), Some(mid)) => state::SpawnEntry::profiled(
                     agent.pane_id.clone(),
                     name.clone(),
@@ -9410,6 +9497,11 @@ projects available: {}",
                     state::SpawnEntry::legacy(agent.pane_id.clone(), name.clone())
                 }
             };
+            // ADR-0013 P1-7/P1-8 provenance: the Muse/slot pin this launch plan
+            // resolved, plus the bounded digest of the profile's attached
+            // skills — ledger evidence, not an inferred column.
+            entry.model_pin = model_pin;
+            entry.skills_digest = skills_digest;
             registry.push(entry);
             println!(
                 "  {} {}",
