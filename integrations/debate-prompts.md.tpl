@@ -42,7 +42,7 @@ why it is stronger. Reply in thread {thread} and acknowledge when done.
 
 ## Invariants
 
-- Every prompt carries `ack_required=true` — turn advancement is ack-gated.
+- Every prompt carries `ack_required=true`; turn advancement is ack-gated.
 - The proposition appears ONLY in the opening + judge prompts (counters
-  reference the prior reply, per ADR-0001 §9.1 — long prompts degrade quality).
+  reference the prior reply, per ADR-0001 s9.1, since long prompts degrade quality).
 - The judge uses `summarize_thread`, not raw message scrolling.

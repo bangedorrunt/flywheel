@@ -1,7 +1,7 @@
 {{TOOL_FRONTMATTER}}
 # Workflow: debate
 
-Run the debate workflow: adversarial synthesis — reviewers brief, an oracle decides.
+Run the debate workflow: adversarial synthesis -- reviewers brief, an oracle decides.
 
 ## This command's focus
 

@@ -1,7 +1,7 @@
 {{TOOL_FRONTMATTER}}
 # Workflow: onboard
 
-Run the onboard workflow: cold-start a newcomer — map the repo, seed context, propose the first task.
+Run the onboard workflow: cold-start a newcomer -- map the repo, seed context, propose the first task.
 
 ## This command's focus
 

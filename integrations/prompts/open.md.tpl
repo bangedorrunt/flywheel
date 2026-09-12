@@ -38,7 +38,7 @@ unless the operator requests a change.
 Session start is `flywheel arrive <project> --as <pin>` then
 `flywheel briefing "<objective>" --project <p> --json`. Open-mode
 stays current-pane when briefing topology is `open` or `join`.
-Join-loud prints JOINING — not spawning. Do not fork a dispatcher
+Join-loud prints JOINING, not spawning. Do not fork a dispatcher
 when one is already up; attach `toron watch --live`.
 
 ## Contract
@@ -63,10 +63,10 @@ not imply the project's Toron identity mode is `swarm`. Use the public mail
 identity supplied by the environment for `toron`, presence, reservations, and
 mail. Do not invent a pin or use an internal pane slug as a public identity.
 
-If you register a mail identity for a collaboration task, bootstrap it — the
+If you register a mail identity for a collaboration task, bootstrap it: the
 mailbox is write-only until you do, and the human must never become the relay:
 
-- **Arrive loudly.** Check the roster first (`toron` list agents — note each
+- **Arrive loudly.** Check the roster first (`toron` list agents; note each
   entry's recency), then publish presence
   (`toron presence publish --state working`) so the next agent discovers you
   instead of being surprised by your mail. Roster entries can be stale
@@ -74,17 +74,17 @@ mailbox is write-only until you do, and the human must never become the relay:
   never address it.
 - **Resolve the captain channel by ladder, never by guessing.** Try the
   `captain` alias; if it is unbound, the operator in THIS pane is the
-  captain channel — report outcomes in chat and keep mail for peers only.
+  captain channel. Report outcomes in chat and keep mail for peers only.
   Do not pick a captain-looking pin from the roster (name-similarity mailed
   a 9-day-dead session once; that failure is why this ladder exists).
 - **Arm an inbox watch.** No dispatcher will ring you in open mode. Run
   `toron watch --live` in the background, or pull
-  `toron mail inbox --since last` after each work unit — a peer's message
+  `toron mail inbox --since last` after each work unit, so a peer's message
   must reach you without the human relaying it.
 - **Mail discipline.** Mint a `corr` per collaboration thread and keep the
   `thread_id` across rounds; reply file-first (findings over ~20 lines go to
   a durable file, the mail carries summary + path); `acknowledge_message`
-  every `ack_required` message you have acted on — the ack is the delivery
+  every `ack_required` message you have acted on; the ack is the delivery
   contract, not the send.
 
 ## When to choose another mode
@@ -105,7 +105,7 @@ explicitly performed.
 
 Open-mode panes can own a dispatcher (peer-aware). Do not spawn work through
 harness-native delegation tools (agent/subagent/task/workflow/spawn/dispatch/
-worktree/delegate-shaped) — they bypass the spawn registry, so the doorbell,
+worktree/delegate-shaped) bypass the spawn registry, so the doorbell,
 dispatcher, and guards see nothing. Fence: `flywheel __subagent-guard <tool>`
 (exit 2 = deny); observe/stop verbs and session-local todo stay legal;
 mcp__* always allowed; crew panes exempt (`--role crew` /

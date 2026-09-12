@@ -1,7 +1,7 @@
 {{TOOL_FRONTMATTER}}
 # Workflow: captain-audit
 
-Run the captain-audit workflow: read-only analysis of a topic within a scope — scout gathers evidence, the oracle synthesizes the report, the reviewer challenges it. ANALYSIS ONLY: no beads, no repo edits; the report is written to `report_path`.
+Run the captain-audit workflow: read-only analysis of a topic within a scope -- scout gathers evidence, the oracle synthesizes the report, the reviewer challenges it. ANALYSIS ONLY: no beads, no repo edits; the report is written to `report_path`.
 
 ## This command's focus
 

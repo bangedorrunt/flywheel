@@ -1,7 +1,7 @@
 {{TOOL_FRONTMATTER}}
 # Workflow: brainstorm
 
-Run the brainstorm workflow: divergent ideation — fan out oracles, a planner reduces to ranked options.
+Run the brainstorm workflow: divergent ideation -- fan out oracles, a planner reduces to ranked options.
 
 ## This command's focus
 
