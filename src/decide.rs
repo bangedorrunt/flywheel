@@ -652,9 +652,73 @@ fn gates_compatible(a: RouteGate, b: RouteGate) -> bool {
     x == 2 || y == 2 || x == y
 }
 
-/// Compile the one routing table. Loud on overlap — callers fail closed.
+/// Table-wide invariants that only make sense for the REAL table (a synthetic
+/// table in a test carries names there is no catalog to compare against).
+///
+/// ADR-0032 Spec 9: one table is the single source for primitive, matcher,
+/// argv shape, and topology — so its load must be loud on every way the table
+/// could produce two routes or a dangling claim.
+pub fn check_catalog(table: &[RouteEntry]) -> Result<(), String> {
+    for e in table {
+        if e.matchers.is_empty() {
+            return Err(format!(
+                "catalog: primitive {:?} declares no matchers — a route needs a trigger",
+                e.primitive
+            ));
+        }
+    }
+    for (i, a) in table.iter().enumerate() {
+        for b in &table[i + 1..] {
+            if a.primitive == b.primitive {
+                continue;
+            }
+            if a.matchers[0] == b.matchers[0] {
+                return Err(format!(
+                    "catalog: trigger {:?} claims both {:?} and {:?} — \
+                     decide_trigger_for would be ambiguous",
+                    a.matchers[0], a.primitive, b.primitive
+                ));
+            }
+        }
+    }
+    for name in UNROUTED_PRIMITIVES {
+        if !table.iter().any(|e| e.primitive == *name) {
+            return Err(format!(
+                "catalog: {name:?} is declared unrouted but has no routing row (stale entry)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Spec 9 cross-check: every row that dispatches `workflow run <primitive>`
+/// must name a workflow the catalog actually resolves. `known` is the merged
+/// catalog's names (builtin < user < project); decide.rs stays pure by taking
+/// them as an argument. Loud, naming the orphaned route.
+pub fn check_workflow_routes(table: &[RouteEntry], known: &[String]) -> Result<(), String> {
+    for e in table {
+        if !matches!(
+            e.argv,
+            RouteArgv::WorkflowRun { .. } | RouteArgv::WorkflowRunNoMode
+        ) {
+            continue;
+        }
+        if !known.iter().any(|k| k == e.primitive) {
+            return Err(format!(
+                "catalog: route {:?} dispatches `workflow run` but no such workflow exists \
+                 (flywheel workflow list)",
+                e.primitive
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Compile the one routing table. Loud on overlap, on an ambiguous trigger, and
+/// on a dangling claim — callers fail closed.
 pub fn compile_routing_table() -> Result<(), String> {
-    check_routing_table(ROUTING_TABLE)
+    check_routing_table(ROUTING_TABLE)?;
+    check_catalog(ROUTING_TABLE)
 }
 
 fn none_decision(target: &str, why: String) -> Decision {
@@ -820,48 +884,40 @@ fn pick(mut hits: Vec<((usize, usize), &RouteEntry)>, target: &str, snap: &Snaps
 }
 
 // ---- bd-x6x4: decide trigger phrase per builtin (workflow list --json) ----
+
+/// Primitives that are deliberately NOT keyword-routed: the command-adjacent
+/// shapes the captain invokes by name (`steer`), the lifecycle fan-out
+/// (`join` / `spawn-send` / `loop-work`), and the compose / cron forms.
+///
+/// This list is the ONLY place "not routed" is stated. Everything outside it
+/// is keyword-routed, and its trigger is derived from the table below.
+pub const UNROUTED_PRIMITIVES: &[&str] = &[
+    "coalition-form",
+    "compose-agent",
+    "compose-parts",
+    "cron-start",
+    "join",
+    "loop-work",
+    "spawn-send",
+    "steer",
+    "steer-direct",
+];
+
 /// The decide keyword phrase that routes to a builtin via `flywheel decide`.
-/// Returns the primary trigger phrase (the first `has()` needle) for each
-/// routed builtin, or None for command-adjacent / recipe / phase-chain
-/// builtins that are deliberately NOT keyword-routed.
+///
+/// ADR-0032 Spec 9: this is DERIVED from the one routing table — the phrase IS
+/// the row's first matcher, never a second hand-kept list that can drift from
+/// what `decide` actually matches. `None` means the primitive is declared
+/// unrouted ([`UNROUTED_PRIMITIVES`]) or has no row at all (command-adjacent
+/// / recipe / phase-chain names).
 pub fn decide_trigger_for(workflow: &str) -> Option<&'static str> {
-    match workflow {
-        // Existing 13
-        "captain-audit" => Some("audit"),
-        "bug-fix" => Some("repro"),
-        "refactoring" => Some("refactor"),
-        "prototype" => Some("prototype"),
-        "arena" => Some("arena"),
-        "perf" => Some("perf"),
-        "hillclimb" => Some("hillclimb"),
-        "forensics" => Some("forensic"),
-        "babysit-bead" => Some("babysit"),
-        "pickup" => Some("pickup"),
-        "pause" => Some("pause"),
-        "interrogate" => Some("interrogate"),
-        "figure-it-out" => Some("figure it out"),
-        "ship-beads" => Some("ship beads"),
-        // New 9 (bd-x6x4)
-        "feature" => Some("feature"),
-        "goal" => Some("goal"),
-        "triage-deep" => Some("triage-deep"),
-        "triage" => Some("triage"),
-        "weekly-review" => Some("weekly-review"),
-        "autonomous-work" => Some("autonomous-work"),
-        "reflect" => Some("reflect"),
-        "awareness-digest" => Some("awareness-digest"),
-        "debate" => Some("argue both sides"),
-        "ce-brainstorm" => Some("brainstorm"),
-        "ce-plan" => Some("break this down"),
-        "ship" => Some("ship the chain"),
-        "beads" => Some("convert to beads"),
-        "onboard" => Some("onboard"),
-        "wave-swarm" => Some("wave-swarm"),
-        "repair-until-verified" => Some("repair-until-verified"),
-        "ce-compound" => Some("compound the learning"),
-        "ce-sweep" => Some("sweep the learnings"),
-        _ => None,
+    if UNROUTED_PRIMITIVES.contains(&workflow) {
+        return None;
     }
+    ROUTING_TABLE
+        .iter()
+        .find(|e| e.primitive == workflow)
+        .and_then(|e| e.matchers.first().copied())
 }
 
 // ---- ADR-0022 §3.7 T4 / W7: delegated composition coverage (bd-adr22-w7) ----
@@ -2036,6 +2092,120 @@ mod decide_router_tests {
         assert!(
             err.contains("aaa") && err.contains("bbb"),
             "names claimants: {err}"
+        );
+    }
+
+    // Spec 9: one trigger per phrase — two primitives sharing a first matcher
+    // would make decide_trigger_for ambiguous, so the catalog refuses to load.
+    #[test]
+    fn decide_router_shared_trigger_fails_load() {
+        let dup = [
+            RouteEntry {
+                primitive: "aaa",
+                matchers: &["same-trigger"],
+                topology: "swarm",
+                gate: RouteGate::Always,
+                argv: RouteArgv::CronStart,
+                reason: "a",
+            },
+            RouteEntry {
+                primitive: "bbb",
+                matchers: &["same-trigger", "other"],
+                topology: "open",
+                gate: RouteGate::Always,
+                argv: RouteArgv::CronStart,
+                reason: "b",
+            },
+        ];
+        let err = check_catalog(&dup).expect_err("shared trigger must fail load");
+        assert!(err.contains("same-trigger"), "names the phrase: {err}");
+        assert!(
+            err.contains("aaa") && err.contains("bbb"),
+            "names claimants: {err}"
+        );
+    }
+
+    // Spec 9: a row that runs a workflow must name a workflow that resolves;
+    // the live table + live catalog are checked together in main.rs.
+    #[test]
+    fn decide_router_orphan_workflow_route_fails_load() {
+        let table = [RouteEntry {
+            primitive: "ghost-wf",
+            matchers: &["ghost"],
+            topology: "swarm",
+            gate: RouteGate::Always,
+            argv: RouteArgv::WorkflowRun { mode: "pane" },
+            reason: "g",
+        }];
+        let err = check_workflow_routes(&table, &["real-wf".to_string()])
+            .expect_err("orphan route must fail load");
+        assert!(err.contains("ghost-wf"), "names the orphan: {err}");
+        check_workflow_routes(&table, &["ghost-wf".to_string()])
+            .expect("a resolvable workflow admits the route");
+        // A non-workflow argv shape is never subject to the cross-check.
+        let non_wf = [RouteEntry {
+            primitive: "join",
+            matchers: &["join it"],
+            topology: "swarm",
+            gate: RouteGate::Always,
+            argv: RouteArgv::Join,
+            reason: "j",
+        }];
+        check_workflow_routes(&non_wf, &[]).expect("Join is not a `workflow run` route");
+    }
+
+    // The LIVE catalog proves the table: every `workflow run` route resolves to
+    // a real workflow. This is the "one catalog" proof — a rename in the
+    // catalog that leaves a route behind turns this red instead of shipping a
+    // decide argv that cannot run.
+    #[test]
+    fn decide_router_live_table_resolves_against_the_real_catalog() {
+        let known: Vec<String> = crate::builtin_workflows::builtin_workflows()
+            .into_keys()
+            .collect();
+        assert!(
+            known.len() > 20,
+            "the builtin catalog is non-trivial: {known:?}"
+        );
+        check_workflow_routes(ROUTING_TABLE, &known)
+            .expect("every routed `workflow run` primitive must exist in the catalog");
+    }
+
+    // The unrouted declaration is one place, and every name in it is real.
+    #[test]
+    fn decide_router_unrouted_list_is_real_and_not_keyword_routed() {
+        for name in UNROUTED_PRIMITIVES {
+            assert!(
+                ROUTING_TABLE.iter().any(|e| e.primitive == *name),
+                "{name} is declared unrouted but has no routing row"
+            );
+            assert_eq!(
+                decide_trigger_for(name),
+                None,
+                "{name} is not keyword-routed"
+            );
+        }
+        // Every OTHER primitive is keyword-routed, and its trigger is the FIRST
+        // row's first matcher. A multi-row primitive (bug-fix: repro…, then
+        // bug…; steer: beads…, then crew-steer…) keeps its secondary needles
+        // out of the trigger position — the phrase is per-primitive, so the
+        // first row owns it.
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for e in ROUTING_TABLE {
+            if UNROUTED_PRIMITIVES.contains(&e.primitive) || !seen.insert(e.primitive) {
+                continue;
+            }
+            assert_eq!(
+                decide_trigger_for(e.primitive),
+                Some(e.matchers[0]),
+                "{} must trigger on its first row's first matcher",
+                e.primitive
+            );
+        }
+        assert!(
+            seen.len() >= 30,
+            "the table carries a real keyword-routed set: {}",
+            seen.len()
         );
     }
 
