@@ -379,8 +379,9 @@ pub struct SpawnEntry {
     /// via the catalog at dispatch time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
-    /// GS-043: in-flight model binding (captain `binding-rebind --model`).
-    /// `None` = inherit from profile catalog; Some = live override.
+    /// GS-043: reserved live model override column. Today write-only —
+    /// spawn/pane/headless do not read it; `binding-rebind --model` fails loud
+    /// (never invent Settled). `None` = inherit profile catalog when wired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// the registered agent-mail identity (adjective+noun) pinned at spawn
