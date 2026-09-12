@@ -384,6 +384,21 @@ pub struct SpawnEntry {
     /// (never invent Settled). `None` = inherit profile catalog when wired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// ADR-0013 P1-7: the Muse/slot pin the spawn's launch plan resolved —
+    /// the concrete registry route (e.g. `opencode-go/muse-spark-1.3-contributor`),
+    /// never the declared `@slot` alias. Same provenance as [`Self::profile`]:
+    /// the PLANNED launch. A reroute hop that changes the route mid-spawn is
+    /// its own evidence on the ADR-0026 reroute audit (`record_reroute_audit`),
+    /// not a silent rewrite of this row. Distinct from [`Self::model`]
+    /// (write-only, GS-043 D6). `None` for legacy / pre-profile rows and for a
+    /// bare launch that declared no route to resolve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_pin: Option<String>,
+    /// ADR-0013 P1-8: bounded digest of the profile's attached skills
+    /// (`profile::skills_digest`) — identity + count, never the list.
+    /// `None` = the profile attaches no skills.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills_digest: Option<String>,
     /// the registered agent-mail identity (adjective+noun) pinned at spawn
     /// (bd-627z.4). `None` for pre-bd-627z.4 entries — assign falls back to
     /// the deterministic hash mapping for those.
@@ -409,6 +424,8 @@ impl SpawnEntry {
             profile: None,
             harness: None,
             model: None,
+            model_pin: None,
+            skills_digest: None,
             mail_identity: None,
             skills_injected: false,
             incarnation: 0,
@@ -427,6 +444,8 @@ impl SpawnEntry {
             profile: None,
             harness: None,
             model: None,
+            model_pin: None,
+            skills_digest: None,
             mail_identity: Some(mail_identity.into()),
             skills_injected: false,
             incarnation: 0,
@@ -449,6 +468,8 @@ impl SpawnEntry {
             profile: Some(profile.into()),
             harness: Some(harness.into()),
             model: None,
+            model_pin: None,
+            skills_digest: None,
             mail_identity,
             skills_injected: false,
             incarnation: 0,
@@ -478,6 +499,10 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 #[serde(default)]
                 model: Option<String>,
                 #[serde(default)]
+                model_pin: Option<String>,
+                #[serde(default)]
+                skills_digest: Option<String>,
+                #[serde(default)]
                 mail_identity: Option<String>,
                 #[serde(default)]
                 skills_injected: bool,
@@ -492,6 +517,8 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 profile: None,
                 harness: None,
                 model: None,
+                model_pin: None,
+                skills_digest: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -502,6 +529,8 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 profile,
                 harness,
                 model,
+                model_pin,
+                skills_digest,
                 mail_identity,
                 skills_injected,
                 incarnation,
@@ -511,6 +540,8 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 profile,
                 harness,
                 model,
+                model_pin,
+                skills_digest,
                 mail_identity,
                 skills_injected,
                 incarnation,
@@ -2796,6 +2827,8 @@ mod loops_sidecar_tests {
                 profile: Some("planner".into()),
                 harness: Some("omp".into()),
                 model: None,
+                model_pin: None,
+                skills_digest: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -2827,6 +2860,14 @@ mod loops_sidecar_tests {
         assert_eq!(loaded[0].profile.as_deref(), Some("planner"));
         assert_eq!(loaded[0].harness, None, "absent column -> None");
         assert_eq!(loaded[0].mail_identity, None, "absent column -> None");
+        assert_eq!(
+            loaded[0].model_pin, None,
+            "absent pin column -> None, never a fabricated route (P1-7)"
+        );
+        assert_eq!(
+            loaded[0].skills_digest, None,
+            "absent digest column -> None (P1-8)"
+        );
         assert!(
             !loaded[0].skills_injected,
             "absent column -> false (bd-eign.10)"
@@ -2849,6 +2890,38 @@ mod loops_sidecar_tests {
         // cleanup
         let _ = std::fs::remove_file(&legacy_path);
         let _ = std::fs::remove_file(legacy_path.with_extension("json.tmp"));
+    }
+
+    /// ADR-0013 P1-7/P1-8 (Wave C): the Muse/slot pin and the bounded skills
+    /// digest round-trip, and are ABSENT (never defaulted) when the launch plan
+    /// recorded none — a legacy row cannot claim a route it never launched on.
+    #[test]
+    fn spawn_registry_pin_and_skills_digest_columns_roundtrip() {
+        let _g = loops_test_guard();
+        let p = test_project("reg-digest");
+        let mut e = SpawnEntry::profiled("w2B:p1", "crew-wf-planner-1", "planner", "pi", None);
+        e.model_pin = Some("opencode-go/muse-spark-1.3-contributor".into());
+        e.skills_digest = Some("skills-v1:0123456789ab:n=2".into());
+        save_spawn_registry(&p, std::slice::from_ref(&e)).unwrap();
+        let raw = std::fs::read_to_string(spawn_registry_file(&p)).unwrap();
+        assert!(raw.contains("model_pin"), "pin column serialized: {raw}");
+        assert!(
+            raw.contains("skills_digest"),
+            "digest column serialized: {raw}"
+        );
+        assert_eq!(load_spawn_registry(&p), vec![e], "provenance round-trips");
+
+        // A row with no resolved route serializes NEITHER column — absence is
+        // the honest encoding (never a placeholder hash for "no attach").
+        let bare = SpawnEntry::profiled("w2B:p2", "crew-wf-coder-1", "coder", "omp", None);
+        save_spawn_registry(&p, std::slice::from_ref(&bare)).unwrap();
+        let raw = std::fs::read_to_string(spawn_registry_file(&p)).unwrap();
+        assert!(!raw.contains("model_pin"), "None pin stays absent: {raw}");
+        assert!(
+            !raw.contains("skills_digest"),
+            "None digest stays absent: {raw}"
+        );
+        assert_eq!(load_spawn_registry(&p), vec![bare]);
     }
 
     /// bd-627z.4: the MAIL IDENTITY column survives a round-trip (the

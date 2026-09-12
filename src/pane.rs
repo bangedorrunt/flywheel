@@ -360,12 +360,14 @@ fn spawn_crew_into(
             // (herdr injects env only at split/create).
             let mail_identity = crate::pinned_mail_identity(cfg, project, &name, harness);
             let pane_env = crate::herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
-            let (agent_pane_id, name) = if let Some(e) = existing {
+            let (agent_pane_id, name, model_pin) = if let Some(e) = existing {
                 eprintln!(
                     "  crew {}: reusing {} ({}) @{}",
                     label, name, e.pane_id, role
                 );
-                (e.pane_id.clone(), name.clone())
+                // A reused live pane keeps the provenance its own spawn
+                // recorded (ADR-0013 P1-7) — this path resolves no plan.
+                (e.pane_id.clone(), name.clone(), e.model_pin.clone())
             } else {
                 let pane_id = match &prev {
                     None => {
@@ -415,12 +417,17 @@ fn spawn_crew_into(
                 // AGENT_ARG must honor Profile.provider via the same
                 // registry pin as cmd_spawn / spawn_launch_plan. Raw
                 // profile.model drops the provider half (ADR-0027 compose gap).
-                let mut agent_args: Vec<String> =
+                // ADR-0013 P1-7: PLAN form (not the argv-only view) so the
+                // registry row below carries the same resolved Muse/slot pin
+                // the argv embeds. No model and no provider = no route to
+                // resolve → no pin (the bare-launch case).
+                let (mut agent_args, model_pin): (Vec<String>, Option<String>) =
                     if profile.model.is_empty() && profile.provider.is_empty() {
-                        vec![]
+                        (vec![], None)
                     } else {
-                        crate::profile_launch_args(harness, profile, None)
-                            .map_err(|e| anyhow!("pane crew @{role} model routing: {e}"))?
+                        let (args, pin) = crate::profile_launch_plan(harness, profile, None)
+                            .map_err(|e| anyhow!("pane crew @{role} model routing: {e}"))?;
+                        (args, Some(pin))
                     };
                 agent_args.extend(headless::role_model_args(
                     harness,
@@ -529,7 +536,7 @@ fn spawn_crew_into(
                         "flywheel: crew {name} readiness wait failed (dispatching anyway): {e}"
                     );
                 }
-                (agent.pane_id.clone(), name.clone())
+                (agent.pane_id.clone(), name.clone(), model_pin)
             };
             prev = Some(agent_pane_id.clone());
             registry.retain(|e| e.name != name);
@@ -541,6 +548,10 @@ fn spawn_crew_into(
                 profile: Some(role.clone()),
                 harness: Some(harness.clone()),
                 model: None,
+                // ADR-0013 P1-7/P1-8: the same resolved plan the pane launched
+                // with — pin + bounded skills digest, never a second resolution.
+                model_pin,
+                skills_digest: crate::profile::skills_digest(&profile.skills),
                 mail_identity,
                 skills_injected: false,
                 incarnation: 0,
@@ -1740,7 +1751,9 @@ mod tests {
             name: name.to_string(),
             profile: Some(profile.to_string()),
             harness: None,
-                model: None,
+            model: None,
+            model_pin: None,
+            skills_digest: None,
             mail_identity: None,
             skills_injected: false,
             incarnation: 0,
@@ -1815,10 +1828,15 @@ mod tests {
         let start = src
             .find("fn spawn_crew_into(")
             .expect("spawn_crew_into present");
-        let slice = &src[start..start.saturating_add(12000)];
+        let slice = &src[start..start.saturating_add(16000)];
         assert!(
-            slice.contains("profile_launch_args(harness, profile, None)"),
-            "compose pre-spawn must honor Profile.provider via profile_launch_args"
+            slice.contains("profile_launch_plan(harness, profile, None)"),
+            "compose pre-spawn must honor Profile.provider via the launch PLAN"
+        );
+        // The row itself, not just a call somewhere in the arm.
+        assert!(
+            slice.contains("model_pin,\n                skills_digest:"),
+            "the crew registry row must carry the pin + skills digest (ADR-0013 P1-7/P1-8)"
         );
     }
 
@@ -1833,6 +1851,8 @@ mod tests {
                 profile: Some("planner".into()),
                 harness: Some("omp".into()),
                 model: None,
+                model_pin: None,
+                skills_digest: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -1843,6 +1863,8 @@ mod tests {
                 profile: Some("coder".into()),
                 harness: Some("omp".into()),
                 model: None,
+                model_pin: None,
+                skills_digest: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -1868,6 +1890,8 @@ mod tests {
                 profile: Some("reviewer".into()),
                 harness: Some("omp".into()),
                 model: None,
+                model_pin: None,
+                skills_digest: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -1878,6 +1902,8 @@ mod tests {
                 profile: Some("scout".into()),
                 harness: Some("opencode".into()),
                 model: None,
+                model_pin: None,
+                skills_digest: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -1903,6 +1929,8 @@ mod tests {
                 profile: Some("coder".into()),
                 harness: Some("omp".into()),
                 model: None,
+                model_pin: None,
+                skills_digest: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -1976,7 +2004,9 @@ mod tests {
             name: name.to_string(),
             profile: Some(profile.to_string()),
             harness: Some(harness.to_string()),
-                model: None,
+            model: None,
+            model_pin: None,
+            skills_digest: None,
             mail_identity: None,
             skills_injected: false,
             incarnation: 0,
@@ -2011,7 +2041,9 @@ mod tests {
             name: "crew-goal-coder".into(),
             profile: Some("coder".into()),
             harness: Some("pi".into()),
-                model: None,
+            model: None,
+            model_pin: None,
+            skills_digest: None,
             mail_identity: None,
             skills_injected: false,
             incarnation: 0,

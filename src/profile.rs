@@ -113,6 +113,56 @@ pub struct Profile {
     pub model_fallback: Vec<String>,
 }
 
+/// Bounded digest of a profile's attached skills (ADR-0013 P1-8): the spawn
+/// ledger records this instead of the list, so a name reused across spawns
+/// can carry a provably different skill set (and the column stays bounded).
+///
+/// Order-sensitive — `Profile.skills` order IS the injection order, so a
+/// reorder is a different attach. No skills → `None`: nothing was attached,
+/// so there is nothing to digest and the column stays absent.
+pub fn skills_digest(skills: &[String]) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"profile-skills-v1\0");
+    for s in skills {
+        h.update(s.as_bytes());
+        h.update(b"\0");
+    }
+    Some(format!(
+        "skills-v1:{}:n={}",
+        &hex::encode(h.finalize())[..12],
+        skills.len()
+    ))
+}
+
+#[cfg(test)]
+mod skills_digest_tests {
+    use super::skills_digest;
+
+    /// Deterministic, bounded, and order-sensitive.
+    #[test]
+    fn digest_is_bounded_deterministic_and_order_sensitive() {
+        let a = vec!["tdd".to_string(), "code-quality".to_string()];
+        let first = skills_digest(&a).expect("non-empty skills digest");
+        assert_eq!(first, skills_digest(&a).expect("stable"));
+        assert!(first.starts_with("skills-v1:"), "{first}");
+        assert!(first.ends_with(":n=2"), "{first}");
+        assert!(first.len() <= 40, "bounded: {first}");
+        // A reordered list is a different attach.
+        let b = vec!["code-quality".to_string(), "tdd".to_string()];
+        assert_ne!(first, skills_digest(&b).expect("digest"));
+    }
+
+    /// No skills → no digest (never a fabricated hash for an empty attach).
+    #[test]
+    fn empty_skills_have_no_digest() {
+        assert_eq!(skills_digest(&[]), None);
+    }
+}
+
 /// `[harness.<name>]` section (ADR-0005 Spec 1): a spawn recipe for a harness
 /// that speaks an existing backend protocol. Config-driven new-harness support
 /// — no code change for the harness itself.
