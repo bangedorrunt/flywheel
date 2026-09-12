@@ -106,9 +106,11 @@ steps:
         action: send_dm
         to: housekeeper
         body: "agent-reach-upgrade FAILED — verify step did not pass"
-      - name: fail-closed
-        action: call_webhook
-        url: "http://127.0.0.1:9/none"
+      - name: escalate
+        action: send_message
+        to: ["housekeeper"]
+        subject: "agent-reach-upgrade FAILED — verify step did not pass"
+        body: "agent-reach-upgrade FAILED — verify step did not pass; no webhook sink is wired (fail-closed), so this message is the escalation"
         on_error: fail_run
 "#,
     ),
