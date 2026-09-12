@@ -86,12 +86,15 @@ arms and what they obligate you to do:
 | steer | objective-driven, captain-free driving | `flywheel steer "<objective>"` |
 | loop-work | bead queue driving | `flywheel loop-mode run <project> --work` |
 | captain-audit | read-only audit of the captain session | run the audit workflow |
+| none | no catalog route matched | declare a trigger, or `workflow compose --agent`; never steer anyway |
 
 Hard rules:
 
 - decide said find-existing / steer / loop-work / captain-audit → **composing
   is wrong**, even if you think you could. Force-fitting `goal` onto a
   read-only audit corrupts the audit's contract.
+- decide said `none` → running `steer` anyway is wrong. Restate with a
+  declared trigger, or author the shape (`compose --agent`).
 - Lint is fail-stop. A workflow that does not lint never runs. Never dispatch
   dirty YAML, never "just this once" past a lint error.
 - Archetype check before composing: scout-fanout, verify-fence, debate,

@@ -144,7 +144,7 @@ steps:
 ```bash
 flywheel workflow lint greet        # fail-stop gate (must pass)
 flywheel workflow run greet --inputs '{"who":"world"}' --execute
-flywheel workflow history greet     # past runs
+flywheel workflow history greet     # past runs: recorded terminal status + project (missing status reads unknown, never done)
 flywheel workflow remove greet
 ```
 

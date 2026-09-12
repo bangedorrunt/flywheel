@@ -91,3 +91,15 @@ Refused (ADR-0028 §6, re-affirmed): OTP GenServer runtime, supervision-as-heal,
 ## Grilling transcript index
 
 Five decision rounds + two clarifications, all via structured ask: port target → Turn granularity → decide revision → schema home (+ elaboration on dynamic authoring surfaces) + compensation scope → sequencing + deliverable shape. Full interview in session transcript; decisions restated in ADR-0032 §Decision Outcome.
+
+## Wave-1 landing pointer (2026-09-12, bd-himk + bd-40d1 + bd-pqrb)
+
+Spec 9 flywheel half is landed, skills synced in bd-pqrb: one `ROUTING_TABLE`
+(`src/decide.rs`, earliest-match position, explicit `none`, topology per row,
+`briefing` reads it); run ledger rows carry terminal status + real project +
+failure artifacts (`src/main.rs`, `workflow history` never defaults `done`);
+headless leaf garbage is typed `Err`; absorbed pipelines emit `CallWorkflow`;
+review archetype is `ce-review`. Defect-table rows 13/17/18/19/24 closed by
+these landings. Effect journal, Turn receipts, and bounded `reduce` execution
+semantics beyond the shipped `Reduce` action remain proposed — docs label them
+as such, never as landed.
