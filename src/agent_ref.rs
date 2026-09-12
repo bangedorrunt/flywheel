@@ -409,6 +409,15 @@ mod tests {
             FailureKind::Billing,
             ""
         ));
+        // B2: rate_limit with empty evidence also refuses (pane must not hop).
+        assert!(!RebindIntent::allowed_from_failure(
+            FailureKind::RateLimit,
+            ""
+        ));
+        assert!(!RebindIntent::allowed_from_failure(
+            FailureKind::RateLimit,
+            "   "
+        ));
     }
 
     #[test]

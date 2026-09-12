@@ -42,8 +42,8 @@
 | Item | Fix |
 | :--- | :--- |
 | Peer-aware SoT | Migrated `CONTROL-PLANE MARKER` (U+2063 + `FLYWHEEL_OP`) + `RED-SURFACE PING` into `integrations/peer-aware.md.tpl`; CI asserts markers in SoT |
-| Invent-green `--model` | `SpawnEntry.model` column; `binding-rebind --model` applies before Settled |
+| Invent-green `--model` | Fail-loud before Settled: `SpawnEntry.model` is write-only (no spawn/pane/headless consumer). Never invent Settled. |
 | I4 ModelEntry.fallback | Headless + pane registry last rung journals via `commit_rebind` |
 | A1 npub freeze | `AgentRef::with_npub` no-ops when already `Some` |
-| B2 pane 429 ProfileFallback | `commit_rebind_opt` → Prepared→InFlight→Settled\|Unknown (not Prepared-only) |
-| C1 evidence redact | `redact_evidence` strips keys/tokens + truncates before `journal_rebind` persist |
+| B2 pane 429 ProfileFallback | `commit_rebind_opt` → Settled\|Unknown; empty-evidence else refuses hop + journals Unknown (no silent continue) |
+| C1 evidence redact | `redact_evidence` on `journal_rebind` **and** `record_reroute_audit` before persist/eprintln |

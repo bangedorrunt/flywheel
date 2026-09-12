@@ -114,6 +114,8 @@ fn record_reroute_audit(
     kind: failure::FailureKind,
     evidence: &str,
 ) {
+    // C1 residual: redact before persist/eprintln — same gate as journal_rebind.
+    let evidence = agent_ref::redact_evidence(evidence);
     let entry = serde_json::json!({
         "attempt": attempt,
         "profile": profile,
@@ -747,9 +749,10 @@ enum Commands {
     /// (bd-fw-name-binding-loss-7rc): panes whose agent restarted show
     /// name:null — this renames them back to their registered names.
     Rebind { project: String },
-    /// Journaled in-flight profile/model rebind (GS-043 / ADR-0032 Spec 7).
+    /// Journaled in-flight profile/harness rebind (GS-043 / ADR-0032 Spec 7).
     /// Updates the live SpawnEntry binding; does NOT edit profiles.toml.
-    /// Pin/npub stay immutable (AgentRef); profile_name/model/harness replace.
+    /// Pin/npub stay immutable (AgentRef). `--model` fails loud until a real
+    /// spawn/pane/headless consumer reads SpawnEntry.model (never invent Settled).
     #[command(name = "binding-rebind")]
     BindingRebind {
         project: String,
@@ -758,7 +761,7 @@ enum Commands {
         /// replaceable profile name
         #[arg(long)]
         profile: Option<String>,
-        /// replaceable model id (journaled; not a silent catalog edit)
+        /// live model override — currently fail-loud (not wired into spawn/pane/headless)
         #[arg(long)]
         model: Option<String>,
         /// replaceable harness
@@ -7333,6 +7336,42 @@ mod workspace_origin_tests {
         assert!(
             add_body.contains("state::save_agent_names(&dir, &registry)"),
             "cmd_add must write the project-local agent-names.json mirror (bd-add-missing-mail-identity-16le)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gs043_residual_honesty_tests {
+    /// MEDIUM invent-green: binding-rebind --model must fail-loud before Settled
+    /// while SpawnEntry.model has no spawn/pane/headless consumer.
+    #[test]
+    fn binding_rebind_model_fails_loud_not_write_only_settled() {
+        let src = include_str!("main.rs");
+        let start = crate::tripwire::find_fn(src, "cmd_binding_rebind");
+        let body = &src[start..start.saturating_add(4500)];
+        assert!(
+            body.contains("--model refused (fail-loud)"),
+            "cmd_binding_rebind must fail-loud on --model before Settled"
+        );
+        assert!(
+            !body.contains("e.model = Some(m.to_string())"),
+            "must not Settled a write-only SpawnEntry.model write"
+        );
+        assert!(
+            body.contains("Never invent Settled"),
+            "error must name invent-Settled refusal"
+        );
+    }
+
+    /// C1 residual: record_reroute_audit redacts evidence like journal_rebind.
+    #[test]
+    fn record_reroute_audit_redacts_evidence() {
+        let src = include_str!("main.rs");
+        let start = crate::tripwire::find_fn(src, "record_reroute_audit");
+        let body = &src[start..start.saturating_add(1200)];
+        assert!(
+            body.contains("agent_ref::redact_evidence(evidence)"),
+            "record_reroute_audit must redact before persist/eprintln"
         );
     }
 }
@@ -14124,8 +14163,14 @@ fn cmd_binding_rebind(
             bail!("binding-rebind: unknown profile {p:?} (flywheel profile list)");
         }
     }
-    // Honesty: --model must apply onto SpawnEntry or we refuse before Settled
-    // (never invent-green a model rebind with no effect).
+    // MEDIUM invent-green: SpawnEntry.model is write-only today — no spawn/pane/
+    // headless consumer. Refuse --model before Settled (fail-loud). Never invent
+    // Settled for a column nobody reads. Wire a real consumer later, then reopen.
+    if model.is_some() {
+        bail!(
+            "binding-rebind: --model refused (fail-loud) — live model override is not wired into spawn/pane/headless dispatch (SpawnEntry.model is write-only). Use `flywheel profile set --model …` for catalog SoT, or pass --profile/--harness only. Never invent Settled."
+        );
+    }
     let intent = agent_ref::RebindIntent::prepare(
         agent,
         from,
@@ -14143,28 +14188,12 @@ fn cmd_binding_rebind(
         if let Some(h) = harness {
             e.harness = Some(h.to_string());
         }
-        if let Some(m) = model {
-            e.model = Some(m.to_string());
-        }
-        // Fail-loud if intent claimed a model change but registry column is empty.
-        if !to.model.is_empty() && model.is_some() && e.model.as_deref() != Some(to.model.as_str()) {
-            anyhow::bail!(
-                "binding-rebind: invent-green refused — --model={:?} did not land on SpawnEntry",
-                to.model
-            );
-        }
         state::save_spawn_registry(project, &entries)?;
         Ok(())
     })?;
     println!(
-        "flywheel: binding-rebind settled pin={pin} profile={} harness={} model={}",
-        to.profile_name,
-        to.harness,
-        if to.model.is_empty() {
-            "(unchanged)"
-        } else {
-            to.model.as_str()
-        }
+        "flywheel: binding-rebind settled pin={pin} profile={} harness={}",
+        to.profile_name, to.harness
     );
     Ok(())
 }

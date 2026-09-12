@@ -857,15 +857,33 @@ pub fn pane_dispatch(
                                         out["reroute"] = json!("target-pane-gone");
                                     }
                                 }
-                            } else if let Some(e) =
-                                resolve_pane_entry(entries, &next_profile)
-                            {
-                                // Evidence gate refused journal; still hop (legacy audit above).
-                                attempt_entry = e;
-                                attempt_profile = next_profile;
-                                continue;
                             } else {
-                                out["reroute"] = json!("target-pane-gone");
+                                // B2 residual / I4: empty or disallowed evidence must NOT
+                                // invent a profile hop without journal. Fail-closed —
+                                // journal Unknown, refuse hop (no silent continue).
+                                eprintln!(
+                                    "flywheel: pane 429 ProfileFallback refused — evidence gate closed (I4); no silent hop to @{next_profile}"
+                                );
+                                let intent = crate::agent_ref::RebindIntent::prepare(
+                                    crate::agent_ref::AgentRef::new(project, &attempt_entry.name),
+                                    crate::agent_ref::AgentBinding::profile(&attempt_profile),
+                                    crate::agent_ref::AgentBinding::profile(&next_profile),
+                                    crate::agent_ref::RebindReason::ProfileFallback {
+                                        kind: "rate_limit".into(),
+                                        evidence: if err_str.trim().is_empty() {
+                                            "(empty)".into()
+                                        } else {
+                                            err_str.clone()
+                                        },
+                                    },
+                                    0,
+                                );
+                                let _ = crate::agent_ref::commit_rebind_opt(
+                                    project,
+                                    intent,
+                                    |_| Ok(None::<()>),
+                                );
+                                out["reroute"] = json!("refused-empty-evidence");
                             }
                         }
                         None => {
@@ -1756,6 +1774,38 @@ mod tests {
                 &["oracle".to_string(), "coder".to_string()]
             ),
             None
+        );
+    }
+
+    /// GS-043 B2 residual: pane 429 empty-evidence must refuse hop + journal
+    /// Unknown — never silent continue without I4.
+    #[test]
+    fn pane_429_empty_evidence_refuses_hop_journals_unknown() {
+        let src = include_str!("pane.rs");
+        assert!(
+            src.contains("refused-empty-evidence"),
+            "pane 429 empty-evidence path must expose refused-empty-evidence"
+        );
+        let dispatch = src
+            .find("bd-mukq: 429 reroute")
+            .expect("429 reroute block");
+        let arm = &src[dispatch..dispatch.saturating_add(12000)];
+        assert!(
+            !arm.contains("still hop (legacy"),
+            "429 reroute arm must not silent-continue hop without I4 journal"
+        );
+        assert!(
+            arm.contains("refused-empty-evidence"),
+            "429 arm must refuse empty-evidence hop"
+        );
+        // The refuse arm journals Unknown via commit_rebind_opt → Ok(None)
+        let idx = src
+            .find("refused-empty-evidence")
+            .expect("refused marker");
+        let window = &src[idx.saturating_sub(900)..idx.saturating_add(200)];
+        assert!(
+            window.contains("commit_rebind_opt") && window.contains("Ok(None"),
+            "refuse arm must journal Unknown via commit_rebind_opt Ok(None)"
         );
     }
 
