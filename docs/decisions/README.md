@@ -16,6 +16,7 @@ This directory contains records of the major architectural decisions made for th
 | [0010](0010-delivery-semantics-attention-triage-decision-lifecycle.md) | Adopt delivery semantics, attention triage, and a keyed decision lifecycle | **Accepted** (2026-09-07; captain; D0–D15; HarborPilot + KeenAuditor agreed on `adr-0010-peer-review`) |
 | [0011](0011-session-conductor-crew-budget-captain-fcfs-join-loud.md) | Session conductor — crew budget N, captain FCFS, join-loud | **Accepted** (2026-09-08; Waves A–D: pack N + briefing.v1 + join-loud/FCFS + rot/SIGNOFF; `verify-0011.sh`) |
 | [0012](0012-doorbell-plane-independent-runtime.md) | Spin doorbell out as an independent plane (always-on wake runtime) | **Accepted** (2026-09-10; bd-asr2 Phase 0: doorbell-core extracted, `verify-0012.sh` green; Phases 1–4 in bd-asr2.1–.19) |
+| [0013](0013-agent-profile-lifecycle-journaled-rebind.md) | Agent-profile lifecycle and journaled fallback rebind | **Proposed** (2026-09-12; GS-044; HOLD merge; ADR-0032 Spec 7 honesty; captain acceptance = word on file) |
 
 ## Related toron ADRs
 
