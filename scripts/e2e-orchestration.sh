@@ -51,8 +51,18 @@ scratch() {
   "$FW" mail register "$PROJ" --name CoralFinch >/dev/null 2>&1 || true
 }
 
-bead() { # bead <title> <desc>
-  (cd "$SCRATCH" && br create --title="$1" --description="$2" --type=task --priority=3 >/dev/null 2>&1)
+bead() { # bead <title> <desc> <verify-cmd>
+  # `br ready` is DISPATCHABILITY-gated (fail-closed work-ledger): EVERY bead
+  # needs a VERIFY command, and a P<=2 bead also needs a principles citation,
+  # or `br ready` returns it to nobody. Without this the loop looks broken when
+  # it is behaving correctly: `loop run --work` finds no ready bead and exits
+  # `loop: complete`. `br create` has no --verify flag; set it with `br update`.
+  local id
+  [ -n "${3:-}" ] || { say "bead: missing verify-cmd for '$1' (would not be dispatchable)"; return 1; }
+  id=$(cd "$SCRATCH" && br create --title="$1" --description="$2" --type=task --priority=3 --json 2>/dev/null \
+    | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+  [ -n "$id" ] || return 1
+  (cd "$SCRATCH" && br update "$id" --verify "$3" >/dev/null 2>&1)
 }
 
 # wait_until <desc> <timeout-secs> <cmd...>
@@ -94,7 +104,7 @@ print(len(ws))")
 scenario_2_loop_fresh_detection() { # bd-bvwf.2
   say "--- scenario 2: LOOP-FRESH-DETECTION (fresh spawn -> ready bead dispatches <=90s)"
   scratch s2 || { fail "S2 setup"; return; }
-  bead "fresh-detection" "Create done-fresh.txt containing ok, then br sync + commit."
+  bead "fresh-detection" "Create done-fresh.txt containing ok, then br sync + commit." "test -f done-fresh.txt"
   "$FW" spawn "$PROJ" --oc 1 --retire-orphans --no-verify --no-focus >/dev/null 2>&1
   # spawn-verify: wait for the agent to be DETECTED (herdr classifies the
   # fresh pane) before the loop's first poll — the loop must then dispatch
@@ -123,6 +133,9 @@ scenario_3_loop_chain() { # bd-bvwf.3
   local A B
   A=$(cd "$SCRATCH" && br create --title="chain-A" --description="Create done-a.txt with ok, close." --type=task --priority=3 --json | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
   B=$(cd "$SCRATCH" && br create --title="chain-B" --description="Create done-b.txt with ok, close." --type=task --priority=3 --json | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+  # same dispatchability gate as bead(): VERIFY or the chain never becomes ready
+  (cd "$SCRATCH" && br update "$A" --verify 'test -f done-a.txt' >/dev/null 2>&1)
+  (cd "$SCRATCH" && br update "$B" --verify 'test -f done-b.txt' >/dev/null 2>&1)
   (cd "$SCRATCH" && br dep add "$B" "$A" >/dev/null 2>&1)
   "$FW" spawn "$PROJ" --oc 2 --retire-orphans --no-verify --no-focus >/dev/null 2>&1
   # spawn-verify (same as S2): the chain loop must not strand A on the
@@ -166,7 +179,7 @@ scenario_4_loop_singleton() { # bd-bvwf.4
 scenario_5_loop_unknown() { # bd-bvwf.5
   say "--- scenario 5: LOOP-UNKNOWN (working agent polling unknown 1-2 polls NOT respawned)"
   scratch s5 || { fail "S5 setup"; return; }
-  bead "unknown-gate" "Create done-unknown.txt with ok, close."
+  bead "unknown-gate" "Create done-unknown.txt with ok, close." "test -f done-unknown.txt"
   "$FW" spawn "$PROJ" --oc 1 --retire-orphans --no-verify --no-focus >/dev/null 2>&1
   nohup "$FW" loop run "$PROJ" --work --interval-active 10 --force >"$SCRATCH/loop5.log" 2>&1 &
   local LPID=$!
@@ -189,7 +202,7 @@ scenario_6_crew_execution() { # bd-efk1
   local ok=1
   for i in 1 2 3; do
     scratch s6 || { ok=0; break; }
-    bead "crew-exec-$i" "Create done-ce$i.txt with ok, close."
+    bead "crew-exec-$i" "Create done-ce$i.txt with ok, close." "test -f done-ce$i.txt"
     "$FW" spawn "$PROJ" --oc 1 --retire-orphans --no-verify --no-focus >/dev/null 2>&1
     if ! wait_until "agent detected" 45 bash -c "herdr agent list 2>/dev/null | grep -q '$(basename "$PROJ")'"; then
       fail "S6 round $i: agent not detected"; ok=0; "$FW" kill "$PROJ" --force >/dev/null 2>&1; continue
@@ -289,7 +302,9 @@ scenario_11_steer_monitor() { # bd-t86p
   say "--- scenario 11: STEER-MONITOR (runs view shows the lifecycle)"
   scratch s11 || { fail "S11 setup"; return; }
   local out
-  out=$(TO 60 "$FW" workflow compose "monitor gate" --parts "coder:systematic-execute" --project "$PROJ" 2>&1)
+  # ce-execute is the coder stage; `systematic-execute` was retired with the
+  # p-code aliases (ADR-0009). Compose resolves against the live stage catalog.
+  out=$(TO 60 "$FW" workflow compose "monitor gate" --parts "coder:ce-execute" --project "$PROJ" 2>&1)
   if echo "$out" | grep -q '"workflow"'; then
     pass "S11: compose preview emits the workflow + crew (monitor surface)"
   else
