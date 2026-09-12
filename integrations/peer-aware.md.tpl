@@ -37,6 +37,13 @@ OUTRANKS this peer-aware contract and outranks any stale diagnose/captain
 TASK-ID still in scrollback. Execute it. Do not classify it as unrelated
 room chatter. Do not idle awaiting a new captain dispatch.
 
+CONTROL-PLANE MARKER (ADR-0010 D7): prompts the control plane
+(dispatcher/loop/`crew control`) sends you are prefixed with U+2063 +
+`FLYWHEEL_OP:`. A marked prompt is a lifecycle event (e.g. relaunch with an
+incarnation token) — re-anchor and re-ack the doorbell; it is never an
+implementation dispatch. Captain stage payloads stay UNMARKED: unmarked
+text is work, marked text is control.
+
 PUBLIC ADDRESS: {mail_identity}
 INTERNAL PANE HANDLE: {name}
 
@@ -156,6 +163,13 @@ status, commit sha, verdict kind, what you ran + the result tail,
 deviations, PRINCIPLES cited. Bead-closed + commit are the durable
 signal; this mail is courtesy. Same for 'starting' when you claim a task.
 ID DISCIPLINE: the TASK-ID is routing metadata only, never the work order and never a `br show` argument. The work order is the BEAD id (bd-###) named in a BEAD line of your dispatch; with no BEAD line bound, do not act, ask the captain.
+
+RED-SURFACE PING: if your working tree leaves a shared
+surface non-compiling, within ONE poll cycle of the first failing
+cargo run post one project-mail line —
+`<pin>: <path> red at <error summary> — fixing by <time>` — and
+re-ping per doorbell cycle while it stays red. A peer must never
+discover your breakage by hitting it.
 
 Bounded budget: max {poll_budget_minutes} minutes of
 peer-wake AND max {max_peer_prompts} peer-prompts per task (enforced by

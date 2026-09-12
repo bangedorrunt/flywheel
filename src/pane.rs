@@ -465,17 +465,39 @@ fn spawn_crew_into(
                                         &profile.slow,
                                         &profile.plan,
                                     ));
+                                    // GS-043 I4: journal before ModelEntry.fallback hop.
+                                    let evidence = e.to_string();
+                                    let intent = crate::agent_ref::RebindIntent::prepare(
+                                        crate::agent_ref::AgentRef::new(project, &name),
+                                        crate::agent_ref::AgentBinding {
+                                            profile_name: role.to_string(),
+                                            model: profile.model.clone(),
+                                            harness: harness.to_string(),
+                                        },
+                                        crate::agent_ref::AgentBinding {
+                                            profile_name: role.to_string(),
+                                            model: fallback_id.clone(),
+                                            harness: fallback_harness.to_string(),
+                                        },
+                                        crate::agent_ref::RebindReason::ModelFallback {
+                                            kind: "rate_limit".into(),
+                                            evidence,
+                                        },
+                                        0,
+                                    );
                                     eprintln!(
-                                        "pane crew: @{role} rate-limited on {} — retrying with fallback {fallback_id}",
+                                        "pane crew: @{role} rate-limited on {} — registry fallback {fallback_id}",
                                         profile.model
                                     );
-                                    crate::start_agent_with_retry(
-                                        c,
-                                        &name,
-                                        fallback_harness,
-                                        &pane_id,
-                                        &fallback_args,
-                                    )?
+                                    crate::agent_ref::commit_rebind(project, intent, |_| {
+                                        crate::start_agent_with_retry(
+                                            c,
+                                            &name,
+                                            fallback_harness,
+                                            &pane_id,
+                                            &fallback_args,
+                                        )
+                                    })?
                                 } else {
                                     return Err(e);
                                 }
@@ -518,6 +540,7 @@ fn spawn_crew_into(
                 name: name.clone(),
                 profile: Some(role.clone()),
                 harness: Some(harness.clone()),
+                model: None,
                 mail_identity,
                 skills_injected: false,
                 incarnation: 0,
@@ -789,10 +812,18 @@ pub fn pane_dispatch(
                                 crate::failure::FailureKind::RateLimit,
                                 &err_str,
                             );
-                            // GS-043: journal intent before in-flight profile hop (I4).
+                            // GS-043 B2 / I4: ProfileFallback full lifecycle —
+                            // Prepared → InFlight → Settled|Unknown (not Prepared-only).
                             // Pane path cannot swap model in-session; profile.fallback
-                            // pane hop is the rate_limit reroute here (model_fallback
-                            // drives headless/spawn model ladder).
+                            // pane hop is the rate_limit reroute here.
+                            eprintln!(
+                                "flywheel: dispatch @{attempt_profile} rate-limited (429) — rerouting prompt to @{next_profile} ({next_name}), one hop"
+                            );
+                            reroute_trail.push(json!({
+                                "from": attempt_profile.clone(),
+                                "to": next_profile.clone(),
+                                "evidence": err_str,
+                            }));
                             if crate::agent_ref::RebindIntent::allowed_from_failure(
                                 crate::failure::FailureKind::RateLimit,
                                 &err_str,
@@ -807,23 +838,35 @@ pub fn pane_dispatch(
                                     },
                                     0,
                                 );
-                                let _ = crate::agent_ref::journal_rebind(project, &intent);
-                            }
-                            eprintln!(
-                                "flywheel: dispatch @{attempt_profile} rate-limited (429) — rerouting prompt to @{next_profile} ({next_name}), one hop"
-                            );
-                            reroute_trail.push(json!({
-                                "from": attempt_profile.clone(),
-                                "to": next_profile.clone(),
-                                "evidence": err_str,
-                            }));
-                            if let Some(e) = resolve_pane_entry(entries, &next_profile) {
+                                match crate::agent_ref::commit_rebind_opt(project, intent, |_| {
+                                    Ok(resolve_pane_entry(entries, &next_profile))
+                                }) {
+                                    Ok(Some(e)) => {
+                                        attempt_entry = e;
+                                        attempt_profile = next_profile;
+                                        continue;
+                                    }
+                                    Ok(None) => {
+                                        // Settled as Unknown: target pane gone mid-hop.
+                                        out["reroute"] = json!("target-pane-gone");
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "flywheel: pane 429 ProfileFallback journal/apply failed: {e:#}"
+                                        );
+                                        out["reroute"] = json!("target-pane-gone");
+                                    }
+                                }
+                            } else if let Some(e) =
+                                resolve_pane_entry(entries, &next_profile)
+                            {
+                                // Evidence gate refused journal; still hop (legacy audit above).
                                 attempt_entry = e;
                                 attempt_profile = next_profile;
                                 continue;
+                            } else {
+                                out["reroute"] = json!("target-pane-gone");
                             }
-                            // Pane vanished between select and send: loud trail.
-                            out["reroute"] = json!("target-pane-gone");
                         }
                         None => {
                             out["reroute"] = json!("none-available");
@@ -1161,17 +1204,39 @@ pub fn launch_spawn_job(
                                         &fallback_model,
                                         None,
                                     );
+                                    // GS-043 I4: journal before ModelEntry.fallback hop.
+                                    let evidence = e.to_string();
+                                    let intent = crate::agent_ref::RebindIntent::prepare(
+                                        crate::agent_ref::AgentRef::new(project, &name),
+                                        crate::agent_ref::AgentBinding {
+                                            profile_name: plan.profile.clone(),
+                                            model: profile.model.clone(),
+                                            harness: plan.harness.clone(),
+                                        },
+                                        crate::agent_ref::AgentBinding {
+                                            profile_name: plan.profile.clone(),
+                                            model: fallback_id.clone(),
+                                            harness: fallback_harness.to_string(),
+                                        },
+                                        crate::agent_ref::RebindReason::ModelFallback {
+                                            kind: "rate_limit".into(),
+                                            evidence,
+                                        },
+                                        0,
+                                    );
                                     eprintln!(
-                                        "pane spawn: {} rate-limited — retrying with fallback {fallback_id}",
+                                        "pane spawn: {} rate-limited — registry fallback {fallback_id}",
                                         plan.profile
                                     );
-                                    crate::start_agent_with_retry(
-                                        &mut c,
-                                        &name,
-                                        fallback_harness,
-                                        &split.pane_id,
-                                        &fallback_args,
-                                    )?
+                                    crate::agent_ref::commit_rebind(project, intent, |_| {
+                                        crate::start_agent_with_retry(
+                                            &mut c,
+                                            &name,
+                                            fallback_harness,
+                                            &split.pane_id,
+                                            &fallback_args,
+                                        )
+                                    })?
                                 } else {
                                     return Err(e);
                                 }
@@ -1657,6 +1722,7 @@ mod tests {
             name: name.to_string(),
             profile: Some(profile.to_string()),
             harness: None,
+                model: None,
             mail_identity: None,
             skills_injected: false,
             incarnation: 0,
@@ -1716,6 +1782,7 @@ mod tests {
                 name: "crew-wf-planner".into(),
                 profile: Some("planner".into()),
                 harness: Some("omp".into()),
+                model: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -1725,6 +1792,7 @@ mod tests {
                 name: "crew-wf-coder".into(),
                 profile: Some("coder".into()),
                 harness: Some("omp".into()),
+                model: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -1749,6 +1817,7 @@ mod tests {
                 name: "crew-wf-reviewer".into(),
                 profile: Some("reviewer".into()),
                 harness: Some("omp".into()),
+                model: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -1758,6 +1827,7 @@ mod tests {
                 name: "crew-wf-scout".into(),
                 profile: Some("scout".into()),
                 harness: Some("opencode".into()),
+                model: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -1782,6 +1852,7 @@ mod tests {
                 name: "crew-wf-coder".into(),
                 profile: Some("coder".into()),
                 harness: Some("omp".into()),
+                model: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -1855,6 +1926,7 @@ mod tests {
             name: name.to_string(),
             profile: Some(profile.to_string()),
             harness: Some(harness.to_string()),
+                model: None,
             mail_identity: None,
             skills_injected: false,
             incarnation: 0,
@@ -1889,6 +1961,7 @@ mod tests {
             name: "crew-goal-coder".into(),
             profile: Some("coder".into()),
             harness: Some("pi".into()),
+                model: None,
             mail_identity: None,
             skills_injected: false,
             incarnation: 0,

@@ -379,6 +379,10 @@ pub struct SpawnEntry {
     /// via the catalog at dispatch time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
+    /// GS-043: in-flight model binding (captain `binding-rebind --model`).
+    /// `None` = inherit from profile catalog; Some = live override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// the registered agent-mail identity (adjective+noun) pinned at spawn
     /// (bd-627z.4). `None` for pre-bd-627z.4 entries — assign falls back to
     /// the deterministic hash mapping for those.
@@ -403,6 +407,7 @@ impl SpawnEntry {
             name: name.into(),
             profile: None,
             harness: None,
+            model: None,
             mail_identity: None,
             skills_injected: false,
             incarnation: 0,
@@ -420,6 +425,7 @@ impl SpawnEntry {
             name: name.into(),
             profile: None,
             harness: None,
+            model: None,
             mail_identity: Some(mail_identity.into()),
             skills_injected: false,
             incarnation: 0,
@@ -441,6 +447,7 @@ impl SpawnEntry {
             name: name.into(),
             profile: Some(profile.into()),
             harness: Some(harness.into()),
+            model: None,
             mail_identity,
             skills_injected: false,
             incarnation: 0,
@@ -468,6 +475,8 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 #[serde(default)]
                 harness: Option<String>,
                 #[serde(default)]
+                model: Option<String>,
+                #[serde(default)]
                 mail_identity: Option<String>,
                 #[serde(default)]
                 skills_injected: bool,
@@ -481,6 +490,7 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 name,
                 profile: None,
                 harness: None,
+                model: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
@@ -490,6 +500,7 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 name,
                 profile,
                 harness,
+                model,
                 mail_identity,
                 skills_injected,
                 incarnation,
@@ -498,6 +509,7 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 name,
                 profile,
                 harness,
+                model,
                 mail_identity,
                 skills_injected,
                 incarnation,
@@ -2722,6 +2734,7 @@ mod loops_sidecar_tests {
                 name: "crew-wf-planner-1".into(),
                 profile: Some("planner".into()),
                 harness: Some("omp".into()),
+                model: None,
                 mail_identity: None,
                 skills_injected: false,
                 incarnation: 0,
