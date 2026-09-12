@@ -366,6 +366,11 @@ fn loop_armed() -> bool {
 }
 
 /// One gate row from `br gate list <id> --json` history.
+///
+/// `note` is optional: worker-recorded rows carry no `note` key (br only
+/// writes it when `--note` is passed, bd-u5yr). A note-less passed row
+/// parses but can never satisfy the SHA rule below — absence of binding
+/// is a skip, never a legal verdict.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GateRow {
     pub id: i64,
@@ -376,7 +381,7 @@ pub struct GateRow {
     pub gate: String,
     pub provider: String,
     pub passed: bool,
-    pub note: String,
+    pub note: Option<String>,
     pub recorded_by: String,
     pub recorded_at: String,
 }
@@ -716,8 +721,9 @@ pub fn ledger_check(cwd: &Path, bead: &BeadUnit, ac: AcShape, sha: &str) -> anyh
             continue;
         }
         // The verdict must bind to this SHA (SHA rule): the note carries
-        // `sha=<sha>`.
-        if !note_has_sha(&row.note, sha) {
+        // `sha=<sha>`. A row with no note carries no binding and is
+        // skipped — it can never legalize a close (bd-u5yr).
+        if !row.note.as_deref().is_some_and(|n| note_has_sha(n, sha)) {
             continue;
         }
         let Some(at) = parse_recorded_at(&row.recorded_at) else {
@@ -729,7 +735,11 @@ pub fn ledger_check(cwd: &Path, bead: &BeadUnit, ac: AcShape, sha: &str) -> anyh
             sha: sha.to_string(),
             at,
             actor: AgentName::new(row.provider.clone()),
-            receipt_path: note_receipt_path(&row.note).unwrap_or_default(),
+            receipt_path: row
+                .note
+                .as_deref()
+                .and_then(note_receipt_path)
+                .unwrap_or_default(),
             verify_cmd: bead.verify.clone(),
         };
         if legal_close(&verdict, bead, ac) {
@@ -1269,7 +1279,12 @@ mod tests {
         assert_eq!(list.history.len(), 1);
         assert!(list.history[0].passed);
         assert_eq!(list.history[0].gate, "command-verified");
-        assert!(note_has_sha(&list.history[0].note, &sha));
+        assert!(
+            list.history[0]
+                .note
+                .as_deref()
+                .is_some_and(|n| note_has_sha(n, &sha))
+        );
         // ledger check: legal for the current SHA, not for a wrong SHA.
         assert!(ledger_check(&dir, &bead, AcShape::Checkable, &sha).unwrap());
         assert!(
@@ -1355,6 +1370,23 @@ mod tests {
             PathBuf::from("/tmp/r.txt")
         );
         assert_eq!(note_receipt_path("no tokens"), None);
+    }
+
+    /// bd-u5yr: worker-recorded gate rows carry no `note` key (br only
+    /// writes it when `--note` is passed). The row must parse, and a
+    /// note-less passed row must never satisfy the SHA rule.
+    #[test]
+    fn gate_row_without_note_parses_and_never_binds_sha() {
+        let raw = r#"{"issue_id":"bd-x","current_status":"closed","history":[{"id":1,"issue_id":"bd-x","from_status":"in_progress","to_status":"closed","status_revision":1,"gate":"unit-test-verified","provider":"a","passed":true,"recorded_by":"b","recorded_at":"2026-09-12 07:02:36"}]}"#;
+        let list: GateList = serde_json::from_str(raw).expect("note-less rows parse");
+        assert!(list.history[0].note.is_none());
+        assert!(
+            !list.history[0]
+                .note
+                .as_deref()
+                .is_some_and(|n| note_has_sha(n, "abc123")),
+            "no note means no SHA binding, never a legal verdict"
+        );
     }
 
     // ---- bd-w1-sha-xyhd: SHA invariant at close-detect ----
