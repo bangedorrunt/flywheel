@@ -238,3 +238,4 @@
 {"id":238,"issue_id":"bd-40d1","from_status":"in_progress","to_status":"closed","status_revision":3096,"gate":"unit-test-verified","provider":"WindyGlen","passed":true,"recorded_by":"crew-toro091203590020-coder3","recorded_at":"2026-09-12 05:44:22"}
 {"id":239,"issue_id":"bd-pqrb","from_status":"in_progress","to_status":"closed","status_revision":3100,"gate":"worker-receipt","provider":"WindyGlen","passed":true,"recorded_by":"WindyGlen","recorded_at":"2026-09-12 06:05:35"}
 {"id":240,"issue_id":"bd-7dkb","from_status":"in_progress","to_status":"closed","status_revision":3106,"gate":"unit-test-verified","provider":"flywheel-toron-coder2","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-12 07:02:36"}
+{"id":241,"issue_id":"bd-99bb","from_status":"in_progress","to_status":"closed","status_revision":3113,"gate":"unit-test-verified","provider":"flywheel-toron-coder2","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-12 07:12:01"}
