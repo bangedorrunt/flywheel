@@ -16,7 +16,7 @@ informed: flywheel × toron × beads maintainers; harness agents
 
 | Field | Value |
 |-------|-------|
-| **Status** | **Proposed**. Acceptance = captain word on this file. **HOLD merge** of implementing PRs until acceptance. |
+| **Status** | **Proposed**. Acceptance = captain word on this file. **HOLD merge** of this ADR PR only — GS-043 PR#8 code already on `origin/main` (`772abd8…`). |
 | **Decision-makers** | Captain (bangedorrunt) |
 | **Extends** | [ADR-0005](0005-always-on-collab-baseline-and-command-surface.md) Spec 1/1b (profile catalog), [ADR-0007](0007-catalog-slots-and-agent-native-cli.md) (slots + `profile set`), [ADR-0011](0011-session-conductor-crew-budget-captain-fcfs-join-loud.md) (crew pack), [toron ADR-0018](../../toron/docs/decisions/0018-agent-identity-naming-grammar.md) (pin≠slug / identity grammar), [toron ADR-0026](../../toron/docs/decisions/0026-failure-taxonomy-funded-preflight-fallback-chains-mail-health-escalation.md) (fallback/reroute), [toron ADR-0032](../../toron/docs/decisions/0032-workflow-engine-honesty-jido-contracts.md) Spec 7 / I4–I6 (intent before dispatch; unknown visible; journal ≠ mailbox) |
 | **Does not amend** | Tick Law; frozen MCP tool count; toron kind registry; one-way `flywheel → toron-workflow → toron-core`; beads legal-close ownership; open-mode AUTHORITATIVE text (GS-039); doorbell plane ownership (ADR-0012) |
@@ -88,7 +88,7 @@ flowchart TB
   SPAWN -.->|"easy to confuse"| MAIL
 ```
 
-### 3.2 Architecture — to-be
+### 3.2 Architecture — to-be (Wave A landed on tip `772abd8…`; Wave B/C still open)
 
 ```mermaid
 flowchart TB
