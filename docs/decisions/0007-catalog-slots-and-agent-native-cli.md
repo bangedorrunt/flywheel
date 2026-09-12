@@ -80,7 +80,7 @@ Noun-verb: `slot` / `model` / `profile` / `squad` / `catalog`.
 - TTY: human table. `--json` or stdout non-TTY: JSON.
 - `--no-input` never prompts. `--force` skips confirm. `--dry-run` on destructive.
 - `remove` takes N ids; TTY + no ids → dialoguer MultiSelect. Resolve bare model ids. Refuse compiled-in models unless `--shadow`.
-- `profile set` is the missing verb (`--model`/`--provider`/`--slot`/`--model-fallback`/`--harness`/`--effort`/`--smol`/`--slow`/`--plan`/`--skills`).
+- `profile set` is the missing verb (`--model`/`--provider`/`--slot`/`--model-fallback`/`--fallback`/`--harness`/`--effort`/`--smol`/`--slow`/`--plan`/`--skills`). `--fallback` = profile names (ADR-0026); `--model-fallback` = model ids (ADR-0007). Live-pane hops use `flywheel binding-rebind` (GS-043), not a silent SoT edit.
 - `flywheel catalog`: ratatui persistent multi-panel (slots | models | profiles/squads). hacker-night semantic slots in `output.rs`. Min 80×24. `NO_COLOR`/`TERM=dumb`/non-TTY refuses the TUI and names the CLI. Keys: `j/k g/G`, `Space` multi-select, `d` delete, `e` edit, `?` help, `q` quit, `Tab` focus.
 
 Skill Sync Contract: Commands enum, `--robot-capabilities` (`catalog` object), AGENTS.md, flywheel skill §5.

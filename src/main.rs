@@ -16,6 +16,7 @@
 #![allow(dead_code, clippy::all, unused)]
 
 mod agentstate;
+mod agent_ref;
 mod artifact;
 mod backend;
 mod briefing;
@@ -746,6 +747,27 @@ enum Commands {
     /// (bd-fw-name-binding-loss-7rc): panes whose agent restarted show
     /// name:null — this renames them back to their registered names.
     Rebind { project: String },
+    /// Journaled in-flight profile/model rebind (GS-043 / ADR-0032 Spec 7).
+    /// Updates the live SpawnEntry binding; does NOT edit profiles.toml.
+    /// Pin/npub stay immutable (AgentRef); profile_name/model/harness replace.
+    #[command(name = "binding-rebind")]
+    BindingRebind {
+        project: String,
+        /// public mail pin (AgentRef.pin) — immutable identity
+        pin: String,
+        /// replaceable profile name
+        #[arg(long)]
+        profile: Option<String>,
+        /// replaceable model id (journaled; not a silent catalog edit)
+        #[arg(long)]
+        model: Option<String>,
+        /// replaceable harness
+        #[arg(long)]
+        harness: Option<String>,
+        /// captain note for the journal row
+        #[arg(long)]
+        note: Option<String>,
+    },
     /// Recover a damaged swarm (bd-fw-interrupt-kills-agent-or3): for each
     /// registered agent, restore the name binding if the pane survived, or
     /// respawn the agent if it died. The durable loop self-heals on its own;
@@ -2878,6 +2900,10 @@ enum ProfileCmd {
         /// those are other profile names, ADR-0026)
         #[arg(long = "model-fallback", value_delimiter = ',')]
         model_fallback: Vec<String>,
+        /// ordered profile-name fallbacks for billing/auth/provider reroute
+        /// (ADR-0026 Spec 3). Distinct from --model-fallback.
+        #[arg(long = "fallback", value_delimiter = ',')]
+        fallback: Vec<String>,
         /// harness / program (empty on a slot-aliased profile inherits the
         /// slot's harness)
         #[arg(long)]
@@ -4436,7 +4462,7 @@ fn main() {
             "catalog": {
                 "slots": "flywheel slot list/show/set/remove — cheap/standard/premium = harness+model; profiles alias @cheap/@standard/@premium (ADR-0007 D1)",
                 "models": "flywheel model list/show/add/set/remove — `set <id> --slot <s>` selects a model as a slot DEFAULT; registry ids are provider/model with tier cheap|standard|premium; compiled-ins are permanent",
-                "profiles": "flywheel profile list/show/create/edit/set/run/remove — `set` is the routing-field verb (--model/@slot/--model-fallback; model_fallback ≠ fallback)",
+                "profiles": "flywheel profile list/show/create/edit/set/run/remove — `set` is the routing-field verb (--model/@slot/--model-fallback/--fallback; model_fallback ≠ fallback). In-flight live-pane hops use `flywheel binding-rebind` (journaled; does not edit profiles.toml)",
                 "squads": "flywheel squad list/show/spawn/create/remove — compiled-ins: default/plan/review/recon; user recipes.toml overrides per name (ADR-0007 D3)",
                 "hub": "flywheel catalog [--json] — ratatui multi-panel; refuses non-TTY/NO_COLOR/TERM=dumb naming the CLI (ADR-0007 D4)"
             },
@@ -4591,6 +4617,14 @@ fn main() {
             *json,
         ),
         Some(Commands::Rebind { project }) => cmd_rebind(&cfg, project),
+        Some(Commands::BindingRebind {
+            project,
+            pin,
+            profile,
+            model,
+            harness,
+            note,
+        }) => cmd_binding_rebind(&cfg, project, pin, profile.as_deref(), model.as_deref(), harness.as_deref(), note.as_deref()),
         Some(Commands::Recover { project }) => cmd_recover(&cfg, project),
         Some(Commands::Send {
             project,
@@ -9200,7 +9234,7 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
             .collect();
         if !still_unbound.is_empty() {
             bail!(
-                "spawn name-binding failed after settle (GS-039 P0-4): panes still unbound/wrong-name: {}. Refusing swarm ready — rebind manually (flywheel rebind {project}) or re-spawn.",
+                "spawn name-binding failed after settle (GS-039 P0-4 / GS-043 AgentRef): panes still unbound/wrong-name: {}. Refusing swarm ready — rebind manually (flywheel rebind {project}) or re-spawn.",
                 still_unbound.join(", ")
             );
         }
@@ -10868,6 +10902,28 @@ fn handle_workspace_cmds(
             | workspace::Cmd::Reclaim { .. }
             | workspace::Cmd::Wait => {
                 // Swarm I/O is applied in swarm_loop via Cmd::to_loop_action.
+            }
+            workspace::Cmd::RebindBinding {
+                pin,
+                profile_name,
+                model,
+                harness,
+                effect_key,
+                note,
+            } => {
+                // GS-043: effect-layer apply of journaled rebind Cmd.
+                eprintln!(
+                    "flywheel: [RebindBinding] effect_key={effect_key} pin={pin} note={note}"
+                );
+                let _ = cmd_binding_rebind(
+                    cfg,
+                    project,
+                    pin,
+                    profile_name.as_deref(),
+                    model.as_deref(),
+                    harness.as_deref(),
+                    Some(note.as_str()),
+                );
             }
         }
     }
@@ -14022,6 +14078,85 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
 /// against live panes. A pane whose agent restarted shows `name:null` (or a
 /// changed name) — this renames it back to its registered name so send /
 /// status / loop resolution works again.
+fn cmd_binding_rebind(
+    cfg: &Config,
+    project: &str,
+    pin: &str,
+    profile: Option<&str>,
+    model: Option<&str>,
+    harness: Option<&str>,
+    note: Option<&str>,
+) -> Result<()> {
+    // GS-043: captain request path = journaled rebind Cmd, not silent SoT edit.
+    let _ = cfg;
+    let mut entries = state::load_spawn_registry(project);
+    let idx = entries
+        .iter()
+        .position(|e| e.mail_identity.as_deref() == Some(pin) || e.name == pin)
+        .ok_or_else(|| {
+            anyhow!("binding-rebind: no SpawnEntry for pin={pin} in project={project}")
+        })?;
+    let entry = &entries[idx];
+    let agent = agent_ref::AgentRef::new(project, pin);
+    agent
+        .assert_bound_after_settle(false)
+        .map_err(|e| anyhow!(e))?;
+    let from = agent_ref::AgentBinding {
+        profile_name: entry.profile.clone().unwrap_or_default(),
+        model: String::new(),
+        harness: entry.harness.clone().unwrap_or_default(),
+    };
+    let to = agent_ref::AgentBinding {
+        profile_name: profile
+            .map(str::to_string)
+            .unwrap_or_else(|| from.profile_name.clone()),
+        model: model.map(str::to_string).unwrap_or_else(|| from.model.clone()),
+        harness: harness
+            .map(str::to_string)
+            .unwrap_or_else(|| from.harness.clone()),
+    };
+    if profile.is_none() && model.is_none() && harness.is_none() {
+        bail!("binding-rebind: pass --profile and/or --model and/or --harness");
+    }
+    if let Some(p) = profile {
+        let cat = ProfileCatalog::load()?;
+        if cat.get(p).is_none() {
+            bail!("binding-rebind: unknown profile {p:?} (flywheel profile list)");
+        }
+    }
+    let intent = agent_ref::RebindIntent::prepare(
+        agent,
+        from,
+        to.clone(),
+        agent_ref::RebindReason::CaptainRequest {
+            note: note.unwrap_or("captain binding-rebind").to_string(),
+        },
+        0,
+    );
+    agent_ref::commit_rebind(project, intent, |_| {
+        let e = &mut entries[idx];
+        if let Some(p) = profile {
+            e.profile = Some(p.to_string());
+        }
+        if let Some(h) = harness {
+            e.harness = Some(h.to_string());
+        }
+        state::save_spawn_registry(project, &entries)?;
+        Ok(())
+    })?;
+    println!(
+        "flywheel: binding-rebind settled pin={pin} profile={} harness={} model={}",
+        to.profile_name,
+        to.harness,
+        if to.model.is_empty() {
+            "(unchanged)"
+        } else {
+            to.model.as_str()
+        }
+    );
+    Ok(())
+}
+
 fn cmd_rebind(cfg: &Config, project: &str) -> Result<()> {
     let backend = backend::multiplexer_backend(cfg)?;
     let ws_id = find_workspace_dyn(&*backend, project)?;
@@ -23569,11 +23704,25 @@ fn render_orchestration_prompt(
         &frontmatter.replace("{{PHASE_DESCRIPTION}}", description),
         tpl,
     );
-    Ok(body
+    let mut out = body
         .replace("{{TOOL_FRONTMATTER}}", &frontmatter)
         .replace("{{VERSION}}", version)
         .replace("{{GENERATED}}", generated)
-        .replace("{{ARGUMENTS_NOTE}}", argument_note(kind)))
+        .replace("{{ARGUMENTS_NOTE}}", argument_note(kind));
+    // GS-043: single peer-aware SoT — slash-command chrome stays thin; append
+    // the spawn-inject body so /peer-aware-mode cannot drift from handler text.
+    if name == "peer-aware-mode" {
+        const PEER_AWARE_SOT: &str = include_str!("../integrations/peer-aware.md.tpl");
+        out.push_str("
+
+---
+
+## Handler body (SoT: integrations/peer-aware.md.tpl)
+
+");
+        out.push_str(PEER_AWARE_SOT);
+    }
+    Ok(out)
 }
 
 /// ADR-0005 D2/§8: per-kind argument adapter. Grok must not fake `$ARGUMENTS`.
@@ -24840,6 +24989,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             provider,
             slot,
             model_fallback,
+            fallback,
             harness,
             effort,
             smol,
@@ -24867,6 +25017,11 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                     base.model_fallback
                 } else {
                     model_fallback.clone()
+                },
+                fallback: if fallback.is_empty() {
+                    base.fallback
+                } else {
+                    fallback.clone()
                 },
                 harness: harness.clone().unwrap_or(base.harness),
                 effort: effort.clone().unwrap_or(base.effort),
@@ -30837,7 +30992,28 @@ fn cmd_internal_run_headless(
                         "flywheel: headless reroute {} -> {} (profile fallback)",
                         profile_name, next_profile
                     );
-                    match run_once(fb_harness, &fb_model_id, &fb_model, &fb_prof.effort) {
+                    let agent = agent_ref::AgentRef::new("flywheel", profile_name);
+                    let intent = agent_ref::RebindIntent::prepare(
+                        agent,
+                        agent_ref::AgentBinding {
+                            profile_name: profile_name.to_string(),
+                            model: model_id.clone(),
+                            harness: harness.to_string(),
+                        },
+                        agent_ref::AgentBinding {
+                            profile_name: next_profile.clone(),
+                            model: fb_model_id.clone(),
+                            harness: fb_harness.to_string(),
+                        },
+                        agent_ref::RebindReason::ProfileFallback {
+                            kind: cf.kind.to_string(),
+                            evidence: cf.evidence.clone(),
+                        },
+                        0,
+                    );
+                    match agent_ref::commit_rebind("flywheel", intent, |_| {
+                        run_once(fb_harness, &fb_model_id, &fb_model, &fb_prof.effort)
+                    }) {
                         Ok(fb) => {
                             attempt = fb;
                             retried_fallback = true;
@@ -30853,29 +31029,81 @@ fn cmd_internal_run_headless(
         }
     }
     if attempt.rate_limited && !model_id.is_empty() {
-        // fallback = the registry's `fallback` for the primary id; absent ->
-        // no retry. A fallback whose entry provider is `grok` runs on the
-        // GROK HARNESS (the decided oracle fallback: glm-5.2 -> grok, the
-        // premium lane) — the model flag is the bare id there.
-        let fallback_entry = registry.get(&model_id).and_then(|e| e.fallback.clone());
-        if let Some(fallback_id) = fallback_entry {
-            eprintln!(
-                "flywheel: @{profile_name} rate-limited on {model_id} (429) — retrying with fallback {fallback_id}"
-            );
-            let fb_entry = registry.get(&fallback_id);
-            let _ = fb_entry;
-            let fb_harness = if registry.family_of(&fallback_id) == "grok" {
-                "grok"
-            } else {
-                harness
-            };
-            let fb_model = registry.resolve(&fallback_id, fb_harness);
-            match run_once(fb_harness, &fallback_id, &fb_model, &profile.effort) {
-                Ok(fb) => {
-                    attempt = fb;
-                    retried_fallback = true;
+        // GS-043: Profile.model_fallback drives in-flight model reroute first
+        // (ADR-0007 + ADR-0032 Spec 7). Journal intent before dispatch (I4).
+        // Registry ModelEntry.fallback remains the last rung. Timeout alone
+        // never reaches this block (rate_limited gate).
+        let err_ev = attempt.outcome.error.clone().unwrap_or_else(|| "429".into());
+        let mut hopped = false;
+        if agent_ref::RebindIntent::allowed_from_failure(failure::FailureKind::RateLimit, &err_ev)
+        {
+            for fb_id in &profile.model_fallback {
+                if fb_id.is_empty() || fb_id == &model_id {
+                    continue;
                 }
-                Err(e) => eprintln!("flywheel: fallback run {fallback_id} failed: {e:#}"),
+                let agent = agent_ref::AgentRef::new("flywheel", profile_name);
+                let from = agent_ref::AgentBinding {
+                    profile_name: profile_name.to_string(),
+                    model: model_id.clone(),
+                    harness: harness.to_string(),
+                };
+                let to = agent_ref::AgentBinding {
+                    profile_name: profile_name.to_string(),
+                    model: fb_id.clone(),
+                    harness: harness.to_string(),
+                };
+                let intent = agent_ref::RebindIntent::prepare(
+                    agent,
+                    from,
+                    to,
+                    agent_ref::RebindReason::ModelFallback {
+                        kind: "rate_limit".into(),
+                        evidence: err_ev.clone(),
+                    },
+                    0,
+                );
+                let fb_harness = if registry.family_of(fb_id) == "grok" {
+                    "grok"
+                } else {
+                    harness
+                };
+                let fb_model = registry.resolve(fb_id, fb_harness);
+                eprintln!(
+                    "flywheel: @{profile_name} rate-limited on {model_id} (429) — model_fallback hop to {fb_id}"
+                );
+                match agent_ref::commit_rebind("flywheel", intent, |_| {
+                    run_once(fb_harness, fb_id, &fb_model, &profile.effort)
+                }) {
+                    Ok(fb) => {
+                        attempt = fb;
+                        retried_fallback = true;
+                        hopped = true;
+                        break;
+                    }
+                    Err(e) => eprintln!("flywheel: model_fallback run {fb_id} failed: {e:#}"),
+                }
+            }
+        }
+        if !hopped {
+            // Last rung: registry ModelEntry.fallback (bd-42fs).
+            let fallback_entry = registry.get(&model_id).and_then(|e| e.fallback.clone());
+            if let Some(fallback_id) = fallback_entry {
+                eprintln!(
+                    "flywheel: @{profile_name} rate-limited on {model_id} (429) — retrying with registry fallback {fallback_id}"
+                );
+                let fb_harness = if registry.family_of(&fallback_id) == "grok" {
+                    "grok"
+                } else {
+                    harness
+                };
+                let fb_model = registry.resolve(&fallback_id, fb_harness);
+                match run_once(fb_harness, &fallback_id, &fb_model, &profile.effort) {
+                    Ok(fb) => {
+                        attempt = fb;
+                        retried_fallback = true;
+                    }
+                    Err(e) => eprintln!("flywheel: fallback run {fallback_id} failed: {e:#}"),
+                }
             }
         }
     }
@@ -34366,7 +34594,37 @@ mod integration_tests {
                 "{kind} budget knobs"
             );
             assert!(out.contains("doorbell"), "{kind} names the doorbell");
+            // GS-043: rendered slash command must include the spawn SoT body
+            assert!(
+                out.contains("OPERATING CONTRACT") || out.contains("Peer-aware agent template"),
+                "{kind} must embed integrations/peer-aware.md.tpl SoT"
+            );
+            assert!(
+                out.contains("integrations/peer-aware.md.tpl"),
+                "{kind} must name the SoT path"
+            );
         }
+    }
+
+    /// GS-043: prompts/peer-aware.md.tpl is thin chrome — no second full body.
+    #[test]
+    fn peer_aware_prompt_chrome_is_thin_not_second_sot() {
+        let chrome = include_str!("../integrations/prompts/peer-aware.md.tpl");
+        let sot = include_str!("../integrations/peer-aware.md.tpl");
+        assert!(
+            chrome.len() < sot.len() / 2,
+            "prompts/peer-aware.md.tpl must stay thin chrome ({}B vs SoT {}B)",
+            chrome.len(),
+            sot.len()
+        );
+        assert!(
+            !chrome.contains("OPERATING CONTRACT"),
+            "chrome must not duplicate the SoT OPERATING CONTRACT body"
+        );
+        assert!(
+            chrome.contains("integrations/peer-aware.md.tpl"),
+            "chrome must point at the SoT path"
+        );
     }
 
     #[test]

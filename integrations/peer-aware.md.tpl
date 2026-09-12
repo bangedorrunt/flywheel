@@ -1,5 +1,7 @@
 # Peer-aware agent template
 
+Arrive then brief before any spawn (ADR-0011): `flywheel arrive <project> --as <pin>` then `flywheel briefing "<objective>" --json`. Do not start a second swarm when the world is joinable.
+
 The dispatcher rings `[doorbell]`. This template is the handler: identity,
 coordination planes, conflict handling, and pull-then-act. It is not a timer
 and does not create additional orchestration.
