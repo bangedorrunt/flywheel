@@ -475,9 +475,15 @@ pub fn stop(state_dir: &Path, workspace: &str) -> Result<()> {
 /// Cutover registration (bd-asr2.13, Phase 3): spawn records one
 /// subscription row per pinned crew member (herdr sink, own workspace —
 /// local-actor allowed, D6). Best-effort: a store failure warns loudly and
-/// never fails the spawn. The daemon serves these rows when it hosts wake;
-/// `kill` never touches them (subscriptions outlive swarms by design).
-pub fn register_workspace_subscriptions(state_dir: &Path, workspace: &str, pins: &[String]) {
+/// never fails the spawn. The daemon auto-hosts these rows (bd-2o1v) — it
+/// needs the project, so spawn names it. `kill` drops the spawn's own rows
+/// (lifecycle symmetry, bd-2o1v); operator/cli rows outlive swarms.
+pub fn register_workspace_subscriptions(
+    state_dir: &Path,
+    project: &str,
+    workspace: &str,
+    pins: &[String],
+) {
     use doorbell_rt::subscribe::{
         Actor, Budget, Filter, Identity, Scope, SinkKind, Subscription, SubscriptionStore,
     };
@@ -490,6 +496,7 @@ pub fn register_workspace_subscriptions(state_dir: &Path, workspace: &str, pins:
             filter: Filter::default(),
             sink: SinkKind::Herdr,
             budget: Budget::default_530(),
+            project: Some(project.to_string()),
         };
         if let Err(e) = store.subscribe(Actor::local_process(), sub, workspace) {
             eprintln!("flywheel: cannot record wake subscription for {pin}: {e:?}");
@@ -3190,6 +3197,7 @@ mod tests {
             filter: Filter::default(),
             sink: SinkKind::Herdr,
             budget: Budget::default_530(),
+            project: Some("proj".into()),
         };
         store
             .subscribe(Actor::local_process(), sub, ws)

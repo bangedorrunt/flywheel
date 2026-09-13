@@ -114,6 +114,11 @@ pub struct Subscription {
     pub filter: Filter,
     pub sink: SinkKind,
     pub budget: Budget,
+    /// Project context for daemon-side auto-host (bd-2o1v): the daemon
+    /// hosts a loop for every subscribed `(project, workspace)` it can
+    /// NAME — legacy rows without a project are never guessed into a host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 /// The actor attempting a verb.
@@ -254,6 +259,7 @@ mod tests {
             filter: Filter::default(),
             sink: SinkKind::Herdr,
             budget: Budget::default_530(),
+            project: None,
         }
     }
 
@@ -294,6 +300,38 @@ mod tests {
         ));
         // Operator passes.
         assert!(store.subscribe(Actor::operator(), hook, "w").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-2o1v: the `project` field is additive — legacy rows (no field on
+    /// disk) deserialize with `None`, and the daemon never guesses a host
+    /// for them; a named project roundtrips.
+    #[test]
+    fn project_field_is_additive_and_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("dbrt-subproj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = SubscriptionStore::open(&dir);
+        let mut with_project = sub();
+        with_project.project = Some("flywheel".into());
+        store
+            .subscribe(Actor::local_process(), with_project, "w")
+            .expect("subscribe");
+        // Legacy JSON (pre-project rows on disk) still loads as None.
+        let sub_path = dir.join("doorbell").join("subscriptions.json");
+        let raw = std::fs::read_to_string(&sub_path).expect("persisted");
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&raw).expect("persisted json");
+        for row in legacy.as_object_mut().expect("map").values_mut() {
+            row.as_object_mut().map(|m| m.remove("project"));
+        }
+        std::fs::write(&sub_path, serde_json::to_string_pretty(&legacy).expect("legacy"))
+            .expect("rewrite legacy");
+        let reopened = SubscriptionStore::open(&dir);
+        assert_eq!(
+            reopened.list()[0].project,
+            None,
+            "legacy row without project reads None, never a guess"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

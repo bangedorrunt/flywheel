@@ -335,32 +335,32 @@ Drivers: `separate-before-serializing-shared-state` (cut at `from_doorbell`/`fro
 
 Phase 0:
 
-- [ ] `verify-0012.sh` green: `doorbell-core` builds standalone; no `resonate_sdk|tokio|toron_|herdr` and no `crate::(config|workspace|durable|main|toron_embed|mail_shim|herdr_shim|backend)` inside it
-- [ ] Same Msg log → byte-identical Action sequence through the crate path
-- [ ] `sc_doorbell_adr0005` + `adr0027_s1/s2/s3` slices green unmodified
-- [ ] Journal replay: pre-v1 lines (missing `v`) fold identically to v1-tagged lines
+- [x] `verify-0012.sh` green (2026-09-13, `RESULT: PASS`): `doorbell-core` builds standalone; no `resonate_sdk|tokio|toron_|herdr` and no `crate::(config|workspace|durable|main|toron_embed|mail_shim|herdr_shim|backend)` inside it
+- [x] Same Msg log → byte-identical Action sequence through the crate path
+- [x] `sc_doorbell_adr0005` + `adr0027_s1/s2/s3` slices green unmodified
+- [x] Journal replay: pre-v1 lines (missing `v`) fold identically to v1-tagged lines
 
 Phase 1:
 
-- [ ] Embedded-vs-daemon journal diff empty modulo timestamps (normalize = strip `ts`; procedure in `verify-0012.sh`) for a full wave-swarm fixture run
-- [ ] `flywheel doorbell status/start/why/afk` output byte-identical via proxy
-- [ ] **Crash-harness**: SIGKILL at each journal stage (after `decided`, after effect, mid-sweep, mid-rotation) × fixture — no lost wake beyond the 24h-lookback floor, no budget breach, no unjournaled delivery; resume logs the redelivery rows
-- [ ] **Fence**: daemon alive + `flywheel spawn` → embedded defers (one prompt total); daemon dead + stale lease → embedded takes over; both-bind conflict → clean exit 0
+- [x] Embedded-vs-daemon journal diff empty modulo timestamps (normalize = strip `ts`; procedure in `verify-0012.sh`) for a full wave-swarm fixture run
+- [x] `flywheel doorbell status/start/why/afk` output byte-identical via proxy
+- [x] **Crash-harness**: SIGKILL at each journal stage (after `decided`, after effect, mid-sweep, mid-rotation) × fixture — no lost wake beyond the 24h-lookback floor, no budget breach, no unjournaled delivery; resume logs the redelivery rows
+- [x] **Fence**: daemon alive + `flywheel spawn` → embedded defers (one prompt total); daemon dead + stale lease → embedded takes over; both-bind conflict → clean exit 0
 
 Phase 2:
 
-- [ ] Subscribed human receives a wake with zero live flywheel swarm; `why` replays it subscriber-filtered
-- [ ] **Budget durability**: 3 prompts, SIGKILL, restart → 0 further prompts in the window (v2); pre-v2 harness documents the RAM-reset as known-and-fixed-in-v2
-- [ ] **Slow sink**: webhook stalled 30s → shed-to-digest + `Degraded` row; herdr-prompt latency unaffected (brain SLA holds)
-- [ ] **Authz negatives**: non-operator webhook subscribe refused; non-allowlisted host refused; `emit` without token refused (Phase 4 endpoint, rule lands here)
-- [ ] **SSE replay**: disconnect/reconnect with `Last-Event-ID` → gap-free stream or explicit first-replayable-seq notice
-- [ ] 120s-heard + 5/30/3 enforced on the new sink; deaf-service digest names subscriber+corr+attempts
+- [x] Subscribed human receives a wake with zero live flywheel swarm; `why` replays it subscriber-filtered
+- [x] **Budget durability**: 3 prompts, SIGKILL, restart → 0 further prompts in the window (v2); pre-v2 harness documents the RAM-reset as known-and-fixed-in-v2
+- [x] **Slow sink**: webhook stalled 30s → shed-to-digest + `Degraded` row; herdr-prompt latency unaffected (brain SLA holds)
+- [x] **Authz negatives**: non-operator webhook subscribe refused; non-allowlisted host refused; `emit` without token refused (Phase 4 endpoint, rule lands here)
+- [x] **SSE replay**: disconnect/reconnect with `Last-Event-ID` → gap-free stream or explicit first-replayable-seq notice
+- [x] 120s-heard + 5/30/3 enforced on the new sink; deaf-service digest names subscriber+corr+attempts
 
 Phase 3:
 
-- [ ] `flywheel kill --force` leaves daemon green; cold boot, no swarm, serves `digest` + `why` + `events`
-- [ ] Embedded degraded mode (daemon stopped) passes the Phase-1 journal-diff gate
-- [ ] Skill + AGENTS.md doorbell sections describe plane D (no spawn-owned speech remains)
+- [x] `flywheel kill --force` leaves daemon green; cold boot, no swarm, serves `digest` + `why` + `events`
+- [x] Embedded degraded mode (daemon stopped) passes the Phase-1 journal-diff gate
+- [x] Skill + AGENTS.md doorbell sections describe plane D (no spawn-owned speech remains; toron skill role-bind section synced 2026-09-13)
 
 Phase 4 (per flag, on opt-in):
 
