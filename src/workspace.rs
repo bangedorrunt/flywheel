@@ -529,11 +529,14 @@ pub fn digest_bead_ids(entries: &[DigestEntry]) -> Vec<String> {
 pub fn render_digest(entries: &[DigestEntry], now: u64) -> String {
     let mut out = format!("doorbell afk digest ({} items)\n", entries.len());
     for e in entries {
-        let age = now.saturating_sub(e.at_unix);
-        out.push_str(&format!(
-            "- [{}s ago] {} {}: {}\n",
-            age, e.kind, e.pin, e.detail
-        ));
+        // bd-z5ut: `at_unix == 0` means "recorded before any clock Msg in this
+        // fold", NOT "56 years ago". Subtracting it printed a raw epoch value
+        // dressed as a duration, which is worse than admitting the unknown.
+        let age = match e.at_unix {
+            0 => "age unknown".to_string(),
+            t => format!("{}s ago", now.saturating_sub(t)),
+        };
+        out.push_str(&format!("- [{age}] {} {}: {}\n", e.kind, e.pin, e.detail));
     }
     let beads = digest_bead_ids(entries);
     if beads.is_empty() {
@@ -4986,6 +4989,29 @@ mod adr0010_d5_tests {
         assert!(
             text.trim_end().ends_with("br show bd-8jlv"),
             "ends with exact commands: {text}"
+        );
+    }
+
+    #[test]
+    fn bd_z5ut_digest_never_dresses_epoch_zero_as_an_age() {
+        // A fold with no clock Msg records `at_unix == 0`. Subtracting it
+        // printed a raw epoch value labelled "s ago" (~56 years), which reads
+        // as a real measurement. It must say unknown instead.
+        let entries = vec![DigestEntry {
+            seq: 1,
+            at_unix: 0,
+            kind: "fact-miss".into(),
+            pin: "-".into(),
+            detail: "fact without captain alias: x".into(),
+        }];
+        let text = render_digest(&entries, 1_789_290_000);
+        assert!(
+            text.contains("[age unknown] fact-miss -:"),
+            "unset clock must read as unknown, got: {text}"
+        );
+        assert!(
+            !text.contains("1789290000s ago"),
+            "a raw epoch must never be printed as a duration: {text}"
         );
     }
 
