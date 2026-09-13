@@ -125,6 +125,26 @@ plane's own files rather than tracked in RAM, so it survives a restart:
 | `standby_with_known_workspaces` | the daemon is hosting nothing while workspaces that expect rings exist — re-arm it |
 | `no_injectable_panes` | the exact opposite of a bug: hosting, registry pins exist, and `herdr agent list` knows the panes of **none** of them. Wakes classify, queue, and digest, and no prompt can land — start agents (`herdr agent start`) or fix the stale registry |
 
+### Signal hygiene: the audit file must stay readable
+
+Two live faults were *found* only by reading the plane's own files, and both
+were buried under self-inflicted noise (gs-044):
+
+- **Stale spawn-registry rows.** The registry is never garbage-collected, so
+a dead fleet's pins live on forever (live: three pins on `w11:*` panes herdr
+had long GC'd). The sweep fetched them every tick. A registry pin whose pane
+is absent from `herdr pane list` now drops out of the sweep after a 120s
+grace, with ONE `registry_pin_stale` audit row naming pin, pane, and grace.
+A pane that reappears un-reaps it; an **empty** pane list means herdr did not
+answer, so nothing is reaped on a transient failure. `/health.injection`
+still counts reaped pins (it reads the raw registry), so the fault stays
+visible after it stops costing a fetch per tick.
+- **The ack-SLA beat.** `toron ack-sla` re-reports every corr still past SLA,
+so a stale backlog re-fired the same wake every 60s (live: `count: 89`, 1440×
+per day). The beat now fires on a **change** only: new overdue ids audit
+`ack_sla_fired`, the backlog clearing audits `ack_sla_cleared`. A steady
+backlog is one fact, not one row per minute.
+
 ### The prompt hop's precondition (`/health.injection`)
 
 A wake reaching a pane needs an *injectable* pane: `should_inject` accepts
