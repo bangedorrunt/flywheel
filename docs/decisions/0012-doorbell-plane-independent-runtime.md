@@ -310,7 +310,7 @@ Drivers: `separate-before-serializing-shared-state` (cut at `from_doorbell`/`fro
 
 ### Phase 1 — `doorbell-rt` + `doorbell` daemon beside flywheel (byte parity)
 
-**Affected:** new `crates/doorbell-rt/` (effect loop ported from `cmd_internal_doorbell` into brain/sensors/sink tasks per D3), new `crates/doorbell-bin/` (`doorbell` daemon, lifecycle per D2), `src/main.rs` (`doorbell` subcommands → proxy; spawn path gains the D9 deference ping), state migration (copy the D2 inventory), unit files, UDS+18980 bind, `/health`.
+**Affected:** new `crates/doorbell-rt/` (effect loop ported from `cmd_internal_doorbell` into brain/sensors/sink tasks per D3), new `crates/doorbell-cli/ (`doorbell` daemon, lifecycle per D2), `src/main.rs` (`doorbell` subcommands → proxy; spawn path gains the D9 deference ping), state migration (copy the D2 inventory), unit files, UDS+18980 bind, `/health`.
 **Pattern:** flywheel embeds `doorbell-rt` (replaces the in-file loop — one implementation, two hosts); toron `daemon.rs` lifecycle copied, not reinvented; proxy byte-preserving.
 **Avoid:** auto-starting the daemon (opt-in via config `[doorbell] url` or `doorbell start`); behavior changes (arrival triple is Phase 4); deleting the embedded host.
 **Tests:** one-release journal-diff acceptance (embedded-vs-daemon, normalize = strip `ts` fields only — v1 has no budget rows), proxy output diffed, crash-resume (SIGKILL mid-queue → restart → pending wakes re-fire at-least-once, no budget dup beyond the known pre-v2 RAM limitation, explicitly asserted), fence test (daemon alive → embedded defers).

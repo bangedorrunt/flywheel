@@ -6,7 +6,7 @@ description = "Multi-agent swarm orchestrator on the herdr backend — NTM-parit
 license = "MIT"
 
 [workspace]
-members = ["crates/doorbell-core", "crates/doorbell-rt", "crates/doorbell-bin"]
+members = ["crates/doorbell-core", "crates/doorbell-rt", "crates/doorbell-cli"]
 
 [dependencies]
 doorbell-core = { path = "crates/doorbell-core" }

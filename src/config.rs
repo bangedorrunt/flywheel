@@ -789,17 +789,21 @@ fn migrate_legacy_config(legacy: &Path, xdg: &Path) {
 
 pub fn state_dir() -> PathBuf {
     // Honor XDG_STATE_HOME first (193.2): hermetic state for tests/prod,
-    // matching how config_dir() honors XDG_CONFIG_HOME. `dirs::state_dir()`
-    // (macOS: ~/Library/Application Support) is the fallback.
+    // matching how config_dir() honors XDG_CONFIG_HOME. The fallback is
+    // ~/.local/state — NEVER dirs::state_dir() (macOS: ~/Library/Application
+    // Support): daemon::default_state_dir() resolves XDG-or-~/.local/state,
+    // and a second fallback here is an env-conditional split-brain (the CLI
+    // reads one tree, the daemon another). The App Support path holds no
+    // live state (fossil evidence: a never-read owner.json), so no
+    // migration — a copy could resurrect stale leases. Live App Support
+    // state from an old install moves to ~/.local/state manually. (bd-y6gw)
     std::env::var_os("XDG_STATE_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            dirs::state_dir().unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("~"))
-                    .join(".local/state")
-            })
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("~"))
+                .join(".local/state")
         })
         .join("flywheel")
 }
@@ -1315,9 +1319,25 @@ daily = [
         );
         unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
+    /// bd-y6gw: without XDG the fallback is ~/.local/state (matching
+    /// daemon::default_state_dir), never dirs::state_dir() — one tree for
+    /// the CLI and the daemon on every platform.
+    #[test]
+    fn state_dir_falls_back_to_dotlocal_not_appsupport() {
+        let _g = lock_env();
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        let home = std::env::temp_dir().join(format!("fw-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        unsafe { std::env::set_var("HOME", &home) };
+        assert_eq!(
+            state_dir(),
+            home.join(".local/state/flywheel"),
+            "no XDG -> ~/.local/state, same tree the daemon uses"
+        );
+        unsafe { std::env::remove_var("HOME") };
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
-    /// `Config::load()` dual-reads: XDG wins when present; a legacy macOS
-    /// config is read as a fallback and COPIED (not moved) to XDG, keeping the
     /// legacy file as backup. The live `[agent_mail]` block survives the copy.
     #[test]
     fn load_migrates_legacy_config_to_xdg_copying() {

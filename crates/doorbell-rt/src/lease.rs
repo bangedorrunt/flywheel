@@ -1,7 +1,7 @@
 // governed-by: ADR-0012
 //! Ownership lease + deference decision (D9, bd-asr2.3). Three layers keep
 //! exactly one writer per workspace: the lease file, the bind fence (in
-//! `doorbell-bin`), and the embedded deference ping. `WatcherGen` stays
+//! `doorbell-cli`), and the embedded deference ping. `WatcherGen` stays
 //! the fourth fence. The flywheel spawn-path call site lands in bd-asr2.5;
 //! the pure decision function and all three layers' tests land here.
 
