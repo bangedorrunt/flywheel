@@ -33,6 +33,7 @@ description: Named failures and their fixes. Door, spawn, loop, compose, and doo
 | A subscribed identity never rings | Only **spawn-registry** pins are fetched, addressed, and routed; a subscribed identity that was never spawned in the project (the operator pin) has mail in its inbox and no ring | Spawn/register the pin so it enters the registry, or track the ADR-0012 Phase-2 gap |
 | `/health` accepts but never responds | Wedged runtime (seen: lock held across a reconcile loop) | `sample <pid>` for `lock_slow` parks; restart; the class is fixed, report a recurrence with the sample |
 | 20+ `spawn-*` subscriptions, `subscribers: 0` | Dead spawns never unsubscribed (pre-fix graveyard) | `flywheel doorbell unsubscribe <id>` each; `kill` now drops its own rows, daemon reaps week-silent ones |
+| `flywheel mail …` fails: `migration N was previously applied but is missing in the resolved migrations` | The store was written by a newer embedded toron, or by the standalone `toron` on the same revision — this binary is behind. The message now names the store path and carries no destructive step | Reinstall at the current revision (`mbx +nightly-aarch64-apple-darwin install --path . --force`), or run the standalone `toron mail …` against the same project. The store is never dropped or rewritten |
 | `briefing --commit` refuses: crew-confirm gate | Spawn-class topology without `--yes` (non-TTY) | Present the proposal to the operator, remix, rerun with `--yes` (or `--crew N`) |
 
 ## Escape costs

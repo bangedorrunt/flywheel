@@ -250,11 +250,14 @@ impl CoalitionStore {
             .block_on(async {
                 std::fs::create_dir_all(&data_dir)
                     .with_context(|| format!("create mail data dir {}", data_dir.display()))?;
-                let pool = toron_core::index::schema::connect(
-                    &data_dir.join("coalition.sqlite").to_string_lossy(),
-                )
-                .await?;
-                toron_core::index::schema::migrate(&pool).await?;
+                let db_path = data_dir
+                    .join("coalition.sqlite")
+                    .to_string_lossy()
+                    .into_owned();
+                let pool = toron_core::index::schema::connect(&db_path).await?;
+                toron_core::index::schema::migrate(&pool)
+                    .await
+                    .with_context(|| crate::mail_shim::migrate_skew_hint("coalition", &db_path))?;
                 let bus = InProcessBus::open(
                     pool.clone(),
                     toron_core::bus::in_process::InProcessBusConfig::default(),

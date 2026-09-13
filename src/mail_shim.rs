@@ -217,6 +217,41 @@ fn pin_test_mail_root_set() {
     }
 }
 
+/// bd-vhia: `sqlx::migrate!` reports a store written by a NEWER embedded toron
+/// as "migration 10 was previously applied but is missing in the resolved
+/// migrations". That error names neither the store nor the remedy, and the
+/// reporter of bd-vhia lost time to it (they reached for `toron mail send` as a
+/// workaround). Name both, and never touch the store.
+pub(crate) fn migrate_skew_hint(store: &str, path: &str) -> String {
+    format!(
+        "the {store} store at {path} carries migrations this binary does not — it was written by a \
+         newer embedded toron, or by the standalone `toron` on the same revision (bd-vhia). \
+         Remedy: rebuild and reinstall this binary at the current revision (`mbx \
+         +nightly-aarch64-apple-darwin install --path . --force`), or run the standalone `toron \
+         mail ...` against the same project. The store is left untouched."
+    )
+}
+
+#[cfg(test)]
+mod bd_vhia_migrate_hint_tests {
+    use super::migrate_skew_hint;
+
+    #[test]
+    fn the_hint_names_the_store_the_path_and_the_remedy() {
+        let h = migrate_skew_hint("mail", "/tmp/x/index.sqlite");
+        assert!(h.contains("mail"), "names which store: {h}");
+        assert!(h.contains("/tmp/x/index.sqlite"), "names the path: {h}");
+        assert!(
+            h.contains("install --path . --force") && h.contains("toron mail"),
+            "names both remedies: {h}"
+        );
+        assert!(
+            h.contains("left untouched"),
+            "says the store is not destroyed: {h}"
+        );
+    }
+}
+
 async fn build_mailbox() -> anyhow::Result<toron_core::mailbox::Mailbox> {
     let (data_dir, db) = mailbox_roots();
     std::fs::create_dir_all(&data_dir)
@@ -235,7 +270,9 @@ async fn build_mailbox() -> anyhow::Result<toron_core::mailbox::Mailbox> {
     }
     let db_path = db.to_string_lossy().into_owned();
     let pool = toron_core::index::schema::connect(&db_path).await?;
-    toron_core::index::schema::migrate(&pool).await?;
+    toron_core::index::schema::migrate(&pool)
+        .await
+        .with_context(|| migrate_skew_hint("mail", &db_path))?;
     let bus = toron_core::bus::InProcessBus::open(
         pool.clone(),
         toron_core::bus::in_process::InProcessBusConfig::default(),
