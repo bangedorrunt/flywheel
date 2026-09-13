@@ -83,6 +83,10 @@ pub struct RtHost {
     // the registry pin set changes (was every 1s sweep: N whois RPCs/sec).
     index_refreshed_at: u64,
     index_pins: Vec<String>,
+    /// The one live `toron watch` child. Shared with the respawn task so a
+    /// replacement reaps its predecessor ([`crate::WatchChild`] kills on
+    /// drop) instead of littering PPID-1 watchers.
+    watch_child: std::sync::Arc<std::sync::Mutex<Option<crate::WatchChild>>>,
 }
 
 impl RtHost {
@@ -121,6 +125,7 @@ impl RtHost {
             retry: doorbell_rt::WatchRetry::default(),
             index_refreshed_at: now,
             index_pins,
+            watch_child: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -222,13 +227,7 @@ impl Host for RtHost {
                 false,
             ),
             BrainMsg::Died => (workspace::Msg::WatchDied, false),
-            BrainMsg::Sweep { since, now } => (
-                workspace::Msg::Sweep {
-                    since: since.clone(),
-                    now: *now,
-                },
-                true,
-            ),
+            BrainMsg::Sweep { now } => (workspace::Msg::Sweep { now: *now }, true),
             BrainMsg::RoleBound { role, pin } => (
                 workspace::Msg::RoleBound {
                     role: role.clone(),
@@ -281,19 +280,18 @@ impl Host for RtHost {
                 workspace::Cmd::Prompt { pin, line } => Some(Effect::Prompt { pin, line }),
                 // Pin is advisory: the brain fetches every known pin with
                 // per-pin cursors (cursor-safe), matching the old sweep arm.
-                workspace::Cmd::FetchInbox { .. } => Some(Effect::FetchInbox {
-                    pin: String::new(),
-                    since: String::new(),
-                }),
+                workspace::Cmd::FetchInbox => Some(Effect::FetchInbox),
                 workspace::Cmd::CheckAckSla => Some(Effect::CheckAckSla),
                 workspace::Cmd::RestartWatch => Some(Effect::RestartWatch),
                 workspace::Cmd::FactMiss { why } => Some(Effect::Audit {
                     kind: "fact_miss".into(),
+                    pin: String::new(),
                     detail: serde_json::json!({ "why": why }),
                 }),
                 workspace::Cmd::Audit { kind, pin, detail } => Some(Effect::Audit {
                     kind,
-                    detail: serde_json::json!({ "pin": pin, "detail": detail }),
+                    pin,
+                    detail: serde_json::json!(detail),
                 }),
                 _ => None,
             })
@@ -389,8 +387,10 @@ impl Host for RtHost {
         self.cover_new_panes();
         // Presence hear: presence.jsonl is the real projection for ephemeral
         // 20001 (bus never stores it). Trust root stays the tick (Brain
-        // ticks Presence per row; hear derives after).
-        let path = crate::mail_shim::mailbox_roots().0.join("presence.jsonl");
+        // ticks Presence per row; hear derives after). The path is toron's
+        // canonical root-level projection (`mailbox_root` lift, bd-m5ym) —
+        // the projects-level file is never written and starves the map.
+        let path = crate::mail_shim::presence_path();
         let Ok(body) = std::fs::read_to_string(&path) else {
             return Vec::new();
         };
@@ -419,16 +419,27 @@ impl Host for RtHost {
         let backoff = self.retry.record_fail();
         let tx = self.brain_tx.clone();
         let project = self.project.clone();
+        let workspace = self.workspace.clone();
+        let slot = self.watch_child.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(backoff)).await;
+            // Reap the predecessor first: one live watcher per host.
+            if let Ok(mut g) = slot.lock() {
+                let _ = g.take();
+            }
             let tx_g = tx.clone();
-            match crate::spawn_watch_child(&project, move |ev| {
-                let _ = match ev {
-                    Some(l) => tx_g.blocking_send(BrainMsg::Watch(l)),
-                    None => tx_g.blocking_send(BrainMsg::Died),
-                };
-            }) {
-                Some(_child) => {
+            let spawned =
+                crate::spawn_watch_child(&project, &workspace, &config::state_dir(), move |ev| {
+                    let _ = match ev {
+                        Some(l) => tx_g.blocking_send(BrainMsg::Watch(l)),
+                        None => tx_g.blocking_send(BrainMsg::Died),
+                    };
+                });
+            match spawned {
+                Some(child) => {
+                    if let Ok(mut g) = slot.lock() {
+                        *g = Some(child);
+                    }
                     doorbell::audit_append(
                         &config::state_dir(),
                         "",
@@ -581,26 +592,29 @@ async fn run_embedded_async(
     );
     let store = FileStore::new(config::state_dir());
     // Watch source: in-process bus watch first (zero fork), CLI child fallback.
-    let mut watch_child: Option<std::process::Child> = None;
-    if !spawn_bus_watch(&cfg, project, tx.clone()) {
+    // Both stamp the watch heartbeat, and the child goes through the host's
+    // slot so the respawn path reaps its predecessor.
+    let watch_slot = host.watch_child.clone();
+    if !spawn_bus_watch(&cfg, project, workspace, tx.clone()) {
         let tx_w = tx.clone();
         let project = project.to_string();
-        watch_child = crate::spawn_watch_child(&project, move |ev| {
-            let _ = match ev {
-                Some(l) => tx_w.blocking_send(BrainMsg::Watch(l)),
-                None => tx_w.blocking_send(BrainMsg::Died),
-            };
-        });
+        let spawned =
+            crate::spawn_watch_child(&project, workspace, &config::state_dir(), move |ev| {
+                let _ = match ev {
+                    Some(l) => tx_w.blocking_send(BrainMsg::Watch(l)),
+                    None => tx_w.blocking_send(BrainMsg::Died),
+                };
+            });
+        if let Ok(mut g) = watch_slot.lock() {
+            *g = spawned;
+        }
     }
     host.cover_new_panes();
     // Beats: 1s sweep, 60s ack-SLA (same cadences as the old loop).
     let sweep_tx = tx.clone();
     let sweep_ticker =
         doorbell_rt::interval_ticker("sweep", sweep_tx, Duration::from_secs(1), || {
-            BrainMsg::Sweep {
-                since: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                now: unix_now(),
-            }
+            BrainMsg::Sweep { now: unix_now() }
         });
     // F3/bd-ene2 D9 heartbeat — refresh our workspace lease every 30s so
     // a crash goes stale within 90s and a wedged writer cannot hold it.
@@ -666,8 +680,9 @@ async fn run_embedded_async(
     let report = brain.run(rx).await;
     drop(sweep_ticker);
     _lease_beat.abort();
-    if let Some(mut c) = watch_child {
-        let _ = c.kill();
+    // Reap the watcher on shutdown rather than orphaning it.
+    if let Ok(mut g) = watch_slot.lock() {
+        let _ = g.take();
     }
     eprintln!(
         "flywheel doorbell: embedded loop exited (injects={} sheds={} degraded={})",
@@ -677,7 +692,12 @@ async fn run_embedded_async(
 }
 
 /// In-process bus watch (zero fork): kinds mirror the CLI fallback filter.
-fn spawn_bus_watch(cfg: &Config, project: &str, tx: mpsc::Sender<BrainMsg>) -> bool {
+fn spawn_bus_watch(
+    cfg: &Config,
+    project: &str,
+    workspace: &str,
+    tx: mpsc::Sender<BrainMsg>,
+) -> bool {
     (|| -> Option<()> {
         let _mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
             .ok()
@@ -704,7 +724,9 @@ fn spawn_bus_watch(cfg: &Config, project: &str, tx: mpsc::Sender<BrainMsg>) -> b
                 .hashtag(project)
         };
         let mut sub = crate::mail_shim::block_on(bus.subscribe_trusted(filter)).ok()?;
+        let ws = workspace.to_string();
         std::thread::spawn(move || {
+            let mut stamped: Option<std::time::Instant> = None;
             loop {
                 let ev_opt = crate::mail_shim::block_on(sub.next());
                 match ev_opt {
@@ -719,6 +741,13 @@ fn spawn_bus_watch(cfg: &Config, project: &str, tx: mpsc::Sender<BrainMsg>) -> b
                             "tags": tags,
                             "created_at": e.created_at.as_secs(),
                         });
+                        // Heartbeat the in-process path too: it is the
+                        // preferred watcher, so `/health` must be able to
+                        // see it delivering (or not) exactly like the child.
+                        if stamped.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+                            doorbell_rt::watchbeat::touch(&config::state_dir(), &ws);
+                            stamped = Some(std::time::Instant::now());
+                        }
                         if let Ok(line) = serde_json::to_string(&v)
                             && tx.blocking_send(BrainMsg::Watch(line)).is_err()
                         {
@@ -800,7 +829,7 @@ mod parity_tests {
     fn registry_key_mirrors_state_key() {
         for proj in ["proj", "/tmp/x/proj", "a/b/c"] {
             assert_eq!(
-                doorbell_rt::file_host::registry_key(proj),
+                doorbell_rt::registry_key(proj),
                 crate::state::state_key(proj),
                 "key mirror for {proj:?}"
             );
@@ -883,7 +912,7 @@ mod parity_tests {
             }
         }
 
-        // One scripted Msg log; fixed `since`/`now` payloads so only `ts`
+        // One scripted Msg log; fixed payloads so only `ts`
         // differs between runs. Built twice (BrainMsg is not Clone).
         let inbox_row =
             |ts: &str| serde_json::json!({"importance": "urgent", "created_ts": ts, "tags": []});
@@ -928,10 +957,7 @@ mod parity_tests {
                 BrainMsg::Fact {
                     summary: "deploy".into(),
                 },
-                BrainMsg::Sweep {
-                    since: "2026-09-10T08:00:00Z".into(),
-                    now: 1_700_000_000,
-                },
+                BrainMsg::Sweep { now: 1_700_000_000 },
                 // NOTE: no AckSlaTick in the live run (the embedded scan
                 // block_ons inside a runtime); tick parity asserted above.
                 // Busy presence holds the next routine ring on both hosts...

@@ -4667,7 +4667,15 @@ fn main() {
             model,
             harness,
             note,
-        }) => cmd_binding_rebind(&cfg, project, pin, profile.as_deref(), model.as_deref(), harness.as_deref(), note.as_deref()),
+        }) => cmd_binding_rebind(
+            &cfg,
+            project,
+            pin,
+            profile.as_deref(),
+            model.as_deref(),
+            harness.as_deref(),
+            note.as_deref(),
+        ),
         Some(Commands::Recover { project }) => cmd_recover(&cfg, project),
         Some(Commands::Send {
             project,
@@ -9930,7 +9938,9 @@ fn ensure_doorbell_supervisor() {
 /// read the same journal files either way, so output is identical without
 /// a proxy hop. Returns true when proxied.
 fn proxy_doorbell_verb(cfg: &Config, verb: &str, extra: &[String]) -> Result<bool> {
-    let url = match doorbell::resolve_host(&config::state_dir(), cfg.doorbell_url()) {
+    // No target: lifecycle verbs address the daemon itself, so they must
+    // not be qualified by whether it hosts any particular workspace.
+    let url = match doorbell::resolve_host(&config::state_dir(), cfg.doorbell_url(), None) {
         doorbell::DoorbellHost::Proxy { url } => url,
         doorbell::DoorbellHost::Embedded => return Ok(false),
     };
@@ -10168,11 +10178,10 @@ fn cmd_doorbell_why(
     }
     // presence/assignment into a single proof (tenant contamination).
     // Each workspace folds its own entries from an identically-seeded Default.
-    let presence_rows =
-        std::fs::read_to_string(crate::mail_shim::mailbox_roots().0.join("presence.jsonl"))
-            .ok()
-            .map(|body| timeout_presence_rows(&body, doorbell_now_unix()))
-            .unwrap_or_default();
+    let presence_rows = std::fs::read_to_string(crate::mail_shim::presence_path())
+        .ok()
+        .map(|body| timeout_presence_rows(&body, doorbell_now_unix()))
+        .unwrap_or_default();
     let mut models: std::collections::BTreeMap<String, workspace::WorkspaceModel> =
         std::collections::BTreeMap::new();
     let mut replay_seq: u64 = 0;
@@ -10241,9 +10250,7 @@ fn cmd_doorbell_why(
                         doorbell_tick::DoorbellAction::Prompt { pin, line } => {
                             workspace::Cmd::Prompt { pin, line }
                         }
-                        doorbell_tick::DoorbellAction::FetchInbox { since } => {
-                            workspace::Cmd::FetchInbox { since }
-                        }
+                        doorbell_tick::DoorbellAction::FetchInbox => workspace::Cmd::FetchInbox,
                         doorbell_tick::DoorbellAction::CheckAckSla => workspace::Cmd::CheckAckSla,
                         doorbell_tick::DoorbellAction::RestartWatch => workspace::Cmd::RestartWatch,
                         doorbell_tick::DoorbellAction::FactMiss { why } => {
@@ -10356,7 +10363,11 @@ fn cmd_doorbell_why(
                                 "fact-miss"
                             } else if v.get("Audit").is_some() {
                                 "audit"
-                            } else if v.get("FetchInbox").is_some() {
+                            } else if v.get("FetchInbox").is_some()
+                                || v.as_str() == Some("FetchInbox")
+                            {
+                                // Unit since bd-z5ou (was {"FetchInbox":{"since"}});
+                                // old journals keep the object shape.
                                 "fetch-inbox"
                             } else {
                                 "unknown"
@@ -10527,9 +10538,7 @@ fn digest_roster_lines(cfg: &Config, project: &str, now: u64) -> Vec<String> {
         .collect();
     // Presence with recency (latest row per pin wins).
     let mut presence: Vec<(String, String, u64)> = Vec::new();
-    if let Ok(body) =
-        std::fs::read_to_string(crate::mail_shim::mailbox_roots().0.join("presence.jsonl"))
-    {
+    if let Ok(body) = std::fs::read_to_string(crate::mail_shim::presence_path()) {
         let mut latest: std::collections::HashMap<String, (u64, String)> =
             std::collections::HashMap::new();
         for line in body.lines() {
@@ -10982,7 +10991,11 @@ fn cmd_internal_doorbell(
     // bd-asr2.5: host selection — one implementation, two hosts. Daemon
     // mode never runs a local loop (subscription registration via API
     // lands in bd-asr2.8); embedded mode drives doorbell-rt's Brain.
-    match doorbell::resolve_host(&config::state_dir(), cfg.doorbell_url()) {
+    match doorbell::resolve_host(
+        &config::state_dir(),
+        cfg.doorbell_url(),
+        Some((project, workspace)),
+    ) {
         doorbell::DoorbellHost::Proxy { url } => {
             eprintln!("flywheel doorbell: daemon host {url} — no local loop (attach only)");
             return Ok(());
@@ -10996,7 +11009,25 @@ fn cmd_internal_doorbell(
 /// Kinds MUST match the in-process filter (presence 20001 + profile 30013).
 const DOORBELL_WATCH_KINDS: &str = "9,14,20001,30013,43001,30031,39002";
 
-fn spawn_watch_child<F>(project: &str, on_event: F) -> Option<std::process::Child>
+/// A `toron watch` child that is killed + reaped on drop. Wrapping is the
+/// point: dropping a bare `std::process::Child` does NOT terminate it, so
+/// every `Died`-driven restart leaked another long-lived watcher holding a
+/// live bus subscription (observed live as PPID-1 orphans).
+pub struct WatchChild(pub std::process::Child);
+
+impl Drop for WatchChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_watch_child<F>(
+    project: &str,
+    workspace: &str,
+    state_dir: &std::path::Path,
+    on_event: F,
+) -> Option<WatchChild>
 where
     F: Fn(Option<String>) + Send + 'static,
 {
@@ -11008,17 +11039,29 @@ where
         .spawn()
         .ok()?;
     let stdout = child.stdout.take()?;
+    let state_dir = state_dir.to_path_buf();
+    let workspace = workspace.to_string();
     std::thread::spawn(move || {
         use std::io::BufRead;
+        // Heartbeat (throttled 1s) so `/health` can tell a quiet bus from a
+        // deaf watcher — the one signal that would have caught a daemon
+        // watching a different mailbox immediately instead of by inference.
+        let mut stamped: Option<std::time::Instant> = None;
         for line in std::io::BufReader::new(stdout).lines() {
             match line {
-                Ok(l) => on_event(Some(l)),
+                Ok(l) => {
+                    if stamped.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+                        doorbell_rt::watchbeat::touch(&state_dir, &workspace);
+                        stamped = Some(std::time::Instant::now());
+                    }
+                    on_event(Some(l));
+                }
                 Err(_) => break,
             }
         }
         on_event(None); // Died
     });
-    Some(child)
+    Some(WatchChild(child))
 }
 
 /// Pins plus npubs so live kind-9 `p` tags (hex) resolve to the pin.
@@ -11265,7 +11308,7 @@ fn handle_workspace_cmds(
             workspace::Cmd::SqliteUpsert { corr, receipt } => {
                 upsert_workspace_receipt(corr, receipt);
             }
-            workspace::Cmd::FetchInbox { .. } => {
+            workspace::Cmd::FetchInbox => {
                 fetch_inbox = true;
             }
             workspace::Cmd::WaitCorr { .. } => {
@@ -14756,7 +14799,9 @@ fn cmd_binding_rebind(
         profile_name: profile
             .map(str::to_string)
             .unwrap_or_else(|| from.profile_name.clone()),
-        model: model.map(str::to_string).unwrap_or_else(|| from.model.clone()),
+        model: model
+            .map(str::to_string)
+            .unwrap_or_else(|| from.model.clone()),
         harness: harness
             .map(str::to_string)
             .unwrap_or_else(|| from.harness.clone()),
@@ -24510,13 +24555,15 @@ fn render_orchestration_prompt(
     // the spawn-inject body so /peer-aware-mode cannot drift from handler text.
     if name == "peer-aware-mode" {
         const PEER_AWARE_SOT: &str = include_str!("../integrations/peer-aware.md.tpl");
-        out.push_str("
+        out.push_str(
+            "
 
 ---
 
 ## Handler body (SoT: integrations/peer-aware.md.tpl)
 
-");
+",
+        );
         out.push_str(PEER_AWARE_SOT);
     }
     Ok(out)
@@ -32088,10 +32135,13 @@ fn cmd_internal_run_headless(
         // (ADR-0007 + ADR-0032 Spec 7). Journal intent before dispatch (I4).
         // Registry ModelEntry.fallback remains the last rung. Timeout alone
         // never reaches this block (rate_limited gate).
-        let err_ev = attempt.outcome.error.clone().unwrap_or_else(|| "429".into());
+        let err_ev = attempt
+            .outcome
+            .error
+            .clone()
+            .unwrap_or_else(|| "429".into());
         let mut hopped = false;
-        if agent_ref::RebindIntent::allowed_from_failure(failure::FailureKind::RateLimit, &err_ev)
-        {
+        if agent_ref::RebindIntent::allowed_from_failure(failure::FailureKind::RateLimit, &err_ev) {
             for fb_id in &profile.model_fallback {
                 if fb_id.is_empty() || fb_id == &model_id {
                     continue;
@@ -38435,10 +38485,22 @@ mod why_resume_tests {
     fn why_seeds_presence_snapshot() {
         let src = include_str!("main.rs");
         let pos = src.find("fn cmd_doorbell_why(").expect("cmd_doorbell_why");
-        let slice = &src[pos..std::cmp::min(src.len(), pos + 6000)];
+        // Whole function (its sibling `why_fold_has_corr_seq_filters_from_default`
+        // bounds the same way): the presence seed lands ~7.3k chars in, past
+        // the old 6000-char window — which passed only on the coincidental
+        // `presence.jsonl` read-site string, not the seed itself.
+        let end = src[pos..]
+            .find("\nfn cmd_loop_why(")
+            .map(|i| pos + i)
+            .unwrap_or(src.len());
+        let slice = &src[pos..end];
         assert!(
-            slice.contains("seed_why_presence") || slice.contains("presence.jsonl"),
+            slice.contains("seed_why_presence"),
             "RED (55nx.1): why folds without a presence seed — working pins replay Prompts live would suppress"
+        );
+        assert!(
+            slice.contains("presence_path()"),
+            "the why presence seed must read the toron-canonical root-level projection"
         );
     }
 }

@@ -46,21 +46,23 @@ pub enum Presence {
 }
 
 impl Presence {
-    /// Wire authority: 20001/jsonl state words. blocked reads as Busy
-    /// (occupied, needs decision via digest not prompt); done reads as
-    /// Idle (available). Anything unparseable is Unknown, never idle.
+    /// Wire authority: 20001/jsonl state words. The word map itself lives
+    /// in core (`parse_presence_word`, bd-z5ou); this only attaches the
+    /// evidence source. blocked reads as Busy (occupied, needs decision
+    /// via digest not prompt); done reads as Idle (available). Anything
+    /// unparseable is Unknown, never idle.
     pub fn from_str(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "working" | "busy" | "blocked" => Self::Busy {
+        match doorbell_core::parse_presence_word(s) {
+            doorbell_core::PresenceVerdict::Busy => Self::Busy {
                 source: "presence".into(),
             },
-            "idle" | "done" => Self::Idle {
+            doorbell_core::PresenceVerdict::Idle => Self::Idle {
                 source: "presence".into(),
             },
-            "dead" | "endpoint-dead" | "endpoint" => Self::Dead {
+            doorbell_core::PresenceVerdict::Dead => Self::Dead {
                 source: "presence".into(),
             },
-            _ => Self::Unknown,
+            doorbell_core::PresenceVerdict::Unknown => Self::Unknown,
         }
     }
     pub fn as_str(&self) -> &str {
@@ -801,10 +803,9 @@ pub enum Msg {
         title: String,
     },
     /// Clock for plane-P fetch: effect runs FetchInbox; rows re-enter as InboxRows.
-    /// Emits exactly one FetchInbox{since}; never performs the fetch itself.
+    /// Emits exactly one FetchInbox signal; never performs the fetch itself.
     /// Carries `now` so the same beat expires bounded waits (bd-zfnx.6).
     Sweep {
-        since: String,
         now: u64,
     },
     /// Write-through of one durable receipt: inserts the assignment cache
@@ -861,9 +862,9 @@ pub enum Cmd {
     // doorbell slice — data equivalents of DoorbellAction
     /// Inject iff prompt_allowed (E5 gate). Line always starts "[doorbell]".
     Prompt { pin: String, line: String },
-    /// Effect runs the fetch; rows re-enter tick as InboxRows. Since is an
-    /// opaque cursor, never a filter.
-    FetchInbox { since: String },
+    /// Effect runs the fetch; rows re-enter tick as InboxRows.
+    /// Signal only (bd-z5ou): per-pin cursors live in the brain.
+    FetchInbox,
     /// Caller-applied dispatcher effects (no tick-side content).
     CheckAckSla,
     /// Caller-applied dispatcher effects (no tick-side content).
@@ -964,9 +965,7 @@ impl Cmd {
             crate::doorbell_tick::DoorbellAction::Prompt { pin, line } => {
                 Self::Prompt { pin, line }
             }
-            crate::doorbell_tick::DoorbellAction::FetchInbox { since } => {
-                Self::FetchInbox { since }
-            }
+            crate::doorbell_tick::DoorbellAction::FetchInbox => Self::FetchInbox,
             crate::doorbell_tick::DoorbellAction::CheckAckSla => Self::CheckAckSla,
             crate::doorbell_tick::DoorbellAction::RestartWatch => Self::RestartWatch,
             crate::doorbell_tick::DoorbellAction::FactMiss { why } => Self::FactMiss { why },
@@ -1560,16 +1559,11 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 },
             );
             next.doorbell = dm;
-            if let Some(pin) = next
-                .roles
-                .get("captain")
-                .cloned()
-                .or_else(|| next.roles.get("wheelhouse").cloned())
-            {
+            if let Some(pin) = doorbell_core::fact_captain_pin(&next.roles) {
                 if prompt_allowed(&next, &pin) {
                     cmds.push(Cmd::Prompt {
                         pin,
-                        line: format!("[doorbell] {summary}"),
+                        line: doorbell_core::fact_prompt_line(summary),
                     });
                 } else {
                     cmds.extend(c);
@@ -1643,10 +1637,8 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 }
             }
         }
-        Msg::Sweep { since, now } => {
-            cmds.push(Cmd::FetchInbox {
-                since: since.clone(),
-            });
+        Msg::Sweep { now } => {
+            cmds.push(Cmd::FetchInbox);
             // bd-zfnx.6: bound the wait cache on every sweep beat. Expired
             // deadlines and over-cap earliest entries leave WITH an Audit
             // wait-timeout record each — a timeout is observable, never a
@@ -2497,10 +2489,7 @@ mod tests {
                 bead_id: "b".into(),
                 title: "t".into(),
             },
-            Msg::Sweep {
-                since: "0".into(),
-                now: 0,
-            },
+            Msg::Sweep { now: 0 },
             Msg::Receipt {
                 corr: "c".into(),
                 receipt: Receipt::default(),
@@ -2592,13 +2581,7 @@ mod tests {
             m.pending_wait
                 .insert(format!("filler-{i:04}"), now + 20_000 + i as u64);
         }
-        let (next, cmds) = tick(
-            &m,
-            &Msg::Sweep {
-                since: "0".into(),
-                now,
-            },
-        );
+        let (next, cmds) = tick(&m, &Msg::Sweep { now });
         assert!(
             !next.pending_wait.contains_key("expired"),
             "expired waits drain on Sweep"
@@ -2663,13 +2646,7 @@ mod tests {
         );
         // Past needed-by surfaces as escalation on the sweep beat:
         // re-surfaced (never dropped) + wait-timeout audit record.
-        let (next, cmds) = tick(
-            &m,
-            &Msg::Sweep {
-                since: "0".into(),
-                now,
-            },
-        );
+        let (next, cmds) = tick(&m, &Msg::Sweep { now });
         assert!(
             next.open_human.contains_key("late"),
             "overdue hold re-surfaces"
@@ -4230,13 +4207,7 @@ mod d6_open_decisions_tests {
     fn d6_pending_wait_expiry_promotes_never_drops() {
         let mut m = empty_model();
         m.pending_wait.insert("FM-W".into(), 100);
-        let (next, cmds) = tick(
-            &m,
-            &Msg::Sweep {
-                since: "t0".into(),
-                now: 200,
-            },
-        );
+        let (next, cmds) = tick(&m, &Msg::Sweep { now: 200 });
         assert!(
             !next.pending_wait.contains_key("FM-W"),
             "expired entry leaves the wait cache"
@@ -4281,10 +4252,7 @@ mod d6_open_decisions_tests {
                 pin: "P".into(),
                 state: "idle".into(),
             },
-            Msg::Sweep {
-                since: "t0".into(),
-                now: 200,
-            },
+            Msg::Sweep { now: 200 },
         ];
         let mut live = empty_model();
         for m in &msgs {

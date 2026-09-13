@@ -59,7 +59,6 @@ async fn host_workspace(
         tx.clone(),
         std::time::Duration::from_secs(1),
         || doorbell_rt::BrainMsg::Sweep {
-            since: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             now: doorbell_rt::lease::unix_now(),
         },
     );
@@ -415,6 +414,45 @@ async fn handle_uds(mut stream: tokio::net::UnixStream, app: AppState) {
 
 /// Journal mtime age per hosted workspace — sweep liveness without
 /// shared mutable state (the journal IS the ground truth D4 points to).
+/// Workspace half of a hosted `project/workspace` pair. `rsplit_once('/')`
+/// matches `parse_host`: project keys are routinely absolute paths, so the
+/// FIRST `/` splits at `/private` and every downstream lookup (sweep age,
+/// journal seq, watch heartbeat, subscriber scope) silently reads the wrong
+/// workspace — `/health` then reported nulls and zeros for a live daemon.
+fn hosted_workspace(hw: &str) -> Option<&str> {
+    hw.rsplit_once('/')
+        .map(|(_, ws)| ws)
+        .filter(|ws| !ws.is_empty())
+}
+
+/// Wake subscriptions registered for the daemon's hosted workspaces
+/// (flywheel `spawn` writes one per pin as `Scope::One(workspace)`). A
+/// standby daemon hosts nothing, so 0 is the honest answer there — but it
+/// is now counted rather than asserted.
+fn hosted_subscribers(fw_state: &std::path::Path, hosted: &[String]) -> usize {
+    let workspaces: Vec<&str> = hosted.iter().filter_map(|h| hosted_workspace(h)).collect();
+    if workspaces.is_empty() {
+        return 0;
+    }
+    doorbell_rt::SubscriptionStore::open(fw_state)
+        .list()
+        .iter()
+        .filter(|s| {
+            matches!(&s.scope, doorbell_rt::Scope::One(ws) if workspaces.contains(&ws.as_str()))
+        })
+        .count()
+}
+
+/// Age of the most recent bus event across the hosted workspaces (min age =
+/// most recent), read back from the watch heartbeat.
+fn hosted_watch_age(fw_state: &std::path::Path, hosted: &[String]) -> Option<u64> {
+    hosted
+        .iter()
+        .filter_map(|h| hosted_workspace(h))
+        .filter_map(|ws| doorbell_rt::watchbeat::age_secs(fw_state, ws))
+        .min()
+}
+
 fn hosted_sweep_age(fw_state: &std::path::Path, hosted: &[String]) -> (Option<u64>, u64) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -423,7 +461,7 @@ fn hosted_sweep_age(fw_state: &std::path::Path, hosted: &[String]) -> (Option<u6
     let mut min_age: Option<u64> = None;
     let mut max_seq = 0u64;
     for hw in hosted {
-        let Some(ws) = hw.split('/').nth(1) else {
+        let Some(ws) = hosted_workspace(hw) else {
             continue;
         };
         let path = fw_state
@@ -492,6 +530,10 @@ fn health_body(app: &AppState) -> String {
         degraded.push("standby_with_known_workspaces".to_string());
     }
     let (sweep_age, max_seq) = hosted_sweep_age(&app.fw_state, &app.hosted);
+    let watch_age = hosted_watch_age(&app.fw_state, &app.hosted);
+    let mailbox_root = doorbell_rt::toron_data_root(None);
+    let presence_age =
+        doorbell_rt::watchbeat::file_age_secs(&doorbell_rt::presence_path(&mailbox_root));
     serde_json::json!({
         "protocol": doorbell_rt::api::PING.protocol,
         "core_v": doorbell_rt::api::PING.core_v,
@@ -499,9 +541,26 @@ fn health_body(app: &AppState) -> String {
         "uptime_s": app.started.elapsed().as_secs(),
         "mode": mode,
         "hosted": app.hosted,
-        "watch": {"state": if app.hosted.is_empty() { "standby" } else { "hosted" }, "last_event_age_s": null},
+        // last_event_age_s is MEASURED from the watch heartbeat (None =
+        // this workspace has never seen a bus event: wrong bus or dead
+        // child), not the literal `null` it used to be.
+        "watch": {
+            "state": if app.hosted.is_empty() { "standby" } else { "hosted" },
+            "last_event_age_s": watch_age,
+        },
         "sweep": {"last_age_s": sweep_age},
-        "subscribers": 0,
+        // Measured, not hardcoded: the literal `0` here read as "no wake
+        // subscriptions" even on a fully hosted daemon mid-ring, and sent
+        // operators hunting the wrong fault.
+        "subscribers": hosted_subscribers(&app.fw_state, &app.hosted),
+        // The mailbox this daemon actually watches. A daemon on a different
+        // toron root than the pins' bus is deaf; presence_age_s (None = no
+        // projection ever written at the canonical root-level path) makes
+        // that comparable in one read.
+        "mailbox": {
+            "toron_data_dir": mailbox_root.display().to_string(),
+            "presence_age_s": presence_age,
+        },
         "degraded": degraded,
         "known_workspaces": known_workspaces.len(),
         "standby_hint": if wake_blind {

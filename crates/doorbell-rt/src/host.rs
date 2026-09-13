@@ -13,14 +13,18 @@ pub enum Effect {
     /// The only delivery intent; sinks translate it (P1 corollary).
     Prompt { pin: String, line: String },
     /// Fetch plane-P inbox off-loop; rows re-enter as `InboxFetched`.
-    FetchInbox { pin: String, since: String },
+    /// Signal only (bd-z5ou): per-pin cursors live in the brain.
+    FetchInbox,
     /// Run the ack-SLA scan; results re-enter as `SlaFired`.
     CheckAckSla,
     /// Restart the watch child with backoff.
     RestartWatch,
-    /// Loud miss: journal + stderr, never silent `Ok(())`.
+    /// Loud miss: journal + stderr, never silent `Ok(())`. Pin is
+    /// first-class (bd-z5ou, same shape as the workspace `Cmd::Audit`);
+    /// pin-less misses (fact without captain, registry ambiguity) use "".
     Audit {
         kind: String,
+        pin: String,
         detail: serde_json::Value,
     },
 }
@@ -182,19 +186,18 @@ impl CoreReducer {
             .into_iter()
             .map(|a| match a {
                 DoorbellAction::Prompt { pin, line } => Effect::Prompt { pin, line },
-                DoorbellAction::FetchInbox { since } => Effect::FetchInbox {
-                    pin: String::new(),
-                    since,
-                },
+                DoorbellAction::FetchInbox => Effect::FetchInbox,
                 DoorbellAction::CheckAckSla => Effect::CheckAckSla,
                 DoorbellAction::RestartWatch => Effect::RestartWatch,
                 DoorbellAction::FactMiss { why } => Effect::Audit {
                     kind: "fact_miss".into(),
+                    pin: String::new(),
                     detail: serde_json::json!({ "why": why }),
                 },
                 DoorbellAction::Audit { kind, pin, detail } => Effect::Audit {
                     kind,
-                    detail: serde_json::json!({ "pin": pin, "detail": detail }),
+                    pin,
+                    detail: serde_json::json!(detail),
                 },
             })
             .collect()
