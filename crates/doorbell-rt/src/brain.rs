@@ -69,6 +69,11 @@ pub struct Brain<H: Host> {
     /// newer than every traced one earns a journal row — O(1) sampling that
     /// keeps the journal bounded while staying answerable.
     dedup_high_us: Option<i64>,
+    /// bd-adms: the last ack-SLA expiry set `toron ack-sla` reported. A corr
+    /// past SLA is re-reported on EVERY scan (live: the same 89 ids every
+    /// 60s, forever), so only a CHANGE is news — a steady backlog is one
+    /// fact, not one row per minute.
+    sla_seen: std::collections::BTreeSet<String>,
 }
 
 impl<H: Host> Brain<H> {
@@ -145,6 +150,7 @@ impl<H: Host> Brain<H> {
             next_seq,
             deaf_attempts: BTreeMap::new(),
             dedup_high_us: None,
+            sla_seen: std::collections::BTreeSet::new(),
         }
     }
 
@@ -557,8 +563,20 @@ impl<H: Host> Brain<H> {
         );
         if scan {
             let posts = self.host.scan_ack_sla();
-            if !posts.is_empty() {
-                self.on_sla_fired(posts).await;
+            // bd-adms: `toron ack-sla` re-reports every corr still past SLA,
+            // so an unchanged backlog re-fired the same wake + journal row
+            // every 60s (live: `SlaFired count: 89` ~1440×/day, which is
+            // exactly the noise that hides a genuine regression). Fire only
+            // on a CHANGE: new overdue ids (the signal), or none left.
+            let current: std::collections::BTreeSet<String> = posts.iter().cloned().collect();
+            if current != self.sla_seen {
+                let cleared = self.sla_seen.len();
+                self.sla_seen = current;
+                if !posts.is_empty() {
+                    self.on_sla_fired(posts).await;
+                } else if cleared > 0 {
+                    self.audit("ack_sla_cleared", serde_json::json!({ "cleared": cleared }));
+                }
             }
         }
         // Live AckSla arm also sweeps the inbox when tick asks for it.
@@ -865,6 +883,43 @@ mod tests {
         let sinks = SinkManager::new(tx.clone());
         let brain = Brain::new(BrainConfig::new("w"), host, FileStore::new(dir), sinks);
         (brain, rx, tx)
+    }
+
+    /// bd-adms: `toron ack-sla` re-reports every corr still past SLA, so an
+    /// unchanged backlog re-fired the same wake ~1440x/day (live: `count: 89`
+    /// on every beat) — noise that buries a genuine regression. Only a CHANGE
+    /// is news.
+    #[tokio::test]
+    async fn sla_refire_is_a_delta_not_a_repeat() {
+        // `on_sla_fired` ticks again, so one AckSlaTick can consume two
+        // script entries; oversupply rather than count.
+        let (mut brain, _rx, _tx) = test_brain(
+            "sla-delta",
+            (0..8).map(|_| vec![Effect::CheckAckSla]).collect(),
+        );
+        let overdue = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        brain.host.sla = overdue(&["corr-1", "corr-2"]);
+        brain.on_ack_sla(1_000).await;
+        // Same two ids: the noise case. Nothing new may fire.
+        brain.host.sla = overdue(&["corr-1", "corr-2"]);
+        brain.on_ack_sla(1_060).await;
+        // A third corr crosses the SLA: news.
+        brain.host.sla = overdue(&["corr-1", "corr-2", "corr-3"]);
+        brain.on_ack_sla(1_120).await;
+        // Backlog fully cleared: news too (one row, then silence).
+        brain.host.sla = Vec::new();
+        brain.on_ack_sla(1_180).await;
+
+        let audit = std::fs::read_to_string(brain.store.audit_file("w")).unwrap();
+        let fired = audit.matches("\"ack_sla_fired\"").count();
+        assert_eq!(
+            fired, 2,
+            "two changes, two audits (not one per beat): {audit}"
+        );
+        assert!(
+            audit.contains("\"ack_sla_cleared\""),
+            "the backlog clearing is named once: {audit}"
+        );
     }
 
     #[tokio::test]
